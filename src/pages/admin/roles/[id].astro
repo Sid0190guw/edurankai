@@ -1,0 +1,272 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { roles, departments } from '@/lib/db/schema';
+import { can } from '@/lib/auth/permissions';
+import { roleSchema, parseLines } from '@/lib/validators';
+import { logAudit } from '@/lib/audit';
+import { eq, asc, and, ne } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+const canEdit = can(user, 'roles.edit');
+
+const { id } = Astro.params;
+
+if (!id) return Astro.redirect('/admin/roles');
+
+const allDepts = await db.select().from(departments).orderBy(asc(departments.sortOrder));
+
+let errorMsg = '';
+let okMsg = '';
+
+const existing = await db.select().from(roles).where(eq(roles.id, id)).limit(1);
+if (existing.length === 0) {
+  return Astro.redirect('/admin/roles');
+}
+let current = existing[0];
+
+if (Astro.request.method === 'POST' && canEdit) {
+  const fd = await Astro.request.formData();
+  const intent = fd.get('_intent');
+
+  if (intent === 'delete') {
+    await db.delete(roles).where(eq(roles.id, id));
+    await logAudit({
+      userId: user.id,
+      action: 'role.delete',
+      entity: 'role',
+      entityId: id,
+      diff: { deleted: { title: current.title, slug: current.slug } },
+      ipAddress: Astro.clientAddress
+    });
+    return Astro.redirect('/admin/roles');
+  }
+
+  const candidate = {
+    title: (fd.get('title') as string || '').trim(),
+    slug: (fd.get('slug') as string || '').trim(),
+    departmentId: fd.get('departmentId'),
+    level: fd.get('level'),
+    function: fd.get('function'),
+    engagementType: fd.get('engagementType'),
+    location: fd.get('location'),
+    duration: fd.get('duration'),
+    salary: fd.get('salary'),
+    about: fd.get('about'),
+    responsibilities: parseLines(fd.get('responsibilities') as string),
+    skills: parseLines(fd.get('skills') as string),
+    eligibility: parseLines(fd.get('eligibility') as string),
+    isOpen: fd.get('isOpen') === 'on',
+    isFeatured: fd.get('isFeatured') === 'on',
+    sortOrder: parseInt((fd.get('sortOrder') as string) || '0', 10)
+  };
+
+  const parsed = roleSchema.safeParse(candidate);
+
+  if (!parsed.success) {
+    errorMsg = parsed.error.errors.map((e) => e.path.join('.') + ': ' + e.message).join('  ·  ');
+  } else {
+    const slugClash = await db.select({ id: roles.id }).from(roles)
+      .where(and(eq(roles.slug, parsed.data.slug), ne(roles.id, id))).limit(1);
+
+    if (slugClash.length > 0) {
+      errorMsg = 'Slug "' + parsed.data.slug + '" is used by another role.';
+    } else {
+      await db.update(roles)
+        .set({ ...parsed.data, updatedAt: new Date() })
+        .where(eq(roles.id, id));
+      await logAudit({
+        userId: user.id,
+        action: 'role.update',
+        entity: 'role',
+        entityId: id,
+        diff: { updated: parsed.data },
+        ipAddress: Astro.clientAddress
+      });
+      okMsg = 'Saved.';
+      const refreshed = await db.select().from(roles).where(eq(roles.id, id)).limit(1);
+      current = refreshed[0];
+    }
+  }
+}
+
+const LEVELS = ['C-Level', 'Lead', 'Senior', 'Mid', 'Junior', 'Intern', 'Apprentice'];
+const ENGAGEMENTS = ['Full-Time', 'Internship', 'Apprenticeship'];
+
+const respText = (current.responsibilities || []).join('\n');
+const skillsText = (current.skills || []).join('\n');
+const eligText = (current.eligibility || []).join('\n');
+---
+<AdminLayout title={'Edit · ' + current.title} activeNav="roles">
+  <div class="admin-page" style="max-width:880px;">
+    <div class="admin-page-header">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow"><a href="/admin/roles" style="color:#6e6e78;text-decoration:none;">← Roles</a></div>
+        <h1 class="admin-page-title">{current.title}</h1>
+        <p class="admin-page-sub" style="font-family:'Geist Mono',monospace;">{current.slug}</p>
+      </div>
+      {!canEdit && (
+        <span class="admin-btn" style="color:#6e6e78;">Read-only access</span>
+      )}
+    </div>
+
+    {errorMsg && (
+      <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;line-height:1.7;">
+        {errorMsg}
+      </div>
+    )}
+
+    {okMsg && (
+      <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">
+        {okMsg}
+      </div>
+    )}
+
+    <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:18px;">
+
+      <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px;">
+        <div>
+          <label class="rolefield-label">Title *</label>
+          <input name="title" required value={current.title} class="rolefield-input" disabled={!canEdit} />
+        </div>
+        <div>
+          <label class="rolefield-label">Slug *</label>
+          <input name="slug" required value={current.slug} class="rolefield-input" pattern="[a-z0-9-]+" disabled={!canEdit} />
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;">
+        <div>
+          <label class="rolefield-label">Department *</label>
+          <select name="departmentId" required class="rolefield-input" disabled={!canEdit}>
+            {allDepts.map((d) => {
+              const sel = current.departmentId === d.id;
+              return <option value={d.id} selected={sel}>{d.name}</option>;
+            })}
+          </select>
+        </div>
+        <div>
+          <label class="rolefield-label">Level *</label>
+          <select name="level" required class="rolefield-input" disabled={!canEdit}>
+            {LEVELS.map((lv) => {
+              const sel = current.level === lv;
+              return <option value={lv} selected={sel}>{lv}</option>;
+            })}
+          </select>
+        </div>
+        <div>
+          <label class="rolefield-label">Engagement *</label>
+          <select name="engagementType" required class="rolefield-input" disabled={!canEdit}>
+            {ENGAGEMENTS.map((e) => {
+              const sel = current.engagementType === e;
+              return <option value={e} selected={sel}>{e}</option>;
+            })}
+          </select>
+        </div>
+      </div>
+
+      <div>
+        <label class="rolefield-label">Function *</label>
+        <input name="function" required value={current.function} class="rolefield-input" disabled={!canEdit} />
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;">
+        <div>
+          <label class="rolefield-label">Location *</label>
+          <input name="location" required value={current.location} class="rolefield-input" disabled={!canEdit} />
+        </div>
+        <div>
+          <label class="rolefield-label">Duration *</label>
+          <input name="duration" required value={current.duration} class="rolefield-input" disabled={!canEdit} />
+        </div>
+        <div>
+          <label class="rolefield-label">Salary / Comp *</label>
+          <input name="salary" required value={current.salary} class="rolefield-input" disabled={!canEdit} />
+        </div>
+      </div>
+
+      <div>
+        <label class="rolefield-label">About *</label>
+        <textarea name="about" required rows="4" class="rolefield-input" disabled={!canEdit}>{current.about}</textarea>
+      </div>
+
+      <div>
+        <label class="rolefield-label">Responsibilities (one per line)</label>
+        <textarea name="responsibilities" rows="6" class="rolefield-input" disabled={!canEdit}>{respText}</textarea>
+      </div>
+
+      <div>
+        <label class="rolefield-label">Skills (one per line)</label>
+        <textarea name="skills" rows="5" class="rolefield-input" disabled={!canEdit}>{skillsText}</textarea>
+      </div>
+
+      <div>
+        <label class="rolefield-label">Eligibility (one per line)</label>
+        <textarea name="eligibility" rows="4" class="rolefield-input" disabled={!canEdit}>{eligText}</textarea>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-items:end;">
+        <div>
+          <label class="rolefield-label">Sort order</label>
+          <input type="number" name="sortOrder" value={current.sortOrder} class="rolefield-input" disabled={!canEdit} />
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;color:#d8d8de;font-size:12.5px;padding:8px 0;cursor:pointer;">
+          <input type="checkbox" name="isOpen" checked={current.isOpen} disabled={!canEdit} style="accent-color:#FF4F00;width:14px;height:14px;" />
+          <span>Open for applications</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;color:#d8d8de;font-size:12.5px;padding:8px 0;cursor:pointer;">
+          <input type="checkbox" name="isFeatured" checked={current.isFeatured} disabled={!canEdit} style="accent-color:#FF4F00;width:14px;height:14px;" />
+          <span>Featured</span>
+        </label>
+      </div>
+
+      {canEdit && (
+        <div style="display:flex;gap:10px;justify-content:flex-end;padding-top:16px;border-top:1px solid #15151a;">
+          <a href="/admin/roles" class="admin-btn">Cancel</a>
+          <button type="submit" name="_intent" value="save" class="admin-btn admin-btn-primary">Save changes</button>
+        </div>
+      )}
+    </form>
+
+    {canEdit && (
+      <div class="admin-card" style="margin-top:24px;border-color:rgba(220,38,38,0.25);">
+        <div class="admin-card-title" style="color:#fca5a5;">Danger Zone</div>
+        <p style="font-size:12.5px;color:#8a8a94;line-height:1.7;margin:8px 0 12px;">
+          Deleting this role removes it permanently. Public /careers will no longer show it. Existing applications referencing this role will be detached but kept.
+        </p>
+        <form method="POST" onsubmit="return confirm('Delete this role? This cannot be undone.');">
+          <button type="submit" name="_intent" value="delete" class="admin-btn" style="background:rgba(220,38,38,0.12);border-color:rgba(220,38,38,0.3);color:#fca5a5;">
+            Delete this role
+          </button>
+        </form>
+      </div>
+    )}
+  </div>
+
+  <style>
+    .rolefield-label {
+      display: block;
+      font-size: 10.5px;
+      font-weight: 600;
+      color: #8a8a94;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+    .rolefield-input {
+      width: 100%;
+      padding: 9px 12px;
+      background: #08080a;
+      border: 1px solid #1f1f26;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+      line-height: 1.5;
+    }
+    .rolefield-input:focus { border-color: #FF4F00; }
+    .rolefield-input:disabled { opacity: 0.6; cursor: not-allowed; }
+    textarea.rolefield-input { resize: vertical; min-height: 80px; }
+  </style>
+</AdminLayout>

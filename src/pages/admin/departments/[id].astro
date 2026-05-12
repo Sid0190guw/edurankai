@@ -1,0 +1,167 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { departments, roles } from '@/lib/db/schema';
+import { can } from '@/lib/auth/permissions';
+import { departmentSchema } from '@/lib/validators';
+import { logAudit } from '@/lib/audit';
+import { eq, sql } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+const canEdit = can(user, 'roles.edit');
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/admin/departments');
+
+const existing = await db.select().from(departments).where(eq(departments.id, id)).limit(1);
+if (existing.length === 0) return Astro.redirect('/admin/departments');
+let current = existing[0];
+
+let errorMsg = '';
+let okMsg = '';
+
+if (Astro.request.method === 'POST' && canEdit) {
+  const fd = await Astro.request.formData();
+  const intent = fd.get('_intent');
+
+  if (intent === 'delete') {
+    const inUse = await db.select({ count: sql<number>`count(*)::int` }).from(roles).where(eq(roles.departmentId, id));
+    if (inUse[0].count > 0) {
+      errorMsg = 'Cannot delete: ' + inUse[0].count + ' role(s) still in this department. Move or delete those roles first.';
+    } else {
+      await db.delete(departments).where(eq(departments.id, id));
+      await logAudit({
+        userId: user.id,
+        action: 'department.delete',
+        entity: 'department',
+        entityId: id,
+        diff: { deleted: { name: current.name } },
+        ipAddress: Astro.clientAddress
+      });
+      return Astro.redirect('/admin/departments');
+    }
+  } else {
+    const candidate = {
+      id: current.id,
+      name: (fd.get('name') as string || '').trim(),
+      icon: (fd.get('icon') as string || '').trim(),
+      description: (fd.get('description') as string || '').trim(),
+      isFlagship: fd.get('isFlagship') === 'on',
+      sortOrder: parseInt((fd.get('sortOrder') as string) || '0', 10),
+      isVisible: fd.get('isVisible') === 'on'
+    };
+
+    const parsed = departmentSchema.safeParse(candidate);
+    if (!parsed.success) {
+      errorMsg = parsed.error.errors.map((e) => e.path.join('.') + ': ' + e.message).join(' · ');
+    } else {
+      await db.update(departments)
+        .set({ ...parsed.data, updatedAt: new Date() })
+        .where(eq(departments.id, id));
+      await logAudit({
+        userId: user.id,
+        action: 'department.update',
+        entity: 'department',
+        entityId: id,
+        diff: { updated: parsed.data },
+        ipAddress: Astro.clientAddress
+      });
+      okMsg = 'Saved.';
+      const refreshed = await db.select().from(departments).where(eq(departments.id, id)).limit(1);
+      current = refreshed[0];
+    }
+  }
+}
+
+const roleCountResult = await db.select({ count: sql<number>`count(*)::int` }).from(roles).where(eq(roles.departmentId, id));
+const roleCount = roleCountResult[0].count;
+---
+<AdminLayout title={'Edit · ' + current.name} activeNav="departments">
+  <div class="admin-page" style="max-width:680px;">
+    <div class="admin-page-header">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow"><a href="/admin/departments" style="color:#6e6e78;text-decoration:none;">← Departments</a></div>
+        <h1 class="admin-page-title">{current.name}</h1>
+        <p class="admin-page-sub" style="font-family:'Geist Mono',monospace;">{current.id} · {roleCount} role(s)</p>
+      </div>
+    </div>
+
+    {errorMsg && (
+      <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">
+        {errorMsg}
+      </div>
+    )}
+    {okMsg && (
+      <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">
+        {okMsg}
+      </div>
+    )}
+
+    <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:16px;">
+      <div>
+        <label class="rolefield-label">Name *</label>
+        <input name="name" required value={current.name} class="rolefield-input" disabled={!canEdit} />
+      </div>
+      <div>
+        <label class="rolefield-label">Icon *</label>
+        <input name="icon" required value={current.icon} class="rolefield-input" disabled={!canEdit} />
+      </div>
+      <div>
+        <label class="rolefield-label">Description *</label>
+        <textarea name="description" required rows="3" class="rolefield-input" disabled={!canEdit}>{current.description}</textarea>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;">
+        <div>
+          <label class="rolefield-label">Sort order</label>
+          <input type="number" name="sortOrder" value={current.sortOrder} class="rolefield-input" disabled={!canEdit} />
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;color:#d8d8de;font-size:12.5px;padding-top:22px;cursor:pointer;">
+          <input type="checkbox" name="isFlagship" checked={current.isFlagship} disabled={!canEdit} style="accent-color:#FF4F00;" />
+          <span>Flagship</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;color:#d8d8de;font-size:12.5px;padding-top:22px;cursor:pointer;">
+          <input type="checkbox" name="isVisible" checked={current.isVisible} disabled={!canEdit} style="accent-color:#FF4F00;" />
+          <span>Visible publicly</span>
+        </label>
+      </div>
+      {canEdit && (
+        <div style="display:flex;gap:10px;justify-content:flex-end;padding-top:14px;border-top:1px solid #15151a;">
+          <a href="/admin/departments" class="admin-btn">Cancel</a>
+          <button type="submit" name="_intent" value="save" class="admin-btn admin-btn-primary">Save changes</button>
+        </div>
+      )}
+    </form>
+
+    {canEdit && (
+      <div class="admin-card" style="margin-top:24px;border-color:rgba(220,38,38,0.25);">
+        <div class="admin-card-title" style="color:#fca5a5;">Danger Zone</div>
+        <p style="font-size:12.5px;color:#8a8a94;line-height:1.7;margin:8px 0 12px;">
+          Departments can only be deleted when they contain zero roles. Currently this department has <strong style="color:#fff;">{roleCount}</strong> role(s).
+        </p>
+        <form method="POST" onsubmit="return confirm('Delete this department?');">
+          <button type="submit" name="_intent" value="delete" class="admin-btn"
+            style={roleCount > 0
+              ? 'background:rgba(120,120,128,0.1);border-color:rgba(120,120,128,0.2);color:#6e6e78;cursor:not-allowed;'
+              : 'background:rgba(220,38,38,0.12);border-color:rgba(220,38,38,0.3);color:#fca5a5;'}
+            disabled={roleCount > 0}>
+            Delete this department
+          </button>
+        </form>
+      </div>
+    )}
+  </div>
+
+  <style>
+    .rolefield-label {
+      display:block;font-size:10.5px;font-weight:600;color:#8a8a94;
+      letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px;
+    }
+    .rolefield-input {
+      width:100%;padding:9px 12px;background:#08080a;border:1px solid #1f1f26;
+      border-radius:6px;color:#fff;font-size:13px;font-family:inherit;outline:none;line-height:1.5;
+    }
+    .rolefield-input:focus { border-color:#FF4F00; }
+    .rolefield-input:disabled { opacity:0.6;cursor:not-allowed; }
+    textarea.rolefield-input { resize:vertical;min-height:80px; }
+  </style>
+</AdminLayout>
