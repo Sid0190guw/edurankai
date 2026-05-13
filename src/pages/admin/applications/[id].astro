@@ -1,0 +1,427 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { applications, applicationMessages, users } from '@/lib/db/schema';
+import { eq, asc } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/admin/applications');
+
+let app: any = null;
+let errorMsg = '';
+let successMsg = '';
+
+const STATUS_LABELS: Record<string, string> = {
+  submitted: 'Submitted',
+  reviewing: 'Under Review',
+  task_sent: 'Task / Walkthrough sent',
+  interview: 'Interview',
+  offer: 'Offer Extended',
+  hired: 'Hired',
+  rejected: 'Closed',
+  withdrawn: 'Withdrawn'
+};
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+
+  try {
+    if (action === 'update_status') {
+      const newStatus = (fd.get('status') as string || '').trim();
+      const validStatuses = ['submitted', 'reviewing', 'task_sent', 'interview', 'offer', 'hired', 'rejected', 'withdrawn'];
+      if (!validStatuses.includes(newStatus)) {
+        errorMsg = 'Invalid status';
+      } else {
+        const current = await db.select({ status: applications.status }).from(applications).where(eq(applications.id, id)).limit(1);
+        const oldStatus = current[0]?.status;
+
+        await db.update(applications)
+          .set({
+            status: newStatus as any,
+            reviewedByUserId: user.id,
+            reviewedAt: new Date(),
+            updatedAt: new Date()
+          })
+          .where(eq(applications.id, id));
+
+        // Auto-post system message to thread when status changes
+        if (oldStatus !== newStatus) {
+          await db.insert(applicationMessages).values({
+            applicationId: id,
+            senderUserId: user.id,
+            senderRole: 'system',
+            senderName: 'System',
+            body: 'Status updated to: ' + (STATUS_LABELS[newStatus] || newStatus),
+            isSystem: true
+          });
+        }
+        successMsg = 'Status updated and applicant notified in thread';
+      }
+    } else if (action === 'send_message') {
+      const body = (fd.get('body') as string || '').trim();
+      if (!body) {
+        errorMsg = 'Message body required';
+      } else if (body.length > 5000) {
+        errorMsg = 'Message too long (max 5000 chars)';
+      } else {
+        const senderName = user.name || 'EduRankAI Team';
+        await db.insert(applicationMessages).values({
+          applicationId: id,
+          senderUserId: user.id,
+          senderRole: 'admin',
+          senderName: senderName,
+          body: body,
+          isSystem: false
+        });
+        await db.update(applications).set({ updatedAt: new Date() }).where(eq(applications.id, id));
+        successMsg = 'Message sent to applicant';
+      }
+    } else if (action === 'add_public_feedback') {
+      const feedback = (fd.get('publicFeedback') as string || '').trim();
+      await db.update(applications)
+        .set({
+          scoringFeedback: feedback,
+          reviewedByUserId: user.id,
+          reviewedAt: new Date(),
+          updatedAt: new Date()
+        })
+        .where(eq(applications.id, id));
+      successMsg = 'Public feedback saved (visible to applicant)';
+    } else if (action === 'add_internal_note') {
+      const note = (fd.get('internalNote') as string || '').trim();
+      await db.update(applications)
+        .set({
+          reviewerNotes: note,
+          reviewedByUserId: user.id,
+          reviewedAt: new Date(),
+          updatedAt: new Date()
+        })
+        .where(eq(applications.id, id));
+      successMsg = 'Internal note saved (admin-only)';
+    } else if (action === 'update_score') {
+      const scoreStr = (fd.get('score') as string || '').trim();
+      const score = parseInt(scoreStr);
+      if (Number.isFinite(score) && score >= 0 && score <= 100) {
+        await db.update(applications)
+          .set({ score: score, updatedAt: new Date() })
+          .where(eq(applications.id, id));
+        successMsg = 'Score updated';
+      } else {
+        errorMsg = 'Score must be 0-100';
+      }
+    }
+  } catch (err: any) {
+    errorMsg = 'Action failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const found = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
+if (found.length === 0) return Astro.redirect('/admin/applications');
+app = found[0];
+
+const messages = await db.select().from(applicationMessages)
+  .where(eq(applicationMessages.applicationId, id))
+  .orderBy(asc(applicationMessages.createdAt));
+
+const shortId = id.substring(0, 8).toUpperCase();
+const fullName = (app.firstName || '') + ' ' + (app.lastName || '');
+const createdDate = new Date(app.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+const updatedDate = new Date(app.updatedAt).toLocaleString('en-IN');
+
+const skills = app.techSkills || {};
+const proofs = Array.isArray(skills.proofs) ? skills.proofs : [];
+const necessary = Array.isArray(skills.necessary) ? skills.necessary : [];
+const optional = Array.isArray(skills.optional) ? skills.optional : [];
+const elite = Array.isArray(skills.elite) ? skills.elite : [];
+const customNecessary = Array.isArray(skills.customNecessary) ? skills.customNecessary : [];
+const customOptional = Array.isArray(skills.customOptional) ? skills.customOptional : [];
+const customElite = Array.isArray(skills.customElite) ? skills.customElite : [];
+
+const raw = app.rawSubmission || {};
+const s3 = raw.step3 || {};
+const educationEntries = Array.isArray(s3.education) ? s3.education : [];
+const certEntries = Array.isArray(s3.certifications) ? s3.certifications : [];
+const workEntries = Array.isArray(s3.workExperience) ? s3.workExperience : [];
+
+const STATUS_OPTIONS = [
+  { value: 'submitted', label: 'Submitted' },
+  { value: 'reviewing', label: 'Reviewing' },
+  { value: 'task_sent', label: 'Task Sent' },
+  { value: 'interview', label: 'Interview' },
+  { value: 'offer', label: 'Offer' },
+  { value: 'hired', label: 'Hired' },
+  { value: 'rejected', label: 'Rejected' },
+  { value: 'withdrawn', label: 'Withdrawn' }
+];
+
+function formatMsgTime(d: Date): string {
+  return new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
+---
+<AdminLayout title={'Application - ' + fullName} description="Review applicant details.">
+
+  <div class="mb-4">
+    <a href="/admin/applications" class="text-[0.78rem] text-white/50 hover:text-white">Back to applications</a>
+  </div>
+
+  {errorMsg && <div class="bg-red-500/10 border border-red-500/30 text-red-300 rounded-lg p-3 mb-4 text-[0.85rem]">{errorMsg}</div>}
+  {successMsg && <div class="bg-leaf-bg/20 border border-leaf-border/50 text-leaf rounded-lg p-3 mb-4 text-[0.85rem]">{successMsg}</div>}
+
+  <div class="mb-6 pb-4 border-b border-white/8">
+    <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+      <div>
+        <p class="font-mono text-[0.72rem] text-white/40 mb-1">{shortId} - Applied {createdDate}</p>
+        <h1 class="font-display text-[1.8rem] font-semibold text-white leading-tight">{fullName}</h1>
+        <p class="text-[0.85rem] text-white/60 mt-1">Applying for <strong class="text-white">{app.roleTitleSnapshot}</strong> - {app.departmentSnapshot} - {app.level || 'No level'}</p>
+      </div>
+      <div class="shrink-0">
+        <p class="text-[0.62rem] font-mono uppercase tracking-wider text-white/40 mb-1">Current status</p>
+        <span class="inline-block text-[0.78rem] font-bold uppercase tracking-wider bg-burn-pale text-burn border border-burn-dim px-3 py-1 rounded-full">{app.status}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+
+    <div class="lg:col-span-2 flex flex-col gap-5">
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-display text-[1rem] font-semibold text-white">Conversation with applicant</h2>
+          <span class="text-[0.7rem] font-mono text-white/40">{messages.length} message(s)</span>
+        </div>
+
+        <div class="space-y-2 mb-4 max-h-[400px] overflow-y-auto pr-1">
+          {messages.length === 0 ? (
+            <p class="text-[0.82rem] text-white/40 italic text-center py-6">No messages yet. Send the first one below.</p>
+          ) : (
+            messages.map((msg) => {
+              const isAdmin = msg.senderRole === 'admin';
+              const isApplicant = msg.senderRole === 'applicant';
+              const isSys = msg.isSystem;
+              return (
+                <div class={'rounded-lg p-3 text-[0.85rem] ' + (isSys ? 'bg-white/3 border border-white/5 text-white/55 text-center italic text-[0.78rem]' : isAdmin ? 'bg-burn-pale/15 border border-burn-dim/30' : 'bg-sky-bg/10 border border-sky-border/30')}>
+                  {!isSys && (
+                    <p class={'text-[0.62rem] font-mono uppercase tracking-wider font-bold mb-1 ' + (isAdmin ? 'text-burn' : 'text-sky')}>
+                      {isAdmin ? (msg.senderName || 'Admin') : (msg.senderName || 'Applicant')}
+                    </p>
+                  )}
+                  <p class="text-white/85 whitespace-pre-wrap leading-relaxed">{msg.body}</p>
+                  <p class="text-[0.62rem] font-mono text-white/40 mt-1">{formatMsgTime(msg.createdAt)}</p>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <form method="POST" class="border-t border-white/10 pt-3">
+          <input type="hidden" name="action" value="send_message" />
+          <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-white/50 mb-2">Reply to applicant (they will see this)</label>
+          <textarea name="body" required rows="3" maxlength="5000" placeholder="Type your reply..." class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn resize-y"></textarea>
+          <button type="submit" class="mt-2 bg-burn hover:bg-burn/90 text-white font-semibold py-2 px-4 rounded-lg text-[0.85rem]">Send to applicant</button>
+        </form>
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Contact</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-2 text-[0.85rem] text-white/80">
+          <p><span class="text-white/40">Email:</span> <a href={'mailto:' + app.email} class="text-burn hover:underline">{app.email}</a></p>
+          <p><span class="text-white/40">Phone:</span> {app.phone}</p>
+          <p><span class="text-white/40">City:</span> {app.city}</p>
+          {app.linkedin && <p><span class="text-white/40">LinkedIn:</span> <a href={app.linkedin} target="_blank" rel="noopener" class="text-burn hover:underline">View</a></p>}
+          {app.portfolioUrl && <p class="md:col-span-2"><span class="text-white/40">Resume/Portfolio:</span> <a href={app.portfolioUrl} target="_blank" rel="noopener" class="text-burn hover:underline break-all">{app.portfolioUrl}</a></p>}
+          {app.dob && <p><span class="text-white/40">DOB:</span> {app.dob}</p>}
+          {app.birthPlace && <p><span class="text-white/40">Birth place:</span> {app.birthPlace}</p>}
+        </div>
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Education and Experience</h2>
+        <p class="text-[0.78rem] text-white/40 mb-2">Years experience: <span class="text-white/80">{app.experienceBand || 'Not specified'}</span> - Duolingo: <span class="text-white/80">{app.duolingoScore || 'N/A'}</span></p>
+
+        {educationEntries.length > 0 && (
+          <div class="mt-3">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-2">Education ({educationEntries.length})</p>
+            <div class="space-y-2">
+              {educationEntries.map((e: any) => (
+                <div class="bg-white/5 rounded-lg p-2.5 text-[0.82rem] text-white/85">
+                  <p class="font-semibold">{e.degree || 'Degree'} in {e.field || 'Field'}</p>
+                  <p class="text-white/55 text-[0.75rem]">{e.institution || ''} - {e.status || ''} - {e.year || ''}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {workEntries.length > 0 && (
+          <div class="mt-3">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-2">Work / Project Experience ({workEntries.length})</p>
+            <div class="space-y-2">
+              {workEntries.map((w: any) => (
+                <div class="bg-white/5 rounded-lg p-2.5 text-[0.82rem] text-white/85">
+                  <p class="font-semibold">{w.role || 'Role'} at {w.organization || 'Org'}</p>
+                  <p class="text-white/55 text-[0.75rem]">{w.duration || ''}</p>
+                  {w.description && <p class="text-white/70 mt-1 text-[0.78rem]">{w.description}</p>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {app.experienceDescription && (
+          <div class="mt-3 bg-burn-pale/10 border border-burn-dim/30 rounded-lg p-3">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-burn mb-1">What they bring to this role</p>
+            <p class="text-[0.85rem] text-white/85 whitespace-pre-wrap">{app.experienceDescription}</p>
+          </div>
+        )}
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Skills (3-tier)</h2>
+
+        {necessary.length + customNecessary.length > 0 && (
+          <div class="mb-3">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-burn mb-1.5">Necessary</p>
+            <div class="flex flex-wrap gap-1.5">
+              {necessary.map((s: string) => <span class="text-[0.72rem] bg-burn-pale/20 text-burn border border-burn-dim/40 px-2 py-0.5 rounded">{s}</span>)}
+              {customNecessary.map((c: any) => <span class="text-[0.72rem] bg-burn-pale/30 text-burn border border-burn px-2 py-0.5 rounded font-semibold">Custom: {c.name}</span>)}
+            </div>
+            {customNecessary.length > 0 && (
+              <div class="mt-2 space-y-1">
+                {customNecessary.map((c: any) => (
+                  <p class="text-[0.72rem] text-white/55">Proof: <strong class="text-white/80">{c.name}</strong> - <a href={c.proof} target="_blank" rel="noopener" class="text-burn hover:underline">{c.proof}</a></p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {optional.length + customOptional.length > 0 && (
+          <div class="mb-3">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-sky mb-1.5">Optional</p>
+            <div class="flex flex-wrap gap-1.5">
+              {optional.map((s: string) => <span class="text-[0.72rem] bg-sky-bg/20 text-sky border border-sky-border/40 px-2 py-0.5 rounded">{s}</span>)}
+              {customOptional.map((c: any) => <span class="text-[0.72rem] bg-sky-bg/30 text-sky border border-sky px-2 py-0.5 rounded font-semibold">Custom: {c.name}</span>)}
+            </div>
+            {customOptional.length > 0 && (
+              <div class="mt-2 space-y-1">
+                {customOptional.map((c: any) => (
+                  <p class="text-[0.72rem] text-white/55">Proof: <strong class="text-white/80">{c.name}</strong> - <a href={c.proof} target="_blank" rel="noopener" class="text-sky hover:underline">{c.proof}</a></p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {elite.length + customElite.length > 0 && (
+          <div class="mb-3">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-plum mb-1.5">Elite</p>
+            <div class="flex flex-wrap gap-1.5">
+              {elite.map((s: string) => <span class="text-[0.72rem] bg-plum-bg/20 text-plum border border-plum-border/40 px-2 py-0.5 rounded">{s}</span>)}
+              {customElite.map((c: any) => <span class="text-[0.72rem] bg-plum-bg/30 text-plum border border-plum px-2 py-0.5 rounded font-semibold">Custom: {c.name}</span>)}
+            </div>
+          </div>
+        )}
+
+        {proofs.length > 0 && (
+          <div class="mt-4 pt-3 border-t border-white/10">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-2">General Proof of Work ({proofs.length})</p>
+            <div class="space-y-2">
+              {proofs.map((p: any) => (
+                <div class="bg-white/5 rounded-lg p-2.5">
+                  <p class="text-[0.82rem] text-white/85 font-semibold">{p.title || 'Untitled'}</p>
+                  {p.whichSkill && <p class="text-[0.72rem] text-white/45">Demonstrates: {p.whichSkill}</p>}
+                  <a href={p.url} target="_blank" rel="noopener" class="text-[0.78rem] text-burn hover:underline break-all">{p.url}</a>
+                  {p.description && <p class="text-[0.78rem] text-white/70 mt-1">{p.description}</p>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {skills.deptResponse && (
+          <div class="mt-4 pt-3 border-t border-white/10 bg-burn-pale/10 border-burn-dim/30 rounded-lg p-3">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-burn mb-1">Department-specific response</p>
+            <p class="text-[0.85rem] text-white/85 whitespace-pre-wrap">{skills.deptResponse}</p>
+          </div>
+        )}
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Motivation</h2>
+        <div class="space-y-3 text-[0.85rem] text-white/85">
+          {app.whyERA && <div><p class="text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1">Why EduRankAI</p><p class="whitespace-pre-wrap">{app.whyERA}</p></div>}
+          {app.whyRole && <div><p class="text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1">Why this role</p><p class="whitespace-pre-wrap">{app.whyRole}</p></div>}
+          {app.whyAIEdu && <div><p class="text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1">Why AI in education</p><p class="whitespace-pre-wrap">{app.whyAIEdu}</p></div>}
+        </div>
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Logistics</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-2 text-[0.85rem] text-white/80">
+          <p><span class="text-white/40">When can start:</span> {app.availability}</p>
+          <p><span class="text-white/40">Engagement type:</span> {app.engagementType}</p>
+          <p><span class="text-white/40">Remote comfort:</span> {app.remoteComfort}</p>
+          {app.compensation && <p><span class="text-white/40">Expected comp:</span> {app.compensation}</p>}
+          <p><span class="text-white/40">Heard via:</span> {app.source}</p>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="flex flex-col gap-4">
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5 sticky top-4">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Update Status</h2>
+        <p class="text-[0.7rem] text-white/50 mb-2 italic">Changing status auto-posts a system message in the thread.</p>
+        <form method="POST" class="flex flex-col gap-2">
+          <input type="hidden" name="action" value="update_status" />
+          <select name="status" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn">
+            {STATUS_OPTIONS.map((opt) => (
+              <option value={opt.value} selected={app.status === opt.value} class="bg-ink">{opt.label}</option>
+            ))}
+          </select>
+          <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-2 px-4 rounded-lg text-[0.85rem]">Update Status</button>
+        </form>
+        <p class="text-[0.7rem] text-white/40 mt-2">Last updated: {updatedDate}</p>
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[0.95rem] font-semibold text-white mb-2">Score (0-100)</h2>
+        <form method="POST" class="flex gap-2">
+          <input type="hidden" name="action" value="update_score" />
+          <input type="number" name="score" value={app.score !== null && app.score !== undefined ? app.score : ''} min="0" max="100" placeholder="Score" class="flex-1 px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" />
+          <button type="submit" class="bg-white/10 hover:bg-white/15 text-white font-semibold py-2 px-3 rounded-lg text-[0.85rem]">Save</button>
+        </form>
+      </div>
+
+      <div class="bg-leaf-bg/10 border border-leaf-border/30 rounded-xl p-5">
+        <h2 class="font-display text-[0.95rem] font-semibold text-leaf mb-1">Public Feedback (pinned)</h2>
+        <p class="text-[0.72rem] text-white/50 mb-2">Always visible to applicant on top of their thread.</p>
+        <form method="POST" class="flex flex-col gap-2">
+          <input type="hidden" name="action" value="add_public_feedback" />
+          <textarea name="publicFeedback" rows="4" placeholder="Pinned note for applicant..." class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-leaf resize-y">{app.scoringFeedback || ''}</textarea>
+          <button type="submit" class="bg-leaf hover:bg-leaf/90 text-white font-semibold py-2 px-4 rounded-lg text-[0.85rem]">Save Pinned Note</button>
+        </form>
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[0.95rem] font-semibold text-white mb-1">Internal Notes (admin-only)</h2>
+        <p class="text-[0.72rem] text-white/50 mb-2">Hidden from applicant.</p>
+        <form method="POST" class="flex flex-col gap-2">
+          <input type="hidden" name="action" value="add_internal_note" />
+          <textarea name="internalNote" rows="4" placeholder="Internal team notes..." class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn resize-y">{app.reviewerNotes || ''}</textarea>
+          <button type="submit" class="bg-white/10 hover:bg-white/15 text-white font-semibold py-2 px-4 rounded-lg text-[0.85rem]">Save Note</button>
+        </form>
+      </div>
+
+    </div>
+
+  </div>
+
+</AdminLayout>

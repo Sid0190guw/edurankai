@@ -313,3 +313,21 @@ export type NewRole = typeof roles.$inferInsert;
 export type Application = typeof applications.$inferSelect;
 export type Event = typeof events.$inferSelect;
 export type Product = typeof products.$inferSelect;
+
+
+// =========================================================================
+// Application Messages - in-app conversation thread between applicant and admin
+// =========================================================================
+export const applicationMessages = pgTable('application_messages', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  applicationId: uuid('application_id').references(() => applications.id, { onDelete: 'cascade' }).notNull(),
+  senderUserId: uuid('sender_user_id').references(() => users.id, { onDelete: 'set null' }),
+  senderRole: varchar('sender_role', { length: 20 }).notNull(),
+  senderName: varchar('sender_name', { length: 200 }),
+  body: text('body').notNull(),
+  isSystem: boolean('is_system').notNull().default(false),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+}, (t) => ({
+  appIdx: index('app_msg_app_idx').on(t.applicationId),
+  createdIdx: index('app_msg_created_idx').on(t.createdAt)
+}));
