@@ -1,0 +1,455 @@
+---
+import ApplyLayout from '@/layouts/ApplyLayout.astro';
+import { db } from '@/lib/db';
+import { roles } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { getActiveDraft, saveDraft } from '@/lib/apply/draft';
+import { safeDraft } from '@/lib/apply/data';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+if (user.role !== 'applicant') return Astro.redirect('/admin');
+
+const url = new URL(Astro.request.url);
+const roleSlug = url.searchParams.get('role') || '';
+
+const draftRow = await getActiveDraft(user.id);
+const draft = safeDraft(draftRow?.data);
+const s3 = draft.step3 || {};
+
+if (!draft.step1) return Astro.redirect('/apply/step-1' + (roleSlug ? '?role=' + roleSlug : ''));
+if (!draft.step2) return Astro.redirect('/apply/step-2' + (roleSlug ? '?role=' + roleSlug : ''));
+
+let preselectedRoleTitle = '';
+if (roleSlug) {
+  const found = await db.select({ title: roles.title }).from(roles).where(eq(roles.slug, roleSlug)).limit(1);
+  if (found.length > 0) preselectedRoleTitle = found[0].title;
+}
+if (!preselectedRoleTitle) preselectedRoleTitle = draft.step2?.roleTitle || '';
+
+let errorMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+
+  // Multi-entry parsing: form arrays come as repeated keys
+  const eduDegrees = fd.getAll('eduDegree').map(v => (v as string).trim());
+  const eduFields = fd.getAll('eduField').map(v => (v as string).trim());
+  const eduInstitutions = fd.getAll('eduInstitution').map(v => (v as string).trim());
+  const eduStatuses = fd.getAll('eduStatus').map(v => (v as string).trim());
+  const eduYears = fd.getAll('eduYear').map(v => (v as string).trim());
+
+  const education = [];
+  for (let i = 0; i < eduDegrees.length; i++) {
+    if (eduDegrees[i] || eduInstitutions[i] || eduFields[i]) {
+      education.push({
+        degree: eduDegrees[i] || '',
+        field: eduFields[i] || '',
+        institution: eduInstitutions[i] || '',
+        status: eduStatuses[i] || '',
+        year: eduYears[i] || ''
+      });
+    }
+  }
+
+  const certNames = fd.getAll('certName').map(v => (v as string).trim());
+  const certIssuers = fd.getAll('certIssuer').map(v => (v as string).trim());
+  const certYears = fd.getAll('certYear').map(v => (v as string).trim());
+
+  const certifications = [];
+  for (let i = 0; i < certNames.length; i++) {
+    if (certNames[i]) {
+      certifications.push({
+        name: certNames[i],
+        issuer: certIssuers[i] || '',
+        year: certYears[i] || ''
+      });
+    }
+  }
+
+  const workRoles = fd.getAll('workRole').map(v => (v as string).trim());
+  const workOrgs = fd.getAll('workOrg').map(v => (v as string).trim());
+  const workDurations = fd.getAll('workDuration').map(v => (v as string).trim());
+  const workDescs = fd.getAll('workDesc').map(v => (v as string).trim());
+
+  const workExperience = [];
+  for (let i = 0; i < workRoles.length; i++) {
+    if (workRoles[i] || workOrgs[i]) {
+      workExperience.push({
+        role: workRoles[i] || '',
+        organization: workOrgs[i] || '',
+        duration: workDurations[i] || '',
+        description: workDescs[i] || ''
+      });
+    }
+  }
+
+  const data = {
+    education,
+    certifications,
+    workExperience,
+    yearsExperience: (fd.get('yearsExperience') as string || '').trim(),
+    whyRelevant: (fd.get('whyRelevant') as string || '').trim(),
+    duolingoScore: (fd.get('duolingoScore') as string || '').trim(),
+    duolingoScreenshotUrl: (fd.get('duolingoScreenshotUrl') as string || '').trim()
+  };
+
+  const missing = [];
+  if (education.length === 0 && workExperience.length === 0) {
+    missing.push('At least one education entry OR one work experience entry');
+  }
+  if (!data.whyRelevant) missing.push('What you bring to this role');
+  if (!data.yearsExperience) missing.push('Years of relevant experience');
+  if (!data.duolingoScore) {
+    missing.push('Duolingo practice score');
+  } else {
+    const n = Number(data.duolingoScore);
+    if (!Number.isFinite(n) || n < 10 || n > 160) missing.push('Valid Duolingo score (10-160)');
+  }
+
+  if (missing.length > 0) {
+    errorMsg = 'Please complete: ' + missing.join(', ');
+  } else {
+    const newDraft = { ...draft, step3: data };
+    await saveDraft(user.id, user.email, newDraft, 4);
+    return Astro.redirect('/apply/step-4' + (roleSlug ? '?role=' + roleSlug : ''));
+  }
+}
+
+const DEGREE_TYPES = [
+  'High School Diploma',
+  'Vocational / Diploma',
+  'Bachelor\'s',
+  'Master\'s',
+  'PhD / Doctorate',
+  'Postdoc',
+  'Self-Taught / Independent Study',
+  'Other'
+];
+
+const STATUS_OPTIONS = ['Pursuing', 'Completed', 'Paused'];
+
+const EXPERIENCE_OPTIONS = [
+  { value: 'No experience yet', label: 'None yet' },
+  { value: 'Less than 1 year', label: 'Less than 1 yr' },
+  { value: '1-2 years', label: '1-2 years' },
+  { value: '3-5 years', label: '3-5 years' },
+  { value: '5-8 years', label: '5-8 years' },
+  { value: '8+ years', label: '8+ years' }
+];
+
+const existingEducation = (s3.education && s3.education.length > 0) ? s3.education : [{ degree: '', field: '', institution: '', status: '', year: '' }];
+const existingCertifications = (s3.certifications && s3.certifications.length > 0) ? s3.certifications : [{ name: '', issuer: '', year: '' }];
+const existingWork = (s3.workExperience && s3.workExperience.length > 0) ? s3.workExperience : [{ role: '', organization: '', duration: '', description: '' }];
+---
+<ApplyLayout step={3} totalSteps={6} stepTitle="Education & Experience" stepSubtitle="Tell us about your full background - everything you bring." roleTitle={preselectedRoleTitle}>
+
+  {errorMsg && (
+    <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.25);color:#b91c1c;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;line-height:1.6;">
+      {errorMsg}
+    </div>
+  )}
+
+  <form method="POST" class="flex flex-col gap-6">
+
+    <div>
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h3 class="font-display text-[1rem] font-semibold text-ink">Education</h3>
+          <p class="text-[0.78rem] text-ink-soft italic">List degrees, diplomas, or formal study. Add more if you have multiple.</p>
+        </div>
+      </div>
+
+      <div id="education-list" class="flex flex-col gap-3">
+        {existingEducation.map((edu, i) => (
+          <div class="education-entry bg-cream-2/50 border border-ink/10 rounded-lg p-4 relative">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Degree Type</label>
+                <select name="eduDegree" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white">
+                  <option value="">Select...</option>
+                  {DEGREE_TYPES.map((t) => {
+                    const sel = edu.degree === t;
+                    return <option value={t} selected={sel}>{t}</option>;
+                  })}
+                </select>
+              </div>
+              <div>
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Field of Study</label>
+                <input type="text" name="eduField" value={edu.field || ''} placeholder="e.g. Computer Science" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+              <div class="md:col-span-2">
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Institution</label>
+                <input type="text" name="eduInstitution" value={edu.institution || ''} placeholder="e.g. IIT Delhi, MIT, Self-taught at home" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+              <div>
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Status</label>
+                <select name="eduStatus" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white">
+                  <option value="">Select...</option>
+                  {STATUS_OPTIONS.map((s) => {
+                    const sel = edu.status === s;
+                    return <option value={s} selected={sel}>{s}</option>;
+                  })}
+                </select>
+              </div>
+              <div>
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Year</label>
+                <input type="text" name="eduYear" value={edu.year || ''} placeholder="2024" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+            </div>
+            <button type="button" class="remove-entry absolute top-2 right-2 text-ink-soft/50 hover:text-burn text-lg leading-none w-7 h-7 flex items-center justify-center" title="Remove entry">x</button>
+          </div>
+        ))}
+      </div>
+
+      <button type="button" id="add-education" class="mt-3 w-full px-4 py-2.5 border border-dashed border-burn-dim text-burn font-semibold text-[0.82rem] rounded-lg hover:bg-burn-pale transition-all flex items-center justify-center gap-2">
+        <span class="text-base">+</span> Add another education entry
+      </button>
+    </div>
+
+    <div class="border-t border-ink/8 pt-6">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h3 class="font-display text-[1rem] font-semibold text-ink">Certifications & Courses <span class="text-ink-soft/60 font-normal text-[0.85rem]">(optional)</span></h3>
+          <p class="text-[0.78rem] text-ink-soft italic">Bootcamps, online courses, professional certs.</p>
+        </div>
+      </div>
+
+      <div id="cert-list" class="flex flex-col gap-3">
+        {existingCertifications.map((cert) => (
+          <div class="cert-entry bg-cream-2/50 border border-ink/10 rounded-lg p-4 relative">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div class="md:col-span-2">
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Certification / Course Name</label>
+                <input type="text" name="certName" value={cert.name || ''} placeholder="e.g. AWS Solutions Architect" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+              <div>
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Year</label>
+                <input type="text" name="certYear" value={cert.year || ''} placeholder="2024" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+              <div class="md:col-span-3">
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Issuer</label>
+                <input type="text" name="certIssuer" value={cert.issuer || ''} placeholder="e.g. AWS, Coursera, Google" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+            </div>
+            <button type="button" class="remove-entry absolute top-2 right-2 text-ink-soft/50 hover:text-burn text-lg leading-none w-7 h-7 flex items-center justify-center" title="Remove entry">x</button>
+          </div>
+        ))}
+      </div>
+
+      <button type="button" id="add-cert" class="mt-3 w-full px-4 py-2.5 border border-dashed border-burn-dim text-burn font-semibold text-[0.82rem] rounded-lg hover:bg-burn-pale transition-all flex items-center justify-center gap-2">
+        <span class="text-base">+</span> Add another certification
+      </button>
+    </div>
+
+    <div class="border-t border-ink/8 pt-6">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h3 class="font-display text-[1rem] font-semibold text-ink">Work / Project Experience</h3>
+          <p class="text-[0.78rem] text-ink-soft italic">Jobs, internships, freelance, side projects, open source.</p>
+        </div>
+      </div>
+
+      <div id="work-list" class="flex flex-col gap-3">
+        {existingWork.map((w) => (
+          <div class="work-entry bg-cream-2/50 border border-ink/10 rounded-lg p-4 relative">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Role / Title</label>
+                <input type="text" name="workRole" value={w.role || ''} placeholder="e.g. ML Engineer Intern" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+              <div>
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Organization / Project</label>
+                <input type="text" name="workOrg" value={w.organization || ''} placeholder="e.g. Google, Open Source, Solo" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+              <div class="md:col-span-2">
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Duration</label>
+                <input type="text" name="workDuration" value={w.duration || ''} placeholder="e.g. Jan 2024 - Present, 6 months" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+              </div>
+              <div class="md:col-span-2">
+                <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Brief Description</label>
+                <textarea name="workDesc" rows="2" placeholder="What did you build or contribute?" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white resize-y">{w.description || ''}</textarea>
+              </div>
+            </div>
+            <button type="button" class="remove-entry absolute top-2 right-2 text-ink-soft/50 hover:text-burn text-lg leading-none w-7 h-7 flex items-center justify-center" title="Remove entry">x</button>
+          </div>
+        ))}
+      </div>
+
+      <button type="button" id="add-work" class="mt-3 w-full px-4 py-2.5 border border-dashed border-burn-dim text-burn font-semibold text-[0.82rem] rounded-lg hover:bg-burn-pale transition-all flex items-center justify-center gap-2">
+        <span class="text-base">+</span> Add another work entry
+      </button>
+    </div>
+
+    <div class="border-t border-ink/8 pt-6">
+      <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Years of Relevant Experience <span class="text-burn">*</span></label>
+      <div class="grid grid-cols-2 md:grid-cols-3 gap-2">
+        {EXPERIENCE_OPTIONS.map((opt) => {
+          const sel = s3.yearsExperience === opt.value;
+          return (
+            <label class={'flex items-center gap-2 px-3.5 py-2.5 border rounded-lg cursor-pointer text-[0.85rem] transition-all ' + (sel ? 'border-burn bg-burn-pale text-burn font-semibold' : 'border-ink/15 bg-cream-2 hover:border-burn-dim')}>
+              <input type="radio" name="yearsExperience" value={opt.value} checked={sel} class="accent-burn" />
+              <span>{opt.label}</span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+
+    <div class="bg-burn-pale border border-burn-dim rounded-xl p-5">
+      <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-burn mb-2">What you bring to {preselectedRoleTitle || 'this role'} <span class="text-burn">*</span></label>
+      <p class="text-[0.78rem] text-ink-soft mb-3 italic">Of everything you have done, what most directly prepares you for this specific role?</p>
+      <textarea name="whyRelevant" required rows="4" placeholder="Be specific. Reference the experiences above. We care about how you think about the connection." class="w-full px-3 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-white resize-y leading-relaxed">{s3.whyRelevant || ''}</textarea>
+      <p class="text-[0.7rem] text-ink-soft mt-1 italic">3 to 5 sentences is plenty.</p>
+    </div>
+
+    <div class="border-t border-ink/8 pt-6">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Duolingo Free Practice Score <span class="text-burn">*</span></label>
+          <input type="number" name="duolingoScore" required value={s3.duolingoScore || ''} min="10" max="160" placeholder="e.g. 120" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+          <p class="text-[0.7rem] text-ink-soft mt-1">Free practice only - not paid cert. <a href="https://englishtest.duolingo.com" target="_blank" rel="noopener" class="text-sky font-semibold hover:underline">Take it free</a></p>
+        </div>
+        <div>
+          <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Score Screenshot URL <span class="text-ink-soft/60 font-normal normal-case tracking-normal">(optional)</span></label>
+          <input type="url" name="duolingoScreenshotUrl" value={s3.duolingoScreenshotUrl || ''} placeholder="https://... (paste a Drive or ImgBB link)" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+        </div>
+      </div>
+    </div>
+
+    <div class="flex gap-3 pt-2">
+      <a href={'/apply/step-2' + (roleSlug ? '?role=' + roleSlug : '')} class="px-5 py-3 border border-ink/15 rounded-lg text-[0.88rem] font-medium text-ink-soft hover:border-burn-dim hover:text-ink transition-all flex items-center gap-2">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+        Back
+      </a>
+      <button type="submit" class="flex-1 bg-ink hover:bg-ink/90 text-white font-semibold py-3 rounded-lg text-[0.9rem] transition-all flex items-center justify-center gap-2">
+        Continue
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+
+  </form>
+
+</ApplyLayout>
+
+<script is:inline>
+(function() {
+  const DEGREE_TYPES = ['High School Diploma', 'Vocational / Diploma', "Bachelor's", "Master's", 'PhD / Doctorate', 'Postdoc', 'Self-Taught / Independent Study', 'Other'];
+  const STATUS_OPTIONS = ['Pursuing', 'Completed', 'Paused'];
+
+  function makeEduEntry() {
+    const div = document.createElement('div');
+    div.className = 'education-entry bg-cream-2/50 border border-ink/10 rounded-lg p-4 relative';
+    div.innerHTML = `
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Degree Type</label>
+          <select name="eduDegree" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white">
+            <option value="">Select...</option>
+            ${DEGREE_TYPES.map(t => `<option value="${t}">${t}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Field of Study</label>
+          <input type="text" name="eduField" placeholder="e.g. Computer Science" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Institution</label>
+          <input type="text" name="eduInstitution" placeholder="e.g. IIT Delhi, MIT, Self-taught at home" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+        <div>
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Status</label>
+          <select name="eduStatus" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white">
+            <option value="">Select...</option>
+            ${STATUS_OPTIONS.map(s => `<option value="${s}">${s}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Year</label>
+          <input type="text" name="eduYear" placeholder="2024" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+      </div>
+      <button type="button" class="remove-entry absolute top-2 right-2 text-ink-soft/50 hover:text-burn text-lg leading-none w-7 h-7 flex items-center justify-center" title="Remove entry">x</button>
+    `;
+    return div;
+  }
+
+  function makeCertEntry() {
+    const div = document.createElement('div');
+    div.className = 'cert-entry bg-cream-2/50 border border-ink/10 rounded-lg p-4 relative';
+    div.innerHTML = `
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div class="md:col-span-2">
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Certification / Course Name</label>
+          <input type="text" name="certName" placeholder="e.g. AWS Solutions Architect" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+        <div>
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Year</label>
+          <input type="text" name="certYear" placeholder="2024" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+        <div class="md:col-span-3">
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Issuer</label>
+          <input type="text" name="certIssuer" placeholder="e.g. AWS, Coursera, Google" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+      </div>
+      <button type="button" class="remove-entry absolute top-2 right-2 text-ink-soft/50 hover:text-burn text-lg leading-none w-7 h-7 flex items-center justify-center" title="Remove entry">x</button>
+    `;
+    return div;
+  }
+
+  function makeWorkEntry() {
+    const div = document.createElement('div');
+    div.className = 'work-entry bg-cream-2/50 border border-ink/10 rounded-lg p-4 relative';
+    div.innerHTML = `
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Role / Title</label>
+          <input type="text" name="workRole" placeholder="e.g. ML Engineer Intern" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+        <div>
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Organization / Project</label>
+          <input type="text" name="workOrg" placeholder="e.g. Google, Open Source, Solo" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Duration</label>
+          <input type="text" name="workDuration" placeholder="e.g. Jan 2024 - Present, 6 months" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white" />
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">Brief Description</label>
+          <textarea name="workDesc" rows="2" placeholder="What did you build or contribute?" class="w-full px-3 py-2 border border-ink/15 rounded-md text-[0.85rem] outline-none focus:border-burn bg-white resize-y"></textarea>
+        </div>
+      </div>
+      <button type="button" class="remove-entry absolute top-2 right-2 text-ink-soft/50 hover:text-burn text-lg leading-none w-7 h-7 flex items-center justify-center" title="Remove entry">x</button>
+    `;
+    return div;
+  }
+
+  document.getElementById('add-education').addEventListener('click', function() {
+    document.getElementById('education-list').appendChild(makeEduEntry());
+  });
+  document.getElementById('add-cert').addEventListener('click', function() {
+    document.getElementById('cert-list').appendChild(makeCertEntry());
+  });
+  document.getElementById('add-work').addEventListener('click', function() {
+    document.getElementById('work-list').appendChild(makeWorkEntry());
+  });
+
+  document.addEventListener('click', function(e) {
+    if (e.target && e.target.classList && e.target.classList.contains('remove-entry')) {
+      const wrap = e.target.closest('.education-entry, .cert-entry, .work-entry');
+      if (wrap) {
+        const parent = wrap.parentElement;
+        if (parent.children.length > 1) {
+          wrap.remove();
+        } else {
+          wrap.querySelectorAll('input, textarea, select').forEach(function(el) {
+            if (el.tagName === 'SELECT') el.selectedIndex = 0;
+            else el.value = '';
+          });
+        }
+      }
+    }
+  });
+})();
+</script>
+

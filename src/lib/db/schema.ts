@@ -94,7 +94,7 @@ export const roles = pgTable('roles', {
   engagementType: engagementEnum('engagement_type').notNull(),
   location: varchar('location', { length: 100 }).notNull(),
   duration: varchar('duration', { length: 50 }).notNull(),
-  salary: varchar('salary', { length: 100 }).notNull(),
+  salary: varchar('salary', { length: 300 }).notNull(),
   about: text('about').notNull(),
   responsibilities: jsonb('responsibilities').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   skills: jsonb('skills').$type<string[]>().notNull().default(sql`'[]'::jsonb`),

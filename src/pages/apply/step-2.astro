@@ -1,0 +1,193 @@
+---
+import ApplyLayout from '@/layouts/ApplyLayout.astro';
+import { db } from '@/lib/db';
+import { roles, departments } from '@/lib/db/schema';
+import { eq, and, asc } from 'drizzle-orm';
+import { getActiveDraft, saveDraft } from '@/lib/apply/draft';
+import { safeDraft } from '@/lib/apply/data';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+if (user.role !== 'applicant') return Astro.redirect('/admin');
+
+const url = new URL(Astro.request.url);
+const roleSlugFromUrl = url.searchParams.get('role') || '';
+
+const draftRow = await getActiveDraft(user.id);
+const draft = safeDraft(draftRow?.data);
+const s2 = draft.step2 || {};
+
+if (!draft.step1) {
+  return Astro.redirect('/apply/step-1' + (roleSlugFromUrl ? '?role=' + roleSlugFromUrl : ''));
+}
+
+const activeRoleSlug = roleSlugFromUrl || s2.roleSlug || draft.roleSlug || '';
+
+let preselected = null;
+let preselectedDept = null;
+if (activeRoleSlug) {
+  const found = await db.select().from(roles).where(eq(roles.slug, activeRoleSlug)).limit(1);
+  if (found.length > 0) {
+    preselected = found[0];
+    const dept = await db.select().from(departments).where(eq(departments.id, found[0].departmentId)).limit(1);
+    if (dept.length > 0) preselectedDept = dept[0];
+  }
+}
+
+// Only load departments and roles list when there's NO pre-selected role
+const allDepts = preselected ? [] : await db.select().from(departments).orderBy(asc(departments.sortOrder));
+const selectedDeptId = preselected?.departmentId || s2.departmentId || '';
+
+let rolesInSelectedDept: { id: string; title: string; slug: string; level: string }[] = [];
+if (!preselected && selectedDeptId) {
+  rolesInSelectedDept = await db.select({
+    id: roles.id, title: roles.title, slug: roles.slug, level: roles.level
+  }).from(roles).where(and(eq(roles.departmentId, selectedDeptId), eq(roles.isOpen, true))).orderBy(asc(roles.sortOrder), asc(roles.title));
+}
+
+let errorMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  // If pre-selected, use the locked role. Otherwise read from form.
+  const submittedRoleSlug = preselected ? preselected.slug : ((fd.get('roleSlug') as string || '').trim());
+  const openToOther = (fd.get('openToOther') as string || '').trim();
+
+  if (submittedRoleSlug) {
+    const roleCheck = await db.select({ title: roles.title, departmentId: roles.departmentId, level: roles.level })
+      .from(roles).where(eq(roles.slug, submittedRoleSlug)).limit(1);
+    if (roleCheck.length > 0) {
+      const r = roleCheck[0];
+      const newDraft = {
+        ...draft,
+        roleSlug: submittedRoleSlug,
+        step2: {
+          roleSlug: submittedRoleSlug,
+          roleTitle: r.title,
+          departmentId: r.departmentId,
+          level: r.level,
+          openToOther: openToOther
+        }
+      };
+      await saveDraft(user.id, user.email, newDraft, 3);
+      return Astro.redirect('/apply/step-3?role=' + submittedRoleSlug);
+    } else {
+      errorMsg = 'That role does not exist or is no longer open.';
+    }
+  } else {
+    errorMsg = 'Please select a role.';
+  }
+}
+
+const initOpenToOther = s2.openToOther || '';
+const isInternOrApprentice = preselected && (preselected.level === 'Intern' || preselected.level === 'Apprentice');
+
+const levelColors: Record<string, string> = {
+  'C-Level': 'bg-plum-bg text-plum border-plum-border',
+  'Lead': 'bg-leaf-bg text-leaf border-leaf-border',
+  'Senior': 'bg-sky-bg text-sky border-sky-border',
+  'Mid': 'bg-burn-pale text-burn border-burn-dim',
+  'Junior': 'bg-cream-2 text-ink-soft border-ink/15',
+  'Intern': 'bg-gold-bg text-gold-deep border-gold-border',
+  'Apprentice': 'bg-leaf-bg text-leaf border-leaf-border'
+};
+const levelChipClass = preselected ? (levelColors[preselected.level] || 'bg-cream-2 text-ink-soft border-ink/15') : '';
+---
+<ApplyLayout step={2} totalSteps={6} stepTitle="Role Preference" stepSubtitle={preselected ? 'Confirm your selection and continue.' : 'Choose a department and role.'} roleTitle={preselected?.title}>
+
+  {errorMsg && (
+    <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.25);color:#b91c1c;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;line-height:1.6;">
+      {errorMsg}
+    </div>
+  )}
+
+  {isInternOrApprentice && (
+    <div class="bg-burn-pale border border-burn-dim rounded-lg p-4 mb-6 text-[0.82rem] text-ink-2 leading-relaxed">
+      <p class="font-semibold text-burn mb-1.5">Engagement Policy - Interns and Apprentices</p>
+      <p>Internship and Apprenticeship roles are currently unpaid (early-stage), with a commitment of 2.5 hrs/day, Mon-Fri. Exceptional Founders Office interns may receive performance bonuses and revenue share. Certificate issued on successful completion.</p>
+    </div>
+  )}
+
+  <form method="POST" class="flex flex-col gap-5">
+
+    {preselected ? (
+      <div class="bg-cream-2 border-2 border-burn-dim rounded-xl p-5 flex flex-col gap-3">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <p class="text-[0.6rem] font-mono uppercase tracking-wider text-burn font-bold mb-1">Role</p>
+            <p class="font-display text-[1.2rem] font-semibold text-ink leading-tight">{preselected.title}</p>
+          </div>
+          <a href="/careers" class="text-[0.72rem] font-mono text-ink-soft hover:text-burn underline whitespace-nowrap">Change role</a>
+        </div>
+        <div class="flex flex-wrap gap-2 pt-3 border-t border-burn-dim/40">
+          <span class={'text-[0.7rem] font-bold uppercase tracking-wider px-2.5 py-1 rounded-md border ' + levelChipClass}>{preselected.level}</span>
+          <span class="text-[0.7rem] font-semibold text-ink-soft bg-white border border-ink/10 px-2.5 py-1 rounded-md">{preselectedDept?.name || 'Department'}</span>
+          <span class="text-[0.7rem] font-semibold text-ink-soft bg-white border border-ink/10 px-2.5 py-1 rounded-md">{preselected.engagementType}</span>
+          <span class="text-[0.7rem] font-semibold text-ink-soft bg-white border border-ink/10 px-2.5 py-1 rounded-md">{preselected.location}</span>
+        </div>
+      </div>
+    ) : (
+      <>
+        <div>
+          <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Department <span class="text-burn">*</span></label>
+          <select name="departmentId" required onchange="this.form.submit()" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2">
+            <option value="">Select a department...</option>
+            {allDepts.map((d) => {
+              const sel = selectedDeptId === d.id;
+              return <option value={d.id} selected={sel}>{d.name}</option>;
+            })}
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Role Title <span class="text-burn">*</span></label>
+          {!selectedDeptId ? (
+            <select disabled class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] bg-cream-2/40 text-ink-soft">
+              <option>Select a department first</option>
+            </select>
+          ) : rolesInSelectedDept.length === 0 ? (
+            <div class="px-3.5 py-2.5 border border-ink/15 rounded-lg bg-cream-2/40 text-[0.85rem] text-ink-soft">
+              No open roles in this department right now. <a href="mailto:hr@edurankai.in" class="text-burn font-semibold hover:underline">Write to HR</a>
+            </div>
+          ) : (
+            <select name="roleSlug" required class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2">
+              <option value="">Select a role...</option>
+              {rolesInSelectedDept.map((r) => {
+                const sel = activeRoleSlug === r.slug;
+                return <option value={r.slug} selected={sel}>{r.title} ({r.level})</option>;
+              })}
+            </select>
+          )}
+        </div>
+      </>
+    )}
+
+    <div>
+      <label class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Open to similar roles if this one is filled?</label>
+      <div class="grid grid-cols-2 gap-2">
+        <label class={'flex items-center gap-2 px-3.5 py-2.5 border rounded-lg cursor-pointer text-[0.85rem] transition-all ' + (initOpenToOther === 'Yes' ? 'border-burn bg-burn-pale text-burn font-semibold' : 'border-ink/15 bg-cream-2 hover:border-burn-dim')}>
+          <input type="radio" name="openToOther" value="Yes" checked={initOpenToOther === 'Yes'} class="accent-burn" />
+          <span>Yes, absolutely</span>
+        </label>
+        <label class={'flex items-center gap-2 px-3.5 py-2.5 border rounded-lg cursor-pointer text-[0.85rem] transition-all ' + (initOpenToOther === 'No' ? 'border-burn bg-burn-pale text-burn font-semibold' : 'border-ink/15 bg-cream-2 hover:border-burn-dim')}>
+          <input type="radio" name="openToOther" value="No" checked={initOpenToOther === 'No'} class="accent-burn" />
+          <span>This role only</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="flex gap-3 pt-2">
+      <a href={'/apply/step-1' + (activeRoleSlug ? '?role=' + activeRoleSlug : '')} class="px-5 py-3 border border-ink/15 rounded-lg text-[0.88rem] font-medium text-ink-soft hover:border-burn-dim hover:text-ink transition-all flex items-center gap-2">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+        Back
+      </a>
+      <button type="submit" class="flex-1 bg-ink hover:bg-ink/90 text-white font-semibold py-3 rounded-lg text-[0.9rem] transition-all flex items-center justify-center gap-2">
+        Continue
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+
+  </form>
+
+</ApplyLayout>
+
