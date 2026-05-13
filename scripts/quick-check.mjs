@@ -1,0 +1,12 @@
+﻿import 'dotenv/config';
+import postgres from 'postgres';
+const sql = postgres(process.env.DATABASE_URL, { max: 1 });
+const r = await sql`SELECT COUNT(*) as c FROM roles WHERE status = 'open';`;
+const e = await sql`SELECT COUNT(*) as c FROM events;`;
+const p = await sql`SELECT COUNT(*) as c FROM products;`;
+const a = await sql`SELECT COUNT(*) as c FROM applications;`;
+console.log('Open roles:', r[0].c);
+console.log('Events:', e[0].c);
+console.log('Products:', p[0].c);
+console.log('Applications:', a[0].c);
+await sql.end();
