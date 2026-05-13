@@ -1,0 +1,346 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { applications, offerLetters, users, departments, roles } from '@/lib/db/schema';
+import { eq, and } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/admin/applications');
+
+let errorMsg = '';
+let successMsg = '';
+
+const found = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
+if (found.length === 0) return Astro.redirect('/admin/applications');
+const app: any = found[0];
+
+// Check if offer already exists for this application
+const existing = await db.select().from(offerLetters)
+  .where(eq(offerLetters.applicationId, id))
+  .limit(1);
+const existingOffer = existing.length > 0 ? existing[0] : null;
+
+function genToken(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789abcdefghjkmnpqrstuvwxyz';
+  let t = '';
+  for (let i = 0; i < 32; i++) t += chars[Math.floor(Math.random() * chars.length)];
+  return t;
+}
+
+function fnvHash(s: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h = h ^ s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36).toUpperCase().padStart(8, '0').substring(0, 8);
+}
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+
+  try {
+    if (action === 'generate') {
+      const candidateName = ((fd.get('candidateName') as string) || '').trim();
+      const candidateEmail = ((fd.get('candidateEmail') as string) || '').trim();
+      const roleTitle = ((fd.get('roleTitle') as string) || '').trim();
+      const department = ((fd.get('department') as string) || '').trim();
+      const templateType = ((fd.get('templateType') as string) || 'intern').trim();
+      const language = ((fd.get('language') as string) || 'en').trim();
+      const employmentType = ((fd.get('employmentType') as string) || '').trim();
+      const workMode = ((fd.get('workMode') as string) || 'Remote').trim();
+      const duration = ((fd.get('duration') as string) || '').trim();
+      const hoursCommitment = ((fd.get('hoursCommitment') as string) || '').trim();
+      const compensation = ((fd.get('compensation') as string) || 'Unpaid').trim();
+      const reportingTo = ((fd.get('reportingTo') as string) || '').trim();
+      const candidatePhone = ((fd.get('candidatePhone') as string) || '').trim();
+      const candidateCity = ((fd.get('candidateCity') as string) || '').trim();
+      const offerDate = ((fd.get('offerDate') as string) || '').trim();
+      const joiningDate = ((fd.get('joiningDate') as string) || '').trim();
+      const expiryDate = ((fd.get('expiryDate') as string) || '').trim();
+      const responseDeadline = ((fd.get('responseDeadline') as string) || '').trim();
+      const signatoryName = ((fd.get('signatoryName') as string) || '').trim();
+      const signatoryTitle = ((fd.get('signatoryTitle') as string) || '').trim();
+      const customNote = ((fd.get('customNote') as string) || '').trim();
+      const refNumber = ((fd.get('refNumber') as string) || '').trim();
+
+      if (!candidateName || !candidateEmail || !roleTitle || !signatoryName) {
+        errorMsg = 'Required: candidate name, email, role, and signatory.';
+      } else {
+        const integrityHash = fnvHash([refNumber, candidateName, roleTitle, department, offerDate, employmentType].join('|'));
+
+        const contentBlob = {
+          candidateName, candidateEmail, candidatePhone, candidateCity,
+          roleTitle, department, employmentType, workMode, duration,
+          hoursCommitment, compensation, reportingTo,
+          offerDate, joiningDate, expiryDate, responseDeadline,
+          signatoryName, signatoryTitle, customNote, language, templateType
+        };
+
+        if (existingOffer) {
+          // Update existing
+          await db.update(offerLetters).set({
+            templateType, language, content: contentBlob,
+            candidateName, candidateEmail, roleTitle, department,
+            refNumber, integrityHash,
+            offerDate: offerDate || null,
+            joiningDate: joiningDate || null,
+            expiryDate: expiryDate || null,
+            responseDeadline: responseDeadline || null,
+            updatedAt: new Date()
+          }).where(eq(offerLetters.id, existingOffer.id));
+          successMsg = 'Offer updated. Token: ' + existingOffer.token;
+        } else {
+          const token = genToken();
+          await db.insert(offerLetters).values({
+            token,
+            applicationId: id,
+            generatedByUserId: user.id,
+            status: 'sent',
+            templateType,
+            language,
+            content: contentBlob,
+            candidateName,
+            candidateEmail,
+            roleTitle,
+            department: department || null,
+            refNumber,
+            integrityHash,
+            offerDate: offerDate || null,
+            joiningDate: joiningDate || null,
+            expiryDate: expiryDate || null,
+            responseDeadline: responseDeadline || null
+          });
+          successMsg = 'Offer created. Token: ' + token + '. Applicant link: /portal/offer/' + token;
+        }
+      }
+    } else if (action === 'withdraw' && existingOffer) {
+      const reason = ((fd.get('reason') as string) || '').trim();
+      await db.update(offerLetters).set({
+        status: 'withdrawn',
+        withdrawnAt: new Date(),
+        withdrawnReason: reason || null,
+        updatedAt: new Date()
+      }).where(eq(offerLetters.id, existingOffer.id));
+      successMsg = 'Offer withdrawn.';
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown');
+  }
+
+  // Re-fetch existing offer after mutation
+  const refresh = await db.select().from(offerLetters).where(eq(offerLetters.applicationId, id)).limit(1);
+  if (refresh.length > 0) Object.assign(existingOffer || {}, refresh[0]);
+}
+
+// Re-fetch one more time for fresh state on every render
+const currentOfferList = await db.select().from(offerLetters).where(eq(offerLetters.applicationId, id)).limit(1);
+const currentOffer = currentOfferList[0] || null;
+
+const shortId = id.substring(0, 8).toUpperCase();
+const fullName = (app.firstName || '') + ' ' + (app.lastName || '');
+const defaultRef = 'ERA-2026-' + shortId.substring(0, 6);
+
+// Pre-fill defaults from application
+const defaults = currentOffer?.content || {
+  candidateName: fullName.trim(),
+  candidateEmail: app.email,
+  candidatePhone: app.phone || '',
+  candidateCity: app.city || '',
+  roleTitle: app.roleTitleSnapshot || '',
+  department: app.departmentSnapshot || '',
+  employmentType: app.engagementType || 'Internship',
+  workMode: app.remoteComfort?.includes('Fully remote') ? 'Remote' : 'Remote',
+  duration: app.level === 'Intern' ? '3 Months' : '12 Months',
+  hoursCommitment: app.level === 'Intern' ? '2.5 hrs/day, 5 days/week' : 'Full-time',
+  compensation: (app.level === 'Intern' || app.level === 'Apprentice') ? 'Unpaid' : (app.compensation || 'To be discussed'),
+  reportingTo: '',
+  offerDate: new Date().toISOString().split('T')[0],
+  joiningDate: '',
+  expiryDate: '',
+  responseDeadline: '',
+  signatoryName: user.name || 'Siddharth Prasad',
+  signatoryTitle: 'Founder & CEO',
+  customNote: '',
+  language: 'en',
+  templateType: (app.level === 'Intern' || app.level === 'Apprentice') ? 'intern' : 'fulltime'
+};
+
+const refNum = currentOffer?.refNumber || defaultRef;
+const isWithdrawn = currentOffer?.status === 'withdrawn';
+const isSigned = currentOffer?.status === 'signed';
+---
+<AdminLayout title="Offer Letter" description="Generate and manage offer letter.">
+
+  <div class="mb-4">
+    <a href={'/admin/applications/' + id} class="text-[0.78rem] text-white/50 hover:text-white">Back to application</a>
+  </div>
+
+  {errorMsg && <div class="bg-red-500/10 border border-red-500/30 text-red-300 rounded-lg p-3 mb-4 text-[0.85rem]">{errorMsg}</div>}
+  {successMsg && <div class="bg-leaf-bg/20 border border-leaf-border/50 text-leaf rounded-lg p-3 mb-4 text-[0.85rem]">{successMsg}</div>}
+
+  <div class="mb-5 pb-4 border-b border-white/8">
+    <p class="font-mono text-[0.7rem] text-white/40">{shortId}</p>
+    <h1 class="font-display text-[1.6rem] font-semibold text-white">Offer Letter</h1>
+    <p class="text-[0.85rem] text-white/60 mt-1">For <strong class="text-white">{fullName}</strong> · {app.roleTitleSnapshot}</p>
+  </div>
+
+  {currentOffer && (
+    <div class={'mb-5 p-4 rounded-xl border ' + (isSigned ? 'bg-leaf-bg/20 border-leaf-border/50' : isWithdrawn ? 'bg-red-500/10 border-red-500/30' : 'bg-burn-pale/20 border-burn-dim/50')}>
+      <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        <div>
+          <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold mb-1">
+            {isSigned ? 'SIGNED BY APPLICANT' : isWithdrawn ? 'WITHDRAWN' : 'SENT - AWAITING SIGNATURE'}
+          </p>
+          <p class="text-[0.85rem] text-white/80">Token: <span class="font-mono text-white">{currentOffer.token}</span></p>
+          <p class="text-[0.78rem] text-white/60 mt-1">Ref: {currentOffer.refNumber} · Hash: {currentOffer.integrityHash}</p>
+          {isSigned && currentOffer.signedAt && (
+            <p class="text-[0.78rem] text-leaf mt-1">Signed: {new Date(currentOffer.signedAt).toLocaleString('en-IN')}</p>
+          )}
+        </div>
+        <div class="flex flex-col gap-2">
+          <a href={'/portal/offer/' + currentOffer.token} target="_blank" class="text-[0.78rem] text-burn hover:underline font-mono">View applicant link &rarr;</a>
+          <a href={'/offer/verify/' + currentOffer.token} target="_blank" class="text-[0.78rem] text-sky hover:underline font-mono">Public verify page &rarr;</a>
+          {!isWithdrawn && !isSigned && (
+            <form method="POST" onsubmit="return confirm('Withdraw this offer? Applicant will see it as cancelled.');">
+              <input type="hidden" name="action" value="withdraw" />
+              <input type="text" name="reason" placeholder="Reason (optional)" class="text-[0.78rem] bg-white/5 border border-white/10 rounded px-2 py-1 text-white outline-none" />
+              <button type="submit" class="ml-1 text-[0.78rem] text-red-400 hover:underline">Withdraw</button>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  )}
+
+  <form method="POST" class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+    <input type="hidden" name="action" value="generate" />
+
+    <div class="lg:col-span-2 flex flex-col gap-4">
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Candidate</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Name *</label>
+            <input type="text" name="candidateName" required value={defaults.candidateName} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Email *</label>
+            <input type="email" name="candidateEmail" required value={defaults.candidateEmail} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Phone</label>
+            <input type="text" name="candidatePhone" value={defaults.candidatePhone} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">City</label>
+            <input type="text" name="candidateCity" value={defaults.candidateCity} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+        </div>
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Role and Terms</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Role Title *</label>
+            <input type="text" name="roleTitle" required value={defaults.roleTitle} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Department</label>
+            <input type="text" name="department" value={defaults.department} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Template Type *</label>
+            <select name="templateType" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn">
+              <option value="intern" selected={defaults.templateType === 'intern'} class="bg-ink">Intern / Apprentice</option>
+              <option value="fulltime" selected={defaults.templateType === 'fulltime'} class="bg-ink">Full-Time</option>
+              <option value="contract" selected={defaults.templateType === 'contract'} class="bg-ink">Contract</option>
+              <option value="leadership" selected={defaults.templateType === 'leadership'} class="bg-ink">Leadership / C-Level</option>
+            </select></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Employment Type</label>
+            <select name="employmentType" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn">
+              <option value="Internship" selected={defaults.employmentType === 'Internship'} class="bg-ink">Internship</option>
+              <option value="Apprenticeship" selected={defaults.employmentType === 'Apprenticeship'} class="bg-ink">Apprenticeship</option>
+              <option value="Full-Time" selected={defaults.employmentType === 'Full-Time'} class="bg-ink">Full-Time</option>
+              <option value="Contract" selected={defaults.employmentType === 'Contract'} class="bg-ink">Contract</option>
+              <option value="Part-Time" selected={defaults.employmentType === 'Part-Time'} class="bg-ink">Part-Time</option>
+            </select></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Work Mode</label>
+            <select name="workMode" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn">
+              <option value="Remote" selected={defaults.workMode === 'Remote'} class="bg-ink">Remote</option>
+              <option value="Hybrid" selected={defaults.workMode === 'Hybrid'} class="bg-ink">Hybrid</option>
+              <option value="On-Site" selected={defaults.workMode === 'On-Site'} class="bg-ink">On-Site</option>
+            </select></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Duration</label>
+            <input type="text" name="duration" value={defaults.duration} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Hours Commitment</label>
+            <input type="text" name="hoursCommitment" value={defaults.hoursCommitment} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Compensation</label>
+            <input type="text" name="compensation" value={defaults.compensation} placeholder="Unpaid / Amount / Not Disclosed" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div class="md:col-span-2"><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Reporting To</label>
+            <input type="text" name="reportingTo" value={defaults.reportingTo} placeholder="Head of AI / Founder" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+        </div>
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Dates</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Offer Date</label>
+            <input type="date" name="offerDate" value={defaults.offerDate} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Joining Date</label>
+            <input type="date" name="joiningDate" value={defaults.joiningDate} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Response Deadline</label>
+            <input type="date" name="responseDeadline" value={defaults.responseDeadline} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Offer Expiry</label>
+            <input type="date" name="expiryDate" value={defaults.expiryDate} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+        </div>
+      </div>
+
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+        <h2 class="font-display text-[1rem] font-semibold text-white mb-3">Signatory and Letter</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Signatory Name *</label>
+            <input type="text" name="signatoryName" required value={defaults.signatoryName} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Signatory Title</label>
+            <input type="text" name="signatoryTitle" value={defaults.signatoryTitle} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Ref Number</label>
+            <input type="text" name="refNumber" value={refNum} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn" /></div>
+          <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Language</label>
+            <select name="language" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn">
+              <option value="en" selected={defaults.language === 'en'} class="bg-ink">English</option>
+              <option value="hi" selected={defaults.language === 'hi'} class="bg-ink">हिन्दी</option>
+              <option value="sa" selected={defaults.language === 'sa'} class="bg-ink">संस्कृत</option>
+              <option value="es" selected={defaults.language === 'es'} class="bg-ink">Español</option>
+            </select></div>
+          <div class="md:col-span-2"><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/50 mb-1.5">Custom Note (optional)</label>
+            <textarea name="customNote" rows="3" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[0.85rem] text-white outline-none focus:border-burn resize-y">{defaults.customNote || ''}</textarea></div>
+        </div>
+      </div>
+
+      <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">
+        {currentOffer ? (isWithdrawn ? 'Re-generate (will replace withdrawn)' : 'Update Offer') : 'Generate and Send Offer'}
+      </button>
+    </div>
+
+    <div class="lg:col-span-1">
+      <div class="bg-white/5 border border-white/10 rounded-xl p-5 sticky top-4">
+        <h3 class="font-display text-[1rem] font-semibold text-white mb-3">How this works</h3>
+        <ol class="space-y-3 text-[0.82rem] text-white/70 leading-relaxed list-decimal pl-5">
+          <li>Fill in all the offer details on the left.</li>
+          <li>Click <strong class="text-white">Generate and Send Offer</strong>.</li>
+          <li>System creates a secure link: <code class="text-[0.72rem] bg-white/10 px-1 rounded">/portal/offer/[token]</code></li>
+          <li>Applicant sees the offer in their portal with a "View offer letter" button.</li>
+          <li>Applicant reviews and signs digitally with their finger / mouse.</li>
+          <li>Application status auto-changes to <strong class="text-leaf">hired</strong> on signing.</li>
+          <li>Both parties can download a PDF copy with the embedded signature and QR.</li>
+        </ol>
+
+        {currentOffer && (
+          <div class="mt-4 pt-4 border-t border-white/10">
+            <h4 class="text-[0.75rem] font-bold uppercase tracking-wider text-white/50 mb-2">Quick links</h4>
+            <div class="flex flex-col gap-1.5 text-[0.78rem]">
+              <a href={'/portal/offer/' + currentOffer.token} target="_blank" class="text-burn hover:underline">Applicant view</a>
+              <a href={'/offer/verify/' + currentOffer.token} target="_blank" class="text-sky hover:underline">Public verify page</a>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+
+  </form>
+
+</AdminLayout>

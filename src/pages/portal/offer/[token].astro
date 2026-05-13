@@ -1,0 +1,428 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { offerLetters, applications, applicationMessages } from '@/lib/db/schema';
+import { eq, and } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+const { token } = Astro.params;
+if (!token) return Astro.redirect('/portal');
+
+let errorMsg = '';
+let successMsg = '';
+
+// Fetch the offer
+const offerList = await db.select().from(offerLetters)
+  .where(eq(offerLetters.token, token))
+  .limit(1);
+
+if (offerList.length === 0) return Astro.redirect('/portal');
+const offer: any = offerList[0];
+
+// Verify the offer belongs to this user via the application
+const appList = await db.select().from(applications)
+  .where(and(eq(applications.id, offer.applicationId), eq(applications.applicantUserId, user.id)))
+  .limit(1);
+
+// Allow admins to view too
+const isAdmin = user.role !== 'applicant';
+if (appList.length === 0 && !isAdmin) return Astro.redirect('/portal');
+const app: any = appList.length > 0 ? appList[0] : null;
+
+// Handle signing
+if (Astro.request.method === 'POST' && !isAdmin) {
+  if (offer.status === 'signed') {
+    errorMsg = 'This offer has already been signed.';
+  } else if (offer.status === 'withdrawn') {
+    errorMsg = 'This offer has been withdrawn and cannot be signed.';
+  } else {
+    const fd = await Astro.request.formData();
+    const signatureDataUrl = (fd.get('signatureDataUrl') as string || '').trim();
+
+    if (!signatureDataUrl || !signatureDataUrl.startsWith('data:image/')) {
+      errorMsg = 'Please draw your signature before submitting.';
+    } else if (signatureDataUrl.length > 500000) {
+      errorMsg = 'Signature image too large.';
+    } else {
+      try {
+        const ipHeader = Astro.request.headers.get('x-forwarded-for') || Astro.request.headers.get('cf-connecting-ip') || '';
+        const ua = Astro.request.headers.get('user-agent') || '';
+
+        await db.update(offerLetters).set({
+          status: 'signed',
+          signedAt: new Date(),
+          signatureDataUrl,
+          signatureIp: ipHeader.substring(0, 64),
+          signatureUserAgent: ua,
+          updatedAt: new Date()
+        }).where(eq(offerLetters.id, offer.id));
+
+        // Update application status to hired
+        if (app) {
+          await db.update(applications).set({
+            status: 'hired',
+            updatedAt: new Date()
+          }).where(eq(applications.id, app.id));
+
+          // Post system message to thread
+          await db.insert(applicationMessages).values({
+            applicationId: app.id,
+            senderUserId: user.id,
+            senderRole: 'system',
+            senderName: 'System',
+            body: 'Offer accepted and signed by the applicant. Status updated to: Hired.',
+            isSystem: true
+          });
+        }
+
+        successMsg = 'Offer accepted. You are officially part of EduRankAI.';
+        offer.status = 'signed';
+        offer.signedAt = new Date();
+        offer.signatureDataUrl = signatureDataUrl;
+      } catch (err: any) {
+        errorMsg = 'Failed to record signature: ' + (err.message || 'Unknown error');
+      }
+    }
+  }
+}
+
+const content = offer.content || {};
+const c = content;
+const verifyUrl = 'https://www.edurankai.in/offer/verify/' + offer.token;
+const shortId = offer.id.substring(0, 8).toUpperCase();
+
+function formatDate(d: any): string {
+  if (!d) return '';
+  const date = typeof d === 'string' ? new Date(d) : d;
+  if (isNaN(date.getTime())) return d;
+  return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+}
+
+const isWithdrawn = offer.status === 'withdrawn';
+const isSigned = offer.status === 'signed';
+const isAvailable = offer.status === 'sent';
+
+// Expiry check
+let expiryStatus = 'ok';
+let daysLeft = null;
+if (offer.expiryDate && !isSigned) {
+  const exp = new Date(offer.expiryDate);
+  const diff = exp.getTime() - Date.now();
+  daysLeft = Math.ceil(diff / 86400000);
+  if (diff <= 0) expiryStatus = 'expired';
+  else if (daysLeft <= 3) expiryStatus = 'warning';
+}
+
+const TEMPLATE_INTROS: Record<string, string> = {
+  intern: 'We are pleased to extend this formal offer of an internship for the position of',
+  fulltime: 'We are pleased to extend this formal full-time employment offer for the position of',
+  contract: 'We are pleased to extend this contract engagement offer for the position of',
+  leadership: 'We are honored to extend this leadership offer for the position of'
+};
+
+const intro = TEMPLATE_INTROS[offer.templateType] || TEMPLATE_INTROS.intern;
+---
+<BaseLayout title={'Offer Letter - ' + c.candidateName} description="Your EduRankAI offer letter">
+
+  <section class="px-[5vw] py-6 md:py-10 max-w-4xl mx-auto">
+
+    <div class="mb-4 flex items-center justify-between flex-wrap gap-2">
+      <a href="/portal" class="text-[0.82rem] text-ink-soft hover:text-burn font-mono">Back to portal</a>
+      <div class="flex gap-2">
+        <button id="downloadPdfBtn" class="text-[0.82rem] bg-ink hover:bg-ink/90 text-white font-semibold px-4 py-2 rounded-lg">Download PDF</button>
+      </div>
+    </div>
+
+    {errorMsg && (
+      <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.25);color:#b91c1c;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:14px;">{errorMsg}</div>
+    )}
+    {successMsg && (
+      <div class="bg-leaf-bg/40 border border-leaf-border text-leaf rounded-lg p-4 mb-4 text-[0.88rem] leading-relaxed">{successMsg}</div>
+    )}
+
+    {isWithdrawn && (
+      <div class="bg-red-500/10 border border-red-500/30 text-red-700 rounded-2xl p-5 mb-5 text-[0.9rem] leading-relaxed">
+        <p class="font-semibold mb-1">This offer has been withdrawn</p>
+        <p>The hiring team has withdrawn this offer. {offer.withdrawnReason && (<span>Reason: {offer.withdrawnReason}</span>)}</p>
+        {!isAdmin && <p class="mt-2">If you have questions, please use the message thread on your application.</p>}
+      </div>
+    )}
+
+    {expiryStatus === 'expired' && !isSigned && (
+      <div class="bg-red-500/10 border border-red-500/30 text-red-700 rounded-2xl p-5 mb-5">
+        <p class="font-semibold">This offer has expired</p>
+        <p class="text-[0.85rem] mt-1">Please contact us via the message thread to discuss.</p>
+      </div>
+    )}
+
+    {expiryStatus === 'warning' && !isSigned && (
+      <div class="bg-burn-pale border border-burn-dim text-burn rounded-2xl p-4 mb-5">
+        <p class="font-semibold text-[0.9rem]">This offer expires in {daysLeft} day{daysLeft !== 1 ? 's' : ''} - {formatDate(offer.expiryDate)}</p>
+      </div>
+    )}
+
+    <article id="offerLetter" class="bg-white border border-ink/10 rounded-2xl overflow-hidden mb-6 shadow-sm">
+
+      <header class="bg-ink text-white p-6 md:p-8">
+        <div class="flex flex-col md:flex-row md:justify-between md:items-start gap-4">
+          <div>
+            <p class="font-display text-[1.6rem] font-semibold leading-tight">Edu<em class="italic text-burn font-medium">Rank</em>AI</p>
+            <p class="text-[0.7rem] text-white/50 mt-1 leading-relaxed">AI Research and Technology - Guwahati, Assam, India</p>
+            <p class="text-[0.7rem] text-white/40 mt-1">Nearby KV GATE, IIT Guwahati, Assam - 781039</p>
+            <p class="text-[0.7rem] text-white/40">hr@edurankai.in - www.edurankai.in</p>
+          </div>
+          <div class="text-left md:text-right">
+            <p class="text-[0.55rem] font-bold uppercase tracking-[0.15em] text-white/40">Reference</p>
+            <p class="font-mono text-[0.95rem] mt-1">{offer.refNumber}</p>
+            {offer.offerDate && (<p class="text-[0.78rem] text-white/55 mt-1">{formatDate(offer.offerDate)}</p>)}
+            <p class="inline-block mt-2 text-[0.6rem] font-bold uppercase tracking-wider text-gold-deep border border-gold-border/50 rounded px-2 py-0.5">Private and Confidential</p>
+          </div>
+        </div>
+      </header>
+
+      <div class="p-6 md:p-8">
+
+        {c.candidateName && (
+          <div class="mb-5">
+            <p class="font-display text-[1.2rem] font-semibold text-ink">{c.candidateName}</p>
+            <p class="text-[0.82rem] text-ink-soft mt-1 leading-relaxed">
+              {c.candidateEmail && <span>{c.candidateEmail}</span>}
+              {c.candidatePhone && <span> · {c.candidatePhone}</span>}
+              {c.candidateCity && <span><br />{c.candidateCity}</span>}
+            </p>
+          </div>
+        )}
+
+        <div class="bg-burn-pale/40 border-l-4 border-burn rounded-r p-3 mb-5">
+          <p class="text-[0.95rem] font-semibold text-ink"><span class="text-ink-soft font-normal">Re: </span>Offer of {c.employmentType} - {c.roleTitle}{c.department && (<span>, {c.department}</span>)}</p>
+        </div>
+
+        <div class="inline-block bg-ink text-burn text-[0.7rem] font-bold uppercase tracking-wider rounded px-3 py-1 mb-5">{c.employmentType} - {c.department || c.roleTitle}</div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+          <div class="bg-burn-pale/30 border border-burn-dim/30 rounded-lg p-3 text-center">
+            <p class="font-display text-[1rem] font-semibold text-burn">{c.duration || 'TBD'}</p>
+            <p class="text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft mt-1">Duration</p>
+          </div>
+          <div class="bg-burn-pale/30 border border-burn-dim/30 rounded-lg p-3 text-center">
+            <p class="font-display text-[1rem] font-semibold text-burn">{c.workMode || 'Remote'}</p>
+            <p class="text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft mt-1">Work Mode</p>
+          </div>
+          <div class="bg-burn-pale/30 border border-burn-dim/30 rounded-lg p-3 text-center">
+            <p class="font-display text-[1rem] font-semibold text-burn">{c.compensation || 'TBD'}</p>
+            <p class="text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft mt-1">Compensation</p>
+          </div>
+        </div>
+
+        <div class="text-[0.92rem] text-ink-2 leading-loose mb-5 space-y-3">
+          <p>Dear <strong class="text-ink">{(c.candidateName || '').split(' ')[0] || 'Candidate'}</strong>,</p>
+          <p>{intro} <strong class="text-ink">{c.roleTitle}</strong>{c.department && (<span> within the <strong class="text-ink">{c.department}</strong></span>)} at <strong class="text-ink">EduRankAI</strong>. Following a thorough evaluation of your application and conversations, we are confident you demonstrate the capability, character, and commitment we look for.</p>
+          {(offer.templateType === 'intern') && (
+            <p>This {c.employmentType} is offered on an <strong>unpaid basis</strong> in accordance with EduRankAI's Internship Policy. You will work <strong>{c.workMode}</strong>, committing <strong>{c.hoursCommitment}</strong> of focused effort. The engagement runs for <strong>{c.duration}</strong>, commencing <strong>{formatDate(c.joiningDate) || 'a mutually agreed date'}</strong>.</p>
+          )}
+          {(offer.templateType !== 'intern') && (
+            <p>This offer is contingent on completion of pre-employment requirements. Your employment commences on <strong>{formatDate(c.joiningDate) || 'a mutually agreed date'}</strong> as a <strong>{c.employmentType}</strong> employee. Onboarding details will be confirmed within 7 days of acceptance.</p>
+          )}
+          <p>You will receive a mid-point review and final review, assessed via EduRankAI's rubric-based evaluation. Outstanding performers receive a Letter of Recommendation; all successful completers receive a Certificate of Completion.</p>
+          <p>By accepting, you confirm you have read and agree to EduRankAI's Recruitment and Work Policy and Code of Conduct.</p>
+          {c.customNote && (<p class="italic">{c.customNote}</p>)}
+        </div>
+
+        <div class="border-t border-ink/8 pt-4 mb-5">
+          <p class="text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-3">Offer Summary</p>
+          <table class="w-full text-[0.85rem]">
+            <tbody>
+              <tr class="border-b border-ink/5"><td class="text-ink-soft py-2 w-2/5">Position</td><td class="font-semibold text-ink">{c.roleTitle}</td></tr>
+              {c.department && <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Department</td><td class="font-semibold text-ink">{c.department}</td></tr>}
+              <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Employment Type</td><td class="font-semibold text-ink">{c.employmentType}</td></tr>
+              <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Work Mode</td><td class="font-semibold text-ink">{c.workMode}</td></tr>
+              <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Duration</td><td class="font-semibold text-ink">{c.duration}</td></tr>
+              {c.joiningDate && <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Joining Date</td><td class="font-semibold text-ink">{formatDate(c.joiningDate)}</td></tr>}
+              {c.reportingTo && <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Reporting To</td><td class="font-semibold text-ink">{c.reportingTo}</td></tr>}
+              {c.hoursCommitment && <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Working Hours</td><td class="font-semibold text-ink">{c.hoursCommitment}</td></tr>}
+              <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Compensation</td><td class="font-semibold text-ink">{c.compensation}</td></tr>
+              {offer.expiryDate && <tr class="border-b border-ink/5"><td class="text-ink-soft py-2">Offer Expires</td><td class="font-semibold text-ink">{formatDate(offer.expiryDate)}</td></tr>}
+              <tr><td class="text-ink-soft py-2">Integrity Hash</td><td class="font-mono text-burn text-[0.78rem]">{offer.integrityHash}</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="border-t border-ink/8 pt-4 mb-5">
+          <div class="flex justify-between items-end">
+            <div>
+              <p class="text-[0.7rem] text-ink-soft mb-2">Issued by EduRankAI - {formatDate(offer.offerDate)}</p>
+              <p class="font-display text-[1.05rem] font-semibold text-ink">{c.signatoryName}</p>
+              <p class="text-[0.82rem] text-ink-soft">{c.signatoryTitle}</p>
+              <p class="text-[0.82rem] font-semibold text-burn">EduRankAI</p>
+            </div>
+            <div class="w-14 h-14 rounded-full border-2 border-burn-dim/40 bg-burn-pale flex flex-col items-center justify-center">
+              <span class="text-burn text-[0.7rem]">◆</span>
+              <span class="text-[0.45rem] font-bold text-burn text-center leading-tight">EDU<br />RANK<br />AI</span>
+            </div>
+          </div>
+        </div>
+
+        {isSigned && offer.signatureDataUrl && (
+          <div class="border-t border-ink/8 pt-4 mb-5">
+            <p class="text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-3">Accepted by Applicant</p>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <p class="text-[0.7rem] text-ink-soft mb-1">Candidate Signature</p>
+                <img src={offer.signatureDataUrl} alt="Signature" class="max-h-20 border border-ink/10 rounded bg-white p-1" />
+                <p class="text-[0.7rem] text-ink-soft italic mt-1">Signed: {new Date(offer.signedAt).toLocaleString('en-IN')}</p>
+              </div>
+              <div>
+                <p class="text-[0.7rem] text-ink-soft mb-1">Date of Signing</p>
+                <p class="text-[0.85rem] font-semibold">{formatDate(offer.signedAt)}</p>
+                <p class="text-[0.7rem] text-ink-soft mt-2 leading-relaxed">By signing, the candidate has accepted this offer and all terms herein.</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div class="border-t border-ink/8 pt-4">
+          <p class="text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Verification</p>
+          <div class="flex items-center gap-3 bg-cream-2 rounded p-3">
+            <div id="qrCanvasBox" class="w-16 h-16 bg-white border border-ink/10 rounded flex items-center justify-center text-[0.6rem] text-ink-soft">QR</div>
+            <div class="flex-1 text-[0.78rem] text-ink-2 leading-relaxed">
+              <p class="font-semibold text-ink">Verify this offer letter</p>
+              <p>Scan the QR or visit:</p>
+              <p class="font-mono text-burn break-all">{verifyUrl}</p>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </article>
+
+    {!isAdmin && isAvailable && !isWithdrawn && expiryStatus !== 'expired' && (
+      <div class="bg-burn-pale border border-burn-dim rounded-2xl p-6 mb-5">
+        <h2 class="font-display text-[1.3rem] font-semibold text-ink mb-2">Accept this offer</h2>
+        <p class="text-[0.9rem] text-ink-2 leading-relaxed mb-4">Draw your signature below and click <strong>Accept and Sign</strong>. This is a binding acceptance. A PDF will be available for download immediately after.</p>
+
+        <form method="POST" id="signForm">
+          <input type="hidden" name="signatureDataUrl" id="signatureDataUrl" />
+          <div class="bg-white border border-ink/15 rounded-lg p-2">
+            <canvas id="sigCanvas" width="600" height="120" style="width:100%;height:120px;display:block;touch-action:none;cursor:crosshair;"></canvas>
+          </div>
+          <div class="flex gap-2 mt-3">
+            <button type="button" id="clearSigBtn" class="bg-cream-2 border border-ink/15 hover:border-burn-dim text-ink font-semibold py-2 px-4 rounded-lg text-[0.85rem]">Clear</button>
+            <button type="submit" id="signSubmitBtn" class="flex-1 bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">Accept and Sign Offer</button>
+          </div>
+        </form>
+        <p class="text-[0.7rem] text-ink-soft mt-3 italic">Your signature, IP, and timestamp will be recorded as evidence of acceptance.</p>
+      </div>
+    )}
+
+    {!isAdmin && isAvailable && expiryStatus !== 'expired' && (
+      <div class="text-[0.78rem] text-ink-soft text-center">
+        Questions? <a href={'/portal/applications/' + offer.applicationId} class="text-burn font-semibold hover:underline">Use the message thread</a>.
+      </div>
+    )}
+
+  </section>
+
+  <script is:inline src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <script is:inline src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script is:inline src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+
+  <script is:inline define:vars={{ verifyUrl: verifyUrl, isAvailable: isAvailable, isAdmin: isAdmin }}>
+    // QR rendering
+    setTimeout(function() {
+      var qrBox = document.getElementById('qrCanvasBox');
+      if (qrBox && typeof QRCode !== 'undefined') {
+        var cv = document.createElement('canvas');
+        cv.width = 64; cv.height = 64;
+        QRCode.toCanvas(cv, verifyUrl, { width: 64, margin: 0, color: { dark: '#0C0C0C', light: '#FFFFFF' } }, function(err) {
+          if (!err) {
+            qrBox.innerHTML = '';
+            qrBox.appendChild(cv);
+          }
+        });
+      }
+    }, 200);
+
+    // Signature canvas
+    var canvas = document.getElementById('sigCanvas');
+    var sigForm = document.getElementById('signForm');
+    var clearBtn = document.getElementById('clearSigBtn');
+    var sigDataInput = document.getElementById('signatureDataUrl');
+    if (canvas && isAvailable && !isAdmin) {
+      var ctx = canvas.getContext('2d');
+      ctx.strokeStyle = '#0C0C0C';
+      ctx.lineWidth = 2.5;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      var drawing = false, lastX = 0, lastY = 0;
+      function pos(e) {
+        var rect = canvas.getBoundingClientRect();
+        var scaleX = canvas.width / rect.width;
+        var scaleY = canvas.height / rect.height;
+        if (e.touches) return { x: (e.touches[0].clientX - rect.left) * scaleX, y: (e.touches[0].clientY - rect.top) * scaleY };
+        return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY };
+      }
+      function start(e) { e.preventDefault(); drawing = true; var p = pos(e); lastX = p.x; lastY = p.y; }
+      function draw(e) { if (!drawing) return; e.preventDefault(); var p = pos(e); ctx.beginPath(); ctx.moveTo(lastX, lastY); ctx.lineTo(p.x, p.y); ctx.stroke(); lastX = p.x; lastY = p.y; }
+      function stop() { drawing = false; }
+      canvas.addEventListener('mousedown', start);
+      canvas.addEventListener('mousemove', draw);
+      canvas.addEventListener('mouseup', stop);
+      canvas.addEventListener('mouseleave', stop);
+      canvas.addEventListener('touchstart', start, { passive: false });
+      canvas.addEventListener('touchmove', draw, { passive: false });
+      canvas.addEventListener('touchend', stop);
+
+      if (clearBtn) clearBtn.addEventListener('click', function() { ctx.clearRect(0, 0, canvas.width, canvas.height); });
+
+      if (sigForm) sigForm.addEventListener('submit', function(e) {
+        var img = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        var hasInk = false;
+        for (var i = 3; i < img.length; i += 4) { if (img[i] > 10) { hasInk = true; break; } }
+        if (!hasInk) { e.preventDefault(); alert('Please draw your signature before submitting.'); return false; }
+        sigDataInput.value = canvas.toDataURL('image/png');
+      });
+    }
+
+    // Download PDF
+    var dlBtn = document.getElementById('downloadPdfBtn');
+    if (dlBtn) dlBtn.addEventListener('click', function() {
+      dlBtn.disabled = true;
+      dlBtn.textContent = 'Preparing PDF...';
+      var letter = document.getElementById('offerLetter');
+      if (!letter || typeof html2canvas === 'undefined' || typeof window.jspdf === 'undefined') {
+        dlBtn.disabled = false;
+        dlBtn.textContent = 'Download PDF';
+        alert('PDF library not loaded. Please refresh the page and try again.');
+        return;
+      }
+      html2canvas(letter, { scale: 2, backgroundColor: '#ffffff', useCORS: true }).then(function(canvasImg) {
+        var imgData = canvasImg.toDataURL('image/jpeg', 0.92);
+        var pdf = new window.jspdf.jsPDF('p', 'mm', 'a4');
+        var pdfW = 210, pdfH = 297;
+        var imgW = pdfW;
+        var imgH = (canvasImg.height * pdfW) / canvasImg.width;
+        var heightLeft = imgH;
+        var pos = 0;
+        pdf.addImage(imgData, 'JPEG', 0, pos, imgW, imgH);
+        heightLeft -= pdfH;
+        while (heightLeft > 0) {
+          pos = heightLeft - imgH;
+          pdf.addPage();
+          pdf.addImage(imgData, 'JPEG', 0, pos, imgW, imgH);
+          heightLeft -= pdfH;
+        }
+        pdf.save('EduRankAI-Offer-Letter.pdf');
+        dlBtn.disabled = false;
+        dlBtn.textContent = 'Download PDF';
+      }).catch(function(err) {
+        console.error(err);
+        dlBtn.disabled = false;
+        dlBtn.textContent = 'Download PDF';
+        alert('Failed to generate PDF. Try printing instead (Ctrl+P).');
+      });
+    });
+  </script>
+
+</BaseLayout>

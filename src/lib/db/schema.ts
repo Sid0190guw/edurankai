@@ -331,3 +331,51 @@ export const applicationMessages = pgTable('application_messages', {
   appIdx: index('app_msg_app_idx').on(t.applicationId),
   createdIdx: index('app_msg_created_idx').on(t.createdAt)
 }));
+// =========================================================================
+// Offer Letters - generated offer letters with digital signatures
+// =========================================================================
+export const offerLetters = pgTable('offer_letters', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  token: varchar('token', { length: 64 }).notNull().unique(),
+  applicationId: uuid('application_id').references(() => applications.id, { onDelete: 'cascade' }).notNull(),
+  generatedByUserId: uuid('generated_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+
+  // Status
+  status: varchar('status', { length: 20 }).notNull().default('draft'),
+
+  // Letter content (jsonb so we can change template fields without migrations)
+  templateType: varchar('template_type', { length: 30 }).notNull().default('intern'),
+  language: varchar('language', { length: 5 }).notNull().default('en'),
+  content: jsonb('content').$type<Record<string, any>>().notNull(),
+
+  // Key fields for quick query
+  candidateName: varchar('candidate_name', { length: 300 }).notNull(),
+  candidateEmail: varchar('candidate_email', { length: 255 }).notNull(),
+  roleTitle: varchar('role_title', { length: 300 }).notNull(),
+  department: varchar('department', { length: 200 }),
+  refNumber: varchar('ref_number', { length: 64 }).notNull(),
+  integrityHash: varchar('integrity_hash', { length: 16 }).notNull(),
+
+  // Dates
+  offerDate: varchar('offer_date', { length: 20 }),
+  joiningDate: varchar('joining_date', { length: 20 }),
+  expiryDate: varchar('expiry_date', { length: 20 }),
+  responseDeadline: varchar('response_deadline', { length: 20 }),
+
+  // Signature (when applicant signs)
+  signedAt: timestamp('signed_at', { withTimezone: true }),
+  signatureDataUrl: text('signature_data_url'),
+  signatureIp: varchar('signature_ip', { length: 64 }),
+  signatureUserAgent: text('signature_user_agent'),
+
+  // Withdrawal
+  withdrawnAt: timestamp('withdrawn_at', { withTimezone: true }),
+  withdrawnReason: text('withdrawn_reason'),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+}, (t) => ({
+  tokenIdx: index('offer_token_idx').on(t.token),
+  appIdx: index('offer_app_idx').on(t.applicationId),
+  statusIdx: index('offer_status_idx').on(t.status)
+}));
