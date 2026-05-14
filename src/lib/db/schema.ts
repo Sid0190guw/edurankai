@@ -484,3 +484,11 @@ export const heiStories = pgTable('hei_stories', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 });
+
+export const heiInstitutionScores = pgTable('hei_institution_scores', {
+  institutionId: uuid('institution_id').notNull().references(() => heiInstitutions.id, { onDelete: 'cascade' }),
+  dimensionId: varchar('dimension_id', { length: 50 }).notNull().references(() => heiDimensions.id, { onDelete: 'cascade' }),
+  score: text('score').notNull().default('0'),
+  notes: text('notes'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+});
