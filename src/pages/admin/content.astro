@@ -1,20 +1,204 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
-const name = 'content';
-const title = name.charAt(0).toUpperCase() + name.slice(1);
+import { db } from '@/lib/db';
+import { contentPages } from '@/lib/db/schema';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
+import { asc, eq } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!can(user, 'content.view')) return Astro.redirect('/admin');
+const canEdit = can(user, 'content.edit');
+
+let errorMsg = '';
+let okMsg = '';
+
+if (Astro.request.method === 'POST' && canEdit) {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'create' || action === 'update') {
+      const id = fd.get('id') as string;
+      const candidate = {
+        slug: (fd.get('slug') as string || '').trim().toLowerCase(),
+        title: (fd.get('title') as string || '').trim(),
+        body: (fd.get('body') as string || ''),
+        metaDescription: (fd.get('metaDescription') as string || '').trim() || null,
+        isPublished: fd.get('isPublished') === 'on',
+        lastEditedByUserId: user.id
+      };
+
+      if (!candidate.slug || !candidate.title) {
+        errorMsg = 'Slug and title are required.';
+      } else if (!candidate.slug.match(/^[a-z0-9-]+$/)) {
+        errorMsg = 'Slug must be lowercase letters, digits, hyphens only.';
+      } else {
+        if (action === 'create') {
+          const existing = await db.select({ id: contentPages.id }).from(contentPages).where(eq(contentPages.slug, candidate.slug)).limit(1);
+          if (existing.length > 0) {
+            errorMsg = 'Slug already exists.';
+          } else {
+            const inserted = await db.insert(contentPages).values({ ...candidate, version: 1 }).returning({ id: contentPages.id });
+            await logAudit({ userId: user.id, action: 'content.create', entity: 'content_page', entityId: inserted[0].id, diff: { slug: candidate.slug }, ipAddress: Astro.clientAddress });
+            okMsg = 'Page "' + candidate.title + '" created.';
+          }
+        } else {
+          const target = await db.select({ version: contentPages.version }).from(contentPages).where(eq(contentPages.id, id)).limit(1);
+          const newVersion = (target[0]?.version || 1) + 1;
+          await db.update(contentPages).set({ ...candidate, version: newVersion, updatedAt: new Date() }).where(eq(contentPages.id, id));
+          await logAudit({ userId: user.id, action: 'content.update', entity: 'content_page', entityId: id, diff: { slug: candidate.slug, version: newVersion }, ipAddress: Astro.clientAddress });
+          okMsg = 'Page updated (v' + newVersion + ').';
+        }
+      }
+    } else if (action === 'delete') {
+      const id = fd.get('id') as string;
+      await db.delete(contentPages).where(eq(contentPages.id, id));
+      await logAudit({ userId: user.id, action: 'content.delete', entity: 'content_page', entityId: id, diff: {}, ipAddress: Astro.clientAddress });
+      okMsg = 'Page deleted.';
+    } else if (action === 'toggle_publish') {
+      const id = fd.get('id') as string;
+      const target = await db.select().from(contentPages).where(eq(contentPages.id, id)).limit(1);
+      if (target.length > 0) {
+        await db.update(contentPages).set({ isPublished: !target[0].isPublished, updatedAt: new Date() }).where(eq(contentPages.id, id));
+        okMsg = target[0].isPublished ? 'Page unpublished.' : 'Page published.';
+      }
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const editId = url.searchParams.get('edit') || '';
+const allPages = await db.select().from(contentPages).orderBy(asc(contentPages.slug));
+const editing = editId ? allPages.find(p => p.id === editId) : null;
 ---
-<AdminLayout title={title} activeNav={name}>
-  <div class="admin-page">
-    <div class="admin-page-header">
+<AdminLayout title="Content Pages" activeNav="content">
+  <div class="admin-page" style="max-width:1400px;">
+
+    <div class="admin-page-header" style="margin-bottom:24px;">
       <div class="admin-page-title-block">
-        <div class="admin-page-eyebrow">Admin</div>
-        <h1 class="admin-page-title">{title}</h1>
-        <p class="admin-page-sub">This page will be built in a subsequent message.</p>
+        <div class="admin-page-eyebrow">Content</div>
+        <h1 class="admin-page-title">Content Pages</h1>
+        <p class="admin-page-sub">{allPages.length} pages. Public pages render at /p/[slug]. Use markdown.</p>
       </div>
     </div>
-    <div class="admin-card">
-      <div class="admin-card-title">Coming soon</div>
-      <p style="font-size:13px;color:#8a8a94;line-height:1.7;margin-top:6px;">Full CRUD interface for {title.toLowerCase()} is scheduled for the next batch of messages. The database tables are already created and the data is ready.</p>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{okMsg}</div>}
+
+    <div style="display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:flex-start;">
+
+      <!-- LIST -->
+      <div class="admin-card" style="padding:0;overflow:hidden;">
+        <div style="padding:14px 16px;border-bottom:1px solid #1f1f26;display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:11px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;">All pages</span>
+          {canEdit && !editing && <a href="?edit=new" class="admin-btn admin-btn-primary" style="padding:5px 11px;font-size:11px;">+ New page</a>}
+        </div>
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Page</th>
+              <th>Status</th>
+              <th style="text-align:right;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {allPages.map((p) => {
+              const isEdit = editing && editing.id === p.id;
+              return (
+                <tr style={isEdit ? 'background:rgba(255,79,0,0.06);' : ''}>
+                  <td>
+                    <div style="font-weight:500;color:#fff;">{p.title}</div>
+                    <div style="font-size:11px;color:#6e6e78;margin-top:3px;font-family:'Geist Mono',monospace;">/p/{p.slug}</div>
+                    <div style="font-size:10px;color:#6e6e78;margin-top:2px;">v{p.version} - updated {new Date(p.updatedAt).toLocaleDateString('en-IN', { day:'numeric', month:'short' })}</div>
+                  </td>
+                  <td>
+                    <span style={'font-size:11px;font-weight:500;color:' + (p.isPublished ? '#10b981' : '#fbbf24') + ';'}>
+                      {p.isPublished ? 'Published' : 'Draft'}
+                    </span>
+                  </td>
+                  <td style="text-align:right;">
+                    {canEdit && (
+                      <div style="display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap;">
+                        <a href={'?edit=' + p.id} class="admin-btn" style="padding:4px 9px;font-size:10.5px;">Edit</a>
+                        <form method="POST" style="margin:0;display:inline;">
+                          <input type="hidden" name="_action" value="toggle_publish" />
+                          <input type="hidden" name="id" value={p.id} />
+                          <button type="submit" class="admin-btn" style="padding:4px 9px;font-size:10.5px;">{p.isPublished ? 'Unpub' : 'Publish'}</button>
+                        </form>
+                        <form method="POST" style="margin:0;display:inline;" onsubmit="return confirm('Delete this page permanently?');">
+                          <input type="hidden" name="_action" value="delete" />
+                          <input type="hidden" name="id" value={p.id} />
+                          <button type="submit" class="admin-btn" style="padding:4px 9px;font-size:10.5px;color:#fca5a5;">Del</button>
+                        </form>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {allPages.length === 0 && <tr><td colspan="3" style="text-align:center;padding:30px;color:#6e6e78;font-size:13px;">No pages yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- FORM -->
+      {canEdit && (editing || editId === 'new') && (
+        <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:12px;">
+          <input type="hidden" name="_action" value={editing ? 'update' : 'create'} />
+          {editing && <input type="hidden" name="id" value={editing.id} />}
+
+          <div class="admin-card-title" style="margin:0 0 4px;">{editing ? 'Edit: ' + editing.title : '+ New content page'}</div>
+
+          <div>
+            <label class="rolefield-label">Title *</label>
+            <input name="title" required class="rolefield-input" value={editing ? editing.title : ''} />
+          </div>
+
+          <div>
+            <label class="rolefield-label">Slug *</label>
+            <input name="slug" required pattern="[a-z0-9-]+" class="rolefield-input" placeholder="privacy" value={editing ? editing.slug : ''} />
+            <p style="font-size:10px;color:#6e6e78;margin-top:3px;">Public URL: /p/{editing ? editing.slug : 'slug'}</p>
+          </div>
+
+          <div>
+            <label class="rolefield-label">Meta description</label>
+            <input name="metaDescription" maxlength="300" class="rolefield-input" placeholder="Shown in search results & social shares" value={editing && editing.metaDescription ? editing.metaDescription : ''} />
+          </div>
+
+          <div>
+            <label class="rolefield-label">Body (Markdown) *</label>
+            <textarea name="body" rows="20" class="rolefield-input" style="font-family:'Geist Mono',monospace;font-size:12px;line-height:1.6;" placeholder="# Heading&#10;&#10;Your content here. Use markdown.&#10;&#10;## Sub-heading&#10;&#10;**bold** _italic_ [link](https://...)&#10;&#10;- bullet&#10;- bullet">{editing ? editing.body : ''}</textarea>
+            <p style="font-size:10px;color:#6e6e78;margin-top:3px;">Supports standard markdown: # ## ### headings, **bold**, _italic_, [links](url), - lists, > quotes, `code`.</p>
+          </div>
+
+          <label style="display:flex;align-items:center;gap:8px;color:#d8d8de;font-size:12px;cursor:pointer;">
+            <input type="checkbox" name="isPublished" style="accent-color:#FF4F00;" checked={editing ? editing.isPublished : false} />
+            <span>Publish (visible at /p/{editing ? editing.slug : 'slug'})</span>
+          </label>
+
+          <div style="display:flex;gap:8px;">
+            <button type="submit" class="admin-btn admin-btn-primary" style="flex:1;justify-content:center;">{editing ? 'Save changes' : 'Create page'}</button>
+            <a href="/admin/content" class="admin-btn" style="display:flex;align-items:center;padding:8px 14px;">Cancel</a>
+          </div>
+        </form>
+      )}
+
+      {!editing && editId !== 'new' && (
+        <div class="admin-card" style="text-align:center;padding:40px 20px;">
+          <p style="font-size:13px;color:#6e6e78;line-height:1.7;">Select a page from the list to edit, or click <strong>+ New page</strong>.</p>
+        </div>
+      )}
+
     </div>
   </div>
+
+  <style>
+    .rolefield-label { display:block;font-size:10.5px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px; }
+    .rolefield-input { width:100%;padding:8px 11px;background:#08080a;border:1px solid #1f1f26;border-radius:6px;color:#fff;font-size:12.5px;font-family:inherit;outline:none; }
+    .rolefield-input:focus { border-color:#FF4F00; }
+    textarea.rolefield-input { resize:vertical; }
+  </style>
 </AdminLayout>
