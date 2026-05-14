@@ -1,0 +1,168 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { inviteTokens, users } from '@/lib/db/schema';
+import { hashPassword } from '@/lib/auth/password';
+import { generateSessionToken, createSession } from '@/lib/auth/session';
+import { setSessionCookie } from '@/lib/auth/cookie';
+import { eq, and, isNull, gt } from 'drizzle-orm';
+
+const { token } = Astro.params;
+if (!token) return Astro.redirect('/portal/login');
+
+let errorMsg = '';
+let okMsg = '';
+
+// Look up token
+const tokenRow = await db.select({
+  token: inviteTokens.token,
+  userId: inviteTokens.userId,
+  applicationId: inviteTokens.applicationId,
+  expiresAt: inviteTokens.expiresAt,
+  usedAt: inviteTokens.usedAt
+}).from(inviteTokens).where(eq(inviteTokens.token, token)).limit(1);
+
+const invite = tokenRow[0];
+
+let invalidReason = '';
+if (!invite) {
+  invalidReason = 'This invitation link is invalid.';
+} else if (invite.usedAt) {
+  invalidReason = 'This invitation link has already been used. Please sign in with the password you set.';
+} else if (new Date(invite.expiresAt) < new Date()) {
+  invalidReason = 'This invitation link has expired. Please contact us at hr@edurankai.in.';
+}
+
+let userRow = null;
+if (invite && !invalidReason) {
+  const u = await db.select().from(users).where(eq(users.id, invite.userId)).limit(1);
+  if (u.length === 0) {
+    invalidReason = 'User account not found. Please contact us.';
+  } else {
+    userRow = u[0];
+  }
+}
+
+if (!invalidReason && Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const password = fd.get('password') as string || '';
+  const confirmPassword = fd.get('confirm_password') as string || '';
+
+  if (!password || password.length < 8) {
+    errorMsg = 'Password must be at least 8 characters.';
+  } else if (password !== confirmPassword) {
+    errorMsg = 'Passwords do not match.';
+  } else {
+    try {
+      const newHash = await hashPassword(password);
+      await db.update(users).set({
+        passwordHash: newHash,
+        emailVerified: true,
+        updatedAt: new Date()
+      }).where(eq(users.id, invite!.userId));
+
+      await db.update(inviteTokens).set({
+        usedAt: new Date()
+      }).where(eq(inviteTokens.token, token));
+
+      // Auto sign-in
+      const sessionToken = generateSessionToken();
+      const session = await createSession(sessionToken, invite!.userId, {
+        userAgent: Astro.request.headers.get('user-agent') || undefined,
+        ipAddress: Astro.clientAddress
+      });
+      setSessionCookie(Astro.cookies, sessionToken, session.expiresAt);
+
+      await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, invite!.userId));
+
+      return Astro.redirect('/portal');
+    } catch (err: any) {
+      errorMsg = 'Failed to set password: ' + (err.message || 'Unknown error');
+    }
+  }
+}
+---
+<BaseLayout title="Claim your account - EduRankAI Portal" description="Set your password to access the EduRankAI applicant portal.">
+  <section class="px-[5vw] py-16 md:py-20 max-w-md mx-auto">
+
+    <div class="mb-8 text-center">
+      <p class="eyebrow mb-3">Applicant Portal</p>
+      <h1 class="font-display text-3xl md:text-4xl font-semibold text-ink leading-tight mb-3">
+        {invalidReason ? 'Invitation issue' : 'Set your password'}
+      </h1>
+      {!invalidReason && userRow && (
+        <p class="text-[0.88rem] text-ink-soft leading-relaxed">
+          Welcome, <strong class="text-ink">{userRow.name}</strong>. You've been invited to the EduRankAI applicant portal. Set a password below to claim your account.
+        </p>
+      )}
+    </div>
+
+    {invalidReason && (
+      <div class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 text-center">
+        <p class="text-[0.95rem] text-ink-2 leading-relaxed mb-5">{invalidReason}</p>
+        <div class="flex flex-wrap gap-3 justify-center">
+          <a href="/portal/login" class="text-[0.85rem] text-burn font-semibold hover:underline">Sign in &rarr;</a>
+          <span class="text-[0.85rem] text-ink-soft">&middot;</span>
+          <a href="mailto:hr@edurankai.in" class="text-[0.85rem] text-burn font-semibold hover:underline">Contact us</a>
+        </div>
+      </div>
+    )}
+
+    {!invalidReason && (
+      <>
+        {errorMsg && (
+          <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2);color:#b91c1c;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;line-height:1.6;">
+            {errorMsg}
+          </div>
+        )}
+
+        <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 flex flex-col gap-5">
+          <div>
+            <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Email (read only)</label>
+            <input type="email" value={userRow?.email || ''} readonly class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] bg-cream-2 text-ink-soft" />
+          </div>
+          <div>
+            <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">New password</label>
+            <input id="claim-pw" type="password" name="password" required minlength="8" autocomplete="new-password" placeholder="At least 8 characters" class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+          </div>
+          <div>
+            <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Confirm password</label>
+            <input id="claim-pw2" type="password" name="confirm_password" required minlength="8" autocomplete="new-password" placeholder="Confirm" class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+          </div>
+          <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.9rem]">
+            Set password &amp; sign in
+          </button>
+          <p class="text-[0.75rem] text-ink-soft text-center italic">
+            By claiming your account, you agree to our <a href="/p/terms" class="text-burn hover:underline">Terms</a> and <a href="/p/privacy" class="text-burn hover:underline">Privacy Policy</a>.
+          </p>
+        </form>
+      </>
+    )}
+
+  </section>
+
+<script is:inline>
+  document.addEventListener('DOMContentLoaded', () => {
+    [['claim-pw'], ['claim-pw2']].forEach(([id]) => {
+      const inp = document.getElementById(id);
+      if (!inp || inp.dataset.toggled) return;
+      inp.dataset.toggled = '1';
+      inp.style.paddingRight = '54px';
+      const wrap = document.createElement('div');
+      wrap.style.position = 'relative';
+      inp.parentNode.insertBefore(wrap, inp);
+      wrap.appendChild(inp);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = 'Show';
+      btn.style.cssText = 'position:absolute;right:8px;top:50%;transform:translateY(-50%);background:transparent;border:none;color:#6e6e78;cursor:pointer;font-size:11px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;padding:6px;font-family:monospace;';
+      btn.addEventListener('click', () => {
+        const isPw = inp.type === 'password';
+        inp.type = isPw ? 'text' : 'password';
+        btn.textContent = isPw ? 'Hide' : 'Show';
+      });
+      wrap.appendChild(btn);
+    });
+  });
+</script>
+</BaseLayout>

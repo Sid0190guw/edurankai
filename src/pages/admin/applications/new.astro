@@ -1,0 +1,469 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { applications, users, roles, departments, inviteTokens } from '@/lib/db/schema';
+import { can } from '@/lib/auth/permissions';
+import { hashPassword } from '@/lib/auth/password';
+import { logAudit } from '@/lib/audit';
+import { eq, asc, sql as drizzleSql, desc } from 'drizzle-orm';
+import { randomBytes } from 'node:crypto';
+
+const currentUser = Astro.locals.user!;
+if (!can(currentUser, 'applications.edit')) return Astro.redirect('/admin');
+
+let errorMsg = '';
+let okMsg = '';
+let createdAppNumber = '';
+let createdInviteLink = '';
+
+// Generate application number EDU-YYYY-NNNNN
+async function generateAppNumber(): Promise<string> {
+  const year = new Date().getFullYear();
+  const result = await db.select({ count: drizzleSql<number>`count(*)::int` }).from(applications);
+  const total = result[0]?.count || 0;
+  const num = String(total + 1).padStart(5, '0');
+  return `EDU-${year}-${num}`;
+}
+
+function generateToken(): string {
+  return randomBytes(32).toString('hex');
+}
+
+function generatePlaceholderPassword(): string {
+  return 'TempBharat' + Math.floor(1000 + Math.random() * 9000) + '!';
+}
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'create_application') {
+      // Required fields
+      const firstName = (fd.get('firstName') as string || '').trim();
+      const lastName = (fd.get('lastName') as string || '').trim();
+      const email = (fd.get('email') as string || '').trim().toLowerCase();
+      const phone = (fd.get('phone') as string || '').trim();
+      const city = (fd.get('city') as string || '').trim();
+      const portfolioUrl = (fd.get('portfolioUrl') as string || '').trim();
+      const roleId = (fd.get('roleId') as string || '').trim() || null;
+      const origin = (fd.get('origin') as string || 'admin_manual').trim();
+      const createAccount = fd.get('createAccount') === 'on';
+      const sendInvite = fd.get('sendInvite') === 'on';
+
+      if (!firstName || !lastName || !email || !phone || !city || !portfolioUrl) {
+        errorMsg = 'First name, last name, email, phone, city, and portfolio URL are required.';
+      } else if (!email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+        errorMsg = 'Invalid email format.';
+      } else {
+        // Optional fields
+        const linkedin = (fd.get('linkedin') as string || '').trim() || null;
+        const dob = (fd.get('dob') as string || '').trim() || null;
+        const birthTime = (fd.get('birthTime') as string || '').trim() || null;
+        const birthPlace = (fd.get('birthPlace') as string || '').trim() || null;
+        const level = (fd.get('level') as string || '').trim() as any || null;
+        const openToOther = fd.get('openToOther') === 'on';
+        const education = (fd.get('education') as string || '').trim() || null;
+        const fieldOfStudy = (fd.get('fieldOfStudy') as string || '').trim() || null;
+        const institution = (fd.get('institution') as string || '').trim() || null;
+        const experienceBand = (fd.get('experienceBand') as string || '').trim() || null;
+        const experienceDescription = (fd.get('experienceDescription') as string || '').trim() || null;
+        const whyERA = (fd.get('whyERA') as string || '').trim() || null;
+        const whyRole = (fd.get('whyRole') as string || '').trim() || null;
+        const whyAIEdu = (fd.get('whyAIEdu') as string || '').trim() || null;
+        const intersection = (fd.get('intersection') as string || '').trim() || null;
+        const ambitious = (fd.get('ambitious') as string || '').trim() || null;
+        const availability = (fd.get('availability') as string || '').trim() || null;
+        const engagementType = (fd.get('engagementType') as string || '').trim() || null;
+        const remoteComfort = (fd.get('remoteComfort') as string || '').trim() || null;
+        const compensation = (fd.get('compensation') as string || '').trim() || null;
+        const adminNote = (fd.get('adminNote') as string || '').trim() || null;
+
+        // Get role snapshot
+        let roleTitleSnapshot = null;
+        let departmentSnapshot = null;
+        if (roleId) {
+          const r = await db.select({ title: roles.title, level: roles.level, departmentId: roles.departmentId })
+            .from(roles).where(eq(roles.id, roleId)).limit(1);
+          if (r.length > 0) {
+            roleTitleSnapshot = r[0].title;
+            const d = await db.select({ name: departments.name }).from(departments).where(eq(departments.id, r[0].departmentId)).limit(1);
+            if (d.length > 0) departmentSnapshot = d[0].name;
+          }
+        }
+
+        // Step 1: handle user account
+        let userId = null;
+        if (createAccount) {
+          const existingUser = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+          if (existingUser.length > 0) {
+            userId = existingUser[0].id;
+          } else {
+            const placeholderPw = generatePlaceholderPassword();
+            const passwordHash = await hashPassword(placeholderPw);
+            const newUser = await db.insert(users).values({
+              email,
+              passwordHash,
+              name: `${firstName} ${lastName}`,
+              role: 'applicant',
+              emailVerified: false,
+              isActive: true
+            }).returning({ id: users.id });
+            userId = newUser[0].id;
+          }
+        }
+
+        // Step 2: create application
+        const appNumber = await generateAppNumber();
+        const inserted = await db.insert(applications).values({
+          applicationNumber: appNumber,
+          roleId: roleId,
+          applicantUserId: userId,
+          firstName, lastName, email, phone, city,
+          linkedin, portfolioUrl,
+          dob, birthTime, birthPlace,
+          departmentSnapshot, roleTitleSnapshot, level,
+          openToOther,
+          education, fieldOfStudy, institution,
+          experienceBand, experienceDescription,
+          whyERA, whyRole, whyAIEdu, intersection, ambitious,
+          availability, engagementType, remoteComfort, compensation,
+          source: origin,
+          status: 'submitted',
+          reviewerNotes: adminNote
+        }).returning({ id: applications.id });
+
+        const appId = inserted[0].id;
+
+        // Step 3: optional invite token
+        let inviteUrl = '';
+        if (sendInvite && userId) {
+          const token = generateToken();
+          const expiresAt = new Date();
+          expiresAt.setDate(expiresAt.getDate() + 14);
+          await db.insert(inviteTokens).values({
+            token,
+            userId,
+            applicationId: appId,
+            expiresAt,
+            createdByUserId: currentUser.id
+          });
+          const baseUrl = new URL(Astro.request.url).origin;
+          inviteUrl = `${baseUrl}/portal/claim/${token}`;
+        }
+
+        await logAudit({
+          userId: currentUser.id,
+          action: 'application.manual_create',
+          entity: 'application',
+          entityId: appId,
+          diff: { applicationNumber: appNumber, origin, createAccount, sendInvite },
+          ipAddress: Astro.clientAddress
+        });
+
+        createdAppNumber = appNumber;
+        createdInviteLink = inviteUrl;
+        okMsg = `Application ${appNumber} created.${createAccount ? ' Applicant account: ' + email : ''}${sendInvite ? ' Invite link generated below.' : ''}`;
+      }
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+// Load roles for dropdown
+const allRoles = await db.select({
+  id: roles.id,
+  title: roles.title,
+  level: roles.level,
+  departmentId: roles.departmentId,
+  slug: roles.slug
+}).from(roles).where(eq(roles.isOpen, true)).orderBy(asc(roles.title));
+
+const allDepts = await db.select({ id: departments.id, name: departments.name }).from(departments).orderBy(asc(departments.sortOrder));
+const deptMap = Object.fromEntries(allDepts.map(d => [d.id, d.name]));
+
+const ORIGIN_OPTIONS = [
+  { value: 'admin_manual', label: 'Admin manual entry' },
+  { value: 'referral', label: 'Referral' },
+  { value: 'walk_in', label: 'Walk-in' },
+  { value: 'headhunted', label: 'Headhunted / sourced' },
+  { value: 'public_form', label: 'Public form (rare)' }
+];
+---
+<AdminLayout title="New Application" activeNav="applications">
+  <div class="admin-page" style="max-width:1100px;">
+
+    <div class="admin-page-header" style="margin-bottom:24px;display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">Applications</div>
+        <h1 class="admin-page-title">Create application manually</h1>
+        <p class="admin-page-sub">For walk-in candidates, referrals, headhunted talent, or any applicant who hasn't filled the public form.</p>
+      </div>
+      <a href="/admin/applications" class="admin-btn" style="padding:6px 12px;font-size:11px;">&larr; All applications</a>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{errorMsg}</div>}
+
+    {okMsg && (
+      <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:14px;border-radius:7px;margin-bottom:18px;line-height:1.6;">
+        <p>{okMsg}</p>
+        {createdInviteLink && (
+          <div style="margin-top:12px;padding:10px;background:rgba(0,0,0,0.3);border-radius:6px;">
+            <p style="font-size:10.5px;color:#a0a0ab;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;margin-bottom:6px;">Invite link (share with applicant - expires in 14 days)</p>
+            <code style="display:block;font-family:'Geist Mono',monospace;font-size:11.5px;color:#fff;word-break:break-all;padding:6px;background:rgba(255,255,255,0.05);border-radius:4px;">{createdInviteLink}</code>
+            <button type="button" onclick={"navigator.clipboard.writeText('" + createdInviteLink + "');this.textContent='Copied!';"} style="margin-top:8px;padding:5px 11px;background:#FF4F00;color:#fff;border:none;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;">Copy link</button>
+          </div>
+        )}
+        <div style="margin-top:10px;display:flex;gap:8px;">
+          <a href="/admin/applications" class="admin-btn" style="padding:5px 11px;font-size:11px;">View all applications</a>
+          <a href="/admin/applications/new" class="admin-btn admin-btn-primary" style="padding:5px 11px;font-size:11px;">Create another</a>
+        </div>
+      </div>
+    )}
+
+    {!createdAppNumber && (
+      <form method="POST" style="display:flex;flex-direction:column;gap:18px;">
+        <input type="hidden" name="_action" value="create_application" />
+
+        <!-- META -->
+        <div class="admin-card">
+          <p class="admin-card-title">Where did this application come from?</p>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div>
+              <label class="rolefield-label">Origin *</label>
+              <select name="origin" required class="rolefield-input">
+                {ORIGIN_OPTIONS.map((o) => <option value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <label class="rolefield-label">Role applying for</label>
+              <select name="roleId" class="rolefield-input">
+                <option value="">Open application (no specific role)</option>
+                {allRoles.map((r) => (
+                  <option value={r.id}>{r.title} - {r.level} ({deptMap[r.departmentId] || ''})</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- STEP 1: PERSONAL -->
+        <div class="admin-card">
+          <p class="admin-card-title">01 - Personal details</p>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+            <div>
+              <label class="rolefield-label">First name *</label>
+              <input name="firstName" required class="rolefield-input" />
+            </div>
+            <div>
+              <label class="rolefield-label">Last name *</label>
+              <input name="lastName" required class="rolefield-input" />
+            </div>
+            <div>
+              <label class="rolefield-label">Email *</label>
+              <input name="email" type="email" required class="rolefield-input" />
+            </div>
+            <div>
+              <label class="rolefield-label">Phone *</label>
+              <input name="phone" required class="rolefield-input" placeholder="+91 9876543210" />
+            </div>
+            <div>
+              <label class="rolefield-label">City *</label>
+              <input name="city" required class="rolefield-input" />
+            </div>
+            <div>
+              <label class="rolefield-label">LinkedIn URL</label>
+              <input name="linkedin" type="url" class="rolefield-input" placeholder="https://linkedin.com/in/..." />
+            </div>
+            <div style="grid-column:span 2;">
+              <label class="rolefield-label">Portfolio URL *</label>
+              <input name="portfolioUrl" type="url" required class="rolefield-input" placeholder="GitHub / website / resume / link to proof of work" />
+            </div>
+          </div>
+          <p style="font-size:10.5px;color:#6e6e78;border-top:1px solid #1f1f26;padding-top:10px;margin-top:6px;">Optional: birth details (some applicants share)</p>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:8px;">
+            <div>
+              <label class="rolefield-label">Date of birth</label>
+              <input name="dob" type="date" class="rolefield-input" />
+            </div>
+            <div>
+              <label class="rolefield-label">Birth time</label>
+              <input name="birthTime" type="time" class="rolefield-input" />
+            </div>
+            <div>
+              <label class="rolefield-label">Birth place</label>
+              <input name="birthPlace" class="rolefield-input" />
+            </div>
+          </div>
+        </div>
+
+        <!-- STEP 2: ROLE PREF -->
+        <div class="admin-card">
+          <p class="admin-card-title">02 - Role preference</p>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div>
+              <label class="rolefield-label">Target level</label>
+              <select name="level" class="rolefield-input">
+                <option value="">Not specified</option>
+                <option value="C-Level">C-Level</option>
+                <option value="Lead">Lead</option>
+                <option value="Senior">Senior</option>
+                <option value="Mid">Mid</option>
+                <option value="Junior">Junior</option>
+                <option value="Intern">Intern</option>
+                <option value="Apprentice">Apprentice</option>
+              </select>
+            </div>
+            <div style="display:flex;align-items:center;padding-top:24px;">
+              <label style="display:flex;align-items:center;gap:8px;color:#d8d8de;font-size:12.5px;cursor:pointer;">
+                <input type="checkbox" name="openToOther" style="accent-color:#FF4F00;" />
+                <span>Open to other roles</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- STEP 3: EDUCATION & EXPERIENCE -->
+        <div class="admin-card">
+          <p class="admin-card-title">03 - Education &amp; experience</p>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+            <div>
+              <label class="rolefield-label">Highest education</label>
+              <select name="education" class="rolefield-input">
+                <option value="">Not specified</option>
+                <option value="High School">High School</option>
+                <option value="Diploma">Diploma</option>
+                <option value="Bachelor's">Bachelor's</option>
+                <option value="Master's">Master's</option>
+                <option value="PhD">PhD</option>
+                <option value="Self-taught">Self-taught</option>
+              </select>
+            </div>
+            <div>
+              <label class="rolefield-label">Field of study</label>
+              <input name="fieldOfStudy" class="rolefield-input" />
+            </div>
+            <div style="grid-column:span 2;">
+              <label class="rolefield-label">Institution</label>
+              <input name="institution" class="rolefield-input" />
+            </div>
+            <div>
+              <label class="rolefield-label">Experience band</label>
+              <select name="experienceBand" class="rolefield-input">
+                <option value="">Not specified</option>
+                <option value="0-1 years">0-1 years</option>
+                <option value="1-3 years">1-3 years</option>
+                <option value="3-5 years">3-5 years</option>
+                <option value="5-10 years">5-10 years</option>
+                <option value="10+ years">10+ years</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label class="rolefield-label">Experience description</label>
+            <textarea name="experienceDescription" rows="4" class="rolefield-input" placeholder="Companies, projects, key wins..."></textarea>
+          </div>
+        </div>
+
+        <!-- STEP 4: MOTIVATION -->
+        <div class="admin-card">
+          <p class="admin-card-title">04 - Motivation (optional)</p>
+          <p style="font-size:10.5px;color:#6e6e78;margin-bottom:12px;">Skip if applicant hasn't shared this yet - they can fill it in via portal later.</p>
+          <div style="display:flex;flex-direction:column;gap:12px;">
+            <div>
+              <label class="rolefield-label">Why EduRankAI?</label>
+              <textarea name="whyERA" rows="3" class="rolefield-input"></textarea>
+            </div>
+            <div>
+              <label class="rolefield-label">Why this role?</label>
+              <textarea name="whyRole" rows="3" class="rolefield-input"></textarea>
+            </div>
+            <div>
+              <label class="rolefield-label">Why AI x Education?</label>
+              <textarea name="whyAIEdu" rows="3" class="rolefield-input"></textarea>
+            </div>
+            <div>
+              <label class="rolefield-label">Most ambitious thing you've built</label>
+              <textarea name="ambitious" rows="3" class="rolefield-input"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- STEP 5: LOGISTICS -->
+        <div class="admin-card">
+          <p class="admin-card-title">05 - Logistics</p>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div>
+              <label class="rolefield-label">Availability</label>
+              <input name="availability" class="rolefield-input" placeholder="Immediate / 1 month notice / etc" />
+            </div>
+            <div>
+              <label class="rolefield-label">Engagement preference</label>
+              <select name="engagementType" class="rolefield-input">
+                <option value="">Not specified</option>
+                <option value="Full-time">Full-time</option>
+                <option value="Part-time">Part-time</option>
+                <option value="Contract">Contract</option>
+                <option value="Internship">Internship</option>
+                <option value="Apprenticeship">Apprenticeship</option>
+              </select>
+            </div>
+            <div>
+              <label class="rolefield-label">Remote comfort</label>
+              <select name="remoteComfort" class="rolefield-input">
+                <option value="">Not specified</option>
+                <option value="Fully remote">Fully remote</option>
+                <option value="Hybrid">Hybrid</option>
+                <option value="In-office">In-office</option>
+              </select>
+            </div>
+            <div>
+              <label class="rolefield-label">Compensation expectations</label>
+              <input name="compensation" class="rolefield-input" placeholder="e.g. INR 30L / negotiable" />
+            </div>
+          </div>
+        </div>
+
+        <!-- STEP 6: ADMIN NOTES + ACCOUNT/INVITE -->
+        <div class="admin-card">
+          <p class="admin-card-title">06 - Admin actions</p>
+          <div style="margin-bottom:14px;">
+            <label class="rolefield-label">Internal note (not visible to applicant)</label>
+            <textarea name="adminNote" rows="3" class="rolefield-input" placeholder="Context for the team..."></textarea>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:10px;padding:12px;background:rgba(255,79,0,0.05);border:1px solid rgba(255,79,0,0.2);border-radius:8px;">
+            <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+              <input type="checkbox" name="createAccount" checked style="accent-color:#FF4F00;margin-top:2px;" />
+              <span style="font-size:12.5px;color:#d8d8de;line-height:1.6;">
+                <strong style="color:#fff;">Create applicant user account</strong><br/>
+                <span style="color:#a0a0ab;font-size:11.5px;">A new user with role "applicant" will be created with a placeholder password. The applicant can reset it after they receive the invite link.</span>
+              </span>
+            </label>
+            <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+              <input type="checkbox" name="sendInvite" checked style="accent-color:#FF4F00;margin-top:2px;" />
+              <span style="font-size:12.5px;color:#d8d8de;line-height:1.6;">
+                <strong style="color:#fff;">Generate invite link</strong><br/>
+                <span style="color:#a0a0ab;font-size:11.5px;">A one-time 14-day token is created. Send the link to the applicant - they will set their own password and gain portal access. Required for the applicant to log in.</span>
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:10px;justify-content:flex-end;padding-top:8px;">
+          <a href="/admin/applications" class="admin-btn" style="display:flex;align-items:center;padding:9px 16px;font-size:12.5px;">Cancel</a>
+          <button type="submit" class="admin-btn admin-btn-primary" style="padding:9px 20px;font-size:12.5px;">Create application</button>
+        </div>
+
+      </form>
+    )}
+
+  </div>
+
+  <style>
+    .rolefield-label { display:block;font-size:10.5px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px; }
+    .rolefield-input { width:100%;padding:8px 11px;background:#08080a;border:1px solid #1f1f26;border-radius:6px;color:#fff;font-size:12.5px;font-family:inherit;outline:none; }
+    .rolefield-input:focus { border-color:#FF4F00; }
+    textarea.rolefield-input { resize:vertical;min-height:60px;line-height:1.6; }
+  </style>
+</AdminLayout>

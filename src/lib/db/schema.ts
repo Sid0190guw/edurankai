@@ -337,6 +337,19 @@ export const applicationMessages = pgTable('application_messages', {
 // =========================================================================
 // Offer Letters - generated offer letters with digital signatures
 // =========================================================================
+
+export const inviteTokens = pgTable('invite_tokens', {
+  token: varchar('token', { length: 64 }).primaryKey(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  applicationId: uuid('application_id').references(() => applications.id, { onDelete: 'cascade' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  usedAt: timestamp('used_at', { withTimezone: true }),
+  createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' })
+});
+
+// =========================================================================
+// =========================================================================
 export const offerLetters = pgTable('offer_letters', {
   id: uuid('id').primaryKey().defaultRandom(),
   token: varchar('token', { length: 64 }).notNull().unique(),
