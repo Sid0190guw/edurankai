@@ -417,3 +417,70 @@ export const adminMessages = pgTable('admin_messages', {
   readAt: timestamp('read_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
 });
+
+// =========================================================================
+// HEI - Holistic Education Index data
+// =========================================================================
+
+export const heiInstitutions = pgTable('hei_institutions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  slug: varchar('slug', { length: 150 }).notNull().unique(),
+  name: varchar('name', { length: 300 }).notNull(),
+  tier: varchar('tier', { length: 20 }).notNull().default('university'),
+  country: varchar('country', { length: 100 }).notNull().default('India'),
+  stateRegion: varchar('state_region', { length: 100 }),
+  city: varchar('city', { length: 100 }),
+  type: varchar('type', { length: 50 }),
+  establishedYear: integer('established_year'),
+  studentCount: integer('student_count'),
+  websiteUrl: text('website_url'),
+  nirfRank: integer('nirf_rank'),
+  qsRank: integer('qs_rank'),
+  theRank: integer('the_rank'),
+  truthScore: text('truth_score'),
+  truthRank: integer('truth_rank'),
+  hasFullData: boolean('has_full_data').notNull().default(false),
+  isPublished: boolean('is_published').notNull().default(false),
+  notes: text('notes'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const heiDimensions = pgTable('hei_dimensions', {
+  id: varchar('id', { length: 50 }).primaryKey(),
+  sortOrder: integer('sort_order').notNull().default(0),
+  title: varchar('title', { length: 200 }).notNull(),
+  subtitle: varchar('subtitle', { length: 300 }),
+  weightPercent: text('weight_percent').notNull().default('0'),
+  blurb: text('blurb').notNull(),
+  evidenceBasis: text('evidence_basis'),
+  isPublished: boolean('is_published').notNull().default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const heiSubmetrics = pgTable('hei_submetrics', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  dimensionId: varchar('dimension_id', { length: 50 }).notNull().references(() => heiDimensions.id, { onDelete: 'cascade' }),
+  sortOrder: integer('sort_order').notNull().default(0),
+  title: varchar('title', { length: 300 }).notNull(),
+  description: text('description'),
+  weightWithinDimension: text('weight_within_dimension').notNull().default('0'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const heiStories = pgTable('hei_stories', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  slug: varchar('slug', { length: 200 }).notNull().unique(),
+  headline: varchar('headline', { length: 500 }).notNull(),
+  deck: text('deck'),
+  body: text('body').notNull(),
+  category: varchar('category', { length: 50 }).notNull().default('investigation'),
+  institutionId: uuid('institution_id').references(() => heiInstitutions.id, { onDelete: 'set null' }),
+  authorUserId: uuid('author_user_id').references(() => users.id, { onDelete: 'set null' }),
+  isPublished: boolean('is_published').notNull().default(false),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+  coverImageUrl: text('cover_image_url'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+});
