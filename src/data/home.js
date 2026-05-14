@@ -1,8 +1,8 @@
 export const HERO = {
   eyebrow: 'A frontier AI research lab',
-  headline: 'Building the AI',
-  headlineEm: 'that thinks.',
-  description: 'While the field builds toward AGI, EduRankAI builds toward ASI — artificial superintelligence rooted in how humans actually learn, reason, and discover. Foundational models. Reasoning systems. Quantum-era architectures. Built in Bharat. For everyone who has ever wanted to understand the universe.'
+  headline: 'Foundational models for',
+  headlineEm: 'how humanity learns.',
+  description: 'EduRankAI is a research lab building the next generation of reasoning systems — models that learn from principles, adapt across domains, and reason in ways closer to how humans actually do. Built in Bharat. Open to the world.'
 };
 
 export const MISSION = {
@@ -19,22 +19,21 @@ export const PILLARS = [
   {
     eyebrow: 'Research',
     title: 'Foundational Models',
-    description: 'ASI-oriented architectures. Reasoning-first. Quantum-era ready. The work that anchors everything else.',
-    href: '/ecosystem/foundational-models',
-    cta: 'Read the research'
+    description: 'Reasoning-first architectures designed for the next decade of compute. The work that anchors everything else at EduRankAI.',
+    href: '/research',
+    cta: 'Read the thesis'
   },
   {
     eyebrow: 'Applied AI',
-    title: 'AquinTutor',
-    description: 'A personalised AI tutoring intelligence. The first deployment of our reasoning systems. Multilingual, adaptive, in active development.',
-    href: 'https://eduverse-omega-sepia.vercel.app',
-    external: true,
-    cta: 'Try AquinTutor'
+    title: 'Holistic Education Index',
+    description: 'A new way to rank universities. Grounded in education research, not citation cartels. Currently in academic advisory review.',
+    href: '/ecosystem/hei',
+    cta: 'See the methodology'
   },
   {
     eyebrow: 'Careers',
     title: '213 open roles',
-    description: 'We are hiring across every level — from C-suite to interns. Remote-first. Every application read personally.',
+    description: 'We are hiring across every level, from Chief Scientist to research interns. Remote-first. Every application read personally.',
     href: '/careers',
     cta: 'View open roles'
   }
@@ -46,9 +45,18 @@ export const PRODUCTS = [
     tagline: 'The research that anchors everything',
     status: 'Research',
     statusVariant: 'research',
-    href: '/ecosystem/foundational-models',
+    href: '/research',
     external: false,
-    description: 'Proprietary educational intelligence models built in-house. ASI-oriented. Reasoning-first. Designed for the quantum era. The work that everything else at EduRankAI serves.'
+    description: 'Proprietary reasoning systems built in-house. Architecture designed for principle-based learning, cross-domain adaptation, and the quantum-era compute substrate of the next decade.'
+  },
+  {
+    name: 'EduRankAI HEI',
+    tagline: 'A new university ranking, built on real research',
+    status: 'Methodology Review',
+    statusVariant: 'dev',
+    href: '/ecosystem/hei',
+    external: false,
+    description: 'The Holistic Education Index. A five-dimension scoring methodology that measures what universities should actually optimise for — learning outcomes, well-being, equity, research originality, ethics — not brand prestige or citation cartels. Grounded in Biggs, Hattie, Keyes, and OECD AHELO research. Currently in academic advisory review.'
   },
   {
     name: 'AquinTutor.ai',

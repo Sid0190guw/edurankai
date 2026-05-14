@@ -16,8 +16,9 @@ export const SITE = {
 };
 
 export const NAV_PRIMARY = [
-  { label: 'Careers', href: '/careers' },
+  { label: 'Research', href: '/research' },
   { label: 'Ecosystem', href: '/ecosystem' },
+  { label: 'Careers', href: '/careers' },
   { label: 'Events', href: '/events' },
   { label: 'Policy', href: '/policy' },
   { label: 'Contact', href: '/contact' }
