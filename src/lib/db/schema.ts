@@ -48,6 +48,7 @@ export const users = pgTable('users', {
   role: userRoleEnum('role').notNull().default('applicant'),
   emailVerified: boolean('email_verified').notNull().default(false),
   isActive: boolean('is_active').notNull().default(true),
+  assignedDepartmentId: varchar('assigned_department_id', { length: 50 }),
   lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()

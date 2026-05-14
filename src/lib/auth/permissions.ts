@@ -30,6 +30,27 @@ const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'events.view', 'events.edit',
     'content.view'
   ],
+  recruiter: [
+    'admin.access',
+    'roles.view',
+    'applications.view', 'applications.edit', 'applications.score'
+  ],
+  reviewer: [
+    'admin.access',
+    'roles.view',
+    'applications.view', 'applications.score'
+  ],
+  department_head: [
+    'admin.access',
+    'roles.view', 'roles.edit',
+    'applications.view', 'applications.edit', 'applications.score'
+  ],
+  marketing: [
+    'admin.access',
+    'content.view', 'content.edit',
+    'events.view', 'events.edit',
+    'products.view', 'products.edit'
+  ],
   editor: [
     'admin.access',
     'roles.view',
@@ -51,3 +72,18 @@ export function requireAdmin(user: User | null): User {
   }
   return user;
 }
+
+// Helper: human-readable role labels
+export const ROLE_LABELS: Record<User['role'], string> = {
+  super_admin: 'Super Admin',
+  hr: 'HR',
+  recruiter: 'Recruiter',
+  reviewer: 'Reviewer',
+  department_head: 'Department Head',
+  marketing: 'Marketing',
+  editor: 'Editor',
+  applicant: 'Applicant'
+};
+
+// Roles that need a department assignment
+export const DEPARTMENT_SCOPED_ROLES: User['role'][] = ['department_head', 'reviewer', 'recruiter'];

@@ -1,20 +1,315 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
-const name = 'users';
-const title = name.charAt(0).toUpperCase() + name.slice(1);
+import { db } from '@/lib/db';
+import { users, departments } from '@/lib/db/schema';
+import { can, ROLE_LABELS, DEPARTMENT_SCOPED_ROLES } from '@/lib/auth/permissions';
+import { hashPassword } from '@/lib/auth/password';
+import { logAudit } from '@/lib/audit';
+import { asc, eq, desc } from 'drizzle-orm';
+
+const currentUser = Astro.locals.user!;
+if (!can(currentUser, 'users.view')) {
+  return Astro.redirect('/admin');
+}
+const canEdit = can(currentUser, 'users.edit');
+
+let errorMsg = '';
+let okMsg = '';
+
+// Generate a strong temp password
+function makeTempPassword(): string {
+  const adj = ['Bharat', 'Frontier', 'Quantum', 'Rooted', 'Honest', 'Curious'];
+  const noun = ['Lab', 'Index', 'Vector', 'Beam', 'River', 'Anchor'];
+  const digit = Math.floor(1000 + Math.random() * 9000);
+  return adj[Math.floor(Math.random()*adj.length)] + noun[Math.floor(Math.random()*noun.length)] + digit + '!';
+}
+
+if (Astro.request.method === 'POST' && canEdit) {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'create') {
+      const username = (fd.get('username') as string || '').trim().toLowerCase();
+      const name = (fd.get('name') as string || '').trim();
+      const role = fd.get('role') as string;
+      const assignedDepartmentId = (fd.get('assignedDepartmentId') as string || '').trim() || null;
+      const customPassword = (fd.get('password') as string || '').trim();
+
+      if (!username || !name || !role) {
+        errorMsg = 'Username, full name, and role are required.';
+      } else if (!username.match(/^[a-z0-9._\-@]+$/)) {
+        errorMsg = 'Username can only contain lowercase letters, digits, dot, hyphen, underscore, and @.';
+      } else {
+        const finalEmail = username.includes('@') ? username : username + '@edurankai.in';
+        const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, finalEmail)).limit(1);
+        if (existing.length > 0) {
+          errorMsg = 'Username "' + finalEmail + '" already exists.';
+        } else {
+          const plainPassword = customPassword || makeTempPassword();
+          const passwordHash = await hashPassword(plainPassword);
+          const inserted = await db.insert(users).values({
+            email: finalEmail,
+            passwordHash,
+            name,
+            role: role as any,
+            assignedDepartmentId,
+            emailVerified: true,
+            isActive: true
+          }).returning({ id: users.id });
+
+          await logAudit({
+            userId: currentUser.id,
+            action: 'user.create',
+            entity: 'user',
+            entityId: inserted[0].id,
+            diff: { email: finalEmail, role, assignedDepartmentId },
+            ipAddress: Astro.clientAddress
+          });
+
+          okMsg = 'Created: ' + finalEmail + ' | Temp password: ' + plainPassword + ' | SHARE THIS WITH THE USER NOW - it will not be shown again.';
+        }
+      }
+    }
+    else if (action === 'reset_password') {
+      const userId = fd.get('userId') as string;
+      const newPass = makeTempPassword();
+      const passwordHash = await hashPassword(newPass);
+      await db.update(users).set({ passwordHash, updatedAt: new Date() }).where(eq(users.id, userId));
+      await logAudit({
+        userId: currentUser.id,
+        action: 'user.password_reset',
+        entity: 'user',
+        entityId: userId,
+        diff: {},
+        ipAddress: Astro.clientAddress
+      });
+      okMsg = 'New temp password: ' + newPass + ' - SHARE NOW';
+    }
+    else if (action === 'toggle_active') {
+      const userId = fd.get('userId') as string;
+      const target = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+      if (target.length === 0) {
+        errorMsg = 'User not found.';
+      } else if (target[0].id === currentUser.id) {
+        errorMsg = 'You cannot deactivate yourself.';
+      } else {
+        await db.update(users).set({ isActive: !target[0].isActive, updatedAt: new Date() }).where(eq(users.id, userId));
+        await logAudit({
+          userId: currentUser.id,
+          action: target[0].isActive ? 'user.deactivate' : 'user.activate',
+          entity: 'user',
+          entityId: userId,
+          diff: { isActive: !target[0].isActive },
+          ipAddress: Astro.clientAddress
+        });
+        okMsg = target[0].isActive ? 'User deactivated.' : 'User re-activated.';
+      }
+    }
+    else if (action === 'change_role') {
+      const userId = fd.get('userId') as string;
+      const newRole = fd.get('role') as string;
+      const newDept = (fd.get('assignedDepartmentId') as string || '').trim() || null;
+      if (userId === currentUser.id) {
+        errorMsg = 'You cannot change your own role.';
+      } else {
+        await db.update(users).set({ role: newRole as any, assignedDepartmentId: newDept, updatedAt: new Date() }).where(eq(users.id, userId));
+        await logAudit({
+          userId: currentUser.id,
+          action: 'user.role_change',
+          entity: 'user',
+          entityId: userId,
+          diff: { role: newRole, assignedDepartmentId: newDept },
+          ipAddress: Astro.clientAddress
+        });
+        okMsg = 'Role updated.';
+      }
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+// Filter
+const url = new URL(Astro.request.url);
+const filter = url.searchParams.get('filter') || 'admins';
+
+const allUsers = await db.select().from(users).orderBy(desc(users.createdAt));
+let filteredUsers = allUsers;
+if (filter === 'admins') filteredUsers = allUsers.filter(u => u.role !== 'applicant');
+else if (filter === 'applicants') filteredUsers = allUsers.filter(u => u.role === 'applicant');
+else if (filter === 'inactive') filteredUsers = allUsers.filter(u => !u.isActive);
+
+const allDepts = await db.select().from(departments).orderBy(asc(departments.sortOrder));
+const deptMap = Object.fromEntries(allDepts.map(d => [d.id, d.name]));
+
+const counts = {
+  admins: allUsers.filter(u => u.role !== 'applicant').length,
+  applicants: allUsers.filter(u => u.role === 'applicant').length,
+  inactive: allUsers.filter(u => !u.isActive).length,
+  total: allUsers.length
+};
+
+const ROLES_AVAILABLE = Object.keys(ROLE_LABELS).filter(r => r !== 'applicant');
 ---
-<AdminLayout title={title} activeNav={name}>
-  <div class="admin-page">
-    <div class="admin-page-header">
+<AdminLayout title="Users" activeNav="users">
+  <div class="admin-page" style="max-width:1300px;">
+
+    <div class="admin-page-header" style="margin-bottom:24px;">
       <div class="admin-page-title-block">
-        <div class="admin-page-eyebrow">Admin</div>
-        <h1 class="admin-page-title">{title}</h1>
-        <p class="admin-page-sub">This page will be built in a subsequent message.</p>
+        <div class="admin-page-eyebrow">Access</div>
+        <h1 class="admin-page-title">Users</h1>
+        <p class="admin-page-sub">{counts.total} users total. {counts.admins} admin accounts. {counts.applicants} applicant accounts. {counts.inactive} deactivated.</p>
       </div>
     </div>
-    <div class="admin-card">
-      <div class="admin-card-title">Coming soon</div>
-      <p style="font-size:13px;color:#8a8a94;line-height:1.7;margin-top:6px;">Full CRUD interface for {title.toLowerCase()} is scheduled for the next batch of messages. The database tables are already created and the data is ready.</p>
+
+    {errorMsg && (
+      <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">
+        {errorMsg}
+      </div>
+    )}
+    {okMsg && (
+      <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:14px;border-radius:7px;margin-bottom:18px;font-family:monospace;line-height:1.7;word-break:break-all;">
+        {okMsg}
+      </div>
+    )}
+
+    <div style="display:grid;grid-template-columns:1.6fr 1fr;gap:18px;align-items:flex-start;">
+
+      <div class="admin-card" style="padding:0;overflow:hidden;">
+        <div style="padding:14px 16px;border-bottom:1px solid #1f1f26;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <a href="?filter=admins" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'admins' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Admins ({counts.admins})</a>
+          <a href="?filter=applicants" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'applicants' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Applicants ({counts.applicants})</a>
+          <a href="?filter=inactive" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'inactive' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Deactivated ({counts.inactive})</a>
+          <a href="?filter=all" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'all' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({counts.total})</a>
+        </div>
+
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Role / Dept</th>
+              <th>Active</th>
+              <th>Last login</th>
+              <th style="text-align:right;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredUsers.map((u) => {
+              const isCurrent = u.id === currentUser.id;
+              const lastLogin = u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleDateString('en-IN', { day:'numeric', month:'short' }) : 'Never';
+              const roleLabel = ROLE_LABELS[u.role] || u.role;
+              const deptName = u.assignedDepartmentId ? deptMap[u.assignedDepartmentId] : null;
+              return (
+                <tr>
+                  <td>
+                    <div style="font-weight:500;color:#fff;display:flex;align-items:center;gap:8px;">
+                      {u.name}
+                      {isCurrent && <span style="font-size:9px;background:rgba(255,79,0,0.12);color:#FF7040;padding:1px 7px;border-radius:100px;letter-spacing:0.06em;text-transform:uppercase;font-weight:700;">You</span>}
+                    </div>
+                    <div style="font-size:11px;color:#6e6e78;margin-top:3px;font-family:'Geist Mono',monospace;">{u.email}</div>
+                  </td>
+                  <td>
+                    <div style="font-size:12px;color:#d8d8de;font-weight:500;">{roleLabel}</div>
+                    {deptName && <div style="font-size:10.5px;color:#6e6e78;margin-top:2px;">{deptName}</div>}
+                  </td>
+                  <td>
+                    <span style={'display:inline-flex;align-items:center;gap:5px;font-size:11px;color:' + (u.isActive ? '#10b981' : '#6e6e78') + ';'}>
+                      <span style={'width:6px;height:6px;border-radius:50%;background:' + (u.isActive ? '#10b981' : '#6e6e78') + ';'}></span>
+                      {u.isActive ? 'Yes' : 'No'}
+                    </span>
+                  </td>
+                  <td><span style="font-size:11px;color:#6e6e78;">{lastLogin}</span></td>
+                  <td style="text-align:right;">
+                    {canEdit && !isCurrent && u.role !== 'applicant' && (
+                      <div style="display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap;">
+                        <form method="POST" style="margin:0;display:inline;">
+                          <input type="hidden" name="_action" value="reset_password" />
+                          <input type="hidden" name="userId" value={u.id} />
+                          <button type="submit" class="admin-btn" style="padding:4px 9px;font-size:10.5px;">Reset PW</button>
+                        </form>
+                        <form method="POST" style="margin:0;display:inline;" onsubmit="return confirm(this.dataset.confirm);" data-confirm={(u.isActive ? 'Deactivate ' : 'Activate ') + u.name + '?'}>
+                          <input type="hidden" name="_action" value="toggle_active" />
+                          <input type="hidden" name="userId" value={u.id} />
+                          <button type="submit" class="admin-btn" style={'padding:4px 9px;font-size:10.5px;' + (u.isActive ? 'color:#fca5a5;' : 'color:#6ee7b7;')}>
+                            {u.isActive ? 'Deactivate' : 'Activate'}
+                          </button>
+                        </form>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {filteredUsers.length === 0 && (
+              <tr><td colspan="5" style="text-align:center;padding:30px;color:#6e6e78;font-size:13px;">No users in this view.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {canEdit && (
+        <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:14px;">
+          <input type="hidden" name="_action" value="create" />
+          <div>
+            <div class="admin-card-title" style="margin:0 0 4px;">+ Create admin user</div>
+            <p style="font-size:11px;color:#6e6e78;line-height:1.6;">Username doesn't need a real mailbox. If no @ given, we append @edurankai.in.</p>
+          </div>
+
+          <div>
+            <label class="rolefield-label">Username *</label>
+            <input name="username" required class="rolefield-input" placeholder="e.g. hr-recruiter-1" />
+            <p style="font-size:10px;color:#6e6e78;margin-top:4px;">a-z, 0-9, . _ - @</p>
+          </div>
+
+          <div>
+            <label class="rolefield-label">Full name *</label>
+            <input name="name" required class="rolefield-input" placeholder="Jane Doe" />
+          </div>
+
+          <div>
+            <label class="rolefield-label">Role *</label>
+            <select name="role" required class="rolefield-input" id="role-select">
+              <option value="">Choose...</option>
+              {ROLES_AVAILABLE.map((r) => (
+                <option value={r}>{ROLE_LABELS[r as keyof typeof ROLE_LABELS]}</option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label class="rolefield-label">Assigned department (optional)</label>
+            <select name="assignedDepartmentId" class="rolefield-input">
+              <option value="">No department (sees all)</option>
+              {allDepts.map((d) => (
+                <option value={d.id}>{d.name}</option>
+              ))}
+            </select>
+            <p style="font-size:10px;color:#6e6e78;margin-top:4px;">Required for Department Head, Reviewer, Recruiter</p>
+          </div>
+
+          <div>
+            <label class="rolefield-label">Password (optional)</label>
+            <input name="password" type="text" class="rolefield-input" placeholder="Leave blank to auto-generate" />
+            <p style="font-size:10px;color:#6e6e78;margin-top:4px;">Auto-generated password will be shown on create. Save it immediately.</p>
+          </div>
+
+          <button type="submit" class="admin-btn admin-btn-primary" style="width:100%;justify-content:center;">Create User</button>
+        </form>
+      )}
+
     </div>
   </div>
+
+  <style>
+    .rolefield-label {
+      display:block;font-size:10.5px;font-weight:600;color:#8a8a94;
+      letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px;
+    }
+    .rolefield-input {
+      width:100%;padding:8px 11px;background:#08080a;border:1px solid #1f1f26;
+      border-radius:6px;color:#fff;font-size:12.5px;font-family:inherit;outline:none;
+    }
+    .rolefield-input:focus { border-color:#FF4F00; }
+  </style>
 </AdminLayout>
