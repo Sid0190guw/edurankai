@@ -395,3 +395,25 @@ export const offerLetters = pgTable('offer_letters', {
   appIdx: index('offer_app_idx').on(t.applicationId),
   statusIdx: index('offer_status_idx').on(t.status)
 }));
+
+// =========================================================================
+// ADMIN TEAM MESSAGING (1-on-1 direct messages between admin users)
+// =========================================================================
+
+export const adminConversations = pgTable('admin_conversations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userAId: uuid('user_a_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  userBId: uuid('user_b_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  lastMessageAt: timestamp('last_message_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const adminMessages = pgTable('admin_messages', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  conversationId: uuid('conversation_id').notNull().references(() => adminConversations.id, { onDelete: 'cascade' }),
+  senderUserId: uuid('sender_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  body: text('body').notNull(),
+  readByRecipient: boolean('read_by_recipient').notNull().default(false),
+  readAt: timestamp('read_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
