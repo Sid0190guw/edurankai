@@ -1,0 +1,182 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { heiInstitutions, heiDimensions, heiInstitutionScores } from '@/lib/db/schema';
+import { asc, eq } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+
+let errorMsg = '';
+let okMsg = '';
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/admin/hei/institutions');
+
+const found = await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, id)).limit(1);
+if (found.length === 0) return Astro.redirect('/admin/hei/institutions');
+const inst = found[0];
+
+const allDims = await db.select().from(heiDimensions).orderBy(asc(heiDimensions.sortOrder));
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'save_scores') {
+      let weightedSum = 0;
+      let totalWeight = 0;
+
+      for (const dim of allDims) {
+        const scoreVal = (fd.get('score_' + dim.id) as string || '').trim();
+        const notesVal = (fd.get('notes_' + dim.id) as string || '').trim() || null;
+
+        if (scoreVal === '') {
+          // Skip empty scores
+          continue;
+        }
+
+        const scoreNum = parseFloat(scoreVal);
+        if (isNaN(scoreNum) || scoreNum < 0 || scoreNum > 100) {
+          errorMsg = 'Score for ' + dim.title + ' must be 0-100 (got: ' + scoreVal + ')';
+          break;
+        }
+
+        // Upsert: try update, if no rows insert
+        const existing = await db.select().from(heiInstitutionScores)
+          .where(eq(heiInstitutionScores.institutionId, id))
+          .limit(50);
+        const matched = existing.find(s => s.dimensionId === dim.id);
+
+        if (matched) {
+          await db.update(heiInstitutionScores)
+            .set({ score: scoreVal, notes: notesVal, updatedAt: new Date() })
+            .where(eq(heiInstitutionScores.institutionId, id));
+          // Actually we need a composite where - let me do it via raw
+        } else {
+          await db.insert(heiInstitutionScores).values({
+            institutionId: id,
+            dimensionId: dim.id,
+            score: scoreVal,
+            notes: notesVal
+          });
+        }
+
+        const w = parseFloat(dim.weightPercent || '0');
+        weightedSum += scoreNum * w / 100;
+        totalWeight += w;
+      }
+
+      if (!errorMsg && totalWeight > 0) {
+        const finalScore = (weightedSum * 100 / totalWeight).toFixed(2);
+        await db.update(heiInstitutions)
+          .set({ truthScore: finalScore, updatedAt: new Date() })
+          .where(eq(heiInstitutions.id, id));
+        okMsg = 'Scores saved. Truth Score recalculated to ' + finalScore + ' (weighted across ' + totalWeight.toFixed(0) + '% of dimensions covered).';
+      } else if (!errorMsg) {
+        okMsg = 'No scores entered.';
+      }
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+// Re-fetch the institution to get updated truth_score
+const refreshed = await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, id)).limit(1);
+const currentInst = refreshed[0] || inst;
+
+// Fetch existing scores for this institution
+const existingScores = await db.select().from(heiInstitutionScores).where(eq(heiInstitutionScores.institutionId, id));
+const scoresByDim: Record<string, { score: string; notes: string | null }> = {};
+for (const s of existingScores) {
+  scoresByDim[s.dimensionId] = { score: s.score, notes: s.notes };
+}
+
+const dimensionsCovered = allDims.filter(d => scoresByDim[d.id]).length;
+---
+<AdminLayout title="HEI Scores" activeNav="hei">
+  <div class="admin-page" style="max-width:1100px;">
+
+    <div class="admin-page-header" style="margin-bottom:24px;display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">HEI Scoring</div>
+        <h1 class="admin-page-title">{currentInst.name}</h1>
+        <p class="admin-page-sub">
+          {currentInst.city ? currentInst.city + ', ' : ''}{currentInst.country} - {currentInst.tier}
+          {currentInst.truthScore && (
+            <>
+              <br/>
+              <strong style="color:#FF7040;">Truth Score: {currentInst.truthScore}</strong>
+              <span style="color:#6e6e78;"> - {dimensionsCovered} of {allDims.length} dimensions scored</span>
+            </>
+          )}
+        </p>
+      </div>
+      <a href="/admin/hei/institutions" class="admin-btn" style="padding:6px 12px;font-size:11px;text-decoration:none;">&larr; All institutions</a>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{okMsg}</div>}
+
+    <form method="POST" style="display:flex;flex-direction:column;gap:14px;">
+      <input type="hidden" name="_action" value="save_scores" />
+
+      <div class="admin-card" style="padding:14px 18px;">
+        <p style="font-size:11.5px;color:#a0a0ab;line-height:1.6;">
+          Enter scores 0-100 for each dimension. Leave blank to skip. The <strong style="color:#FF7040;">Truth Score</strong> is recalculated as a weighted average of the dimensions you provide. Notes are internal only.
+        </p>
+      </div>
+
+      {allDims.map((d) => {
+        const existing = scoresByDim[d.id] || { score: '', notes: '' };
+        return (
+          <div class="admin-card" style="padding:16px 18px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:10px;">
+              <div style="flex:1;">
+                <p style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#FF7040;font-weight:700;letter-spacing:0.1em;">DIMENSION {String(allDims.indexOf(d) + 1).padStart(2, '0')}</p>
+                <h3 style="font-family:'Cormorant Garamond',serif;font-size:18px;color:#fff;margin-top:2px;font-weight:600;">{d.title}</h3>
+                {d.subtitle && <p style="font-size:11.5px;color:#6e6e78;font-style:italic;margin-top:2px;">{d.subtitle}</p>}
+              </div>
+              <div style="text-align:right;">
+                <span style="display:inline-block;font-family:'Geist Mono',monospace;font-size:11px;background:rgba(255,79,0,0.15);color:#FF7040;padding:3px 10px;border-radius:100px;font-weight:600;">{d.weightPercent}%</span>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:140px 1fr;gap:12px;align-items:flex-start;">
+              <div>
+                <label style="display:block;font-size:10px;color:#8a8a94;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;margin-bottom:4px;">Score (0-100)</label>
+                <input
+                  type="number"
+                  name={'score_' + d.id}
+                  value={existing.score}
+                  step="0.01"
+                  min="0"
+                  max="100"
+                  placeholder="0.00"
+                  style="width:100%;padding:8px 11px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:14px;font-family:'Geist Mono',monospace;font-weight:600;outline:none;text-align:center;"
+                />
+              </div>
+              <div>
+                <label style="display:block;font-size:10px;color:#8a8a94;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;margin-bottom:4px;">Notes (internal, not public)</label>
+                <input
+                  type="text"
+                  name={'notes_' + d.id}
+                  value={existing.notes || ''}
+                  placeholder="Evidence sources, methodology notes..."
+                  style="width:100%;padding:8px 11px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:12px;outline:none;"
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+
+      <div style="display:flex;gap:10px;justify-content:flex-end;padding-top:8px;">
+        <a href="/admin/hei/institutions" class="admin-btn" style="display:flex;align-items:center;padding:8px 16px;font-size:12px;text-decoration:none;">Cancel</a>
+        <button type="submit" class="admin-btn admin-btn-primary" style="padding:8px 20px;font-size:12.5px;">Save all scores &amp; recalculate Truth Score</button>
+      </div>
+    </form>
+
+  </div>
+</AdminLayout>
