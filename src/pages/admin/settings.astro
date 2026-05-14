@@ -1,20 +1,160 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
-const name = 'settings';
-const title = name.charAt(0).toUpperCase() + name.slice(1);
+import { can } from '@/lib/auth/permissions';
+import postgres from 'postgres';
+import { logAudit } from '@/lib/audit';
+
+const user = Astro.locals.user!;
+if (!can(user, 'settings.view')) return Astro.redirect('/admin');
+const canEdit = can(user, 'settings.edit');
+
+const databaseUrl = import.meta.env.DATABASE_URL || process.env.DATABASE_URL;
+const sql = postgres(databaseUrl, { max: 1 });
+
+let errorMsg = '';
+let okMsg = '';
+
+if (Astro.request.method === 'POST' && canEdit) {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'save_section') {
+      const category = fd.get('_category') as string;
+      const updates: { key: string; value: string }[] = [];
+
+      // Get all settings in this category to know which keys to expect
+      const inCategory = await sql`SELECT key, input_type FROM site_settings WHERE category = ${category}`;
+
+      for (const row of inCategory) {
+        const key = row.key as string;
+        const inputType = row.input_type as string;
+        let value: string;
+        if (inputType === 'bool') {
+          value = fd.get(key) === 'on' ? 'true' : 'false';
+        } else {
+          value = (fd.get(key) as string || '').trim();
+        }
+        updates.push({ key, value });
+      }
+
+      for (const u of updates) {
+        await sql`
+          UPDATE site_settings
+          SET value = ${u.value}, updated_at = NOW(), updated_by_user_id = ${user.id}
+          WHERE key = ${u.key}
+        `;
+      }
+
+      await logAudit({
+        userId: user.id,
+        action: 'settings.update',
+        entity: 'site_settings',
+        entityId: category,
+        diff: Object.fromEntries(updates.map(u => [u.key, u.value])),
+        ipAddress: Astro.clientAddress
+      });
+
+      okMsg = 'Settings saved for: ' + category;
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const allSettings = await sql`
+  SELECT key, value, category, label, description, input_type, updated_at
+  FROM site_settings
+  ORDER BY category, key
+`;
+
+await sql.end();
+
+// Group by category
+const grouped: Record<string, any[]> = {};
+for (const s of allSettings) {
+  const cat = s.category as string;
+  if (!grouped[cat]) grouped[cat] = [];
+  grouped[cat].push(s);
+}
+
+const CATEGORY_META: Record<string, { title: string; icon: string; description: string }> = {
+  site: { title: 'Site basics', icon: 'globe', description: 'Name, tagline, URLs - used in meta tags and footer' },
+  email: { title: 'Contact emails', icon: 'mail', description: 'Email addresses shown across forms and pages' },
+  hiring: { title: 'Hiring config', icon: 'briefcase', description: 'Defaults for new roles and applicant SLAs' },
+  features: { title: 'Feature flags', icon: 'flag', description: 'Enable or disable parts of the public site' }
+};
+
+const orderedCategories = ['site', 'email', 'hiring', 'features'];
 ---
-<AdminLayout title={title} activeNav={name}>
-  <div class="admin-page">
-    <div class="admin-page-header">
+<AdminLayout title="Settings" activeNav="settings">
+  <div class="admin-page" style="max-width:900px;">
+
+    <div class="admin-page-header" style="margin-bottom:24px;">
       <div class="admin-page-title-block">
-        <div class="admin-page-eyebrow">Admin</div>
-        <h1 class="admin-page-title">{title}</h1>
-        <p class="admin-page-sub">This page will be built in a subsequent message.</p>
+        <div class="admin-page-eyebrow">System</div>
+        <h1 class="admin-page-title">Settings</h1>
+        <p class="admin-page-sub">Site-wide configuration. {allSettings.length} settings across {orderedCategories.length} sections.</p>
       </div>
     </div>
-    <div class="admin-card">
-      <div class="admin-card-title">Coming soon</div>
-      <p style="font-size:13px;color:#8a8a94;line-height:1.7;margin-top:6px;">Full CRUD interface for {title.toLowerCase()} is scheduled for the next batch of messages. The database tables are already created and the data is ready.</p>
-    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{okMsg}</div>}
+
+    {orderedCategories.map((cat) => {
+      const items = grouped[cat] || [];
+      if (items.length === 0) return null;
+      const meta = CATEGORY_META[cat] || { title: cat, description: '' };
+      return (
+        <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:14px;margin-bottom:18px;">
+          <input type="hidden" name="_action" value="save_section" />
+          <input type="hidden" name="_category" value={cat} />
+
+          <div style="border-bottom:1px solid #1f1f26;padding-bottom:12px;margin-bottom:4px;">
+            <div class="admin-card-title" style="margin:0 0 3px;font-size:14px;">{meta.title}</div>
+            <p style="font-size:11.5px;color:#6e6e78;line-height:1.5;">{meta.description}</p>
+          </div>
+
+          {items.map((s) => {
+            const key = s.key as string;
+            const inputType = s.input_type as string;
+            const value = s.value as string;
+            const label = s.label as string;
+            const description = s.description as string;
+            const isChecked = value === 'true';
+            return (
+              <div>
+                <label class="rolefield-label" style="display:flex;align-items:center;gap:8px;">
+                  {inputType === 'bool' && canEdit && <input type="checkbox" name={key} checked={isChecked} style="accent-color:#FF4F00;margin-bottom:6px;" />}
+                  {inputType === 'bool' && !canEdit && <span style={'width:8px;height:8px;border-radius:50%;background:' + (isChecked ? '#10b981' : '#6e6e78') + ';display:inline-block;'}></span>}
+                  <span>{label}</span>
+                </label>
+                {inputType !== 'bool' && inputType !== 'textarea' && (
+                  <input type={inputType === 'email' ? 'email' : (inputType === 'number' ? 'number' : 'text')} name={key} value={value} class="rolefield-input" readonly={!canEdit} />
+                )}
+                {inputType === 'textarea' && (
+                  <textarea name={key} rows="3" class="rolefield-input" readonly={!canEdit}>{value}</textarea>
+                )}
+                {description && <p style="font-size:10.5px;color:#6e6e78;margin-top:4px;line-height:1.5;">{description}</p>}
+                <p style="font-size:9.5px;color:#6e6e78;margin-top:3px;font-family:'Geist Mono',monospace;opacity:0.6;">key: {key}</p>
+              </div>
+            );
+          })}
+
+          {canEdit && (
+            <button type="submit" class="admin-btn admin-btn-primary" style="align-self:flex-start;padding:7px 16px;font-size:12px;">Save {meta.title}</button>
+          )}
+        </form>
+      );
+    })}
+
   </div>
+
+  <style>
+    .rolefield-label { display:block;font-size:10.5px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px; }
+    .rolefield-input { width:100%;padding:8px 11px;background:#08080a;border:1px solid #1f1f26;border-radius:6px;color:#fff;font-size:12.5px;font-family:inherit;outline:none; }
+    .rolefield-input:focus { border-color:#FF4F00; }
+    .rolefield-input[readonly] { opacity:0.6;cursor:not-allowed; }
+    textarea.rolefield-input { resize:vertical;min-height:60px;line-height:1.6; }
+  </style>
 </AdminLayout>

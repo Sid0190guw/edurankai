@@ -1,20 +1,207 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
-const name = 'audit';
-const title = name.charAt(0).toUpperCase() + name.slice(1);
+import { db } from '@/lib/db';
+import { auditLog, users } from '@/lib/db/schema';
+import { can } from '@/lib/auth/permissions';
+import { eq, desc, sql, and, gte, lte } from 'drizzle-orm';
+
+const currentUser = Astro.locals.user!;
+if (!can(currentUser, 'audit.view')) return Astro.redirect('/admin');
+
+const url = new URL(Astro.request.url);
+const actionFilter = url.searchParams.get('action') || '';
+const entityFilter = url.searchParams.get('entity') || '';
+const userFilter = url.searchParams.get('user') || '';
+const daysBack = parseInt(url.searchParams.get('days') || '30', 10);
+
+const sinceDate = new Date();
+sinceDate.setDate(sinceDate.getDate() - daysBack);
+
+// Build conditions
+const conditions: any[] = [gte(auditLog.createdAt, sinceDate)];
+if (actionFilter) conditions.push(eq(auditLog.action, actionFilter));
+if (entityFilter) conditions.push(eq(auditLog.entity, entityFilter));
+if (userFilter) conditions.push(eq(auditLog.userId, userFilter));
+
+const entries = await db.select({
+  id: auditLog.id,
+  userId: auditLog.userId,
+  action: auditLog.action,
+  entity: auditLog.entity,
+  entityId: auditLog.entityId,
+  diff: auditLog.diff,
+  ipAddress: auditLog.ipAddress,
+  createdAt: auditLog.createdAt
+}).from(auditLog)
+  .where(and(...conditions))
+  .orderBy(desc(auditLog.createdAt))
+  .limit(500);
+
+// Get all users for name lookup + filter dropdown
+const allUsers = await db.select({ id: users.id, name: users.name, email: users.email }).from(users);
+const userMap = Object.fromEntries(allUsers.map(u => [u.id, u]));
+
+// Unique actions + entities for filter dropdowns
+const uniqueActionsRaw = await db.selectDistinct({ action: auditLog.action }).from(auditLog);
+const uniqueEntitiesRaw = await db.selectDistinct({ entity: auditLog.entity }).from(auditLog);
+const uniqueActions = uniqueActionsRaw.map(r => r.action).sort();
+const uniqueEntities = uniqueEntitiesRaw.map(r => r.entity).sort();
+
+// Action color coding
+const actionStyle = (action: string): string => {
+  if (action.includes('delete')) return '#f87171';
+  if (action.includes('create')) return '#10b981';
+  if (action.includes('update') || action.includes('edit')) return '#60a5fa';
+  if (action.includes('login')) return '#a78bfa';
+  if (action.includes('deactivate') || action.includes('reject')) return '#fbbf24';
+  return '#a0a0ab';
+};
+
+function formatDateTime(d: Date | string): string {
+  return new Date(d).toLocaleString('en-IN', {
+    day: 'numeric', month: 'short', year: 'numeric',
+    hour: 'numeric', minute: '2-digit'
+  });
+}
+
+function shortDiff(d: any): string {
+  if (!d || typeof d !== 'object' || Object.keys(d).length === 0) return '';
+  const str = JSON.stringify(d);
+  return str.length > 100 ? str.substring(0, 97) + '...' : str;
+}
+
+// Stats
+const totalCount = entries.length;
+const activeAdmins = new Set(entries.map(e => e.userId).filter(Boolean)).size;
 ---
-<AdminLayout title={title} activeNav={name}>
-  <div class="admin-page">
-    <div class="admin-page-header">
+<AdminLayout title="Audit Log" activeNav="audit">
+  <div class="admin-page" style="max-width:1400px;">
+
+    <div class="admin-page-header" style="margin-bottom:24px;">
       <div class="admin-page-title-block">
-        <div class="admin-page-eyebrow">Admin</div>
-        <h1 class="admin-page-title">{title}</h1>
-        <p class="admin-page-sub">This page will be built in a subsequent message.</p>
+        <div class="admin-page-eyebrow">System</div>
+        <h1 class="admin-page-title">Audit Log</h1>
+        <p class="admin-page-sub">Last {daysBack} days. {totalCount} actions logged. {activeAdmins} unique users.</p>
       </div>
     </div>
-    <div class="admin-card">
-      <div class="admin-card-title">Coming soon</div>
-      <p style="font-size:13px;color:#8a8a94;line-height:1.7;margin-top:6px;">Full CRUD interface for {title.toLowerCase()} is scheduled for the next batch of messages. The database tables are already created and the data is ready.</p>
+
+    <!-- FILTERS -->
+    <form method="GET" class="admin-card" style="display:grid;grid-template-columns:repeat(5, 1fr) auto;gap:10px;align-items:end;margin-bottom:18px;padding:14px 16px;">
+
+      <div>
+        <label class="rolefield-label">Days back</label>
+        <select name="days" class="rolefield-input">
+          <option value="1" selected={daysBack === 1}>Last 24h</option>
+          <option value="7" selected={daysBack === 7}>Last 7 days</option>
+          <option value="30" selected={daysBack === 30}>Last 30 days</option>
+          <option value="90" selected={daysBack === 90}>Last 90 days</option>
+          <option value="365" selected={daysBack === 365}>Last 1 year</option>
+        </select>
+      </div>
+
+      <div>
+        <label class="rolefield-label">Action</label>
+        <select name="action" class="rolefield-input">
+          <option value="">All actions</option>
+          {uniqueActions.map((a) => <option value={a} selected={actionFilter === a}>{a}</option>)}
+        </select>
+      </div>
+
+      <div>
+        <label class="rolefield-label">Entity</label>
+        <select name="entity" class="rolefield-input">
+          <option value="">All entities</option>
+          {uniqueEntities.map((e) => <option value={e} selected={entityFilter === e}>{e}</option>)}
+        </select>
+      </div>
+
+      <div>
+        <label class="rolefield-label">User</label>
+        <select name="user" class="rolefield-input">
+          <option value="">All users</option>
+          {allUsers.filter(u => u.email).map((u) => <option value={u.id} selected={userFilter === u.id}>{u.name}</option>)}
+        </select>
+      </div>
+
+      <div></div>
+
+      <div style="display:flex;gap:6px;">
+        <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;">Apply</button>
+        {(actionFilter || entityFilter || userFilter || daysBack !== 30) && <a href="/admin/audit" class="admin-btn" style="padding:7px 14px;font-size:11px;display:flex;align-items:center;">Clear</a>}
+      </div>
+    </form>
+
+    <!-- ENTRIES -->
+    <div class="admin-card" style="padding:0;overflow:hidden;">
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th style="width:160px;">When</th>
+            <th style="width:170px;">User</th>
+            <th style="width:140px;">Action</th>
+            <th style="width:90px;">Entity</th>
+            <th>Entity ID / Details</th>
+            <th style="width:110px;">IP</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.length === 0 && (
+            <tr>
+              <td colspan="6" style="text-align:center;padding:40px 20px;color:#6e6e78;font-size:13px;">
+                No audit entries match your filters.
+              </td>
+            </tr>
+          )}
+          {entries.map((e) => {
+            const usr = e.userId ? userMap[e.userId] : null;
+            const ac = actionStyle(e.action);
+            const diffPreview = shortDiff(e.diff);
+            return (
+              <tr>
+                <td>
+                  <span style="font-size:11px;color:#a0a0ab;font-family:'Geist Mono',monospace;">{formatDateTime(e.createdAt)}</span>
+                </td>
+                <td>
+                  {usr ? (
+                    <div>
+                      <div style="font-size:12px;color:#d8d8de;font-weight:500;">{usr.name}</div>
+                      <div style="font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;margin-top:2px;">{usr.email}</div>
+                    </div>
+                  ) : (
+                    <span style="font-size:11px;color:#6e6e78;font-style:italic;">System / deleted</span>
+                  )}
+                </td>
+                <td>
+                  <span style={'display:inline-block;font-size:10.5px;color:' + ac + ';font-weight:600;font-family:"Geist Mono",monospace;padding:2px 8px;background:' + ac + '15;border:1px solid ' + ac + '30;border-radius:100px;'}>
+                    {e.action}
+                  </span>
+                </td>
+                <td>
+                  <span style="font-size:11px;color:#a0a0ab;font-family:'Geist Mono',monospace;">{e.entity}</span>
+                </td>
+                <td>
+                  {e.entityId && <div style="font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;word-break:break-all;">{e.entityId}</div>}
+                  {diffPreview && <div style="font-size:10.5px;color:#a0a0ab;margin-top:3px;font-family:'Geist Mono',monospace;line-height:1.5;word-break:break-word;">{diffPreview}</div>}
+                </td>
+                <td>
+                  <span style="font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;">{e.ipAddress || '-'}</span>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
+
+    {entries.length >= 500 && (
+      <p style="font-size:11px;color:#fbbf24;margin-top:10px;text-align:center;font-family:'Geist Mono',monospace;">Showing first 500 entries. Narrow filters to see more specific results.</p>
+    )}
+
   </div>
+
+  <style>
+    .rolefield-label { display:block;font-size:10.5px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px; }
+    .rolefield-input { width:100%;padding:7px 10px;background:#08080a;border:1px solid #1f1f26;border-radius:6px;color:#fff;font-size:12px;font-family:inherit;outline:none; }
+    .rolefield-input:focus { border-color:#FF4F00; }
+  </style>
 </AdminLayout>
