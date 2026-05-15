@@ -1,0 +1,245 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { users, heiInstitutions, institutionClaims } from '@/lib/db/schema';
+import { hashPassword } from '@/lib/auth/password';
+import { generateSessionToken, createSession } from '@/lib/auth/session';
+import { setSessionCookie } from '@/lib/auth/cookie';
+import { eq, ilike, or, asc } from 'drizzle-orm';
+import { randomBytes } from 'node:crypto';
+
+// If already logged in as institution user, send them to portal
+if (Astro.locals.user && Astro.locals.user.role === 'institution_admin') {
+  return Astro.redirect('/hei/portal');
+}
+
+let errorMsg = '';
+let okMsg = '';
+let step: 'search' | 'form' | 'done' = 'search';
+let matchedInstitution: any = null;
+let searchResults: any[] = [];
+
+const url = new URL(Astro.request.url);
+const preselectId = url.searchParams.get('id') || '';
+if (preselectId && Astro.request.method !== 'POST') {
+  const found = await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, preselectId)).limit(1);
+  if (found.length > 0) { matchedInstitution = found[0]; step = 'form'; }
+}
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  if (action === 'search') {
+    const q = (fd.get('q') as string || '').trim();
+    if (q.length < 3) {
+      errorMsg = 'Search at least 3 characters.';
+    } else {
+      const term = '%' + q + '%';
+      searchResults = await db.select().from(heiInstitutions)
+        .where(or(ilike(heiInstitutions.name, term), ilike(heiInstitutions.city, term)))
+        .orderBy(asc(heiInstitutions.name))
+        .limit(20);
+      step = 'search';
+    }
+  } else if (action === 'register') {
+    const institutionId = (fd.get('institution_id') as string || '').trim();
+    const name = (fd.get('name') as string || '').trim();
+    const designation = (fd.get('designation') as string || '').trim();
+    const email = (fd.get('email') as string || '').trim().toLowerCase();
+    const phone = (fd.get('phone') as string || '').trim() || null;
+    const password = fd.get('password') as string || '';
+    const passwordConfirm = fd.get('password_confirm') as string || '';
+    const letterheadUrl = (fd.get('letterheadUrl') as string || '').trim() || null;
+
+    // Validation
+    if (!institutionId || !name || !designation || !email || !password) {
+      errorMsg = 'Please complete all required fields.';
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      errorMsg = 'Invalid email address.';
+    } else if (password.length < 8) {
+      errorMsg = 'Password must be at least 8 characters.';
+    } else if (password !== passwordConfirm) {
+      errorMsg = 'Passwords do not match.';
+    } else {
+      // Check email already exists
+      const existingUser = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+      if (existingUser.length > 0) {
+        errorMsg = 'An account with this email already exists. Use Sign in instead.';
+        const found = await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, institutionId)).limit(1);
+        if (found.length > 0) { matchedInstitution = found[0]; step = 'form'; }
+      } else {
+        // Check institution exists
+        const inst = (await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, institutionId)).limit(1))[0];
+        if (!inst) {
+          errorMsg = 'Selected institution not found.';
+        } else {
+          try {
+            const passwordHash = await hashPassword(password);
+            const claimToken = randomBytes(20).toString('hex');
+
+            // 1. Create user with institution_admin role + institution_id
+            const [newUser] = await db.insert(users).values({
+              email,
+              name,
+              passwordHash,
+              role: 'institution_admin' as any,
+              institutionId,
+              isActive: true
+            }).returning();
+
+            // 2. Create institution_claims row (status pending — admin verifies)
+            await db.insert(institutionClaims).values({
+              institutionId,
+              claimToken,
+              contactName: name,
+              contactDesignation: designation,
+              contactEmail: email,
+              contactPhone: phone,
+              letterheadUrl,
+              status: 'pending'
+            });
+
+            // 3. Create session + log them in
+            const sessionToken = generateSessionToken();
+            await createSession(sessionToken, newUser.id, {
+              userAgent: Astro.request.headers.get('user-agent') || undefined,
+              ipAddress: Astro.request.headers.get('x-forwarded-for') || undefined
+            });
+            setSessionCookie(Astro, sessionToken);
+
+            matchedInstitution = inst;
+            okMsg = 'Account created. Your institution claim is under editorial review (5-10 business days). You can submit data once verified.';
+            step = 'done';
+          } catch (err: any) {
+            errorMsg = 'Registration failed: ' + (err.message || 'Unknown error');
+            const found = await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, institutionId)).limit(1);
+            if (found.length > 0) { matchedInstitution = found[0]; step = 'form'; }
+          }
+        }
+      }
+    }
+  }
+}
+---
+<BaseLayout title="Institution Sign-up - EduRankAI HEI" description="Register your institution on EduRankAI Truth Report">
+  <section class="px-[5vw] py-12 md:py-16 max-w-3xl mx-auto">
+
+    <div class="mb-8 text-center">
+      <p class="eyebrow mb-3">Institution Registration</p>
+      <h1 class="font-display text-3xl md:text-4xl font-semibold text-ink leading-tight mb-3">Register your institution</h1>
+      <p class="text-[0.92rem] text-ink-soft leading-relaxed max-w-xl mx-auto">Create an account to claim your institution, submit verified data, and respond to findings on the EduRankAI Truth Report.</p>
+      <p class="text-[0.85rem] text-ink-soft mt-3">Already have an account? <a href="/hei/login" class="text-burn font-semibold hover:underline">Sign in</a></p>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2);color:#b91c1c;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;">{errorMsg}</div>}
+
+    {step === 'done' && matchedInstitution && (
+      <div class="bg-leaf-bg/40 border border-leaf-border rounded-2xl p-7">
+        <p class="text-[0.72rem] font-mono uppercase tracking-wider text-leaf font-bold mb-3">Registration complete</p>
+        <h2 class="font-display text-2xl font-semibold text-ink mb-3">Welcome, {matchedInstitution.name}</h2>
+        <p class="text-[0.92rem] text-ink-2 leading-relaxed mb-4">{okMsg}</p>
+        <a href="/hei/portal" class="inline-block bg-burn hover:bg-burn/90 text-white font-semibold py-2.5 px-6 rounded-lg text-[0.9rem]">Go to portal &rarr;</a>
+      </div>
+    )}
+
+    {step === 'search' && (
+      <>
+        <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 mb-6">
+          <input type="hidden" name="_action" value="search" />
+          <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Search your institution</label>
+          <div class="flex gap-2">
+            <input type="text" name="q" required minlength="3" placeholder="e.g. IIT Bombay, Stanford..." class="flex-1 px-4 py-3 border border-ink/15 rounded-lg text-[0.95rem] outline-none focus:border-burn bg-cream-2" />
+            <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold px-6 py-3 rounded-lg text-[0.9rem]">Search</button>
+          </div>
+          <p class="text-[0.78rem] text-ink-soft mt-3">Not listed? Email <a href="mailto:hei@edurankai.in" class="text-burn hover:underline">hei@edurankai.in</a> with your institution name.</p>
+        </form>
+
+        {searchResults.length > 0 && (
+          <div class="bg-cream-2 border border-ink/8 rounded-2xl p-4">
+            <p class="text-[0.72rem] font-mono uppercase tracking-wider text-ink-soft font-bold mb-3 px-2">{searchResults.length} match{searchResults.length === 1 ? '' : 'es'}</p>
+            <div class="flex flex-col gap-2">
+              {searchResults.map((r) => (
+                <a href={'/hei/register?id=' + r.id} class="block bg-white border border-ink/10 hover:border-burn/40 rounded-lg p-4 transition-all">
+                  <div class="flex justify-between items-start gap-3">
+                    <div>
+                      <p class="font-semibold text-ink text-[0.95rem]">{r.name}</p>
+                      <p class="text-[0.82rem] text-ink-soft mt-1">{r.city ? r.city + ', ' : ''}{r.country}{r.establishedYear ? ' · Est. ' + r.establishedYear : ''}</p>
+                    </div>
+                    <span class="text-[0.78rem] font-semibold text-burn">Register &rarr;</span>
+                  </div>
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
+      </>
+    )}
+
+    {step === 'form' && matchedInstitution && (
+      <div>
+        <div class="bg-burn-pale border border-burn-dim rounded-2xl p-5 mb-5">
+          <p class="text-[0.72rem] font-mono uppercase tracking-wider text-burn font-bold mb-2">Registering for</p>
+          <p class="font-display text-xl font-semibold text-ink">{matchedInstitution.name}</p>
+          <p class="text-[0.85rem] text-ink-soft mt-1">{matchedInstitution.city ? matchedInstitution.city + ', ' : ''}{matchedInstitution.country}</p>
+          <p class="text-[0.78rem] text-ink-soft mt-3"><a href="/hei/register" class="text-burn hover:underline">&larr; Different institution?</a></p>
+        </div>
+
+        <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 flex flex-col gap-5">
+          <input type="hidden" name="_action" value="register" />
+          <input type="hidden" name="institution_id" value={matchedInstitution.id} />
+
+          <div>
+            <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Your full name *</label>
+            <input type="text" name="name" required class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+          </div>
+
+          <div>
+            <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Your designation *</label>
+            <input type="text" name="designation" required placeholder="Registrar, Vice Chancellor, PRO..." class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+          </div>
+
+          <div>
+            <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Official email *</label>
+            <input type="email" name="email" required placeholder="Use official institution domain" class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+          </div>
+
+          <div>
+            <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Phone (optional)</label>
+            <input type="tel" name="phone" class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Password * (8+ chars)</label>
+              <input type="password" name="password" required minlength="8" class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+            </div>
+            <div>
+              <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Confirm password *</label>
+              <input type="password" name="password_confirm" required minlength="8" class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Authorization letterhead URL</label>
+            <input type="url" name="letterheadUrl" placeholder="https://... (Google Drive / website link)" class="w-full px-4 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2" />
+            <p class="text-[0.72rem] text-ink-soft mt-1.5">Required for verification. Upload to Google Drive / Dropbox and paste public link.</p>
+          </div>
+
+          <div class="bg-cream-2 border border-ink/8 rounded-lg p-4 text-[0.82rem] text-ink-2 leading-relaxed">
+            <p class="font-semibold mb-2 text-ink">By registering, you confirm:</p>
+            <ul class="list-disc pl-5 space-y-1">
+              <li>You are authorized to represent <strong>{matchedInstitution.name}</strong></li>
+              <li>Your account is for institutional use only</li>
+              <li>EduRankAI editorial team will review your claim within 5-10 business days</li>
+              <li>You agree to right-of-reply protocols on any findings</li>
+            </ul>
+          </div>
+
+          <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">Create account + submit claim</button>
+        </form>
+      </div>
+    )}
+
+  </section>
+</BaseLayout>
