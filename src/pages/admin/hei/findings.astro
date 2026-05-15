@@ -1,0 +1,313 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { heiFindings, heiInstitutions, heiDimensions, institutionClaims, users } from '@/lib/db/schema';
+import { desc, eq, asc } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+
+let errorMsg = '';
+let okMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'create_draft') {
+      const institutionId = (fd.get('institution_id') as string || '').trim();
+      const dimensionId = (fd.get('dimension_id') as string || '').trim() || null;
+      const findingTitle = (fd.get('finding_title') as string || '').trim();
+      const findingBody = (fd.get('finding_body') as string || '').trim();
+      const evidenceSummary = (fd.get('evidence_summary') as string || '').trim();
+      const proposedScoreImpactRaw = (fd.get('proposed_score_impact') as string || '').trim();
+
+      if (!institutionId || !findingTitle || !findingBody || !evidenceSummary) {
+        errorMsg = 'Institution, title, body, and evidence summary are required.';
+      } else {
+        let impact: string | null = null;
+        if (proposedScoreImpactRaw) {
+          const n = parseFloat(proposedScoreImpactRaw);
+          if (isNaN(n) || n < -100 || n > 100) {
+            errorMsg = 'Score impact must be between -100 and 100.';
+          } else impact = n.toFixed(2);
+        }
+        if (!errorMsg) {
+          await db.insert(heiFindings).values({
+            institutionId, dimensionId, findingTitle, findingBody, evidenceSummary,
+            proposedScoreImpact: impact,
+            status: 'draft',
+            createdByUserId: user.id
+          });
+          okMsg = 'Draft finding created.';
+        }
+      }
+    } else if (action === 'send_notice') {
+      const findingId = (fd.get('finding_id') as string || '').trim();
+      const now = new Date();
+      const ends = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
+      await db.update(heiFindings).set({
+        status: 'notice_sent',
+        noticeSentAt: now,
+        responseWindowEndsAt: ends,
+        updatedAt: now
+      }).where(eq(heiFindings.id, findingId));
+      okMsg = 'Notice sent. Institution has 30 days to respond.';
+    } else if (action === 'set_response_quality') {
+      const findingId = (fd.get('finding_id') as string || '').trim();
+      const qualityRaw = (fd.get('quality') as string || '').trim();
+      const q = parseInt(qualityRaw, 10);
+      if (isNaN(q) || q < 1 || q > 5) {
+        errorMsg = 'Quality must be 1-5.';
+      } else {
+        // Map quality to D7 modifier per rubric
+        const d7Map: Record<number, string> = {
+          5: '5.0',   // exceptional: full evidence, commitment, plan
+          4: '2.5',   // good: substantive response
+          3: '0.0',   // neutral: acknowledged
+          2: '-2.5',  // weak: dismissive or partial
+          1: '-5.0'   // poor: no response or hostile
+        };
+        await db.update(heiFindings).set({
+          responseQualityScore: q,
+          d7Modifier: d7Map[q],
+          updatedAt: new Date()
+        }).where(eq(heiFindings.id, findingId));
+        okMsg = 'Quality recorded. D7 modifier: ' + d7Map[q];
+      }
+    } else if (action === 'publish') {
+      const findingId = (fd.get('finding_id') as string || '').trim();
+      await db.update(heiFindings).set({
+        status: 'published',
+        publishedAt: new Date(),
+        updatedAt: new Date()
+      }).where(eq(heiFindings.id, findingId));
+      okMsg = 'Finding published. Visible on institution profile.';
+    } else if (action === 'unpublish') {
+      const findingId = (fd.get('finding_id') as string || '').trim();
+      await db.update(heiFindings).set({
+        status: 'notice_sent',
+        publishedAt: null,
+        updatedAt: new Date()
+      }).where(eq(heiFindings.id, findingId));
+      okMsg = 'Unpublished.';
+    } else if (action === 'delete') {
+      const findingId = (fd.get('finding_id') as string || '').trim();
+      await db.delete(heiFindings).where(eq(heiFindings.id, findingId));
+      okMsg = 'Finding deleted.';
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const filterStatus = url.searchParams.get('status') || 'draft';
+const showCreateForm = url.searchParams.get('new') === '1';
+
+let allFindings = await db.select().from(heiFindings).orderBy(desc(heiFindings.createdAt));
+if (filterStatus !== 'all') allFindings = allFindings.filter(f => f.status === filterStatus);
+
+const allInst = await db.select().from(heiInstitutions).orderBy(asc(heiInstitutions.name));
+const instMap = Object.fromEntries(allInst.map(i => [i.id, i]));
+const dimensions = await db.select().from(heiDimensions).orderBy(asc(heiDimensions.sortOrder));
+const dimMap = Object.fromEntries(dimensions.map(d => [d.id, d.title]));
+
+// Find verified claim tokens for institutions in findings (so admin can copy the institution-portal URL)
+const findingInstIds = Array.from(new Set(allFindings.map(f => f.institutionId)));
+const verifiedClaims = await db.select().from(institutionClaims).where(eq(institutionClaims.status, 'verified'));
+const tokenByInstId: Record<string, string> = {};
+for (const c of verifiedClaims) tokenByInstId[c.institutionId] = c.claimToken;
+
+const counts: Record<string, number> = { all: 0, draft: 0, notice_sent: 0, published: 0 };
+const allFresh = await db.select({ status: heiFindings.status }).from(heiFindings);
+for (const c of allFresh) {
+  counts.all++;
+  counts[c.status] = (counts[c.status] || 0) + 1;
+}
+
+function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '-'; }
+function daysUntil(d: any): number | null {
+  if (!d) return null;
+  const ms = new Date(d).getTime() - Date.now();
+  return Math.ceil(ms / (1000 * 60 * 60 * 24));
+}
+---
+<AdminLayout title="HEI Findings" activeNav="hei-findings">
+  <div class="admin-page" style="max-width:1400px;">
+
+    <div class="admin-page-header" style="margin-bottom:18px;display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">HEI Stage 4</div>
+        <h1 class="admin-page-title">Findings &amp; Right-of-Reply</h1>
+        <p class="admin-page-sub">Admin drafts findings → sends 30-day notice → institution responds → admin rates response quality → D7 modifier applied → publish.</p>
+      </div>
+      <a href="?new=1" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11.5px;text-decoration:none;">+ New finding</a>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+      <a href="?status=draft" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'draft' ? '#fbbf24;background:rgba(251,191,36,0.15);color:#fbbf24' : '#1f1f26;color:#a0a0ab')}>Draft ({counts.draft || 0})</a>
+      <a href="?status=notice_sent" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'notice_sent' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Notice sent ({counts.notice_sent || 0})</a>
+      <a href="?status=published" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'published' ? '#10b981;background:rgba(16,185,129,0.15);color:#10b981' : '#1f1f26;color:#a0a0ab')}>Published ({counts.published || 0})</a>
+      <a href="?status=all" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'all' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({counts.all || 0})</a>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{okMsg}</div>}
+
+    {showCreateForm && (
+      <form method="POST" class="admin-card" style="padding:18px;margin-bottom:16px;display:flex;flex-direction:column;gap:11px;">
+        <input type="hidden" name="_action" value="create_draft" />
+        <h3 style="font-size:13px;font-weight:600;color:#fff;margin-bottom:4px;">+ New draft finding</h3>
+
+        <div>
+          <label class="rfl">Institution *</label>
+          <select name="institution_id" required class="rfi">
+            <option value="">— pick —</option>
+            {allInst.map((i) => <option value={i.id}>{i.name}{i.country !== 'India' ? ' (' + i.country + ')' : ''}</option>)}
+          </select>
+        </div>
+
+        <div>
+          <label class="rfl">Dimension (optional)</label>
+          <select name="dimension_id" class="rfi">
+            <option value="">— general / cross-cutting —</option>
+            {dimensions.map((d) => <option value={d.id}>{d.title} ({d.weightPercent}%)</option>)}
+          </select>
+        </div>
+
+        <div>
+          <label class="rfl">Finding title *</label>
+          <input name="finding_title" required class="rfi" placeholder="e.g. Inflated placement statistics in 2023-24 report" />
+        </div>
+
+        <div>
+          <label class="rfl">Finding body *</label>
+          <textarea name="finding_body" rows="4" required class="rfi" placeholder="What was found, when, by whom..."></textarea>
+        </div>
+
+        <div>
+          <label class="rfl">Evidence summary * (cited URLs, pipelines used)</label>
+          <textarea name="evidence_summary" rows="3" required class="rfi" placeholder="Evidence: AISHE filing 2024 + verified alumni survey N=234. Pipelines used: P1, P3."></textarea>
+        </div>
+
+        <div>
+          <label class="rfl">Proposed score impact (-100 to +100, optional)</label>
+          <input type="number" name="proposed_score_impact" min="-100" max="100" step="0.1" class="rfi" placeholder="e.g. -8.0 (reduces Truth Score by 8 points)" />
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:4px;">
+          <button type="submit" class="admin-btn admin-btn-primary" style="flex:1;">Create draft</button>
+          <a href="/admin/hei/findings" class="admin-btn" style="padding:7px 14px;text-decoration:none;display:flex;align-items:center;">Cancel</a>
+        </div>
+      </form>
+    )}
+
+    {allFindings.length === 0 && <div class="admin-card" style="padding:30px;text-align:center;color:#6e6e78;font-size:13px;">No findings with this filter.</div>}
+
+    <div style="display:flex;flex-direction:column;gap:14px;">
+      {allFindings.map((f) => {
+        const inst = instMap[f.institutionId];
+        const days = daysUntil(f.responseWindowEndsAt);
+        const portalToken = tokenByInstId[f.institutionId];
+
+        return (
+          <div class="admin-card" style="padding:18px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:10px;flex-wrap:wrap;">
+              <div style="flex:1;min-width:240px;">
+                <h3 style="font-weight:600;color:#fff;font-size:15px;">{f.findingTitle}</h3>
+                <p style="font-size:11.5px;color:#a0a0ab;margin-top:3px;">{inst ? inst.name : '(institution missing)'}{f.dimensionId ? ' · ' + (dimMap[f.dimensionId] || f.dimensionId) : ' · general'}</p>
+              </div>
+              <span style={'font-size:10.5px;padding:3px 10px;border-radius:100px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;' + (f.status === 'published' ? 'background:rgba(16,185,129,0.15);color:#10b981;' : f.status === 'notice_sent' ? 'background:rgba(255,79,0,0.15);color:#FF7040;' : 'background:rgba(251,191,36,0.15);color:#fbbf24;')}>{(f.status || '').replace(/_/g, ' ')}</span>
+            </div>
+
+            <div style="font-size:12px;color:#d8d8de;line-height:1.6;margin-bottom:10px;background:#0e0e12;padding:10px 12px;border-radius:5px;">{f.findingBody}</div>
+
+            <div style="font-size:11.5px;color:#a0a0ab;line-height:1.55;margin-bottom:8px;">
+              <strong style="color:#FF7040;">Evidence:</strong> {f.evidenceSummary}
+            </div>
+
+            {f.proposedScoreImpact && <div style="font-size:11.5px;color:#fbbf24;margin-bottom:8px;">Score impact: <strong style="font-family:'Geist Mono',monospace;">{parseFloat(f.proposedScoreImpact) > 0 ? '+' : ''}{f.proposedScoreImpact} pts</strong></div>}
+
+            {f.noticeSentAt && (
+              <div style="font-size:10.5px;color:#6e6e78;margin-bottom:8px;">
+                Notice sent {fmt(f.noticeSentAt)}{f.responseWindowEndsAt && ' · '}{f.responseWindowEndsAt && (days !== null && days >= 0 ? <span style="color:#fbbf24;">Response due in {days} day{days === 1 ? '' : 's'}</span> : <span style="color:#fca5a5;">Window expired</span>)}
+              </div>
+            )}
+
+            {f.institutionResponse && (
+              <div style="margin-top:10px;padding:10px 12px;background:rgba(16,185,129,0.05);border-left:2px solid #10b981;border-radius:0 5px 5px 0;">
+                <p style="font-size:9.5px;color:#10b981;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;margin-bottom:4px;">Institution response · {fmt(f.institutionResponseAt)}</p>
+                <p style="font-size:12px;color:#d8d8de;line-height:1.6;">{f.institutionResponse}</p>
+
+                {f.responseQualityScore && (
+                  <p style="font-size:10.5px;color:#a0a0ab;margin-top:6px;">Quality rated: <strong style="color:#fff;">{f.responseQualityScore}/5</strong> · D7 modifier: <strong style="color:#FF7040;font-family:'Geist Mono',monospace;">{f.d7Modifier && parseFloat(f.d7Modifier) > 0 ? '+' : ''}{f.d7Modifier}</strong></p>
+                )}
+              </div>
+            )}
+
+            {portalToken && (
+              <p style="font-size:10px;color:#6e6e78;margin-top:8px;font-family:'Geist Mono',monospace;">Institution portal: <a href={'/hei/portal/' + portalToken + '/findings'} target="_blank" style="color:#FF7040;text-decoration:underline;">/hei/portal/{portalToken.substring(0, 12)}.../findings</a></p>
+            )}
+
+            <div style="display:flex;gap:6px;margin-top:12px;padding-top:12px;border-top:1px solid #1f1f26;flex-wrap:wrap;align-items:center;">
+              {f.status === 'draft' && (
+                <form method="POST" style="display:inline;" onsubmit="return confirm('Send 30-day right-of-reply notice to the institution? This locks the response window.');">
+                  <input type="hidden" name="_action" value="send_notice" />
+                  <input type="hidden" name="finding_id" value={f.id} />
+                  <button type="submit" class="admin-btn admin-btn-primary" style="padding:5px 11px;font-size:10.5px;">Send notice (30d window)</button>
+                </form>
+              )}
+
+              {f.institutionResponse && !f.responseQualityScore && (
+                <form method="POST" style="display:flex;gap:6px;align-items:center;">
+                  <input type="hidden" name="_action" value="set_response_quality" />
+                  <input type="hidden" name="finding_id" value={f.id} />
+                  <select name="quality" required class="rfi" style="padding:4px 8px;font-size:10.5px;width:auto;">
+                    <option value="">Rate response 1-5</option>
+                    <option value="5">5 — Exceptional (D7 +5)</option>
+                    <option value="4">4 — Good (D7 +2.5)</option>
+                    <option value="3">3 — Neutral (D7 0)</option>
+                    <option value="2">2 — Weak (D7 -2.5)</option>
+                    <option value="1">1 — Poor (D7 -5)</option>
+                  </select>
+                  <button type="submit" class="admin-btn" style="padding:4px 10px;font-size:10.5px;">Apply</button>
+                </form>
+              )}
+
+              {f.status !== 'published' && f.status !== 'draft' && (
+                <form method="POST" style="display:inline;" onsubmit="return confirm('Publish this finding? Will appear on /hei institution profile.');">
+                  <input type="hidden" name="_action" value="publish" />
+                  <input type="hidden" name="finding_id" value={f.id} />
+                  <button type="submit" class="admin-btn admin-btn-primary" style="padding:5px 11px;font-size:10.5px;color:#6ee7b7;border-color:#10b981;">✓ Publish</button>
+                </form>
+              )}
+
+              {f.status === 'published' && (
+                <form method="POST" style="display:inline;">
+                  <input type="hidden" name="_action" value="unpublish" />
+                  <input type="hidden" name="finding_id" value={f.id} />
+                  <button type="submit" class="admin-btn" style="padding:5px 11px;font-size:10.5px;">Unpublish</button>
+                </form>
+              )}
+
+              <form method="POST" style="margin-left:auto;display:inline;" onsubmit="return confirm('Delete this finding permanently?');">
+                <input type="hidden" name="_action" value="delete" />
+                <input type="hidden" name="finding_id" value={f.id} />
+                <button type="submit" class="admin-btn" style="padding:5px 11px;font-size:10.5px;color:#fca5a5;">Del</button>
+              </form>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+
+  </div>
+  <style>
+    .rfl { display:block;font-size:10px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px; }
+    .rfi { width:100%;padding:7px 10px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:12px;font-family:inherit;outline:none; }
+    .rfi:focus { border-color:#FF4F00; }
+    textarea.rfi { resize:vertical; }
+  </style>
+</AdminLayout>

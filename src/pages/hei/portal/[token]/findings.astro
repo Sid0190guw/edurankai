@@ -1,0 +1,152 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { institutionClaims, heiInstitutions, heiFindings, heiDimensions } from '@/lib/db/schema';
+import { eq, desc, asc } from 'drizzle-orm';
+
+const { token } = Astro.params;
+if (!token) return new Response('Not found', { status: 404 });
+
+const claim = await db.select().from(institutionClaims).where(eq(institutionClaims.claimToken, token)).limit(1);
+if (claim.length === 0) return new Response('Invalid token.', { status: 404 });
+const myClaim = claim[0];
+
+if (myClaim.status !== 'verified') {
+  return Astro.redirect('/hei/portal/' + token);
+}
+
+const inst = (await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, myClaim.institutionId)).limit(1))[0];
+
+let okMsg = '';
+let errorMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const findingId = (fd.get('finding_id') as string || '').trim();
+  const response = (fd.get('response') as string || '').trim();
+
+  if (!findingId || !response || response.length < 30) {
+    errorMsg = 'Response must be at least 30 characters.';
+  } else {
+    try {
+      // Validate finding belongs to this institution
+      const finding = (await db.select().from(heiFindings).where(eq(heiFindings.id, findingId)).limit(1))[0];
+      if (!finding || finding.institutionId !== myClaim.institutionId) {
+        errorMsg = 'Finding not accessible.';
+      } else if (finding.status === 'published') {
+        errorMsg = 'This finding has already been published. Contact hei@edurankai.in for corrections.';
+      } else {
+        await db.update(heiFindings).set({
+          institutionResponse: response,
+          institutionResponseAt: new Date(),
+          updatedAt: new Date()
+        }).where(eq(heiFindings.id, findingId));
+        okMsg = 'Response recorded. Editorial team will review and apply the response quality rubric.';
+      }
+    } catch (err: any) {
+      errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+    }
+  }
+}
+
+// Pending findings for this institution: notice_sent but no response yet
+const myFindings = await db.select().from(heiFindings)
+  .where(eq(heiFindings.institutionId, myClaim.institutionId))
+  .orderBy(desc(heiFindings.noticeSentAt));
+
+const dims = await db.select().from(heiDimensions);
+const dimMap = Object.fromEntries(dims.map(d => [d.id, d.title]));
+
+function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : '-'; }
+function daysUntil(d: any): number | null {
+  if (!d) return null;
+  return Math.ceil((new Date(d).getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+}
+---
+<BaseLayout title={'Findings - ' + (inst ? inst.name : '')} description="Right-of-reply on findings about your institution">
+  <section class="px-[5vw] py-10 md:py-14 max-w-4xl mx-auto">
+
+    <div class="mb-6">
+      <p class="eyebrow mb-2">Institution Portal · Right of Reply</p>
+      <h1 class="font-display text-3xl md:text-4xl font-semibold text-ink leading-tight">Findings about {inst ? inst.name : 'your institution'}</h1>
+      <a href={'/hei/portal/' + token} class="text-[0.85rem] text-burn hover:underline font-semibold mt-2 inline-block">&larr; Back to portal</a>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2);color:#b91c1c;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;">{errorMsg}</div>}
+    {okMsg && <div class="bg-leaf-bg/40 border border-leaf-border rounded-2xl p-5 mb-6"><p class="text-[0.92rem] text-ink-2 leading-relaxed">{okMsg}</p></div>}
+
+    <div class="bg-cream-2 border border-ink/8 rounded-2xl p-5 mb-6 text-[0.85rem] text-ink-2 leading-relaxed">
+      <p class="font-semibold text-ink mb-2">How right-of-reply works</p>
+      <ol class="list-decimal pl-5 space-y-1">
+        <li>Editorial team identifies a finding via the 7-pipeline evidence chain</li>
+        <li>You receive a 30-day notice — visible on this page</li>
+        <li>You can respond with evidence, commit to change, or contest the finding</li>
+        <li>Editorial team rates the response on a 1-5 quality rubric → applies D7 modifier (±5 points)</li>
+        <li>Your response is published verbatim alongside the finding</li>
+      </ol>
+    </div>
+
+    {myFindings.length === 0 && <div class="bg-white border border-ink/10 rounded-2xl p-8 text-center"><p class="text-[0.95rem] text-ink-2">No findings have been issued. This page will populate if the editorial team ever sends a notice.</p></div>}
+
+    <div class="flex flex-col gap-5">
+      {myFindings.map((f) => {
+        const days = daysUntil(f.responseWindowEndsAt);
+        const isOpen = f.status === 'notice_sent' && !f.institutionResponse && (days === null || days >= 0);
+
+        return (
+          <div class={'bg-white border rounded-2xl p-6 ' + (isOpen ? 'border-burn/40' : 'border-ink/10')}>
+            <div class="flex justify-between items-start gap-3 mb-3 flex-wrap">
+              <h3 class="font-display text-xl font-semibold text-ink flex-1 min-w-[200px]">{f.findingTitle}</h3>
+              <span class={'text-[0.7rem] uppercase tracking-wider font-bold px-3 py-1 rounded-full ' +
+                (f.status === 'published' ? 'bg-leaf-bg text-leaf border border-leaf-border' :
+                 f.status === 'notice_sent' ? 'bg-burn-pale text-burn border border-burn-dim' :
+                 'bg-gold-bg/30 text-gold-deep border border-gold-border')}>{(f.status || '').replace(/_/g, ' ')}</span>
+            </div>
+
+            {f.dimensionId && <p class="text-[0.78rem] text-ink-soft mb-2">Dimension: <strong>{dimMap[f.dimensionId] || f.dimensionId}</strong></p>}
+
+            <div class="bg-cream-2 border-l-4 border-burn rounded-r-lg p-4 my-4">
+              <p class="text-[0.92rem] text-ink-2 leading-relaxed">{f.findingBody}</p>
+            </div>
+
+            <div class="text-[0.82rem] text-ink-soft mb-3">
+              <strong class="text-ink">Evidence:</strong> {f.evidenceSummary}
+            </div>
+
+            {f.noticeSentAt && (
+              <p class="text-[0.78rem] text-ink-soft mb-4">
+                Notice sent {fmt(f.noticeSentAt)}{f.responseWindowEndsAt && ' · '}
+                {f.responseWindowEndsAt && (days !== null && days >= 0 ?
+                  <span class="text-burn font-semibold">Response window: {days} day{days === 1 ? '' : 's'} remaining</span> :
+                  <span class="text-red-700 font-semibold">Window expired</span>
+                )}
+              </p>
+            )}
+
+            {f.institutionResponse && (
+              <div class="bg-leaf-bg/30 border-l-4 border-leaf rounded-r-lg p-4 my-3">
+                <p class="text-[0.72rem] font-mono uppercase tracking-wider text-leaf font-bold mb-1">Your response · {fmt(f.institutionResponseAt)}</p>
+                <p class="text-[0.92rem] text-ink-2 leading-relaxed">{f.institutionResponse}</p>
+              </div>
+            )}
+
+            {isOpen && !f.institutionResponse && (
+              <form method="POST" class="mt-5">
+                <input type="hidden" name="finding_id" value={f.id} />
+                <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Your response *</label>
+                <textarea name="response" required minlength="30" rows="6" placeholder="Address the finding directly. Cite supporting evidence URLs. State what action your institution will take, if any." class="w-full px-4 py-3 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2"></textarea>
+                <p class="text-[0.72rem] text-ink-soft mt-1">Minimum 30 characters. Response will be published verbatim alongside the finding.</p>
+                <button type="submit" class="mt-3 bg-burn hover:bg-burn/90 text-white font-semibold py-2.5 px-6 rounded-lg text-[0.9rem]">Submit response</button>
+              </form>
+            )}
+          </div>
+        );
+      })}
+    </div>
+
+    <div class="text-center mt-8 text-[0.78rem] text-ink-soft">
+      Questions? <a href="mailto:hei@edurankai.in" class="text-burn hover:underline font-semibold">hei@edurankai.in</a>
+    </div>
+
+  </section>
+</BaseLayout>
