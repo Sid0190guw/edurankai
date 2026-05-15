@@ -1,0 +1,165 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { institutionClaims, heiInstitutions, institutionSubmissions, institutionSubmissionScores, heiDimensions } from '@/lib/db/schema';
+import { eq, asc } from 'drizzle-orm';
+
+const { token } = Astro.params;
+if (!token) return new Response('Not found', { status: 404 });
+
+const claim = await db.select().from(institutionClaims).where(eq(institutionClaims.claimToken, token)).limit(1);
+if (claim.length === 0) return new Response('Invalid token.', { status: 404 });
+const myClaim = claim[0];
+
+if (myClaim.status !== 'verified') {
+  return Astro.redirect('/institution/portal/' + token);
+}
+
+const inst = await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, myClaim.institutionId)).limit(1);
+const institution = inst[0];
+
+const dimensions = await db.select().from(heiDimensions).orderBy(asc(heiDimensions.sortOrder));
+
+let errorMsg = '';
+let okMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const notes = (fd.get('notes') as string || '').trim() || null;
+
+  try {
+    // Validate at least one score is filled
+    const scoreEntries: any[] = [];
+    for (const dim of dimensions) {
+      const proposedRaw = fd.get('score_' + dim.id) as string;
+      const evidenceUrl = (fd.get('evidence_' + dim.id) as string || '').trim();
+      const evidenceDesc = (fd.get('description_' + dim.id) as string || '').trim() || null;
+
+      if (proposedRaw && proposedRaw.trim()) {
+        const proposed = parseFloat(proposedRaw);
+        if (isNaN(proposed) || proposed < 0 || proposed > 100) {
+          errorMsg = 'Score for ' + dim.title + ' must be between 0 and 100.';
+          break;
+        }
+        if (!evidenceUrl) {
+          errorMsg = 'Evidence URL is required for ' + dim.title + ' (since you provided a score).';
+          break;
+        }
+        if (!/^https?:\/\/.+/.test(evidenceUrl)) {
+          errorMsg = 'Evidence URL for ' + dim.title + ' must start with http:// or https://';
+          break;
+        }
+        scoreEntries.push({
+          dimensionId: dim.id,
+          proposedScore: proposed.toString(),
+          evidenceUrl,
+          evidenceDescription: evidenceDesc
+        });
+      }
+    }
+
+    if (!errorMsg && scoreEntries.length === 0) {
+      errorMsg = 'Please submit at least one dimension score with evidence.';
+    }
+
+    if (!errorMsg) {
+      // Create submission
+      const [submission] = await db.insert(institutionSubmissions).values({
+        institutionId: myClaim.institutionId,
+        submittedByEmail: myClaim.contactEmail,
+        submissionStatus: 'submitted',
+        notes,
+        methodologyVersion: 'v0.4'
+      }).returning();
+
+      // Insert all score entries linked to this submission
+      for (const entry of scoreEntries) {
+        await db.insert(institutionSubmissionScores).values({
+          submissionId: submission.id,
+          ...entry,
+          adminDecision: 'pending'
+        });
+      }
+
+      okMsg = scoreEntries.length + ' dimension score(s) submitted for editorial review. You will receive notification when decisions are made.';
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+---
+<BaseLayout title="Submit Scores - EduRankAI Institution Portal" description="Submit institution scores with evidence">
+  <section class="px-[5vw] py-10 md:py-14 max-w-4xl mx-auto">
+
+    <div class="mb-6">
+      <p class="eyebrow mb-2">Institution Portal</p>
+      <h1 class="font-display text-3xl md:text-4xl font-semibold text-ink leading-tight">Submit dimension scores</h1>
+      <p class="text-[0.88rem] text-ink-soft mt-2">{institution.name} · {myClaim.contactName}</p>
+      <a href={'/institution/portal/' + token} class="text-[0.85rem] text-burn hover:underline font-semibold mt-2 inline-block">&larr; Back to portal</a>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2);color:#b91c1c;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;">{errorMsg}</div>}
+    {okMsg && (
+      <div class="bg-leaf-bg/40 border border-leaf-border rounded-2xl p-6 mb-6">
+        <p class="text-[0.72rem] font-mono uppercase tracking-wider text-leaf font-bold mb-2">Submission received</p>
+        <p class="text-[0.92rem] text-ink-2 leading-relaxed">{okMsg}</p>
+        <a href={'/institution/portal/' + token} class="inline-block mt-4 bg-burn text-white font-semibold py-2 px-5 rounded-lg text-[0.88rem] hover:bg-burn/90">Return to portal</a>
+      </div>
+    )}
+
+    {!okMsg && (
+      <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-6 md:p-8 flex flex-col gap-6">
+
+        <div class="bg-cream-2 border border-ink/8 rounded-lg p-4 text-[0.82rem] text-ink-2 leading-relaxed">
+          <p class="font-semibold mb-2 text-ink">Methodology requirements:</p>
+          <ul class="list-disc pl-5 space-y-1">
+            <li>Provide scores only for dimensions where you have verifiable evidence</li>
+            <li>Each score requires a publicly accessible evidence URL (audit report, AISHE/NIRF filing, third-party study, etc.)</li>
+            <li>Submitted scores are <strong>candidates</strong>; editorial team verifies each evidence URL before accepting</li>
+            <li>Per Principle 1, self-reported scores alone are never published — they require independent triangulation</li>
+          </ul>
+        </div>
+
+        {dimensions.map((dim) => (
+          <div class="border border-ink/10 rounded-xl p-5 bg-cream-2/50">
+            <div class="flex justify-between items-start gap-3 mb-3 flex-wrap">
+              <div style="flex:1;min-width:200px;">
+                <h3 class="font-display text-lg font-semibold text-ink">{dim.title}</h3>
+                {dim.subtitle && <p class="text-[0.82rem] text-ink-soft italic mt-1">{dim.subtitle}</p>}
+              </div>
+              <span class="text-[0.72rem] font-mono uppercase tracking-wider text-burn font-bold bg-burn-pale px-3 py-1 rounded-full whitespace-nowrap">Weight {dim.weightPercent}%</span>
+            </div>
+            {dim.description && <p class="text-[0.85rem] text-ink-2 leading-relaxed mb-4">{dim.description}</p>}
+
+            <div class="grid md:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-1">Proposed score (0-100)</label>
+                <input type="number" min="0" max="100" step="0.1" name={'score_' + dim.id} placeholder="e.g. 72.5" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-white" />
+                <p class="text-[0.72rem] text-ink-soft mt-1">Leave blank if no evidence to submit</p>
+              </div>
+              <div>
+                <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-1">Evidence URL</label>
+                <input type="url" name={'evidence_' + dim.id} placeholder="https://..." class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-white" />
+                <p class="text-[0.72rem] text-ink-soft mt-1">Required if score provided</p>
+              </div>
+            </div>
+
+            <div class="mt-3">
+              <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-1">Evidence description (optional)</label>
+              <textarea name={'description_' + dim.id} rows="2" placeholder="What does this evidence show? Which year? Which independent source?" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.88rem] outline-none focus:border-burn bg-white"></textarea>
+            </div>
+          </div>
+        ))}
+
+        <div>
+          <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Submission notes (optional)</label>
+          <textarea name="notes" rows="3" placeholder="Anything else the editorial team should know?" class="w-full px-3.5 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-cream-2"></textarea>
+        </div>
+
+        <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">Submit for editorial review</button>
+
+      </form>
+    )}
+
+  </section>
+</BaseLayout>

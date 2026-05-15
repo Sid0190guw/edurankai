@@ -1,0 +1,288 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import {
+  institutionSubmissions,
+  institutionSubmissionScores,
+  heiInstitutions,
+  heiDimensions,
+  heiInstitutionScores,
+  users
+} from '@/lib/db/schema';
+import { eq, desc, asc, and } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+
+let errorMsg = '';
+let okMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'review_score') {
+      const scoreId = (fd.get('score_id') as string || '').trim();
+      const decision = (fd.get('decision') as string || '').trim();
+      const acceptedRaw = (fd.get('accepted_score') as string || '').trim();
+      const adminNotes = (fd.get('admin_notes') as string || '').trim() || null;
+
+      if (!scoreId || !['accepted', 'rejected', 'pending'].includes(decision)) {
+        errorMsg = 'Invalid decision.';
+      } else {
+        let accepted: string | null = null;
+        if (decision === 'accepted') {
+          if (!acceptedRaw) { errorMsg = 'Accepted score required.'; }
+          else {
+            const n = parseFloat(acceptedRaw);
+            if (isNaN(n) || n < 0 || n > 100) { errorMsg = 'Score must be 0-100.'; }
+            else accepted = n.toFixed(2);
+          }
+        }
+        if (!errorMsg) {
+          await db.update(institutionSubmissionScores).set({
+            adminDecision: decision,
+            adminAcceptedScore: accepted,
+            adminNotes,
+            reviewedAt: new Date()
+          }).where(eq(institutionSubmissionScores.id, scoreId));
+          okMsg = 'Decision recorded.';
+        }
+      }
+    } else if (action === 'publish_submission') {
+      const submissionId = (fd.get('submission_id') as string || '').trim();
+      const sub = (await db.select().from(institutionSubmissions).where(eq(institutionSubmissions.id, submissionId)).limit(1))[0];
+      if (!sub) { errorMsg = 'Submission not found.'; }
+      else {
+        const accepted = await db.select().from(institutionSubmissionScores).where(
+          and(eq(institutionSubmissionScores.submissionId, submissionId), eq(institutionSubmissionScores.adminDecision, 'accepted'))
+        );
+        if (accepted.length === 0) {
+          errorMsg = 'No accepted scores in this submission — nothing to publish.';
+        } else {
+          // Flow accepted scores to hei_institution_scores (upsert)
+          for (const a of accepted) {
+            const existing = await db.select().from(heiInstitutionScores).where(
+              and(eq(heiInstitutionScores.institutionId, sub.institutionId), eq(heiInstitutionScores.dimensionId, a.dimensionId))
+            ).limit(1);
+            if (existing.length > 0) {
+              await db.update(heiInstitutionScores).set({
+                score: a.adminAcceptedScore || '0',
+                evidenceUrl: a.evidenceUrl,
+                updatedAt: new Date()
+              }).where(eq(heiInstitutionScores.id, existing[0].id));
+            } else {
+              await db.insert(heiInstitutionScores).values({
+                institutionId: sub.institutionId,
+                dimensionId: a.dimensionId,
+                score: a.adminAcceptedScore || '0',
+                evidenceUrl: a.evidenceUrl,
+                source: 'institution_submission'
+              });
+            }
+          }
+          // Recompute weighted Truth Score
+          const allDims = await db.select().from(heiDimensions);
+          const dimMap = Object.fromEntries(allDims.map(d => [d.id, parseFloat(d.weightPercent || '0')]));
+          const allScores = await db.select().from(heiInstitutionScores).where(eq(heiInstitutionScores.institutionId, sub.institutionId));
+          let weightedSum = 0; let totalWeight = 0;
+          for (const s of allScores) {
+            const w = dimMap[s.dimensionId] || 0;
+            if (w > 0) {
+              weightedSum += parseFloat(s.score) * w / 100;
+              totalWeight += w;
+            }
+          }
+          const finalScore = totalWeight > 0 ? (weightedSum * 100 / totalWeight).toFixed(2) : null;
+          await db.update(heiInstitutions).set({
+            truthScore: finalScore,
+            isPublished: true,
+            updatedAt: new Date()
+          }).where(eq(heiInstitutions.id, sub.institutionId));
+
+          await db.update(institutionSubmissions).set({
+            submissionStatus: 'accepted',
+            reviewedByUserId: user.id,
+            reviewedAt: new Date()
+          }).where(eq(institutionSubmissions.id, submissionId));
+
+          okMsg = 'Published ' + accepted.length + ' accepted score(s). Truth Score recomputed: ' + (finalScore || 'n/a');
+        }
+      }
+    } else if (action === 'reject_submission') {
+      const submissionId = (fd.get('submission_id') as string || '').trim();
+      const notes = (fd.get('admin_notes') as string || '').trim() || null;
+      await db.update(institutionSubmissions).set({
+        submissionStatus: 'rejected',
+        notes,
+        reviewedByUserId: user.id,
+        reviewedAt: new Date()
+      }).where(eq(institutionSubmissions.id, submissionId));
+      okMsg = 'Submission rejected.';
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const filterStatus = url.searchParams.get('status') || 'submitted';
+
+let allSubmissions = await db.select().from(institutionSubmissions).orderBy(desc(institutionSubmissions.submittedAt));
+if (filterStatus !== 'all') allSubmissions = allSubmissions.filter(s => s.submissionStatus === filterStatus);
+
+// Get related data
+const subIds = allSubmissions.map(s => s.id);
+const instIds = Array.from(new Set(allSubmissions.map(s => s.institutionId)));
+const institutionsList = instIds.length > 0 ? await db.select().from(heiInstitutions) : [];
+const instMap = Object.fromEntries(institutionsList.map(i => [i.id, i]));
+const dimensions = await db.select().from(heiDimensions).orderBy(asc(heiDimensions.sortOrder));
+const dimMap = Object.fromEntries(dimensions.map(d => [d.id, d]));
+
+const allScoreEntries = subIds.length > 0 ? await db.select().from(institutionSubmissionScores) : [];
+const scoresBySubId: Record<string, any[]> = {};
+for (const s of allScoreEntries) {
+  if (!scoresBySubId[s.submissionId]) scoresBySubId[s.submissionId] = [];
+  scoresBySubId[s.submissionId].push(s);
+}
+
+const counts: Record<string, number> = { all: 0, submitted: 0, accepted: 0, rejected: 0, partially_accepted: 0 };
+const allFresh = await db.select({ submissionStatus: institutionSubmissions.submissionStatus }).from(institutionSubmissions);
+for (const c of allFresh) {
+  counts.all++;
+  counts[c.submissionStatus] = (counts[c.submissionStatus] || 0) + 1;
+}
+
+function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '-'; }
+function categoryColor(s: string): string {
+  if (s === 'accepted') return 'background:rgba(16,185,129,0.15);color:#10b981;';
+  if (s === 'rejected') return 'background:rgba(220,38,38,0.15);color:#fca5a5;';
+  if (s === 'partially_accepted') return 'background:rgba(251,191,36,0.15);color:#fbbf24;';
+  return 'background:rgba(255,79,0,0.15);color:#FF7040;';
+}
+---
+<AdminLayout title="HEI Submissions" activeNav="hei-submissions">
+  <div class="admin-page" style="max-width:1400px;">
+    <div class="admin-page-header" style="margin-bottom:18px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">HEI Stage 3</div>
+        <h1 class="admin-page-title">Submission Review Queue</h1>
+        <p class="admin-page-sub">Verified institutions submit dimension scores with evidence URLs. Review each evidence URL, accept/reject per dimension, then publish.</p>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
+      <a href="?status=submitted" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'submitted' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Submitted ({counts.submitted || 0})</a>
+      <a href="?status=accepted" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'accepted' ? '#10b981;background:rgba(16,185,129,0.15);color:#10b981' : '#1f1f26;color:#a0a0ab')}>Accepted ({counts.accepted || 0})</a>
+      <a href="?status=partially_accepted" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'partially_accepted' ? '#fbbf24;background:rgba(251,191,36,0.15);color:#fbbf24' : '#1f1f26;color:#a0a0ab')}>Partial ({counts.partially_accepted || 0})</a>
+      <a href="?status=rejected" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'rejected' ? '#fca5a5;background:rgba(220,38,38,0.15);color:#fca5a5' : '#1f1f26;color:#a0a0ab')}>Rejected ({counts.rejected || 0})</a>
+      <a href="?status=all" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'all' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({counts.all || 0})</a>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{okMsg}</div>}
+
+    {allSubmissions.length === 0 && <div class="admin-card" style="padding:30px;text-align:center;color:#6e6e78;font-size:13px;">No submissions with this filter.</div>}
+
+    <div style="display:flex;flex-direction:column;gap:16px;">
+      {allSubmissions.map((sub) => {
+        const inst = instMap[sub.institutionId];
+        const scoreEntries = scoresBySubId[sub.id] || [];
+        const acceptedCount = scoreEntries.filter(s => s.adminDecision === 'accepted').length;
+        const pendingCount = scoreEntries.filter(s => s.adminDecision === 'pending').length;
+        const rejectedCount = scoreEntries.filter(s => s.adminDecision === 'rejected').length;
+
+        return (
+          <div class="admin-card" style="padding:18px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:12px;flex-wrap:wrap;">
+              <div style="flex:1;min-width:240px;">
+                <h3 style="font-weight:600;color:#fff;font-size:15px;">{inst ? inst.name : '(institution missing)'}</h3>
+                {inst && <p style="font-size:11.5px;color:#a0a0ab;margin-top:2px;">{inst.city ? inst.city + ', ' : ''}{inst.country}</p>}
+                <p style="font-size:10.5px;color:#6e6e78;margin-top:4px;">Submitted {fmt(sub.submittedAt)} by <a href={'mailto:' + sub.submittedByEmail} style="color:#FF7040;">{sub.submittedByEmail}</a></p>
+              </div>
+              <span style={'font-size:10.5px;padding:3px 10px;border-radius:100px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;' + categoryColor(sub.submissionStatus)}>{(sub.submissionStatus || '').replace(/_/g, ' ')}</span>
+            </div>
+
+            <div style="display:flex;gap:6px;margin-bottom:10px;font-size:11px;">
+              <span style="color:#6ee7b7;">✓ {acceptedCount} accepted</span>
+              <span style="color:#FF7040;">○ {pendingCount} pending</span>
+              <span style="color:#fca5a5;">✗ {rejectedCount} rejected</span>
+            </div>
+
+            {sub.notes && <div style="font-size:11.5px;color:#d8d8de;background:#0e0e12;border-left:2px solid #1f1f26;padding:8px 12px;margin-bottom:10px;line-height:1.5;"><span style="color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-size:9.5px;">Institution notes</span><br/>{sub.notes}</div>}
+
+            <details style="margin-top:10px;">
+              <summary style="cursor:pointer;color:#FF7040;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;">▶ Review per-dimension ({scoreEntries.length} dimensions)</summary>
+              <div style="margin-top:12px;display:flex;flex-direction:column;gap:10px;">
+                {scoreEntries.map((entry) => {
+                  const dim = dimMap[entry.dimensionId];
+                  return (
+                    <form method="POST" style="background:#08080a;border:1px solid #1f1f26;border-radius:6px;padding:12px;">
+                      <input type="hidden" name="_action" value="review_score" />
+                      <input type="hidden" name="score_id" value={entry.id} />
+                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <div>
+                          <span style="font-weight:600;color:#fff;font-size:13px;">{dim ? dim.title : entry.dimensionId}</span>
+                          {dim && <span style="color:#6e6e78;font-size:10.5px;margin-left:8px;">(weight {dim.weightPercent}%)</span>}
+                        </div>
+                        <span style={'font-size:10px;padding:2px 8px;border-radius:100px;' + (entry.adminDecision === 'accepted' ? 'background:rgba(16,185,129,0.15);color:#10b981;' : entry.adminDecision === 'rejected' ? 'background:rgba(220,38,38,0.15);color:#fca5a5;' : 'background:rgba(255,79,0,0.15);color:#FF7040;')}>{entry.adminDecision}</span>
+                      </div>
+
+                      <div style="font-size:11px;color:#d8d8de;margin-bottom:8px;">
+                        <div><span style="color:#6e6e78;">Proposed:</span> <strong style="color:#fff;font-family:Geist Mono,monospace;">{entry.proposedScore}</strong></div>
+                        <div style="margin-top:3px;"><span style="color:#6e6e78;">Evidence:</span> <a href={entry.evidenceUrl} target="_blank" style="color:#FF7040;text-decoration:underline;word-break:break-all;">{entry.evidenceUrl}</a></div>
+                        {entry.evidenceDescription && <div style="margin-top:3px;color:#a0a0ab;font-style:italic;">"{entry.evidenceDescription}"</div>}
+                      </div>
+
+                      <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:6px;margin-bottom:6px;">
+                        <div>
+                          <label style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;">Decision</label>
+                          <select name="decision" required class="rfi-sm">
+                            <option value="pending" selected={entry.adminDecision === 'pending'}>Pending</option>
+                            <option value="accepted" selected={entry.adminDecision === 'accepted'}>Accept</option>
+                            <option value="rejected" selected={entry.adminDecision === 'rejected'}>Reject</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;">Accepted score (0-100)</label>
+                          <input type="number" name="accepted_score" min="0" max="100" step="0.1" placeholder="e.g. 72.5" value={entry.adminAcceptedScore || entry.proposedScore} class="rfi-sm" />
+                        </div>
+                        <div>
+                          <label style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;">Admin notes</label>
+                          <input name="admin_notes" placeholder="Reason / supporting note..." value={entry.adminNotes || ''} class="rfi-sm" />
+                        </div>
+                      </div>
+
+                      <button type="submit" class="admin-btn" style="padding:4px 11px;font-size:10.5px;">Save decision</button>
+                    </form>
+                  );
+                })}
+              </div>
+            </details>
+
+            {(sub.submissionStatus === 'submitted' || sub.submissionStatus === 'partially_accepted') && (
+              <div style="display:flex;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid #1f1f26;">
+                <form method="POST" style="display:inline;" onsubmit="return confirm('Publish accepted scores? This updates the institution Truth Score on /hei.');">
+                  <input type="hidden" name="_action" value="publish_submission" />
+                  <input type="hidden" name="submission_id" value={sub.id} />
+                  <button type="submit" class="admin-btn admin-btn-primary" style="padding:6px 12px;font-size:11px;" disabled={acceptedCount === 0}>Publish {acceptedCount > 0 ? '(' + acceptedCount + ' accepted)' : '(no accepted yet)'}</button>
+                </form>
+                <form method="POST" style="display:inline;" onsubmit="return confirm('Reject this entire submission?');">
+                  <input type="hidden" name="_action" value="reject_submission" />
+                  <input type="hidden" name="submission_id" value={sub.id} />
+                  <button type="submit" class="admin-btn" style="padding:6px 12px;font-size:11px;color:#fca5a5;">Reject submission</button>
+                </form>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  </div>
+
+  <style>
+    .rfi-sm { width:100%;padding:5px 8px;background:#0e0e12;border:1px solid #1f1f26;border-radius:4px;color:#fff;font-size:11px;font-family:inherit;outline:none; }
+    .rfi-sm:focus { border-color:#FF4F00; }
+  </style>
+</AdminLayout>
