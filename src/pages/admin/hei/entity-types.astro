@@ -1,0 +1,252 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { heiEntityTypes, heiInstitutions } from '@/lib/db/schema';
+import { asc, eq, sql } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+
+let errorMsg = '';
+let okMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'create' || action === 'update') {
+      const candidate = {
+        id: (fd.get('id') as string || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '_'),
+        label: (fd.get('label') as string || '').trim(),
+        category: (fd.get('category') as string || '').trim(),
+        description: (fd.get('description') as string || '').trim() || null,
+        sortOrder: parseInt((fd.get('sortOrder') as string) || '0', 10),
+        isActive: fd.get('isActive') === 'on'
+      };
+
+      if (!candidate.id || !candidate.label || !candidate.category) {
+        errorMsg = 'ID, label and category are required.';
+      } else if (action === 'create') {
+        const exists = await db.select().from(heiEntityTypes).where(eq(heiEntityTypes.id, candidate.id)).limit(1);
+        if (exists.length > 0) {
+          errorMsg = 'ID already exists: ' + candidate.id;
+        } else {
+          await db.insert(heiEntityTypes).values(candidate);
+          okMsg = 'Created: ' + candidate.label;
+        }
+      } else {
+        await db.update(heiEntityTypes).set({
+          label: candidate.label,
+          category: candidate.category,
+          description: candidate.description,
+          sortOrder: candidate.sortOrder,
+          isActive: candidate.isActive
+        }).where(eq(heiEntityTypes.id, candidate.id));
+        okMsg = 'Updated: ' + candidate.label;
+      }
+    } else if (action === 'toggle_active') {
+      const id = fd.get('id') as string;
+      const target = await db.select().from(heiEntityTypes).where(eq(heiEntityTypes.id, id)).limit(1);
+      if (target.length > 0) {
+        await db.update(heiEntityTypes).set({ isActive: !target[0].isActive }).where(eq(heiEntityTypes.id, id));
+        okMsg = target[0].isActive ? 'Deactivated' : 'Activated';
+      }
+    } else if (action === 'delete') {
+      const id = fd.get('id') as string;
+      // Check if any institutions use this type
+      const inUse = await db.select({ id: heiInstitutions.id }).from(heiInstitutions).where(eq(heiInstitutions.entityTypeId, id)).limit(1);
+      if (inUse.length > 0) {
+        errorMsg = 'Cannot delete: institutions currently use this type. Deactivate instead.';
+      } else {
+        await db.delete(heiEntityTypes).where(eq(heiEntityTypes.id, id));
+        okMsg = 'Deleted.';
+      }
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const editId = url.searchParams.get('edit') || '';
+const filterCategory = url.searchParams.get('cat') || '';
+
+const allTypes = await db.select().from(heiEntityTypes).orderBy(asc(heiEntityTypes.sortOrder), asc(heiEntityTypes.label));
+const categories = Array.from(new Set(allTypes.map(t => t.category))).sort();
+const editing = editId && editId !== 'new' ? allTypes.find(t => t.id === editId) : null;
+
+const filtered = filterCategory ? allTypes.filter(t => t.category === filterCategory) : allTypes;
+
+// Usage count: how many institutions per entity type
+const usageRows = await db.select({
+  entityTypeId: heiInstitutions.entityTypeId,
+  cnt: sql<number>`count(*)::int`
+}).from(heiInstitutions).groupBy(heiInstitutions.entityTypeId);
+
+const usageMap: Record<string, number> = {};
+for (const r of usageRows) {
+  if (r.entityTypeId) usageMap[r.entityTypeId] = r.cnt as number;
+}
+
+const totalInstitutions = Object.values(usageMap).reduce((s: number, n: number) => s + (n as number), 0);
+
+function categoryLabel(c: string): string {
+  return c.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+}
+---
+<AdminLayout title="HEI Entity Types" activeNav="hei">
+  <div class="admin-page" style="max-width:1400px;">
+
+    <div class="admin-page-header" style="margin-bottom:20px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">HEI Taxonomy</div>
+        <h1 class="admin-page-title">Entity Types</h1>
+        <p class="admin-page-sub">
+          {allTypes.length} types across {categories.length} categories.
+          {totalInstitutions > 0 && (
+            <> {totalInstitutions} institution{totalInstitutions === 1 ? '' : 's'} currently classified.</>
+          )}
+        </p>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;">
+      <a href="/admin/hei/entity-types" style={'font-size:10.5px;padding:5px 10px;border-radius:100px;text-decoration:none;border:1px solid ' + (!filterCategory ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({allTypes.length})</a>
+      {categories.map((c) => {
+        const n = allTypes.filter(t => t.category === c).length;
+        return (
+          <a href={'/admin/hei/entity-types?cat=' + c} style={'font-size:10.5px;padding:5px 10px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterCategory === c ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>{categoryLabel(c)} ({n})</a>
+        );
+      })}
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{okMsg}</div>}
+
+    <div style="display:grid;grid-template-columns:1.5fr 1fr;gap:16px;align-items:flex-start;">
+
+      <div class="admin-card" style="padding:0;overflow:hidden;">
+        <div style="padding:12px 14px;border-bottom:1px solid #1f1f26;display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:10.5px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;">{filtered.length} types</span>
+          {!editing && <a href={'?edit=new' + (filterCategory ? '&cat=' + filterCategory : '')} class="admin-btn admin-btn-primary" style="padding:5px 11px;font-size:10.5px;text-decoration:none;">+ Add type</a>}
+        </div>
+
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Label / ID</th>
+              <th>Category</th>
+              <th>Used by</th>
+              <th>Status</th>
+              <th style="text-align:right;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((t) => (
+              <tr style={editing && editing.id === t.id ? 'background:rgba(255,79,0,0.06);' : ''}>
+                <td>
+                  <div style="font-weight:500;color:#fff;font-size:12.5px;">{t.label}</div>
+                  <div style="font-size:10px;color:#6e6e78;font-family:'Geist Mono',monospace;margin-top:2px;">{t.id}</div>
+                  {t.description && <div style="font-size:10.5px;color:#a0a0ab;margin-top:3px;line-height:1.5;">{t.description.substring(0, 90)}{t.description.length > 90 ? '...' : ''}</div>}
+                </td>
+                <td><span style="font-size:11px;color:#a0a0ab;">{categoryLabel(t.category)}</span></td>
+                <td><span style="font-size:11px;color:#FF7040;font-weight:600;font-family:'Geist Mono',monospace;">{usageMap[t.id] || 0}</span></td>
+                <td>
+                  <span style={'font-size:10.5px;color:' + (t.isActive ? '#10b981' : '#6e6e78') + ';'}>
+                    {t.isActive ? '● Active' : '○ Inactive'}
+                  </span>
+                </td>
+                <td style="text-align:right;">
+                  <div style="display:flex;gap:4px;justify-content:flex-end;flex-wrap:wrap;">
+                    <a href={'?edit=' + t.id} class="admin-btn" style="padding:3px 8px;font-size:10px;">Edit</a>
+                    <form method="POST" style="margin:0;display:inline;">
+                      <input type="hidden" name="_action" value="toggle_active" />
+                      <input type="hidden" name="id" value={t.id} />
+                      <button type="submit" class="admin-btn" style="padding:3px 8px;font-size:10px;">{t.isActive ? 'Deact' : 'Act'}</button>
+                    </form>
+                    {(usageMap[t.id] || 0) === 0 && (
+                      <form method="POST" style="margin:0;display:inline;" onsubmit="return confirm('Delete this type? Only allowed if no institutions use it.');">
+                        <input type="hidden" name="_action" value="delete" />
+                        <input type="hidden" name="id" value={t.id} />
+                        <button type="submit" class="admin-btn" style="padding:3px 8px;font-size:10px;color:#fca5a5;">Del</button>
+                      </form>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {(editing || editId === 'new') && (
+        <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:11px;">
+          <input type="hidden" name="_action" value={editing ? 'update' : 'create'} />
+          {editing && <input type="hidden" name="id" value={editing.id} />}
+
+          <div class="admin-card-title" style="margin:0 0 4px;font-size:13px;">{editing ? 'Edit type' : '+ Add entity type'}</div>
+
+          {!editing && (
+            <div>
+              <label class="rfl">ID (lowercase, snake_case) *</label>
+              <input name="id" required pattern="[a-z0-9_]+" class="rfi" placeholder="e.g. ayurveda_college" />
+              <p style="font-size:10px;color:#6e6e78;margin-top:3px;">Used in URLs, cannot be changed after creation.</p>
+            </div>
+          )}
+
+          <div>
+            <label class="rfl">Label (human-readable) *</label>
+            <input name="label" required class="rfi" placeholder="e.g. Ayurveda College" value={editing ? editing.label : ''} />
+          </div>
+
+          <div>
+            <label class="rfl">Category *</label>
+            <input name="category" required list="categoryList" class="rfi" placeholder="Pick or type new category" value={editing ? editing.category : (filterCategory || '')} />
+            <datalist id="categoryList">
+              {categories.map((c) => <option value={c} />)}
+            </datalist>
+            <p style="font-size:10px;color:#6e6e78;margin-top:3px;">Type a new value to create a new category.</p>
+          </div>
+
+          <div>
+            <label class="rfl">Description</label>
+            <textarea name="description" rows="3" class="rfi">{editing && editing.description ? editing.description : ''}</textarea>
+          </div>
+
+          <div>
+            <label class="rfl">Sort order</label>
+            <input type="number" name="sortOrder" class="rfi" value={editing ? editing.sortOrder : 100} />
+          </div>
+
+          <label style="display:flex;align-items:center;gap:8px;color:#d8d8de;font-size:12px;">
+            <input type="checkbox" name="isActive" style="accent-color:#FF4F00;" checked={!editing || editing.isActive} />
+            <span>Active (selectable when classifying institutions)</span>
+          </label>
+
+          <div style="display:flex;gap:8px;margin-top:4px;">
+            <button type="submit" class="admin-btn admin-btn-primary" style="flex:1;justify-content:center;">{editing ? 'Save' : 'Create'}</button>
+            <a href="/admin/hei/entity-types" class="admin-btn" style="padding:8px 14px;display:flex;align-items:center;text-decoration:none;">Cancel</a>
+          </div>
+        </form>
+      )}
+
+      {!editing && editId !== 'new' && (
+        <div class="admin-card" style="text-align:center;padding:30px 20px;">
+          <p style="font-size:12px;color:#6e6e78;line-height:1.7;">
+            Click <strong>+ Add type</strong> to create a new entity type, or <strong>Edit</strong> on any row.<br/><br/>
+            Types are open-ended: as new categories of institutions emerge (e.g. AI bootcamp, drone pilot academy), add them here without code changes.
+          </p>
+        </div>
+      )}
+
+    </div>
+  </div>
+
+  <style>
+    .rfl { display:block;font-size:10px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px; }
+    .rfi { width:100%;padding:7px 10px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:12px;font-family:inherit;outline:none; }
+    .rfi:focus { border-color:#FF4F00; }
+    textarea.rfi { resize:vertical; }
+  </style>
+</AdminLayout>

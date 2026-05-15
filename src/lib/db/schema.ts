@@ -440,6 +440,8 @@ export const heiInstitutions = pgTable('hei_institutions', {
   truthScore: text('truth_score'),
   truthRank: integer('truth_rank'),
   hasFullData: boolean('has_full_data').notNull().default(false),
+  entityTypeId: varchar('entity_type_id', { length: 80 }),
+  parentInstitutionId: uuid('parent_institution_id'),
   isPublished: boolean('is_published').notNull().default(false),
   notes: text('notes'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -491,4 +493,18 @@ export const heiInstitutionScores = pgTable('hei_institution_scores', {
   score: text('score').notNull().default('0'),
   notes: text('notes'),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+// =========================================================================
+// HEI Entity Types (universal taxonomy for all education/training entities)
+// =========================================================================
+
+export const heiEntityTypes = pgTable('hei_entity_types', {
+  id: varchar('id', { length: 80 }).primaryKey(),
+  label: varchar('label', { length: 200 }).notNull(),
+  category: varchar('category', { length: 50 }).notNull(),
+  description: text('description'),
+  sortOrder: integer('sort_order').notNull().default(0),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
 });

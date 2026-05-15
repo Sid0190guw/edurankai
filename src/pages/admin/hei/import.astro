@@ -1,0 +1,260 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { heiInstitutions } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { parse } from 'csv-parse/sync';
+import countryCodes from '@/lib/country-codes.json';
+
+const user = Astro.locals.user!;
+if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+
+let okMsg = '';
+let errorMsg = '';
+let report: { added: number; skipped: number; errors: string[]; sample: any[] } | null = null;
+
+const COUNTRIES = countryCodes as Record<string, string>;
+
+function slugify(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').substring(0, 140);
+}
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const file = fd.get('csvfile') as File;
+    const mappingMode = fd.get('mapping') as string || 'github_world';
+
+    if (!file || file.size === 0) {
+      errorMsg = 'Please choose a CSV file.';
+    } else if (file.size > 10 * 1024 * 1024) {
+      errorMsg = 'File too large (max 10MB).';
+    } else {
+      const csvText = await file.text();
+
+      // Try to parse with different settings based on mapping
+      let records: any[] = [];
+
+      if (mappingMode === 'github_world') {
+        // GitHub world-universities CSV: country_code, name, website (no header)
+        records = parse(csvText, {
+          skip_empty_lines: true,
+          relax_quotes: true,
+          relax_column_count: true,
+          columns: ['country_code', 'name', 'website']
+        });
+      } else if (mappingMode === 'aishe_india') {
+        // AISHE export: assume standard headers from data.gov.in
+        records = parse(csvText, {
+          skip_empty_lines: true,
+          relax_quotes: true,
+          relax_column_count: true,
+          columns: true
+        });
+      } else {
+        // Generic: first row is headers
+        records = parse(csvText, {
+          skip_empty_lines: true,
+          relax_quotes: true,
+          relax_column_count: true,
+          columns: true
+        });
+      }
+
+      let added = 0;
+      let skipped = 0;
+      const errors: string[] = [];
+      const sample: any[] = [];
+
+      for (let i = 0; i < records.length; i++) {
+        const r = records[i];
+
+        let name = '';
+        let country = '';
+        let website = '';
+        let city = null;
+        let stateRegion = null;
+
+        if (mappingMode === 'github_world') {
+          const code = (r.country_code || '').trim().toUpperCase();
+          country = COUNTRIES[code] || code || 'Unknown';
+          name = (r.name || '').trim();
+          website = (r.website || '').trim();
+        } else if (mappingMode === 'aishe_india') {
+          name = (r['University Name'] || r['Institution Name'] || r['College Name'] || r['Name'] || '').trim();
+          city = (r['District Name'] || r['City'] || null);
+          stateRegion = (r['State Name'] || r['State'] || null);
+          country = 'India';
+          website = (r['Website'] || r['Website URL'] || '').trim();
+        } else {
+          name = (r.name || r.Name || r.NAME || '').trim();
+          country = (r.country || r.Country || 'Unknown').trim();
+          website = (r.website || r.Website || '').trim();
+          city = r.city || r.City || null;
+          stateRegion = r.state || r.State || null;
+        }
+
+        if (!name || name.length < 3) {
+          skipped++;
+          continue;
+        }
+
+        const slug = slugify(name);
+        if (!slug || slug.length < 3) {
+          skipped++;
+          continue;
+        }
+
+        try {
+          const existing = await db.select({ id: heiInstitutions.id }).from(heiInstitutions).where(eq(heiInstitutions.slug, slug)).limit(1);
+          if (existing.length > 0) {
+            skipped++;
+            continue;
+          }
+
+          await db.insert(heiInstitutions).values({
+            slug,
+            name: name.substring(0, 290),
+            tier: 'university',
+            country,
+            stateRegion,
+            city,
+            websiteUrl: website || null,
+            isPublished: false,
+            hasFullData: false
+          });
+          added++;
+
+          if (sample.length < 8) sample.push({ name, country, website });
+        } catch (err: any) {
+          if (errors.length < 10) errors.push('Row ' + i + ': ' + (err.message || 'unknown'));
+          skipped++;
+        }
+      }
+
+      report = { added, skipped, errors, sample };
+      okMsg = 'Import complete. Added ' + added + ', skipped ' + skipped + '.';
+    }
+  } catch (err: any) {
+    errorMsg = 'Import failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+// Current institution counts for context
+const allCount = await db.select({ id: heiInstitutions.id }).from(heiInstitutions);
+const byCountry: Record<string, number> = {};
+for (const _ of allCount) { /* counted below */ }
+
+const allList = await db.select({ country: heiInstitutions.country }).from(heiInstitutions);
+for (const r of allList) {
+  byCountry[r.country] = (byCountry[r.country] || 0) + 1;
+}
+const topCountries = Object.entries(byCountry).sort((a, b) => b[1] - a[1]).slice(0, 12);
+---
+<AdminLayout title="HEI Import" activeNav="hei">
+  <div class="admin-page" style="max-width:1100px;">
+
+    <div class="admin-page-header" style="margin-bottom:24px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">HEI Data</div>
+        <h1 class="admin-page-title">CSV Import</h1>
+        <p class="admin-page-sub">{allList.length} institutions currently in DB. Bulk-import from public sources (AISHE, world-universities GitHub CSV, IPEDS, HESA, etc).</p>
+      </div>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{okMsg}</div>}
+
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:18px;align-items:flex-start;">
+
+      <form method="POST" enctype="multipart/form-data" class="admin-card" style="display:flex;flex-direction:column;gap:14px;">
+        <div class="admin-card-title" style="margin:0 0 4px;font-size:13px;">Upload CSV</div>
+
+        <div>
+          <label class="rfl">Data source / mapping</label>
+          <select name="mapping" class="rfi" required>
+            <option value="github_world">GitHub world-universities CSV (9,362 unis, no header, fields: country_code, name, website)</option>
+            <option value="aishe_india">AISHE India export (standard headers: University Name, State Name, District Name, Website)</option>
+            <option value="generic">Generic CSV (with headers: name, country, city, state, website)</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="rfl">CSV file (max 10MB)</label>
+          <input type="file" name="csvfile" accept=".csv" required class="rfi" style="padding:6px;" />
+          <p style="font-size:10.5px;color:#6e6e78;margin-top:6px;line-height:1.55;">
+            Duplicates (by slug) are skipped automatically. All imports default to <strong style="color:#fbbf24;">unpublished</strong> - you choose what to publish.
+          </p>
+        </div>
+
+        <button type="submit" class="admin-btn admin-btn-primary" style="padding:9px 16px;font-size:12.5px;">Upload &amp; Import</button>
+
+        {report && (
+          <div style="margin-top:8px;padding:12px;background:rgba(16,185,129,0.05);border:1px solid rgba(16,185,129,0.2);border-radius:6px;">
+            <p style="font-size:12px;color:#6ee7b7;font-weight:600;margin-bottom:6px;">Result</p>
+            <p style="font-size:11.5px;color:#a0a0ab;line-height:1.6;">
+              <strong style="color:#fff;">{report.added}</strong> added &middot; <strong style="color:#fff;">{report.skipped}</strong> skipped (duplicates or invalid)
+            </p>
+            {report.sample.length > 0 && (
+              <div style="margin-top:8px;font-size:10.5px;color:#6e6e78;">
+                <div style="margin-bottom:3px;">Sample imports:</div>
+                {report.sample.map((s) => <div style="font-family:'Geist Mono',monospace;color:#a0a0ab;">- {s.name} ({s.country})</div>)}
+              </div>
+            )}
+            {report.errors.length > 0 && (
+              <div style="margin-top:8px;font-size:10.5px;color:#fca5a5;">
+                <div>Errors (first 10):</div>
+                {report.errors.map((e) => <div style="font-family:'Geist Mono',monospace;">- {e}</div>)}
+              </div>
+            )}
+          </div>
+        )}
+      </form>
+
+      <div class="admin-card">
+        <div class="admin-card-title" style="font-size:13px;margin-bottom:10px;">Where to get the data</div>
+        <p style="font-size:11.5px;color:#a0a0ab;line-height:1.7;margin-bottom:12px;">
+          <strong style="color:#fff;">World (9,362 unis):</strong><br/>
+          <a href="https://github.com/endSly/world-universities-csv" target="_blank" style="color:#FF7040;word-break:break-all;">github.com/endSly/world-universities-csv</a> &mdash; click "world-universities.csv" &rarr; "Raw" &rarr; save file
+        </p>
+        <p style="font-size:11.5px;color:#a0a0ab;line-height:1.7;margin-bottom:12px;">
+          <strong style="color:#fff;">India (AISHE):</strong><br/>
+          <a href="https://aishe.gov.in/aishe-final-report/" target="_blank" style="color:#FF7040;">aishe.gov.in/aishe-final-report</a> &mdash; Annual Excel reports with all India institutions
+        </p>
+        <p style="font-size:11.5px;color:#a0a0ab;line-height:1.7;margin-bottom:12px;">
+          <strong style="color:#fff;">US (IPEDS):</strong><br/>
+          <a href="https://nces.ed.gov/ipeds/use-the-data" target="_blank" style="color:#FF7040;">nces.ed.gov/ipeds</a> &mdash; 7,000+ US institutions CSV
+        </p>
+        <p style="font-size:11.5px;color:#a0a0ab;line-height:1.7;margin-bottom:12px;">
+          <strong style="color:#fff;">UK (HESA):</strong><br/>
+          <a href="https://www.hesa.ac.uk/data-and-analysis" target="_blank" style="color:#FF7040;">hesa.ac.uk</a> &mdash; UK higher ed bulk data
+        </p>
+        <p style="font-size:11.5px;color:#a0a0ab;line-height:1.7;">
+          <strong style="color:#fff;">Africa (1,331 unis):</strong><br/>
+          <a href="https://openwashdata.github.io/universityrankingafrica/" target="_blank" style="color:#FF7040;word-break:break-all;">openwashdata.github.io/universityrankingafrica</a>
+        </p>
+      </div>
+
+      {topCountries.length > 0 && (
+        <div class="admin-card" style="grid-column:span 2;">
+          <div class="admin-card-title" style="font-size:13px;margin-bottom:10px;">Current DB coverage by country</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;">
+            {topCountries.map(([country, count]) => (
+              <div style="display:flex;justify-content:space-between;padding:7px 11px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;font-size:12px;">
+                <span style="color:#d8d8de;">{country}</span>
+                <span style="font-family:'Geist Mono',monospace;color:#FF7040;font-weight:600;">{count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+    </div>
+  </div>
+
+  <style>
+    .rfl { display:block;font-size:10px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px; }
+    .rfi { width:100%;padding:7px 10px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:12px;font-family:inherit;outline:none; }
+    .rfi:focus { border-color:#FF4F00; }
+  </style>
+</AdminLayout>
