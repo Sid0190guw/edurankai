@@ -1,0 +1,155 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { institutionClaims, heiInstitutions, users } from '@/lib/db/schema';
+import { desc, eq, asc } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+
+let errorMsg = '';
+let okMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+  const id = (fd.get('id') as string || '').trim();
+  const notes = (fd.get('decision_notes') as string || '').trim() || null;
+
+  try {
+    if (action === 'verify' || action === 'reject') {
+      const newStatus = action === 'verify' ? 'verified' : 'rejected';
+      await db.update(institutionClaims).set({
+        status: newStatus,
+        decisionNotes: notes,
+        reviewedByUserId: user.id,
+        reviewedAt: new Date()
+      }).where(eq(institutionClaims.id, id));
+      okMsg = action === 'verify' ? 'Claim verified.' : 'Claim rejected.';
+    } else if (action === 'reset_pending') {
+      await db.update(institutionClaims).set({
+        status: 'pending',
+        decisionNotes: null,
+        reviewedByUserId: null,
+        reviewedAt: null
+      }).where(eq(institutionClaims.id, id));
+      okMsg = 'Reset to pending.';
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const filterStatus = url.searchParams.get('status') || 'pending';
+
+let allClaims = await db.select().from(institutionClaims).orderBy(desc(institutionClaims.submittedAt));
+if (filterStatus !== 'all') allClaims = allClaims.filter(c => c.status === filterStatus);
+
+// Fetch institutions + reviewers in batch
+const instIds = Array.from(new Set(allClaims.map(c => c.institutionId)));
+const institutionsList = instIds.length > 0 ? await db.select().from(heiInstitutions) : [];
+const instMap = Object.fromEntries(institutionsList.map(i => [i.id, i]));
+
+const reviewerIds = Array.from(new Set(allClaims.map(c => c.reviewedByUserId).filter(x => x !== null) as string[]));
+const reviewersList = reviewerIds.length > 0 ? await db.select({ id: users.id, name: users.name }).from(users) : [];
+const reviewerMap = Object.fromEntries(reviewersList.map(u => [u.id, u.name]));
+
+const counts: Record<string, number> = { all: 0, pending: 0, verified: 0, rejected: 0 };
+const allFresh = await db.select({ status: institutionClaims.status }).from(institutionClaims);
+for (const c of allFresh) {
+  counts.all = (counts.all || 0) + 1;
+  counts[c.status] = (counts[c.status] || 0) + 1;
+}
+
+function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '-'; }
+---
+<AdminLayout title="HEI Claims" activeNav="hei-claims">
+  <div class="admin-page" style="max-width:1400px;">
+
+    <div class="admin-page-header" style="margin-bottom:20px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">HEI Stage 1</div>
+        <h1 class="admin-page-title">Institution Claims</h1>
+        <p class="admin-page-sub">Institutions submit verification requests here. Verified claims unlock score submission, right-of-reply, and institution-portal access.</p>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:16px;">
+      <a href="?status=pending" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'pending' ? '#fbbf24;background:rgba(251,191,36,0.15);color:#fbbf24' : '#1f1f26;color:#a0a0ab')}>Pending ({counts.pending || 0})</a>
+      <a href="?status=verified" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'verified' ? '#10b981;background:rgba(16,185,129,0.15);color:#10b981' : '#1f1f26;color:#a0a0ab')}>Verified ({counts.verified || 0})</a>
+      <a href="?status=rejected" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'rejected' ? '#fca5a5;background:rgba(220,38,38,0.15);color:#fca5a5' : '#1f1f26;color:#a0a0ab')}>Rejected ({counts.rejected || 0})</a>
+      <a href="?status=all" style={'font-size:11px;padding:6px 12px;border-radius:100px;text-decoration:none;border:1px solid ' + (filterStatus === 'all' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({counts.all || 0})</a>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{okMsg}</div>}
+
+    {allClaims.length === 0 && (
+      <div class="admin-card" style="padding:30px;text-align:center;color:#6e6e78;font-size:13px;">No claims with this filter.</div>
+    )}
+
+    <div style="display:flex;flex-direction:column;gap:11px;">
+      {allClaims.map((c) => {
+        const inst = instMap[c.institutionId];
+        const reviewerName = c.reviewedByUserId ? (reviewerMap[c.reviewedByUserId] || c.reviewedByUserId) : null;
+        return (
+          <div class="admin-card" style="padding:18px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:10px;flex-wrap:wrap;">
+              <div style="flex:1;min-width:240px;">
+                <p style="font-family:'Geist Mono',monospace;font-size:10px;color:#6e6e78;letter-spacing:0.1em;">{c.claimToken}</p>
+                <h3 style="font-weight:600;color:#fff;font-size:15px;margin-top:3px;">{inst ? inst.name : '(institution missing)'}</h3>
+                {inst && <p style="font-size:11.5px;color:#a0a0ab;margin-top:2px;">{inst.city ? inst.city + ', ' : ''}{inst.country}</p>}
+              </div>
+              <span style={'font-size:10.5px;padding:3px 10px;border-radius:100px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;' +
+                (c.status === 'verified' ? 'background:rgba(16,185,129,0.15);color:#10b981;' :
+                 c.status === 'rejected' ? 'background:rgba(220,38,38,0.15);color:#fca5a5;' :
+                 'background:rgba(251,191,36,0.15);color:#fbbf24;')}>{c.status}</span>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;font-size:11.5px;color:#d8d8de;margin-bottom:10px;background:#08080a;padding:10px;border-radius:5px;">
+              <div><span style="color:#6e6e78;">Name:</span> <strong style="color:#fff;">{c.contactName}</strong></div>
+              <div><span style="color:#6e6e78;">Designation:</span> {c.contactDesignation}</div>
+              <div><span style="color:#6e6e78;">Email:</span> <a href={'mailto:' + c.contactEmail} style="color:#FF7040;text-decoration:underline;">{c.contactEmail}</a></div>
+              {c.contactPhone && <div><span style="color:#6e6e78;">Phone:</span> {c.contactPhone}</div>}
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:5px;margin-bottom:10px;font-size:11.5px;">
+              {c.letterheadUrl ? <div><span style="color:#6e6e78;">Letterhead:</span> <a href={c.letterheadUrl} target="_blank" style="color:#FF7040;text-decoration:underline;word-break:break-all;">{c.letterheadUrl}</a></div> : <div style="color:#fbbf24;">⚠ No letterhead URL provided</div>}
+              {c.additionalEvidenceUrl && <div><span style="color:#6e6e78;">Additional:</span> <a href={c.additionalEvidenceUrl} target="_blank" style="color:#FF7040;text-decoration:underline;word-break:break-all;">{c.additionalEvidenceUrl}</a></div>}
+            </div>
+
+            <div style="font-size:10.5px;color:#6e6e78;margin-bottom:12px;">Submitted: {fmt(c.submittedAt)}{c.reviewedAt && ' · Reviewed: ' + fmt(c.reviewedAt) + (reviewerName ? ' by ' + reviewerName : '')}</div>
+
+            {c.decisionNotes && (
+              <div style="font-size:11.5px;color:#d8d8de;background:#0e0e12;border-left:2px solid #1f1f26;padding:8px 12px;margin-bottom:12px;line-height:1.5;">
+                <span style="color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-size:9.5px;">Decision notes</span><br/>
+                {c.decisionNotes}
+              </div>
+            )}
+
+            {c.status === 'pending' && (
+              <form method="POST" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+                <input type="hidden" name="id" value={c.id} />
+                <div style="flex:1;min-width:200px;">
+                  <label style="font-size:9.5px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;">Decision notes (optional)</label>
+                  <input name="decision_notes" placeholder="Reason / next steps..." style="width:100%;padding:6px 9px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:11px;outline:none;" />
+                </div>
+                <button type="submit" name="_action" value="verify" class="admin-btn" style="padding:6px 14px;font-size:11px;color:#6ee7b7;border-color:#10b981;">✓ Verify</button>
+                <button type="submit" name="_action" value="reject" class="admin-btn" style="padding:6px 14px;font-size:11px;color:#fca5a5;" onclick="return confirm('Reject this claim?');">✗ Reject</button>
+              </form>
+            )}
+
+            {(c.status === 'verified' || c.status === 'rejected') && (
+              <form method="POST">
+                <input type="hidden" name="id" value={c.id} />
+                <button type="submit" name="_action" value="reset_pending" class="admin-btn" style="padding:4px 11px;font-size:10.5px;">Reset to pending</button>
+              </form>
+            )}
+          </div>
+        );
+      })}
+    </div>
+
+  </div>
+</AdminLayout>

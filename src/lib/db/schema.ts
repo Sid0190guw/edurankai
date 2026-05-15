@@ -568,3 +568,71 @@ export const heiPurusharthas = pgTable('hei_purusharthas', {
   description: text('description').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
 });
+
+// =========================================================================
+// Institution self-claim + score submission + findings (4 stages)
+// =========================================================================
+
+export const institutionClaims = pgTable('institution_claims', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  institutionId: uuid('institution_id').notNull().references(() => heiInstitutions.id, { onDelete: 'cascade' }),
+  claimToken: varchar('claim_token', { length: 80 }).notNull().unique(),
+  contactName: varchar('contact_name', { length: 200 }).notNull(),
+  contactDesignation: varchar('contact_designation', { length: 200 }).notNull(),
+  contactEmail: varchar('contact_email', { length: 255 }).notNull(),
+  contactPhone: varchar('contact_phone', { length: 50 }),
+  letterheadUrl: text('letterhead_url'),
+  additionalEvidenceUrl: text('additional_evidence_url'),
+  status: varchar('status', { length: 30 }).notNull().default('pending'),
+  decisionNotes: text('decision_notes'),
+  reviewedByUserId: uuid('reviewed_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+  submittedAt: timestamp('submitted_at', { withTimezone: true }).notNull().defaultNow(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const institutionSubmissions = pgTable('institution_submissions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  institutionId: uuid('institution_id').notNull().references(() => heiInstitutions.id, { onDelete: 'cascade' }),
+  submittedByEmail: varchar('submitted_by_email', { length: 255 }).notNull(),
+  submissionStatus: varchar('submission_status', { length: 30 }).notNull().default('submitted'),
+  notes: text('notes'),
+  submittedAt: timestamp('submitted_at', { withTimezone: true }).notNull().defaultNow(),
+  reviewedByUserId: uuid('reviewed_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+  methodologyVersion: varchar('methodology_version', { length: 10 }).notNull().default('v0.4')
+});
+
+export const institutionSubmissionScores = pgTable('institution_submission_scores', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  submissionId: uuid('submission_id').notNull().references(() => institutionSubmissions.id, { onDelete: 'cascade' }),
+  dimensionId: varchar('dimension_id', { length: 50 }).notNull(),
+  proposedScore: text('proposed_score').notNull(),
+  evidenceUrl: text('evidence_url').notNull(),
+  evidenceDescription: text('evidence_description'),
+  adminDecision: varchar('admin_decision', { length: 20 }).notNull().default('pending'),
+  adminAcceptedScore: text('admin_accepted_score'),
+  adminNotes: text('admin_notes'),
+  reviewedAt: timestamp('reviewed_at', { withTimezone: true })
+});
+
+export const heiFindings = pgTable('hei_findings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  institutionId: uuid('institution_id').notNull().references(() => heiInstitutions.id, { onDelete: 'cascade' }),
+  dimensionId: varchar('dimension_id', { length: 50 }),
+  findingTitle: varchar('finding_title', { length: 500 }).notNull(),
+  findingBody: text('finding_body').notNull(),
+  evidenceSummary: text('evidence_summary').notNull(),
+  proposedScoreImpact: text('proposed_score_impact'),
+  status: varchar('status', { length: 30 }).notNull().default('draft'),
+  noticeSentAt: timestamp('notice_sent_at', { withTimezone: true }),
+  responseWindowEndsAt: timestamp('response_window_ends_at', { withTimezone: true }),
+  institutionResponse: text('institution_response'),
+  institutionResponseAt: timestamp('institution_response_at', { withTimezone: true }),
+  responseQualityScore: integer('response_quality_score'),
+  d7Modifier: text('d7_modifier'),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+  createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+});
