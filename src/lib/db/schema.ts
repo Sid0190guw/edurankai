@@ -671,3 +671,18 @@ export const userRoleAssignments = pgTable('user_role_assignments', {
   assignedByUserId: uuid('assigned_by_user_id').references(() => users.id, { onDelete: 'set null' }),
   assignedAt: timestamp('assigned_at', { withTimezone: true }).notNull().defaultNow()
 });
+
+// =========================================================================
+// Brand profiles (for offer letters across EduRankAI and partner products)
+// =========================================================================
+export const brandProfiles = pgTable('brand_profiles', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  slug: varchar('slug', { length: 60 }).notNull().unique(),
+  name: varchar('name', { length: 120 }).notNull(),
+  tagline: varchar('tagline', { length: 200 }),
+  primaryColor: varchar('primary_color', { length: 20 }).notNull().default('#FF4F00'),
+  domain: varchar('domain', { length: 120 }),
+  isActive: boolean('is_active').notNull().default(true),
+  sortOrder: integer('sort_order').notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
