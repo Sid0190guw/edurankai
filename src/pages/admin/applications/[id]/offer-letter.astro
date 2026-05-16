@@ -2,6 +2,7 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { applications, offerLetters, users } from '@/lib/db/schema';
+import { generateInternalHandle } from '@/lib/auth/handle';
 import { eq } from 'drizzle-orm';
 
 const user = Astro.locals.user;
@@ -47,14 +48,22 @@ function genPassword(): string {
   return p;
 }
 
-async function createUserAccount(email: string, fullName: string, plaintextPw: string, templateType: string): Promise<string | null> {
+async function createUserAccount(email: string, fullName: string, plaintextPw: string, templateType: string): Promise<{userId: string, handle: string} | null> {
   try {
     const { hashPassword } = await import('@/lib/auth/password');
     const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
     if (existing.length > 0) {
       const hashed = await hashPassword(plaintextPw);
       await db.update(users).set({ passwordHash: hashed, updatedAt: new Date() }).where(eq(users.id, existing[0].id));
-      return existing[0].id;
+      const existingUserId = existing[0].id;
+      // Get or generate handle for existing user
+      const u = await db.select({ h: users.internalHandle, n: users.name }).from(users).where(eq(users.id, existingUserId)).limit(1);
+      let handle = u[0]?.h || null;
+      if (!handle) {
+        handle = await generateInternalHandle(fullName);
+        await db.update(users).set({ internalHandle: handle }).where(eq(users.id, existingUserId));
+      }
+      return { userId: existingUserId, handle };
     }
     let role: any = 'editor';
     if (templateType === 'leadership') role = 'super_admin';
@@ -66,7 +75,11 @@ async function createUserAccount(email: string, fullName: string, plaintextPw: s
       role,
       isActive: true
     }).returning({ id: users.id });
-    return inserted[0]?.id || null;
+    const newUserId = inserted[0]?.id;
+    if (!newUserId) return null;
+    const handle = await generateInternalHandle(fullName);
+    await db.update(users).set({ internalHandle: handle }).where(eq(users.id, newUserId));
+    return { userId: newUserId, handle };
   } catch (e) {
     console.error('createUserAccount failed:', e);
     return null;
@@ -128,7 +141,9 @@ if (Astro.request.method === 'POST') {
         } else {
           const token = genToken();
           const plaintextPw = genPassword();
-          const createdUserId = await createUserAccount(candidateEmail, candidateName, plaintextPw, templateType);
+          const accountResult = await createUserAccount(candidateEmail, candidateName, plaintextPw, templateType);
+          const createdUserId = accountResult?.userId || null;
+          const internalHandle = accountResult?.handle || null;
 
           await db.insert(offerLetters).values({
             token,
@@ -150,7 +165,7 @@ if (Astro.request.method === 'POST') {
             plaintextPassword: plaintextPw,
             createdUserId: createdUserId
           });
-          successMsg = 'Offer created. Token: ' + token + '. Account created with login: ' + candidateEmail;
+          successMsg = 'Offer created. Token: ' + token + '. Login: ' + candidateEmail + (internalHandle ? ' OR ' + internalHandle : '');
         }
       }
     } else if (action === 'withdraw' && existingOffer) {

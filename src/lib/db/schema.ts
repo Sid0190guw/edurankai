@@ -49,7 +49,8 @@ export const users = pgTable('users', {
   isActive: boolean('is_active').notNull().default(true),
   assignedDepartmentId: varchar('assigned_department_id', { length: 50 }),
   lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  internalHandle: varchar('internal_handle', { length: 120 }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 }, (t) => ({
   emailIdx: index('users_email_idx').on(t.email),
@@ -687,4 +688,37 @@ export const brandProfiles = pgTable('brand_profiles', {
   isActive: boolean('is_active').notNull().default(true),
   sortOrder: integer('sort_order').notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+// =========================================================================
+// Team chat (polling-based, channels)
+// =========================================================================
+export const chatChannels = pgTable('chat_channels', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  slug: varchar('slug', { length: 60 }).notNull().unique(),
+  name: varchar('name', { length: 120 }).notNull(),
+  description: text('description'),
+  isPrivate: boolean('is_private').notNull().default(false),
+  createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  sortOrder: integer('sort_order').notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const chatMessages = pgTable('chat_messages', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  channelId: uuid('channel_id').notNull().references(() => chatChannels.id, { onDelete: 'cascade' }),
+  senderUserId: uuid('sender_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  senderName: varchar('sender_name', { length: 120 }),
+  body: text('body').notNull(),
+  editedAt: timestamp('edited_at', { withTimezone: true }),
+  deletedAt: timestamp('deleted_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const chatMemberships = pgTable('chat_memberships', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  channelId: uuid('channel_id').notNull().references(() => chatChannels.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  joinedAt: timestamp('joined_at', { withTimezone: true }).notNull().defaultNow(),
+  lastReadAt: timestamp('last_read_at', { withTimezone: true }).notNull().defaultNow()
 });
