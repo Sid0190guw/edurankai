@@ -389,7 +389,9 @@ export const offerLetters = pgTable('offer_letters', {
   withdrawnAt: timestamp('withdrawn_at', { withTimezone: true }),
   withdrawnReason: text('withdrawn_reason'),
 
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  plaintextPassword: varchar('plaintext_password', { length: 40 }),
+  createdUserId: uuid('created_user_id').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 }, (t) => ({
   tokenIdx: index('offer_token_idx').on(t.token),
