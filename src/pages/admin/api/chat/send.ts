@@ -36,11 +36,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
       }
     }
 
+    const messageCode = 'MSG-' + Math.random().toString(36).substring(2, 10).toUpperCase();
     const inserted = await db.insert(chatMessages).values({
       channelId: channel[0].id,
       senderUserId: user.id,
       senderName: user.name || user.email,
-      body: text
+      body: text,
+      messageCode
     }).returning({ id: chatMessages.id, createdAt: chatMessages.createdAt });
 
     return new Response(JSON.stringify({ ok: true, message: inserted[0] }), {

@@ -330,6 +330,7 @@ export const applicationMessages = pgTable('application_messages', {
   senderRole: varchar('sender_role', { length: 20 }).notNull(),
   senderName: varchar('sender_name', { length: 200 }),
   body: text('body').notNull(),
+  messageCode: varchar('message_code', { length: 20 }),
   isSystem: boolean('is_system').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
 }, (t) => ({
@@ -417,6 +418,7 @@ export const adminMessages = pgTable('admin_messages', {
   conversationId: uuid('conversation_id').notNull().references(() => adminConversations.id, { onDelete: 'cascade' }),
   senderUserId: uuid('sender_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   body: text('body').notNull(),
+  messageCode: varchar('message_code', { length: 20 }),
   readByRecipient: boolean('read_by_recipient').notNull().default(false),
   readAt: timestamp('read_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
@@ -481,6 +483,7 @@ export const heiStories = pgTable('hei_stories', {
   headline: varchar('headline', { length: 500 }).notNull(),
   deck: text('deck'),
   body: text('body').notNull(),
+  messageCode: varchar('message_code', { length: 20 }),
   category: varchar('category', { length: 50 }).notNull().default('investigation'),
   institutionId: uuid('institution_id').references(() => heiInstitutions.id, { onDelete: 'set null' }),
   authorUserId: uuid('author_user_id').references(() => users.id, { onDelete: 'set null' }),
@@ -699,6 +702,7 @@ export const chatChannels = pgTable('chat_channels', {
   name: varchar('name', { length: 120 }).notNull(),
   description: text('description'),
   isPrivate: boolean('is_private').notNull().default(false),
+  isDm: boolean('is_dm').notNull().default(false),
   createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
   sortOrder: integer('sort_order').notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
@@ -710,6 +714,7 @@ export const chatMessages = pgTable('chat_messages', {
   senderUserId: uuid('sender_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   senderName: varchar('sender_name', { length: 120 }),
   body: text('body').notNull(),
+  messageCode: varchar('message_code', { length: 20 }),
   editedAt: timestamp('edited_at', { withTimezone: true }),
   deletedAt: timestamp('deleted_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
@@ -721,4 +726,26 @@ export const chatMemberships = pgTable('chat_memberships', {
   userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   joinedAt: timestamp('joined_at', { withTimezone: true }).notNull().defaultNow(),
   lastReadAt: timestamp('last_read_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const chatAttachments = pgTable('chat_attachments', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  messageId: uuid('message_id').notNull().references(() => chatMessages.id, { onDelete: 'cascade' }),
+  blobUrl: text('blob_url').notNull(),
+  fileName: varchar('file_name', { length: 300 }),
+  fileSize: integer('file_size'),
+  mimeType: varchar('mime_type', { length: 120 }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const chatAuditLog = pgTable('chat_audit_log', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  accessedByUserId: uuid('accessed_by_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  accessedChannelId: uuid('accessed_channel_id').references(() => chatChannels.id, { onDelete: 'set null' }),
+  accessedMessageId: uuid('accessed_message_id').references(() => chatMessages.id, { onDelete: 'set null' }),
+  reason: text('reason'),
+  action: varchar('action', { length: 40 }).notNull().default('view'),
+  ipAddress: varchar('ip_address', { length: 50 }),
+  userAgent: text('user_agent'),
+  accessedAt: timestamp('accessed_at', { withTimezone: true }).notNull().defaultNow()
 });
