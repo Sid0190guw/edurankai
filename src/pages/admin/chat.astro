@@ -1,0 +1,217 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { chatChannels } from '@/lib/db/schema';
+import { asc } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const channels = await db.select().from(chatChannels).orderBy(asc(chatChannels.sortOrder), asc(chatChannels.name));
+
+const url = new URL(Astro.request.url);
+const activeChannel = url.searchParams.get('c') || (channels[0]?.slug || 'general');
+const currentChannel = channels.find(c => c.slug === activeChannel) || channels[0];
+
+const currentUserPayload = JSON.stringify({
+  id: user.id,
+  name: user.name || user.email,
+  email: user.email
+});
+---
+<AdminLayout title="Team Chat" description="Internal team chat">
+  <div class="admin-page" style="max-width:100%;padding:0;">
+    <div id="chatRoot" style="display:grid;grid-template-columns:240px 1fr;gap:0;height:calc(100vh - 70px);background:#0a0a0c;border-radius:0;overflow:hidden;border-top:1px solid #1f1f26;">
+
+      <!-- CHANNELS SIDEBAR -->
+      <aside style="background:#08080a;border-right:1px solid #1f1f26;overflow-y:auto;">
+        <div style="padding:14px 14px 8px;border-bottom:1px solid #1f1f26;">
+          <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;font-weight:700;text-transform:uppercase;">Team Chat</p>
+          <p style="font-size:11px;color:#6e6e78;margin-top:2px;">{channels.length} channels</p>
+        </div>
+        <div style="padding:8px 0;">
+          {channels.map((c) => (
+            <a href={'/admin/chat?c=' + c.slug} style={'display:block;padding:8px 14px;text-decoration:none;font-size:13px;border-left:3px solid ' + (c.slug === activeChannel ? '#FF4F00;background:rgba(255,79,0,0.08);color:#fff' : 'transparent;color:#a0a0ab') + ';transition:all 0.12s;'}>
+              <span style="color:#6e6e78;">#</span> {c.name}
+            </a>
+          ))}
+        </div>
+      </aside>
+
+      <!-- MESSAGE THREAD + COMPOSER -->
+      <section style="display:flex;flex-direction:column;background:#0a0a0c;min-width:0;">
+        <header style="padding:14px 18px;border-bottom:1px solid #1f1f26;background:#0a0a0c;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+            <div>
+              <h1 style="font-size:16px;font-weight:600;color:#fff;margin:0;"><span style="color:#6e6e78;">#</span> {currentChannel?.name || activeChannel}</h1>
+              {currentChannel?.description && <p style="font-size:11.5px;color:#6e6e78;margin-top:2px;">{currentChannel.description}</p>}
+            </div>
+            <p style="font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;"><span id="connectionStatus">Live</span></p>
+          </div>
+        </header>
+
+        <div id="messageStream" style="flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:14px;">
+          <p style="text-align:center;color:#6e6e78;font-size:12px;padding:20px 0;" id="emptyState">Loading messages...</p>
+        </div>
+
+        <footer style="padding:12px 18px;border-top:1px solid #1f1f26;background:#0a0a0c;">
+          <form id="sendForm" style="display:flex;gap:8px;align-items:flex-end;">
+            <textarea id="composerInput" rows="1" placeholder={'Message #' + (currentChannel?.name || activeChannel)} style="flex:1;background:#15151a;border:1px solid #1f1f26;border-radius:8px;padding:9px 12px;color:#fff;font-size:13.5px;font-family:inherit;outline:none;resize:none;max-height:140px;min-height:38px;line-height:1.4;"></textarea>
+            <button type="submit" id="sendBtn" style="background:#FF4F00;border:none;border-radius:8px;padding:9px 18px;color:#fff;font-weight:600;font-size:13px;cursor:pointer;">Send</button>
+          </form>
+          <p style="font-size:10px;color:#6e6e78;margin-top:6px;">Press <kbd style="background:#15151a;border:1px solid #1f1f26;padding:1px 5px;border-radius:3px;font-size:9.5px;">Enter</kbd> to send · <kbd style="background:#15151a;border:1px solid #1f1f26;padding:1px 5px;border-radius:3px;font-size:9.5px;">Shift+Enter</kbd> for new line · Polls every 3s</p>
+        </footer>
+      </section>
+    </div>
+  </div>
+
+  <script is:inline define:vars={{ channel: activeChannel, me: currentUserPayload }}>
+    (function() {
+      var currentUser = JSON.parse(me);
+      var stream = document.getElementById('messageStream');
+      var emptyState = document.getElementById('emptyState');
+      var input = document.getElementById('composerInput');
+      var form = document.getElementById('sendForm');
+      var sendBtn = document.getElementById('sendBtn');
+      var statusEl = document.getElementById('connectionStatus');
+
+      var seenIds = {};
+      var lastTs = null;
+      var pollTimer = null;
+
+      function formatTime(iso) {
+        try {
+          var d = new Date(iso);
+          return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+        } catch (e) { return ''; }
+      }
+      function formatDate(iso) {
+        try {
+          var d = new Date(iso);
+          var today = new Date();
+          var sameDay = d.toDateString() === today.toDateString();
+          if (sameDay) return 'Today';
+          return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+        } catch (e) { return ''; }
+      }
+      function escapeHtml(s) {
+        return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br/>');
+      }
+
+      function renderMessage(m) {
+        if (seenIds[m.id]) return;
+        seenIds[m.id] = true;
+        if (emptyState) { emptyState.style.display = 'none'; }
+
+        var isMe = m.senderUserId === currentUser.id;
+        var bubble = document.createElement('div');
+        bubble.style.cssText = 'display:flex;flex-direction:column;align-items:' + (isMe ? 'flex-end' : 'flex-start') + ';';
+
+        var meta = document.createElement('div');
+        meta.style.cssText = 'font-size:10.5px;color:#6e6e78;margin-bottom:3px;font-family:Geist Mono,monospace;';
+        meta.textContent = (isMe ? 'You' : (m.senderName || '?')) + ' · ' + formatTime(m.createdAt);
+        bubble.appendChild(meta);
+
+        var body = document.createElement('div');
+        body.style.cssText = 'max-width:75%;padding:9px 13px;border-radius:14px;font-size:13.5px;line-height:1.5;color:' + (isMe ? '#fff' : '#d8d8de') + ';background:' + (isMe ? '#FF4F00' : '#15151a') + ';border:1px solid ' + (isMe ? '#FF4F00' : '#1f1f26') + ';word-wrap:break-word;white-space:pre-wrap;';
+        body.innerHTML = escapeHtml(m.body);
+        bubble.appendChild(body);
+
+        stream.appendChild(bubble);
+        lastTs = m.createdAt;
+      }
+
+      function scrollToBottom() {
+        stream.scrollTop = stream.scrollHeight;
+      }
+
+      function fetchMessages() {
+        var url = '/admin/api/chat/messages?channel=' + encodeURIComponent(channel);
+        if (lastTs) url += '&since=' + encodeURIComponent(lastTs);
+        fetch(url, { credentials: 'same-origin' })
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            statusEl.textContent = 'Live';
+            statusEl.style.color = '#10b981';
+            if (data && data.messages) {
+              var nearBottom = (stream.scrollHeight - stream.scrollTop - stream.clientHeight) < 100;
+              for (var i = 0; i < data.messages.length; i++) {
+                renderMessage(data.messages[i]);
+              }
+              if (data.messages.length > 0) {
+                if (Object.keys(seenIds).length === data.messages.length || nearBottom) {
+                  scrollToBottom();
+                }
+              } else if (Object.keys(seenIds).length === 0 && emptyState) {
+                emptyState.textContent = 'No messages yet. Say hello.';
+              }
+            }
+          })
+          .catch(function(err) {
+            statusEl.textContent = 'Reconnecting...';
+            statusEl.style.color = '#fbbf24';
+          });
+      }
+
+      function sendMessage() {
+        var text = input.value.trim();
+        if (!text) return;
+        sendBtn.disabled = true;
+        sendBtn.textContent = 'Sending...';
+        fetch('/admin/api/chat/send', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel: channel, body: text })
+        })
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            if (data.ok) {
+              input.value = '';
+              input.style.height = 'auto';
+              fetchMessages();
+            } else {
+              alert('Send failed: ' + (data.error || 'unknown'));
+            }
+          })
+          .catch(function(err) {
+            alert('Network error: ' + err.message);
+          })
+          .finally(function() {
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Send';
+            input.focus();
+          });
+      }
+
+      // Auto-grow textarea
+      input.addEventListener('input', function() {
+        input.style.height = 'auto';
+        input.style.height = Math.min(140, input.scrollHeight) + 'px';
+      });
+
+      // Enter to send, Shift+Enter for newline
+      input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+
+      form.addEventListener('submit', function(e) {
+        e.preventDefault();
+        sendMessage();
+      });
+
+      // Initial load + polling
+      fetchMessages();
+      pollTimer = setInterval(fetchMessages, 3000);
+
+      // Clean up on page hide
+      window.addEventListener('beforeunload', function() {
+        if (pollTimer) clearInterval(pollTimer);
+      });
+    })();
+  </script>
+</AdminLayout>
