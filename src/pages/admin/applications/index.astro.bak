@@ -1,0 +1,313 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { applications, users } from '@/lib/db/schema';
+import { eq, desc, sql, and, or, ilike, inArray } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+let errorMsg = '';
+let okMsg = '';
+
+// Action handlers
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'delete_one') {
+      const id = (fd.get('id') as string || '').trim();
+      if (id) {
+        await db.delete(applications).where(eq(applications.id, id));
+        okMsg = 'Application deleted.';
+      }
+    } else if (action === 'bulk_delete' || action === 'bulk_archive' || action === 'bulk_status' || action === 'bulk_assign') {
+      const idsRaw = fd.get('selected_ids') as string;
+      const ids = (idsRaw || '').split(',').map(s => s.trim()).filter(s => s.length > 0);
+      if (ids.length === 0) {
+        errorMsg = 'No applications selected.';
+      } else {
+        if (action === 'bulk_delete') {
+          await db.delete(applications).where(inArray(applications.id, ids));
+          okMsg = 'Deleted ' + ids.length + ' application(s).';
+        } else if (action === 'bulk_archive') {
+          await db.update(applications).set({ isArchived: true }).where(inArray(applications.id, ids));
+          okMsg = 'Archived ' + ids.length + ' application(s).';
+        } else if (action === 'bulk_status') {
+          const newStatus = fd.get('new_status') as string;
+          if (!newStatus) { errorMsg = 'Pick a status to set.'; }
+          else {
+            await db.update(applications).set({ status: newStatus as any }).where(inArray(applications.id, ids));
+            okMsg = 'Set status "' + newStatus + '" on ' + ids.length + ' application(s).';
+          }
+        } else if (action === 'bulk_assign') {
+          const reviewerId = (fd.get('reviewer_id') as string || '').trim() || null;
+          await db.update(applications).set({ assignedReviewerId: reviewerId }).where(inArray(applications.id, ids));
+          okMsg = reviewerId ? 'Assigned reviewer to ' + ids.length + ' app(s).' : 'Cleared reviewer on ' + ids.length + ' app(s).';
+        }
+      }
+    } else if (action === 'unarchive_one') {
+      const id = (fd.get('id') as string || '').trim();
+      if (id) {
+        await db.update(applications).set({ isArchived: false }).where(eq(applications.id, id));
+        okMsg = 'Unarchived.';
+      }
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const statusFilter = url.searchParams.get('status') || 'all';
+const search = url.searchParams.get('q') || '';
+const reviewerFilter = url.searchParams.get('reviewer') || '';
+const archivedFilter = url.searchParams.get('archived') || 'active';
+const exportCsv = url.searchParams.get('export') === 'csv';
+
+const conditions = [];
+if (statusFilter !== 'all') conditions.push(eq(applications.status, statusFilter as any));
+if (reviewerFilter === 'unassigned') conditions.push(sql`${applications.assignedReviewerId} IS NULL`);
+else if (reviewerFilter && reviewerFilter !== 'all') conditions.push(eq(applications.assignedReviewerId, reviewerFilter));
+if (archivedFilter === 'archived') conditions.push(eq(applications.isArchived, true));
+else if (archivedFilter === 'active') conditions.push(eq(applications.isArchived, false));
+if (search.trim()) {
+  const term = '%' + search.trim() + '%';
+  conditions.push(or(
+    ilike(applications.firstName, term),
+    ilike(applications.lastName, term),
+    ilike(applications.email, term),
+    ilike(applications.roleTitleSnapshot, term),
+    ilike(applications.city, term)
+  ));
+}
+const whereClause = conditions.length > 0 ? (conditions.length === 1 ? conditions[0] : and(...conditions)) : undefined;
+
+const apps = whereClause
+  ? await db.select().from(applications).where(whereClause).orderBy(desc(applications.createdAt)).limit(500)
+  : await db.select().from(applications).orderBy(desc(applications.createdAt)).limit(500);
+
+// CSV export
+if (exportCsv) {
+  const headers = ['id','application_number','first_name','last_name','email','phone','city','role_title','department','level','status','assigned_reviewer_id','is_archived','created_at'];
+  const rows = apps.map(a => headers.map(h => {
+    const key = h.replace(/_([a-z])/g, (_, c) => c.toUpperCase()) as keyof typeof a;
+    const v = a[key] as any;
+    if (v === null || v === undefined) return '';
+    const s = String(v).replace(/"/g, '""');
+    return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s + '"' : s;
+  }).join(','));
+  const csv = headers.join(',') + '\n' + rows.join('\n');
+  return new Response(csv, {
+    headers: {
+      'Content-Type': 'text/csv',
+      'Content-Disposition': 'attachment; filename="applications-' + new Date().toISOString().split('T')[0] + '.csv"'
+    }
+  });
+}
+
+// Counts (active only)
+const counts = await db.select({
+  status: applications.status,
+  count: sql<number>`count(*)::int`
+}).from(applications).where(eq(applications.isArchived, false)).groupBy(applications.status);
+const countMap: Record<string, number> = {};
+let totalActive = 0;
+counts.forEach((c) => { countMap[c.status] = c.count; totalActive += c.count; });
+
+const archivedCount = (await db.select({ c: sql<number>`count(*)::int` }).from(applications).where(eq(applications.isArchived, true)))[0]?.c || 0;
+
+// Reviewers list (admin users)
+const reviewers = await db.select({ id: users.id, name: users.name, role: users.role }).from(users).where(sql`${users.role} <> 'applicant' AND ${users.role} <> 'institution_admin' AND ${users.isActive} = true`).orderBy(users.name);
+const reviewerMap = Object.fromEntries(reviewers.map(r => [r.id, r.name]));
+
+const STATUS_OPTIONS = [
+  { value: 'all', label: 'All' },
+  { value: 'submitted', label: 'Submitted' },
+  { value: 'reviewing', label: 'Reviewing' },
+  { value: 'task_sent', label: 'Task Sent' },
+  { value: 'interview', label: 'Interview' },
+  { value: 'offer', label: 'Offer' },
+  { value: 'hired', label: 'Hired' },
+  { value: 'rejected', label: 'Rejected' },
+  { value: 'withdrawn', label: 'Withdrawn' }
+];
+
+const statusColors: Record<string, string> = {
+  submitted: 'bg-sky-bg text-sky border-sky-border',
+  reviewing: 'bg-burn-pale text-burn border-burn-dim',
+  task_sent: 'bg-gold-bg text-gold-deep border-gold-border',
+  interview: 'bg-plum-bg text-plum border-plum-border',
+  offer: 'bg-leaf-bg text-leaf border-leaf-border',
+  hired: 'bg-leaf-bg text-leaf border-leaf-border',
+  rejected: 'bg-ink/5 text-ink-soft border-ink/15',
+  withdrawn: 'bg-ink/5 text-ink-soft border-ink/15'
+};
+
+function buildQs(overrides: Record<string, string>): string {
+  const p = new URLSearchParams();
+  const current = { status: statusFilter, q: search, reviewer: reviewerFilter, archived: archivedFilter, ...overrides };
+  for (const [k, v] of Object.entries(current)) if (v && v !== 'all') p.set(k, v);
+  const s = p.toString();
+  return s ? '?' + s : '';
+}
+---
+<AdminLayout title="Applications" activeNav="applications">
+  <div class="admin-page" style="max-width:1500px;">
+
+    <div class="admin-page-header" style="margin-bottom:18px;display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">Career Submissions</div>
+        <h1 class="admin-page-title">Applications</h1>
+        <p class="admin-page-sub">{totalActive} active · {archivedCount} archived · {apps.length} shown</p>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <a href={'/admin/applications' + buildQs({ export: 'csv' })} class="admin-btn" style="padding:7px 12px;font-size:11px;text-decoration:none;">↓ Export CSV</a>
+        <a href="/admin/applications/new" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;text-decoration:none;">+ New</a>
+      </div>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{okMsg}</div>}
+
+    <!-- FILTERS -->
+    <form method="GET" class="admin-card" style="padding:12px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px;align-items:end;">
+      <div style="flex:1;min-width:180px;"><label class="rfl">Search</label><input name="q" value={search} placeholder="Name, email, role, city..." class="rfi" /></div>
+      <div style="min-width:140px;"><label class="rfl">Status</label>
+        <select name="status" class="rfi">
+          {STATUS_OPTIONS.map((o) => <option value={o.value} selected={statusFilter === o.value}>{o.label}</option>)}
+        </select>
+      </div>
+      <div style="min-width:160px;"><label class="rfl">Reviewer</label>
+        <select name="reviewer" class="rfi">
+          <option value="">All</option>
+          <option value="unassigned" selected={reviewerFilter === 'unassigned'}>Unassigned</option>
+          {reviewers.map((r) => <option value={r.id} selected={reviewerFilter === r.id}>{r.name}</option>)}
+        </select>
+      </div>
+      <div style="min-width:120px;"><label class="rfl">Archived</label>
+        <select name="archived" class="rfi">
+          <option value="active" selected={archivedFilter === 'active'}>Active</option>
+          <option value="archived" selected={archivedFilter === 'archived'}>Archived</option>
+          <option value="all" selected={archivedFilter === 'all'}>Both</option>
+        </select>
+      </div>
+      <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;">Filter</button>
+      {(statusFilter !== 'all' || search || reviewerFilter || archivedFilter !== 'active') && <a href="/admin/applications" class="admin-btn" style="padding:7px 14px;font-size:11px;text-decoration:none;display:flex;align-items:center;">Clear</a>}
+    </form>
+
+    <!-- BULK ACTION BAR -->
+    <form method="POST" class="admin-card" style="padding:10px 14px;margin-bottom:14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+      <input type="hidden" name="selected_ids" id="selected_ids" value="" />
+      <span style="font-size:11px;color:#6e6e78;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;">Bulk:</span>
+
+      <select name="new_status" class="rfi" style="padding:5px 8px;font-size:10.5px;width:auto;min-width:120px;">
+        <option value="">— set status —</option>
+        {STATUS_OPTIONS.filter(o => o.value !== 'all').map((o) => <option value={o.value}>{o.label}</option>)}
+      </select>
+      <button type="submit" name="_action" value="bulk_status" class="admin-btn" style="padding:5px 10px;font-size:10.5px;">Apply status</button>
+
+      <select name="reviewer_id" class="rfi" style="padding:5px 8px;font-size:10.5px;width:auto;min-width:140px;">
+        <option value="">— unassign —</option>
+        {reviewers.map((r) => <option value={r.id}>{r.name}</option>)}
+      </select>
+      <button type="submit" name="_action" value="bulk_assign" class="admin-btn" style="padding:5px 10px;font-size:10.5px;">Assign reviewer</button>
+
+      <button type="submit" name="_action" value="bulk_archive" class="admin-btn" style="padding:5px 10px;font-size:10.5px;">Archive</button>
+      <button type="submit" name="_action" value="bulk_delete" class="admin-btn" style="padding:5px 10px;font-size:10.5px;color:#fca5a5;" onclick="return confirm('Permanently delete selected applications?');">Delete</button>
+
+      <span id="selectedCount" style="font-size:11px;color:#a0a0ab;margin-left:auto;">0 selected</span>
+    </form>
+
+    <!-- STATUS CHIPS -->
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;">
+      {STATUS_OPTIONS.map((o) => {
+        const isActive = statusFilter === o.value;
+        const count = o.value === 'all' ? totalActive : (countMap[o.value] || 0);
+        return (
+          <a href={'/admin/applications' + buildQs({ status: o.value })} style={'font-size:10.5px;padding:5px 10px;border-radius:100px;text-decoration:none;border:1px solid ' + (isActive ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>{o.label} ({count})</a>
+        );
+      })}
+    </div>
+
+    {apps.length === 0 && <div class="admin-card" style="padding:30px;text-align:center;color:#6e6e78;font-size:13px;">No applications match.</div>}
+
+    <div class="admin-card" style="padding:0;overflow:hidden;">
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th style="width:30px;"><input type="checkbox" id="selectAll" style="accent-color:#FF4F00;" /></th>
+            <th>Applicant</th>
+            <th>Role</th>
+            <th>Status</th>
+            <th>Reviewer</th>
+            <th>When</th>
+            <th style="text-align:right;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {apps.map((a) => {
+            const shortId = a.id.substring(0, 8).toUpperCase();
+            const fullName = ((a.firstName || '') + ' ' + (a.lastName || '')).trim() || a.email;
+            const createdDate = new Date(a.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+            const reviewerName = a.assignedReviewerId ? (reviewerMap[a.assignedReviewerId] || '?') : null;
+            return (
+              <tr style={a.isArchived ? 'opacity:0.55;' : ''}>
+                <td><input type="checkbox" class="row-check" data-id={a.id} style="accent-color:#FF4F00;" /></td>
+                <td>
+                  <div style="font-weight:500;color:#fff;font-size:12.5px;">{fullName}</div>
+                  <div style="font-size:10.5px;color:#6e6e78;margin-top:2px;font-family:'Geist Mono',monospace;">{shortId} · {a.email}</div>
+                </td>
+                <td><span style="font-size:11.5px;color:#a0a0ab;">{a.roleTitleSnapshot || '—'}</span>{a.level && <span style="font-size:10px;color:#6e6e78;margin-left:6px;">({a.level})</span>}</td>
+                <td><span style="font-size:10.5px;color:#FF7040;text-transform:uppercase;letter-spacing:0.05em;">{a.status}</span></td>
+                <td><span style="font-size:11px;color:#a0a0ab;">{reviewerName || <span style="color:#6e6e78;font-style:italic;">—</span>}</span></td>
+                <td><span style="font-size:11px;color:#6e6e78;font-family:'Geist Mono',monospace;">{createdDate}</span></td>
+                <td style="text-align:right;">
+                  <div style="display:flex;gap:4px;justify-content:flex-end;">
+                    <a href={'/admin/applications/' + a.id} class="admin-btn" style="padding:3px 8px;font-size:10px;text-decoration:none;">View</a>
+                    {a.isArchived ? (
+                      <form method="POST" style="margin:0;display:inline;">
+                        <input type="hidden" name="_action" value="unarchive_one" />
+                        <input type="hidden" name="id" value={a.id} />
+                        <button type="submit" class="admin-btn" style="padding:3px 8px;font-size:10px;">Unarchive</button>
+                      </form>
+                    ) : null}
+                    <form method="POST" style="margin:0;display:inline;" onsubmit="return confirm('Delete this application permanently?');">
+                      <input type="hidden" name="_action" value="delete_one" />
+                      <input type="hidden" name="id" value={a.id} />
+                      <button type="submit" class="admin-btn" style="padding:3px 8px;font-size:10px;color:#fca5a5;">Del</button>
+                    </form>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script is:inline>
+    (function() {
+      const selectAll = document.getElementById('selectAll');
+      const checks = Array.from(document.querySelectorAll('.row-check'));
+      const idsInput = document.getElementById('selected_ids');
+      const countLabel = document.getElementById('selectedCount');
+      function updateSelected() {
+        const selected = checks.filter(c => c.checked).map(c => c.dataset.id);
+        idsInput.value = selected.join(',');
+        countLabel.textContent = selected.length + ' selected';
+      }
+      if (selectAll) selectAll.addEventListener('change', function() { checks.forEach(c => c.checked = selectAll.checked); updateSelected(); });
+      checks.forEach(c => c.addEventListener('change', updateSelected));
+    })();
+  </script>
+
+  <style>
+    .rfl { display:block;font-size:10px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px; }
+    .rfi { width:100%;padding:7px 10px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:12px;font-family:inherit;outline:none; }
+    .rfi:focus { border-color:#FF4F00; }
+  </style>
+</AdminLayout>
