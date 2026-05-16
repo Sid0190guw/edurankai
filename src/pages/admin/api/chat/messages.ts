@@ -16,6 +16,16 @@ export const GET: APIRoute = async ({ request, locals }) => {
     return new Response(JSON.stringify({ error: 'channel not found' }), { status: 404 });
   }
 
+  // Private channel? Check membership
+  if (channel[0].isPrivate) {
+    const { chatMemberships } = await import('@/lib/db/schema');
+    const member = await db.select({ id: chatMemberships.id }).from(chatMemberships)
+      .where(and(eq(chatMemberships.channelId, channel[0].id), eq(chatMemberships.userId, user.id))).limit(1);
+    if (member.length === 0) {
+      return new Response(JSON.stringify({ error: 'not a member of this private channel' }), { status: 403 });
+    }
+  }
+
   const conditions = [eq(chatMessages.channelId, channel[0].id), isNull(chatMessages.deletedAt)];
   if (sinceIso) {
     const since = new Date(sinceIso);

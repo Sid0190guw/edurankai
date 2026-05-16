@@ -24,6 +24,18 @@ export const POST: APIRoute = async ({ request, locals }) => {
       return new Response(JSON.stringify({ error: 'channel not found' }), { status: 404 });
     }
 
+    // Need to re-query channel with isPrivate column
+    const fullCh = await db.select().from(chatChannels).where(eq(chatChannels.id, channel[0].id)).limit(1);
+    if (fullCh[0].isPrivate) {
+      const { chatMemberships } = await import('@/lib/db/schema');
+      const { and } = await import('drizzle-orm');
+      const m = await db.select({ id: chatMemberships.id }).from(chatMemberships)
+        .where(and(eq(chatMemberships.channelId, fullCh[0].id), eq(chatMemberships.userId, user.id))).limit(1);
+      if (m.length === 0) {
+        return new Response(JSON.stringify({ error: 'not a member' }), { status: 403 });
+      }
+    }
+
     const inserted = await db.insert(chatMessages).values({
       channelId: channel[0].id,
       senderUserId: user.id,
