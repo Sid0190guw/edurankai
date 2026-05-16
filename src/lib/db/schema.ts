@@ -185,7 +185,9 @@ export const applications = pgTable('applications', {
   rawSubmission: jsonb('raw_submission').$type<Record<string, any>>(),
   ipAddress: varchar('ip_address', { length: 64 }),
   userAgent: text('user_agent'),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  assignedReviewerId: uuid('assigned_reviewer_id'),
+  isArchived: boolean('is_archived').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 }, (t) => ({
   emailIdx: index('apps_email_idx').on(t.email),
