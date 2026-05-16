@@ -636,3 +636,36 @@ export const heiFindings = pgTable('hei_findings', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 });
+
+// =========================================================================
+// Dynamic role system (additive — coexists with hardcoded role enum)
+// =========================================================================
+
+export const teamRoles = pgTable('team_roles', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  name: varchar('name', { length: 80 }).notNull().unique(),
+  description: text('description'),
+  color: varchar('color', { length: 20 }).notNull().default('orange'),
+  isSystem: boolean('is_system').notNull().default(false),
+  createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
+});
+
+export const rolePermissions = pgTable('role_permissions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  roleId: uuid('role_id').notNull().references(() => teamRoles.id, { onDelete: 'cascade' }),
+  pageKey: varchar('page_key', { length: 80 }).notNull(),
+  canView: boolean('can_view').notNull().default(false),
+  canEdit: boolean('can_edit').notNull().default(false),
+  canDelete: boolean('can_delete').notNull().default(false),
+  canExport: boolean('can_export').notNull().default(false)
+});
+
+export const userRoleAssignments = pgTable('user_role_assignments', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  roleId: uuid('role_id').notNull().references(() => teamRoles.id, { onDelete: 'cascade' }),
+  assignedByUserId: uuid('assigned_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+  assignedAt: timestamp('assigned_at', { withTimezone: true }).notNull().defaultNow()
+});

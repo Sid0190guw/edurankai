@@ -1,0 +1,358 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { teamRoles, rolePermissions, userRoleAssignments, users } from '@/lib/db/schema';
+import { PAGE_KEYS } from '@/lib/auth/permissions';
+import { eq, asc, sql } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+if (user.role !== 'super_admin' && user.role !== 'hr') return Astro.redirect('/admin');
+
+let errorMsg = '';
+let okMsg = '';
+
+const PAGE_GROUPS = [
+  { label: 'Core Admin', pages: [
+    { key: PAGE_KEYS.DASHBOARD, label: 'Dashboard' },
+    { key: PAGE_KEYS.APPLICATIONS, label: 'Applications' },
+    { key: PAGE_KEYS.MESSAGES, label: 'Team Messages' },
+    { key: PAGE_KEYS.OFFERS, label: 'Offer Letters' },
+    { key: PAGE_KEYS.USERS, label: 'Users' },
+    { key: PAGE_KEYS.ROLES, label: 'Job Roles' },
+    { key: PAGE_KEYS.DEPARTMENTS, label: 'Departments' },
+    { key: PAGE_KEYS.EVENTS, label: 'Events' },
+    { key: PAGE_KEYS.PRODUCTS, label: 'Products' },
+    { key: PAGE_KEYS.CONTENT, label: 'Content Pages' },
+    { key: PAGE_KEYS.AUDIT, label: 'Audit Log' },
+    { key: PAGE_KEYS.SETTINGS, label: 'Settings' }
+  ]},
+  { label: 'HEI · Truth Report', pages: [
+    { key: PAGE_KEYS.HEI_INSTITUTIONS, label: 'Institutions' },
+    { key: PAGE_KEYS.HEI_ENTITY_TYPES, label: 'Entity Types' },
+    { key: PAGE_KEYS.HEI_IMPORT, label: 'CSV Import' },
+    { key: PAGE_KEYS.HEI_SUBMETRICS, label: 'Sub-metrics' },
+    { key: PAGE_KEYS.HEI_V1, label: 'v1.0 Methodology' },
+    { key: PAGE_KEYS.HEI_STORIES, label: 'Stories' },
+    { key: PAGE_KEYS.HEI_CLAIMS, label: 'Institution Claims' },
+    { key: PAGE_KEYS.HEI_SUBMISSIONS, label: 'Submissions' },
+    { key: PAGE_KEYS.HEI_FINDINGS, label: 'Findings' }
+  ]},
+  { label: 'Team Management', pages: [
+    { key: PAGE_KEYS.TEAM_ROLES, label: 'Custom Roles' }
+  ]}
+];
+
+const COLORS = ['orange', 'blue', 'green', 'purple', 'red', 'gold', 'pink'];
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('_action') as string;
+
+  try {
+    if (action === 'create_role' || action === 'update_role') {
+      const id = (fd.get('id') as string || '').trim();
+      const name = (fd.get('name') as string || '').trim();
+      const description = (fd.get('description') as string || '').trim() || null;
+      const color = (fd.get('color') as string || 'orange').trim();
+
+      if (!name || name.length < 2) {
+        errorMsg = 'Role name required (min 2 chars).';
+      } else if (action === 'create_role') {
+        const exists = await db.select({ id: teamRoles.id }).from(teamRoles).where(eq(teamRoles.name, name)).limit(1);
+        if (exists.length > 0) {
+          errorMsg = 'Role name already exists.';
+        } else {
+          await db.insert(teamRoles).values({ name, description, color, createdByUserId: user.id });
+          okMsg = 'Role "' + name + '" created.';
+        }
+      } else {
+        await db.update(teamRoles).set({ name, description, color, updatedAt: new Date() }).where(eq(teamRoles.id, id));
+        okMsg = 'Role updated.';
+      }
+    } else if (action === 'delete_role') {
+      const id = (fd.get('id') as string || '').trim();
+      if (id) {
+        await db.delete(teamRoles).where(eq(teamRoles.id, id));
+        okMsg = 'Role deleted (assignments + permissions cascade).';
+      }
+    } else if (action === 'save_permissions') {
+      const roleId = (fd.get('role_id') as string || '').trim();
+      if (!roleId) {
+        errorMsg = 'No role selected.';
+      } else {
+        // Wipe existing perms for this role
+        await db.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
+
+        // Insert checked permissions
+        const allPageKeys = PAGE_GROUPS.flatMap(g => g.pages.map(p => p.key));
+        for (const pk of allPageKeys) {
+          const canView = fd.get('perm_' + pk + '_view') === 'on';
+          const canEdit = fd.get('perm_' + pk + '_edit') === 'on';
+          const canDelete = fd.get('perm_' + pk + '_delete') === 'on';
+          const canExport = fd.get('perm_' + pk + '_export') === 'on';
+          if (canView || canEdit || canDelete || canExport) {
+            await db.insert(rolePermissions).values({
+              roleId, pageKey: pk, canView, canEdit, canDelete, canExport
+            });
+          }
+        }
+        okMsg = 'Permissions saved.';
+      }
+    } else if (action === 'assign_user') {
+      const userId = (fd.get('user_id') as string || '').trim();
+      const roleId = (fd.get('role_id') as string || '').trim();
+      if (userId && roleId) {
+        const exists = await db.select().from(userRoleAssignments)
+          .where(sql`${userRoleAssignments.userId} = ${userId} AND ${userRoleAssignments.roleId} = ${roleId}`).limit(1);
+        if (exists.length === 0) {
+          await db.insert(userRoleAssignments).values({ userId, roleId, assignedByUserId: user.id });
+          okMsg = 'User assigned to role.';
+        } else {
+          errorMsg = 'User already has this role.';
+        }
+      }
+    } else if (action === 'unassign_user') {
+      const userId = (fd.get('user_id') as string || '').trim();
+      const roleId = (fd.get('role_id') as string || '').trim();
+      if (userId && roleId) {
+        await db.delete(userRoleAssignments)
+          .where(sql`${userRoleAssignments.userId} = ${userId} AND ${userRoleAssignments.roleId} = ${roleId}`);
+        okMsg = 'Removed from role.';
+      }
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const editingRoleId = url.searchParams.get('edit') || '';
+const showPermsForId = url.searchParams.get('perms') || '';
+const showAssignForId = url.searchParams.get('assign') || '';
+
+const allRoles = await db.select().from(teamRoles).orderBy(asc(teamRoles.name));
+const editingRole = editingRoleId && editingRoleId !== 'new' ? allRoles.find(r => r.id === editingRoleId) : null;
+const permsRole = showPermsForId ? allRoles.find(r => r.id === showPermsForId) : null;
+const assignRole = showAssignForId ? allRoles.find(r => r.id === showAssignForId) : null;
+
+// Existing perms for the role being edited
+const currentPerms = permsRole
+  ? await db.select().from(rolePermissions).where(eq(rolePermissions.roleId, permsRole.id))
+  : [];
+const permMap: Record<string, any> = {};
+for (const p of currentPerms) permMap[p.pageKey] = p;
+
+// Member counts per role
+const memberCounts = await db.select({
+  roleId: userRoleAssignments.roleId,
+  count: sql<number>`count(*)::int`
+}).from(userRoleAssignments).groupBy(userRoleAssignments.roleId);
+const memberCountMap: Record<string, number> = {};
+for (const m of memberCounts) memberCountMap[m.roleId] = m.count as number;
+
+// For assign UI: members of this role + all eligible users
+let currentMembers: any[] = [];
+let eligibleUsers: any[] = [];
+if (assignRole) {
+  const mids = await db.select({ uid: userRoleAssignments.userId }).from(userRoleAssignments).where(eq(userRoleAssignments.roleId, assignRole.id));
+  const memberIds = mids.map(m => m.uid);
+  if (memberIds.length > 0) {
+    currentMembers = await db.select({ id: users.id, name: users.name, email: users.email, role: users.role })
+      .from(users).where(sql`${users.id} = ANY(ARRAY[${sql.raw(memberIds.map(id => "'" + id + "'").join(','))}]::uuid[])`);
+  }
+  eligibleUsers = await db.select({ id: users.id, name: users.name, email: users.email, role: users.role })
+    .from(users)
+    .where(sql`${users.role} <> 'applicant' AND ${users.role} <> 'institution_admin' AND ${users.isActive} = true`)
+    .orderBy(asc(users.name));
+}
+
+function colorStyle(c: string): string {
+  const map: Record<string, string> = {
+    orange: 'background:rgba(255,79,0,0.15);color:#FF7040;',
+    blue: 'background:rgba(59,130,246,0.15);color:#60a5fa;',
+    green: 'background:rgba(16,185,129,0.15);color:#10b981;',
+    purple: 'background:rgba(139,92,246,0.15);color:#a78bfa;',
+    red: 'background:rgba(220,38,38,0.15);color:#fca5a5;',
+    gold: 'background:rgba(251,191,36,0.15);color:#fbbf24;',
+    pink: 'background:rgba(236,72,153,0.15);color:#f9a8d4;'
+  };
+  return map[c] || map.orange;
+}
+---
+<AdminLayout title="Custom Roles" activeNav="team-roles">
+  <div class="admin-page" style="max-width:1400px;">
+
+    <div class="admin-page-header" style="margin-bottom:18px;display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">Team Management</div>
+        <h1 class="admin-page-title">Custom Roles</h1>
+        <p class="admin-page-sub">Define custom roles (e.g. "HEI Editor", "Assam Region Lead") and grant per-page permissions. <em>Additive — does not replace existing role enum.</em></p>
+      </div>
+      <a href="?edit=new" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11.5px;text-decoration:none;">+ New role</a>
+    </div>
+
+    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{errorMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{okMsg}</div>}
+
+    {/* CREATE/EDIT ROLE FORM */}
+    {(editingRoleId === 'new' || editingRole) && (
+      <form method="POST" class="admin-card" style="padding:16px;margin-bottom:14px;display:flex;flex-direction:column;gap:10px;">
+        <input type="hidden" name="_action" value={editingRole ? 'update_role' : 'create_role'} />
+        {editingRole && <input type="hidden" name="id" value={editingRole.id} />}
+        <h3 style="font-size:13px;font-weight:600;color:#fff;margin-bottom:2px;">{editingRole ? 'Edit role' : '+ New role'}</h3>
+
+        <div><label class="rfl">Name *</label><input name="name" required class="rfi" placeholder="e.g. HEI Editor" value={editingRole ? editingRole.name : ''} /></div>
+        <div><label class="rfl">Description</label><textarea name="description" rows="2" class="rfi" placeholder="What this role is for...">{editingRole && editingRole.description ? editingRole.description : ''}</textarea></div>
+        <div>
+          <label class="rfl">Color</label>
+          <select name="color" class="rfi">
+            {COLORS.map((c) => <option value={c} selected={editingRole ? editingRole.color === c : c === 'orange'}>{c}</option>)}
+          </select>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button type="submit" class="admin-btn admin-btn-primary" style="flex:1;">{editingRole ? 'Save' : 'Create'}</button>
+          <a href="/admin/team/roles" class="admin-btn" style="padding:7px 14px;text-decoration:none;display:flex;align-items:center;">Cancel</a>
+        </div>
+      </form>
+    )}
+
+    {/* PERMISSIONS MATRIX */}
+    {permsRole && (
+      <form method="POST" class="admin-card" style="padding:18px;margin-bottom:14px;">
+        <input type="hidden" name="_action" value="save_permissions" />
+        <input type="hidden" name="role_id" value={permsRole.id} />
+
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px;flex-wrap:wrap;">
+          <div>
+            <h3 style="font-size:15px;font-weight:600;color:#fff;">Permissions for <span style={'padding:2px 10px;border-radius:100px;font-size:13px;' + colorStyle(permsRole.color)}>{permsRole.name}</span></h3>
+            <p style="font-size:11.5px;color:#a0a0ab;margin-top:4px;">Check the actions this role can perform on each page. Unchecked = no access.</p>
+          </div>
+          <a href="/admin/team/roles" class="admin-btn" style="padding:6px 12px;font-size:11px;text-decoration:none;">Close</a>
+        </div>
+
+        {PAGE_GROUPS.map((group) => (
+          <div style="margin-bottom:18px;">
+            <h4 style="font-size:11px;color:#FF7040;text-transform:uppercase;letter-spacing:0.12em;font-weight:700;margin-bottom:8px;">{group.label}</h4>
+            <table class="admin-table">
+              <thead>
+                <tr>
+                  <th>Page</th>
+                  <th style="text-align:center;width:70px;">View</th>
+                  <th style="text-align:center;width:70px;">Edit</th>
+                  <th style="text-align:center;width:70px;">Delete</th>
+                  <th style="text-align:center;width:70px;">Export</th>
+                </tr>
+              </thead>
+              <tbody>
+                {group.pages.map((p) => {
+                  const cur = permMap[p.key];
+                  return (
+                    <tr>
+                      <td style="font-size:12px;color:#d8d8de;">{p.label}</td>
+                      <td style="text-align:center;"><input type="checkbox" name={'perm_' + p.key + '_view'} checked={cur && cur.canView} style="accent-color:#FF4F00;" /></td>
+                      <td style="text-align:center;"><input type="checkbox" name={'perm_' + p.key + '_edit'} checked={cur && cur.canEdit} style="accent-color:#FF4F00;" /></td>
+                      <td style="text-align:center;"><input type="checkbox" name={'perm_' + p.key + '_delete'} checked={cur && cur.canDelete} style="accent-color:#FF4F00;" /></td>
+                      <td style="text-align:center;"><input type="checkbox" name={'perm_' + p.key + '_export'} checked={cur && cur.canExport} style="accent-color:#FF4F00;" /></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+        <button type="submit" class="admin-btn admin-btn-primary" style="margin-top:6px;">Save permissions</button>
+      </form>
+    )}
+
+    {/* ASSIGN MEMBERS */}
+    {assignRole && (
+      <div class="admin-card" style="padding:18px;margin-bottom:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px;flex-wrap:wrap;">
+          <div>
+            <h3 style="font-size:15px;font-weight:600;color:#fff;">Members of <span style={'padding:2px 10px;border-radius:100px;font-size:13px;' + colorStyle(assignRole.color)}>{assignRole.name}</span></h3>
+            <p style="font-size:11.5px;color:#a0a0ab;margin-top:4px;">{currentMembers.length} assigned</p>
+          </div>
+          <a href="/admin/team/roles" class="admin-btn" style="padding:6px 12px;font-size:11px;text-decoration:none;">Close</a>
+        </div>
+
+        {/* Current members */}
+        {currentMembers.length > 0 && (
+          <div style="margin-bottom:14px;">
+            <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;margin-bottom:6px;">Currently assigned</p>
+            <div style="display:flex;flex-direction:column;gap:5px;">
+              {currentMembers.map((m) => (
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;">
+                  <div>
+                    <span style="color:#fff;font-size:12.5px;font-weight:500;">{m.name}</span>
+                    <span style="color:#6e6e78;font-size:11px;margin-left:8px;">{m.email}</span>
+                    <span style="color:#a0a0ab;font-size:10.5px;margin-left:8px;">({m.role})</span>
+                  </div>
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="_action" value="unassign_user" />
+                    <input type="hidden" name="role_id" value={assignRole.id} />
+                    <input type="hidden" name="user_id" value={m.id} />
+                    <button type="submit" class="admin-btn" style="padding:3px 9px;font-size:10.5px;color:#fca5a5;">Remove</button>
+                  </form>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Add member form */}
+        <form method="POST" style="padding-top:14px;border-top:1px solid #1f1f26;display:flex;gap:8px;align-items:end;">
+          <input type="hidden" name="_action" value="assign_user" />
+          <input type="hidden" name="role_id" value={assignRole.id} />
+          <div style="flex:1;">
+            <label class="rfl">Add user</label>
+            <select name="user_id" required class="rfi">
+              <option value="">Pick user...</option>
+              {eligibleUsers.filter(u => !currentMembers.some(m => m.id === u.id)).map((u) => (
+                <option value={u.id}>{u.name} ({u.email}) — {u.role}</option>
+              ))}
+            </select>
+          </div>
+          <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;">Assign</button>
+        </form>
+      </div>
+    )}
+
+    {/* LIST ALL ROLES */}
+    {allRoles.length === 0 && !editingRoleId && (
+      <div class="admin-card" style="padding:30px;text-align:center;color:#6e6e78;font-size:13px;">No custom roles yet. Click <strong>+ New role</strong> above.</div>
+    )}
+
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      {allRoles.map((r) => (
+        <div class="admin-card" style="padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+          <div style="flex:1;min-width:180px;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <span style={'padding:3px 10px;border-radius:100px;font-size:12.5px;font-weight:600;' + colorStyle(r.color)}>{r.name}</span>
+              <span style="font-size:11px;color:#6e6e78;">{memberCountMap[r.id] || 0} member{(memberCountMap[r.id] || 0) === 1 ? '' : 's'}</span>
+            </div>
+            {r.description && <p style="font-size:11.5px;color:#a0a0ab;margin-top:4px;line-height:1.5;">{r.description}</p>}
+          </div>
+          <div style="display:flex;gap:4px;flex-wrap:wrap;">
+            <a href={'?perms=' + r.id} class="admin-btn" style="padding:5px 10px;font-size:10.5px;text-decoration:none;">Permissions</a>
+            <a href={'?assign=' + r.id} class="admin-btn" style="padding:5px 10px;font-size:10.5px;text-decoration:none;">Members</a>
+            <a href={'?edit=' + r.id} class="admin-btn" style="padding:5px 10px;font-size:10.5px;text-decoration:none;">Edit</a>
+            <form method="POST" style="display:inline;" onsubmit="return confirm('Delete role and unassign all members?');">
+              <input type="hidden" name="_action" value="delete_role" />
+              <input type="hidden" name="id" value={r.id} />
+              <button type="submit" class="admin-btn" style="padding:5px 10px;font-size:10.5px;color:#fca5a5;">Del</button>
+            </form>
+          </div>
+        </div>
+      ))}
+    </div>
+
+  </div>
+  <style>
+    .rfl { display:block;font-size:10px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px; }
+    .rfi { width:100%;padding:7px 10px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:12px;font-family:inherit;outline:none; }
+    .rfi:focus { border-color:#FF4F00; }
+    textarea.rfi { resize:vertical; }
+  </style>
+</AdminLayout>
