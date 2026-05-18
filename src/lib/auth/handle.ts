@@ -1,4 +1,5 @@
 import { db } from '@/lib/db';
+import { randomBytes } from 'node:crypto';
 import { users } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 
@@ -31,7 +32,7 @@ export async function generateInternalHandle(fullName: string): Promise<string> 
 
   // Both base attempts collided - add random 4-char suffix
   for (let i = 0; i < 5; i++) {
-    const suffix = Math.random().toString(36).substring(2, 6);
+    const suffix = randomBytes(3).toString('hex').substring(0, 4);
     const candidate = last
       ? first + '.' + last + suffix + '@edurankai.in'
       : first + suffix + '@edurankai.in';
