@@ -51,6 +51,8 @@ export const users = pgTable('users', {
   assignedDepartmentId: varchar('assigned_department_id', { length: 50 }),
   lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
   internalHandle: varchar('internal_handle', { length: 120 }),
+  consentGivenAt: timestamp('consent_given_at', { withTimezone: true }),
+  consentIp: varchar('consent_ip', { length: 64 }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 }, (t) => ({
