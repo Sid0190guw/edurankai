@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 export const levelSchema = z.enum(['C-Level', 'Lead', 'Senior', 'Mid', 'Junior', 'Intern', 'Apprentice']);
-export const engagementSchema = z.enum(['Full-Time', 'Internship', 'Apprenticeship']);
+export const engagementSchema = z.enum(['Full-Time', 'Part-Time', 'Contract', 'Freelance', 'Consultant', 'Internship', 'Apprenticeship', 'Fellowship', 'Volunteer']);
 
 export const roleSchema = z.object({
   title: z.string().min(2, 'Title required (min 2 chars)').max(200),

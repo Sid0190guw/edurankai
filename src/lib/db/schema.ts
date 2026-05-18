@@ -16,7 +16,8 @@ export const levelEnum = pgEnum('role_level', [
 ]);
 
 export const engagementEnum = pgEnum('engagement_type', [
-  'Full-Time', 'Internship', 'Apprenticeship'
+  'Full-Time', 'Part-Time', 'Contract', 'Freelance', 'Consultant',
+  'Internship', 'Apprenticeship', 'Fellowship', 'Volunteer'
 ]);
 
 export const applicationStatusEnum = pgEnum('application_status', [
