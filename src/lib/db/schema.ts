@@ -392,7 +392,7 @@ export const offerLetters = pgTable('offer_letters', {
   declinedAt: timestamp('declined_at', { withTimezone: true }),
   declinedReason: text('declined_reason'),
 
-  plaintextPassword: varchar('plaintext_password', { length: 40 }),
+  // plaintextPassword removed - was a security risk (plaintext in DB)
   createdUserId: uuid('created_user_id').references(() => users.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
