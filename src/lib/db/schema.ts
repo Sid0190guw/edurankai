@@ -16,8 +16,7 @@ export const levelEnum = pgEnum('role_level', [
 ]);
 
 export const engagementEnum = pgEnum('engagement_type', [
-  'Full-Time', 'Part-Time', 'Contract', 'Freelance', 'Consultant',
-  'Internship', 'Apprenticeship', 'Fellowship', 'Volunteer'
+  'Full-Time', 'Internship', 'Apprenticeship'
 ]);
 
 export const applicationStatusEnum = pgEnum('application_status', [
@@ -51,8 +50,6 @@ export const users = pgTable('users', {
   assignedDepartmentId: varchar('assigned_department_id', { length: 50 }),
   lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
   internalHandle: varchar('internal_handle', { length: 120 }),
-  consentGivenAt: timestamp('consent_given_at', { withTimezone: true }),
-  consentIp: varchar('consent_ip', { length: 64 }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow()
 }, (t) => ({
@@ -750,4 +747,28 @@ export const chatAuditLog = pgTable('chat_audit_log', {
   ipAddress: varchar('ip_address', { length: 50 }),
   userAgent: text('user_agent'),
   accessedAt: timestamp('accessed_at', { withTimezone: true }).notNull().defaultNow()
+});
+// ─── Push Notifications ───────────────────────────────────────────────────────
+
+export const pushSubscriptions = pgTable('push_subscriptions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  endpoint: text('endpoint').notNull(),
+  p256dh: text('p256dh').notNull(),
+  auth: text('auth').notNull(),
+  userAgent: varchar('user_agent', { length: 300 }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+});
+
+export const notificationPreferences = pgTable('notification_preferences', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }).unique(),
+  notifyChat: boolean('notify_chat').notNull().default(true),
+  notifyNewApplication: boolean('notify_new_application').notNull().default(true),
+  notifyApplicationStatus: boolean('notify_application_status').notNull().default(true),
+  notifyNewHeiSubmission: boolean('notify_new_hei_submission').notNull().default(true),
+  notifyNewUser: boolean('notify_new_user').notNull().default(true),
+  notifyOfferSigned: boolean('notify_offer_signed').notNull().default(true),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
