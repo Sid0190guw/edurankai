@@ -45,6 +45,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
       messageCode
     }).returning({ id: chatMessages.id, createdAt: chatMessages.createdAt });
 
+    // Fire push notification to other admins (non-blocking)
+    try {
+      const { pushNotify } = await import('@/lib/push');
+      const preview = text.length > 80 ? text.substring(0, 80) + '...' : text;
+      await pushNotify.chatMessage(fullCh[0].name, user.name || user.email, preview, channelSlug, user.id);
+    } catch (_) {}
     return new Response(JSON.stringify({ ok: true, message: inserted[0] }), {
       headers: { 'Content-Type': 'application/json' }
     });
