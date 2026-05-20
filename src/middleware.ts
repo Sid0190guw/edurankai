@@ -1,7 +1,7 @@
-﻿import { defineMiddleware } from 'astro:middleware';
+import { defineMiddleware } from 'astro:middleware';
 import { validateSessionToken } from '@/lib/auth/session';
 import { readSessionCookie, setSessionCookie, clearSessionCookie } from '@/lib/auth/cookie';
-import { getDb } from '@/lib/db';
+
 
 export const onRequest = defineMiddleware(async (context, next) => {
   // Initialize DB with Cloudflare runtime env (if present)
