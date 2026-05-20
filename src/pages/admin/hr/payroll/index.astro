@@ -1,0 +1,489 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql as sqlExpr } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+let errorMsg = '';
+let successMsg = '';
+
+const currentMonth = new Date().getMonth() + 1;
+const currentYear = new Date().getFullYear();
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+
+  try {
+    if (action === 'create_run') {
+      const month = parseInt(fd.get('month') as string);
+      const year = parseInt(fd.get('year') as string);
+      const notes = (fd.get('notes') as string || '').trim();
+
+      // Check if run already exists
+      const existing = await db.execute(sqlExpr`SELECT id FROM hr_payroll_runs WHERE month = ${month} AND year = ${year} LIMIT 1`);
+      if (existing.rows.length > 0) {
+        errorMsg = `Payroll run for ${month}/${year} already exists.`;
+      } else {
+        // Create payroll run
+        const run = await db.execute(sqlExpr`
+          INSERT INTO hr_payroll_runs (month, year, status, notes, processed_by)
+          VALUES (${month}, ${year}, 'draft', ${notes || null}, ${user.id})
+          RETURNING id
+        `);
+        const runId = (run.rows[0] as any).id;
+
+        // Get all active employees with salary structures
+        const employees = await db.execute(sqlExpr`
+          SELECT e.id, e.full_name, e.base_salary, e.currency,
+            ss.basic, ss.hra, ss.da, ss.special_allowance, ss.transport_allowance,
+            ss.medical_allowance, ss.other_allowances, ss.gross_salary,
+            ss.pf_employee, ss.esic_employee, ss.professional_tax, ss.tds,
+            ss.other_deductions, ss.net_salary
+          FROM hr_employees e
+          LEFT JOIN hr_salary_structures ss ON ss.employee_id = e.id
+            AND ss.effective_from <= NOW()
+            AND (ss.effective_to IS NULL OR ss.effective_to >= NOW())
+          WHERE e.is_active = true
+          ORDER BY e.full_name
+        `);
+
+        let totalGross = 0, totalDeductions = 0, totalNet = 0;
+        let empCount = 0;
+
+        for (const emp of employees.rows as any[]) {
+          // Use salary structure if exists, else use base_salary as basic
+          const basic = parseFloat(emp.basic || emp.base_salary || 0);
+          const hra = parseFloat(emp.hra || basic * 0.4); // 40% HRA default
+          const da = parseFloat(emp.da || 0);
+          const specialAllowance = parseFloat(emp.special_allowance || 0);
+          const transportAllowance = parseFloat(emp.transport_allowance || 1600);
+          const medicalAllowance = parseFloat(emp.medical_allowance || 1250);
+          const otherAllowances = parseFloat(emp.other_allowances || 0);
+          const gross = basic + hra + da + specialAllowance + transportAllowance + medicalAllowance + otherAllowances;
+
+          // PF: 12% of basic (employee), 12% employer (not deducted from salary)
+          const pfEmployee = Math.min(basic * 0.12, 1800); // capped at 1800
+          // ESIC: 0.75% of gross if gross < 21000
+          const esicEmployee = gross < 21000 ? gross * 0.0075 : 0;
+          // Professional tax (Karnataka/Maharashtra standard)
+          let professionalTax = 0;
+          if (gross > 15000) professionalTax = 200;
+          else if (gross > 10000) professionalTax = 150;
+          const tds = parseFloat(emp.tds || 0);
+          const otherDeductions = parseFloat(emp.other_deductions || 0);
+          const totalDed = pfEmployee + esicEmployee + professionalTax + tds + otherDeductions;
+          const net = gross - totalDed;
+
+          // Count attendance for this month
+          const attResult = await db.execute(sqlExpr`
+            SELECT 
+              COUNT(*) FILTER (WHERE status = 'present' OR status = 'wfh') as days_worked,
+              COUNT(*) FILTER (WHERE status = 'on_leave') as days_leave,
+              COUNT(*) FILTER (WHERE status = 'absent') as days_absent
+            FROM hr_attendance
+            WHERE employee_id = ${emp.id}
+            AND EXTRACT(MONTH FROM date) = ${month}
+            AND EXTRACT(YEAR FROM date) = ${year}
+          `);
+          const att = attResult.rows[0] as any;
+
+          await db.execute(sqlExpr`
+            INSERT INTO hr_payslips (
+              payroll_run_id, employee_id, month, year,
+              days_worked, days_leave, days_absent,
+              basic, hra, da, special_allowance, transport_allowance, medical_allowance,
+              other_allowances, gross_salary,
+              pf_employee, esic_employee, professional_tax, tds, other_deductions,
+              total_deductions, net_salary, currency, status
+            ) VALUES (
+              ${runId}, ${emp.id}, ${month}, ${year},
+              ${parseFloat(att.days_worked || 0)}, ${parseFloat(att.days_leave || 0)}, ${parseFloat(att.days_absent || 0)},
+              ${basic}, ${hra}, ${da}, ${specialAllowance}, ${transportAllowance}, ${medicalAllowance},
+              ${otherAllowances}, ${gross},
+              ${pfEmployee}, ${esicEmployee}, ${professionalTax}, ${tds}, ${otherDeductions},
+              ${totalDed}, ${net}, ${emp.currency || 'INR'}, 'pending'
+            )
+            ON CONFLICT (payroll_run_id, employee_id) DO NOTHING
+          `);
+
+          totalGross += gross;
+          totalDeductions += totalDed;
+          totalNet += net;
+          empCount++;
+        }
+
+        // Update run totals
+        await db.execute(sqlExpr`
+          UPDATE hr_payroll_runs SET
+            total_employees = ${empCount},
+            total_gross = ${totalGross},
+            total_deductions = ${totalDeductions},
+            total_net = ${totalNet}
+          WHERE id = ${runId}
+        `);
+
+        successMsg = `Payroll run created for ${month}/${year} with ${empCount} employees. Total net: ₹${Math.round(totalNet).toLocaleString('en-IN')}`;
+      }
+    } else if (action === 'approve_run') {
+      const runId = fd.get('runId') as string;
+      await db.execute(sqlExpr`
+        UPDATE hr_payroll_runs SET status = 'approved', approved_by = ${user.id}, approved_at = NOW()
+        WHERE id = ${runId}
+      `);
+      await db.execute(sqlExpr`UPDATE hr_payslips SET status = 'approved' WHERE payroll_run_id = ${runId}`);
+      successMsg = 'Payroll run approved.';
+    } else if (action === 'mark_paid') {
+      const runId = fd.get('runId') as string;
+      await db.execute(sqlExpr`
+        UPDATE hr_payroll_runs SET status = 'paid', paid_at = NOW() WHERE id = ${runId}
+      `);
+      await db.execute(sqlExpr`UPDATE hr_payslips SET status = 'paid', paid_at = NOW() WHERE payroll_run_id = ${runId}`);
+      successMsg = 'Payroll marked as paid.';
+    } else if (action === 'update_salary') {
+      const empId = fd.get('empId') as string;
+      const basic = parseFloat(fd.get('basic') as string || '0');
+      const hra = parseFloat(fd.get('hra') as string || '0');
+      const da = parseFloat(fd.get('da') as string || '0');
+      const specialAllowance = parseFloat(fd.get('specialAllowance') as string || '0');
+      const transportAllowance = parseFloat(fd.get('transportAllowance') as string || '0');
+      const medicalAllowance = parseFloat(fd.get('medicalAllowance') as string || '0');
+      const otherAllowances = parseFloat(fd.get('otherAllowances') as string || '0');
+      const tds = parseFloat(fd.get('tds') as string || '0');
+      const currency = (fd.get('currency') as string || 'INR').trim();
+
+      const gross = basic + hra + da + specialAllowance + transportAllowance + medicalAllowance + otherAllowances;
+      const pfEmployee = Math.min(basic * 0.12, 1800);
+      const esicEmployee = gross < 21000 ? gross * 0.0075 : 0;
+      const professionalTax = gross > 15000 ? 200 : gross > 10000 ? 150 : 0;
+      const totalDed = pfEmployee + esicEmployee + professionalTax + tds;
+      const net = gross - totalDed;
+
+      // Close existing structure
+      await db.execute(sqlExpr`
+        UPDATE hr_salary_structures SET effective_to = CURRENT_DATE - INTERVAL '1 day'
+        WHERE employee_id = ${empId} AND effective_to IS NULL
+      `);
+
+      // Insert new structure
+      await db.execute(sqlExpr`
+        INSERT INTO hr_salary_structures (
+          employee_id, effective_from, currency,
+          basic, hra, da, special_allowance, transport_allowance, medical_allowance,
+          other_allowances, gross_salary, pf_employee, esic_employee,
+          professional_tax, tds, total_deductions: net_salary, created_by
+        ) VALUES (
+          ${empId}, CURRENT_DATE, ${currency},
+          ${basic}, ${hra}, ${da}, ${specialAllowance}, ${transportAllowance}, ${medicalAllowance},
+          ${otherAllowances}, ${gross}, ${pfEmployee}, ${esicEmployee},
+          ${professionalTax}, ${tds}, ${totalDed}, ${net}, ${user.id}
+        )
+      `);
+
+      // Update base salary on employee
+      await db.execute(sqlExpr`UPDATE hr_employees SET base_salary = ${gross}, currency = ${currency} WHERE id = ${empId}`);
+      successMsg = `Salary structure updated. Gross: ${currency} ${gross.toLocaleString('en-IN')}, Net: ${currency} ${net.toLocaleString('en-IN')}`;
+    }
+  } catch (err: any) {
+    errorMsg = 'Error: ' + (err.message || 'Unknown');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const tab = url.searchParams.get('tab') || 'runs';
+const selectedRunId = url.searchParams.get('run') || '';
+
+// Payroll runs
+const runs = await db.execute(sqlExpr`SELECT * FROM hr_payroll_runs ORDER BY year DESC, month DESC LIMIT 24`);
+
+// Payslips for selected run
+const payslips = selectedRunId ? await db.execute(sqlExpr`
+  SELECT ps.*, e.full_name, e.employee_code, e.designation
+  FROM hr_payslips ps
+  JOIN hr_employees e ON ps.employee_id = e.id
+  WHERE ps.payroll_run_id = ${selectedRunId}
+  ORDER BY e.full_name
+`) : null;
+
+const selectedRun = selectedRunId ? (runs.rows as any[]).find(r => r.id === selectedRunId) : null;
+
+// Employees for salary setup
+const employees = await db.execute(sqlExpr`
+  SELECT e.id, e.full_name, e.employee_code, e.base_salary, e.currency,
+    ss.basic, ss.hra, ss.da, ss.special_allowance, ss.transport_allowance,
+    ss.medical_allowance, ss.gross_salary, ss.net_salary, ss.tds
+  FROM hr_employees e
+  LEFT JOIN hr_salary_structures ss ON ss.employee_id = e.id
+    AND ss.effective_from <= NOW() AND (ss.effective_to IS NULL OR ss.effective_to >= NOW())
+  WHERE e.is_active = true
+  ORDER BY e.full_name
+  LIMIT 100
+`);
+
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function fmt(n: any) {
+  if (!n || n == 0) return '0';
+  return parseFloat(n).toLocaleString('en-IN');
+}
+---
+<AdminLayout title="Payroll — HRMS" activeNav="hr">
+<div style="padding-bottom:80px;">
+
+  <!-- Header -->
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:16px;position:sticky;top:0;z-index:10;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+      <div>
+        <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">HRMS · Payroll</p>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Payroll</h1>
+      </div>
+      <button onclick="document.getElementById('runModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:12px;padding:8px 14px;border-radius:8px;cursor:pointer;">+ Run Payroll</button>
+    </div>
+
+    <!-- Tabs -->
+    <div style="display:flex;gap:4px;">
+      {[['runs','Payroll Runs'],['payslips','Payslips'],['salary','Salary Setup']].map(([t, label]) => (
+        <a href={`?tab=${t}`} style={`text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;${tab === t ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;color:#8a8a94;'}`}>{label}</a>
+      ))}
+    </div>
+  </div>
+
+  {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
+  {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
+
+  <!-- PAYROLL RUNS TAB -->
+  {tab === 'runs' && (
+    <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
+      {(runs.rows as any[]).length === 0 && (
+        <div style="text-align:center;padding:48px;color:#6e6e78;">
+          <p style="font-size:32px;margin-bottom:8px;">💰</p>
+          <p style="font-size:13px;">No payroll runs yet</p>
+          <p style="font-size:12px;margin-top:4px;">Click "+ Run Payroll" to create your first payroll run</p>
+        </div>
+      )}
+      {(runs.rows as any[]).map(run => (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+          <div style="padding:12px 14px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+              <div>
+                <p style="font-size:15px;font-weight:700;color:#fff;margin:0;">{MONTH_NAMES[(run.month || 1) - 1]} {run.year}</p>
+                <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;">{run.total_employees} employees</p>
+              </div>
+              <span style={`font-size:10px;font-weight:700;padding:3px 8px;border-radius:100px;text-transform:uppercase;${run.status === 'paid' ? 'background:rgba(16,185,129,0.15);color:#6ee7b7;' : run.status === 'approved' ? 'background:rgba(99,102,241,0.15);color:#a5b4fc;' : 'background:rgba(251,191,36,0.15);color:#fbbf24;'}`}>
+                {run.status}
+              </span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px;">
+              <div style="background:#15151a;border-radius:6px;padding:6px 8px;text-align:center;">
+                <p style="font-size:9px;color:#6e6e78;margin:0;text-transform:uppercase;">Gross</p>
+                <p style="font-size:12px;font-weight:600;color:#fff;margin:2px 0 0;">₹{fmt(run.total_gross)}</p>
+              </div>
+              <div style="background:#15151a;border-radius:6px;padding:6px 8px;text-align:center;">
+                <p style="font-size:9px;color:#6e6e78;margin:0;text-transform:uppercase;">Deductions</p>
+                <p style="font-size:12px;font-weight:600;color:#fca5a5;margin:2px 0 0;">₹{fmt(run.total_deductions)}</p>
+              </div>
+              <div style="background:#15151a;border-radius:6px;padding:6px 8px;text-align:center;">
+                <p style="font-size:9px;color:#6e6e78;margin:0;text-transform:uppercase;">Net Pay</p>
+                <p style="font-size:12px;font-weight:600;color:#6ee7b7;margin:2px 0 0;">₹{fmt(run.total_net)}</p>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <a href={`?tab=payslips&run=${run.id}`} style="flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;font-size:12px;font-weight:500;padding:7px;border-radius:6px;min-width:80px;">
+                View Payslips
+              </a>
+              {run.status === 'draft' && (
+                <form method="POST" style="flex:1;">
+                  <input type="hidden" name="action" value="approve_run" />
+                  <input type="hidden" name="runId" value={run.id} />
+                  <button type="submit" style="width:100%;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.3);color:#a5b4fc;font-size:12px;font-weight:500;padding:7px;border-radius:6px;cursor:pointer;">
+                    Approve
+                  </button>
+                </form>
+              )}
+              {run.status === 'approved' && (
+                <form method="POST" style="flex:1;" onsubmit="return confirm('Mark this payroll as paid? This cannot be undone.')">
+                  <input type="hidden" name="action" value="mark_paid" />
+                  <input type="hidden" name="runId" value={run.id} />
+                  <button type="submit" style="width:100%;background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:12px;font-weight:500;padding:7px;border-radius:6px;cursor:pointer;">
+                    Mark Paid ✓
+                  </button>
+                </form>
+              )}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+
+  <!-- PAYSLIPS TAB -->
+  {tab === 'payslips' && (
+    <div style="padding:12px 16px;">
+      <!-- Run selector -->
+      <form method="GET" style="display:flex;gap:8px;margin-bottom:12px;">
+        <input type="hidden" name="tab" value="payslips" />
+        <select name="run" onchange="this.form.submit()" style="flex:1;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 12px;color:#fff;font-size:13px;outline:none;">
+          <option value="">Select Payroll Run</option>
+          {(runs.rows as any[]).map(r => (
+            <option value={r.id} selected={selectedRunId === r.id}>{MONTH_NAMES[(r.month||1)-1]} {r.year} · {r.status}</option>
+          ))}
+        </select>
+      </form>
+
+      {selectedRun && (
+        <div style="background:#0f0f14;border:1px solid #FF4F00;border-radius:10px;padding:10px 14px;margin-bottom:12px;">
+          <p style="font-size:12px;color:#FF7040;margin:0;font-weight:600;">{MONTH_NAMES[(selectedRun.month||1)-1]} {selectedRun.year} — {selectedRun.status?.toUpperCase()}</p>
+          <p style="font-size:11px;color:#6e6e78;margin:4px 0 0;">{selectedRun.total_employees} employees · Net: ₹{fmt(selectedRun.total_net)}</p>
+        </div>
+      )}
+
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        {!selectedRunId && <div style="text-align:center;padding:32px;color:#6e6e78;"><p style="font-size:13px;">Select a payroll run to view payslips</p></div>}
+        {payslips && (payslips.rows as any[]).map(ps => (
+          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;overflow:hidden;">
+            <div style="padding:12px 14px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                <div>
+                  <p style="font-size:13px;font-weight:600;color:#fff;margin:0;">{ps.full_name}</p>
+                  <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;font-family:'Geist Mono',monospace;">{ps.employee_code} · {ps.days_worked}d worked</p>
+                </div>
+                <div style="text-align:right;">
+                  <p style="font-size:15px;font-weight:700;color:#6ee7b7;margin:0;">{ps.currency} {fmt(ps.net_salary)}</p>
+                  <p style="font-size:10px;color:#6e6e78;margin:0;">net pay</p>
+                </div>
+              </div>
+              <!-- Earnings/Deductions breakdown -->
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+                <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
+                  <p style="font-size:9px;color:#6e6e78;margin:0;text-transform:uppercase;">Basic</p>
+                  <p style="font-size:11px;font-weight:500;color:#d8d8de;margin:2px 0 0;">{ps.currency} {fmt(ps.basic)}</p>
+                </div>
+                <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
+                  <p style="font-size:9px;color:#6e6e78;margin:0;text-transform:uppercase;">Gross</p>
+                  <p style="font-size:11px;font-weight:500;color:#d8d8de;margin:2px 0 0;">{ps.currency} {fmt(ps.gross_salary)}</p>
+                </div>
+                <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
+                  <p style="font-size:9px;color:#6e6e78;margin:0;text-transform:uppercase;">PF</p>
+                  <p style="font-size:11px;font-weight:500;color:#fca5a5;margin:2px 0 0;">- {ps.currency} {fmt(ps.pf_employee)}</p>
+                </div>
+                <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
+                  <p style="font-size:9px;color:#6e6e78;margin:0;text-transform:uppercase;">TDS</p>
+                  <p style="font-size:11px;font-weight:500;color:#fca5a5;margin:2px 0 0;">- {ps.currency} {fmt(ps.tds)}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+
+  <!-- SALARY SETUP TAB -->
+  {tab === 'salary' && (
+    <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
+      <p style="font-size:12px;color:#6e6e78;margin:0 0 8px;">Set salary structure for each employee. Changes take effect from current date.</p>
+      {(employees.rows as any[]).map(emp => (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+          <button type="button" data-salary-emp={emp.id} class="salary-toggle" style="width:100%;background:none;border:none;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;text-align:left;">
+            <div>
+              <p style="font-size:13px;font-weight:600;color:#fff;margin:0;">{emp.full_name}</p>
+              <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;font-family:'Geist Mono',monospace;">{emp.employee_code}</p>
+            </div>
+            <div style="text-align:right;">
+              <p style="font-size:13px;font-weight:600;color:{emp.gross_salary ? '#fff' : '#6e6e78'};margin:0;">
+                {emp.gross_salary ? `${emp.currency || 'INR'} ${fmt(emp.gross_salary)}/mo` : 'Not set'}
+              </p>
+              <p style="font-size:10px;color:#FF7040;margin:0;">Tap to edit ›</p>
+            </div>
+          </button>
+          <div id={`salary-${emp.id}`} style="display:none;border-top:1px solid #1a1a1f;padding:14px;">
+            <form method="POST" style="display:flex;flex-direction:column;gap:10px;">
+              <input type="hidden" name="action" value="update_salary" />
+              <input type="hidden" name="empId" value={emp.id} />
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div style="grid-column:1/-1;display:flex;gap:8px;align-items:center;">
+                  <label style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;white-space:nowrap;">Currency</label>
+                  <select name="currency" style="flex:1;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px;color:#fff;font-size:12px;outline:none;">
+                    {['INR','USD','GBP','EUR','SGD','AED'].map(c => (
+                      <option value={c} selected={emp.currency === c}>{c}</option>
+                    ))}
+                  </select>
+                </div>
+                {[
+                  ['basic','Basic Salary', emp.basic || emp.base_salary],
+                  ['hra','HRA', emp.hra],
+                  ['da','DA', emp.da],
+                  ['specialAllowance','Special Allowance', emp.special_allowance],
+                  ['transportAllowance','Transport Allowance', emp.transport_allowance || 1600],
+                  ['medicalAllowance','Medical Allowance', emp.medical_allowance || 1250],
+                  ['otherAllowances','Other Allowances', emp.other_allowances],
+                  ['tds','TDS (monthly)', emp.tds],
+                ].map(([name, label, val]: any) => (
+                  <div>
+                    <label style="display:block;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#6e6e78;margin-bottom:4px;">{label}</label>
+                    <input type="number" name={name} value={val || 0} step="0.01" min="0" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;" />
+                  </div>
+                ))}
+              </div>
+              <div style="background:#15151a;border-radius:8px;padding:8px 10px;font-size:11px;color:#6e6e78;">
+                PF (12% basic, max ₹1800) + ESIC (0.75% if gross &lt;₹21k) + Prof. Tax (₹200 if gross &gt;₹15k) auto-calculated
+              </div>
+              <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:13px;padding:10px;border-radius:8px;cursor:pointer;">Save Salary Structure</button>
+            </form>
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+
+<!-- Create Payroll Run Modal -->
+<div id="runModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:100;align-items:flex-end;justify-content:center;">
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;padding:20px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">Create Payroll Run</h2>
+      <button onclick="document.getElementById('runModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
+    </div>
+    <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="action" value="create_run" />
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Month</label>
+          <select name="month" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            {MONTH_NAMES.map((m, i) => (
+              <option value={i+1} selected={i+1 === currentMonth}>{m}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Year</label>
+          <input type="number" name="year" value={currentYear} min="2024" max="2030" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+      </div>
+      <div>
+        <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Notes (optional)</label>
+        <input type="text" name="notes" placeholder="e.g. May 2026 payroll" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+      </div>
+      <div style="background:rgba(255,159,0,0.08);border:1px solid rgba(255,159,0,0.2);border-radius:8px;padding:10px 12px;">
+        <p style="font-size:11px;color:#fbbf24;margin:0;">This will auto-calculate salary for all active employees based on their salary structures and attendance data for the selected month.</p>
+      </div>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Generate Payroll</button>
+    </form>
+  </div>
+</div>
+
+<script is:inline>
+document.addEventListener('DOMContentLoaded', function() {
+  document.querySelectorAll('.salary-toggle').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var empId = btn.getAttribute('data-salary-emp');
+      var panel = document.getElementById('salary-' + empId);
+      if (panel) panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    });
+  });
+});
+</script>
+</AdminLayout>
