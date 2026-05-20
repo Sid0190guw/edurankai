@@ -1,0 +1,303 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql as sqlExpr, eq, ilike, or, desc } from 'drizzle-orm';
+import { pgTable, uuid, varchar, boolean, date, text, decimal, timestamp } from 'drizzle-orm/pg-core';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+// Runtime table definition (not in schema.ts yet)
+const hrEmployees = pgTable('hr_employees', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  employeeCode: varchar('employee_code', { length: 30 }),
+  fullName: varchar('full_name', { length: 200 }).notNull(),
+  email: varchar('email', { length: 200 }).notNull(),
+  phone: varchar('phone', { length: 30 }),
+  designation: varchar('designation', { length: 150 }),
+  departmentId: text('department_id'),
+  employmentType: varchar('employment_type', { length: 50 }),
+  workMode: varchar('work_mode', { length: 30 }),
+  employmentStatus: varchar('employment_status', { length: 30 }),
+  joiningDate: date('joining_date'),
+  baseSalary: decimal('base_salary', { precision: 12, scale: 2 }),
+  currency: varchar('currency', { length: 10 }),
+  isActive: boolean('is_active').default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+});
+
+let errorMsg = '';
+let successMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+
+  try {
+    if (action === 'add') {
+      const fullName = (fd.get('fullName') as string || '').trim();
+      const email = (fd.get('email') as string || '').trim().toLowerCase();
+      const phone = (fd.get('phone') as string || '').trim();
+      const designation = (fd.get('designation') as string || '').trim();
+      const employmentType = (fd.get('employmentType') as string || 'Full-Time').trim();
+      const workMode = (fd.get('workMode') as string || 'Remote').trim();
+      const joiningDate = (fd.get('joiningDate') as string || '').trim();
+      const baseSalary = (fd.get('baseSalary') as string || '').trim();
+      const currency = (fd.get('currency') as string || 'INR').trim();
+
+      if (!fullName || !email) {
+        errorMsg = 'Full name and email are required.';
+      } else {
+        // Generate employee code
+        const count = await db.execute(sqlExpr`SELECT COUNT(*) as n FROM hr_employees`);
+        const n = parseInt((count.rows[0] as any).n || '0') + 1;
+        const code = 'ERA-EMP-' + String(n).padStart(4, '0');
+
+        await db.execute(sqlExpr`
+          INSERT INTO hr_employees (employee_code, full_name, email, phone, designation, employment_type, work_mode, joining_date, base_salary, currency, employment_status)
+          VALUES (${code}, ${fullName}, ${email}, ${phone || null}, ${designation || null}, ${employmentType}, ${workMode}, ${joiningDate || null}, ${baseSalary ? parseFloat(baseSalary) : null}, ${currency}, 'active')
+        `);
+        successMsg = `Employee ${fullName} added. Code: ${code}`;
+      }
+    } else if (action === 'deactivate') {
+      const id = fd.get('id') as string;
+      await db.execute(sqlExpr`UPDATE hr_employees SET employment_status = 'inactive', is_active = false, updated_at = NOW() WHERE id = ${id}`);
+      successMsg = 'Employee deactivated.';
+    } else if (action === 'activate') {
+      const id = fd.get('id') as string;
+      await db.execute(sqlExpr`UPDATE hr_employees SET employment_status = 'active', is_active = true, updated_at = NOW() WHERE id = ${id}`);
+      successMsg = 'Employee activated.';
+    }
+  } catch (err: any) {
+    errorMsg = 'Error: ' + (err.message || 'Unknown');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const q = url.searchParams.get('q') || '';
+const statusFilter = url.searchParams.get('status') || 'active';
+const page = parseInt(url.searchParams.get('page') || '1');
+const perPage = 20;
+const offset = (page - 1) * perPage;
+
+const countResult = await db.execute(sqlExpr`
+  SELECT COUNT(*) as n FROM hr_employees
+  WHERE (${statusFilter === 'all'} OR employment_status = ${statusFilter})
+  AND (${!q} OR full_name ILIKE ${'%' + q + '%'} OR email ILIKE ${'%' + q + '%'} OR employee_code ILIKE ${'%' + q + '%'} OR designation ILIKE ${'%' + q + '%'})
+`);
+const totalCount = parseInt((countResult.rows[0] as any).n || '0');
+const totalPages = Math.ceil(totalCount / perPage);
+
+const employees = await db.execute(sqlExpr`
+  SELECT id, employee_code, full_name, email, phone, designation, employment_type, work_mode, employment_status, joining_date, base_salary, currency, is_active
+  FROM hr_employees
+  WHERE (${statusFilter === 'all'} OR employment_status = ${statusFilter})
+  AND (${!q} OR full_name ILIKE ${'%' + q + '%'} OR email ILIKE ${'%' + q + '%'} OR employee_code ILIKE ${'%' + q + '%'} OR designation ILIKE ${'%' + q + '%'})
+  ORDER BY created_at DESC
+  LIMIT ${perPage} OFFSET ${offset}
+`);
+
+const stats = await db.execute(sqlExpr`
+  SELECT 
+    COUNT(*) FILTER (WHERE employment_status = 'active') as active,
+    COUNT(*) FILTER (WHERE employment_status = 'inactive') as inactive,
+    COUNT(*) FILTER (WHERE joining_date >= NOW() - INTERVAL '30 days') as new_this_month,
+    COUNT(*) as total
+  FROM hr_employees
+`);
+const s = stats.rows[0] as any;
+---
+<AdminLayout title="Employees — HRMS" activeNav="hr">
+<div class="admin-page" style="padding: 0 0 80px;">
+
+  <!-- Mobile-first Header -->
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:16px;position:sticky;top:0;z-index:10;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;">
+      <div>
+        <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">HRMS</p>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;line-height:1.2;">Employees</h1>
+      </div>
+      <button onclick="document.getElementById('addModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:13px;padding:8px 16px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:6px;flex-shrink:0;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Add
+      </button>
+    </div>
+
+    <!-- Stats row -->
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px;">
+      {[
+        { label: 'Total', value: s.total, color: '#fff' },
+        { label: 'Active', value: s.active, color: '#10b981' },
+        { label: 'Inactive', value: s.inactive, color: '#ef4444' },
+        { label: 'New (30d)', value: s.new_this_month, color: '#FF7040' },
+      ].map(stat => (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:8px;text-align:center;">
+          <p style={`font-size:18px;font-weight:700;color:${stat.color};margin:0;line-height:1;`}>{stat.value}</p>
+          <p style="font-size:9px;color:#6e6e78;margin:2px 0 0;text-transform:uppercase;letter-spacing:0.08em;">{stat.label}</p>
+        </div>
+      ))}
+    </div>
+
+    <!-- Search + Filter -->
+    <form method="GET" style="display:flex;gap:8px;">
+      <input type="text" name="q" value={q} placeholder="Search name, email, code..." style="flex:1;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 12px;color:#fff;font-size:13px;outline:none;min-width:0;" />
+      <select name="status" onchange="this.form.submit()" style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 10px;color:#fff;font-size:12px;outline:none;cursor:pointer;">
+        <option value="active" selected={statusFilter === 'active'}>Active</option>
+        <option value="inactive" selected={statusFilter === 'inactive'}>Inactive</option>
+        <option value="all" selected={statusFilter === 'all'}>All</option>
+      </select>
+      <button type="submit" style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 12px;color:#fff;font-size:13px;cursor:pointer;">Go</button>
+    </form>
+  </div>
+
+  <!-- Messages -->
+  {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
+  {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
+
+  <!-- Employee Cards (mobile-first) -->
+  <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
+    {employees.rows.length === 0 && (
+      <div style="text-align:center;padding:48px 16px;color:#6e6e78;">
+        <p style="font-size:32px;margin-bottom:8px;">👥</p>
+        <p style="font-size:14px;font-weight:500;color:#a0a0ab;">No employees found</p>
+        <p style="font-size:12px;margin-top:4px;">Add your first employee to get started</p>
+      </div>
+    )}
+    {employees.rows.map((emp: any) => (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+        <!-- Card header -->
+        <div style="padding:12px 14px;display:flex;align-items:flex-start;gap:12px;">
+          <div style={`width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,${emp.employment_status === 'active' ? '#FF4F00,#FF7040' : '#2a2a32,#1a1a1f'});display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;color:#fff;flex-shrink:0;`}>
+            {emp.full_name.substring(0, 1).toUpperCase()}
+          </div>
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <p style="font-size:14px;font-weight:600;color:#fff;margin:0;">{emp.full_name}</p>
+              <span style={`font-size:9px;font-weight:700;padding:2px 7px;border-radius:100px;text-transform:uppercase;letter-spacing:0.06em;${emp.employment_status === 'active' ? 'background:rgba(16,185,129,0.15);color:#6ee7b7;' : 'background:rgba(239,68,68,0.15);color:#fca5a5;'}`}>
+                {emp.employment_status}
+              </span>
+            </div>
+            <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;">{emp.designation || 'No designation'} · {emp.employment_type || 'Full-Time'}</p>
+            <p style="font-size:11px;color:#8a8a94;margin:1px 0 0;font-family:'Geist Mono',monospace;">{emp.employee_code}</p>
+          </div>
+          <a href={`/admin/hr/employees/${emp.id}`} style="display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:8px;background:#1a1a1f;color:#8a8a94;text-decoration:none;flex-shrink:0;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+          </a>
+        </div>
+        <!-- Card details -->
+        <div style="padding:0 14px 12px;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+          <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
+            <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Email</p>
+            <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{emp.email}</p>
+          </div>
+          <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
+            <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Work Mode</p>
+            <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;">{emp.work_mode || 'Remote'}</p>
+          </div>
+          <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
+            <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Joining Date</p>
+            <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;">{emp.joining_date ? new Date(emp.joining_date).toLocaleDateString('en-IN', {day:'2-digit',month:'short',year:'numeric'}) : '—'}</p>
+          </div>
+          <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
+            <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Salary</p>
+            <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;">{emp.base_salary ? `${emp.currency || 'INR'} ${parseFloat(emp.base_salary).toLocaleString('en-IN')}` : 'Unpaid'}</p>
+          </div>
+        </div>
+        <!-- Actions -->
+        <div style="border-top:1px solid #1a1a1f;padding:8px 14px;display:flex;gap:8px;">
+          <a href={`/admin/hr/employees/${emp.id}`} style="flex:1;text-align:center;background:#1a1a1f;color:#d8d8de;text-decoration:none;font-size:12px;font-weight:500;padding:7px;border-radius:6px;border:1px solid #2a2a32;">
+            View Profile
+          </a>
+          <form method="POST" style="flex:1;">
+            <input type="hidden" name="action" value={emp.employment_status === 'active' ? 'deactivate' : 'activate'} />
+            <input type="hidden" name="id" value={emp.id} />
+            <button type="submit" style={`width:100%;font-size:12px;font-weight:500;padding:7px;border-radius:6px;border:none;cursor:pointer;${emp.employment_status === 'active' ? 'background:rgba(239,68,68,0.15);color:#fca5a5;' : 'background:rgba(16,185,129,0.15);color:#6ee7b7;'}`}>
+              {emp.employment_status === 'active' ? 'Deactivate' : 'Activate'}
+            </button>
+          </form>
+        </div>
+      </div>
+    ))}
+  </div>
+
+  <!-- Pagination -->
+  {totalPages > 1 && (
+    <div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:16px;">
+      {page > 1 && <a href={`?q=${q}&status=${statusFilter}&page=${page-1}`} style="background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;padding:7px 14px;border-radius:8px;font-size:12px;">← Prev</a>}
+      <span style="font-size:12px;color:#6e6e78;">{page} / {totalPages}</span>
+      {page < totalPages && <a href={`?q=${q}&status=${statusFilter}&page=${page+1}`} style="background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;padding:7px 14px;border-radius:8px;font-size:12px;">Next →</a>}
+    </div>
+  )}
+</div>
+
+<!-- Add Employee Modal -->
+<div id="addModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:100;align-items:flex-end;justify-content:center;">
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;max-height:90vh;overflow-y:auto;padding:20px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;">
+      <h2 style="font-size:16px;font-weight:700;color:#fff;margin:0;">Add Employee</h2>
+      <button onclick="document.getElementById('addModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;">&times;</button>
+    </div>
+    <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="action" value="add" />
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div style="grid-column:1/-1;">
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Full Name *</label>
+          <input type="text" name="fullName" required placeholder="Ravi Kumar" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div style="grid-column:1/-1;">
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Email *</label>
+          <input type="email" name="email" required placeholder="ravi@edurankai.in" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Phone</label>
+          <input type="tel" name="phone" placeholder="+91 98765 43210" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Designation</label>
+          <input type="text" name="designation" placeholder="Software Engineer" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Employment Type</label>
+          <select name="employmentType" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="Full-Time">Full-Time</option>
+            <option value="Part-Time">Part-Time</option>
+            <option value="Contract">Contract</option>
+            <option value="Internship">Internship</option>
+            <option value="Freelance">Freelance</option>
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Work Mode</label>
+          <select name="workMode" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="Remote">Remote</option>
+            <option value="Hybrid">Hybrid</option>
+            <option value="On-Site">On-Site</option>
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Joining Date</label>
+          <input type="date" name="joiningDate" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Base Salary</label>
+          <div style="display:flex;gap:6px;">
+            <select name="currency" style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 8px;color:#fff;font-size:12px;outline:none;width:80px;">
+              <option value="INR">INR</option>
+              <option value="USD">USD</option>
+              <option value="GBP">GBP</option>
+              <option value="EUR">EUR</option>
+            </select>
+            <input type="number" name="baseSalary" placeholder="0 = Unpaid" style="flex:1;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+          </div>
+        </div>
+      </div>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;margin-top:4px;">
+        Add Employee
+      </button>
+    </form>
+  </div>
+</div>
+
+</AdminLayout>
