@@ -1,4 +1,4 @@
-import { defineMiddleware } from 'astro:middleware';
+﻿import { defineMiddleware } from 'astro:middleware';
 import { validateSessionToken } from '@/lib/auth/session';
 import { readSessionCookie, setSessionCookie, clearSessionCookie } from '@/lib/auth/cookie';
 
@@ -6,9 +6,6 @@ import { readSessionCookie, setSessionCookie, clearSessionCookie } from '@/lib/a
 export const onRequest = defineMiddleware(async (context, next) => {
   // Initialize DB with Cloudflare runtime env (if present)
   // On Cloudflare Workers, env vars live at context.locals.runtime.env
-  // On Node local, runtime is undefined and getDb falls back to process.env
-  const runtimeEnv = (context.locals as any).runtime?.env;
-  await getDb(runtimeEnv);
 
   const token = readSessionCookie(context.cookies);
   if (!token) {
