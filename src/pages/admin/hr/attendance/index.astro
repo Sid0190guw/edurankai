@@ -1,0 +1,381 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql as sqlExpr } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+let errorMsg = '';
+let successMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+
+  try {
+    if (action === 'mark') {
+      const employeeId = fd.get('employeeId') as string;
+      const date = fd.get('date') as string;
+      const status = fd.get('status') as string;
+      const clockIn = fd.get('clockIn') as string;
+      const clockOut = fd.get('clockOut') as string;
+      const workMode = fd.get('workMode') as string || 'remote';
+      const notes = (fd.get('notes') as string || '').trim();
+
+      // Calculate work hours
+      let workHours = null;
+      if (clockIn && clockOut) {
+        const inTime = new Date(`${date}T${clockIn}`);
+        const outTime = new Date(`${date}T${clockOut}`);
+        workHours = Math.round(((outTime.getTime() - inTime.getTime()) / 3600000) * 100) / 100;
+      }
+
+      await db.execute(sqlExpr`
+        INSERT INTO hr_attendance (employee_id, date, clock_in, clock_out, work_hours, status, work_mode, notes, ip_address)
+        VALUES (
+          ${employeeId}, ${date},
+          ${clockIn ? `${date}T${clockIn}:00` : null},
+          ${clockOut ? `${date}T${clockOut}:00` : null},
+          ${workHours}, ${status}, ${workMode}, ${notes || null},
+          ${Astro.clientAddress || null}
+        )
+        ON CONFLICT (employee_id, date)
+        DO UPDATE SET
+          clock_in = EXCLUDED.clock_in,
+          clock_out = EXCLUDED.clock_out,
+          work_hours = EXCLUDED.work_hours,
+          status = EXCLUDED.status,
+          work_mode = EXCLUDED.work_mode,
+          notes = EXCLUDED.notes
+      `);
+      successMsg = 'Attendance marked.';
+    } else if (action === 'bulk_mark') {
+      const date = fd.get('date') as string;
+      const status = fd.get('status') as string;
+      const workMode = fd.get('workMode') as string || 'remote';
+
+      const emps = await db.execute(sqlExpr`SELECT id FROM hr_employees WHERE is_active = true`);
+      let count = 0;
+      for (const emp of emps.rows as any[]) {
+        await db.execute(sqlExpr`
+          INSERT INTO hr_attendance (employee_id, date, status, work_mode)
+          VALUES (${emp.id}, ${date}, ${status}, ${workMode})
+          ON CONFLICT (employee_id, date) DO NOTHING
+        `);
+        count++;
+      }
+      successMsg = `Marked ${count} employees as ${status} for ${date}.`;
+    }
+  } catch (err: any) {
+    errorMsg = 'Error: ' + (err.message || 'Unknown');
+  }
+}
+
+const url = new URL(Astro.request.url);
+const tab = url.searchParams.get('tab') || 'today';
+const dateFilter = url.searchParams.get('date') || new Date().toISOString().split('T')[0];
+const empFilter = url.searchParams.get('emp') || '';
+
+// Today's attendance
+const todayAttendance = await db.execute(sqlExpr`
+  SELECT a.*, e.full_name, e.employee_code, e.designation
+  FROM hr_attendance a
+  JOIN hr_employees e ON a.employee_id = e.id
+  WHERE a.date = ${dateFilter}
+  ORDER BY e.full_name
+`);
+
+// Employees not marked today
+const unmarkedToday = await db.execute(sqlExpr`
+  SELECT e.id, e.full_name, e.employee_code, e.designation
+  FROM hr_employees e
+  WHERE e.is_active = true
+  AND e.id NOT IN (SELECT employee_id FROM hr_attendance WHERE date = ${dateFilter})
+  ORDER BY e.full_name
+`);
+
+// Monthly summary for an employee
+const monthlySummary = empFilter ? await db.execute(sqlExpr`
+  SELECT 
+    COUNT(*) FILTER (WHERE status = 'present') as present_days,
+    COUNT(*) FILTER (WHERE status = 'absent') as absent_days,
+    COUNT(*) FILTER (WHERE status = 'half_day') as half_days,
+    COUNT(*) FILTER (WHERE status = 'wfh') as wfh_days,
+    COUNT(*) FILTER (WHERE status = 'on_leave') as leave_days,
+    ROUND(AVG(work_hours)::numeric, 1) as avg_hours,
+    SUM(overtime_hours) as total_overtime
+  FROM hr_attendance a
+  WHERE a.employee_id = ${empFilter}
+  AND DATE_TRUNC('month', a.date) = DATE_TRUNC('month', NOW())
+`) : null;
+
+// Stats for today
+const todayStats = await db.execute(sqlExpr`
+  SELECT 
+    COUNT(*) FILTER (WHERE status = 'present') as present,
+    COUNT(*) FILTER (WHERE status = 'absent') as absent,
+    COUNT(*) FILTER (WHERE status = 'wfh') as wfh,
+    COUNT(*) FILTER (WHERE status = 'half_day') as half,
+    COUNT(*) FILTER (WHERE status = 'on_leave') as on_leave,
+    COUNT(*) as total
+  FROM hr_attendance WHERE date = ${dateFilter}
+`);
+const ts = todayStats.rows[0] as any;
+
+const allEmployees = await db.execute(sqlExpr`SELECT id, full_name, employee_code FROM hr_employees WHERE is_active = true ORDER BY full_name LIMIT 200`);
+
+const STATUS_COLORS: Record<string, string> = {
+  present: 'rgba(16,185,129,0.15)',
+  absent: 'rgba(239,68,68,0.15)',
+  half_day: 'rgba(251,191,36,0.15)',
+  wfh: 'rgba(99,102,241,0.15)',
+  on_leave: 'rgba(168,85,247,0.15)',
+  holiday: 'rgba(107,114,128,0.15)',
+};
+const STATUS_TEXT: Record<string, string> = {
+  present: '#6ee7b7',
+  absent: '#fca5a5',
+  half_day: '#fbbf24',
+  wfh: '#a5b4fc',
+  on_leave: '#d8b4fe',
+  holiday: '#9ca3af',
+};
+
+function formatTime(ts: any) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+}
+---
+<AdminLayout title="Attendance — HRMS" activeNav="hr">
+<div style="padding-bottom:80px;">
+
+  <!-- Header -->
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:16px;position:sticky;top:0;z-index:10;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+      <div>
+        <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">HRMS · Attendance</p>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Attendance</h1>
+      </div>
+      <button onclick="document.getElementById('markModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:12px;padding:8px 14px;border-radius:8px;cursor:pointer;">+ Mark</button>
+    </div>
+
+    <!-- Date picker -->
+    <form method="GET" style="display:flex;gap:8px;margin-bottom:12px;">
+      <input type="hidden" name="tab" value={tab} />
+      <input type="date" name="date" value={dateFilter} style="flex:1;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 12px;color:#fff;font-size:13px;outline:none;" onchange="this.form.submit()" />
+      <button type="submit" style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 14px;color:#fff;font-size:12px;cursor:pointer;">Go</button>
+    </form>
+
+    <!-- Stats for selected date -->
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:12px;">
+      {[
+        { label: 'Present', value: ts.present, color: '#6ee7b7' },
+        { label: 'Absent', value: ts.absent, color: '#fca5a5' },
+        { label: 'WFH', value: ts.wfh, color: '#a5b4fc' },
+        { label: 'Half', value: ts.half, color: '#fbbf24' },
+        { label: 'Leave', value: ts.on_leave, color: '#d8b4fe' },
+      ].map(stat => (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:6px;text-align:center;">
+          <p style={`font-size:16px;font-weight:700;color:${stat.color};margin:0;line-height:1;`}>{stat.value || 0}</p>
+          <p style="font-size:8px;color:#6e6e78;margin:2px 0 0;text-transform:uppercase;">{stat.label}</p>
+        </div>
+      ))}
+    </div>
+
+    <!-- Tabs -->
+    <div style="display:flex;gap:4px;">
+      {[['today','Daily'],['monthly','Monthly'],['bulk','Bulk Mark']].map(([t, label]) => (
+        <a href={`?tab=${t}&date=${dateFilter}`} style={`text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;${tab === t ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;color:#8a8a94;'}`}>{label}</a>
+      ))}
+    </div>
+  </div>
+
+  {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
+  {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
+
+  <!-- DAILY TAB -->
+  {tab === 'today' && (
+    <div style="padding:12px 16px;">
+      {unmarkedToday.rows.length > 0 && (
+        <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.2);border-radius:10px;padding:10px 14px;margin-bottom:12px;">
+          <p style="font-size:12px;color:#fbbf24;font-weight:600;margin:0 0 4px;">⚠ {unmarkedToday.rows.length} employees not yet marked for {dateFilter}</p>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;">
+            {(unmarkedToday.rows as any[]).slice(0, 8).map((e: any) => (
+              <span style="font-size:10px;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;padding:2px 8px;border-radius:100px;">{e.full_name.split(' ')[0]}</span>
+            ))}
+            {unmarkedToday.rows.length > 8 && <span style="font-size:10px;color:#6e6e78;">+{unmarkedToday.rows.length - 8} more</span>}
+          </div>
+        </div>
+      )}
+
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        {todayAttendance.rows.length === 0 && (
+          <div style="text-align:center;padding:48px;color:#6e6e78;">
+            <p style="font-size:32px;margin-bottom:8px;">📅</p>
+            <p style="font-size:13px;">No attendance marked for {dateFilter}</p>
+          </div>
+        )}
+        {(todayAttendance.rows as any[]).map(a => (
+          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;display:flex;align-items:center;gap:12px;">
+            <div style={`width:36px;height:36px;border-radius:8px;background:${STATUS_COLORS[a.status] || 'rgba(107,114,128,0.15)'};display:flex;align-items:center;justify-content:center;flex-shrink:0;`}>
+              <span style={`font-size:14px;color:${STATUS_TEXT[a.status] || '#9ca3af'};font-weight:700;`}>
+                {a.status === 'present' ? '✓' : a.status === 'absent' ? '✗' : a.status === 'wfh' ? '🏠' : a.status === 'half_day' ? '½' : '~'}
+              </span>
+            </div>
+            <div style="flex:1;min-width:0;">
+              <p style="font-size:13px;font-weight:600;color:#fff;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{a.full_name}</p>
+              <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;">
+                {formatTime(a.clock_in)} → {formatTime(a.clock_out)}
+                {a.work_hours ? ` · ${a.work_hours}h` : ''}
+                {a.work_mode ? ` · ${a.work_mode}` : ''}
+              </p>
+            </div>
+            <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;flex-shrink:0;background:${STATUS_COLORS[a.status] || 'rgba(107,114,128,0.15)'};color:${STATUS_TEXT[a.status] || '#9ca3af'};`}>
+              {a.status.replace('_', ' ')}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+
+  <!-- MONTHLY TAB -->
+  {tab === 'monthly' && (
+    <div style="padding:12px 16px;">
+      <form method="GET" style="display:flex;gap:8px;margin-bottom:12px;">
+        <input type="hidden" name="tab" value="monthly" />
+        <input type="hidden" name="date" value={dateFilter} />
+        <select name="emp" onchange="this.form.submit()" style="flex:1;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 12px;color:#fff;font-size:13px;outline:none;">
+          <option value="">Select Employee</option>
+          {(allEmployees.rows as any[]).map(e => (
+            <option value={e.id} selected={empFilter === e.id}>{e.full_name} ({e.employee_code})</option>
+          ))}
+        </select>
+      </form>
+
+      {monthlySummary && monthlySummary.rows.length > 0 && (
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            {[
+              { label: 'Present Days', value: (monthlySummary.rows[0] as any).present_days, color: '#6ee7b7' },
+              { label: 'Absent Days', value: (monthlySummary.rows[0] as any).absent_days, color: '#fca5a5' },
+              { label: 'WFH Days', value: (monthlySummary.rows[0] as any).wfh_days, color: '#a5b4fc' },
+              { label: 'Half Days', value: (monthlySummary.rows[0] as any).half_days, color: '#fbbf24' },
+              { label: 'Leave Days', value: (monthlySummary.rows[0] as any).leave_days, color: '#d8b4fe' },
+              { label: 'Avg Hours/Day', value: (monthlySummary.rows[0] as any).avg_hours || '—', color: '#fff' },
+            ].map(stat => (
+              <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px;display:flex;align-items:center;gap:12px;">
+                <p style={`font-size:22px;font-weight:700;color:${stat.color};margin:0;`}>{stat.value || 0}</p>
+                <p style="font-size:11px;color:#6e6e78;margin:0;">{stat.label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {!empFilter && (
+        <div style="text-align:center;padding:48px;color:#6e6e78;">
+          <p style="font-size:13px;">Select an employee to view monthly summary</p>
+        </div>
+      )}
+    </div>
+  )}
+
+  <!-- BULK MARK TAB -->
+  {tab === 'bulk' && (
+    <div style="padding:12px 16px;">
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
+        <p style="font-size:14px;font-weight:600;color:#fff;margin:0 0 4px;">Bulk Mark Attendance</p>
+        <p style="font-size:12px;color:#6e6e78;margin:0 0 16px;">Marks all active employees at once. Won't overwrite existing records.</p>
+        <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+          <input type="hidden" name="action" value="bulk_mark" />
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Date</label>
+            <input type="date" name="date" value={dateFilter} style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+          </div>
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Status</label>
+            <select name="status" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+              <option value="present">Present</option>
+              <option value="absent">Absent</option>
+              <option value="wfh">Work From Home</option>
+              <option value="holiday">Holiday</option>
+              <option value="on_leave">On Leave</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Work Mode</label>
+            <select name="workMode" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+              <option value="remote">Remote</option>
+              <option value="office">Office</option>
+              <option value="hybrid">Hybrid</option>
+            </select>
+          </div>
+          <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Mark All Active Employees</button>
+        </form>
+      </div>
+    </div>
+  )}
+</div>
+
+<!-- Mark Individual Modal -->
+<div id="markModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:100;align-items:flex-end;justify-content:center;">
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;max-height:90vh;overflow-y:auto;padding:20px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">Mark Attendance</h2>
+      <button onclick="document.getElementById('markModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
+    </div>
+    <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="action" value="mark" />
+      <div>
+        <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Employee</label>
+        <select name="employeeId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+          {(allEmployees.rows as any[]).map(e => (
+            <option value={e.id}>{e.full_name} ({e.employee_code})</option>
+          ))}
+        </select>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div style="grid-column:1/-1;">
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Date</label>
+          <input type="date" name="date" value={dateFilter} style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Status</label>
+          <select name="status" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="present">Present</option>
+            <option value="absent">Absent</option>
+            <option value="wfh">WFH</option>
+            <option value="half_day">Half Day</option>
+            <option value="on_leave">On Leave</option>
+            <option value="holiday">Holiday</option>
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Work Mode</label>
+          <select name="workMode" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="remote">Remote</option>
+            <option value="office">Office</option>
+            <option value="hybrid">Hybrid</option>
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Clock In</label>
+          <input type="time" name="clockIn" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Clock Out</label>
+          <input type="time" name="clockOut" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div style="grid-column:1/-1;">
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Notes</label>
+          <input type="text" name="notes" placeholder="Optional note..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+      </div>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Save Attendance</button>
+    </form>
+  </div>
+</div>
+
+</AdminLayout>
