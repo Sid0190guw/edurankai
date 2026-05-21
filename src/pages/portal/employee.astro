@@ -1,0 +1,315 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+if (user.role !== 'applicant') return Astro.redirect('/admin');
+
+// Check if this user is a hired employee
+let employee: any = null;
+let leaveBalances: any[] = [];
+let recentLeave: any[] = [];
+let recentAttendance: any[] = [];
+let payslips: any[] = [];
+
+try {
+  const empResult = await db.execute(sql`
+    SELECT e.*, d.name as dept_name
+    FROM hr_employees e
+    LEFT JOIN departments d ON e.department_id = d.id
+    WHERE e.personal_email = ${user.email} AND e.is_active = true
+    LIMIT 1
+  `);
+  const rows = Array.isArray(empResult) ? empResult : (empResult?.rows || []);
+  employee = rows[0] || null;
+} catch(e) {}
+
+if (!employee) {
+  // Not an employee - redirect to applicant portal
+  return Astro.redirect('/portal/applications');
+}
+
+const empId = employee.id;
+
+// Leave balances
+try {
+  const r = await db.execute(sql`
+    SELECT lb.*, lt.name as leave_name, lt.code, lt.is_paid
+    FROM hr_leave_balances lb
+    JOIN hr_leave_types lt ON lb.leave_type_id = lt.id
+    WHERE lb.employee_id = ${empId} AND lb.year = EXTRACT(YEAR FROM NOW())::int
+    ORDER BY lt.name
+  `);
+  leaveBalances = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+// Recent leave requests
+try {
+  const r = await db.execute(sql`
+    SELECT lr.*, lt.name as leave_name
+    FROM hr_leave_requests lr
+    JOIN hr_leave_types lt ON lr.leave_type_id = lt.id
+    WHERE lr.employee_id = ${empId}
+    ORDER BY lr.applied_at DESC LIMIT 5
+  `);
+  recentLeave = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+// Recent attendance (last 7 days)
+try {
+  const r = await db.execute(sql`
+    SELECT * FROM hr_attendance
+    WHERE employee_id = ${empId}
+    ORDER BY date DESC LIMIT 7
+  `);
+  recentAttendance = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+// Recent payslips
+try {
+  const r = await db.execute(sql`
+    SELECT ps.*, pr.status as run_status
+    FROM hr_payslips ps
+    JOIN hr_payroll_runs pr ON ps.payroll_run_id = pr.id
+    WHERE ps.employee_id = ${empId}
+    ORDER BY ps.year DESC, ps.month DESC LIMIT 3
+  `);
+  payslips = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const firstName = employee.full_name ? employee.full_name.split(' ')[0] : 'there';
+
+function fmtDate(d: any) {
+  if (!d) return '-';
+  return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function fmt(n: any) {
+  if (!n) return '0';
+  return parseFloat(n).toLocaleString('en-IN');
+}
+
+// Handle leave application
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+  if (action === 'apply_leave') {
+    const leaveTypeId = fd.get('leaveTypeId') as string;
+    const startDate = fd.get('startDate') as string;
+    const endDate = fd.get('endDate') as string;
+    const reason = (fd.get('reason') as string || '').trim();
+    if (leaveTypeId && startDate && endDate) {
+      try {
+        // Calculate days
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        const days = Math.max(1, Math.round((end.getTime() - start.getTime()) / 86400000) + 1);
+        await db.execute(sql`
+          INSERT INTO hr_leave_requests (employee_id, leave_type_id, start_date, end_date, days, reason, status, applied_at)
+          VALUES (${empId}, ${leaveTypeId}, ${startDate}, ${endDate}, ${days}, ${reason || null}, 'pending', NOW())
+        `);
+        return Astro.redirect('/portal/employee?applied=1');
+      } catch(e: any) {}
+    }
+  }
+}
+
+const applied = new URL(Astro.request.url).searchParams.get('applied') === '1';
+
+// Get leave types for apply form
+let leaveTypes: any[] = [];
+try {
+  const r = await db.execute(sql`SELECT id, name, code FROM hr_leave_types WHERE is_active = true ORDER BY name`);
+  leaveTypes = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+---
+<BaseLayout title="Employee Portal - EduRankAI" description="Your employee self-service portal.">
+<div style="min-height:100vh;background:#08080a;padding-bottom:80px;">
+
+  <!-- Header -->
+  <div style="background:#0f0f14;border-bottom:1px solid #1a1a1f;padding:20px 16px;">
+    <p style="font-size:10px;font-family:monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 4px;">Employee Portal</p>
+    <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 2px;">Hello, {firstName}.</h1>
+    <p style="font-size:12px;color:#6e6e78;margin:0;">{employee.designation} · {employee.dept_name || 'EduRankAI'}</p>
+    <div style="display:flex;align-items:center;gap:10px;margin-top:10px;">
+      <span style="font-size:10px;font-family:monospace;background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;padding:3px 8px;border-radius:6px;">{employee.employee_code}</span>
+      <a href="/portal/logout" style="font-size:11px;color:#6e6e78;text-decoration:none;">Sign out</a>
+    </div>
+  </div>
+
+  {applied && (
+    <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">
+      Leave application submitted. Your manager will review it shortly.
+    </div>
+  )}
+
+  <div style="padding:16px;display:flex;flex-direction:column;gap:14px;">
+
+    <!-- Leave balances -->
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <p style="font-size:13px;font-weight:600;color:#fff;margin:0;">Leave Balance {new Date().getFullYear()}</p>
+        <button onclick="document.getElementById('applyLeaveModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer;">Apply Leave</button>
+      </div>
+      {leaveBalances.length === 0 ? (
+        <p style="font-size:12px;color:#6e6e78;text-align:center;padding:12px;">No leave balance allocated yet. Contact HR.</p>
+      ) : (
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          {leaveBalances.map((lb: any) => {
+            const remaining = (lb.allocated || 0) - (lb.used || 0);
+            const pct = lb.allocated > 0 ? Math.round((lb.used / lb.allocated) * 100) : 0;
+            return (
+              <div style="background:#15151a;border-radius:8px;padding:10px;">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
+                  <div>
+                    <p style="font-size:11px;font-weight:600;color:#fff;margin:0;">{lb.leave_name}</p>
+                    <p style="font-size:9px;color:#6e6e78;margin:1px 0 0;">{lb.is_paid ? 'Paid' : 'Unpaid'}</p>
+                  </div>
+                  <span style="font-size:16px;font-weight:800;color:#FF7040;">{remaining}</span>
+                </div>
+                <div style="background:#0f0f14;border-radius:100px;height:3px;">
+                  <div style={`background:#FF4F00;height:100%;width:${100-pct}%;border-radius:100px;`}></div>
+                </div>
+                <p style="font-size:9px;color:#6e6e78;margin:4px 0 0;">{lb.used || 0} used of {lb.allocated || 0}</p>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+
+    <!-- Recent leave requests -->
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
+      <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 10px;">My Leave Requests</p>
+      {recentLeave.length === 0 ? (
+        <p style="font-size:12px;color:#6e6e78;text-align:center;padding:12px;">No leave requests yet.</p>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          {recentLeave.map((lr: any) => {
+            const color = lr.status === 'approved' ? '#10b981' : lr.status === 'rejected' ? '#ef4444' : '#fbbf24';
+            return (
+              <div style="background:#15151a;border-radius:8px;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;">
+                <div>
+                  <p style="font-size:12px;font-weight:600;color:#fff;margin:0;">{lr.leave_name}</p>
+                  <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;">{fmtDate(lr.start_date)} - {fmtDate(lr.end_date)} · {lr.days} day{lr.days > 1 ? 's' : ''}</p>
+                </div>
+                <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;background:${color}22;color:${color};text-transform:uppercase;`}>{lr.status}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+
+    <!-- Attendance this week -->
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
+      <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 10px;">Recent Attendance</p>
+      {recentAttendance.length === 0 ? (
+        <p style="font-size:12px;color:#6e6e78;text-align:center;padding:12px;">No attendance records yet.</p>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:4px;">
+          {recentAttendance.map((a: any) => {
+            const statusColor: Record<string,string> = {
+              present: '#10b981', absent: '#ef4444', wfh: '#6366f1',
+              half_day: '#fbbf24', on_leave: '#a855f7', holiday: '#6b7280'
+            };
+            const color = statusColor[a.status] || '#6b7280';
+            return (
+              <div style="background:#15151a;border-radius:6px;padding:8px 12px;display:flex;align-items:center;justify-content:space-between;">
+                <p style="font-size:12px;color:#d8d8de;margin:0;">{fmtDate(a.date)}</p>
+                <div style="display:flex;align-items:center;gap:8px;">
+                  {a.work_hours && <span style="font-size:10px;color:#6e6e78;">{a.work_hours}h</span>}
+                  <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;background:${color}22;color:${color};text-transform:uppercase;`}>{a.status?.replace('_',' ')}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+
+    <!-- Payslips -->
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
+      <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 10px;">Recent Payslips</p>
+      {payslips.length === 0 ? (
+        <p style="font-size:12px;color:#6e6e78;text-align:center;padding:12px;">No payslips yet. Contact HR.</p>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          {payslips.map((ps: any) => (
+            <div style="background:#15151a;border-radius:8px;padding:12px;display:flex;align-items:center;justify-content:space-between;">
+              <div>
+                <p style="font-size:13px;font-weight:600;color:#fff;margin:0;">{MONTH_NAMES[(ps.month||1)-1]} {ps.year}</p>
+                <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;">Gross: {ps.currency} {fmt(ps.gross_salary)}</p>
+              </div>
+              <div style="text-align:right;">
+                <p style="font-size:15px;font-weight:700;color:#10b981;margin:0;">{ps.currency} {fmt(ps.net_salary)}</p>
+                <p style="font-size:9px;color:#6e6e78;margin:0;">net pay</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+
+    <!-- Profile summary -->
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
+      <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 10px;">My Profile</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        {[
+          { label: 'Employee Code', value: employee.employee_code },
+          { label: 'Designation', value: employee.designation || '-' },
+          { label: 'Department', value: employee.dept_name || '-' },
+          { label: 'Join Date', value: fmtDate(employee.join_date) },
+          { label: 'Employment Type', value: (employee.employment_type || 'full_time').replace('_',' ') },
+          { label: 'Work Email', value: employee.work_email || '-' },
+        ].map(item => (
+          <div style="background:#15151a;border-radius:6px;padding:8px 10px;">
+            <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;margin:0;">{item.label}</p>
+            <p style="font-size:12px;color:#d8d8de;margin:3px 0 0;word-break:break-all;">{item.value}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Apply Leave Modal -->
+<div id="applyLeaveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:100;align-items:flex-end;justify-content:center;">
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;padding:20px;max-height:90vh;overflow-y:auto;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">Apply for Leave</h2>
+      <button onclick="document.getElementById('applyLeaveModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
+    </div>
+    <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="action" value="apply_leave" />
+      <div>
+        <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Leave Type</label>
+        <select name="leaveTypeId" required style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+          <option value="">Select type...</option>
+          {leaveTypes.map((lt: any) => <option value={lt.id}>{lt.name} ({lt.code})</option>)}
+        </select>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">From Date</label>
+          <input type="date" name="startDate" required style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">To Date</label>
+          <input type="date" name="endDate" required style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+      </div>
+      <div>
+        <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Reason</label>
+        <textarea name="reason" rows="3" placeholder="Brief reason for leave..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;"></textarea>
+      </div>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Submit Leave Application</button>
+    </form>
+  </div>
+</div>
+
+</BaseLayout>
