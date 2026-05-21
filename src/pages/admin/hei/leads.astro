@@ -1,0 +1,198 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+let okMsg = '', errorMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+  try {
+    if (action === 'promote') {
+      const id = fd.get('id') as string;
+      const lead = await db.execute(sql`SELECT * FROM hei_leads WHERE id = ${id} LIMIT 1`);
+      const rows = Array.isArray(lead) ? lead : (lead?.rows || []);
+      if (rows.length > 0) {
+        const l = rows[0] as any;
+        await db.execute(sql`UPDATE hei_leads SET status = 'promoted', updated_at = NOW() WHERE id = ${id}`);
+        await db.execute(sql`INSERT INTO hei_findings (title, description, status, institution_id, created_by) VALUES (${l.title}, ${l.summary || ''}, 'draft', ${l.institution_id || null}, ${user.id})`);
+        okMsg = 'Lead promoted to draft finding.';
+      }
+    } else if (action === 'dismiss') {
+      await db.execute(sql`UPDATE hei_leads SET status = 'dismissed', updated_at = NOW() WHERE id = ${fd.get('id') as string}`);
+      okMsg = 'Lead dismissed.';
+    } else if (action === 'add') {
+      const title = (fd.get('title') as string || '').trim();
+      const summary = (fd.get('summary') as string || '').trim();
+      const priority = fd.get('priority') as string || 'medium';
+      const category = fd.get('category') as string || 'general';
+      const pipeline = fd.get('pipeline') as string || '';
+      const instName = (fd.get('institution_name') as string || '').trim();
+      const confidence = parseInt(fd.get('confidence') as string || '0') || 0;
+      if (!title) { errorMsg = 'Title required.'; }
+      else {
+        await db.execute(sql`INSERT INTO hei_leads (title, summary, priority, category, pipeline, institution_name, confidence_pct, status, created_by) VALUES (${title}, ${summary||null}, ${priority}, ${category}, ${pipeline||null}, ${instName||null}, ${confidence}, 'needs_review', ${user.id})`);
+        okMsg = 'Lead added to queue.';
+      }
+    } else if (action === 'assign') {
+      const id = fd.get('id') as string;
+      const assignTo = fd.get('assign_to') as string;
+      await db.execute(sql`UPDATE hei_leads SET assigned_to = ${assignTo||null}, updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Assigned.';
+    }
+  } catch(e: any) { errorMsg = e.message; }
+}
+
+const url = new URL(Astro.request.url);
+const filter = url.searchParams.get('filter') || 'active';
+const cat = url.searchParams.get('cat') || 'all';
+
+let leads: any[] = [];
+try {
+  const statusFilter = filter === 'active'
+    ? sql`AND l.status NOT IN ('promoted','dismissed')`
+    : filter === 'promoted' ? sql`AND l.status = 'promoted'`
+    : filter === 'dismissed' ? sql`AND l.status = 'dismissed'`
+    : sql``;
+  const catFilter = cat !== 'all' ? sql`AND l.category = ${cat}` : sql``;
+  const r = await db.execute(sql`
+    SELECT l.*, u.name as assignee_name
+    FROM hei_leads l LEFT JOIN users u ON l.assigned_to = u.id
+    WHERE 1=1 ${statusFilter} ${catFilter}
+    ORDER BY CASE l.priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, l.created_at DESC
+    LIMIT 100
+  `);
+  leads = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+let admins: any[] = [];
+try {
+  const r = await db.execute(sql`SELECT id, name FROM users WHERE role != 'applicant' AND is_active = true ORDER BY name`);
+  admins = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+const PRIORITY_COLOR: Record<string,string> = { critical:'#ef4444', high:'#f97316', medium:'#fbbf24', low:'#6b7280', signal:'#60a5fa' };
+const STATUS_COLOR: Record<string,string> = { needs_review:'#fbbf24', drafting:'#60a5fa', context_needed:'#a78bfa', file_rti:'#f97316', promoted:'#10b981', dismissed:'#6b7280' };
+
+function timeAgo(d: any) {
+  if (!d) return '';
+  const diff = Date.now() - new Date(d).getTime();
+  const mins = Math.floor(diff/60000);
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.floor(mins/60);
+  if (hrs < 24) return hrs + 'h ago';
+  return Math.floor(hrs/24) + 'd ago';
+}
+---
+<AdminLayout title="Lead Queue" activeNav="hei">
+<div style="padding-bottom:80px;">
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;position:sticky;top:0;z-index:10;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+      <div>
+        <p style="font-size:10px;font-family:monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">HEI Editorial</p>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Lead Queue <span style="font-size:12px;color:#6e6e78;">({leads.length})</span></h1>
+      </div>
+      <div style="display:flex;gap:6px;">
+        <a href="/admin/hei" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;text-decoration:none;font-size:11px;padding:6px 10px;border-radius:6px;">Dashboard</a>
+        <button onclick="document.getElementById('addLeadModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer;">+ Add Lead</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:5px;overflow-x:auto;margin-bottom:8px;">
+      {(['active','promoted','dismissed','all'] as const).map(f => (
+        <a href={`?filter=${f}&cat=${cat}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:5px 10px;border-radius:100px;white-space:nowrap;${filter===f?'background:#FF4F00;color:#fff;':'background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;'}`}>{f.charAt(0).toUpperCase()+f.slice(1)}</a>
+      ))}
+    </div>
+    <div style="display:flex;gap:5px;overflow-x:auto;">
+      {(['all','equity','wellbeing','outcomes','integrity','research'] as const).map(c => (
+        <a href={`?filter=${filter}&cat=${c}`} style={`text-decoration:none;font-size:10px;font-weight:600;padding:4px 10px;border-radius:100px;white-space:nowrap;${cat===c?'background:#1a1a1f;color:#fff;border:1px solid #FF4F00;':'background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;'}`}>{c.charAt(0).toUpperCase()+c.slice(1)}</a>
+      ))}
+    </div>
+  </div>
+
+  {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
+  {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+
+  <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
+    {leads.length === 0 && <div style="text-align:center;padding:40px;color:#6e6e78;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;"><p style="font-size:13px;">No leads in this view.</p></div>}
+    {leads.map((l: any) => {
+      const pc = PRIORITY_COLOR[l.priority] || '#6b7280';
+      const sc = STATUS_COLOR[l.status] || '#6b7280';
+      return (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+          <div style="padding:12px 14px;">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:6px;">
+              <div style="flex:1;min-width:0;">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;flex-wrap:wrap;">
+                  <span style={`font-size:9px;font-weight:700;padding:2px 7px;border-radius:100px;background:${pc}22;color:${pc};`}>{l.priority?.toUpperCase()}</span>
+                  <span style={`font-size:9px;font-weight:600;color:${sc};`}>{l.status?.replace('_',' ').toUpperCase()}</span>
+                  {l.category && <span style="font-size:9px;background:#15151a;color:#8a8a94;padding:1px 6px;border-radius:4px;">{l.category}</span>}
+                </div>
+                <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 4px;line-height:1.4;">{l.title}</p>
+                <p style="font-size:10px;color:#6e6e78;margin:0;font-family:monospace;">{l.institution_name && l.institution_name + ' - '}{l.pipeline && l.pipeline + ' - '}{timeAgo(l.created_at)}</p>
+              </div>
+              {l.confidence_pct > 0 && <div style="text-align:right;flex-shrink:0;"><p style="font-size:16px;font-weight:700;color:#fff;margin:0;font-family:monospace;">{l.confidence_pct}%</p><p style="font-size:9px;color:#6e6e78;margin:0;">confidence</p></div>}
+            </div>
+            {l.summary && <p style="font-size:11px;color:#8a8a94;margin:6px 0 0;line-height:1.4;">{l.summary}</p>}
+            {l.assignee_name && <p style="font-size:10px;color:#6e6e78;margin:6px 0 0;">Assigned: {l.assignee_name}</p>}
+          </div>
+          {l.status !== 'promoted' && l.status !== 'dismissed' && (
+            <div style="border-top:1px solid #1a1a1f;padding:8px 14px;display:flex;gap:6px;flex-wrap:wrap;">
+              <form method="POST" style="display:contents;">
+                <input type="hidden" name="action" value="promote" /><input type="hidden" name="id" value={l.id} />
+                <button type="submit" style="background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:11px;font-weight:600;padding:5px 12px;border-radius:6px;cursor:pointer;">Promote to draft</button>
+              </form>
+              <form method="POST" style="display:contents;">
+                <input type="hidden" name="action" value="dismiss" /><input type="hidden" name="id" value={l.id} />
+                <button type="submit" style="background:#15151a;border:1px solid #1a1a1f;color:#6e6e78;font-size:11px;padding:5px 12px;border-radius:6px;cursor:pointer;">Dismiss</button>
+              </form>
+              <form method="POST" style="display:flex;gap:4px;margin-left:auto;">
+                <input type="hidden" name="action" value="assign" /><input type="hidden" name="id" value={l.id} />
+                <select name="assign_to" style="background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:5px 8px;color:#fff;font-size:10px;outline:none;">
+                  <option value="">Unassigned</option>
+                  {admins.map((a: any) => <option value={a.id} selected={l.assigned_to===a.id}>{a.name}</option>)}
+                </select>
+                <button type="submit" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:10px;padding:5px 8px;border-radius:6px;cursor:pointer;">Assign</button>
+              </form>
+            </div>
+          )}
+        </div>
+      );
+    })}
+  </div>
+</div>
+
+<div id="addLeadModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:100;align-items:flex-end;justify-content:center;">
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;padding:20px;max-height:90vh;overflow-y:auto;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">Add Lead</h2>
+      <button onclick="document.getElementById('addLeadModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
+    </div>
+    <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="action" value="add" />
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Title *</label><input name="title" required placeholder="Lead title..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" /></div>
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Institution</label><input name="institution_name" placeholder="IIT Bombay..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" /></div>
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Summary</label><textarea name="summary" rows="3" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;"></textarea></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Priority</label>
+          <select name="priority" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 8px;color:#fff;font-size:12px;outline:none;">
+            <option value="critical">Critical</option><option value="high">High</option><option value="medium" selected>Medium</option><option value="low">Low</option><option value="signal">Signal</option>
+          </select></div>
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Category</label>
+          <select name="category" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 8px;color:#fff;font-size:12px;outline:none;">
+            <option value="equity">Equity</option><option value="wellbeing">Wellbeing</option><option value="outcomes">Outcomes</option><option value="integrity">Integrity</option><option value="research">Research</option><option value="general" selected>General</option>
+          </select></div>
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Pipeline</label>
+          <select name="pipeline" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 8px;color:#fff;font-size:12px;outline:none;">
+            <option value="">Manual</option><option value="P1">P1 Public</option><option value="P2">P2 RTI</option><option value="P3">P3 Survey</option><option value="P4">P4 Alumni</option><option value="P5">P5 Research</option><option value="P6">P6 News</option><option value="P7">P7 Social</option>
+          </select></div>
+      </div>
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Confidence %</label><input name="confidence" type="number" min="0" max="100" placeholder="0-100" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" /></div>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Add to Queue</button>
+    </form>
+  </div>
+</div>
+</AdminLayout>
