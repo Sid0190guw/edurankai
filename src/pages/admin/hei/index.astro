@@ -1,0 +1,567 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const firstName = user.name ? user.name.split(' ')[0] : 'there';
+const hour = new Date().getHours();
+const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+
+// Load all dashboard data
+let stats = { leads: 0, drafts: 0, replies: 0, published: 0, sources: 0, surveys: 0, rti: 0, coverage: 0, legal: 0 };
+let leads: any[] = [];
+let crawlers: any[] = [];
+let auditLog: any[] = [];
+let workbench: any[] = [];
+let pendingFindings = 0;
+
+try {
+  const r = await db.execute(sql`
+    SELECT
+      (SELECT COUNT(*)::int FROM hei_leads WHERE status NOT IN ('promoted','dismissed')) as leads,
+      (SELECT COUNT(*)::int FROM hei_findings WHERE status = 'draft') as drafts,
+      (SELECT COUNT(*)::int FROM hei_right_of_reply WHERE status IN ('sent','pending')) as replies,
+      (SELECT COUNT(*)::int FROM hei_institutions WHERE is_published = true) as published,
+      (SELECT COALESCE(SUM(sources_count),0)::int FROM hei_crawlers WHERE status = 'active') as sources,
+      (SELECT COUNT(*)::int FROM hei_survey_responses) as surveys,
+      (SELECT COUNT(*)::int FROM hei_rti_filings) as rti,
+      (SELECT COUNT(*)::int FROM hei_institutions) as coverage,
+      (SELECT COUNT(*)::int FROM hei_legal_queue WHERE status = 'open') as legal
+  `);
+  const rows = Array.isArray(r) ? r : (r?.rows || []);
+  if (rows[0]) {
+    const d = rows[0] as any;
+    stats = {
+      leads: Number(d.leads)||0, drafts: Number(d.drafts)||0,
+      replies: Number(d.replies)||0, published: Number(d.published)||0,
+      sources: Number(d.sources)||0, surveys: Number(d.surveys)||0,
+      rti: Number(d.rti)||0, coverage: Number(d.coverage)||0,
+      legal: Number(d.legal)||0
+    };
+  }
+} catch(e) {}
+
+// Leads
+try {
+  const r = await db.execute(sql`
+    SELECT l.*, u.name as assignee_name,
+      SUBSTRING(u.name FROM 1 FOR 2) as assignee_initials
+    FROM hei_leads l
+    LEFT JOIN users u ON l.assigned_to = u.id
+    WHERE l.status NOT IN ('promoted','dismissed')
+    ORDER BY CASE l.priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END,
+    l.created_at DESC
+    LIMIT 10
+  `);
+  leads = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+// Crawlers
+try {
+  const r = await db.execute(sql`SELECT * FROM hei_crawlers ORDER BY code`);
+  crawlers = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+// Audit log (from existing audit_log table)
+try {
+  const r = await db.execute(sql`
+    SELECT al.*, u.name as user_name, SUBSTRING(u.name FROM 1 FOR 2) as initials
+    FROM audit_log al
+    LEFT JOIN users u ON al.user_id = u.id
+    WHERE al.entity IN ('hei_finding','hei_lead','hei_crawler','hei_institution')
+       OR al.action LIKE 'hei%'
+    ORDER BY al.created_at DESC
+    LIMIT 10
+  `);
+  auditLog = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+// Workbench - findings awaiting sign-off
+try {
+  const r = await db.execute(sql`
+    SELECT f.*, i.name as institution_name,
+      (SELECT COUNT(*)::int FROM hei_evidence_locks WHERE finding_id = f.id) as total_locks,
+      (SELECT COUNT(*)::int FROM hei_evidence_locks WHERE finding_id = f.id AND is_locked = true) as locked_count
+    FROM hei_findings f
+    LEFT JOIN hei_institutions i ON f.institution_id = i.id
+    WHERE f.status IN ('review','pending_publication')
+    ORDER BY f.updated_at DESC
+    LIMIT 5
+  `);
+  workbench = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+// Handle POST actions
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+  try {
+    if (action === 'promote_lead') {
+      const id = fd.get('id') as string;
+      await db.execute(sql`UPDATE hei_leads SET status = 'promoted', updated_at = NOW() WHERE id = ${id}`);
+      // Create a draft finding
+      const lead = leads.find((l: any) => l.id === id) as any;
+      if (lead) {
+        await db.execute(sql`
+          INSERT INTO hei_findings (title, description, status, institution_id, created_by)
+          VALUES (${lead.title}, ${lead.summary || ''}, 'draft', ${lead.institution_id || null}, ${user.id})
+        `);
+      }
+      return Astro.redirect('/admin/hei');
+    } else if (action === 'dismiss_lead') {
+      const id = fd.get('id') as string;
+      await db.execute(sql`UPDATE hei_leads SET status = 'dismissed', updated_at = NOW() WHERE id = ${id}`);
+      return Astro.redirect('/admin/hei');
+    } else if (action === 'add_lead') {
+      const title = (fd.get('title') as string || '').trim();
+      const summary = (fd.get('summary') as string || '').trim();
+      const priority = (fd.get('priority') as string || 'medium');
+      const category = (fd.get('category') as string || 'general');
+      const pipeline = (fd.get('pipeline') as string || '');
+      const institutionName = (fd.get('institution_name') as string || '').trim();
+      if (title) {
+        await db.execute(sql`
+          INSERT INTO hei_leads (title, summary, priority, category, pipeline, institution_name, status, created_by)
+          VALUES (${title}, ${summary || null}, ${priority}, ${category}, ${pipeline || null}, ${institutionName || null}, 'needs_review', ${user.id})
+        `);
+      }
+      return Astro.redirect('/admin/hei');
+    }
+  } catch(e: any) { console.error(e.message); }
+}
+
+const PRIORITY_CONFIG: Record<string, { color: string; bg: string; label: string }> = {
+  critical: { color: '#ef4444', bg: 'rgba(239,68,68,0.1)', label: 'CRITICAL' },
+  high: { color: '#f97316', bg: 'rgba(249,115,22,0.1)', label: 'HIGH' },
+  medium: { color: '#fbbf24', bg: 'rgba(251,191,36,0.1)', label: 'MEDIUM' },
+  low: { color: '#6b7280', bg: 'rgba(107,114,128,0.1)', label: 'LOW' },
+  signal: { color: '#60a5fa', bg: 'rgba(96,165,250,0.1)', label: 'SIGNAL' },
+};
+
+const STATUS_CONFIG: Record<string, { color: string; label: string }> = {
+  needs_review: { color: '#fbbf24', label: 'NEEDS REVIEW' },
+  drafting: { color: '#60a5fa', label: 'DRAFTING' },
+  context_needed: { color: '#a78bfa', label: 'CONTEXT NEEDED' },
+  file_rti: { color: '#f97316', label: 'FILE RTI' },
+  promoted: { color: '#10b981', label: 'PROMOTED' },
+};
+
+function timeAgo(d: any) {
+  if (!d) return '';
+  const diff = Date.now() - new Date(d).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + 'h ago';
+  return Math.floor(hrs / 24) + 'd ago';
+}
+---
+<AdminLayout title="HEI Editorial Control Plane" activeNav="hei">
+<style>
+  .ecp-shell { display: flex; min-height: 100vh; background: #0a0a0d; }
+  .ecp-sidebar { width: 220px; background: #0e0e12; border-right: 1px solid #1a1a1f; flex-shrink: 0; display: flex; flex-direction: column; position: fixed; top: 0; left: 0; height: 100vh; overflow-y: auto; z-index: 20; }
+  .ecp-main { flex: 1; margin-left: 220px; min-height: 100vh; }
+  .ecp-brand { padding: 16px; border-bottom: 1px solid #1a1a1f; }
+  .ecp-brand-name { font-size: 15px; font-weight: 700; color: #fff; }
+  .ecp-brand-sub { font-size: 10px; color: #6e6e78; font-family: 'Geist Mono', monospace; margin-top: 2px; }
+  .ecp-nav-group { padding: 12px 0 4px; }
+  .ecp-nav-group-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: #6e6e78; padding: 0 14px; margin-bottom: 4px; }
+  .ecp-nav-item { display: flex; align-items: center; justify-content: space-between; padding: 7px 14px; font-size: 12px; color: #8a8a94; text-decoration: none; cursor: pointer; transition: all 0.12s; }
+  .ecp-nav-item:hover, .ecp-nav-item.active { background: #15151a; color: #fff; }
+  .ecp-nav-item.active { border-left: 2px solid #FF4F00; color: #FF7040; }
+  .ecp-nav-badge { background: #FF4F00; color: #fff; font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 100px; font-family: 'Geist Mono', monospace; }
+  .ecp-nav-badge.yellow { background: #fbbf24; color: #000; }
+  .ecp-nav-badge.blue { background: #3b82f6; }
+  .ecp-user { margin-top: auto; padding: 12px 14px; border-top: 1px solid #1a1a1f; display: flex; align-items: center; gap: 8px; }
+  .ecp-user-avatar { width: 28px; height: 28px; border-radius: 50%; background: #FF4F00; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: #fff; flex-shrink: 0; }
+  .ecp-header { background: #08080a; border-bottom: 1px solid #1a1a1f; padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 10; }
+  .ecp-breadcrumb { font-size: 11px; color: #6e6e78; font-family: 'Geist Mono', monospace; }
+  .ecp-breadcrumb span { color: #fff; font-weight: 600; }
+  .ecp-status-bar { font-size: 11px; color: #10b981; display: flex; align-items: center; gap: 6px; }
+  .ecp-status-dot { width: 6px; height: 6px; background: #10b981; border-radius: 50%; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .ecp-body { padding: 20px; }
+  .ecp-hero { margin-bottom: 20px; }
+  .ecp-hero h1 { font-size: 22px; font-weight: 700; color: #fff; margin: 0 0 6px; }
+  .ecp-hero p { font-size: 13px; color: #8a8a94; line-height: 1.6; margin: 0; }
+  .ecp-meta { font-size: 10px; color: #6e6e78; font-family: 'Geist Mono', monospace; margin-top: 8px; }
+  .ecp-stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 16px; }
+  .ecp-stat { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 10px; padding: 12px; }
+  .ecp-stat-num { font-size: 24px; font-weight: 800; color: #fff; font-family: 'Geist Mono', monospace; line-height: 1; }
+  .ecp-stat-label { font-size: 10px; color: #6e6e78; margin-top: 4px; }
+  .ecp-stat-sub { font-size: 10px; color: #8a8a94; margin-top: 2px; }
+  .ecp-section { margin-bottom: 20px; }
+  .ecp-section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #6e6e78; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
+  .ecp-section-title a { font-size: 10px; color: #FF7040; text-decoration: none; font-weight: 500; text-transform: none; letter-spacing: 0; }
+  .ecp-lead { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 10px; overflow: hidden; margin-bottom: 6px; }
+  .ecp-lead-header { padding: 10px 12px; }
+  .ecp-lead-priority { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 100px; text-transform: uppercase; display: inline-block; margin-bottom: 6px; }
+  .ecp-lead-title { font-size: 13px; font-weight: 600; color: #fff; margin: 0 0 4px; line-height: 1.4; }
+  .ecp-lead-meta { font-size: 10px; color: #6e6e78; font-family: 'Geist Mono', monospace; }
+  .ecp-lead-footer { border-top: 1px solid #1a1a1f; padding: 6px 12px; display: flex; align-items: center; justify-content: space-between; }
+  .ecp-lead-status { font-size: 9px; font-weight: 700; color: #fbbf24; }
+  .ecp-lead-actions { display: flex; gap: 5px; }
+  .ecp-btn-sm { font-size: 10px; font-weight: 600; padding: 4px 10px; border-radius: 5px; border: none; cursor: pointer; }
+  .ecp-crawler { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 8px; padding: 10px 12px; margin-bottom: 5px; display: flex; align-items: center; gap: 10px; }
+  .ecp-crawler-code { font-size: 10px; font-weight: 700; font-family: 'Geist Mono', monospace; background: #15151a; padding: 2px 7px; border-radius: 4px; color: #FF7040; flex-shrink: 0; }
+  .ecp-crawler-info { flex: 1; min-width: 0; }
+  .ecp-crawler-name { font-size: 12px; font-weight: 600; color: #fff; }
+  .ecp-crawler-desc { font-size: 10px; color: #6e6e78; }
+  .ecp-crawler-stats { text-align: right; flex-shrink: 0; }
+  .ecp-crawler-num { font-size: 13px; font-weight: 700; color: #10b981; font-family: 'Geist Mono', monospace; }
+  .ecp-crawler-stat-label { font-size: 9px; color: #6e6e78; }
+  .ecp-status-indicator { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .ecp-audit-item { padding: 8px 0; border-bottom: 1px solid #0a0a0c; display: flex; align-items: flex-start; gap: 8px; }
+  .ecp-audit-avatar { width: 22px; height: 22px; border-radius: 50%; background: #15151a; display: flex; align-items: center; justify-content: center; font-size: 8px; font-weight: 700; color: #8a8a94; flex-shrink: 0; margin-top: 1px; }
+  .ecp-audit-avatar.system { background: #0f0f14; border: 1px solid #1a1a1f; }
+  .ecp-audit-text { flex: 1; font-size: 11px; color: #8a8a94; line-height: 1.4; }
+  .ecp-audit-time { font-size: 9px; color: #6e6e78; font-family: 'Geist Mono', monospace; flex-shrink: 0; }
+  .ecp-workbench-item { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 10px; padding: 14px; margin-bottom: 8px; }
+  .ecp-workbench-badge { font-size: 9px; font-weight: 700; background: rgba(96,165,250,0.15); color: #60a5fa; padding: 2px 8px; border-radius: 100px; display: inline-block; margin-bottom: 8px; }
+  .ecp-evidence-lock { display: flex; align-items: center; gap: 6px; font-size: 11px; padding: 4px 0; }
+  .ecp-evidence-lock.locked { color: #6ee7b7; }
+  .ecp-evidence-lock.unlocked { color: #6e6e78; }
+  .ecp-filter-pills { display: flex; gap: 5px; overflow-x: auto; margin-bottom: 10px; }
+  .ecp-pill { font-size: 10px; font-weight: 600; padding: 4px 10px; border-radius: 100px; border: 1px solid #1a1a1f; background: #15151a; color: #8a8a94; cursor: pointer; white-space: nowrap; text-decoration: none; }
+  .ecp-pill.active { background: #FF4F00; color: #fff; border-color: #FF4F00; }
+  .ecp-add-btn { background: #FF4F00; border: none; color: #fff; font-size: 11px; font-weight: 600; padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+  @media (max-width: 768px) {
+    .ecp-sidebar { display: none; }
+    .ecp-main { margin-left: 0; }
+  }
+</style>
+
+<div class="ecp-shell">
+  <!-- Sidebar -->
+  <aside class="ecp-sidebar">
+    <div class="ecp-brand">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div style="width:28px;height:28px;background:#FF4F00;border-radius:6px;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:14px;">E</div>
+        <div>
+          <div class="ecp-brand-name">EduRankAI</div>
+          <div class="ecp-brand-sub">Editorial Control Plane - v0.1</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="ecp-nav-group">
+      <div class="ecp-nav-group-label">Editorial</div>
+      <a href="/admin/hei" class="ecp-nav-item active">[D] Dashboard</a>
+      <a href="/admin/hei/leads" class="ecp-nav-item">[Q] Lead queue <span class="ecp-nav-badge">{stats.leads}</span></a>
+      <a href="/admin/hei/findings" class="ecp-nav-item">[E] Draft findings <span class="ecp-nav-badge yellow">{stats.drafts}</span></a>
+      <a href="/admin/hei/replies" class="ecp-nav-item">[R] Right-of-reply <span class="ecp-nav-badge blue">{stats.replies}</span></a>
+      <a href="/admin/hei/institutions" class="ecp-nav-item">[P] Published <span style="font-size:10px;color:#6e6e78;">{stats.published}</span></a>
+    </div>
+
+    <div class="ecp-nav-group">
+      <div class="ecp-nav-group-label">Data layer</div>
+      <a href="/admin/hei/crawlers" class="ecp-nav-item">[C] Ingestion sources <span style="font-size:10px;color:#6e6e78;">{stats.sources}</span></a>
+      <a href="/admin/hei/crawlers" class="ecp-nav-item">[*] Crawlers live</a>
+      <a href="/admin/hei/surveys" class="ecp-nav-item">[S] Survey responses <span style="font-size:10px;color:#6e6e78;">{stats.surveys}</span></a>
+      <a href="/admin/hei/rti" class="ecp-nav-item">[T] RTI tracker <span style="font-size:10px;color:#6e6e78;">{stats.rti}</span></a>
+      <a href="/admin/hei/institutions" class="ecp-nav-item">[D] Evidence store</a>
+    </div>
+
+    <div class="ecp-nav-group">
+      <div class="ecp-nav-group-label">Public surface</div>
+      <a href="/admin/hei/surveys" class="ecp-nav-item">[Q] Form builder</a>
+      <a href="/admin/hei/institutions" class="ecp-nav-item">[S] Ranking publication</a>
+      <a href="/admin/hei/findings" class="ecp-nav-item">[I] Investigations</a>
+      <a href="/admin/hei/institutions" class="ecp-nav-item">[D] Data downloads</a>
+    </div>
+
+    <div class="ecp-nav-group">
+      <div class="ecp-nav-group-label">Operations</div>
+      <a href="/admin/users" class="ecp-nav-item">[D] Team & roles</a>
+      <a href="/admin/audit" class="ecp-nav-item">[D] Audit log</a>
+      <a href="/admin/hei/legal" class="ecp-nav-item">[L] Legal queue {stats.legal > 0 && <span class="ecp-nav-badge">{stats.legal}</span>}</a>
+      <a href="/admin/hei" class="ecp-nav-item">[!] Incident response</a>
+    </div>
+
+    <div class="ecp-user">
+      <div class="ecp-user-avatar">{user.name?.substring(0,2).toUpperCase() || 'SP'}</div>
+      <div style="min-width:0;">
+        <div style="font-size:11px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{user.name}</div>
+        <div style="font-size:9px;color:#6e6e78;">{user.role?.replace('_',' ')}</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main content -->
+  <main class="ecp-main">
+    <!-- Header -->
+    <div class="ecp-header">
+      <div class="ecp-breadcrumb">Editorial - <span>Dashboard</span></div>
+      <div class="ecp-status-bar">
+        <div class="ecp-status-dot"></div>
+        All crawlers healthy - {crawlers.filter((c:any) => c.status === 'active').length} pipelines active
+      </div>
+    </div>
+
+    <div class="ecp-body">
+      <!-- Hero -->
+      <div class="ecp-hero">
+        <h1>{greeting}. {stats.drafts > 0 ? `${stats.drafts} finding${stats.drafts > 1 ? 's' : ''} awaiting review.` : 'Everything is up to date.'}</h1>
+        <p>
+          {stats.sources > 0 ? `Continuous data flow active across ${stats.sources} sources. ` : ''}
+          {stats.leads > 0 ? `${stats.leads} leads in queue. ` : ''}
+          {stats.replies > 0 ? `${stats.replies} in right-of-reply window. ` : ''}
+          {stats.legal > 0 ? `${stats.legal} in legal review.` : ''}
+        </p>
+        <div class="ecp-meta">{new Date().toLocaleDateString('en-IN', { day:'numeric', month:'long', year:'numeric' })} - {new Date().toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit' })} IST</div>
+      </div>
+
+      <!-- Stats grid -->
+      <div class="ecp-stats-grid">
+        <div class="ecp-stat">
+          <div class="ecp-stat-num" style="color:#FF7040;">{stats.leads}</div>
+          <div class="ecp-stat-label">Lead queue</div>
+          <div class="ecp-stat-sub">await editorial</div>
+        </div>
+        <div class="ecp-stat">
+          <div class="ecp-stat-num" style="color:#fbbf24;">{stats.drafts}</div>
+          <div class="ecp-stat-label">Drafts</div>
+          <div class="ecp-stat-sub">in workbench</div>
+        </div>
+        <div class="ecp-stat">
+          <div class="ecp-stat-num" style="color:#60a5fa;">{stats.replies}</div>
+          <div class="ecp-stat-label">Right-of-reply</div>
+          <div class="ecp-stat-sub">institutions notified</div>
+        </div>
+        <div class="ecp-stat">
+          <div class="ecp-stat-num" style="color:#10b981;">{stats.published}</div>
+          <div class="ecp-stat-label">Published</div>
+          <div class="ecp-stat-sub">institutions ranked</div>
+        </div>
+        <div class="ecp-stat">
+          <div class="ecp-stat-num" style="color:#a78bfa;">{stats.surveys}</div>
+          <div class="ecp-stat-label">Survey responses</div>
+          <div class="ecp-stat-sub">verified</div>
+        </div>
+        <div class="ecp-stat">
+          <div class="ecp-stat-num" style="color:#f97316;">{stats.rti}</div>
+          <div class="ecp-stat-label">RTI filings</div>
+          <div class="ecp-stat-sub">tracked</div>
+        </div>
+      </div>
+
+      <!-- Lead queue -->
+      <div class="ecp-section">
+        <div class="ecp-section-title">
+          Lead queue - awaiting editorial review
+          <a href="/admin/hei/leads">View all -</a>
+        </div>
+        <div class="ecp-filter-pills">
+          {['All','Equity','Wellbeing','Outcomes','Integrity','Research'].map(cat => (
+            <span class={`ecp-pill${cat === 'All' ? ' active' : ''}`}>{cat}</span>
+          ))}
+        </div>
+
+        {leads.length === 0 && (
+          <div style="text-align:center;padding:32px;color:#6e6e78;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;">
+            <p style="font-size:13px;">No leads in queue.</p>
+            <p style="font-size:11px;margin-top:4px;">Add a lead or connect crawlers to auto-populate.</p>
+          </div>
+        )}
+
+        {leads.map((lead: any) => {
+          const pc = PRIORITY_CONFIG[lead.priority] || PRIORITY_CONFIG['medium'];
+          const sc = STATUS_CONFIG[lead.status] || { color: '#6e6e78', label: lead.status };
+          return (
+            <div class="ecp-lead">
+              <div class="ecp-lead-header">
+                <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">
+                  <div style="flex:1;">
+                    <span class="ecp-lead-priority" style={`background:${pc.bg};color:${pc.color};`}>{pc.label}</span>
+                    <p class="ecp-lead-title">{lead.title}</p>
+                    <div class="ecp-lead-meta">
+                      {lead.institution_name && <span>{lead.institution_name} - </span>}
+                      {lead.pipeline && <span>{lead.pipeline} - </span>}
+                      <span>{timeAgo(lead.created_at)}</span>
+                    </div>
+                  </div>
+                  {lead.confidence_pct > 0 && (
+                    <div style="text-align:right;flex-shrink:0;">
+                      <div style="font-size:14px;font-weight:700;color:#fff;font-family:'Geist Mono',monospace;">{lead.confidence_pct}%</div>
+                      <div style="font-size:9px;color:#6e6e78;">confidence</div>
+                    </div>
+                  )}
+                </div>
+                {lead.summary && <p style="font-size:11px;color:#8a8a94;margin:6px 0 0;line-height:1.4;">{lead.summary}</p>}
+              </div>
+              <div class="ecp-lead-footer">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span class="ecp-lead-status" style={`color:${sc.color};`}>{sc.label}</span>
+                  {lead.assignee_name && (
+                    <div style={`width:20px;height:20px;border-radius:50%;background:#15151a;display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:700;color:#8a8a94;`}>
+                      {lead.assignee_initials}
+                    </div>
+                  )}
+                </div>
+                <div class="ecp-lead-actions">
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="action" value="promote_lead" />
+                    <input type="hidden" name="id" value={lead.id} />
+                    <button type="submit" class="ecp-btn-sm" style="background:rgba(16,185,129,0.15);color:#6ee7b7;">Promote to draft</button>
+                  </form>
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="action" value="dismiss_lead" />
+                    <input type="hidden" name="id" value={lead.id} />
+                    <button type="submit" class="ecp-btn-sm" style="background:#15151a;color:#6e6e78;">Dismiss</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+
+        <!-- Add lead -->
+        <button onclick="document.getElementById('addLeadModal').style.display='flex'" class="ecp-btn-sm" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;width:100%;margin-top:8px;padding:8px;">+ Add lead manually</button>
+      </div>
+
+      <!-- Crawler health -->
+      <div class="ecp-section">
+        <div class="ecp-section-title">
+          Crawler health - continuous ingestion
+          <a href="/admin/hei/crawlers">Manage -</a>
+        </div>
+        {crawlers.map((c: any) => (
+          <div class="ecp-crawler">
+            <div class="ecp-status-indicator" style={`background:${c.status === 'active' ? '#10b981' : c.status === 'error' ? '#ef4444' : '#fbbf24'};`}></div>
+            <span class="ecp-crawler-code">{c.code}</span>
+            <div class="ecp-crawler-info">
+              <div class="ecp-crawler-name">{c.name}</div>
+              <div class="ecp-crawler-desc">{c.description}</div>
+            </div>
+            <div class="ecp-crawler-stats">
+              <div class="ecp-crawler-num">{c.sources_count || 0}</div>
+              <div class="ecp-crawler-stat-label">sources</div>
+            </div>
+          </div>
+        ))}
+        {crawlers.length === 0 && (
+          <div style="background:#0f0f14;border:1px dashed #1a1a1f;border-radius:8px;padding:16px;text-align:center;color:#6e6e78;font-size:12px;">
+            No crawlers configured. Run the migration to seed default pipelines.
+          </div>
+        )}
+      </div>
+
+      <!-- Workbench -->
+      {workbench.length > 0 && (
+        <div class="ecp-section">
+          <div class="ecp-section-title">
+            Currently in your workbench
+            <a href="/admin/hei/findings">View all -</a>
+          </div>
+          {workbench.map((f: any) => (
+            <div class="ecp-workbench-item">
+              <span class="ecp-workbench-badge">IN REVIEW - {f.locked_count || 0} of {f.total_locks || 0} evidence locks</span>
+              <p style="font-size:14px;font-weight:600;color:#fff;margin:0 0 4px;">{f.title}</p>
+              {f.institution_name && <p style="font-size:11px;color:#6e6e78;margin:0 0 10px;font-family:'Geist Mono',monospace;">{f.institution_name}</p>}
+              {f.description && <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.5;">{f.description?.substring(0,200)}{f.description?.length > 200 ? '...' : ''}</p>}
+              <div style="display:flex;gap:8px;margin-top:10px;">
+                <a href={`/admin/hei/findings`} style="flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;text-decoration:none;font-size:11px;font-weight:500;padding:7px;border-radius:6px;">Review</a>
+                <button style="flex:1;background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:11px;font-weight:600;padding:7px;border-radius:6px;cursor:pointer;">Approve & publish</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <!-- Audit log -->
+      <div class="ecp-section">
+        <div class="ecp-section-title">
+          Audit log - last 24 hours
+          <a href="/admin/audit">Full log -</a>
+        </div>
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;">
+          {auditLog.length === 0 && (
+            <p style="font-size:12px;color:#6e6e78;text-align:center;padding:12px;">No HEI audit events in last 24 hours.</p>
+          )}
+          {auditLog.map((entry: any) => (
+            <div class="ecp-audit-item">
+              <div class={`ecp-audit-avatar${!entry.user_name ? ' system' : ''}`}>
+                {entry.user_name ? entry.initials || '?' : '[C]'}
+              </div>
+              <div class="ecp-audit-text">
+                {entry.user_name && <strong style="color:#d8d8de;">{entry.user_name?.split(' ')[0]} </strong>}
+                {entry.action} - {entry.entity_id || ''}
+              </div>
+              <div class="ecp-audit-time">{timeAgo(entry.created_at)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+    </div>
+  </main>
+</div>
+
+<!-- Add Lead Modal -->
+<div id="addLeadModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:200;align-items:flex-end;justify-content:center;">
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;padding:20px;max-height:90vh;overflow-y:auto;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">Add Lead</h2>
+      <button onclick="document.getElementById('addLeadModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
+    </div>
+    <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="action" value="add_lead" />
+      <div>
+        <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Title *</label>
+        <input name="title" required placeholder="Brief description of the lead..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+      </div>
+      <div>
+        <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Institution</label>
+        <input name="institution_name" placeholder="IIT Bombay, Delhi University..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+      </div>
+      <div>
+        <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Summary</label>
+        <textarea name="summary" rows="3" placeholder="Additional context..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;"></textarea>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Priority</label>
+          <select name="priority" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="critical">Critical</option>
+            <option value="high">High</option>
+            <option value="medium" selected>Medium</option>
+            <option value="low">Low</option>
+            <option value="signal">Signal only</option>
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Category</label>
+          <select name="category" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="equity">Equity</option>
+            <option value="wellbeing">Wellbeing</option>
+            <option value="outcomes">Outcomes</option>
+            <option value="integrity">Integrity</option>
+            <option value="research">Research</option>
+            <option value="general" selected>General</option>
+          </select>
+        </div>
+        <div>
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Pipeline</label>
+          <select name="pipeline" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="">Manual</option>
+            <option value="P1">P1 - Public data</option>
+            <option value="P2">P2 - RTI / FOI</option>
+            <option value="P3">P3 - Survey</option>
+            <option value="P4">P4 - Alumni scan</option>
+            <option value="P5">P5 - Research integrity</option>
+            <option value="P6">P6 - News monitoring</option>
+            <option value="P7">P7 - Social signal</option>
+          </select>
+        </div>
+      </div>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Add to Lead Queue</button>
+    </form>
+  </div>
+</div>
+
+</AdminLayout>
