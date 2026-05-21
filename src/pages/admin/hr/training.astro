@@ -1,0 +1,418 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+let okMsg = '', errorMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+  try {
+    if (action === 'create_course') {
+      const title = (fd.get('title') as string || '').trim();
+      const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '-' + Date.now();
+      const desc = (fd.get('description') as string || '').trim();
+      const shortDesc = (fd.get('short_desc') as string || '').trim();
+      const category = fd.get('category') as string || 'general';
+      const level = fd.get('level') as string || 'beginner';
+      const hours = parseFloat(fd.get('duration_hours') as string || '0') || 0;
+      const instructor = (fd.get('instructor_name') as string || '').trim() || null;
+      const instructorTitle = (fd.get('instructor_title') as string || '').trim() || null;
+      const accessType = fd.get('access_type') as string || 'employees';
+      const isFree = fd.get('is_free') !== 'false';
+      if (!title) { errorMsg = 'Title required.'; }
+      else {
+        await db.execute(sql`
+          INSERT INTO training_courses (title, slug, description, short_desc, category, level, duration_hours, instructor_name, instructor_title, access_type, is_free, created_by)
+          VALUES (${title}, ${slug}, ${desc||null}, ${shortDesc||null}, ${category}, ${level}, ${hours}, ${instructor}, ${instructorTitle}, ${accessType}, ${isFree}, ${user.id})
+        `);
+        okMsg = 'Course created. Add modules and lessons to it.';
+      }
+    } else if (action === 'toggle_publish') {
+      const id = fd.get('id') as string;
+      const cur = await db.execute(sql`SELECT is_published FROM training_courses WHERE id = ${id} LIMIT 1`);
+      const rows = Array.isArray(cur) ? cur : (cur?.rows || []);
+      const pub = (rows[0] as any)?.is_published;
+      await db.execute(sql`UPDATE training_courses SET is_published = ${!pub}, updated_at = NOW() WHERE id = ${id}`);
+      okMsg = pub ? 'Course unpublished.' : 'Course published.';
+    } else if (action === 'delete_course') {
+      await db.execute(sql`DELETE FROM training_courses WHERE id = ${fd.get('id') as string}`);
+      okMsg = 'Course deleted.';
+    } else if (action === 'add_module') {
+      const courseId = fd.get('course_id') as string;
+      const title = (fd.get('title') as string || '').trim();
+      const sortOrder = await db.execute(sql`SELECT COUNT(*)::int as n FROM training_modules WHERE course_id = ${courseId}`);
+      const sortRows = Array.isArray(sortOrder) ? sortOrder : (sortOrder?.rows || []);
+      const n = Number((sortRows[0] as any)?.n) || 0;
+      await db.execute(sql`INSERT INTO training_modules (course_id, title, sort_order) VALUES (${courseId}, ${title}, ${n})`);
+      okMsg = 'Module added.';
+    } else if (action === 'add_lesson') {
+      const courseId = fd.get('course_id') as string;
+      const moduleId = fd.get('module_id') as string || null;
+      const title = (fd.get('title') as string || '').trim();
+      const type = fd.get('type') as string || 'video';
+      const content = (fd.get('content') as string || '').trim() || null;
+      const videoUrl = (fd.get('video_url') as string || '').trim() || null;
+      const durationMins = parseInt(fd.get('duration_mins') as string || '0') || 0;
+      const isPreview = fd.get('is_preview') === 'on';
+      const sortCount = await db.execute(sql`SELECT COUNT(*)::int as n FROM training_lessons WHERE course_id = ${courseId}`);
+      const sortRows = Array.isArray(sortCount) ? sortCount : (sortCount?.rows || []);
+      const n = Number((sortRows[0] as any)?.n) || 0;
+      await db.execute(sql`
+        INSERT INTO training_lessons (course_id, module_id, title, type, content, video_url, duration_mins, is_preview, sort_order)
+        VALUES (${courseId}, ${moduleId}, ${title}, ${type}, ${content}, ${videoUrl}, ${durationMins}, ${isPreview}, ${n})
+      `);
+      // Update total lessons count
+      await db.execute(sql`UPDATE training_courses SET total_lessons = (SELECT COUNT(*) FROM training_lessons WHERE course_id = ${courseId}) WHERE id = ${courseId}`);
+      okMsg = 'Lesson added.';
+    }
+  } catch(e: any) { errorMsg = e.message; }
+}
+
+const url = new URL(Astro.request.url);
+const selectedId = url.searchParams.get('course') || '';
+
+let courses: any[] = [];
+try {
+  const r = await db.execute(sql`
+    SELECT c.*,
+      (SELECT COUNT(*)::int FROM training_enrollments WHERE course_id = c.id) as enrollments
+    FROM training_courses c ORDER BY c.created_at DESC
+  `);
+  courses = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+const selectedCourse = courses.find((c: any) => c.id === selectedId);
+
+let modules: any[] = [];
+let lessons: any[] = [];
+if (selectedId) {
+  try {
+    const r = await db.execute(sql`SELECT * FROM training_modules WHERE course_id = ${selectedId} ORDER BY sort_order`);
+    modules = Array.isArray(r) ? r : (r?.rows || []);
+    const r2 = await db.execute(sql`SELECT * FROM training_lessons WHERE course_id = ${selectedId} ORDER BY sort_order`);
+    lessons = Array.isArray(r2) ? r2 : (r2?.rows || []);
+  } catch(e) {}
+}
+
+const CATEGORY_COLORS: Record<string,string> = {
+  technology:'#60a5fa', business:'#fbbf24', design:'#a78bfa',
+  leadership:'#f97316', communication:'#34d399', compliance:'#ef4444',
+  hr:'#10b981', general:'#6e6e78'
+};
+const LEVEL_COLOR: Record<string,string> = { beginner:'#10b981', intermediate:'#fbbf24', advanced:'#ef4444' };
+---
+<AdminLayout title="Training & Certifications" activeNav="hr">
+<style>
+  .course-card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; overflow: hidden; transition: border-color 0.15s; }
+  .course-card:hover { border-color: #2a2a2f; }
+  .lesson-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid #0a0a0c; }
+  .lesson-type-icon { width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .tab-btn { font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px; border: none; cursor: pointer; }
+  .tab-btn.active { background: #FF4F00; color: #fff; }
+  .tab-btn:not(.active) { background: #15151a; color: #8a8a94; }
+</style>
+<div style="padding-bottom:100px;">
+
+  <!-- Header -->
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;position:sticky;top:0;z-index:10;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+      <div>
+        <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">HR Management</p>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Training & Certifications</h1>
+      </div>
+      <div style="display:flex;gap:6px;">
+        <a href="/admin/hr" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;text-decoration:none;font-size:11px;padding:6px 10px;border-radius:6px;">HR Home</a>
+        <button onclick="document.getElementById('newCourseModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer;">+ New Course</button>
+      </div>
+    </div>
+    <p style="font-size:11px;color:#6e6e78;margin:0;">{courses.length} courses - {courses.filter((c:any)=>c.is_published).length} published</p>
+  </div>
+
+  {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
+  {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+
+  {!selectedId && (
+    <div style="padding:12px 16px;display:flex;flex-direction:column;gap:10px;">
+      {courses.length === 0 && (
+        <div style="text-align:center;padding:56px 24px;background:#0f0f14;border:1px dashed #1a1a1f;border-radius:14px;">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5" style="margin-bottom:14px;"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+          <p style="font-size:15px;font-weight:700;color:#fff;margin-bottom:6px;">No courses yet</p>
+          <p style="font-size:12px;color:#6e6e78;margin-bottom:20px;">Build your training library. Employees and applicants can enroll and earn certificates.</p>
+          <button onclick="document.getElementById('newCourseModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-size:13px;font-weight:600;padding:10px 20px;border-radius:8px;cursor:pointer;">Create First Course</button>
+        </div>
+      )}
+      {courses.map((c: any) => {
+        const catColor = CATEGORY_COLORS[c.category] || '#6e6e78';
+        const lvlColor = LEVEL_COLOR[c.level] || '#6e6e78';
+        return (
+          <div class="course-card">
+            <!-- Course header with visual -->
+            <div style={`background:linear-gradient(135deg,${catColor}15 0%,transparent 100%);border-bottom:1px solid #1a1a1f;padding:16px;display:flex;gap:14px;`}>
+              <div style={`width:56px;height:56px;border-radius:12px;background:${catColor}22;border:1px solid ${catColor}33;display:flex;align-items:center;justify-content:center;flex-shrink:0;`}>
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke={catColor} stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
+                </svg>
+              </div>
+              <div style="flex:1;min-width:0;">
+                <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:5px;">
+                  <p style="font-size:14px;font-weight:700;color:#fff;margin:0;line-height:1.3;">{c.title}</p>
+                  <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;flex-shrink:0;${c.is_published?'background:rgba(16,185,129,0.15);color:#6ee7b7;':'background:#15151a;color:#6e6e78;'}`}>{c.is_published?'Published':'Draft'}</span>
+                </div>
+                {c.short_desc && <p style="font-size:11px;color:#8a8a94;margin:0 0 6px;line-height:1.4;">{c.short_desc}</p>}
+                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                  <span style={`font-size:9px;font-weight:600;padding:2px 7px;border-radius:100px;background:${catColor}22;color:${catColor};text-transform:capitalize;`}>{c.category}</span>
+                  <span style={`font-size:9px;font-weight:600;padding:2px 7px;border-radius:100px;background:${lvlColor}22;color:${lvlColor};text-transform:capitalize;`}>{c.level}</span>
+                  <span style="font-size:9px;color:#6e6e78;">{c.duration_hours}h</span>
+                  <span style="font-size:9px;color:#6e6e78;">{c.total_lessons} lessons</span>
+                  <span style="font-size:9px;color:#6e6e78;">{c.enrollments} enrolled</span>
+                </div>
+              </div>
+            </div>
+            <!-- Access & stats -->
+            <div style="padding:10px 16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+              <div style="display:flex;align-items:center;gap:6px;">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                <span style="font-size:10px;color:#6e6e78;text-transform:capitalize;">{c.access_type === 'both' ? 'Employees + Applicants' : c.access_type}</span>
+              </div>
+              <div style="display:flex;gap:5px;">
+                <a href={`?course=${c.id}`} style="background:#15151a;border:1px solid #1a1a1f;color:#FF7040;text-decoration:none;font-size:11px;font-weight:600;padding:5px 10px;border-radius:6px;">Manage</a>
+                <form method="POST" style="display:contents;">
+                  <input type="hidden" name="action" value="toggle_publish" /><input type="hidden" name="id" value={c.id} />
+                  <button type="submit" style={`font-size:11px;padding:5px 10px;border-radius:6px;border:none;cursor:pointer;${c.is_published?'background:rgba(251,191,36,0.1);color:#fbbf24;':'background:rgba(16,185,129,0.1);color:#6ee7b7;'}`}>{c.is_published?'Unpublish':'Publish'}</button>
+                </form>
+                <form method="POST" style="display:contents;" onsubmit="return confirm('Delete this course and all its content?')">
+                  <input type="hidden" name="action" value="delete_course" /><input type="hidden" name="id" value={c.id} />
+                  <button type="submit" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);color:#fca5a5;font-size:11px;padding:5px 8px;border-radius:6px;cursor:pointer;">Del</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  )}
+
+  <!-- Course detail / content management -->
+  {selectedId && selectedCourse && (
+    <div style="padding:12px 16px;">
+      <a href="/admin/hr/training" style="font-size:11px;color:#6e6e78;text-decoration:none;display:flex;align-items:center;gap:4px;margin-bottom:12px;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+        All courses
+      </a>
+
+      <!-- Course info banner -->
+      <div style="background:linear-gradient(135deg,rgba(255,79,0,0.1) 0%,transparent 100%);border:1px solid rgba(255,79,0,0.2);border-radius:12px;padding:14px;margin-bottom:14px;">
+        <p style="font-size:15px;font-weight:700;color:#fff;margin:0 0 4px;">{selectedCourse.title}</p>
+        <p style="font-size:11px;color:#8a8a94;margin:0 0 8px;">{selectedCourse.description}</p>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <span style="font-size:10px;background:#15151a;color:#8a8a94;padding:2px 8px;border-radius:4px;">{selectedCourse.level}</span>
+          <span style="font-size:10px;background:#15151a;color:#8a8a94;padding:2px 8px;border-radius:4px;">{selectedCourse.duration_hours}h</span>
+          <span style="font-size:10px;background:#15151a;color:#8a8a94;padding:2px 8px;border-radius:4px;">{selectedCourse.total_lessons} lessons</span>
+          <span style="font-size:10px;background:#15151a;color:#8a8a94;padding:2px 8px;border-radius:4px;text-transform:capitalize;">{selectedCourse.access_type}</span>
+          <a href={`/courses/${selectedCourse.slug}`} target="_blank" style="font-size:10px;background:rgba(96,165,250,0.15);color:#60a5fa;padding:2px 8px;border-radius:4px;text-decoration:none;">Preview</a>
+        </div>
+      </div>
+
+      <!-- Tabs -->
+      <div style="display:flex;gap:6px;margin-bottom:14px;">
+        <button class="tab-btn active" onclick="showTab('modules', this)">Modules & Lessons</button>
+        <button class="tab-btn" onclick="showTab('add-lesson', this)">Add Lesson</button>
+        <button class="tab-btn" onclick="showTab('enrollments', this)">Enrollments</button>
+      </div>
+
+      <!-- Modules tab -->
+      <div id="tab-modules">
+        <!-- Add module form -->
+        <form method="POST" style="display:flex;gap:8px;margin-bottom:12px;">
+          <input type="hidden" name="action" value="add_module" />
+          <input type="hidden" name="course_id" value={selectedId} />
+          <input name="title" placeholder="New module title..." required style="flex:1;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;" />
+          <button type="submit" style="background:#FF4F00;border:none;color:#fff;font-size:12px;font-weight:600;padding:9px 14px;border-radius:8px;cursor:pointer;">+ Module</button>
+        </form>
+
+        {modules.length === 0 && lessons.length === 0 && (
+          <div style="text-align:center;padding:32px;color:#6e6e78;background:#0f0f14;border:1px dashed #1a1a1f;border-radius:10px;">
+            <p style="font-size:13px;">No modules or lessons yet. Add a module first, then add lessons to it.</p>
+          </div>
+        )}
+
+        {modules.map((m: any) => {
+          const moduleLessons = lessons.filter((l: any) => l.module_id === m.id);
+          return (
+            <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;overflow:hidden;margin-bottom:8px;">
+              <div style="padding:10px 12px;background:#15151a;border-bottom:1px solid #1a1a1f;display:flex;align-items:center;gap:8px;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FF7040" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+                <p style="font-size:13px;font-weight:600;color:#fff;margin:0;flex:1;">{m.title}</p>
+                <span style="font-size:10px;color:#6e6e78;">{moduleLessons.length} lessons</span>
+              </div>
+              {moduleLessons.map((l: any) => {
+                const typeColors: Record<string,string> = { video:'#ef4444', text:'#60a5fa', quiz:'#a78bfa', pdf:'#f97316', link:'#10b981' };
+                const tc = typeColors[l.type] || '#6e6e78';
+                return (
+                  <div class="lesson-row">
+                    <div class="lesson-type-icon" style={`background:${tc}22;border:1px solid ${tc}33;`}>
+                      {l.type === 'video' && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={tc} stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>}
+                      {l.type === 'text' && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={tc} stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>}
+                      {l.type === 'quiz' && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={tc} stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>}
+                      {(l.type === 'pdf' || l.type === 'link') && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={tc} stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>}
+                    </div>
+                    <div style="flex:1;min-width:0;">
+                      <p style="font-size:12px;font-weight:500;color:#d8d8de;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{l.title}</p>
+                      <p style="font-size:10px;color:#6e6e78;margin:1px 0 0;">{l.duration_mins}m {l.is_preview && '- Free preview'}</p>
+                    </div>
+                    <span style={`font-size:9px;font-weight:600;padding:1px 6px;border-radius:4px;background:${tc}22;color:${tc};text-transform:uppercase;`}>{l.type}</span>
+                  </div>
+                );
+              })}
+              {moduleLessons.length === 0 && <div style="padding:10px 12px;"><p style="font-size:11px;color:#6e6e78;margin:0;">No lessons yet in this module.</p></div>}
+            </div>
+          );
+        })}
+
+        <!-- Unmodules lessons -->
+        {lessons.filter((l: any) => !l.module_id).length > 0 && (
+          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;overflow:hidden;">
+            <div style="padding:8px 12px;border-bottom:1px solid #1a1a1f;"><p style="font-size:11px;color:#6e6e78;margin:0;">Unassigned lessons</p></div>
+            {lessons.filter((l: any) => !l.module_id).map((l: any) => (
+              <div class="lesson-row">
+                <p style="font-size:12px;color:#d8d8de;margin:0;">{l.title}</p>
+                <span style="font-size:9px;color:#6e6e78;margin-left:auto;">{l.type}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <!-- Add lesson tab -->
+      <div id="tab-add-lesson" style="display:none;">
+        <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+          <input type="hidden" name="action" value="add_lesson" />
+          <input type="hidden" name="course_id" value={selectedId} />
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Lesson Title *</label>
+            <input name="title" required placeholder="Introduction to the topic..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <div>
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Type</label>
+              <select name="type" id="lessonType" onchange="toggleLessonFields()" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+                <option value="video">Video</option><option value="text">Text / Article</option>
+                <option value="quiz">Quiz</option><option value="pdf">PDF</option><option value="link">External Link</option>
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Module</label>
+              <select name="module_id" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+                <option value="">No module</option>
+                {modules.map((m: any) => <option value={m.id}>{m.title}</option>)}
+              </select>
+            </div>
+          </div>
+          <div id="videoField">
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Video URL</label>
+            <input name="video_url" placeholder="YouTube, Vimeo, or direct MP4 URL..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+          </div>
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Content / Description</label>
+            <textarea name="content" rows="4" placeholder="Lesson content, transcript, notes, or link..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;"></textarea>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <div style="flex:1;">
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Duration (mins)</label>
+              <input name="duration_mins" type="number" placeholder="15" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:16px;">
+              <input type="checkbox" name="is_preview" style="accent-color:#FF4F00;width:16px;height:16px;" />
+              <span style="font-size:12px;color:#d8d8de;">Free preview</span>
+            </label>
+          </div>
+          <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Add Lesson</button>
+        </form>
+      </div>
+
+      <!-- Enrollments tab -->
+      <div id="tab-enrollments" style="display:none;">
+        <p style="font-size:12px;color:#6e6e78;text-align:center;padding:24px;">Enrollment data loads here. {selectedCourse.enrollments || 0} enrolled.</p>
+      </div>
+    </div>
+  )}
+
+</div>
+
+<!-- New Course Modal -->
+<div id="newCourseModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:200;align-items:flex-end;justify-content:center;overflow-y:auto;padding:16px;">
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px;width:100%;max-width:600px;margin:auto;padding:20px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">New Course</h2>
+      <button onclick="document.getElementById('newCourseModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
+    </div>
+    <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="action" value="create_course" />
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Course Title *</label>
+        <input name="title" required placeholder="Introduction to Data Science, Leadership Essentials..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+      </div>
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Short Description</label>
+        <input name="short_desc" placeholder="One-line summary shown in catalog..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+      </div>
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Full Description</label>
+        <textarea name="description" rows="3" placeholder="What students will learn and why it matters..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;"></textarea>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Category</label>
+          <select name="category" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:12px;outline:none;">
+            <option value="technology">Technology</option><option value="business">Business</option>
+            <option value="design">Design</option><option value="leadership">Leadership</option>
+            <option value="communication">Communication</option><option value="compliance">Compliance</option>
+            <option value="hr">HR</option><option value="general">General</option>
+          </select>
+        </div>
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Level</label>
+          <select name="level" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:12px;outline:none;">
+            <option value="beginner">Beginner</option><option value="intermediate">Intermediate</option><option value="advanced">Advanced</option>
+          </select>
+        </div>
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Duration (hours)</label>
+          <input name="duration_hours" type="number" step="0.5" placeholder="2.5" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Access</label>
+          <select name="access_type" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:12px;outline:none;">
+            <option value="employees">Employees only</option><option value="applicants">Applicants only</option>
+            <option value="both">Employees + Applicants</option><option value="public">Public</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Instructor Name</label>
+          <input name="instructor_name" placeholder="Dr. Priya Sharma" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Instructor Title</label>
+          <input name="instructor_title" placeholder="Senior Data Scientist" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+      </div>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Create Course</button>
+    </form>
+  </div>
+</div>
+
+<script is:inline>
+function showTab(tab, btn) {
+  ['modules','add-lesson','enrollments'].forEach(function(t) {
+    var el = document.getElementById('tab-' + t);
+    if (el) el.style.display = t === tab ? 'block' : 'none';
+  });
+  document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+  if (btn) btn.classList.add('active');
+}
+function toggleLessonFields() {
+  var type = document.getElementById('lessonType')?.value;
+  var vf = document.getElementById('videoField');
+  if (vf) vf.style.display = type === 'video' ? 'block' : 'none';
+}
+</script>
+</AdminLayout>
