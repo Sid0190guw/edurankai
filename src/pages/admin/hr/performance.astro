@@ -1,0 +1,333 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+let okMsg = '', errorMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+  try {
+    if (action === 'create_cycle') {
+      const title = (fd.get('title') as string || '').trim();
+      const start = fd.get('period_start') as string;
+      const end = fd.get('period_end') as string;
+      const type = fd.get('review_type') as string || 'annual';
+      if (!title || !start || !end) { errorMsg = 'Title and dates required.'; }
+      else {
+        const cycle = await db.execute(sql`
+          INSERT INTO hr_review_cycles (title, period_start, period_end, review_type, status, created_by)
+          VALUES (${title}, ${start}, ${end}, ${type}, 'draft', ${user.id})
+          RETURNING id
+        `);
+        const cycleRows = Array.isArray(cycle) ? cycle : (cycle?.rows || []);
+        const cycleId = (cycleRows[0] as any)?.id;
+        // Auto-create review entries for all active employees
+        if (cycleId) {
+          await db.execute(sql`
+            INSERT INTO hr_performance_reviews (cycle_id, employee_id, status)
+            SELECT ${cycleId}, id, 'pending' FROM hr_employees WHERE is_active = true
+            ON CONFLICT (cycle_id, employee_id) DO NOTHING
+          `);
+        }
+        okMsg = 'Review cycle created with entries for all active employees.';
+      }
+    } else if (action === 'activate_cycle') {
+      await db.execute(sql`UPDATE hr_review_cycles SET status = 'active' WHERE id = ${fd.get('id') as string}`);
+      okMsg = 'Cycle activated.';
+    } else if (action === 'close_cycle') {
+      await db.execute(sql`UPDATE hr_review_cycles SET status = 'closed' WHERE id = ${fd.get('id') as string}`);
+      okMsg = 'Cycle closed.';
+    } else if (action === 'save_review') {
+      const reviewId = fd.get('review_id') as string;
+      const overall = parseInt(fd.get('overall_rating') as string || '0') || null;
+      const goals = parseInt(fd.get('goals_score') as string || '0') || null;
+      const skills = parseInt(fd.get('skills_score') as string || '0') || null;
+      const attitude = parseInt(fd.get('attitude_score') as string || '0') || null;
+      const strengths = (fd.get('strengths') as string || '').trim() || null;
+      const improvements = (fd.get('improvements') as string || '').trim() || null;
+      const goalsNext = (fd.get('goals_next') as string || '').trim() || null;
+      const comments = (fd.get('reviewer_comments') as string || '').trim() || null;
+      const submit = fd.get('submit') === '1';
+      await db.execute(sql`
+        UPDATE hr_performance_reviews SET
+          overall_rating = ${overall}, goals_score = ${goals}, skills_score = ${skills},
+          attitude_score = ${attitude}, strengths = ${strengths}, improvements = ${improvements},
+          goals_next = ${goalsNext}, reviewer_comments = ${comments},
+          status = ${submit ? 'submitted' : 'in_progress'},
+          submitted_at = ${submit ? new Date().toISOString() : null},
+          updated_at = NOW()
+        WHERE id = ${reviewId}
+      `);
+      okMsg = submit ? 'Review submitted.' : 'Review saved as draft.';
+    }
+  } catch(e: any) { errorMsg = e.message; }
+}
+
+const url = new URL(Astro.request.url);
+const selectedCycleId = url.searchParams.get('cycle') || '';
+const reviewId = url.searchParams.get('review') || '';
+
+let cycles: any[] = [];
+try {
+  const r = await db.execute(sql`
+    SELECT c.*, 
+      (SELECT COUNT(*)::int FROM hr_performance_reviews WHERE cycle_id = c.id) as total,
+      (SELECT COUNT(*)::int FROM hr_performance_reviews WHERE cycle_id = c.id AND status = 'submitted') as submitted,
+      (SELECT COUNT(*)::int FROM hr_performance_reviews WHERE cycle_id = c.id AND status = 'pending') as pending
+    FROM hr_review_cycles c ORDER BY c.created_at DESC
+  `);
+  cycles = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+const selectedCycle = cycles.find((c: any) => c.id === selectedCycleId);
+
+let reviews: any[] = [];
+if (selectedCycleId) {
+  try {
+    const r = await db.execute(sql`
+      SELECT pr.*, e.full_name, e.employee_code, e.designation,
+        u.name as reviewer_name
+      FROM hr_performance_reviews pr
+      JOIN hr_employees e ON pr.employee_id = e.id
+      LEFT JOIN users u ON pr.reviewer_id = u.id
+      WHERE pr.cycle_id = ${selectedCycleId}
+      ORDER BY e.full_name
+    `);
+    reviews = Array.isArray(r) ? r : (r?.rows || []);
+  } catch(e) {}
+}
+
+let editingReview: any = null;
+if (reviewId) {
+  editingReview = reviews.find((r: any) => r.id === reviewId);
+}
+
+const STATUS_COLOR: Record<string, string> = {
+  pending: '#6b7280', in_progress: '#fbbf24', submitted: '#60a5fa', approved: '#10b981'
+};
+const CYCLE_STATUS_COLOR: Record<string, string> = {
+  draft: '#6b7280', active: '#10b981', closed: '#6e6e78'
+};
+
+function fmtDate(d: any) {
+  if (!d) return '-';
+  return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function starRating(n: number) {
+  return Array.from({length: 5}, (_, i) => i < n ? 'filled' : 'empty').join(',');
+}
+---
+<AdminLayout title="Performance Reviews" activeNav="hr">
+<div style="padding-bottom:80px;">
+
+  <!-- Header -->
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;position:sticky;top:0;z-index:10;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+      <div>
+        <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">HR Management</p>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Performance Reviews</h1>
+      </div>
+      <div style="display:flex;gap:6px;">
+        <a href="/admin/hr" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;text-decoration:none;font-size:11px;padding:6px 10px;border-radius:6px;">HR Home</a>
+        <button onclick="document.getElementById('newCycleModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer;">+ New Cycle</button>
+      </div>
+    </div>
+  </div>
+
+  {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
+  {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+
+  <!-- If editing a review -->
+  {editingReview && (
+    <div style="padding:12px 16px;">
+      <a href={`?cycle=${selectedCycleId}`} style="font-size:11px;color:#6e6e78;text-decoration:none;display:flex;align-items:center;gap:4px;margin-bottom:12px;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+        Back to cycle
+      </a>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;margin-bottom:12px;">
+        <p style="font-size:14px;font-weight:700;color:#fff;margin:0 0 2px;">{editingReview.full_name}</p>
+        <p style="font-size:11px;color:#6e6e78;margin:0;">{editingReview.employee_code} - {editingReview.designation}</p>
+      </div>
+      <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+        <input type="hidden" name="action" value="save_review" />
+        <input type="hidden" name="review_id" value={editingReview.id} />
+
+        <!-- Rating sections -->
+        {[
+          { name: 'overall_rating', label: 'Overall Performance', current: editingReview.overall_rating },
+          { name: 'goals_score', label: 'Goals Achievement', current: editingReview.goals_score },
+          { name: 'skills_score', label: 'Skills & Competencies', current: editingReview.skills_score },
+          { name: 'attitude_score', label: 'Attitude & Teamwork', current: editingReview.attitude_score },
+        ].map(r => (
+          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px;">
+            <label style="display:block;font-size:11px;font-weight:700;color:#fff;margin-bottom:8px;">{r.label}</label>
+            <div style="display:flex;gap:8px;">
+              {[1,2,3,4,5].map(n => (
+                <label style="flex:1;cursor:pointer;">
+                  <input type="radio" name={r.name} value={String(n)} checked={editingReview[r.name.replace('_','')] === n || r.current === n} style="display:none;" />
+                  <div class="rating-btn" style={`text-align:center;padding:8px 4px;border-radius:6px;font-size:13px;font-weight:700;border:1px solid ${r.current >= n ? '#FF4F00' : '#1a1a1f'};background:${r.current >= n ? 'rgba(255,79,0,0.15)' : '#15151a'};color:${r.current >= n ? '#FF7040' : '#6e6e78'};`}>{n}</div>
+                </label>
+              ))}
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:4px;">
+              {['Poor','Below Avg','Average','Good','Excellent'].map(l => (
+                <span style="font-size:9px;color:#6e6e78;flex:1;text-align:center;">{l}</span>
+              ))}
+            </div>
+          </div>
+        ))}
+
+        <!-- Text fields -->
+        {[
+          { name: 'strengths', label: 'Key Strengths', placeholder: 'What this employee does exceptionally well...', value: editingReview.strengths },
+          { name: 'improvements', label: 'Areas for Improvement', placeholder: 'Where they need to grow...', value: editingReview.improvements },
+          { name: 'goals_next', label: 'Goals for Next Period', placeholder: 'Specific, measurable goals...', value: editingReview.goals_next },
+          { name: 'reviewer_comments', label: 'Additional Comments', placeholder: 'Any other observations...', value: editingReview.reviewer_comments },
+        ].map(f => (
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">{f.label}</label>
+            <textarea name={f.name} rows="3" placeholder={f.placeholder} style="width:100%;background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;">{f.value || ''}</textarea>
+          </div>
+        ))}
+
+        <div style="display:flex;gap:8px;">
+          <button type="submit" name="submit" value="0" style="flex:1;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;font-weight:600;font-size:13px;padding:12px;border-radius:10px;cursor:pointer;">Save Draft</button>
+          <button type="submit" name="submit" value="1" style="flex:2;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Submit Review</button>
+        </div>
+      </form>
+    </div>
+  )}
+
+  <!-- Cycle list -->
+  {!editingReview && !selectedCycleId && (
+    <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
+      {cycles.length === 0 && (
+        <div style="text-align:center;padding:48px;color:#6e6e78;background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5" style="margin-bottom:12px;"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          <p style="font-size:14px;font-weight:600;color:#fff;margin-bottom:4px;">No review cycles yet</p>
+          <p style="font-size:12px;margin-bottom:16px;">Create your first review cycle to start evaluating your team.</p>
+          <button onclick="document.getElementById('newCycleModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-size:12px;font-weight:600;padding:9px 18px;border-radius:8px;cursor:pointer;">Create First Cycle</button>
+        </div>
+      )}
+      {cycles.map((c: any) => {
+        const sc = CYCLE_STATUS_COLOR[c.status] || '#6b7280';
+        const pct = c.total > 0 ? Math.round((c.submitted / c.total) * 100) : 0;
+        return (
+          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+            <div style="padding:14px 16px;">
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:8px;">
+                <div>
+                  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+                    <p style="font-size:14px;font-weight:600;color:#fff;margin:0;">{c.title}</p>
+                    <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;background:${sc}22;color:${sc};`}>{c.status.toUpperCase()}</span>
+                    <span style="font-size:9px;background:#15151a;color:#8a8a94;padding:2px 6px;border-radius:4px;">{c.review_type}</span>
+                  </div>
+                  <p style="font-size:11px;color:#6e6e78;margin:0;">{fmtDate(c.period_start)} - {fmtDate(c.period_end)}</p>
+                </div>
+                <div style="text-align:right;flex-shrink:0;">
+                  <p style="font-size:18px;font-weight:700;color:#FF7040;margin:0;font-family:'Geist Mono',monospace;">{pct}%</p>
+                  <p style="font-size:9px;color:#6e6e78;margin:0;">complete</p>
+                </div>
+              </div>
+              <div style="background:#15151a;border-radius:100px;height:4px;margin-bottom:6px;">
+                <div style={`background:#FF4F00;height:100%;width:${pct}%;border-radius:100px;`}></div>
+              </div>
+              <p style="font-size:10px;color:#6e6e78;margin:0;font-family:'Geist Mono',monospace;">{c.submitted} of {c.total} submitted - {c.pending} pending</p>
+            </div>
+            <div style="border-top:1px solid #1a1a1f;padding:8px 16px;display:flex;gap:6px;">
+              <a href={`?cycle=${c.id}`} style="flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#FF7040;text-decoration:none;font-size:11px;font-weight:600;padding:7px;border-radius:6px;">View Reviews</a>
+              {c.status === 'draft' && (
+                <form method="POST" style="display:contents;">
+                  <input type="hidden" name="action" value="activate_cycle" /><input type="hidden" name="id" value={c.id} />
+                  <button type="submit" style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:11px;font-weight:600;padding:7px 12px;border-radius:6px;cursor:pointer;">Activate</button>
+                </form>
+              )}
+              {c.status === 'active' && (
+                <form method="POST" style="display:contents;">
+                  <input type="hidden" name="action" value="close_cycle" /><input type="hidden" name="id" value={c.id} />
+                  <button type="submit" style="background:#15151a;border:1px solid #1a1a1f;color:#6e6e78;font-size:11px;padding:7px 12px;border-radius:6px;cursor:pointer;">Close</button>
+                </form>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  )}
+
+  <!-- Reviews list for selected cycle -->
+  {!editingReview && selectedCycleId && selectedCycle && (
+    <div style="padding:12px 16px;">
+      <a href="/admin/hr/performance" style="font-size:11px;color:#6e6e78;text-decoration:none;display:flex;align-items:center;gap:4px;margin-bottom:12px;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+        All cycles
+      </a>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;margin-bottom:12px;">
+        <p style="font-size:14px;font-weight:600;color:#fff;margin:0 0 2px;">{selectedCycle.title}</p>
+        <p style="font-size:11px;color:#6e6e78;margin:0;">{fmtDate(selectedCycle.period_start)} - {fmtDate(selectedCycle.period_end)} - {reviews.length} employees</p>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        {reviews.map((r: any) => {
+          const sc = STATUS_COLOR[r.status] || '#6b7280';
+          return (
+            <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;display:flex;align-items:center;gap:10px;">
+              <div style={`width:36px;height:36px;border-radius:50%;background:${sc}22;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:${sc};flex-shrink:0;`}>{r.full_name?.charAt(0)}</div>
+              <div style="flex:1;min-width:0;">
+                <p style="font-size:13px;font-weight:600;color:#fff;margin:0;">{r.full_name}</p>
+                <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;">{r.employee_code} - {r.designation}</p>
+                {r.overall_rating && (
+                  <div style="display:flex;gap:2px;margin-top:3px;">
+                    {[1,2,3,4,5].map(n => (
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill={n <= r.overall_rating ? '#FF7040' : 'none'} stroke="#FF7040" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">
+                <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;background:${sc}22;color:${sc};`}>{r.status.replace('_',' ').toUpperCase()}</span>
+                {selectedCycle.status === 'active' && (
+                  <a href={`?cycle=${selectedCycleId}&review=${r.id}`} style="font-size:10px;background:#FF4F00;color:#fff;text-decoration:none;padding:4px 10px;border-radius:5px;font-weight:600;">Review</a>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  )}
+
+</div>
+
+<!-- New Cycle Modal -->
+<div id="newCycleModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:100;align-items:flex-end;justify-content:center;">
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;padding:20px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">New Review Cycle</h2>
+      <button onclick="document.getElementById('newCycleModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
+    </div>
+    <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="action" value="create_cycle" />
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Cycle Title *</label><input name="title" required placeholder="Q1 2026 Review, Annual Performance 2025..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" /></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Start Date *</label><input name="period_start" type="date" required style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" /></div>
+        <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">End Date *</label><input name="period_end" type="date" required style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" /></div>
+      </div>
+      <div><label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Review Type</label>
+        <select name="review_type" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+          <option value="annual">Annual</option><option value="quarterly">Quarterly</option><option value="probation">Probation</option><option value="pip">PIP</option>
+        </select>
+      </div>
+      <p style="font-size:11px;color:#6e6e78;margin:0;">Review entries will be auto-created for all active employees.</p>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Create Cycle</button>
+    </form>
+  </div>
+</div>
+
+</AdminLayout>
