@@ -9,21 +9,24 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 
 const url = new URL(Astro.request.url);
 const range = url.searchParams.get('range') || '7d';
-
 const days = range === '30d' ? 30 : range === '90d' ? 90 : 7;
 
-let totalViews = 0, uniqueSessions = 0, onlineNow = 0;
+let totalViews = 0, uniqueSessions = 0, onlineNow = 0, avgDuration = 0;
 let topPages: any[] = [];
 let deviceStats: any[] = [];
 let countryStats: any[] = [];
+let cityStats: any[] = [];
+let sourceStats: any[] = [];
 let dailyStats: any[] = [];
 let recentViews: any[] = [];
+let onlineSessions: any[] = [];
+let loggedInVisitors: any[] = [];
 
 try {
   const r = await db.execute(sql`
-    SELECT
-      COUNT(*)::int as total_views,
-      COUNT(DISTINCT session_id)::int as unique_sessions
+    SELECT COUNT(*)::int as total_views,
+      COUNT(DISTINCT session_id)::int as unique_sessions,
+      ROUND(AVG(duration_ms)/1000)::int as avg_secs
     FROM analytics_pageviews
     WHERE created_at >= NOW() - INTERVAL '1 day' * ${days}
   `);
@@ -31,49 +34,73 @@ try {
   const d = rows[0] as any;
   totalViews = Number(d?.total_views) || 0;
   uniqueSessions = Number(d?.unique_sessions) || 0;
+  avgDuration = Number(d?.avg_secs) || 0;
 } catch(e) {}
 
-// Online now (last 5 min)
 try {
   const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM analytics_sessions WHERE last_seen >= NOW() - INTERVAL '5 minutes'`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   onlineNow = Number((rows[0] as any)?.n) || 0;
 } catch(e) {}
 
-// Top pages
+try {
+  const r = await db.execute(sql`
+    SELECT s.session_id, s.page, s.country, s.city, s.device_type, s.last_seen, s.user_id,
+      u.name as user_name, u.email as user_email, u.role as user_role
+    FROM analytics_sessions s
+    LEFT JOIN users u ON s.user_id = u.id
+    WHERE s.last_seen >= NOW() - INTERVAL '30 minutes'
+    ORDER BY s.last_seen DESC LIMIT 10
+  `);
+  onlineSessions = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
 try {
   const r = await db.execute(sql`
     SELECT page, COUNT(*)::int as views, COUNT(DISTINCT session_id)::int as sessions
     FROM analytics_pageviews
     WHERE created_at >= NOW() - INTERVAL '1 day' * ${days}
-    GROUP BY page ORDER BY views DESC LIMIT 10
+    GROUP BY page ORDER BY views DESC LIMIT 15
   `);
   topPages = Array.isArray(r) ? r : (r?.rows || []);
 } catch(e) {}
 
-// Device breakdown
 try {
   const r = await db.execute(sql`
-    SELECT device_type, COUNT(*)::int as n
-    FROM analytics_pageviews
+    SELECT device_type, COUNT(*)::int as n FROM analytics_pageviews
     WHERE created_at >= NOW() - INTERVAL '1 day' * ${days} AND device_type IS NOT NULL
     GROUP BY device_type ORDER BY n DESC
   `);
   deviceStats = Array.isArray(r) ? r : (r?.rows || []);
 } catch(e) {}
 
-// Country breakdown
 try {
   const r = await db.execute(sql`
-    SELECT country, COUNT(*)::int as n
-    FROM analytics_pageviews
+    SELECT country, COUNT(*)::int as n FROM analytics_pageviews
     WHERE created_at >= NOW() - INTERVAL '1 day' * ${days} AND country IS NOT NULL
-    GROUP BY country ORDER BY n DESC LIMIT 8
+    GROUP BY country ORDER BY n DESC LIMIT 10
   `);
   countryStats = Array.isArray(r) ? r : (r?.rows || []);
 } catch(e) {}
 
-// Daily stats
+try {
+  const r = await db.execute(sql`
+    SELECT city, region, country, COUNT(*)::int as n FROM analytics_pageviews
+    WHERE created_at >= NOW() - INTERVAL '1 day' * ${days} AND city IS NOT NULL
+    GROUP BY city, region, country ORDER BY n DESC LIMIT 10
+  `);
+  cityStats = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+try {
+  const r = await db.execute(sql`
+    SELECT referrer_source, COUNT(*)::int as n FROM analytics_pageviews
+    WHERE created_at >= NOW() - INTERVAL '1 day' * ${days} AND referrer_source IS NOT NULL
+    GROUP BY referrer_source ORDER BY n DESC
+  `);
+  sourceStats = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
 try {
   const r = await db.execute(sql`
     SELECT DATE(created_at) as day, COUNT(*)::int as views, COUNT(DISTINCT session_id)::int as sessions
@@ -84,14 +111,25 @@ try {
   dailyStats = Array.isArray(r) ? r : (r?.rows || []);
 } catch(e) {}
 
-// Recent views
 try {
   const r = await db.execute(sql`
-    SELECT page, device_type, country, browser, created_at
+    SELECT page, device_type, country, city, region, browser, os, referrer_source,
+      user_name, user_role, created_at, duration_ms
     FROM analytics_pageviews
-    ORDER BY created_at DESC LIMIT 20
+    ORDER BY created_at DESC LIMIT 30
   `);
   recentViews = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+// Logged-in visitors
+try {
+  const r = await db.execute(sql`
+    SELECT DISTINCT ON (user_id) user_name, user_role, page, city, country, created_at
+    FROM analytics_pageviews
+    WHERE user_id IS NOT NULL AND created_at >= NOW() - INTERVAL '1 day' * ${days}
+    ORDER BY user_id, created_at DESC
+  `);
+  loggedInVisitors = Array.isArray(r) ? r : (r?.rows || []);
 } catch(e) {}
 
 function timeAgo(d: any) {
@@ -100,11 +138,28 @@ function timeAgo(d: any) {
   const mins = Math.floor(diff/60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return mins + 'm ago';
-  return Math.floor(mins/60) + 'h ago';
+  if (mins < 1440) return Math.floor(mins/60) + 'h ago';
+  return Math.floor(mins/1440) + 'd ago';
 }
 
-const maxViews = topPages.length > 0 ? Math.max(...(topPages as any[]).map((p: any) => p.views)) : 1;
-const maxDaily = dailyStats.length > 0 ? Math.max(...(dailyStats as any[]).map((d: any) => d.views)) : 1;
+function fmtDuration(secs: number) {
+  if (!secs) return '-';
+  if (secs < 60) return secs + 's';
+  return Math.floor(secs/60) + 'm ' + (secs%60) + 's';
+}
+
+const maxViews = topPages.length > 0 ? Math.max(...(topPages as any[]).map((p:any)=>p.views)) : 1;
+const maxDaily = dailyStats.length > 0 ? Math.max(...(dailyStats as any[]).map((d:any)=>d.views)) : 1;
+
+const SOURCE_COLOR: Record<string,string> = {
+  google:'#4285f4', direct:'#FF7040', internal:'#10b981', linkedin:'#0077b5',
+  twitter:'#1da1f2', facebook:'#1877f2', external:'#a78bfa', whatsapp:'#25d366',
+  instagram:'#e1306c'
+};
+const ROLE_COLOR: Record<string,string> = {
+  super_admin:'#f97316', admin:'#FF4F00', applicant:'#60a5fa',
+  editor:'#a78bfa', marketing:'#fbbf24', hr:'#10b981'
+};
 ---
 <AdminLayout title="Analytics" activeNav="analytics">
 <div style="padding-bottom:80px;">
@@ -116,11 +171,13 @@ const maxDaily = dailyStats.length > 0 ? Math.max(...(dailyStats as any[]).map((
         <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Insights</p>
         <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Analytics</h1>
       </div>
-      <div style="display:flex;align-items:center;gap:6px;">
-        <div style="display:flex;align-items:center;gap:5px;background:#0f0f14;border:1px solid rgba(16,185,129,0.3);border-radius:100px;padding:4px 10px;">
-          <div style="width:7px;height:7px;background:#10b981;border-radius:50%;animation:pulse 2s infinite;"></div>
-          <span style="font-size:11px;font-weight:600;color:#10b981;">{onlineNow} online</span>
-        </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        {onlineNow > 0 && (
+          <div style="display:flex;align-items:center;gap:5px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:100px;padding:4px 10px;">
+            <div style="width:7px;height:7px;background:#10b981;border-radius:50%;animation:pulse 2s infinite;"></div>
+            <span style="font-size:11px;font-weight:600;color:#10b981;">{onlineNow} online now</span>
+          </div>
+        )}
       </div>
     </div>
     <div style="display:flex;gap:5px;">
@@ -133,18 +190,48 @@ const maxDaily = dailyStats.length > 0 ? Math.max(...(dailyStats as any[]).map((
   <div style="padding:14px 16px;display:flex;flex-direction:column;gap:12px;">
 
     <!-- Key stats -->
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
       {[
-        { label: 'Page Views', value: totalViews, color: '#FF7040' },
-        { label: 'Sessions', value: uniqueSessions, color: '#60a5fa' },
-        { label: 'Online Now', value: onlineNow, color: '#10b981' },
+        { label:'Page Views', value:totalViews, color:'#FF7040' },
+        { label:'Sessions', value:uniqueSessions, color:'#60a5fa' },
+        { label:'Online Now', value:onlineNow, color:'#10b981' },
+        { label:'Avg Duration', value:fmtDuration(avgDuration), color:'#a78bfa' },
       ].map(s => (
-        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px;text-align:center;">
-          <p style={`font-size:24px;font-weight:800;color:${s.color};margin:0;line-height:1;font-family:'Geist Mono',monospace;`}>{s.value}</p>
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:10px;text-align:center;">
+          <p style={`font-size:20px;font-weight:800;color:${s.color};margin:0;line-height:1;font-family:'Geist Mono',monospace;`}>{s.value}</p>
           <p style="font-size:9px;color:#6e6e78;margin:4px 0 0;text-transform:uppercase;">{s.label}</p>
         </div>
       ))}
     </div>
+
+    <!-- Who is online right now -->
+    {onlineSessions.length > 0 && (
+      <div style="background:#0f0f14;border:1px solid rgba(16,185,129,0.2);border-radius:12px;overflow:hidden;">
+        <div style="padding:10px 14px;border-bottom:1px solid #1a1a1f;display:flex;align-items:center;gap:8px;">
+          <div style="width:8px;height:8px;background:#10b981;border-radius:50%;animation:pulse 2s infinite;flex-shrink:0;"></div>
+          <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0;">Active in last 30 min</p>
+        </div>
+        {(onlineSessions as any[]).map((s: any) => (
+          <div style="padding:8px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #0a0a0c;">
+            <div style={`width:28px;height:28px;border-radius:50%;background:${s.user_name?'rgba(255,79,0,0.15)':'#15151a'};display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:${s.user_name?'#FF7040':'#6e6e78'};flex-shrink:0;`}>
+              {s.user_name ? s.user_name.charAt(0).toUpperCase() : '?'}
+            </div>
+            <div style="flex:1;min-width:0;">
+              <p style="font-size:12px;font-weight:600;color:#fff;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                {s.user_name || 'Anonymous visitor'}
+              </p>
+              <p style="font-size:10px;color:#6e6e78;margin:1px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                {s.page} - {s.city ? s.city + ', ' : ''}{s.country || 'Unknown'}
+              </p>
+            </div>
+            <div style="text-align:right;flex-shrink:0;">
+              {s.user_role && <span style={`font-size:9px;font-weight:700;padding:1px 6px;border-radius:100px;background:${(ROLE_COLOR as any)[s.user_role]||'#6b7280'}22;color:${(ROLE_COLOR as any)[s.user_role]||'#6b7280'};display:block;margin-bottom:2px;`}>{s.user_role}</span>}
+              <span style="font-size:10px;color:#6e6e78;">{timeAgo(s.last_seen)}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    )}
 
     <!-- Daily chart -->
     {dailyStats.length > 0 && (
@@ -152,10 +239,10 @@ const maxDaily = dailyStats.length > 0 ? Math.max(...(dailyStats as any[]).map((
         <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 12px;">Daily Traffic</p>
         <div style="display:flex;align-items:flex-end;gap:3px;height:80px;">
           {(dailyStats as any[]).map((d: any) => {
-            const h = maxDaily > 0 ? Math.max(4, Math.round((d.views / maxDaily) * 80)) : 4;
+            const h = maxDaily > 0 ? Math.max(4, Math.round((d.views/maxDaily)*80)) : 4;
             return (
-              <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;">
-                <div style={`width:100%;background:#FF4F00;border-radius:2px;height:${h}px;`} title={d.views + ' views'}></div>
+              <div style="flex:1;display:flex;flex-direction:column;align-items:center;" title={d.views + ' views on ' + d.day}>
+                <div style={`width:100%;background:#FF4F00;border-radius:2px 2px 0 0;height:${h}px;`}></div>
               </div>
             );
           })}
@@ -167,18 +254,42 @@ const maxDaily = dailyStats.length > 0 ? Math.max(...(dailyStats as any[]).map((
       </div>
     )}
 
+    <!-- Traffic sources -->
+    {sourceStats.length > 0 && (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
+        <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 12px;">Traffic Sources</p>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          {(sourceStats as any[]).map((s: any) => {
+            const sc = (SOURCE_COLOR as any)[s.referrer_source] || '#6e6e78';
+            const pct = totalViews > 0 ? Math.round((s.n/totalViews)*100) : 0;
+            return (
+              <div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                  <span style={`font-size:11px;font-weight:600;color:${sc};text-transform:capitalize;`}>{s.referrer_source}</span>
+                  <span style="font-size:11px;color:#6e6e78;font-family:'Geist Mono',monospace;">{s.n} ({pct}%)</span>
+                </div>
+                <div style="background:#15151a;border-radius:100px;height:4px;">
+                  <div style={`background:${sc};height:100%;width:${pct}%;border-radius:100px;`}></div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    )}
+
     <!-- Top pages -->
     {topPages.length > 0 && (
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
         <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 12px;">Top Pages</p>
         <div style="display:flex;flex-direction:column;gap:6px;">
           {(topPages as any[]).map((p: any) => {
-            const pct = maxViews > 0 ? Math.round((p.views / maxViews) * 100) : 0;
+            const pct = maxViews > 0 ? Math.round((p.views/maxViews)*100) : 0;
             return (
               <div>
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
-                  <span style="font-size:11px;color:#d8d8de;font-family:'Geist Mono',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%;">{p.page || '/'}</span>
-                  <span style="font-size:11px;color:#6e6e78;font-family:'Geist Mono',monospace;flex-shrink:0;">{p.views}</span>
+                  <span style="font-size:11px;color:#d8d8de;font-family:'Geist Mono',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70%;">{p.page || '/'}</span>
+                  <span style="font-size:11px;color:#6e6e78;flex-shrink:0;">{p.views}</span>
                 </div>
                 <div style="background:#15151a;border-radius:100px;height:3px;">
                   <div style={`background:#FF4F00;height:100%;width:${pct}%;border-radius:100px;`}></div>
@@ -190,61 +301,98 @@ const maxDaily = dailyStats.length > 0 ? Math.max(...(dailyStats as any[]).map((
       </div>
     )}
 
-    <!-- Device + Country -->
+    <!-- Locations -->
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-      <!-- Devices -->
-      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px;">
-        <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 10px;">Devices</p>
-        {deviceStats.length === 0 && <p style="font-size:11px;color:#6e6e78;text-align:center;padding:8px;">No data yet</p>}
-        {(deviceStats as any[]).map((d: any) => {
-          const icon = d.device_type === 'mobile' ? 'M' : d.device_type === 'tablet' ? 'T' : 'D';
-          return (
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-              <span style="font-size:10px;font-weight:700;background:#15151a;color:#8a8a94;width:20px;height:20px;border-radius:4px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">{icon}</span>
-              <span style="font-size:11px;color:#d8d8de;flex:1;text-transform:capitalize;">{d.device_type}</span>
-              <span style="font-size:11px;color:#FF7040;font-family:'Geist Mono',monospace;">{d.n}</span>
-            </div>
-          );
-        })}
-      </div>
-      <!-- Countries -->
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px;">
         <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 10px;">Countries</p>
-        {countryStats.length === 0 && <p style="font-size:11px;color:#6e6e78;text-align:center;padding:8px;">No data yet</p>}
+        {countryStats.length === 0 && <p style="font-size:11px;color:#6e6e78;text-align:center;padding:8px;">No data</p>}
         {(countryStats as any[]).map((c: any) => (
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-            <span style="font-size:11px;color:#d8d8de;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{c.country || 'Unknown'}</span>
+            <span style="font-size:11px;color:#d8d8de;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{c.country}</span>
+            <span style="font-size:11px;color:#FF7040;font-family:'Geist Mono',monospace;">{c.n}</span>
+          </div>
+        ))}
+      </div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px;">
+        <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 10px;">Cities</p>
+        {cityStats.length === 0 && <p style="font-size:11px;color:#6e6e78;text-align:center;padding:8px;">No data</p>}
+        {(cityStats as any[]).map((c: any) => (
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+            <div style="flex:1;min-width:0;">
+              <p style="font-size:11px;color:#d8d8de;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{c.city}</p>
+              <p style="font-size:9px;color:#6e6e78;margin:0;">{c.region}</p>
+            </div>
             <span style="font-size:11px;color:#60a5fa;font-family:'Geist Mono',monospace;">{c.n}</span>
           </div>
         ))}
       </div>
     </div>
 
-    <!-- Recent views -->
-    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
-      <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 12px;">Recent Activity</p>
-      {recentViews.length === 0 && <p style="font-size:11px;color:#6e6e78;text-align:center;padding:12px;">No page views tracked yet. Add the tracking snippet to your public pages.</p>}
+    <!-- Devices -->
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px;">
+      <p style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 10px;">Devices</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        {(deviceStats as any[]).map((d: any) => {
+          const pct = totalViews > 0 ? Math.round((d.n/totalViews)*100) : 0;
+          const color = d.device_type === 'mobile' ? '#10b981' : d.device_type === 'tablet' ? '#a78bfa' : '#60a5fa';
+          return (
+            <div style={`flex:1;min-width:100px;background:${color}11;border:1px solid ${color}33;border-radius:10px;padding:10px;text-align:center;`}>
+              <p style={`font-size:22px;font-weight:800;color:${color};margin:0;font-family:'Geist Mono',monospace;`}>{pct}%</p>
+              <p style="font-size:10px;color:#6e6e78;margin:3px 0 0;text-transform:capitalize;">{d.device_type}</p>
+              <p style="font-size:10px;color:#6e6e78;margin:0;">{d.n} views</p>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+
+    <!-- Logged-in visitors -->
+    {loggedInVisitors.length > 0 && (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+        <div style="padding:10px 14px;border-bottom:1px solid #1a1a1f;">
+          <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0;">Identified Visitors (logged in)</p>
+        </div>
+        {(loggedInVisitors as any[]).map((v: any) => {
+          const rc = (ROLE_COLOR as any)[v.user_role] || '#6b7280';
+          return (
+            <div style="padding:8px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #0a0a0c;">
+              <div style={`width:30px;height:30px;border-radius:50%;background:${rc}22;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;color:${rc};flex-shrink:0;`}>{v.user_name?.charAt(0).toUpperCase()}</div>
+              <div style="flex:1;min-width:0;">
+                <p style="font-size:12px;font-weight:600;color:#fff;margin:0;">{v.user_name}</p>
+                <p style="font-size:10px;color:#6e6e78;margin:1px 0 0;">{v.city ? v.city + ', ' : ''}{v.country}</p>
+              </div>
+              <div style="text-align:right;flex-shrink:0;">
+                <span style={`font-size:9px;font-weight:700;padding:1px 6px;border-radius:100px;background:${rc}22;color:${rc};display:block;margin-bottom:2px;`}>{v.user_role}</span>
+                <span style="font-size:10px;color:#6e6e78;">{timeAgo(v.created_at)}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    )}
+
+    <!-- Recent activity -->
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+      <div style="padding:10px 14px;border-bottom:1px solid #1a1a1f;">
+        <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0;">Recent Page Views</p>
+      </div>
+      {recentViews.length === 0 && <p style="font-size:11px;color:#6e6e78;text-align:center;padding:16px;">No page views yet.</p>}
       {(recentViews as any[]).map((v: any) => (
-        <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #0a0a0c;">
+        <div style="padding:8px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #0a0a0c;">
           <div style="flex:1;min-width:0;">
             <p style="font-size:11px;color:#d8d8de;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Geist Mono',monospace;">{v.page || '/'}</p>
-            <p style="font-size:9px;color:#6e6e78;margin:1px 0 0;">{v.country || 'Unknown'} - {v.device_type || 'unknown'} - {v.browser || 'unknown'}</p>
+            <p style="font-size:9px;color:#6e6e78;margin:1px 0 0;">
+              {v.user_name ? v.user_name + ' - ' : ''}{v.city ? v.city + ', ' : ''}{v.country || 'Unknown'} - {v.device_type} - {v.browser}
+              {v.referrer_source && v.referrer_source !== 'direct' && ` - via ${v.referrer_source}`}
+            </p>
           </div>
-          <span style="font-size:10px;color:#6e6e78;flex-shrink:0;">{timeAgo(v.created_at)}</span>
+          <div style="text-align:right;flex-shrink:0;">
+            <span style="font-size:10px;color:#6e6e78;display:block;">{timeAgo(v.created_at)}</span>
+            {v.duration_ms && <span style="font-size:9px;color:#6e6e78;">{fmtDuration(Math.round(v.duration_ms/1000))}</span>}
+          </div>
         </div>
       ))}
     </div>
-
-    <!-- Setup instructions -->
-    {totalViews === 0 && (
-      <div style="background:#0f0f14;border:1px solid rgba(255,79,0,0.2);border-radius:12px;padding:14px;">
-        <p style="font-size:12px;font-weight:600;color:#FF7040;margin:0 0 8px;">Setup Required</p>
-        <p style="font-size:11px;color:#8a8a94;margin:0 0 10px;">Add this script to your public pages to start tracking visitors:</p>
-        <div style="background:#0a0a0c;border-radius:8px;padding:10px;font-family:'Geist Mono',monospace;font-size:10px;color:#6ee7b7;overflow-x:auto;">
-          <p style="margin:0;">&lt;script src="/analytics.js"&gt;&lt;/script&gt;</p>
-        </div>
-      </div>
-    )}
 
   </div>
 </div>
