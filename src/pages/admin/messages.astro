@@ -12,31 +12,26 @@ let errorMsg = '';
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('_action') as string;
-
   try {
     if (action === 'start_conversation') {
       const recipientId = fd.get('recipientId') as string;
-      const initialBody = (fd.get('body') as string || '').trim();
-      if (!recipientId || !initialBody) {
-        errorMsg = 'Recipient and message body required.';
-      } else if (recipientId === currentUser.id) {
-        errorMsg = 'You cannot message yourself.';
-      } else {
+      const body = (fd.get('body') as string || '').trim();
+      if (!recipientId || !body) { errorMsg = 'Recipient and message required.'; }
+      else if (recipientId === currentUser.id) { errorMsg = 'Cannot message yourself.'; }
+      else {
         const [userA, userB] = currentUser.id < recipientId ? [currentUser.id, recipientId] : [recipientId, currentUser.id];
         const existing = await db.select().from(adminConversations).where(and(eq(adminConversations.userAId, userA), eq(adminConversations.userBId, userB))).limit(1);
         let convId = '';
-        if (existing.length > 0) {
-          convId = existing[0].id;
-        } else {
+        if (existing.length > 0) { convId = existing[0].id; }
+        else {
           const created = await db.insert(adminConversations).values({ userAId: userA, userBId: userB, lastMessageAt: new Date() }).returning({ id: adminConversations.id });
           convId = created[0].id;
         }
-        await db.insert(adminMessages).values({ conversationId: convId, senderUserId: currentUser.id, body: initialBody });
+        await db.insert(adminMessages).values({ conversationId: convId, senderUserId: currentUser.id, body });
         await db.update(adminConversations).set({ lastMessageAt: new Date() }).where(eq(adminConversations.id, convId));
         return Astro.redirect('/admin/messages?c=' + convId);
       }
-    }
-    else if (action === 'send_message') {
+    } else if (action === 'send_message') {
       const convId = fd.get('conversationId') as string;
       const body = (fd.get('body') as string || '').trim();
       if (convId && body) {
@@ -44,240 +39,295 @@ if (Astro.request.method === 'POST') {
         if (conv.length > 0 && (conv[0].userAId === currentUser.id || conv[0].userBId === currentUser.id)) {
           await db.insert(adminMessages).values({ conversationId: convId, senderUserId: currentUser.id, body });
           await db.update(adminConversations).set({ lastMessageAt: new Date() }).where(eq(adminConversations.id, convId));
-          return Astro.redirect('/admin/messages?c=' + convId);
+          return Astro.redirect('/admin/messages?c=' + convId + '#bottom');
         }
       }
     }
-  } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
-  }
+  } catch(err: any) { errorMsg = err.message; }
 }
+
+const allAdmins = await db.select({ id: users.id, name: users.name, email: users.email, role: users.role }).from(users).where(ne(users.id, currentUser.id));
+const userMap: Record<string, any> = {};
+allAdmins.forEach(u => { userMap[u.id] = u; });
 
 const myConvos = await db.select().from(adminConversations)
   .where(or(eq(adminConversations.userAId, currentUser.id), eq(adminConversations.userBId, currentUser.id)))
   .orderBy(desc(adminConversations.lastMessageAt));
 
-const allAdmins = await db.select({ id: users.id, name: users.name, email: users.email, role: users.role }).from(users).where(ne(users.role, 'applicant'));
-const userMap = Object.fromEntries(allAdmins.map(u => [u.id, u]));
-
 const convoSummaries = await Promise.all(myConvos.map(async (c) => {
   const otherId = c.userAId === currentUser.id ? c.userBId : c.userAId;
-  const otherUser = userMap[otherId];
   const lastMsg = await db.select().from(adminMessages).where(eq(adminMessages.conversationId, c.id)).orderBy(desc(adminMessages.createdAt)).limit(1);
   const unread = await db.select({ id: adminMessages.id }).from(adminMessages)
     .where(and(eq(adminMessages.conversationId, c.id), ne(adminMessages.senderUserId, currentUser.id), eq(adminMessages.readByRecipient, false)));
-  return { id: c.id, otherUser, lastMessage: lastMsg[0] || null, lastMessageAt: c.lastMessageAt, unreadCount: unread.length };
+  return { id: c.id, otherUser: userMap[otherId] || null, lastMessage: lastMsg[0] || null, lastMessageAt: c.lastMessageAt, unreadCount: unread.length };
 }));
 
 const url = new URL(Astro.request.url);
 const openConvId = url.searchParams.get('c') || '';
-let openConv: any = null;
+const showNew = url.searchParams.get('new') === '1';
 let openMessages: any[] = [];
-let otherUserInOpenConv: any = null;
+let otherUser: any = null;
 
 if (openConvId) {
   const found = await db.select().from(adminConversations).where(eq(adminConversations.id, openConvId)).limit(1);
   if (found.length > 0 && (found[0].userAId === currentUser.id || found[0].userBId === currentUser.id)) {
-    openConv = found[0];
-    const otherId = openConv.userAId === currentUser.id ? openConv.userBId : openConv.userAId;
-    otherUserInOpenConv = userMap[otherId];
+    const otherId = found[0].userAId === currentUser.id ? found[0].userBId : found[0].userAId;
+    otherUser = userMap[otherId];
     await db.update(adminMessages).set({ readByRecipient: true, readAt: new Date() })
       .where(and(eq(adminMessages.conversationId, openConvId), ne(adminMessages.senderUserId, currentUser.id), eq(adminMessages.readByRecipient, false)));
     openMessages = await db.select().from(adminMessages).where(eq(adminMessages.conversationId, openConvId)).orderBy(adminMessages.createdAt);
   }
 }
 
-const showNew = url.searchParams.get('new') === '1';
-const recipientCandidates = allAdmins.filter(u => u.id !== currentUser.id);
+const totalUnread = convoSummaries.reduce((s, c) => s + c.unreadCount, 0);
 
-function fmtTime(d: Date | string | null): string {
+function fmtTime(d: any) {
   if (!d) return '';
   const dt = new Date(d);
   const sameDay = dt.toDateString() === new Date().toDateString();
   return sameDay ? dt.toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' }) : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
 }
-function fmtTs(d: Date | string): string {
-  return new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
-}
-function trunc(s: string | null, n: number): string {
-  if (!s) return '';
-  return s.length > n ? s.substring(0, n - 1) + '...' : s;
-}
-function initial(name: string): string {
-  return name ? name.charAt(0).toUpperCase() : '?';
-}
-const totalUnread = convoSummaries.reduce((s, c) => s + c.unreadCount, 0);
+function initial(name: string) { return name ? name.charAt(0).toUpperCase() : '?'; }
+function trunc(s: string | null, n: number) { if (!s) return ''; return s.length > n ? s.substring(0, n-1) + '...' : s; }
+const roleColor: Record<string,string> = { super_admin:'#f97316', admin:'#FF4F00', editor:'#a78bfa', marketing:'#fbbf24', hr:'#10b981', applicant:'#60a5fa' };
 ---
-<AdminLayout title="DMs" activeNav="messages">
-<div style="height:calc(100vh - 56px);display:flex;flex-direction:column;overflow:hidden;">
+<AdminLayout title="Messages" activeNav="messages">
+<style>
+  * { box-sizing: border-box; }
+  .dm-root { display: flex; height: calc(100vh - 56px); overflow: hidden; }
+  .dm-list { width: 320px; flex-shrink: 0; background: #0e0e12; border-right: 1px solid #1a1a1f; display: flex; flex-direction: column; }
+  .dm-panel { flex: 1; display: flex; flex-direction: column; background: #08080a; min-width: 0; }
+  .dm-list-header { padding: 14px 16px; border-bottom: 1px solid #1a1a1f; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  .dm-list-scroll { flex: 1; overflow-y: auto; }
+  .conv-item { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid #0a0a0c; text-decoration: none; color: inherit; transition: background 0.1s; cursor: pointer; }
+  .conv-item:hover { background: #15151a; }
+  .conv-item.active { background: rgba(255,79,0,0.08); border-left: 2px solid #FF4F00; }
+  .avatar { width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; color: #fff; flex-shrink: 0; }
+  .msg-header { padding: 12px 14px; border-bottom: 1px solid #1a1a1f; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .msg-back { display: none; color: #6e6e78; text-decoration: none; font-size: 22px; line-height: 1; padding: 4px 8px 4px 0; }
+  .msg-scroll { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .msg-bubble { max-width: 70%; padding: 10px 13px; border-radius: 14px; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-wrap: break-word; }
+  .msg-bubble.me { background: #FF4F00; color: #fff; border-bottom-right-radius: 4px; align-self: flex-end; }
+  .msg-bubble.them { background: #1a1a20; color: #e8e8ee; border-bottom-left-radius: 4px; align-self: flex-start; }
+  .msg-meta { font-size: 9.5px; color: #6e6e78; margin-top: 2px; }
+  .msg-input-row { padding: 10px 14px; border-top: 1px solid #1a1a1f; display: flex; gap: 8px; align-items: flex-end; flex-shrink: 0; background: #0e0e12; }
+  .msg-textarea { flex: 1; background: #15151a; border: 1px solid #1a1a1f; border-radius: 20px; padding: 9px 14px; color: #fff; font-size: 13px; font-family: inherit; outline: none; resize: none; min-height: 38px; max-height: 120px; line-height: 1.4; }
+  .msg-textarea:focus { border-color: #FF4F00; }
+  .send-btn { width: 38px; height: 38px; background: #FF4F00; border: none; border-radius: 50%; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; color: #6e6e78; text-align: center; padding: 32px; }
+  @media (max-width: 640px) {
+    .dm-list { width: 100%; border-right: none; }
+    .dm-panel { position: fixed; inset: 56px 0 0; z-index: 30; display: none; }
+    .dm-panel.mobile-open { display: flex; flex-direction: column; }
+    .msg-back { display: block; }
+    .msg-bubble { max-width: 82%; }
+  }
+</style>
 
-  <!-- Mobile: show list OR conversation, not both side by side -->
-  <div id="dmRoot" style="display:flex;flex:1;overflow:hidden;">
-
-    <!-- Conversation list -->
-    <div id="dmList" style="display:flex;flex-direction:column;background:#0e0e12;width:100%;max-width:360px;border-right:1px solid #1a1a1f;flex-shrink:0;">
-
-      <div style="border-right:1px solid #1f1f26;display:flex;flex-direction:column;background:#0e0e12;">
-        <div style="padding:14px 16px;border-bottom:1px solid #1f1f26;display:flex;justify-content:space-between;align-items:center;">
-          <div>
-            <div style="display:flex;align-items:center;gap:8px;">
-            <h1 style="font-size:14px;font-weight:600;color:#fff;margin:0;">DMs</h1>
-          </div>
-            <p style="font-size:10.5px;color:#6e6e78;margin-top:2px;">{convoSummaries.length} conversation{convoSummaries.length === 1 ? '' : 's'}{totalUnread > 0 ? ' / ' + totalUnread + ' unread' : ''}</p>
-          </div>
-          <a href="/admin/messages?new=1" class="admin-btn admin-btn-primary" style="padding:5px 10px;font-size:10.5px;text-decoration:none;">+ New</a>
+<div class="dm-root">
+  <!-- Conversation list -->
+  <div class="dm-list" id="dmList">
+    <div class="dm-list-header">
+      <div>
+        <h1 style="font-size:15px;font-weight:700;color:#fff;margin:0;">Messages</h1>
+        <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;">{totalUnread > 0 ? totalUnread + ' unread' : convoSummaries.length + ' conversations'}</p>
+      </div>
+      <a href="/admin/messages?new=1" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:6px;text-decoration:none;cursor:pointer;">+ New</a>
+    </div>
+    <div class="dm-list-scroll">
+      {convoSummaries.length === 0 && (
+        <div style="padding:40px 20px;text-align:center;">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5" style="margin-bottom:12px;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <p style="font-size:13px;color:#6e6e78;margin:0;">No conversations yet</p>
         </div>
-        <div style="flex:1;overflow-y:auto;">
-          {convoSummaries.length === 0 && (
-            <div style="padding:30px 20px;text-align:center;">
-              <p style="font-size:12.5px;color:#6e6e78;line-height:1.7;margin-bottom:14px;">No conversations yet.<br/>Start one to message your team.</p>
+      )}
+      {convoSummaries.map((c) => {
+        const isActive = openConvId === c.id;
+        const rc = (roleColor as any)[c.otherUser?.role] || '#6e6e78';
+        return (
+          <a href={'/admin/messages?c=' + c.id} class={`conv-item${isActive ? ' active' : ''}`} onclick="openConv(event, this)">
+            <div class="avatar" style={`background:${rc}33;color:${rc};`}>{initial(c.otherUser?.name || '?')}</div>
+            <div style="flex:1;min-width:0;">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:3px;">
+                <span style={`font-size:13px;font-weight:${c.unreadCount > 0 ? '700' : '500'};color:#fff;`}>{c.otherUser?.name || 'Unknown'}</span>
+                <span style="font-size:10px;color:#6e6e78;flex-shrink:0;">{fmtTime(c.lastMessageAt)}</span>
+              </div>
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
+                <span style={`font-size:11px;color:${c.unreadCount > 0 ? '#d8d8de' : '#6e6e78'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`}>{trunc(c.lastMessage?.body || 'No messages', 45)}</span>
+                {c.unreadCount > 0 && <span style="background:#FF4F00;color:#fff;font-size:9px;font-weight:700;padding:1px 6px;border-radius:100px;flex-shrink:0;">{c.unreadCount}</span>}
+              </div>
             </div>
-          )}
-          {convoSummaries.map((c) => {
-            const isOpen = openConvId === c.id;
-            const lastMsgBody = c.lastMessage ? c.lastMessage.body : '(no messages yet)';
-            const lastFromMe = c.lastMessage && c.lastMessage.senderUserId === currentUser.id;
+          </a>
+        );
+      })}
+    </div>
+  </div>
+
+  <!-- Conversation panel -->
+  <div class="dm-panel" id="dmPanel">
+
+    {/* New conversation form */}
+    {showNew && (
+      <div style="flex:1;overflow-y:auto;padding:24px;max-width:560px;width:100%;margin:0 auto;">
+        <a href="/admin/messages" class="msg-back" style="display:inline-flex;align-items:center;gap:4px;font-size:13px;color:#6e6e78;text-decoration:none;margin-bottom:20px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+          Back
+        </a>
+        <h2 style="font-size:16px;font-weight:700;color:#fff;margin:0 0 20px;">New Message</h2>
+        {errorMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:14px;">{errorMsg}</div>}
+        <form method="POST" style="display:flex;flex-direction:column;gap:14px;">
+          <input type="hidden" name="_action" value="start_conversation"/>
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:6px;">Send to</label>
+            <select name="recipientId" required style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+              <option value="">Choose person...</option>
+              {allAdmins.map(u => <option value={u.id}>{u.name} ({u.role})</option>)}
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:6px;">Message</label>
+            <textarea name="body" rows="4" required placeholder="Type your message..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;font-family:inherit;"></textarea>
+          </div>
+          <button type="submit" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Send Message</button>
+        </form>
+      </div>
+    )}
+
+    {/* Open conversation */}
+    {!showNew && openConvId && otherUser && (
+      <>
+        <div class="msg-header">
+          <a href="/admin/messages" class="msg-back" onclick="closeMobile(event)">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+          </a>
+          <div class="avatar" style={`background:${(roleColor as any)[otherUser.role]||'#6e6e78'}33;color:${(roleColor as any)[otherUser.role]||'#6e6e78'};width:36px;height:36px;font-size:14px;`}>{initial(otherUser.name)}</div>
+          <div style="flex:1;min-width:0;">
+            <p style="font-size:14px;font-weight:600;color:#fff;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{otherUser.name}</p>
+            <p style="font-size:10px;color:#6e6e78;margin:0;text-transform:capitalize;">{otherUser.role?.replace(/_/g,' ')}</p>
+          </div>
+        </div>
+        <div class="msg-scroll" id="msgList">
+          {openMessages.length === 0 && <p style="text-align:center;color:#6e6e78;font-size:12px;padding:20px 0;">Start the conversation</p>}
+          {openMessages.map((m: any) => {
+            const fromMe = m.senderUserId === currentUser.id;
             return (
-              <a href={'/admin/messages?c=' + c.id} style={'display:block;padding:12px 16px;border-bottom:1px solid #15151a;text-decoration:none;color:inherit;' + (isOpen ? 'background:rgba(255,79,0,0.08);' : '')}>
-                <div style="display:flex;align-items:flex-start;gap:10px;">
-                  <div style="width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#FF4F00,#FF7040);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:13px;flex-shrink:0;">{c.otherUser ? initial(c.otherUser.name) : '?'}</div>
-                  <div style="flex:1;min-width:0;">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:3px;">
-                      <span style="font-weight:500;color:#fff;font-size:12.5px;">{c.otherUser ? c.otherUser.name : 'Unknown'}</span>
-                      <span style="font-size:9.5px;color:#6e6e78;flex-shrink:0;">{fmtTime(c.lastMessageAt)}</span>
-                    </div>
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
-                      <span style={'font-size:11px;color:' + (c.unreadCount > 0 ? '#d8d8de' : '#6e6e78') + ';overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;'}>
-                        {lastFromMe && <span style="color:#6e6e78;">You: </span>}
-                        {trunc(lastMsgBody, 50)}
-                      </span>
-                      {c.unreadCount > 0 && <span style="background:#FF4F00;color:#fff;font-size:9.5px;font-weight:700;padding:1px 6px;border-radius:100px;flex-shrink:0;">{c.unreadCount}</span>}
-                    </div>
-                  </div>
+              <div style={`display:flex;flex-direction:column;align-items:${fromMe?'flex-end':'flex-start'};`}>
+                <div class={`msg-bubble ${fromMe?'me':'them'}`}>{m.body}</div>
+                <div class="msg-meta" style={`text-align:${fromMe?'right':'left'};margin-top:3px;`}>
+                  {fmtTime(m.createdAt)}
+                  {fromMe && m.readByRecipient && <span style="margin-left:5px;color:#60a5fa;">Read</span>}
                 </div>
-              </a>
+              </div>
             );
           })}
+          <div id="bottom"></div>
         </div>
+        <form method="POST" class="msg-input-row" id="msgForm">
+          <input type="hidden" name="_action" value="send_message"/>
+          <input type="hidden" name="conversationId" value={openConvId}/>
+          <textarea name="body" class="msg-textarea" placeholder="Message..." rows="1" id="msgInput" required autofocus></textarea>
+          <button type="submit" class="send-btn">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </form>
+      </>
+    )}
+
+    {/* Empty state */}
+    {!showNew && !openConvId && (
+      <div class="empty-state">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.2" style="margin-bottom:14px;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <p style="font-size:15px;font-weight:600;color:#fff;margin-bottom:6px;">Select a conversation</p>
+        <p style="font-size:13px;margin-bottom:20px;">or start a new one</p>
+        <a href="/admin/messages?new=1" style="background:#FF4F00;color:#fff;text-decoration:none;font-size:13px;font-weight:600;padding:10px 20px;border-radius:8px;">New Message</a>
       </div>
-
-    <!-- Conversation panel -->
-    <div id="dmPanel" style="display:flex;flex-direction:column;flex:1;background:#0a0a0d;min-width:0;">
-        {errorMsg && <div style="margin:14px 18px 0;background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12px;padding:8px 11px;border-radius:6px;">{errorMsg}</div>}
-
-        {showNew && (
-          <div style="padding:30px 40px;max-width:600px;margin:0 auto;width:100%;">
-            <h2 style="font-size:16px;font-weight:600;color:#fff;margin-bottom:18px;">Start a new conversation</h2>
-            <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
-              <input type="hidden" name="_action" value="start_conversation" />
-              <div>
-                <label class="rolefield-label">Send to *</label>
-                <select name="recipientId" required class="rolefield-input">
-                  <option value="">Choose team member...</option>
-                  {recipientCandidates.map((u) => <option value={u.id}>{u.name} ({u.role})</option>)}
-                </select>
-              </div>
-              <div>
-                <label class="rolefield-label">Message *</label>
-                <textarea name="body" rows="4" required class="rolefield-input" placeholder="Hello..."></textarea>
-              </div>
-              <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
-                <a href="/admin/messages" class="admin-btn" style="padding:7px 14px;font-size:12px;text-decoration:none;display:flex;align-items:center;">Cancel</a>
-                <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:12px;">Send</button>
-              </div>
-            </form>
-          </div>
-        )}
-
-        {!showNew && openConv && otherUserInOpenConv && (
-          <>
-            <div style="padding:12px 14px;border-bottom:1px solid #1a1a1f;display:flex;align-items:center;gap:10px;">
-              <a href="/admin/messages" id="dmBack" style="display:none;color:#6e6e78;text-decoration:none;font-size:20px;line-height:1;padding:4px;">-</a>
-              <div style="width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#FF4F00,#FF7040);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:15px;">{initial(otherUserInOpenConv.name)}</div>
-              <div>
-                <div style="font-size:13.5px;font-weight:600;color:#fff;">{otherUserInOpenConv.name}</div>
-                <div style="font-size:10.5px;color:#6e6e78;">{otherUserInOpenConv.role.replace(/_/g, ' ')} - {otherUserInOpenConv.email}</div>
-              </div>
-            </div>
-            <div style="flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:10px;" id="message-list">
-              {openMessages.length === 0 && <p style="text-align:center;color:#6e6e78;font-size:12.5px;padding:30px;">No messages yet. Send the first one below.</p>}
-              {openMessages.map((m) => {
-                const fromMe = m.senderUserId === currentUser.id;
-                return (
-                  <div style={'display:flex;flex-direction:column;align-items:' + (fromMe ? 'flex-end' : 'flex-start')}>
-                    <div style={'max-width:65%;padding:9px 13px;border-radius:14px;' + (fromMe ? 'background:#FF4F00;color:#fff;border-bottom-right-radius:4px;' : 'background:#1a1a20;color:#e8e8ee;border-bottom-left-radius:4px;') + 'font-size:13px;line-height:1.55;white-space:pre-wrap;word-wrap:break-word;'}>{m.body}</div>
-                    <div style="font-size:9.5px;color:#6e6e78;margin-top:3px;">
-                      {fmtTs(m.createdAt)}
-                      {fromMe && m.readByRecipient && <span style="margin-left:6px;color:#60a5fa;">read</span>}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            <form method="POST" style="padding:14px 18px;border-top:1px solid #1f1f26;display:flex;gap:10px;align-items:flex-end;">
-              <input type="hidden" name="_action" value="send_message" />
-              <input type="hidden" name="conversationId" value={openConvId} />
-              <textarea name="body" rows="1" required placeholder="Type a message..." class="rolefield-input" style="resize:none;min-height:38px;max-height:120px;flex:1;" autofocus></textarea>
-              <button type="submit" class="admin-btn admin-btn-primary" style="padding:9px 16px;font-size:12px;align-self:flex-end;">Send</button>
-            </form>
-          </>
-        )}
-
-        {!showNew && !openConv && (
-          <div style="display:flex;align-items:center;justify-content:center;flex:1;flex-direction:column;gap:8px;">
-            <p style="color:#6e6e78;font-size:14px;">Pick a conversation from the left</p>
-            <p style="color:#6e6e78;font-size:12px;">or <a href="/admin/messages?new=1" style="color:#FF4F00;text-decoration:underline;">start a new one</a></p>
-          </div>
-        )}
-      </div>
-    </div>
-
+    )}
   </div>
 </div>
 
-  <script is:inline>
-    const ml = document.getElementById('message-list');
-    if (ml) ml.scrollTop = ml.scrollHeight;
-    // Mobile: show panel when conversation selected
-    const panel = document.getElementById('dmPanel');
-    const list = document.getElementById('dmList');
-    if (panel && list && window.innerWidth < 640) {
-      const hasConv = window.location.search.includes('?c=') || window.location.search.includes('new=1');
-      if (hasConv) { list.style.display = 'none'; panel.style.display = 'flex'; panel.style.flexDirection = 'column'; }
-    }
+<script is:inline>
+// Scroll to bottom
+var msgList = document.getElementById('msgList');
+if (msgList) {
+  msgList.scrollTop = msgList.scrollHeight;
+}
 
-    // Live polling for new DMs every 2 seconds
-    var convParam = new URLSearchParams(window.location.search).get('c');
-    if (convParam && ml) {
-      var dmLastCount = ml.children.length;
-      var dmPollTimer = setInterval(function() {
-        fetch(window.location.href, { credentials: 'same-origin' })
-          .then(function(r) { return r.text(); })
-          .then(function(html) {
-            var doc = new DOMParser().parseFromString(html, 'text/html');
-            var newMl = doc.getElementById('message-list');
-            if (!newMl || newMl.children.length <= dmLastCount) return;
-            var wasBottom = (ml.scrollHeight - ml.scrollTop - ml.clientHeight) < 100;
-            var existingHtml = Array.from(ml.children).map(function(el) { return el.innerHTML; });
-            Array.from(newMl.children).forEach(function(el) {
-              if (!existingHtml.includes(el.innerHTML)) {
-                ml.appendChild(el.cloneNode(true));
-              }
-            });
-            dmLastCount = newMl.children.length;
-            if (wasBottom) ml.scrollTop = ml.scrollHeight;
-          }).catch(function() {});
-      }, 2000);
-      document.addEventListener('visibilitychange', function() {
-        if (document.hidden) { clearInterval(dmPollTimer); }
-        else { dmPollTimer = setInterval(arguments.callee, 2000); }
-      });
+// Auto-expand textarea
+var msgInput = document.getElementById('msgInput');
+if (msgInput) {
+  msgInput.addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+  });
+  // Cmd/Ctrl+Enter to send
+  msgInput.addEventListener('keydown', function(e) {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      document.getElementById('msgForm')?.submit();
     }
-  </script>
+  });
+}
 
-  <style>
-    .rolefield-label { display:block;font-size:10.5px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px; }
-    .rolefield-input { width:100%;padding:8px 11px;background:#08080a;border:1px solid #1f1f26;border-radius:6px;color:#fff;font-size:12.5px;font-family:inherit;outline:none; }
-    .rolefield-input:focus { border-color:#FF4F00; }
-  </style>
+// Mobile: open panel
+function openConv(e, el) {
+  if (window.innerWidth > 640) return;
+  e.preventDefault();
+  var href = el.getAttribute('href');
+  history.pushState({}, '', href);
+  document.getElementById('dmPanel').classList.add('mobile-open');
+  document.getElementById('dmList').style.display = 'none';
+  // Fetch and load the conversation
+  fetch(href, { credentials: 'same-origin' })
+    .then(function(r) { return r.text(); })
+    .then(function(html) {
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+      var newPanel = doc.getElementById('dmPanel');
+      if (newPanel) {
+        var panel = document.getElementById('dmPanel');
+        panel.innerHTML = newPanel.innerHTML;
+        var ml = panel.querySelector('#msgList');
+        if (ml) ml.scrollTop = ml.scrollHeight;
+        // Re-init textarea
+        var inp = panel.querySelector('#msgInput');
+        if (inp) inp.focus();
+      }
+    });
+}
+
+function closeMobile(e) {
+  if (window.innerWidth > 640) return;
+  e.preventDefault();
+  document.getElementById('dmPanel').classList.remove('mobile-open');
+  document.getElementById('dmList').style.display = 'flex';
+  document.getElementById('dmList').style.flexDirection = 'column';
+  history.pushState({}, '', '/admin/messages');
+}
+
+// Mobile: if URL has ?c= on load, show panel
+if (window.innerWidth <= 640 && window.location.search.includes('c=')) {
+  document.getElementById('dmPanel')?.classList.add('mobile-open');
+  document.getElementById('dmList').style.display = 'none';
+}
+
+// Live polling every 3s
+var convId = new URLSearchParams(window.location.search).get('c');
+if (convId && msgList) {
+  var lastCount = msgList.children.length;
+  setInterval(function() {
+    fetch(window.location.href, { credentials: 'same-origin' })
+      .then(function(r) { return r.text(); })
+      .then(function(html) {
+        var doc = new DOMParser().parseFromString(html, 'text/html');
+        var newList = doc.getElementById('msgList');
+        if (!newList || newList.children.length <= lastCount) return;
+        var wasBottom = (msgList.scrollHeight - msgList.scrollTop - msgList.clientHeight) < 80;
+        var seen = new Set(Array.from(msgList.children).map(function(el) { return el.textContent; }));
+        Array.from(newList.children).forEach(function(el) {
+          if (!seen.has(el.textContent)) msgList.insertBefore(el.cloneNode(true), msgList.lastElementChild);
+        });
+        lastCount = newList.children.length;
+        if (wasBottom) msgList.scrollTop = msgList.scrollHeight;
+      }).catch(function() {});
+  }, 3000);
+}
+</script>
 </AdminLayout>
