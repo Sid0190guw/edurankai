@@ -1,0 +1,727 @@
+---
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const { slug } = Astro.params;
+const user = Astro.locals.user;
+const urlP = new URL(Astro.request.url).searchParams;
+const resume = urlP.get('resume') === '1';
+
+let test: any = null;
+let questions: any[] = [];
+let attempt: any = null;
+
+try {
+  const r = await db.execute(sql`SELECT * FROM tests WHERE slug = ${slug} AND is_published = true LIMIT 1`);
+  const rows = Array.isArray(r) ? r : (r?.rows || []);
+  test = rows[0] || null;
+} catch(e) {}
+
+if (!test) return Astro.redirect('/aquintutor');
+
+try {
+  const r = await db.execute(sql`SELECT id, question_type, question_text, options, code_starter, code_language, marks, difficulty FROM test_questions WHERE test_id = ${test.id} ORDER BY sort_order, created_at`);
+  questions = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+if (questions.length === 0) return Astro.redirect('/aquintutor/test/' + slug);
+
+// Find or create attempt
+if (resume && user) {
+  try {
+    const r = await db.execute(sql`SELECT * FROM test_attempts WHERE test_id = ${test.id} AND candidate_id = ${user.id} AND status = 'in_progress' ORDER BY started_at DESC LIMIT 1`);
+    const rows = Array.isArray(r) ? r : (r?.rows || []);
+    attempt = rows[0] || null;
+  } catch(e) {}
+}
+
+if (!attempt) {
+  const candidateName = user?.name || 'Anonymous';
+  const candidateEmail = user?.email || 'anon-' + Math.random().toString(36).substring(2,10) + '@aquintutor.local';
+  const candidateId = user?.id || null;
+
+  try {
+    const r = await db.execute(sql`
+      INSERT INTO test_attempts (test_id, candidate_id, candidate_email, candidate_name, status, max_score)
+      VALUES (${test.id}, ${candidateId}, ${candidateEmail}, ${candidateName}, 'in_progress', ${test.total_marks || 0})
+      RETURNING *
+    `);
+    const rows = Array.isArray(r) ? r : (r?.rows || []);
+    attempt = rows[0];
+  } catch(e: any) {
+    console.error('Failed to create attempt:', e.message);
+    return Astro.redirect('/aquintutor/test/' + slug);
+  }
+}
+
+const existingAnswers = attempt?.answers || {};
+const startedAt = attempt?.started_at ? new Date(attempt.started_at) : new Date();
+const elapsedSecs = Math.floor((Date.now() - startedAt.getTime()) / 1000);
+const remainingSecs = Math.max(0, (test.duration_mins * 60) - elapsedSecs);
+
+const CAT_THEMES: Record<string, any> = {
+  coding: { bg: '#020c08', fg: '#10b981', accent: '#34d399' },
+  aptitude: { bg: '#03081a', fg: '#60a5fa', accent: '#93c5fd' },
+  mcq: { bg: '#1a0a02', fg: '#FF7040', accent: '#FFB088' },
+  subjective: { bg: '#150828', fg: '#a78bfa', accent: '#c4b5fd' },
+  personality: { bg: '#1a1408', fg: '#fbbf24', accent: '#fcd34d' },
+  video: { bg: '#1a0808', fg: '#ef4444', accent: '#fca5a5' },
+  mixed: { bg: '#1a0a00', fg: '#FF4F00', accent: '#FF7040' },
+};
+const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
+---
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>{test.title} - In Progress</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+      user-select: none;
+    }
+
+    /* COUNTDOWN OVERLAY */
+    .countdown {
+      position: fixed;
+      inset: 0;
+      background: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      z-index: 100;
+    }
+    .count-num {
+      font-size: 220px;
+      font-weight: 900;
+      color: var(--fg);
+      font-family: monospace;
+      animation: countPulse 1s ease-out;
+    }
+    .count-label { font-size: 16px; color: rgba(255,255,255,0.7); letter-spacing: 0.3em; text-transform: uppercase; margin-top: 12px; }
+    @keyframes countPulse {
+      0% { transform: scale(0.3); opacity: 0; }
+      50% { transform: scale(1.2); opacity: 1; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+    .go-text { font-size: 120px; font-weight: 900; color: var(--fg); animation: goAnim 0.8s ease-out forwards; }
+    @keyframes goAnim {
+      0% { transform: scale(0.5); opacity: 0; letter-spacing: 0; }
+      50% { transform: scale(1.5); opacity: 1; letter-spacing: 0.3em; }
+      100% { transform: scale(1); opacity: 0; }
+    }
+
+    /* MAIN GAMEPLAY */
+    .game { display: none; min-height: 100vh; flex-direction: column; }
+    .game.active { display: flex; }
+
+    /* HUD */
+    .hud {
+      background: rgba(0,0,0,0.5);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      padding: 12px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .hud-left, .hud-right { display: flex; gap: 14px; align-items: center; }
+    .hud-tile {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .hud-tile .label { color: rgba(255,255,255,0.5); font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; }
+    .hud-tile .val { font-weight: 700; color: #fff; font-family: monospace; font-size: 14px; }
+    .timer-tile { background: rgba(255,255,255,0.05); }
+    .timer-tile.warning { background: rgba(251,191,36,0.15); border-color: #fbbf24; }
+    .timer-tile.danger { background: rgba(239,68,68,0.15); border-color: #ef4444; animation: heartbeat 1s infinite; }
+    @keyframes heartbeat { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.05); } }
+
+    /* PROGRESS PATH */
+    .progress-path {
+      display: flex;
+      gap: 4px;
+      padding: 0 20px;
+      margin-top: 14px;
+      overflow-x: auto;
+      scrollbar-width: thin;
+    }
+    .path-node {
+      flex-shrink: 0;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 700;
+      color: rgba(255,255,255,0.5);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .path-node.current {
+      background: var(--fg);
+      color: #000;
+      transform: scale(1.15);
+      box-shadow: 0 0 0 3px rgba(255,255,255,0.1);
+    }
+    .path-node.answered { background: rgba(255,255,255,0.15); color: #fff; border-color: var(--fg); }
+    .path-node.flagged { background: rgba(251,191,36,0.2); border-color: #fbbf24; color: #fbbf24; }
+
+    /* QUESTION */
+    .stage {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 30px 20px;
+    }
+    .question-card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 18px;
+      padding: 36px;
+      max-width: 760px;
+      width: 100%;
+      animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    @keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+    .q-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .q-meta-pill { font-size: 10px; font-weight: 700; padding: 3px 10px; border-radius: 100px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .q-text { font-size: 22px; font-weight: 600; color: #fff; line-height: 1.5; margin-bottom: 28px; user-select: text; }
+    .q-text code { background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-family: 'SF Mono', monospace; font-size: 0.9em; color: var(--accent); }
+
+    /* OPTIONS (MCQ) */
+    .options { display: flex; flex-direction: column; gap: 10px; }
+    .option {
+      background: rgba(255,255,255,0.04);
+      border: 2px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 16px 20px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      transition: all 0.15s;
+      text-align: left;
+      width: 100%;
+      color: #fff;
+      font-family: inherit;
+      font-size: 15px;
+    }
+    .option:hover { background: rgba(255,255,255,0.07); border-color: rgba(255,255,255,0.2); transform: translateX(4px); }
+    .option.selected { background: rgba(255,255,255,0.1); border-color: var(--fg); transform: translateX(8px); }
+    .option-letter {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.08);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 13px;
+      flex-shrink: 0;
+      transition: all 0.15s;
+    }
+    .option.selected .option-letter { background: var(--fg); color: #000; }
+    .option-text { flex: 1; line-height: 1.5; }
+
+    /* TEXT ANSWER */
+    .text-answer {
+      width: 100%;
+      background: rgba(255,255,255,0.04);
+      border: 2px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 16px 20px;
+      color: #fff;
+      font-size: 15px;
+      font-family: inherit;
+      resize: vertical;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .text-answer:focus { border-color: var(--fg); }
+
+    /* CODE EDITOR */
+    .code-editor {
+      width: 100%;
+      background: #000;
+      border: 2px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 16px;
+      color: #34d399;
+      font-size: 14px;
+      font-family: 'SF Mono', Menlo, Consolas, monospace;
+      resize: vertical;
+      outline: none;
+      min-height: 240px;
+      line-height: 1.6;
+      tab-size: 2;
+    }
+    .code-editor:focus { border-color: var(--fg); }
+
+    /* BOTTOM NAV */
+    .nav-bar {
+      background: rgba(0,0,0,0.6);
+      backdrop-filter: blur(10px);
+      border-top: 1px solid rgba(255,255,255,0.05);
+      padding: 14px 20px;
+      display: flex;
+      gap: 10px;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      bottom: 0;
+    }
+    .nav-btn {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 11px 22px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .nav-btn:hover { background: rgba(255,255,255,0.08); }
+    .nav-btn.primary { background: var(--fg); color: #000; border-color: var(--fg); }
+    .nav-btn.primary:hover { box-shadow: 0 4px 16px var(--fg); }
+    .nav-btn.flag { background: rgba(251,191,36,0.1); border-color: #fbbf24; color: #fbbf24; }
+    .nav-btn.flag.active { background: #fbbf24; color: #000; }
+    .nav-btn.submit-final { background: linear-gradient(135deg, #10b981, #34d399); border-color: #10b981; color: #000; font-weight: 800; }
+
+    /* TOAST */
+    .toast {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.9);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: #fff;
+      font-size: 13px;
+      padding: 12px 22px;
+      border-radius: 100px;
+      z-index: 50;
+      animation: toastIn 0.3s ease-out;
+    }
+    @keyframes toastIn { from { opacity: 0; transform: translate(-50%, -10px); } to { opacity: 1; transform: translate(-50%, 0); } }
+    .toast.warn { border-color: #fbbf24; color: #fbbf24; }
+
+    /* SUBMIT CONFIRM */
+    .confirm-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(10px); z-index: 200; display: none; align-items: center; justify-content: center; padding: 20px; }
+    .confirm-overlay.show { display: flex; }
+    .confirm-box { background: #0a0a0c; border: 1px solid rgba(255,255,255,0.15); border-radius: 16px; padding: 32px; max-width: 440px; width: 100%; text-align: center; }
+    .confirm-box h2 { font-size: 24px; font-weight: 800; color: #fff; margin-bottom: 10px; }
+    .confirm-box p { font-size: 14px; color: rgba(255,255,255,0.7); line-height: 1.6; margin-bottom: 20px; }
+    .confirm-stat { background: rgba(255,255,255,0.05); border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; font-size: 13px; }
+    .confirm-actions { display: flex; gap: 10px; margin-top: 22px; }
+  </style>
+</head>
+<body style={`--bg:${theme.bg};--fg:${theme.fg};--accent:${theme.accent};`}>
+
+  <!-- COUNTDOWN -->
+  <div class="countdown" id="countdown">
+    <div class="count-num" id="countNum">3</div>
+    <p class="count-label">Get ready</p>
+  </div>
+
+  <!-- MAIN GAME -->
+  <div class="game" id="game">
+    <!-- HUD -->
+    <div class="hud">
+      <div class="hud-left">
+        <div class="hud-tile">
+          <span class="label">Q</span>
+          <span class="val"><span id="qCurrent">1</span>/{questions.length}</span>
+        </div>
+        <div class="hud-tile">
+          <span class="label">Answered</span>
+          <span class="val" id="answeredCount">0</span>
+        </div>
+      </div>
+      <div class="hud-right">
+        <div class="hud-tile timer-tile" id="timerTile">
+          <span class="label">Time</span>
+          <span class="val" id="timer">00:00</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Progress path -->
+    <div class="progress-path" id="progressPath"></div>
+
+    <!-- Stage -->
+    <div class="stage">
+      <div class="question-card" id="qCard">
+        <div class="q-meta" id="qMeta"></div>
+        <div class="q-text" id="qText"></div>
+        <div id="qAnswerArea"></div>
+      </div>
+    </div>
+
+    <!-- Bottom nav -->
+    <div class="nav-bar">
+      <button class="nav-btn" id="prevBtn">&lt; Previous</button>
+      <button class="nav-btn flag" id="flagBtn">Flag for review</button>
+      <button class="nav-btn primary" id="nextBtn">Next &gt;</button>
+      <button class="nav-btn submit-final" id="submitBtn" style="display:none;">Submit Test</button>
+    </div>
+  </div>
+
+  <!-- SUBMIT CONFIRM -->
+  <div class="confirm-overlay" id="confirmOverlay">
+    <div class="confirm-box">
+      <h2>Submit Test?</h2>
+      <p>You can't change answers after submission.</p>
+      <div class="confirm-stat"><span style="color:rgba(255,255,255,0.6);">Answered</span><span id="confAnswered">0</span></div>
+      <div class="confirm-stat"><span style="color:rgba(255,255,255,0.6);">Unanswered</span><span id="confUnanswered">0</span></div>
+      <div class="confirm-stat"><span style="color:rgba(255,255,255,0.6);">Flagged</span><span id="confFlagged">0</span></div>
+      <div class="confirm-actions">
+        <button class="nav-btn" onclick="document.getElementById('confirmOverlay').classList.remove('show')" style="flex:1;">Keep going</button>
+        <button class="nav-btn submit-final" onclick="submitTest()" style="flex:1;">Yes, Submit</button>
+      </div>
+    </div>
+  </div>
+
+  <script is:inline define:vars={{
+    questions: questions,
+    existingAnswers: existingAnswers,
+    remainingSecs: remainingSecs,
+    attemptId: attempt.id,
+    testSlug: slug,
+    fg: theme.fg
+  }}>
+    var currentIdx = 0;
+    var answers = existingAnswers || {};
+    var flagged = {};
+    var tabSwitches = 0;
+    var timeLeft = remainingSecs;
+    var saveTimer = null;
+    var submitted = false;
+
+    // Countdown then start
+    var countNum = document.getElementById('countNum');
+    var countdown = document.getElementById('countdown');
+    var game = document.getElementById('game');
+
+    function startCountdown() {
+      var i = 3;
+      var t = setInterval(function() {
+        i--;
+        if (i > 0) { countNum.textContent = i; }
+        else if (i === 0) { countNum.innerHTML = '<div class="go-text">GO!</div>'; }
+        else {
+          clearInterval(t);
+          countdown.style.display = 'none';
+          game.classList.add('active');
+          startGame();
+        }
+      }, 1000);
+    }
+
+    function startGame() {
+      buildProgressPath();
+      renderQuestion();
+      startTimer();
+      attachListeners();
+    }
+
+    function buildProgressPath() {
+      var path = document.getElementById('progressPath');
+      var html = '';
+      for (var i = 0; i < questions.length; i++) {
+        html += '<div class="path-node" data-idx="' + i + '" onclick="goTo(' + i + ')">' + (i+1) + '</div>';
+      }
+      path.innerHTML = html;
+      updateProgressPath();
+    }
+
+    function updateProgressPath() {
+      var nodes = document.querySelectorAll('.path-node');
+      nodes.forEach(function(n, i) {
+        n.classList.remove('current', 'answered', 'flagged');
+        var qId = questions[i].id;
+        if (i === currentIdx) n.classList.add('current');
+        else if (flagged[qId]) n.classList.add('flagged');
+        else if (answers[qId] !== undefined && answers[qId] !== null && answers[qId] !== '') n.classList.add('answered');
+      });
+    }
+
+    function renderQuestion() {
+      var q = questions[currentIdx];
+      document.getElementById('qCurrent').textContent = (currentIdx + 1);
+
+      var diff = q.difficulty || 'medium';
+      var diffColor = diff === 'easy' ? '#10b981' : diff === 'hard' ? '#ef4444' : '#fbbf24';
+      var typeLabel = (q.question_type || 'mcq').replace('_', ' ').toUpperCase();
+
+      document.getElementById('qMeta').innerHTML =
+        '<span class="q-meta-pill" style="background:rgba(255,255,255,0.08);color:#fff;">' + typeLabel + '</span>' +
+        '<span class="q-meta-pill" style="background:' + diffColor + '22;color:' + diffColor + ';">' + diff.toUpperCase() + '</span>' +
+        '<span class="q-meta-pill" style="background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.7);">' + q.marks + ' pt' + (q.marks !== 1 ? 's' : '') + '</span>';
+
+      document.getElementById('qText').textContent = q.question_text;
+
+      var answerArea = document.getElementById('qAnswerArea');
+      var qId = q.id;
+      var current = answers[qId];
+
+      if (q.question_type === 'mcq_single' || q.question_type === 'true_false') {
+        var opts = q.options || [];
+        var html = '<div class="options">';
+        opts.forEach(function(o, i) {
+          var sel = current === i ? 'selected' : '';
+          var letter = String.fromCharCode(65 + i);
+          html += '<button class="option ' + sel + '" onclick="selectOption(' + i + ')"><span class="option-letter">' + letter + '</span><span class="option-text">' + escapeHtml(o.text) + '</span></button>';
+        });
+        html += '</div>';
+        answerArea.innerHTML = html;
+      } else if (q.question_type === 'mcq_multi') {
+        var opts = q.options || [];
+        var html = '<div class="options"><p style="font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:8px;">Select all that apply</p>';
+        var selected = Array.isArray(current) ? current : [];
+        opts.forEach(function(o, i) {
+          var sel = selected.indexOf(i) > -1 ? 'selected' : '';
+          var letter = String.fromCharCode(65 + i);
+          html += '<button class="option ' + sel + '" onclick="toggleOption(' + i + ')"><span class="option-letter">' + letter + '</span><span class="option-text">' + escapeHtml(o.text) + '</span></button>';
+        });
+        html += '</div>';
+        answerArea.innerHTML = html;
+      } else if (q.question_type === 'short_answer') {
+        answerArea.innerHTML = '<input type="text" class="text-answer" placeholder="Type your answer..." oninput="setTextAnswer(this.value)" value="' + escapeHtml(current || '') + '" />';
+      } else if (q.question_type === 'long_answer') {
+        answerArea.innerHTML = '<textarea class="text-answer" rows="6" placeholder="Type your answer..." oninput="setTextAnswer(this.value)">' + escapeHtml(current || '') + '</textarea>';
+      } else if (q.question_type === 'code') {
+        var starter = q.code_starter || '';
+        var val = current || starter;
+        answerArea.innerHTML =
+          '<p style="font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:6px;">Language: ' + (q.code_language || 'python') + '</p>' +
+          '<textarea class="code-editor" spellcheck="false" oninput="setTextAnswer(this.value)" placeholder="Write your code...">' + escapeHtml(val) + '</textarea>';
+      }
+
+      // Flag button state
+      var flagBtn = document.getElementById('flagBtn');
+      if (flagged[qId]) flagBtn.classList.add('active');
+      else flagBtn.classList.remove('active');
+
+      // Next/Submit visibility
+      document.getElementById('nextBtn').style.display = (currentIdx < questions.length - 1) ? '' : 'none';
+      document.getElementById('submitBtn').style.display = (currentIdx === questions.length - 1) ? '' : 'none';
+      document.getElementById('prevBtn').disabled = (currentIdx === 0);
+      document.getElementById('prevBtn').style.opacity = (currentIdx === 0) ? '0.4' : '1';
+
+      updateProgressPath();
+      updateAnsweredCount();
+    }
+
+    function selectOption(idx) {
+      var q = questions[currentIdx];
+      answers[q.id] = idx;
+      renderQuestion();
+      scheduleSave();
+    }
+
+    function toggleOption(idx) {
+      var q = questions[currentIdx];
+      var cur = Array.isArray(answers[q.id]) ? answers[q.id].slice() : [];
+      var pos = cur.indexOf(idx);
+      if (pos > -1) cur.splice(pos, 1);
+      else cur.push(idx);
+      answers[q.id] = cur;
+      renderQuestion();
+      scheduleSave();
+    }
+
+    function setTextAnswer(val) {
+      var q = questions[currentIdx];
+      answers[q.id] = val;
+      scheduleSave();
+      updateAnsweredCount();
+      updateProgressPath();
+    }
+
+    function goTo(idx) {
+      currentIdx = idx;
+      renderQuestion();
+    }
+
+    function next() {
+      if (currentIdx < questions.length - 1) {
+        currentIdx++;
+        renderQuestion();
+      }
+    }
+    function prev() {
+      if (currentIdx > 0) {
+        currentIdx--;
+        renderQuestion();
+      }
+    }
+    function toggleFlag() {
+      var qId = questions[currentIdx].id;
+      flagged[qId] = !flagged[qId];
+      renderQuestion();
+    }
+
+    function updateAnsweredCount() {
+      var count = 0;
+      for (var i = 0; i < questions.length; i++) {
+        var a = answers[questions[i].id];
+        if (a !== undefined && a !== null && a !== '' && !(Array.isArray(a) && a.length === 0)) count++;
+      }
+      document.getElementById('answeredCount').textContent = count;
+    }
+
+    function startTimer() {
+      var timerEl = document.getElementById('timer');
+      var tile = document.getElementById('timerTile');
+      function tick() {
+        if (submitted) return;
+        if (timeLeft <= 0) {
+          autoSubmit();
+          return;
+        }
+        var m = Math.floor(timeLeft / 60);
+        var s = timeLeft % 60;
+        timerEl.textContent = (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+        tile.classList.toggle('warning', timeLeft <= 300 && timeLeft > 60);
+        tile.classList.toggle('danger', timeLeft <= 60);
+        timeLeft--;
+      }
+      tick();
+      setInterval(tick, 1000);
+    }
+
+    function scheduleSave() {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(doSave, 1500);
+    }
+
+    function doSave() {
+      fetch('/api/tests/save-progress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ attemptId: attemptId, answers: answers, flagged: flagged, tabSwitches: tabSwitches })
+      }).catch(function() {});
+    }
+
+    function attachListeners() {
+      document.getElementById('nextBtn').onclick = next;
+      document.getElementById('prevBtn').onclick = prev;
+      document.getElementById('flagBtn').onclick = toggleFlag;
+      document.getElementById('submitBtn').onclick = openSubmitConfirm;
+
+      // Tab switch detection
+      document.addEventListener('visibilitychange', function() {
+        if (document.hidden && !submitted) {
+          tabSwitches++;
+          showToast('Warning: tab switch detected (' + tabSwitches + ')', 'warn');
+          scheduleSave();
+        }
+      });
+
+      // Keyboard shortcuts
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'ArrowRight' && !isInInput(e.target)) next();
+        if (e.key === 'ArrowLeft' && !isInInput(e.target)) prev();
+      });
+    }
+
+    function isInInput(el) {
+      return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
+    }
+
+    function showToast(msg, type) {
+      var t = document.createElement('div');
+      t.className = 'toast' + (type ? ' ' + type : '');
+      t.textContent = msg;
+      document.body.appendChild(t);
+      setTimeout(function() { t.remove(); }, 3000);
+    }
+
+    function openSubmitConfirm() {
+      var answered = 0, unanswered = 0, flaggedCount = 0;
+      for (var i = 0; i < questions.length; i++) {
+        var a = answers[questions[i].id];
+        if (a !== undefined && a !== null && a !== '' && !(Array.isArray(a) && a.length === 0)) answered++;
+        else unanswered++;
+        if (flagged[questions[i].id]) flaggedCount++;
+      }
+      document.getElementById('confAnswered').textContent = answered;
+      document.getElementById('confUnanswered').textContent = unanswered;
+      document.getElementById('confFlagged').textContent = flaggedCount;
+      document.getElementById('confirmOverlay').classList.add('show');
+    }
+
+    function submitTest() {
+      submitted = true;
+      document.getElementById('confirmOverlay').classList.remove('show');
+      var stage = document.querySelector('.stage');
+      stage.innerHTML = '<div style="text-align:center;"><div style="font-size:60px;margin-bottom:14px;">...</div><p style="font-size:18px;color:#fff;">Submitting your test...</p></div>';
+
+      fetch('/api/tests/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ attemptId: attemptId, answers: answers, flagged: flagged })
+      }).then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.ok) {
+          window.location.href = '/aquintutor/test/' + testSlug + '/result?attempt=' + attemptId;
+        } else {
+          stage.innerHTML = '<div style="text-align:center;color:#fca5a5;"><p>Submit failed: ' + (data.error || 'try again') + '</p></div>';
+        }
+      });
+    }
+
+    function autoSubmit() {
+      if (submitted) return;
+      submitted = true;
+      showToast('Time is up - auto-submitting', 'warn');
+      setTimeout(submitTest, 1500);
+    }
+
+    function escapeHtml(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+        return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+      });
+    }
+
+    // Start
+    startCountdown();
+
+    // Prevent accidental nav-away
+    window.addEventListener('beforeunload', function(e) {
+      if (!submitted) { e.preventDefault(); e.returnValue = 'You have unsaved answers. Leave anyway?'; return e.returnValue; }
+    });
+
+    // Auto-save every 30s as safety net
+    setInterval(function() { if (!submitted) doSave(); }, 30000);
+  </script>
+</body>
+</html>
