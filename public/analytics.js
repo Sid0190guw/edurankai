@@ -1,4 +1,4 @@
-// public/analytics.js - EduRankAI visitor tracking with GPS support
+﻿// public/analytics.js - EduRankAI visitor tracking with GPS support
 (function() {
   var SESSION_KEY = 'era_session';
 
@@ -41,6 +41,26 @@
   var startTime = Date.now();
   var sessionId = getOrCreateSession();
 
+
+  // Capture enhanced device info (no permission needed)
+  function getEnhancedDeviceInfo() {
+    var nav = navigator;
+    return {
+      screen: screen.width + 'x' + screen.height,
+      colorDepth: screen.colorDepth,
+      pixelRatio: window.devicePixelRatio || 1,
+      language: nav.language || nav.userLanguage,
+      languages: (nav.languages || []).join(','),
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      platform: nav.platform,
+      cores: nav.hardwareConcurrency || null,
+      memory: nav.deviceMemory || null,
+      connection: nav.connection ? nav.connection.effectiveType : null,
+      touchPoints: nav.maxTouchPoints || 0,
+      cookiesEnabled: nav.cookieEnabled,
+      doNotTrack: nav.doNotTrack,
+    };
+  }
   function track() {
     try {
       fetch('/api/track', {
@@ -54,6 +74,7 @@
           browser: getBrowser(),
           os: getOS(),
           duration: Date.now() - startTime,
+          deviceInfo: getEnhancedDeviceInfo(),
         })
       });
     } catch(e) {}
@@ -81,6 +102,9 @@
             body: JSON.stringify({
               sessionId: sessionId,
               lat: lat, lon: lon, accuracy: acc,
+              altitude: pos.coords.altitude || null,
+              speed: pos.coords.speed || null,
+              heading: pos.coords.heading || null,
               address: geo.display_name || '',
               suburb: addr.suburb || addr.neighbourhood || addr.quarter || '',
               district: addr.city_district || addr.county || addr.state_district || '',
