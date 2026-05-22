@@ -1,0 +1,253 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+let test: any = null;
+let questions: any[] = [];
+let okMsg = '', errorMsg = '';
+
+try {
+  const r = await db.execute(sql`SELECT * FROM tests WHERE id = ${id} LIMIT 1`);
+  const rows = Array.isArray(r) ? r : (r?.rows || []);
+  test = rows[0] || null;
+} catch(e) {}
+
+if (!test) return Astro.redirect('/admin/tests');
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+  try {
+    if (action === 'add_question') {
+      const qType = fd.get('question_type') as string;
+      const qText = (fd.get('question_text') as string || '').trim();
+      const marks = parseInt(fd.get('marks') as string || '1');
+      const difficulty = fd.get('difficulty') as string || 'medium';
+      const explanation = (fd.get('explanation') as string || '').trim() || null;
+
+      let options: any = [];
+      let correctAnswer: any = null;
+      let codeStarter: string | null = null;
+      let codeLang: string | null = null;
+      let testCases: any = [];
+
+      if (qType === 'mcq_single' || qType === 'mcq_multi') {
+        const optsRaw = (fd.get('options') as string || '').split('\n').map(s => s.trim()).filter(Boolean);
+        options = optsRaw.map((text, i) => ({ id: i, text }));
+        if (qType === 'mcq_single') {
+          correctAnswer = parseInt(fd.get('correct_index') as string || '0');
+        } else {
+          correctAnswer = (fd.get('correct_indices') as string || '').split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+        }
+      } else if (qType === 'true_false') {
+        options = [{id:0,text:'True'},{id:1,text:'False'}];
+        correctAnswer = fd.get('correct_index') === '0' ? 0 : 1;
+      } else if (qType === 'short_answer' || qType === 'long_answer') {
+        correctAnswer = (fd.get('correct_answer') as string || '').trim();
+      } else if (qType === 'code') {
+        codeStarter = (fd.get('code_starter') as string || '').trim();
+        codeLang = fd.get('code_language') as string || 'python';
+        const tcRaw = (fd.get('test_cases') as string || '').trim();
+        if (tcRaw) {
+          try { testCases = JSON.parse(tcRaw); } catch(e) {
+            testCases = tcRaw.split('\n').filter(Boolean).map(line => {
+              const [input, expected] = line.split('|');
+              return { input: (input||'').trim(), expected: (expected||'').trim() };
+            });
+          }
+        }
+      }
+
+      const countR = await db.execute(sql`SELECT COUNT(*)::int as c FROM test_questions WHERE test_id = ${id}`);
+      const countRows = Array.isArray(countR) ? countR : (countR?.rows || []);
+      const sortOrder = ((countRows[0] as any)?.c || 0) + 1;
+
+      await db.execute(sql`
+        INSERT INTO test_questions (test_id, question_type, question_text, code_starter, code_language, options, correct_answer, test_cases, marks, difficulty, explanation, sort_order)
+        VALUES (${id}, ${qType}, ${qText}, ${codeStarter}, ${codeLang}, ${JSON.stringify(options)}, ${JSON.stringify(correctAnswer)}, ${JSON.stringify(testCases)}, ${marks}, ${difficulty}, ${explanation}, ${sortOrder})
+      `);
+
+      // Update test totals
+      await db.execute(sql`
+        UPDATE tests SET
+          total_questions = (SELECT COUNT(*)::int FROM test_questions WHERE test_id = ${id}),
+          total_marks = (SELECT COALESCE(SUM(marks),0)::int FROM test_questions WHERE test_id = ${id}),
+          updated_at = NOW()
+        WHERE id = ${id}
+      `);
+      okMsg = 'Question added.';
+    } else if (action === 'delete_question') {
+      await db.execute(sql`DELETE FROM test_questions WHERE id = ${fd.get('qid') as string}`);
+      await db.execute(sql`
+        UPDATE tests SET
+          total_questions = (SELECT COUNT(*)::int FROM test_questions WHERE test_id = ${id}),
+          total_marks = (SELECT COALESCE(SUM(marks),0)::int FROM test_questions WHERE test_id = ${id}),
+          updated_at = NOW()
+        WHERE id = ${id}
+      `);
+      okMsg = 'Question deleted.';
+    }
+  } catch(e: any) { errorMsg = e.message; }
+}
+
+try {
+  const r = await db.execute(sql`SELECT * FROM test_questions WHERE test_id = ${id} ORDER BY sort_order, created_at`);
+  questions = Array.isArray(r) ? r : (r?.rows || []);
+} catch(e) {}
+
+const Q_TYPE_LABELS: Record<string,string> = {
+  mcq_single:'MCQ (Single)', mcq_multi:'MCQ (Multi)', true_false:'True/False',
+  short_answer:'Short Answer', long_answer:'Long Answer', code:'Coding', file_upload:'File Upload', video_response:'Video'
+};
+---
+<AdminLayout title={'Edit: ' + test.title} activeNav="hr">
+<div style="padding-bottom:80px;">
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;">
+    <a href="/admin/tests" style="font-size:11px;color:#6e6e78;text-decoration:none;display:inline-flex;align-items:center;gap:4px;margin-bottom:6px;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      Back to tests
+    </a>
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <div>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">{test.title}</h1>
+        <p style="font-size:11px;color:#8a8a94;margin:2px 0 0;">{test.test_type} - {test.duration_mins}min - {questions.length} questions - {test.total_marks} marks total</p>
+      </div>
+      {test.is_published && <a href={`/aquintutor/test/${test.slug}`} target="_blank" style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:11px;font-weight:600;padding:7px 14px;border-radius:6px;text-decoration:none;">View Public</a>}
+    </div>
+  </div>
+
+  {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
+  {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+
+  <div style="padding:14px 16px;display:grid;grid-template-columns:1fr 360px;gap:16px;">
+
+    <!-- Questions list -->
+    <div>
+      <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 10px;">{questions.length} Questions</p>
+      {questions.length === 0 && (
+        <div style="background:#0f0f14;border:1px dashed #1a1a1f;border-radius:12px;padding:32px;text-align:center;color:#6e6e78;">
+          <p style="font-size:13px;color:#fff;margin-bottom:4px;">No questions yet</p>
+          <p style="font-size:11px;">Add your first question using the form on the right.</p>
+        </div>
+      )}
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        {questions.map((q: any, idx: number) => (
+          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;">
+            <div style="display:flex;align-items:flex-start;gap:10px;">
+              <div style="width:28px;height:28px;background:rgba(255,79,0,0.15);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#FF7040;flex-shrink:0;">{idx+1}</div>
+              <div style="flex:1;min-width:0;">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap;">
+                  <span style="font-size:9px;background:#15151a;color:#8a8a94;padding:2px 7px;border-radius:100px;text-transform:uppercase;">{Q_TYPE_LABELS[q.question_type] || q.question_type}</span>
+                  <span style={`font-size:9px;padding:2px 7px;border-radius:100px;background:${q.difficulty==='easy'?'rgba(16,185,129,0.15)':q.difficulty==='hard'?'rgba(239,68,68,0.15)':'rgba(251,191,36,0.15)'};color:${q.difficulty==='easy'?'#6ee7b7':q.difficulty==='hard'?'#fca5a5':'#fbbf24'};text-transform:uppercase;`}>{q.difficulty}</span>
+                  <span style="font-size:9px;color:#6e6e78;">{q.marks} mark{q.marks!==1?'s':''}</span>
+                </div>
+                <p style="font-size:13px;color:#d8d8de;margin:0;line-height:1.5;">{q.question_text}</p>
+              </div>
+              <form method="POST" style="display:inline;flex-shrink:0;" onsubmit="return confirm('Delete this question?');">
+                <input type="hidden" name="action" value="delete_question"/>
+                <input type="hidden" name="qid" value={q.id}/>
+                <button type="submit" style="background:none;border:none;color:#6e6e78;cursor:pointer;font-size:16px;padding:4px 8px;">x</button>
+              </form>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+
+    <!-- Add question form (sticky) -->
+    <div style="position:sticky;top:80px;height:fit-content;">
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
+        <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 12px;">Add Question</p>
+        <form method="POST" id="qForm" style="display:flex;flex-direction:column;gap:10px;">
+          <input type="hidden" name="action" value="add_question"/>
+
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Type</label>
+            <select name="question_type" id="qType" onchange="toggleQFields(this.value)" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;">
+              <option value="mcq_single">Multiple Choice (Single answer)</option>
+              <option value="mcq_multi">Multiple Choice (Multi-select)</option>
+              <option value="true_false">True / False</option>
+              <option value="short_answer">Short Answer</option>
+              <option value="long_answer">Long Answer (Essay)</option>
+              <option value="code">Coding Challenge</option>
+            </select>
+          </div>
+
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Question</label>
+            <textarea name="question_text" rows="3" required placeholder="What is..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;resize:vertical;font-family:inherit;"></textarea>
+          </div>
+
+          <div id="qMCQFields">
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Options (one per line)</label>
+            <textarea name="options" rows="4" placeholder="Option 1&#10;Option 2&#10;Option 3&#10;Option 4" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;resize:vertical;font-family:inherit;"></textarea>
+            <div id="singleIndex" style="margin-top:6px;">
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Correct option index (0-based)</label>
+              <input name="correct_index" type="number" min="0" value="0" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;"/>
+            </div>
+            <div id="multiIndex" style="display:none;margin-top:6px;">
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Correct indices (comma-separated)</label>
+              <input name="correct_indices" placeholder="0,2,3" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;"/>
+            </div>
+          </div>
+
+          <div id="qTextFields" style="display:none;">
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Model answer (for AI grading)</label>
+            <textarea name="correct_answer" rows="2" placeholder="Reference answer..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;resize:vertical;font-family:inherit;"></textarea>
+          </div>
+
+          <div id="qCodeFields" style="display:none;">
+            <select name="code_language" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;margin-bottom:6px;">
+              <option value="python">Python</option>
+              <option value="javascript">JavaScript</option>
+              <option value="java">Java</option>
+              <option value="cpp">C++</option>
+            </select>
+            <textarea name="code_starter" rows="3" placeholder="def solution(n):&#10;    # Your code" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:11px;outline:none;resize:vertical;font-family:monospace;margin-bottom:6px;"></textarea>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Test cases (input|expected per line)</label>
+            <textarea name="test_cases" rows="3" placeholder="5|25&#10;10|100" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:11px;outline:none;resize:vertical;font-family:monospace;"></textarea>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+            <div>
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Marks</label>
+              <input name="marks" type="number" value="1" min="1" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;"/>
+            </div>
+            <div>
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Difficulty</label>
+              <select name="difficulty" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;">
+                <option value="easy">Easy</option>
+                <option value="medium" selected>Medium</option>
+                <option value="hard">Hard</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin-bottom:4px;">Explanation (shown after submission)</label>
+            <textarea name="explanation" rows="2" placeholder="Why this answer is correct..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;resize:vertical;font-family:inherit;"></textarea>
+          </div>
+
+          <button type="submit" style="background:#FF4F00;border:none;color:#fff;font-size:13px;font-weight:700;padding:10px;border-radius:8px;cursor:pointer;">+ Add Question</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script is:inline>
+function toggleQFields(type) {
+  document.getElementById('qMCQFields').style.display = (type==='mcq_single'||type==='mcq_multi'||type==='true_false') ? 'block' : 'none';
+  document.getElementById('singleIndex').style.display = (type==='mcq_single'||type==='true_false') ? 'block' : 'none';
+  document.getElementById('multiIndex').style.display = type==='mcq_multi' ? 'block' : 'none';
+  document.getElementById('qTextFields').style.display = (type==='short_answer'||type==='long_answer') ? 'block' : 'none';
+  document.getElementById('qCodeFields').style.display = type==='code' ? 'block' : 'none';
+}
+</script>
+</AdminLayout>
