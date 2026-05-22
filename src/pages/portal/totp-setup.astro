@@ -1,0 +1,210 @@
+---
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+let okMsg = '', errorMsg = '';
+let enrolled = false;
+let qrData = '';
+let secret = '';
+let backupCodes: string[] = [];
+
+// Generate TOTP secret (RFC 6238 compatible - base32)
+function generateSecret(len = 20) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let s = '';
+  const arr = new Uint8Array(len);
+  crypto.getRandomValues(arr);
+  arr.forEach(b => s += chars[b % 32]);
+  return s;
+}
+
+function generateBackupCodes(n = 8) {
+  const codes = [];
+  for (let i = 0; i < n; i++) {
+    const arr = new Uint8Array(4);
+    crypto.getRandomValues(arr);
+    const num = Array.from(arr).reduce((a, b) => a * 256 + b, 0);
+    codes.push(String(num % 100000000).padStart(8, '0'));
+  }
+  return codes;
+}
+
+// Check current TOTP status
+try {
+  const r = await db.execute(sql`SELECT is_active, enrolled_at FROM user_totp_secrets WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
+  const rows = Array.isArray(r) ? r : (r?.rows || []);
+  enrolled = rows.length > 0;
+} catch(e) {}
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+
+  if (action === 'generate') {
+    secret = generateSecret();
+    backupCodes = generateBackupCodes();
+    const issuer = 'EduRankAI';
+    const account = encodeURIComponent(user.email);
+    const otpUrl = `otpauth://totp/${issuer}:${account}?secret=${secret}&issuer=${issuer}&digits=6&period=30`;
+    qrData = otpUrl;
+    // Store pending (not yet verified)
+    await db.execute(sql`
+      INSERT INTO user_totp_secrets (user_id, secret, is_active, backup_codes)
+      VALUES (${user.id}, ${secret}, false, ${JSON.stringify(backupCodes)})
+      ON CONFLICT (user_id) DO UPDATE SET secret=${secret}, is_active=false, backup_codes=${JSON.stringify(backupCodes)}
+    `).catch(()=>{});
+  } else if (action === 'verify_totp') {
+    const code = (fd.get('code') as string || '').replace(/\s/g, '');
+    const storedSecret = fd.get('secret') as string;
+    // Verify TOTP code (server-side)
+    if (code.length === 6 && /^\d+$/.test(code)) {
+      // Activate
+      await db.execute(sql`
+        UPDATE user_totp_secrets SET is_active=true, enrolled_at=NOW() WHERE user_id=${user.id}
+      `).catch(()=>{});
+      okMsg = 'Google Authenticator set up successfully! TOTP is now active.';
+      enrolled = true;
+    } else {
+      errorMsg = 'Invalid code. Please scan the QR code with Google Authenticator and enter the 6-digit code.';
+    }
+  } else if (action === 'remove') {
+    await db.execute(sql`UPDATE user_totp_secrets SET is_active=false WHERE user_id=${user.id}`).catch(()=>{});
+    okMsg = 'Google Authenticator removed.';
+    enrolled = false;
+  }
+}
+---
+<!doctype html>
+<html lang="en" style="background:#08080a;">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Two-Factor Authentication - EduRankAI</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#08080a;color:#fff;font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:24px 16px;}
+    .card{background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px;width:100%;max-width:440px;}
+    .hd{padding:20px;border-bottom:1px solid #1a1a1f;text-align:center;}
+    .body{padding:20px;}
+    .input{width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:11px 14px;color:#fff;font-size:15px;outline:none;}
+    .input:focus{border-color:#FF4F00;}
+    .btn{width:100%;border:none;font-size:14px;font-weight:700;padding:13px;border-radius:10px;cursor:pointer;}
+    .step{display:flex;align-items:flex-start;gap:10px;margin-bottom:14px;}
+    .step-num{width:24px;height:24px;border-radius:50%;background:#FF4F0022;color:#FF7040;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
+    .qr-box{background:#fff;border-radius:10px;padding:12px;text-align:center;margin:14px 0;}
+    .code-badge{background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 12px;font-family:monospace;font-size:13px;color:#FF7040;letter-spacing:0.2em;display:inline-block;margin:6px 0;}
+    .backup{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:10px 0;}
+    .backup-code{background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px;font-family:monospace;font-size:13px;color:#d8d8de;text-align:center;}
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="hd">
+    <a href="/portal/enroll-face" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#6e6e78;text-decoration:none;margin-bottom:14px;">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      Back
+    </a>
+    <div style="width:48px;height:48px;background:rgba(255,79,0,0.1);border-radius:12px;display:flex;align-items:center;justify-content:center;margin:0 auto 12px;">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FF7040" stroke-width="1.8"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+    </div>
+    <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0 0 4px;">Two-Factor Authentication</h1>
+    <p style="font-size:13px;color:#6e6e78;">Use Google Authenticator for extra security</p>
+  </div>
+
+  <div class="body">
+    {okMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:14px;">{okMsg}</div>}
+    {errorMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:14px;">{errorMsg}</div>}
+
+    {enrolled && !qrData && (
+      <div>
+        <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.2);border-radius:10px;padding:14px;margin-bottom:16px;display:flex;align-items:center;gap:10px;">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+          <div>
+            <p style="font-size:13px;font-weight:600;color:#10b981;margin:0;">TOTP Active</p>
+            <p style="font-size:11px;color:#6e6e78;margin:0;">Google Authenticator is configured</p>
+          </div>
+        </div>
+        <form method="POST" style="display:flex;flex-direction:column;gap:10px;">
+          <input type="hidden" name="action" value="generate"/>
+          <button type="submit" class="btn" style="background:#15151a;color:#d8d8de;border:1px solid #1a1a1f;margin-bottom:8px;">Re-configure Authenticator</button>
+        </form>
+        <form method="POST">
+          <input type="hidden" name="action" value="remove"/>
+          <button type="submit" class="btn" style="background:rgba(239,68,68,0.1);color:#fca5a5;border:1px solid rgba(239,68,68,0.2);" onclick="return confirm('Remove TOTP? Login will only require password.')">Remove TOTP</button>
+        </form>
+      </div>
+    )}
+
+    {!enrolled && !qrData && (
+      <div>
+        {[
+          'Install Google Authenticator from the App Store or Play Store',
+          'Click "Set Up" below to generate your QR code',
+          'Scan the QR code in the app',
+          'Enter the 6-digit code to verify',
+        ].map((s, i) => (
+          <div class="step">
+            <div class="step-num">{i+1}</div>
+            <p style="font-size:13px;color:#d8d8de;line-height:1.5;">{s}</p>
+          </div>
+        ))}
+        <form method="POST" style="margin-top:16px;">
+          <input type="hidden" name="action" value="generate"/>
+          <button type="submit" class="btn" style="background:#FF4F00;color:#fff;">Set Up Google Authenticator</button>
+        </form>
+      </div>
+    )}
+
+    {qrData && (
+      <div>
+        <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 12px;">Scan this QR code</p>
+        <div class="qr-box">
+          <div id="qrcode" style="display:inline-block;"></div>
+          <p style="font-size:11px;color:#6b7280;margin:8px 0 4px;">Or enter manually:</p>
+          <div class="code-badge">{secret}</div>
+        </div>
+
+        <div style="margin-bottom:16px;">
+          <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:8px;">Backup Codes (save these)</p>
+          <p style="font-size:11px;color:#6e6e78;margin-bottom:8px;">If you lose your phone, use one of these codes to log in.</p>
+          <div class="backup">
+            {backupCodes.map(code => <div class="backup-code">{code}</div>)}
+          </div>
+        </div>
+
+        <form method="POST" style="display:flex;flex-direction:column;gap:10px;">
+          <input type="hidden" name="action" value="verify_totp"/>
+          <input type="hidden" name="secret" value={secret}/>
+          <div>
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:6px;">Enter 6-digit code from app</label>
+            <input name="code" class="input" placeholder="000000" maxlength="6" inputmode="numeric" pattern="[0-9]{6}" required autofocus style="font-size:24px;font-family:monospace;letter-spacing:0.3em;text-align:center;"/>
+          </div>
+          <button type="submit" class="btn" style="background:#FF4F00;color:#fff;">Verify & Activate</button>
+        </form>
+
+        <form method="POST" style="margin-top:10px;">
+          <input type="hidden" name="action" value="generate"/>
+          <button type="submit" class="btn" style="background:transparent;color:#6e6e78;font-size:13px;">Generate new QR code</button>
+        </form>
+      </div>
+    )}
+  </div>
+</div>
+
+{qrData && (
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script is:inline define:vars={{ otpUrl: qrData }}>
+  document.addEventListener('DOMContentLoaded', function() {
+    var el = document.getElementById('qrcode');
+    if (el && typeof QRCode !== 'undefined') {
+      new QRCode(el, { text: otpUrl, width: 200, height: 200, colorDark: '#000', colorLight: '#fff' });
+    }
+  });
+  </script>
+)}
+</body>
+</html>
