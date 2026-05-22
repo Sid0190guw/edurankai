@@ -61,6 +61,20 @@
       doNotTrack: nav.doNotTrack,
     };
   }
+
+  function getEnhancedDeviceInfo() {
+    return {
+      screen: screen.width + 'x' + screen.height,
+      pixelRatio: window.devicePixelRatio || 1,
+      language: navigator.language,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      cores: navigator.hardwareConcurrency || null,
+      memory: navigator.deviceMemory || null,
+      connection: navigator.connection ? navigator.connection.effectiveType : null,
+      touchPoints: navigator.maxTouchPoints || 0,
+    };
+  }
+
   function track() {
     try {
       fetch('/api/track', {
@@ -74,6 +88,7 @@
           browser: getBrowser(),
           os: getOS(),
           duration: Date.now() - startTime,
+          deviceInfo: getEnhancedDeviceInfo(),
           deviceInfo: getEnhancedDeviceInfo(),
         })
       });
