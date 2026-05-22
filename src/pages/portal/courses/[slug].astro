@@ -6,8 +6,6 @@ const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 
 const { slug } = Astro.params;
-
-// Get course
 let course: any = null;
 let modules: any[] = [];
 let lessons: any[] = [];
@@ -23,32 +21,25 @@ try {
 
 if (!course) return Astro.redirect('/portal/courses');
 
-// Check access
 const isEmployee = user.role !== 'applicant';
-const accessOk = course.access_type === 'public' ||
-  (course.access_type === 'both') ||
+const accessOk = course.access_type === 'public' || course.access_type === 'both' ||
   (course.access_type === 'employees' && isEmployee) ||
   (course.access_type === 'applicants' && !isEmployee);
-
 if (!accessOk) return Astro.redirect('/portal/courses');
 
-// Get or create enrollment
 try {
   const r = await db.execute(sql`SELECT * FROM training_enrollments WHERE course_id = ${course.id} AND user_id = ${user.id} LIMIT 1`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   if (rows.length > 0) {
     enrollment = rows[0];
   } else {
-    // Auto-enroll
     const e = await db.execute(sql`INSERT INTO training_enrollments (course_id, user_id, progress_pct) VALUES (${course.id}, ${user.id}, 0) RETURNING *`);
     const erows = Array.isArray(e) ? e : (e?.rows || []);
     enrollment = erows[0];
-    // Increment enrolled count
     await db.execute(sql`UPDATE training_courses SET enrolled_count = enrolled_count + 1 WHERE id = ${course.id}`);
   }
 } catch(e) {}
 
-// Get modules and lessons
 try {
   const r = await db.execute(sql`SELECT * FROM training_modules WHERE course_id = ${course.id} ORDER BY sort_order`);
   modules = Array.isArray(r) ? r : (r?.rows || []);
@@ -56,7 +47,6 @@ try {
   lessons = Array.isArray(r2) ? r2 : (r2?.rows || []);
 } catch(e) {}
 
-// Get completed lessons
 if (enrollment) {
   try {
     const r = await db.execute(sql`SELECT lesson_id FROM training_progress WHERE enrollment_id = ${enrollment.id}`);
@@ -65,14 +55,12 @@ if (enrollment) {
   } catch(e) {}
 }
 
-// Get certificate if completed
 try {
   const r = await db.execute(sql`SELECT * FROM training_certificates WHERE course_id = ${course.id} AND user_id = ${user.id} LIMIT 1`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   certificate = rows[0] || null;
 } catch(e) {}
 
-// Handle POST - mark lesson complete
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
@@ -80,300 +68,263 @@ if (Astro.request.method === 'POST') {
     const lessonId = fd.get('lesson_id') as string;
     try {
       await db.execute(sql`INSERT INTO training_progress (enrollment_id, lesson_id) VALUES (${enrollment.id}, ${lessonId}) ON CONFLICT DO NOTHING`);
-      // Recalculate progress
       const total = lessons.length;
       const done = completedLessonIds.length + 1;
       const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
-      await db.execute(sql`UPDATE training_enrollments SET progress_pct = ${pct}, last_lesson_id = ${lessonId}, ${pct >= 100 ? sql`completed_at = NOW(),` : sql``} updated_at = NOW() WHERE id = ${enrollment.id}`);
-      // Issue certificate if 100%
+      await db.execute(sql`UPDATE training_enrollments SET progress_pct = ${pct}, last_lesson_id = ${lessonId}, updated_at = NOW() WHERE id = ${enrollment.id}`);
       if (pct >= 100 && !certificate) {
         const certNum = 'ERA-CERT-' + Date.now().toString(36).toUpperCase();
         await db.execute(sql`INSERT INTO training_certificates (course_id, user_id, enrollment_id, certificate_number) VALUES (${course.id}, ${user.id}, ${enrollment.id}, ${certNum}) ON CONFLICT DO NOTHING`);
       }
     } catch(e) {}
-    return Astro.redirect(`/portal/courses/${slug}?lesson=${lessonId}&completed=1`);
+    return Astro.redirect(`/portal/courses/${slug}?lesson=${lessonId}&done=1`);
   }
 }
 
 const urlParams = new URL(Astro.request.url).searchParams;
 const activeLessonId = urlParams.get('lesson') || lessons[0]?.id || '';
-const justCompleted = urlParams.get('completed') === '1';
-const activeLesson = lessons.find((l: any) => l.id === activeLessonId) || lessons[0];
-
+const justDone = urlParams.get('done') === '1';
+const activeLesson = (lessons as any[]).find((l: any) => l.id === activeLessonId) || lessons[0] || null;
 const progressPct = enrollment?.progress_pct || 0;
 const isCompleted = !!enrollment?.completed_at;
 
-function getYoutubeEmbed(url: string) {
+// Pre-compute navigation
+const currentIdx = activeLesson ? (lessons as any[]).findIndex((l: any) => l.id === activeLesson.id) : -1;
+const prevLesson = currentIdx > 0 ? lessons[currentIdx - 1] : null;
+const nextLesson = currentIdx < lessons.length - 1 ? lessons[currentIdx + 1] : null;
+const activeLessonDone = activeLesson ? completedLessonIds.includes(activeLesson.id) : false;
+
+function getYoutubeId(url: string) {
   if (!url) return null;
-  const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/);
-  return match ? `https://www.youtube.com/embed/${match[1]}?rel=0&modestbranding=1` : null;
+  const m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+function getVimeoId(url: string) {
+  if (!url) return null;
+  const m = url.match(/vimeo\.com\/(\d+)/);
+  return m ? m[1] : null;
 }
 
-function getVimeoEmbed(url: string) {
-  if (!url) return null;
-  const match = url.match(/vimeo\.com\/(\d+)/);
-  return match ? `https://player.vimeo.com/video/${match[1]}` : null;
-}
+const typeColors: Record<string,string> = { video:'#ef4444', text:'#60a5fa', quiz:'#a78bfa', pdf:'#f97316', link:'#10b981' };
 ---
 <!doctype html>
 <html lang="en" style="background:#08080a;">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>{course.title} - EduRankAI Learning</title>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #08080a; color: #fff; font-family: system-ui, sans-serif; min-height: 100vh; }
-    .topbar { background: #0f0f14; border-bottom: 1px solid #1a1a1f; padding: 0 20px; height: 56px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 50; }
-    .topbar-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
-    .back-btn { color: #6e6e78; text-decoration: none; font-size: 13px; display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-    .course-title-bar { font-size: 13px; font-weight: 600; color: #fff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .progress-chip { background: #15151a; border: 1px solid #1a1a1f; border-radius: 100px; padding: 4px 12px; font-size: 11px; color: #FF7040; font-family: monospace; flex-shrink: 0; }
-    .layout { display: grid; grid-template-columns: 300px 1fr; min-height: calc(100vh - 56px); }
-    .sidebar { background: #0f0f14; border-right: 1px solid #1a1a1f; overflow-y: auto; max-height: calc(100vh - 56px); position: sticky; top: 56px; }
-    .sidebar-header { padding: 14px 16px; border-bottom: 1px solid #1a1a1f; }
-    .progress-bar { background: #15151a; border-radius: 100px; height: 4px; margin-top: 8px; }
-    .progress-fill { background: #FF4F00; height: 100%; border-radius: 100px; transition: width 0.5s; }
-    .module-header { padding: 10px 16px; background: #15151a; border-bottom: 1px solid #1a1a1f; display: flex; align-items: center; gap: 8px; }
-    .module-icon { color: #FF7040; flex-shrink: 0; }
-    .module-title { font-size: 11px; font-weight: 700; color: #fff; text-transform: uppercase; letter-spacing: 0.05em; }
-    .lesson-item { padding: 10px 16px; display: flex; align-items: center; gap: 10px; cursor: pointer; text-decoration: none; border-bottom: 1px solid #0a0a0c; transition: background 0.1s; }
-    .lesson-item:hover { background: #15151a; }
-    .lesson-item.active { background: rgba(255,79,0,0.1); border-left: 2px solid #FF4F00; }
-    .lesson-item.done .lesson-check { background: #10b981; border-color: #10b981; color: #fff; }
-    .lesson-check { width: 20px; height: 20px; border-radius: 50%; border: 1.5px solid #1a1a1f; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 10px; color: transparent; }
-    .lesson-check.active { border-color: #FF4F00; }
-    .lesson-type-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-    .lesson-name { font-size: 12px; color: #d8d8de; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .lesson-name.active { color: #FF7040; font-weight: 600; }
-    .lesson-duration { font-size: 10px; color: #6e6e78; flex-shrink: 0; }
-    .main-content { padding: 24px; max-width: 900px; }
-    .video-container { background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 16/9; margin-bottom: 20px; display: flex; align-items: center; justify-content: center; }
-    .video-container iframe { width: 100%; height: 100%; border: none; }
-    .content-block { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
-    .lesson-nav { display: flex; gap: 10px; margin-top: 20px; }
-    .nav-btn { flex: 1; padding: 12px; border-radius: 10px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; text-decoration: none; text-align: center; display: block; }
-    .cert-card { background: linear-gradient(135deg,#1a0a00 0%,#0f0f14 100%); border: 1px solid rgba(255,79,0,0.3); border-radius: 14px; padding: 24px; text-align: center; margin-bottom: 20px; }
-    @media (max-width: 768px) {
-      .layout { grid-template-columns: 1fr; }
-      .sidebar { position: fixed; left: -300px; top: 56px; height: calc(100vh - 56px); z-index: 40; transition: left 0.3s; width: 300px; }
-      .sidebar.open { left: 0; }
-      .main-content { padding: 16px; }
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#08080a;color:#fff;font-family:system-ui,sans-serif;min-height:100vh;}
+    .topbar{background:#0f0f14;border-bottom:1px solid #1a1a1f;padding:0 16px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50;}
+    .layout{display:grid;grid-template-columns:280px 1fr;}
+    .sidebar{background:#0f0f14;border-right:1px solid #1a1a1f;height:calc(100vh - 52px);overflow-y:auto;position:sticky;top:52px;}
+    .sidebar-hd{padding:12px 14px;border-bottom:1px solid #1a1a1f;}
+    .prog-bar{background:#15151a;border-radius:100px;height:4px;margin-top:6px;}
+    .prog-fill{background:#FF4F00;height:100%;border-radius:100px;transition:width 0.5s;}
+    .mod-hd{padding:8px 14px;background:#15151a;border-bottom:1px solid #1a1a1f;display:flex;align-items:center;gap:6px;}
+    .l-item{padding:9px 14px;display:flex;align-items:center;gap:8px;text-decoration:none;border-bottom:1px solid #0a0a0c;transition:background 0.1s;}
+    .l-item:hover{background:#15151a;}
+    .l-item.active{background:rgba(255,79,0,0.1);border-left:2px solid #FF4F00;}
+    .l-check{width:18px;height:18px;border-radius:50%;border:1.5px solid #1a1a1f;flex-shrink:0;display:flex;align-items:center;justify-content:center;}
+    .l-check.done{background:#10b981;border-color:#10b981;}
+    .l-check.cur{border-color:#FF4F00;}
+    .l-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0;}
+    .l-name{font-size:12px;color:#d8d8de;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .l-name.active{color:#FF7040;font-weight:600;}
+    .l-done .l-name{color:#6e6e78;}
+    .main{padding:24px;max-width:860px;}
+    .vid-wrap{background:#000;border-radius:12px;overflow:hidden;aspect-ratio:16/9;margin-bottom:20px;}
+    .vid-wrap iframe,.vid-wrap video{width:100%;height:100%;border:none;}
+    .content-box{background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:18px;margin-bottom:16px;}
+    .nav-row{display:flex;gap:10px;margin-top:16px;}
+    .nav-btn{flex:1;padding:12px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;border:none;text-decoration:none;text-align:center;display:block;}
+    .cert-banner{background:linear-gradient(135deg,#1a0a00,#0f0f14);border:1px solid rgba(255,79,0,0.3);border-radius:14px;padding:24px;text-align:center;margin-bottom:20px;}
+    @media(max-width:768px){
+      .layout{grid-template-columns:1fr;}
+      .sidebar{position:fixed;left:-290px;top:52px;height:calc(100vh - 52px);z-index:40;transition:left 0.3s;width:280px;}
+      .sidebar.open{left:0;}
+      .main{padding:14px;}
     }
   </style>
 </head>
 <body>
-  <!-- Topbar -->
-  <nav class="topbar">
-    <div class="topbar-left">
-      <a href="/portal/courses" class="back-btn">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
-        Courses
-      </a>
-      <span style="color:#1a1a1f;">|</span>
-      <span class="course-title-bar">{course.title}</span>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px;">
-      <span class="progress-chip">{progressPct}% complete</span>
-      <button onclick="document.getElementById('sidebar').classList.toggle('open')" style="display:none;background:#15151a;border:1px solid #1a1a1f;color:#fff;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px;" id="menuBtn">
-        Menu
-      </button>
-    </div>
-  </nav>
-
-  <div class="layout">
-    <!-- Sidebar -->
-    <aside class="sidebar" id="sidebar">
-      <div class="sidebar-header">
-        <p style="font-size:12px;font-weight:600;color:#fff;margin:0 0 6px;">Course Progress</p>
-        <div class="progress-bar"><div class="progress-fill" style={`width:${progressPct}%;`}></div></div>
-        <p style="font-size:10px;color:#6e6e78;margin:4px 0 0;">{completedLessonIds.length} of {lessons.length} lessons complete</p>
-      </div>
-
-      {modules.length === 0 ? (
-        <!-- No modules - flat list -->
-        lessons.map((l: any) => {
-          const done = completedLessonIds.includes(l.id);
-          const active = l.id === activeLessonId;
-          const typeColors: Record<string,string> = { video:'#ef4444', text:'#60a5fa', quiz:'#a78bfa', pdf:'#f97316', link:'#10b981' };
-          return (
-            <a href={`/portal/courses/${slug}?lesson=${l.id}`} class={`lesson-item${active?' active':''}${done?' done':''}`}>
-              <div class={`lesson-check${active?' active':''}`}>
-                {done && <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>}
-              </div>
-              <div class="lesson-type-dot" style={`background:${(typeColors as any)[l.type]||'#6e6e78'};`}></div>
-              <span class={`lesson-name${active?' active':''}`}>{l.title}</span>
-              {l.duration_mins > 0 && <span class="lesson-duration">{l.duration_mins}m</span>}
-            </a>
-          );
-        })
-      ) : (
-        modules.map((m: any) => {
-          const moduleLessons = lessons.filter((l: any) => l.module_id === m.id);
-          return (
-            <div>
-              <div class="module-header">
-                <svg class="module-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-                <span class="module-title">{m.title}</span>
-              </div>
-              {moduleLessons.map((l: any) => {
-                const done = completedLessonIds.includes(l.id);
-                const active = l.id === activeLessonId;
-                const typeColors: Record<string,string> = { video:'#ef4444', text:'#60a5fa', quiz:'#a78bfa', pdf:'#f97316', link:'#10b981' };
-                return (
-                  <a href={`/portal/courses/${slug}?lesson=${l.id}`} class={`lesson-item${active?' active':''}${done?' done':''}`}>
-                    <div class={`lesson-check${active?' active':''}`}>
-                      {done && <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>}
-                    </div>
-                    <div class="lesson-type-dot" style={`background:${(typeColors as any)[l.type]||'#6e6e78'};`}></div>
-                    <span class={`lesson-name${active?' active':''}`}>{l.title}</span>
-                    {l.duration_mins > 0 && <span class="lesson-duration">{l.duration_mins}m</span>}
-                  </a>
-                );
-              })}
-            </div>
-          );
-        })
-      )}
-    </aside>
-
-    <!-- Main content -->
-    <main class="main-content">
-
-      {/* Certificate banner */}
-      {isCompleted && certificate && (
-        <div class="cert-card">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#FF7040" stroke-width="1.5" style="margin-bottom:12px;"><circle cx="12" cy="8" r="6"/><path d="M15.477 12.89L17 22l-5-3-5 3 1.523-9.11"/></svg>
-          <p style="font-size:18px;font-weight:800;color:#fff;margin:0 0 4px;">Course Completed!</p>
-          <p style="font-size:13px;color:#8a8a94;margin:0 0 12px;">Certificate #{certificate.certificate_number}</p>
-          <a href={`/portal/certificate/${certificate.certificate_number}`} style="background:#FF4F00;color:#fff;text-decoration:none;font-size:13px;font-weight:600;padding:9px 20px;border-radius:8px;display:inline-block;">View Certificate</a>
-        </div>
-      )}
-
-      {justCompleted && !isCompleted && (
-        <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;gap:10px;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-          <p style="font-size:13px;color:#6ee7b7;margin:0;">Lesson marked complete!</p>
-        </div>
-      )}
-
-      {activeLesson && (
-        <div>
-          <!-- Lesson title -->
-          <div style="margin-bottom:20px;">
-            <p style="font-size:10px;font-family:monospace;color:#FF7040;text-transform:uppercase;letter-spacing:0.1em;margin:0 0 6px;">{course.title}</p>
-            <h1 style="font-size:22px;font-weight:700;color:#fff;margin:0 0 6px;">{activeLesson.title}</h1>
-            <div style="display:flex;align-items:center;gap:10px;">
-              <span style="font-size:11px;background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;padding:2px 8px;border-radius:4px;text-transform:uppercase;">{activeLesson.type}</span>
-              {activeLesson.duration_mins > 0 && <span style="font-size:11px;color:#6e6e78;">{activeLesson.duration_mins} min</span>}
-              {completedLessonIds.includes(activeLesson.id) && <span style="font-size:11px;background:rgba(16,185,129,0.15);color:#6ee7b7;padding:2px 8px;border-radius:100px;">Completed</span>}
-            </div>
-          </div>
-
-          <!-- Video player -->
-          {activeLesson.type === 'video' && activeLesson.video_url && (
-            <div class="video-container">
-              {getYoutubeEmbed(activeLesson.video_url) ? (
-                <iframe src={getYoutubeEmbed(activeLesson.video_url)!} allowfullscreen allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"></iframe>
-              ) : getVimeoEmbed(activeLesson.video_url) ? (
-                <iframe src={getVimeoEmbed(activeLesson.video_url)!} allowfullscreen></iframe>
-              ) : (
-                <video controls style="width:100%;height:100%;" src={activeLesson.video_url}>
-                  Your browser does not support video.
-                </video>
-              )}
-            </div>
-          )}
-
-          <!-- Text content -->
-          {(activeLesson.type === 'text' || activeLesson.type === 'quiz') && activeLesson.content && (
-            <div class="content-block">
-              <div style="font-size:14px;color:#d8d8de;line-height:1.8;white-space:pre-wrap;">{activeLesson.content}</div>
-            </div>
-          )}
-
-          <!-- PDF viewer -->
-          {activeLesson.type === 'pdf' && activeLesson.video_url && (
-            <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;margin-bottom:16px;">
-              <iframe src={activeLesson.video_url} style="width:100%;height:600px;border:none;" title={activeLesson.title}></iframe>
-            </div>
-          )}
-
-          <!-- External link -->
-          {activeLesson.type === 'link' && activeLesson.content && (
-            <div class="content-block" style="text-align:center;padding:32px;">
-              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="1.5" style="margin-bottom:12px;"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-              <p style="font-size:14px;color:#d8d8de;margin:0 0 16px;">This lesson links to an external resource.</p>
-              <a href={activeLesson.content} target="_blank" rel="noopener" style="background:#60a5fa;color:#fff;text-decoration:none;font-size:13px;font-weight:600;padding:10px 20px;border-radius:8px;">Open Resource</a>
-            </div>
-          )}
-
-          <!-- Content description -->
-          {activeLesson.content && activeLesson.type === 'video' && (
-            <div class="content-block">
-              <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 10px;">Notes</p>
-              <p style="font-size:14px;color:#8a8a94;line-height:1.7;white-space:pre-wrap;">{activeLesson.content}</p>
-            </div>
-          )}
-
-          <!-- Complete + Navigation -->
-          <div class="lesson-nav">
-            {(() => {
-              const currentIdx = lessons.findIndex((l: any) => l.id === activeLesson.id);
-              const prevLesson = currentIdx > 0 ? lessons[currentIdx - 1] : null;
-              const nextLesson = currentIdx < lessons.length - 1 ? lessons[currentIdx + 1] : null;
-              const isDone = completedLessonIds.includes(activeLesson.id);
-              return (
-                <>
-                  {prevLesson && (
-                    <a href={`/portal/courses/${slug}?lesson=${prevLesson.id}`} class="nav-btn" style="background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;">
-                      Previous
-                    </a>
-                  )}
-                  {!isDone && (
-                    <form method="POST" style="flex:2;">
-                      <input type="hidden" name="action" value="complete_lesson" />
-                      <input type="hidden" name="lesson_id" value={activeLesson.id} />
-                      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-size:13px;font-weight:600;padding:12px;border-radius:10px;cursor:pointer;">
-                        {nextLesson ? 'Mark Complete & Continue' : 'Complete Course'}
-                      </button>
-                    </form>
-                  )}
-                  {isDone && nextLesson && (
-                    <a href={`/portal/courses/${slug}?lesson=${nextLesson.id}`} class="nav-btn" style="flex:2;background:#10b981;color:#fff;">
-                      Next Lesson
-                    </a>
-                  )}
-                </>
-              );
-            })()}
-          </div>
-        </div>
-      )}
-
-      {lessons.length === 0 && (
-        <div style="text-align:center;padding:64px;color:#6e6e78;">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5" style="margin-bottom:16px;"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-          <p style="font-size:15px;font-weight:600;color:#fff;margin-bottom:6px;">No lessons yet</p>
-          <p style="font-size:13px;">The instructor is still building this course. Check back soon.</p>
-        </div>
-      )}
-    </main>
+<nav class="topbar">
+  <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+    <a href="/portal/courses" style="color:#6e6e78;text-decoration:none;font-size:13px;display:flex;align-items:center;gap:3px;flex-shrink:0;">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>Courses
+    </a>
+    <span style="color:#1a1a1f;">|</span>
+    <span style="font-size:13px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{course.title}</span>
   </div>
+  <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+    <span style="font-size:11px;font-family:monospace;color:#FF7040;background:#15151a;border:1px solid #1a1a1f;border-radius:100px;padding:3px 10px;">{progressPct}%</span>
+    <button id="sidebarToggle" onclick="document.getElementById('sidebar').classList.toggle('open')" style="background:#15151a;border:1px solid #1a1a1f;color:#fff;padding:5px 10px;border-radius:6px;cursor:pointer;font-size:11px;display:none;">Menu</button>
+  </div>
+</nav>
 
-  <script is:inline>
-  // Mobile sidebar toggle
-  var menuBtn = document.getElementById('menuBtn');
-  if (window.innerWidth <= 768 && menuBtn) {
-    menuBtn.style.display = 'block';
-  }
-  // Close sidebar on lesson click (mobile)
-  document.querySelectorAll('.lesson-item').forEach(function(el) {
-    el.addEventListener('click', function() {
-      document.getElementById('sidebar')?.classList.remove('open');
-    });
+<div class="layout">
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-hd">
+      <p style="font-size:11px;font-weight:600;color:#fff;margin:0 0 2px;">Course Progress</p>
+      <div class="prog-bar"><div class="prog-fill" style={`width:${progressPct}%;`}></div></div>
+      <p style="font-size:9px;color:#6e6e78;margin:4px 0 0;">{completedLessonIds.length}/{lessons.length} completed</p>
+    </div>
+
+    {modules.length === 0 && (lessons as any[]).map((l: any) => {
+      const done = completedLessonIds.includes(l.id);
+      const active = l.id === activeLessonId;
+      return (
+        <a href={`/portal/courses/${slug}?lesson=${l.id}`} class={`l-item${active?' active':''}${done?' l-done':''}`}>
+          <div class={`l-check${done?' done':''}${active&&!done?' cur':''}`}>
+            {done && <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>}
+          </div>
+          <div class="l-dot" style={`background:${(typeColors as any)[l.type]||'#6e6e78'};`}></div>
+          <span class={`l-name${active?' active':''}`}>{l.title}</span>
+          {l.duration_mins > 0 && <span style="font-size:9px;color:#6e6e78;flex-shrink:0;">{l.duration_mins}m</span>}
+        </a>
+      );
+    })}
+
+    {modules.length > 0 && (modules as any[]).map((m: any) => {
+      const ml = (lessons as any[]).filter((l: any) => l.module_id === m.id);
+      return (
+        <div>
+          <div class="mod-hd">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#FF7040" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+            <span style="font-size:10px;font-weight:700;color:#fff;text-transform:uppercase;">{m.title}</span>
+          </div>
+          {ml.map((l: any) => {
+            const done = completedLessonIds.includes(l.id);
+            const active = l.id === activeLessonId;
+            return (
+              <a href={`/portal/courses/${slug}?lesson=${l.id}`} class={`l-item${active?' active':''}${done?' l-done':''}`}>
+                <div class={`l-check${done?' done':''}${active&&!done?' cur':''}`}>
+                  {done && <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>}
+                </div>
+                <div class="l-dot" style={`background:${(typeColors as any)[l.type]||'#6e6e78'};`}></div>
+                <span class={`l-name${active?' active':''}`}>{l.title}</span>
+                {l.duration_mins > 0 && <span style="font-size:9px;color:#6e6e78;flex-shrink:0;">{l.duration_mins}m</span>}
+              </a>
+            );
+          })}
+        </div>
+      );
+    })}
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    {isCompleted && certificate && (
+      <div class="cert-banner">
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#FF7040" stroke-width="1.5" style="margin-bottom:10px;"><circle cx="12" cy="8" r="6"/><path d="M15.477 12.89L17 22l-5-3-5 3 1.523-9.11"/></svg>
+        <p style="font-size:17px;font-weight:800;color:#fff;margin:0 0 4px;">Course Completed!</p>
+        <p style="font-size:12px;color:#8a8a94;margin:0 0 12px;">Certificate #{certificate.certificate_number}</p>
+        <a href={`/portal/certificate/${certificate.certificate_number}`} style="background:#FF4F00;color:#fff;text-decoration:none;font-size:13px;font-weight:600;padding:9px 20px;border-radius:8px;display:inline-block;">View Certificate</a>
+      </div>
+    )}
+
+    {justDone && !isCompleted && (
+      <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:10px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:8px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+        <p style="font-size:13px;color:#6ee7b7;margin:0;">Lesson completed!</p>
+      </div>
+    )}
+
+    {activeLesson && (
+      <div>
+        <div style="margin-bottom:18px;">
+          <p style="font-size:10px;font-family:monospace;color:#FF7040;text-transform:uppercase;letter-spacing:0.1em;margin:0 0 4px;">{course.title}</p>
+          <h1 style="font-size:20px;font-weight:700;color:#fff;margin:0 0 6px;">{activeLesson.title}</h1>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;background:${(typeColors as any)[activeLesson.type]||'#6e6e78'}22;color:${(typeColors as any)[activeLesson.type]||'#6e6e78'};text-transform:uppercase;`}>{activeLesson.type}</span>
+            {activeLesson.duration_mins > 0 && <span style="font-size:11px;color:#6e6e78;">{activeLesson.duration_mins}m</span>}
+            {activeLessonDone && <span style="font-size:10px;background:rgba(16,185,129,0.15);color:#6ee7b7;padding:2px 8px;border-radius:100px;">Completed</span>}
+          </div>
+        </div>
+
+        {activeLesson.type === 'video' && activeLesson.video_url && (
+          <div class="vid-wrap">
+            {getYoutubeId(activeLesson.video_url) ? (
+              <iframe src={`https://www.youtube.com/embed/${getYoutubeId(activeLesson.video_url)}?rel=0`} allowfullscreen allow="accelerometer;autoplay;clipboard-write;encrypted-media;gyroscope;picture-in-picture"></iframe>
+            ) : getVimeoId(activeLesson.video_url) ? (
+              <iframe src={`https://player.vimeo.com/video/${getVimeoId(activeLesson.video_url)}`} allowfullscreen></iframe>
+            ) : (
+              <video controls src={activeLesson.video_url} style="width:100%;height:100%;"></video>
+            )}
+          </div>
+        )}
+
+        {(activeLesson.type === 'text' || activeLesson.type === 'quiz') && activeLesson.content && (
+          <div class="content-box">
+            <div style="font-size:14px;color:#d8d8de;line-height:1.8;white-space:pre-wrap;">{activeLesson.content}</div>
+          </div>
+        )}
+
+        {activeLesson.type === 'pdf' && activeLesson.video_url && (
+          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;margin-bottom:16px;">
+            <iframe src={activeLesson.video_url} style="width:100%;height:600px;border:none;"></iframe>
+          </div>
+        )}
+
+        {activeLesson.type === 'link' && activeLesson.content && (
+          <div class="content-box" style="text-align:center;padding:32px;">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="1.5" style="margin-bottom:12px;"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            <p style="font-size:14px;color:#d8d8de;margin:0 0 16px;">External resource</p>
+            <a href={activeLesson.content} target="_blank" rel="noopener" style="background:#60a5fa;color:#fff;text-decoration:none;font-size:13px;font-weight:600;padding:10px 20px;border-radius:8px;">Open Resource</a>
+          </div>
+        )}
+
+        {activeLesson.content && activeLesson.type === 'video' && (
+          <div class="content-box">
+            <p style="font-size:10px;font-weight:700;text-transform:uppercase;color:#6e6e78;margin:0 0 8px;">Notes</p>
+            <p style="font-size:14px;color:#8a8a94;line-height:1.7;white-space:pre-wrap;">{activeLesson.content}</p>
+          </div>
+        )}
+
+        <!-- Navigation -->
+        <div class="nav-row">
+          {prevLesson && (
+            <a href={`/portal/courses/${slug}?lesson=${(prevLesson as any).id}`} class="nav-btn" style="background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;">Previous</a>
+          )}
+          {!activeLessonDone && (
+            <form method="POST" style="flex:2;display:contents;">
+              <input type="hidden" name="action" value="complete_lesson"/>
+              <input type="hidden" name="lesson_id" value={activeLesson.id}/>
+              <button type="submit" class="nav-btn" style="flex:2;background:#FF4F00;border:none;color:#fff;">
+                {nextLesson ? 'Mark Complete & Continue' : 'Complete Course'}
+              </button>
+            </form>
+          )}
+          {activeLessonDone && nextLesson && (
+            <a href={`/portal/courses/${slug}?lesson=${(nextLesson as any).id}`} class="nav-btn" style="flex:2;background:#10b981;color:#fff;">Next Lesson</a>
+          )}
+        </div>
+      </div>
+    )}
+
+    {lessons.length === 0 && (
+      <div style="text-align:center;padding:64px 20px;color:#6e6e78;">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5" style="margin-bottom:14px;"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+        <p style="font-size:15px;font-weight:600;color:#fff;margin-bottom:6px;">No lessons yet</p>
+        <p style="font-size:13px;">Check back soon.</p>
+      </div>
+    )}
+  </main>
+</div>
+
+<script is:inline>
+if (window.innerWidth <= 768) {
+  var btn = document.getElementById('sidebarToggle');
+  if (btn) btn.style.display = 'block';
+}
+document.querySelectorAll('.l-item').forEach(function(el) {
+  el.addEventListener('click', function() {
+    document.getElementById('sidebar')?.classList.remove('open');
   });
-  </script>
+});
+</script>
 </body>
 </html>
