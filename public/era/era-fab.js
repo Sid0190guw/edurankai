@@ -14,6 +14,15 @@
     if (initialized) return;
     initialized = true;
 
+    // Reserve bottom space for FAB so content doesn't hide behind it
+    if (!document.getElementById('eraFabSpacing')) {
+      var sp = document.createElement('style');
+      sp.id = 'eraFabSpacing';
+      sp.textContent = 'body { padding-bottom: 80px !important; } @media (max-width: 768px) { body { padding-bottom: 90px !important; } }';
+      document.head.appendChild(sp);
+    }
+
+
     // Main FAB
     fab = document.createElement('button');
     fab.id = 'eraFab';
