@@ -1,24 +1,14 @@
-// public/ai-assistant.js - Floating Help Assistant
-// Available on every page
+// public/ai-assistant.js v2 - Help Assistant, registers with ERA.FAB
 (function() {
-  var btn, panel, msgList, input, isOpen = false, conversation = [];
+  var panel, msgList, input, isOpen = false, conversation = [], built = false;
   var WELCOME = "Hi! I'm the EduRankAI help assistant. Ask me about applications, the portal, or how things work here. I can't see your account data - for that, log in.";
 
   function build() {
-    // Floating button
-    btn = document.createElement('button');
-    btn.id = 'aiHelpBtn';
-    btn.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>';
-    btn.style.cssText = 'position:fixed;bottom:16px;right:16px;width:48px;height:48px;background:#FF4F00;border:none;border-radius:50%;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(255,79,0,0.4);z-index:60;transition:transform 0.2s;';
-    btn.onmouseenter = function() { btn.style.transform = 'scale(1.08)'; };
-    btn.onmouseleave = function() { btn.style.transform = 'scale(1)'; };
-    btn.onclick = toggle;
-    document.body.appendChild(btn);
-
-    // Chat panel
+    if (built) return;
+    built = true;
     panel = document.createElement('div');
     panel.id = 'aiHelpPanel';
-    panel.style.cssText = 'position:fixed;bottom:80px;right:16px;width:360px;max-width:calc(100vw - 32px);height:520px;max-height:calc(100vh - 120px);background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;display:none;flex-direction:column;box-shadow:0 20px 50px rgba(0,0,0,0.5);z-index:60;overflow:hidden;';
+    panel.style.cssText = 'position:fixed;bottom:80px;right:16px;width:360px;max-width:calc(100vw - 32px);height:520px;max-height:calc(100vh - 120px);background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;display:none;flex-direction:column;box-shadow:0 20px 50px rgba(0,0,0,0.5);z-index:9995;overflow:hidden;';
     panel.innerHTML = '\
 <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;">\
   <div style="display:flex;align-items:center;gap:8px;">\
@@ -43,32 +33,25 @@
   <p style="font-size:9px;color:#6e6e78;margin:6px 0 0;text-align:center;">Powered by AI - I can not access your account. Log in for that.</p>\
 </div>';
     document.body.appendChild(panel);
-
     msgList = document.getElementById('aiMsgList');
     input = document.getElementById('aiInput');
-
     document.getElementById('aiCloseBtn').onclick = toggle;
     document.getElementById('aiSendBtn').onclick = send;
     input.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        send();
-      }
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
     input.addEventListener('input', function() {
       this.style.height = 'auto';
       this.style.height = Math.min(this.scrollHeight, 90) + 'px';
     });
-
     addMsg('assistant', WELCOME);
     addQuickReplies();
   }
 
   function toggle() {
-    if (!panel) return;
+    if (!built) build();
     isOpen = !isOpen;
     panel.style.display = isOpen ? 'flex' : 'none';
-    btn.style.display = isOpen ? 'none' : 'flex';
     if (isOpen) setTimeout(function() { input.focus(); }, 100);
   }
 
@@ -88,20 +71,12 @@
     var div = document.createElement('div');
     div.id = 'aiQuickReplies';
     div.style.cssText = 'display:flex;flex-wrap:wrap;gap:5px;padding:6px 0;';
-    var replies = [
-      'How do I apply for a job?',
-      'I forgot my password',
-      'Track my application',
-      'What is EduRankAI?',
-    ];
+    var replies = ['How do I apply for a job?', 'I forgot my password', 'Track my application', 'What is EduRankAI?'];
     replies.forEach(function(text) {
       var chip = document.createElement('button');
       chip.textContent = text;
       chip.style.cssText = 'background:#15151a;border:1px solid #1a1a1f;color:#FF7040;font-size:11px;font-weight:500;padding:5px 10px;border-radius:100px;cursor:pointer;';
-      chip.onclick = function() {
-        input.value = text;
-        send();
-      };
+      chip.onclick = function() { input.value = text; send(); };
       div.appendChild(chip);
     });
     msgList.appendChild(div);
@@ -134,19 +109,15 @@
     input.style.height = 'auto';
     var qr = document.getElementById('aiQuickReplies');
     if (qr) qr.remove();
-
     addMsg('user', text);
     conversation.push({ role: 'user', content: text });
     addTyping();
-
     fetch('/api/ai/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
       body: JSON.stringify({ messages: conversation })
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
+    }).then(function(r) { return r.json(); }).then(function(data) {
       removeTyping();
       if (data.ok && data.reply) {
         addMsg('assistant', data.reply);
@@ -154,17 +125,30 @@
       } else {
         addMsg('assistant', data.error || 'Sorry, I had trouble responding. Please try again or contact hr@edurankai.in');
       }
-    })
-    .catch(function() {
+    }).catch(function() {
       removeTyping();
       addMsg('assistant', 'Connection error. Please check your internet and try again.');
     });
   }
 
-  // Initialize when DOM ready
+  // Register with FAB once it's available
+  function register() {
+    if (!window.ERA || !window.ERA.FAB) {
+      setTimeout(register, 100);
+      return;
+    }
+    window.ERA.FAB.add({
+      key: 'ai-help',
+      label: 'Help Assistant',
+      color: '#a78bfa',
+      icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
+      onClick: toggle
+    });
+  }
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', build);
+    document.addEventListener('DOMContentLoaded', register);
   } else {
-    build();
+    register();
   }
 })();
