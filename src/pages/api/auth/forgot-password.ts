@@ -62,9 +62,10 @@ export const POST: APIRoute = async ({ request }) => {
   }
 
   try {
-    // Find user by email or name (case-insensitive)
+    // Find user by email or name (case-insensitive). Pull users.dob too -
+    // identity-setup writes there, and that should be checked first.
     const u = await db.execute(sql`
-      SELECT id, email, name, role FROM users
+      SELECT id, email, name, role, dob FROM users
       WHERE LOWER(email) = ${emailOrName} OR LOWER(name) = ${emailOrName}
       LIMIT 1
     `);
@@ -74,15 +75,25 @@ export const POST: APIRoute = async ({ request }) => {
     }
     const user = uRows[0] as any;
 
-    // Look up DOB from applications first
+    // 1) Prefer users.dob (set by /identity-setup)
     let foundDob: string | null = null;
-    try {
-      const a = await db.execute(sql`SELECT dob FROM applications WHERE applicant_user_id = ${user.id} AND dob IS NOT NULL ORDER BY created_at DESC LIMIT 1`);
-      const aRows = Array.isArray(a) ? a : (a?.rows || []);
-      if (aRows.length > 0) foundDob = (aRows[0] as any).dob;
-    } catch (_) {}
+    if (user.dob) {
+      foundDob = typeof user.dob === 'string' ? user.dob.substring(0, 10) : new Date(user.dob).toISOString().split('T')[0];
+    }
 
-    // Fall back to hr_employees.date_of_birth (linked by user_id if column exists)
+    // 2) Fall back to applications.dob
+    if (!foundDob) {
+      try {
+        const a = await db.execute(sql`SELECT dob FROM applications WHERE applicant_user_id = ${user.id} AND dob IS NOT NULL ORDER BY created_at DESC LIMIT 1`);
+        const aRows = Array.isArray(a) ? a : (a?.rows || []);
+        if (aRows.length > 0) {
+          const d = (aRows[0] as any).dob;
+          foundDob = typeof d === 'string' ? d.substring(0, 10) : new Date(d).toISOString().split('T')[0];
+        }
+      } catch (_) {}
+    }
+
+    // 3) Fall back to hr_employees.date_of_birth (linked by user_id)
     if (!foundDob) {
       try {
         const e = await db.execute(sql`SELECT date_of_birth FROM hr_employees WHERE user_id = ${user.id} AND date_of_birth IS NOT NULL LIMIT 1`);
