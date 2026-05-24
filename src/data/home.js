@@ -59,13 +59,13 @@ export const PRODUCTS = [
     description: 'The Holistic Education Index. A five-dimension scoring methodology that measures what universities should actually optimise for — learning outcomes, well-being, equity, research originality, ethics — not brand prestige or citation cartels. Grounded in Biggs, Hattie, Keyes, and OECD AHELO research. Currently in academic advisory review.'
   },
   {
-    name: 'AquinTutor.ai',
-    tagline: 'Personalised tutoring intelligence',
-    status: 'Active Development',
-    statusVariant: 'dev',
-    href: 'https://eduverse-omega-sepia.vercel.app',
-    external: true,
-    description: 'The first deployment of our reasoning systems. A virtual full-scale university — adaptive, multilingual, reasoning-first. Currently building study-abroad tools, an AI suite, and a learning management system for 10,000+ students.'
+    name: 'AquinTutor',
+    tagline: 'A virtual institution by EduRankAI',
+    status: 'Live',
+    statusVariant: 'launch',
+    href: '/aquintutor',
+    external: false,
+    description: 'Personalised AI tutoring, gamified assessments, verifiable credentials. Six schools across computing, mathematics, the liberal arts, business, design, and a foundational core. Free where possible. Built in Bharat.'
   },
   {
     name: 'karate.support',
