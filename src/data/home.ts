@@ -1,16 +1,16 @@
 export const HERO = {
-  headline: 'Frontier AI',
-  headlineEm: 'educational intelligence.',
-  description: 'EduRankAI is a Bharat-built frontier AI company. We build foundational models, reasoning systems, and a family of products that touch how humanity learns, connects, travels, works, and builds community. Currently building six ventures across these domains, with more coming. One mission. Built for Bharat. Built for the world.'
+  headline: 'Frontier AI,',
+  headlineEm: 'shipped.',
+  description: 'EduRankAI is a Bharat-built frontier AI lab. We have shipped a virtual university (AquinTutor) with verifiable credentials, the HEI Truth Report on Indian higher education, gamified assessments with anti-cheat instrumentation, a safety platform (Karate.support), in-house code editor, live tutoring chat, face-login with on-device descriptor matching, accessible from the first pixel. Six ventures live or in active build. Every product designed to WCAG 2.1 AA, optimised for mobile-first 44px touch targets, indexed for Google rich results, and free where it matters.'
 };
 
 export const MISSION = {
   eyebrow: 'Mission',
   title: 'Education, rebuilt from <em>first principles.</em>',
   body: [
-    'Traditional education is one-dimensional. It measures memorisation. It rewards conformity. It treats every learner as identical input.',
-    'EduRankAI builds the antidote - AI systems that develop whole humans across every dimension. Not just academic achievement, but physical wellbeing, emotional intelligence, social capability, intellectual depth, and spiritual clarity.',
-    'And we go beyond education. Around the core research, we incubate ventures across human connection, travel, work, and community. One mission, many ventures.'
+    'Traditional education measures memorisation, rewards conformity, treats every learner as identical input. We are building the opposite - AI systems that develop whole humans across five dimensions: physical, mental, emotional, social, spiritual.',
+    'AquinTutor is the first proof: a self-paced virtual institution with six schools, verifiable credentials at public URLs, AI tutoring grounded in course content, and pricing that starts at ₹1 because access is the point. The HEI Truth Report is the second: independent investigative scoring on Indian universities, built on RTI evidence, not paid placements.',
+    'Every venture in the ecosystem is in production today, with the next layer (Sambandh, Sancharan, Sampark, foundational-model research) advancing on a public roadmap. No mystery boxes. No demos that do not ship.'
   ]
 };
 

@@ -24,6 +24,10 @@ export const POST: APIRoute = async ({ request, cookies, locals }) => {
   try { body = await request.json(); } catch {}
   const name = (body?.name || '').toString().trim().slice(0, 200);
   const email = (body?.email || '').toString().trim().slice(0, 255).toLowerCase();
+  const phoneRaw = (body?.phone || '').toString().trim().slice(0, 40);
+  const phone = phoneRaw.replace(/[^0-9+\-\s()]/g, '').slice(0, 40);
+  const dobRaw = (body?.dob || '').toString().trim().slice(0, 20);
+  const dob = /^\d{4}-\d{2}-\d{2}$/.test(dobRaw) ? dobRaw : '';
   const path = (body?.path || '').toString().slice(0, 500);
   const ua = (request.headers.get('user-agent') || '').slice(0, 500);
   const initialMessage = (body?.initialMessage || '').toString().trim().slice(0, 5000);
@@ -46,22 +50,24 @@ export const POST: APIRoute = async ({ request, cookies, locals }) => {
       });
       const r = await db.execute(sql`
         INSERT INTO help_conversations (
-          visitor_token, visitor_name, visitor_email, visitor_path, visitor_user_agent,
-          user_id, status
+          visitor_token, visitor_name, visitor_email, visitor_phone, visitor_dob,
+          visitor_path, visitor_user_agent, user_id, status
         ) VALUES (
-          ${token}, ${name || null}, ${email || null}, ${path || null}, ${ua || null},
-          ${signedInUserId}, 'open'
+          ${token}, ${name || null}, ${email || null}, ${phone || null}, ${dob || null},
+          ${path || null}, ${ua || null}, ${signedInUserId}, 'open'
         )
         RETURNING *
       `);
       const rows = Array.isArray(r) ? r : (r?.rows || []);
       conv = rows[0];
-    } else if (name || email) {
-      // Refresh name/email if visitor provided them
+    } else if (name || email || phone || dob) {
+      // Refresh contact fields if visitor provided them
       await db.execute(sql`
         UPDATE help_conversations SET
           visitor_name = COALESCE(NULLIF(${name || null}, ''), visitor_name),
           visitor_email = COALESCE(NULLIF(${email || null}, ''), visitor_email),
+          visitor_phone = COALESCE(NULLIF(${phone || null}, ''), visitor_phone),
+          visitor_dob = COALESCE(${dob || null}::date, visitor_dob),
           updated_at = NOW()
         WHERE id = ${conv.id}
       `);

@@ -89,6 +89,8 @@ const tags: string[] = Array.isArray(course.tags) ? course.tags : [];
 const pageTitle = course.title;
 const pageDesc = (course.short_desc || course.description || '').substring(0, 160);
 const enrolUrl = '/portal/login?next=' + encodeURIComponent('/portal/courses/' + slug);
+const isPaidCourse = course.is_paid_course === true && (course.is_free !== true);
+const priceInr = Math.max(1, Math.floor((course.price_inr_paise || 100) / 100));
 
 function timeAgo(d: any) {
   if (!d) return '';
@@ -170,9 +172,9 @@ function starRow(n: number) {
           <div style="aspect-ratio:16/9; background:var(--ac-paper-deep); border-radius:8px; margin-bottom:18px; display:flex; align-items:center; justify-content:center; color:var(--ac-ink-muted); border:1px solid var(--ac-border);">
             <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
           </div>
-          <p style="font-family:'Fraunces',serif; font-size:2rem; font-weight:500; color:var(--ac-ink); line-height:1; margin-bottom:4px;">{course.is_free ? 'Free' : 'Premium'}</p>
-          <p style="font-size:12.5px; color:var(--ac-ink-soft); margin-bottom:18px;">{course.is_free ? 'No payment required to enrol' : 'Paid course - one-time fee'}</p>
-          <a href={enrolUrl} class="ac-btn" style="width:100%; justify-content:center; margin-bottom:8px;">Enrol &amp; start learning</a>
+          <p style="font-family:'Fraunces',serif; font-size:2rem; font-weight:500; color:var(--ac-ink); line-height:1; margin-bottom:4px;">{isPaidCourse ? ('INR ' + priceInr) : 'Free'}</p>
+          <p style="font-size:12.5px; color:var(--ac-ink-soft); margin-bottom:18px;">{isPaidCourse ? 'One-time fee &middot; lifetime access' : 'No payment required to enrol'}</p>
+          <button type="button" id="enrolBtn" data-course-slug={slug} class="ac-btn" style="width:100%; justify-content:center; margin-bottom:8px; cursor:pointer;">{isPaidCourse ? ('Enrol now &middot; INR ' + priceInr) : 'Enrol &amp; start learning'}</button>
           <a href="/portal/signup" class="ac-btn ac-btn-ghost" style="width:100%; justify-content:center;">Create free account</a>
 
           <div style="margin-top:20px; padding-top:18px; border-top:1px solid var(--ac-rule);">
@@ -457,8 +459,11 @@ function starRow(n: number) {
     }
   </style>
 
-  <script is:inline>
+  <script is:inline src="https://checkout.razorpay.com/v1/checkout.js"></script>
+
+  <script is:inline define:vars={{ courseSlug: slug, courseTitle: course.title }}>
     document.addEventListener('DOMContentLoaded', function() {
+      // Tabs
       var tabs = document.querySelectorAll('.tab-btn');
       var panels = document.querySelectorAll('.tab-panel');
       tabs.forEach(function(t) {
@@ -469,6 +474,87 @@ function starRow(n: number) {
           panels.forEach(function(p) { p.classList.remove('active'); });
           var target = document.getElementById('panel-' + name);
           if (target) target.classList.add('active');
+        });
+      });
+
+      // Enrol button - calls start-enrollment, opens Razorpay if paid, otherwise redirects
+      var enrolBtn = document.getElementById('enrolBtn');
+      if (!enrolBtn) return;
+      enrolBtn.addEventListener('click', function() {
+        enrolBtn.disabled = true;
+        var prev = enrolBtn.innerHTML;
+        enrolBtn.innerHTML = 'Loading...';
+
+        fetch('/api/aquintutor/start-enrollment', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ courseSlug: courseSlug }),
+        }).then(function(r) {
+          if (r.status === 401) {
+            // Not signed in - bounce to login
+            window.location.href = '/portal/login?next=' + encodeURIComponent('/aquintutor/courses/' + courseSlug);
+            return null;
+          }
+          return r.json();
+        }).then(function(d) {
+          if (!d) return;
+          if (!d.ok) {
+            enrolBtn.disabled = false;
+            enrolBtn.innerHTML = prev;
+            alert(d.error || 'Could not enrol. Try again.');
+            return;
+          }
+          if (!d.paid) {
+            // Free enrolment done
+            window.location.href = d.redirect || '/portal/courses';
+            return;
+          }
+          // Paid: open Razorpay checkout
+          if (typeof Razorpay === 'undefined') {
+            alert('Payment SDK failed to load. Refresh and try again.');
+            enrolBtn.disabled = false;
+            enrolBtn.innerHTML = prev;
+            return;
+          }
+          var rzp = new Razorpay({
+            key: d.keyId,
+            amount: d.amountPaise,
+            currency: d.currency || 'INR',
+            order_id: d.orderId,
+            name: 'AquinTutor',
+            description: courseTitle,
+            prefill: d.prefill || {},
+            theme: { color: '#B8512E' },
+            handler: function(resp) {
+              enrolBtn.innerHTML = 'Confirming...';
+              fetch('/api/aquintutor/confirm-payment', {
+                method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  razorpay_order_id: resp.razorpay_order_id,
+                  razorpay_payment_id: resp.razorpay_payment_id,
+                  razorpay_signature: resp.razorpay_signature,
+                  courseSlug: courseSlug,
+                }),
+              }).then(function(r) { return r.json(); }).then(function(c) {
+                if (c.ok) window.location.href = c.redirect || ('/portal/courses/' + courseSlug);
+                else { alert('Payment received but enrolment failed: ' + (c.error || 'unknown')); enrolBtn.disabled = false; enrolBtn.innerHTML = prev; }
+              }).catch(function() {
+                alert('Payment received but network failed. Contact hr@edurankai.in with payment ID: ' + resp.razorpay_payment_id);
+              });
+            },
+            modal: {
+              ondismiss: function() {
+                enrolBtn.disabled = false;
+                enrolBtn.innerHTML = prev;
+              },
+            },
+          });
+          rzp.open();
+        }).catch(function() {
+          enrolBtn.disabled = false;
+          enrolBtn.innerHTML = prev;
+          alert('Network error - try again.');
         });
       });
     });
