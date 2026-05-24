@@ -43,20 +43,22 @@ function normaliseName(n: string): string {
   return (n || '').toLowerCase().replace(/[^a-z\s]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-// Simple fuzzy name match: every token in claimed must appear in stored, OR vice versa
+// Lenient fuzzy name match: covers (a) exact equality, (b) one string contained
+// in the other (handles "Siddharth" account vs "SIDDHARTH PRASAD" on gov ID),
+// (c) at least one substantial token (>= 3 chars) overlap. Face match is the
+// strongest signal; the name check is corroborating, not gatekeeping.
 function nameMatches(claimed: string, stored: string): boolean {
   const a = normaliseName(claimed);
   const b = normaliseName(stored);
   if (!a || !b) return false;
   if (a === b) return true;
-  const aTokens = a.split(' ').filter(Boolean);
-  const bTokens = b.split(' ').filter(Boolean);
-  // Require at least 2 tokens from claimed to be present in stored (handles middle names)
-  let matched = 0;
+  if (a.indexOf(b) !== -1 || b.indexOf(a) !== -1) return true;
+  const aTokens = a.split(' ').filter(t => t.length >= 3);
+  const bTokens = b.split(' ').filter(t => t.length >= 3);
   for (const t of aTokens) {
-    if (t.length >= 2 && bTokens.indexOf(t) !== -1) matched++;
+    if (bTokens.indexOf(t) !== -1) return true;
   }
-  return matched >= Math.min(2, aTokens.length);
+  return false;
 }
 
 export const POST: APIRoute = async ({ request, clientAddress }) => {
