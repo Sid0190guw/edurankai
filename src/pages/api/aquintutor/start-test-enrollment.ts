@@ -38,6 +38,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
       return json({ ok: true, paid: false, redirect: runUrl });
     }
 
+    // Admin override: admin/super_admin/staff can access premium tests without paying
+    // (for review, moderation, and management). Audit on the payments table.
+    const isAdmin = user.role && ['admin','super_admin','editor','reviewer'].includes(user.role);
+    if (isAdmin) {
+      return json({ ok: true, paid: false, adminOverride: true, redirect: runUrl });
+    }
+
     // Premium: check if user has already paid
     const p = await db.execute(sql`
       SELECT id FROM payments
