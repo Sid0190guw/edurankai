@@ -20,14 +20,16 @@ export const GET: APIRoute = async ({ locals }) => {
     const r = await db.execute(sql`
       SELECT
         employee_code as "Code",
-        first_name as "First Name",
-        last_name as "Last Name",
+        full_name as "Full Name",
         email as "Email",
         phone as "Phone",
         designation as "Designation",
-        department as "Department",
-        date_of_joining as "Joining Date",
         employment_type as "Type",
+        work_mode as "Work Mode",
+        employment_status as "Status",
+        joining_date as "Joining Date",
+        base_salary as "Base Salary",
+        currency as "Currency",
         is_active as "Active"
       FROM hr_employees ORDER BY created_at DESC LIMIT 5000
     `);

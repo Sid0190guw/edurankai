@@ -33,18 +33,21 @@ async function syncHiredToEmployee(applicationId: string, actorUserId: string) {
       LIMIT 1
     `);
 
-    if (app.rows.length === 0) return;
-    const a = app.rows[0] as any;
+    const _appRows = Array.isArray(app) ? app : (app?.rows || []);
+    if (_appRows.length === 0) return;
+    const a = _appRows[0] as any;
 
     // Check if employee already exists for this application
     const existing = await db.execute(sql`
       SELECT id FROM hr_employees WHERE application_id = ${applicationId} LIMIT 1
     `);
-    if (existing.rows.length > 0) return; // Already synced
+    const _existingRows = Array.isArray(existing) ? existing : (existing?.rows || []);
+    if (_existingRows.length > 0) return; // Already synced
 
     // Generate employee code
     const countResult = await db.execute(sql`SELECT COUNT(*)::int as n FROM hr_employees`);
-    const count = (countResult.rows[0] as any).n || 0;
+    const _countRows = Array.isArray(countResult) ? countResult : (countResult?.rows || []);
+    const count = (_countRows[0] as any)?.n || 0;
     const empCode = 'ERA-EMP-' + String(count + 1).padStart(4, '0');
 
     const fullName = ((a.first_name || '') + ' ' + (a.last_name || '')).trim();
@@ -75,10 +78,12 @@ async function syncHiredToEmployee(applicationId: string, actorUserId: string) {
     // Allocate default leave balances for current year
     const year = new Date().getFullYear();
     const empResult = await db.execute(sql`SELECT id FROM hr_employees WHERE application_id = ${applicationId} LIMIT 1`);
-    if (empResult.rows.length > 0) {
-      const empId = (empResult.rows[0] as any).id;
+    const _empResultRows = Array.isArray(empResult) ? empResult : (empResult?.rows || []);
+    if (_empResultRows.length > 0) {
+      const empId = (_empResultRows[0] as any).id;
       const leaveTypes = await db.execute(sql`SELECT id, days_per_year FROM hr_leave_types WHERE is_active = true`);
-      for (const lt of leaveTypes.rows as any[]) {
+      const _ltRows = (Array.isArray(leaveTypes) ? leaveTypes : (leaveTypes?.rows || [])) as any[];
+      for (const lt of _ltRows) {
         await db.execute(sql`
           INSERT INTO hr_leave_balances (employee_id, leave_type_id, year, allocated, used)
           VALUES (${empId}, ${lt.id}, ${year}, ${lt.days_per_year || 0}, 0)

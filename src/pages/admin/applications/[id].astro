@@ -1,6 +1,7 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
+import { sendEmail, brandedEmail } from '@/lib/email';
 import { applications, applicationMessages, users } from '@/lib/db/schema';
 import { eq, asc } from 'drizzle-orm';
 
@@ -37,8 +38,16 @@ if (Astro.request.method === 'POST') {
       if (!validStatuses.includes(newStatus)) {
         errorMsg = 'Invalid status';
       } else {
-        const current = await db.select({ status: applications.status }).from(applications).where(eq(applications.id, id)).limit(1);
+        const current = await db.select({
+          status: applications.status,
+          email: applications.email,
+          firstName: applications.firstName,
+          roleTitleSnapshot: applications.roleTitleSnapshot,
+        }).from(applications).where(eq(applications.id, id)).limit(1);
         const oldStatus = current[0]?.status;
+        const applicantEmail = current[0]?.email;
+        const applicantFirstName = current[0]?.firstName;
+        const applicantRole = current[0]?.roleTitleSnapshot;
 
         await db.update(applications)
           .set({
@@ -72,6 +81,26 @@ if (Astro.request.method === 'POST') {
           const appName = ((appRow[0]?.firstName || '') + ' ' + (appRow[0]?.lastName || '')).trim() || 'Applicant';
           await pushNotify.applicationStatus(appName, newStatus, id);
         } catch (_) {}
+        // Email the applicant about the status change (best-effort)
+        if (oldStatus !== newStatus && applicantEmail) {
+          try {
+            const label = STATUS_LABELS[newStatus] || newStatus;
+            await sendEmail({
+              to: applicantEmail,
+              subject: 'Your EduRankAI application: ' + label,
+              html: brandedEmail({
+                preheader: 'Status updated to ' + label,
+                heading: 'Application update',
+                body: '<p>Hi ' + ((applicantFirstName || '').trim() || 'there') + ',</p>'
+                  + '<p>Your application for <strong>' + (applicantRole || 'an open role') + '</strong> has moved to <strong>' + label + '</strong>.</p>'
+                  + '<p>You can view the full conversation and any next steps from your applicant portal.</p>',
+                ctaText: 'Open my application',
+                ctaUrl: 'https://www.edurankai.in/portal/applications/' + id,
+                footerNote: 'You\'re receiving this because you applied to EduRankAI. Reply to this email if you have questions.'
+              })
+            });
+          } catch (_) {}
+        }
         successMsg = 'Status updated and applicant notified in thread';
       }
     } else if (action === 'send_message') {
@@ -91,6 +120,38 @@ if (Astro.request.method === 'POST') {
           isSystem: false
         });
         await db.update(applications).set({ updatedAt: new Date() }).where(eq(applications.id, id));
+        // Email the applicant that there's a new message in their thread (best-effort)
+        try {
+          const recip = await db.select({
+            email: applications.email,
+            firstName: applications.firstName,
+            roleTitleSnapshot: applications.roleTitleSnapshot,
+          }).from(applications).where(eq(applications.id, id)).limit(1);
+          const r = recip[0];
+          if (r?.email) {
+            const escapedBody = body
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/\n/g, '<br/>');
+            await sendEmail({
+              to: r.email,
+              subject: 'New message about your application — ' + (r.roleTitleSnapshot || 'EduRankAI'),
+              replyTo: 'hr@edurankai.in',
+              html: brandedEmail({
+                preheader: senderName + ' sent you a message',
+                heading: 'You have a new message',
+                body: '<p>Hi ' + ((r.firstName || '').trim() || 'there') + ',</p>'
+                  + '<p><strong>' + senderName + '</strong> replied on your application thread:</p>'
+                  + '<blockquote style="margin:12px 0;padding:12px 14px;border-left:3px solid #FF4F00;background:#f8f6f1;color:#374151;border-radius:6px;">' + escapedBody + '</blockquote>'
+                  + '<p>Reply from your applicant portal to keep everything in one place.</p>',
+                ctaText: 'Open my application',
+                ctaUrl: 'https://www.edurankai.in/portal/applications/' + id,
+                footerNote: 'You\'re receiving this because you applied to EduRankAI.'
+              })
+            });
+          }
+        } catch (_) {}
         return Astro.redirect('/admin/applications/' + id + '?sent=1');
       }
     } else if (action === 'add_public_feedback') {
