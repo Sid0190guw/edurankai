@@ -24,12 +24,12 @@ export const PRODUCTS = [
     description: 'A complete platform for the global karate community - instructor discovery, dojo management, training resources, certification tracking, and tournament infrastructure. Pre-launched now, full release with iOS and Android apps on 30 May 2026.'
   },
   {
-    name: 'AquinTutor.ai',
-    status: 'Active Development',
-    statusVariant: 'dev',
-    href: 'https://eduverse-omega-sepia.vercel.app',
-    external: true,
-    description: 'A personalised AI tutoring intelligence and a virtual full-scale university. Adaptive, multilingual, reasoning-first. Currently building study-abroad tools, an AI tools suite, and a full learning management system for 10,000+ students.'
+    name: 'AquinTutor',
+    status: 'Live',
+    statusVariant: 'launch',
+    href: '/aquintutor',
+    external: false,
+    description: 'A virtual institution by EduRankAI - personalised AI tutoring, gamified assessments, verifiable credentials. Six schools across computing, mathematics, the liberal arts, business, design, and a foundational core. Free where possible.'
   },
   {
     name: 'Sambandh',
