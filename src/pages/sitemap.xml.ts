@@ -10,6 +10,8 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
   { path: '/research', changefreq: 'monthly', priority: '0.9' },
   { path: '/ecosystem', changefreq: 'monthly', priority: '0.8' },
   { path: '/careers', changefreq: 'daily', priority: '0.9' },
+  { path: '/aquintutor', changefreq: 'weekly', priority: '0.9' },
+  { path: '/aquintutor/courses', changefreq: 'daily', priority: '0.9' },
   { path: '/events', changefreq: 'weekly', priority: '0.7' },
   { path: '/policy', changefreq: 'monthly', priority: '0.6' },
   { path: '/contact', changefreq: 'monthly', priority: '0.7' },
@@ -35,6 +37,18 @@ export const GET: APIRoute = async () => {
     // DB unreachable - degrade to static sitemap
   }
 
+  // Public published courses for Course rich-results
+  let publicCourses: Array<{ slug: string; updated_at: any }> = [];
+  try {
+    const { sql: rawSql } = await import('drizzle-orm');
+    const r = await db.execute(rawSql`
+      SELECT slug, updated_at FROM training_courses
+      WHERE is_published = true AND access_type IN ('public', 'both')
+      ORDER BY updated_at DESC LIMIT 500
+    `);
+    publicCourses = (Array.isArray(r) ? r : (r?.rows || [])) as any[];
+  } catch (_) {}
+
   const staticUrls = STATIC_ROUTES.map((r) => {
     return '  <url>'
       + '<loc>' + SITE.url + r.path + '</loc>'
@@ -56,9 +70,21 @@ export const GET: APIRoute = async () => {
       + '</url>';
   });
 
+  const courseUrls = publicCourses.map((c) => {
+    const lastmod = c.updated_at
+      ? new Date(c.updated_at).toISOString().split('T')[0]
+      : today;
+    return '  <url>'
+      + '<loc>' + SITE.url + '/aquintutor/courses/' + c.slug + '</loc>'
+      + '<lastmod>' + lastmod + '</lastmod>'
+      + '<changefreq>weekly</changefreq>'
+      + '<priority>0.8</priority>'
+      + '</url>';
+  });
+
   const xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
     + '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-    + staticUrls.concat(roleUrls).join('\n') + '\n'
+    + staticUrls.concat(roleUrls).concat(courseUrls).join('\n') + '\n'
     + '</urlset>\n';
 
   return new Response(xml, {
