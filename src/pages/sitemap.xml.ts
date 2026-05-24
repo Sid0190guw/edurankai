@@ -1,5 +1,8 @@
 import type { APIRoute } from 'astro';
 import { SITE } from '@/lib/site';
+import { db } from '@/lib/db';
+import { roles } from '@/lib/db/schema';
+import { eq, desc } from 'drizzle-orm';
 
 const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string }> = [
   { path: '/', changefreq: 'weekly', priority: '1.0' },
@@ -20,25 +23,49 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
 
 export const GET: APIRoute = async () => {
   const today = new Date().toISOString().split('T')[0];
-  const urls = STATIC_ROUTES.map((r) => {
+
+  // Dynamic: every open role gets a sitemap entry so Google for Jobs crawls them
+  let openRoles: Array<{ slug: string; updatedAt: Date | null }> = [];
+  try {
+    openRoles = await db.select({
+      slug: roles.slug,
+      updatedAt: roles.updatedAt,
+    }).from(roles).where(eq(roles.isOpen, true)).orderBy(desc(roles.updatedAt));
+  } catch (_) {
+    // DB unreachable - degrade to static sitemap
+  }
+
+  const staticUrls = STATIC_ROUTES.map((r) => {
     return '  <url>'
       + '<loc>' + SITE.url + r.path + '</loc>'
       + '<lastmod>' + today + '</lastmod>'
       + '<changefreq>' + r.changefreq + '</changefreq>'
       + '<priority>' + r.priority + '</priority>'
       + '</url>';
-  }).join('\n');
+  });
+
+  const roleUrls = openRoles.map((r) => {
+    const lastmod = r.updatedAt
+      ? new Date(r.updatedAt).toISOString().split('T')[0]
+      : today;
+    return '  <url>'
+      + '<loc>' + SITE.url + '/careers/' + r.slug + '</loc>'
+      + '<lastmod>' + lastmod + '</lastmod>'
+      + '<changefreq>weekly</changefreq>'
+      + '<priority>0.85</priority>'
+      + '</url>';
+  });
 
   const xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
     + '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-    + urls + '\n'
+    + staticUrls.concat(roleUrls).join('\n') + '\n'
     + '</urlset>\n';
 
   return new Response(xml, {
     status: 200,
     headers: {
       'Content-Type': 'application/xml; charset=utf-8',
-      'Cache-Control': 'public, max-age=3600',
+      'Cache-Control': 'public, max-age=900',
     },
   });
 };
