@@ -11,6 +11,7 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
   { path: '/ecosystem', changefreq: 'monthly', priority: '0.8' },
   { path: '/careers', changefreq: 'daily', priority: '0.9' },
   { path: '/aquintutor', changefreq: 'weekly', priority: '0.9' },
+  { path: '/aquintutor/schools', changefreq: 'weekly', priority: '0.88' },
   { path: '/aquintutor/courses', changefreq: 'daily', priority: '0.9' },
   { path: '/aquintutor/paths', changefreq: 'weekly', priority: '0.85' },
   { path: '/aquintutor/instructors', changefreq: 'weekly', priority: '0.8' },
@@ -66,6 +67,13 @@ export const GET: APIRoute = async () => {
     publicInstructors = (Array.isArray(r) ? r : (r?.rows || [])) as any[];
   } catch (_) {}
 
+  // Schools (each gets its own detail page at /aquintutor/schools/[slug])
+  let publicSchools: Array<{ slug: string; updated_at: any }> = [];
+  try {
+    const r = await db.execute(rawSql`SELECT slug, updated_at FROM schools WHERE is_published = true ORDER BY display_order ASC`);
+    publicSchools = (Array.isArray(r) ? r : (r?.rows || [])) as any[];
+  } catch (_) {}
+
   const staticUrls = STATIC_ROUTES.map((r) => {
     return '  <url>'
       + '<loc>' + SITE.url + r.path + '</loc>'
@@ -119,9 +127,19 @@ export const GET: APIRoute = async () => {
       + '</url>';
   });
 
+  const schoolUrls = publicSchools.map((s) => {
+    const lastmod = s.updated_at ? new Date(s.updated_at).toISOString().split('T')[0] : today;
+    return '  <url>'
+      + '<loc>' + SITE.url + '/aquintutor/schools/' + s.slug + '</loc>'
+      + '<lastmod>' + lastmod + '</lastmod>'
+      + '<changefreq>weekly</changefreq>'
+      + '<priority>0.85</priority>'
+      + '</url>';
+  });
+
   const xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
     + '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-    + staticUrls.concat(roleUrls).concat(courseUrls).concat(pathUrls).concat(instructorUrls).join('\n') + '\n'
+    + staticUrls.concat(roleUrls).concat(courseUrls).concat(pathUrls).concat(instructorUrls).concat(schoolUrls).join('\n') + '\n'
     + '</urlset>\n';
 
   return new Response(xml, {
