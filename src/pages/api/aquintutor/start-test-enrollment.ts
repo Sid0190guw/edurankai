@@ -8,6 +8,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { createOrder, getPublicKeyId, isConfigured } from '@/lib/razorpay';
+import { convertToInrPaise } from '@/lib/fx';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -24,7 +25,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   try {
     const t = await db.execute(sql`
-      SELECT id, slug, title, is_premium, price_inr_paise
+      SELECT id, slug, title, is_premium, price_inr_paise, currency
       FROM tests WHERE slug = ${testSlug} AND is_published = true LIMIT 1
     `);
     const tRows = Array.isArray(t) ? t : (t?.rows || []);
@@ -61,7 +62,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
       return json({ ok: false, error: 'Payments not yet configured. Contact hr@edurankai.in to enrol.' }, 503);
     }
 
-    const amountPaise = Math.max(100, parseInt(test.price_inr_paise || 9900));
+    // Display currency may be CHF / USD / EUR etc; Razorpay India settles in
+    // INR, so we convert at the live ECB rate (frankfurter.app), cached 1h.
+    const displayCurrency = (test.currency || 'INR').toUpperCase();
+    const displayAmountMinor = Math.max(1, parseInt(test.price_inr_paise || 100));
+    const fx = await convertToInrPaise(displayCurrency, displayAmountMinor);
+    const amountPaise = fx.paise;
     const receipt = 'qt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 
     const result = await createOrder({
@@ -73,6 +79,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
         testSlug: test.slug,
         userId: user.id,
         email: user.email || '',
+        displayCurrency,
+        displayAmountMinor: displayAmountMinor.toString(),
+        fxRate: fx.rate.toString(),
+        fxDate: fx.date,
       },
     });
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
@@ -84,7 +94,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       ) VALUES (
         ${result.order.id}, ${amountPaise}, 'INR', 'created', 'test_enrollment',
         'test', ${test.id}, ${user.id}, ${user.email || 'unknown@edurankai.in'},
-        ${sql.raw("'" + JSON.stringify({ receipt, testSlug: test.slug }).replace(/'/g, "''") + "'::jsonb")}
+        ${sql.raw("'" + JSON.stringify({ receipt, testSlug: test.slug, displayCurrency, displayAmountMinor, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")}
       )
     `).catch(() => {});
 
@@ -95,6 +105,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
       keyId: getPublicKeyId(),
       amountPaise,
       currency: 'INR',
+      displayCurrency,
+      displayAmountMinor,
+      fxRate: fx.rate,
+      fxDate: fx.date,
       testTitle: test.title,
       testSlug: test.slug,
       prefill: { name: user.name || '', email: user.email || '' },
