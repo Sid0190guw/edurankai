@@ -18,6 +18,7 @@ function isExempt(path: string): boolean {
   if (path === '/verify-by-questions') return true;
   if (path === '/forgot-password') return true;
   if (path === '/admin/login' || path === '/portal/login' || path === '/hei/login') return true;
+  if (path === '/aquintutor/login' || path === '/aquintutor/signup') return true;
   if (path === '/portal/signup' || path === '/portal/forgot') return true;
   if (path === '/hei/register' || path === '/hei/claim') return true;
   if (path.startsWith('/portal/claim/')) return true;

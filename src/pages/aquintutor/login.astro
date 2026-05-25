@@ -1,0 +1,287 @@
+---
+import '@/styles/aquintutor-academy.css';
+
+if (Astro.locals.user) {
+  return Astro.redirect('/aquintutor');
+}
+
+let errorMsg = '';
+let requireFace = false;
+let pendingUserId = '';
+let pendingUserName = '';
+let faceDescriptor = '';
+
+const pendingId = Astro.cookies.get('aquintutor_face_pending')?.value || '';
+
+if (pendingId) {
+  requireFace = true;
+  pendingUserId = pendingId;
+  try {
+    const { db } = await import('@/lib/db');
+    const { users } = await import('@/lib/db/schema');
+    const { eq } = await import('drizzle-orm');
+    const { sql } = await import('drizzle-orm');
+    const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pendingId)).limit(1);
+    pendingUserName = u[0]?.name || '';
+    const fd = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${pendingId} AND is_active = true LIMIT 1`);
+    const rows = Array.isArray(fd) ? fd : (fd?.rows || []);
+    faceDescriptor = rows.length > 0 ? JSON.stringify((rows[0] as any).face_descriptor) : '';
+  } catch (_) {}
+}
+
+if (Astro.request.method === 'POST') {
+  const fd2 = await Astro.request.formData();
+  const action = (fd2.get('action') as string) || '';
+
+  if (action === 'face_verified') {
+    const userId = (fd2.get('user_id') as string) || '';
+    if (userId === pendingId) {
+      try {
+        const { db } = await import('@/lib/db');
+        const { users } = await import('@/lib/db/schema');
+        const { generateSessionToken, createSession } = await import('@/lib/auth/session');
+        const { setSessionCookie } = await import('@/lib/auth/cookie');
+        const { eq } = await import('drizzle-orm');
+        const { sql } = await import('drizzle-orm');
+        await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
+        const token = generateSessionToken();
+        const session = await createSession(token, userId, {
+          userAgent: Astro.request.headers.get('user-agent') || undefined,
+          ipAddress: Astro.clientAddress
+        });
+        setSessionCookie(Astro.cookies, token, session.expiresAt);
+        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, userId));
+        Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
+        return Astro.redirect('/aquintutor');
+      } catch (_) { errorMsg = 'Sign-in error. Please try again.'; }
+    } else {
+      errorMsg = 'Session mismatch. Please sign in again.';
+      Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
+      requireFace = false;
+    }
+  } else if (action === 'cancel_face') {
+    Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
+    return Astro.redirect('/aquintutor/login');
+  } else {
+    const email = (fd2.get('email') as string || '').trim().toLowerCase();
+    const password = (fd2.get('password') as string) || '';
+    if (!email || !password) {
+      errorMsg = 'Email and password are required.';
+    } else {
+      try {
+        const { db } = await import('@/lib/db');
+        const { users } = await import('@/lib/db/schema');
+        const { verifyPassword } = await import('@/lib/auth/password');
+        const { generateSessionToken, createSession } = await import('@/lib/auth/session');
+        const { setSessionCookie } = await import('@/lib/auth/cookie');
+        const { eq, or } = await import('drizzle-orm');
+        const { sql } = await import('drizzle-orm');
+
+        const found = await db.select().from(users).where(or(eq(users.email, email), eq(users.internalHandle, email))).limit(1);
+        const user = found[0];
+        if (!user || !user.isActive) {
+          errorMsg = 'Invalid email or password.';
+        } else {
+          const valid = await verifyPassword(user.passwordHash, password);
+          if (!valid) {
+            errorMsg = 'Invalid email or password.';
+          } else {
+            const faceCheck = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
+            const faceRows = Array.isArray(faceCheck) ? faceCheck : (faceCheck?.rows || []);
+            if (faceRows.length > 0) {
+              Astro.cookies.set('aquintutor_face_pending', user.id, { path: '/', httpOnly: true, maxAge: 300, sameSite: 'lax' });
+              return Astro.redirect('/aquintutor/login');
+            } else {
+              const token = generateSessionToken();
+              const session = await createSession(token, user.id, {
+                userAgent: Astro.request.headers.get('user-agent') || undefined,
+                ipAddress: Astro.clientAddress
+              });
+              setSessionCookie(Astro.cookies, token, session.expiresAt);
+              await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, user.id));
+              return Astro.redirect('/aquintutor');
+            }
+          }
+        }
+      } catch (e: any) {
+        errorMsg = 'Sign-in error. Please try again.';
+      }
+    }
+  }
+}
+---
+<!doctype html>
+<html lang="en" class="academy editorial">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Sign in - AquinTutor</title>
+  <meta name="description" content="Sign in to AquinTutor - the virtual institution of EduRankAI." />
+  <meta name="robots" content="noindex" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <meta name="theme-color" content="#FBFAF4" />
+</head>
+<body class="academy editorial grain">
+
+  <header style="border-bottom:1px solid var(--rule); background:rgba(251,250,244,0.85); backdrop-filter:blur(6px); position:relative; z-index:20;">
+    <div style="border-bottom:1px solid rgba(11,14,20,0.08);">
+      <div style="max-width:1400px; margin:0 auto; padding:8px 24px; display:flex; align-items:center; justify-content:space-between;" class="numplate">
+        <span style="color:var(--ink-500);">EST. MMXXVI &middot; AN INSTITUTION OF EDURANK&middot;AI</span>
+        <span class="hide-mobile" style="color:var(--ink-500);">SIGN IN &middot; AQUINTUTOR</span>
+      </div>
+    </div>
+    <div style="max-width:1400px; margin:0 auto; padding:20px 24px; display:flex; align-items:center; justify-content:space-between;">
+      <a href="/aquintutor" style="display:flex; align-items:baseline; gap:8px; text-decoration:none; color:var(--ink);">
+        <span class="font-display" style="font-size:30px; font-weight:500; letter-spacing:-0.02em;">Aquin<span style="color:var(--rust);">Tutor</span></span>
+        <span class="numplate" style="color:var(--ink-300);">.ai</span>
+      </a>
+      <nav class="hide-mobile" style="display:flex; align-items:center; gap:32px;">
+        <a href="/aquintutor/schools" class="eyebrow" style="color:var(--ink-500); text-decoration:none;">Schools</a>
+        <a href="/aquintutor/courses" class="eyebrow" style="color:var(--ink-500); text-decoration:none;">Courses</a>
+      </nav>
+      <a href="/aquintutor/signup" class="btn-pill outline" style="padding:10px 18px; font-size:11px;">Enrol</a>
+    </div>
+  </header>
+
+  <section style="max-width:540px; margin:0 auto; padding:80px 24px 64px;">
+
+    <div style="display:flex; align-items:center; gap:16px; margin-bottom:32px;" class="numplate">
+      <span style="height:1px; width:48px; background:var(--ink);"></span>
+      <span style="color:var(--ink-500);">{requireFace ? 'VERIFY YOUR FACE' : 'SIGN IN'}</span>
+    </div>
+
+    <h1 class="font-display" style="font-size:clamp(3rem, 7vw, 5rem); line-height:0.95; letter-spacing:-0.025em; font-weight:500; margin:0;">
+      {requireFace ? <>Welcome back,<br/><span style="font-style:italic; font-weight:300; color:var(--ink-500);">{pendingUserName}.</span></> : <>Continue your<br/><span style="font-style:italic; font-weight:300; color:var(--ink-500);">enrolment.</span></>}
+    </h1>
+
+    {errorMsg && (
+      <div style="background:rgba(160,66,30,0.08); border:1px solid var(--rust); color:var(--rust); padding:14px 16px; border-radius:12px; margin-top:32px; font-family:'Cormorant Garamond',serif; font-size:1.125rem; font-style:italic;">
+        {errorMsg}
+      </div>
+    )}
+
+    {!requireFace && (
+      <form method="POST" style="margin-top:40px; display:flex; flex-direction:column; gap:18px;">
+        <div>
+          <label class="eyebrow" for="email" style="display:block; margin-bottom:8px;">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" required autofocus style="width:100%; background:var(--paper); border:1px solid var(--rule); border-bottom:1.5px solid var(--ink); padding:12px 0; font-family:'Inter Tight',sans-serif; font-size:16px; color:var(--ink); outline:none; border-radius:0;" />
+        </div>
+        <div>
+          <label class="eyebrow" for="password" style="display:block; margin-bottom:8px;">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required style="width:100%; background:var(--paper); border:1px solid var(--rule); border-bottom:1.5px solid var(--ink); padding:12px 0; font-family:'Inter Tight',sans-serif; font-size:16px; color:var(--ink); outline:none; border-radius:0;" />
+        </div>
+        <button type="submit" class="btn-pill filled" style="margin-top:14px; align-self:flex-start;">Sign in &rarr;</button>
+      </form>
+    )}
+
+    {requireFace && faceDescriptor && (
+      <div style="margin-top:40px; background:var(--paper); border:1px solid var(--rule); border-radius:16px; overflow:hidden;">
+        <div style="background:#000; aspect-ratio:3/4; position:relative; max-height:380px;">
+          <video id="videoEl" autoplay playsinline muted style="width:100%; height:100%; object-fit:cover; transform:scaleX(-1);"></video>
+          <div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none;">
+            <div style="width:55%; aspect-ratio:3/4; border:2.5px solid rgba(160,66,30,0.7); border-radius:50%;"></div>
+          </div>
+          <div style="position:absolute; bottom:12px; left:0; right:0; text-align:center;">
+            <span id="camStatus" style="background:rgba(0,0,0,0.75); color:#fff; font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:0.16em; text-transform:uppercase; padding:5px 14px; border-radius:100px;">Loading face model...</span>
+          </div>
+        </div>
+        <div style="height:3px; background:var(--rule);">
+          <div id="progFill" style="height:100%; background:var(--rust); width:0%; transition:width 0.4s;"></div>
+        </div>
+        <button id="verifyBtn" type="button" disabled style="width:100%; border:none; font-family:'Inter Tight',sans-serif; font-size:13px; font-weight:600; letter-spacing:0.22em; text-transform:uppercase; padding:18px; cursor:pointer; background:var(--ink); color:var(--sand-50); border-radius:0;">Scanning&hellip;</button>
+      </div>
+    )}
+
+    {requireFace && (
+      <form id="faceSuccessForm" method="POST" style="display:none;">
+        <input type="hidden" name="action" value="face_verified"/>
+        <input type="hidden" name="user_id" value={pendingUserId}/>
+      </form>
+    )}
+
+    {requireFace && (
+      <div style="text-align:center; margin-top:24px;">
+        <form method="POST" style="display:inline;">
+          <input type="hidden" name="action" value="cancel_face"/>
+          <button type="submit" style="background:transparent; border:none; font-family:'Inter Tight',sans-serif; font-size:11px; font-weight:600; letter-spacing:0.22em; text-transform:uppercase; color:var(--ink-500); cursor:pointer; text-decoration:underline; padding:8px;">Use password instead</button>
+        </form>
+      </div>
+    )}
+
+    <div style="margin-top:48px; padding-top:32px; border-top:1px solid var(--rule); display:flex; flex-wrap:wrap; gap:14px; align-items:center; justify-content:space-between;">
+      <p class="font-serif" style="font-size:1.125rem; color:var(--ink-500); margin:0; font-style:italic;">No account yet?</p>
+      <a href="/aquintutor/signup" class="btn-pill outline" style="padding:10px 20px; font-size:11px;">Enrol &mdash; 1 CHF</a>
+    </div>
+
+    <div style="margin-top:24px; display:flex; gap:16px; flex-wrap:wrap;" class="numplate">
+      <a href="/forgot-password" style="color:var(--ink-500); text-decoration:underline;">Forgot password</a>
+      <a href="/identity-setup" style="color:var(--ink-500); text-decoration:underline;">First-time identity setup</a>
+    </div>
+  </section>
+
+  {requireFace && faceDescriptor && (
+    <script is:inline src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js"></script>
+    <script is:inline define:vars={{ storedDescriptor: faceDescriptor }}>
+      var video = document.getElementById('videoEl');
+      var verifyBtn = document.getElementById('verifyBtn');
+      var camStatus = document.getElementById('camStatus');
+      var progFill = document.getElementById('progFill');
+      var verified = false;
+      var attempts = 0;
+      function setStatus(msg, color) { camStatus.style.color = color || '#fff'; camStatus.textContent = msg; }
+      async function init() {
+        try {
+          setStatus('Loading face model...');
+          progFill.style.width = '20%';
+          var URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
+          await Promise.all([
+            faceapi.nets.tinyFaceDetector.loadFromUri(URL),
+            faceapi.nets.faceLandmark68TinyNet.loadFromUri(URL),
+            faceapi.nets.faceRecognitionNet.loadFromUri(URL),
+          ]);
+          progFill.style.width = '60%';
+          var stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640 } });
+          video.srcObject = stream;
+          progFill.style.width = '100%';
+          setTimeout(function() {
+            progFill.style.display = 'none';
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = 'Verify face';
+            verifyBtn.onclick = doVerify;
+            setStatus('Center face in the oval', '#10b981');
+            autoVerifyLoop();
+          }, 300);
+        } catch (e) { setStatus('Camera error: ' + e.message, '#ef4444'); }
+      }
+      async function tryMatch() {
+        var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks(true).withFaceDescriptor();
+        if (!det) return false;
+        var stored = JSON.parse(storedDescriptor);
+        var storedArr = Array.isArray(stored) ? stored : Object.values(stored);
+        var dist = faceapi.euclideanDistance(det.descriptor, new Float32Array(storedArr));
+        return dist < 0.5;
+      }
+      async function autoVerifyLoop() {
+        if (verified || attempts > 25) { if (attempts > 25) setStatus('Auto-verify timed out. Click verify.', '#fbbf24'); return; }
+        attempts++;
+        try { if (await tryMatch()) { onVerified(); return; } } catch(_) {}
+        setTimeout(autoVerifyLoop, 700);
+      }
+      async function doVerify() {
+        verifyBtn.disabled = true;
+        verifyBtn.textContent = 'Verifying...';
+        try { if (await tryMatch()) onVerified(); else { setStatus('Face not recognised. Try again.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; } }
+        catch (e) { setStatus('Error: ' + e.message, '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
+      }
+      function onVerified() {
+        verified = true;
+        setStatus('Verified. Signing you in...', '#10b981');
+        verifyBtn.textContent = 'Verified';
+        verifyBtn.style.background = '#10b981';
+        setTimeout(function() { document.getElementById('faceSuccessForm').submit(); }, 600);
+      }
+      init();
+    </script>
+  )}
+</body>
+</html>
