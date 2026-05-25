@@ -517,7 +517,9 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
     remainingSecs: remainingSecs,
     attemptId: attempt.id,
     testSlug: slug,
-    fg: theme.fg
+    fg: theme.fg,
+    copyPasteBlocked: !!test.copy_paste_blocked,
+    fullscreenRequired: !!test.fullscreen_required
   }}>
     var currentIdx = 0;
     var answers = existingAnswers || {};
@@ -941,20 +943,151 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
       document.getElementById('flagBtn').onclick = toggleFlag;
       document.getElementById('submitBtn').onclick = openSubmitConfirm;
 
-      // Tab switch detection
+      // ---- PROCTORING MONITOR ----------------------------------------------
+      // Buffered text-only event log: every browser activity that could
+      // indicate cheating is captured locally, batched, and flushed to
+      // /api/tests/log-event every 4s (and on submit / page unload).
+      // The candidate sees a warning toast for high-severity events; the
+      // admin sees the full trail in /admin/tests/attempts/<id>.
+      var eventBuffer = [];
+      var totalFlags = 0;
+      function logEvent(type, severity, detail) {
+        if (submitted) return;
+        eventBuffer.push({ type: type, severity: severity || 'info', detail: detail || {}, clientTs: new Date().toISOString() });
+        if (severity === 'warn' || severity === 'flag') totalFlags++;
+        // Best-effort immediate flush for the most severe ones so admins see them in real time
+        if (eventBuffer.length >= 12 || severity === 'flag') flushEvents();
+      }
+      function flushEvents() {
+        if (eventBuffer.length === 0) return;
+        var batch = eventBuffer.splice(0);
+        try {
+          var payload = JSON.stringify({ attemptId: attemptId, events: batch });
+          if (navigator.sendBeacon) {
+            navigator.sendBeacon('/api/tests/log-event', new Blob([payload], { type: 'application/json' }));
+          } else {
+            fetch('/api/tests/log-event', {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' }, body: payload, keepalive: true,
+            }).catch(function() { eventBuffer = batch.concat(eventBuffer); });
+          }
+        } catch (_) { eventBuffer = batch.concat(eventBuffer); }
+      }
+      setInterval(flushEvents, 4000);
+      window.addEventListener('beforeunload', flushEvents);
+
+      // Tab visibility (cheating signal: switching tab / minimising / locking screen)
       document.addEventListener('visibilitychange', function() {
-        if (document.hidden && !submitted) {
+        if (submitted) return;
+        if (document.hidden) {
           tabSwitches++;
-          showToast('Warning: tab switch detected (' + tabSwitches + ')', 'warn');
+          showToast('Warning: do not switch tabs (' + tabSwitches + ')', 'warn');
+          logEvent('tab_hidden', 'warn', { tab_switches: tabSwitches });
           scheduleSave();
+        } else {
+          logEvent('tab_visible', 'info', {});
         }
       });
 
-      // Keyboard shortcuts
-      document.addEventListener('keydown', function(e) {
-        if (e.key === 'ArrowRight' && !isInInput(e.target)) next();
-        if (e.key === 'ArrowLeft' && !isInInput(e.target)) prev();
+      // Window focus loss (another tab/app stole focus)
+      window.addEventListener('blur', function() { logEvent('window_blur', 'warn', {}); });
+      window.addEventListener('focus', function() { logEvent('window_focus', 'info', {}); });
+
+      // Right-click is blocked + logged
+      document.addEventListener('contextmenu', function(e) {
+        e.preventDefault();
+        logEvent('right_click_blocked', 'warn', { x: e.clientX, y: e.clientY });
+        showToast('Right-click is disabled during the test', 'warn');
       });
+
+      // Copy / paste / cut (logged; blocked by config)
+      document.addEventListener('copy', function(e) {
+        if (copyPasteBlocked) { e.preventDefault(); logEvent('copy_blocked', 'flag', {}); showToast('Copying is disabled', 'warn'); }
+        else { logEvent('copy', 'info', {}); }
+      });
+      document.addEventListener('paste', function(e) {
+        if (copyPasteBlocked) { e.preventDefault(); logEvent('paste_blocked', 'flag', {}); showToast('Pasting is disabled', 'warn'); }
+        else { logEvent('paste', 'info', {}); }
+      });
+      document.addEventListener('cut', function(e) {
+        if (copyPasteBlocked) { e.preventDefault(); logEvent('copy_blocked', 'flag', { variant: 'cut' }); }
+      });
+
+      // Block + log devtools-style and tab-management shortcuts
+      var BLOCKED_SHORTCUTS = [
+        { key: 'F12', ctrl: false, shift: false, label: 'F12 (devtools)' },
+        { key: 'I',   ctrl: true,  shift: true,  label: 'Ctrl+Shift+I' },
+        { key: 'J',   ctrl: true,  shift: true,  label: 'Ctrl+Shift+J' },
+        { key: 'C',   ctrl: true,  shift: true,  label: 'Ctrl+Shift+C' },
+        { key: 'U',   ctrl: true,  shift: false, label: 'Ctrl+U (view source)' },
+        { key: 'S',   ctrl: true,  shift: false, label: 'Ctrl+S (save page)' },
+        { key: 'P',   ctrl: true,  shift: false, label: 'Ctrl+P (print)' },
+      ];
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'ArrowRight' && !isInInput(e.target)) { next(); return; }
+        if (e.key === 'ArrowLeft' && !isInInput(e.target)) { prev(); return; }
+        for (var i = 0; i < BLOCKED_SHORTCUTS.length; i++) {
+          var s = BLOCKED_SHORTCUTS[i];
+          var ctrlOk = !s.ctrl || e.ctrlKey || e.metaKey;
+          var shiftOk = !s.shift || e.shiftKey;
+          if (e.key === s.key && ctrlOk && (s.shift ? e.shiftKey : !e.shiftKey)) {
+            if (!s.ctrl || (e.ctrlKey || e.metaKey)) {
+              e.preventDefault();
+              logEvent('keyboard_shortcut_blocked', 'flag', { shortcut: s.label });
+              showToast('Shortcut blocked: ' + s.label, 'warn');
+              return;
+            }
+          }
+        }
+      });
+
+      // Fullscreen monitoring (when fullscreen_required is set)
+      document.addEventListener('fullscreenchange', function() {
+        if (document.fullscreenElement) logEvent('fullscreen_enter', 'info', {});
+        else if (fullscreenRequired) { logEvent('fullscreen_exit', 'flag', {}); showToast('Fullscreen exited - return to fullscreen', 'warn'); }
+        else logEvent('fullscreen_exit', 'info', {});
+      });
+
+      // Mouse leaving the window (could indicate alt-tab to another monitor)
+      document.addEventListener('mouseleave', function() { logEvent('mouse_leave', 'info', {}); });
+      document.addEventListener('mouseenter', function() { logEvent('mouse_enter', 'info', {}); });
+
+      // Network state
+      window.addEventListener('offline', function() { logEvent('network_offline', 'warn', {}); showToast('You went offline - reconnect to save', 'warn'); });
+      window.addEventListener('online', function() { logEvent('network_online', 'info', {}); });
+
+      // Window resize (could indicate split-screen or DevTools panel)
+      var resizeT = null;
+      window.addEventListener('resize', function() {
+        clearTimeout(resizeT);
+        resizeT = setTimeout(function() {
+          logEvent('resize', 'info', { w: window.innerWidth, h: window.innerHeight });
+          // Heuristic: a sudden width drop > 200px while inner area shrinks usually means DevTools panel opened.
+          if (window.outerWidth - window.innerWidth > 200) {
+            logEvent('devtools_suspected', 'flag', { outer_w: window.outerWidth, inner_w: window.innerWidth });
+          }
+        }, 300);
+      });
+      window.addEventListener('orientationchange', function() { logEvent('orientation_change', 'info', { orientation: (screen.orientation || {}).type || 'unknown' }); });
+
+      // Idle detection (no input for 30s)
+      var lastActivity = Date.now();
+      var idleNotified = false;
+      function bumpActivity() { lastActivity = Date.now(); if (idleNotified) { logEvent('idle_end', 'info', {}); idleNotified = false; } }
+      ['mousemove','keydown','click','touchstart'].forEach(function(ev) { document.addEventListener(ev, bumpActivity, { passive: true }); });
+      setInterval(function() {
+        if (submitted) return;
+        if (!idleNotified && Date.now() - lastActivity > 30000) {
+          idleNotified = true;
+          logEvent('idle_start', 'info', { idle_for_ms: Date.now() - lastActivity });
+        }
+      }, 5000);
+
+      // First event when listeners are wired
+      logEvent('attempt_listeners_attached', 'info', { ua: navigator.userAgent.slice(0, 200), w: window.innerWidth, h: window.innerHeight });
+
+      // Expose flush so submitTest can call it
+      window.__proctorFlush = flushEvents;
     }
 
     function isInInput(el) {
@@ -988,6 +1121,9 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
       document.getElementById('confirmOverlay').classList.remove('show');
       var stage = document.querySelector('.stage');
       stage.innerHTML = '<div style="text-align:center;"><div style="font-size:60px;margin-bottom:14px;">...</div><p style="font-size:18px;color:#fff;">Submitting your test...</p></div>';
+
+      // Final flush of proctoring events before submit
+      try { if (window.__proctorFlush) window.__proctorFlush(); } catch(_) {}
 
       fetch('/api/tests/submit', {
         method: 'POST',
