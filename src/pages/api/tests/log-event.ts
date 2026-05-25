@@ -36,6 +36,11 @@ const ALLOWED_TYPES = new Set([
   'orientation_change',
   'resize',
   'fullscreen_required_violation',
+  'attempt_listeners_attached',
+  // Camera + mic real-time analysis (no bytes stored, only text events)
+  'media_consent_granted', 'media_consent_denied', 'media_lost',
+  'face_lost', 'face_visible', 'multiple_faces', 'looking_away',
+  'voice_detected', 'voice_silenced',
 ]);
 
 const SEVERITIES = new Set(['info', 'warn', 'flag']);
