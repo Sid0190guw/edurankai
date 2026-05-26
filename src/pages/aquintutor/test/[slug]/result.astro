@@ -30,6 +30,70 @@ const duration = attempt.duration_seconds || 0;
 const minutes = Math.floor(duration / 60);
 const seconds = duration % 60;
 
+// Per-question review
+let questions: any[] = [];
+try {
+  const r = await db.execute(sql`SELECT id, question_text, question_type, options, correct_answer, marks, explanation, sort_order FROM test_questions WHERE test_id = ${test.id} ORDER BY sort_order ASC`);
+  questions = Array.isArray(r) ? r : (r?.rows || []);
+} catch (_) {}
+const answers = attempt.answers || {};
+const flaggedSet = attempt.flagged_questions || {};
+let correctN = 0, wrongN = 0, blankN = 0, flaggedN = 0;
+const reviewRows = (questions as any[]).map((q: any, i: number) => {
+  const u = answers[q.id];
+  const c = q.correct_answer;
+  const isBlank = u === undefined || u === null || u === '' || (Array.isArray(u) && u.length === 0);
+  let isCorrect = false;
+  if (!isBlank) {
+    if (q.question_type === 'mcq_multi') {
+      const uSet = new Set(Array.isArray(u) ? u : []);
+      const cSet = new Set(Array.isArray(c) ? c : []);
+      isCorrect = uSet.size === cSet.size && [...uSet].every(x => cSet.has(x));
+    } else {
+      isCorrect = u === c;
+    }
+  }
+  if (isBlank) blankN++; else if (isCorrect) correctN++; else wrongN++;
+  if (flaggedSet[q.id]) flaggedN++;
+  return { idx: i + 1, q, userAns: u, isBlank, isCorrect, flagged: !!flaggedSet[q.id] };
+});
+const firstWrong = reviewRows.find((r: any) => !r.isCorrect && !r.isBlank);
+
+// Next quest: pick another published test not yet taken by this candidate
+let nextQuest: any = null;
+try {
+  const candidateId = attempt.candidate_id;
+  const r = await db.execute(sql`
+    SELECT slug, title, test_type, duration_mins, currency, price_inr_paise, is_premium
+    FROM tests
+    WHERE is_published = true AND id != ${test.id}
+      ${candidateId ? sql`AND NOT EXISTS (SELECT 1 FROM test_attempts WHERE test_id = tests.id AND candidate_id = ${candidateId} AND status IN ('submitted','auto_submitted'))` : sql``}
+    ORDER BY created_at DESC LIMIT 1
+  `);
+  const rows = Array.isArray(r) ? r : (r?.rows || []);
+  nextQuest = rows[0] || null;
+} catch (_) {}
+
+// Badges - awarded by simple thresholds
+const BADGES = [
+  { id: 'first-finish', name: 'First completion', desc: 'Completed an examination', earned: true },
+  { id: 'fifty-plus', name: 'Above the cut', desc: 'Scored 50% or higher', earned: percentage >= 50 },
+  { id: 'distinction', name: 'Distinction', desc: 'Scored 80% or higher', earned: percentage >= 80 },
+  { id: 'perfect', name: 'Perfect score', desc: '100% on every question', earned: percentage >= 100 },
+  { id: 'flow', name: 'Flow', desc: 'Eight or more correct in a row', earned: correctN >= 8 },
+  { id: 'no-flags', name: 'Clean session', desc: 'Zero proctor flags', earned: (attempt.tab_switches || 0) === 0 && (attempt.fullscreen_exits || 0) === 0 },
+];
+const earnedCount = BADGES.filter(b => b.earned).length;
+
+const optionText = (q: any, idx: any) => {
+  if (q.question_type === 'mcq_multi' && Array.isArray(idx)) {
+    const opts = (q.options || []) as any[];
+    return idx.map((i: number) => opts[i]?.text).filter(Boolean).join(', ');
+  }
+  const opts = (q.options || []) as any[];
+  return opts[idx]?.text || '';
+};
+
 let rank = '';
 let rankColor = '#FF4F00';
 if (percentile >= 90) { rank = 'TOP 10%'; rankColor = '#fbbf24'; }
@@ -254,9 +318,205 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
 
     <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
       <a href={`/aquintutor/test/${slug}`} class="btn btn-secondary">Try Again</a>
-      <a href="/aquintutor" class="btn btn-primary">More Tests &gt;</a>
+      <a href="/aquintutor/dashboard" class="btn btn-primary">Back to dashboard &gt;</a>
     </div>
   </div>
+
+  <!-- ATLAS Scene 6 - 3-COL DEBRIEF -->
+  <section class="debrief">
+    <div class="debrief-grid">
+      <!-- LEFT: Score + breakdown + per-discipline + time analytics -->
+      <div class="debrief-col debrief-score">
+        <p class="dl-eyebrow">Scoreboard</p>
+        <p class="big-score"><span class="bs-num tabular">{Math.round(percentage)}</span><span class="bs-den">/100</span></p>
+        {percentile > 0 && (
+          <p class="bs-pile" style={'color:' + rankColor + ';'}>{rank} &middot; {Math.round(percentile)}<sup>th</sup> percentile</p>
+        )}
+        <div class="bell">
+          <svg viewBox="0 0 200 60" preserveAspectRatio="none" width="100%" height="60">
+            <path d="M0 60 Q 50 0 100 60 T 200 60 Z" fill="rgba(217,119,87,0.10)" stroke="rgba(217,119,87,0.5)" stroke-width="0.8"/>
+            <line x1={(Math.max(0, Math.min(100, percentile || 50)) * 2).toString()} y1="0" x2={(Math.max(0, Math.min(100, percentile || 50)) * 2).toString()} y2="60" stroke="var(--fg)" stroke-width="1.2" stroke-dasharray="2 2"/>
+            <circle cx={(Math.max(0, Math.min(100, percentile || 50)) * 2).toString()} cy="14" r="3" fill="var(--fg)"/>
+          </svg>
+          <p class="bell-axis"><span>WEAK</span><span>AVG</span><span>YOU</span><span>STRONG</span></p>
+        </div>
+        <div class="breakdown">
+          <div class="brk-row"><span>Correct</span><span class="tabular">{correctN} / {questions.length}</span><span class="brk-bar"><span style={'width:' + Math.round((correctN / Math.max(1, questions.length)) * 100) + '%; background:#7dd3a8;'}></span></span></div>
+          <div class="brk-row"><span>Wrong</span><span class="tabular">{wrongN}</span><span class="brk-bar"><span style={'width:' + Math.round((wrongN / Math.max(1, questions.length)) * 100) + '%; background:#e07a6c;'}></span></span></div>
+          <div class="brk-row"><span>Blank</span><span class="tabular">{blankN}</span><span class="brk-bar"><span style={'width:' + Math.round((blankN / Math.max(1, questions.length)) * 100) + '%; background:#5a5650;'}></span></span></div>
+          <div class="brk-row"><span>Flagged</span><span class="tabular">{flaggedN}</span><span class="brk-bar"><span style={'width:' + Math.round((flaggedN / Math.max(1, questions.length)) * 100) + '%; background:#f0b54f;'}></span></span></div>
+        </div>
+        <div class="time-foot">
+          <div><p class="tf-k">TIME USED</p><p class="tf-v tabular">{minutes}m {seconds < 10 ? '0' : ''}{seconds}s</p></div>
+          <div><p class="tf-k">PER Q</p><p class="tf-v tabular">{questions.length > 0 ? Math.round(duration / questions.length) : 0}s</p></div>
+          <div><p class="tf-k">FLAGGED</p><p class="tf-v tabular">{flaggedN}</p></div>
+        </div>
+      </div>
+
+      <!-- MIDDLE: AI explanation -->
+      <div class="debrief-col debrief-ai">
+        <p class="dl-eyebrow">Why you might have missed</p>
+        {firstWrong ? (
+          <>
+            <p class="ai-q">Q{firstWrong.idx} &middot; {firstWrong.q.question_text}</p>
+            <div class="ai-cmp">
+              <div class="ai-side ai-wrong">
+                <p class="ai-side-k">YOUR ANSWER</p>
+                <p class="ai-side-v">{firstWrong.isBlank ? '(left blank)' : optionText(firstWrong.q, firstWrong.userAns)}</p>
+              </div>
+              <div class="ai-side ai-right">
+                <p class="ai-side-k">EXPECTED</p>
+                <p class="ai-side-v">{optionText(firstWrong.q, firstWrong.q.correct_answer)}</p>
+              </div>
+            </div>
+            {firstWrong.q.explanation && (
+              <p class="ai-expl"><em>{firstWrong.q.explanation}</em></p>
+            )}
+            {!firstWrong.q.explanation && (
+              <p class="ai-expl"><em>No instructor note recorded for this question. Ask the AI tutor on the course detail page for a step-by-step explanation grounded in the syllabus.</em></p>
+            )}
+            <div class="ai-actions">
+              <a href={'/aquintutor/test/' + slug} class="ai-btn ai-btn-pri">Try again</a>
+              <a href="/aquintutor/courses" class="ai-btn">Find practice course</a>
+            </div>
+          </>
+        ) : (
+          <>
+            <p class="ai-q-perfect">No incorrect answers to explain.</p>
+            <p class="ai-expl"><em>You answered every question correctly, or every wrong answer was left blank. Sit a harder examination next.</em></p>
+            <div class="ai-actions">
+              <a href="/aquintutor" class="ai-btn ai-btn-pri">Browse more examinations</a>
+            </div>
+          </>
+        )}
+      </div>
+
+      <!-- RIGHT TOP: Badges grid 3x2 -->
+      <div class="debrief-col debrief-badges">
+        <p class="dl-eyebrow">Badges ({earnedCount} / {BADGES.length})</p>
+        <div class="badge-grid">
+          {BADGES.map((b: any) => (
+            <div class={'badge-tile ' + (b.earned ? 'earned' : 'locked')}>
+              <div class="badge-medal">
+                {b.earned ? (
+                  <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-4"/></svg>
+                ) : (
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:20px;opacity:0.5;">?</span>
+                )}
+              </div>
+              <p class="badge-name">{b.name}</p>
+              <p class="badge-desc">{b.desc}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <!-- RIGHT BOTTOM: Next quest -->
+      <div class="debrief-col debrief-quest">
+        <p class="dl-eyebrow">Next quest</p>
+        {nextQuest ? (
+          <>
+            <p class="quest-title">{nextQuest.title}</p>
+            <p class="quest-meta">{(nextQuest.test_type || 'EXAM').toUpperCase()} &middot; {nextQuest.duration_mins || 0} min</p>
+            <a href={'/aquintutor/test/' + nextQuest.slug} class="quest-cta">Begin quest &rarr;</a>
+          </>
+        ) : (
+          <>
+            <p class="quest-title">You have completed every available examination.</p>
+            <p class="quest-meta">CHECK BACK NEXT TERM FOR NEW OFFERINGS</p>
+            <a href="/aquintutor/courses" class="quest-cta">Browse courses &rarr;</a>
+          </>
+        )}
+      </div>
+    </div>
+
+    <!-- Per-question review -->
+    {reviewRows.length > 0 && (
+      <div class="review-card">
+        <p class="dl-eyebrow">Question-by-question review</p>
+        <div class="review-list">
+          {reviewRows.map((r: any) => (
+            <div class={'review-row ' + (r.isCorrect ? 'ok' : r.isBlank ? 'blank' : 'wrong')}>
+              <span class="rr-idx">Q{r.idx}</span>
+              <span class="rr-status">{r.isCorrect ? 'CORRECT' : r.isBlank ? 'BLANK' : 'WRONG'}</span>
+              <span class="rr-q">{r.q.question_text}</span>
+              {r.flagged && <span class="rr-flag">FLAGGED</span>}
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
+  </section>
+
+  <style is:inline>
+    .debrief { background: var(--bg); padding: 60px 24px 80px; min-height: 100vh; overflow: visible; }
+    .debrief-grid { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: 1fr; gap: 18px; }
+    @media (min-width: 1024px) {
+      .debrief-grid { grid-template-columns: 1.1fr 1fr 0.9fr; grid-auto-rows: auto; }
+      .debrief-score { grid-row: span 2; }
+    }
+    .debrief-col { background: var(--atlas-surface, #14181d); border: 1px solid var(--atlas-border, #2a3038); border-radius: 14px; padding: 22px; min-width: 0; }
+    .dl-eyebrow { font-family: var(--font-mono, 'JetBrains Mono', monospace); font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--atlas-ink-3, #8a8579); margin: 0 0 14px; font-weight: 500; }
+    .tabular { font-variant-numeric: tabular-nums; }
+
+    .big-score { display: flex; align-items: baseline; gap: 6px; margin: 0 0 8px; }
+    .bs-num { font-family: var(--font-serif, 'Instrument Serif', serif); font-size: clamp(70px, 9vw, 110px); font-weight: 400; color: var(--fg); line-height: 0.9; }
+    .bs-den { font-family: var(--font-serif, serif); font-size: 28px; color: var(--atlas-ink-3, #8a8579); }
+    .bs-pile { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; margin: 0 0 18px; font-weight: 600; }
+    .bell { margin: 18px 0; }
+    .bell-axis { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.16em; color: var(--atlas-ink-3, #8a8579); margin: 6px 0 0; }
+    .breakdown { display: flex; flex-direction: column; gap: 8px; margin: 14px 0 18px; }
+    .brk-row { display: grid; grid-template-columns: 80px 60px 1fr; gap: 10px; align-items: center; font-family: var(--font-mono); font-size: 11px; color: var(--atlas-ink-2, #c8c3b8); letter-spacing: 0.08em; text-transform: uppercase; }
+    .brk-bar { background: rgba(255,255,255,0.06); height: 6px; border-radius: 3px; overflow: hidden; }
+    .brk-bar > span { display: block; height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+    .time-foot { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; border-top: 1px solid var(--atlas-border, #2a3038); padding-top: 14px; margin-top: 8px; }
+    .tf-k { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.16em; color: var(--atlas-ink-3, #8a8579); margin: 0 0 3px; }
+    .tf-v { font-family: var(--font-mono); font-size: 13px; color: var(--atlas-ink, #f4f1ea); margin: 0; font-weight: 600; }
+
+    .ai-q { font-family: var(--font-serif); font-size: 1.25rem; line-height: 1.4; color: var(--atlas-ink, #f4f1ea); margin: 0 0 14px; font-style: italic; }
+    .ai-q-perfect { font-family: var(--font-serif); font-size: 1.2rem; color: var(--atlas-ink); margin: 0 0 14px; }
+    .ai-cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0 0 14px; }
+    .ai-side { padding: 10px 12px; border-radius: 8px; }
+    .ai-side-k { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.16em; margin: 0 0 4px; }
+    .ai-side-v { font-size: 13px; margin: 0; line-height: 1.4; }
+    .ai-wrong { background: rgba(224,122,108,0.10); border: 1px solid rgba(224,122,108,0.3); color: #e07a6c; }
+    .ai-wrong .ai-side-v { color: #f4f1ea; }
+    .ai-right { background: rgba(125,211,168,0.10); border: 1px solid rgba(125,211,168,0.3); color: #7dd3a8; }
+    .ai-right .ai-side-v { color: #f4f1ea; }
+    .ai-expl { font-family: var(--font-serif); font-size: 1rem; color: var(--atlas-ink-2, #c8c3b8); line-height: 1.55; margin: 0 0 14px; }
+    .ai-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .ai-btn { display: inline-block; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--atlas-border); color: var(--atlas-ink); text-decoration: none; font-family: var(--font-sans, 'Space Grotesk', sans-serif); font-size: 12px; font-weight: 600; }
+    .ai-btn-pri { background: var(--fg); color: #1a0f08; border-color: var(--fg); }
+
+    .badge-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .badge-tile { padding: 12px; border-radius: 10px; text-align: center; }
+    .badge-tile.earned { background: rgba(217,119,87,0.08); border: 1px solid rgba(217,119,87,0.35); color: var(--fg); }
+    .badge-tile.locked { background: rgba(255,255,255,0.03); border: 1px solid var(--atlas-border); color: var(--atlas-ink-4, #5a5650); filter: grayscale(0.6); }
+    .badge-medal { width: 48px; height: 48px; border-radius: 50%; background: rgba(255,255,255,0.04); margin: 0 auto 6px; display: flex; align-items: center; justify-content: center; }
+    .badge-tile.earned .badge-medal { background: radial-gradient(circle, rgba(217,119,87,0.25), transparent); color: var(--fg); }
+    .badge-name { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--atlas-ink); margin: 0 0 2px; font-weight: 600; }
+    .badge-tile.locked .badge-name { color: var(--atlas-ink-3, #8a8579); }
+    .badge-desc { font-size: 10.5px; color: var(--atlas-ink-3); margin: 0; line-height: 1.4; }
+
+    .debrief-quest { background: linear-gradient(135deg, rgba(217,119,87,0.18), rgba(167,139,250,0.14)); border-color: rgba(217,119,87,0.4); }
+    .quest-title { font-family: var(--font-serif); font-size: 1.4rem; color: var(--atlas-ink); margin: 0 0 8px; line-height: 1.2; }
+    .quest-meta { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.16em; color: rgba(244,241,234,0.7); margin: 0 0 18px; }
+    .quest-cta { display: inline-block; padding: 10px 18px; border-radius: 999px; background: #f4f1ea; color: #0b0d10; text-decoration: none; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; font-weight: 700; }
+
+    .review-card { max-width: 1400px; margin: 22px auto 0; background: var(--atlas-surface, #14181d); border: 1px solid var(--atlas-border, #2a3038); border-radius: 14px; padding: 22px; }
+    .review-list { display: flex; flex-direction: column; gap: 4px; max-height: 460px; overflow-y: auto; }
+    .review-row { display: grid; grid-template-columns: 50px 80px 1fr 70px; gap: 10px; align-items: center; padding: 8px 10px; border-radius: 6px; font-size: 12px; }
+    .review-row.ok { background: rgba(125,211,168,0.06); }
+    .review-row.wrong { background: rgba(224,122,108,0.06); }
+    .review-row.blank { background: rgba(255,255,255,0.02); }
+    .rr-idx { font-family: var(--font-mono); font-size: 11px; color: var(--atlas-ink-3); }
+    .rr-status { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.16em; font-weight: 600; }
+    .review-row.ok .rr-status { color: #7dd3a8; }
+    .review-row.wrong .rr-status { color: #e07a6c; }
+    .review-row.blank .rr-status { color: var(--atlas-ink-3); }
+    .rr-q { color: var(--atlas-ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    .rr-flag { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.16em; color: #f0b54f; text-align: right; }
+  </style>
 
   <script is:inline define:vars={{ themeFg: theme.fg, passed: passed }}>
     if (passed) {
