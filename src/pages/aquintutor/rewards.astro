@@ -1,0 +1,302 @@
+---
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/aquintutor/login?next=' + encodeURIComponent('/aquintutor/rewards'));
+
+// ATLAS Scene 5 - Rewards. Builds the candidate's gamified profile from real
+// data: attempts, enrolments, certs. No fake stats - every number is derived.
+
+let attempts: any[] = [];
+let enrollments: any[] = [];
+let certificates: any[] = [];
+let cohortTop: any[] = [];
+
+try {
+  const r = await db.execute(sql`
+    SELECT a.id, a.test_id, a.percentage, a.total_score, a.status, a.tab_switches, a.fullscreen_exits, a.submitted_at,
+      t.title as test_title, t.slug as test_slug, t.test_type, t.total_marks
+    FROM test_attempts a LEFT JOIN tests t ON a.test_id = t.id
+    WHERE a.candidate_id = ${user.id} AND a.status IN ('submitted','auto_submitted')
+    ORDER BY a.submitted_at DESC NULLS LAST LIMIT 100
+  `);
+  attempts = Array.isArray(r) ? r : (r?.rows || []);
+} catch (_) {}
+
+try {
+  const r = await db.execute(sql`
+    SELECT e.id, e.progress_pct, c.slug, c.title, c.school_id, s.name as school_name
+    FROM training_enrollments e LEFT JOIN training_courses c ON e.course_id = c.id LEFT JOIN schools s ON c.school_id = s.id
+    WHERE e.user_id = ${user.id}
+  `);
+  enrollments = Array.isArray(r) ? r : (r?.rows || []);
+} catch (_) {}
+
+try {
+  const r = await db.execute(sql`SELECT credential_number, course_title, issued_at FROM training_certificates WHERE user_id = ${user.id} ORDER BY issued_at DESC LIMIT 12`);
+  certificates = Array.isArray(r) ? r : (r?.rows || []);
+} catch (_) {}
+
+// Derived gamification stats
+let xpTotal = 0;
+let perfectCount = 0;
+let cleanCount = 0;
+let distinctionCount = 0;
+let bestStreak = 0;
+let currentStreak = 0;
+let totalScore = 0;
+let maxScore = 0;
+
+for (const a of attempts as any[]) {
+  const pct = parseFloat(a.percentage || 0);
+  const marks = parseFloat(a.total_score || 0);
+  totalScore += marks;
+  maxScore += parseFloat(a.total_marks || 0);
+  // XP rule: base 50 per attempt + 5*percentage + bonuses
+  let xp = 50 + Math.round(pct * 5);
+  if (pct >= 100) { xp += 200; perfectCount++; }
+  if (pct >= 80)  { xp += 100; distinctionCount++; }
+  if ((a.tab_switches || 0) === 0 && (a.fullscreen_exits || 0) === 0) { xp += 30; cleanCount++; }
+  xpTotal += xp;
+  // Streak: consecutive submitted attempts above 60%
+  if (pct >= 60) {
+    currentStreak++;
+    bestStreak = Math.max(bestStreak, currentStreak);
+  } else {
+    currentStreak = 0;
+  }
+}
+
+// Level: every 500 XP = 1 level. Tier band by level.
+const level = Math.max(1, Math.floor(xpTotal / 500) + 1);
+const levelXpFloor = (level - 1) * 500;
+const levelXpCeil = level * 500;
+const levelProgress = xpTotal - levelXpFloor;
+const levelDenom = levelXpCeil - levelXpFloor;
+const tier = level >= 30 ? 'Scholar' : level >= 20 ? 'Adept' : level >= 10 ? 'Practitioner' : level >= 5 ? 'Apprentice' : 'Initiate';
+
+const totalSchools = new Set(enrollments.filter((e: any) => e.school_name).map((e: any) => e.school_name)).size;
+
+// Cohort leaderboard (anyone who attempted any test). Real data.
+try {
+  const r = await db.execute(sql`
+    SELECT u.id, u.name, COUNT(a.id)::int as attempts, ROUND(AVG(a.percentage)::numeric, 1) as avg_pct
+    FROM users u
+    JOIN test_attempts a ON a.candidate_id = u.id AND a.status IN ('submitted','auto_submitted')
+    GROUP BY u.id, u.name
+    ORDER BY attempts DESC, avg_pct DESC NULLS LAST
+    LIMIT 8
+  `);
+  cohortTop = Array.isArray(r) ? r : (r?.rows || []);
+} catch (_) {}
+
+const myRank = cohortTop.findIndex((u: any) => u.id === user.id);
+
+// Badges - earned by real conditions
+const BADGES = [
+  { id: 'first-attempt', name: 'First attempt', desc: 'Complete any examination', earned: attempts.length >= 1, rarity: 'common' },
+  { id: 'ten-attempts', name: 'Decathlete', desc: 'Complete ten examinations', earned: attempts.length >= 10, rarity: 'uncommon' },
+  { id: 'distinction', name: 'Distinction', desc: 'Score 80% on any examination', earned: distinctionCount >= 1, rarity: 'uncommon' },
+  { id: 'perfect', name: 'Perfect score', desc: 'Score 100% on any examination', earned: perfectCount >= 1, rarity: 'rare' },
+  { id: 'clean-3', name: 'Clean three', desc: 'Three sessions with zero proctor flags', earned: cleanCount >= 3, rarity: 'rare' },
+  { id: 'streak-5', name: 'Five-in-a-row', desc: 'Five consecutive passing attempts', earned: bestStreak >= 5, rarity: 'epic' },
+  { id: 'enrolled-3', name: 'Three schools', desc: 'Enrol in courses from three schools', earned: totalSchools >= 3, rarity: 'uncommon' },
+  { id: 'certified', name: 'Credentialled', desc: 'Earn any verifiable credential', earned: certificates.length >= 1, rarity: 'epic' },
+  { id: 'scholar', name: 'Scholar tier', desc: 'Reach level 30', earned: level >= 30, rarity: 'legendary' },
+];
+const earnedCount = BADGES.filter(b => b.earned).length;
+
+const RARITY_COLOR: Record<string, string> = {
+  common: '#9c9a85', uncommon: '#7dd3a8', rare: '#7fb3ff', epic: '#a78bfa', legendary: '#f0b54f',
+};
+
+// Skill tree nodes - based on which schools the user has touched
+const TREE_NODES = [
+  { id: 'foundations', name: 'Foundations', tier: 1, unlocked: attempts.length >= 1 },
+  { id: 'reasoning',   name: 'Reasoning',   tier: 2, unlocked: distinctionCount >= 1 },
+  { id: 'composition', name: 'Composition', tier: 2, unlocked: attempts.length >= 3 },
+  { id: 'craft',       name: 'Craft',       tier: 2, unlocked: cleanCount >= 1 },
+  { id: 'mastery',     name: 'Mastery',     tier: 3, unlocked: perfectCount >= 1 },
+  { id: 'integrity',   name: 'Integrity',   tier: 3, unlocked: cleanCount >= 3 },
+  { id: 'apex',        name: 'Apex',        tier: 4, unlocked: level >= 20 },
+];
+---
+<AquintutorLayout title="Rewards" description="XP, streak, skill tree, badges, and cohort leaderboard - the gamified record of your AquinTutor progress.">
+
+  <!-- HUD strip -->
+  <section style="border-bottom:1px solid var(--rule);">
+    <div style="max-width:1400px; margin:0 auto; padding:48px 24px 32px;">
+      <div style="display:flex; align-items:center; gap:14px; margin-bottom:18px;" class="numplate">
+        <span style="height:1px; width:48px; background:var(--ink);"></span>
+        <span style="color:var(--ink-500);">LEVEL UP &middot; YOUR RECORD</span>
+      </div>
+      <h1 class="font-display" style="font-size:clamp(2.5rem, 6vw, 5rem); line-height:0.95; letter-spacing:-0.025em; font-weight:500; margin:0;">
+        Mastery, <span style="font-style:italic; font-weight:300; color:var(--ink-500);">recorded.</span>
+      </h1>
+      <p class="font-serif" style="font-size:clamp(1.125rem, 1.6vw, 1.5rem); line-height:1.4; color:var(--ink-500); margin-top:18px; max-width:48rem;">
+        XP, streaks, skill trees, and seasonal ranks &mdash; computed from your real attempts, enrolments, and credentials. No fake numbers.
+      </p>
+    </div>
+  </section>
+
+  <!-- XP CARD - full width -->
+  <section style="border-bottom:1px solid var(--rule); background:var(--sand-100);">
+    <div style="max-width:1400px; margin:0 auto; padding:48px 24px;">
+      <div style="display:grid; grid-template-columns:1fr; gap:32px; align-items:end; margin-bottom:32px;" class="thesis-grid">
+        <div>
+          <p class="eyebrow">XP &middot; Level</p>
+          <p class="numplate" style="color:var(--ink-300); margin-top:8px;">{xpTotal.toLocaleString()} TOTAL XP</p>
+        </div>
+        <div>
+          <div style="display:flex; align-items:baseline; gap:24px; flex-wrap:wrap;">
+            <span class="font-display" style="font-size:clamp(3rem, 7vw, 6rem); line-height:0.95; font-weight:500;">Level {level}</span>
+            <span class="numplate" style="color:var(--rust); font-size:14px;">{tier.toUpperCase()} TIER</span>
+          </div>
+          <p class="font-serif" style="font-size:1.25rem; color:var(--ink-500); margin:8px 0 0; font-style:italic;">
+            {levelDenom - levelProgress} XP to level {level + 1} &middot; best streak {bestStreak}{currentStreak > 0 ? ' (current ' + currentStreak + ')' : ''}
+          </p>
+        </div>
+      </div>
+
+      <!-- XP bar -->
+      <div style="background:var(--paper); border:1px solid var(--rule); border-radius:14px; padding:18px 22px;">
+        <div style="display:flex; justify-content:space-between; margin-bottom:10px;" class="numplate">
+          <span style="color:var(--ink-500);">{levelXpFloor.toLocaleString()} XP</span>
+          <span style="color:var(--rust);">{levelProgress.toLocaleString()} / {levelDenom.toLocaleString()}</span>
+          <span style="color:var(--ink-500);">{levelXpCeil.toLocaleString()} XP</span>
+        </div>
+        <div style="height:14px; background:rgba(11,14,20,0.08); border-radius:7px; overflow:hidden; position:relative;">
+          <div style={'height:100%; width:' + Math.min(100, Math.max(2, Math.round((levelProgress / Math.max(1, levelDenom)) * 100))) + '%; background:linear-gradient(90deg, var(--rust), var(--gold)); border-radius:7px; box-shadow:0 0 18px rgba(217,119,87,0.4); transition:width 0.6s;'}></div>
+        </div>
+      </div>
+
+      <!-- KPI tiles -->
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:10px; margin-top:18px;">
+        {[
+          ['ATTEMPTS', attempts.length],
+          ['PERFECT', perfectCount],
+          ['DISTINCTIONS', distinctionCount],
+          ['CLEAN SESSIONS', cleanCount],
+          ['BEST STREAK', bestStreak],
+          ['CREDENTIALS', certificates.length],
+        ].map(([k, v]) => (
+          <div style="background:var(--paper); border:1px solid var(--rule); border-radius:10px; padding:12px 14px;">
+            <p class="numplate" style="color:var(--ink-500); margin:0 0 6px;">{k}</p>
+            <p class="font-display" style="font-size:1.875rem; font-weight:500; margin:0; line-height:1; font-variant-numeric:tabular-nums;">{v}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- Skill tree + Badges + Leaderboard -->
+  <section style="border-bottom:1px solid var(--rule);">
+    <div style="max-width:1400px; margin:0 auto; padding:48px 24px;">
+      <div style="display:grid; grid-template-columns:1fr; gap:18px;" class="rewards-grid">
+
+        <!-- Skill tree -->
+        <div style="background:var(--paper); border:1px solid var(--rule); border-radius:14px; padding:22px;">
+          <p class="eyebrow">Skill tree</p>
+          <p class="numplate" style="color:var(--ink-300); margin:6px 0 18px;">{TREE_NODES.filter(n => n.unlocked).length} / {TREE_NODES.length} UNLOCKED</p>
+          <svg viewBox="0 0 400 360" width="100%" style="height:auto; max-height:380px;">
+            <!-- edges -->
+            <line x1="200" y1="50" x2="120" y2="140" stroke="var(--rule)" stroke-width="1.5"/>
+            <line x1="200" y1="50" x2="200" y2="140" stroke="var(--rule)" stroke-width="1.5"/>
+            <line x1="200" y1="50" x2="280" y2="140" stroke="var(--rule)" stroke-width="1.5"/>
+            <line x1="120" y1="160" x2="160" y2="240" stroke="var(--rule)" stroke-width="1.5"/>
+            <line x1="280" y1="160" x2="240" y2="240" stroke="var(--rule)" stroke-width="1.5"/>
+            <line x1="200" y1="160" x2="200" y2="240" stroke="var(--rule)" stroke-width="1.5"/>
+            <line x1="200" y1="260" x2="200" y2="330" stroke="var(--rule)" stroke-width="1.5"/>
+            <!-- nodes -->
+            {TREE_NODES.map((n: any) => {
+              const pos: any = {
+                foundations: [200, 50],
+                reasoning:   [120, 160],
+                composition: [200, 160],
+                craft:       [280, 160],
+                mastery:     [160, 260],
+                integrity:   [240, 260],
+                apex:        [200, 330],
+              };
+              const coords = pos[n.id] || [200, 200];
+              const cx = coords[0];
+              const cy = coords[1];
+              return (
+                <g>
+                  <circle cx={cx} cy={cy} r="22" fill={n.unlocked ? '#d97757' : 'rgba(11,14,20,0.05)'} stroke={n.unlocked ? '#b85e3f' : 'var(--rule)'} stroke-width="2" />
+                  {n.unlocked && <circle cx={cx} cy={cy} r="26" fill="none" stroke="#d97757" stroke-width="1" opacity="0.4" />}
+                  <text x={cx} y={cy + 4} text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="10" font-weight="600" fill={n.unlocked ? '#f4f1ea' : 'var(--ink-300)'}>{n.tier}</text>
+                  <text x={cx} y={cy + 40} text-anchor="middle" font-family="'JetBrains Mono', monospace" font-size="9" letter-spacing="0.1em" text-transform="uppercase" fill={n.unlocked ? 'var(--ink)' : 'var(--ink-300)'}>{n.name.toUpperCase()}</text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+
+        <!-- Badges -->
+        <div style="background:var(--paper); border:1px solid var(--rule); border-radius:14px; padding:22px;">
+          <p class="eyebrow">Badges</p>
+          <p class="numplate" style="color:var(--ink-300); margin:6px 0 18px;">{earnedCount} / {BADGES.length} EARNED</p>
+          <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:10px;">
+            {BADGES.map((b: any) => {
+              const color = b.earned ? RARITY_COLOR[b.rarity] : 'rgba(11,14,20,0.15)';
+              return (
+                <div style={'padding:12px 10px; border-radius:10px; text-align:center; background:' + (b.earned ? color + '14' : 'transparent') + '; border:1px solid ' + (b.earned ? color + '55' : 'var(--rule)') + '; ' + (b.earned ? '' : 'opacity:0.6; filter:grayscale(0.8);')}>
+                  <div style={'width:42px; height:42px; border-radius:50%; background:' + (b.earned ? 'radial-gradient(circle, ' + color + '44, transparent)' : 'rgba(11,14,20,0.04)') + '; margin:0 auto 6px; display:flex; align-items:center; justify-content:center;'}>
+                    {b.earned ? (
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={color} stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-4"/></svg>
+                    ) : (
+                      <span style="font-family:'JetBrains Mono',monospace; color:var(--ink-300); font-size:18px;">?</span>
+                    )}
+                  </div>
+                  <p class="numplate" style={'margin:0; font-size:9.5px; color:' + (b.earned ? 'var(--ink)' : 'var(--ink-300)') + ';'}>{b.name}</p>
+                  {b.earned && <p class="numplate" style={'margin:3px 0 0; font-size:8.5px; color:' + color + ';'}>{b.rarity.toUpperCase()}</p>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <!-- Leaderboard -->
+        <div style="background:var(--paper); border:1px solid var(--rule); border-radius:14px; padding:22px;">
+          <p class="eyebrow">Cohort leaderboard</p>
+          <p class="numplate" style="color:var(--ink-300); margin:6px 0 18px;">TOP {cohortTop.length} OF THIS SEASON</p>
+          {cohortTop.length === 0 && <p class="font-serif" style="font-size:1rem; color:var(--ink-500); font-style:italic;">No attempts in the cohort yet.</p>}
+          {cohortTop.map((u: any, i: number) => {
+            const isYou = u.id === user.id;
+            const bg = isYou ? 'rgba(217,119,87,0.10)' : 'transparent';
+            const border = isYou ? 'var(--rust)' : 'var(--rule)';
+            return (
+              <div style={'display:grid; grid-template-columns:34px 34px 1fr 60px 50px; gap:10px; align-items:center; padding:9px 12px; border-radius:8px; background:' + bg + '; border:1px solid ' + border + '; margin-bottom:6px;'}>
+                <span class="numplate" style={'color:' + (i < 3 ? 'var(--rust)' : 'var(--ink-300)') + '; font-size:12px; font-weight:600;'}>{String(i + 1).padStart(2, '0')}</span>
+                <span style={'width:28px; height:28px; border-radius:50%; background:' + (isYou ? 'var(--rust)' : 'var(--ink)') + '; color:var(--sand-50); font-family:"Instrument Serif", serif; font-size:14px; display:flex; align-items:center; justify-content:center;'}>{(u.name || '?').substring(0, 1).toUpperCase()}</span>
+                <span style="font-size:13px; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{isYou ? 'You' : (u.name || 'Anonymous')}</span>
+                <span class="numplate" style="color:var(--ink-500);">{u.attempts}A</span>
+                <span class="numplate" style="color:var(--rust); text-align:right;">{u.avg_pct ? Math.round(u.avg_pct) + '%' : '-'}</span>
+              </div>
+            );
+          })}
+          {myRank === -1 && attempts.length === 0 && (
+            <p class="font-serif" style="font-size:0.95rem; color:var(--ink-500); margin-top:12px; font-style:italic;">Complete your first examination to enter the leaderboard.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section style="border-bottom:1px solid var(--rule);">
+    <div style="max-width:1400px; margin:0 auto; padding:48px 24px; display:flex; gap:14px; justify-content:center; flex-wrap:wrap;">
+      <a href="/aquintutor/test/quantum-challenge-100" class="btn-pill filled">Sit the Quantum Challenge &rarr;</a>
+      <a href="/aquintutor/dashboard" class="btn-pill outline">Back to dashboard</a>
+      <a href="/aquintutor/courses" class="btn-pill outline">Browse the catalogue</a>
+    </div>
+  </section>
+
+  <style>
+    @media (min-width: 768px) { .thesis-grid { grid-template-columns: 3fr 9fr !important; } }
+    @media (min-width: 1024px) { .rewards-grid { grid-template-columns: 1.2fr 1fr 1fr !important; } }
+  </style>
+</AquintutorLayout>
