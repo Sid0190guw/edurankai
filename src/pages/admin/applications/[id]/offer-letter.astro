@@ -129,6 +129,7 @@ if (Astro.request.method === 'POST') {
       const signatoryTitle = ((fd.get('signatoryTitle') as string) || '').trim();
       const customNote = ((fd.get('customNote') as string) || '').trim();
       const refNumber = ((fd.get('refNumber') as string) || '').trim();
+      const saveDraft = fd.get('saveDraft') === '1';
 
       if (!candidateName || !candidateEmail || !roleTitle || !signatoryName) {
         errorMsg = 'Required: candidate name, email, role, and signatory.';
@@ -143,7 +144,17 @@ if (Astro.request.method === 'POST') {
         };
 
         if (existingOffer) {
-          await db.update(offerLetters).set({
+          const wasDraft = existingOffer.status === 'draft';
+          const sendingNow = !saveDraft;
+          // Draft -> Send transition: create the account now if it wasn't yet.
+          let acct: any = null;
+          let tempPw = '';
+          if (wasDraft && sendingNow && !existingOffer.createdUserId) {
+            tempPw = genPassword();
+            acct = await createUserAccount(candidateEmail, candidateName, tempPw, templateType);
+          }
+          const newStatus = sendingNow ? 'sent' : 'draft';
+          const setVals: any = {
             templateType, content: contentBlob,
             candidateName, candidateEmail, roleTitle, department,
             refNumber, integrityHash,
@@ -151,22 +162,46 @@ if (Astro.request.method === 'POST') {
             joiningDate: joiningDate || null,
             expiryDate: expiryDate || null,
             responseDeadline: responseDeadline || null,
+            status: newStatus,
             updatedAt: new Date()
-          }).where(eq(offerLetters.id, existingOffer.id));
-          successMsg = 'Offer updated. Token: ' + existingOffer.token;
+          };
+          if (acct?.userId) setVals.createdUserId = acct.userId;
+          await db.update(offerLetters).set(setVals).where(eq(offerLetters.id, existingOffer.id));
+          if (wasDraft && sendingNow) {
+            if (app.status !== 'hired' && app.status !== 'offer') {
+              await db.update(applications).set({ status: 'offer', updatedAt: new Date() }).where(eq(applications.id, id));
+              app.status = 'offer';
+            }
+            try {
+              const { pushNotify } = await import('@/lib/push');
+              if ((pushNotify as any).offerSent) await (pushNotify as any).offerSent(candidateName, roleTitle, id);
+            } catch (_) {}
+            successMsg = acct?.isNew
+              ? 'Offer sent. TEMPORARY PASSWORD (copy now, shown once): ' + tempPw + ' — email ' + candidateEmail + (acct.handle ? ' OR handle ' + acct.handle : '') + '. Token: ' + existingOffer.token + '.'
+              : 'Offer sent. Token: ' + existingOffer.token + '.';
+          } else {
+            successMsg = saveDraft ? 'Draft saved (not sent). Token: ' + existingOffer.token : 'Offer updated. Token: ' + existingOffer.token;
+          }
         } else {
           const token = genToken();
-          const plaintextPw = genPassword();
-          const accountResult = await createUserAccount(candidateEmail, candidateName, plaintextPw, templateType);
-          const createdUserId = accountResult?.userId || null;
-          const internalHandle = accountResult?.handle || null;
-          const accountIsNew = accountResult?.isNew || false;
+          let createdUserId: string | null = null;
+          let internalHandle: string | null = null;
+          let accountIsNew = false;
+          let plaintextPw = '';
+          // Only provision an account + advance + notify when actually sending.
+          if (!saveDraft) {
+            plaintextPw = genPassword();
+            const accountResult = await createUserAccount(candidateEmail, candidateName, plaintextPw, templateType);
+            createdUserId = accountResult?.userId || null;
+            internalHandle = accountResult?.handle || null;
+            accountIsNew = accountResult?.isNew || false;
+          }
 
           await db.insert(offerLetters).values({
             token,
             applicationId: id,
             generatedByUserId: user.id,
-            status: 'sent',
+            status: saveDraft ? 'draft' : 'sent',
             templateType,
             content: contentBlob,
             candidateName,
@@ -182,19 +217,20 @@ if (Astro.request.method === 'POST') {
             // plaintextPassword intentionally omitted - do not store plaintext passwords
             createdUserId: createdUserId
           });
-          // Sending the formal letter implies the offer is extended - advance
-          // the application stage so status reflects it everywhere.
-          if (app.status !== 'hired' && app.status !== 'offer') {
-            await db.update(applications).set({ status: 'offer', updatedAt: new Date() }).where(eq(applications.id, id));
-            app.status = 'offer';
-          }
-          if (accountIsNew) {
-            // A brand-new account can't reach the (login-gated) offer page to set
-            // a password, so surface the one-time temp password to the admin now
-            // to relay to the new employee. Not stored anywhere (no plaintext in DB).
-            successMsg = 'Offer letter sent. Login at edurankai.in/admin/login with email ' + candidateEmail + (internalHandle ? ' OR handle ' + internalHandle : '') + '. TEMPORARY PASSWORD (shown once, copy now and send to the candidate): ' + plaintextPw + ' — they should change it after first sign-in. Offer token: ' + token + '.';
+          if (saveDraft) {
+            successMsg = 'Draft saved (not sent). Review it, then click "Generate & send" to issue. Token: ' + token + '.';
           } else {
-            successMsg = 'Offer letter sent. Token: ' + token + '. Existing account — the candidate keeps their current password (handle ' + (internalHandle || candidateEmail) + ').';
+            // Sending the formal letter implies the offer is extended - advance
+            // the application stage so status reflects it everywhere.
+            if (app.status !== 'hired' && app.status !== 'offer') {
+              await db.update(applications).set({ status: 'offer', updatedAt: new Date() }).where(eq(applications.id, id));
+              app.status = 'offer';
+            }
+            if (accountIsNew) {
+              successMsg = 'Offer letter sent. Login at edurankai.in/admin/login with email ' + candidateEmail + (internalHandle ? ' OR handle ' + internalHandle : '') + '. TEMPORARY PASSWORD (shown once, copy now and send to the candidate): ' + plaintextPw + ' — they should change it after first sign-in. Offer token: ' + token + '.';
+            } else {
+              successMsg = 'Offer letter sent. Token: ' + token + '. Existing account — the candidate keeps their current password (handle ' + (internalHandle || candidateEmail) + ').';
+            }
           }
         }
       }
@@ -394,8 +430,13 @@ const letterStatusLabel = !currentOffer ? 'Not sent'
 
       <div class="flex gap-3 flex-wrap">
         <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">
-          {currentOffer ? 'Update offer letter' : 'Generate & send offer letter'}
+          {!currentOffer ? 'Generate & send offer letter' : (currentOffer.status === 'draft' ? 'Generate & send offer letter' : 'Update offer letter')}
         </button>
+        {(!currentOffer || currentOffer.status === 'draft') && (
+          <button type="submit" name="saveDraft" value="1" class="bg-white/5 hover:bg-white/10 text-ink border border-ink/20 font-semibold py-3 px-6 rounded-lg text-[0.95rem]">
+            Save as draft
+          </button>
+        )}
         <a href={'/admin/offer/blank?from=' + id} class="bg-ink hover:bg-ink/80 text-white border border-white/20 font-semibold py-3 px-6 rounded-lg text-[0.95rem] no-underline inline-flex items-center">Preview / Download PDF &rarr;</a>
       </div>
     </div>
