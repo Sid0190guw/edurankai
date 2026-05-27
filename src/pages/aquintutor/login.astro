@@ -238,6 +238,53 @@ if (Astro.request.method === 'POST') {
         var stored = JSON.parse(storedDescriptor);
         return new Float32Array(Array.isArray(stored) ? stored : Object.values(stored));
       }
+      // ── Liveness: eye-aspect-ratio blink detection (defeats a static photo) ──
+      function eyeAspect(eye) {
+        function d(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+        return (d(eye[1], eye[5]) + d(eye[2], eye[4])) / (2 * d(eye[0], eye[3]));
+      }
+      // Resolves true once a genuine blink (eyes close then re-open) is seen on a
+      // single face within the window. A photo can't blink, so it never passes.
+      async function requireBlink(timeoutMs) {
+        var start = Date.now();
+        var closed = false;
+        while (Date.now() - start < timeoutMs) {
+          if (verified) return false;
+          try {
+            var all = await faceapi.detectAllFaces(video, fvOptions).withFaceLandmarks();
+            if (all && all.length > 1) return { multi: true };
+            if (all && all.length === 1) {
+              var lm = all[0].landmarks;
+              var e = (eyeAspect(lm.getLeftEye()) + eyeAspect(lm.getRightEye())) / 2;
+              if (e < 0.19) closed = true;
+              else if (e > 0.27 && closed) return true;
+            }
+          } catch (_) {}
+          await new Promise(function(res){ setTimeout(res, 90); });
+        }
+        return false;
+      }
+      // One verification attempt = liveness blink, then strict identity match.
+      async function runVerification(isAuto) {
+        setStatus(isAuto ? 'Blink to confirm you are live' : 'Blink now…', '#fbbf24');
+        var live = await requireBlink(isAuto ? 4500 : 9000);
+        if (live && live.multi) {
+          setStatus('Only your face should be visible.', '#ef4444');
+          if (!isAuto) { verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
+          else { setTimeout(autoVerifyLoop, 500); }
+          return;
+        }
+        if (!live) {
+          if (isAuto) { setStatus('Center face in the oval', '#7dd3a8'); setTimeout(autoVerifyLoop, 400); }
+          else { setStatus('No blink detected - look at the camera and blink.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
+          return;
+        }
+        setStatus('Verifying identity… hold still', '#fbbf24');
+        var v = await verifyStrict();
+        if (v.ok) { onVerified(); return; }
+        if (isAuto) { setStatus('Center face in the oval', '#7dd3a8'); setTimeout(autoVerifyLoop, 500); }
+        else { setStatus(v.msg || 'Face not recognised. Try again.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
+      }
       // One strict reading: requires exactly one clear, close, confident face,
       // and returns its distance to the enrolled signature (or null on reject).
       async function measureOnce() {
@@ -275,25 +322,15 @@ if (Astro.request.method === 'POST') {
         return { ok: (median < MATCH_THRESHOLD && passing >= Math.ceil(dists.length * 0.6)) };
       }
       async function autoVerifyLoop() {
-        if (verified || attempts > 8) { if (attempts > 8) setStatus('Auto-verify timed out. Click verify.', '#fbbf24'); return; }
+        if (verified || attempts > 6) { if (attempts > 6) setStatus('Tap "Verify face" and blink when prompted.', '#fbbf24'); return; }
         attempts++;
-        try {
-          setStatus('Checking… hold still', '#fbbf24');
-          var v = await verifyStrict();
-          if (v.ok) { onVerified(); return; }
-        } catch(_) {}
-        setStatus('Center face in the oval', '#7dd3a8');
-        setTimeout(autoVerifyLoop, 500);
+        try { await runVerification(true); } catch(_) { setTimeout(autoVerifyLoop, 600); }
       }
       async function doVerify() {
         verifyBtn.disabled = true;
         verifyBtn.textContent = 'Verifying...';
-        setStatus('Hold still…', '#fbbf24');
-        try {
-          var v = await verifyStrict();
-          if (v.ok) { onVerified(); }
-          else { setStatus(v.msg || 'Face not recognised. Try again.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
-        } catch (e) { setStatus('Error: ' + e.message, '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
+        try { await runVerification(false); }
+        catch (e) { setStatus('Error: ' + e.message, '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
       }
       function onVerified() {
         verified = true;
