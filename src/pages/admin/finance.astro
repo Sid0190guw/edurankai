@@ -1,0 +1,129 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { isConfigured } from '@/lib/razorpay';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!['super_admin', 'hr'].includes(user.role)) return Astro.redirect('/admin');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const url = new URL(Astro.request.url);
+const fPurpose = url.searchParams.get('purpose') || '';
+const fStatus = url.searchParams.get('status') || '';
+
+// KPIs (paid only, INR settlement amounts)
+let kpi = { collectedPaise: 0, paidCount: 0, attempts: 0, failed: 0 };
+let byPurpose: any[] = [];
+let recent: any[] = [];
+let hasTable = true;
+try {
+  const k = rows(await db.execute(sql`
+    SELECT
+      COALESCE(SUM(amount_paise) FILTER (WHERE status='paid'),0)::bigint AS collected,
+      COUNT(*) FILTER (WHERE status='paid')::int AS paid,
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE status IN ('signature_mismatch','failed'))::int AS failed
+    FROM payments`))[0] as any;
+  kpi = { collectedPaise: Number(k?.collected || 0), paidCount: k?.paid || 0, attempts: k?.total || 0, failed: k?.failed || 0 };
+  byPurpose = rows(await db.execute(sql`
+    SELECT purpose, COUNT(*) FILTER (WHERE status='paid')::int AS paid_count,
+           COALESCE(SUM(amount_paise) FILTER (WHERE status='paid'),0)::bigint AS paid_paise,
+           COUNT(*)::int AS total
+    FROM payments GROUP BY purpose ORDER BY paid_paise DESC`));
+  recent = rows(await db.execute(sql`
+    SELECT order_id, amount_paise, currency, status, purpose, email, razorpay_payment_id, created_at
+    FROM payments
+    WHERE (${fPurpose} = '' OR purpose = ${fPurpose}) AND (${fStatus} = '' OR status = ${fStatus})
+    ORDER BY created_at DESC LIMIT 100`));
+} catch (e) { hasTable = false; }
+
+const inr = (paise: number) => '₹' + (Number(paise) / 100).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+const fmt = (d: any) => d ? new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) : '-';
+const STATUS_COLOR: Record<string, string> = { paid: '#6ee7b7', created: '#8a8a94', attempted: '#fbbf24', failed: '#fca5a5', signature_mismatch: '#fca5a5' };
+const PURPOSES = ['', 'application_fee', 'registration_fee', 'event_level', 'test_enrollment', 'event', 'course_premium', 'donation', 'other'];
+const STATUSES = ['', 'paid', 'created', 'attempted', 'failed', 'signature_mismatch'];
+const paymentsReady = isConfigured();
+---
+<AdminLayout title="Finance" activeNav="finance">
+  <div class="admin-page" style="max-width:1280px;">
+    <div class="admin-page-header" style="margin-bottom:18px;">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">Finance</div>
+        <h1 class="admin-page-title">Payments &amp; revenue</h1>
+        <p class="admin-page-sub">All Razorpay transactions across application, registration, event, and test fees.</p>
+      </div>
+    </div>
+
+    {!paymentsReady && (
+      <div style="background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);color:#fbbf24;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.6;">
+        Razorpay is <strong>not configured</strong> (no API keys in this environment). New payments cannot be taken until <code>RAZORPAY_KEY_ID</code> and <code>RAZORPAY_KEY_SECRET</code> are added in Vercel. Existing records still show below.
+      </div>
+    )}
+    {!hasTable && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px;">No payments table / no data yet.</div>}
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px;">
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+        <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Collected (paid)</p>
+        <p style="font-size:24px;font-weight:800;color:#6ee7b7;margin:0;">{inr(kpi.collectedPaise)}</p>
+      </div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+        <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Paid transactions</p>
+        <p style="font-size:24px;font-weight:800;color:#fff;margin:0;">{kpi.paidCount}</p>
+      </div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+        <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Total records</p>
+        <p style="font-size:24px;font-weight:800;color:#fff;margin:0;">{kpi.attempts}</p>
+      </div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+        <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Failed / mismatch</p>
+        <p style="font-size:24px;font-weight:800;color:#fca5a5;margin:0;">{kpi.failed}</p>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:start;">
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
+        <p style="font-size:12px;font-weight:700;color:#fff;margin:0 0 10px;">Revenue by purpose</p>
+        {byPurpose.map((p: any) => (
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #1a1a1f;">
+            <span style="font-size:12px;color:#c8c3b8;">{p.purpose || 'unknown'} <span style="color:#6e6e78;">({p.paid_count}/{p.total})</span></span>
+            <span style="font-size:12.5px;font-weight:700;color:#6ee7b7;font-family:monospace;">{inr(p.paid_paise)}</span>
+          </div>
+        ))}
+        {byPurpose.length === 0 && <p style="font-size:12px;color:#6e6e78;">No data.</p>}
+      </div>
+
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;overflow-x:auto;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+          <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;">
+            <select name="purpose" onchange="this.form.submit()" style="background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:6px 10px;border-radius:6px;font-size:12px;">
+              {PURPOSES.map((p) => <option value={p} selected={fPurpose === p}>{p || 'all purposes'}</option>)}
+            </select>
+            <select name="status" onchange="this.form.submit()" style="background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:6px 10px;border-radius:6px;font-size:12px;">
+              {STATUSES.map((s) => <option value={s} selected={fStatus === s}>{s || 'all statuses'}</option>)}
+            </select>
+          </form>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead><tr style="text-align:left;color:#6e6e78;border-bottom:1px solid #1a1a1f;">
+            <th style="padding:6px 8px;">When</th><th style="padding:6px 8px;">Purpose</th><th style="padding:6px 8px;">Amount</th><th style="padding:6px 8px;">Status</th><th style="padding:6px 8px;">Email</th>
+          </tr></thead>
+          <tbody>
+            {recent.map((p: any) => (
+              <tr style="border-bottom:1px solid #151519;color:#c8c3b8;">
+                <td style="padding:6px 8px;white-space:nowrap;">{fmt(p.created_at)}</td>
+                <td style="padding:6px 8px;">{p.purpose}</td>
+                <td style="padding:6px 8px;font-family:monospace;">{inr(p.amount_paise)}</td>
+                <td style="padding:6px 8px;"><span style={'font-family:monospace;font-size:11px;color:' + (STATUS_COLOR[p.status] || '#8a8a94')}>{p.status}</span></td>
+                <td style="padding:6px 8px;color:#8a8a94;">{p.email}</td>
+              </tr>
+            ))}
+            {recent.length === 0 && <tr><td colspan="5" style="padding:16px 8px;color:#6e6e78;">No transactions match.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</AdminLayout>
