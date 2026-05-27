@@ -176,6 +176,12 @@ export const applications = pgTable('applications', {
   compensation: varchar('compensation', { length: 200 }),
   source: varchar('source', { length: 100 }),
 
+  // Processing / verification fee (charged after submission; tiered by level)
+  feePaid: boolean('fee_paid').notNull().default(false),
+  feeChf: integer('fee_chf'),
+  feePaymentId: varchar('fee_payment_id', { length: 80 }),
+  feePaidAt: timestamp('fee_paid_at', { withTimezone: true }),
+
   // System
   status: applicationStatusEnum('status').notNull().default('submitted'),
   score: integer('score'),

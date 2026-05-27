@@ -37,12 +37,13 @@ if (test.is_premium === true && (test.price_inr_paise || 0) >= 100) {
   }
 }
 
+let allQuestions: any[] = [];
 try {
   const r = await db.execute(sql`SELECT id, question_type, question_text, options, code_starter, code_language, marks, difficulty FROM test_questions WHERE test_id = ${test.id} ORDER BY sort_order, created_at`);
-  questions = Array.isArray(r) ? r : (r?.rows || []);
+  allQuestions = Array.isArray(r) ? r : (r?.rows || []);
 } catch(e) {}
 
-if (questions.length === 0) return Astro.redirect('/aquintutor/test/' + slug);
+if (allQuestions.length === 0) return Astro.redirect('/aquintutor/test/' + slug);
 
 // Find or create attempt
 if (resume && user) {
@@ -71,6 +72,39 @@ if (!attempt) {
     return Astro.redirect('/aquintutor/test/' + slug);
   }
 }
+
+// ---- Question pool: serve a shuffled subset of N from the bank ------------
+// The exact subset + order is persisted per attempt so resume + grading stay
+// consistent. If questions_to_show is unset (or >= bank size), serve all.
+function shuffle<T>(arr: T[]): T[] {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+let servedIds: string[] | null = null;
+const rawServed = attempt?.served_question_ids;
+if (Array.isArray(rawServed) && rawServed.length > 0) {
+  servedIds = rawServed.map((x: any) => String(x));
+} else {
+  const toShow = parseInt(test.questions_to_show || 0) || 0;
+  const wantSubset = toShow > 0 && toShow < allQuestions.length;
+  let chosen = allQuestions;
+  if (wantSubset) chosen = shuffle(allQuestions).slice(0, toShow);
+  if (test.randomize_questions) chosen = shuffle(chosen);
+  // Persist when we deviate from the natural full order (subset or randomised).
+  if (wantSubset || test.randomize_questions) {
+    servedIds = chosen.map((q: any) => String(q.id));
+    try { await db.execute(sql`UPDATE test_attempts SET served_question_ids = ${JSON.stringify(servedIds)} WHERE id = ${attempt.id}`); } catch (_) {}
+  }
+}
+if (servedIds) {
+  const byId: Record<string, any> = {};
+  for (const q of allQuestions) byId[String(q.id)] = q;
+  questions = servedIds.map((qid) => byId[qid]).filter(Boolean);
+} else {
+  questions = allQuestions;
+}
+if (questions.length === 0) questions = allQuestions;
 
 const existingAnswers = attempt?.answers || {};
 const startedAt = attempt?.started_at ? new Date(attempt.started_at) : new Date();
@@ -1361,6 +1395,13 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
         if (type === 'face_lost')         setSig('sigGaze', 'lost', 'warn');
         else if (type === 'multiple_faces') setSig('sigGaze', 'multi', 'bad');
         else if (type === 'looking_away')   setSig('sigGaze', 'away', 'warn');
+        else if (type === 'looking_down')   setSig('sigGaze', 'looking down', 'warn');
+        else if (type === 'looking_up')     setSig('sigGaze', 'looking up', 'warn');
+        else if (type === 'head_tilt')      setSig('sigGaze', 'head tilt', 'warn');
+        else if (type === 'bad_posture')    setSig('sigGaze', 'posture', 'warn');
+        else if (type === 'face_partial')   setSig('sigGaze', 'off-frame', 'warn');
+        else if (type === 'face_too_small') setSig('sigGaze', 'too far', 'warn');
+        else if (type === 'gaze_restored')  setSig('sigGaze', 'steady', '');
         else if (type === 'face_visible')   setSig('sigGaze', 'steady', '');
         else if (type === 'voice_detected') setSig('sigAudio', 'talking', 'warn');
         else if (type === 'voice_silenced') setSig('sigAudio', 'quiet', '');
@@ -1581,46 +1622,85 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
           await loadFaceApi();
           var MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
           await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-          await faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL);
+          // Full 68-point landmark net (not the tiny variant) for accurate pitch/yaw.
+          await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
         } catch (e) {
           logEvent('media_lost', 'warn', { reason: 'face_model_load_failed' });
           return;
         }
         var lastFaceCount = 1;
-        var awaySince = 0;
+        // Per-condition "bad since" timers; a condition must persist before we flag.
+        var t = { yaw: 0, pitch: 0, posture: 0, partial: 0, small: 0 };
+        // Current sticky gaze state so we only re-log on change + can restore.
+        var gazeState = 'steady';
+        var lastWarnAt = 0;
+        function gazeWarn(msg) { var now = Date.now(); if (now - lastWarnAt > 3500) { showToast(msg, 'warn'); lastWarnAt = now; } }
+        function setGaze(state, evType, detail) {
+          if (state === gazeState) return;
+          gazeState = state;
+          if (state === 'steady') { logEvent('gaze_restored', 'info', {}); }
+          else { logEvent(evType, 'warn', detail || {}); }
+        }
+        // A condition is "active" once it has persisted for `ms`.
+        function persisted(key, cond, ms) {
+          if (cond) { if (!t[key]) t[key] = Date.now(); return Date.now() - t[key] > ms; }
+          t[key] = 0; return false;
+        }
+        var vidW = videoEl.videoWidth || 320, vidH = videoEl.videoHeight || 240;
         setInterval(async function() {
           if (submitted || videoEl.readyState < 2) return;
           try {
-            var dets = await faceapi.detectAllFaces(videoEl, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 })).withFaceLandmarks(true);
+            vidW = videoEl.videoWidth || vidW; vidH = videoEl.videoHeight || vidH;
+            var dets = await faceapi.detectAllFaces(videoEl, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 })).withFaceLandmarks();
             var n = dets.length;
-            if (n === 0 && lastFaceCount > 0) { logEvent('face_lost', 'warn', {}); showToast('Face not visible to camera', 'warn'); }
+            if (n === 0 && lastFaceCount > 0) { logEvent('face_lost', 'warn', {}); showToast('Face not visible to camera', 'warn'); setGaze('lost', 'face_lost'); }
             else if (n > 0 && lastFaceCount === 0) { logEvent('face_visible', 'info', { count: n }); }
             if (n > 1 && lastFaceCount <= 1) { logEvent('multiple_faces', 'flag', { count: n }); showToast('Multiple faces detected', 'warn'); }
             lastFaceCount = n;
+            if (n !== 1) return;
 
-            // Looking-away heuristic via nose-tip vs eye midline
-            if (n === 1 && dets[0].landmarks) {
-              var lm = dets[0].landmarks;
-              var leftEye = lm.getLeftEye(); var rightEye = lm.getRightEye(); var nose = lm.getNose();
-              if (leftEye && rightEye && nose && nose.length > 3) {
-                var eyeMidX = (leftEye[0].x + rightEye[3].x) / 2;
-                var noseX = nose[3].x;
-                var faceWidth = Math.abs(rightEye[3].x - leftEye[0].x) || 1;
-                var offset = (noseX - eyeMidX) / faceWidth;
-                if (Math.abs(offset) > 0.25) {
-                  if (!awaySince) awaySince = Date.now();
-                  else if (Date.now() - awaySince > 2000) {
-                    logEvent('looking_away', 'warn', { offset: offset.toFixed(2) });
-                    showToast('Look at the screen', 'warn');
-                    awaySince = Date.now() + 4000; // throttle next warning
-                  }
-                } else {
-                  awaySince = 0;
-                }
-              }
-            }
+            var det = dets[0];
+            var lm = det.landmarks;
+            if (!lm) return;
+            var box = det.detection.box;
+
+            // Face-too-small / too-far (face width < 22% of frame) or partially out of frame.
+            var faceFrac = box.width / vidW;
+            var outOfFrame = (box.x < -4) || (box.y < -4) || (box.x + box.width > vidW + 4) || (box.y + box.height > vidH + 4);
+            if (persisted('small', faceFrac < 0.22, 2500)) { setGaze('far', 'face_too_small', { frac: faceFrac.toFixed(2) }); gazeWarn('Move closer to the camera'); t.small = Date.now(); return; }
+            if (persisted('partial', outOfFrame, 1800)) { setGaze('partial', 'face_partial', {}); gazeWarn('Keep your full face in frame'); t.partial = Date.now(); return; }
+
+            var leftEye = lm.getLeftEye(), rightEye = lm.getRightEye(), nose = lm.getNose(), jaw = lm.getJawOutline(), mouth = lm.getMouth();
+            function cy(pts) { var s = 0; for (var i = 0; i < pts.length; i++) s += pts[i].y; return s / pts.length; }
+            function cx(pts) { var s = 0; for (var i = 0; i < pts.length; i++) s += pts[i].x; return s / pts.length; }
+            var leftC = { x: cx(leftEye), y: cy(leftEye) }, rightC = { x: cx(rightEye), y: cy(rightEye) };
+            var eyeMidX = (leftC.x + rightC.x) / 2, eyeMidY = (leftC.y + rightC.y) / 2;
+            var noseTip = nose[Math.min(6, nose.length - 1)]; // tip ~ landmark 30
+            var chin = jaw[Math.floor(jaw.length / 2)];        // ~ landmark 8
+            var faceW = Math.abs(rightC.x - leftC.x) || 1;
+            var faceH = Math.abs(chin.y - eyeMidY) || 1;
+
+            // YAW (left/right): nose tip horizontal offset from eye midline.
+            var yaw = (noseTip.x - eyeMidX) / faceW;
+            // PITCH (up/down): vertical span eyes->nose vs nose->chin. Looking down
+            // compresses the upper span; looking up expands it.
+            var upper = (noseTip.y - eyeMidY);
+            var lower = (chin.y - noseTip.y) || 1;
+            var pitchRatio = upper / lower; // ~0.6-0.9 neutral; <0.45 head down; >1.2 head up
+            // Head roll/tilt: eye line angle.
+            var roll = Math.atan2(rightC.y - leftC.y, rightC.x - leftC.x) * 180 / Math.PI;
+
+            var downBad = persisted('pitch', pitchRatio < 0.45, 1500);
+            var yawBad = persisted('yaw', Math.abs(yaw) > 0.20, 1800);
+            var tiltBad = persisted('posture', Math.abs(roll) > 16, 2500);
+
+            if (downBad) { setGaze('down', 'looking_down', { pitch: pitchRatio.toFixed(2) }); gazeWarn('Eyes on the screen, not down'); }
+            else if (yawBad) { setGaze('away', 'looking_away', { yaw: yaw.toFixed(2) }); gazeWarn('Look at the screen'); }
+            else if (tiltBad) { setGaze('tilt', 'head_tilt', { roll: Math.round(roll) }); gazeWarn('Sit upright, keep head level'); }
+            else if (pitchRatio > 1.25 && persisted('pitch', true, 1800)) { setGaze('up', 'looking_up', { pitch: pitchRatio.toFixed(2) }); }
+            else if (!downBad && !yawBad && !tiltBad) { setGaze('steady', ''); }
           } catch(_) {}
-        }, 1500);
+        }, 1200);
       }
 
       function startMicMonitor(stream) {
@@ -1724,6 +1804,83 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
         return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
       });
     }
+
+    // ---- Scientific calculator (in-panel, candidate tool) ----------------
+    (function () {
+      var toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.id = 'calcToggle';
+      toggle.textContent = 'Calculator';
+      toggle.style.cssText = 'position:fixed;bottom:80px;left:14px;z-index:56;background:rgba(0,0,0,0.85);border:1px solid rgba(255,255,255,0.2);color:#fff;font-family:var(--font-mono),monospace;font-size:11px;font-weight:600;padding:7px 12px;border-radius:10px;cursor:pointer;';
+      document.body.appendChild(toggle);
+
+      var panel = document.createElement('div');
+      panel.id = 'calcPanel';
+      panel.style.cssText = 'position:fixed;bottom:120px;left:14px;z-index:57;width:236px;background:#14181d;border:1px solid #2a3038;border-radius:12px;padding:10px;display:none;box-shadow:0 10px 30px rgba(0,0,0,0.5);';
+      var disp = '';
+      var keys = [
+        ['sin(','cos(','tan(','^'],
+        ['ln(','log(','√(','%'],
+        ['(',')','π','e'],
+        ['7','8','9','/'],
+        ['4','5','6','*'],
+        ['1','2','3','-'],
+        ['0','.','C','+'],
+        ['⌫','=']
+      ];
+      var dispEl = document.createElement('input');
+      dispEl.type = 'text'; dispEl.readOnly = true;
+      dispEl.style.cssText = 'width:100%;background:#0b0d10;border:1px solid #2a3038;border-radius:8px;color:#f4f1ea;font-family:var(--font-mono),monospace;font-size:15px;padding:8px 10px;margin-bottom:8px;text-align:right;';
+      panel.appendChild(dispEl);
+      var grid = document.createElement('div');
+      grid.style.cssText = 'display:flex;flex-direction:column;gap:5px;';
+      panel.appendChild(grid);
+
+      function render() { dispEl.value = disp || '0'; }
+      function evalExpr() {
+        try {
+          var js = disp
+            .replace(/√\(/g, 'Math.sqrt(')
+            .replace(/sin\(/g, 'Math.sin(')
+            .replace(/cos\(/g, 'Math.cos(')
+            .replace(/tan\(/g, 'Math.tan(')
+            .replace(/ln\(/g, 'Math.log(')
+            .replace(/log\(/g, 'Math.log10(')
+            .replace(/π/g, '(Math.PI)')
+            .replace(/(?<![a-zA-Z.])e(?![a-zA-Z(])/g, '(Math.E)')
+            .replace(/\^/g, '**');
+          var stripped = js.replace(/Math\.(sqrt|sin|cos|tan|log10|log|PI|E)/g, '');
+          if (!/^[0-9.+\-*/()%\s]*$/.test(stripped)) { dispEl.value = 'Error'; return; }
+          var val = Function('"use strict"; return (' + js + ')')();
+          if (val === undefined || val === null || (typeof val === 'number' && !isFinite(val))) { dispEl.value = 'Error'; return; }
+          disp = String(Math.round(val * 1e10) / 1e10);
+          render();
+        } catch (e) { dispEl.value = 'Error'; }
+      }
+      keys.forEach(function (row) {
+        var r = document.createElement('div');
+        r.style.cssText = 'display:flex;gap:5px;';
+        row.forEach(function (k) {
+          var b = document.createElement('button');
+          b.type = 'button'; b.textContent = k;
+          var wide = (k === '=') ? 'flex:3;' : 'flex:1;';
+          var accent = (k === '=') ? 'background:#d97757;color:#0b0d10;' : (/^[0-9.]$/.test(k) ? 'background:#1c2128;' : 'background:#222831;');
+          b.style.cssText = wide + accent + 'color:#f4f1ea;border:1px solid #2a3038;border-radius:7px;padding:9px 0;font-family:var(--font-mono),monospace;font-size:13px;cursor:pointer;';
+          b.addEventListener('click', function () {
+            if (k === 'C') { disp = ''; render(); return; }
+            if (k === '⌫') { disp = disp.slice(0, -1); render(); return; }
+            if (k === '=') { evalExpr(); return; }
+            if (dispEl.value === 'Error') disp = '';
+            disp += k; render();
+          });
+          r.appendChild(b);
+        });
+        grid.appendChild(r);
+      });
+      render();
+      document.body.appendChild(panel);
+      toggle.addEventListener('click', function () { panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; });
+    })();
 
     // Start
     startCountdown();

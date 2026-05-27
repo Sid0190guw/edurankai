@@ -40,6 +40,7 @@ const ALLOWED_TYPES = new Set([
   // Camera + mic real-time analysis (no bytes stored, only text events)
   'media_consent_granted', 'media_consent_denied', 'media_lost',
   'face_lost', 'face_visible', 'multiple_faces', 'looking_away',
+  'looking_down', 'looking_up', 'head_tilt', 'bad_posture', 'face_partial', 'face_too_small', 'gaze_restored',
   'voice_detected', 'voice_silenced',
 ]);
 

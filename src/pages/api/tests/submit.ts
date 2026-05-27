@@ -30,9 +30,16 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
       });
     }
 
-    // Get all questions for this test
+    // Get questions for this test. If the attempt was served a subset
+    // (question pool), grade ONLY the served questions so max score matches.
     const qR = await db.execute(sql`SELECT * FROM test_questions WHERE test_id = ${attempt.test_id} ORDER BY sort_order`);
-    const questions = Array.isArray(qR) ? qR : (qR?.rows || []);
+    let questions = Array.isArray(qR) ? qR : (qR?.rows || []);
+    let served: any = attempt.served_question_ids;
+    if (typeof served === 'string') { try { served = JSON.parse(served); } catch { served = null; } }
+    if (Array.isArray(served) && served.length > 0) {
+      const set = new Set(served.map((x: any) => String(x)));
+      questions = (questions as any[]).filter((q: any) => set.has(String(q.id)));
+    }
 
     // Auto-grade MCQs
     let totalScore = 0;
@@ -95,6 +102,32 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         await db.execute(sql`UPDATE test_attempts SET percentile = ${percentile.toFixed(2)} WHERE id = ${attemptId}`);
       }
     } catch(e) {}
+
+    // Event-series hook: if this test gates one or more event levels and the
+    // candidate is registered, record per-level pass/fail and auto-issue.
+    try {
+      if (attempt.candidate_id) {
+        const lvR = await db.execute(sql`SELECT id, event_id, pass_mark, auto_issue_artifact FROM event_levels WHERE test_id = ${attempt.test_id} AND is_active = true`);
+        const lvRows = Array.isArray(lvR) ? lvR : (lvR?.rows || []);
+        for (const lv of lvRows as any[]) {
+          const regR = await db.execute(sql`SELECT id FROM event_registrations WHERE event_id = ${lv.event_id} AND user_id = ${attempt.candidate_id} LIMIT 1`);
+          const regRows = Array.isArray(regR) ? regR : (regR?.rows || []);
+          const reg: any = regRows[0];
+          if (!reg) continue;
+          const passed = lv.pass_mark != null ? percentage >= Number(lv.pass_mark) : true;
+          const newStatus = passed ? 'passed' : 'failed';
+          await db.execute(sql`
+            INSERT INTO event_level_progress (registration_id, level_id, event_id, status, score, test_attempt_id)
+            VALUES (${reg.id}, ${lv.id}, ${lv.event_id}, ${newStatus}, ${percentage.toFixed(2)}, ${attemptId})
+            ON CONFLICT (registration_id, level_id) DO UPDATE SET status = ${newStatus}, score = ${percentage.toFixed(2)}, test_attempt_id = ${attemptId}, updated_at = NOW()
+          `);
+          if (passed && lv.auto_issue_artifact) {
+            const { issueArtifact } = await import('@/lib/issue-artifact');
+            await issueArtifact({ registrationId: reg.id, eventId: lv.event_id, levelId: lv.id, artifactType: lv.auto_issue_artifact, autoIssued: true });
+          }
+        }
+      }
+    } catch (e2: any) { console.error('[tests] event level auto-issue failed:', e2?.message); }
 
     return new Response(JSON.stringify({
       ok: true,

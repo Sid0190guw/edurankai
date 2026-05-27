@@ -1,0 +1,353 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { issueArtifact } from '@/lib/issue-artifact';
+import { ARTIFACT_TYPES, ARTIFACT_LABELS, ARTIFACT_TITLES, isArtifactType } from '@/lib/event-cert';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/admin/events');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+function toDt(v: string): Date | null { const s = (v || '').trim(); return s ? new Date(s) : null; }
+
+let errorMsg = '';
+let successMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action') as string;
+  try {
+    if (action === 'update_event') {
+      const isSeries = fd.get('isSeries') === 'true';
+      const conclusionAt = toDt(fd.get('conclusionAt') as string);
+      const organiser = (fd.get('organiser') as string || '').trim() || null;
+      const registrationOpen = fd.get('registrationOpen') === 'true';
+      await db.execute(sql`UPDATE events SET is_series = ${isSeries}, conclusion_at = ${conclusionAt}, organiser = ${organiser}, registration_open = ${registrationOpen}, updated_at = NOW() WHERE id = ${id}`);
+      successMsg = 'Event settings saved.';
+    } else if (action === 'add_level' || action === 'update_level') {
+      const name = (fd.get('name') as string || '').trim();
+      if (!name) { errorMsg = 'Level name required'; }
+      else {
+        const description = (fd.get('description') as string || '').trim() || null;
+        const startsAt = toDt(fd.get('startsAt') as string);
+        const endsAt = toDt(fd.get('endsAt') as string);
+        const conclusionAt = toDt(fd.get('conclusionAt') as string);
+        const testSlug = (fd.get('testSlug') as string || '').trim() || null;
+        const passMarkRaw = (fd.get('passMark') as string || '').trim();
+        const passMark = passMarkRaw ? parseInt(passMarkRaw) : null;
+        const feeChf = parseInt((fd.get('feeChf') as string || '0').trim()) || 0;
+        const capacityRaw = (fd.get('capacity') as string || '').trim();
+        const capacity = capacityRaw ? parseInt(capacityRaw) : null;
+        const autoIssue = (fd.get('autoIssue') as string || '').trim();
+        const autoIssueArtifact = isArtifactType(autoIssue) ? autoIssue : null;
+        const outcomeLabel = (fd.get('outcomeLabel') as string || '').trim() || null;
+        const isActive = fd.get('isActive') !== 'false';
+        const sortOrder = parseInt((fd.get('sortOrder') as string || '0').trim()) || 0;
+        // Resolve test slug -> id.
+        let testId: string | null = null;
+        if (testSlug) {
+          const t = rows(await db.execute(sql`SELECT id FROM tests WHERE slug = ${testSlug} LIMIT 1`))[0] as any;
+          testId = t?.id || null;
+        }
+        if (action === 'add_level') {
+          await db.execute(sql`
+            INSERT INTO event_levels (event_id, sort_order, name, description, starts_at, ends_at, conclusion_at, test_id, test_slug, pass_mark, fee_chf, capacity, auto_issue_artifact, outcome_label, is_active)
+            VALUES (${id}, ${sortOrder}, ${name}, ${description}, ${startsAt}, ${endsAt}, ${conclusionAt}, ${testId}, ${testSlug}, ${passMark}, ${feeChf}, ${capacity}, ${autoIssueArtifact}, ${outcomeLabel}, ${isActive})
+          `);
+          successMsg = 'Level added: ' + name;
+        } else {
+          const levelId = (fd.get('levelId') as string || '').trim();
+          await db.execute(sql`
+            UPDATE event_levels SET sort_order = ${sortOrder}, name = ${name}, description = ${description}, starts_at = ${startsAt}, ends_at = ${endsAt}, conclusion_at = ${conclusionAt}, test_id = ${testId}, test_slug = ${testSlug}, pass_mark = ${passMark}, fee_chf = ${feeChf}, capacity = ${capacity}, auto_issue_artifact = ${autoIssueArtifact}, outcome_label = ${outcomeLabel}, is_active = ${isActive}, updated_at = NOW()
+            WHERE id = ${levelId} AND event_id = ${id}
+          `);
+          successMsg = 'Level updated: ' + name;
+        }
+      }
+    } else if (action === 'delete_level') {
+      const levelId = (fd.get('levelId') as string || '').trim();
+      if (levelId) { await db.execute(sql`DELETE FROM event_levels WHERE id = ${levelId} AND event_id = ${id}`); successMsg = 'Level deleted.'; }
+    } else if (action === 'set_progress') {
+      const registrationId = (fd.get('registrationId') as string || '').trim();
+      const levelId = (fd.get('levelId') as string || '').trim();
+      const status = (fd.get('status') as string || 'pending').trim();
+      const outcome = (fd.get('outcome') as string || '').trim() || null;
+      const adminNote = (fd.get('adminNote') as string || '').trim() || null;
+      if (registrationId && levelId) {
+        await db.execute(sql`
+          INSERT INTO event_level_progress (registration_id, level_id, event_id, status, outcome, admin_note)
+          VALUES (${registrationId}, ${levelId}, ${id}, ${status}, ${outcome}, ${adminNote})
+          ON CONFLICT (registration_id, level_id) DO UPDATE SET status = EXCLUDED.status, outcome = EXCLUDED.outcome, admin_note = EXCLUDED.admin_note, updated_at = NOW()
+        `);
+        // If an outcome artifact was chosen, issue it now.
+        if (outcome && isArtifactType(outcome)) {
+          await issueArtifact({ registrationId, eventId: id, levelId, artifactType: outcome, issuedByUserId: user.id, autoIssued: false });
+        }
+        successMsg = 'Progress updated.';
+      }
+    } else if (action === 'issue_artifact') {
+      const registrationId = (fd.get('registrationId') as string || '').trim();
+      const levelId = (fd.get('levelId') as string || '').trim() || null;
+      const artifactType = (fd.get('artifactType') as string || '').trim();
+      const title = (fd.get('title') as string || '').trim();
+      const body = (fd.get('body') as string || '').trim();
+      if (registrationId && isArtifactType(artifactType)) {
+        const r = await issueArtifact({ registrationId, eventId: id, levelId, artifactType, title, body, issuedByUserId: user.id, autoIssued: false });
+        successMsg = r.ok ? (r.existing ? 'Artifact already issued (serial ' + r.serial + ').' : 'Issued: ' + r.serial) : ('Issue failed: ' + r.error);
+        if (!r.ok) errorMsg = 'Issue failed: ' + r.error;
+      } else errorMsg = 'Pick a valid artifact type.';
+    } else if (action === 'revoke_artifact') {
+      const certId = (fd.get('certId') as string || '').trim();
+      if (certId) { await db.execute(sql`UPDATE event_certificates SET revoked = true WHERE id = ${certId} AND event_id = ${id}`); successMsg = 'Artifact revoked.'; }
+    } else if (action === 'delete_registration') {
+      const registrationId = (fd.get('registrationId') as string || '').trim();
+      if (registrationId) { await db.execute(sql`DELETE FROM event_registrations WHERE id = ${registrationId} AND event_id = ${id}`); successMsg = 'Registration removed.'; }
+    }
+  } catch (err: any) {
+    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+  }
+}
+
+const ev: any = rows(await db.execute(sql`SELECT * FROM events WHERE id = ${id} LIMIT 1`))[0];
+if (!ev) return Astro.redirect('/admin/events');
+
+const levels = rows(await db.execute(sql`SELECT * FROM event_levels WHERE event_id = ${id} ORDER BY sort_order ASC, created_at ASC`));
+const regs = rows(await db.execute(sql`SELECT * FROM event_registrations WHERE event_id = ${id} ORDER BY created_at DESC`));
+const progress = rows(await db.execute(sql`SELECT * FROM event_level_progress WHERE event_id = ${id}`));
+const certs = rows(await db.execute(sql`SELECT * FROM event_certificates WHERE event_id = ${id} ORDER BY issued_at DESC`));
+const tests = rows(await db.execute(sql`SELECT slug, title FROM tests ORDER BY created_at DESC LIMIT 200`));
+
+// index progress by reg|level
+const progIdx: Record<string, any> = {};
+for (const p of progress) progIdx[p.registration_id + '|' + p.level_id] = p;
+const certByReg: Record<string, any[]> = {};
+for (const c of certs) { (certByReg[c.registration_id] = certByReg[c.registration_id] || []).push(c); }
+
+function dtLocal(v: any): string { return v ? new Date(v).toISOString().slice(0, 16) : ''; }
+function fmt(v: any): string { return v ? new Date(v).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'TBD'; }
+const STATUS_OPTS = ['pending', 'paid', 'tested', 'passed', 'failed', 'selected', 'completed', 'withdrawn'];
+---
+<AdminLayout title={'Manage Event - ' + ev.title} description="Per-event control: levels, registrations, artifacts.">
+<div style="padding-bottom:90px;">
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;position:sticky;top:0;z-index:10;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+      <div>
+        <p style="font-size:10px;font-family:monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Event control</p>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">{ev.title}</h1>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <a href="/admin/events" class="text-[0.78rem] text-white/60 hover:text-white font-mono px-3 py-1.5 border border-white/10 rounded-lg">All events</a>
+        <a href={'/events/' + ev.slug} target="_blank" class="text-[0.78rem] text-burn hover:text-white font-mono px-3 py-1.5 border border-burn/30 rounded-lg">View public</a>
+      </div>
+    </div>
+  </div>
+
+  <div style="padding:16px;max-width:1100px;margin:0 auto;">
+    {errorMsg && <div class="bg-red-500/10 border border-red-500/30 text-red-300 rounded-lg p-3 mb-4 text-[0.85rem]">{errorMsg}</div>}
+    {successMsg && <div class="bg-leaf-bg/20 border border-leaf-border/50 text-leaf rounded-lg p-3 mb-4 text-[0.85rem]">{successMsg}</div>}
+
+    <!-- Event settings -->
+    <div class="bg-white/5 border border-white/10 rounded-xl p-5 mb-5">
+      <h2 class="font-display text-[1.05rem] font-semibold text-white mb-3">Series settings</h2>
+      <form method="POST" class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <input type="hidden" name="action" value="update_event" />
+        <div class="flex items-center gap-2"><input type="checkbox" name="isSeries" value="true" checked={ev.is_series} class="accent-burn" /><label class="text-[0.85rem] text-white/80">Multi-level series event</label></div>
+        <div class="flex items-center gap-2"><input type="checkbox" name="registrationOpen" value="true" checked={ev.registration_open} class="accent-burn" /><label class="text-[0.85rem] text-white/80">Registration open</label></div>
+        <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/40 mb-1">Organiser (on certificates)</label><input type="text" name="organiser" value={ev.organiser || ''} placeholder="EduRankAI" class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-[0.82rem] outline-none focus:border-burn" /></div>
+        <div><label class="block text-[0.65rem] font-bold uppercase tracking-wider text-white/40 mb-1">Conclusion / results day</label><input type="datetime-local" name="conclusionAt" value={dtLocal(ev.conclusion_at)} class="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-[0.82rem] outline-none focus:border-burn" /></div>
+        <div class="md:col-span-2"><button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-2 px-5 rounded-lg text-[0.82rem] border-0 cursor-pointer">Save settings</button></div>
+      </form>
+      <p class="text-[0.72rem] text-white/40 mt-2">Overall window: {fmt(ev.startsAt || ev.starts_at)} to {fmt(ev.endsAt || ev.ends_at)}. Edit title/description/dates from the <a href="/admin/events" class="text-burn underline">events list</a>.</p>
+    </div>
+
+    <!-- Levels -->
+    <div class="bg-white/5 border border-white/10 rounded-xl p-5 mb-5">
+      <h2 class="font-display text-[1.05rem] font-semibold text-white mb-1">Levels / stages ({levels.length})</h2>
+      <p class="text-[0.75rem] text-white/50 mb-3">Ordered stages (e.g. School, District, National, International). Each can require a test, charge a fee, and auto-issue an artifact.</p>
+
+      <div class="flex flex-col gap-3 mb-5">
+        {levels.map((lv: any, i: number) => (
+          <div class="bg-white/5 border border-white/10 rounded-lg p-3">
+            <div class="flex items-center justify-between gap-2 mb-2">
+              <p class="font-semibold text-white text-[0.92rem]">#{lv.sort_order} - {lv.name} {!lv.is_active && <span class="text-[0.62rem] text-white/40">(inactive)</span>}</p>
+              <div class="flex items-center gap-2">
+                <button type="button" data-lvl-edit={lv.id} class="lvl-edit text-[0.72rem] text-sky-400 hover:text-sky-300 font-mono">edit</button>
+                <form method="POST" class="inline" onsubmit="return confirm('Delete this level and all its progress?');">
+                  <input type="hidden" name="action" value="delete_level" />
+                  <input type="hidden" name="levelId" value={lv.id} />
+                  <button type="submit" class="text-[0.72rem] text-red-400 hover:text-red-300 font-mono">delete</button>
+                </form>
+              </div>
+            </div>
+            <div class="text-[0.74rem] text-white/55 flex flex-wrap gap-x-4 gap-y-1">
+              <span>{fmt(lv.starts_at)}{lv.ends_at ? ' to ' + fmt(lv.ends_at) : ''}</span>
+              {lv.conclusion_at && <span>results {fmt(lv.conclusion_at)}</span>}
+              <span>{lv.test_slug ? 'test: ' + lv.test_slug + (lv.pass_mark ? ' (>=' + lv.pass_mark + '%)' : '') : 'no test'}</span>
+              <span>{lv.fee_chf > 0 ? 'fee ' + lv.fee_chf + ' CHF' : 'free'}</span>
+              {lv.auto_issue_artifact && <span class="text-burn">auto: {ARTIFACT_LABELS[lv.auto_issue_artifact] || lv.auto_issue_artifact}</span>}
+            </div>
+            <div id={'lvledit-' + lv.id} style="display:none;" class="mt-3 pt-3 border-t border-white/10">
+              <form method="POST" class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                <input type="hidden" name="action" value="update_level" />
+                <input type="hidden" name="levelId" value={lv.id} />
+                <div><label class="lvll">Order</label><input type="number" name="sortOrder" value={lv.sort_order} class="lvli" /></div>
+                <div><label class="lvll">Name *</label><input type="text" name="name" required value={lv.name} class="lvli" /></div>
+                <div class="md:col-span-2"><label class="lvll">Description</label><textarea name="description" rows="2" class="lvli">{lv.description || ''}</textarea></div>
+                <div><label class="lvll">Starts</label><input type="datetime-local" name="startsAt" value={dtLocal(lv.starts_at)} class="lvli" /></div>
+                <div><label class="lvll">Ends</label><input type="datetime-local" name="endsAt" value={dtLocal(lv.ends_at)} class="lvli" /></div>
+                <div><label class="lvll">Conclusion / results</label><input type="datetime-local" name="conclusionAt" value={dtLocal(lv.conclusion_at)} class="lvli" /></div>
+                <div><label class="lvll">Test (slug)</label>
+                  <select name="testSlug" class="lvli">
+                    <option value="" class="bg-ink">- none -</option>
+                    {tests.map((t: any) => (<option value={t.slug} selected={lv.test_slug === t.slug} class="bg-ink">{t.title} ({t.slug})</option>))}
+                  </select>
+                </div>
+                <div><label class="lvll">Pass mark %</label><input type="number" name="passMark" value={lv.pass_mark || ''} class="lvli" /></div>
+                <div><label class="lvll">Fee (CHF, 0 = free)</label><input type="number" name="feeChf" value={lv.fee_chf || 0} class="lvli" /></div>
+                <div><label class="lvll">Capacity</label><input type="number" name="capacity" value={lv.capacity || ''} class="lvli" /></div>
+                <div><label class="lvll">Auto-issue on completion</label>
+                  <select name="autoIssue" class="lvli">
+                    <option value="" class="bg-ink">- none -</option>
+                    {ARTIFACT_TYPES.map((a) => (<option value={a} selected={lv.auto_issue_artifact === a} class="bg-ink">{ARTIFACT_TITLES[a]}</option>))}
+                  </select>
+                </div>
+                <div><label class="lvll">Outcome label</label><input type="text" name="outcomeLabel" value={lv.outcome_label || ''} class="lvli" /></div>
+                <div class="flex items-center gap-2"><input type="checkbox" name="isActive" value="true" checked={lv.is_active} class="accent-burn" /><label class="text-[0.8rem] text-white/70">Active</label><input type="hidden" name="isActive" value="false" /></div>
+                <div class="md:col-span-2 flex gap-2"><button type="submit" class="bg-burn text-white font-semibold py-2 px-4 rounded-lg text-[0.8rem] border-0 cursor-pointer">Save level</button><button type="button" data-lvl-cancel={lv.id} class="lvl-cancel bg-white/10 text-white py-2 px-4 rounded-lg text-[0.8rem] border border-white/20 cursor-pointer">Cancel</button></div>
+              </form>
+            </div>
+          </div>
+        ))}
+        {levels.length === 0 && <p class="text-[0.82rem] text-white/40">No levels yet. Add the first one below.</p>}
+      </div>
+
+      <details class="bg-white/5 border border-white/10 rounded-lg p-3">
+        <summary class="cursor-pointer text-[0.85rem] font-semibold text-burn">+ Add level</summary>
+        <form method="POST" class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-3">
+          <input type="hidden" name="action" value="add_level" />
+          <div><label class="lvll">Order</label><input type="number" name="sortOrder" value={levels.length + 1} class="lvli" /></div>
+          <div><label class="lvll">Name *</label><input type="text" name="name" required placeholder="School level" class="lvli" /></div>
+          <div class="md:col-span-2"><label class="lvll">Description</label><textarea name="description" rows="2" class="lvli"></textarea></div>
+          <div><label class="lvll">Starts</label><input type="datetime-local" name="startsAt" class="lvli" /></div>
+          <div><label class="lvll">Ends</label><input type="datetime-local" name="endsAt" class="lvli" /></div>
+          <div><label class="lvll">Conclusion / results</label><input type="datetime-local" name="conclusionAt" class="lvli" /></div>
+          <div><label class="lvll">Test (slug)</label>
+            <select name="testSlug" class="lvli">
+              <option value="" class="bg-ink">- none -</option>
+              {tests.map((t: any) => (<option value={t.slug} class="bg-ink">{t.title} ({t.slug})</option>))}
+            </select>
+          </div>
+          <div><label class="lvll">Pass mark %</label><input type="number" name="passMark" placeholder="60" class="lvli" /></div>
+          <div><label class="lvll">Fee (CHF, 0 = free)</label><input type="number" name="feeChf" value="0" class="lvli" /></div>
+          <div><label class="lvll">Capacity</label><input type="number" name="capacity" class="lvli" /></div>
+          <div><label class="lvll">Auto-issue on completion</label>
+            <select name="autoIssue" class="lvli">
+              <option value="" class="bg-ink">- none -</option>
+              {ARTIFACT_TYPES.map((a) => (<option value={a} class="bg-ink">{ARTIFACT_TITLES[a]}</option>))}
+            </select>
+          </div>
+          <div><label class="lvll">Outcome label</label><input type="text" name="outcomeLabel" placeholder="Qualified for District" class="lvli" /></div>
+          <div class="md:col-span-2"><button type="submit" class="bg-burn text-white font-semibold py-2 px-5 rounded-lg text-[0.82rem] border-0 cursor-pointer">Add level</button></div>
+        </form>
+      </details>
+    </div>
+
+    <!-- Registrations -->
+    <div class="bg-white/5 border border-white/10 rounded-xl p-5">
+      <h2 class="font-display text-[1.05rem] font-semibold text-white mb-1">Registrations ({regs.length})</h2>
+      <p class="text-[0.75rem] text-white/50 mb-3">Per participant: set their status/outcome at each level (optionally issuing the artifact), or issue an artifact directly.</p>
+
+      <div class="flex flex-col gap-3">
+        {regs.map((r: any) => {
+          const myCerts = certByReg[r.id] || [];
+          return (
+            <div class="bg-white/5 border border-white/10 rounded-lg p-3">
+              <div class="flex items-start justify-between gap-2 mb-2">
+                <div>
+                  <p class="font-semibold text-white text-[0.92rem]">{r.participant_name}</p>
+                  <p class="text-[0.72rem] text-white/50">{r.participant_email}{r.participant_phone ? ' | ' + r.participant_phone : ''}{r.institution ? ' | ' + r.institution : ''}</p>
+                  {r.notes && <p class="text-[0.7rem] text-white/40 mt-0.5">ID/notes: {r.notes}</p>}
+                </div>
+                <form method="POST" class="inline" onsubmit="return confirm('Remove this registration?');">
+                  <input type="hidden" name="action" value="delete_registration" />
+                  <input type="hidden" name="registrationId" value={r.id} />
+                  <button type="submit" class="text-[0.7rem] text-red-400 hover:text-red-300 font-mono">remove</button>
+                </form>
+              </div>
+
+              <div class="flex flex-col gap-2">
+                {levels.map((lv: any) => {
+                  const pr = progIdx[r.id + '|' + lv.id];
+                  return (
+                    <form method="POST" class="flex flex-wrap items-center gap-2 bg-black/20 rounded-md p-2">
+                      <input type="hidden" name="action" value="set_progress" />
+                      <input type="hidden" name="registrationId" value={r.id} />
+                      <input type="hidden" name="levelId" value={lv.id} />
+                      <span class="text-[0.72rem] text-white/60 font-mono w-28 shrink-0">{lv.name}</span>
+                      <span class="text-[0.68rem] text-white/40">{pr && pr.fee_paid ? 'paid' : (lv.fee_chf > 0 ? 'unpaid' : 'free')}{pr && pr.score != null ? ' | ' + pr.score + '%' : ''}</span>
+                      <select name="status" class="text-[0.72rem] bg-white/5 border border-white/10 rounded px-2 py-1 text-white outline-none">
+                        {STATUS_OPTS.map((s) => (<option value={s} selected={pr && pr.status === s} class="bg-ink">{s}</option>))}
+                      </select>
+                      <select name="outcome" class="text-[0.72rem] bg-white/5 border border-white/10 rounded px-2 py-1 text-white outline-none">
+                        <option value="" class="bg-ink">- no artifact -</option>
+                        {ARTIFACT_TYPES.map((a) => (<option value={a} selected={pr && pr.outcome === a} class="bg-ink">issue {ARTIFACT_LABELS[a]}</option>))}
+                      </select>
+                      <input type="text" name="adminNote" placeholder="note" value={pr && pr.admin_note ? pr.admin_note : ''} class="text-[0.72rem] bg-white/5 border border-white/10 rounded px-2 py-1 text-white outline-none flex-1 min-w-[80px]" />
+                      <button type="submit" class="text-[0.72rem] bg-burn/80 hover:bg-burn text-white px-3 py-1 rounded border-0 cursor-pointer">save</button>
+                    </form>
+                  );
+                })}
+              </div>
+
+              {myCerts.length > 0 && (
+                <div class="mt-2 pt-2 border-t border-white/10">
+                  <p class="text-[0.68rem] uppercase tracking-wider text-white/40 mb-1">Issued artifacts</p>
+                  <div class="flex flex-col gap-1">
+                    {myCerts.map((c: any) => (
+                      <div class="flex items-center gap-2 text-[0.72rem]">
+                        <span class={'font-mono ' + (c.revoked ? 'text-white/30 line-through' : 'text-leaf')}>{ARTIFACT_LABELS[c.artifact_type] || c.artifact_type}</span>
+                        <span class="text-white/40">{c.serial}</span>
+                        <a href={'/c/' + c.share_token} target="_blank" class="text-sky-400 hover:underline font-mono">share</a>
+                        {!c.revoked && (
+                          <form method="POST" class="inline" onsubmit="return confirm('Revoke this artifact?');">
+                            <input type="hidden" name="action" value="revoke_artifact" />
+                            <input type="hidden" name="certId" value={c.id} />
+                            <button type="submit" class="text-red-400 hover:text-red-300 font-mono">revoke</button>
+                          </form>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {regs.length === 0 && <p class="text-[0.82rem] text-white/40">No registrations yet.</p>}
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .lvll { display:block; font-size:0.6rem; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:rgba(255,255,255,0.4); margin-bottom:3px; }
+  .lvli { width:100%; padding:7px 10px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); border-radius:8px; color:#fff; font-size:0.8rem; outline:none; }
+  .lvli:focus { border-color:#FF4F00; }
+</style>
+
+<script is:inline>
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('.lvl-edit').forEach(function (b) {
+    b.addEventListener('click', function () { var el = document.getElementById('lvledit-' + b.getAttribute('data-lvl-edit')); if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none'; });
+  });
+  document.querySelectorAll('.lvl-cancel').forEach(function (b) {
+    b.addEventListener('click', function () { var el = document.getElementById('lvledit-' + b.getAttribute('data-lvl-cancel')); if (el) el.style.display = 'none'; });
+  });
+});
+</script>
+</AdminLayout>

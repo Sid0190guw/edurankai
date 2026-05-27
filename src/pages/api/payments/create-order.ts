@@ -7,7 +7,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { createOrder, getPublicKeyId, isConfigured } from '@/lib/razorpay';
 
-const ALLOWED_PURPOSES = new Set(['event', 'aquintutor_test', 'course_premium', 'donation', 'other']);
+const ALLOWED_PURPOSES = new Set(['event', 'aquintutor_test', 'course_premium', 'donation', 'application_fee', 'other']);
 const ALLOWED_CURRENCIES = new Set(['INR', 'USD']);
 
 export const POST: APIRoute = async ({ request, locals }) => {

@@ -182,6 +182,32 @@
     ];
     for (var i = 0; i < paras.length; i++) { doc.para(paras[i], { size: 10.5, color: [0.2, 0.2, 0.23], lh: 15 }); doc.gap(8); }
 
+    // Founder's remark (fixed, on every offer)
+    doc.gap(4);
+    doc.ensure(40);
+    doc.line(MARGIN, doc.y, PAGE_W - MARGIN, doc.y, [0.85, 0.85, 0.87], 0.6);
+    doc.gap(8);
+    doc.para('A REMARK FROM THE FOUNDER', { font: 'bold', size: 8, color: RUST, lh: 13 });
+    doc.gap(3);
+    doc.para('Your active contribution hours are fixed in accordance with our policies. Beyond them, we warmly encourage you to devote a further 2.5 hours each day to staying holistically fit. A sound body and a steady mind are the quiet foundation of exceptional work, and so this practice is regarded as part of your eligibility criteria and is assessed accordingly.', { size: 9.5, color: [0.2, 0.2, 0.23], lh: 13.5 });
+    doc.gap(5);
+    doc.para('A gentle rhythm you might follow for that time:', { size: 9.5, color: [0.2, 0.2, 0.23], lh: 13.5 });
+    doc.gap(2);
+    var remarkBullets = [
+      '15 to 30 minutes of meditation: the chanting of Aum, the Hare Krishna Mahamantra, or any practice true to your own faith.',
+      '45 minutes of intensive physical exercise.',
+      '15 minutes of focused rest.',
+      '30 minutes with the Srimad Bhagavad Gita, or any scripture that speaks to you.'
+    ];
+    for (var rb = 0; rb < remarkBullets.length; rb++) {
+      doc.textAt('-', MARGIN + 6, doc.y - 12, 9.5, 'bold', RUST);
+      doc.para(remarkBullets[rb], { x: MARGIN + 16, maxW: CONTENT_W - 16, size: 9.5, color: [0.2, 0.2, 0.23], lh: 13 });
+      doc.gap(2);
+    }
+    doc.gap(4);
+    doc.para('Why ask for something so personal in a professional letter? Because good health shapes character, and character is what upholds true professional excellence. Consider this an invitation, offered with care. Thank you for your precious time and your kind efforts.', { size: 9.5, color: [0.2, 0.2, 0.23], lh: 13.5 });
+    doc.gap(6);
+
     // Offer summary table
     doc.gap(6);
     doc.ensure(20);
