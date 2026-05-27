@@ -1,6 +1,6 @@
 // src/pages/admin/api/push/preferences.ts
-// GET: fetch current user's notification preferences
-// POST: update preferences
+// GET:  fetch current user's notification opt-out map { [type]: boolean }
+// POST: merge a single toggle { type, enabled } into that map
 
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
@@ -13,19 +13,10 @@ export const GET: APIRoute = async ({ locals }) => {
     return new Response(JSON.stringify({ ok: false, error: 'Unauthorized' }), { status: 401 });
   }
   try {
-    const prefs = await db.select().from(notificationPreferences)
+    const rows = await db.select().from(notificationPreferences)
       .where(eq(notificationPreferences.userId, user.id)).limit(1);
-    if (prefs.length === 0) {
-      // Return defaults
-      return new Response(JSON.stringify({
-        ok: true, prefs: {
-          notifyChat: true, notifyNewApplication: true,
-          notifyApplicationStatus: true, notifyNewHeiSubmission: true,
-          notifyNewUser: true, notifyOfferSigned: true
-        }
-      }));
-    }
-    return new Response(JSON.stringify({ ok: true, prefs: prefs[0] }));
+    const map = (rows.length > 0 && rows[0].prefs && typeof rows[0].prefs === 'object') ? rows[0].prefs : {};
+    return new Response(JSON.stringify({ ok: true, prefs: map }));
   } catch (err: any) {
     return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 500 });
   }
@@ -38,23 +29,23 @@ export const POST: APIRoute = async ({ request, locals }) => {
   }
   try {
     const body = await request.json();
-    const update = {
-      notifyChat: body.notifyChat !== false,
-      notifyNewApplication: body.notifyNewApplication !== false,
-      notifyApplicationStatus: body.notifyApplicationStatus !== false,
-      notifyNewHeiSubmission: body.notifyNewHeiSubmission !== false,
-      notifyNewUser: body.notifyNewUser !== false,
-      notifyOfferSigned: body.notifyOfferSigned !== false,
-      updatedAt: new Date()
-    };
-    const existing = await db.select({ id: notificationPreferences.id })
-      .from(notificationPreferences)
+    const type = String(body?.type || '').trim();
+    if (!type) {
+      return new Response(JSON.stringify({ ok: false, error: 'Missing type' }), { status: 400 });
+    }
+    const enabled = body?.enabled !== false;
+
+    const existing = await db.select().from(notificationPreferences)
       .where(eq(notificationPreferences.userId, user.id)).limit(1);
+
     if (existing.length > 0) {
-      await db.update(notificationPreferences).set(update)
+      const map: any = (existing[0].prefs && typeof existing[0].prefs === 'object') ? { ...existing[0].prefs } : {};
+      map[type] = enabled;
+      await db.update(notificationPreferences)
+        .set({ prefs: map, updatedAt: new Date() })
         .where(eq(notificationPreferences.userId, user.id));
     } else {
-      await db.insert(notificationPreferences).values({ userId: user.id, ...update });
+      await db.insert(notificationPreferences).values({ userId: user.id, prefs: { [type]: enabled } as any });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   } catch (err: any) {

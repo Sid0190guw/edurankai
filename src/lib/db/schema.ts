@@ -770,5 +770,8 @@ export const notificationPreferences = pgTable('notification_preferences', {
   notifyNewHeiSubmission: boolean('notify_new_hei_submission').notNull().default(true),
   notifyNewUser: boolean('notify_new_user').notNull().default(true),
   notifyOfferSigned: boolean('notify_offer_signed').notNull().default(true),
+  // Flexible per-type opt-out map: { [notificationType]: boolean }. Absent key
+  // = on by default. Lets new notification types ship without a migration.
+  prefs: jsonb('prefs').notNull().default({}),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });

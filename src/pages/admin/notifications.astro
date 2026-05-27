@@ -2,10 +2,29 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { NOTIFICATION_TYPES } from '@/lib/push';
+import { notificationPreferences } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
+
+// Load this admin's saved opt-out map so toggles render their real state.
+let savedPrefs: Record<string, boolean> = {};
+try {
+  const rows = await db.select().from(notificationPreferences)
+    .where(eq(notificationPreferences.userId, user.id)).limit(1);
+  if (rows.length > 0 && rows[0].prefs && typeof rows[0].prefs === 'object') {
+    savedPrefs = rows[0].prefs as any;
+  }
+} catch (_) {}
+
+// Group the catalogue for display
+const prefGroups: Record<string, typeof NOTIFICATION_TYPES> = {};
+for (const t of NOTIFICATION_TYPES) {
+  (prefGroups[t.group] = prefGroups[t.group] || []).push(t);
+}
 
 const VAPID_PUBLIC = import.meta.env.VAPID_PUBLIC_KEY || 'PASTE_YOUR_PUBLIC_KEY_HERE';
 
@@ -190,27 +209,31 @@ function timeAgo(d: any) {
 
       <!-- Preferences -->
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
-        <div style="padding:12px 14px;border-bottom:1px solid #1a1a1f;">
+        <div style="padding:12px 14px;border-bottom:1px solid #1a1a1f;display:flex;align-items:center;justify-content:space-between;">
           <p style="font-size:13px;font-weight:600;color:#fff;margin:0;">What to notify me about</p>
+          <span id="prefSaveState" style="font-size:11px;color:#6e6e78;"></span>
         </div>
-        {[
-          { key: 'chat', label: 'New Discussion messages', desc: 'When someone sends a message in any channel' },
-          { key: 'application', label: 'New applications', desc: 'When someone submits an application' },
-          { key: 'status', label: 'Application status changes', desc: 'When an application moves to a new stage' },
-          { key: 'offer', label: 'Offer accepted', desc: 'When a candidate signs their offer letter' },
-          { key: 'user', label: 'New user registrations', desc: 'When someone creates a portal account' },
-          { key: 'hei', label: 'HEI submissions', desc: 'When an institution submits scores' },
-          { key: 'leave', label: 'Leave requests', desc: 'When an employee applies for leave' },
-        ].map(pref => (
-          <div style="padding:12px 14px;border-bottom:1px solid #0a0a0c;display:flex;align-items:center;justify-content:space-between;">
-            <div>
-              <p style="font-size:13px;font-weight:500;color:#fff;margin:0;">{pref.label}</p>
-              <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;">{pref.desc}</p>
+        {Object.entries(prefGroups).map(([group, items]) => (
+          <div>
+            <div style="padding:9px 14px;background:#0a0a0c;border-bottom:1px solid #1a1a1f;">
+              <p style="font-size:10px;font-family:'Geist Mono',monospace;letter-spacing:0.14em;text-transform:uppercase;color:#FF7040;margin:0;font-weight:700;">{group}</p>
             </div>
-            <label style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0;">
-              <input type="checkbox" class="pref-toggle" data-key={pref.key} style="opacity:0;width:0;height:0;position:absolute;" defaultChecked />
-              <span style="position:absolute;cursor:pointer;inset:0;background:#1a1a1f;border-radius:100px;transition:0.2s;" class="pref-slider"></span>
-            </label>
+            {items.map(pref => {
+              const on = savedPrefs[pref.type] !== false;
+              return (
+                <div style="padding:12px 14px;border-bottom:1px solid #0a0a0c;display:flex;align-items:center;justify-content:space-between;gap:14px;">
+                  <div>
+                    <p style="font-size:13px;font-weight:500;color:#fff;margin:0;">{pref.label}</p>
+                    <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;">{pref.desc}</p>
+                  </div>
+                  <label style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0;">
+                    <input type="checkbox" class="pref-toggle" data-type={pref.type} checked={on} style="opacity:0;width:0;height:0;position:absolute;" />
+                    <span style={'position:absolute;cursor:pointer;inset:0;background:' + (on ? '#FF4F00' : '#1a1a1f') + ';border-radius:100px;transition:0.2s;'} class="pref-slider"></span>
+                    <span style={'position:absolute;top:3px;left:' + (on ? '23px' : '3px') + ';width:18px;height:18px;background:#fff;border-radius:50%;transition:0.2s;pointer-events:none;'} class="pref-knob"></span>
+                  </label>
+                </div>
+              );
+            })}
           </div>
         ))}
       </div>
@@ -297,14 +320,41 @@ document.addEventListener('DOMContentLoaded', function() {
     if (statusSub) statusSub.textContent = err.message;
   });
 
-  // Toggle sliders visual
+  // Toggle sliders: visual + persist to server
+  var saveState = document.getElementById('prefSaveState');
+  function flash(msg, ok) {
+    if (!saveState) return;
+    saveState.textContent = msg;
+    saveState.style.color = ok ? '#10b981' : '#ef4444';
+    setTimeout(function() { if (saveState) saveState.textContent = ''; }, 2000);
+  }
   document.querySelectorAll('.pref-toggle').forEach(function(toggle) {
-    var slider = toggle.nextElementSibling;
-    function updateSlider() {
-      slider.style.background = toggle.checked ? '#FF4F00' : '#1a1a1f';
+    var slider = toggle.parentElement.querySelector('.pref-slider');
+    var knob = toggle.parentElement.querySelector('.pref-knob');
+    function paint() {
+      if (slider) slider.style.background = toggle.checked ? '#FF4F00' : '#1a1a1f';
+      if (knob) knob.style.left = toggle.checked ? '23px' : '3px';
     }
-    updateSlider();
-    toggle.addEventListener('change', updateSlider);
+    paint();
+    toggle.addEventListener('change', function() {
+      paint();
+      var type = toggle.getAttribute('data-type');
+      toggle.disabled = true;
+      fetch('/admin/api/push/preferences', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: type, enabled: toggle.checked })
+      }).then(function(r) { return r.json(); }).then(function(d) {
+        toggle.disabled = false;
+        if (d && d.ok) flash('Saved', true);
+        else { flash('Failed to save', false); toggle.checked = !toggle.checked; paint(); }
+      }).catch(function() {
+        toggle.disabled = false;
+        flash('Network error', false);
+        toggle.checked = !toggle.checked; paint();
+      });
+    });
   });
 });
 </script>

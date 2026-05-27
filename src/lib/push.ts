@@ -16,13 +16,7 @@ if (VAPID_PUBLIC && VAPID_PRIVATE) {
   webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
 }
 
-export type NotificationType =
-  | 'chat_message'
-  | 'new_application'
-  | 'application_status'
-  | 'new_hei_submission'
-  | 'new_user'
-  | 'offer_signed';
+export type NotificationType = string;
 
 export interface PushPayload {
   type: NotificationType;
@@ -32,15 +26,35 @@ export interface PushPayload {
   tag?: string;
 }
 
-// Map notification type to the preference column name
-const PREF_MAP: Record<NotificationType, keyof typeof notificationPreferences.$inferSelect> = {
-  chat_message: 'notifyChat',
-  new_application: 'notifyNewApplication',
-  application_status: 'notifyApplicationStatus',
-  new_hei_submission: 'notifyNewHeiSubmission',
-  new_user: 'notifyNewUser',
-  offer_signed: 'notifyOfferSigned',
-};
+// ── Canonical notification catalogue ────────────────────────────────────────
+// Single source of truth. Add a row here and it appears in the settings UI and
+// is respected by sendPushToAdmins automatically (no migration needed - the
+// per-user opt-out lives in notification_preferences.prefs jsonb).
+export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; group: string }[] = [
+  // Recruitment
+  { type: 'new_application',    label: 'New applications',          desc: 'When someone submits an application',          group: 'Recruitment' },
+  { type: 'applicant_message',  label: 'Applicant messages',        desc: 'When an applicant replies on their application', group: 'Recruitment' },
+  { type: 'application_status', label: 'Application status changes', desc: 'When an application moves to a new stage',      group: 'Recruitment' },
+  { type: 'offer_extended',     label: 'Offer extended',            desc: 'When an offer is extended to a candidate',     group: 'Recruitment' },
+  { type: 'offer_signed',       label: 'Offer accepted',            desc: 'When a candidate signs their offer letter',    group: 'Recruitment' },
+  { type: 'offer_declined',     label: 'Offer declined',            desc: 'When a candidate declines their offer',        group: 'Recruitment' },
+  // Communication
+  { type: 'chat_message',       label: 'Discussion messages',       desc: 'When someone posts in any discussion channel', group: 'Communication' },
+  { type: 'dm_message',         label: 'Direct messages',           desc: 'When you receive a direct message',            group: 'Communication' },
+  { type: 'help_message',       label: 'Help inbox',                desc: 'When a new help / support message arrives',    group: 'Communication' },
+  // People & HR
+  { type: 'new_user',           label: 'New user registrations',    desc: 'When someone creates a portal account',        group: 'People & HR' },
+  { type: 'leave_request',      label: 'Leave requests',            desc: 'When an employee applies for leave',           group: 'People & HR' },
+  { type: 'attendance_flag',    label: 'Attendance flags',          desc: 'When attendance needs attention',              group: 'People & HR' },
+  { type: 'payroll_run',        label: 'Payroll',                   desc: 'When a payroll run completes or needs review',  group: 'People & HR' },
+  // Academic / LMS
+  { type: 'interview_scheduled',label: 'Interviews',                desc: 'When an interview is scheduled or updated',    group: 'Academic' },
+  { type: 'test_submitted',     label: 'Test submissions',          desc: 'When a candidate submits a proctored test',    group: 'Academic' },
+  { type: 'lms_enrolment',      label: 'AquinTutor enrolments',     desc: 'When a learner enrols in a course',            group: 'Academic' },
+  // Institutional
+  { type: 'new_hei_submission', label: 'HEI submissions',           desc: 'When an institution submits scores',           group: 'Institutional' },
+  { type: 'hei_truth_report',   label: 'HEI truth reports',         desc: 'When an HEI truth report is generated',        group: 'Institutional' },
+];
 
 // Send a push notification to all admin users who have opted in for this type
 export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: string): Promise<void> {
@@ -67,13 +81,14 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
       .where(inArray(notificationPreferences.userId, adminIds));
 
     const prefMap = new Map(prefs.map(p => [p.userId, p]));
-    const prefKey = PREF_MAP[payload.type];
 
-    // Filter to users who want this notification type
+    // Filter to users who want this notification type. Opt-out lives in the
+    // flexible jsonb `prefs` map ({ [type]: false } = muted). Absent = ON.
     const eligibleIds = adminIds.filter(id => {
-      const pref = prefMap.get(id);
-      if (!pref) return true; // No prefs set = default ON
-      return pref[prefKey] !== false;
+      const pref: any = prefMap.get(id);
+      if (!pref) return true; // No prefs row = default ON
+      const map = (pref.prefs && typeof pref.prefs === 'object') ? pref.prefs : {};
+      return map[payload.type] !== false;
     });
 
     if (eligibleIds.length === 0) return;
@@ -166,5 +181,51 @@ export const pushNotify = {
       body: `${candidateName} signed their offer for ${roleName}`,
       url: `/admin/applications/${appId}`,
       tag: `offer-signed-${appId}`
+    }),
+
+  offerDeclined: (candidateName: string, roleName: string, appId: string) =>
+    sendPushToAdmins({
+      type: 'offer_declined',
+      title: 'Offer Declined',
+      body: `${candidateName} declined their offer for ${roleName}`,
+      url: `/admin/applications/${appId}`,
+      tag: `offer-declined-${appId}`
+    }),
+
+  // An applicant replied on their own application thread.
+  applicantMessage: (applicantName: string, preview: string, appId: string) =>
+    sendPushToAdmins({
+      type: 'applicant_message',
+      title: `Message from ${applicantName}`,
+      body: preview,
+      url: `/admin/applications/${appId}`,
+      tag: `app-msg-${appId}`
+    }),
+
+  leaveRequest: (employeeName: string, detail: string, url = '/admin/leave') =>
+    sendPushToAdmins({
+      type: 'leave_request',
+      title: 'Leave Request',
+      body: `${employeeName}: ${detail}`,
+      url,
+      tag: 'leave-request'
+    }),
+
+  testSubmitted: (candidateName: string, testTitle: string, url = '/admin/tests/attempts') =>
+    sendPushToAdmins({
+      type: 'test_submitted',
+      title: 'Test Submitted',
+      body: `${candidateName} submitted ${testTitle}`,
+      url,
+      tag: 'test-submitted'
+    }),
+
+  lmsEnrolment: (learnerName: string, courseTitle: string, url = '/admin/training') =>
+    sendPushToAdmins({
+      type: 'lms_enrolment',
+      title: 'New Enrolment',
+      body: `${learnerName} enrolled in ${courseTitle}`,
+      url,
+      tag: 'lms-enrolment'
     }),
 };
