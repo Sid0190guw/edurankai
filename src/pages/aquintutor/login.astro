@@ -204,19 +204,24 @@ if (Astro.request.method === 'POST') {
       var progFill = document.getElementById('progFill');
       var verified = false;
       var attempts = 0;
+      var fvOptions;
+      // Strict match threshold: lower = stricter. 0.6 is face-api's default
+      // "same person" line; we use 0.45 so a different person is rejected.
+      var MATCH_THRESHOLD = 0.45;
       function setStatus(msg, color) { camStatus.style.color = color || '#fff'; camStatus.textContent = msg; }
       async function init() {
         try {
-          setStatus('Loading face model...');
+          setStatus('Loading high-accuracy model...');
           progFill.style.width = '20%';
           var URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
           await Promise.all([
-            faceapi.nets.tinyFaceDetector.loadFromUri(URL),
-            faceapi.nets.faceLandmark68TinyNet.loadFromUri(URL),
+            faceapi.nets.ssdMobilenetv1.loadFromUri(URL),
+            faceapi.nets.faceLandmark68Net.loadFromUri(URL),
             faceapi.nets.faceRecognitionNet.loadFromUri(URL),
           ]);
+          fvOptions = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
           progFill.style.width = '60%';
-          var stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640 } });
+          var stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 720 } });
           video.srcObject = stream;
           progFill.style.width = '100%';
           setTimeout(function() {
@@ -229,25 +234,66 @@ if (Astro.request.method === 'POST') {
           }, 300);
         } catch (e) { setStatus('Camera error: ' + e.message, '#ef4444'); }
       }
-      async function tryMatch() {
-        var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks(true).withFaceDescriptor();
-        if (!det) return false;
+      function storedArr() {
         var stored = JSON.parse(storedDescriptor);
-        var storedArr = Array.isArray(stored) ? stored : Object.values(stored);
-        var dist = faceapi.euclideanDistance(det.descriptor, new Float32Array(storedArr));
-        return dist < 0.5;
+        return new Float32Array(Array.isArray(stored) ? stored : Object.values(stored));
+      }
+      // One strict reading: requires exactly one clear, close, confident face,
+      // and returns its distance to the enrolled signature (or null on reject).
+      async function measureOnce() {
+        var all = await faceapi.detectAllFaces(video, fvOptions).withFaceLandmarks().withFaceDescriptors();
+        if (!all || all.length === 0) return { reject: 'no_face' };
+        if (all.length > 1) return { reject: 'multiple' };
+        var d = all[0];
+        if ((d.detection.score || 0) < 0.6) return { reject: 'low_conf' };
+        var vw = video.videoWidth || 640;
+        if (d.detection.box.width < vw * 0.22) return { reject: 'too_small' };
+        return { dist: faceapi.euclideanDistance(d.descriptor, storedArr()) };
+      }
+      // Multi-frame decision: sample several readings, require the MEDIAN
+      // distance under threshold AND a majority of frames to agree. This stops
+      // a single lucky frame (or a different person) from passing.
+      async function verifyStrict() {
+        var dists = [];
+        var samples = 0;
+        var lastReject = '';
+        while (samples < 5) {
+          var r = await measureOnce();
+          if (r.reject) { lastReject = r.reject; if (r.reject === 'multiple') return { ok: false, msg: 'Only your face should be visible.' }; }
+          else { dists.push(r.dist); }
+          samples++;
+          await new Promise(function(res){ setTimeout(res, 140); });
+        }
+        if (dists.length < 3) {
+          var m = lastReject === 'too_small' ? 'Move closer to the camera.' : lastReject === 'low_conf' ? 'Face not clear - improve lighting.' : 'Center your face in the oval.';
+          return { ok: false, msg: m, soft: true };
+        }
+        dists.sort(function(a,b){ return a-b; });
+        var median = dists[Math.floor(dists.length / 2)];
+        var passing = dists.filter(function(x){ return x < MATCH_THRESHOLD; }).length;
+        // Median must clear the strict line AND most frames must agree.
+        return { ok: (median < MATCH_THRESHOLD && passing >= Math.ceil(dists.length * 0.6)) };
       }
       async function autoVerifyLoop() {
-        if (verified || attempts > 25) { if (attempts > 25) setStatus('Auto-verify timed out. Click verify.', '#fbbf24'); return; }
+        if (verified || attempts > 8) { if (attempts > 8) setStatus('Auto-verify timed out. Click verify.', '#fbbf24'); return; }
         attempts++;
-        try { if (await tryMatch()) { onVerified(); return; } } catch(_) {}
-        setTimeout(autoVerifyLoop, 700);
+        try {
+          setStatus('Checking… hold still', '#fbbf24');
+          var v = await verifyStrict();
+          if (v.ok) { onVerified(); return; }
+        } catch(_) {}
+        setStatus('Center face in the oval', '#7dd3a8');
+        setTimeout(autoVerifyLoop, 500);
       }
       async function doVerify() {
         verifyBtn.disabled = true;
         verifyBtn.textContent = 'Verifying...';
-        try { if (await tryMatch()) onVerified(); else { setStatus('Face not recognised. Try again.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; } }
-        catch (e) { setStatus('Error: ' + e.message, '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
+        setStatus('Hold still…', '#fbbf24');
+        try {
+          var v = await verifyStrict();
+          if (v.ok) { onVerified(); }
+          else { setStatus(v.msg || 'Face not recognised. Try again.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
+        } catch (e) { setStatus('Error: ' + e.message, '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
       }
       function onVerified() {
         verified = true;

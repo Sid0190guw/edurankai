@@ -1,0 +1,183 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+const url = new URL(Astro.request.url);
+const next = url.searchParams.get('next') || '/portal';
+
+// If already enrolled, skip straight to next (unless ?force=1 to re-enrol)
+const force = url.searchParams.get('force') === '1';
+let alreadyEnrolled = false;
+try {
+  const r = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
+  const rows = Array.isArray(r) ? r : (r?.rows || []);
+  alreadyEnrolled = rows.length > 0;
+} catch (_) {}
+if (alreadyEnrolled && !force) return Astro.redirect(next);
+
+const firstName = (user.name || '').split(' ')[0] || 'there';
+---
+<BaseLayout title="Set up Face 2FA" description="Add face verification to secure your EduRankAI account." noindex={true}>
+
+  <script is:inline src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js"></script>
+
+  <section class="px-[5vw] py-10 md:py-14 max-w-xl mx-auto">
+    <p class="text-[0.62rem] font-mono uppercase tracking-[0.15em] text-burn font-bold mb-3">Account security</p>
+    <h1 class="font-display text-[clamp(1.8rem,4vw,2.6rem)] font-semibold text-ink leading-[1.1] tracking-tight mb-3">
+      Set up <em class="italic text-burn font-medium">face verification.</em>
+    </h1>
+    <p class="text-[0.95rem] text-ink-soft leading-relaxed mb-6">
+      {firstName}, add a face check to your account. On future sign-ins you'll confirm it's really you with a quick look at the camera - a second factor on top of your password. The photo never leaves your browser; only a numeric face signature is stored.
+    </p>
+
+    <div class="bg-amber-50 border border-amber-200 rounded-xl p-4 mb-6 text-[0.85rem] text-amber-900 leading-relaxed">
+      <strong>Tip:</strong> Good, even lighting. Face the camera straight on. Remove sunglasses or a mask. You can re-enrol any time from your account settings.
+    </div>
+
+    <div class="bg-white border border-ink/10 rounded-2xl overflow-hidden mb-5">
+      <div class="bg-black aspect-[3/4] relative max-h-[420px]">
+        <video id="videoEl" autoplay playsinline muted class="w-full h-full object-cover" style="transform:scaleX(-1);"></video>
+        <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div class="w-[55%] aspect-[3/4] border-[2.5px] rounded-full" style="border-color:rgba(255,79,0,0.7);"></div>
+        </div>
+        <div class="absolute bottom-3 left-0 right-0 text-center">
+          <span id="camStatus" class="bg-black/75 text-white font-mono text-[11px] tracking-[0.16em] uppercase px-3.5 py-1.5 rounded-full">Loading face model…</span>
+        </div>
+      </div>
+      <div class="h-[3px] bg-ink/10">
+        <div id="progFill" class="h-full bg-burn transition-[width] duration-300" style="width:0%;"></div>
+      </div>
+      <button id="enrollBtn" type="button" disabled class="w-full border-0 font-display text-[0.95rem] font-semibold tracking-[0.04em] py-4 cursor-pointer bg-ink text-white disabled:opacity-60">Scanning…</button>
+    </div>
+
+    <div class="flex items-center justify-between flex-wrap gap-3">
+      <a href={next} class="text-[0.82rem] text-ink-soft hover:text-ink underline underline-offset-2">Skip for now</a>
+      <p id="resultMsg" class="text-[0.82rem]"></p>
+    </div>
+  </section>
+
+  <script is:inline define:vars={{ nextUrl: next }}>
+    var video = document.getElementById('videoEl');
+    var enrollBtn = document.getElementById('enrollBtn');
+    var camStatus = document.getElementById('camStatus');
+    var progFill = document.getElementById('progFill');
+    var resultMsg = document.getElementById('resultMsg');
+    var ready = false;
+
+    function setStatus(msg, color) { camStatus.style.color = color || '#fff'; camStatus.textContent = msg; }
+
+    var MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
+    var options;
+
+    async function detectBest() {
+      // Full-accuracy pipeline: SSD MobileNet detector + 68-pt landmarks + recognition net.
+      var all = await faceapi.detectAllFaces(video, options).withFaceLandmarks().withFaceDescriptors();
+      if (!all || all.length === 0) return { error: 'No face detected. Center your face in the oval.' };
+      if (all.length > 1) return { error: 'Multiple faces in frame. Only you should be visible.' };
+      var d = all[0];
+      var box = d.detection.box;
+      var score = d.detection.score || 0;
+      // Reject low-confidence / too-small (far away or spoofed) faces.
+      if (score < 0.6) return { error: 'Face not clear enough. Improve lighting, face the camera.' };
+      var vw = video.videoWidth || 640;
+      if (box.width < vw * 0.22) return { error: 'Move closer - your face is too small in frame.' };
+      return { descriptor: d.descriptor };
+    }
+
+    async function init() {
+      if (!('mediaDevices' in navigator)) { setStatus('Camera not available', '#ef4444'); return; }
+      try {
+        setStatus('Loading high-accuracy model…');
+        progFill.style.width = '20%';
+        await Promise.all([
+          faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+        ]);
+        options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
+        progFill.style.width = '60%';
+        var stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 720 } });
+        video.srcObject = stream;
+        progFill.style.width = '100%';
+        setTimeout(function() {
+          progFill.style.width = '0%';
+          ready = true;
+          enrollBtn.disabled = false;
+          enrollBtn.textContent = 'Capture & enable Face 2FA';
+          enrollBtn.style.background = '#FF4F00';
+          setStatus('Center your face in the oval', '#7dd3a8');
+        }, 300);
+      } catch (e) { setStatus('Camera error: ' + e.message, '#ef4444'); }
+    }
+
+    function avgDescriptors(list) {
+      var out = new Array(128).fill(0);
+      list.forEach(function(d) { for (var i = 0; i < 128; i++) out[i] += d[i]; });
+      for (var j = 0; j < 128; j++) out[j] /= list.length;
+      return out;
+    }
+
+    enrollBtn.addEventListener('click', async function() {
+      if (!ready) return;
+      enrollBtn.disabled = true;
+      enrollBtn.textContent = 'Capturing…';
+      // Multi-sample: collect several consistent descriptors and average them so
+      // the stored signature is stable and matching can be strict.
+      var samples = [];
+      var attempts = 0;
+      var lastErr = '';
+      try {
+        while (samples.length < 5 && attempts < 12) {
+          attempts++;
+          setStatus('Hold still… capturing ' + (samples.length + 1) + ' / 5', '#fbbf24');
+          var r = await detectBest();
+          if (r.descriptor) {
+            // Consistency: reject a frame that is far from the first sample.
+            if (samples.length > 0) {
+              var dist = faceapi.euclideanDistance(new Float32Array(r.descriptor), new Float32Array(samples[0]));
+              if (dist > 0.5) { lastErr = 'Keep still - readings varied too much.'; await new Promise(function(res){setTimeout(res,150);}); continue; }
+            }
+            samples.push(Array.from(r.descriptor));
+          } else {
+            lastErr = r.error || 'No face';
+          }
+          await new Promise(function(res){ setTimeout(res, 160); });
+        }
+        if (samples.length < 3) {
+          setStatus(lastErr || 'Could not capture a clear face. Try again.', '#ef4444');
+          enrollBtn.disabled = false; enrollBtn.textContent = 'Try again';
+          return;
+        }
+        var descriptor = avgDescriptors(samples);
+        var res = await fetch('/api/auth/enroll-face-selfie', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ faceDescriptor: descriptor })
+        });
+        var data = await res.json();
+        if (data && data.ok) {
+          progFill.style.background = '#10b981';
+          progFill.style.width = '100%';
+          setStatus('Face 2FA enabled. Redirecting…', '#10b981');
+          enrollBtn.textContent = 'Done';
+          enrollBtn.style.background = '#10b981';
+          if (resultMsg) { resultMsg.textContent = 'Saved'; resultMsg.style.color = '#10b981'; }
+          try { (video.srcObject && video.srcObject.getTracks().forEach(function(t){t.stop();})); } catch(_) {}
+          setTimeout(function() { window.location.href = nextUrl; }, 900);
+        } else {
+          setStatus((data && data.error) || 'Could not save. Try again.', '#ef4444');
+          enrollBtn.disabled = false; enrollBtn.textContent = 'Try again';
+        }
+      } catch (e) {
+        setStatus('Error: ' + e.message, '#ef4444');
+        enrollBtn.disabled = false; enrollBtn.textContent = 'Try again';
+      }
+    });
+
+    init();
+  </script>
+</BaseLayout>
