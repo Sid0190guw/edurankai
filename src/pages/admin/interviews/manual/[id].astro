@@ -1,0 +1,117 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+let okMsg = '', errMsg = '';
+
+const CRITERIA = [
+  { key: 'technical', label: 'Technical ability' },
+  { key: 'communication', label: 'Communication' },
+  { key: 'problem_solving', label: 'Problem solving' },
+  { key: 'culture', label: 'Values / culture fit' },
+];
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action');
+  try {
+    if (action === 'submit_score') {
+      const scores: Record<string, number> = {};
+      let sum = 0, n = 0;
+      for (const c of CRITERIA) {
+        const v = parseInt(fd.get('s_' + c.key) as string || '0');
+        if (v >= 1 && v <= 5) { scores[c.key] = v; sum += v; n++; }
+      }
+      const overall = n > 0 ? (sum / n) : null;
+      const recommendation = (fd.get('recommendation') as string || '').trim() || null;
+      const notes = (fd.get('notes') as string || '').trim() || null;
+      const judgeName = user.name || user.email || 'Judge';
+      await db.execute(sql`
+        INSERT INTO interview_panel_scores (interview_id, judge_user_id, judge_name, scores, overall, recommendation, notes)
+        VALUES (${id}, ${user.id}, ${judgeName}, ${sql.raw("'" + JSON.stringify(scores).replace(/'/g, "''") + "'::jsonb")}, ${overall}, ${recommendation}, ${notes})
+        ON CONFLICT (interview_id, judge_user_id) DO UPDATE SET scores = EXCLUDED.scores, overall = EXCLUDED.overall, recommendation = EXCLUDED.recommendation, notes = EXCLUDED.notes, updated_at = NOW()
+      `);
+      okMsg = 'Your evaluation was saved.';
+    } else if (action === 'decision') {
+      const dec = (fd.get('final_decision') as string || '').trim();
+      const notes = (fd.get('decision_notes') as string || '').trim() || null;
+      if (['selected','hold','rejected'].includes(dec)) {
+        await db.execute(sql`UPDATE manual_interviews SET final_decision = ${dec}, decision_notes = ${notes}, decided_by = ${user.id}, decided_at = NOW(), status = 'completed', updated_at = NOW() WHERE id = ${id}`);
+        okMsg = 'Final decision recorded.';
+      }
+    }
+  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'error'); }
+}
+
+const mi: any = rows(await db.execute(sql`SELECT * FROM manual_interviews WHERE id = ${id} LIMIT 1`))[0];
+if (!mi) return Astro.redirect('/admin/interviews/manual');
+const scores = rows(await db.execute(sql`SELECT * FROM interview_panel_scores WHERE interview_id = ${id} ORDER BY created_at ASC`));
+const mine: any = scores.find((s: any) => s.judge_user_id === user.id);
+const panelAvg = scores.length ? (scores.reduce((a: number, s: any) => a + Number(s.overall || 0), 0) / scores.length) : null;
+const fmt = (d: any) => d ? new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Not scheduled';
+const origin = Astro.url.origin;
+---
+<AdminLayout title={'Interview - ' + mi.candidate_name} activeNav="interviews">
+  <div class="admin-page" style="max-width:1000px;">
+    <a href="/admin/interviews/manual" style="font-size:11px;color:#FF7040;text-decoration:none;font-weight:600;">&lt; All manual interviews</a>
+    <h1 class="admin-page-title" style="margin-top:8px;">{mi.candidate_name}</h1>
+    <p class="admin-page-sub">{mi.title}{mi.role_title ? ' · ' + mi.role_title : ''} · {fmt(mi.scheduled_at)} · {mi.duration_mins}m</p>
+    <p style="font-size:12px;color:#8a8a94;margin-top:6px;">Candidate link: <span style="font-family:monospace;color:#c8c3b8;">{origin}/interview/{mi.join_token}</span>{mi.meeting_link ? ' · ' : ''}{mi.meeting_link && <a href={mi.meeting_link} target="_blank" style="color:#60a5fa;">meeting</a>}</p>
+
+    {errMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 13px;margin:14px 0;font-size:12.5px;">{errMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 13px;margin:14px 0;font-size:12.5px;">{okMsg}</div>}
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start;margin-top:16px;">
+      <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
+        <input type="hidden" name="action" value="submit_score" />
+        <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 4px;">Your evaluation (as {user.name || 'judge'})</p>
+        <p style="font-size:11px;color:#8a8a94;margin:0 0 12px;">Score each 1 (poor) - 5 (excellent). Each judge scores independently for fairness.</p>
+        {CRITERIA.map((c) => (
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;">
+            <label style="font-size:12.5px;color:#c8c3b8;">{c.label}</label>
+            <select name={'s_' + c.key} style="background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:5px 10px;border-radius:6px;font-size:13px;">
+              <option value="0" selected={!mine || mine.scores?.[c.key] == null}>-</option>
+              {[1,2,3,4,5].map((n) => <option value={n} selected={mine && mine.scores?.[c.key] === n}>{n}</option>)}
+            </select>
+          </div>
+        ))}
+        <label style="font-size:10px;color:#8a8a94;text-transform:uppercase;font-family:monospace;display:block;margin-top:10px;">Recommendation</label>
+        <select name="recommendation" style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:7px 10px;border-radius:6px;font-size:13px;margin-top:4px;">
+          {['', 'strong_yes', 'yes', 'maybe', 'no', 'strong_no'].map((r) => <option value={r} selected={mine && mine.recommendation === r}>{r || '-'}</option>)}
+        </select>
+        <textarea name="notes" rows="3" placeholder="Notes / rationale" style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:8px 10px;border-radius:6px;font-size:12.5px;margin-top:8px;">{mine && mine.notes ? mine.notes : ''}</textarea>
+        <button type="submit" class="admin-btn admin-btn-primary" style="margin-top:10px;justify-content:center;width:100%;">{mine ? 'Update my evaluation' : 'Submit my evaluation'}</button>
+      </form>
+
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
+          <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 10px;">Panel ({scores.length}) {panelAvg != null && <span style="color:#6ee7b7;">· avg {panelAvg.toFixed(2)}/5</span>}</p>
+          {scores.map((s: any) => (
+            <div style="border-top:1px solid #1a1a1f;padding:8px 0;">
+              <div style="display:flex;justify-content:space-between;"><span style="font-size:12.5px;color:#fff;">{s.judge_name}</span><span style="font-size:12px;color:#6ee7b7;font-family:monospace;">{s.overall != null ? Number(s.overall).toFixed(2) : '-'}/5 {s.recommendation ? '· ' + s.recommendation : ''}</span></div>
+              {s.notes && <p style="font-size:11.5px;color:#a0a0ab;margin:4px 0 0;font-style:italic;">"{s.notes}"</p>}
+            </div>
+          ))}
+          {scores.length === 0 && <p style="font-size:12px;color:#6e6e78;">No evaluations yet.</p>}
+        </div>
+
+        <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
+          <input type="hidden" name="action" value="decision" />
+          <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 8px;">Final decision {mi.final_decision && <span style="color:#6ee7b7;">· current: {mi.final_decision}</span>}</p>
+          <select name="final_decision" required style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:7px 10px;border-radius:6px;font-size:13px;">
+            {['', 'selected', 'hold', 'rejected'].map((d) => <option value={d} selected={mi.final_decision === d}>{d || 'choose...'}</option>)}
+          </select>
+          <textarea name="decision_notes" rows="2" placeholder="Decision rationale" style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:8px 10px;border-radius:6px;font-size:12.5px;margin-top:8px;">{mi.decision_notes || ''}</textarea>
+          <button type="submit" class="admin-btn admin-btn-primary" style="margin-top:10px;justify-content:center;width:100%;">Record decision</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</AdminLayout>
