@@ -4,7 +4,8 @@ import { sql } from 'drizzle-orm';
 
 export const GET: APIRoute = async ({ params, locals }) => {
   const user = locals.user;
-  if (!user || user.role === 'applicant') {
+  // Payslips are restricted to designated authority (super admin / HR).
+  if (!user || !['super_admin', 'hr'].includes(user.role)) {
     return new Response('Unauthorized', { status: 401 });
   }
 
