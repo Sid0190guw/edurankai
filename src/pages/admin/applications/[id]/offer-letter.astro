@@ -2,7 +2,7 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { randomBytes, createHmac } from 'node:crypto';
 import { db } from '@/lib/db';
-import { applications, offerLetters, users } from '@/lib/db/schema';
+import { applications, offerLetters, users, applicationMessages } from '@/lib/db/schema';
 import { generateInternalHandle } from '@/lib/auth/handle';
 import { eq } from 'drizzle-orm';
 
@@ -91,7 +91,23 @@ if (Astro.request.method === 'POST') {
   const action = fd.get('action') as string;
 
   try {
-    if (action === 'generate') {
+    if (action === 'extend_offer') {
+      // Milestone only: mark the application stage as "offer extended" without
+      // sending the formal letter. The letter is a separate step below.
+      await db.update(applications).set({ status: 'offer', updatedAt: new Date() }).where(eq(applications.id, id));
+      try {
+        await db.insert(applicationMessages).values({
+          applicationId: id,
+          senderUserId: user.id,
+          senderRole: 'system',
+          senderName: 'System',
+          body: 'Offer extended to the candidate. A formal offer letter will follow.',
+          isSystem: true
+        });
+      } catch (_) {}
+      app.status = 'offer';
+      successMsg = 'Offer extension confirmed. Application stage is now "Offer". Send the formal letter below when ready.';
+    } else if (action === 'generate') {
       const candidateName = ((fd.get('candidateName') as string) || '').trim();
       const candidateEmail = ((fd.get('candidateEmail') as string) || '').trim();
       const roleTitle = ((fd.get('roleTitle') as string) || '').trim();
@@ -166,7 +182,13 @@ if (Astro.request.method === 'POST') {
             // plaintextPassword intentionally omitted - do not store plaintext passwords
             createdUserId: createdUserId
           });
-          successMsg = 'Offer created. Token: ' + token + '. Login: ' + candidateEmail + (internalHandle ? ' OR ' + internalHandle : '') + (accountIsNew ? ' — NEW account: candidate sets their password via "Set password" on the offer page.' : ' — existing account: candidate keeps their current password.');
+          // Sending the formal letter implies the offer is extended - advance
+          // the application stage so status reflects it everywhere.
+          if (app.status !== 'hired' && app.status !== 'offer') {
+            await db.update(applications).set({ status: 'offer', updatedAt: new Date() }).where(eq(applications.id, id));
+            app.status = 'offer';
+          }
+          successMsg = 'Offer letter sent. Token: ' + token + '. Login: ' + candidateEmail + (internalHandle ? ' OR ' + internalHandle : '') + (accountIsNew ? ' — NEW account: candidate sets their password via "Set password" on the offer page.' : ' — existing account: candidate keeps their current password.');
         }
       }
     } else if (action === 'withdraw' && existingOffer) {
@@ -219,6 +241,23 @@ const defaults: any = currentOffer && currentOffer.content ? currentOffer.conten
 const refNum = (currentOffer && currentOffer.refNumber) ? currentOffer.refNumber : defaultRef;
 const isWithdrawn = currentOffer && currentOffer.status === 'withdrawn';
 const isSigned = currentOffer && currentOffer.status === 'signed';
+const isDeclined = currentOffer && currentOffer.status === 'declined';
+
+// Two independent milestones surfaced as status:
+//  1. Offer extension - the application stage ('offer' or 'hired')
+//  2. Offer letter    - whether the formal letter exists and its sign state
+const offerExtended = app.status === 'offer' || app.status === 'hired';
+const STAGE_LABELS: Record<string, string> = {
+  submitted: 'Submitted', reviewing: 'Under review', task_sent: 'Task sent',
+  interview: 'Interview', offer: 'Offer extended', hired: 'Hired',
+  rejected: 'Closed', withdrawn: 'Withdrawn'
+};
+const stageLabel = STAGE_LABELS[app.status] || app.status;
+const letterStatusLabel = !currentOffer ? 'Not sent'
+  : isSigned ? 'Signed by candidate'
+  : isWithdrawn ? 'Withdrawn'
+  : isDeclined ? 'Declined'
+  : 'Sent - awaiting signature';
 ---
 <AdminLayout title="Offer Letter" description="Generate and manage offer letter">
 
@@ -235,23 +274,44 @@ const isSigned = currentOffer && currentOffer.status === 'signed';
     <p class="text-[0.85rem] text-white/60 mt-1">For <strong class="text-white">{fullName}</strong> &middot; {app.roleTitleSnapshot}</p>
   </div>
 
-  {currentOffer && (
-    <div class={'mb-5 p-4 rounded-xl border ' + (isSigned ? 'bg-leaf-bg/20 border-leaf-border/50' : isWithdrawn ? 'bg-red-500/10 border-red-500/30' : 'bg-burn-pale/20 border-burn-dim/50')}>
-      <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        <div>
-          <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold mb-1">
-            {isSigned ? 'SIGNED BY APPLICANT' : isWithdrawn ? 'WITHDRAWN' : 'SENT - AWAITING SIGNATURE'}
-          </p>
-          <p class="text-[0.85rem] text-white/80">Token: <span class="font-mono text-white">{currentOffer.token}</span></p>
-          <p class="text-[0.78rem] text-white/60 mt-1">Ref: {currentOffer.refNumber} &middot; Hash: {currentOffer.integrityHash}</p>
-        </div>
-        <div class="flex flex-col gap-2 text-right">
-          <a href={'/portal/offer/' + currentOffer.token} target="_blank" class="text-[0.78rem] text-burn hover:underline font-mono">Applicant link &rarr;</a>
-          <a href={'/offer/verify/' + currentOffer.token} target="_blank" class="text-[0.78rem] text-sky hover:underline font-mono">Public verify &rarr;</a>
-        </div>
+  <!-- DUAL STATUS PANEL: offer extension + offer letter, always visible -->
+  <div class="mb-5 grid grid-cols-1 md:grid-cols-2 gap-3">
+    <!-- Milestone 1: offer extension (application stage) -->
+    <div class={'p-4 rounded-xl border ' + (offerExtended ? 'bg-leaf-bg/20 border-leaf-border/50' : 'bg-white/5 border-white/10')}>
+      <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold mb-1 text-white/50">Offer extension</p>
+      <div class="flex items-center gap-2">
+        <span class={'inline-block w-2 h-2 rounded-full ' + (offerExtended ? 'bg-leaf' : 'bg-white/30')}></span>
+        <p class="text-[0.95rem] font-semibold text-white">{offerExtended ? 'Extended' : 'Not yet extended'}</p>
       </div>
+      <p class="text-[0.74rem] text-white/55 mt-1">Application stage: <strong class="text-white/80">{stageLabel}</strong></p>
+      {!offerExtended && (
+        <form method="POST" class="mt-3">
+          <input type="hidden" name="action" value="extend_offer" />
+          <button type="submit" class="bg-leaf/20 hover:bg-leaf/30 border border-leaf-border/50 text-leaf font-semibold py-2 px-4 rounded-lg text-[0.82rem]">Confirm offer extension</button>
+        </form>
+      )}
     </div>
-  )}
+
+    <!-- Milestone 2: offer letter (document) -->
+    <div class={'p-4 rounded-xl border ' + (isSigned ? 'bg-leaf-bg/20 border-leaf-border/50' : (isWithdrawn || isDeclined) ? 'bg-red-500/10 border-red-500/30' : currentOffer ? 'bg-burn-pale/20 border-burn-dim/50' : 'bg-white/5 border-white/10')}>
+      <p class="text-[0.62rem] font-mono uppercase tracking-wider font-bold mb-1 text-white/50">Offer letter</p>
+      <div class="flex items-center gap-2">
+        <span class={'inline-block w-2 h-2 rounded-full ' + (isSigned ? 'bg-leaf' : (isWithdrawn || isDeclined) ? 'bg-red-400' : currentOffer ? 'bg-burn' : 'bg-white/30')}></span>
+        <p class="text-[0.95rem] font-semibold text-white">{letterStatusLabel}</p>
+      </div>
+      {currentOffer ? (
+        <>
+          <p class="text-[0.74rem] text-white/55 mt-1">Ref: {currentOffer.refNumber} &middot; Hash: {currentOffer.integrityHash}</p>
+          <div class="flex gap-3 mt-2">
+            <a href={'/portal/offer/' + currentOffer.token} target="_blank" class="text-[0.76rem] text-burn hover:underline font-mono">Applicant link &rarr;</a>
+            <a href={'/offer/verify/' + currentOffer.token} target="_blank" class="text-[0.76rem] text-sky hover:underline font-mono">Public verify &rarr;</a>
+          </div>
+        </>
+      ) : (
+        <p class="text-[0.74rem] text-white/55 mt-1">Fill the form below and send the formal letter.</p>
+      )}
+    </div>
+  </div>
 
   <form method="POST" class="grid grid-cols-1 lg:grid-cols-3 gap-5">
     <input type="hidden" name="action" value="generate" />
@@ -318,7 +378,7 @@ const isSigned = currentOffer && currentOffer.status === 'signed';
 
       <div class="flex gap-3 flex-wrap">
         <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">
-          {currentOffer ? 'Update Offer' : 'Generate & Send Offer'}
+          {currentOffer ? 'Update offer letter' : 'Generate & send offer letter'}
         </button>
         <a href={'/admin/offer/blank?from=' + id} class="bg-ink hover:bg-ink/80 text-white border border-white/20 font-semibold py-3 px-6 rounded-lg text-[0.95rem] no-underline inline-flex items-center">Preview / Download PDF &rarr;</a>
       </div>
