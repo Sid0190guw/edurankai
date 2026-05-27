@@ -41,32 +41,59 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
       questions = (questions as any[]).filter((q: any) => set.has(String(q.id)));
     }
 
-    // Auto-grade MCQs
+    // Auto-grade. Negative marking applies to wrong objective answers only
+    // (never to blanks), per the test's negative_mark_fraction.
     let totalScore = 0;
     let maxScore = 0;
+    let negativeTotal = 0;
     const sectionScores: Record<string, any> = {};
+
+    // The negative-marking fraction lives on the test row.
+    let negativeFraction = 0;
+    try {
+      const tr = await db.execute(sql`SELECT negative_mark_fraction FROM tests WHERE id = ${attempt.test_id} LIMIT 1`);
+      const trRows = Array.isArray(tr) ? tr : (tr?.rows || []);
+      negativeFraction = Math.max(0, Math.min(1, parseFloat(trRows[0]?.negative_mark_fraction ?? '0') || 0));
+    } catch (_) {}
+
+    function isBlankAns(v: any) { return v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0); }
+    function numClose(a: number, b: number, tol: number) { return Math.abs(a - b) <= (tol || 0); }
 
     for (const q of questions as any[]) {
       const userAns = (answers || {})[q.id];
       const correctAns = q.correct_answer;
       const marks = q.marks || 1;
       maxScore += marks;
+      if (isBlankAns(userAns)) continue; // blanks never penalised
 
+      let correct = false;
+      let objective = false; // eligible for negative marking
       if (q.question_type === 'mcq_single' || q.question_type === 'true_false') {
-        if (userAns !== undefined && userAns !== null && userAns === correctAns) {
-          totalScore += marks;
-        }
+        objective = true;
+        correct = userAns === correctAns;
       } else if (q.question_type === 'mcq_multi') {
-        if (Array.isArray(userAns) && Array.isArray(correctAns)) {
-          const userSet = new Set(userAns);
-          const correctSet = new Set(correctAns);
-          if (userSet.size === correctSet.size && [...userSet].every(x => correctSet.has(x))) {
-            totalScore += marks;
-          }
+        objective = true;
+        const userSet = new Set(Array.isArray(userAns) ? userAns : []);
+        const correctSet = new Set(Array.isArray(correctAns) ? correctAns : []);
+        correct = userSet.size === correctSet.size && [...userSet].every(x => correctSet.has(x));
+      } else if (q.question_type === 'numeric' || q.question_type === 'calculative') {
+        objective = true;
+        const ua = parseFloat(String(userAns));
+        const ca = parseFloat(String(Array.isArray(correctAns) ? correctAns[0] : correctAns));
+        if (!isNaN(ua) && !isNaN(ca)) correct = numClose(ua, ca, parseFloat(q.answer_tolerance ?? '0') || 0);
+      } else if (q.question_type === 'short_answer') {
+        // Auto-grade only when a model answer exists; case/space-insensitive.
+        const ca = Array.isArray(correctAns) ? correctAns[0] : correctAns;
+        if (ca != null && String(ca).trim() !== '') {
+          correct = String(userAns).trim().toLowerCase() === String(ca).trim().toLowerCase();
         }
       }
-      // Subjective + code: not auto-graded yet (pending AI grading)
+      // long_answer, code, file_upload, video: pending manual/AI grading.
+
+      if (correct) totalScore += marks;
+      else if (objective && negativeFraction > 0) { const pen = marks * negativeFraction; totalScore -= pen; negativeTotal += pen; }
     }
+    if (totalScore < 0) totalScore = 0;
 
     const percentage = maxScore > 0 ? (totalScore / maxScore) * 100 : 0;
 
@@ -83,11 +110,28 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         total_score = ${totalScore},
         max_score = ${maxScore},
         percentage = ${percentage.toFixed(2)},
+        negative_marks = ${negativeTotal.toFixed(2)},
         duration_seconds = ${duration},
         submitted_at = NOW(),
         ip_address = ${clientAddress || null}
       WHERE id = ${attemptId}
     `);
+
+    // Auto-rank all graded attempts for this test by score (ties broken by
+    // faster duration). Ranks are computed automatically from scores so the
+    // ordering is objective; the candidate only sees it once results are
+    // released/declared (see the result page + admin declare action).
+    try {
+      const ar = await db.execute(sql`
+        SELECT id FROM test_attempts
+        WHERE test_id = ${attempt.test_id} AND status IN ('submitted','auto_submitted')
+        ORDER BY percentage DESC NULLS LAST, duration_seconds ASC NULLS LAST, submitted_at ASC
+      `);
+      const arRows = Array.isArray(ar) ? ar : (ar?.rows || []);
+      for (let i = 0; i < arRows.length; i++) {
+        await db.execute(sql`UPDATE test_attempts SET rank = ${i + 1} WHERE id = ${(arRows[i] as any).id}`);
+      }
+    } catch (_) {}
 
     // Calculate percentile against other attempts
     try {

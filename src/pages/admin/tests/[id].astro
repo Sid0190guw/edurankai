@@ -24,7 +24,17 @@ if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
   try {
-    if (action === 'add_question') {
+    if (action === 'declare_results') {
+      await db.execute(sql`UPDATE tests SET results_declared = true, results_declared_at = NOW(), updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Results declared - candidates can now see their results and ranking.';
+      const r = await db.execute(sql`SELECT * FROM tests WHERE id = ${id} LIMIT 1`);
+      test = (Array.isArray(r) ? r : (r?.rows || []))[0] || test;
+    } else if (action === 'unpublish_results') {
+      await db.execute(sql`UPDATE tests SET results_declared = false, results_declared_at = NULL, updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Results withdrawn from candidates.';
+      const r = await db.execute(sql`SELECT * FROM tests WHERE id = ${id} LIMIT 1`);
+      test = (Array.isArray(r) ? r : (r?.rows || []))[0] || test;
+    } else if (action === 'add_question') {
       const qType = fd.get('question_type') as string;
       const qText = (fd.get('question_text') as string || '').trim();
       const marks = parseInt(fd.get('marks') as string || '1');
@@ -101,6 +111,10 @@ if (Astro.request.method === 'POST') {
       const passMark = parseInt(fd.get('pass_mark') as string || '60') || 60;
       const questionsToShowRaw = parseInt(fd.get('questions_to_show') as string || '0') || 0;
       const questionsToShow = questionsToShowRaw > 0 ? questionsToShowRaw : null;
+      const resultReleaseMode = ((fd.get('result_release_mode') as string) || 'immediate').trim();
+      const rankingMode = ((fd.get('ranking_mode') as string) || 'none').trim();
+      let negFrac = parseFloat(fd.get('negative_mark_fraction') as string || '0'); if (!(negFrac >= 0 && negFrac <= 1)) negFrac = 0;
+      const restricted = fd.get('restricted') === 'on';
       const currency = (fd.get('currency') as string || 'INR').toUpperCase().slice(0, 3);
       const priceMinor = parseInt(fd.get('price_minor') as string || '0') || 0;
       const isPremium = fd.get('is_premium') === 'on';
@@ -120,6 +134,10 @@ if (Astro.request.method === 'POST') {
           duration_mins = ${durationMins},
           pass_mark = ${passMark},
           questions_to_show = ${questionsToShow},
+          result_release_mode = ${resultReleaseMode},
+          ranking_mode = ${rankingMode},
+          negative_mark_fraction = ${negFrac},
+          restricted = ${restricted},
           currency = ${currency},
           price_inr_paise = ${priceMinor},
           is_premium = ${isPremium},
@@ -154,6 +172,19 @@ try {
   const r = await db.execute(sql`SELECT * FROM test_questions WHERE test_id = ${id} ORDER BY sort_order, created_at`);
   questions = Array.isArray(r) ? r : (r?.rows || []);
 } catch(e) {}
+
+// Leaderboard (auto-ranked by score) for evaluation in the admin panel.
+let leaderboard: any[] = [];
+try {
+  const r = await db.execute(sql`
+    SELECT rank, candidate_name, candidate_email, percentage, total_score, max_score, negative_marks, duration_seconds, tab_switches, fullscreen_exits, id
+    FROM test_attempts
+    WHERE test_id = ${id} AND status IN ('submitted','auto_submitted')
+    ORDER BY rank ASC NULLS LAST, percentage DESC NULLS LAST
+    LIMIT 200
+  `);
+  leaderboard = Array.isArray(r) ? r : (r?.rows || []);
+} catch (_) {}
 
 const Q_TYPE_LABELS: Record<string,string> = {
   mcq_single:'MCQ (Single)', mcq_multi:'MCQ (Multi)', true_false:'True/False',
@@ -222,6 +253,27 @@ const Q_TYPE_LABELS: Record<string,string> = {
         <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#c8c3b8;cursor:pointer;"><input type="checkbox" name="copy_paste_blocked" checked={test.copy_paste_blocked} /> <span>Block copy / paste</span></label>
       </div>
 
+      <div style="grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr 130px;gap:10px;">
+        <div><label style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#8a8579;">Result release</label>
+          <select name="result_release_mode" style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:8px 10px;border-radius:6px;font-size:13px;margin-top:4px;font-family:inherit;">
+            <option value="immediate" selected={(test.result_release_mode || 'immediate') === 'immediate'}>Immediate (show after submit)</option>
+            <option value="on_declare" selected={test.result_release_mode === 'on_declare'}>Hold until authority declares</option>
+          </select>
+        </div>
+        <div><label style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#8a8579;">Ranking shown to candidate</label>
+          <select name="ranking_mode" style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:8px 10px;border-radius:6px;font-size:13px;margin-top:4px;font-family:inherit;">
+            <option value="none" selected={(test.ranking_mode || 'none') === 'none'}>None</option>
+            <option value="rank" selected={test.ranking_mode === 'rank'}>Own rank only</option>
+            <option value="leaderboard" selected={test.ranking_mode === 'leaderboard'}>Full leaderboard</option>
+          </select>
+        </div>
+        <div><label style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#8a8579;" title="Fraction of a question's marks deducted per wrong objective answer. 0.25 = -1/4. Blanks never penalised.">Negative marking</label><input name="negative_mark_fraction" type="number" step="0.05" min="0" max="1" value={test.negative_mark_fraction || 0} style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:8px 10px;border-radius:6px;font-size:13px;margin-top:4px;font-family:'JetBrains Mono',monospace;" /></div>
+      </div>
+
+      <div style="grid-column:1/-1;display:flex;flex-wrap:wrap;gap:14px 22px;padding-bottom:8px;">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#c8c3b8;cursor:pointer;"><input type="checkbox" name="restricted" checked={test.restricted} /> <span>Restricted exam (questions limited to designated authority)</span></label>
+      </div>
+
       <div style="grid-column:1/-1;">
         <label style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#8a8579;">Instructions (shown to candidate before they start)</label>
         <textarea name="instructions" rows="3" style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:8px 10px;border-radius:6px;font-size:13px;margin-top:4px;resize:vertical;font-family:inherit;">{test.instructions || ''}</textarea>
@@ -232,6 +284,48 @@ const Q_TYPE_LABELS: Record<string,string> = {
         <p style="font-size:11px;color:#8a8579;margin:0;">For currency=CHF, price=100 means 1 CHF (Razorpay charges live INR equivalent).</p>
       </div>
     </form>
+  </details>
+
+  <!-- RESULTS & RANKING - declare + leaderboard for evaluation -->
+  <details style="margin:14px 16px;background:#14181d;border:1px solid #2a3038;border-radius:12px;padding:14px 18px;">
+    <summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;letter-spacing:0.16em;text-transform:uppercase;color:#d97757;">Results &middot; ranking &middot; declaration ({leaderboard.length} attempts)</summary>
+
+    <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+      <span style="font-size:12.5px;color:#c8c3b8;">Release mode: <strong style="color:#f4f1ea;">{test.result_release_mode === 'on_declare' ? 'Held until declared' : 'Immediate'}</strong></span>
+      {test.result_release_mode === 'on_declare' && (
+        test.results_declared ? (
+          <>
+            <span style="font-size:11px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;padding:4px 10px;border-radius:100px;">Declared</span>
+            <form method="POST" style="display:inline;" onsubmit="return confirm('Withdraw results from candidates?');"><input type="hidden" name="action" value="unpublish_results" /><button type="submit" style="font-size:11px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;padding:5px 12px;border-radius:6px;cursor:pointer;">Withdraw results</button></form>
+          </>
+        ) : (
+          <form method="POST" style="display:inline;" onsubmit="return confirm('Declare results to all candidates now? Ranking is auto-computed from scores.');"><input type="hidden" name="action" value="declare_results" /><button type="submit" class="btn-atlas">Declare results now</button></form>
+        )
+      )}
+    </div>
+    <p style="font-size:11px;color:#8a8579;margin:8px 0 0;line-height:1.6;">Ranks are auto-computed from scores (ties broken by faster time). Proctoring flags are advisory only and never auto-penalise a candidate - a human reviews the attempt and decides. This protects candidates from harm caused by any false detection.</p>
+
+    <div style="margin-top:14px;overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+        <thead><tr style="text-align:left;color:#8a8579;border-bottom:1px solid #2a3038;">
+          <th style="padding:6px 8px;">Rank</th><th style="padding:6px 8px;">Candidate</th><th style="padding:6px 8px;">Score</th><th style="padding:6px 8px;">Neg</th><th style="padding:6px 8px;">Time</th><th style="padding:6px 8px;">Flags</th><th style="padding:6px 8px;"></th>
+        </tr></thead>
+        <tbody>
+          {leaderboard.map((a: any) => (
+            <tr style="border-bottom:1px solid #1a1a1f;color:#c8c3b8;">
+              <td style="padding:6px 8px;font-family:'JetBrains Mono',monospace;color:#d97757;font-weight:700;">{a.rank || '-'}</td>
+              <td style="padding:6px 8px;">{a.candidate_name || a.candidate_email || 'anon'}</td>
+              <td style="padding:6px 8px;font-family:'JetBrains Mono',monospace;">{a.percentage != null ? Math.round(a.percentage) + '%' : '-'} <span style="color:#6e6e78;">({a.total_score}/{a.max_score})</span></td>
+              <td style="padding:6px 8px;color:#fca5a5;">{a.negative_marks && Number(a.negative_marks) > 0 ? '-' + a.negative_marks : '-'}</td>
+              <td style="padding:6px 8px;color:#8a8579;">{a.duration_seconds ? Math.floor(a.duration_seconds / 60) + 'm' : '-'}</td>
+              <td style="padding:6px 8px;">{((a.tab_switches || 0) + (a.fullscreen_exits || 0)) > 0 ? <span style="color:#f0b54f;">{(a.tab_switches || 0) + (a.fullscreen_exits || 0)}</span> : <span style="color:#6ee7b7;">clean</span>}</td>
+              <td style="padding:6px 8px;"><a href={'/admin/tests/attempts/' + a.id} style="color:#60a5fa;text-decoration:none;">review</a></td>
+            </tr>
+          ))}
+          {leaderboard.length === 0 && <tr><td colspan="7" style="padding:14px 8px;color:#6e6e78;">No graded attempts yet.</td></tr>}
+        </tbody>
+      </table>
+    </div>
   </details>
 
   <div style="padding:14px 16px;display:grid;grid-template-columns:1fr 360px;gap:16px;">
