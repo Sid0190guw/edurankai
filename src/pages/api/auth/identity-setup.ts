@@ -21,6 +21,7 @@ import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { verifyIdNumber, isIdType } from '@/lib/id-verify';
 
 const scrypt = promisify(crypto.scrypt) as (pw: string, salt: Buffer, len: number) => Promise<Buffer>;
 const KEY_LEN = 64;
@@ -73,6 +74,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   const matchDistanceRaw = Number(body?.matchDistance);
   const idCardType = (body?.idCardType || '').toString().slice(0, 50);
   const idCardBlobUrl = body?.idCardBlobUrl ? body.idCardBlobUrl.toString().slice(0, 1000) : null;
+  const idNumberRaw = (body?.idNumber || '').toString().slice(0, 60);
 
   const ua = (request.headers.get('user-agent') || '').slice(0, 500);
   const ip = (clientAddress || request.headers.get('x-forwarded-for') || '').toString().split(',')[0].trim().slice(0, 64);
@@ -85,6 +87,14 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   if (newPassword.length > 200) return json({ ok: false, error: 'Password too long' }, 400);
   if (!Array.isArray(descriptor) || descriptor.length !== 128) return json({ ok: false, error: 'Invalid face descriptor (need 128 floats)' }, 400);
   if (!Number.isFinite(matchDistanceRaw) || matchDistanceRaw < 0 || matchDistanceRaw > 2) return json({ ok: false, error: 'Invalid match distance' }, 400);
+
+  // ID type + number must be present and the number must structurally match
+  // the chosen ID type (no junk/empty IDs).
+  if (!isIdType(idCardType)) return json({ ok: false, error: 'Select a valid government ID type' }, 400);
+  const idCheck = verifyIdNumber(idCardType as any, idNumberRaw);
+  if (!idCheck.valid) return json({ ok: false, error: idCheck.reason || 'ID number does not match the selected ID type' }, 400);
+  const idNumber = idCheck.normalised;
+  if (!idCardBlobUrl) return json({ ok: false, error: 'Upload a photo/PDF of your government ID' }, 400);
 
   // Don't allow the user to "verify" with a face that doesn't match the ID
   const matchPassed = matchDistanceRaw <= FACE_MATCH_THRESHOLD;
@@ -136,6 +146,8 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         identity_verified = true,
         identity_verified_at = NOW(),
         id_card_type = ${idCardType || null},
+        id_number = ${idNumber},
+        id_doc_url = ${idCardBlobUrl},
         is_active = true,
         updated_at = NOW()
       WHERE id = ${user.id}
