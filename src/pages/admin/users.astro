@@ -164,6 +164,18 @@ if (Astro.request.method === 'POST' && canEdit) {
       });
       okMsg = 'Face enrollment cleared. User must re-enroll at /portal/enroll-face';
     }
+    else if (action === 'approve_access') {
+      const userId = fd.get('userId') as string;
+      await db.execute(sql`UPDATE users SET access_status = 'approved', waiver_decided_by = ${currentUser.id}, waiver_decided_at = NOW(), updated_at = NOW() WHERE id = ${userId}`);
+      await logAudit({ userId: currentUser.id, action: 'user.access_approve', entity: 'user', entityId: userId, diff: {}, ipAddress: Astro.clientAddress });
+      okMsg = 'Account approved - the user now has full access.';
+    }
+    else if (action === 'reject_access') {
+      const userId = fd.get('userId') as string;
+      await db.execute(sql`UPDATE users SET access_status = 'rejected', waiver_decided_by = ${currentUser.id}, waiver_decided_at = NOW(), updated_at = NOW() WHERE id = ${userId}`);
+      await logAudit({ userId: currentUser.id, action: 'user.access_reject', entity: 'user', entityId: userId, diff: {}, ipAddress: Astro.clientAddress });
+      okMsg = 'Waiver request rejected - account stays restricted until the fee is paid.';
+    }
     else if (action === 'change_role') {
       const userId = fd.get('userId') as string;
       const newRole = fd.get('role') as string;
@@ -193,10 +205,19 @@ const url = new URL(Astro.request.url);
 const filter = url.searchParams.get('filter') || 'admins';
 
 const allUsers = await db.select().from(users).orderBy(desc(users.createdAt));
+
+// Access status + waiver fields live on raw columns (not in the Drizzle model).
+const accessRowsRaw = await db.execute(sql`SELECT id, access_status, waiver_requested, waiver_reason FROM users`);
+const accessRows = Array.isArray(accessRowsRaw) ? accessRowsRaw : (accessRowsRaw?.rows || []);
+const accessMap: Record<string, any> = {};
+for (const a of (accessRows as any[])) accessMap[a.id] = a;
+const isPending = (uid: string) => (accessMap[uid]?.access_status || 'approved') === 'pending';
+
 let filteredUsers = allUsers;
 if (filter === 'admins') filteredUsers = allUsers.filter(u => u.role !== 'applicant');
 else if (filter === 'applicants') filteredUsers = allUsers.filter(u => u.role === 'applicant');
 else if (filter === 'inactive') filteredUsers = allUsers.filter(u => !u.isActive);
+else if (filter === 'pending') filteredUsers = allUsers.filter(u => isPending(u.id));
 
 const allDepts = await db.select().from(departments).orderBy(asc(departments.sortOrder));
 const deptMap = Object.fromEntries(allDepts.map(d => [d.id, d.name]));
@@ -205,6 +226,7 @@ const counts = {
   admins: allUsers.filter(u => u.role !== 'applicant').length,
   applicants: allUsers.filter(u => u.role === 'applicant').length,
   inactive: allUsers.filter(u => !u.isActive).length,
+  pending: allUsers.filter(u => isPending(u.id)).length,
   total: allUsers.length
 };
 
@@ -243,6 +265,7 @@ const ROLES_AVAILABLE = Object.keys(ROLE_LABELS).filter(r => r !== 'applicant');
         <div style="padding:14px 16px;border-bottom:1px solid #1f1f26;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
           <a href="?filter=admins" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'admins' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Admins ({counts.admins})</a>
           <a href="?filter=applicants" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'applicants' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Applicants ({counts.applicants})</a>
+          <a href="?filter=pending" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'pending' ? '#FF4F00;background:#FF4F00;color:#fff' : (counts.pending > 0 ? '#fbbf24;color:#fbbf24' : '#1f1f26;color:#a0a0ab'))}>Pending approval ({counts.pending})</a>
           <a href="?filter=inactive" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'inactive' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>Deactivated ({counts.inactive})</a>
           <a href="?filter=all" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'all' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({counts.total})</a>
         </div>
@@ -275,6 +298,14 @@ const ROLES_AVAILABLE = Object.keys(ROLE_LABELS).filter(r => r !== 'applicant');
                     {handle && handle !== u.email && (
                       <div style="font-size:11px;color:#FF7040;margin-top:2px;font-family:'Geist Mono',monospace;" title="Assigned internal credential - candidate can sign in with this too">@ {handle}</div>
                     )}
+                    {accessMap[u.id] && accessMap[u.id].access_status === 'pending' && (
+                      <div style="margin-top:4px;">
+                        <span style="font-size:9px;background:rgba(251,191,36,0.14);color:#fbbf24;padding:1px 7px;border-radius:100px;letter-spacing:0.05em;text-transform:uppercase;font-weight:700;">Pending {accessMap[u.id].waiver_requested ? '· waiver requested' : '· unpaid'}</span>
+                        {accessMap[u.id].waiver_requested && accessMap[u.id].waiver_reason && (
+                          <div style="font-size:11px;color:#a0a0ab;margin-top:3px;font-style:italic;max-width:320px;">"{accessMap[u.id].waiver_reason}"</div>
+                        )}
+                      </div>
+                    )}
                   </td>
                   <td>
                     <div style="font-size:12px;color:#d8d8de;font-weight:500;">{roleLabel}</div>
@@ -290,6 +321,20 @@ const ROLES_AVAILABLE = Object.keys(ROLE_LABELS).filter(r => r !== 'applicant');
                   <td style="text-align:right;">
                     {canEdit && !isCurrent && (
                       <div style="display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap;">
+                        {accessMap[u.id] && accessMap[u.id].access_status === 'pending' && (
+                          <>
+                            <form method="POST" style="margin:0;display:inline;">
+                              <input type="hidden" name="_action" value="approve_access" />
+                              <input type="hidden" name="userId" value={u.id} />
+                              <button type="submit" class="admin-btn" style="padding:4px 9px;font-size:10.5px;color:#6ee7b7;border-color:rgba(16,185,129,0.3);">Approve</button>
+                            </form>
+                            <form method="POST" style="margin:0;display:inline;" onsubmit="return confirm('Reject this waiver request? The account stays restricted.');">
+                              <input type="hidden" name="_action" value="reject_access" />
+                              <input type="hidden" name="userId" value={u.id} />
+                              <button type="submit" class="admin-btn" style="padding:4px 9px;font-size:10.5px;color:#fca5a5;">Reject</button>
+                            </form>
+                          </>
+                        )}
                         <form method="POST" style="margin:0;display:inline;">
                           <input type="hidden" name="_action" value="reset_password" />
                           <input type="hidden" name="userId" value={u.id} />

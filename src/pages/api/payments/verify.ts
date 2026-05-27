@@ -63,6 +63,11 @@ export const POST: APIRoute = async ({ request }) => {
           UPDATE applications SET fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), updated_at = NOW()
           WHERE id = ${pay.reference_id}
         `);
+      } else if (pay && (pay.purpose === 'registration_fee' || (pay.reference_type === 'user')) && pay.reference_id) {
+        await db.execute(sql`
+          UPDATE users SET reg_fee_paid = true, reg_fee_payment_id = ${paymentId}, access_status = 'approved', updated_at = NOW()
+          WHERE id = ${pay.reference_id}
+        `);
       } else if (pay && (pay.purpose === 'event_level' || pay.reference_type === 'event_level') && pay.reference_id) {
         // reference_id is the event_level_progress row id.
         await db.execute(sql`
