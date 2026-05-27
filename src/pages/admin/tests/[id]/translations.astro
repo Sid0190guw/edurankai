@@ -1,0 +1,134 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+let okMsg = '', errMsg = '';
+
+const LANGS: { code: string; label: string }[] = [
+  { code: 'en', label: 'English' }, { code: 'hi', label: 'Hindi' }, { code: 'bn', label: 'Bengali' },
+  { code: 'ta', label: 'Tamil' }, { code: 'te', label: 'Telugu' }, { code: 'mr', label: 'Marathi' },
+  { code: 'gu', label: 'Gujarati' }, { code: 'kn', label: 'Kannada' }, { code: 'ml', label: 'Malayalam' },
+  { code: 'pa', label: 'Punjabi' }, { code: 'ur', label: 'Urdu' }, { code: 'as', label: 'Assamese' },
+  { code: 'es', label: 'Spanish' }, { code: 'fr', label: 'French' }, { code: 'de', label: 'German' },
+  { code: 'pt', label: 'Portuguese' }, { code: 'ar', label: 'Arabic' }, { code: 'zh', label: 'Mandarin' },
+  { code: 'ja', label: 'Japanese' }, { code: 'ru', label: 'Russian' },
+];
+const langLabel = (c: string) => LANGS.find(l => l.code === c)?.label || c;
+
+const test: any = rows(await db.execute(sql`SELECT * FROM tests WHERE id = ${id} LIMIT 1`))[0];
+if (!test) return Astro.redirect('/admin/tests');
+
+const url = new URL(Astro.request.url);
+const lang = (url.searchParams.get('lang') || 'hi').trim();
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action');
+  try {
+    if (action === 'set_languages') {
+      const offered = LANGS.map(l => l.code).filter(c => fd.get('lang_' + c) === 'on');
+      if (!offered.includes('en')) offered.unshift('en');
+      await db.execute(sql`UPDATE tests SET languages = ${sql.raw("'" + JSON.stringify(offered).replace(/'/g, "''") + "'::jsonb")}, updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Offered languages updated.';
+      const t = rows(await db.execute(sql`SELECT * FROM tests WHERE id = ${id} LIMIT 1`))[0]; if (t) test.languages = t.languages;
+    } else if (action === 'save_translations' || action === 'approve_translations') {
+      const tlang = (fd.get('lang') as string || lang).trim();
+      const qs = rows(await db.execute(sql`SELECT id, options FROM test_questions WHERE test_id = ${id}`));
+      const status = action === 'approve_translations' ? 'approved' : 'draft';
+      for (const q of qs as any[]) {
+        const qtext = (fd.get('q_' + q.id) as string || '').trim();
+        if (!qtext) continue; // skip untranslated
+        const origOpts = Array.isArray(q.options) ? q.options : [];
+        const transOpts = origOpts.map((o: any, idx: number) => ({ id: o.id != null ? o.id : idx, text: (fd.get('opt_' + q.id + '_' + idx) as string || o.text || '').trim() }));
+        await db.execute(sql`
+          INSERT INTO test_question_translations (question_id, test_id, lang, question_text, options, status, updated_by)
+          VALUES (${q.id}, ${id}, ${tlang}, ${qtext}, ${sql.raw("'" + JSON.stringify(transOpts).replace(/'/g, "''") + "'::jsonb")}, ${status}, ${user.id})
+          ON CONFLICT (question_id, lang) DO UPDATE SET question_text = EXCLUDED.question_text, options = EXCLUDED.options, status = EXCLUDED.status, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+        `);
+      }
+      okMsg = action === 'approve_translations' ? ('Translations for ' + langLabel(tlang) + ' approved and live.') : 'Draft translations saved.';
+    }
+  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'error'); }
+}
+
+const offered = Array.isArray(test.languages) ? test.languages : ['en'];
+const questions = rows(await db.execute(sql`SELECT id, question_text, question_type, options, sort_order FROM test_questions WHERE test_id = ${id} ORDER BY sort_order, created_at`));
+const trans = rows(await db.execute(sql`SELECT question_id, question_text, options, status FROM test_question_translations WHERE test_id = ${id} AND lang = ${lang}`));
+const tmap: Record<string, any> = {}; for (const t of trans) tmap[t.question_id] = t;
+const approvedCount = trans.filter((t: any) => t.status === 'approved').length;
+---
+<AdminLayout title={'Translations - ' + test.title} activeNav="tests">
+  <div class="admin-page" style="max-width:1100px;">
+    <a href={'/admin/tests/' + id} style="font-size:11px;color:#FF7040;text-decoration:none;font-weight:600;">&lt; Back to test</a>
+    <h1 class="admin-page-title" style="margin-top:8px;">Translations · {test.title}</h1>
+    <p class="admin-page-sub">Add per-language translations. They go live only after you <strong>approve</strong> them, so meaning is preserved by human review.</p>
+
+    {errMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 13px;margin:12px 0;font-size:12.5px;">{errMsg}</div>}
+    {okMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 13px;margin:12px 0;font-size:12.5px;">{okMsg}</div>}
+
+    <details style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;margin:14px 0;">
+      <summary style="cursor:pointer;font-size:12px;font-weight:700;color:#FF7040;">Offered languages ({offered.length})</summary>
+      <form method="POST" style="margin-top:12px;">
+        <input type="hidden" name="action" value="set_languages" />
+        <div style="display:flex;flex-wrap:wrap;gap:8px 16px;">
+          {LANGS.map((l) => (
+            <label style="font-size:12px;color:#c8c3b8;display:flex;gap:6px;align-items:center;">
+              <input type="checkbox" name={'lang_' + l.code} checked={offered.includes(l.code)} disabled={l.code === 'en'} /> {l.label}
+            </label>
+          ))}
+        </div>
+        <button type="submit" class="admin-btn admin-btn-primary" style="margin-top:10px;">Save offered languages</button>
+      </form>
+    </details>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:14px 0;">
+      {offered.filter((c: string) => c !== 'en').map((c: string) => (
+        <a href={'?lang=' + c} style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (lang === c ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>{langLabel(c)}</a>
+      ))}
+      {offered.filter((c: string) => c !== 'en').length === 0 && <span style="font-size:12px;color:#6e6e78;">Add a language above first.</span>}
+    </div>
+
+    {offered.includes(lang) && lang !== 'en' && (
+      <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
+        <input type="hidden" name="lang" value={lang} />
+        <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 4px;">{langLabel(lang)} translation ({approvedCount}/{questions.length} approved)</p>
+        <p style="font-size:11px;color:#8a8a94;margin:0 0 14px;">Enter the translated wording. Leave blank to keep using the original for that question.</p>
+        {questions.map((q: any, i: number) => {
+          const tr = tmap[q.id];
+          const opts = Array.isArray(q.options) ? q.options : [];
+          return (
+            <div style="border-top:1px solid #1a1a1f;padding:12px 0;">
+              <p style="font-size:12px;color:#8a8a94;margin:0 0 4px;">Q{i + 1} (original): {q.question_text}</p>
+              <textarea name={'q_' + q.id} rows="2" placeholder="Translated question text" style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:8px 10px;border-radius:6px;font-size:13px;">{tr ? tr.question_text : ''}</textarea>
+              {opts.length > 0 && (
+                <div style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+                  {opts.map((o: any, idx: number) => {
+                    const trOpt = tr && Array.isArray(tr.options) ? tr.options[idx] : null;
+                    return (
+                      <div>
+                        <span style="font-size:10px;color:#6e6e78;">{o.text}</span>
+                        <input name={'opt_' + q.id + '_' + idx} value={trOpt ? trOpt.text : ''} placeholder="translated option" style="width:100%;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:5px 8px;border-radius:6px;font-size:12px;" />
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {tr && <span style={'font-size:10px;font-family:monospace;' + (tr.status === 'approved' ? 'color:#6ee7b7;' : 'color:#fbbf24;')}>{tr.status}</span>}
+            </div>
+          );
+        })}
+        <div style="display:flex;gap:10px;margin-top:14px;">
+          <button type="submit" name="action" value="save_translations" class="admin-btn">Save draft</button>
+          <button type="submit" name="action" value="approve_translations" class="admin-btn admin-btn-primary">Approve &amp; make live</button>
+        </div>
+      </form>
+    )}
+  </div>
+</AdminLayout>
