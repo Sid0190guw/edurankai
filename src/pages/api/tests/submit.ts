@@ -108,6 +108,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         answers = ${JSON.stringify(answers || {})},
         flagged_questions = ${JSON.stringify(flagged || {})},
         total_score = ${totalScore},
+        auto_score = ${totalScore},
         max_score = ${maxScore},
         percentage = ${percentage.toFixed(2)},
         negative_marks = ${negativeTotal.toFixed(2)},

@@ -26,6 +26,66 @@ try {
 
 if (!attempt) return Astro.redirect('/admin/tests/attempts');
 
+function aRows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+let gradeMsg = '';
+
+// Manual grading: save marks + feedback for subjective questions, then
+// recompute total = auto (objective) + manual, plus percentage, then re-rank.
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  if (fd.get('action') === 'save_grades') {
+    try {
+      const qrows = aRows(await db.execute(sql`SELECT id, marks, question_type FROM test_questions WHERE test_id = ${attempt.test_id}`));
+      const manualScores: Record<string, number> = {};
+      const manualFeedback: Record<string, string> = {};
+      let manualTotal = 0;
+      for (const q of qrows as any[]) {
+        const maxM = Number(q.marks || 0);
+        const raw = fd.get('mark_' + q.id);
+        if (raw !== null && String(raw).trim() !== '') {
+          let m = parseFloat(String(raw));
+          if (!isFinite(m)) m = 0;
+          m = Math.max(0, Math.min(maxM, m));
+          manualScores[q.id] = m; manualTotal += m;
+        }
+        const fb = (fd.get('fb_' + q.id) as string || '').trim();
+        if (fb) manualFeedback[q.id] = fb.slice(0, 2000);
+      }
+      const autoScore = Number(attempt.auto_score ?? attempt.total_score ?? 0);
+      const maxScore = Number(attempt.max_score ?? 0);
+      const newTotal = autoScore + manualTotal;
+      const newPct = maxScore > 0 ? (newTotal / maxScore) * 100 : 0;
+      await db.execute(sql`
+        UPDATE test_attempts SET
+          manual_scores = ${sql.raw("'" + JSON.stringify(manualScores).replace(/'/g, "''") + "'::jsonb")},
+          manual_feedback = ${sql.raw("'" + JSON.stringify(manualFeedback).replace(/'/g, "''") + "'::jsonb")},
+          total_score = ${newTotal}, percentage = ${newPct.toFixed(2)},
+          graded = true, graded_by = ${user.id}, graded_at = NOW()
+        WHERE id = ${id}
+      `);
+      // Re-rank the cohort by the updated scores.
+      const ar = aRows(await db.execute(sql`SELECT id FROM test_attempts WHERE test_id = ${attempt.test_id} AND status IN ('submitted','auto_submitted') ORDER BY percentage DESC NULLS LAST, duration_seconds ASC NULLS LAST, submitted_at ASC`));
+      for (let i = 0; i < ar.length; i++) await db.execute(sql`UPDATE test_attempts SET rank = ${i + 1} WHERE id = ${(ar[i] as any).id}`);
+      gradeMsg = 'Grades saved. New score: ' + newTotal + '/' + maxScore + ' (' + newPct.toFixed(1) + '%).';
+      const rr = aRows(await db.execute(sql`SELECT a.*, t.title as test_title, t.slug as test_slug, t.total_questions, t.duration_mins FROM test_attempts a LEFT JOIN tests t ON a.test_id = t.id WHERE a.id = ${id} LIMIT 1`));
+      attempt = rr[0] || attempt;
+    } catch (e: any) { gradeMsg = 'Grade save failed: ' + (e?.message || 'error'); }
+  }
+}
+
+// Load questions + answers for manual grading of subjective items.
+let gradeQuestions: any[] = [];
+try {
+  const qr = aRows(await db.execute(sql`SELECT id, question_text, question_type, marks, correct_answer, sort_order FROM test_questions WHERE test_id = ${attempt.test_id} ORDER BY sort_order, created_at`));
+  const ans = attempt.answers || {};
+  const ms = attempt.manual_scores || {};
+  const mf = attempt.manual_feedback || {};
+  const SUBJECTIVE = ['long_answer', 'short_answer', 'code', 'file_upload', 'video_response'];
+  gradeQuestions = (qr as any[]).filter(q => SUBJECTIVE.includes(q.question_type)).map(q => ({
+    ...q, answer: ans[q.id], mark: (ms as any)[q.id], feedback: (mf as any)[q.id] || ''
+  }));
+} catch (_) {}
+
 try {
   const r = await db.execute(sql`
     SELECT id, event_type, severity, detail, client_ts, ip_address, created_at
@@ -103,6 +163,33 @@ function labelFor(t: string) { return evtLabel[t] || t; }
       <a href="/admin/tests/attempts" style="font-size:11px;color:#FF7040;text-decoration:none;font-weight:600;">&lt; All attempts</a>
       <a href={'/admin/tests/sentinel/' + attempt.id} style="font-size:11px;color:#fff;background:#d97757;border:none;font-weight:700;padding:7px 14px;border-radius:8px;text-decoration:none;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;">Sentinel live view &rarr;</a>
     </div>
+
+    {gradeMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{gradeMsg}</div>}
+
+    {gradeQuestions.length > 0 && (
+      <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px 22px;margin-bottom:18px;">
+        <input type="hidden" name="action" value="save_grades" />
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+          <p style="font-size:13px;font-weight:700;color:#fff;margin:0;">Manual grading ({gradeQuestions.length} subjective question{gradeQuestions.length === 1 ? '' : 's'})</p>
+          <span style={'font-size:11px;font-family:monospace;' + (attempt.graded ? 'color:#6ee7b7;' : 'color:#fbbf24;')}>{attempt.graded ? 'graded' : 'needs grading'}</span>
+        </div>
+        <p style="font-size:11px;color:#8a8a94;margin:0 0 14px;">Objective (auto) score: {attempt.auto_score ?? attempt.total_score ?? 0}. Enter marks for each subjective answer; the total + rank update on save.</p>
+        {gradeQuestions.map((q: any, i: number) => (
+          <div style="border-top:1px solid #1a1a1f;padding:12px 0;">
+            <p style="font-size:12.5px;color:#d8d8de;margin:0 0 6px;"><strong style="color:#fff;">Q{i + 1}</strong> ({q.question_type}, max {q.marks}) &middot; {q.question_text}</p>
+            <div style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;font-size:12.5px;color:#c8c3b8;white-space:pre-wrap;margin-bottom:8px;">{(q.answer === undefined || q.answer === null || q.answer === '') ? '(no answer submitted)' : (typeof q.answer === 'string' ? q.answer : JSON.stringify(q.answer))}</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+              <label style="font-size:11px;color:#8a8a94;">Marks
+                <input type="number" name={'mark_' + q.id} min="0" max={q.marks} step="0.5" value={q.mark != null ? q.mark : ''} style="width:80px;margin-left:6px;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:6px 8px;border-radius:6px;font-size:13px;font-family:monospace;" />
+                <span style="color:#6e6e78;"> / {q.marks}</span>
+              </label>
+              <input type="text" name={'fb_' + q.id} value={q.feedback} placeholder="Feedback to candidate (optional)" style="flex:1;min-width:200px;background:#1c2128;border:1px solid #2a3038;color:#f4f1ea;padding:6px 10px;border-radius:6px;font-size:12.5px;" />
+            </div>
+          </div>
+        ))}
+        <button type="submit" class="btn-atlas" style="margin-top:12px;background:#FF4F00;color:#fff;border:none;font-weight:700;padding:9px 18px;border-radius:8px;cursor:pointer;font-size:13px;">Save grades &amp; recompute</button>
+      </form>
+    )}
 
     <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px 22px;margin-bottom:18px;">
       <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 4px;">Attempt {attempt.id.slice(0,8)}</p>
