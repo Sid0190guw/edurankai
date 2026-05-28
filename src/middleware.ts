@@ -64,9 +64,16 @@ export const onRequest = defineMiddleware(async (context, next) => {
   context.locals.user = result.user;
   context.locals.session = result.session;
 
+  const path = new URL(context.request.url).pathname;
+
+  // Applicants get full access only in the application portal, never the admin
+  // panel. Central guard (complements per-page checks).
+  if (result.user.role === 'applicant' && path !== '/admin/login' && (path === '/admin' || path.startsWith('/admin/'))) {
+    return new Response(null, { status: 302, headers: { Location: '/portal' } });
+  }
+
   // 2FA gate: every authenticated request to a protected route must come from
   // an account that has a face descriptor on file. If not, route to /enroll-face.
-  const path = new URL(context.request.url).pathname;
   if (!isExempt(path) && isProtected(path)) {
     const hasFace = await hasFaceEnrolled(result.user.id);
     if (!hasFace) {
