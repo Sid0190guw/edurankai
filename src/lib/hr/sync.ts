@@ -53,12 +53,14 @@ async function syncHiredToEmployee(applicationId: string, actorUserId: string) {
     const fullName = ((a.first_name || '') + ' ' + (a.last_name || '')).trim();
     const joinDate = new Date().toISOString().split('T')[0];
 
-    // Create employee record
+    // Create employee record. Column names must match the real hr_employees
+    // schema: email (NOT NULL) + personal_email + joining_date (not work_email
+    // / join_date, which do not exist). Existence already checked above.
     await db.execute(sql`
       INSERT INTO hr_employees (
-        employee_code, full_name, personal_email, work_email,
-        phone, designation, department_id, join_date,
-        employment_type, application_id, is_active,
+        employee_code, full_name, email, personal_email,
+        phone, designation, department_id, joining_date,
+        employment_type, application_id, is_active, onboarding_status,
         created_at, updated_at
       ) VALUES (
         ${empCode}, ${fullName},
@@ -66,13 +68,12 @@ async function syncHiredToEmployee(applicationId: string, actorUserId: string) {
         ${a.phone || null},
         ${a.role_title_snapshot || 'Employee'},
         ${a.department_id || null},
-        ${joinDate},
+        ${joinDate}::date,
         'full_time',
         ${applicationId},
-        true,
+        true, 'pending',
         NOW(), NOW()
       )
-      ON CONFLICT (application_id) DO NOTHING
     `);
 
     // Allocate default leave balances for current year
