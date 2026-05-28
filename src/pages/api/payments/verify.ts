@@ -51,46 +51,15 @@ export const POST: APIRoute = async ({ request }) => {
     console.error('[payments] verify update failed:', e?.message);
   }
 
-  // If this was an application processing/verification fee, mark the application
-  // as paid so it can move forward.
+  // Apply downstream effects (mark application/registration/event paid, etc.).
+  // Shared with the webhook so a payment completes regardless of which path
+  // confirms it first; idempotent.
   if (captured) {
     try {
-      const r = await db.execute(sql`SELECT purpose, reference_type, reference_id FROM payments WHERE order_id = ${orderId} LIMIT 1`);
-      const rows = Array.isArray(r) ? r : (r?.rows || []);
-      const pay: any = rows[0];
-      if (pay && (pay.purpose === 'application_fee' || pay.reference_type === 'application') && pay.reference_id) {
-        await db.execute(sql`
-          UPDATE applications SET fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), updated_at = NOW()
-          WHERE id = ${pay.reference_id}
-        `);
-      } else if (pay && (pay.purpose === 'registration_fee' || (pay.reference_type === 'user')) && pay.reference_id) {
-        await db.execute(sql`
-          UPDATE users SET reg_fee_paid = true, reg_fee_payment_id = ${paymentId}, access_status = 'approved', updated_at = NOW()
-          WHERE id = ${pay.reference_id}
-        `);
-      } else if (pay && (pay.purpose === 'event_level' || pay.reference_type === 'event_level') && pay.reference_id) {
-        // reference_id is the event_level_progress row id.
-        await db.execute(sql`
-          UPDATE event_level_progress SET fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), status = 'paid', updated_at = NOW()
-          WHERE id = ${pay.reference_id}
-        `);
-        // Auto-issue for levels that grant an artifact on payment alone (no test gate).
-        try {
-          const lr = await db.execute(sql`
-            SELECT elp.registration_id, elp.level_id, elp.event_id, el.auto_issue_artifact, el.test_id
-            FROM event_level_progress elp JOIN event_levels el ON el.id = elp.level_id
-            WHERE elp.id = ${pay.reference_id} LIMIT 1
-          `);
-          const lrows = Array.isArray(lr) ? lr : (lr?.rows || []);
-          const prog: any = lrows[0];
-          if (prog && prog.auto_issue_artifact && !prog.test_id) {
-            const { issueArtifact } = await import('@/lib/issue-artifact');
-            await issueArtifact({ registrationId: prog.registration_id, eventId: prog.event_id, levelId: prog.level_id, artifactType: prog.auto_issue_artifact, autoIssued: true });
-          }
-        } catch (e2: any) { console.error('[payments] event auto-issue failed:', e2?.message); }
-      }
+      const { applyPaidEffects } = await import('@/lib/payment-effects');
+      await applyPaidEffects(orderId, paymentId);
     } catch (e: any) {
-      console.error('[payments] application fee mark failed:', e?.message);
+      console.error('[payments] paid effects failed:', e?.message);
     }
   }
 

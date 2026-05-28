@@ -12,11 +12,13 @@ function json(d: any, s = 200) {
 }
 
 const MAX_BYTES = 6 * 1024 * 1024; // 6 MB
+// Image only: the ID photo must be a real image so the face on it can be
+// detected and matched against the live selfie. PDFs are not accepted.
 const ALLOWED = [
   { ext: 'png', mime: 'image/png', magic: [[0x89, 0x50, 0x4e, 0x47]] },
   { ext: 'jpg', mime: 'image/jpeg', magic: [[0xff, 0xd8, 0xff]] },
   { ext: 'jpeg', mime: 'image/jpeg', magic: [[0xff, 0xd8, 0xff]] },
-  { ext: 'pdf', mime: 'application/pdf', magic: [[0x25, 0x50, 0x44, 0x46]] }, // %PDF
+  { ext: 'webp', mime: 'image/webp', magic: [[0x52, 0x49, 0x46, 0x46]] }, // RIFF (WEBP)
 ];
 
 function magicMatches(bytes: Uint8Array, magic: number[][]): boolean {
@@ -37,16 +39,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const name = (file.name || '').toLowerCase();
   const ext = name.split('.').pop() || '';
   const spec = ALLOWED.find((a) => a.ext === ext);
-  if (!spec) return json({ ok: false, error: 'Only PNG, JPG, or PDF files are allowed' }, 415);
+  if (!spec) return json({ ok: false, error: 'Only image files (PNG, JPG, WEBP) are allowed for ID' }, 415);
 
   // Read leading bytes and verify the true file signature.
   const buf = new Uint8Array(await file.arrayBuffer());
   if (!magicMatches(buf, spec.magic)) {
-    return json({ ok: false, error: 'File content does not match a real PNG/JPG/PDF (rejected for safety)' }, 415);
+    return json({ ok: false, error: 'File content does not match a real image (rejected for safety)' }, 415);
   }
   // Reject obvious script/HTML payloads sneaking in (defence in depth).
   const head = new TextDecoder('latin1').decode(buf.subarray(0, 512)).toLowerCase();
-  if (spec.mime !== 'application/pdf' && (head.includes('<script') || head.includes('<?php') || head.includes('<html'))) {
+  if (head.includes('<script') || head.includes('<?php') || head.includes('<html')) {
     return json({ ok: false, error: 'File rejected for safety' }, 415);
   }
 

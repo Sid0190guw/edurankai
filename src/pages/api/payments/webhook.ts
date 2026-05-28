@@ -74,6 +74,13 @@ export const POST: APIRoute = async ({ request }) => {
         WHERE order_id = ${orderId}
       `);
     }
+
+    // On capture, apply the same downstream effects as the browser verify so
+    // the payment completes even if the user never returned to the site.
+    if (eventType === 'payment.captured' || eventType === 'order.paid') {
+      const { applyPaidEffects } = await import('@/lib/payment-effects');
+      await applyPaidEffects(orderId, paymentEntity?.id || null);
+    }
   } catch (e: any) {
     console.error('[payments webhook] db update failed:', e?.message);
     // Still return 200 to prevent Razorpay retry storms - log + alert separately
