@@ -232,6 +232,8 @@ export const events = pgTable('events', {
   location: varchar('location', { length: 300 }),
   capacity: integer('capacity'),
   registrationUrl: text('registration_url'),
+  coverImageUrl: text('cover_image_url'),
+  videoUrl: text('video_url'),
   isFeatured: boolean('is_featured').notNull().default(false),
   tags: jsonb('tags').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
