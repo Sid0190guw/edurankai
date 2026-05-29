@@ -2,6 +2,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureMailSchema } from '@/lib/mail';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -26,6 +27,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const filter = sql`user_id = ${user.id} AND thread_id = ANY(${threadIds}::uuid[])`;
 
   try {
+    await ensureMailSchema();
     switch (action) {
       case 'read':
         await db.execute(sql`UPDATE mail_box SET is_read = true WHERE ${filter}`); break;

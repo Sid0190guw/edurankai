@@ -15,6 +15,66 @@ function rows<T = any>(r: any): T[] {
   return (Array.isArray(r) ? r : (r?.rows || [])) as T[];
 }
 
+// Self-bootstrap the mail schema at runtime so the system works even if the
+// .dev-scripts migration was never run. Idempotent; runs once per warm instance.
+let schemaReady: Promise<void> | null = null;
+export function ensureMailSchema(): Promise<void> {
+  if (!schemaReady) schemaReady = bootstrapSchema();
+  return schemaReady;
+}
+async function bootstrapSchema(): Promise<void> {
+  await db.execute(sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS mailbox_address VARCHAR(160)`);
+  // non-unique on purpose so a best-effort backfill never errors on a collision
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS users_mailbox_address_idx ON users(mailbox_address)`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), thread_id UUID NOT NULL, subject TEXT,
+    from_user_id UUID REFERENCES users(id) ON DELETE SET NULL, from_email VARCHAR(255) NOT NULL,
+    from_name VARCHAR(200), body_html TEXT, body_text TEXT, snippet VARCHAR(320),
+    direction VARCHAR(12) NOT NULL DEFAULT 'internal', has_attachments BOOLEAN NOT NULL DEFAULT false,
+    rfc_message_id VARCHAR(255), in_reply_to VARCHAR(255), is_draft BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_msg_thread_idx ON mail_messages(thread_id, created_at ASC)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_msg_rfc_idx ON mail_messages(rfc_message_id)`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_recipients (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), message_id UUID NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+    kind VARCHAR(4) NOT NULL DEFAULT 'to', user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    email VARCHAR(255) NOT NULL, name VARCHAR(200))`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_recip_msg_idx ON mail_recipients(message_id)`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_box (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    message_id UUID NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE, thread_id UUID NOT NULL,
+    folder VARCHAR(12) NOT NULL DEFAULT 'inbox', is_read BOOLEAN NOT NULL DEFAULT false,
+    is_starred BOOLEAN NOT NULL DEFAULT false, is_important BOOLEAN NOT NULL DEFAULT false,
+    labels TEXT[] NOT NULL DEFAULT '{}', snoozed_until TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, message_id))`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_box_folder_idx ON mail_box(user_id, folder, created_at DESC)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_box_thread_idx ON mail_box(user_id, thread_id)`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_attachments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), message_id UUID NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+    filename VARCHAR(300), url TEXT NOT NULL, mime VARCHAR(120), size_bytes BIGINT)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_attach_msg_idx ON mail_attachments(message_id)`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_settings (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, signature_html TEXT,
+    display_name VARCHAR(200), vacation_on BOOLEAN NOT NULL DEFAULT false, vacation_message TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS email_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(), message_id UUID, to_email VARCHAR(255),
+    from_email VARCHAR(255), subject TEXT, status VARCHAR(20) NOT NULL DEFAULT 'queued',
+    provider VARCHAR(20), error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  // best-effort backfill of mailbox addresses for everyone missing one
+  try {
+    await db.execute(sql`
+      WITH d AS (
+        SELECT id,
+          lower(regexp_replace(split_part(email, '@', 1), '[^a-zA-Z0-9._-]+', '.', 'g')) AS loc,
+          row_number() OVER (PARTITION BY lower(regexp_replace(split_part(email, '@', 1), '[^a-zA-Z0-9._-]+', '.', 'g')) ORDER BY created_at) AS rn
+        FROM users WHERE mailbox_address IS NULL AND email IS NOT NULL
+      )
+      UPDATE users u SET mailbox_address = d.loc || (CASE WHEN d.rn = 1 THEN '' ELSE d.rn::text END) || '@' || ${MAIL_DOMAIN}
+      FROM d WHERE u.id = d.id`);
+  } catch (e) { /* collisions left NULL; lazy assignment covers the active user */ }
+}
+
 export function normalizeEmail(e: string): string {
   return String(e || '').trim().toLowerCase();
 }
@@ -47,6 +107,7 @@ export function makeSnippet(text: string | null | undefined, html?: string | nul
 
 // Resolve a single email to a platform user (by mailbox address or login email)
 export async function resolveAddress(email: string): Promise<ResolvedUser> {
+  await ensureMailSchema();
   const e = normalizeEmail(email);
   const r = await db.execute(sql`
     SELECT id, name, email, mailbox_address FROM users
@@ -59,9 +120,20 @@ export async function resolveAddress(email: string): Promise<ResolvedUser> {
 }
 
 export async function getMailboxAddress(userId: string): Promise<string> {
+  await ensureMailSchema();
   const r = await db.execute(sql`SELECT mailbox_address, email FROM users WHERE id = ${userId} LIMIT 1`);
   const u = rows(r)[0];
-  return u?.mailbox_address || u?.email || '';
+  if (u?.mailbox_address) return u.mailbox_address;
+  // Lazy-assign for this user if the backfill missed them.
+  const localBase = (u?.email ? String(u.email).split('@')[0] : 'user').toLowerCase().replace(/[^a-z0-9._-]+/g, '.').replace(/^[.-]+|[.-]+$/g, '') || 'user';
+  let local = localBase, n = 1, addr = `${local}@${MAIL_DOMAIN}`;
+  while (n < 50) {
+    const clash = rows(await db.execute(sql`SELECT 1 FROM users WHERE lower(mailbox_address) = ${addr.toLowerCase()} AND id <> ${userId} LIMIT 1`));
+    if (!clash.length) break;
+    n += 1; local = `${localBase}${n}`; addr = `${local}@${MAIL_DOMAIN}`;
+  }
+  try { await db.execute(sql`UPDATE users SET mailbox_address = ${addr} WHERE id = ${userId}`); } catch (e) {}
+  return addr;
 }
 
 export interface DeliverInput {
@@ -90,6 +162,7 @@ export interface DeliverResult {
 // Persist a message + create mailbox copies for sender and internal recipients.
 // Returns the list of EXTERNAL recipients so the caller can hand off to SMTP/Resend.
 export async function deliverMessage(opts: DeliverInput): Promise<DeliverResult> {
+  await ensureMailSchema();
   const threadId = opts.threadId || randomUUID();
   const rfcMessageId = `<${randomUUID()}@${MAIL_DOMAIN}>`;
   const atts = opts.attachments || [];
@@ -178,6 +251,7 @@ export const FOLDERS: { key: Folder; label: string }[] = [
 ];
 
 export async function getFolderCounts(userId: string): Promise<Record<string, number>> {
+  await ensureMailSchema();
   const r = await db.execute(sql`
     SELECT folder, COUNT(*) FILTER (WHERE is_read = false)::int AS unread, COUNT(*)::int AS total
     FROM mail_box WHERE user_id = ${userId} GROUP BY folder
@@ -199,6 +273,7 @@ export interface ThreadRow {
 
 // List the latest message per thread within a folder for a user, with optional search.
 export async function listFolder(userId: string, folder: Folder, q?: string, starred?: boolean): Promise<ThreadRow[]> {
+  await ensureMailSchema();
   const search = q && q.trim() ? `%${q.trim().toLowerCase()}%` : null;
   const r = await db.execute(sql`
     WITH box AS (
@@ -224,6 +299,7 @@ export async function listFolder(userId: string, folder: Folder, q?: string, sta
 }
 
 export async function getThreadMessages(userId: string, threadId: string) {
+  await ensureMailSchema();
   const r = await db.execute(sql`
     SELECT m.id, m.subject, m.from_name, m.from_email, m.from_user_id, m.body_html, m.body_text,
            m.created_at, m.direction, m.has_attachments, b.folder, b.is_read, b.is_starred

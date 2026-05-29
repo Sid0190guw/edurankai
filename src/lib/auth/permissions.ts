@@ -124,14 +124,46 @@ export async function userCanAccess(userId: string, pageKey: string, action: Per
   return false;
 }
 
+// Default section access per built-in role (used when a user has NO custom role
+// assigned). super_admin is unrestricted. Keys come from src/lib/admin-sections.ts.
+const ROLE_SECTIONS: Record<string, string[]> = {
+  hr: [
+    'dashboard', 'applications', 'offers', 'messages', 'dms', 'discussion',
+    'hr', 'employees', 'leave', 'attendance', 'payroll', 'payouts', 'training', 'finance',
+    'roles', 'departments', 'interviews', 'interviews_manual', 'interviews_ai',
+    'events', 'content', 'custom_offer',
+  ],
+  recruiter: [
+    'dashboard', 'applications', 'offers', 'messages', 'dms',
+    'roles', 'interviews', 'interviews_manual', 'interviews_ai',
+    'tests', 'tests_proctoring', 'custom_offer',
+  ],
+  reviewer: [
+    'dashboard', 'applications', 'interviews', 'interviews_manual', 'interviews_ai',
+    'tests', 'tests_proctoring',
+  ],
+  department_head: [
+    'dashboard', 'applications', 'offers', 'roles',
+    'interviews', 'interviews_manual', 'interviews_ai', 'custom_offer',
+  ],
+  marketing: [
+    'dashboard', 'content', 'products', 'events',
+    'hei_institutions', 'hei_stories',
+  ],
+  editor: [
+    'dashboard', 'content', 'products', 'events', 'lms', 'custom_offer',
+  ],
+  applicant: [],
+};
+
 /**
  * Returns the set of admin section keys this user may VIEW, used to filter the
- * sidebar so people only see pages they can open.
+ * sidebar (and enforce in middleware) so people only see pages they can open.
  *   - super_admin            -> null  (means "everything", no filtering)
- *   - has >=1 custom role    -> set of granted view page-keys (+ dashboard)
- *   - no custom role assigned -> null  (status quo: show all, no regression)
- * Restriction therefore only kicks in once an admin assigns a custom role at
- * /admin/team/roles, which is the intended mechanism.
+ *   - has >=1 custom role    -> exactly the granted view page-keys (+ dashboard)
+ *   - else built-in role     -> that role's default section set (ROLE_SECTIONS)
+ * Custom-role assignment is the precise override; built-in roles get sane
+ * defaults so a Marketing/Recruiter/etc. account no longer sees every tab.
  */
 export async function getViewableSectionKeys(user: { id: string; role: string } | null): Promise<Set<string> | null> {
   if (!user) return new Set();
@@ -139,14 +171,18 @@ export async function getViewableSectionKeys(user: { id: string; role: string } 
   const assigns = await db.select({ roleId: userRoleAssignments.roleId })
     .from(userRoleAssignments)
     .where(eq(userRoleAssignments.userId, user.id));
-  if (assigns.length === 0) return null;
-  const roleIds = assigns.map(r => r.roleId);
-  const perms = await db.select({ pageKey: rolePermissions.pageKey, canView: rolePermissions.canView })
-    .from(rolePermissions)
-    .where(inArray(rolePermissions.roleId, roleIds));
-  const set = new Set<string>(['dashboard']);
-  for (const p of perms) if (p.canView) set.add(p.pageKey);
-  return set;
+  if (assigns.length > 0) {
+    const roleIds = assigns.map(r => r.roleId);
+    const perms = await db.select({ pageKey: rolePermissions.pageKey, canView: rolePermissions.canView })
+      .from(rolePermissions)
+      .where(inArray(rolePermissions.roleId, roleIds));
+    const set = new Set<string>(['dashboard']);
+    for (const p of perms) if (p.canView) set.add(p.pageKey);
+    return set;
+  }
+  const defaults = ROLE_SECTIONS[user.role];
+  if (!defaults) return null; // unknown role -> don't restrict
+  return new Set<string>(defaults);
 }
 
 /** Standard page-key constants. Use these instead of hardcoding strings. */

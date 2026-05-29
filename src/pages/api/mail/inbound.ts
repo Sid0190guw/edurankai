@@ -8,7 +8,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { parseAddressList, resolveAddress, makeSnippet } from '@/lib/mail';
+import { parseAddressList, resolveAddress, makeSnippet, ensureMailSchema } from '@/lib/mail';
 import { randomUUID } from 'node:crypto';
 
 function json(d: any, s = 200) {
@@ -36,6 +36,7 @@ export const POST: APIRoute = async ({ request }) => {
   const rfcId = (body.messageId || body.message_id || `<${randomUUID()}@inbound>`).toString();
 
   try {
+    await ensureMailSchema();
     // Deliver to each internal recipient mailbox
     let delivered = 0;
     const seen = new Set<string>();
