@@ -2,7 +2,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { deliverMessage, parseAddressList, getMailboxAddress, logOutbound } from '@/lib/mail';
+import { deliverMessage, parseAddressList, getMailboxAddress, logOutbound, getMailConfig } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
 
 function json(d: any, s = 200) {
@@ -58,8 +58,15 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const extTo = result.external.filter(e => e.kind === 'to').map(e => e.email);
       const extCc = result.external.filter(e => e.kind === 'cc').map(e => e.email);
       const extBcc = result.external.filter(e => e.kind === 'bcc').map(e => e.email);
+      // The SMTP server typically only allows sending AS the authenticated
+      // mailbox, so use the configured From address; set Reply-To to the actual
+      // composer so external replies route back to them.
+      const cfg = await getMailConfig();
+      const envFrom = cfg.fromAddress
+        ? `${cfg.fromName || fromName} <${cfg.fromAddress}>`
+        : `${fromName} <${fromEmail}>`;
       const send = await sendExternal({
-        from: `${fromName} <${fromEmail}>`,
+        from: envFrom,
         to: extTo.length ? extTo : (extCc[0] ? extCc : extBcc),
         cc: extCc, bcc: extBcc,
         subject, html: bodyHtml, text: bodyText,

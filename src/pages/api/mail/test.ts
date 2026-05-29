@@ -19,15 +19,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const cfg = await getMailConfig();
   if (cfg.source === 'none') return json({ ok: false, error: 'No transport configured. Add SMTP details or a Resend key first.' }, 400);
 
-  const fromAddr = await getMailboxAddress(user.id);
+  const userAddr = await getMailboxAddress(user.id);
+  const fromAddr = cfg.fromAddress || userAddr;
   const fromName = cfg.fromName || user.name || 'EduRankAI';
   const result = await sendExternal({
     from: `${fromName} <${fromAddr}>`,
+    replyTo: userAddr,
     to,
     subject: 'EduRankAI mail test',
     html: `<div style="font-family:sans-serif"><h2>It works.</h2><p>This is a test email from your EduRankAI mail system, sent via <b>${cfg.source === 'db' ? 'your saved settings' : 'environment config'}</b>.</p><p>Sent by ${fromName} (${fromAddr}).</p></div>`,
     text: `It works. Test email from EduRankAI mail, sent by ${fromName} (${fromAddr}).`,
-    replyTo: fromAddr,
   });
 
   if (result.ok) return json({ ok: true, provider: result.provider, id: result.id });
