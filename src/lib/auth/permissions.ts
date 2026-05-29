@@ -124,6 +124,31 @@ export async function userCanAccess(userId: string, pageKey: string, action: Per
   return false;
 }
 
+/**
+ * Returns the set of admin section keys this user may VIEW, used to filter the
+ * sidebar so people only see pages they can open.
+ *   - super_admin            -> null  (means "everything", no filtering)
+ *   - has >=1 custom role    -> set of granted view page-keys (+ dashboard)
+ *   - no custom role assigned -> null  (status quo: show all, no regression)
+ * Restriction therefore only kicks in once an admin assigns a custom role at
+ * /admin/team/roles, which is the intended mechanism.
+ */
+export async function getViewableSectionKeys(user: { id: string; role: string } | null): Promise<Set<string> | null> {
+  if (!user) return new Set();
+  if (user.role === 'super_admin') return null;
+  const assigns = await db.select({ roleId: userRoleAssignments.roleId })
+    .from(userRoleAssignments)
+    .where(eq(userRoleAssignments.userId, user.id));
+  if (assigns.length === 0) return null;
+  const roleIds = assigns.map(r => r.roleId);
+  const perms = await db.select({ pageKey: rolePermissions.pageKey, canView: rolePermissions.canView })
+    .from(rolePermissions)
+    .where(inArray(rolePermissions.roleId, roleIds));
+  const set = new Set<string>(['dashboard']);
+  for (const p of perms) if (p.canView) set.add(p.pageKey);
+  return set;
+}
+
 /** Standard page-key constants. Use these instead of hardcoding strings. */
 export const PAGE_KEYS = {
   DASHBOARD: 'dashboard',
