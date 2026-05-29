@@ -1,7 +1,8 @@
 // src/lib/mail-transport.ts - outbound email delivery to EXTERNAL addresses.
-// Priority: your own VPS SMTP (nodemailer) -> Resend HTTP API -> log only.
+// Config comes from the DB (UI-editable, /admin/mail/settings) and falls back to
+// environment vars. Priority: SMTP (your VPS) -> Resend HTTP API -> log only.
 import nodemailer from 'nodemailer';
-import { sendEmail } from '@/lib/email';
+import { getMailConfig } from '@/lib/mail';
 
 export interface SendExternalParams {
   from: string;          // "Name <addr@edurankai.in>"
@@ -19,35 +20,26 @@ export interface SendExternalParams {
 
 export interface SendResult { ok: boolean; provider: 'smtp' | 'resend' | 'none'; id?: string; error?: string; }
 
-let cachedTransport: nodemailer.Transporter | null = null;
-
-function getSmtpTransport(): nodemailer.Transporter | null {
-  if (!process.env.SMTP_HOST) return null;
-  if (cachedTransport) return cachedTransport;
-  const port = Number(process.env.SMTP_PORT || 587);
-  cachedTransport = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port,
-    secure: process.env.SMTP_SECURE === 'true' || port === 465,
-    auth: process.env.SMTP_USER
-      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-      : undefined,
-    tls: { rejectUnauthorized: process.env.SMTP_INSECURE !== 'true' },
-  });
-  return cachedTransport;
-}
-
-export function transportStatus(): { mode: 'smtp' | 'resend' | 'none'; detail: string } {
-  if (process.env.SMTP_HOST) return { mode: 'smtp', detail: `${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587}` };
-  if (process.env.RESEND_API_KEY) return { mode: 'resend', detail: 'Resend HTTP API' };
+export async function transportStatus(): Promise<{ mode: 'smtp' | 'resend' | 'none'; detail: string }> {
+  const c = await getMailConfig();
+  if (c.smtpHost) return { mode: 'smtp', detail: `${c.smtpHost}:${c.smtpPort}` };
+  if (c.resendApiKey) return { mode: 'resend', detail: 'Resend HTTP API' };
   return { mode: 'none', detail: 'No outbound transport configured' };
 }
 
 export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
-  const smtp = getSmtpTransport();
-  if (smtp) {
+  const c = await getMailConfig();
+
+  if (c.smtpHost) {
     try {
-      const info = await smtp.sendMail({
+      const transport = nodemailer.createTransport({
+        host: c.smtpHost,
+        port: c.smtpPort,
+        secure: c.smtpSecure || c.smtpPort === 465,
+        auth: c.smtpUser ? { user: c.smtpUser, pass: c.smtpPass } : undefined,
+        tls: { rejectUnauthorized: process.env.SMTP_INSECURE !== 'true' },
+      });
+      const info = await transport.sendMail({
         from: p.from,
         to: Array.isArray(p.to) ? p.to.join(', ') : p.to,
         cc: p.cc && p.cc.length ? p.cc.join(', ') : undefined,
@@ -67,10 +59,26 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     }
   }
 
-  if (process.env.RESEND_API_KEY) {
-    const r = await sendEmail({ to: p.to, subject: p.subject, html: p.html, text: p.text, replyTo: p.replyTo });
-    return { ok: r.ok, provider: 'resend', id: r.id, error: r.error };
+  if (c.resendApiKey) {
+    try {
+      const resp = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${c.resendApiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: p.from || c.fromAddress || 'EduRankAI <noreply@edurankai.in>',
+          to: Array.isArray(p.to) ? p.to : [p.to],
+          cc: p.cc && p.cc.length ? p.cc : undefined,
+          bcc: p.bcc && p.bcc.length ? p.bcc : undefined,
+          subject: p.subject, html: p.html, text: p.text, reply_to: p.replyTo,
+        }),
+      });
+      if (!resp.ok) return { ok: false, provider: 'resend', error: await resp.text() };
+      const data = await resp.json() as any;
+      return { ok: true, provider: 'resend', id: data.id };
+    } catch (e: any) {
+      return { ok: false, provider: 'resend', error: e?.message || 'Resend error' };
+    }
   }
 
-  return { ok: false, provider: 'none', error: 'No outbound transport configured (set SMTP_HOST or RESEND_API_KEY)' };
+  return { ok: false, provider: 'none', error: 'No outbound transport configured (add SMTP details in Mail Settings)' };
 }

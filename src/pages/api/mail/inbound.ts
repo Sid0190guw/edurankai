@@ -8,7 +8,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { parseAddressList, resolveAddress, makeSnippet, ensureMailSchema } from '@/lib/mail';
+import { parseAddressList, resolveAddress, makeSnippet, ensureMailSchema, getMailConfig } from '@/lib/mail';
 import { randomUUID } from 'node:crypto';
 
 function json(d: any, s = 200) {
@@ -17,10 +17,12 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request }) => {
-  const secret = process.env.MAIL_INBOUND_SECRET;
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
+  await ensureMailSchema();
+  const cfg = await getMailConfig();
+  const secret = cfg.inboundSecret;
   const provided = request.headers.get('x-mail-secret') || body.secret;
   if (!secret || provided !== secret) return json({ ok: false, error: 'forbidden' }, 403);
 

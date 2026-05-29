@@ -61,6 +61,14 @@ async function bootstrapSchema(): Promise<void> {
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), message_id UUID, to_email VARCHAR(255),
     from_email VARCHAR(255), subject TEXT, status VARCHAR(20) NOT NULL DEFAULT 'queued',
     provider VARCHAR(20), error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  // single-row mail server config (UI-editable, overrides env vars)
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_config (
+    id INT PRIMARY KEY DEFAULT 1,
+    smtp_host TEXT, smtp_port INT, smtp_user TEXT, smtp_pass TEXT, smtp_secure BOOLEAN NOT NULL DEFAULT false,
+    from_name TEXT, from_address TEXT, resend_api_key TEXT, inbound_secret TEXT,
+    outbound_enabled BOOLEAN NOT NULL DEFAULT false,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT mail_config_singleton CHECK (id = 1))`);
   // best-effort backfill of mailbox addresses.
   // 1) Anyone with an assigned internal handle: that handle IS their mailbox
   //    address (it's what's shown on the Users page and what people send to).
@@ -253,6 +261,48 @@ export async function deliverMessage(opts: DeliverInput): Promise<DeliverResult>
   }
 
   return { messageId, threadId, rfcMessageId, external };
+}
+
+export interface MailConfig {
+  smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean;
+  fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string;
+  outboundEnabled: boolean; source: 'db' | 'env' | 'none';
+}
+
+// Merged mail-server config: DB row (UI-editable) wins over environment vars.
+export async function getMailConfig(): Promise<MailConfig> {
+  await ensureMailSchema();
+  let row: any = {};
+  try { row = rows(await db.execute(sql`SELECT * FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; } catch (e) {}
+  const smtpHost = row.smtp_host || process.env.SMTP_HOST || '';
+  const resendApiKey = row.resend_api_key || process.env.RESEND_API_KEY || '';
+  return {
+    smtpHost,
+    smtpPort: Number(row.smtp_port || process.env.SMTP_PORT || 587),
+    smtpUser: row.smtp_user || process.env.SMTP_USER || '',
+    smtpPass: row.smtp_pass || process.env.SMTP_PASS || '',
+    smtpSecure: row.smtp_secure != null ? !!row.smtp_secure : (process.env.SMTP_SECURE === 'true'),
+    fromName: row.from_name || 'EduRankAI',
+    fromAddress: row.from_address || process.env.EMAIL_FROM || '',
+    resendApiKey,
+    inboundSecret: row.inbound_secret || process.env.MAIL_INBOUND_SECRET || '',
+    outboundEnabled: row.smtp_host ? true : (smtpHost ? true : !!resendApiKey),
+    source: (row.smtp_host || row.resend_api_key) ? 'db' : ((process.env.SMTP_HOST || process.env.RESEND_API_KEY) ? 'env' : 'none'),
+  };
+}
+
+export async function saveMailConfig(p: Partial<{ smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean; fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string }>): Promise<void> {
+  await ensureMailSchema();
+  await db.execute(sql`
+    INSERT INTO mail_config (id, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_secure, from_name, from_address, resend_api_key, inbound_secret, updated_at)
+    VALUES (1, ${p.smtpHost ?? null}, ${p.smtpPort ?? null}, ${p.smtpUser ?? null}, ${p.smtpPass ?? null}, ${p.smtpSecure ?? false}, ${p.fromName ?? null}, ${p.fromAddress ?? null}, ${p.resendApiKey ?? null}, ${p.inboundSecret ?? null}, NOW())
+    ON CONFLICT (id) DO UPDATE SET
+      smtp_host = EXCLUDED.smtp_host, smtp_port = EXCLUDED.smtp_port, smtp_user = EXCLUDED.smtp_user,
+      smtp_pass = COALESCE(EXCLUDED.smtp_pass, mail_config.smtp_pass), smtp_secure = EXCLUDED.smtp_secure,
+      from_name = EXCLUDED.from_name, from_address = EXCLUDED.from_address,
+      resend_api_key = COALESCE(EXCLUDED.resend_api_key, mail_config.resend_api_key),
+      inbound_secret = COALESCE(EXCLUDED.inbound_secret, mail_config.inbound_secret), updated_at = NOW()
+  `);
 }
 
 export async function logOutbound(p: { messageId: string; to: string; from: string; subject: string; status: string; provider: string; error?: string | null }) {
