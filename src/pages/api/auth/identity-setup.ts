@@ -75,6 +75,10 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   const idCardType = (body?.idCardType || '').toString().slice(0, 50);
   const idCardBlobUrl = body?.idCardBlobUrl ? body.idCardBlobUrl.toString().slice(0, 1000) : null;
   const idNumberRaw = (body?.idNumber || '').toString().slice(0, 60);
+  // Compact selfie data URL captured at verification -> stored as profile photo.
+  // Guard size (~200KB) so a tampered payload can't bloat the row.
+  let selfieDataUrl = (body?.selfieDataUrl || '').toString();
+  if (!(selfieDataUrl.startsWith('data:image/') && selfieDataUrl.length <= 250000)) selfieDataUrl = '';
 
   const ua = (request.headers.get('user-agent') || '').slice(0, 500);
   const ip = (clientAddress || request.headers.get('x-forwarded-for') || '').toString().split(',')[0].trim().slice(0, 64);
@@ -149,6 +153,8 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         id_card_type = ${idCardType || null},
         id_number = ${idNumber},
         id_doc_url = ${idCardBlobUrl},
+        photo_url = COALESCE(${selfieDataUrl || null}, photo_url),
+        photo_verified = ${selfieDataUrl ? true : false},
         is_active = true,
         updated_at = NOW()
       WHERE id = ${user.id}
