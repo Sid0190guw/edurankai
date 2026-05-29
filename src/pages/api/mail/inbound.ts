@@ -1,10 +1,9 @@
-// POST /api/mail/inbound - receive external email from your VPS/MTA (Postfix pipe,
-// Cloudflare Email Worker, Resend Inbound, etc). Secured by a shared secret.
-//
-// Configure your MTA to POST JSON:
-//   { "to": "siddharth@edurankai.in", "from": "alice@gmail.com", "fromName": "Alice",
-//     "subject": "Hi", "text": "...", "html": "...", "messageId": "<...>", "inReplyTo": "<...>" }
-// with header  x-mail-secret: $MAIL_INBOUND_SECRET   (or include "secret" in the body).
+// POST /api/mail/inbound - receive external email. Accepts EITHER:
+//   (a) JSON: { to, from, fromName, subject, text, html, messageId, inReplyTo }
+//   (b) raw MIME (Content-Type not JSON) + headers x-mail-to / x-mail-from
+//       -> parsed here with postal-mime. This lets a Cloudflare Email Worker just
+//          forward the raw message with no bundling.
+// Secured by a shared secret (header x-mail-secret, or "secret" in JSON body).
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
@@ -17,14 +16,36 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request }) => {
-  let body: any = {};
-  try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
-
   await ensureMailSchema();
   const cfg = await getMailConfig();
   const secret = cfg.inboundSecret;
-  const provided = request.headers.get('x-mail-secret') || body.secret;
-  if (!secret || provided !== secret) return json({ ok: false, error: 'forbidden' }, 403);
+  const provided = request.headers.get('x-mail-secret');
+  const ct = request.headers.get('content-type') || '';
+
+  let body: any = {};
+  if (ct.includes('application/json')) {
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
+  } else {
+    // Raw MIME from a Cloudflare Email Worker (or any MTA pipe).
+    const raw = await request.text();
+    let parsed: any = {};
+    try {
+      const PostalMime = (await import('postal-mime')).default as any;
+      parsed = await PostalMime.parse(raw);
+    } catch (e) { parsed = {}; }
+    body = {
+      to: request.headers.get('x-mail-to') || (parsed.to || []).map((a: any) => a.address).join(','),
+      from: request.headers.get('x-mail-from') || (parsed.from && parsed.from.address) || '',
+      fromName: (parsed.from && parsed.from.name) || '',
+      subject: parsed.subject || '',
+      text: parsed.text || '',
+      html: parsed.html || '',
+      messageId: parsed.messageId || '',
+      inReplyTo: parsed.inReplyTo || '',
+    };
+  }
+
+  if (!secret || (provided || body.secret) !== secret) return json({ ok: false, error: 'forbidden' }, 403);
 
   const toList = parseAddressList(body.to).concat(parseAddressList(body.cc));
   if (!toList.length) return json({ ok: false, error: 'no recipients' }, 400);
@@ -38,8 +59,6 @@ export const POST: APIRoute = async ({ request }) => {
   const rfcId = (body.messageId || body.message_id || `<${randomUUID()}@inbound>`).toString();
 
   try {
-    await ensureMailSchema();
-    // Deliver to each internal recipient mailbox
     let delivered = 0;
     const seen = new Set<string>();
     for (const addr of toList) {
@@ -47,7 +66,6 @@ export const POST: APIRoute = async ({ request }) => {
       if (!resolved.userId || seen.has(resolved.userId)) continue;
       seen.add(resolved.userId);
 
-      // thread by in-reply-to if we have it
       let threadId: string | null = null;
       if (inReplyTo) {
         const t = rows(await db.execute(sql`SELECT thread_id FROM mail_messages WHERE rfc_message_id = ${inReplyTo} LIMIT 1`));
