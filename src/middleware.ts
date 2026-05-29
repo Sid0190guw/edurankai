@@ -3,6 +3,69 @@ import { validateSessionToken } from '@/lib/auth/session';
 import { readSessionCookie, setSessionCookie, clearSessionCookie } from '@/lib/auth/cookie';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { getViewableSectionKeys } from '@/lib/auth/permissions';
+
+// Map an /admin/* path to its permission section key (longest-prefix wins).
+// Universal/auth paths (dashboard, mail, notifications, login, logout) are not
+// listed -> never gated. Unmapped admin paths fall through (allowed).
+const PATH_SECTION: [string, string][] = [
+  ['/admin/applications', 'applications'],
+  ['/admin/help', 'messages'],
+  ['/admin/messages', 'dms'],
+  ['/admin/chat', 'discussion'],
+  ['/admin/offer/blank', 'custom_offer'],
+  ['/admin/offers', 'offers'],
+  ['/admin/offer', 'offers'],
+  ['/admin/hr/employees', 'employees'],
+  ['/admin/hr/leave', 'leave'],
+  ['/admin/hr/attendance', 'attendance'],
+  ['/admin/hr/payroll', 'payroll'],
+  ['/admin/hr/payouts', 'payouts'],
+  ['/admin/hr/training', 'training'],
+  ['/admin/hr', 'hr'],
+  ['/admin/finance', 'finance'],
+  ['/admin/interviews/manual', 'interviews_manual'],
+  ['/admin/interviews/ai', 'interviews_ai'],
+  ['/admin/ai-interview-templates', 'interviews_ai'],
+  ['/admin/interviews', 'interviews'],
+  ['/admin/tests/attempts', 'tests_proctoring'],
+  ['/admin/tests', 'tests'],
+  ['/admin/identity-verifications', 'tests_proctoring'],
+  ['/admin/aquintutor', 'lms'],
+  ['/admin/schools', 'lms'],
+  ['/admin/courses', 'lms'],
+  ['/admin/paths', 'lms'],
+  ['/admin/instructors', 'lms'],
+  ['/admin/hei/entity-types', 'hei_entity_types'],
+  ['/admin/hei/import', 'hei_import'],
+  ['/admin/hei/submetrics', 'hei_submetrics'],
+  ['/admin/hei/v1-methodology', 'hei_v1'],
+  ['/admin/hei/stories', 'hei_stories'],
+  ['/admin/hei/claims', 'hei_claims'],
+  ['/admin/hei/submissions', 'hei_submissions'],
+  ['/admin/hei/findings', 'hei_findings'],
+  ['/admin/hei/institutions', 'hei_institutions'],
+  ['/admin/hei', 'hei_institutions'],
+  ['/admin/team/roles', 'team_roles'],
+  ['/admin/roles', 'roles'],
+  ['/admin/departments', 'departments'],
+  ['/admin/events', 'events'],
+  ['/admin/forms', 'content'],
+  ['/admin/products', 'products'],
+  ['/admin/content', 'content'],
+  ['/admin/users', 'users'],
+  ['/admin/analytics', 'audit'],
+  ['/admin/audit', 'audit'],
+  ['/admin/settings', 'settings'],
+  ['/admin/diagnostics', 'settings'],
+].sort((a, b) => b[0].length - a[0].length);
+
+function resolveAdminSection(path: string): string | null {
+  for (const [prefix, key] of PATH_SECTION) {
+    if (path === prefix || path.startsWith(prefix + '/')) return key;
+  }
+  return null;
+}
 
 // Paths that ALWAYS bypass the face-enrollment gate.
 // Login surfaces + enrollment surfaces + APIs + public marketing all skip the gate.
@@ -70,6 +133,19 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // panel. Central guard (complements per-page checks).
   if (result.user.role === 'applicant' && path !== '/admin/login' && (path === '/admin' || path.startsWith('/admin/'))) {
     return new Response(null, { status: 302, headers: { Location: '/portal' } });
+  }
+
+  // Permission gate: a user assigned a custom role only reaches sections that
+  // role grants view on. Mirrors the sidebar filter so URL-typing can't bypass
+  // it. super_admins / unrestricted users return null (no gating).
+  if (result.user.role !== 'applicant' && path.startsWith('/admin/') && path !== '/admin/login' && path !== '/admin/logout') {
+    const sectionKey = resolveAdminSection(path);
+    if (sectionKey) {
+      const allowed = await getViewableSectionKeys(result.user);
+      if (allowed && !allowed.has(sectionKey)) {
+        return new Response(null, { status: 302, headers: { Location: '/admin?denied=' + encodeURIComponent(sectionKey) } });
+      }
+    }
   }
 
   // 2FA gate: every authenticated request to a protected route must come from
