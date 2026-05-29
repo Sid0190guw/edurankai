@@ -61,7 +61,17 @@ async function bootstrapSchema(): Promise<void> {
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), message_id UUID, to_email VARCHAR(255),
     from_email VARCHAR(255), subject TEXT, status VARCHAR(20) NOT NULL DEFAULT 'queued',
     provider VARCHAR(20), error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-  // best-effort backfill of mailbox addresses for everyone missing one
+  // best-effort backfill of mailbox addresses.
+  // 1) Anyone with an assigned internal handle: that handle IS their mailbox
+  //    address (it's what's shown on the Users page and what people send to).
+  //    Also corrects any address an earlier email-local backfill set wrongly.
+  try {
+    await db.execute(sql`
+      UPDATE users SET mailbox_address = lower(internal_handle)
+      WHERE internal_handle IS NOT NULL AND internal_handle LIKE '%@%'
+        AND (mailbox_address IS DISTINCT FROM lower(internal_handle))`);
+  } catch (e) {}
+  // 2) Everyone still missing one: derive from their login email local part.
   try {
     await db.execute(sql`
       WITH d AS (
@@ -105,24 +115,37 @@ export function makeSnippet(text: string | null | undefined, html?: string | nul
   return s.slice(0, 300);
 }
 
-// Resolve a single email to a platform user (by mailbox address or login email)
+// Resolve a single email to a platform user. Matches the canonical mailbox
+// address, the assigned internal handle (what's shown on the Users page), AND
+// the login email - so whichever form the sender typed will deliver internally.
 export async function resolveAddress(email: string): Promise<ResolvedUser> {
   await ensureMailSchema();
   const e = normalizeEmail(email);
+  const local = e.split('@')[0];
   const r = await db.execute(sql`
-    SELECT id, name, email, mailbox_address FROM users
-    WHERE lower(mailbox_address) = ${e} OR lower(email) = ${e}
+    SELECT id, name, email, mailbox_address, internal_handle FROM users
+    WHERE lower(mailbox_address) = ${e}
+       OR lower(email) = ${e}
+       OR lower(internal_handle) = ${e}
+       OR lower(internal_handle) = ${local}
+       OR lower(internal_handle || '@' || ${MAIL_DOMAIN}) = ${e}
     LIMIT 1
   `);
   const u = rows(r)[0];
-  if (u) return { userId: u.id, email: u.mailbox_address || u.email, name: u.name };
+  if (u) {
+    const canonical = (u.internal_handle && String(u.internal_handle).includes('@'))
+      ? u.internal_handle
+      : (u.mailbox_address || u.email);
+    return { userId: u.id, email: canonical, name: u.name };
+  }
   return { userId: null, email: e, name: null };
 }
 
 export async function getMailboxAddress(userId: string): Promise<string> {
   await ensureMailSchema();
-  const r = await db.execute(sql`SELECT mailbox_address, email FROM users WHERE id = ${userId} LIMIT 1`);
+  const r = await db.execute(sql`SELECT mailbox_address, internal_handle, email FROM users WHERE id = ${userId} LIMIT 1`);
   const u = rows(r)[0];
+  if (u?.internal_handle && String(u.internal_handle).includes('@')) return u.internal_handle;
   if (u?.mailbox_address) return u.mailbox_address;
   // Lazy-assign for this user if the backfill missed them.
   const localBase = (u?.email ? String(u.email).split('@')[0] : 'user').toLowerCase().replace(/[^a-z0-9._-]+/g, '.').replace(/^[.-]+|[.-]+$/g, '') || 'user';
