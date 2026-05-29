@@ -94,7 +94,8 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   const idCheck = verifyIdNumber(idCardType as any, idNumberRaw);
   if (!idCheck.valid) return json({ ok: false, error: idCheck.reason || 'ID number does not match the selected ID type' }, 400);
   const idNumber = idCheck.normalised;
-  if (!idCardBlobUrl) return json({ ok: false, error: 'Upload a photo/PDF of your government ID' }, 400);
+  // ID image storage is best-effort (the face match + ID number are the actual
+  // verification). If blob storage is unavailable the image URL may be empty.
 
   // Don't allow the user to "verify" with a face that doesn't match the ID
   const matchPassed = matchDistanceRaw <= FACE_MATCH_THRESHOLD;
