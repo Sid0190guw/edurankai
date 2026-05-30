@@ -12,7 +12,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { createOrder, getPublicKeyId, isConfigured } from '@/lib/razorpay';
 import { convertToInrPaise } from '@/lib/fx';
-import { applicationFeeChf } from '@/lib/application-fee';
+import { resolveApplicationFeeChf } from '@/lib/application-fee';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -29,9 +29,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   try {
     const a = await db.execute(sql`
-      SELECT id, level, fee_paid, first_name, last_name, email, role_title_snapshot
-      FROM applications
-      WHERE id = ${appId} AND applicant_user_id = ${user.id}
+      SELECT a.id, a.level, a.fee_paid, a.first_name, a.last_name, a.email,
+             a.role_title_snapshot,
+             r.application_fee_amount AS role_fee, r.application_fee_currency AS role_fee_ccy
+      FROM applications a
+      LEFT JOIN roles r ON a.role_id = r.id
+      WHERE a.id = ${appId} AND a.applicant_user_id = ${user.id}
       LIMIT 1
     `);
     const aRows = Array.isArray(a) ? a : (a?.rows || []);
@@ -47,8 +50,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
       return json({ ok: false, error: 'Payments not yet configured. Contact hr@edurankai.in.' }, 503);
     }
 
-    // Authoritative fee from the level on the application row.
-    const feeChf = applicationFeeChf(app.level);
+    // Authoritative fee: per-role amount (CHF) if set on the seeded role,
+    // otherwise the level-tiered fallback. Currency is always treated as CHF
+    // even if a different one is stored, until we add multi-currency settle.
+    const feeChf = resolveApplicationFeeChf({ roleFee: app.role_fee, level: app.level });
     const fx = await convertToInrPaise('CHF', feeChf * 100);
     const amountPaise = fx.paise;
     const receipt = 'appfee_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
