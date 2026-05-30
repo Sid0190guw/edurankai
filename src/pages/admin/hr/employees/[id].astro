@@ -10,6 +10,18 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 const { id } = Astro.params;
 if (!id) return Astro.redirect('/admin/hr/employees');
 
+// Self-bootstrap offboarding columns (idempotent). Runs each load; UPDATE noop
+// after the first time. Lets the Exit tab work without a manual migration.
+try {
+  await db.execute(sqlExpr`ALTER TABLE hr_employees
+    ADD COLUMN IF NOT EXISTS exit_type VARCHAR(40),
+    ADD COLUMN IF NOT EXISTS last_working_day DATE,
+    ADD COLUMN IF NOT EXISTS notice_period_days INTEGER,
+    ADD COLUMN IF NOT EXISTS notice_served_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS offboarding_state JSONB DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS relieving_letter_url TEXT`);
+} catch (_) {}
+
 let errorMsg = '';
 let successMsg = '';
 
@@ -101,6 +113,93 @@ if (Astro.request.method === 'POST') {
       const notes = (fd.get('notes') as string || '').trim();
       await db.execute(sqlExpr`UPDATE hr_employees SET notes = ${notes}, updated_at = NOW() WHERE id = ${id}`);
       successMsg = 'Notes saved.';
+    } else if (action === 'initiate_exit') {
+      const exitType = (fd.get('exitType') as string || 'resignation').trim();
+      const noticeDays = parseInt((fd.get('noticePeriodDays') as string) || '0', 10) || 0;
+      const lastWorkingDay = (fd.get('lastWorkingDay') as string || '').trim() || null;
+      const exitReason = (fd.get('exitReason') as string || '').trim() || null;
+      await db.execute(sqlExpr`
+        UPDATE hr_employees SET
+          exit_type = ${exitType},
+          notice_period_days = ${noticeDays || null},
+          last_working_day = ${lastWorkingDay},
+          exit_reason = ${exitReason},
+          notice_served_at = COALESCE(notice_served_at, NOW()),
+          employment_status = 'notice_period',
+          offboarding_state = COALESCE(offboarding_state, '{}'::jsonb),
+          updated_at = NOW()
+        WHERE id = ${id}
+      `);
+      successMsg = 'Offboarding initiated. The employee is now on notice period.';
+    } else if (action === 'update_exit_checklist') {
+      const state = {
+        exit_interview: fd.get('exit_interview') === 'on',
+        dues_cleared: fd.get('dues_cleared') === 'on',
+        assets_returned: fd.get('assets_returned') === 'on',
+        access_revoked: fd.get('access_revoked') === 'on',
+        relieving_letter_issued: fd.get('relieving_letter_issued') === 'on',
+        knowledge_handover: fd.get('knowledge_handover') === 'on',
+        final_payroll: fd.get('final_payroll') === 'on',
+      };
+      const relievingUrl = (fd.get('relievingLetterUrl') as string || '').trim() || null;
+      await db.execute(sqlExpr`
+        UPDATE hr_employees SET
+          offboarding_state = ${JSON.stringify(state)}::jsonb,
+          relieving_letter_url = ${relievingUrl},
+          updated_at = NOW()
+        WHERE id = ${id}
+      `);
+      successMsg = 'Offboarding checklist updated.';
+    } else if (action === 'mark_relieved') {
+      // Final step: deactivate employee record + linked user account.
+      const exitDate = (fd.get('exitDate') as string || '').trim() || null;
+      const exitReason = (fd.get('exitReason') as string || '').trim() || null;
+      await db.execute(sqlExpr`
+        UPDATE hr_employees SET
+          is_active = false,
+          employment_status = 'exited',
+          exit_date = ${exitDate || sqlExpr`COALESCE(last_working_day, CURRENT_DATE)`},
+          exit_reason = COALESCE(${exitReason}, exit_reason),
+          updated_at = NOW()
+        WHERE id = ${id}
+      `);
+      // If linked to a user account, deactivate the login + clear face enrol
+      // so a future rehire forces re-enrolment.
+      await db.execute(sqlExpr`
+        UPDATE users SET is_active = false, updated_at = NOW()
+        WHERE id = (SELECT user_id FROM hr_employees WHERE id = ${id})
+      `);
+      await db.execute(sqlExpr`
+        UPDATE user_face_enrollments SET is_active = false
+        WHERE user_id = (SELECT user_id FROM hr_employees WHERE id = ${id})
+      `).catch(() => {});
+      successMsg = 'Employee relieved. Login deactivated and access revoked.';
+    } else if (action === 'cancel_exit') {
+      await db.execute(sqlExpr`
+        UPDATE hr_employees SET
+          employment_status = 'active',
+          exit_type = NULL, notice_period_days = NULL, last_working_day = NULL,
+          notice_served_at = NULL, exit_date = NULL, exit_reason = NULL,
+          offboarding_state = '{}'::jsonb, relieving_letter_url = NULL,
+          updated_at = NOW()
+        WHERE id = ${id}
+      `);
+      successMsg = 'Exit cancelled - employee back to active status.';
+    } else if (action === 'reactivate') {
+      await db.execute(sqlExpr`
+        UPDATE hr_employees SET
+          is_active = true, employment_status = 'active',
+          exit_type = NULL, notice_period_days = NULL, last_working_day = NULL,
+          notice_served_at = NULL, exit_date = NULL, exit_reason = NULL,
+          offboarding_state = '{}'::jsonb, relieving_letter_url = NULL,
+          updated_at = NOW()
+        WHERE id = ${id}
+      `);
+      await db.execute(sqlExpr`
+        UPDATE users SET is_active = true, updated_at = NOW()
+        WHERE id = (SELECT user_id FROM hr_employees WHERE id = ${id})
+      `);
+      successMsg = 'Employee reactivated. Login restored.';
     }
   } catch (err: any) {
     errorMsg = 'Error: ' + (err.message || 'Unknown');
@@ -151,7 +250,11 @@ function formatDate(d: any) {
   return new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 }
 
-const tabs = ['Personal', 'Employment', 'Banking', 'Leave', 'Attendance', 'Notes', 'Reports'];
+const tabs = ['Personal', 'Employment', 'Banking', 'Leave', 'Attendance', 'Notes', 'Reports', 'Exit'];
+
+const offboardState = (emp.offboarding_state && typeof emp.offboarding_state === 'object') ? emp.offboarding_state as any : {};
+const onNotice = emp.employment_status === 'notice_period';
+const hasExited = !emp.is_active || emp.employment_status === 'exited';
 ---
 <AdminLayout title={`${emp.full_name} — Employee`} activeNav="hr">
 <div style="padding-bottom:80px;">
@@ -462,6 +565,120 @@ const tabs = ['Personal', 'Employment', 'Banking', 'Leave', 'Attendance', 'Notes
         </div>
         <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Save Notes</button>
       </form>
+    </div>
+
+    <!-- EXIT / OFFBOARDING -->
+    <div id="panel-7" class="hr-panel" style="display:none;">
+      {hasExited && (
+        <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);border-radius:12px;padding:14px;margin-bottom:14px;">
+          <p style="font-size:13px;font-weight:700;color:#fca5a5;margin:0 0 4px;">This employee has been relieved.</p>
+          <p style="font-size:12px;color:#fca5a5;margin:0;line-height:1.6;">
+            Exit type: <b>{emp.exit_type || '—'}</b> · Exit date: <b>{formatDate(emp.exit_date)}</b>
+          </p>
+          {emp.exit_reason && <p style="font-size:12px;color:#fca5a5;margin:6px 0 0;">Reason: {emp.exit_reason}</p>}
+          <form method="POST" style="margin:10px 0 0;" onsubmit="return confirm('Reactivate this employee? Their login will be restored.');">
+            <input type="hidden" name="action" value="reactivate" />
+            <button type="submit" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:12px;padding:8px 14px;border-radius:8px;cursor:pointer;">Reactivate (rehire)</button>
+          </form>
+        </div>
+      )}
+
+      {!hasExited && !onNotice && (
+        <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:12px;">
+          <input type="hidden" name="action" value="initiate_exit" />
+          <div>
+            <p style="font-size:14px;font-weight:700;color:#fff;margin:0 0 4px;">Initiate offboarding</p>
+            <p style="font-size:11.5px;color:#6e6e78;margin:0;">This moves the employee to <b>notice period</b>, after which you can run the offboarding checklist and finally relieve them.</p>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <div>
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Exit type</label>
+              <select name="exitType" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+                <option value="resignation">Resignation</option>
+                <option value="termination">Termination (for cause)</option>
+                <option value="layoff">Layoff</option>
+                <option value="end_of_contract">End of contract</option>
+                <option value="retirement">Retirement</option>
+                <option value="absconding">Absconding</option>
+                <option value="death">Death</option>
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Notice period (days)</label>
+              <input type="number" name="noticePeriodDays" min="0" value="30" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+            </div>
+            <div>
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Last working day</label>
+              <input type="date" name="lastWorkingDay" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+            </div>
+            <div style="grid-column:1/-1;">
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Reason / notes</label>
+              <textarea name="exitReason" rows="3" placeholder="Why are they leaving? (visible to HR only)" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;resize:vertical;"></textarea>
+            </div>
+          </div>
+          <button type="submit" style="background:#fbbf24;border:none;color:#1a1a1f;font-weight:700;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Start offboarding (notice period)</button>
+        </form>
+      )}
+
+      {onNotice && (
+        <div style="display:flex;flex-direction:column;gap:14px;">
+          <div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.28);border-radius:12px;padding:14px;">
+            <p style="font-size:13px;font-weight:700;color:#fbbf24;margin:0 0 4px;">On notice period</p>
+            <p style="font-size:12px;color:#fcd34d;margin:0;line-height:1.7;">
+              {emp.exit_type || 'Resignation'} · Notice served {formatDate(emp.notice_served_at)} · Last day {formatDate(emp.last_working_day)}
+              {emp.notice_period_days ? ` · ${emp.notice_period_days} days notice` : ''}
+            </p>
+            {emp.exit_reason && <p style="font-size:11.5px;color:#fcd34d;margin:6px 0 0;">Reason: {emp.exit_reason}</p>}
+          </div>
+
+          <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px;">
+            <input type="hidden" name="action" value="update_exit_checklist" />
+            <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 4px;">Offboarding checklist</p>
+            <p style="font-size:11.5px;color:#6e6e78;margin:0 0 6px;">Tick what's done. All recommended before clicking "Mark as relieved".</p>
+            {[
+              { key: 'exit_interview', label: 'Exit interview conducted' },
+              { key: 'knowledge_handover', label: 'Knowledge handover documented' },
+              { key: 'assets_returned', label: 'Company assets (laptop, ID card, access) returned' },
+              { key: 'access_revoked', label: 'System access revoked (will auto-revoke on relieve)' },
+              { key: 'dues_cleared', label: 'Dues / advances cleared' },
+              { key: 'final_payroll', label: 'Final settlement & payroll processed' },
+              { key: 'relieving_letter_issued', label: 'Relieving letter / experience letter issued' },
+            ].map((item) => (
+              <label style="display:flex;align-items:center;gap:9px;font-size:12.5px;color:#d8d8de;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;cursor:pointer;">
+                <input type="checkbox" name={item.key} checked={!!offboardState[item.key]} />
+                <span>{item.label}</span>
+              </label>
+            ))}
+            <div>
+              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:6px 0 5px;">Relieving letter URL (Drive link)</label>
+              <input type="url" name="relievingLetterUrl" value={emp.relieving_letter_url || ''} placeholder="https://drive.google.com/..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+            </div>
+            <button type="submit" style="background:#15151a;border:1px solid #FF4F00;color:#FF7040;font-weight:600;font-size:13px;padding:10px;border-radius:10px;cursor:pointer;">Save checklist</button>
+          </form>
+
+          <form method="POST" style="background:#0f0f14;border:1px solid rgba(239,68,68,0.3);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px;" onsubmit="return confirm('Mark this employee as relieved? This deactivates their login and revokes face access.');">
+            <input type="hidden" name="action" value="mark_relieved" />
+            <p style="font-size:13px;font-weight:700;color:#fca5a5;margin:0;">Final step — mark as relieved</p>
+            <p style="font-size:11.5px;color:#fcd5d5;margin:0;">Deactivates the employee record and the linked user login. Face enrolment cleared. Reversible via Reactivate.</p>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+              <div>
+                <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Exit date</label>
+                <input type="date" name="exitDate" value={emp.last_working_day ? String(emp.last_working_day).slice(0,10) : ''} style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+              </div>
+              <div>
+                <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Final reason (optional)</label>
+                <input type="text" name="exitReason" placeholder="Override reason" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+              </div>
+            </div>
+            <button type="submit" style="background:#dc2626;border:none;color:#fff;font-weight:700;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Mark as relieved</button>
+          </form>
+
+          <form method="POST" onsubmit="return confirm('Cancel the exit and put the employee back to active status?');">
+            <input type="hidden" name="action" value="cancel_exit" />
+            <button type="submit" style="width:100%;background:none;border:1px dashed #1f1f26;color:#6e6e78;font-size:12px;padding:9px;border-radius:8px;cursor:pointer;">Cancel exit (back to active)</button>
+          </form>
+        </div>
+      )}
     </div>
 
     <!-- REPORTS (daily work reports submitted by the employee) -->
