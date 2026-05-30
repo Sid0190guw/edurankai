@@ -24,11 +24,21 @@ if (Astro.request.method === 'POST') {
       const workMode = fd.get('workMode') as string || 'remote';
       const notes = (fd.get('notes') as string || '').trim();
 
-      // Calculate work hours
-      let workHours = null;
+      // Calculate work hours. If clock_out is earlier than clock_in (overnight
+      // shift), assume it's the NEXT day - that's the bug behind "-7.50h".
+      let workHours: number | null = null;
+      let clockInTs: string | null = clockIn ? `${date}T${clockIn}:00` : null;
+      let clockOutTs: string | null = clockOut ? `${date}T${clockOut}:00` : null;
       if (clockIn && clockOut) {
         const inTime = new Date(`${date}T${clockIn}`);
-        const outTime = new Date(`${date}T${clockOut}`);
+        let outTime = new Date(`${date}T${clockOut}`);
+        if (outTime.getTime() <= inTime.getTime()) {
+          outTime = new Date(outTime.getTime() + 24 * 3600 * 1000);
+          const y = outTime.getFullYear();
+          const m = String(outTime.getMonth() + 1).padStart(2, '0');
+          const d = String(outTime.getDate()).padStart(2, '0');
+          clockOutTs = `${y}-${m}-${d}T${clockOut}:00`;
+        }
         workHours = Math.round(((outTime.getTime() - inTime.getTime()) / 3600000) * 100) / 100;
       }
 
@@ -36,8 +46,8 @@ if (Astro.request.method === 'POST') {
         INSERT INTO hr_attendance (employee_id, date, clock_in, clock_out, work_hours, status, work_mode, notes, ip_address)
         VALUES (
           ${employeeId}, ${date},
-          ${clockIn ? `${date}T${clockIn}:00` : null},
-          ${clockOut ? `${date}T${clockOut}:00` : null},
+          ${clockInTs},
+          ${clockOutTs},
           ${workHours}, ${status}, ${workMode}, ${notes || null},
           ${Astro.clientAddress || null}
         )
@@ -50,7 +60,12 @@ if (Astro.request.method === 'POST') {
           work_mode = EXCLUDED.work_mode,
           notes = EXCLUDED.notes
       `);
-      successMsg = 'Attendance marked.';
+      successMsg = 'Attendance saved.';
+    } else if (action === 'delete') {
+      const employeeId = fd.get('employeeId') as string;
+      const date = fd.get('date') as string;
+      await db.execute(sqlExpr`DELETE FROM hr_attendance WHERE employee_id = ${employeeId} AND date = ${date}`);
+      successMsg = 'Attendance entry deleted.';
     } else if (action === 'bulk_mark') {
       const date = fd.get('date') as string;
       const status = fd.get('status') as string;
@@ -78,6 +93,18 @@ const url = new URL(Astro.request.url);
 const tab = url.searchParams.get('tab') || 'today';
 const dateFilter = url.searchParams.get('date') || new Date().toISOString().split('T')[0];
 const empFilter = url.searchParams.get('emp') || '';
+
+// One-shot heal: fix rows where clock_out got stored on the same calendar day
+// as clock_in but is earlier (overnight shifts). Shift clock_out to next day
+// and recompute work_hours. Idempotent - matches zero rows once corrected.
+try {
+  await db.execute(sqlExpr`
+    UPDATE hr_attendance
+    SET clock_out = clock_out + INTERVAL '1 day',
+        work_hours = ROUND((EXTRACT(EPOCH FROM ((clock_out + INTERVAL '1 day') - clock_in)) / 3600.0)::numeric, 2)
+    WHERE clock_in IS NOT NULL AND clock_out IS NOT NULL AND clock_out < clock_in
+  `);
+} catch (_) {}
 
 // Today's attendance (with the employee's daily diary/progress report for the day)
 const todayAttendance = await db.execute(sqlExpr`
@@ -161,6 +188,19 @@ function formatTime(ts: any) {
   if (!ts) return '—';
   return new Date(ts).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
 }
+function timeInputValue(ts: any) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+function dateValue(d: any) {
+  if (!d) return '';
+  return String(d).slice(0, 10);
+}
+function crossesMidnight(a: any) {
+  if (!a.clock_in || !a.clock_out) return false;
+  return new Date(a.clock_in).toDateString() !== new Date(a.clock_out).toDateString();
+}
 ---
 <AdminLayout title="Attendance — HRMS" activeNav="hr">
 <div style="padding-bottom:80px;">
@@ -242,15 +282,35 @@ function formatTime(ts: any) {
               <div style="flex:1;min-width:0;">
                 <p style="font-size:13px;font-weight:600;color:#fff;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{a.full_name}</p>
                 <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;">
-                  {formatTime(a.clock_in)} → {formatTime(a.clock_out)}
-                  {a.work_hours ? ` · ${a.work_hours}h clocked` : ''}
+                  {formatTime(a.clock_in)} {crossesMidnight(a) ? '(prev) ' : ''}→ {formatTime(a.clock_out)} {crossesMidnight(a) ? '(next day) ' : ''}
+                  {a.work_hours != null ? ` · ${a.work_hours}h clocked` : ''}
                   {Number(a.logged_hours) > 0 ? ` · ${a.logged_hours}h logged (${a.log_count})` : ''}
                   {a.work_mode ? ` · ${a.work_mode}` : ''}
                 </p>
               </div>
-              <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;flex-shrink:0;background:${STATUS_COLORS[a.status] || 'rgba(107,114,128,0.15)'};color:${STATUS_TEXT[a.status] || '#9ca3af'};`}>
-                {a.status.replace('_', ' ')}
-              </span>
+              <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;">
+                <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;background:${STATUS_COLORS[a.status] || 'rgba(107,114,128,0.15)'};color:${STATUS_TEXT[a.status] || '#9ca3af'};`}>
+                  {a.status.replace('_', ' ')}
+                </span>
+                <div style="display:flex;gap:4px;">
+                  <button type="button"
+                    data-emp-id={a.employee_id}
+                    data-date={dateValue(a.date)}
+                    data-status={a.status}
+                    data-work-mode={a.work_mode || 'remote'}
+                    data-clock-in={timeInputValue(a.clock_in)}
+                    data-clock-out={timeInputValue(a.clock_out)}
+                    data-notes={a.notes || ''}
+                    onclick="editAttendance(this)"
+                    style="background:#15151a;border:1px solid #1a1a1f;color:#FF7040;font-size:10.5px;padding:3px 9px;border-radius:6px;cursor:pointer;">Edit</button>
+                  <form method="POST" style="margin:0;display:inline;" onsubmit="return confirm('Delete this attendance entry?');">
+                    <input type="hidden" name="action" value="delete" />
+                    <input type="hidden" name="employeeId" value={a.employee_id} />
+                    <input type="hidden" name="date" value={dateValue(a.date)} />
+                    <button type="submit" style="background:#15151a;border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:10.5px;padding:3px 9px;border-radius:6px;cursor:pointer;">Delete</button>
+                  </form>
+                </div>
+              </div>
             </div>
             {(timeLogsByEmp[a.employee_id] && timeLogsByEmp[a.employee_id].length > 0) && (
               <div style="margin-top:10px;padding-top:10px;border-top:1px solid #1a1a1f;">
@@ -359,6 +419,34 @@ function formatTime(ts: any) {
     </div>
   )}
 </div>
+
+<script is:inline>
+function editAttendance(btn) {
+  var m = document.getElementById('markModal');
+  var f = m.querySelector('form');
+  function set(name, v) { var el = f.querySelector('[name="' + name + '"]'); if (el) el.value = v || ''; }
+  set('employeeId', btn.dataset.empId);
+  set('date',       btn.dataset.date);
+  set('status',     btn.dataset.status);
+  set('workMode',   btn.dataset.workMode);
+  set('clockIn',    btn.dataset.clockIn);
+  set('clockOut',   btn.dataset.clockOut);
+  set('notes',      btn.dataset.notes);
+  m.querySelector('h2').textContent = 'Edit Attendance';
+  m.style.display = 'flex';
+}
+// Reset the modal title when the "+ Mark" button opens it fresh.
+document.addEventListener('click', function(e) {
+  var t = e.target;
+  if (t && t.tagName === 'BUTTON' && t.textContent && t.textContent.trim() === '+ Mark') {
+    var m = document.getElementById('markModal');
+    if (m) {
+      var f = m.querySelector('form'); if (f) f.reset();
+      m.querySelector('h2').textContent = 'Mark Attendance';
+    }
+  }
+});
+</script>
 
 <!-- Mark Individual Modal -->
 <div id="markModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:100;align-items:flex-end;justify-content:center;">
