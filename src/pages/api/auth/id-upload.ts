@@ -52,6 +52,17 @@ export const POST: APIRoute = async ({ request, locals }) => {
     return json({ ok: false, error: 'File rejected for safety' }, 415);
   }
 
+  // The Vercel Blob store needs BLOB_READ_WRITE_TOKEN to be configured. If not,
+  // return a CLEAR error (the SDK otherwise throws a cryptic "internal blob"
+  // message) so the UI can offer to skip the ID step.
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    return json({
+      ok: false,
+      blobNotConfigured: true,
+      error: 'Image upload is not set up on this server. Skip this step (you can still finish 2FA with just a selfie) or paste a public photo URL instead.',
+    }, 503);
+  }
+
   try {
     const safeName = (user?.id ? user.id : 'anon') + '-' + Date.now() + '.' + (ext === 'jpeg' ? 'jpg' : ext);
     const blob = await put('id-docs/' + safeName, file, {
@@ -61,6 +72,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
     });
     return json({ ok: true, url: blob.url });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'upload failed' }, 500);
+    const msg = String(e?.message || '');
+    const friendly = /token|forbidden|access|unauthorized|not configured/i.test(msg)
+      ? 'Image upload is not set up on this server. Skip this step (you can still finish 2FA with just a selfie).'
+      : (msg || 'upload failed');
+    return json({ ok: false, blobNotConfigured: true, error: friendly }, 500);
   }
 };
