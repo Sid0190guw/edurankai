@@ -36,11 +36,16 @@ if (Astro.request.method === 'POST' && canEdit) {
     if (action === 'create') {
       const username = (fd.get('username') as string || '').trim().toLowerCase();
       const name = (fd.get('name') as string || '').trim();
-      const role = fd.get('role') as string;
+      const rawRole = (fd.get('role') as string) || '';
       const assignedDepartmentId = (fd.get('assignedDepartmentId') as string || '').trim() || null;
       const customPassword = (fd.get('password') as string || '').trim();
+      // If a custom role is chosen, persist users.role as 'editor' as a baseline
+      // and capture the custom role id to assign after the user row is created.
+      const isCustom = rawRole.startsWith('custom:');
+      const customRoleId = isCustom ? rawRole.slice('custom:'.length) : null;
+      const role = isCustom ? 'editor' : rawRole;
 
-      if (!username || !name || !role) {
+      if (!username || !name || !rawRole) {
         errorMsg = 'Username, full name, and role are required.';
       } else if (!username.match(/^[a-z0-9._\-@]+$/)) {
         errorMsg = 'Username can only contain lowercase letters, digits, dot, hyphen, underscore, and @.';
@@ -62,12 +67,16 @@ if (Astro.request.method === 'POST' && canEdit) {
             isActive: true
           }).returning({ id: users.id });
 
+          if (customRoleId) {
+            await db.insert(userRoleAssignments).values({ userId: inserted[0].id, roleId: customRoleId, assignedByUserId: currentUser.id });
+          }
+
           await logAudit({
             userId: currentUser.id,
             action: 'user.create',
             entity: 'user',
             entityId: inserted[0].id,
-            diff: { email: finalEmail, role, assignedDepartmentId },
+            diff: { email: finalEmail, role, customRoleId, assignedDepartmentId },
             ipAddress: Astro.clientAddress
           });
 
@@ -178,39 +187,26 @@ if (Astro.request.method === 'POST' && canEdit) {
     }
     else if (action === 'change_role') {
       const userId = fd.get('userId') as string;
-      const newRole = fd.get('role') as string;
+      const rawRole = (fd.get('role') as string) || '';
       const newDept = (fd.get('assignedDepartmentId') as string || '').trim() || null;
       if (userId === currentUser.id) {
         errorMsg = 'You cannot change your own role.';
+      } else if (rawRole.startsWith('custom:')) {
+        // Custom role selected: keep the user's built-in role unchanged (it's a
+        // baseline), replace their custom-role assignment with this one.
+        const roleId = rawRole.slice('custom:'.length);
+        await db.update(users).set({ assignedDepartmentId: newDept, updatedAt: new Date() }).where(eq(users.id, userId));
+        await db.delete(userRoleAssignments).where(eq(userRoleAssignments.userId, userId));
+        await db.insert(userRoleAssignments).values({ userId, roleId, assignedByUserId: currentUser.id });
+        await logAudit({ userId: currentUser.id, action: 'user.custom_role_assign', entity: 'user', entityId: userId, diff: { roleId, assignedDepartmentId: newDept }, ipAddress: Astro.clientAddress });
+        okMsg = 'Custom role assigned. This user now only sees the pages that role grants.';
       } else {
-        await db.update(users).set({ role: newRole as any, assignedDepartmentId: newDept, updatedAt: new Date() }).where(eq(users.id, userId));
-        await logAudit({
-          userId: currentUser.id,
-          action: 'user.role_change',
-          entity: 'user',
-          entityId: userId,
-          diff: { role: newRole, assignedDepartmentId: newDept },
-          ipAddress: Astro.clientAddress
-        });
+        // Built-in role: set it and clear any custom-role assignments.
+        await db.update(users).set({ role: rawRole as any, assignedDepartmentId: newDept, updatedAt: new Date() }).where(eq(users.id, userId));
+        await db.delete(userRoleAssignments).where(eq(userRoleAssignments.userId, userId));
+        await logAudit({ userId: currentUser.id, action: 'user.role_change', entity: 'user', entityId: userId, diff: { role: rawRole, assignedDepartmentId: newDept }, ipAddress: Astro.clientAddress });
         okMsg = 'Role updated.';
       }
-    }
-    else if (action === 'set_custom_roles') {
-      const userId = fd.get('userId') as string;
-      const roleIds = (fd.getAll('roleIds') as string[]).filter(Boolean);
-      await db.delete(userRoleAssignments).where(eq(userRoleAssignments.userId, userId));
-      for (const rid of roleIds) {
-        await db.insert(userRoleAssignments).values({ userId, roleId: rid, assignedByUserId: currentUser.id });
-      }
-      await logAudit({
-        userId: currentUser.id,
-        action: 'user.custom_roles_change',
-        entity: 'user',
-        entityId: userId,
-        diff: { roleIds },
-        ipAddress: Astro.clientAddress
-      });
-      okMsg = roleIds.length ? 'Custom roles assigned - this user now sees only the pages those roles grant.' : 'Custom roles cleared - this user falls back to their built-in role access.';
     }
   } catch (err: any) {
     errorMsg = 'Failed: ' + (err.message || 'Unknown error');
@@ -392,9 +388,20 @@ try {
                           <form method="POST" style="margin:6px 0 0;display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;align-items:center;background:#08080a;border:1px solid #1f1f26;border-radius:7px;padding:8px;">
                             <input type="hidden" name="_action" value="change_role" />
                             <input type="hidden" name="userId" value={u.id} />
-                            <select name="role" class="rolefield-input" style="width:auto;min-width:130px;padding:5px 8px;font-size:11px;">
-                              {ROLES_AVAILABLE.map((r) => (<option value={r} selected={u.role === r}>{ROLE_LABELS[r as keyof typeof ROLE_LABELS]}</option>))}
-                              <option value="applicant" selected={u.role === 'applicant'}>Applicant (no admin access)</option>
+                            <select name="role" class="rolefield-input" style="width:auto;min-width:160px;padding:5px 8px;font-size:11px;">
+                              <optgroup label="Built-in roles">
+                                {ROLES_AVAILABLE.map((r) => (
+                                  <option value={r} selected={(userRolesMap[u.id] || []).length === 0 && u.role === r}>{ROLE_LABELS[r as keyof typeof ROLE_LABELS]}</option>
+                                ))}
+                                <option value="applicant" selected={(userRolesMap[u.id] || []).length === 0 && u.role === 'applicant'}>Applicant (no admin access)</option>
+                              </optgroup>
+                              {customRoles.length > 0 && (
+                                <optgroup label="Custom roles">
+                                  {customRoles.map((cr) => (
+                                    <option value={`custom:${cr.id}`} selected={(userRolesMap[u.id] || []).includes(cr.id)}>{cr.name}</option>
+                                  ))}
+                                </optgroup>
+                              )}
                             </select>
                             <select name="assignedDepartmentId" class="rolefield-input" style="width:auto;min-width:130px;padding:5px 8px;font-size:11px;">
                               <option value="">No department (sees all)</option>
@@ -402,24 +409,8 @@ try {
                             </select>
                             <button type="submit" class="admin-btn" style="padding:5px 11px;font-size:10.5px;color:#6ee7b7;">Save access</button>
                           </form>
-                          {customRoles.length > 0 ? (
-                            <form method="POST" style="margin:6px 0 0;background:#08080a;border:1px solid #1f1f26;border-radius:7px;padding:8px;">
-                              <input type="hidden" name="_action" value="set_custom_roles" />
-                              <input type="hidden" name="userId" value={u.id} />
-                              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#6e6e78;margin-bottom:6px;">Custom roles (restrict to specific pages)</div>
-                              <div style="display:flex;flex-direction:column;gap:5px;margin-bottom:7px;">
-                                {customRoles.map((cr) => (
-                                  <label style="display:flex;align-items:center;gap:7px;font-size:11.5px;color:#d8d8de;">
-                                    <input type="checkbox" name="roleIds" value={cr.id} checked={(userRolesMap[u.id] || []).includes(cr.id)} />
-                                    <span style={'display:inline-block;width:8px;height:8px;border-radius:50%;background:' + (cr.color || '#FF7040') + ';'}></span>
-                                    <span>{cr.name}</span>
-                                  </label>
-                                ))}
-                              </div>
-                              <button type="submit" class="admin-btn" style="padding:5px 11px;font-size:10.5px;color:#6ee7b7;">Save custom roles</button>
-                            </form>
-                          ) : (
-                            <p style="margin:6px 0 0;font-size:10.5px;color:#6e6e78;text-align:right;">No custom roles yet. <a href="/admin/team/roles" style="color:#FF7040;text-decoration:none;">Create one</a> to restrict pages.</p>
+                          {customRoles.length === 0 && (
+                            <p style="margin:6px 0 0;font-size:10.5px;color:#6e6e78;text-align:right;"><a href="/admin/team/roles" style="color:#FF7040;text-decoration:none;">Create a custom role</a> to add it to this list.</p>
                           )}
                         </details>
                       </div>
@@ -458,9 +449,18 @@ try {
             <label class="rolefield-label">Role *</label>
             <select name="role" required class="rolefield-input" id="role-select">
               <option value="">Choose...</option>
-              {ROLES_AVAILABLE.map((r) => (
-                <option value={r}>{ROLE_LABELS[r as keyof typeof ROLE_LABELS]}</option>
-              ))}
+              <optgroup label="Built-in roles">
+                {ROLES_AVAILABLE.map((r) => (
+                  <option value={r}>{ROLE_LABELS[r as keyof typeof ROLE_LABELS]}</option>
+                ))}
+              </optgroup>
+              {customRoles.length > 0 && (
+                <optgroup label="Custom roles">
+                  {customRoles.map((cr) => (
+                    <option value={`custom:${cr.id}`}>{cr.name}</option>
+                  ))}
+                </optgroup>
+              )}
             </select>
           </div>
 
