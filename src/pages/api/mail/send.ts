@@ -59,12 +59,11 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const extCc = result.external.filter(e => e.kind === 'cc').map(e => e.email);
       const extBcc = result.external.filter(e => e.kind === 'bcc').map(e => e.email);
       // The SMTP server typically only allows sending AS the authenticated
-      // mailbox, so use the configured From address; set Reply-To to the actual
-      // composer so external replies route back to them.
+      // mailbox, so use the configured From address (fallback to SMTP user);
+      // set Reply-To to the actual composer so replies route back to them.
       const cfg = await getMailConfig();
-      const envFrom = cfg.fromAddress
-        ? `${cfg.fromName || fromName} <${cfg.fromAddress}>`
-        : `${fromName} <${fromEmail}>`;
+      const envFromAddr = cfg.fromAddress || cfg.smtpUser || fromEmail;
+      const envFrom = `${cfg.fromName || fromName} <${envFromAddr}>`;
       const send = await sendExternal({
         from: envFrom,
         to: extTo.length ? extTo : (extCc[0] ? extCc : extBcc),
