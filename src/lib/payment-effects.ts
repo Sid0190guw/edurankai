@@ -13,10 +13,17 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
   const pay = rows(await db.execute(sql`SELECT purpose, reference_type, reference_id FROM payments WHERE order_id = ${orderId} LIMIT 1`))[0] as any;
   if (!pay || !pay.reference_id) return;
 
-  // Application processing/verification fee -> mark application paid.
+  // Application processing/verification fee -> mark application paid AND flip
+  // pending_payment -> submitted so it joins the live queue. Without this flip
+  // the candidate row stays hidden under the pending tab and admins never see it.
   if (pay.purpose === 'application_fee' || pay.reference_type === 'application') {
     await db.execute(sql`
-      UPDATE applications SET fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), updated_at = NOW()
+      UPDATE applications SET
+        fee_paid = true,
+        fee_payment_id = ${paymentId},
+        fee_paid_at = NOW(),
+        status = CASE WHEN status = 'pending_payment' THEN 'submitted' ELSE status END,
+        updated_at = NOW()
       WHERE id = ${pay.reference_id}
     `).catch(() => {});
     return;
