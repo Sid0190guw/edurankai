@@ -127,6 +127,67 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
   }
 }
 
+// Send a push to ONE specific user (applicant or admin) - used for personalised
+// updates like "your application moved to Reviewing" or "the team replied".
+export async function sendPushToUser(userId: string, payload: PushPayload): Promise<void> {
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return;
+  if (!userId) return;
+  try {
+    const subs = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId));
+    if (subs.length === 0) return;
+    const pushData = JSON.stringify(payload);
+    await Promise.allSettled(
+      subs.map(async (sub) => {
+        try {
+          await webpush.sendNotification(
+            { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+            pushData, { TTL: 86400 }
+          );
+          await db.update(pushSubscriptions).set({ lastUsedAt: new Date() }).where(eq(pushSubscriptions.id, sub.id));
+        } catch (err: any) {
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            await db.delete(pushSubscriptions).where(eq(pushSubscriptions.id, sub.id));
+          }
+        }
+      })
+    );
+  } catch (err) {
+    console.error('[push] sendPushToUser failed:', err);
+  }
+}
+
+// Applicant-facing notifications (sent to the candidate, not the admins)
+export const pushApplicant = {
+  newMessage: (applicantUserId: string, fromName: string, preview: string, appId: string) =>
+    sendPushToUser(applicantUserId, {
+      type: 'applicant_thread_message',
+      title: `Reply from ${fromName}`,
+      body: preview.slice(0, 140),
+      url: `/portal/applications/${appId}`,
+      tag: `app-thread-${appId}`,
+    }),
+
+  statusChanged: (applicantUserId: string, roleTitle: string, newStatus: string, appId: string) =>
+    sendPushToUser(applicantUserId, {
+      type: 'applicant_status_change',
+      title: 'Application update',
+      body: `${roleTitle}: ${newStatus.replace(/_/g, ' ')}`,
+      url: `/portal/applications/${appId}`,
+      tag: `app-status-${appId}`,
+      requireInteraction: true,
+    } as any),
+
+  offerExtended: (applicantUserId: string, roleTitle: string, appId: string) =>
+    sendPushToUser(applicantUserId, {
+      type: 'applicant_offer',
+      title: 'You have an offer waiting',
+      body: `Offer extended for ${roleTitle}. Open your application to review.`,
+      url: `/portal/applications/${appId}`,
+      tag: `offer-${appId}`,
+      requireInteraction: true,
+    } as any),
+};
+
 // Convenience wrappers for each notification type
 export const pushNotify = {
   chatMessage: (channelName: string, senderName: string, preview: string, channelSlug: string, excludeUserId?: string) =>

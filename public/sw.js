@@ -1,13 +1,58 @@
-const CACHE = 'mmakf-v1';
-const ASSETS = ['./mmakf.html','./mmakf-admin.html','./manifest.json'];
-self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).catch(()=>{}));
+// EduRankAI service worker
+// Cache name bumped: clears the legacy "mmakf-v1" SW that didn't handle push.
+const CACHE = 'edurankai-v2';
+
+self.addEventListener('install', (e) => {
   self.skipWaiting();
 });
-self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));
-  self.clients.claim();
+
+self.addEventListener('activate', (e) => {
+  // Drop every old cache so stale SWs on existing devices get evicted.
+  e.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
+    ).then(() => self.clients.claim())
+  );
 });
-self.addEventListener('fetch', e => {
-  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).catch(() => caches.match('./mmakf.html'))));
+
+// Push: read the JSON payload from the server (title/body/url/tag) and show
+// THAT notification. Without this the OS falls back to a generic message.
+self.addEventListener('push', (event) => {
+  let data = {};
+  try {
+    if (event.data) {
+      try { data = event.data.json(); }
+      catch (_) { data = { title: 'EduRankAI', body: event.data.text() }; }
+    }
+  } catch (_) {}
+
+  const title = data.title || 'EduRankAI';
+  const options = {
+    body: data.body || '',
+    icon: data.icon || '/era/icon-192.png',
+    badge: data.badge || '/era/badge-72.png',
+    tag: data.tag || undefined,
+    data: { url: data.url || '/', type: data.type || '' },
+    requireInteraction: !!data.requireInteraction,
+  };
+
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+// Click: focus an existing tab on the same URL, or open a new one.
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const url = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        try {
+          if ('focus' in client && client.url.includes(new URL(url, self.location.origin).pathname)) {
+            return client.focus();
+          }
+        } catch (_) {}
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(url);
+    })
+  );
 });
