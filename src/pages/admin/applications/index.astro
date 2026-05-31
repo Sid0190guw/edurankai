@@ -38,24 +38,45 @@ if (Astro.request.method === 'POST') {
     } else if (action === 'archive_one') {
       const id = (fd.get('id') as string || '').trim();
       if (id) { await db.update(applications).set({ isArchived: true }).where(eq(applications.id, id)); okMsg = 'Archived.'; }
+    } else if (action === 'mark_paid') {
+      // Manual override: HR confirms the candidate paid (waiver, cash, prior
+      // flow, anything). Promotes pending_payment -> submitted + fee_paid=true.
+      const id = (fd.get('id') as string || '').trim();
+      if (id) {
+        await db.execute(sql`
+          UPDATE applications SET
+            fee_paid = true,
+            fee_paid_at = COALESCE(fee_paid_at, NOW()),
+            status = CASE WHEN status = 'pending_payment' THEN 'submitted' ELSE status END,
+            updated_at = NOW()
+          WHERE id = ${id}
+        `);
+        okMsg = 'Marked paid + promoted to submitted.';
+      }
     }
   } catch (err: any) { errorMsg = 'Failed: ' + (err.message || 'Unknown'); }
 }
 
 // Ensure the 'pending_payment' enum value exists before any query uses it.
-// Self-bootstrap so no separate migration is needed.
 try {
   await db.execute(sql`ALTER TYPE application_status ADD VALUE IF NOT EXISTS 'pending_payment'`);
 } catch (_) {}
 
-// One-shot heal: any 'submitted' application without fee_paid AND older than
-// 24h is an abandoned-checkout orphan. Move it to pending_payment so it stops
-// appearing in the live queue. Idempotent.
+// REVERSE the previous (too-aggressive) auto-demote: any application currently
+// in pending_payment that has a captured/paid payments row was legitimately
+// paid - promote it back to 'submitted' and mark fee_paid. Idempotent.
 try {
   await db.execute(sql`
-    UPDATE applications SET status = 'pending_payment', updated_at = NOW()
-    WHERE status = 'submitted' AND (fee_paid IS NULL OR fee_paid = false)
-      AND created_at < NOW() - INTERVAL '24 hours'
+    UPDATE applications a SET
+      status = 'submitted',
+      fee_paid = true,
+      fee_paid_at = COALESCE(a.fee_paid_at, NOW()),
+      updated_at = NOW()
+    FROM payments p
+    WHERE a.status = 'pending_payment'
+      AND p.reference_id = a.id
+      AND p.purpose = 'application_fee'
+      AND p.status IN ('paid','captured')
   `);
 } catch (_) {}
 
@@ -231,6 +252,13 @@ const ALL_STATUSES = ['pending_payment','submitted','reviewing','shortlisted','i
               <a href={`/admin/applications/${a.id}`} data-preview={`/admin/applications/${a.id}`} data-preview-title={`Application: ${a.id}`} style="flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;font-size:12px;font-weight:500;padding:7px;border-radius:6px;">
                 View Details
               </a>
+              {a.status === 'pending_payment' && (
+                <form method="POST" style="flex:1;" onsubmit="return confirm('Mark this application as paid and move it to Submitted? Use only if you have confirmed payment another way.');">
+                  <input type="hidden" name="_action" value="mark_paid" />
+                  <input type="hidden" name="id" value={a.id} />
+                  <button type="submit" style="width:100%;background:#10b981;border:none;color:#fff;font-size:12px;font-weight:600;padding:7px;border-radius:6px;cursor:pointer;">Mark paid</button>
+                </form>
+              )}
               {a.isArchived ? (
                 <form method="POST" style="flex:1;">
                   <input type="hidden" name="_action" value="unarchive_one" />
