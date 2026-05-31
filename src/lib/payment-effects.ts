@@ -17,6 +17,7 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
   // pending_payment -> submitted so it joins the live queue. Without this flip
   // the candidate row stays hidden under the pending tab and admins never see it.
   if (pay.purpose === 'application_fee' || pay.reference_type === 'application') {
+    try { await db.execute(sql`ALTER TYPE application_status ADD VALUE IF NOT EXISTS 'pending_payment'`); } catch (_) {}
     await db.execute(sql`
       UPDATE applications SET
         fee_paid = true,
