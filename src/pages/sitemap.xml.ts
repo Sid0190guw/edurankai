@@ -24,6 +24,10 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
   { path: '/p/privacy', changefreq: 'yearly', priority: '0.4' },
   { path: '/p/terms', changefreq: 'yearly', priority: '0.4' },
   { path: '/p/hiring-philosophy', changefreq: 'yearly', priority: '0.5' },
+  // Official policy documents - high priority for SEO + recruiter discovery
+  { path: '/policy/hiring',       changefreq: 'monthly', priority: '0.9' },
+  { path: '/policy/recruitment',  changefreq: 'monthly', priority: '0.9' },
+  { path: '/policy/work-culture', changefreq: 'monthly', priority: '0.85' },
 ];
 
 export const GET: APIRoute = async () => {
