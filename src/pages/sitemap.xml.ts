@@ -28,6 +28,8 @@ const STATIC_ROUTES: Array<{ path: string; changefreq: string; priority: string 
   { path: '/policy/hiring',       changefreq: 'monthly', priority: '0.9' },
   { path: '/policy/recruitment',  changefreq: 'monthly', priority: '0.9' },
   { path: '/policy/work-culture', changefreq: 'monthly', priority: '0.85' },
+  // Visvambhara aerospace research product
+  { path: '/products/visvambhara', changefreq: 'weekly', priority: '0.9' },
 ];
 
 export const GET: APIRoute = async () => {
