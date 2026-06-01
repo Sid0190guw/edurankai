@@ -1,6 +1,7 @@
 // EduRankAI service worker
-// Cache name bumped: clears the legacy "mmakf-v1" SW that didn't handle push.
-const CACHE = 'edurankai-v2';
+// Cache name bumped on each material change so devices pick up the new SW
+// (browsers consider the SW updated if the file bytes differ).
+const CACHE = 'edurankai-v3';
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
