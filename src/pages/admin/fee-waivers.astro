@@ -1,0 +1,131 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureFeeWaiverSchema, materialiseFromIntent } from '@/lib/fee-waiver';
+
+const user = Astro.locals.user!;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+await ensureFeeWaiverSchema();
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('_action') as string || '').trim();
+    const id = (fd.get('id') as string || '').trim();
+    const reason = (fd.get('reason') as string || '').trim() || null;
+    if (!id) errMsg = 'id required';
+    else if (action === 'approve') {
+      // Materialise the application from the intent, mark fee_paid=true +
+      // fee_waiver_granted=true. Backfill the waiver row with application_id.
+      const row = ((Array.isArray(await db.execute(sql`SELECT intent_id FROM application_fee_waivers WHERE id = ${id}`)) ? await db.execute(sql`SELECT intent_id FROM application_fee_waivers WHERE id = ${id}`) : (await db.execute(sql`SELECT intent_id FROM application_fee_waivers WHERE id = ${id}`) as any)?.rows || []) as any[])[0];
+      const intentId = row?.intent_id;
+      let appId: string | null = null;
+      if (intentId) appId = await materialiseFromIntent(intentId, { paid: true, waiverGranted: true, waiverReason: 'Fee waiver approved by ' + (user.name || user.email) });
+      await db.execute(sql`UPDATE application_fee_waivers SET status='approved', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=NULL, application_id=${appId} WHERE id=${id}`);
+      // Notify applicant
+      try {
+        const w = (Array.isArray(await db.execute(sql`SELECT user_id FROM application_fee_waivers WHERE id=${id}`)) ? await db.execute(sql`SELECT user_id FROM application_fee_waivers WHERE id=${id}`) : []) as any[];
+        const uid = (w as any)[0]?.user_id;
+        if (uid && appId) {
+          const { sendPushToUser } = await import('@/lib/push');
+          await sendPushToUser(uid, { type: 'fee_waiver_approved', title: 'Fee waiver approved', body: 'Your application is now in review.', url: '/portal/applications/' + appId, tag: 'waiver-' + id });
+        }
+      } catch (_) {}
+      okMsg = 'Waiver approved. Application created and notified.';
+    } else if (action === 'reject') {
+      await db.execute(sql`UPDATE application_fee_waivers SET status='rejected', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=${reason} WHERE id=${id}`);
+      try {
+        const r = await db.execute(sql`SELECT user_id, intent_id FROM application_fee_waivers WHERE id=${id}`);
+        const w = ((Array.isArray(r) ? r : (r as any)?.rows || []) as any[])[0];
+        if (w?.user_id) {
+          const { sendPushToUser } = await import('@/lib/push');
+          await sendPushToUser(w.user_id, { type: 'fee_waiver_rejected', title: 'Fee waiver decision', body: 'Your waiver was not granted. You can update and resubmit, or pay the fee.', url: '/apply/waiver?intent=' + (w.intent_id || ''), tag: 'waiver-' + id });
+        }
+      } catch (_) {}
+      okMsg = 'Waiver rejected.';
+    }
+  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+}
+
+function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+const filter = new URL(Astro.request.url).searchParams.get('status') || 'pending';
+const requests = rows(await db.execute(sql`
+  SELECT w.*, u.email AS user_email, u.name AS user_name,
+         i.role_title_snapshot, i.first_name, i.last_name
+  FROM application_fee_waivers w
+  JOIN users u ON u.id = w.user_id
+  LEFT JOIN application_intents i ON i.id = w.intent_id
+  ${filter === 'all' ? sql`` : sql`WHERE w.status = ${filter}`}
+  ORDER BY w.created_at DESC LIMIT 200
+`));
+const counts = rows(await db.execute(sql`SELECT status, COUNT(*)::int n FROM application_fee_waivers GROUP BY status`));
+const cMap: Record<string, number> = {}; for (const c of counts) cMap[c.status] = c.n;
+function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' }) : '-'; }
+---
+<AdminLayout title="Fee Waiver Requests" activeNav="">
+<div style="padding-bottom:80px;">
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;">
+    <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Recruiting · Hardship</p>
+    <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0 0 10px;">Fee Waiver Requests</h1>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;">
+      {[
+        { k: 'pending',  l: 'Pending',  c: cMap.pending  || 0, color: '#fbbf24' },
+        { k: 'approved', l: 'Approved', c: cMap.approved || 0, color: '#34d399' },
+        { k: 'rejected', l: 'Rejected', c: cMap.rejected || 0, color: '#f87171' },
+        { k: 'all',      l: 'All',      c: Object.values(cMap).reduce((a:any,b:any)=>a+b,0) as number, color: '#9aa6b6' },
+      ].map((t: any) => (
+        <a href={`?status=${t.k}`} style={`text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;${filter === t.k ? 'background:'+t.color+';color:#0a0a0c;' : 'background:#15151a;color:#8a8a94;'}`}>{t.l} ({t.c})</a>
+      ))}
+    </div>
+  </div>
+
+  {okMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.30);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+  {errMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errMsg}</div>}
+
+  <div style="padding:14px 16px;display:flex;flex-direction:column;gap:10px;">
+    {requests.length === 0 && <p style="color:#6e6e78;font-size:13px;text-align:center;padding:40px;">No {filter !== 'all' ? filter : ''} requests.</p>}
+    {requests.map((r: any) => {
+      const candidate = (r.first_name || '') + ' ' + (r.last_name || '');
+      return (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:6px;">
+            <div>
+              <p style="font-size:14px;font-weight:700;color:#fff;margin:0;">{candidate.trim() || r.user_name || r.user_email}</p>
+              <p style="font-size:11px;color:#8a8a94;margin:2px 0 0;font-family:'Geist Mono',monospace;">{r.user_email}{r.role_title_snapshot ? ' · ' + r.role_title_snapshot : ''}</p>
+            </div>
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+              <span style={`font-size:10px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;background:${r.status === 'approved' ? 'rgba(16,185,129,0.15)' : r.status === 'rejected' ? 'rgba(239,68,68,0.15)' : 'rgba(251,191,36,0.15)'};color:${r.status === 'approved' ? '#6ee7b7' : r.status === 'rejected' ? '#fca5a5' : '#fbbf24'};`}>{r.status}</span>
+              <span style="font-size:10.5px;color:#6e6e78;">{fmt(r.created_at)}</span>
+            </div>
+          </div>
+          <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#6e6e78;margin:8px 0 3px;">Situation</p>
+          <p style="font-size:12.5px;color:#d8d8de;margin:0;white-space:pre-wrap;line-height:1.7;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">{r.situation_note}</p>
+          <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#6e6e78;margin:8px 0 3px;">Expertise</p>
+          <p style="font-size:12.5px;color:#d8d8de;margin:0;white-space:pre-wrap;line-height:1.7;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">{r.expertise_note}</p>
+          <p style="font-size:11.5px;color:#6e6e78;margin:8px 0;">Docs: <a href={r.drive_url} target="_blank" rel="noopener" style="color:#60a5fa;text-decoration:none;font-family:'Geist Mono',monospace;word-break:break-all;">{r.drive_url}</a></p>
+          {r.status === 'rejected' && r.reject_reason && <p style="font-size:11px;color:#fca5a5;margin:4px 0 0;">Reason: {r.reject_reason}</p>}
+          {r.status === 'pending' && (
+            <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+              <form method="POST" style="margin:0;">
+                <input type="hidden" name="_action" value="approve" />
+                <input type="hidden" name="id" value={r.id} />
+                <button type="submit" style="background:#10b981;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Approve &amp; create application</button>
+              </form>
+              <form method="POST" onsubmit="this.querySelector('input[name=reason]').value = prompt('Reason for rejection (shown to applicant):') || ''; if (!this.querySelector('input[name=reason]').value) return false;" style="margin:0;">
+                <input type="hidden" name="_action" value="reject" />
+                <input type="hidden" name="id" value={r.id} />
+                <input type="hidden" name="reason" value="" />
+                <button type="submit" style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Reject</button>
+              </form>
+            </div>
+          )}
+        </div>
+      );
+    })}
+  </div>
+</div>
+</AdminLayout>

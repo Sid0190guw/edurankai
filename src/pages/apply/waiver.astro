@@ -1,0 +1,101 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureFeeWaiverSchema, getWaiverForIntent } from '@/lib/fee-waiver';
+import { getIntent } from '@/lib/application-intent';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+if (user.role !== 'applicant') return Astro.redirect('/admin');
+
+await ensureFeeWaiverSchema();
+
+const url = new URL(Astro.request.url);
+const intentId = url.searchParams.get('intent') || '';
+if (!intentId) return Astro.redirect('/portal');
+const intent = await getIntent(intentId, user.id);
+if (!intent) return Astro.redirect('/portal');
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const situation = (fd.get('situation') as string || '').trim();
+    const expertise = (fd.get('expertise') as string || '').trim();
+    const driveUrl = (fd.get('drive_url') as string || '').trim();
+    if (!situation || !expertise || !driveUrl) errMsg = 'All three fields are required.';
+    else if (situation.length > 6000 || expertise.length > 6000) errMsg = 'Notes must be under 6000 characters each.';
+    else if (!/^https?:\/\/.+/i.test(driveUrl)) errMsg = 'Drive link must start with http(s)://';
+    else {
+      await db.execute(sql`
+        INSERT INTO application_fee_waivers (user_id, intent_id, situation_note, expertise_note, drive_url, status)
+        VALUES (${user.id}, ${intentId}, ${situation}, ${expertise}, ${driveUrl}, 'pending')
+      `);
+      // Notify admins so this surfaces in their bell + /admin/notifications.
+      try {
+        const { sendPushToAdmins } = await import('@/lib/push');
+        const name = ((intent.first_name || '') + ' ' + (intent.last_name || '')).trim() || intent.email || 'Applicant';
+        await sendPushToAdmins({
+          type: 'fee_waiver_request',
+          title: 'Fee waiver request',
+          body: name + ' is requesting a fee waiver for ' + (intent.role_title_snapshot || 'an open role'),
+          url: '/admin/fee-waivers',
+          tag: 'fee-waiver',
+        });
+      } catch (_) {}
+      okMsg = 'Waiver request submitted. We will respond inside your portal — no email.';
+    }
+  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+}
+
+const existing = await getWaiverForIntent(intentId, user.id);
+---
+<BaseLayout title="Request a fee waiver - EduRankAI" description="Apply for a processing fee waiver based on financial hardship. We review every request manually.">
+  <section class="px-[5vw] py-10 md:py-16 max-w-2xl mx-auto">
+    <a href={'/apply/pay?intent=' + intentId} class="inline-flex items-center gap-2 text-[0.78rem] font-mono uppercase tracking-wider text-ink-soft hover:text-burn no-underline mb-6">← Back to payment</a>
+
+    <p class="eyebrow mb-3">Fee waiver</p>
+    <h1 class="font-display text-[clamp(1.8rem,4vw,2.4rem)] font-semibold text-ink leading-[1.1] tracking-tight mb-3">Request a <em class="italic text-burn font-medium">fee waiver</em></h1>
+    <p class="text-[0.92rem] text-ink-2 leading-[1.8] font-light mb-8">If paying the processing &amp; verification fee is a genuine barrier, request a waiver. Tell us your situation honestly and share where your expertise lies. Link a CV / portfolio / supporting documents from Google Drive (anyone with the link, viewer access). We review every request manually within 5 business days. Decisions arrive inside your portal — no email.</p>
+
+    {okMsg && <div class="bg-leaf-bg/40 border border-leaf-border text-leaf rounded-xl p-4 mb-6 text-[0.88rem]">{okMsg}</div>}
+    {errMsg && <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.25);color:#b91c1c;font-size:0.88rem;padding:14px 18px;border-radius:10px;margin-bottom:20px;">{errMsg}</div>}
+
+    {existing && existing.status === 'pending' && (
+      <div class="bg-gold-bg/40 border border-gold-border rounded-xl p-5 mb-6">
+        <p class="font-semibold text-gold-deep mb-1">Pending review</p>
+        <p class="text-[0.88rem] text-ink-2">Your waiver request is with the research team. You will be notified inside your portal when there is a decision. You can update the notes below to add detail at any time.</p>
+      </div>
+    )}
+    {existing && existing.status === 'approved' && (
+      <div class="bg-leaf-bg/40 border border-leaf-border rounded-xl p-5 mb-6">
+        <p class="font-semibold text-leaf mb-1">Waiver approved</p>
+        <p class="text-[0.88rem] text-ink-2">Your application has been created and is in our review queue. <a href="/portal" class="text-burn font-semibold underline">Open your portal →</a></p>
+      </div>
+    )}
+    {existing && existing.status === 'rejected' && (
+      <div style="background:#fee2e2;border:1px solid #fca5a5;color:#991b1b;font-size:0.88rem;padding:14px 18px;border-radius:10px;margin-bottom:20px;">
+        <p class="font-semibold mb-1">Waiver not granted</p>
+        <p>{existing.reject_reason || 'Your waiver was not granted at this time.'} You can update the notes below and re-submit, or pay the fee on the previous page.</p>
+      </div>
+    )}
+
+    <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 flex flex-col gap-5">
+      <div>
+        <label class="block text-[0.72rem] font-mono uppercase tracking-wider text-burn font-bold mb-2">Your situation</label>
+        <textarea name="situation" rows="6" required maxlength="6000" placeholder="What is the financial situation that makes paying the fee difficult right now? Be honest — we don't penalise honesty." class="w-full bg-cream-2/50 border border-ink/15 rounded-lg p-3 text-[0.9rem] leading-relaxed font-light outline-none focus:border-burn">{existing?.situation_note || ''}</textarea>
+      </div>
+      <div>
+        <label class="block text-[0.72rem] font-mono uppercase tracking-wider text-burn font-bold mb-2">Your expertise</label>
+        <textarea name="expertise" rows="6" required maxlength="6000" placeholder="What concretely have you built, written, designed, researched, or shipped? Point us at proof of work. This is what tips the decision." class="w-full bg-cream-2/50 border border-ink/15 rounded-lg p-3 text-[0.9rem] leading-relaxed font-light outline-none focus:border-burn">{existing?.expertise_note || ''}</textarea>
+      </div>
+      <div>
+        <label class="block text-[0.72rem] font-mono uppercase tracking-wider text-burn font-bold mb-2">Drive link (CV / portfolio / supporting docs)</label>
+        <input name="drive_url" type="url" required value={existing?.drive_url || ''} placeholder="https://drive.google.com/file/d/..." class="w-full bg-cream-2/50 border border-ink/15 rounded-lg p-3 text-[0.88rem] font-mono outline-none focus:border-burn" />
+        <p class="text-[0.74rem] text-ink-soft mt-1">Anyone with the link → Viewer. Combine multiple files into a single folder or PDF if helpful.</p>
+      </div>
+      <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 rounded-lg text-[0.92rem]">{existing ? 'Resubmit waiver request' : 'Submit waiver request'}</button>
+    </form>
+  </section>
+</BaseLayout>
