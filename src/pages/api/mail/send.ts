@@ -64,11 +64,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const cfg = await getMailConfig();
       const envFromAddr = cfg.fromAddress || cfg.smtpUser || fromEmail;
       const envFrom = `${cfg.fromName || fromName} <${envFromAddr}>`;
+      // Inject a 1x1 read-receipt pixel before sending so we know when the
+      // recipient opens. Inserted at the bottom of the HTML so it loads after
+      // body content; falls through silently if their client blocks images.
+      const trackingPixel = `<img src="https://edurankai.in/api/mail/track/${result.messageId}.gif" width="1" height="1" alt="" style="display:none;border:0;width:1px;height:1px;" />`;
+      const htmlWithPixel = (bodyHtml || '') + trackingPixel;
       const send = await sendExternal({
         from: envFrom,
         to: extTo.length ? extTo : (extCc[0] ? extCc : extBcc),
         cc: extCc, bcc: extBcc,
-        subject, html: bodyHtml, text: bodyText,
+        subject, html: htmlWithPixel, text: bodyText,
         replyTo: fromEmail,
         messageId: result.rfcMessageId,
         inReplyTo: body.inReplyTo || undefined,

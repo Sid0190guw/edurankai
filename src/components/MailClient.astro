@@ -31,6 +31,23 @@ if (threadId && dbReady) {
   try {
     thread = await getThreadMessages(user.id, threadId);
     await markThreadRead(user.id, threadId);
+    // Pull read receipts for messages the CURRENT user authored, so the
+    // sender sees who has opened their messages and where from.
+    const { db } = await import('@/lib/db');
+    const { sql } = await import('drizzle-orm');
+    const myMessageIds = (thread as any[]).filter(m => m.from_user_id === user.id).map(m => m.id);
+    if (myMessageIds.length) {
+      const r = await db.execute(sql`
+        SELECT message_id, kind, country, region, city, ip_address, read_at, user_id
+        FROM mail_reads
+        WHERE message_id = ANY(${myMessageIds}::uuid[])
+        ORDER BY read_at DESC
+      `);
+      const allReads = (Array.isArray(r) ? r : (r?.rows || [])) as any[];
+      const readsByMsg: Record<string, any[]> = {};
+      for (const x of allReads) (readsByMsg[x.message_id] = readsByMsg[x.message_id] || []).push(x);
+      for (const m of thread as any[]) m.reads = readsByMsg[m.id] || [];
+    }
   } catch (e) { thread = []; }
   const first = thread[0];
   threadSubject = first?.subject || '(no subject)';
@@ -178,6 +195,23 @@ const folderLinks = [
                   <span class="mc-msg-time">{fullTime(m.created_at)}</span>
                 </div>
                 <div class="mc-msg-body">{bodyToText(m)}</div>
+                {m.from_user_id === user.id && (m.reads || []).length > 0 && (
+                  <div class="mc-reads">
+                    <p class="mc-reads-head">Read by</p>
+                    {(m.reads as any[]).slice(0, 6).map((r: any) => {
+                      const place = [r.city, r.region, r.country].filter(Boolean).join(', ') || (r.ip_address ? 'IP ' + r.ip_address : 'unknown location');
+                      const when = new Date(r.read_at).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+                      return (
+                        <div class="mc-read-row">
+                          <span class="mc-read-dot" data-kind={r.kind}></span>
+                          <span class="mc-read-when">{when}</span>
+                          <span class="mc-read-place">{place}</span>
+                          <span class="mc-read-kind">{r.kind === 'external' ? 'external open' : 'in app'}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
                 {(m.attachments || []).length > 0 && (
                   <div class="mc-atts">
                     {m.attachments.map((a: any) => (
@@ -300,6 +334,14 @@ const folderLinks = [
 .mc-msg-to{ font-size:11px; color:var(--mc-mid); margin:1px 0 0; }
 .mc-msg-time{ font-size:11px; color:var(--mc-mid); flex-shrink:0; }
 .mc-msg-body{ font-size:14px; line-height:1.65; white-space:pre-wrap; word-break:break-word; }
+.mc-reads{ margin-top:12px; padding:10px 12px; background:var(--mc-soft); border:1px solid var(--mc-border); border-radius:9px; }
+.mc-reads-head{ font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--mc-mid); margin:0 0 6px; }
+.mc-read-row{ display:flex; align-items:center; gap:8px; font-size:11.5px; padding:2px 0; flex-wrap:wrap; }
+.mc-read-dot{ width:6px; height:6px; border-radius:50%; background:#34d399; flex-shrink:0; }
+.mc-read-dot[data-kind="external"]{ background:#60a5fa; }
+.mc-read-when{ color:var(--mc-mid); font-family:var(--o-font-mono,monospace); }
+.mc-read-place{ color:var(--mc-text); flex:1; }
+.mc-read-kind{ color:var(--mc-mid); font-size:10.5px; text-transform:lowercase; }
 .mc-atts{ display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
 .mc-att{ display:flex; align-items:center; gap:6px; background:var(--mc-soft); border:1px solid var(--mc-border); border-radius:8px; padding:6px 10px; font-size:12px; color:var(--mc-text); text-decoration:none; }
 .mc-reply{ padding:12px 18px 22px; display:flex; gap:8px; }
@@ -342,8 +384,19 @@ const folderLinks = [
 }
 </style>
 
-<script is:inline define:vars={{ basePath, myAddress }}>
+<script is:inline define:vars={{ basePath, myAddress, openMessageIds: (thread || []).filter((m: any) => m.from_user_id !== user.id).map((m: any) => m.id) }}>
 (function(){
+  // Log an "open" event for every message the current user did NOT author
+  // when a thread is shown - server logs it with IP + geolocation.
+  if (Array.isArray(openMessageIds) && openMessageIds.length) {
+    try {
+      fetch('/api/mail/open', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageIds: openMessageIds }),
+      }).catch(function () {});
+    } catch (_) {}
+  }
   const modal = document.getElementById('mcModal');
   const $ = function(id){ return document.getElementById(id); };
   function openModal(title){ $('mcModalTitle').textContent = title || 'New message'; modal.hidden = false; $('mcTo').focus(); }

@@ -61,6 +61,22 @@ async function bootstrapSchema(): Promise<void> {
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), message_id UUID, to_email VARCHAR(255),
     from_email VARCHAR(255), subject TEXT, status VARCHAR(20) NOT NULL DEFAULT 'queued',
     provider VARCHAR(20), error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  // Per-open read-receipt log. One row per read event (so multiple opens are
+  // visible). Recipient_email is for external reads (pixel tracker), user_id
+  // is for internal reads.
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_reads (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    message_id UUID NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    recipient_email VARCHAR(255),
+    kind VARCHAR(12) NOT NULL DEFAULT 'internal',
+    ip_address VARCHAR(64),
+    country VARCHAR(80),
+    region VARCHAR(120),
+    city VARCHAR(120),
+    user_agent TEXT,
+    read_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS mail_reads_msg_idx ON mail_reads(message_id, read_at DESC)`);
   // single-row mail server config (UI-editable, overrides env vars)
   await db.execute(sql`CREATE TABLE IF NOT EXISTS mail_config (
     id INT PRIMARY KEY DEFAULT 1,
