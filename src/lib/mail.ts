@@ -286,38 +286,66 @@ export interface MailConfig {
 }
 
 // Merged mail-server config: DB row (UI-editable) wins over environment vars.
+function nonEmpty(v: any): string { const s = (v ?? '').toString().trim(); return s; }
+
 export async function getMailConfig(): Promise<MailConfig> {
   await ensureMailSchema();
   let row: any = {};
   try { row = rows(await db.execute(sql`SELECT * FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; } catch (e) {}
-  const smtpHost = row.smtp_host || process.env.SMTP_HOST || '';
-  const resendApiKey = row.resend_api_key || process.env.RESEND_API_KEY || '';
+
+  const dbSmtpHost = nonEmpty(row.smtp_host);
+  const dbResendKey = nonEmpty(row.resend_api_key);
+  const envSmtpHost = nonEmpty(process.env.SMTP_HOST);
+  const envResendKey = nonEmpty(process.env.RESEND_API_KEY);
+
+  const smtpHost = dbSmtpHost || envSmtpHost;
+  const resendApiKey = dbResendKey || envResendKey;
+  const hasDb = !!(dbSmtpHost || dbResendKey);
+  const hasEnv = !!(envSmtpHost || envResendKey);
+
   return {
     smtpHost,
-    smtpPort: Number(row.smtp_port || process.env.SMTP_PORT || 587),
-    smtpUser: row.smtp_user || process.env.SMTP_USER || '',
-    smtpPass: row.smtp_pass || process.env.SMTP_PASS || '',
+    smtpPort: Number(nonEmpty(row.smtp_port) || nonEmpty(process.env.SMTP_PORT) || '587'),
+    smtpUser: nonEmpty(row.smtp_user) || nonEmpty(process.env.SMTP_USER),
+    smtpPass: nonEmpty(row.smtp_pass) || nonEmpty(process.env.SMTP_PASS),
     smtpSecure: row.smtp_secure != null ? !!row.smtp_secure : (process.env.SMTP_SECURE === 'true'),
-    fromName: row.from_name || 'EduRankAI',
-    fromAddress: row.from_address || process.env.EMAIL_FROM || '',
+    fromName: nonEmpty(row.from_name) || 'EduRankAI',
+    fromAddress: nonEmpty(row.from_address) || nonEmpty(process.env.EMAIL_FROM),
     resendApiKey,
-    inboundSecret: row.inbound_secret || process.env.MAIL_INBOUND_SECRET || '',
-    outboundEnabled: row.smtp_host ? true : (smtpHost ? true : !!resendApiKey),
-    source: (row.smtp_host || row.resend_api_key) ? 'db' : ((process.env.SMTP_HOST || process.env.RESEND_API_KEY) ? 'env' : 'none'),
+    inboundSecret: nonEmpty(row.inbound_secret) || nonEmpty(process.env.MAIL_INBOUND_SECRET),
+    outboundEnabled: !!(smtpHost || resendApiKey),
+    source: hasDb ? 'db' : (hasEnv ? 'env' : 'none'),
   };
 }
 
 export async function saveMailConfig(p: Partial<{ smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean; fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string }>): Promise<void> {
   await ensureMailSchema();
+  // Convert empty / blank values to NULL so the source-detection logic in
+  // getMailConfig (which uses nonEmpty) sees the row consistently.
+  const s = (v: any) => { const t = (v ?? '').toString().trim(); return t === '' ? null : t; };
+  const smtpHost     = s(p.smtpHost);
+  const smtpPort     = p.smtpPort == null || isNaN(Number(p.smtpPort)) ? null : Number(p.smtpPort);
+  const smtpUser     = s(p.smtpUser);
+  const smtpPass     = s(p.smtpPass);                   // null = keep existing
+  const smtpSecure   = p.smtpSecure ?? false;
+  const fromName     = s(p.fromName);
+  const fromAddress  = s(p.fromAddress);
+  const resendApiKey = s(p.resendApiKey);                // null = keep existing
+  const inboundSecret = s(p.inboundSecret);              // null = keep existing
   await db.execute(sql`
     INSERT INTO mail_config (id, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_secure, from_name, from_address, resend_api_key, inbound_secret, updated_at)
-    VALUES (1, ${p.smtpHost ?? null}, ${p.smtpPort ?? null}, ${p.smtpUser ?? null}, ${p.smtpPass ?? null}, ${p.smtpSecure ?? false}, ${p.fromName ?? null}, ${p.fromAddress ?? null}, ${p.resendApiKey ?? null}, ${p.inboundSecret ?? null}, NOW())
+    VALUES (1, ${smtpHost}, ${smtpPort}, ${smtpUser}, ${smtpPass}, ${smtpSecure}, ${fromName}, ${fromAddress}, ${resendApiKey}, ${inboundSecret}, NOW())
     ON CONFLICT (id) DO UPDATE SET
-      smtp_host = EXCLUDED.smtp_host, smtp_port = EXCLUDED.smtp_port, smtp_user = EXCLUDED.smtp_user,
-      smtp_pass = COALESCE(EXCLUDED.smtp_pass, mail_config.smtp_pass), smtp_secure = EXCLUDED.smtp_secure,
-      from_name = EXCLUDED.from_name, from_address = EXCLUDED.from_address,
+      smtp_host    = EXCLUDED.smtp_host,
+      smtp_port    = EXCLUDED.smtp_port,
+      smtp_user    = EXCLUDED.smtp_user,
+      smtp_pass    = COALESCE(EXCLUDED.smtp_pass, mail_config.smtp_pass),
+      smtp_secure  = EXCLUDED.smtp_secure,
+      from_name    = EXCLUDED.from_name,
+      from_address = EXCLUDED.from_address,
       resend_api_key = COALESCE(EXCLUDED.resend_api_key, mail_config.resend_api_key),
-      inbound_secret = COALESCE(EXCLUDED.inbound_secret, mail_config.inbound_secret), updated_at = NOW()
+      inbound_secret = COALESCE(EXCLUDED.inbound_secret, mail_config.inbound_secret),
+      updated_at = NOW()
   `);
 }
 
