@@ -25,9 +25,62 @@ export const POST: APIRoute = async ({ request, locals }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
   const appId = (body?.applicationId || '').toString().trim();
-  if (!appId) return json({ ok: false, error: 'applicationId required' }, 400);
+  const intentId = (body?.intentId || '').toString().trim();
+  if (!appId && !intentId) return json({ ok: false, error: 'applicationId or intentId required' }, 400);
 
   try {
+    // Intent path: pre-payment, no applications row exists yet. Look up the
+    // intent + role fee, create the order, and stash intentId in the notes
+    // so payment-effects can materialise the application after capture.
+    if (intentId && !appId) {
+      const intentRows = await db.execute(sql`
+        SELECT i.id, i.role_id, i.level, i.email, i.first_name, i.last_name, i.role_title_snapshot,
+               r.application_fee_amount AS role_fee
+        FROM application_intents i
+        LEFT JOIN roles r ON i.role_id = r.id
+        WHERE i.id = ${intentId} AND i.user_id = ${user.id}
+        LIMIT 1
+      `);
+      const intentRow = (Array.isArray(intentRows) ? intentRows : (intentRows?.rows || []))[0] as any;
+      if (!intentRow) return json({ ok: false, error: 'Application intent not found' }, 404);
+      if (!isConfigured()) return json({ ok: false, error: 'Payments not yet configured.' }, 503);
+
+      const feeChf = resolveApplicationFeeChf({ roleFee: intentRow.role_fee, level: intentRow.level });
+      const fx = await convertToInrPaise('CHF', feeChf * 100);
+      const amountPaise = fx.paise;
+      const receipt = 'appint_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+
+      const result = await createOrder({
+        amountPaise, currency: 'INR', receipt,
+        notes: {
+          purpose: 'application_fee_intent',
+          intentId: intentRow.id, userId: user.id,
+          email: intentRow.email || user.email || '',
+          feeChf: feeChf.toString(), fxRate: fx.rate.toString(), fxDate: fx.date,
+        },
+      });
+      if (!result.ok) return json({ ok: false, error: result.error }, 502);
+
+      await db.execute(sql`
+        INSERT INTO payments (
+          order_id, amount_paise, currency, status, purpose,
+          reference_type, reference_id, user_id, email, notes
+        ) VALUES (
+          ${result.order.id}, ${amountPaise}, 'INR', 'created', 'application_fee_intent',
+          'application_intent', ${intentRow.id}, ${user.id}, ${intentRow.email || user.email || 'unknown@edurankai.in'},
+          ${sql.raw("'" + JSON.stringify({ receipt, intentId: intentRow.id, feeChf, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")}
+        )
+      `).catch(() => {});
+
+      const candidateName = ((intentRow.first_name || '') + ' ' + (intentRow.last_name || '')).trim();
+      return json({
+        ok: true, orderId: result.order.id, keyId: getPublicKeyId(),
+        amountPaise, currency: 'INR', feeChf, fxRate: fx.rate, fxDate: fx.date,
+        roleTitle: intentRow.role_title_snapshot || '',
+        prefill: { name: candidateName, email: intentRow.email || user.email || '' },
+      });
+    }
+
     const a = await db.execute(sql`
       SELECT a.id, a.level, a.fee_paid, a.first_name, a.last_name, a.email,
              a.role_title_snapshot,

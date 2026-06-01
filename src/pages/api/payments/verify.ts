@@ -54,16 +54,18 @@ export const POST: APIRoute = async ({ request }) => {
   // Apply downstream effects (mark application/registration/event paid, etc.).
   // Shared with the webhook so a payment completes regardless of which path
   // confirms it first; idempotent.
+  let applicationId: string | undefined;
   if (captured) {
     try {
       const { applyPaidEffects } = await import('@/lib/payment-effects');
-      await applyPaidEffects(orderId, paymentId);
+      const r = await applyPaidEffects(orderId, paymentId);
+      applicationId = (r && (r as any).applicationId) || undefined;
     } catch (e: any) {
       console.error('[payments] paid effects failed:', e?.message);
     }
   }
 
-  return json({ ok: true, status: captured ? 'paid' : 'attempted' });
+  return json({ ok: true, status: captured ? 'paid' : 'attempted', applicationId });
 };
 
 function json(data: any, status = 200) {

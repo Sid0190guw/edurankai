@@ -56,7 +56,43 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
   { type: 'hei_truth_report',   label: 'HEI truth reports',         desc: 'When an HEI truth report is generated',        group: 'Institutional' },
 ];
 
-// Send a push notification to all admin users who have opted in for this type
+// In-app notifications feed. Self-bootstrap so /admin/notifications populates
+// even if no migration ran.
+let notificationsReady: Promise<void> | null = null;
+function ensureNotificationsTable(): Promise<void> {
+  if (notificationsReady) return notificationsReady;
+  notificationsReady = (async () => {
+    try {
+      const { sql } = await import('drizzle-orm');
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL, body TEXT,
+        type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
+        entity_type TEXT, entity_id TEXT,
+        is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW())`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS notifications_user_id_idx ON notifications(user_id, created_at DESC)`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS notifications_unread_idx ON notifications(user_id, is_read) WHERE is_read = false`);
+    } catch (_) {}
+  })();
+  return notificationsReady;
+}
+
+async function persistNotification(userId: string, p: PushPayload) {
+  try {
+    const { sql } = await import('drizzle-orm');
+    await ensureNotificationsTable();
+    await db.execute(sql`
+      INSERT INTO notifications (user_id, title, body, type, action_url)
+      VALUES (${userId}, ${p.title}, ${p.body}, ${p.type}, ${p.url})
+    `);
+  } catch (e) { /* silent — never block delivery */ }
+}
+
+// Send a push notification to all admin users who have opted in for this type.
+// ALSO writes a row to the in-app notifications feed for each eligible admin
+// so the bell + /admin/notifications populate even if browser push fails.
 export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: string): Promise<void> {
   if (!VAPID_PUBLIC || !VAPID_PRIVATE) {
     console.warn('[push] VAPID keys not configured. Skipping push.');
@@ -92,6 +128,11 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
     });
 
     if (eligibleIds.length === 0) return;
+
+    // Persist in-app notifications for every eligible admin FIRST. This is the
+    // source of truth for the bell + /admin/notifications feed and is what
+    // the user actually sees if the browser push is missed / stripped / muted.
+    await Promise.all(eligibleIds.map((id) => persistNotification(id, payload)));
 
     // Get push subscriptions for eligible users
     const subs = await db.select()
@@ -130,8 +171,11 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
 // Send a push to ONE specific user (applicant or admin) - used for personalised
 // updates like "your application moved to Reviewing" or "the team replied".
 export async function sendPushToUser(userId: string, payload: PushPayload): Promise<void> {
-  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return;
   if (!userId) return;
+  // Persist to in-app feed regardless of VAPID config so the bell still shows
+  // activity even before push is wired.
+  await persistNotification(userId, payload);
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return;
   try {
     const subs = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId));
     if (subs.length === 0) return;
