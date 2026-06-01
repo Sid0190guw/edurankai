@@ -110,6 +110,33 @@ async function hasFaceEnrolled(userId: string): Promise<boolean> {
 }
 
 export const onRequest = defineMiddleware(async (context, next) => {
+  const path = new URL(context.request.url).pathname;
+
+  // Viśvambhara deep modules ALWAYS require sign-in + admin approval. Handled
+  // first so unauthenticated visitors are bounced to the access page instead
+  // of seeing raw HTML.
+  if (path.startsWith('/visvambhara/')) {
+    const tokenEarly = readSessionCookie(context.cookies);
+    let userEarly: any = null;
+    if (tokenEarly) {
+      const v = await validateSessionToken(tokenEarly);
+      if (v) userEarly = v.user;
+    }
+    if (!userEarly) {
+      return new Response(null, { status: 302, headers: { Location: '/products/visvambhara/access' } });
+    }
+    try {
+      const { hasApprovedAccess } = await import('@/lib/visvambhara-access');
+      // Non-applicant staff (admins, HR, editors) can always view internal research.
+      if (userEarly.role === 'applicant') {
+        const ok = await hasApprovedAccess(userEarly.id);
+        if (!ok) return new Response(null, { status: 302, headers: { Location: '/products/visvambhara/access' } });
+      }
+    } catch (_) { /* fail-closed: redirect rather than leak */
+      return new Response(null, { status: 302, headers: { Location: '/products/visvambhara/access' } });
+    }
+  }
+
   const token = readSessionCookie(context.cookies);
   if (!token) {
     context.locals.user = null;
@@ -126,8 +153,6 @@ export const onRequest = defineMiddleware(async (context, next) => {
   setSessionCookie(context.cookies, token, result.session.expiresAt);
   context.locals.user = result.user;
   context.locals.session = result.session;
-
-  const path = new URL(context.request.url).pathname;
 
   // Applicants get full access only in the application portal, never the admin
   // panel. Central guard (complements per-page checks).
