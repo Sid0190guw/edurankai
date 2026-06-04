@@ -3,7 +3,8 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { randomBytes } from 'node:crypto';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { getMailConfig, saveMailConfig, ensureMailSchema } from '@/lib/mail';
+import { getMailConfig, saveMailConfig, ensureMailSchema, clearMailField } from '@/lib/mail';
+import { getImapConfig, saveImapConfig } from '@/lib/mail-imap';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -25,24 +26,54 @@ if (Astro.request.method === 'POST') {
         smtpUser: (fd.get('smtp_user') as string || '').trim(),
         smtpPass: pass || undefined, // blank keeps existing
         smtpSecure: fd.get('smtp_secure') === 'on',
+        smtpInsecure: fd.get('smtp_insecure') === 'on',
         fromName: (fd.get('from_name') as string || '').trim(),
         fromAddress: (fd.get('from_address') as string || '').trim(),
       });
-      okMsg = 'SMTP settings saved. Send a test email below to verify.';
+      // Auto-mint an inbound secret on first SMTP save so inbound mail isn't
+      // silently blocked by an empty `mail_config.inbound_secret`.
+      try {
+        const cur = rows(await db.execute(sql`SELECT inbound_secret FROM mail_config WHERE id = 1 LIMIT 1`))[0] as any;
+        if (!cur?.inbound_secret) {
+          await saveMailConfig({ inboundSecret: randomBytes(24).toString('hex') });
+        }
+      } catch (_) {}
+      okMsg = 'SMTP settings saved. Use "Verify connection" above the form to confirm the server accepts auth.';
     } else if (action === 'gen_inbound') {
       const secret = randomBytes(24).toString('hex');
       await saveMailConfig({ inboundSecret: secret });
       okMsg = 'New inbound secret generated.';
+    } else if (action === 'clear_smtp') {
+      try {
+        await clearMailField('smtp_host');
+        await clearMailField('smtp_user');
+        await clearMailField('smtp_pass');
+        await clearMailField('from_name');
+        await clearMailField('from_address');
+        okMsg = 'SMTP settings cleared. The mail system is now offline until you re-save.';
+      } catch (e: any) { errMsg = 'Clear failed: ' + (e?.message || 'error'); }
+    } else if (action === 'save_imap') {
+      const pass = (fd.get('imap_pass') as string || '').trim();
+      await saveImapConfig({
+        host: (fd.get('imap_host') as string || '').trim(),
+        port: Number(fd.get('imap_port') || 993),
+        user: (fd.get('imap_user') as string || '').trim(),
+        pass: pass || undefined,
+        secure: fd.get('imap_secure') !== 'off',
+      });
+      okMsg = 'IMAP settings saved. Click "Verify IMAP" to confirm, then "Check now" to fetch.';
     }
   } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'error'); }
 }
 
 const cfg = await getMailConfig();
 let raw: any = {};
-try { raw = rows(await db.execute(sql`SELECT smtp_host, smtp_port, smtp_user, smtp_secure, from_name, from_address, inbound_secret, (smtp_pass IS NOT NULL) AS has_pass, (resend_api_key IS NOT NULL) AS has_resend FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; } catch (e) {}
+try { raw = rows(await db.execute(sql`SELECT smtp_host, smtp_port, smtp_user, smtp_secure, COALESCE(smtp_insecure, false) AS smtp_insecure, from_name, from_address, inbound_secret, (smtp_pass IS NOT NULL AND smtp_pass <> '') AS has_pass, (resend_api_key IS NOT NULL AND resend_api_key <> '') AS has_resend FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; } catch (e) {}
 
+const imap = await getImapConfig();
 const origin = new URL(Astro.request.url).origin;
 const inboundUrl = origin + '/api/mail/inbound';
+const imapHasPass = !!imap.pass;
 ---
 <AdminLayout title="Mail Settings" activeNav="mail">
   <div class="admin-page" style="max-width:780px;">
@@ -57,18 +88,49 @@ const inboundUrl = origin + '/api/mail/inbound';
     {okMsg && <div style="background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.28);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:8px;margin-bottom:16px;">{okMsg}</div>}
     {errMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.28);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:8px;margin-bottom:16px;">{errMsg}</div>}
 
-    <div class="admin-card" style="margin-bottom:16px;display:flex;align-items:center;gap:10px;">
-      <span style={'width:10px;height:10px;border-radius:50%;background:' + (cfg.source === 'none' ? '#f87171' : '#34d399') + ';'}></span>
-      <div>
-        <div style="font-size:13px;font-weight:700;color:var(--o-hi,#fff);">Outbound: {cfg.source === 'none' ? 'Not configured' : (cfg.smtpHost ? 'SMTP (' + cfg.smtpHost + ':' + cfg.smtpPort + ')' : 'Resend')}</div>
-        <div style="font-size:11.5px;color:var(--o-mid,#8a8a94);">{cfg.source === 'db' ? 'Using saved settings' : cfg.source === 'env' ? 'Using environment variables' : 'Add SMTP details or a Resend key to start sending external mail'}</div>
+    <div class="admin-card" style="margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+        <span style={'width:10px;height:10px;border-radius:50%;background:' + (cfg.source === 'none' ? '#f87171' : '#34d399') + ';flex-shrink:0;'}></span>
+        <div style="flex:1;">
+          <div style="font-size:13px;font-weight:700;color:var(--o-hi,#fff);">Outbound: {cfg.source === 'none' ? 'Not configured' : (cfg.smtpHost ? 'SMTP (' + cfg.smtpHost + ':' + cfg.smtpPort + ')' : 'Resend')}</div>
+          <div style="font-size:11.5px;color:var(--o-mid,#8a8a94);">{cfg.source === 'db' ? 'Using saved settings' : cfg.source === 'env' ? 'Using environment variables' : 'No SMTP host or Resend key on file — fill the form below and Save.'}</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;font-size:11px;font-family:'Geist Mono',monospace;color:var(--o-mid,#8a8a94);background:var(--o-panel,#08080a);border:1px solid var(--o-stroke,#1f1f26);border-radius:8px;padding:10px 12px;">
+        <div>host: <b style={'color:' + (raw.smtp_host ? '#6ee7b7' : '#f87171') + ';'}>{raw.smtp_host || '(empty)'}</b></div>
+        <div>port: <b style="color:#d8d8de;">{raw.smtp_port || 587}</b></div>
+        <div>user: <b style={'color:' + (raw.smtp_user ? '#6ee7b7' : '#f87171') + ';'}>{raw.smtp_user || '(empty)'}</b></div>
+        <div>pass: <b style={'color:' + (raw.has_pass ? '#6ee7b7' : '#f87171') + ';'}>{raw.has_pass ? 'set' : '(empty)'}</b></div>
+        <div>tls: <b style="color:#d8d8de;">{raw.smtp_secure ? 'forced' : 'STARTTLS'}</b></div>
+        <div>cert: <b style="color:#d8d8de;">{raw.smtp_insecure ? 'permissive' : 'strict'}</b></div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+        <button type="button" id="verifyBtn" class="admin-btn" style="padding:7px 14px;font-size:12px;">Verify connection</button>
+        <form method="POST" style="display:inline;" onsubmit="return confirm('Clear all saved SMTP fields? You can re-enter them after.')">
+          <input type="hidden" name="_action" value="clear_smtp" />
+          <button type="submit" class="admin-btn" style="padding:7px 14px;font-size:12px;background:rgba(239,68,68,0.10);color:#fca5a5;border-color:rgba(239,68,68,0.30);">Clear SMTP</button>
+        </form>
+        <span id="verifyStatus" style="font-size:11.5px;color:var(--o-mid,#8a8a94);align-self:center;flex:1;min-width:200px;"></span>
+      </div>
+    </div>
+
+    <!-- Provider presets -->
+    <div class="admin-card" style="margin-bottom:16px;">
+      <div class="admin-card-title" style="margin-bottom:8px;">Provider quick-fill</div>
+      <p style="font-size:12px;color:var(--o-mid,#8a8a94);margin:0 0 10px;line-height:1.6;">Click your provider — fields below fill in. Password and from-address you still type yourself.</p>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button type="button" class="admin-btn preset-btn" data-preset="godaddy-workspace" style="padding:7px 12px;font-size:11.5px;">GoDaddy Workspace (legacy)</button>
+        <button type="button" class="admin-btn preset-btn" data-preset="godaddy-pro" style="padding:7px 12px;font-size:11.5px;">GoDaddy Professional Email</button>
+        <button type="button" class="admin-btn preset-btn" data-preset="m365" style="padding:7px 12px;font-size:11.5px;">Microsoft 365</button>
+        <button type="button" class="admin-btn preset-btn" data-preset="gmail" style="padding:7px 12px;font-size:11.5px;">Gmail / Workspace</button>
+        <button type="button" class="admin-btn preset-btn" data-preset="zoho" style="padding:7px 12px;font-size:11.5px;">Zoho</button>
       </div>
     </div>
 
     <!-- SMTP -->
     <form method="POST" class="admin-card" style="margin-bottom:16px;display:flex;flex-direction:column;gap:12px;">
       <input type="hidden" name="_action" value="save_smtp" />
-      <div class="admin-card-title">Your mail server (SMTP)</div>
+      <div class="admin-card-title">Outbound — SMTP server</div>
       <div style="display:grid;grid-template-columns:2fr 1fr;gap:12px;">
         <div><label class="rolefield-label">SMTP host</label><input name="smtp_host" value={raw.smtp_host || ''} class="rolefield-input" placeholder="mail.edurankai.in" /></div>
         <div><label class="rolefield-label">Port</label><input name="smtp_port" type="number" value={raw.smtp_port || 587} class="rolefield-input" /></div>
@@ -82,9 +144,15 @@ const inboundUrl = origin + '/api/mail/inbound';
         <div><label class="rolefield-label">From address</label><input name="from_address" value={raw.from_address || ''} class="rolefield-input" placeholder="no-reply@edurankai.in" /></div>
       </div>
       <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--o-mid,#8a8a94);">
-        <input type="checkbox" name="smtp_secure" checked={!!raw.smtp_secure} /> Use TLS/SSL (tick for port 465)
+        <input type="checkbox" name="smtp_secure" checked={!!raw.smtp_secure} /> Use TLS/SSL (tick for port 465 — leave off for port 587 STARTTLS)
       </label>
-      <div><button type="submit" class="admin-btn-primary" style="padding:9px 20px;">Save SMTP</button></div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--o-mid,#8a8a94);">
+        <input type="checkbox" name="smtp_insecure" checked={!!raw.smtp_insecure} /> Allow self-signed / mismatched certs (tick if your VPS mail server uses a self-signed cert)
+      </label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="submit" class="admin-btn-primary" style="padding:9px 20px;">Save SMTP</button>
+        <p style="font-size:11.5px;color:var(--o-mid,#8a8a94);align-self:center;margin:0;">Blank fields keep the existing saved value (use "Clear SMTP" above to wipe).</p>
+      </div>
     </form>
 
     <!-- Send test -->
@@ -97,21 +165,49 @@ const inboundUrl = origin + '/api/mail/inbound';
       <p id="testStatus" style="font-size:12px;color:var(--o-mid,#8a8a94);margin:10px 0 0;"></p>
     </div>
 
+    <!-- IMAP inbound -->
+    <form method="POST" class="admin-card" style="margin-bottom:16px;display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" name="_action" value="save_imap" />
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+        <div class="admin-card-title">Inbound — IMAP polling</div>
+        <span style={'font-size:10.5px;font-family:Geist Mono,monospace;padding:2px 8px;border-radius:100px;background:' + (imap.host && imapHasPass ? 'rgba(16,185,129,0.18);color:#6ee7b7' : 'rgba(239,68,68,0.18);color:#fca5a5') + ';'}>{imap.host && imapHasPass ? 'configured' : 'not configured'}</span>
+      </div>
+      <p style="font-size:12px;color:var(--o-mid,#8a8a94);margin:0;line-height:1.6;">We poll your mailbox over IMAP every few minutes (or on demand) and copy new messages into the in-app inbox. No DNS changes needed.</p>
+      <div style="display:grid;grid-template-columns:2fr 1fr;gap:12px;">
+        <div><label class="rolefield-label">IMAP host</label><input name="imap_host" value={imap.host || ''} class="rolefield-input" placeholder="imap.secureserver.net" /></div>
+        <div><label class="rolefield-label">Port</label><input name="imap_port" type="number" value={imap.port || 993} class="rolefield-input" /></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div><label class="rolefield-label">Username (full email)</label><input name="imap_user" value={imap.user || ''} class="rolefield-input" placeholder="hr@edurankai.in" /></div>
+        <div><label class="rolefield-label">Password</label><input name="imap_pass" type="password" class="rolefield-input" placeholder={imapHasPass ? '•••••••• (unchanged)' : 'mailbox password'} /></div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--o-mid,#8a8a94);">
+        <input type="checkbox" name="imap_secure" checked={imap.secure} /> Use SSL/TLS (recommended — port 993)
+      </label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <button type="submit" class="admin-btn-primary" style="padding:9px 20px;">Save IMAP</button>
+        <button type="button" id="imapVerifyBtn" class="admin-btn" style="padding:9px 16px;font-size:12.5px;">Verify IMAP</button>
+        <button type="button" id="imapPollBtn" class="admin-btn" style="padding:9px 16px;font-size:12.5px;">Check now</button>
+        <span id="imapStatus" style="font-size:11.5px;color:var(--o-mid,#8a8a94);flex:1;min-width:200px;">{imap.lastRun ? 'Last poll: ' + new Date(imap.lastRun).toLocaleString() + ' · last UID: ' + imap.lastUid : 'Never polled.'}</span>
+      </div>
+    </form>
+
     <div class="admin-card" style="margin-bottom:16px;">
-      <div class="admin-card-title" style="margin-bottom:6px;">Where to get SMTP details</div>
-      <ul style="margin:0;padding-left:18px;font-size:12px;color:var(--o-mid,#8a8a94);line-height:1.8;">
-        <li><b>Your own mail server (VPS):</b> host = your server, port 587 (or 465 + TLS), user/pass = the SMTP account you created.</li>
-        <li><b>GoDaddy / Microsoft 365 mailbox:</b> host <code>smtp.office365.com</code>, port 587, user = full email, pass = mailbox password (or app password if 2FA).</li>
-        <li><b>GoDaddy Workspace (legacy):</b> host <code>smtpout.secureserver.net</code>, port 465 + TLS.</li>
+      <div class="admin-card-title" style="margin-bottom:6px;">Where to get the mail-server details</div>
+      <ul style="margin:0;padding-left:18px;font-size:12px;color:var(--o-mid,#8a8a94);line-height:1.85;">
+        <li><b>GoDaddy Professional Email / Workspace (your case):</b> SMTP <code>smtpout.secureserver.net:465</code> (SSL), IMAP <code>imap.secureserver.net:993</code> (SSL). Username = full email, password = the mailbox password you set in GoDaddy.</li>
+        <li><b>Microsoft 365 / Outlook:</b> SMTP <code>smtp.office365.com:587</code> (STARTTLS), IMAP <code>outlook.office365.com:993</code>. Use an app password if 2FA is on.</li>
+        <li><b>Gmail / Google Workspace:</b> SMTP <code>smtp.gmail.com:587</code>, IMAP <code>imap.gmail.com:993</code>. Requires an app password.</li>
+        <li><b>Zoho:</b> SMTP <code>smtp.zoho.com:465</code>, IMAP <code>imap.zoho.com:993</code>.</li>
       </ul>
     </div>
 
-    <!-- Inbound -->
+    <!-- Webhook inbound (optional alt) -->
     <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:12px;">
       <input type="hidden" name="_action" value="gen_inbound" />
-      <div class="admin-card-title">Receive external mail (inbound)</div>
+      <div class="admin-card-title">Optional: push-based inbound (webhook)</div>
       <p style="font-size:12px;color:var(--o-mid,#8a8a94);margin:0;line-height:1.6;">
-        Point your mail server (Postfix pipe, Cloudflare Email Routing, or Resend Inbound) to POST each received message as JSON to the URL below, with the secret as the <b>x-mail-secret</b> header. Also set DNS <b>MX</b> records for edurankai.in to your server, plus SPF/DKIM/DMARC.
+        If you'd rather push than poll, hook Cloudflare Email Routing / Resend Inbound / a Postfix pipe to POST each received message as JSON to the URL below with the <b>x-mail-secret</b> header. This is independent of IMAP — use either or both.
       </p>
       <div>
         <label class="rolefield-label">Inbound webhook URL</label>
@@ -133,6 +229,113 @@ const inboundUrl = origin + '/api/mail/inbound';
 
   <script is:inline>
     (function(){
+      // ===== Provider presets =====
+      var PRESETS = {
+        'godaddy-workspace': { smtp: { host: 'smtpout.secureserver.net', port: 465, secure: true }, imap: { host: 'imap.secureserver.net', port: 993, secure: true } },
+        'godaddy-pro':       { smtp: { host: 'smtpout.secureserver.net', port: 465, secure: true }, imap: { host: 'imap.secureserver.net', port: 993, secure: true } },
+        'm365':              { smtp: { host: 'smtp.office365.com',       port: 587, secure: false }, imap: { host: 'outlook.office365.com', port: 993, secure: true } },
+        'gmail':             { smtp: { host: 'smtp.gmail.com',           port: 587, secure: false }, imap: { host: 'imap.gmail.com',        port: 993, secure: true } },
+        'zoho':              { smtp: { host: 'smtp.zoho.com',            port: 465, secure: true }, imap: { host: 'imap.zoho.com',         port: 993, secure: true } },
+      };
+      function setVal(name, val) { var el = document.querySelector('input[name="' + name + '"]'); if (el) el.value = val; }
+      function setChk(name, val) { var el = document.querySelector('input[name="' + name + '"]'); if (el) el.checked = !!val; }
+      document.querySelectorAll('.preset-btn').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var p = PRESETS[b.getAttribute('data-preset')];
+          if (!p) return;
+          setVal('smtp_host', p.smtp.host); setVal('smtp_port', p.smtp.port); setChk('smtp_secure', p.smtp.secure);
+          setVal('imap_host', p.imap.host); setVal('imap_port', p.imap.port); setChk('imap_secure', p.imap.secure);
+          b.textContent = 'Filled ✓';
+          setTimeout(function () { b.textContent = b.dataset.original || b.textContent; }, 1500);
+        });
+        b.dataset.original = b.textContent;
+      });
+
+      // ===== IMAP buttons =====
+      var imapVBtn = document.getElementById('imapVerifyBtn');
+      var imapPBtn = document.getElementById('imapPollBtn');
+      var imapSt   = document.getElementById('imapStatus');
+      function readImap() {
+        return {
+          host: (document.querySelector('input[name="imap_host"]') || {}).value || '',
+          port: Number(((document.querySelector('input[name="imap_port"]') || {}).value) || 993),
+          user: (document.querySelector('input[name="imap_user"]') || {}).value || '',
+          pass: (document.querySelector('input[name="imap_pass"]') || {}).value || '',
+          secure: !!(document.querySelector('input[name="imap_secure"]') || {}).checked,
+        };
+      }
+      if (imapVBtn) {
+        imapVBtn.addEventListener('click', async function () {
+          imapSt.style.color = '#a0a0ab'; imapSt.textContent = 'Connecting to IMAP…'; imapVBtn.disabled = true;
+          try {
+            var r = await fetch('/api/mail/imap-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(readImap()) });
+            var d = await r.json();
+            if (d.ok) {
+              imapSt.style.color = '#6ee7b7';
+              imapSt.innerHTML = '<b>IMAP OK.</b> ' + (d.detail || '') + (d.mailboxes && d.mailboxes.length ? '<br>Folders: ' + d.mailboxes.join(', ') : '');
+            } else {
+              imapSt.style.color = '#fca5a5';
+              imapSt.innerHTML = '<b>IMAP failed:</b> ' + (d.detail || d.error || 'unknown') + (d.hint ? '<br><span style="color:#fde68a;">' + d.hint + '</span>' : '');
+            }
+          } catch (e) { imapSt.style.color = '#fca5a5'; imapSt.textContent = 'Network error'; }
+          imapVBtn.disabled = false;
+        });
+      }
+      if (imapPBtn) {
+        imapPBtn.addEventListener('click', async function () {
+          imapSt.style.color = '#a0a0ab'; imapSt.textContent = 'Polling mailbox…'; imapPBtn.disabled = true;
+          try {
+            var r = await fetch('/api/mail/imap-poll', { method: 'POST', credentials: 'same-origin' });
+            var d = await r.json();
+            if (d.ok) {
+              imapSt.style.color = '#6ee7b7';
+              imapSt.innerHTML = '<b>Polled.</b> Fetched ' + (d.fetched || 0) + ' message(s); delivered ' + (d.delivered || 0) + ' to known mailboxes. ' + (d.detail || '');
+            } else {
+              imapSt.style.color = '#fca5a5';
+              imapSt.innerHTML = '<b>Poll failed:</b> ' + (d.error || 'unknown') + ' — save IMAP settings + verify first.';
+            }
+          } catch (e) { imapSt.style.color = '#fca5a5'; imapSt.textContent = 'Network error'; }
+          imapPBtn.disabled = false;
+        });
+      }
+
+      var vBtn = document.getElementById('verifyBtn');
+      var vStatus = document.getElementById('verifyStatus');
+      if (vBtn) {
+        vBtn.addEventListener('click', async function(){
+          var hostEl = document.querySelector('input[name="smtp_host"]');
+          var portEl = document.querySelector('input[name="smtp_port"]');
+          var userEl = document.querySelector('input[name="smtp_user"]');
+          var passEl = document.querySelector('input[name="smtp_pass"]');
+          var secEl  = document.querySelector('input[name="smtp_secure"]');
+          var insEl  = document.querySelector('input[name="smtp_insecure"]');
+          vStatus.style.color = '#a0a0ab';
+          vStatus.textContent = 'Connecting…';
+          vBtn.disabled = true;
+          try {
+            var r = await fetch('/api/mail/verify', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                host: hostEl ? hostEl.value : '',
+                port: portEl ? Number(portEl.value || 587) : 587,
+                user: userEl ? userEl.value : '',
+                pass: passEl && passEl.value ? passEl.value : '',
+                secure: !!(secEl && secEl.checked),
+                insecure: !!(insEl && insEl.checked),
+              }),
+            });
+            var d = await r.json();
+            if (d.ok) {
+              vStatus.style.color = '#6ee7b7';
+              vStatus.innerHTML = '<b>Connection OK.</b> ' + (d.detail || '');
+            } else {
+              vStatus.style.color = '#fca5a5';
+              vStatus.innerHTML = '<b>Failed:</b> ' + (d.detail || d.error || 'unknown') + (d.hint ? '<br><span style="color:#fde68a;">' + d.hint + '</span>' : '');
+            }
+          } catch (e) { vStatus.style.color = '#fca5a5'; vStatus.textContent = 'Network error'; }
+          vBtn.disabled = false;
+        });
+      }
       var btn = document.getElementById('testBtn');
       if (!btn) return;
       btn.addEventListener('click', async function(){
@@ -140,14 +343,35 @@ const inboundUrl = origin + '/api/mail/inbound';
         var st = document.getElementById('testStatus');
         if (!to) { st.textContent = 'Enter an address first.'; return; }
         st.textContent = 'Sending...'; btn.disabled = true;
+        // Read the current SMTP form values so the test can use them even
+        // BEFORE Save. The server falls back to the saved password when blank.
+        var hostEl = document.querySelector('input[name="smtp_host"]');
+        var portEl = document.querySelector('input[name="smtp_port"]');
+        var userEl = document.querySelector('input[name="smtp_user"]');
+        var passEl = document.querySelector('input[name="smtp_pass"]');
+        var secEl  = document.querySelector('input[name="smtp_secure"]');
+        var insEl  = document.querySelector('input[name="smtp_insecure"]');
+        var fnEl   = document.querySelector('input[name="from_name"]');
+        var faEl   = document.querySelector('input[name="from_address"]');
+        var payload = {
+          to: to,
+          host: hostEl ? hostEl.value.trim() : '',
+          port: portEl ? Number(portEl.value || 587) : 587,
+          user: userEl ? userEl.value.trim() : '',
+          pass: passEl && passEl.value ? passEl.value : '',
+          secure: !!(secEl && secEl.checked),
+          insecure: !!(insEl && insEl.checked),
+          fromName: fnEl ? fnEl.value.trim() : '',
+          fromAddress: faEl ? faEl.value.trim() : '',
+        };
         try {
-          var r = await fetch('/api/mail/test', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ to: to }) });
+          var r = await fetch('/api/mail/test', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
           var d = await r.json();
           if (d.ok) {
-            st.innerHTML = '<b>Accepted by mail server.</b> ' + (d.details || '') + '<br><br><b>Now check SPAM / "All Mail"</b> at ' + to + ' - without SPF/DKIM/DMARC records on edurankai.in DNS, Gmail almost always quarantines mail from a brand-new sender. If it is in spam, mark "Not spam"; if it is nowhere, add the DNS records (see GoDaddy / Microsoft 365 setup).';
+            st.innerHTML = '<b>Accepted by mail server.</b> ' + (d.details || '') + '<br><br><b>Now check SPAM / "All Mail"</b> at ' + to + ' — without SPF/DKIM/DMARC records on edurankai.in DNS, Gmail almost always quarantines mail from a brand-new sender. If it is in spam, mark "Not spam"; if it is nowhere, add the DNS records.';
             st.style.color = '#6ee7b7';
           } else {
-            st.innerHTML = '<b>Failed:</b> ' + (d.error || 'unknown') + (d.from ? '<br>From tried: ' + d.from : '') + (d.to ? '<br>To: ' + d.to : '');
+            st.innerHTML = '<b>Failed:</b> ' + (d.error || 'unknown') + (d.hint ? '<br><span style="color:#fde68a;">' + d.hint + '</span>' : '') + (d.from ? '<br>From tried: ' + d.from : '') + (d.to ? '<br>To: ' + d.to : '');
             st.style.color = '#fca5a5';
           }
         } catch(e){ st.textContent = 'Network error'; st.style.color = '#fca5a5'; }

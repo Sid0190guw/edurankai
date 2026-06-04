@@ -20,6 +20,20 @@ export const POST: APIRoute = async ({ request }) => {
       UPDATE ai_interview_sessions SET status = 'completed', ended_at = NOW()
       WHERE id = ${sessionId} AND status = 'in_progress'
     `);
+    // Notify admins so HR/reviewers see the new submission in their bell
+    try {
+      const r = await db.execute(sql`
+        SELECT s.candidate_name, s.candidate_email, t.title AS template_title
+        FROM ai_interview_sessions s LEFT JOIN ai_interview_templates t ON s.template_id = t.id
+        WHERE s.id = ${sessionId} LIMIT 1
+      `);
+      const rows = Array.isArray(r) ? r : (r?.rows || []);
+      const row = rows[0] as any;
+      if (row) {
+        const { pushNotify } = await import('@/lib/push');
+        await pushNotify.aiInterviewCompleted(row.candidate_name || row.candidate_email || 'A candidate', row.template_title || 'an interview', sessionId);
+      }
+    } catch (_) {}
     return json({ ok: true, redirect: '/aquintutor/interview/done?session=' + encodeURIComponent(sessionId) });
   } catch (e: any) {
     return json({ ok: false, error: e?.message || 'server error' }, 500);

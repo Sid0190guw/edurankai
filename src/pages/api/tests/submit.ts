@@ -81,12 +81,21 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         const ua = parseFloat(String(userAns));
         const ca = parseFloat(String(Array.isArray(correctAns) ? correctAns[0] : correctAns));
         if (!isNaN(ua) && !isNaN(ca)) correct = numClose(ua, ca, parseFloat(q.answer_tolerance ?? '0') || 0);
-      } else if (q.question_type === 'short_answer') {
-        // Auto-grade only when a model answer exists; case/space-insensitive.
-        const ca = Array.isArray(correctAns) ? correctAns[0] : correctAns;
-        if (ca != null && String(ca).trim() !== '') {
-          correct = String(userAns).trim().toLowerCase() === String(ca).trim().toLowerCase();
+      } else if (q.question_type === 'short_answer' || q.question_type === 'fill_in_blank') {
+        // Accept any of `accepted_answers` (jsonb array) OR the single correct_answer.
+        // Case + leading/trailing whitespace insensitive; treat multiple spaces as one.
+        objective = q.question_type === 'fill_in_blank'; // negative-marking eligible for fill-in only
+        const norm = (s: any) => String(s == null ? '' : s).trim().toLowerCase().replace(/\s+/g, ' ');
+        const candidate = norm(userAns);
+        const accepted: string[] = [];
+        let acceptedRaw: any = q.accepted_answers;
+        if (typeof acceptedRaw === 'string') { try { acceptedRaw = JSON.parse(acceptedRaw); } catch { acceptedRaw = []; } }
+        if (Array.isArray(acceptedRaw)) for (const a of acceptedRaw) { const n = norm(a); if (n) accepted.push(n); }
+        const single = Array.isArray(correctAns) ? correctAns[0] : correctAns;
+        if (single != null && String(single).trim() !== '') {
+          const n = norm(single); if (n && !accepted.includes(n)) accepted.push(n);
         }
+        if (candidate && accepted.length) correct = accepted.includes(candidate);
       }
       // long_answer, code, file_upload, video: pending manual/AI grading.
 
@@ -117,6 +126,38 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         ip_address = ${clientAddress || null}
       WHERE id = ${attemptId}
     `);
+
+    // Award XP if this is an official, signed-in attempt. Practice attempts
+    // award XP through the practice endpoint instead.
+    try {
+      if (attempt.candidate_id && (attempt.mode || 'official') === 'official') {
+        const { awardXp } = await import('@/lib/xp');
+        const baseXp = Math.max(10, Math.round(totalScore * 5)); // 5 XP per mark, min 10
+        const bonus = percentage >= 90 ? 30 : percentage >= 75 ? 15 : 0;
+        const delta = baseXp + bonus;
+        await awardXp({
+          userId: attempt.candidate_id,
+          source: 'test_official',
+          refId: attempt.id,
+          delta,
+          reason: 'Official test submitted (' + Math.round(percentage) + '%)',
+        });
+        await db.execute(sql`UPDATE test_attempts SET xp_awarded = ${delta} WHERE id = ${attemptId}`).catch(() => {});
+      }
+    } catch (_) {}
+
+    // Notify admins that an official test was submitted (so the bell + inbox
+    // light up for HR / reviewers — currently only "new user" events surface).
+    try {
+      if ((attempt.mode || 'official') === 'official') {
+        const tt = await db.execute(sql`SELECT title FROM tests WHERE id = ${attempt.test_id} LIMIT 1`);
+        const ttRows = Array.isArray(tt) ? tt : (tt?.rows || []);
+        const testTitle = (ttRows[0] as any)?.title || 'a test';
+        const candidateName = attempt.candidate_name || attempt.candidate_email || 'A candidate';
+        const { pushNotify } = await import('@/lib/push');
+        await pushNotify.testSubmitted(candidateName, testTitle + ' (' + Math.round(percentage) + '%)', '/admin/tests/attempts');
+      }
+    } catch (_) {}
 
     // Auto-rank all graded attempts for this test by score (ties broken by
     // faster duration). Ranks are computed automatically from scores so the

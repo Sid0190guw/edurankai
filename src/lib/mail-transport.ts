@@ -27,17 +27,65 @@ export async function transportStatus(): Promise<{ mode: 'smtp' | 'resend' | 'no
   return { mode: 'none', detail: 'No outbound transport configured' };
 }
 
+export interface VerifySmtpParams {
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  secure: boolean;
+  insecure?: boolean;
+}
+
+export async function verifySmtp(p: VerifySmtpParams): Promise<{ ok: boolean; detail: string; hint?: string }> {
+  if (!p.host) return { ok: false, detail: 'SMTP host is empty', hint: 'Type your mail server hostname (e.g. mail.yourdomain.com or smtp.office365.com)' };
+  if (!p.user || !p.pass) return { ok: false, detail: 'Username or password missing', hint: 'Most SMTP servers require auth. Use the full email for username and an app password if 2FA is on.' };
+  // Auto-correct: 587 → STARTTLS (secure:false), 465 → implicit TLS (secure:true).
+  const port = p.port || 587;
+  const secure = port === 465 ? true : port === 587 ? false : !!p.secure;
+  try {
+    const transport = nodemailer.createTransport({
+      host: p.host,
+      port,
+      secure,
+      auth: { user: p.user, pass: p.pass },
+      tls: { rejectUnauthorized: !p.insecure },
+      connectionTimeout: 12000,
+      greetingTimeout: 10000,
+      socketTimeout: 20000,
+    });
+    await transport.verify();
+    return { ok: true, detail: `Authenticated as ${p.user} against ${p.host}:${port} (${secure ? 'implicit TLS' : 'STARTTLS'})` };
+  } catch (e: any) {
+    const msg = (e?.message || 'connect failed').toString();
+    let hint: string | undefined;
+    const low = msg.toLowerCase();
+    if (low.includes('wrong version number') || low.includes('tlsv1') || low.includes('ssl routines')) hint = 'TLS mode mismatch. Port 587 uses STARTTLS — UNTICK "Use TLS/SSL" for port 587. Only tick it for port 465.';
+    else if (low.includes('etimedout') || low.includes('econnrefused')) hint = 'The server did not respond on that port. Try 587 (STARTTLS) or 465 (TLS). Check that the firewall allows outbound to your mail host.';
+    else if (low.includes('self-signed') || low.includes('self signed') || low.includes('certificate')) hint = 'TLS certificate problem. Tick "Allow self-signed certs" below if you trust this server.';
+    else if (low.includes('authentication') || low.includes('535') || low.includes('invalid login')) hint = 'Auth failed. For Office365 / GoDaddy use the FULL email address as username and an app password if 2FA is on.';
+    else if (low.includes('enotfound') || low.includes('getaddrinfo')) hint = 'Could not resolve that hostname — check the SMTP host spelling.';
+    return { ok: false, detail: msg, hint };
+  }
+}
+
 export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
   const c = await getMailConfig();
 
   if (c.smtpHost) {
     try {
+      // Port-driven secure mode: 465 = implicit TLS, 587 = STARTTLS, anything
+      // else honours the saved checkbox.
+      const port = c.smtpPort || 587;
+      const secure = port === 465 ? true : port === 587 ? false : !!c.smtpSecure;
       const transport = nodemailer.createTransport({
         host: c.smtpHost,
-        port: c.smtpPort,
-        secure: c.smtpSecure || c.smtpPort === 465,
+        port,
+        secure,
         auth: c.smtpUser ? { user: c.smtpUser, pass: c.smtpPass } : undefined,
-        tls: { rejectUnauthorized: process.env.SMTP_INSECURE !== 'true' },
+        tls: { rejectUnauthorized: !(c.smtpInsecure || process.env.SMTP_INSECURE === 'true') },
+        connectionTimeout: 15000,
+        greetingTimeout: 10000,
+        socketTimeout: 30000,
       });
       const info = await transport.sendMail({
         from: p.from,

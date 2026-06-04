@@ -117,6 +117,40 @@ export function getPublicKeyId(): string | null {
   return process.env.RAZORPAY_KEY_ID || null;
 }
 
+// Issue a refund against a captured payment. Full refund if amountPaise is
+// omitted; partial refund otherwise. Returns the Razorpay refund entity or
+// an error message.
+export async function refundPayment(opts: {
+  paymentId: string;
+  amountPaise?: number;
+  speed?: 'normal' | 'optimum';
+  notes?: Record<string, string>;
+}): Promise<{ ok: true; refund: any } | { ok: false; error: string }> {
+  const creds = getCreds();
+  if (!creds) return { ok: false, error: 'Razorpay keys not configured' };
+  const body: any = { speed: opts.speed || 'normal' };
+  if (opts.amountPaise && opts.amountPaise > 0) body.amount = opts.amountPaise;
+  if (opts.notes) body.notes = opts.notes;
+  try {
+    const resp = await fetch(RZP_API + '/payments/' + encodeURIComponent(opts.paymentId) + '/refund', {
+      method: 'POST',
+      headers: {
+        'Authorization': authHeader(creds.keyId, creds.keySecret),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const msg = (data as any)?.error?.description || (data as any)?.error?.code || ('HTTP ' + resp.status);
+      return { ok: false, error: msg };
+    }
+    return { ok: true, refund: data };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || 'refund request failed' };
+  }
+}
+
 // Convenience for the in-app checkout
 export function isConfigured(): boolean {
   return !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);

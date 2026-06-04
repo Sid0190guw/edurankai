@@ -21,6 +21,12 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
     if (!intent) return; // intent already materialised by a prior call; idempotent.
     const d = (intent.data || {}) as any;
     let newAppId: string | undefined;
+    // Make sure programme columns exist (best effort) so PD applications can land them.
+    try {
+      await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS programme_choice VARCHAR(80)`);
+      await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS programme_engagement_note TEXT`);
+      await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS programme_engagement_url TEXT`);
+    } catch (_) {}
     try {
       const inserted = rows(await db.execute(sql`
         INSERT INTO applications (
@@ -33,7 +39,8 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
           why_era, why_role, why_ai_edu, intersection, ambitious,
           ethics_experience, ethics_ideal, availability, engagement_type, remote_comfort,
           compensation, source, status, raw_submission, ip_address, user_agent,
-          fee_paid, fee_payment_id, fee_paid_at
+          fee_paid, fee_payment_id, fee_paid_at,
+          programme_choice, programme_engagement_note, programme_engagement_url
         ) VALUES (
           ${d.applicationNumber || null}, ${d.roleId || null}, ${intent.user_id},
           ${d.firstName || ''}, ${d.lastName || ''}, ${d.email || ''}, ${d.phone || null},
@@ -46,7 +53,8 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
           ${d.ethicsExperience || null}, ${d.ethicsIdeal || null}, ${d.availability || null}, ${d.engagementType || null}, ${d.remoteComfort || null},
           ${d.compensation || null}, ${d.source || null}, 'submitted', ${JSON.stringify(d.rawSubmission || {})}::jsonb,
           ${d.ipAddress || null}, ${d.userAgent || null},
-          true, ${paymentId}, NOW()
+          true, ${paymentId}, NOW(),
+          ${d.programmeChoice || null}, ${d.programmeEngagementNote || null}, ${d.programmeEngagementUrl || null}
         )
         RETURNING id
       `));

@@ -17,6 +17,8 @@ if (!intentId) return Astro.redirect('/portal');
 const intent = await getIntent(intentId, user.id);
 if (!intent) return Astro.redirect('/portal');
 
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
 let okMsg = '', errMsg = '';
 if (Astro.request.method === 'POST') {
   try {
@@ -28,25 +30,56 @@ if (Astro.request.method === 'POST') {
     else if (situation.length > 6000 || expertise.length > 6000) errMsg = 'Notes must be under 6000 characters each.';
     else if (!/^https?:\/\/.+/i.test(driveUrl)) errMsg = 'Drive link must start with http(s)://';
     else {
-      await db.execute(sql`
-        INSERT INTO application_fee_waivers (user_id, intent_id, situation_note, expertise_note, drive_url, status)
-        VALUES (${user.id}, ${intentId}, ${situation}, ${expertise}, ${driveUrl}, 'pending')
-      `);
+      // Idempotent: if there's already a pending or rejected waiver for this
+      // intent, UPDATE it. Only INSERT when none exists or the existing one
+      // was approved (in which case the application was already created).
+      const prior = rows(await db.execute(sql`
+        SELECT id, status FROM application_fee_waivers
+        WHERE user_id = ${user.id} AND intent_id = ${intentId}
+        ORDER BY created_at DESC LIMIT 1
+      `))[0];
+      let waiverId: string;
+      let isNew = false;
+      if (prior && prior.status !== 'approved') {
+        await db.execute(sql`
+          UPDATE application_fee_waivers
+          SET situation_note = ${situation},
+              expertise_note = ${expertise},
+              drive_url = ${driveUrl},
+              status = 'pending',
+              reject_reason = NULL,
+              reviewed_by_user_id = NULL,
+              reviewed_at = NULL
+          WHERE id = ${prior.id}
+        `);
+        waiverId = prior.id;
+      } else {
+        const ins = rows(await db.execute(sql`
+          INSERT INTO application_fee_waivers (user_id, intent_id, situation_note, expertise_note, drive_url, status)
+          VALUES (${user.id}, ${intentId}, ${situation}, ${expertise}, ${driveUrl}, 'pending')
+          RETURNING id
+        `));
+        waiverId = ins[0]?.id;
+        isNew = true;
+      }
       // Notify admins so this surfaces in their bell + /admin/notifications.
       try {
         const { sendPushToAdmins } = await import('@/lib/push');
         const name = ((intent.first_name || '') + ' ' + (intent.last_name || '')).trim() || intent.email || 'Applicant';
         await sendPushToAdmins({
           type: 'fee_waiver_request',
-          title: 'Fee waiver request',
-          body: name + ' is requesting a fee waiver for ' + (intent.role_title_snapshot || 'an open role'),
+          title: isNew ? 'Fee waiver request' : 'Fee waiver request updated',
+          body: name + ' ' + (isNew ? 'is requesting' : 'updated their request for') + ' a fee waiver for ' + (intent.role_title_snapshot || 'an open role'),
           url: '/admin/fee-waivers',
-          tag: 'fee-waiver',
+          tag: 'fee-waiver-' + (waiverId || ''),
         });
       } catch (_) {}
-      okMsg = 'Waiver request submitted. We will respond inside your portal — no email.';
+      okMsg = 'Waiver request submitted. We will respond inside your portal thread — no email. You can continue to update the notes below at any time.';
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+  } catch (e: any) {
+    errMsg = 'Could not submit your request: ' + (e?.message || 'unknown error') + '. Please try again, or pay the fee on the previous page.';
+    console.error('[apply/waiver] POST error:', e);
+  }
 }
 
 const existing = await getWaiverForIntent(intentId, user.id);

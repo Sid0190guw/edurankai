@@ -152,6 +152,18 @@ export const onRequest = defineMiddleware(async (context, next) => {
   }
   setSessionCookie(context.cookies, token, result.session.expiresAt);
   context.locals.user = result.user;
+
+  // Belt-and-braces auto-promote: any applicant who is still on
+  // access_status='pending' gets promoted on EVERY page load. Account
+  // creation is free and the application fee is the only paid step, so
+  // pending = approved for applicants. This catches every race / fallback
+  // path where the post-signup UPDATE didn't fire, so admins never have to
+  // hand-click Approve on applicant accounts ever again.
+  if (result.user.role === 'applicant') {
+    try {
+      await db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE id = ${result.user.id} AND access_status = 'pending'`);
+    } catch (_) { /* never block the request on this */ }
+  }
   context.locals.session = result.session;
 
   // Applicants get full access only in the application portal, never the admin
@@ -173,9 +185,14 @@ export const onRequest = defineMiddleware(async (context, next) => {
     }
   }
 
-  // 2FA gate: every authenticated request to a protected route must come from
-  // an account that has a face descriptor on file. If not, route to /enroll-face.
-  if (!isExempt(path) && isProtected(path)) {
+  // 2FA gate: face-enrollment is REQUIRED for staff (admins, HR, editors,
+  // super_admins) because they touch sensitive shared data. For APPLICANTS
+  // it is optional — gating their first portal visit on a face capture was
+  // bouncing real candidates whose camera / lighting / ID photo wouldn't pass.
+  // They can opt in to face 2FA from /portal anytime, and we still require it
+  // at high-trust moments (offer signing, identity-verified interviews) where
+  // the cost of the friction is justified.
+  if (!isExempt(path) && isProtected(path) && result.user.role !== 'applicant') {
     const hasFace = await hasFaceEnrolled(result.user.id);
     if (!hasFace) {
       return new Response(null, {

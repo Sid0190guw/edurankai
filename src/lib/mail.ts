@@ -280,7 +280,7 @@ export async function deliverMessage(opts: DeliverInput): Promise<DeliverResult>
 }
 
 export interface MailConfig {
-  smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean;
+  smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean; smtpInsecure: boolean;
   fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string;
   outboundEnabled: boolean; source: 'db' | 'env' | 'none';
 }
@@ -309,6 +309,7 @@ export async function getMailConfig(): Promise<MailConfig> {
     smtpUser: nonEmpty(row.smtp_user) || nonEmpty(process.env.SMTP_USER),
     smtpPass: nonEmpty(row.smtp_pass) || nonEmpty(process.env.SMTP_PASS),
     smtpSecure: row.smtp_secure != null ? !!row.smtp_secure : (process.env.SMTP_SECURE === 'true'),
+    smtpInsecure: row.smtp_insecure != null ? !!row.smtp_insecure : (process.env.SMTP_INSECURE === 'true'),
     fromName: nonEmpty(row.from_name) || 'EduRankAI',
     fromAddress: nonEmpty(row.from_address) || nonEmpty(process.env.EMAIL_FROM),
     resendApiKey,
@@ -318,35 +319,50 @@ export async function getMailConfig(): Promise<MailConfig> {
   };
 }
 
-export async function saveMailConfig(p: Partial<{ smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean; fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string }>): Promise<void> {
+export async function saveMailConfig(p: Partial<{ smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean; smtpInsecure: boolean; fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string }>): Promise<void> {
   await ensureMailSchema();
-  // Convert empty / blank values to NULL so the source-detection logic in
-  // getMailConfig (which uses nonEmpty) sees the row consistently.
+  // ensure the optional cert-tolerance column exists
+  try { await db.execute(sql`ALTER TABLE mail_config ADD COLUMN IF NOT EXISTS smtp_insecure BOOLEAN NOT NULL DEFAULT false`); } catch (_) {}
+  // Convert empty / blank values to NULL. We then use COALESCE on every text
+  // field in the UPDATE so a blank input PRESERVES the existing value rather
+  // than wiping it — the old behaviour silently nuked smtp_host when users
+  // re-saved without re-typing it.
   const s = (v: any) => { const t = (v ?? '').toString().trim(); return t === '' ? null : t; };
   const smtpHost     = s(p.smtpHost);
   const smtpPort     = p.smtpPort == null || isNaN(Number(p.smtpPort)) ? null : Number(p.smtpPort);
   const smtpUser     = s(p.smtpUser);
   const smtpPass     = s(p.smtpPass);                   // null = keep existing
-  const smtpSecure   = p.smtpSecure ?? false;
+  const smtpSecure   = p.smtpSecure == null ? null : !!p.smtpSecure;
+  const smtpInsecure = p.smtpInsecure == null ? null : !!p.smtpInsecure;
   const fromName     = s(p.fromName);
   const fromAddress  = s(p.fromAddress);
   const resendApiKey = s(p.resendApiKey);                // null = keep existing
   const inboundSecret = s(p.inboundSecret);              // null = keep existing
   await db.execute(sql`
-    INSERT INTO mail_config (id, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_secure, from_name, from_address, resend_api_key, inbound_secret, updated_at)
-    VALUES (1, ${smtpHost}, ${smtpPort}, ${smtpUser}, ${smtpPass}, ${smtpSecure}, ${fromName}, ${fromAddress}, ${resendApiKey}, ${inboundSecret}, NOW())
+    INSERT INTO mail_config (id, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_secure, smtp_insecure, from_name, from_address, resend_api_key, inbound_secret, updated_at)
+    VALUES (1, ${smtpHost}, ${smtpPort}, ${smtpUser}, ${smtpPass}, ${smtpSecure ?? false}, ${smtpInsecure ?? false}, ${fromName}, ${fromAddress}, ${resendApiKey}, ${inboundSecret}, NOW())
     ON CONFLICT (id) DO UPDATE SET
-      smtp_host    = EXCLUDED.smtp_host,
-      smtp_port    = EXCLUDED.smtp_port,
-      smtp_user    = EXCLUDED.smtp_user,
+      smtp_host    = COALESCE(EXCLUDED.smtp_host, mail_config.smtp_host),
+      smtp_port    = COALESCE(EXCLUDED.smtp_port, mail_config.smtp_port),
+      smtp_user    = COALESCE(EXCLUDED.smtp_user, mail_config.smtp_user),
       smtp_pass    = COALESCE(EXCLUDED.smtp_pass, mail_config.smtp_pass),
-      smtp_secure  = EXCLUDED.smtp_secure,
-      from_name    = EXCLUDED.from_name,
-      from_address = EXCLUDED.from_address,
+      smtp_secure  = COALESCE(${smtpSecure}::boolean, mail_config.smtp_secure),
+      smtp_insecure = COALESCE(${smtpInsecure}::boolean, mail_config.smtp_insecure),
+      from_name    = COALESCE(EXCLUDED.from_name, mail_config.from_name),
+      from_address = COALESCE(EXCLUDED.from_address, mail_config.from_address),
       resend_api_key = COALESCE(EXCLUDED.resend_api_key, mail_config.resend_api_key),
       inbound_secret = COALESCE(EXCLUDED.inbound_secret, mail_config.inbound_secret),
       updated_at = NOW()
   `);
+}
+
+// Hard-clear a single field. Used by the "Clear" button in the admin so a user
+// CAN actually wipe a setting (since saveMailConfig now preserves on blank).
+export async function clearMailField(field: 'smtp_host' | 'smtp_user' | 'smtp_pass' | 'from_name' | 'from_address' | 'resend_api_key' | 'inbound_secret'): Promise<void> {
+  await ensureMailSchema();
+  const allowed = new Set(['smtp_host','smtp_user','smtp_pass','from_name','from_address','resend_api_key','inbound_secret']);
+  if (!allowed.has(field)) return;
+  await db.execute(sql.raw(`UPDATE mail_config SET ${field} = NULL, updated_at = NOW() WHERE id = 1`));
 }
 
 export async function logOutbound(p: { messageId: string; to: string; from: string; subject: string; status: string; provider: string; error?: string | null }) {

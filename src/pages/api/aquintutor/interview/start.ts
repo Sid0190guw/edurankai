@@ -27,7 +27,15 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
 
   try {
     const t = await db.execute(sql`
-      SELECT id, slug, title, language_default, max_minutes, is_published
+      SELECT id, slug, title, language_default, max_minutes, is_published,
+        COALESCE(proctor_level, 'standard') AS proctor_level,
+        COALESCE(require_face_enroll, true) AS require_face_enroll,
+        COALESCE(block_tab_switch, true) AS block_tab_switch,
+        COALESCE(max_tab_switches, 3) AS max_tab_switches,
+        COALESCE(max_strikes, 5) AS max_strikes,
+        COALESCE(require_fullscreen, false) AS require_fullscreen,
+        COALESCE(enable_object_detection, false) AS enable_object_detection,
+        COALESCE(allow_paste, false) AS allow_paste
       FROM ai_interview_templates WHERE slug = ${templateSlug} LIMIT 1
     `);
     const tRows = Array.isArray(t) ? t : (t?.rows || []);
@@ -78,6 +86,16 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
       },
       maxMinutes: template.max_minutes || 30,
       title: template.title,
+      proctor: {
+        level: template.proctor_level,
+        requireFaceEnroll: !!template.require_face_enroll,
+        blockTabSwitch: !!template.block_tab_switch,
+        maxTabSwitches: template.max_tab_switches,
+        maxStrikes: template.max_strikes,
+        requireFullscreen: !!template.require_fullscreen,
+        enableObjectDetection: !!template.enable_object_detection,
+        allowPaste: !!template.allow_paste,
+      },
     });
   } catch (e: any) {
     return json({ ok: false, error: e?.message || 'server error' }, 500);

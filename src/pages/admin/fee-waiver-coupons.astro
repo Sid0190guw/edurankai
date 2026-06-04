@@ -1,0 +1,148 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureCouponSchema, generateCoupon, revokeCoupon } from '@/lib/fee-waiver-coupons';
+
+const user = Astro.locals.user!;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+await ensureCouponSchema();
+
+let okMsg = '', errMsg = '', newCode = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('_action') as string || '').trim();
+    if (action === 'mint') {
+      const reason = (fd.get('reason') as string || '').trim() || null;
+      const maxUses = Math.max(1, Math.min(1000, parseInt((fd.get('maxUses') as string) || '1')));
+      const expiresInDays = Math.max(1, Math.min(365, parseInt((fd.get('expiresInDays') as string) || '30')));
+      const boundEmail = (fd.get('boundEmail') as string || '').trim().toLowerCase();
+      let boundUserId: string | null = null;
+      if (boundEmail) {
+        const u = (Array.isArray(await db.execute(sql`SELECT id FROM users WHERE email = ${boundEmail} LIMIT 1`)) ? await db.execute(sql`SELECT id FROM users WHERE email = ${boundEmail} LIMIT 1`) : []) as any[];
+        const found = (u as any)[0];
+        if (found) boundUserId = found.id;
+        else { errMsg = 'No applicant found for ' + boundEmail; }
+      }
+      if (!errMsg) {
+        const gen = await generateCoupon({
+          createdByUserId: user.id,
+          reason, boundUserId, maxUses, expiresInDays,
+        });
+        if (gen.ok && gen.code) { newCode = gen.code; okMsg = 'Coupon minted.'; }
+        else errMsg = gen.error || 'Could not mint code';
+      }
+    } else if (action === 'revoke') {
+      const id = (fd.get('id') as string || '').trim();
+      if (id) { await revokeCoupon(id, user.id); okMsg = 'Coupon revoked.'; }
+    }
+  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+}
+
+function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+const url = new URL(Astro.request.url);
+const filter = url.searchParams.get('show') || 'active';
+const list = rows(await db.execute(sql`
+  SELECT c.*, bu.email AS bound_email, bu.name AS bound_name,
+    (SELECT COUNT(*)::int FROM fee_waiver_coupon_redemptions WHERE coupon_id = c.id) AS redemptions
+  FROM fee_waiver_coupons c
+  LEFT JOIN users bu ON bu.id = c.bound_user_id
+  ${filter === 'all' ? sql`` :
+    filter === 'redeemed' ? sql`WHERE c.used_count >= c.max_uses` :
+    filter === 'revoked' ? sql`WHERE c.revoked_at IS NOT NULL` :
+    filter === 'expired' ? sql`WHERE c.expires_at < NOW() AND c.used_count < c.max_uses AND c.revoked_at IS NULL` :
+    sql`WHERE c.used_count < c.max_uses AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > NOW())`}
+  ORDER BY c.created_at DESC LIMIT 200
+`));
+
+function fmt(d: any): string {
+  try { return new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
+}
+function couponState(c: any): { label: string; bg: string; fg: string } {
+  if (c.revoked_at) return { label: 'revoked', bg: 'rgba(115,115,115,0.15)', fg: '#9aa6b6' };
+  if (c.used_count >= c.max_uses) return { label: 'redeemed', bg: 'rgba(16,185,129,0.15)', fg: '#6ee7b7' };
+  if (c.expires_at && new Date(c.expires_at).getTime() < Date.now()) return { label: 'expired', bg: 'rgba(239,68,68,0.15)', fg: '#fca5a5' };
+  return { label: 'active', bg: 'rgba(255,80,0,0.15)', fg: '#FF7040' };
+}
+---
+<AdminLayout title="Fee Waiver Coupons" activeNav="">
+<div style="padding-bottom:80px;">
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;">
+    <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Admissions &middot; Hardship</p>
+    <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0 0 10px;">Fee Waiver Coupons</h1>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;">
+      {[
+        { k: 'active',   l: 'Active' },
+        { k: 'redeemed', l: 'Redeemed' },
+        { k: 'expired',  l: 'Expired' },
+        { k: 'revoked',  l: 'Revoked' },
+        { k: 'all',      l: 'All' },
+      ].map((t: any) => (
+        <a href={`?show=${t.k}`} style={`text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;${filter === t.k ? 'background:#FF7040;color:#0a0a0c;' : 'background:#15151a;color:#8a8a94;'}`}>{t.l}</a>
+      ))}
+    </div>
+  </div>
+
+  {okMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.30);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}{newCode && <strong style="color:#fff;margin-left:8px;font-family:'Geist Mono',monospace;letter-spacing:0.1em;">{newCode}</strong>}</div>}
+  {errMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errMsg}</div>}
+
+  <div style="padding:14px 16px;display:flex;flex-direction:column;gap:18px;">
+    <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
+      <p style="font-size:11px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 10px;">Mint a coupon</p>
+      <input type="hidden" name="_action" value="mint" />
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:10px;">
+        <div>
+          <label style="display:block;font-size:10.5px;color:#8a8a94;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.08em;">Bind to applicant email <span style="color:#6e6e78;">(optional)</span></label>
+          <input name="boundEmail" type="email" placeholder="applicant@example.com" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:7px 10px;border-radius:6px;font-size:12.5px;font-family:'Geist Mono',monospace;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10.5px;color:#8a8a94;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.08em;">Max uses</label>
+          <input name="maxUses" type="number" min="1" max="1000" value="1" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:7px 10px;border-radius:6px;font-size:12.5px;" />
+        </div>
+        <div>
+          <label style="display:block;font-size:10.5px;color:#8a8a94;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.08em;">Expires in (days)</label>
+          <input name="expiresInDays" type="number" min="1" max="365" value="30" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:7px 10px;border-radius:6px;font-size:12.5px;" />
+        </div>
+      </div>
+      <label style="display:block;font-size:10.5px;color:#8a8a94;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.08em;">Internal note / reason (shown to applicant on redeem)</label>
+      <textarea name="reason" rows="2" placeholder="Hardship case approved by..." style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:7px 10px;border-radius:6px;font-size:12.5px;font-family:'Inter Tight',system-ui,sans-serif;resize:vertical;outline:none;"></textarea>
+      <button type="submit" style="margin-top:10px;background:#FF4F00;color:#fff;border:none;font-size:12.5px;font-weight:700;padding:8px 18px;border-radius:6px;cursor:pointer;">Mint code</button>
+      <span style="margin-left:10px;font-size:11px;color:#6e6e78;">Codes look like <code style="font-family:'Geist Mono',monospace;background:#08080a;border:1px solid #1a1a1f;padding:1px 6px;border-radius:4px;color:#9aa6b6;">EDU-XXXX-XXXX</code></span>
+    </form>
+
+    {list.length === 0 && <p style="color:#6e6e78;font-size:13px;text-align:center;padding:40px;">No coupons in this view.</p>}
+    {list.map((c: any) => {
+      const state = couponState(c);
+      const canRevoke = !c.revoked_at && c.used_count < c.max_uses;
+      return (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;">
+            <div>
+              <p style="font-size:18px;font-weight:700;color:#fff;margin:0;font-family:'Geist Mono',monospace;letter-spacing:0.1em;">{c.code}</p>
+              <p style="font-size:11px;color:#8a8a94;margin:3px 0 0;font-family:'Geist Mono',monospace;">created {fmt(c.created_at)}{c.expires_at && ' · expires ' + fmt(c.expires_at)}</p>
+            </div>
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+              <span style={`font-size:10px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;background:${state.bg};color:${state.fg};`}>{state.label}</span>
+              <span style="font-size:10.5px;color:#6e6e78;">{c.used_count} / {c.max_uses} used</span>
+            </div>
+          </div>
+          {c.bound_email && (
+            <p style="font-size:12.5px;color:#d8d8de;margin:8px 0 0;">Bound to <strong style="color:#fff;">{c.bound_name || c.bound_email}</strong> <span style="color:#8a8a94;font-family:'Geist Mono',monospace;">({c.bound_email})</span></p>
+          )}
+          {c.reason && <p style="font-size:12.5px;color:#9aa6b6;margin:6px 0 0;font-style:italic;">{c.reason}</p>}
+          {canRevoke && (
+            <form method="POST" style="margin-top:10px;" onsubmit="return confirm('Revoke this coupon? It will no longer be redeemable.');">
+              <input type="hidden" name="_action" value="revoke" />
+              <input type="hidden" name="id" value={c.id} />
+              <button type="submit" style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:11.5px;font-weight:600;padding:5px 12px;border-radius:6px;cursor:pointer;">Revoke</button>
+            </form>
+          )}
+        </div>
+      );
+    })}
+  </div>
+</div>
+</AdminLayout>

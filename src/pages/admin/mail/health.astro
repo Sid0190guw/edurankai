@@ -1,0 +1,258 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { getMailConfig, MAIL_DOMAIN, ensureMailSchema } from '@/lib/mail';
+import { getImapConfig } from '@/lib/mail-imap';
+import { transportStatus } from '@/lib/mail-transport';
+import { randomBytes } from 'node:crypto';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+await ensureMailSchema();
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const cfg = await getMailConfig();
+const imap = await getImapConfig();
+const transport = await transportStatus();
+
+// Counts and last-activity timestamps so admin can see whether mail is flowing.
+let stats: any = { inbox: 0, sent: 0, drafts: 0, external_attempts: 0, external_failures: 0, last_inbound_at: null, last_outbound_at: null };
+try {
+  const r = await db.execute(sql`
+    SELECT
+      (SELECT COUNT(*)::int FROM mail_messages WHERE direction = 'inbound') AS inbound,
+      (SELECT COUNT(*)::int FROM mail_messages WHERE direction = 'outbound') AS outbound,
+      (SELECT COUNT(*)::int FROM mail_messages WHERE direction = 'internal') AS internal,
+      (SELECT COUNT(*)::int FROM email_logs) AS external_attempts,
+      (SELECT COUNT(*)::int FROM email_logs WHERE status = 'failed') AS external_failures,
+      (SELECT MAX(created_at) FROM mail_messages WHERE direction = 'inbound') AS last_inbound_at,
+      (SELECT MAX(created_at) FROM mail_messages WHERE direction = 'outbound') AS last_outbound_at,
+      (SELECT MAX(created_at) FROM mail_reads) AS last_read_at,
+      (SELECT COUNT(*)::int FROM mail_reads) AS reads
+  `);
+  stats = (rows(r)[0] || stats);
+} catch (_) {}
+
+// CRON_SECRET runtime presence — we can't read the value, but we CAN show whether
+// it's set (so the admin knows the IMAP cron is actually authorised in prod).
+const cronSecretSet = !!process.env.CRON_SECRET;
+const suggestedCronSecret = randomBytes(24).toString('hex');
+
+// Last 10 outbound log lines
+let recentLog: any[] = [];
+try {
+  recentLog = rows(await db.execute(sql`
+    SELECT to_email, from_email, subject, status, provider, error, created_at
+    FROM email_logs ORDER BY created_at DESC LIMIT 10
+  `));
+} catch (_) {}
+
+function fmt(d: any): string { try { return new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return ''; } }
+function ago(d: any): string {
+  if (!d) return 'never';
+  try {
+    const diff = (Date.now() - new Date(d).getTime()) / 1000;
+    if (diff < 60) return Math.floor(diff) + 's ago';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+    return Math.floor(diff / 86400) + 'd ago';
+  } catch { return ''; }
+}
+
+function badge(ok: boolean, label: string) {
+  const bg = ok ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)';
+  const fg = ok ? '#6ee7b7' : '#fca5a5';
+  return { bg, fg, label };
+}
+
+const smtpOk = !!cfg.smtpHost && !!cfg.smtpUser && !!cfg.smtpPass;
+const imapOk = !!imap.host && !!imap.user && !!imap.pass;
+const inboundOk = !!cfg.inboundSecret;
+---
+<AdminLayout title="Mail Health" activeNav="mail">
+<div class="admin-page" style="max-width:900px;">
+  <div class="admin-page-header" style="margin-bottom:18px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail</div>
+      <h1 class="admin-page-title">Mail Health</h1>
+      <p class="admin-page-sub">Everything you need to confirm sending + receiving works. <a href="/admin/mail/settings" style="color:#FF7040;text-decoration:none;">Settings</a> &middot; <a href="/admin/mail" style="color:#FF7040;text-decoration:none;">Inbox</a></p>
+    </div>
+  </div>
+
+  <!-- Top status grid -->
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:18px;">
+    {[
+      { label: 'Outbound SMTP',  ok: smtpOk,           detail: smtpOk ? cfg.smtpHost + ':' + cfg.smtpPort : 'not configured' },
+      { label: 'Inbound IMAP',   ok: imapOk,           detail: imapOk ? imap.host + ':' + imap.port : 'not configured' },
+      { label: 'Inbound webhook',ok: inboundOk,        detail: inboundOk ? 'secret set' : 'no x-mail-secret stored' },
+      { label: 'Cron secret',    ok: cronSecretSet,    detail: cronSecretSet ? 'CRON_SECRET env present' : 'NOT set — IMAP cron will get 401' },
+    ].map((t: any) => {
+      const b = badge(t.ok, t.label);
+      return (
+        <div style={`background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:12px 14px;`}>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+            <span style={`width:8px;height:8px;border-radius:50%;background:${t.ok ? '#34d399' : '#f87171'};flex-shrink:0;`}></span>
+            <p style="font-size:12.5px;font-weight:700;color:#fff;margin:0;">{t.label}</p>
+          </div>
+          <p style={`font-size:11px;color:${t.ok ? '#9aa6b6' : '#fca5a5'};margin:0;font-family:'Geist Mono',monospace;`}>{t.detail}</p>
+        </div>
+      );
+    })}
+  </div>
+
+  <!-- CRON_SECRET helper -->
+  {!cronSecretSet && (
+    <div style="background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.30);border-radius:12px;padding:14px 16px;margin-bottom:18px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fbbf24;margin:0 0 6px;">CRON_SECRET is not set on this deployment.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0 0 10px;line-height:1.6;">The Vercel cron at <code style="font-family:'Geist Mono',monospace;background:#08080a;padding:1px 6px;border-radius:4px;">*/10 * * * *</code> calls <code style="font-family:'Geist Mono',monospace;background:#08080a;padding:1px 6px;border-radius:4px;">GET /api/mail/imap-poll</code> and authenticates with this env var. Without it, IMAP-fetched inbound mail will never arrive.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0 0 6px;">Paste this into <strong>Vercel → Project → Settings → Environment Variables</strong> as <code style="font-family:'Geist Mono',monospace;background:#08080a;padding:1px 6px;border-radius:4px;">CRON_SECRET</code> (Production, Preview, Development):</p>
+      <code id="cronVal" style="display:block;font-family:'Geist Mono',monospace;background:#08080a;border:1px solid #2a2a2f;color:#FF7040;padding:8px 12px;border-radius:6px;font-size:12px;word-break:break-all;letter-spacing:0.04em;">{suggestedCronSecret}</code>
+      <button type="button" id="copyCron" style="margin-top:8px;background:#FF4F00;color:#fff;border:none;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Copy value</button>
+    </div>
+  )}
+
+  <!-- Traffic stats -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:10px;">Traffic</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-family:'Geist Mono',monospace;font-size:12px;">
+      <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+        <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">Inbound messages</p>
+        <p style="font-size:18px;font-weight:700;color:#fff;margin:0;">{(stats as any).inbound || 0}</p>
+        <p style="font-size:10.5px;color:#6e6e78;margin:4px 0 0;">last {ago((stats as any).last_inbound_at)}</p>
+      </div>
+      <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+        <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">Outbound messages</p>
+        <p style="font-size:18px;font-weight:700;color:#fff;margin:0;">{(stats as any).outbound || 0}</p>
+        <p style="font-size:10.5px;color:#6e6e78;margin:4px 0 0;">last {ago((stats as any).last_outbound_at)}</p>
+      </div>
+      <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+        <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">External send attempts</p>
+        <p style="font-size:18px;font-weight:700;color:#fff;margin:0;">{(stats as any).external_attempts || 0}</p>
+        <p style="font-size:10.5px;color:#6e6e78;margin:4px 0 0;">failed: <strong style={(stats as any).external_failures > 0 ? 'color:#fca5a5;' : 'color:#9aa6b6;'}>{(stats as any).external_failures || 0}</strong></p>
+      </div>
+      <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+        <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">Read receipts logged</p>
+        <p style="font-size:18px;font-weight:700;color:#fff;margin:0;">{(stats as any).reads || 0}</p>
+        <p style="font-size:10.5px;color:#6e6e78;margin:4px 0 0;">last {ago((stats as any).last_read_at)}</p>
+      </div>
+      <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
+        <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">Last IMAP poll</p>
+        <p style="font-size:13px;font-weight:700;color:#fff;margin:0;">{imap.lastRun ? fmt(imap.lastRun) : 'never'}</p>
+        <p style="font-size:10.5px;color:#6e6e78;margin:4px 0 0;">UID watermark: {imap.lastUid}</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- DNS deliverability -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
+      <div class="admin-card-title" style="margin:0;">DNS deliverability for <span style="font-family:'Geist Mono',monospace;color:#FF7040;">{MAIL_DOMAIN}</span></div>
+      <button type="button" id="dnsRun" style="background:#15151a;border:1px solid #2a2a2f;color:#9aa6b6;font-size:11.5px;font-weight:600;padding:5px 12px;border-radius:6px;cursor:pointer;">Run check</button>
+    </div>
+    <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">Without these, Gmail and Outlook will quarantine your outbound mail. Lookups are live via Cloudflare DNS-over-HTTPS.</p>
+    <div id="dnsResult" style="font-family:'Geist Mono',monospace;font-size:11.5px;color:#9aa6b6;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;min-height:50px;">
+      Click <strong>Run check</strong> to look up SPF / DKIM / DMARC / MX.
+    </div>
+  </div>
+
+  <!-- Recent external send log -->
+  <div class="admin-card" style="margin-bottom:18px;">
+    <div class="admin-card-title" style="margin-bottom:10px;">Recent external send attempts (last 10)</div>
+    {recentLog.length === 0 ? (
+      <p style="font-size:12px;color:#6e6e78;margin:0;">No external sends logged yet. Send a test from <a href="/admin/mail/settings" style="color:#FF7040;">Mail Settings</a> to populate this.</p>
+    ) : (
+      <div style="display:flex;flex-direction:column;gap:6px;font-family:'Geist Mono',monospace;font-size:11px;">
+        {recentLog.map((r: any) => {
+          const ok = r.status === 'sent';
+          return (
+            <div style={`background:#08080a;border:1px solid ${ok ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)'};border-radius:6px;padding:8px 10px;`}>
+              <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+                <span style={`color:${ok ? '#6ee7b7' : '#fca5a5'};font-weight:700;`}>{r.status} via {r.provider}</span>
+                <span style="color:#6e6e78;">{fmt(r.created_at)}</span>
+              </div>
+              <p style="color:#d8d8de;margin:3px 0 0;">{r.from_email} → {r.to_email} &middot; <span style="color:#9aa6b6;">{(r.subject || '(no subject)').substring(0, 80)}</span></p>
+              {r.error && <p style="color:#fca5a5;margin:2px 0 0;font-size:10.5px;">{r.error}</p>}
+            </div>
+          );
+        })}
+      </div>
+    )}
+  </div>
+
+  <!-- Live tests -->
+  <div class="admin-card">
+    <div class="admin-card-title" style="margin-bottom:10px;">Live tests</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <button type="button" id="imapNow" style="background:#15151a;border:1px solid #2a2a2f;color:#9aa6b6;font-size:11.5px;font-weight:600;padding:6px 14px;border-radius:6px;cursor:pointer;">Run IMAP poll now</button>
+      <span id="imapResult" style="font-size:11.5px;color:#6e6e78;"></span>
+    </div>
+    <p style="font-size:11.5px;color:#6e6e78;margin:8px 0 0;line-height:1.6;">For full send-test, use <a href="/admin/mail/settings" style="color:#FF7040;">Mail Settings</a> &rarr; "Send test".</p>
+  </div>
+</div>
+
+<script is:inline>
+  document.getElementById('copyCron')?.addEventListener('click', function () {
+    var el = document.getElementById('cronVal');
+    if (!el) return;
+    var v = el.textContent || '';
+    navigator.clipboard.writeText(v).then(function () { this.textContent = 'Copied'; setTimeout(function () { document.getElementById('copyCron').textContent = 'Copy value'; }, 1400); }.bind(this));
+  });
+
+  document.getElementById('dnsRun')?.addEventListener('click', function () {
+    var btn = this; var box = document.getElementById('dnsResult');
+    if (!box) return;
+    btn.disabled = true; var prev = btn.textContent; btn.textContent = 'Checking...';
+    box.innerHTML = '<span style="color:#9aa6b6;">Looking up SPF / DKIM / DMARC / MX...</span>';
+    fetch('/api/mail/dns-check', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        btn.disabled = false; btn.textContent = prev;
+        if (!d.ok) { box.innerHTML = '<span style="color:#fca5a5;">' + (d.error || 'lookup failed') + '</span>'; return; }
+        function line(label, ok, detail, note) {
+          var color = ok ? '#6ee7b7' : '#fca5a5';
+          var icon = ok ? 'PASS' : 'FAIL';
+          return '<div style="margin-bottom:6px;"><strong style="color:' + color + ';">[' + icon + '] ' + label + '</strong> <span style="color:#d8d8de;">' + (detail || '') + '</span>' + (note ? '<div style="color:#fbbf24;margin-top:2px;font-size:10.5px;">' + note + '</div>' : '') + '</div>';
+        }
+        var html = '';
+        html += line('SPF (TXT @)', d.spf.present, d.spf.record || 'no v=spf1 record found', d.spf.note);
+        html += line('DMARC (TXT _dmarc)', d.dmarc.present, d.dmarc.record || 'no v=DMARC1 record found', d.dmarc.policy ? ('policy=' + d.dmarc.policy) : null);
+        if (d.dkim.present) {
+          html += '<div style="margin-bottom:6px;"><strong style="color:#6ee7b7;">[PASS] DKIM</strong> <span style="color:#d8d8de;">found selectors: ' + d.dkim.selectors.map(function (s) { return s.selector; }).join(', ') + '</span></div>';
+        } else {
+          html += line('DKIM', false, 'no DKIM record at common selectors (default, google, k1, s1, selector1, selector2, mail, smtp)', 'Your SMTP provider should give you a selector + record. Add a TXT at <selector>._domainkey.' + d.domain);
+        }
+        if (d.mx && d.mx.length) {
+          html += '<div style="margin-bottom:6px;"><strong style="color:#6ee7b7;">[PASS] MX</strong> <span style="color:#d8d8de;">' + d.mx.map(function (m) { return m.priority + ' ' + m.host; }).join(', ') + '</span></div>';
+        } else {
+          html += line('MX', false, 'no MX records found — inbound mail to this domain has nowhere to land', null);
+        }
+        box.innerHTML = html;
+      })
+      .catch(function (e) {
+        btn.disabled = false; btn.textContent = prev;
+        box.innerHTML = '<span style="color:#fca5a5;">DNS check error: ' + (e && e.message ? e.message : 'network') + '</span>';
+      });
+  });
+
+  document.getElementById('imapNow')?.addEventListener('click', function () {
+    var btn = this; var msg = document.getElementById('imapResult');
+    btn.disabled = true; var prev = btn.textContent; btn.textContent = 'Polling...';
+    fetch('/api/mail/imap-poll', { method: 'POST', credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        btn.disabled = false; btn.textContent = prev;
+        if (msg) {
+          if (d.ok) { msg.textContent = (d.detail || ('fetched ' + d.fetched + ', delivered ' + d.delivered)); msg.style.color = '#6ee7b7'; }
+          else { msg.textContent = d.error || 'failed'; msg.style.color = '#fca5a5'; }
+        }
+      })
+      .catch(function () {
+        btn.disabled = false; btn.textContent = prev;
+        if (msg) { msg.textContent = 'network error'; msg.style.color = '#fca5a5'; }
+      });
+  });
+</script>
+</AdminLayout>

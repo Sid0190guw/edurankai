@@ -5,7 +5,7 @@
 import webpush from 'web-push';
 import { db } from '@/lib/db';
 import { pushSubscriptions, notificationPreferences, users } from '@/lib/db/schema';
-import { eq, inArray } from 'drizzle-orm';
+import { eq, inArray, and, ne } from 'drizzle-orm';
 
 // Configure web-push with VAPID keys
 const VAPID_PUBLIC = import.meta.env.VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY || '';
@@ -38,6 +38,10 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
   { type: 'offer_extended',     label: 'Offer extended',            desc: 'When an offer is extended to a candidate',     group: 'Recruitment' },
   { type: 'offer_signed',       label: 'Offer accepted',            desc: 'When a candidate signs their offer letter',    group: 'Recruitment' },
   { type: 'offer_declined',     label: 'Offer declined',            desc: 'When a candidate declines their offer',        group: 'Recruitment' },
+  { type: 'fee_waiver_applicant_reply', label: 'Fee waiver replies',        desc: 'When an applicant replies on a fee waiver thread', group: 'Recruitment' },
+  { type: 'fee_waiver_coupon_redeemed', label: 'Fee waiver coupon redeemed', desc: 'When an applicant redeems a fee-waiver coupon to bypass payment', group: 'Recruitment' },
+  { type: 'intl_payment_request',       label: 'International payment requests', desc: 'When an applicant requests an international payment path (Stripe / PayPal / wire / Wise)', group: 'Recruitment' },
+  { type: 'visvambhara_applicant_reply',label: 'Visvambhara access replies', desc: 'When an applicant replies on a Visvambhara access request', group: 'Recruitment' },
   // Communication
   { type: 'chat_message',       label: 'Discussion messages',       desc: 'When someone posts in any discussion channel', group: 'Communication' },
   { type: 'dm_message',         label: 'Direct messages',           desc: 'When you receive a direct message',            group: 'Communication' },
@@ -94,16 +98,17 @@ async function persistNotification(userId: string, p: PushPayload) {
 // ALSO writes a row to the in-app notifications feed for each eligible admin
 // so the bell + /admin/notifications populate even if browser push fails.
 export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: string): Promise<void> {
-  if (!VAPID_PUBLIC || !VAPID_PRIVATE) {
-    console.warn('[push] VAPID keys not configured. Skipping push.');
-    return;
+  const vapidConfigured = !!(VAPID_PUBLIC && VAPID_PRIVATE);
+  if (!vapidConfigured) {
+    console.warn('[push] VAPID keys not configured. Browser push skipped — in-app bell still works.');
   }
 
   try {
-    // Get all admin users (not applicants)
+    // Admins only — applicants share the users table, must be excluded so
+    // sendPushToAdmins doesn't fan out admin events to candidates' inboxes.
     const adminUsers = await db.select({ id: users.id })
       .from(users)
-      .where(eq(users.isActive, true));
+      .where(and(eq(users.isActive, true), ne(users.role, 'applicant' as any)));
 
     const adminIds = adminUsers
       .map(u => u.id)
@@ -133,6 +138,9 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
     // source of truth for the bell + /admin/notifications feed and is what
     // the user actually sees if the browser push is missed / stripped / muted.
     await Promise.all(eligibleIds.map((id) => persistNotification(id, payload)));
+
+    // If VAPID isn't configured, the in-app bell is everything — stop here.
+    if (!vapidConfigured) return;
 
     // Get push subscriptions for eligible users
     const subs = await db.select()
@@ -332,5 +340,50 @@ export const pushNotify = {
       body: `${learnerName} enrolled in ${courseTitle}`,
       url,
       tag: 'lms-enrolment'
+    }),
+
+  courseCompleted: (learnerName: string, courseTitle: string, certNumber: string) =>
+    sendPushToAdmins({
+      type: 'course_completed',
+      title: 'Course completed',
+      body: `${learnerName} finished ${courseTitle} (${certNumber})`,
+      url: '/admin/training',
+      tag: `course-complete-${certNumber}`,
+    }),
+
+  aiInterviewCompleted: (candidateName: string, templateTitle: string, sessionId: string) =>
+    sendPushToAdmins({
+      type: 'ai_interview_completed',
+      title: 'AI interview submitted',
+      body: `${candidateName} finished ${templateTitle}`,
+      url: `/admin/interviews/ai/${sessionId}`,
+      tag: `ai-interview-${sessionId}`,
+    }),
+
+  inboundMail: (toUserId: string, fromName: string, subject: string) =>
+    sendPushToUser(toUserId, {
+      type: 'inbound_mail',
+      title: `New mail from ${fromName}`,
+      body: (subject || '(no subject)').slice(0, 160),
+      url: '/admin/mail',
+      tag: `inbound-${Date.now()}`,
+    }),
+
+  friendJoined: (toUserId: string, friendName: string) =>
+    sendPushToUser(toUserId, {
+      type: 'friend_joined',
+      title: 'New friend',
+      body: `${friendName} accepted your invite. You both earned 50 XP.`,
+      url: '/aquintutor/friends',
+      tag: `friend-${friendName}`,
+    }),
+
+  certificateIssued: (toUserId: string, courseTitle: string, certNumber: string) =>
+    sendPushToUser(toUserId, {
+      type: 'certificate_issued',
+      title: 'Certificate awarded',
+      body: `${courseTitle} — certificate ${certNumber}`,
+      url: '/verify/' + certNumber,
+      tag: `cert-${certNumber}`,
     }),
 };

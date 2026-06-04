@@ -24,15 +24,29 @@ const GIF_HEADERS: Record<string, string> = {
 
 async function geo(ip: string | null): Promise<{ country?: string; region?: string; city?: string }> {
   if (!ip) return {};
-  // ipapi.co is free + no auth for low volume. Best-effort; never blocks.
+  // ipapi.co with a tight timeout — we never want geo to slow the GIF response.
   try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
     const r = await fetch('https://ipapi.co/' + encodeURIComponent(ip) + '/json/', {
       headers: { 'User-Agent': 'EduRankAI-mail-tracker' },
-    });
+      signal: ctrl.signal,
+    }).finally(() => clearTimeout(t));
     if (!r.ok) return {};
     const d = await r.json() as any;
     return { country: d?.country_name, region: d?.region, city: d?.city };
   } catch (_) { return {}; }
+}
+
+async function recordRead(messageId: string, ip: string | null, ua: string) {
+  try {
+    await ensureMailSchema();
+    const g = await geo(ip);
+    await db.execute(sql`
+      INSERT INTO mail_reads (message_id, kind, ip_address, country, region, city, user_agent)
+      VALUES (${messageId}, 'external', ${ip || null}, ${g.country || null}, ${g.region || null}, ${g.city || null}, ${ua})
+    `);
+  } catch (_) { /* silent — never break the recipient's render */ }
 }
 
 export const GET: APIRoute = async ({ params, request, clientAddress }) => {
@@ -41,15 +55,10 @@ export const GET: APIRoute = async ({ params, request, clientAddress }) => {
   if (!messageId || !/^[0-9a-f-]{32,36}$/i.test(messageId)) {
     return new Response(GIF, { status: 200, headers: GIF_HEADERS });
   }
-  try {
-    await ensureMailSchema();
-    const ua = (request.headers.get('user-agent') || '').slice(0, 500);
-    const ip = (clientAddress || request.headers.get('x-forwarded-for') || '').toString().split(',')[0].trim().slice(0, 64);
-    const g = await geo(ip);
-    await db.execute(sql`
-      INSERT INTO mail_reads (message_id, kind, ip_address, country, region, city, user_agent)
-      VALUES (${messageId}, 'external', ${ip || null}, ${g.country || null}, ${g.region || null}, ${g.city || null}, ${ua})
-    `);
-  } catch (_) { /* silent — never break the recipient's render */ }
+  const ua = (request.headers.get('user-agent') || '').slice(0, 500);
+  const ip = (clientAddress || request.headers.get('x-forwarded-for') || '').toString().split(',')[0].trim().slice(0, 64);
+  // Fire-and-forget — return the pixel immediately so the recipient's client
+  // never waits on the geo lookup or DB write.
+  void recordRead(messageId, ip, ua);
   return new Response(GIF, { status: 200, headers: GIF_HEADERS });
 };

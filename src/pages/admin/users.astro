@@ -179,6 +179,24 @@ if (Astro.request.method === 'POST' && canEdit) {
       await logAudit({ userId: currentUser.id, action: 'user.access_approve', entity: 'user', entityId: userId, diff: {}, ipAddress: Astro.clientAddress });
       okMsg = 'Account approved - the user now has full access.';
     }
+    else if (action === 'approve_access_bulk') {
+      // Approve a specific subset, or every pending applicant if no subset given.
+      const raw = fd.getAll('userIds[]') as string[];
+      const ids = (raw || []).map(s => (s || '').toString().trim()).filter(Boolean);
+      let promoted = 0;
+      if (ids.length > 0) {
+        const r = await db.execute(sql`UPDATE users SET access_status = 'approved', waiver_decided_by = ${currentUser.id}, waiver_decided_at = NOW(), updated_at = NOW() WHERE id = ANY(${ids}::uuid[]) AND access_status = 'pending' RETURNING id`);
+        const rs = Array.isArray(r) ? r : ((r as any)?.rows || []);
+        promoted = rs.length;
+        await logAudit({ userId: currentUser.id, action: 'user.access_approve_bulk', entity: 'user', entityId: ids.join(','), diff: { count: promoted, scope: 'selected' }, ipAddress: Astro.clientAddress });
+      } else {
+        const r = await db.execute(sql`UPDATE users SET access_status = 'approved', waiver_decided_by = ${currentUser.id}, waiver_decided_at = NOW(), updated_at = NOW() WHERE access_status = 'pending' AND role = 'applicant' RETURNING id`);
+        const rs = Array.isArray(r) ? r : ((r as any)?.rows || []);
+        promoted = rs.length;
+        await logAudit({ userId: currentUser.id, action: 'user.access_approve_bulk', entity: 'user', entityId: '*', diff: { count: promoted, scope: 'all_pending' }, ipAddress: Astro.clientAddress });
+      }
+      okMsg = 'Approved ' + promoted + ' account(s). They now have full access.';
+    }
     else if (action === 'reject_access') {
       const userId = fd.get('userId') as string;
       await db.execute(sql`UPDATE users SET access_status = 'rejected', waiver_decided_by = ${currentUser.id}, waiver_decided_at = NOW(), updated_at = NOW() WHERE id = ${userId}`);
@@ -216,6 +234,14 @@ if (Astro.request.method === 'POST' && canEdit) {
 // Filter
 const url = new URL(Astro.request.url);
 const filter = url.searchParams.get('filter') || 'admins';
+
+// Belt-and-braces: auto-promote every pending APPLICANT before rendering the
+// list. Account creation is free and the application fee is the only paid
+// step, so 'pending' for an applicant is always a signup-time bug, never a
+// real state. Admins should never hand-approve applicant accounts again.
+try {
+  await db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE access_status = 'pending' AND role = 'applicant'`);
+} catch (_) {}
 
 const allUsers = await db.select().from(users).orderBy(desc(users.createdAt));
 
@@ -292,9 +318,25 @@ try {
           <a href="?filter=all" style={'font-size:11px;padding:5px 11px;border-radius:100px;text-decoration:none;border:1px solid ' + (filter === 'all' ? '#FF4F00;background:#FF4F00;color:#fff' : '#1f1f26;color:#a0a0ab')}>All ({counts.total})</a>
         </div>
 
+        {filter === 'pending' && counts.pending > 0 && (
+          <div style="padding:12px 16px;background:rgba(251,191,36,0.06);border-bottom:1px solid #1f1f26;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <p style="margin:0;font-size:11.5px;color:#fbbf24;font-weight:600;flex:1;min-width:180px;">{counts.pending} account(s) pending approval. Select rows below or use the bulk actions.</p>
+            <form method="POST" style="margin:0;display:inline-flex;gap:6px;" id="bulkApproveForm">
+              <input type="hidden" name="_action" value="approve_access_bulk" />
+              <span id="bulkSelectionInputs"></span>
+              <button type="button" id="bulkApproveSelectedBtn" disabled style="background:#10b981;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;opacity:0.4;">Approve selected (<span id="bulkSelectedCount">0</span>)</button>
+            </form>
+            <form method="POST" style="margin:0;display:inline-flex;" onsubmit={`return confirm('Approve ALL ${counts.pending} pending applicants at once?');`}>
+              <input type="hidden" name="_action" value="approve_access_bulk" />
+              <button type="submit" style="background:#15151a;border:1px solid rgba(16,185,129,0.5);color:#10b981;font-size:11.5px;font-weight:700;padding:6px 12px;border-radius:6px;cursor:pointer;">Approve ALL pending ({counts.pending})</button>
+            </form>
+          </div>
+        )}
+
         <table class="admin-table">
           <thead>
             <tr>
+              {filter === 'pending' && <th style="width:32px;"><input type="checkbox" id="bulkSelectAll" style="accent-color:#10b981;cursor:pointer;" title="Select all visible" /></th>}
               <th>User</th>
               <th>Role / Dept</th>
               <th>Active</th>
@@ -311,6 +353,13 @@ try {
               const handle = (u as any).internalHandle || null;
               return (
                 <tr class="user-row" data-search={((u.name || '') + ' ' + (u.email || '') + ' ' + (handle || '')).toLowerCase()}>
+                  {filter === 'pending' && (
+                    <td style="vertical-align:top;padding-top:14px;">
+                      {accessMap[u.id] && accessMap[u.id].access_status === 'pending' ? (
+                        <input type="checkbox" class="bulk-select-row" data-uid={u.id} style="accent-color:#10b981;cursor:pointer;" />
+                      ) : null}
+                    </td>
+                  )}
                   <td>
                     <div style="font-weight:500;color:#fff;display:flex;align-items:center;gap:8px;">
                       {accessMap[u.id] && accessMap[u.id].photo_url && <img src={accessMap[u.id].photo_url} alt="" style="width:26px;height:26px;border-radius:50%;object-fit:cover;border:1px solid #2a2a32;" />}
@@ -502,14 +551,67 @@ try {
   <script is:inline>
     (function () {
       var box = document.getElementById('userSearch');
-      if (!box) return;
-      box.addEventListener('input', function () {
-        var q = box.value.trim().toLowerCase();
-        document.querySelectorAll('.user-row').forEach(function (row) {
-          var hay = row.getAttribute('data-search') || '';
-          row.style.display = (!q || hay.indexOf(q) !== -1) ? '' : 'none';
+      if (box) {
+        box.addEventListener('input', function () {
+          var q = box.value.trim().toLowerCase();
+          document.querySelectorAll('.user-row').forEach(function (row) {
+            var hay = row.getAttribute('data-search') || '';
+            row.style.display = (!q || hay.indexOf(q) !== -1) ? '' : 'none';
+          });
         });
-      });
+      }
+
+      // ---- Bulk approve on the pending tab ----
+      var bulkForm = document.getElementById('bulkApproveForm');
+      var bulkBtn = document.getElementById('bulkApproveSelectedBtn');
+      var bulkCount = document.getElementById('bulkSelectedCount');
+      var bulkInputs = document.getElementById('bulkSelectionInputs');
+      var selectAll = document.getElementById('bulkSelectAll');
+      var rowChecks = document.querySelectorAll('.bulk-select-row');
+
+      function refreshBulk() {
+        if (!bulkBtn || !bulkInputs || !bulkCount) return;
+        var ids = [];
+        rowChecks.forEach(function (cb) { if (cb.checked) ids.push(cb.getAttribute('data-uid')); });
+        bulkCount.textContent = ids.length;
+        if (ids.length > 0) {
+          bulkBtn.disabled = false;
+          bulkBtn.style.opacity = '1';
+          bulkBtn.style.cursor = 'pointer';
+        } else {
+          bulkBtn.disabled = true;
+          bulkBtn.style.opacity = '0.4';
+          bulkBtn.style.cursor = 'not-allowed';
+        }
+        bulkInputs.innerHTML = '';
+        ids.forEach(function (id) {
+          var inp = document.createElement('input');
+          inp.type = 'hidden'; inp.name = 'userIds[]'; inp.value = id;
+          bulkInputs.appendChild(inp);
+        });
+      }
+
+      rowChecks.forEach(function (cb) { cb.addEventListener('change', refreshBulk); });
+
+      if (selectAll) {
+        selectAll.addEventListener('change', function () {
+          rowChecks.forEach(function (cb) {
+            // Only flip checkboxes whose row is currently visible (respects search).
+            var row = cb.closest('tr');
+            if (row && row.style.display !== 'none') cb.checked = selectAll.checked;
+          });
+          refreshBulk();
+        });
+      }
+
+      if (bulkBtn && bulkForm) {
+        bulkBtn.addEventListener('click', function () {
+          if (bulkBtn.disabled) return;
+          if (confirm('Approve ' + bulkCount.textContent + ' selected account(s)?')) {
+            bulkForm.submit();
+          }
+        });
+      }
     })();
   </script>
 </AdminLayout>

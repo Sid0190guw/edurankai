@@ -21,32 +21,68 @@ if (Astro.request.method === 'POST') {
     else if (action === 'approve') {
       // Materialise the application from the intent, mark fee_paid=true +
       // fee_waiver_granted=true. Backfill the waiver row with application_id.
-      const row = ((Array.isArray(await db.execute(sql`SELECT intent_id FROM application_fee_waivers WHERE id = ${id}`)) ? await db.execute(sql`SELECT intent_id FROM application_fee_waivers WHERE id = ${id}`) : (await db.execute(sql`SELECT intent_id FROM application_fee_waivers WHERE id = ${id}`) as any)?.rows || []) as any[])[0];
+      const row = ((Array.isArray(await db.execute(sql`SELECT intent_id, user_id FROM application_fee_waivers WHERE id = ${id}`)) ? await db.execute(sql`SELECT intent_id, user_id FROM application_fee_waivers WHERE id = ${id}`) : (await db.execute(sql`SELECT intent_id, user_id FROM application_fee_waivers WHERE id = ${id}`) as any)?.rows || []) as any[])[0];
       const intentId = row?.intent_id;
+      const applicantUid = row?.user_id;
       let appId: string | null = null;
       if (intentId) appId = await materialiseFromIntent(intentId, { paid: true, waiverGranted: true, waiverReason: 'Fee waiver approved by ' + (user.name || user.email) });
       await db.execute(sql`UPDATE application_fee_waivers SET status='approved', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=NULL, application_id=${appId} WHERE id=${id}`);
+      // Post a decision message into the thread so the applicant sees the
+      // outcome inside /portal/requests/fee-waiver/<id>. Without this the
+      // thread stays empty after approval and the applicant has nothing
+      // to read except a push notification.
+      try {
+        const { postMessage } = await import('@/lib/request-threads');
+        await postMessage({
+          requestType: 'fee_waiver',
+          requestId: id,
+          applicantUserId: applicantUid || null,
+          senderRole: 'admin',
+          senderUserId: user.id,
+          senderName: user.name || 'Admissions team',
+          body: 'Your fee waiver has been approved.\n\nYour application has been moved into review. You can track it from your portal home.\n\n' + (appId ? 'Open your application: /portal/applications/' + appId : 'Open your portal: /portal'),
+        });
+      } catch (_) {}
       // Notify applicant
       try {
-        const w = (Array.isArray(await db.execute(sql`SELECT user_id FROM application_fee_waivers WHERE id=${id}`)) ? await db.execute(sql`SELECT user_id FROM application_fee_waivers WHERE id=${id}`) : []) as any[];
-        const uid = (w as any)[0]?.user_id;
-        if (uid && appId) {
+        if (applicantUid) {
           const { sendPushToUser } = await import('@/lib/push');
-          await sendPushToUser(uid, { type: 'fee_waiver_approved', title: 'Fee waiver approved', body: 'Your application is now in review.', url: '/portal/applications/' + appId, tag: 'waiver-' + id });
+          await sendPushToUser(applicantUid, { type: 'fee_waiver_approved', title: 'Fee waiver approved', body: 'Your application is now in review.', url: appId ? '/portal/applications/' + appId : '/portal/requests/fee-waiver/' + id, tag: 'waiver-' + id });
         }
       } catch (_) {}
-      okMsg = 'Waiver approved. Application created and notified.';
+      okMsg = 'Waiver approved. Application created, decision posted into thread, applicant notified.';
     } else if (action === 'reject') {
+      const r0 = await db.execute(sql`SELECT user_id, intent_id FROM application_fee_waivers WHERE id=${id}`);
+      const w0 = ((Array.isArray(r0) ? r0 : (r0 as any)?.rows || []) as any[])[0];
+      const applicantUid = w0?.user_id;
+      const intentId = w0?.intent_id;
       await db.execute(sql`UPDATE application_fee_waivers SET status='rejected', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=${reason} WHERE id=${id}`);
+      // Post the decision into the thread so the applicant sees the reason
+      // inside their portal thread, not just as a push notification.
       try {
-        const r = await db.execute(sql`SELECT user_id, intent_id FROM application_fee_waivers WHERE id=${id}`);
-        const w = ((Array.isArray(r) ? r : (r as any)?.rows || []) as any[])[0];
-        if (w?.user_id) {
+        const { postMessage } = await import('@/lib/request-threads');
+        const reasonText = (reason || '').toString().trim();
+        const body = 'Your fee waiver request was not granted at this time.'
+          + (reasonText ? '\n\nReason from the reviewer:\n' + reasonText : '')
+          + '\n\nYou are welcome to update the situation / expertise notes and re-submit, or pay the application fee'
+          + (intentId ? ' on /apply/pay?intent=' + intentId : '') + '. Replies to this thread reach the admissions team directly.';
+        await postMessage({
+          requestType: 'fee_waiver',
+          requestId: id,
+          applicantUserId: applicantUid || null,
+          senderRole: 'admin',
+          senderUserId: user.id,
+          senderName: user.name || 'Admissions team',
+          body,
+        });
+      } catch (_) {}
+      try {
+        if (applicantUid) {
           const { sendPushToUser } = await import('@/lib/push');
-          await sendPushToUser(w.user_id, { type: 'fee_waiver_rejected', title: 'Fee waiver decision', body: 'Your waiver was not granted. You can update and resubmit, or pay the fee.', url: '/apply/waiver?intent=' + (w.intent_id || ''), tag: 'waiver-' + id });
+          await sendPushToUser(applicantUid, { type: 'fee_waiver_rejected', title: 'Fee waiver decision', body: 'Your waiver was not granted. Open your portal thread to read the reason and reply.', url: '/portal/requests/fee-waiver/' + id, tag: 'waiver-' + id });
         }
       } catch (_) {}
-      okMsg = 'Waiver rejected.';
+      okMsg = 'Waiver rejected. Decision posted into thread, applicant notified.';
     }
   } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
 }
@@ -109,23 +145,136 @@ function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day:'num
           <p style="font-size:11.5px;color:#6e6e78;margin:8px 0;">Docs: <a href={r.drive_url} target="_blank" rel="noopener" style="color:#60a5fa;text-decoration:none;font-family:'Geist Mono',monospace;word-break:break-all;">{r.drive_url}</a></p>
           {r.status === 'rejected' && r.reject_reason && <p style="font-size:11px;color:#fca5a5;margin:4px 0 0;">Reason: {r.reject_reason}</p>}
           {r.status === 'pending' && (
-            <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+            <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;align-items:center;">
               <form method="POST" style="margin:0;">
                 <input type="hidden" name="_action" value="approve" />
                 <input type="hidden" name="id" value={r.id} />
                 <button type="submit" style="background:#10b981;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Approve &amp; create application</button>
               </form>
+              <button type="button" data-coupon-waiver={r.id} class="js-coupon-btn" style="background:#0f0f14;border:1px solid #FF7040;color:#FF7040;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Generate coupon</button>
               <form method="POST" onsubmit="this.querySelector('input[name=reason]').value = prompt('Reason for rejection (shown to applicant):') || ''; if (!this.querySelector('input[name=reason]').value) return false;" style="margin:0;">
                 <input type="hidden" name="_action" value="reject" />
                 <input type="hidden" name="id" value={r.id} />
                 <input type="hidden" name="reason" value="" />
                 <button type="submit" style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Reject</button>
               </form>
+              <span id={`coupon-status-${r.id}`} style="font-size:11px;color:#6e6e78;"></span>
             </div>
           )}
+          <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+            <button type="button" data-thread-toggle={r.id} class="js-thread-toggle" style="background:#15151a;border:1px solid #2a2a2f;color:#9aa6b6;font-size:11.5px;font-weight:600;padding:5px 12px;border-radius:6px;cursor:pointer;">Open thread</button>
+            <span style="font-size:11px;color:#6e6e78;">Reply to the applicant in their portal thread.</span>
+          </div>
+          <div id={`thread-panel-${r.id}`} style="display:none;margin-top:10px;background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:12px;">
+            <div id={`thread-msgs-${r.id}`} style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px;max-height:300px;overflow-y:auto;">
+              <p style="color:#6e6e78;font-size:12px;text-align:center;padding:14px 0;">Loading thread...</p>
+            </div>
+            <textarea id={`thread-body-${r.id}`} rows="3" maxlength="5000" placeholder="Type your reply..." style="width:100%;background:#0f0f14;border:1px solid #2a2a2f;color:#fff;font-size:13px;padding:8px 10px;border-radius:6px;font-family:Inter Tight,system-ui,sans-serif;resize:vertical;outline:none;"></textarea>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:8px;">
+              <span id={`thread-status-${r.id}`} style="font-size:11px;color:#6e6e78;"></span>
+              <button type="button" data-thread-send={r.id} class="js-thread-send" style="background:#FF4F00;color:#fff;border:none;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Send reply</button>
+            </div>
+          </div>
         </div>
       );
     })}
   </div>
 </div>
+
+<script is:inline>
+  function escapeHtml(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function fmtTime(d) {
+    try { return new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
+  }
+  function renderThread(waiverId, messages) {
+    var box = document.getElementById('thread-msgs-' + waiverId);
+    if (!box) return;
+    if (!messages || messages.length === 0) {
+      box.innerHTML = '<p style="color:#6e6e78;font-size:12px;text-align:center;padding:14px 0;">No messages yet.</p>';
+      return;
+    }
+    box.innerHTML = messages.map(function (m) {
+      var isAdmin = m.sender_role === 'admin';
+      var bg = isAdmin ? 'rgba(255,80,0,0.07)' : '#15151a';
+      var border = isAdmin ? 'rgba(255,80,0,0.25)' : '#2a2a2f';
+      var nameLabel = isAdmin ? 'Admissions - ' + escapeHtml(m.sender_name || 'team') : 'Applicant';
+      var nameColor = isAdmin ? '#FF7040' : '#9aa6b6';
+      return '<div style="background:' + bg + ';border:1px solid ' + border + ';border-radius:8px;padding:9px 11px;">'
+        + '<div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px;">'
+        + '<span style="font-family:Geist Mono,monospace;font-size:10px;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;color:' + nameColor + ';">' + nameLabel + '</span>'
+        + '<span style="font-family:Geist Mono,monospace;font-size:10px;color:#6e6e78;">' + fmtTime(m.created_at) + '</span>'
+        + '</div>'
+        + '<p style="font-size:12.5px;color:#d8d8de;margin:0;white-space:pre-wrap;line-height:1.55;">' + escapeHtml(m.body) + '</p>'
+        + '</div>';
+    }).join('');
+    box.scrollTop = box.scrollHeight;
+  }
+  function loadThread(waiverId) {
+    fetch('/api/admin/fee-waivers/thread?id=' + encodeURIComponent(waiverId), { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { if (d.ok) renderThread(waiverId, d.messages); });
+  }
+  document.addEventListener('click', function (ev) {
+    var btn = ev.target;
+    if (!(btn instanceof HTMLElement)) return;
+    if (btn.classList.contains('js-coupon-btn')) {
+      var waiverId = btn.getAttribute('data-coupon-waiver');
+      if (!waiverId) return;
+      var reason = prompt('Optional note shown to the applicant (or leave blank):') || '';
+      var sendEmail = confirm('Also send the code to the applicant by email? (OK = email + thread, Cancel = thread only)');
+      var status = document.getElementById('coupon-status-' + waiverId);
+      if (status) status.textContent = 'Minting...';
+      fetch('/api/admin/fee-waivers/generate-coupon', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ waiverId: waiverId, reason: reason, postToThread: true, sendEmail: sendEmail, expiresInDays: 30, maxUses: 1 }),
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (d.ok) {
+          if (status) { status.textContent = 'Code: ' + d.code + (sendEmail ? ' (posted + emailed)' : ' (posted to thread)'); status.style.color = '#6ee7b7'; }
+          loadThread(waiverId);
+        } else {
+          if (status) { status.textContent = d.error || 'failed'; status.style.color = '#fca5a5'; }
+        }
+      }).catch(function () {
+        if (status) { status.textContent = 'network error'; status.style.color = '#fca5a5'; }
+      });
+      return;
+    }
+    if (btn.classList.contains('js-thread-toggle')) {
+      var wid = btn.getAttribute('data-thread-toggle');
+      if (!wid) return;
+      var panel = document.getElementById('thread-panel-' + wid);
+      if (!panel) return;
+      var open = panel.style.display !== 'none';
+      panel.style.display = open ? 'none' : 'block';
+      btn.textContent = open ? 'Open thread' : 'Close thread';
+      if (!open) loadThread(wid);
+      return;
+    }
+    if (btn.classList.contains('js-thread-send')) {
+      var wid2 = btn.getAttribute('data-thread-send');
+      if (!wid2) return;
+      var ta = document.getElementById('thread-body-' + wid2);
+      var st = document.getElementById('thread-status-' + wid2);
+      var body = (ta && ta.value || '').trim();
+      if (!body) { if (st) { st.textContent = 'Type a reply first.'; st.style.color = '#fbbf24'; } return; }
+      if (st) { st.textContent = 'Sending...'; st.style.color = '#9aa6b6'; }
+      fetch('/api/admin/fee-waivers/reply', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestId: wid2, body: body }),
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (d.ok) {
+          if (ta) ta.value = '';
+          if (st) { st.textContent = 'Sent.'; st.style.color = '#6ee7b7'; }
+          loadThread(wid2);
+        } else {
+          if (st) { st.textContent = d.error || 'failed'; st.style.color = '#fca5a5'; }
+        }
+      }).catch(function () {
+        if (st) { st.textContent = 'network error'; st.style.color = '#fca5a5'; }
+      });
+    }
+  });
+</script>
 </AdminLayout>

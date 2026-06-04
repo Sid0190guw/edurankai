@@ -58,12 +58,13 @@ const seconds = duration % 60;
 // Per-question review
 let questions: any[] = [];
 try {
-  const r = await db.execute(sql`SELECT id, question_text, question_type, options, correct_answer, marks, explanation, sort_order FROM test_questions WHERE test_id = ${test.id} ORDER BY sort_order ASC`);
+  const r = await db.execute(sql`SELECT id, question_text, question_type, options, correct_answer, accepted_answers, answer_tolerance, marks, explanation, sort_order, category, image_url FROM test_questions WHERE test_id = ${test.id} ORDER BY sort_order ASC`);
   questions = Array.isArray(r) ? r : (r?.rows || []);
 } catch (_) {}
 const answers = attempt.answers || {};
 const flaggedSet = attempt.flagged_questions || {};
 let correctN = 0, wrongN = 0, blankN = 0, flaggedN = 0;
+function normTxt(s: any) { return String(s == null ? '' : s).trim().toLowerCase().replace(/\s+/g, ' '); }
 const reviewRows = (questions as any[]).map((q: any, i: number) => {
   const u = answers[q.id];
   const c = q.correct_answer;
@@ -74,6 +75,22 @@ const reviewRows = (questions as any[]).map((q: any, i: number) => {
       const uSet = new Set(Array.isArray(u) ? u : []);
       const cSet = new Set(Array.isArray(c) ? c : []);
       isCorrect = uSet.size === cSet.size && [...uSet].every(x => cSet.has(x));
+    } else if (q.question_type === 'fill_in_blank' || q.question_type === 'short_answer') {
+      const cand = normTxt(u);
+      const accepted: string[] = [];
+      let raw: any = q.accepted_answers;
+      if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch { raw = []; } }
+      if (Array.isArray(raw)) for (const a of raw) { const n = normTxt(a); if (n) accepted.push(n); }
+      const single = Array.isArray(c) ? c[0] : c;
+      if (single != null && String(single).trim() !== '') {
+        const n = normTxt(single); if (n && !accepted.includes(n)) accepted.push(n);
+      }
+      isCorrect = cand !== '' && accepted.includes(cand);
+    } else if (q.question_type === 'numeric') {
+      const ua = parseFloat(String(u));
+      const ca = parseFloat(String(Array.isArray(c) ? c[0] : c));
+      const tol = parseFloat(q.answer_tolerance ?? '0') || 0;
+      isCorrect = !isNaN(ua) && !isNaN(ca) && Math.abs(ua - ca) <= tol;
     } else {
       isCorrect = u === c;
     }
@@ -83,6 +100,23 @@ const reviewRows = (questions as any[]).map((q: any, i: number) => {
   return { idx: i + 1, q, userAns: u, isBlank, isCorrect, flagged: !!flaggedSet[q.id] };
 });
 const firstWrong = reviewRows.find((r: any) => !r.isCorrect && !r.isBlank);
+
+// Per-category breakdown so candidates see strengths/weaknesses
+const byCategory: Record<string, { total: number; correct: number; blank: number }> = {};
+for (const row of reviewRows) {
+  const cat = (row.q.category || '').trim() || 'Uncategorised';
+  if (!byCategory[cat]) byCategory[cat] = { total: 0, correct: 0, blank: 0 };
+  byCategory[cat].total++;
+  if (row.isCorrect) byCategory[cat].correct++;
+  if (row.isBlank) byCategory[cat].blank++;
+}
+const categoryRows = Object.keys(byCategory).map(k => ({
+  name: k,
+  total: byCategory[k].total,
+  correct: byCategory[k].correct,
+  blank: byCategory[k].blank,
+  pct: byCategory[k].total > 0 ? Math.round((byCategory[k].correct / byCategory[k].total) * 100) : 0,
+})).sort((a, b) => b.pct - a.pct);
 
 // Next quest: pick another published test not yet taken by this candidate
 let nextQuest: any = null;
@@ -465,6 +499,32 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
         )}
       </div>
     </div>
+
+    <!-- Category breakdown -->
+    {categoryRows.length > 1 && (
+      <div class="review-card" style="margin-bottom:18px;">
+        <p class="dl-eyebrow">Strengths &amp; weaknesses by section</p>
+        <div style="display:grid;grid-template-columns:1fr;gap:10px;margin-top:14px;">
+          {categoryRows.map((c: any) => {
+            const bandColor = c.pct >= 80 ? '#10b981' : c.pct >= 60 ? '#fbbf24' : c.pct >= 40 ? '#f97316' : '#ef4444';
+            return (
+              <div style="background:#15151a;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;">
+                <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;">
+                  <p style="font-size:13.5px;font-weight:600;color:#f4f1ea;margin:0;">{c.name}</p>
+                  <p style={'font-size:14px;font-weight:800;font-family:Geist Mono,JetBrains Mono,monospace;margin:0;color:' + bandColor + ';'}>{c.correct}/{c.total} · {c.pct}%</p>
+                </div>
+                <div style="height:6px;background:#0d1117;border-radius:100px;margin-top:8px;overflow:hidden;">
+                  <div style={'width:' + c.pct + '%;height:100%;background:' + bandColor + ';transition:width .35s;'}></div>
+                </div>
+                {c.blank > 0 && (
+                  <p style="font-size:11px;color:#8a8a94;margin:6px 0 0;font-family:Geist Mono,monospace;">{c.blank} blank</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    )}
 
     <!-- Per-question review -->
     {reviewRows.length > 0 && (

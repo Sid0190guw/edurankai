@@ -85,6 +85,11 @@ export const POST: APIRoute = async ({ request }) => {
         VALUES (${resolved.userId}, ${messageId}, ${threadId}, 'inbox', false)
         ON CONFLICT (user_id, message_id) DO NOTHING
       `);
+      // Notify the recipient that new mail arrived
+      try {
+        const { pushNotify } = await import('@/lib/push');
+        await pushNotify.inboundMail(resolved.userId, fromName || fromEmail || 'someone', subject);
+      } catch (_) {}
       delivered += 1;
     }
     return json({ ok: true, delivered });

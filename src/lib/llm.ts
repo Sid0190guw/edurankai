@@ -3,7 +3,7 @@
 // silently fall back to deterministic behaviour.
 
 const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
-const MODEL = 'claude-sonnet-4-5'; // current best general-purpose Sonnet
+const MODEL = 'claude-sonnet-4-6'; // current best general-purpose Sonnet
 
 const LANGUAGE_NAMES: Record<string, string> = {
   'en': 'English', 'en-IN': 'English (India)', 'en-US': 'English (US)', 'en-GB': 'English (UK)',

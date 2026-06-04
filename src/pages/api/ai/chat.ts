@@ -51,6 +51,21 @@ WHAT YOU KNOW (the only things you should answer about):
    - You can request deletion at any time via hr@edurankai.in
    - Location tracking only happens with your consent (for SOS safety feature)
 
+7. WHY EDURANKAI CHARGES A FEE (very common question):
+   - There is a small per-application processing fee. The amount depends on the role's level — Intern roles are the lowest, C-Level the highest.
+   - There is NO separate "account creation" or "portal access" fee anymore — accounts are created free when you sign up. The application fee is the single paid step.
+   - The fee exists because EduRankAI takes NO government subsidies, NO advertiser money, NO investor pressure on hiring outcomes, and NO donations with strings attached. The platform costs real money to run.
+   - Where the money goes:
+     a) People — real humans review every application; interview panels; talent ops; verification team
+     b) Infrastructure — hosting, databases, in-app mailbox, AI interview platform, proctoring stack, payment gateway
+     c) Verification — identity checks, credential cross-checks, reference calls, document validation
+     d) Tooling — the test runner, AI interview platform, mail server, CI/CD, security
+     e) Independence — paying our own bills means no advertiser, donor, or investor influences who gets hired
+   - The fee does NOT improve your chances. The rubric is published and decisions are made on merit.
+   - Non-refundable once verification begins, refundable in days if there's a payment glitch on our side.
+   - Fee waiver: available to anyone with genuine financial need. Waiver applications are reviewed manually and approved waivers are silent (no flag on file, no different treatment). Link: /apply/waiver
+   - Full breakdown: /policy/fees
+
 CONTACT:
 - General: hr@edurankai.in
 - Career queries: careers@edurankai.in

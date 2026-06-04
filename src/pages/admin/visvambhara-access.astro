@@ -12,21 +12,51 @@ await ensureVisvambharaAccessSchema();
 
 let okMsg = '', errMsg = '';
 
+function rowsLocal(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+async function postDecisionToThread(requestId: string, applicantUid: string | null, body: string) {
+  try {
+    const { postMessage } = await import('@/lib/request-threads');
+    await postMessage({
+      requestType: 'visvambhara_access',
+      requestId,
+      applicantUserId: applicantUid,
+      senderRole: 'admin',
+      senderUserId: user.id,
+      senderName: user.name || 'Research team',
+      body,
+    });
+  } catch (_) {}
+}
+
 if (Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
     const action = (fd.get('_action') as string || '').trim();
     const id = (fd.get('id') as string || '').trim();
     const reason = (fd.get('reason') as string || '').trim() || null;
+
+    // Look up the applicant once so every action below can post a decision
+    // message into the thread (and so the push notification routes correctly).
+    const reqRow = id ? (rowsLocal(await db.execute(sql`SELECT user_id FROM visvambhara_access_requests WHERE id = ${id} LIMIT 1`))[0] as any) : null;
+    const applicantUid: string | null = reqRow?.user_id || null;
+
     if (action === 'approve' && id) {
       await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'approved', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = NULL WHERE id = ${id}`);
-      okMsg = 'Approved. The user now has access to the Viśvambhara modules.';
+      await postDecisionToThread(id, applicantUid, 'Your Viśvambhara access request has been approved.\n\nYou now have access to the Viśvambhara modules from your portal. Replies to this thread reach the research team directly.');
+      okMsg = 'Approved. Decision posted into thread, applicant notified.';
     } else if (action === 'reject' && id) {
       await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'rejected', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = ${reason} WHERE id = ${id}`);
-      okMsg = 'Marked as rejected. The user will see the reason on their request page.';
+      const body = 'Your Viśvambhara access request was not granted at this time.'
+        + (reason ? '\n\nReason from the reviewer:\n' + reason : '')
+        + '\n\nYou are welcome to update your engagement note and re-submit, or reply on this thread with additional context.';
+      await postDecisionToThread(id, applicantUid, body);
+      okMsg = 'Marked as rejected. Decision posted into thread.';
     } else if (action === 'revoke' && id) {
+      const finalReason = reason || 'Access revoked';
       await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'rejected', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = COALESCE(${reason}, 'Access revoked') WHERE id = ${id}`);
-      okMsg = 'Access revoked.';
+      await postDecisionToThread(id, applicantUid, 'Your Viśvambhara access has been revoked.\n\nReason: ' + finalReason + '\n\nReplies to this thread reach the research team directly.');
+      okMsg = 'Access revoked. Decision posted into thread.';
     }
   } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
 }
@@ -106,9 +136,79 @@ function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day: 'nu
               <button type="submit" style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">{r.status === 'approved' ? 'Revoke' : 'Reject'}</button>
             </form>
           )}
+          <button type="button" class="toggle-thread" data-req={r.id} style="background:#15151a;border:1px solid #1a1a1f;color:#9aa6b6;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Open thread</button>
+        </div>
+
+        <div class="thread-panel" id={'thread-' + r.id} data-req={r.id} style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #1a1a1f;">
+          <div class="thread-list" style="display:flex;flex-direction:column;gap:8px;max-height:380px;overflow-y:auto;margin-bottom:10px;">
+            <p style="color:#6e6e78;font-size:11.5px;text-align:center;padding:12px;">Loading…</p>
+          </div>
+          <textarea class="thread-input" rows="3" placeholder="Reply to the applicant — they will see this inside their portal thread" maxlength="5000" style="width:100%;background:#08080a;border:1px solid #1a1a1f;color:#fff;border-radius:8px;padding:9px 12px;font-size:13px;font-family:inherit;outline:none;resize:vertical;line-height:1.55;"></textarea>
+          <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px;">
+            <button type="button" class="thread-send" data-req={r.id} style="background:#FF4F00;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:7px 16px;border-radius:6px;cursor:pointer;">Send reply</button>
+          </div>
         </div>
       </div>
     ))}
   </div>
 </div>
+
+<script is:inline>
+  (function () {
+    function fmt(d) { try { return new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch (_) { return ''; } }
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+    function renderThread(panel, msgs) {
+      var list = panel.querySelector('.thread-list');
+      if (!msgs || !msgs.length) {
+        list.innerHTML = '<p style="color:#6e6e78;font-size:11.5px;text-align:center;padding:12px;">No replies yet. Be the first to respond — your message lands in the applicant\'s portal thread.</p>';
+        return;
+      }
+      list.innerHTML = msgs.map(function (m) {
+        var bg = m.sender_role === 'admin' ? 'rgba(255,79,0,0.08)' : '#15151a';
+        var border = m.sender_role === 'admin' ? 'rgba(255,79,0,0.30)' : '#1a1a1f';
+        var label = m.sender_role === 'admin' ? 'Research team · ' + esc(m.sender_name || 'You') : esc(m.sender_name || 'Applicant');
+        var labelColor = m.sender_role === 'admin' ? '#FF7040' : '#9aa6b6';
+        return '<div style="background:' + bg + ';border:1px solid ' + border + ';border-radius:8px;padding:9px 12px;">'
+          + '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px;">'
+          + '<p style="font-size:10px;color:' + labelColor + ';font-weight:700;letter-spacing:0.08em;text-transform:uppercase;font-family:Geist Mono,monospace;margin:0;">' + label + '</p>'
+          + '<p style="font-size:10px;color:#6e6e78;font-family:Geist Mono,monospace;margin:0;">' + fmt(m.created_at) + '</p>'
+          + '</div>'
+          + '<p style="font-size:13px;color:#d8d8de;line-height:1.6;white-space:pre-wrap;margin:0;">' + esc(m.body) + '</p>'
+          + '</div>';
+      }).join('');
+      list.scrollTop = list.scrollHeight;
+    }
+    function load(panel) {
+      var req = panel.getAttribute('data-req');
+      fetch('/api/admin/visvambhara-access/thread?id=' + encodeURIComponent(req), { credentials: 'same-origin' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) { if (d && d.ok) renderThread(panel, d.messages); });
+    }
+    document.querySelectorAll('.toggle-thread').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var panel = document.getElementById('thread-' + btn.getAttribute('data-req'));
+        if (!panel) return;
+        var open = panel.style.display !== 'none';
+        if (open) { panel.style.display = 'none'; btn.textContent = 'Open thread'; }
+        else { panel.style.display = 'block'; btn.textContent = 'Close thread'; load(panel); }
+      });
+    });
+    document.querySelectorAll('.thread-send').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var req = b.getAttribute('data-req');
+        var panel = document.getElementById('thread-' + req);
+        var ta = panel.querySelector('.thread-input');
+        var body = (ta.value || '').trim();
+        if (!body) return;
+        b.disabled = true; b.textContent = 'Sending…';
+        fetch('/api/admin/visvambhara-access/reply', { method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ requestId: req, body: body })})
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            b.disabled = false; b.textContent = 'Send reply';
+            if (d && d.ok) { ta.value = ''; load(panel); }
+          });
+      });
+    });
+  })();
+</script>
 </AdminLayout>

@@ -7,12 +7,20 @@ const sessionId = new URL(Astro.request.url).searchParams.get('session') || '';
 if (!sessionId) return Astro.redirect('/aquintutor/interview/' + slug);
 
 let session: any = null;
-let template: any = null;
 let firstTurn: any = null;
 try {
   const r = await db.execute(sql`
     SELECT s.id, s.template_id, s.candidate_name, s.candidate_email, s.language, s.status, s.started_at,
-      t.title, t.slug as template_slug, t.max_minutes
+      s.preflight_passed, s.face_descriptor,
+      t.title, t.slug as template_slug, t.max_minutes,
+      COALESCE(t.proctor_level, 'standard') AS proctor_level,
+      COALESCE(t.require_face_enroll, true) AS require_face_enroll,
+      COALESCE(t.block_tab_switch, true) AS block_tab_switch,
+      COALESCE(t.max_tab_switches, 3) AS max_tab_switches,
+      COALESCE(t.max_strikes, 5) AS max_strikes,
+      COALESCE(t.require_fullscreen, false) AS require_fullscreen,
+      COALESCE(t.enable_object_detection, false) AS enable_object_detection,
+      COALESCE(t.allow_paste, false) AS allow_paste
     FROM ai_interview_sessions s JOIN ai_interview_templates t ON s.template_id = t.id
     WHERE s.id = ${sessionId} LIMIT 1
   `);
@@ -22,6 +30,7 @@ try {
 
 if (!session) return Astro.redirect('/aquintutor/interview/' + slug);
 if (session.status !== 'in_progress') return Astro.redirect('/aquintutor/interview/done?session=' + sessionId);
+if (!session.preflight_passed) return Astro.redirect('/aquintutor/interview/' + slug + '/preflight?session=' + sessionId);
 
 try {
   const r = await db.execute(sql`
@@ -95,6 +104,23 @@ const lang = session.language || 'en-IN';
     .stt-status .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #6e6e78; margin-right: 6px; vertical-align: middle; }
     .stt-status.live .dot { background: #10b981; animation: pulse 1.2s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .proctor-bar { background: #11141a; border-bottom: 1px solid #1d2128; padding: 8px 14px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 10.5px; font-family: 'JetBrains Mono', monospace; letter-spacing: 0.03em; color: #8a8579; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .proctor-bar::-webkit-scrollbar { display: none; }
+    .proctor-bar .chip { display: inline-flex; gap: 5px; align-items: center; padding: 3px 7px; border-radius: 100px; background: #15191f; border: 1px solid #2a3038; flex-shrink: 0; white-space: nowrap; }
+    .proctor-bar .chip b { color: #f4f1ea; font-weight: 700; }
+    @media (max-width: 760px) {
+      .proctor-bar { flex-wrap: nowrap; padding: 6px 12px; gap: 6px; font-size: 10px; }
+      .proctor-bar .chip { padding: 2px 6px; }
+    }
+    .proctor-bar .chip.warn { border-color: #fbbf24; color: #fde68a; }
+    .proctor-bar .chip.bad  { border-color: #ef4444; color: #fca5a5; }
+    .proctor-bar .chip.ok   { border-color: #10b981; color: #6ee7b7; }
+    .term-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.94); display: none; align-items: center; justify-content: center; z-index: 100; padding: 22px; }
+    .term-overlay.show { display: flex; }
+    .term-box { max-width: 460px; background: #11141a; border: 1px solid #ef4444; border-radius: 16px; padding: 30px; text-align: center; }
+    .term-box h2 { font-family: 'Fraunces', serif; font-size: 24px; color: #fca5a5; margin-bottom: 10px; font-weight: 500; }
+    .term-box p { font-size: 14px; color: #c8c3b8; line-height: 1.6; margin-bottom: 18px; }
+    .term-box code { background: #0d1117; padding: 2px 7px; border-radius: 4px; font-size: 12px; color: #f0b48f; }
   </style>
 </head>
 <body>
@@ -104,6 +130,24 @@ const lang = session.language || 'en-IN';
       <p class="meta">{session.candidate_name || session.candidate_email || 'anonymous'} &middot; lang {lang} &middot; session {session.id.slice(0, 8)}</p>
     </div>
     <p class="meta" id="timerEl">--:--</p>
+  </div>
+
+  <div class="proctor-bar">
+    <span class="chip" id="proctorLevelChip"><b>Proctor</b> {session.proctor_level || 'standard'}</span>
+    <span class="chip" id="riskChip"><b>Risk</b> <span id="riskVal">0</span>/100</span>
+    <span class="chip" id="strikeChip"><b>Strikes</b> <span id="strikeVal">0</span>/{session.max_strikes}</span>
+    <span class="chip" id="tabChip"><b>Tab</b> <span id="tabVal">0</span>/{session.max_tab_switches}</span>
+    <span class="chip" id="faceChip"><b>Identity</b> <span id="faceVal">checking…</span></span>
+    {session.enable_object_detection && <span class="chip" id="objChip"><b>Objects</b> <span id="objVal">scanning…</span></span>}
+    {session.require_fullscreen && <span class="chip" id="fsChip"><b>FS</b> <span id="fsVal">on</span></span>}
+  </div>
+
+  <div class="term-overlay" id="termOverlay">
+    <div class="term-box">
+      <h2>Session ended</h2>
+      <p id="termReason">The proctoring system has ended this session.</p>
+      <p style="font-size:12px;color:#8a8579;">You will be redirected in a moment. The activity log has been saved.</p>
+    </div>
   </div>
 
   <div class="wrap">
@@ -145,7 +189,18 @@ const lang = session.language || 'en-IN';
     templateSlug: slug,
     firstQuestion: firstTurn ? { text: firstTurn.text, lang: firstTurn.lang || lang, isFollowUp: firstTurn.is_follow_up || false, turnIndex: 0 } : null,
     maxMinutes: session.max_minutes || 30,
-    startedAt: session.started_at
+    startedAt: session.started_at,
+    proctorCfg: {
+      level: session.proctor_level,
+      requireFaceEnroll: !!session.require_face_enroll,
+      blockTabSwitch: !!session.block_tab_switch,
+      maxTabSwitches: session.max_tab_switches,
+      maxStrikes: session.max_strikes,
+      requireFullscreen: !!session.require_fullscreen,
+      enableObjectDetection: !!session.enable_object_detection,
+      allowPaste: !!session.allow_paste,
+    },
+    enrolledDescriptor: session.face_descriptor || null
   }}>
   (function() {
     var currentSeedIndex = 0;
@@ -171,30 +226,95 @@ const lang = session.language || 'en-IN';
       setTimeout(function() { t.remove(); }, 3500);
     }
 
-    // ===== Proctoring event buffer (same shape as test runner) =====
+    // ===== Proctoring event buffer =====
     var eventBuffer = [];
+    var riskVal = document.getElementById('riskVal');
+    var strikeVal = document.getElementById('strikeVal');
+    var strikeChip = document.getElementById('strikeChip');
+    var riskChip = document.getElementById('riskChip');
+    var tabVal = document.getElementById('tabVal');
+    var tabChip = document.getElementById('tabChip');
+    var fsChipVal = document.getElementById('fsVal');
+    var fsChip = document.getElementById('fsChip');
+    function paintRisk(s) {
+      if (!riskChip || !riskVal) return;
+      riskVal.textContent = s;
+      riskChip.classList.remove('ok','warn','bad');
+      if (s <= 5) riskChip.classList.add('ok');
+      else if (s <= 45) riskChip.classList.add('warn');
+      else riskChip.classList.add('bad');
+    }
+    function paintStrikes(n) {
+      if (!strikeVal) return;
+      strikeVal.textContent = n;
+      var max = proctorCfg.maxStrikes || 5;
+      strikeChip.classList.remove('ok','warn','bad');
+      if (n === 0) strikeChip.classList.add('ok');
+      else if (n < max) strikeChip.classList.add('warn');
+      else strikeChip.classList.add('bad');
+    }
+    function paintTabs(n) {
+      if (!tabVal) return;
+      tabVal.textContent = n;
+      var max = proctorCfg.maxTabSwitches || 3;
+      tabChip.classList.remove('ok','warn','bad');
+      if (n === 0) tabChip.classList.add('ok');
+      else if (n < max) tabChip.classList.add('warn');
+      else tabChip.classList.add('bad');
+    }
     function logEvent(type, severity, detail) {
       if (ended) return;
       eventBuffer.push({ type: type, severity: severity || 'info', detail: detail || {}, clientTs: new Date().toISOString() });
-      if (eventBuffer.length >= 12 || severity === 'flag') flushEvents();
+      if (eventBuffer.length >= 8 || severity === 'flag') flushEvents();
     }
     function flushEvents() {
       if (eventBuffer.length === 0) return;
       var batch = eventBuffer.splice(0);
       try {
         var payload = JSON.stringify({ sessionId: sessionId, events: batch });
-        if (navigator.sendBeacon) {
-          navigator.sendBeacon('/api/aquintutor/interview/log-event', new Blob([payload], { type: 'application/json' }));
-        } else {
-          fetch('/api/aquintutor/interview/log-event', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' }, body: payload, keepalive: true,
-          }).catch(function() { eventBuffer = batch.concat(eventBuffer); });
-        }
+        fetch('/api/aquintutor/interview/log-event', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' }, body: payload, keepalive: true,
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (!d || !d.ok) return;
+          paintRisk(d.riskScore || 0);
+          paintStrikes(d.strikes || 0);
+          paintTabs(d.tabSwitches || 0);
+          if (d.autoTerminated && !ended) {
+            handleAutoTerm(d.autoTerminatedReason || 'policy_violation');
+          }
+        }).catch(function () { eventBuffer = batch.concat(eventBuffer); });
       } catch (_) { eventBuffer = batch.concat(eventBuffer); }
     }
-    setInterval(flushEvents, 4000);
+    setInterval(function () { if (!document.hidden) flushEvents(); }, 5000);
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) flushEvents(); });
     window.addEventListener('beforeunload', flushEvents);
+
+    function handleAutoTerm(reason) {
+      if (ended) return;
+      ended = true;
+      var labels = {
+        max_strikes_exceeded: 'Maximum strikes exceeded — the proctoring system has flagged enough serious events to end the session.',
+        tab_switch_limit_exceeded: 'Too many tab/window switches — the session was set to end after exceeding the allowed limit.',
+        risk_score_critical: 'Risk score reached the critical threshold (90/100). The session has been ended.',
+        policy_violation: 'A serious policy violation ended this session.',
+      };
+      try { if (rec) rec.stop(); } catch (_) {}
+      try { window.speechSynthesis.cancel(); } catch (_) {}
+      var ov = document.getElementById('termOverlay');
+      var rs = document.getElementById('termReason');
+      if (rs) rs.innerHTML = (labels[reason] || labels.policy_violation) + ' <br><br>Reason code: <code>' + reason + '</code>';
+      if (ov) ov.classList.add('show');
+      flushEvents();
+      setTimeout(function () {
+        fetch('/api/aquintutor/interview/end', {
+          method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: sessionId }),
+        }).finally(function () {
+          window.location.href = '/aquintutor/interview/done?session=' + encodeURIComponent(sessionId);
+        });
+      }, 4000);
+    }
 
     // ===== Window / tab / clipboard monitoring =====
     document.addEventListener('visibilitychange', function() { if (document.hidden) { logEvent('tab_hidden', 'warn', {}); toast('Stay in this tab', 'warn'); } else { logEvent('tab_visible', 'info', {}); } });
@@ -206,18 +326,99 @@ const lang = session.language || 'en-IN';
     window.addEventListener('offline', function() { logEvent('network_offline', 'warn', {}); toast('You went offline', 'err'); });
     window.addEventListener('online', function() { logEvent('network_online', 'info', {}); });
 
-    var BLOCKED = [{k:'F12',l:'F12'},{k:'I',c:true,s:true,l:'Ctrl+Shift+I'},{k:'U',c:true,l:'Ctrl+U'}];
+    var BLOCKED = [
+      {k:'F12',l:'F12',t:'devtools_suspected'},
+      {k:'I',c:true,s:true,l:'Ctrl+Shift+I',t:'devtools_suspected'},
+      {k:'J',c:true,s:true,l:'Ctrl+Shift+J',t:'devtools_suspected'},
+      {k:'C',c:true,s:true,l:'Ctrl+Shift+C',t:'devtools_suspected'},
+      {k:'U',c:true,l:'Ctrl+U',t:'keyboard_shortcut_blocked'},
+      {k:'p',c:true,l:'Ctrl+P',t:'print_blocked'},
+      {k:'P',c:true,l:'Ctrl+P',t:'print_blocked'},
+      {k:'s',c:true,l:'Ctrl+S',t:'save_blocked'},
+      {k:'S',c:true,l:'Ctrl+S',t:'save_blocked'},
+      {k:'PrintScreen',l:'PrintScreen',t:'print_blocked'},
+    ];
     document.addEventListener('keydown', function(e) {
       for (var i = 0; i < BLOCKED.length; i++) {
         var b = BLOCKED[i];
         if (e.key === b.k && (!b.c || e.ctrlKey || e.metaKey) && (!b.s || e.shiftKey)) {
           e.preventDefault();
-          logEvent('keyboard_shortcut_blocked', 'flag', { shortcut: b.l });
-          toast('Shortcut blocked: ' + b.l, 'warn');
+          logEvent(b.t || 'keyboard_shortcut_blocked', 'flag', { shortcut: b.l });
+          toast('Blocked: ' + b.l, 'warn');
           return;
         }
       }
     });
+
+    // ===== Print / beforeprint =====
+    window.addEventListener('beforeprint', function () { logEvent('print_blocked', 'flag', { via: 'beforeprint' }); });
+
+    // ===== Paste policy =====
+    if (!proctorCfg.allowPaste) {
+      document.addEventListener('paste', function (e) {
+        // The default click on a transcript area is allowed by browser; we just flag it.
+        logEvent('paste', 'warn', {});
+      }, true);
+    }
+
+    // ===== Idle detection =====
+    var lastInputAt = Date.now();
+    ['mousemove','keydown','click','touchstart'].forEach(function (ev) {
+      window.addEventListener(ev, function () { lastInputAt = Date.now(); }, { passive: true });
+    });
+    setInterval(function () {
+      if (ended) return;
+      var idleMs = Date.now() - lastInputAt;
+      if (idleMs > 120000 && !window.__idleLoggedAt) {
+        logEvent('idle_long', 'warn', { idleMs: idleMs });
+        window.__idleLoggedAt = Date.now();
+      } else if (idleMs < 5000) {
+        window.__idleLoggedAt = 0;
+      }
+    }, 15000);
+
+    // ===== Multi-monitor & display sanity =====
+    function checkDisplay() {
+      var multi = (screen.width > window.innerWidth * 1.6) || (screen.availWidth - screen.width > 200);
+      if (multi && !window.__monLogged) {
+        logEvent('multi_monitor_detected', 'warn', { sw: screen.width, sa: screen.availWidth, iw: window.innerWidth });
+        window.__monLogged = true;
+      }
+    }
+    checkDisplay();
+    window.addEventListener('resize', checkDisplay);
+    var initialDpr = window.devicePixelRatio || 1;
+    setInterval(function () {
+      var dpr = window.devicePixelRatio || 1;
+      if (Math.abs(dpr - initialDpr) > 0.05) {
+        logEvent('devicepixel_change', 'info', { from: initialDpr, to: dpr });
+        initialDpr = dpr;
+      }
+    }, 8000);
+
+    // ===== Fullscreen enforcement =====
+    if (proctorCfg.requireFullscreen) {
+      document.addEventListener('fullscreenchange', function () {
+        if (document.fullscreenElement) {
+          logEvent('fullscreen_enter', 'info', {});
+          if (fsChipVal) { fsChipVal.textContent = 'on'; fsChip.classList.remove('bad'); fsChip.classList.add('ok'); }
+        } else {
+          logEvent('fullscreen_exit', 'warn', {});
+          if (fsChipVal) { fsChipVal.textContent = 'off'; fsChip.classList.remove('ok'); fsChip.classList.add('bad'); }
+          // Re-prompt with a warning toast
+          toast('Fullscreen required — click anywhere to re-enter.', 'err');
+          var enforce = function () {
+            try { var el = document.documentElement; (el.requestFullscreen || el.webkitRequestFullscreen).call(el); } catch (_) {}
+            document.removeEventListener('click', enforce);
+          };
+          document.addEventListener('click', enforce, { once: true });
+          // If they refuse for >12s, escalate
+          setTimeout(function () {
+            if (!document.fullscreenElement && !ended) logEvent('fullscreen_required_violation', 'flag', {});
+          }, 12000);
+        }
+      });
+    }
 
     // ===== Camera + mic =====
     var faceLastCount = 1;
@@ -251,38 +452,173 @@ const lang = session.language || 'en-IN';
       });
     }
 
+    var enrolledF32 = null;
+    if (enrolledDescriptor && Array.isArray(enrolledDescriptor) && enrolledDescriptor.length === 128) {
+      enrolledF32 = new Float32Array(enrolledDescriptor);
+    }
+    var faceChipEl = document.getElementById('faceVal');
+    var faceChipBox = document.getElementById('faceChip');
+    function paintFace(state, label) {
+      if (!faceChipEl || !faceChipBox) return;
+      faceChipEl.textContent = label;
+      faceChipBox.classList.remove('ok','warn','bad');
+      if (state === 'ok') faceChipBox.classList.add('ok');
+      else if (state === 'warn') faceChipBox.classList.add('warn');
+      else if (state === 'bad') faceChipBox.classList.add('bad');
+    }
+
+    function l2(a, b) {
+      var s = 0;
+      for (var i = 0; i < a.length; i++) { var d = a[i] - b[i]; s += d * d; }
+      return Math.sqrt(s);
+    }
+
     async function startFaceMonitor() {
       try {
         await loadFaceApi();
+        try { if (window.faceapi && faceapi.tf && faceapi.tf.setBackend) await window.faceapi.tf.setBackend('webgl'); } catch (_) {}
         var URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
         await faceapi.nets.tinyFaceDetector.loadFromUri(URL);
-        await faceapi.nets.faceLandmark68TinyNet.loadFromUri(URL);
+        await faceapi.nets.faceLandmark68Net.loadFromUri(URL);
+        if (enrolledF32) await faceapi.nets.faceRecognitionNet.loadFromUri(URL);
       } catch (e) {
         logEvent('media_lost', 'warn', { reason: 'face_model_load_failed' });
+        paintFace('warn', 'model load failed');
         return;
       }
       var v = document.getElementById('monitorVideo');
-      setInterval(async function() {
-        if (ended || v.readyState < 2) return;
+      var mismatchSince = 0;
+      var isMobile = window.matchMedia('(max-width: 760px)').matches;
+      // Cheap mode: smaller input, slower cadence, identity check every 3rd frame.
+      var FACE_INTERVAL = isMobile ? 2400 : 1600;
+      var FACE_INPUT_SIZE = isMobile ? 224 : 320;
+      var identityCounter = 0;
+      var IDENTITY_EVERY = 3; // run descriptor compare every 3rd cycle
+      async function faceTick() {
+        if (ended) return;
+        if (document.hidden || v.readyState < 2) { setTimeout(faceTick, FACE_INTERVAL); return; }
         try {
-          var dets = await faceapi.detectAllFaces(v, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 })).withFaceLandmarks(true);
+          identityCounter++;
+          var doIdentity = enrolledF32 && (identityCounter % IDENTITY_EVERY === 0);
+          var detector = faceapi.detectAllFaces(v, new faceapi.TinyFaceDetectorOptions({ inputSize: FACE_INPUT_SIZE, scoreThreshold: 0.5 })).withFaceLandmarks();
+          if (doIdentity) detector = detector.withFaceDescriptors();
+          var dets = await detector;
           var n = dets.length;
-          if (n === 0 && faceLastCount > 0) { logEvent('face_lost', 'warn', {}); toast('Face not visible', 'warn'); }
-          else if (n > 0 && faceLastCount === 0) { logEvent('face_visible', 'info', { count: n }); }
-          if (n > 1 && faceLastCount <= 1) { logEvent('multiple_faces', 'flag', { count: n }); toast('Multiple faces detected', 'warn'); }
+          if (n === 0 && faceLastCount > 0) { logEvent('face_lost', 'warn', {}); toast('Face not visible', 'warn'); paintFace('warn', 'face lost'); }
+          else if (n > 0 && faceLastCount === 0) { logEvent('face_visible', 'info', { count: n }); paintFace('ok', 'visible'); }
+          if (n > 1 && faceLastCount <= 1) { logEvent('multiple_faces', 'flag', { count: n }); toast('Multiple faces detected', 'warn'); paintFace('bad', n + ' faces'); }
           faceLastCount = n;
-          if (n === 1 && dets[0].landmarks) {
-            var lm = dets[0].landmarks;
-            var le = lm.getLeftEye(); var re = lm.getRightEye(); var nose = lm.getNose();
-            if (le && re && nose && nose.length > 3) {
-              var mid = (le[0].x + re[3].x) / 2;
-              var off = (nose[3].x - mid) / Math.max(1, Math.abs(re[3].x - le[0].x));
-              if (Math.abs(off) > 0.25) { if (!awaySince) awaySince = Date.now(); else if (Date.now() - awaySince > 2000) { logEvent('looking_away', 'warn', { off: off.toFixed(2) }); awaySince = Date.now() + 4000; } }
-              else awaySince = 0;
+          if (n === 1) {
+            var det = dets[0];
+            var lm = det.landmarks;
+            // Identity match (only when descriptor was computed this cycle)
+            if (enrolledF32 && det.descriptor) {
+              var dist = l2(enrolledF32, det.descriptor);
+              if (dist < 0.45) {
+                if (mismatchSince) { logEvent('face_match', 'info', { dist: dist.toFixed(3) }); paintFace('ok', 'verified'); mismatchSince = 0; }
+                else paintFace('ok', 'verified');
+              } else if (dist < 0.65) {
+                paintFace('warn', 'similar (' + dist.toFixed(2) + ')');
+              } else {
+                if (!mismatchSince) mismatchSince = Date.now();
+                else if (Date.now() - mismatchSince > 4000) {
+                  logEvent('face_mismatch', 'flag', { dist: dist.toFixed(3) });
+                  paintFace('bad', 'mismatch (' + dist.toFixed(2) + ')');
+                  toast('Identity mismatch — confirm camera shows you', 'err');
+                  mismatchSince = Date.now() + 30000;
+                }
+              }
+            } else if (!enrolledF32) {
+              paintFace('warn', 'no reference');
+            }
+            // Gaze / yaw
+            if (lm) {
+              var le = lm.getLeftEye(); var re = lm.getRightEye(); var nose = lm.getNose();
+              if (le && re && nose && nose.length > 3) {
+                var mid = (le[0].x + re[3].x) / 2;
+                var off = (nose[3].x - mid) / Math.max(1, Math.abs(re[3].x - le[0].x));
+                if (Math.abs(off) > 0.25) {
+                  if (!awaySince) awaySince = Date.now();
+                  else if (Date.now() - awaySince > 2000) {
+                    logEvent('looking_away', 'warn', { off: off.toFixed(2) });
+                    awaySince = Date.now() + 4000;
+                  }
+                } else { if (awaySince) logEvent('gaze_restored', 'info', {}); awaySince = 0; }
+              }
             }
           }
         } catch(_) {}
-      }, 1500);
+        setTimeout(faceTick, FACE_INTERVAL);
+      }
+      faceTick();
+
+      if (proctorCfg.enableObjectDetection) startObjectDetector(v);
+    }
+
+    // ===== Object detection (coco-ssd) — gated by template config =====
+    function loadCocoSsd() {
+      return new Promise(function (resolve, reject) {
+        if (window.cocoSsd) return resolve();
+        // coco-ssd needs window.tf; piggyback on face-api's bundled tensorflow.
+        try { if (window.faceapi && faceapi.tf && !window.tf) window.tf = faceapi.tf; } catch (_) {}
+        var s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js';
+        s.onload = function () { resolve(); };
+        s.onerror = function () { reject(new Error('coco-ssd load failed')); };
+        document.head.appendChild(s);
+      });
+    }
+    async function startObjectDetector(v) {
+      var objChipEl = document.getElementById('objVal');
+      try {
+        await loadCocoSsd();
+        var model = await window.cocoSsd.load({ base: 'lite_mobilenet_v2' });
+        if (objChipEl) objChipEl.textContent = 'scanning';
+        var lastSeen = {};
+        var EVT_FOR = { 'cell phone': 'cell_phone_detected', 'book': 'book_detected', 'laptop': 'laptop_detected', 'tv': 'tv_detected', 'remote': 'remote_detected' };
+        var SEV_FOR  = { 'cell phone': 'flag', 'book': 'warn', 'laptop': 'flag', 'tv': 'warn', 'remote': 'warn' };
+        var isMobileObj = window.matchMedia('(max-width: 760px)').matches;
+        var OBJ_INTERVAL = isMobileObj ? 4500 : 2800;
+        async function objTick() {
+          if (ended) return;
+          if (document.hidden || v.readyState < 2) { setTimeout(objTick, OBJ_INTERVAL); return; }
+          try {
+            var preds = await model.detect(v);
+            var seen = {};
+            var personCount = 0;
+            for (var i = 0; i < preds.length; i++) {
+              var p = preds[i];
+              if (p.class === 'person') { personCount++; continue; }
+              if (p.score < 0.55) continue;
+              if (!(p.class in EVT_FOR)) continue;
+              seen[p.class] = true;
+              if (!lastSeen[p.class]) {
+                logEvent(EVT_FOR[p.class], SEV_FOR[p.class] || 'warn', { score: p.score.toFixed(2) });
+                lastSeen[p.class] = Date.now();
+              }
+            }
+            if (personCount > 1 && !lastSeen['__extra_person']) {
+              logEvent('extra_person_detected', 'flag', { count: personCount });
+              lastSeen['__extra_person'] = Date.now();
+            }
+            // Clear notifications when objects leave
+            Object.keys(lastSeen).forEach(function (k) {
+              if (!seen[k] && k !== '__extra_person' && Date.now() - lastSeen[k] > 6000) {
+                logEvent('object_cleared', 'info', { what: k });
+                delete lastSeen[k];
+              }
+            });
+            if (objChipEl) {
+              var keys = Object.keys(seen);
+              objChipEl.textContent = keys.length ? keys.join(', ') : 'clear';
+            }
+          } catch (_) {}
+          setTimeout(objTick, OBJ_INTERVAL);
+        }
+        objTick();
+      } catch (e) {
+        if (objChipEl) objChipEl.textContent = 'unavailable';
+      }
     }
 
     startMedia();
@@ -415,7 +751,7 @@ const lang = session.language || 'en-IN';
         window.location.href = loc;
       }).catch(function() { window.location.href = '/aquintutor/interview/done?session=' + encodeURIComponent(sessionId); });
     }
-    endBtn.addEventListener('click', function() { if (confirm('End the interview now? You won\\'t be able to add more answers.')) endInterview(false); });
+    endBtn.addEventListener('click', function() { if (confirm("End the interview now? You won't be able to add more answers.")) endInterview(false); });
 
     // ===== Timer =====
     var endsAt = new Date(startedAt).getTime() + maxMinutes * 60 * 1000;

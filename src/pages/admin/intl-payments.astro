@@ -1,0 +1,150 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Self-bootstrap the schema so this page works even before the api endpoint runs.
+try {
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS application_intl_payments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    intent_id UUID,
+    country VARCHAR(80),
+    preferred_method VARCHAR(40),
+    applicant_notes TEXT,
+    admin_notes TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    invoice_url TEXT,
+    reviewer_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    reviewed_at TIMESTAMPTZ,
+    paid_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+} catch (_) {}
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('_action') as string || '').trim();
+    const id = (fd.get('id') as string || '').trim();
+    const invoiceUrl = (fd.get('invoice_url') as string || '').trim() || null;
+    const adminNote = (fd.get('admin_note') as string || '').trim() || null;
+    if (!id) errMsg = 'id required';
+    else if (action === 'mark_invoice_sent') {
+      await db.execute(sql`UPDATE application_intl_payments SET status='invoice_sent', invoice_url=COALESCE(${invoiceUrl}, invoice_url), admin_notes=COALESCE(${adminNote}, admin_notes), reviewer_user_id=${user.id}, reviewed_at=NOW() WHERE id=${id}`);
+      okMsg = 'Marked as invoice sent. Applicant gets a thread message + push.';
+      try {
+        const r0 = rows(await db.execute(sql`SELECT user_id, intent_id, invoice_url FROM application_intl_payments WHERE id = ${id}`))[0] as any;
+        if (r0?.user_id) {
+          const { sendPushToUser } = await import('@/lib/push');
+          await sendPushToUser(r0.user_id, { type: 'intl_payment_invoice', title: 'Your invoice is ready', body: 'Open it to complete payment.', url: r0.invoice_url || '/portal', tag: 'intl-pay-invoice-' + id });
+        }
+      } catch (_) {}
+    } else if (action === 'mark_paid') {
+      // Mark the request paid + materialise the application via intent if present.
+      const r0 = rows(await db.execute(sql`SELECT user_id, intent_id FROM application_intl_payments WHERE id = ${id}`))[0] as any;
+      let appId: string | null = null;
+      if (r0?.intent_id) {
+        const { materialiseFromIntent } = await import('@/lib/fee-waiver');
+        appId = await materialiseFromIntent(r0.intent_id, { paid: true, waiverGranted: false, waiverReason: 'International payment received (offline / wire / Stripe / PayPal). Confirmed by ' + (user.name || user.email) });
+      }
+      await db.execute(sql`UPDATE application_intl_payments SET status='paid', paid_at=NOW(), reviewer_user_id=${user.id} WHERE id=${id}`);
+      try {
+        if (r0?.user_id) {
+          const { sendPushToUser } = await import('@/lib/push');
+          await sendPushToUser(r0.user_id, { type: 'intl_payment_received', title: 'Payment received', body: 'Your application is now in review.', url: appId ? '/portal/applications/' + appId : '/portal', tag: 'intl-pay-paid-' + id });
+        }
+      } catch (_) {}
+      okMsg = 'Marked paid. Application materialised + applicant notified.';
+    } else if (action === 'reject') {
+      await db.execute(sql`UPDATE application_intl_payments SET status='rejected', admin_notes=COALESCE(${adminNote}, admin_notes), reviewer_user_id=${user.id}, reviewed_at=NOW() WHERE id=${id}`);
+      okMsg = 'Request rejected.';
+    }
+  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+}
+
+const filter = new URL(Astro.request.url).searchParams.get('status') || 'pending';
+const list = rows(await db.execute(sql`
+  SELECT p.*, u.email AS user_email, u.name AS user_name, i.role_title_snapshot
+  FROM application_intl_payments p
+  JOIN users u ON u.id = p.user_id
+  LEFT JOIN application_intents i ON i.id = p.intent_id
+  ${filter === 'all' ? sql`` : sql`WHERE p.status = ${filter}`}
+  ORDER BY p.created_at DESC LIMIT 200
+`));
+const counts = rows(await db.execute(sql`SELECT status, COUNT(*)::int n FROM application_intl_payments GROUP BY status`));
+const cMap: Record<string, number> = {}; for (const c of counts) cMap[c.status] = c.n;
+function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' }) : '-'; }
+---
+<AdminLayout title="International Payments" activeNav="">
+<div style="padding-bottom:80px;">
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;">
+    <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Payments &middot; International</p>
+    <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0 0 4px;">International payment requests</h1>
+    <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 10px;">Applicants whose Razorpay rejected, or who paid via wire / Stripe / PayPal / Wise. Send them an invoice. Mark paid when funds arrive.</p>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;">
+      {[
+        { k: 'pending',       l: 'Pending' },
+        { k: 'invoice_sent',  l: 'Invoice sent' },
+        { k: 'paid',          l: 'Paid' },
+        { k: 'rejected',      l: 'Rejected' },
+        { k: 'all',           l: 'All' },
+      ].map((t: any) => (
+        <a href={`?status=${t.k}`} style={`text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;${filter === t.k ? 'background:#FF7040;color:#0a0a0c;' : 'background:#15151a;color:#8a8a94;'}`}>{t.l} ({cMap[t.k] || (t.k === 'all' ? Object.values(cMap).reduce((a:any,b:any)=>a+b,0) : 0)})</a>
+      ))}
+    </div>
+  </div>
+
+  {okMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.30);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+  {errMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errMsg}</div>}
+
+  <div style="padding:14px 16px;display:flex;flex-direction:column;gap:10px;">
+    {list.length === 0 && <p style="color:#6e6e78;font-size:13px;text-align:center;padding:40px;">No requests in this view.</p>}
+    {list.map((r: any) => (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
+          <div>
+            <p style="font-size:14px;font-weight:700;color:#fff;margin:0;">{r.user_name || r.user_email}</p>
+            <p style="font-size:11px;color:#8a8a94;margin:2px 0 0;font-family:'Geist Mono',monospace;">{r.user_email} &middot; {r.country} &middot; {r.preferred_method} {r.role_title_snapshot && '· ' + r.role_title_snapshot}</p>
+          </div>
+          <div style="text-align:right;">
+            <span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;background:rgba(255,80,0,0.15);color:#FF7040;">{r.status}</span>
+            <p style="font-size:10.5px;color:#6e6e78;margin:3px 0 0;">{fmt(r.created_at)}</p>
+          </div>
+        </div>
+        {r.applicant_notes && <p style="font-size:12px;color:#d8d8de;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 11px;margin:6px 0;white-space:pre-wrap;line-height:1.6;">{r.applicant_notes}</p>}
+        {r.admin_notes && <p style="font-size:11px;color:#fbbf24;margin:6px 0 0;">Admin note: {r.admin_notes}</p>}
+        {r.invoice_url && <p style="font-size:11px;color:#9aa6b6;margin:4px 0 0;">Invoice: <a href={r.invoice_url} target="_blank" rel="noopener" style="color:#60a5fa;text-decoration:none;font-family:'Geist Mono',monospace;word-break:break-all;">{r.invoice_url}</a></p>}
+
+        {r.status !== 'paid' && r.status !== 'rejected' && (
+          <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+            <form method="POST" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin:0;">
+              <input type="hidden" name="_action" value="mark_invoice_sent" />
+              <input type="hidden" name="id" value={r.id} />
+              <input type="url" name="invoice_url" placeholder="invoice / payment link URL" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:6px 8px;border-radius:6px;font-size:11.5px;width:280px;font-family:'Geist Mono',monospace;" />
+              <button type="submit" style="background:#15151a;border:1px solid rgba(96,165,250,0.4);color:#60a5fa;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Send invoice</button>
+            </form>
+            <form method="POST" style="margin:0;" onsubmit="return confirm('Mark this as paid? This will materialise the application and notify the applicant.');">
+              <input type="hidden" name="_action" value="mark_paid" />
+              <input type="hidden" name="id" value={r.id} />
+              <button type="submit" style="background:#10b981;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Mark paid &amp; materialise application</button>
+            </form>
+            <form method="POST" style="margin:0;" onsubmit="this.querySelector('input[name=admin_note]').value = prompt('Reason for rejection (optional, will be visible internally):') || '';">
+              <input type="hidden" name="_action" value="reject" />
+              <input type="hidden" name="id" value={r.id} />
+              <input type="hidden" name="admin_note" value="" />
+              <button type="submit" style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Reject</button>
+            </form>
+          </div>
+        )}
+      </div>
+    ))}
+  </div>
+</div>
+</AdminLayout>
