@@ -40,6 +40,7 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
   { type: 'offer_declined',     label: 'Offer declined',            desc: 'When a candidate declines their offer',        group: 'Recruitment' },
   { type: 'fee_waiver_applicant_reply', label: 'Fee waiver replies',        desc: 'When an applicant replies on a fee waiver thread', group: 'Recruitment' },
   { type: 'fee_waiver_coupon_redeemed', label: 'Fee waiver coupon redeemed', desc: 'When an applicant redeems a fee-waiver coupon to bypass payment', group: 'Recruitment' },
+  { type: 'study_abroad_request',       label: 'Study-abroad requests',       desc: 'When an applicant submits a study-abroad support request',       group: 'Recruitment' },
   { type: 'intl_payment_request',       label: 'International payment requests', desc: 'When an applicant requests an international payment path (Stripe / PayPal / wire / Wise)', group: 'Recruitment' },
   { type: 'visvambhara_applicant_reply',label: 'Visvambhara access replies', desc: 'When an applicant replies on a Visvambhara access request', group: 'Recruitment' },
   // Communication
