@@ -1,0 +1,152 @@
+---
+// /admin/study-abroad — admin queue for study-abroad requests.
+// Triage + assign to consultants + monitor.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureStudyAbroadSchema, listConsultants } from '@/lib/study-abroad';
+
+const user = Astro.locals.user!;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+await ensureStudyAbroadSchema();
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('_action') as string || '').trim();
+    const id = (fd.get('id') as string || '').trim();
+    if (action === 'assign' && id) {
+      const consultantId = (fd.get('consultant_id') as string || '').trim();
+      if (!consultantId) errMsg = 'Pick a consultant.';
+      else {
+        await db.execute(sql`UPDATE study_abroad_requests SET consultant_id = ${consultantId}, status = 'assigned', assigned_at = NOW(), assigned_by_user_id = ${user.id}, updated_at = NOW() WHERE id = ${id}`);
+        okMsg = 'Assigned.';
+      }
+    } else if (action === 'mark_in_progress' && id) {
+      await db.execute(sql`UPDATE study_abroad_requests SET status = 'in_progress', updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Marked in progress.';
+    } else if (action === 'mark_completed' && id) {
+      await db.execute(sql`UPDATE study_abroad_requests SET status = 'completed', completed_at = NOW(), updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Marked completed.';
+    } else if (action === 'cancel' && id) {
+      await db.execute(sql`UPDATE study_abroad_requests SET status = 'cancelled', updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Cancelled.';
+    }
+  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+}
+
+const url = new URL(Astro.request.url);
+const filter = url.searchParams.get('status') || 'pending';
+const list = rows(await db.execute(sql`
+  SELECT r.*, u.email AS applicant_email, u.name AS applicant_name,
+    c.display_name AS consultant_name
+  FROM study_abroad_requests r
+  JOIN users u ON u.id = r.applicant_user_id
+  LEFT JOIN study_abroad_consultants c ON c.id = r.consultant_id
+  ${filter === 'all' ? sql`` : sql`WHERE r.status = ${filter}`}
+  ORDER BY r.created_at DESC LIMIT 200
+`));
+
+const counts = rows(await db.execute(sql`SELECT status, COUNT(*)::int n FROM study_abroad_requests GROUP BY status`));
+const cMap: Record<string, number> = {}; for (const c of counts) cMap[c.status] = c.n;
+
+const consultants = await listConsultants({ activeOnly: true });
+
+function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' }) : '-'; }
+function statusColor(s: string) {
+  if (s === 'pending') return '#fbbf24';
+  if (s === 'assigned') return '#60a5fa';
+  if (s === 'in_progress') return '#a78bfa';
+  if (s === 'completed') return '#34d399';
+  return '#9aa6b6';
+}
+---
+<AdminLayout title="Study Abroad" activeNav="">
+<div style="padding-bottom:80px;">
+  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;">
+    <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Study Abroad</p>
+    <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0 0 4px;">Request queue</h1>
+    <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 10px;">Applicants submit on /portal/study-abroad/new. Triage + assign here.</p>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;">
+      {[
+        { k: 'pending', l: 'Pending', c: cMap.pending || 0 },
+        { k: 'assigned', l: 'Assigned', c: cMap.assigned || 0 },
+        { k: 'in_progress', l: 'In progress', c: cMap.in_progress || 0 },
+        { k: 'completed', l: 'Completed', c: cMap.completed || 0 },
+        { k: 'cancelled', l: 'Cancelled', c: cMap.cancelled || 0 },
+        { k: 'all', l: 'All', c: Object.values(cMap).reduce((a:any,b:any)=>a+b,0) as number },
+      ].map((t: any) => (
+        <a href={`?status=${t.k}`} style={`text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;${filter === t.k ? 'background:#FF7040;color:#0a0a0c;' : 'background:#15151a;color:#8a8a94;'}`}>{t.l} ({t.c})</a>
+      ))}
+    </div>
+  </div>
+
+  {okMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.30);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+  {errMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errMsg}</div>}
+
+  <div style="padding:14px 16px;display:flex;flex-direction:column;gap:10px;">
+    {list.length === 0 && <p style="color:#6e6e78;font-size:13px;text-align:center;padding:30px;">No requests in this view.</p>}
+    {list.map((r: any) => {
+      const sc = statusColor(r.status);
+      return (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+            <div>
+              <p style="font-size:14px;font-weight:700;color:#fff;margin:0;">{r.applicant_name || r.applicant_email}</p>
+              <p style="font-size:11px;color:#8a8a94;margin:2px 0 0;font-family:'Geist Mono',monospace;">{r.applicant_email}</p>
+              <p style="font-size:12px;color:#d8d8de;margin:6px 0 0;">{(r.countries || []).join(', ')} &middot; {r.programme_level} {r.intake_term && ' · ' + r.intake_term + ' ' + (r.intake_year || '')} {r.budget_band && ' · ' + r.budget_band}</p>
+            </div>
+            <div style="text-align:right;">
+              <span style={'font-size:10px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;background:rgba(255,255,255,0.04);color:' + sc + ';'}>{r.status.replace('_', ' ')}</span>
+              <p style="font-size:10.5px;color:#6e6e78;margin:3px 0 0;">{fmt(r.created_at)}</p>
+            </div>
+          </div>
+          {r.notes && <p style="font-size:12px;color:#d8d8de;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:9px 11px;margin:6px 0;white-space:pre-wrap;line-height:1.6;">{r.notes}</p>}
+          {r.consultant_name && <p style="font-size:11.5px;color:#a78bfa;margin:6px 0 0;">Consultant: {r.consultant_name}</p>}
+
+          {r.status === 'pending' && consultants.length > 0 && (
+            <form method="POST" style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;">
+              <input type="hidden" name="_action" value="assign" />
+              <input type="hidden" name="id" value={r.id} />
+              <select name="consultant_id" required style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:7px 10px;border-radius:6px;font-size:12px;min-width:200px;">
+                <option value="">Pick consultant...</option>
+                {consultants.map((c: any) => <option value={c.id}>{c.display_name} ({c.active_cases || 0}/{c.active_case_cap})</option>)}
+              </select>
+              <button type="submit" style="background:#3b82f6;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;">Assign</button>
+            </form>
+          )}
+          {r.status === 'assigned' && (
+            <form method="POST" style="margin-top:10px;display:inline-flex;gap:6px;">
+              <input type="hidden" name="_action" value="mark_in_progress" />
+              <input type="hidden" name="id" value={r.id} />
+              <button type="submit" style="background:#a78bfa;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;">Mark in progress</button>
+            </form>
+          )}
+          {r.status === 'in_progress' && (
+            <form method="POST" style="margin-top:10px;display:inline-flex;gap:6px;" onsubmit="return confirm('Mark this case completed?');">
+              <input type="hidden" name="_action" value="mark_completed" />
+              <input type="hidden" name="id" value={r.id} />
+              <button type="submit" style="background:#10b981;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;">Mark completed</button>
+            </form>
+          )}
+          {['pending','assigned','in_progress'].includes(r.status) && (
+            <form method="POST" style="margin-top:10px;margin-left:6px;display:inline-flex;" onsubmit="return confirm('Cancel this request?');">
+              <input type="hidden" name="_action" value="cancel" />
+              <input type="hidden" name="id" value={r.id} />
+              <button type="submit" style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:11.5px;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;">Cancel</button>
+            </form>
+          )}
+        </div>
+      );
+    })}
+  </div>
+
+  <div style="padding:14px 16px;">
+    <a href="/admin/study-abroad/consultants" style="font-size:12px;color:#FF7040;text-decoration:none;font-weight:600;">Manage consultant pool →</a>
+  </div>
+</div>
+</AdminLayout>
