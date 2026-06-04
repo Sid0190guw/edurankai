@@ -1,9 +1,13 @@
 // POST /api/mail/send - compose / reply / forward. Internal delivery + external via SMTP/Resend.
+// Supports the @group:slug token in To/Cc/Bcc — see /lib/mail-groups.ts.
+// Groups marked hidden_recipients=true ALWAYS route to BCC so members never
+// see each other's addresses.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { deliverMessage, parseAddressList, getMailboxAddress, logOutbound, getMailConfig } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
+import { expandGroupTokens } from '@/lib/mail-groups';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -19,9 +23,23 @@ export const POST: APIRoute = async ({ request, locals }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
-  const to = parseAddressList(body.to);
-  const cc = parseAddressList(body.cc);
-  const bcc = parseAddressList(body.bcc);
+  // Pull tokens BEFORE parseAddressList strips display names — so we can spot
+  // @group:slug entries that wouldn't match the email regex.
+  function splitTokens(input: any): string[] {
+    if (!input) return [];
+    const raw = Array.isArray(input) ? input.join(',') : String(input);
+    return raw.split(/[,;\n]+/).map(s => s.trim()).filter(Boolean);
+  }
+  const toTokens = splitTokens(body.to);
+  const ccTokens = splitTokens(body.cc);
+  const bccTokens = splitTokens(body.bcc);
+
+  // Expand @group:slug tokens. Hidden-recipient groups go into BCC regardless
+  // of which field the token was placed in.
+  const expanded = await expandGroupTokens({ to: toTokens, cc: ccTokens, bcc: bccTokens });
+  const to = parseAddressList(expanded.to);
+  const cc = parseAddressList(expanded.cc);
+  const bcc = parseAddressList(expanded.bcc);
   if (to.length + cc.length + bcc.length === 0) return json({ ok: false, error: 'at least one recipient required' }, 400);
 
   const subject = (body.subject || '').toString().slice(0, 500);

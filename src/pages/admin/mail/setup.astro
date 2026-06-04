@@ -1,0 +1,313 @@
+---
+// /admin/mail/setup — one-page wizard. Detects current state, walks through
+// every step to get mail working end-to-end, and tests each one in place.
+// Designed to be the *only* page you need to make mail go live today.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { getMailConfig, MAIL_DOMAIN, ensureMailSchema } from '@/lib/mail';
+import { getImapConfig } from '@/lib/mail-imap';
+import { transportStatus } from '@/lib/mail-transport';
+import { randomBytes } from 'node:crypto';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+await ensureMailSchema();
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const cfg = await getMailConfig();
+const imap = await getImapConfig();
+const transport = await transportStatus();
+
+const smtpOk = !!cfg.smtpHost && !!cfg.smtpUser && !!cfg.smtpPass;
+const imapOk = !!imap.host && !!imap.user && !!imap.pass;
+const inboundOk = !!cfg.inboundSecret;
+const cronOk = !!process.env.CRON_SECRET;
+const fromOk = !!cfg.fromAddress;
+const suggestedCronSecret = cronOk ? '' : randomBytes(24).toString('hex');
+
+// Last test send + last IMAP poll
+let lastTestSendAt: string | null = null;
+let lastImapRun = imap.lastRun;
+let recentLog: any[] = [];
+try {
+  const r = await db.execute(sql`SELECT MAX(created_at) AS at FROM email_logs WHERE status='sent'`);
+  const rs = rows(r);
+  lastTestSendAt = rs[0]?.at || null;
+} catch (_) {}
+try {
+  recentLog = rows(await db.execute(sql`SELECT to_email, status, provider, error, created_at FROM email_logs ORDER BY created_at DESC LIMIT 5`));
+} catch (_) {}
+
+const origin = new URL(Astro.request.url).origin;
+const inboundUrl = origin + '/api/mail/inbound';
+
+// Step state — each step is done/pending. Drives the visual progress.
+const steps = [
+  { key: 'smtp',     done: smtpOk,    title: 'Configure SMTP (outbound)',                go: '/admin/mail/settings#smtp' },
+  { key: 'from',     done: fromOk,    title: 'Set sender (From) address',                go: '/admin/mail/settings#smtp' },
+  { key: 'verify',   done: smtpOk && !!lastTestSendAt, title: 'Verify SMTP + send a test email', go: '#verify-section' },
+  { key: 'inbound',  done: inboundOk, title: 'Set inbound webhook secret',               go: '#inbound-section' },
+  { key: 'cron',     done: cronOk,    title: 'Set CRON_SECRET on Vercel (for IMAP cron)', go: '#cron-section' },
+  { key: 'imap',     done: imapOk,    title: 'Configure IMAP (inbound polling)',         go: '/admin/mail/settings#imap' },
+  { key: 'dns',      done: false,     title: 'Add SPF / DKIM / DMARC DNS records',       go: '#dns-section' },
+];
+const doneCount = steps.filter(s => s.done).length;
+const totalCount = steps.length;
+---
+<AdminLayout title="Mail Setup" activeNav="mail">
+<div class="admin-page" style="max-width:980px;">
+
+  <div class="admin-page-header" style="margin-bottom:18px;">
+    <div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Mail</div>
+      <h1 class="admin-page-title">Mail Setup Wizard</h1>
+      <p class="admin-page-sub">Get mail working end-to-end today. Each step has a check, a button, and a clear next action.</p>
+    </div>
+  </div>
+
+  <!-- Progress card -->
+  <div class="admin-card" style="margin-bottom:18px;background:linear-gradient(180deg,rgba(255,80,0,0.06),transparent);">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+      <div>
+        <p style="font-size:11px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;font-weight:700;">Progress</p>
+        <p style="font-size:22px;font-weight:700;color:var(--o-hi,#fff);margin:2px 0 0;">{doneCount} of {totalCount} steps complete</p>
+      </div>
+      <a href="/admin/mail/health" style="font-size:12px;color:#FF7040;text-decoration:none;font-weight:600;">Open Mail Health →</a>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+      {steps.map((s, i) => (
+        <a href={s.go} style={`flex:1;min-width:120px;text-decoration:none;background:${s.done ? 'rgba(16,185,129,0.12)' : 'rgba(255,80,0,0.06)'};border:1px solid ${s.done ? 'rgba(16,185,129,0.40)' : 'rgba(255,80,0,0.30)'};border-radius:8px;padding:9px 12px;color:inherit;`}>
+          <p style="font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.1em;color:#9aa6b6;margin:0;">STEP {i + 1}</p>
+          <p style={`font-size:12px;font-weight:600;margin:3px 0 0;color:${s.done ? '#6ee7b7' : '#fbbf24'};`}>{s.done ? '✓ ' : '○ '} {s.title}</p>
+        </a>
+      ))}
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- STEP 1 + 2: SMTP -->
+  <!-- ============================================================ -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <span style={'width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;background:' + (smtpOk ? '#10b981' : '#FF7040') + ';flex-shrink:0;'}>{smtpOk ? '✓' : '1'}</span>
+      <h2 style="font-family:Fraunces,serif;font-size:1.2rem;font-weight:600;color:var(--o-hi,#fff);margin:0;">Configure SMTP (outbound mail)</h2>
+    </div>
+    <p style="font-size:12.5px;color:var(--o-mid,#9aa6b6);margin:0 0 12px;line-height:1.6;">SMTP lets us send mail from your domain. We support GoDaddy, Microsoft 365, Gmail / Workspace, Zoho, and any standard SMTP server.</p>
+    <div style="background:var(--o-panel,#08080a);border:1px solid var(--o-stroke,#1a1a1f);border-radius:8px;padding:10px 14px;font-size:11.5px;font-family:'Geist Mono',monospace;margin-bottom:12px;">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:6px;">
+        <div>host: <strong style={'color:' + (smtpOk ? '#6ee7b7' : '#f87171') + ';'}>{cfg.smtpHost || '(empty)'}</strong></div>
+        <div>port: <strong style="color:#d8d8de;">{cfg.smtpPort}</strong></div>
+        <div>user: <strong style={'color:' + (cfg.smtpUser ? '#6ee7b7' : '#f87171') + ';'}>{cfg.smtpUser || '(empty)'}</strong></div>
+        <div>from: <strong style={'color:' + (fromOk ? '#6ee7b7' : '#f87171') + ';'}>{cfg.fromAddress || '(empty)'}</strong></div>
+      </div>
+    </div>
+    <a href="/admin/mail/settings" class="admin-btn" style="background:#FF4F00;color:#fff;border:none;padding:9px 18px;font-size:12.5px;font-weight:700;border-radius:7px;text-decoration:none;display:inline-block;">{smtpOk ? 'Edit SMTP settings' : 'Set up SMTP now →'}</a>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- STEP 3: VERIFY + TEST SEND -->
+  <!-- ============================================================ -->
+  <div class="admin-card" id="verify-section" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <span style={'width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;background:' + ((smtpOk && lastTestSendAt) ? '#10b981' : '#FF7040') + ';flex-shrink:0;'}>{(smtpOk && lastTestSendAt) ? '✓' : '2'}</span>
+      <h2 style="font-family:Fraunces,serif;font-size:1.2rem;font-weight:600;color:var(--o-hi,#fff);margin:0;">Verify + send a test email</h2>
+    </div>
+    <p style="font-size:12.5px;color:var(--o-mid,#9aa6b6);margin:0 0 12px;line-height:1.6;">Type your personal email below and we'll send a test from the saved SMTP. If it arrives (check spam too), outbound works.</p>
+    {!smtpOk && <p style="font-size:11.5px;color:#fbbf24;margin:0 0 10px;">Save SMTP settings first.</p>}
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+      <input id="testSendEmail" type="email" placeholder="you@personal.com" value={user.email || ''} style="flex:1;min-width:240px;background:var(--o-panel,#08080a);border:1px solid var(--o-stroke,#2a2a2f);color:var(--o-hi,#fff);padding:9px 12px;border-radius:7px;font-size:12.5px;font-family:'Geist Mono',monospace;" />
+      <button id="sendTestBtn" type="button" disabled={!smtpOk} style={'background:' + (smtpOk ? '#FF4F00' : '#3a3a40') + ';color:#fff;border:none;font-size:12.5px;font-weight:700;padding:9px 18px;border-radius:7px;cursor:' + (smtpOk ? 'pointer' : 'not-allowed') + ';'}>Send test email</button>
+    </div>
+    <p id="sendTestMsg" style="font-size:12px;color:var(--o-mid,#9aa6b6);margin:0;min-height:1.2em;"></p>
+    {lastTestSendAt && <p style="font-size:11px;color:#6e6e78;margin:6px 0 0;font-family:'Geist Mono',monospace;">Last successful send: {new Date(lastTestSendAt).toLocaleString('en-IN')}</p>}
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- STEP 4: INBOUND SECRET -->
+  <!-- ============================================================ -->
+  <div class="admin-card" id="inbound-section" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <span style={'width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;background:' + (inboundOk ? '#10b981' : '#FF7040') + ';flex-shrink:0;'}>{inboundOk ? '✓' : '3'}</span>
+      <h2 style="font-family:Fraunces,serif;font-size:1.2rem;font-weight:600;color:var(--o-hi,#fff);margin:0;">Inbound webhook secret</h2>
+    </div>
+    <p style="font-size:12.5px;color:var(--o-mid,#9aa6b6);margin:0 0 10px;line-height:1.6;">Used by a Cloudflare Email Worker (or your MTA) to push raw MIME directly to <code style="font-family:'Geist Mono',monospace;background:var(--o-panel,#08080a);padding:1px 6px;border-radius:4px;color:#FF7040;">{inboundUrl}</code> with header <code style="font-family:'Geist Mono',monospace;background:var(--o-panel,#08080a);padding:1px 6px;border-radius:4px;color:#FF7040;">x-mail-secret</code>. If you only use IMAP polling, you can skip this step.</p>
+    {inboundOk ? (
+      <p style="font-size:11.5px;color:#6ee7b7;margin:0;">✓ Secret is set. Auto-generated on first SMTP save.</p>
+    ) : (
+      <a href="/admin/mail/settings" style="font-size:12.5px;color:#FF7040;text-decoration:none;font-weight:600;">Generate secret on settings page →</a>
+    )}
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- STEP 5: CRON_SECRET -->
+  <!-- ============================================================ -->
+  <div class="admin-card" id="cron-section" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <span style={'width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;background:' + (cronOk ? '#10b981' : '#FF7040') + ';flex-shrink:0;'}>{cronOk ? '✓' : '4'}</span>
+      <h2 style="font-family:Fraunces,serif;font-size:1.2rem;font-weight:600;color:var(--o-hi,#fff);margin:0;">Set CRON_SECRET on Vercel</h2>
+    </div>
+    <p style="font-size:12.5px;color:var(--o-mid,#9aa6b6);margin:0 0 10px;line-height:1.6;">Required for the IMAP poll cron (every 10 min). Without it the cron gets 401 and inbound mail never arrives.</p>
+    {cronOk ? (
+      <p style="font-size:11.5px;color:#6ee7b7;margin:0;">✓ CRON_SECRET is set on this deployment.</p>
+    ) : (
+      <>
+        <p style="font-size:11.5px;color:#fbbf24;margin:0 0 8px;">Paste this in Vercel → Project → Settings → Environment Variables as <strong>CRON_SECRET</strong> (Production, Preview, Development):</p>
+        <code id="cronVal" style="display:block;font-family:'Geist Mono',monospace;background:var(--o-panel,#08080a);border:1px solid var(--o-stroke,#2a2a2f);color:#FF7040;padding:9px 12px;border-radius:7px;font-size:11.5px;word-break:break-all;letter-spacing:0.04em;">{suggestedCronSecret}</code>
+        <button type="button" id="copyCronBtn" style="margin-top:8px;background:#FF4F00;color:#fff;border:none;font-size:11.5px;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;">Copy value</button>
+        <p style="font-size:11px;color:var(--o-mid,#9aa6b6);margin:8px 0 0;">After pasting, click <strong>Redeploy</strong> in Vercel — env var changes only apply to new deploys.</p>
+      </>
+    )}
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- STEP 6: IMAP -->
+  <!-- ============================================================ -->
+  <div class="admin-card" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <span style={'width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;background:' + (imapOk ? '#10b981' : '#FF7040') + ';flex-shrink:0;'}>{imapOk ? '✓' : '5'}</span>
+      <h2 style="font-family:Fraunces,serif;font-size:1.2rem;font-weight:600;color:var(--o-hi,#fff);margin:0;">Configure IMAP (inbound polling)</h2>
+    </div>
+    <p style="font-size:12.5px;color:var(--o-mid,#9aa6b6);margin:0 0 10px;line-height:1.6;">IMAP polls your mailbox every 10 minutes and ingests new mail into the platform. Configure in Mail Settings → IMAP section.</p>
+    <div style="background:var(--o-panel,#08080a);border:1px solid var(--o-stroke,#1a1a1f);border-radius:8px;padding:10px 14px;font-size:11.5px;font-family:'Geist Mono',monospace;margin-bottom:12px;">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:6px;">
+        <div>host: <strong style={'color:' + (imap.host ? '#6ee7b7' : '#f87171') + ';'}>{imap.host || '(empty)'}</strong></div>
+        <div>port: <strong style="color:#d8d8de;">{imap.port}</strong></div>
+        <div>user: <strong style={'color:' + (imap.user ? '#6ee7b7' : '#f87171') + ';'}>{imap.user || '(empty)'}</strong></div>
+        <div>last poll: <strong style="color:#d8d8de;">{lastImapRun ? new Date(lastImapRun).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : 'never'}</strong></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <a href="/admin/mail/settings#imap" class="admin-btn" style="background:#FF4F00;color:#fff;border:none;padding:9px 18px;font-size:12.5px;font-weight:700;border-radius:7px;text-decoration:none;display:inline-block;">{imapOk ? 'Edit IMAP settings' : 'Set up IMAP now →'}</a>
+      <button type="button" id="pollNowBtn" style={'background:#15151a;border:1px solid #2a2a2f;color:#9aa6b6;font-size:12px;font-weight:600;padding:7px 14px;border-radius:7px;cursor:pointer;'} disabled={!imapOk}>Poll IMAP now</button>
+      <span id="pollNowMsg" style="font-size:11.5px;color:var(--o-mid,#9aa6b6);align-self:center;"></span>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- STEP 7: DNS -->
+  <!-- ============================================================ -->
+  <div class="admin-card" id="dns-section" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <span style="width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;background:#FF7040;flex-shrink:0;">6</span>
+      <h2 style="font-family:Fraunces,serif;font-size:1.2rem;font-weight:600;color:var(--o-hi,#fff);margin:0;">Add deliverability DNS records</h2>
+    </div>
+    <p style="font-size:12.5px;color:var(--o-mid,#9aa6b6);margin:0 0 10px;line-height:1.6;">Without SPF / DKIM / DMARC, Gmail and Outlook will quarantine your outbound mail. Add these TXT records at your DNS host (GoDaddy DNS, Cloudflare, etc.) for <strong style="color:#FF7040;">{MAIL_DOMAIN}</strong>:</p>
+    <div style="background:var(--o-panel,#08080a);border:1px solid var(--o-stroke,#1a1a1f);border-radius:8px;padding:12px 14px;font-size:11.5px;font-family:'Geist Mono',monospace;color:#d8d8de;margin-bottom:10px;line-height:1.7;">
+      <p style="margin:0 0 8px;color:#FF7040;font-weight:700;">SPF (TXT @)</p>
+      <p style="margin:0 0 12px;">v=spf1 include:secureserver.net include:_spf.mx.cloudflare.net ~all</p>
+      <p style="margin:0 0 8px;color:#FF7040;font-weight:700;">DMARC (TXT _dmarc)</p>
+      <p style="margin:0 0 12px;">v=DMARC1; p=quarantine; rua=mailto:dmarc@{MAIL_DOMAIN}; pct=100; adkim=s; aspf=s</p>
+      <p style="margin:0 0 8px;color:#FF7040;font-weight:700;">DKIM</p>
+      <p style="margin:0;">Get the DKIM selector + public key from your SMTP provider's dashboard (GoDaddy: cPanel → Email Deliverability; Microsoft 365: Defender → Email auth → DKIM; Google Workspace: Apps → Gmail → Authenticate email). Add as <strong>TXT</strong> at <strong>&lt;selector&gt;._domainkey.{MAIL_DOMAIN}</strong>.</p>
+    </div>
+    <button type="button" id="dnsCheckBtn" style="background:#15151a;border:1px solid #2a2a2f;color:#9aa6b6;font-size:12px;font-weight:600;padding:7px 14px;border-radius:7px;cursor:pointer;">Check DNS now</button>
+    <div id="dnsCheckResult" style="font-family:'Geist Mono',monospace;font-size:11.5px;color:#9aa6b6;background:var(--o-panel,#08080a);border:1px solid var(--o-stroke,#1a1a1f);border-radius:7px;padding:0;margin-top:10px;min-height:0;"></div>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- RECENT ACTIVITY -->
+  <!-- ============================================================ -->
+  {recentLog.length > 0 && (
+    <div class="admin-card">
+      <h2 style="font-family:Fraunces,serif;font-size:1.1rem;font-weight:600;color:var(--o-hi,#fff);margin:0 0 10px;">Recent mail activity</h2>
+      <div style="display:flex;flex-direction:column;gap:5px;font-family:'Geist Mono',monospace;font-size:11px;">
+        {recentLog.map((r: any) => (
+          <div style={`background:var(--o-panel,#08080a);border:1px solid ${r.status === 'sent' ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)'};border-radius:6px;padding:7px 10px;`}>
+            <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+              <span style={`color:${r.status === 'sent' ? '#6ee7b7' : '#fca5a5'};font-weight:700;`}>{r.status} · {r.provider}</span>
+              <span style="color:#6e6e78;">{new Date(r.created_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
+            </div>
+            <p style="color:#d8d8de;margin:3px 0 0;">→ {r.to_email}</p>
+            {r.error && <p style="color:#fca5a5;margin:2px 0 0;font-size:10.5px;">{r.error}</p>}
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+</div>
+
+<script is:inline>
+  // ---- Copy CRON_SECRET ----
+  document.getElementById('copyCronBtn')?.addEventListener('click', function () {
+    var el = document.getElementById('cronVal'); if (!el) return;
+    navigator.clipboard.writeText((el.textContent || '').trim()).then(function () {
+      this.textContent = 'Copied';
+      setTimeout(function () { var b = document.getElementById('copyCronBtn'); if (b) b.textContent = 'Copy value'; }, 1500);
+    }.bind(this));
+  });
+
+  // ---- Send test ----
+  document.getElementById('sendTestBtn')?.addEventListener('click', function () {
+    var btn = this; var input = document.getElementById('testSendEmail'); var msg = document.getElementById('sendTestMsg');
+    var to = (input && input.value || '').trim();
+    if (!to) { msg.textContent = 'Enter an email address first.'; msg.style.color = '#fbbf24'; return; }
+    var prev = btn.textContent; btn.disabled = true; btn.textContent = 'Sending...';
+    msg.textContent = ''; msg.style.color = '';
+    fetch('/api/mail/test', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: to }) })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        btn.disabled = false; btn.textContent = prev;
+        if (d.ok) {
+          msg.textContent = '✓ Sent. ' + (d.details || ('Check ' + to + ' (including spam folder).'));
+          msg.style.color = '#6ee7b7';
+        } else {
+          msg.textContent = '✗ ' + (d.error || 'Send failed.') + (d.hint ? ' Hint: ' + d.hint : '');
+          msg.style.color = '#fca5a5';
+        }
+      })
+      .catch(function () { btn.disabled = false; btn.textContent = prev; msg.textContent = 'Network error.'; msg.style.color = '#fca5a5'; });
+  });
+
+  // ---- Poll IMAP now ----
+  document.getElementById('pollNowBtn')?.addEventListener('click', function () {
+    var btn = this; var msg = document.getElementById('pollNowMsg');
+    var prev = btn.textContent; btn.disabled = true; btn.textContent = 'Polling...';
+    fetch('/api/mail/imap-poll', { method: 'POST', credentials: 'same-origin' })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        btn.disabled = false; btn.textContent = prev;
+        if (d.ok) {
+          msg.textContent = '✓ ' + (d.detail || ('fetched ' + d.fetched + ', delivered ' + d.delivered));
+          msg.style.color = '#6ee7b7';
+        } else {
+          msg.textContent = '✗ ' + (d.error || 'Poll failed.');
+          msg.style.color = '#fca5a5';
+        }
+      })
+      .catch(function () { btn.disabled = false; btn.textContent = prev; msg.textContent = 'Network error.'; msg.style.color = '#fca5a5'; });
+  });
+
+  // ---- DNS check ----
+  document.getElementById('dnsCheckBtn')?.addEventListener('click', function () {
+    var btn = this; var box = document.getElementById('dnsCheckResult');
+    var prev = btn.textContent; btn.disabled = true; btn.textContent = 'Checking...';
+    box.innerHTML = '<div style="padding:10px 12px;color:#9aa6b6;">Looking up SPF / DKIM / DMARC / MX...</div>';
+    fetch('/api/mail/dns-check', { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
+      btn.disabled = false; btn.textContent = prev;
+      if (!d.ok) { box.innerHTML = '<div style="padding:10px 12px;color:#fca5a5;">' + (d.error || 'lookup failed') + '</div>'; return; }
+      function line(label, ok, detail, note) {
+        var c = ok ? '#6ee7b7' : '#fca5a5'; var icon = ok ? '✓' : '✗';
+        return '<div style="padding:8px 12px;border-bottom:1px solid #1a1a1f;"><strong style="color:' + c + ';">' + icon + ' ' + label + '</strong> <span style="color:#d8d8de;">' + (detail || '') + '</span>' + (note ? '<div style="color:#fbbf24;margin-top:3px;font-size:10.5px;">' + note + '</div>' : '') + '</div>';
+      }
+      var html = '';
+      html += line('SPF', d.spf.present, d.spf.record || 'no v=spf1 record found', d.spf.note);
+      html += line('DMARC', d.dmarc.present, d.dmarc.record || 'no v=DMARC1 record found', d.dmarc.policy ? 'policy=' + d.dmarc.policy : null);
+      if (d.dkim.present) {
+        html += '<div style="padding:8px 12px;border-bottom:1px solid #1a1a1f;"><strong style="color:#6ee7b7;">✓ DKIM</strong> <span style="color:#d8d8de;">selectors found: ' + d.dkim.selectors.map(function (s) { return s.selector; }).join(', ') + '</span></div>';
+      } else {
+        html += line('DKIM', false, 'no DKIM record at common selectors', 'Get your selector + public key from your SMTP provider dashboard.');
+      }
+      if (d.mx && d.mx.length) {
+        html += '<div style="padding:8px 12px;"><strong style="color:#6ee7b7;">✓ MX</strong> <span style="color:#d8d8de;">' + d.mx.map(function (m) { return m.priority + ' ' + m.host; }).join(', ') + '</span></div>';
+      } else {
+        html += line('MX', false, 'no MX records found', 'Inbound mail has nowhere to land.');
+      }
+      box.innerHTML = html;
+    }).catch(function () {
+      btn.disabled = false; btn.textContent = prev;
+      box.innerHTML = '<div style="padding:10px 12px;color:#fca5a5;">network error</div>';
+    });
+  });
+</script>
+</AdminLayout>
