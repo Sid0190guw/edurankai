@@ -31,19 +31,58 @@ jobs:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           SITE_ORIGIN: ${{ secrets.SITE_ORIGIN }}
         run: |
-          if [ -z "$CRON_SECRET" ] || [ -z "$SITE_ORIGIN" ]; then
-            echo "::error::CRON_SECRET and SITE_ORIGIN secrets must be set in repository settings."
+          # Sanity check the secrets are even present.
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::Repository secret CRON_SECRET is not set. Add it at: Settings → Secrets and variables → Actions → New repository secret."
             exit 1
           fi
+          if [ -z "$SITE_ORIGIN" ]; then
+            echo "::error::Repository secret SITE_ORIGIN is not set. Should be https://edurankai.in"
+            exit 1
+          fi
+
+          echo "Polling $SITE_ORIGIN/api/mail/imap-poll ..."
+
+          # 120s timeout is generous; the endpoint itself caps at 90s.
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X GET "${SITE_ORIGIN}/api/mail/imap-poll" \
             -H "Authorization: Bearer ${CRON_SECRET}" \
-            --max-time 90)
+            --max-time 120 || echo $'\nCURL_FAILED')
+
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | head -n -1)
-          echo "HTTP $HTTP_CODE"
-          echo "$BODY"
-          if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "::error::IMAP poll returned non-200 status"
+          echo "HTTP_CODE=$HTTP_CODE"
+          echo "BODY=$BODY"
+
+          # Auth misconfig — fail loudly so the user knows to fix CRON_SECRET.
+          if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+            echo "::error::Auth rejected. The CRON_SECRET in this repo doesn't match the CRON_SECRET on Vercel. Regenerate one, set the SAME value in both Vercel env vars and this repo's Actions secret, then redeploy Vercel."
             exit 1
           fi
+
+          # Transient errors (502 cold-start, 504 timeout, 503, network drop)
+          # — log a warning but don't fail. The next 10-min run will pick up
+          # whatever this run missed; IMAP polling is idempotent.
+          if [ "$HTTP_CODE" = "CURL_FAILED" ] || [ "$HTTP_CODE" = "000" ]; then
+            echo "::warning::curl could not reach the endpoint (network / DNS / connection). Will retry on the next schedule."
+            exit 0
+          fi
+          if [ "$HTTP_CODE" -ge 500 ] 2>/dev/null; then
+            echo "::warning::Server returned $HTTP_CODE. This is usually a Vercel cold-start or transient deploy issue. Next run will retry."
+            exit 0
+          fi
+          if [ "$HTTP_CODE" -ne 200 ] 2>/dev/null; then
+            echo "::warning::Unexpected status $HTTP_CODE. Body above. Not failing the workflow."
+            exit 0
+          fi
+
+          # HTTP 200 — check whether the IMAP poll itself succeeded inside.
+          # The endpoint always returns 200 (we made it crash-safe) but the
+          # JSON body says ok:false when credentials are bad / IMAP not
+          # configured / mail-config table missing values.
+          if echo "$BODY" | grep -q '"ok":false'; then
+            echo "::warning::IMAP poll reported a soft failure. Body above. This is NOT a workflow failure — fix the IMAP credentials at /admin/mail/setup if it persists."
+            exit 0
+          fi
+
+          echo "Success."
