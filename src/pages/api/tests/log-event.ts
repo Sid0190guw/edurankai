@@ -61,6 +61,14 @@ const ALLOWED_TYPES = new Set([
   'phone_like_object_detected',
   'unusual_typing_pattern',
   'paste_after_blur',
+  // Per-click + per-action tracking (every click, nav, answer change persisted as text)
+  'question_navigated', 'question_answered', 'answer_changed', 'answer_cleared',
+  'click', 'click_outside_question', 'rapid_clicks',
+  'key_press_burst', 'long_idle_then_answer',
+  'option_select', 'option_deselect',
+  'mouse_pattern_unusual', 'scroll_burst',
+  'submit_clicked', 'submit_blocked',
+  'flag_review_toggle', 'review_panel_opened',
 ]);
 
 const SEVERITIES = new Set(['info', 'warn', 'flag']);

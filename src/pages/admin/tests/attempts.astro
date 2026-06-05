@@ -2,6 +2,7 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { computeIntegrityScore, RISK_BAND_COLORS, EVENT_SEVERITY } from '@/lib/proctoring-integrity';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -34,8 +35,47 @@ try {
   attempts = Array.isArray(r) ? r : (r?.rows || []);
 } catch (_) {}
 
+// Fetch event TYPES per attempt in one shot, then compute the real integrity
+// score per row using the severity-weighted lib. The old "clean if no
+// warn/flag" logic was misleading — an attempt with zero events is suspicious
+// (no proctoring data at all), not clean.
+const attemptIds = attempts.map((a: any) => a.id).filter(Boolean);
+const eventsByAttempt: Record<string, { type: string }[]> = {};
+if (attemptIds.length > 0) {
+  try {
+    const ev = await db.execute(sql`
+      SELECT attempt_id, event_type FROM test_attempt_events
+      WHERE attempt_id = ANY(${attemptIds}::uuid[])
+      LIMIT 50000
+    `);
+    const evRows = Array.isArray(ev) ? ev : ((ev as any)?.rows || []);
+    for (const e of evRows) {
+      const aid = String(e.attempt_id);
+      if (!eventsByAttempt[aid]) eventsByAttempt[aid] = [];
+      eventsByAttempt[aid].push({ type: e.event_type });
+    }
+  } catch (_) {}
+}
+
+for (const a of attempts) {
+  const evs = eventsByAttempt[a.id] || [];
+  if (evs.length === 0) {
+    // Zero events = no proctoring data captured at all. NOT clean — unknown.
+    a.integrity_score = null;
+    a.risk_band = 'unknown';
+    a.critical_count = 0;
+  } else {
+    const r = computeIntegrityScore(evs);
+    a.integrity_score = r.score;
+    a.risk_band = r.riskBand;
+    a.critical_count = r.bySeverity.critical;
+    a.high_count = r.bySeverity.high;
+  }
+}
+
 if (flagFilter === '1') {
-  attempts = attempts.filter((a: any) => (a.flag_count || 0) > 0);
+  // Real flagged filter: critical / high band OR has critical/high severity events
+  attempts = attempts.filter((a: any) => a.risk_band === 'critical' || a.risk_band === 'high' || a.critical_count > 0);
 }
 
 function ago(d: any) {
@@ -94,11 +134,11 @@ function fmtDur(s: number) {
             <p style="font-size:11px;margin:0;">{a.status}</p>
             <p style="font-size:11px;color:#a0a0ab;margin:0;font-family:'Geist Mono',monospace;">{fmtDur(a.duration_seconds)}</p>
             <p style="font-size:11.5px;margin:0;">
-              {(a.flag_count || 0) > 0
-                ? <span style="background:rgba(239,68,68,0.18);color:#fca5a5;padding:2px 8px;border-radius:100px;font-weight:700;">{a.flag_count} flags</span>
-                : <span style="color:#10b981;font-weight:600;">clean</span>}
+              {a.risk_band === 'unknown'
+                ? <span style="background:rgba(110,110,120,0.18);color:#a0a0ab;padding:2px 8px;border-radius:100px;font-weight:700;font-size:10.5px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;">no data</span>
+                : <span style={`background:${RISK_BAND_COLORS[a.risk_band].bg};color:${RISK_BAND_COLORS[a.risk_band].fg};border:1px solid ${RISK_BAND_COLORS[a.risk_band].border};padding:2px 8px;border-radius:100px;font-weight:700;font-size:10.5px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;`}>{a.integrity_score}/100 · {RISK_BAND_COLORS[a.risk_band].label}</span>}
             </p>
-            <p style="font-size:11px;color:#8a8a94;font-family:'Geist Mono',monospace;margin:0;">{a.event_count || 0}</p>
+            <p style="font-size:11px;color:#8a8a94;font-family:'Geist Mono',monospace;margin:0;">{a.event_count || 0}{a.critical_count ? <span style="color:#fca5a5;font-weight:700;"> ({a.critical_count}!)</span> : ''}</p>
             <p style="font-size:11px;color:#FF7040;font-weight:600;margin:0;">View &rarr;</p>
           </a>
         ))}
