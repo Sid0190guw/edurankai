@@ -2164,30 +2164,95 @@ const theme = CAT_THEMES[test.test_type] || CAT_THEMES.mixed;
           var ctx = new AudioCtx();
           var src = ctx.createMediaStreamSource(stream);
           var analyser = ctx.createAnalyser();
-          analyser.fftSize = 1024;
+          analyser.fftSize = 2048;
+          analyser.smoothingTimeConstant = 0.6;
           src.connect(analyser);
-          var buf = new Uint8Array(analyser.fftSize);
-          var voiceSince = 0;
+          var timeBuf = new Uint8Array(analyser.fftSize);
+          var freqBuf = new Uint8Array(analyser.frequencyBinCount);
+          var sampleRate = ctx.sampleRate || 48000;
+          var binHz = sampleRate / analyser.fftSize;
+          // Human speech: fundamental 85–300 Hz; first/second formants 300–3400 Hz.
+          // We measure energy across full band vs the speech band — a true voice
+          // has >55% of its energy in the speech band. Broadband noise (fan,
+          // AC, keyboard) is roughly flat-spectrum so its speech-band ratio is
+          // closer to (3400 - 85) / (sampleRate / 2) ≈ 14% — well under 55%.
+          var SPEECH_LO_BIN = Math.floor(85 / binHz);
+          var SPEECH_HI_BIN = Math.min(freqBuf.length, Math.ceil(3400 / binHz));
+
+          // Baseline calibration: sample ambient for 3 seconds, then set
+          // threshold = baseline + 14 dB. This adapts per environment so a
+          // quiet study room and a noisy office both flag only real speech.
+          var calibration = { samples: [], done: false, startAt: Date.now(), baselineDb: -60 };
+
+          var voiceSince = 0, silenceSince = 0;
           var voicing = false;
+          var lastVoiceLogAt = 0;
+
           setInterval(function() {
             if (submitted) return;
-            analyser.getByteTimeDomainData(buf);
-            // RMS of zero-centred audio
+            analyser.getByteTimeDomainData(timeBuf);
+            analyser.getByteFrequencyData(freqBuf);
+
+            // Overall energy (RMS dB)
             var sum = 0;
-            for (var i = 0; i < buf.length; i++) { var v = (buf[i] - 128) / 128; sum += v * v; }
-            var rms = Math.sqrt(sum / buf.length);
+            for (var i = 0; i < timeBuf.length; i++) {
+              var v = (timeBuf[i] - 128) / 128;
+              sum += v * v;
+            }
+            var rms = Math.sqrt(sum / timeBuf.length);
             var db = 20 * Math.log10(rms || 0.00001);
-            var loud = db > -45;
-            if (loud) {
+
+            // Speech-band ratio
+            var bandSum = 0, totalSum = 0;
+            for (var j = 0; j < freqBuf.length; j++) {
+              totalSum += freqBuf[j];
+              if (j >= SPEECH_LO_BIN && j <= SPEECH_HI_BIN) bandSum += freqBuf[j];
+            }
+            var speechRatio = totalSum > 0 ? bandSum / totalSum : 0;
+
+            // Calibration phase
+            if (!calibration.done) {
+              calibration.samples.push(db);
+              if (Date.now() - calibration.startAt > 3000) {
+                calibration.samples.sort(function(a,b){ return a-b; });
+                // Use 75th percentile as baseline — robust to a stray cough during calibration
+                var idx = Math.floor(calibration.samples.length * 0.75);
+                calibration.baselineDb = calibration.samples[idx] || -60;
+                calibration.done = true;
+              }
+              return;
+            }
+
+            // Decision: speech if energy is > baseline + 14 dB AND > 55% concentrated in speech band
+            var threshold = calibration.baselineDb + 14;
+            var loud = db > threshold;
+            var voiceLike = loud && speechRatio > 0.55;
+
+            if (voiceLike) {
+              silenceSince = 0;
               if (!voiceSince) voiceSince = Date.now();
-              else if (!voicing && Date.now() - voiceSince > 1000) {
+              // Need 1.5s of sustained voice-like signal to log — prevents
+              // single cough / door slam from triggering.
+              if (!voicing && Date.now() - voiceSince > 1500) {
                 voicing = true;
-                logEvent('voice_detected', 'warn', { db: Math.round(db) });
-                showToast('Talking detected', 'warn');
+                // Throttle: don't log voice_detected more than once per 15s
+                if (Date.now() - lastVoiceLogAt > 15000) {
+                  logEvent('voice_detected', 'warn', { db: Math.round(db), baseline_db: Math.round(calibration.baselineDb), speech_ratio: Math.round(speechRatio*100) });
+                  lastVoiceLogAt = Date.now();
+                }
+                // Update right-rail signal but no toast — toasts were noisy
               }
             } else {
-              if (voicing) { logEvent('voice_silenced', 'info', {}); voicing = false; }
               voiceSince = 0;
+              if (voicing) {
+                if (!silenceSince) silenceSince = Date.now();
+                else if (Date.now() - silenceSince > 1500) {
+                  // 1.5s of sustained silence before declaring end-of-voice
+                  voicing = false;
+                  silenceSince = 0;
+                  logEvent('voice_silenced', 'info', {});
+                }
+              }
             }
           }, 250);
         } catch (e) {
