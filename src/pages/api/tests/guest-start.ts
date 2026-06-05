@@ -31,10 +31,12 @@ export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
   if (!ph.valid) return json({ ok: false, error: ph.reason || 'Enter a valid phone number.' }, 400);
 
   try {
-    const test = rows(await db.execute(sql`SELECT id, slug, title, is_premium, price_inr_paise, currency FROM tests WHERE slug = ${testSlug} AND is_published = true LIMIT 1`))[0] as any;
+    const test = rows(await db.execute(sql`SELECT id, slug, title, is_premium, price_inr_paise, price_chf, currency FROM tests WHERE slug = ${testSlug} AND is_published = true LIMIT 1`))[0] as any;
     if (!test) return json({ ok: false, error: 'Test not found' }, 404);
 
-    const treatAsFree = !test.is_premium || (test.price_inr_paise || 0) < 100;
+    const priceChf = Number(test.price_chf || 0);
+    const treatAsFree = !test.is_premium
+      || (priceChf <= 0 && (test.price_inr_paise || 0) < 100);
     const runUrl = '/aquintutor/test/' + test.slug + '/run';
 
     if (treatAsFree) {
@@ -50,9 +52,14 @@ export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
 
     // Premium: guest pays via Razorpay, then guest-confirm finalises.
     if (!isConfigured()) return json({ ok: false, error: 'Payments not configured. Please sign in to pay, or contact us.' }, 503);
-    const displayCurrency = (test.currency || 'INR').toUpperCase();
-    const displayAmountMinor = Math.max(1, parseInt(test.price_inr_paise || 100));
-    const fx = await convertToInrPaise(displayCurrency, displayAmountMinor);
+    // Prefer price_chf as canonical (legacy price_inr_paise was charging 1 INR
+    // for 1 CHF tests — ~99% revenue loss). Fall back only when price_chf=0.
+    let fx;
+    if (priceChf > 0) {
+      fx = await convertToInrPaise('CHF', Math.round(priceChf * 100));
+    } else {
+      fx = await convertToInrPaise('INR', Math.max(1, parseInt(test.price_inr_paise || 100)));
+    }
     const receipt = 'gqt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
     const result = await createOrder({
       amountPaise: fx.paise, currency: 'INR', receipt,

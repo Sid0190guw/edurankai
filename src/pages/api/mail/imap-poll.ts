@@ -20,12 +20,33 @@ function cronAuthorized(request: Request): boolean {
   return x === secret;
 }
 
+// Wrap pollImapInbox so it can NEVER crash the cron / external scheduler.
+// Bad credentials, network drops, malformed messages, imapflow library
+// throws — all caught here and returned as a 200 with structured error info.
+// This stops GitHub Actions / Vercel cron from retrying-and-crashing-and-
+// retrying in a loop.
+async function safePollWithTimeout(limit: number) {
+  const timeoutMs = 90_000; // 90s — longer than any real IMAP fetch
+  let timer: any = null;
+  const timeoutPromise = new Promise<{ ok: false; fetched: 0; delivered: 0; error: string }>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, fetched: 0, delivered: 0, error: 'IMAP poll timed out after 90s' }), timeoutMs);
+  });
+  try {
+    const result = await Promise.race([pollImapInbox({ limit }), timeoutPromise]);
+    if (timer) clearTimeout(timer);
+    return result;
+  } catch (e: any) {
+    if (timer) clearTimeout(timer);
+    return { ok: false, fetched: 0, delivered: 0, error: 'IMAP poll threw: ' + (e?.message || 'unknown error') };
+  }
+}
+
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any).user;
   const isAdmin = user && user.role !== 'applicant';
   if (!isAdmin && !cronAuthorized(request)) return json({ ok: false, error: 'unauthorized' }, 401);
 
-  const result = await pollImapInbox({ limit: 100 });
+  const result = await safePollWithTimeout(100);
   return json(result);
 };
 
@@ -34,6 +55,6 @@ export const GET: APIRoute = async ({ request, locals }) => {
   const user = (locals as any).user;
   const isAdmin = user && user.role !== 'applicant';
   if (!isAdmin && !cronAuthorized(request)) return json({ ok: false, error: 'unauthorized' }, 401);
-  const result = await pollImapInbox({ limit: 100 });
+  const result = await safePollWithTimeout(100);
   return json(result);
 };

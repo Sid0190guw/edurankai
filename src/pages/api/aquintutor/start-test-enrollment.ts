@@ -25,14 +25,18 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   try {
     const t = await db.execute(sql`
-      SELECT id, slug, title, is_premium, price_inr_paise, currency
+      SELECT id, slug, title, is_premium, price_inr_paise, price_chf, currency
       FROM tests WHERE slug = ${testSlug} AND is_published = true LIMIT 1
     `);
     const tRows = Array.isArray(t) ? t : (t?.rows || []);
     if (tRows.length === 0) return json({ ok: false, error: 'Test not found' }, 404);
     const test = tRows[0] as any;
 
-    const treatAsFree = !test.is_premium || (test.price_inr_paise || 0) < 100;
+    // Free criteria — any one of these is enough:
+    //   is_premium=false, price_chf=0, or price_inr_paise<100 (legacy)
+    const priceChf = Number(test.price_chf || 0);
+    const treatAsFree = !test.is_premium
+      || priceChf <= 0 && (test.price_inr_paise || 0) < 100;
     const runUrl = '/aquintutor/test/' + test.slug + '/run';
 
     if (treatAsFree) {
@@ -62,12 +66,21 @@ export const POST: APIRoute = async ({ request, locals }) => {
       return json({ ok: false, error: 'Payments not yet configured. Contact hr@edurankai.in to enrol.' }, 503);
     }
 
-    // Display currency may be CHF / USD / EUR etc; Razorpay India settles in
-    // INR, so we convert at the live ECB rate (frankfurter.app), cached 1h.
-    const displayCurrency = (test.currency || 'INR').toUpperCase();
-    const displayAmountMinor = Math.max(1, parseInt(test.price_inr_paise || 100));
-    const fx = await convertToInrPaise(displayCurrency, displayAmountMinor);
-    const amountPaise = fx.paise;
+    // CRITICAL: price_chf is the canonical price (set by every test seed at
+    // 1 CHF). The legacy price_inr_paise=100 column was being used as a
+    // standalone INR amount, which was charging 1 INR for a test that should
+    // cost ~108 INR (1 CHF) — losing ~99% of revenue. We now prefer price_chf
+    // and only fall back to price_inr_paise if price_chf is 0.
+    let amountPaise: number;
+    let displayCurrency = 'INR';
+    if (priceChf > 0) {
+      // 1 CHF = 100 centimes — convertToInrPaise expects MINOR units
+      const fx = await convertToInrPaise('CHF', Math.round(priceChf * 100));
+      amountPaise = fx.paise;
+      displayCurrency = 'CHF';
+    } else {
+      amountPaise = Math.max(1, parseInt(test.price_inr_paise || 100));
+    }
     const receipt = 'qt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 
     const result = await createOrder({
