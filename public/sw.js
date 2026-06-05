@@ -1,7 +1,9 @@
 // EduRankAI service worker
 // Cache name bumped on each material change so devices pick up the new SW
 // (browsers consider the SW updated if the file bytes differ).
-const CACHE = 'edurankai-v3';
+// v4: forced invalidation to clear black-screen state caused by a stale
+// pre-Astro-build worker that was still installed on some devices.
+const CACHE = 'edurankai-v4';
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
