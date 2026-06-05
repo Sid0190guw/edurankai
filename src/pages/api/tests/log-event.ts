@@ -96,24 +96,50 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
       return json({ ok: true, inserted: 0, note: 'attempt closed' });
     }
 
+    // Ensure schema exists (first-call bootstrap) so older deployments without
+    // a prior migration don't silently drop every event.
+    try {
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS test_attempt_events (
+        id BIGSERIAL PRIMARY KEY,
+        attempt_id UUID NOT NULL,
+        event_type VARCHAR(60) NOT NULL,
+        severity VARCHAR(16) NOT NULL DEFAULT 'info',
+        detail JSONB,
+        client_ts TIMESTAMPTZ,
+        ip_address VARCHAR(64),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS tae_attempt_idx ON test_attempt_events(attempt_id, created_at DESC)`);
+    } catch (_) {}
+
     let inserted = 0;
+    let skipped = 0;
+    let failed = 0;
+    const errors: string[] = [];
     let tabSwitchInc = 0;
     let fullscreenExitInc = 0;
     const flagSummary: any[] = [];
 
     for (const ev of events) {
       const type = (ev?.type || '').toString();
-      if (!ALLOWED_TYPES.has(type)) continue;
+      if (!ALLOWED_TYPES.has(type)) { skipped++; continue; }
       const severity = SEVERITIES.has(ev?.severity) ? ev.severity : 'info';
       const detail = ev?.detail || {};
       const clientTs = ev?.clientTs ? new Date(ev.clientTs) : null;
+      const detailJson = (() => { try { return JSON.stringify(detail); } catch { return '{}'; } })();
 
-      await db.execute(sql`
-        INSERT INTO test_attempt_events (attempt_id, event_type, severity, detail, client_ts, ip_address)
-        VALUES (${attemptId}, ${type}, ${severity}, ${sql.raw("'" + JSON.stringify(detail).replace(/'/g, "''") + "'::jsonb")},
-          ${clientTs}, ${ip || null})
-      `).catch(() => {});
-      inserted++;
+      try {
+        await db.execute(sql`
+          INSERT INTO test_attempt_events (attempt_id, event_type, severity, detail, client_ts, ip_address)
+          VALUES (${attemptId}::uuid, ${type}, ${severity}, ${detailJson}::jsonb,
+            ${clientTs}, ${ip || null})
+        `);
+        inserted++;
+      } catch (err: any) {
+        failed++;
+        if (errors.length < 3) errors.push(String(err?.message || err).slice(0, 200));
+        continue;
+      }
 
       if (type === 'tab_hidden' || type === 'window_blur') tabSwitchInc++;
       if (type === 'fullscreen_exit' || type === 'fullscreen_required_violation') fullscreenExitInc++;
@@ -130,7 +156,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
       `).catch(() => {});
     }
 
-    return json({ ok: true, inserted });
+    return json({ ok: true, inserted, skipped, failed, errors: errors.length ? errors : undefined });
   } catch (e: any) {
     return json({ ok: false, error: e?.message || 'server error' }, 500);
   }
