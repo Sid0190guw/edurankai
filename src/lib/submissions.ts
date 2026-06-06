@@ -28,11 +28,11 @@ export function ensureSubmissionsSchema(): Promise<void> {
         description TEXT,
         drive_url TEXT,
         external_url TEXT,
-          -- e.g. Unstop submission url, Github repo, Figma, Behance
+          -- e.g. Github repo, Figma, Behance, YouTube
         attachment_urls JSONB DEFAULT '[]'::jsonb,
           -- Array of {name, url, size_bytes, mime} from Vercel Blob
         platform VARCHAR(40) DEFAULT 'direct',
-          -- direct | drive | unstop | github | other
+          -- direct | drive | github | other
         word_count INT,
         page_count INT,
         reviewer_user_id UUID,
