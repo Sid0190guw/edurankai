@@ -81,7 +81,7 @@ export interface CreateSubmissionOpts {
   driveUrl?: string;
   externalUrl?: string;
   attachmentUrls?: { name: string; url: string; size_bytes?: number; mime?: string }[];
-  platform?: 'direct' | 'drive' | 'unstop' | 'github' | 'other';
+  platform?: 'direct' | 'drive' | 'github' | 'other';
   wordCount?: number;
   pageCount?: number;
   metadata?: Record<string, any>;
