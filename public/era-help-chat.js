@@ -158,8 +158,9 @@
       setTimeout(function() { var inp = document.getElementById('eraHelpInput'); if (inp) inp.focus(); }, 250);
       return;
     }
-    // First-time visitor: show intake
-    setStage('intake');
+    // First-time visitor: show topics screen first (lets users self-serve before
+    // dropping into intake form). Skip via the "Type my own question" link.
+    setStage('topics');
     setTimeout(function() {
       var nameInp = document.querySelector('#eraHelpIntakeForm [name="name"]');
       if (nameInp) nameInp.focus();
@@ -181,7 +182,23 @@
       '#eraHelpPanel{display:none;position:fixed;bottom:max(80px,env(safe-area-inset-bottom,16px) + 80px);right:16px;width:360px;max-width:calc(100vw - 32px);height:540px;max-height:calc(100vh - 120px);background:#0a0a0c;border:1px solid #1a1a1f;border-radius:16px;overflow:hidden;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.6);}' +
       '#eraHelpWidget.era-help-open #eraHelpPanel{display:flex;}' +
       '#eraHelpWidget.era-help-open #eraHelpLauncher{transform:scale(0.85);opacity:0.85;}' +
-      '#eraHelpHeader{padding:14px 16px;background:linear-gradient(135deg,#FF4F00,#FF7040);color:#fff;display:flex;justify-content:space-between;align-items:center;}' +
+      '#eraHelpHeader{padding:14px 16px;background:linear-gradient(135deg,#FF4F00,#FF7040);color:#fff;display:flex;align-items:center;gap:12px;}' +
+      '#eraHelpAvatar{flex-shrink:0;width:40px;height:40px;border-radius:50%;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.18);}' +
+      '#eraHelpHeaderInfo{flex:1;min-width:0;}' +
+      '#eraHelpTopics{display:none;padding:18px 16px 16px;background:#08080a;flex:1;overflow-y:auto;}' +
+      '#eraHelpWidget[data-stage="topics"] #eraHelpTopics{display:block;}' +
+      '#eraHelpWidget[data-stage="topics"] #eraHelpStream,#eraHelpWidget[data-stage="topics"] #eraHelpForm,#eraHelpWidget[data-stage="topics"] #eraHelpFoot{display:none;}' +
+      '.era-topics-greet{font-size:15px;color:#fff;margin:0 0 4px;font-weight:600;line-height:1.4;}' +
+      '.era-topics-sub{font-size:12px;color:#9aa6b6;margin:0 0 14px;line-height:1.5;}' +
+      '.era-topics-section{margin:14px 0 8px;}' +
+      '.era-topics-section-label{font-size:10px;color:#FF7040;font-family:ui-monospace,monospace;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;}' +
+      '.era-topics-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;}' +
+      '.era-topic{background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;border-radius:10px;padding:10px 11px;font-size:11.5px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:7px;text-align:left;font-family:inherit;transition:border-color 0.12s, transform 0.12s;}' +
+      '.era-topic:hover{border-color:#FF4F00;transform:translateY(-1px);}' +
+      '.era-topic svg{flex-shrink:0;color:#FF7040;}' +
+      '.era-topic span{flex:1;line-height:1.25;}' +
+      '.era-topic-skip{margin-top:14px;background:transparent;border:none;color:#FF7040;font-size:12px;cursor:pointer;width:100%;padding:8px;font-weight:600;font-family:inherit;}' +
+      '.era-topic-skip:hover{text-decoration:underline;}' +
       '#eraHelpHeader h3{font-size:14px;font-weight:700;margin:0;}' +
       '#eraHelpHeader p{font-size:11px;margin:2px 0 0;opacity:0.9;font-family:ui-monospace,monospace;letter-spacing:0.08em;text-transform:uppercase;}' +
       '#eraHelpClose{background:rgba(0,0,0,0.2);border:none;color:#fff;width:28px;height:28px;border-radius:6px;cursor:pointer;font-size:18px;line-height:1;}' +
@@ -218,14 +235,43 @@
 
     // Panel
     var panel = el('div', { id: 'eraHelpPanel' });
+    // Persona header — avatar + tagline. Inspired by airline / fintech assistants.
     var header = el('div', { id: 'eraHelpHeader' });
-    var headerInfo = el('div');
-    headerInfo.appendChild(el('h3', null, 'Talk to us'));
-    headerInfo.appendChild(el('p', null, 'Real humans &middot; usually within an hour'));
+    var avatar = el('div', { id: 'eraHelpAvatar' });
+    avatar.innerHTML = '<svg viewBox="0 0 40 40" width="40" height="40"><defs><linearGradient id="eraG" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF7040"/><stop offset="1" stop-color="#d63b00"/></linearGradient></defs><circle cx="20" cy="20" r="20" fill="url(#eraG)"/><text x="50%" y="56%" text-anchor="middle" font-size="16" font-weight="800" fill="#fff" font-family="\'Inter Tight\', sans-serif">E</text></svg>';
+    var headerInfo = el('div', { id: 'eraHelpHeaderInfo' });
+    headerInfo.appendChild(el('h3', null, 'Era · EduRankAI Assistant'));
+    headerInfo.appendChild(el('p', null, 'Real humans &middot; English &middot; Hindi'));
     var closeBtn = el('button', { id: 'eraHelpClose', type: 'button', 'aria-label': 'Close chat' }, '&times;');
+    header.appendChild(avatar);
     header.appendChild(headerInfo);
     header.appendChild(closeBtn);
     panel.appendChild(header);
+
+    // Quick-topic categories (shown only on first open before intake)
+    var topics = el('div', { id: 'eraHelpTopics' });
+    topics.innerHTML =
+      '<p class="era-topics-greet">Hi, I\'m <strong>Era</strong>. How may I help you today?</p>' +
+      '<p class="era-topics-sub">Pick a topic or type your question below.</p>' +
+      '<div class="era-topics-section"><span class="era-topics-section-label">For applicants</span></div>' +
+      '<div class="era-topics-grid">' +
+        '<button type="button" class="era-topic" data-topic="application_status"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><span>Application status</span></button>' +
+        '<button type="button" class="era-topic" data-topic="open_roles"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg><span>Open roles</span></button>' +
+        '<button type="button" class="era-topic" data-topic="submit_work"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg><span>Submit my work</span></button>' +
+      '</div>' +
+      '<div class="era-topics-section"><span class="era-topics-section-label">For test takers</span></div>' +
+      '<div class="era-topics-grid">' +
+        '<button type="button" class="era-topic" data-topic="test_help"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span>Test or proctoring</span></button>' +
+        '<button type="button" class="era-topic" data-topic="verify_cert"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></svg><span>Verify a credential</span></button>' +
+        '<button type="button" class="era-topic" data-topic="payment"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg><span>Payment / refund</span></button>' +
+      '</div>' +
+      '<div class="era-topics-section"><span class="era-topics-section-label">For Campus Ambassadors</span></div>' +
+      '<div class="era-topics-grid">' +
+        '<button type="button" class="era-topic" data-topic="ca_report"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></svg><span>Submit CA report</span></button>' +
+        '<button type="button" class="era-topic" data-topic="ca_perks"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg><span>Perks &amp; rewards</span></button>' +
+      '</div>' +
+      '<button type="button" class="era-topic-skip">Type my own question →</button>';
+    panel.appendChild(topics);
 
     // Intake form (shown until visitor provides contact details)
     var intakeEl = el('div', { id: 'eraHelpIntake' });
@@ -275,6 +321,37 @@
       else openWidget();
     });
     closeBtn.addEventListener('click', closeWidget);
+
+    // Topic chip clicks — route to internal pages instead of waiting on a human
+    var TOPIC_ROUTES = {
+      application_status: { url: '/portal/applications', message: 'I want to check the status of my application.' },
+      open_roles:         { url: '/careers',             message: 'Show me current open roles.' },
+      submit_work:        { url: '/portal/submissions/new', message: 'I want to submit my original work.' },
+      test_help:          { url: '/aquintutor/tests',    message: 'I need help with a test or proctoring.' },
+      verify_cert:        { url: '/credentials/',        message: 'I want to verify a credential.' },
+      payment:            { url: '/portal/payments',     message: 'I have a question about a payment or refund.' },
+      ca_report:          { url: '/portal/submissions/new', message: 'I want to submit my Campus Ambassador report.' },
+      ca_perks:           { url: '/careers/campus-ambassador', message: 'Tell me about Campus Ambassador perks and rewards.' },
+    };
+    document.addEventListener('click', function(e) {
+      var t = e.target;
+      while (t && t !== widgetEl) {
+        if (t.classList && t.classList.contains('era-topic') && t.getAttribute('data-topic')) {
+          var topic = t.getAttribute('data-topic');
+          var route = TOPIC_ROUTES[topic];
+          if (route && route.url) { window.location.href = route.url; return; }
+          break;
+        }
+        if (t.classList && t.classList.contains('era-topic-skip')) {
+          // Skip topics, drop into chat/intake as before
+          if (intake && conversationId) setStage('chat');
+          else if (intake) { setStage('chat'); start(); }
+          else setStage('intake');
+          return;
+        }
+        t = t.parentNode;
+      }
+    });
 
     // Intake form submit -> save contact details + start conversation + switch to chat stage
     var intakeForm = document.getElementById('eraHelpIntakeForm');
