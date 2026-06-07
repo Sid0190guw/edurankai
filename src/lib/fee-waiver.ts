@@ -31,6 +31,14 @@ export function ensureFeeWaiverSchema(): Promise<void> {
       // The applications table doesn't have a fee-waiver column yet; add idempotently.
       await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS fee_waiver_granted BOOLEAN NOT NULL DEFAULT false`);
       await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS fee_waiver_reason TEXT`);
+      // Aid extent + voucher columns — populated when admin approves with a
+      // specific grant amount and auto-generates a fee_waiver_coupon code.
+      await db.execute(sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS grant_amount DECIMAL(8,2)`);
+      await db.execute(sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS grant_currency VARCHAR(8) DEFAULT 'CHF'`);
+      await db.execute(sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS grant_pct INT`);
+      await db.execute(sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS coupon_code VARCHAR(64)`);
+      await db.execute(sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS coupon_id UUID`);
+      await db.execute(sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS coupon_expires_at TIMESTAMPTZ`);
     } catch (_) {}
   })();
   return ready;
