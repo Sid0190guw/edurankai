@@ -73,13 +73,22 @@ export const POST: APIRoute = async ({ request, locals }) => {
     // and only fall back to price_inr_paise if price_chf is 0.
     let amountPaise: number;
     let displayCurrency = 'INR';
+    let displayAmountMinor: number;
+    let fxRate: number | null = null;
+    let fxDate: string | null = null;
+    let fxLive: boolean | null = null;
     if (priceChf > 0) {
       // 1 CHF = 100 centimes — convertToInrPaise expects MINOR units
       const fx = await convertToInrPaise('CHF', Math.round(priceChf * 100));
       amountPaise = fx.paise;
       displayCurrency = 'CHF';
+      displayAmountMinor = Math.round(priceChf * 100);
+      fxRate = fx.rate;
+      fxDate = fx.date;
+      fxLive = fx.live;
     } else {
       amountPaise = Math.max(1, parseInt(test.price_inr_paise || 100));
+      displayAmountMinor = amountPaise;
     }
     const receipt = 'qt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 
@@ -94,12 +103,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
         email: user.email || '',
         displayCurrency,
         displayAmountMinor: displayAmountMinor.toString(),
-        fxRate: fx.rate.toString(),
-        fxDate: fx.date,
+        ...(fxRate != null ? { fxRate: fxRate.toString(), fxDate: fxDate || '' } : {}),
       },
     });
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
+    const notesJson = JSON.stringify({ receipt, testSlug: test.slug, displayCurrency, displayAmountMinor, fxRate, fxDate, fxLive });
     await db.execute(sql`
       INSERT INTO payments (
         order_id, amount_paise, currency, status, purpose,
@@ -107,7 +116,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       ) VALUES (
         ${result.order.id}, ${amountPaise}, 'INR', 'created', 'test_enrollment',
         'test', ${test.id}, ${user.id}, ${user.email || 'unknown@edurankai.in'},
-        ${sql.raw("'" + JSON.stringify({ receipt, testSlug: test.slug, displayCurrency, displayAmountMinor, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")}
+        ${notesJson}::jsonb
       )
     `).catch(() => {});
 
@@ -120,8 +129,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       currency: 'INR',
       displayCurrency,
       displayAmountMinor,
-      fxRate: fx.rate,
-      fxDate: fx.date,
+      fxRate, fxDate,
       testTitle: test.title,
       testSlug: test.slug,
       prefill: { name: user.name || '', email: user.email || '' },
