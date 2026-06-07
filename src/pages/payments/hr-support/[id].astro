@@ -1,0 +1,118 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureHrSupportSchema, SUPPORT_KINDS } from '@/lib/hr-support';
+import { createOrder, getPublicKeyId } from '@/lib/razorpay';
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/careers#hr-support-form');
+
+await ensureHrSupportSchema();
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const reqRow = rows(await db.execute(sql`SELECT * FROM hr_application_support WHERE id = ${id} LIMIT 1`))[0] as any;
+if (!reqRow) return Astro.redirect('/careers#hr-support-form');
+
+// If already paid, jump to a confirmation view.
+const isPaid = reqRow.payment_status === 'paid';
+
+// Create a fresh Razorpay order if we don't have one yet (or previous was lost).
+let razorpayOrderId = reqRow.razorpay_order_id;
+let razorpayError = '';
+if (!razorpayOrderId && !isPaid) {
+  // CHF 25 — we charge equivalent INR via Razorpay; assume ~93 INR/CHF spot.
+  // Adjust later via the same FX helper Tests uses. For now, fixed 2500 INR.
+  const amountPaise = 2500 * 100;
+  const r = await createOrder({
+    amountPaise, currency: 'INR',
+    receipt: 'hrs_' + String(id).slice(0, 32),
+    notes: { kind: 'hr_application_support', request_id: String(id), email: reqRow.candidate_email },
+  });
+  if (r.ok) {
+    razorpayOrderId = r.order.id;
+    try { await db.execute(sql`UPDATE hr_application_support SET razorpay_order_id = ${razorpayOrderId}, updated_at = NOW() WHERE id = ${id}`); } catch (_) {}
+  } else { razorpayError = r.error; }
+}
+
+const publicKey = getPublicKeyId();
+
+const kindMeta = SUPPORT_KINDS[reqRow.support_kind] || SUPPORT_KINDS.general;
+---
+<BaseLayout title="HR Application Support · Payment" description="Pay 25 CHF (≈ ₹2,500) to book an HR-led application support call.">
+
+<section class="px-[5vw] py-10 md:py-16 max-w-2xl mx-auto">
+  <a href="/careers#hr-support-form" class="text-[0.78rem] font-mono uppercase tracking-wider text-burn hover:underline no-underline">← Back to careers</a>
+
+  <div class="mt-4 mb-6">
+    <p class="text-[0.6rem] font-mono uppercase tracking-[0.16em] text-sky font-bold mb-2">Confirm &amp; pay</p>
+    <h1 class="font-display text-[clamp(1.8rem,4.5vw,2.4rem)] font-semibold text-ink leading-[1.15] mb-3">
+      Book your <em class="italic text-burn font-medium">HR support call</em>
+    </h1>
+  </div>
+
+  {isPaid ? (
+    <div class="bg-leaf-bg border border-leaf-border rounded-2xl p-6 md:p-8">
+      <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-leaf font-bold mb-2">Paid</p>
+      <h2 class="font-display text-[1.35rem] font-semibold text-ink leading-tight mb-2">Payment confirmed</h2>
+      <p class="text-[0.92rem] text-ink-2 leading-relaxed">Our HR team will email you within 24 hours with a Google Meet link and a scheduled slot in your preferred window. Reference: <strong class="text-ink font-mono">{String(id).slice(0,8)}</strong>.</p>
+    </div>
+  ) : (
+    <div class="bg-white border border-ink/10 rounded-2xl p-6 md:p-8">
+
+      <div class="border-b border-ink/8 pb-4 mb-4">
+        <p class="text-[0.6rem] font-mono uppercase tracking-[0.14em] text-ink-soft font-bold mb-1">Order summary</p>
+        <p class="font-display text-[1.05rem] font-semibold text-ink leading-tight m-0 mb-1">HR application support · {kindMeta.label}</p>
+        <p class="text-[0.82rem] text-ink-soft m-0">For: {reqRow.candidate_name} · {reqRow.candidate_email}</p>
+      </div>
+
+      <div class="flex justify-between items-baseline mb-5">
+        <span class="text-[0.92rem] text-ink-2">Booking fee</span>
+        <div class="text-right">
+          <p class="font-display text-[1.8rem] font-semibold text-ink leading-none m-0">CHF 25</p>
+          <p class="text-[0.76rem] text-ink-soft m-0 mt-1">≈ ₹2,500 charged via Razorpay</p>
+        </div>
+      </div>
+
+      {razorpayError && <div class="bg-burn-pale border border-burn-dim rounded-xl px-4 py-3 mb-4 text-[0.86rem] text-burn font-semibold">Payment unavailable: {razorpayError}. Email hr@edurankai.in.</div>}
+
+      {!razorpayError && razorpayOrderId && publicKey && (
+        <>
+          <button id="rzpBtn" type="button" class="w-full bg-sky hover:bg-sky/90 text-white font-semibold py-3 px-7 rounded-xl text-[0.95rem]">Pay 25 CHF →</button>
+          <p class="text-[0.74rem] text-ink-soft mt-3 mb-0 text-center">Powered by Razorpay · cards · UPI · netbanking · wallets</p>
+
+          <script is:inline src="https://checkout.razorpay.com/v1/checkout.js"></script>
+          <script is:inline define:vars={{ orderId: razorpayOrderId, publicKey, name: reqRow.candidate_name, email: reqRow.candidate_email, phone: reqRow.candidate_phone || '', requestId: String(id) }}>
+            document.getElementById('rzpBtn').addEventListener('click', function() {
+              var rzp = new Razorpay({
+                key: publicKey,
+                order_id: orderId,
+                amount: 250000, currency: 'INR',
+                name: 'EduRankAI', description: 'HR Application Support (25 CHF)',
+                prefill: { name: name, email: email, contact: phone },
+                theme: { color: '#1045BB' },
+                handler: function(resp) {
+                  fetch('/api/payments/hr-support/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      requestId: requestId,
+                      razorpay_order_id: resp.razorpay_order_id,
+                      razorpay_payment_id: resp.razorpay_payment_id,
+                      razorpay_signature: resp.razorpay_signature,
+                    }),
+                  }).then(function(r){ return r.json(); }).then(function(d){
+                    if (d.ok) window.location.href = '/payments/hr-support/' + requestId;
+                    else alert('Payment verified but the server could not record it. Please email hr@edurankai.in with reference ' + requestId);
+                  });
+                },
+              });
+              rzp.open();
+            });
+          </script>
+        </>
+      )}
+    </div>
+  )}
+</section>
+</BaseLayout>
