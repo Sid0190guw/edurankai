@@ -1,0 +1,210 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureHrSupportSchema, SUPPORT_KINDS, REPLY_TEMPLATES, renderTemplate } from '@/lib/hr-support';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/admin/hr-support');
+
+await ensureHrSupportSchema();
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('action') as string) || '';
+
+    if (action === 'send_reply') {
+      const body = (fd.get('body') as string || '').trim().slice(0, 8000);
+      const templateKey = (fd.get('template_key') as string || '').trim();
+      const meetLink = (fd.get('meet_link') as string || '').trim().slice(0, 1000) || undefined;
+      const statusUpdate = (fd.get('status_update') as string || '').trim() || undefined;
+      if (!body) errMsg = 'Reply body is required.';
+      else {
+        await db.execute(sql`
+          INSERT INTO hr_support_messages (request_id, sender_role, sender_user_id, sender_name, body, meta)
+          VALUES (${id}, 'admin', ${user.id}, ${user.name || user.email}, ${body}, ${JSON.stringify({ template: templateKey || null, meet_link: meetLink || null })}::jsonb)
+        `);
+        if (meetLink) {
+          await db.execute(sql`UPDATE hr_application_support SET meet_link = ${meetLink}, meet_scheduled_at = COALESCE(meet_scheduled_at, NOW()), hr_rep_user_id = ${user.id}, updated_at = NOW() WHERE id = ${id}`);
+        }
+        if (statusUpdate === 'completed') await db.execute(sql`UPDATE hr_application_support SET completed_at = NOW(), updated_at = NOW() WHERE id = ${id}`);
+        else if (statusUpdate === 'cancelled') await db.execute(sql`UPDATE hr_application_support SET payment_status = 'cancelled', updated_at = NOW() WHERE id = ${id}`);
+        else if (statusUpdate === 'refunded') await db.execute(sql`UPDATE hr_application_support SET payment_status = 'refunded', updated_at = NOW() WHERE id = ${id}`);
+        else if (statusUpdate === 'no_show' || statusUpdate === 'reschedule_pending') await db.execute(sql`UPDATE hr_application_support SET notes = COALESCE(notes,'') || ${'\n[' + statusUpdate + ']'}, updated_at = NOW() WHERE id = ${id}`);
+        okMsg = 'Reply sent. Candidate sees it instantly in /portal/hr-support.';
+      }
+    } else if (action === 'mark_paid') {
+      await db.execute(sql`UPDATE hr_application_support SET payment_status = 'paid', paid_at = COALESCE(paid_at, NOW()), updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Marked paid manually.';
+    } else if (action === 'modify_slot') {
+      const newSlot = (fd.get('new_slot_iso') as string || '').trim();
+      const newSlotLabel = (fd.get('new_slot_label') as string || '').trim().slice(0, 60);
+      if (newSlot) {
+        await db.execute(sql`UPDATE hr_application_support SET requested_slot_at = ${newSlot}::timestamptz, requested_slot_label = ${newSlotLabel || null}, updated_at = NOW() WHERE id = ${id}`);
+        okMsg = 'Slot modified.';
+      }
+    } else if (action === 'edit_notes') {
+      const notes = (fd.get('notes') as string || '').trim().slice(0, 10000);
+      await db.execute(sql`UPDATE hr_application_support SET notes = ${notes}, updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Internal notes updated.';
+    }
+  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+}
+
+const r = rows(await db.execute(sql`SELECT * FROM hr_application_support WHERE id = ${id} LIMIT 1`))[0] as any;
+if (!r) return Astro.redirect('/admin/hr-support');
+
+const messages = rows(await db.execute(sql`
+  SELECT id, sender_role, sender_name, body, meta, created_at FROM hr_support_messages
+  WHERE request_id = ${id} ORDER BY created_at ASC LIMIT 500
+`));
+
+function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' }); } catch { return ''; } }
+const kindMeta = SUPPORT_KINDS[r.support_kind] || SUPPORT_KINDS.general;
+const status = r.completed_at ? 'completed' : r.meet_scheduled_at ? 'scheduled' : r.payment_status === 'paid' ? 'paid' : 'awaiting payment';
+
+// Pre-render the templates with this request's vars so admin can click any
+// and the textarea gets the filled body instantly.
+const filledTemplates = Object.entries(REPLY_TEMPLATES).map(([key, t]) => {
+  const slotStr = r.requested_slot_label || (r.requested_slot_at ? fmt(r.requested_slot_at) : 'your scheduled time');
+  return {
+    key, label: t.label, tone: t.tone, statusUpdate: t.statusUpdate || '',
+    body: renderTemplate(t.body, { name: r.candidate_name, slot: slotStr, meet_link: r.meet_link || '{{meet_link}}', id: r.id }),
+  };
+});
+---
+<AdminLayout title="HR Support · Request" activeNav="">
+<div style="padding:14px 16px 80px;max-width:1280px;margin:0 auto;">
+  <a href="/admin/hr-support" style="font-size:11.5px;color:#9aa6b6;text-decoration:none;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">← All requests</a>
+
+  <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:18px;margin-top:14px;">
+
+    {/* ============ LEFT: thread + reply ============ */}
+    <div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;margin-bottom:14px;">
+        <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+          <div>
+            <p style="font-size:10.5px;color:#1045BB;letter-spacing:0.1em;text-transform:uppercase;margin:0;font-family:'Geist Mono',monospace;font-weight:700;">{kindMeta.label}</p>
+            <h1 style="font-size:20px;color:#fff;margin:4px 0 4px;font-weight:700;">{r.candidate_name}</h1>
+            <p style="font-size:11.5px;color:#9aa6b6;margin:0;font-family:'Geist Mono',monospace;">{r.candidate_email}{r.candidate_phone && ' · ' + r.candidate_phone}</p>
+          </div>
+          <span style="background:rgba(16,69,187,0.18);color:#67e8f9;font-size:10px;font-weight:700;padding:4px 10px;border-radius:100px;text-transform:uppercase;letter-spacing:0.08em;font-family:'Geist Mono',monospace;height:fit-content;">{status}</span>
+        </div>
+
+        <div style="padding:12px;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;margin-bottom:10px;">
+          <p style="font-size:10px;color:#FF7040;letter-spacing:0.1em;text-transform:uppercase;margin:0 0 4px;font-family:'Geist Mono',monospace;font-weight:700;">Original request</p>
+          <p style="font-size:12.5px;color:#cfd6da;margin:0;line-height:1.6;white-space:pre-wrap;">{r.situation}</p>
+        </div>
+      </div>
+
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;margin-bottom:14px;">
+        <p style="font-size:11px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 12px;font-family:'Geist Mono',monospace;font-weight:700;">Thread ({messages.length})</p>
+        {messages.length === 0 ? (
+          <p style="font-size:12px;color:#6e6e78;margin:0;">No messages yet. Use a template below to send your first reply.</p>
+        ) : (
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            {messages.map((m: any) => (
+              <div style={`background:${m.sender_role === 'admin' ? 'rgba(16,69,187,0.10)' : '#08080a'};border:1px solid ${m.sender_role === 'admin' ? 'rgba(16,69,187,0.32)' : '#1a1a1f'};border-radius:8px;padding:10px 14px;`}>
+                <p style="font-size:10px;color:#9aa6b6;letter-spacing:0.08em;text-transform:uppercase;margin:0 0 4px;font-family:'Geist Mono',monospace;font-weight:700;">{m.sender_role === 'admin' ? 'You' : 'Candidate'} · {m.sender_name || ''} · {fmt(m.created_at)}</p>
+                <p style="font-size:12.5px;color:#fff;margin:0;line-height:1.6;white-space:pre-wrap;">{m.body}</p>
+                {m.meta && m.meta.meet_link && <p style="font-size:11px;color:#67e8f9;margin:6px 0 0;font-family:'Geist Mono',monospace;">Meet: <a href={m.meta.meet_link} target="_blank" style="color:#67e8f9;">{m.meta.meet_link}</a></p>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {okMsg && <div style="background:rgba(74,222,128,0.10);border:1px solid rgba(74,222,128,0.32);color:#86efac;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12.5px;">{okMsg}</div>}
+      {errMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12.5px;">{errMsg}</div>}
+
+      <form method="POST" id="replyForm" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;">
+        <input type="hidden" name="action" value="send_reply" />
+        <input type="hidden" name="template_key" id="tplKey" value="" />
+        <input type="hidden" name="status_update" id="statusUpdate" value="" />
+
+        <p style="font-size:11px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 10px;font-family:'Geist Mono',monospace;font-weight:700;">Quick-reply templates</p>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;">
+          {filledTemplates.map((t: any) => {
+            const c = t.tone === 'leaf' ? '#86efac' : t.tone === 'gold' ? '#fbbf24' : t.tone === 'burn' ? '#FF7040' : t.tone === 'plum' ? '#c4b5fd' : '#67e8f9';
+            return (
+              <button type="button" class="tplBtn" data-body={t.body} data-key={t.key} data-status={t.statusUpdate} style={`background:${c}18;border:1px solid ${c};color:${c};font-size:11px;font-weight:700;padding:6px 12px;border-radius:6px;cursor:pointer;font-family:'Geist Mono',monospace;letter-spacing:0.04em;`}>{t.label}</button>
+            );
+          })}
+        </div>
+
+        <label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Meet link (optional — included in reply if filled)</label>
+        <input name="meet_link" id="meetLink" type="url" placeholder="https://meet.google.com/..." style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin:5px 0 10px;" />
+
+        <label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Reply body *</label>
+        <textarea name="body" id="replyBody" rows="6" required style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;font-family:'Inter Tight',sans-serif;line-height:1.55;resize:vertical;margin-top:5px;"></textarea>
+
+        <button type="submit" style="margin-top:12px;background:#1045BB;color:#fff;border:none;padding:10px 20px;border-radius:8px;font-size:12.5px;font-weight:700;cursor:pointer;letter-spacing:0.04em;text-transform:uppercase;font-family:'Geist Mono',monospace;">Send reply</button>
+      </form>
+
+      <script is:inline>
+        document.querySelectorAll('.tplBtn').forEach(function(b){
+          b.addEventListener('click', function(){
+            var body = b.getAttribute('data-body') || '';
+            var meet = document.getElementById('meetLink').value || '{{meet_link}}';
+            document.getElementById('replyBody').value = body.replace('{{meet_link}}', meet);
+            document.getElementById('tplKey').value = b.getAttribute('data-key') || '';
+            document.getElementById('statusUpdate').value = b.getAttribute('data-status') || '';
+          });
+        });
+      </script>
+    </div>
+
+    {/* ============ RIGHT: facts + controls ============ */}
+    <div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;margin-bottom:14px;">
+        <p style="font-size:11px;color:#67e8f9;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 12px;font-family:'Geist Mono',monospace;font-weight:700;">Request facts</p>
+        <dl style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0;font-size:12px;">
+          <dt style="color:#9aa6b6;font-family:'Geist Mono',monospace;">Slot</dt><dd style="color:#fff;margin:0;">{r.requested_slot_label || fmt(r.requested_slot_at) || '—'}</dd>
+          <dt style="color:#9aa6b6;font-family:'Geist Mono',monospace;">Target role</dt><dd style="color:#fff;margin:0;">{r.target_role_slug || '—'}</dd>
+          <dt style="color:#9aa6b6;font-family:'Geist Mono',monospace;">Fee</dt><dd style="color:#fff;margin:0;">{r.fee_currency} {Number(r.fee_amount).toFixed(2)} · <span style={`color:${r.payment_status==='paid'?'#86efac':r.payment_status==='pending'?'#fbbf24':'#fca5a5'};font-weight:700;`}>{r.payment_status}</span></dd>
+          <dt style="color:#9aa6b6;font-family:'Geist Mono',monospace;">Razorpay order</dt><dd style="color:#cfd6da;margin:0;font-family:'Geist Mono',monospace;font-size:11px;">{r.razorpay_order_id || '—'}</dd>
+          <dt style="color:#9aa6b6;font-family:'Geist Mono',monospace;">Razorpay payment</dt><dd style="color:#cfd6da;margin:0;font-family:'Geist Mono',monospace;font-size:11px;">{r.razorpay_payment_id || '—'}</dd>
+          <dt style="color:#9aa6b6;font-family:'Geist Mono',monospace;">Meet link</dt><dd style="color:#67e8f9;margin:0;font-family:'Geist Mono',monospace;font-size:11px;word-break:break-all;">{r.meet_link || '—'}</dd>
+          <dt style="color:#9aa6b6;font-family:'Geist Mono',monospace;">Created</dt><dd style="color:#cfd6da;margin:0;">{fmt(r.created_at)}</dd>
+        </dl>
+      </div>
+
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;margin-bottom:14px;">
+        <p style="font-size:11px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 10px;font-family:'Geist Mono',monospace;font-weight:700;">Controls</p>
+
+        {r.payment_status !== 'paid' && (
+          <form method="POST" style="margin-bottom:10px;">
+            <input type="hidden" name="action" value="mark_paid" />
+            <button type="submit" style="background:#10b981;color:#fff;border:none;padding:8px 14px;border-radius:6px;font-size:11.5px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;width:100%;">Mark paid (manual)</button>
+          </form>
+        )}
+
+        <form method="POST" style="margin-bottom:10px;">
+          <input type="hidden" name="action" value="modify_slot" />
+          <label style="font-size:10px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Modify slot</label>
+          <input name="new_slot_iso" type="datetime-local" required style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:7px 10px;border-radius:5px;font-size:11.5px;margin:5px 0;" />
+          <input name="new_slot_label" type="text" placeholder="Label (e.g. '12 Jun · 14:00 IST')" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:7px 10px;border-radius:5px;font-size:11.5px;margin-bottom:6px;" />
+          <button type="submit" style="background:#15151a;border:1px solid #2a2a2f;color:#67e8f9;padding:7px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;width:100%;">Save slot</button>
+        </form>
+      </div>
+
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;">
+        <p style="font-size:11px;color:#c4b5fd;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 10px;font-family:'Geist Mono',monospace;font-weight:700;">Internal notes (admin only)</p>
+        <form method="POST">
+          <input type="hidden" name="action" value="edit_notes" />
+          <textarea name="notes" rows="5" maxlength="10000" placeholder="Not visible to candidate." style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12px;font-family:'Inter Tight',sans-serif;line-height:1.55;resize:vertical;">{r.notes || ''}</textarea>
+          <button type="submit" style="margin-top:8px;background:#15151a;border:1px solid #2a2a2f;color:#c4b5fd;padding:7px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;">Save notes</button>
+        </form>
+      </div>
+
+    </div>
+  </div>
+</div>
+</AdminLayout>

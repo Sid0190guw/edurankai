@@ -40,8 +40,29 @@ export function ensureHrSupportSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
+      // Candidate-picked slot — locked into the row at submission time, then
+      // committed to the calendar once payment lands.
+      await db.execute(sql`ALTER TABLE hr_application_support ADD COLUMN IF NOT EXISTS requested_slot_at TIMESTAMPTZ`);
+      await db.execute(sql`ALTER TABLE hr_application_support ADD COLUMN IF NOT EXISTS requested_slot_label VARCHAR(60)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hras_status_idx ON hr_application_support(payment_status, created_at DESC)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hras_email_idx ON hr_application_support(candidate_email)`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS hras_slot_idx ON hr_application_support(requested_slot_at) WHERE requested_slot_at IS NOT NULL`);
+
+      // Threaded messages — admin replies + candidate responses, all in one
+      // stream visible to both sides.
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_support_messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        request_id UUID NOT NULL REFERENCES hr_application_support(id) ON DELETE CASCADE,
+        sender_role VARCHAR(16) NOT NULL,
+          -- admin | candidate | system
+        sender_user_id UUID,
+        sender_name VARCHAR(200),
+        body TEXT NOT NULL,
+        meta JSONB,
+          -- e.g. { template: 'confirm_meet', meet_link: 'https://...' }
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS hrsm_req_idx ON hr_support_messages(request_id, created_at ASC)`);
     } catch (_) {}
   })();
   return ready;
@@ -73,6 +94,56 @@ export async function createHrSupportRequest(opts: CreateHrSupportOpts) {
     ) RETURNING id, created_at
   `));
   return { ok: true, id: r[0]?.id };
+}
+
+// Auto-response templates. Admin clicks one in the dashboard and the
+// {{placeholders}} get filled with the request row before sending. The
+// rendered text lands in hr_support_messages and is visible to the candidate
+// in their portal thread.
+export const REPLY_TEMPLATES: Record<string, { label: string; tone: string; body: string; statusUpdate?: string }> = {
+  confirm_meet: {
+    label: 'Confirm meeting',
+    tone: 'leaf',
+    body: 'Hi {{name}}, your slot of {{slot}} is confirmed. Please join the Google Meet here: {{meet_link}}\n\nPlease have your CV / portfolio open during the call. The call is 30–45 minutes — we will use the first 5 to align on what to cover.',
+    statusUpdate: 'scheduled',
+  },
+  reschedule_request: {
+    label: 'Reschedule request',
+    tone: 'gold',
+    body: 'Hi {{name}}, the slot of {{slot}} is no longer available on our side. Please pick a new slot from this link and we will confirm: https://edurankai.in/careers/hr-support?req={{id}}',
+    statusUpdate: 'reschedule_pending',
+  },
+  cancelled_refund: {
+    label: 'Cancelled + refunded',
+    tone: 'burn',
+    body: 'Hi {{name}}, this session has been cancelled and a full refund of 25 CHF has been initiated. The refund typically reflects in 5–7 business days. We are sorry we could not make this work.',
+    statusUpdate: 'cancelled',
+  },
+  no_show: {
+    label: 'No-show recorded',
+    tone: 'plum',
+    body: 'Hi {{name}}, we waited at the scheduled slot but the call did not connect. As per policy, no-shows are not refunded but you may re-book at any time at the standard 25 CHF fee.',
+    statusUpdate: 'no_show',
+  },
+  completed: {
+    label: 'Mark completed',
+    tone: 'leaf',
+    body: 'Hi {{name}}, thanks for the call. A summary of what we covered and the next steps are attached. If you have follow-up questions, reply to this thread within 7 days at no extra cost.',
+    statusUpdate: 'completed',
+  },
+  general_reply: {
+    label: 'General reply (blank)',
+    tone: 'sky',
+    body: '',
+  },
+};
+
+export function renderTemplate(body: string, vars: { name?: string; slot?: string; meet_link?: string; id?: string }): string {
+  return body
+    .replace(/{{name}}/g, vars.name || 'there')
+    .replace(/{{slot}}/g, vars.slot || 'your scheduled time')
+    .replace(/{{meet_link}}/g, vars.meet_link || '[meet link]')
+    .replace(/{{id}}/g, vars.id || '');
 }
 
 export const SUPPORT_KINDS: Record<string, { label: string; description: string }> = {
