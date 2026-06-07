@@ -1,4 +1,4 @@
-﻿---
+---
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { applications, applicationMessages } from '@/lib/db/schema';
@@ -8,61 +8,104 @@ const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 if (user.role !== 'applicant') return Astro.redirect('/admin');
 
-// Auto-promote any legacy 'pending' account. The 1 CHF registration fee is no
-// longer required — the application fee is now the single paid step — and we
-// don't want existing pending users to remain locked out.
+// Auto-promote any legacy 'pending' account.
 try {
   await db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE id = ${user.id} AND access_status = 'pending'`);
 } catch (_) {}
 
-// Check if this user is an active employee → employee portal (or onboarding
-// first if they were just hired and haven't completed it).
+// Active employee → employee portal.
 try {
   const empCheck = await db.execute(sql`
     SELECT id, onboarding_status FROM hr_employees
     WHERE (personal_email = ${user.email} OR email = ${user.email} OR user_id = ${user.id}) AND is_active = true
     LIMIT 1
   `);
-  const rows = Array.isArray(empCheck) ? empCheck : (empCheck?.rows || []);
-  if (rows.length > 0) {
-    if ((rows[0] as any).onboarding_status === 'pending') return Astro.redirect('/portal/employee/onboarding');
+  const empRows = Array.isArray(empCheck) ? empCheck : (empCheck?.rows || []);
+  if (empRows.length > 0) {
+    if ((empRows[0] as any).onboarding_status === 'pending') return Astro.redirect('/portal/employee/onboarding');
     return Astro.redirect('/portal/employee');
   }
-} catch(e) {}
+} catch(_) {}
 
-const apps = await db.select({
-  id: applications.id,
-  roleTitleSnapshot: applications.roleTitleSnapshot,
-  departmentSnapshot: applications.departmentSnapshot,
-  level: applications.level,
-  status: applications.status,
-  score: applications.score,
-  scoringFeedback: applications.scoringFeedback,
-  createdAt: applications.createdAt,
-  updatedAt: applications.updatedAt
-}).from(applications)
-  .where(eq(applications.applicantUserId, user.id))
-  .orderBy(desc(applications.createdAt));
-
-const appsWithMessages = [];
-for (const app of apps) {
-  const lastMsgs = await db.select({
-    body: applicationMessages.body,
-    senderRole: applicationMessages.senderRole,
-    senderName: applicationMessages.senderName,
-    isSystem: applicationMessages.isSystem,
-    createdAt: applicationMessages.createdAt
-  }).from(applicationMessages)
-    .where(eq(applicationMessages.applicationId, app.id))
-    .orderBy(desc(applicationMessages.createdAt))
-    .limit(1);
-
-  appsWithMessages.push({ ...app, lastMessage: lastMsgs[0] || null });
+// Applications + last message (single LATERAL join — no N+1).
+let appsWithMessages: any[] = [];
+try {
+  const r = await db.execute(sql`
+    SELECT a.id, a.role_title_snapshot, a.department_snapshot, a.level, a.status,
+      a.score, a.scoring_feedback, a.created_at, a.updated_at,
+      m.body AS last_msg_body, m.sender_role AS last_msg_role,
+      m.sender_name AS last_msg_name, m.is_system AS last_msg_system, m.created_at AS last_msg_at,
+      COALESCE(unread.n, 0)::int AS unread_count
+    FROM applications a
+    LEFT JOIN LATERAL (
+      SELECT body, sender_role, sender_name, is_system, created_at
+      FROM application_messages
+      WHERE application_id = a.id
+      ORDER BY created_at DESC LIMIT 1
+    ) m ON true
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*)::int AS n
+      FROM application_messages
+      WHERE application_id = a.id AND sender_role = 'admin' AND COALESCE(read_by_applicant, false) = false
+    ) unread ON true
+    WHERE a.applicant_user_id = ${user.id}
+    ORDER BY a.created_at DESC
+  `);
+  const rows = Array.isArray(r) ? r : ((r as any)?.rows || []);
+  appsWithMessages = rows.map((row: any) => ({
+    id: row.id,
+    roleTitleSnapshot: row.role_title_snapshot,
+    departmentSnapshot: row.department_snapshot,
+    level: row.level,
+    status: row.status,
+    score: row.score,
+    scoringFeedback: row.scoring_feedback,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    unreadCount: row.unread_count || 0,
+    lastMessage: row.last_msg_body ? {
+      body: row.last_msg_body,
+      senderRole: row.last_msg_role,
+      senderName: row.last_msg_name,
+      isSystem: row.last_msg_system,
+      createdAt: row.last_msg_at,
+    } : null,
+  }));
+} catch (_) {
+  // Fallback: minimal query if the read_by_applicant column doesn't exist.
+  try {
+    const apps = await db.select({
+      id: applications.id,
+      roleTitleSnapshot: applications.roleTitleSnapshot,
+      departmentSnapshot: applications.departmentSnapshot,
+      level: applications.level,
+      status: applications.status,
+      score: applications.score,
+      scoringFeedback: applications.scoringFeedback,
+      createdAt: applications.createdAt,
+      updatedAt: applications.updatedAt
+    }).from(applications)
+      .where(eq(applications.applicantUserId, user.id))
+      .orderBy(desc(applications.createdAt));
+    for (const app of apps) {
+      const lastMsgs = await db.select({
+        body: applicationMessages.body,
+        senderRole: applicationMessages.senderRole,
+        senderName: applicationMessages.senderName,
+        isSystem: applicationMessages.isSystem,
+        createdAt: applicationMessages.createdAt
+      }).from(applicationMessages)
+        .where(eq(applicationMessages.applicationId, app.id))
+        .orderBy(desc(applicationMessages.createdAt))
+        .limit(1);
+      appsWithMessages.push({ ...app, lastMessage: lastMsgs[0] || null, unreadCount: 0 });
+    }
+  } catch (_) {}
 }
 
 const firstName = user.name ? user.name.split(' ')[0] : 'there';
 
-// Face 2FA enrollment status - prompt applicants who haven't set it up.
+// Face 2FA enrollment status.
 let faceEnrolled = false;
 try {
   const fr = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
@@ -70,16 +113,14 @@ try {
   faceEnrolled = frows.length > 0;
 } catch (_) {}
 
-// Open admin↔applicant request threads (Vis-vambhara, fee waivers, ...)
+// Open admin↔applicant request threads.
 let openRequests: any[] = [];
 try {
   const { listApplicantRequests } = await import('@/lib/request-threads');
   openRequests = await listApplicantRequests(user.id);
 } catch (_) {}
 
-// Pending intents — applications the user started but never completed because
-// the processing & verification fee step is unpaid. They can finish payment
-// or redeem a fee-waiver coupon here.
+// Pending intents (unpaid application fees).
 let pendingIntents: any[] = [];
 try {
   const ri = await db.execute(sql`
@@ -93,51 +134,14 @@ try {
     LIMIT 20
   `);
   pendingIntents = (Array.isArray(ri) ? ri : (ri as any)?.rows || []).map((r: any) => ({
-    id: r.id,
-    roleTitle: r.role_title_snapshot,
-    department: r.department_snapshot,
-    level: r.level,
+    id: r.id, roleTitle: r.role_title_snapshot, department: r.department_snapshot, level: r.level,
     createdAt: r.created_at,
-    name: ((r.first_name || '') + ' ' + (r.last_name || '')).trim(),
-    waiverId: r.waiver_id,
-    waiverStatus: r.waiver_status,
+    waiverId: r.waiver_id, waiverStatus: r.waiver_status,
   }));
 } catch (_) {}
 
-const STAGE_ORDER = ['submitted', 'reviewing', 'task_sent', 'interview', 'offer', 'hired'];
-const STAGE_LABELS: Record<string, string> = {
-  submitted: 'Submitted', reviewing: 'Under Review', task_sent: 'Task / Walkthrough',
-  interview: 'Interview', offer: 'Offer Extended', hired: 'Hired',
-  rejected: 'Closed', withdrawn: 'Withdrawn'
-};
-const STATUS_COLORS: Record<string, string> = {
-  submitted: 'bg-sky-bg text-sky border-sky-border',
-  reviewing: 'bg-burn-pale text-burn border-burn-dim',
-  task_sent: 'bg-gold-bg text-gold-deep border-gold-border',
-  interview: 'bg-plum-bg text-plum border-plum-border',
-  offer: 'bg-leaf-bg text-leaf border-leaf-border',
-  hired: 'bg-leaf-bg text-leaf border-leaf-border',
-  rejected: 'bg-ink/5 text-ink-soft border-ink/15',
-  withdrawn: 'bg-ink/5 text-ink-soft border-ink/15'
-};
-
-function getStageIndex(status: string): number {
-  const i = STAGE_ORDER.indexOf(status);
-  return i >= 0 ? i : -1;
-}
-function isClosedStatus(status: string): boolean {
-  return status === 'rejected' || status === 'withdrawn';
-}
-function timeAgo(date: Date): string {
-  const diff = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
-  if (diff < 60) return 'just now';
-  if (diff < 3600) return Math.floor(diff / 60) + ' min ago';
-  if (diff < 86400) return Math.floor(diff / 3600) + ' hr ago';
-  return Math.floor(diff / 86400) + ' day ago';
-}
-
-// ===== AquinTutor learning surface inside the portal =====
-function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// AquinTutor learning surface — trimmed to 3 courses + 3 tests (slim rail).
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 let learnerXp: any = { totalXp: 0, level: 1, streakDays: 0 };
 try {
   const { getUserXp } = await import('@/lib/xp');
@@ -150,313 +154,629 @@ try {
       (SELECT COUNT(*)::int FROM training_lessons WHERE course_id = c.id) AS lesson_count
     FROM training_courses c
     WHERE c.is_published = true AND c.access_type IN ('public','both','applicants')
-    ORDER BY c.created_at DESC LIMIT 8
+    ORDER BY c.created_at DESC LIMIT 3
   `);
-  portalCourses = rows(r);
+  portalCourses = rowsOf(r);
 } catch (_) {}
 let portalTests: any[] = [];
 try {
   const r = await db.execute(sql`
     SELECT t.slug, t.title, t.duration_mins, t.total_questions,
-      COALESCE(t.price_chf, 0) AS price_chf, COALESCE(t.is_premium, false) AS is_premium,
+      COALESCE(t.is_premium, false) AS is_premium,
       COALESCE(t.practice_enabled, true) AS practice_enabled
     FROM tests t WHERE t.is_published = true
-    ORDER BY t.created_at ASC LIMIT 6
+    ORDER BY t.created_at ASC LIMIT 3
   `);
-  portalTests = rows(r);
+  portalTests = rowsOf(r);
 } catch (_) {}
+
+// Quick access counts (interviews / submissions / mail / appeals).
+const quickCounts: Record<string, number> = { interviews: 0, submissions: 0, mail: 0, appeals: 0, certificates: 0 };
+try {
+  const c = await db.execute(sql`
+    SELECT
+      (SELECT COUNT(*)::int FROM interviews WHERE user_id = ${user.id} AND scheduled_at >= NOW()) AS interviews,
+      (SELECT COUNT(*)::int FROM portal_submissions WHERE submitter_user_id = ${user.id} AND status IN ('submitted','under_review','revisions_requested')) AS submissions,
+      (SELECT COUNT(*)::int FROM application_appeals WHERE user_id = ${user.id} AND status IN ('open','reviewing')) AS appeals,
+      (SELECT COUNT(*)::int FROM training_certificates WHERE user_id = ${user.id}) AS certificates
+  `);
+  const cr = rowsOf(c)[0] as any;
+  if (cr) {
+    quickCounts.interviews = cr.interviews || 0;
+    quickCounts.submissions = cr.submissions || 0;
+    quickCounts.appeals = cr.appeals || 0;
+    quickCounts.certificates = cr.certificates || 0;
+  }
+} catch (_) {}
+
+// Six-stage stepper labels (matches /policy/recruitment).
+const STAGES = [
+  { key: 'submitted',  label: 'Submitted' },
+  { key: 'reviewing',  label: 'Reviewing' },
+  { key: 'task_sent',  label: 'Assessment' },
+  { key: 'interview',  label: 'Interview' },
+  { key: 'offer',      label: 'Decision' },
+  { key: 'hired',      label: 'Onboarded' },
+];
+
+function getStageIndex(status: string): number {
+  const i = STAGES.findIndex(s => s.key === status);
+  return i >= 0 ? i : 0;
+}
+function isClosedStatus(status: string): boolean {
+  return status === 'rejected' || status === 'withdrawn';
+}
+function timeAgo(date: any): string {
+  if (!date) return '';
+  const diff = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return Math.floor(diff / 60) + ' min ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' h ago';
+  if (diff < 86400 * 7) return Math.floor(diff / 86400) + ' d ago';
+  return new Date(date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+}
+
+const STATUS_TONE: Record<string, { cls: string; label: string }> = {
+  submitted:  { cls: 'bg-sky-bg text-sky border-sky-border',                  label: 'Submitted' },
+  reviewing:  { cls: 'bg-gold-bg text-gold-deep border-gold-border',          label: 'Reviewing' },
+  task_sent:  { cls: 'bg-burn-pale text-burn border-burn-dim',                label: 'Assessment' },
+  interview:  { cls: 'bg-plum-bg text-plum border-plum-border',               label: 'Interview' },
+  offer:      { cls: 'bg-leaf-bg text-leaf border-leaf-border',               label: 'Offer' },
+  hired:      { cls: 'bg-leaf-bg text-leaf border-leaf-border',               label: 'Hired' },
+  rejected:   { cls: 'bg-cream-3 text-ink-soft border-ink/15',                label: 'Closed' },
+  withdrawn:  { cls: 'bg-cream-3 text-ink-soft border-ink/15',                label: 'Withdrawn' },
+};
+
+// ============ Compute the single Next Step (server-side) ============
+type NextStep = { kind: string; eyebrow: string; title: string; subtitle?: string; cta: string; href: string; urgent: boolean };
+let nextStep: NextStep | null = null;
+
+const newestUnread = appsWithMessages.find((a: any) => a.lastMessage && a.lastMessage.senderRole === 'admin' && (a.unreadCount > 0));
+const unpaidIntent = pendingIntents.find((p: any) => p.waiverStatus !== 'approved');
+const interviewApp = appsWithMessages.find((a: any) => a.status === 'interview');
+
+if (newestUnread) {
+  nextStep = {
+    kind: 'unread',
+    eyebrow: 'Next step',
+    title: 'Reply to your ' + (newestUnread.roleTitleSnapshot || 'application') + ' thread.',
+    subtitle: 'A reviewer wrote to you ' + timeAgo(newestUnread.lastMessage.createdAt) + '.',
+    cta: 'Open thread',
+    href: '/portal/applications/' + newestUnread.id,
+    urgent: true,
+  };
+} else if (unpaidIntent) {
+  nextStep = {
+    kind: 'intent',
+    eyebrow: 'Next step',
+    title: 'Finish your ' + (unpaidIntent.roleTitle || 'application') + ' fee.',
+    subtitle: 'Your application is saved. Pay the processing fee, redeem a coupon, or request a waiver.',
+    cta: 'Resume application',
+    href: '/apply/' + unpaidIntent.id,
+    urgent: true,
+  };
+} else if (openRequests && openRequests.length > 0) {
+  const r = openRequests[0];
+  nextStep = {
+    kind: 'request',
+    eyebrow: 'Next step',
+    title: 'Open the ' + (r.title || 'support') + ' thread.',
+    subtitle: r.subject || 'A reply is waiting for you.',
+    cta: 'Open',
+    href: r.href || '/portal/requests',
+    urgent: true,
+  };
+} else if (!faceEnrolled && interviewApp) {
+  nextStep = {
+    kind: 'face',
+    eyebrow: 'Next step',
+    title: 'Set up Face 2FA before your interview.',
+    subtitle: 'Identity verification keeps your offer letter signing secure.',
+    cta: 'Set up Face 2FA',
+    href: '/portal/face-setup',
+    urgent: true,
+  };
+} else if (appsWithMessages.length === 0) {
+  nextStep = {
+    kind: 'browse',
+    eyebrow: 'Ready',
+    title: 'Browse the open roles.',
+    subtitle: 'Hundreds of roles, every application read by a human.',
+    cta: 'Open roles',
+    href: '/careers',
+    urgent: false,
+  };
+} else {
+  nextStep = {
+    kind: 'ready',
+    eyebrow: 'Ready',
+    title: "You're all caught up.",
+    subtitle: 'No outstanding actions. We will message you when there is news.',
+    cta: 'Browse more roles',
+    href: '/careers',
+    urgent: false,
+  };
+}
+
+// ============ Build the merged Action-needed inbox ============
+type InboxRow = { key: string; icon: string; title: string; subtitle: string; href: string; dismissible?: boolean };
+const inboxRows: InboxRow[] = [];
+pendingIntents.forEach((p: any) => {
+  if (p.waiverStatus === 'approved') return;
+  inboxRows.push({
+    key: 'intent:' + p.id,
+    icon: 'wallet',
+    title: 'Fee pending — ' + (p.roleTitle || 'Application draft'),
+    subtitle: (p.department || '') + ' · ' + (p.level || '') + ' · started ' + timeAgo(p.createdAt),
+    href: '/apply/' + p.id,
+  });
+});
+(openRequests || []).forEach((r: any) => {
+  inboxRows.push({
+    key: 'request:' + (r.id || r.href),
+    icon: 'message',
+    title: r.title || 'Open request',
+    subtitle: r.subject || 'Reply waiting',
+    href: r.href || '/portal/requests',
+  });
+});
+if (!faceEnrolled) {
+  inboxRows.push({
+    key: 'face',
+    icon: 'shield',
+    title: 'Set up Face 2FA',
+    subtitle: 'Adds an extra layer of identity verification on your offer letter signing.',
+    href: '/portal/face-setup',
+    dismissible: true,
+  });
+}
+
+// ============ Quick access strip ============
+const QUICK_ACCESS = [
+  { key: 'interviews',  label: 'Interviews',   href: '/portal/interviews',  count: quickCounts.interviews,  icon: 'calendar' },
+  { key: 'submissions', label: 'Submissions',  href: '/portal/submissions', count: quickCounts.submissions, icon: 'upload' },
+  { key: 'appeals',     label: 'Appeals',      href: '/portal/appeals',     count: quickCounts.appeals,     icon: 'gavel' },
+  { key: 'certificates',label: 'Credentials',  href: '/portal/profile#credentials', count: quickCounts.certificates, icon: 'award' },
+  { key: 'tools',       label: 'Profile Tools',href: '/portal/tools',       count: 0, icon: 'tool' },
+  { key: 'discussion',  label: 'Discussion',   href: '/portal/discussion',  count: 0, icon: 'community' },
+];
+
+const noOpenApps = appsWithMessages.length === 0;
 ---
-<BaseLayout title="My Applications - EduRankAI" description="Track your applications transparently.">
-  <section class="px-[5vw] py-10 md:py-14 max-w-4xl mx-auto">
+<BaseLayout title="Portal — EduRankAI" description="Track every application, message, and next step.">
+<style>
+  /* finish-level micro-polish */
+  .glow-soft { box-shadow: 0 1px 2px rgba(14,11,8,0.04), 0 8px 24px rgba(14,11,8,0.04); }
+  .glow-soft:hover { box-shadow: 0 1px 2px rgba(14,11,8,0.06), 0 14px 36px rgba(14,11,8,0.07); }
+  .fade-in { animation: fadeUp 0.55s cubic-bezier(0.16,1,0.3,1) both; }
+  .fade-in-delay-1 { animation-delay: 0.08s; }
+  .fade-in-delay-2 { animation-delay: 0.16s; }
+  .fade-in-delay-3 { animation-delay: 0.24s; }
+  @keyframes fadeUp { from { opacity:0; transform:translateY(14px); } to { opacity:1; transform:translateY(0); } }
+  .step-line { background: linear-gradient(90deg, var(--from, #0E0B08) 0%, var(--to, #0E0B0815) 100%); }
+  details.menu > summary { list-style: none; cursor: pointer; }
+  details.menu > summary::-webkit-details-marker { display: none; }
+  details.menu[open] .menu-panel { display: block; }
+  details.menu .menu-panel { display: none; }
+</style>
 
-    <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3 mb-8">
-      <div>
-        <p class="text-[0.62rem] font-mono uppercase tracking-[0.15em] text-burn font-bold mb-1">PORTAL</p>
-        <h1 class="font-display text-[clamp(1.8rem,4vw,2.5rem)] font-semibold text-ink leading-[1.1] tracking-tight mb-2">
-          Welcome, {firstName}.
+<main class="bg-cream min-h-screen pb-16">
+
+  {/* ============ 1. WELCOME BAR ============ */}
+  <header class="px-[5vw] pt-10 md:pt-14 pb-6 max-w-6xl mx-auto">
+    <div class="flex items-start justify-between gap-6 flex-wrap">
+      <div class="fade-in">
+        <p class="text-[0.62rem] font-mono uppercase tracking-[0.2em] text-burn font-bold">Portal</p>
+        <h1 class="font-display text-[clamp(2.2rem,4.5vw,3.2rem)] font-semibold text-ink leading-[1.05] tracking-tightest mt-2">
+          Welcome back, <em class="italic text-burn font-medium">{firstName}</em>.
         </h1>
-        <p class="text-[0.88rem] text-ink-soft">Track every application and message us anytime. We never keep you in the dark.</p>
+        <p class="text-[0.95rem] text-ink-soft mt-3 max-w-xl leading-relaxed">
+          Every application, message, and next step in one place. We never keep you in the dark.
+        </p>
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;"><a href="/portal/courses" style="font-size:12px;font-weight:600;color:#DC5000;padding:6px 12px;border:1px solid rgba(220,80,0,0.3);border-radius:8px;text-decoration:none;">Courses</a><a href="/portal/discussion" style="font-size:12px;color:#374151;padding:6px 12px;border:1px solid rgba(0,0,0,0.1);border-radius:8px;text-decoration:none;">Community</a><a href="/portal/logout" class="text-[0.82rem] font-medium text-ink-soft hover:text-burn px-4 py-2 border border-ink/15 rounded-lg hover:border-burn-dim transition-all">Sign out</a></div>
+      <details class="menu relative fade-in fade-in-delay-1">
+        <summary class="inline-flex items-center gap-2 bg-white border border-ink/10 hover:border-ink/25 rounded-full pl-1.5 pr-3 py-1.5 transition-all">
+          <span class="w-8 h-8 rounded-full bg-burn text-white flex items-center justify-center font-display text-[0.95rem] font-semibold">{firstName.charAt(0).toUpperCase()}</span>
+          <span class="text-sm text-ink font-medium hidden sm:inline">{firstName}</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-ink-soft"><polyline points="6 9 12 15 18 9"/></svg>
+        </summary>
+        <div class="menu-panel absolute right-0 mt-2 w-56 bg-white border border-ink/10 rounded-xl glow-soft py-2 z-20">
+          <a href="/portal/profile" class="flex items-center gap-3 px-4 py-2 text-sm text-ink hover:bg-cream-2"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Profile</a>
+          <a href="/portal/notifications" class="flex items-center gap-3 px-4 py-2 text-sm text-ink hover:bg-cream-2"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>Notifications</a>
+          <a href="/portal/face-setup" class="flex items-center gap-3 px-4 py-2 text-sm text-ink hover:bg-cream-2"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Security & 2FA</a>
+          <div class="my-1 border-t border-ink/10"></div>
+          <a href="/auth/logout" class="flex items-center gap-3 px-4 py-2 text-sm text-ink-soft hover:bg-cream-2 hover:text-ink"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Sign out</a>
+        </div>
+      </details>
+    </div>
+  </header>
+
+  {/* ============ 2. NEXT STEP CARD ============ */}
+  {nextStep && (
+    <section class="px-[5vw] mb-10 max-w-6xl mx-auto">
+      <div class={`rounded-2xl p-6 md:p-7 flex flex-col sm:flex-row sm:items-center gap-5 fade-in fade-in-delay-1 ${nextStep.urgent ? 'bg-burn-pale border border-burn-dim' : 'bg-white border border-ink/10'}`}>
+        <div class={`w-12 h-12 rounded-xl flex items-center justify-center shrink-0 ${nextStep.urgent ? 'bg-burn text-white' : 'bg-cream-2 text-burn'}`}>
+          {nextStep.urgent ? (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
+          ) : (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="20 6 9 17 4 12"/></svg>
+          )}
+        </div>
+        <div class="flex-1">
+          <p class={`text-[0.6rem] font-mono uppercase tracking-[0.2em] font-bold ${nextStep.urgent ? 'text-burn' : 'text-ink-soft'}`}>{nextStep.eyebrow}</p>
+          <p class="text-[1.05rem] font-display font-semibold text-ink mt-1.5 leading-snug">{nextStep.title}</p>
+          {nextStep.subtitle && <p class="text-[0.88rem] text-ink-soft mt-1.5 leading-relaxed">{nextStep.subtitle}</p>}
+        </div>
+        <a href={nextStep.href} class={`inline-flex items-center justify-center gap-2 px-6 py-3 rounded-lg text-sm font-semibold transition-all hover:-translate-y-0.5 shrink-0 ${nextStep.urgent ? 'bg-burn text-white hover:bg-burn-2' : 'border border-ink/15 text-ink-2 hover:border-ink/40'}`}>
+          {nextStep.cta}
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+        </a>
+      </div>
+    </section>
+  )}
+
+  {/* ============ 3. APPLICATIONS — the work list ============ */}
+  <section class="px-[5vw] mb-14 max-w-6xl mx-auto fade-in fade-in-delay-2">
+    <div class="flex items-end justify-between gap-4 mb-6 flex-wrap">
+      <div>
+        <p class="text-[0.62rem] font-mono uppercase tracking-[0.2em] text-burn font-bold">Applications</p>
+        <h2 class="font-display text-[clamp(1.6rem,3vw,2.2rem)] font-semibold text-ink leading-[1.1] tracking-tight mt-1.5">
+          Your <em class="italic text-burn font-medium">applications</em>.
+        </h2>
+      </div>
+      <p class="text-[0.72rem] font-mono text-ink-soft" data-applist-updated>Updated just now</p>
     </div>
 
-    <div id="notifCard" class="flex items-center gap-4 rounded-2xl p-4 md:p-5 mb-6" style="background:#fff7ed;border:1px solid #fdba74;display:none;">
-      <div class="shrink-0 w-11 h-11 rounded-full flex items-center justify-center" style="background:rgba(194,65,12,0.12);border:1px solid #fdba74;">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c2410c" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
-      </div>
-      <div class="flex-1 min-w-0">
-        <p class="font-display text-[1rem] font-semibold" style="color:#7c2d12;">Turn on notifications</p>
-        <p class="text-[0.82rem] leading-snug mt-0.5" style="color:#9a3412;">We will not email or call. Get pinged the moment our team replies, your status moves, or an offer arrives.</p>
-      </div>
-      <button type="button" id="enableNotifBtnHome" class="shrink-0 inline-flex items-center gap-1.5 font-semibold px-4 py-2 rounded-lg text-[0.85rem]" style="background:#c2410c;color:#fff;border:none;cursor:pointer;">Enable</button>
-    </div>
-
-    <meta name="vapid-public-key" content={import.meta.env.VAPID_PUBLIC_KEY || ''} />
-    <script is:inline>
-      (function () {
-        var card = document.getElementById('notifCard');
-        var btn = document.getElementById('enableNotifBtnHome');
-        var vapid = document.querySelector('meta[name="vapid-public-key"]')?.getAttribute('content');
-        function urlB64(s) {
-          var pad = '='.repeat((4 - s.length % 4) % 4);
-          var b64 = (s + pad).replace(/-/g, '+').replace(/_/g, '/');
-          var raw = atob(b64); var out = new Uint8Array(raw.length);
-          for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
-          return out;
-        }
-        if (!('serviceWorker' in navigator) || !('PushManager' in window) || !vapid) return;
-        navigator.serviceWorker.register('/sw.js').then(function (reg) {
-          return reg.pushManager.getSubscription().then(function (sub) {
-            if (sub) return; // already enabled - keep card hidden
-            if (card) card.style.display = 'flex';
-            if (btn) btn.addEventListener('click', function () {
-              btn.disabled = true; btn.textContent = 'Enabling...';
-              reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64(vapid) })
-                .then(function (s) {
-                  return fetch('/api/push/subscribe', {
-                    method: 'POST', credentials: 'same-origin',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(s),
-                  });
-                })
-                .then(function () { if (card) card.style.display = 'none'; })
-                .catch(function () { btn.disabled = false; btn.textContent = 'Try again'; });
-            });
-          });
-        }).catch(function () {});
-      })();
-    </script>
-
-    {!faceEnrolled && (
-      <a href="/portal/face-setup?next=/portal" class="flex items-center gap-4 bg-burn-pale/60 border-2 border-burn-dim rounded-2xl p-4 md:p-5 mb-6 no-underline group">
-        <div class="shrink-0 w-11 h-11 rounded-full bg-burn/15 border border-burn-dim flex items-center justify-center">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c2410c" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.5 9-8 11-4.5-2-8-6-8-11V5l8-3z"/><circle cx="12" cy="11" r="2.4"/><path d="M8.5 17a3.6 3.6 0 017 0"/></svg>
+    {noOpenApps ? (
+      <div class="bg-white border border-ink/10 rounded-2xl p-10 md:p-14 text-center glow-soft">
+        <div class="w-14 h-14 rounded-full bg-burn-pale flex items-center justify-center mx-auto mb-5">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
         </div>
-        <div class="flex-1 min-w-0">
-          <p class="font-display text-[1rem] font-semibold text-ink leading-tight">Secure your account with Face 2FA</p>
-          <p class="text-[0.82rem] text-ink-2 leading-snug mt-0.5">Add a quick face check for sign-in. Ten seconds — your photo never leaves your browser.</p>
-        </div>
-        <span class="shrink-0 inline-flex items-center gap-1.5 text-[0.82rem] font-semibold text-burn group-hover:gap-2.5 transition-all">Set up
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-        </span>
-      </a>
-    )}
-
-    {pendingIntents.length > 0 && (
-      <div style="background:linear-gradient(180deg,#fff7ed 0%,#ffffff 100%);border:1px solid rgba(220,80,0,0.25);border-radius:16px;padding:18px 22px;margin-bottom:18px;">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap;">
-          <div>
-            <p style="font-family:'Geist Mono','JetBrains Mono',monospace;font-size:10.5px;letter-spacing:0.16em;text-transform:uppercase;color:#DC5000;font-weight:700;margin:0 0 4px;">Pending - fee step</p>
-            <p style="font-family:Fraunces,serif;font-size:1.15rem;font-weight:600;color:#1c1d22;margin:0;">Applications waiting on you</p>
-            <p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#5b5b5b;margin:4px 0 0;">Pay the process &amp; verification fee, redeem a coupon, or request a waiver.</p>
-          </div>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:8px;">
-          {pendingIntents.map((p: any) => (
-            <div style="background:#fff;border:1px solid #e6e3da;border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:8px;">
-              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;">
-                <div style="min-width:0;flex:1;">
-                  <p style="font-family:'Inter Tight',sans-serif;font-size:13.5px;font-weight:600;margin:0 0 2px;color:#1c1d22;">{p.roleTitle || 'Application draft'}</p>
-                  <p style="font-family:'Inter Tight',sans-serif;font-size:11.5px;color:#5b5b5b;margin:0;">{[p.department, p.level].filter(Boolean).join(' · ') || 'Started ' + new Date(p.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}</p>
-                </div>
-                <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:0.14em;font-weight:700;padding:3px 9px;border-radius:100px;background:rgba(250,204,21,0.16);color:#92400e;">Fee pending</span>
-              </div>
-              <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                <a href={`/apply/pay?intent=${p.id}`} style="background:#FF4F00;color:#fff;text-decoration:none;font-size:11.5px;font-weight:700;padding:6px 13px;border-radius:6px;font-family:'Inter Tight',sans-serif;">Pay or redeem coupon</a>
-                {!p.waiverId && <a href={`/apply/waiver?intent=${p.id}`} style="background:#fff;color:#1c1d22;text-decoration:none;font-size:11.5px;font-weight:700;padding:6px 13px;border-radius:6px;border:1px solid #d6d3cb;font-family:'Inter Tight',sans-serif;">Request waiver</a>}
-                {p.waiverId && p.waiverStatus === 'pending' && <span style="font-size:11.5px;color:#92400e;align-self:center;">Waiver pending review</span>}
-                {p.waiverId && p.waiverStatus === 'rejected' && <span style="font-size:11.5px;color:#991b1b;align-self:center;">Waiver declined - pay or use a coupon</span>}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    )}
-
-    {openRequests.length > 0 && (
-      <div style="background:#fff;border:1px solid rgba(0,0,0,0.08);border-radius:16px;padding:18px 22px;margin-bottom:18px;">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;">
-          <div>
-            <p style="font-family:'Geist Mono','JetBrains Mono',monospace;font-size:10.5px;letter-spacing:0.16em;text-transform:uppercase;color:#DC5000;font-weight:700;margin:0 0 4px;">Open requests</p>
-            <p style="font-family:Fraunces,serif;font-size:1.15rem;font-weight:600;color:#1c1d22;margin:0;">Your live threads with the team</p>
-          </div>
-          <a href="/portal/requests" style="font-size:12px;color:#DC5000;font-weight:600;text-decoration:none;">View all →</a>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:8px;">
-          {openRequests.slice(0, 3).map((r: any) => {
-            const sBg = r.status === 'approved' ? 'rgba(16,185,129,0.12)' : r.status === 'rejected' ? 'rgba(239,68,68,0.10)' : 'rgba(250,204,21,0.14)';
-            const sFg = r.status === 'approved' ? '#047857' : r.status === 'rejected' ? '#991b1b' : '#92400e';
-            return (
-              <a href={r.href} style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 14px;background:#faf8f3;border:1px solid #e6e3da;border-radius:10px;text-decoration:none;color:#1c1d22;">
-                <div style="min-width:0;flex:1;">
-                  <p style="font-family:'Inter Tight',sans-serif;font-size:13.5px;font-weight:600;margin:0 0 2px;">{r.title}</p>
-                  <p style="font-family:'Inter Tight',sans-serif;font-size:11.5px;color:#5b5b5b;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{(r.subject || '').substring(0, 100)}</p>
-                </div>
-                <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;">
-                  <span style={'font-family:JetBrains Mono,monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:0.14em;font-weight:700;padding:2px 8px;border-radius:100px;background:' + sBg + ';color:' + sFg + ';'}>{r.status}</span>
-                  {r.unread > 0 && <span style="background:#FF4F00;color:#fff;font-size:10px;font-weight:700;padding:2px 7px;border-radius:100px;">{r.unread} new</span>}
-                </div>
-              </a>
-            );
-          })}
-        </div>
-      </div>
-    )}
-
-    <!-- ===== Learning surface (AquinTutor in the portal) ===== -->
-    <div style="background:linear-gradient(180deg,#fff8f3 0%,#ffffff 100%); border:1px solid rgba(217,119,87,0.25); border-radius:16px; padding:22px 24px; margin-bottom:24px;">
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom:16px;">
-        <div>
-          <p style="font-family:'Geist Mono','JetBrains Mono',monospace; font-size:10.5px; letter-spacing:0.16em; text-transform:uppercase; color:#d97757; font-weight:700; margin:0 0 6px;">AquinTutor · learning portal</p>
-          <p class="font-display" style="font-size:1.3rem; font-weight:600; color:#1c1d22; margin:0;">Keep your streak. Stretch your skills.</p>
-        </div>
-        <div style="display:flex; gap:18px; align-items:center; font-family:'JetBrains Mono',monospace; font-size:11.5px; color:#5b5b5b;">
-          <span style="display:inline-flex; align-items:center; gap:8px;">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14a4 4 0 1 0 7 0c0-2-1-3.5-3-5-2 1.5-3 3-3 5z"/><path d="M12 2c1 2 2 3.5 2 5a3 3 0 0 1-3 3"/></svg>
-            <b style="color:#f97316; font-size:14px;">{learnerXp.streakDays}</b> day{learnerXp.streakDays === 1 ? '' : 's'}
-          </span>
-          <span style="display:inline-flex; align-items:center; gap:8px;">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#d97757" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-            <b style="color:#d97757; font-size:14px;">{learnerXp.totalXp.toLocaleString()}</b> XP · Lv {learnerXp.level}
-          </span>
-        </div>
-      </div>
-
-      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; margin-bottom:18px;">
-        <a href="/aquintutor/dashboard" style="background:#0f172a; color:#fff; padding:10px 14px; border-radius:8px; text-decoration:none; font-size:12.5px; font-weight:700; text-align:center; font-family:'Inter Tight',sans-serif;">Dashboard</a>
-        <a href="/aquintutor/daily" style="background:#d97757; color:#fff; padding:10px 14px; border-radius:8px; text-decoration:none; font-size:12.5px; font-weight:700; text-align:center; font-family:'Inter Tight',sans-serif;">Daily challenge</a>
-        <a href="/aquintutor/converse" style="background:#fff; color:#1c1d22; padding:10px 14px; border-radius:8px; text-decoration:none; font-size:12.5px; font-weight:700; text-align:center; font-family:'Inter Tight',sans-serif; border:1px solid #e6e3da;">AI tutor</a>
-        <a href="/aquintutor/league" style="background:#fff; color:#1c1d22; padding:10px 14px; border-radius:8px; text-decoration:none; font-size:12.5px; font-weight:700; text-align:center; font-family:'Inter Tight',sans-serif; border:1px solid #e6e3da;">League</a>
-        <a href="/aquintutor/review" style="background:#fff; color:#1c1d22; padding:10px 14px; border-radius:8px; text-decoration:none; font-size:12.5px; font-weight:700; text-align:center; font-family:'Inter Tight',sans-serif; border:1px solid #e6e3da;">Review</a>
-        <a href="/aquintutor/classrooms" style="background:#fff; color:#1c1d22; padding:10px 14px; border-radius:8px; border:1px solid #e6e3da; text-decoration:none; font-size:12.5px; font-weight:700; text-align:center; font-family:'Inter Tight',sans-serif;">Classroom</a>
-      </div>
-
-      {portalCourses.length > 0 && (
-        <div style="margin-bottom:14px;">
-          <p style="font-family:'Geist Mono','JetBrains Mono',monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:#5b5b5b; font-weight:700; margin:0 0 8px;">Language + skill courses (free)</p>
-          <div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:8px;">
-            {portalCourses.map((c: any) => (
-              <a href={'/aquintutor/courses/' + c.slug} style="background:#fff; border:1px solid #e6e3da; border-radius:10px; padding:12px 14px; text-decoration:none; color:#1c1d22; transition:transform .12s;">
-                <p style="font-family:'Fraunces',serif; font-size:14.5px; font-weight:600; margin:0 0 4px; line-height:1.25;">{c.title}</p>
-                <p style="font-family:'Inter Tight',sans-serif; font-size:11.5px; color:#5b5b5b; margin:0; line-height:1.4;">{c.category} · {c.lesson_count} lesson{c.lesson_count === 1 ? '' : 's'}</p>
-              </a>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {portalTests.length > 0 && (
-        <div>
-          <p style="font-family:'Geist Mono','JetBrains Mono',monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:#5b5b5b; font-weight:700; margin:0 0 8px;">Tests · practice free · official 1 CHF</p>
-          <div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:8px;">
-            {portalTests.map((t: any) => {
-              const priceChf = Number(t.price_chf || 0);
-              const free = !t.is_premium || priceChf < 0.01;
-              return (
-                <div style="background:#fff; border:1px solid #e6e3da; border-radius:10px; padding:12px 14px;">
-                  <p style="font-family:'Fraunces',serif; font-size:14.5px; font-weight:600; margin:0 0 4px; line-height:1.25;">{t.title}</p>
-                  <p style="font-family:'JetBrains Mono',monospace; font-size:10.5px; color:#5b5b5b; margin:0 0 8px;">{t.total_questions}q · {t.duration_mins}m · {free ? 'FREE' : (priceChf + ' CHF')}</p>
-                  <div style="display:flex; gap:6px;">
-                    {t.practice_enabled && <a href={'/aquintutor/practice/' + t.slug} style="flex:1; background:#faf8f3; color:#1c1d22; padding:6px 8px; border-radius:6px; font-size:11.5px; font-weight:700; text-decoration:none; text-align:center; border:1px solid #e6e3da;">Practise</a>}
-                    <a href={'/aquintutor/test/' + t.slug} style="flex:1; background:#1c1d22; color:#fff; padding:6px 8px; border-radius:6px; font-size:11.5px; font-weight:700; text-decoration:none; text-align:center;">{free ? 'Take' : 'Official →'}</a>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-    </div>
-
-    {appsWithMessages.length === 0 ? (
-      <div class="bg-cream-2 border border-ink/10 rounded-2xl p-8 md:p-10 text-center">
-        <p class="font-display text-[1.2rem] font-semibold text-ink mb-2">No applications yet.</p>
-        <p class="text-[0.88rem] text-ink-soft mb-5">Browse open roles and apply, or check your fee-waiver requests if you have one in review.</p>
-        <div class="flex gap-3 justify-center flex-wrap">
-          <a href="/careers" class="inline-block bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.9rem] transition-all no-underline">View Open Roles</a>
-          <a href="/portal/study-abroad" class="inline-block bg-white hover:bg-cream-2 text-ink border border-ink/15 font-semibold py-3 px-6 rounded-lg text-[0.9rem] transition-all no-underline">Study abroad support</a>
-          <a href="/portal/waivers" class="inline-block bg-white hover:bg-cream-2 text-ink border border-ink/15 font-semibold py-3 px-6 rounded-lg text-[0.9rem] transition-all no-underline">My waiver requests</a>
+        <p class="text-[0.62rem] font-mono uppercase tracking-[0.2em] text-burn font-bold">Start here</p>
+        <h3 class="font-display text-[1.5rem] md:text-[1.9rem] font-semibold text-ink mt-2 leading-[1.1]">
+          No applications <em class="italic text-burn font-medium">yet</em>.
+        </h3>
+        <p class="text-[0.92rem] text-ink-soft mt-3 max-w-md mx-auto leading-relaxed">
+          Hundreds of open roles, every application read by a human. Start with the one that fits.
+        </p>
+        <div class="mt-7 flex flex-col sm:flex-row gap-3 justify-center">
+          <a href="/careers" class="inline-flex items-center justify-center gap-2 bg-burn text-white px-6 py-3 rounded-lg text-sm font-semibold transition-all hover:bg-burn-2 hover:-translate-y-0.5">Browse open roles<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="12 5 19 12 12 19"/></svg></a>
+          <a href="/portal/study-abroad" class="text-sm text-ink-soft hover:text-ink underline-offset-4 hover:underline self-center">Study abroad support</a>
+          <a href="/portal/waivers" class="text-sm text-ink-soft hover:text-ink underline-offset-4 hover:underline self-center">My waiver requests</a>
         </div>
       </div>
     ) : (
-      <div class="flex flex-col gap-5">
-        {appsWithMessages.map((app) => {
+      <div class="space-y-4">
+        {appsWithMessages.map((app: any) => {
+          const closed = isClosedStatus(app.status);
           const stageIdx = getStageIndex(app.status);
-          const isClosed = isClosedStatus(app.status);
-          const shortId = app.id.substring(0, 8).toUpperCase();
-          const submittedDate = new Date(app.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-          const statusClass = STATUS_COLORS[app.status] || 'bg-cream-2 text-ink-soft border-ink/15';
+          const stTone = STATUS_TONE[app.status] || STATUS_TONE.submitted;
           return (
-            <div class="bg-white border border-ink/10 rounded-2xl p-5 md:p-6">
-              <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4 pb-4 border-b border-ink/8">
-                <div>
-                  <div class="flex items-center gap-2 mb-1.5">
-                    <p class="font-mono text-[0.7rem] text-ink-soft">{shortId}</p>
-                    <span class={'inline-block text-[0.68rem] font-bold uppercase tracking-wider border px-2 py-0.5 rounded-full ' + statusClass}>
-                      {STAGE_LABELS[app.status] || app.status}
+            <article class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 glow-soft transition-all">
+
+              {/* Row 1 — title + status */}
+              <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-5">
+                <div class="min-w-0">
+                  <h3 class="font-display text-[1.15rem] md:text-[1.25rem] text-ink leading-snug truncate">{app.roleTitleSnapshot || 'Application'}</h3>
+                  <p class="text-[0.78rem] text-ink-soft mt-1 font-mono uppercase tracking-[0.08em]">
+                    {app.departmentSnapshot || '—'} · {app.level || '—'} · #{String(app.id).slice(0,8)}
+                  </p>
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                  {app.unreadCount > 0 && (
+                    <span class="inline-flex items-center gap-1 text-[0.68rem] font-mono uppercase tracking-[0.12em] text-burn font-bold">
+                      <span class="w-1.5 h-1.5 rounded-full bg-burn animate-pulse-slow"></span>
+                      {app.unreadCount} new
                     </span>
-                  </div>
-                  <p class="font-display text-[1.15rem] font-semibold text-ink leading-tight">{app.roleTitleSnapshot}</p>
-                  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[0.78rem] text-ink-soft mt-1">
-                    <span>{app.departmentSnapshot}</span>
-                    {app.level && <><span>-</span><span>{app.level}</span></>}
-                    <span>-</span><span>Applied {submittedDate}</span>
-                  </div>
+                  )}
+                  <span class={`inline-block text-[0.6rem] font-mono uppercase tracking-[0.15em] border px-3 py-1 rounded-full font-bold ${stTone.cls}`}>{stTone.label}</span>
                 </div>
               </div>
-              {!isClosed && (
-                <div class="mb-4">
-                  <div class="flex items-center justify-between mb-2">
-                    {STAGE_ORDER.slice(0, 5).map((stage, i) => {
-                      const isDone = stageIdx > i;
-                      const isCurrent = stageIdx === i;
+
+              {/* Row 2 — stepper (desktop horizontal, mobile progress bar) */}
+              {!closed && (
+                <>
+                  <div class="hidden md:flex items-center mb-5">
+                    {STAGES.map((stage, i) => {
+                      const done = i < stageIdx;
+                      const cur = i === stageIdx;
+                      const stepCls = done ? 'bg-ink text-cream' : cur ? 'bg-burn text-white' : 'bg-cream-2 text-ink-soft border border-ink/15';
                       return (
-                        <div class="flex flex-col items-center flex-1 relative">
-                          <div class={'w-6 h-6 rounded-full border-2 flex items-center justify-center text-[0.62rem] font-bold relative z-10 ' + (isDone ? 'bg-leaf border-leaf text-white' : isCurrent ? 'bg-burn border-burn text-white animate-pulse' : 'bg-white border-ink/15 text-ink-soft')}>
-                            {isDone ? 'OK' : (i + 1)}
+                        <>
+                          <div class="flex flex-col items-center" style={`width:${100 / STAGES.length}%`}>
+                            <div class={`w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-mono font-bold ${stepCls}`}>
+                              {done ? (
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                              ) : (i + 1)}
+                            </div>
+                            <p class={`mt-2 text-[0.6rem] font-mono uppercase tracking-[0.12em] font-medium truncate max-w-[9ch] ${cur ? 'text-burn font-bold' : 'text-ink-soft'}`}>{stage.label}</p>
                           </div>
-                          {i < 4 && <div class={'absolute top-3 left-1/2 w-full h-[2px] ' + (isDone ? 'bg-leaf' : 'bg-ink/10')} style="z-index: 0;"></div>}
-                          <p class={'text-[0.6rem] font-mono mt-1.5 text-center ' + (isCurrent ? 'text-burn font-bold' : isDone ? 'text-ink-2' : 'text-ink-soft')}>
-                            {STAGE_LABELS[stage]}
-                          </p>
-                        </div>
+                          {i < STAGES.length - 1 && (
+                            <div class={`flex-1 h-px -mt-5 ${done ? 'bg-ink' : 'bg-ink/15'}`}></div>
+                          )}
+                        </>
                       );
                     })}
                   </div>
-                </div>
-              )}
-              {app.lastMessage && (
-                <div class="bg-cream-2 border border-ink/10 rounded-lg p-3.5 mb-3 text-[0.85rem] leading-relaxed">
-                  <div class="flex items-center justify-between mb-1.5">
-                    <p class="text-[0.7rem] font-mono uppercase tracking-wider text-ink-soft font-bold">
-                      {app.lastMessage.isSystem ? 'System update' : (app.lastMessage.senderRole === 'admin' ? 'From the team' : 'You')}
-                    </p>
-                    <p class="text-[0.7rem] text-ink-soft font-mono">{timeAgo(app.lastMessage.createdAt)}</p>
+                  <div class="md:hidden mb-5">
+                    <div class="flex items-center justify-between mb-2">
+                      <p class="text-sm text-burn font-medium">{STAGES[stageIdx]?.label || 'In progress'}</p>
+                      <p class="text-[0.7rem] font-mono text-ink-soft">Step {stageIdx + 1} of {STAGES.length}</p>
+                    </div>
+                    <div class="h-1.5 bg-cream-2 rounded-full overflow-hidden">
+                      <div class="h-full bg-burn rounded-full transition-all" style={`width:${((stageIdx + 1) / STAGES.length) * 100}%`}></div>
+                    </div>
                   </div>
-                  <p class="text-ink-2 line-clamp-2">{app.lastMessage.body}</p>
+                </>
+              )}
+
+              {/* Row 3 — last message preview */}
+              {app.lastMessage && (
+                <div class="bg-cream-2/60 border border-ink/8 rounded-xl p-4 mb-5">
+                  <div class="flex items-center gap-2 mb-2 flex-wrap">
+                    <span class={`inline-flex items-center gap-1.5 text-[0.62rem] font-mono uppercase tracking-[0.12em] px-2 py-0.5 rounded-full font-bold ${app.lastMessage.senderRole === 'admin' ? 'bg-burn text-white' : app.lastMessage.isSystem ? 'bg-cream-3 text-ink-soft' : 'bg-leaf text-white'}`}>
+                      {app.lastMessage.isSystem ? 'System' : app.lastMessage.senderRole === 'admin' ? 'EduRankAI' : 'You'}
+                    </span>
+                    <span class="text-[0.7rem] font-mono text-ink-soft">{timeAgo(app.lastMessage.createdAt)}</span>
+                  </div>
+                  <p class="text-[0.88rem] text-ink-2 leading-relaxed line-clamp-2">{app.lastMessage.body}</p>
                 </div>
               )}
-              <div class="flex gap-2 mt-3">
-                <a href={'/portal/applications/' + app.id} class="flex-1 bg-ink hover:bg-ink/90 text-white font-semibold py-2.5 px-4 rounded-lg text-[0.85rem] transition-all text-center flex items-center justify-center gap-2">
-                  View thread and reply
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+
+              {/* Row 4 — per-card primary */}
+              <div class="flex items-center gap-3 flex-wrap">
+                <a href={`/portal/applications/${app.id}`} class="inline-flex items-center gap-2 bg-burn text-white px-5 py-2.5 rounded-lg text-sm font-semibold transition-all hover:bg-burn-2 hover:-translate-y-0.5">
+                  View thread
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
                 </a>
+                {closed && (
+                  <a href={`/portal/appeals/new?application=${app.id}`} class="text-sm text-ink-soft hover:text-ink underline-offset-4 hover:underline">Appeal decision</a>
+                )}
+                {app.score != null && <span class="text-[0.78rem] font-mono text-ink-soft">Score · <span class="text-ink font-bold">{Number(app.score).toFixed(1)}</span></span>}
               </div>
-            </div>
+            </article>
           );
         })}
       </div>
     )}
-
-    {appsWithMessages.length > 0 && (
-      <div class="mt-6 text-center text-[0.78rem] text-ink-soft italic">
-        Status and messages auto-refresh every 30 seconds.
-      </div>
-    )}
-
   </section>
-</BaseLayout>
+
+  {/* ============ 4. ACTION NEEDED inbox ============ */}
+  {inboxRows.length > 0 && (
+    <section class="px-[5vw] mb-14 max-w-6xl mx-auto fade-in fade-in-delay-3">
+      <div class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 glow-soft">
+        <div class="mb-5">
+          <p class="text-[0.62rem] font-mono uppercase tracking-[0.2em] text-burn font-bold">Action needed</p>
+          <h2 class="font-display text-[1.4rem] md:text-[1.6rem] font-semibold text-ink leading-[1.15] mt-1">
+            Things waiting on <em class="italic text-burn font-medium">you</em>.
+          </h2>
+        </div>
+        <ul class="divide-y divide-ink/10">
+          {inboxRows.map((row) => (
+            <li class="py-4 flex items-start gap-4">
+              <div class="w-10 h-10 rounded-full bg-burn-pale flex items-center justify-center shrink-0">
+                {row.icon === 'wallet' && <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/></svg>}
+                {row.icon === 'message' && <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8z"/></svg>}
+                {row.icon === 'shield' && <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>}
+              </div>
+              <div class="flex-1 min-w-0">
+                <p class="text-ink font-medium text-[0.92rem] truncate">{row.title}</p>
+                <p class="text-ink-soft text-[0.82rem] mt-0.5 truncate">{row.subtitle}</p>
+              </div>
+              <a href={row.href} class="inline-flex items-center gap-1 border border-ink/15 hover:border-ink/40 text-ink-2 px-4 py-2 rounded-lg text-[0.78rem] font-semibold transition-all shrink-0">
+                Open
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="12 5 19 12 12 19"/></svg>
+              </a>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </section>
+  )}
+
+  {/* ============ 5. QUICK ACCESS STRIP ============ */}
+  <section class="px-[5vw] mb-14 max-w-6xl mx-auto">
+    <div class="flex items-end justify-between mb-4">
+      <p class="text-[0.62rem] font-mono uppercase tracking-[0.2em] text-ink-soft font-bold">Quick access</p>
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+      {QUICK_ACCESS.map((tile) => (
+        <a href={tile.href} class="bg-white border border-ink/10 hover:border-burn-dim rounded-xl p-4 transition-all hover:-translate-y-0.5 glow-soft block">
+          <div class="flex items-start justify-between mb-3">
+            <div class="w-9 h-9 rounded-lg bg-cream-2 flex items-center justify-center">
+              {tile.icon === 'calendar' && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>}
+              {tile.icon === 'upload' && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>}
+              {tile.icon === 'gavel' && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M14 5l5 5"/><path d="M19 10l-9 9"/><path d="M9 14H4v5"/><path d="M9 14l5-5-5-5L4 9z"/></svg>}
+              {tile.icon === 'award' && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></svg>}
+              {tile.icon === 'tool' && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>}
+              {tile.icon === 'community' && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>}
+            </div>
+            {tile.count > 0 && (
+              <span class="text-[0.62rem] font-mono px-2 py-0.5 rounded-full bg-burn-pale border border-burn-dim text-burn font-bold">{tile.count}</span>
+            )}
+          </div>
+          <p class="text-[0.88rem] font-medium text-ink">{tile.label}</p>
+        </a>
+      ))}
+    </div>
+  </section>
+
+  {/* ============ 6. AQUINTUTOR slim rail ============ */}
+  {(portalCourses.length > 0 || portalTests.length > 0) && (
+    <section class="px-[5vw] mb-14 max-w-6xl mx-auto">
+      <div class="bg-cream-2/50 border border-ink/10 rounded-2xl p-6 md:p-8">
+        <div class="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4 mb-7">
+          <div>
+            <p class="text-[0.62rem] font-mono uppercase tracking-[0.2em] text-burn font-bold">AquinTutor</p>
+            <h2 class="font-display text-[1.5rem] md:text-[1.75rem] font-semibold text-ink leading-[1.1] mt-1">
+              Keep your <em class="italic text-burn font-medium">streak</em>.
+            </h2>
+          </div>
+          <div class="flex gap-6">
+            <div>
+              <p class="font-display text-[1.5rem] font-semibold text-ink leading-none font-mono">{learnerXp.streakDays || 0}<span class="text-[0.75rem] text-ink-soft font-normal">d</span></p>
+              <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-ink-soft mt-1.5 font-bold">Streak</p>
+            </div>
+            <div>
+              <p class="font-display text-[1.5rem] font-semibold text-ink leading-none font-mono">{learnerXp.totalXp || 0}</p>
+              <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-ink-soft mt-1.5 font-bold">XP</p>
+            </div>
+            <div>
+              <p class="font-display text-[1.5rem] font-semibold text-burn leading-none font-mono">{learnerXp.level || 1}</p>
+              <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-ink-soft mt-1.5 font-bold">Level</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid lg:grid-cols-2 gap-8">
+          <div>
+            <p class="text-[0.6rem] font-mono uppercase tracking-[0.2em] text-ink-soft mb-3 font-bold">Courses</p>
+            <ul class="divide-y divide-ink/10">
+              {portalCourses.length === 0 ? (
+                <li class="py-3 text-[0.86rem] text-ink-soft italic">Start your first course →</li>
+              ) : portalCourses.map((c: any) => (
+                <li>
+                  <a href={`/aquintutor/courses/${c.slug}`} class="py-3 flex items-center justify-between gap-3 group">
+                    <div class="min-w-0">
+                      <p class="font-display text-[1rem] text-ink leading-snug group-hover:text-burn transition truncate">{c.title}</p>
+                      <p class="text-[0.72rem] font-mono text-ink-soft mt-0.5 uppercase tracking-[0.05em] truncate">{c.category} · {c.lesson_count} lessons</p>
+                    </div>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="text-ink-soft group-hover:text-burn transition shrink-0"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <p class="text-[0.6rem] font-mono uppercase tracking-[0.2em] text-ink-soft mb-3 font-bold">Tests</p>
+            <ul class="divide-y divide-ink/10">
+              {portalTests.length === 0 ? (
+                <li class="py-3 text-[0.86rem] text-ink-soft italic">No tests published yet.</li>
+              ) : portalTests.map((t: any) => (
+                <li>
+                  <a href={`/aquintutor/test/${t.slug}`} class="py-3 flex items-center justify-between gap-3 group">
+                    <div class="min-w-0">
+                      <p class="font-display text-[1rem] text-ink leading-snug group-hover:text-burn transition truncate">{t.title}</p>
+                      <p class="text-[0.72rem] font-mono text-ink-soft mt-0.5 uppercase tracking-[0.05em] truncate">{t.total_questions} questions · {t.duration_mins} min</p>
+                    </div>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="text-ink-soft group-hover:text-burn transition shrink-0"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+
+        <div class="mt-7 pt-5 border-t border-ink/10 flex items-center justify-between flex-wrap gap-3">
+          <a href="/aquintutor" class="inline-flex items-center gap-2 border border-ink/15 hover:border-ink/40 text-ink-2 px-5 py-2.5 rounded-lg text-sm font-medium transition-all">
+            Open AquinTutor
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </a>
+          <a href="/aquintutor/dashboard" class="text-sm text-ink-soft hover:text-ink underline-offset-4 hover:underline">Daily challenge →</a>
+        </div>
+      </div>
+    </section>
+  )}
+
+  {/* ============ 7. ALSO FOR YOU ============ */}
+  <section class="px-[5vw] mb-16 max-w-6xl mx-auto">
+    <p class="text-[0.62rem] font-mono uppercase tracking-[0.2em] text-ink-soft font-bold mb-4">Also for you</p>
+    <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      <a href="/portal/tools" class="bg-white border border-ink/10 hover:border-burn-dim rounded-xl p-6 transition-all hover:-translate-y-0.5 glow-soft block">
+        <div class="w-10 h-10 rounded-lg bg-burn-pale flex items-center justify-center mb-4">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+        </div>
+        <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-burn font-bold">Tools</p>
+        <h3 class="font-display text-[1.1rem] text-ink mt-1 leading-snug">Profile Tools suite.</h3>
+        <p class="text-[0.85rem] text-ink-soft mt-2 leading-relaxed">24 browser-side PDF, image, and design tools. Day pass available.</p>
+        <p class="text-[0.8rem] text-burn font-semibold mt-3 inline-flex items-center gap-1">Open <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="12 5 19 12 12 19"/></svg></p>
+      </a>
+      <a href="/portal/discussion" class="bg-white border border-ink/10 hover:border-burn-dim rounded-xl p-6 transition-all hover:-translate-y-0.5 glow-soft block">
+        <div class="w-10 h-10 rounded-lg bg-sky-bg flex items-center justify-center mb-4">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1045BB" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        </div>
+        <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-sky font-bold">Community</p>
+        <h3 class="font-display text-[1.1rem] text-ink mt-1 leading-snug">Discussion board.</h3>
+        <p class="text-[0.85rem] text-ink-soft mt-2 leading-relaxed">Ask questions, share notes, find study partners across cohorts.</p>
+        <p class="text-[0.8rem] text-sky font-semibold mt-3 inline-flex items-center gap-1">Open <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="12 5 19 12 12 19"/></svg></p>
+      </a>
+      <a href="/portal/study-abroad" class="bg-white border border-ink/10 hover:border-burn-dim rounded-xl p-6 transition-all hover:-translate-y-0.5 glow-soft block">
+        <div class="w-10 h-10 rounded-lg bg-leaf-bg flex items-center justify-center mb-4">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1A6B35" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        </div>
+        <p class="text-[0.6rem] font-mono uppercase tracking-[0.15em] text-leaf font-bold">Advisory</p>
+        <h3 class="font-display text-[1.1rem] text-ink mt-1 leading-snug">Study abroad.</h3>
+        <p class="text-[0.85rem] text-ink-soft mt-2 leading-relaxed">Get matched with an advisor for your next programme.</p>
+        <p class="text-[0.8rem] text-leaf font-semibold mt-3 inline-flex items-center gap-1">Open <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="12 5 19 12 12 19"/></svg></p>
+      </a>
+    </div>
+  </section>
+
+  {/* ============ 8. FOOTER ============ */}
+  <footer class="px-[5vw] max-w-6xl mx-auto border-t border-ink/10 pt-8 pb-4">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-6 text-[0.8rem]">
+      <div>
+        <p class="text-[0.6rem] font-mono uppercase tracking-[0.2em] text-burn font-bold mb-3">Account</p>
+        <ul class="space-y-1.5">
+          <li><a href="/portal/profile" class="text-ink-soft hover:text-ink">Profile</a></li>
+          <li><a href="/portal/notifications" class="text-ink-soft hover:text-ink">Notifications</a></li>
+          <li><a href="/portal/face-setup" class="text-ink-soft hover:text-ink">Security & 2FA</a></li>
+          <li><a href="/auth/logout" class="text-ink-soft hover:text-ink">Sign out</a></li>
+        </ul>
+      </div>
+      <div>
+        <p class="text-[0.6rem] font-mono uppercase tracking-[0.2em] text-burn font-bold mb-3">Communicate</p>
+        <ul class="space-y-1.5">
+          <li><a href="/portal/mail" class="text-ink-soft hover:text-ink">Mail</a></li>
+          <li><a href="/portal/discussion" class="text-ink-soft hover:text-ink">Discussion</a></li>
+          <li><a href="/portal/hr-support" class="text-ink-soft hover:text-ink">HR support</a></li>
+          <li><a href="/portal/requests" class="text-ink-soft hover:text-ink">All threads</a></li>
+        </ul>
+      </div>
+      <div>
+        <p class="text-[0.6rem] font-mono uppercase tracking-[0.2em] text-burn font-bold mb-3">More</p>
+        <ul class="space-y-1.5">
+          <li><a href="/portal/submissions" class="text-ink-soft hover:text-ink">Submissions</a></li>
+          <li><a href="/portal/appeals" class="text-ink-soft hover:text-ink">Appeals</a></li>
+          <li><a href="/portal/waivers" class="text-ink-soft hover:text-ink">Waivers</a></li>
+          <li><a href="/portal/tools" class="text-ink-soft hover:text-ink">Profile tools</a></li>
+        </ul>
+      </div>
+      <div>
+        <p class="text-[0.6rem] font-mono uppercase tracking-[0.2em] text-burn font-bold mb-3">Legal</p>
+        <ul class="space-y-1.5">
+          <li><a href="/policy/candidate-transparency" class="text-ink-soft hover:text-ink">Transparency</a></li>
+          <li><a href="/policy/recruitment" class="text-ink-soft hover:text-ink">Recruitment policy</a></li>
+          <li><a href="/policy/work-culture" class="text-ink-soft hover:text-ink">Work culture</a></li>
+          <li><a href="/policy/fees" class="text-ink-soft hover:text-ink">Fee policy</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="mt-8 text-[0.7rem] font-mono uppercase tracking-[0.15em] text-ink-soft text-center">EduRankAI — every application read by a human.</p>
+  </footer>
+
+</main>
 
 <script is:inline>
-  setTimeout(function() { window.location.reload(); }, 30000);
+  // Quiet update-stamp on the applications section + close avatar menu on outside click.
+  (function () {
+    var stamp = document.querySelector('[data-applist-updated]');
+    var start = Date.now();
+    if (stamp) {
+      setInterval(function () {
+        var s = Math.round((Date.now() - start) / 1000);
+        if (s < 5) stamp.textContent = 'Updated just now';
+        else if (s < 60) stamp.textContent = 'Updated ' + s + 's ago';
+        else if (s < 3600) stamp.textContent = 'Updated ' + Math.floor(s / 60) + ' min ago';
+        else stamp.textContent = 'Updated ' + Math.floor(s / 3600) + ' h ago';
+      }, 5000);
+    }
+    document.addEventListener('click', function (e) {
+      var menus = document.querySelectorAll('details.menu[open]');
+      menus.forEach(function (m) {
+        if (!m.contains(e.target)) m.removeAttribute('open');
+      });
+    });
+  })();
 </script>
+</BaseLayout>
