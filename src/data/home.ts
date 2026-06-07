@@ -37,7 +37,7 @@ export const PRODUCTS = [
     statusVariant: 'planning',
     href: '/ecosystem/sambandh',
     external: false,
-    description: 'India most honest dating platform. Every profile is government-ID verified, every profession cross-checked, and a Karma Book catches lies, manipulation, and fraud across the platform. Four intents: marriage, dating, casual, friendship.'
+    description: 'Sanskrit for relationship. The connection layer for collaborative learning communities — purposeful matching between learners, educators, mentors, and peer cohorts. Designed around outcomes (did this connection actually help the learner), not engagement metrics.'
   },
   {
     name: 'Sancharan',
@@ -45,7 +45,7 @@ export const PRODUCTS = [
     statusVariant: 'planning',
     href: '/ecosystem/sancharan',
     external: false,
-    description: 'A thoughtful travel platform being built carefully in India, for every kind of journey that matters - weekend getaways, pilgrimages, school excursions, corporate offsites, family trips. Honest pricing, no dark patterns, bootstrapped.'
+    description: 'Sanskrit for movement. A communication infrastructure for educational organisations — structured, asynchronous-first, attention-respecting. Designed for learning communities, not adapted from chat tools built for office work.'
   },
   {
     name: 'Sampark',
@@ -53,7 +53,7 @@ export const PRODUCTS = [
     statusVariant: 'planning',
     href: '/ecosystem/sampark',
     external: false,
-    description: 'A modern CRM with chat, meetings, forms, and websites - built for the way you actually work. End-to-end encrypted. Made in Bharat for businesses that refuse to juggle six tools.'
+    description: 'Sanskrit for contact. The bridge between learning and the working world — internships, projects, and real-world application. Built as a learning-design problem, not a matching market, so both learners and host organisations genuinely benefit.'
   },
   {
     name: 'Foundational Models',

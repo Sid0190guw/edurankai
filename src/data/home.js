@@ -78,29 +78,29 @@ export const PRODUCTS = [
   },
   {
     name: 'Sambandh',
-    tagline: 'The most honest relationship platform',
+    tagline: 'Relationships that help learners',
     status: 'Early Build',
     statusVariant: 'planning',
     href: '/ecosystem/sambandh',
     external: false,
-    description: 'India\'s most honest relationship platform. Every profile government-ID verified. Every profession cross-checked. A Karma Book catches lies, manipulation, and fraud across the network. Four intents: marriage, dating, casual, friendship.'
+    description: 'Sanskrit for relationship. The connection layer for collaborative learning communities — purposeful matching between learners, educators, mentors, and peer cohorts. Designed around outcomes (did this connection actually help the learner), not engagement metrics.'
   },
   {
     name: 'Sancharan',
-    tagline: 'Travel, designed thoughtfully',
+    tagline: 'Communication for learning',
     status: 'Early Build',
     statusVariant: 'planning',
     href: '/ecosystem/sancharan',
     external: false,
-    description: 'A thoughtful travel platform built carefully in India — for every kind of journey that matters: weekend getaways, pilgrimages, school excursions, corporate off-sites, family trips. Honest pricing. No dark patterns. Bootstrapped.'
+    description: 'Sanskrit for movement. A communication infrastructure for educational organisations — structured, asynchronous-first, attention-respecting. Designed for learning communities, not adapted from chat tools built for office work.'
   },
   {
     name: 'Sampark',
-    tagline: 'CRM, finally done right',
+    tagline: 'Classroom to working world',
     status: 'Early Build',
     statusVariant: 'planning',
     href: '/ecosystem/sampark',
     external: false,
-    description: 'A modern CRM with chat, meetings, forms, and websites — built for the way you actually work. End-to-end encrypted. Made in Bharat for businesses that refuse to juggle six tools.'
+    description: 'Sanskrit for contact. The bridge between learning and the working world — internships, projects, and real-world application. Built as a learning-design problem, not a matching market, so both learners and host organisations genuinely benefit.'
   }
 ];
