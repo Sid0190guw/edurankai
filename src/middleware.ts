@@ -77,6 +77,8 @@ function isExempt(path: string): boolean {
   if (path === '/robots.txt' || path === '/sitemap.xml' || path === '/manifest.webmanifest' || path === '/sw.js') return true;
   // Auth + enrollment surfaces
   if (path === '/enroll-face') return true;
+  if (path === '/portal/face-setup') return true;
+  if (path === '/portal/enroll-face') return true;
   if (path === '/identity-setup') return true;
   if (path === '/verify-by-questions') return true;
   if (path === '/forgot-password') return true;
@@ -185,19 +187,21 @@ export const onRequest = defineMiddleware(async (context, next) => {
     }
   }
 
-  // 2FA gate: face-enrollment is REQUIRED for staff (admins, HR, editors,
-  // super_admins) because they touch sensitive shared data. For APPLICANTS
-  // it is optional — gating their first portal visit on a face capture was
-  // bouncing real candidates whose camera / lighting / ID photo wouldn't pass.
-  // They can opt in to face 2FA from /portal anytime, and we still require it
-  // at high-trust moments (offer signing, identity-verified interviews) where
-  // the cost of the friction is justified.
-  if (!isExempt(path) && isProtected(path) && result.user.role !== 'applicant') {
+  // 2FA gate: face-enrollment is REQUIRED for ALL signed-in users hitting a
+  // protected surface — staff AND applicants. Per founder instruction:
+  // every applicant must complete Face 2FA before accessing the portal.
+  // Login / signup / enrollment flows are exempt via isExempt(path) above.
+  if (!isExempt(path) && isProtected(path)) {
     const hasFace = await hasFaceEnrolled(result.user.id);
     if (!hasFace) {
+      // For applicants, route them through the portal-styled face-setup
+      // page so the back-link goes back to /portal. Staff use /enroll-face.
+      const target = result.user.role === 'applicant'
+        ? '/portal/face-setup?next=' + encodeURIComponent(path)
+        : '/enroll-face';
       return new Response(null, {
         status: 302,
-        headers: { Location: '/enroll-face' },
+        headers: { Location: target },
       });
     }
   }
