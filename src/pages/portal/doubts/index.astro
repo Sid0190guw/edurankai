@@ -1,0 +1,308 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/doubts'));
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Self-bootstrap schema
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS doubts (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id uuid NOT NULL,
+      course_id uuid,
+      subject text NOT NULL,
+      body text NOT NULL,
+      language text DEFAULT 'en',
+      urgency text DEFAULT 'med',
+      status text DEFAULT 'open',
+      aquin_answer text,
+      accepted_answer_id uuid,
+      created_at timestamptz DEFAULT now()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS doubt_answers (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      doubt_id uuid NOT NULL REFERENCES doubts(id) ON DELETE CASCADE,
+      user_id uuid,
+      body text NOT NULL,
+      is_aquin boolean DEFAULT false,
+      upvotes integer DEFAULT 0,
+      created_at timestamptz DEFAULT now()
+    )
+  `);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_doubts_status_created ON doubts (status, created_at DESC)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_doubt_answers_doubt ON doubt_answers (doubt_id)`);
+} catch (e) {
+  console.error('doubts schema bootstrap', e);
+}
+
+const SUBJECTS = ['Math', 'Physics', 'Chemistry', 'Biology', 'CS', 'GK', 'English', 'Hindi', 'Sanskrit', 'Tamil', 'Bengali', 'Marathi'];
+const URGENCY_LABEL: Record<string, string> = { low: 'Low', med: 'Medium', high: 'High' };
+const LANG_OPTIONS = [
+  { code: 'en', label: 'English' },
+  { code: 'hi', label: 'Hindi' },
+  { code: 'sa', label: 'Sanskrit' },
+  { code: 'ta', label: 'Tamil' },
+  { code: 'te', label: 'Telugu' },
+  { code: 'bn', label: 'Bengali' },
+  { code: 'mr', label: 'Marathi' },
+  { code: 'gu', label: 'Gujarati' },
+  { code: 'kn', label: 'Kannada' },
+  { code: 'ml', label: 'Malayalam' },
+  { code: 'pa', label: 'Punjabi' },
+  { code: 'or', label: 'Odia' },
+];
+
+let okMsg = '', errMsg = '', newDoubtId = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const subject = (fd.get('subject') as string || '').trim().slice(0, 80);
+    const body = (fd.get('body') as string || '').trim().slice(0, 6000);
+    const language = (fd.get('language') as string || 'en').trim().slice(0, 8);
+    const urgency = (fd.get('urgency') as string || 'med').trim();
+    const courseId = (fd.get('course_id') as string || '').trim() || null;
+
+    if (!subject) errMsg = 'Pick a subject.';
+    else if (body.length < 15) errMsg = 'Describe your doubt in at least 15 characters so a peer can help.';
+    else {
+      const r = rowsOf(await db.execute(sql`
+        INSERT INTO doubts (user_id, course_id, subject, body, language, urgency)
+        VALUES (${user.id}, ${courseId}, ${subject}, ${body}, ${language}, ${urgency})
+        RETURNING id
+      `));
+      newDoubtId = r[0]?.id || '';
+      okMsg = 'Doubt posted. A peer or mentor usually responds within 20 minutes.';
+
+      // Aquin AI quick answer if urgency=high or subject="quick"
+      const shouldAskAquin = urgency === 'high' || subject.toLowerCase() === 'quick';
+      if (shouldAskAquin && process.env.ANTHROPIC_API_KEY && newDoubtId) {
+        try {
+          const origin = new URL(Astro.request.url).origin;
+          // Fire-and-forget. Don't await full chain — we still return promptly.
+          (async () => {
+            try {
+              const r2 = await fetch(origin + '/api/ai/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  messages: [{
+                    role: 'user',
+                    content: `A learner posted this doubt on subject "${subject}" (language: ${language}). Give a clear, short, accurate explanation in 4-8 sentences. Doubt: ${body}`
+                  }]
+                })
+              });
+              const j: any = await r2.json();
+              if (j?.ok && j.reply) {
+                await db.execute(sql`
+                  INSERT INTO doubt_answers (doubt_id, user_id, body, is_aquin)
+                  VALUES (${newDoubtId}, NULL, ${j.reply}, true)
+                `);
+                await db.execute(sql`
+                  UPDATE doubts SET aquin_answer = ${j.reply}, status = 'aquin_answered'
+                  WHERE id = ${newDoubtId}
+                `);
+              }
+            } catch (e) {
+              console.error('aquin async', e);
+            }
+          })();
+        } catch (e) {
+          console.error('aquin trigger', e);
+        }
+      }
+    }
+  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+}
+
+// Filter by subject
+const filterSubject = (Astro.url.searchParams.get('subject') || '').trim();
+
+const feedQuery = filterSubject
+  ? sql`
+    SELECT d.*,
+      (SELECT COUNT(*) FROM doubt_answers da WHERE da.doubt_id = d.id) AS reply_count
+    FROM doubts d
+    WHERE d.status != 'resolved' AND lower(d.subject) = lower(${filterSubject})
+    ORDER BY d.created_at DESC
+    LIMIT 80
+  `
+  : sql`
+    SELECT d.*,
+      (SELECT COUNT(*) FROM doubt_answers da WHERE da.doubt_id = d.id) AS reply_count
+    FROM doubts d
+    WHERE d.status != 'resolved'
+    ORDER BY d.created_at DESC
+    LIMIT 80
+  `;
+const feed = rowsOf(await db.execute(feedQuery));
+
+function relTime(d: any): string {
+  try {
+    const t = new Date(d).getTime();
+    const diff = Date.now() - t;
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return m + ' min ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + ' h ago';
+    const days = Math.floor(h / 24);
+    if (days < 30) return days + ' d ago';
+    return new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+  } catch { return ''; }
+}
+---
+<BaseLayout title="Doubt Board · EduRankAI">
+<section class="px-[5vw] pt-10 md:pt-14 pb-6 max-w-4xl mx-auto">
+  <a href="/portal" class="text-[0.78rem] font-mono uppercase tracking-wider text-burn hover:underline no-underline">&larr; Portal home</a>
+  <div class="mt-5 mb-3">
+    <p class="text-[0.62rem] font-mono uppercase tracking-[0.18em] text-burn font-bold mb-2">Portal &middot; Doubt Board</p>
+    <h1 class="font-display text-[clamp(2rem,5vw,3rem)] font-semibold text-ink leading-[1.05] mb-3">
+      Stuck? <em class="italic text-burn font-normal">Ask Aquin</em> or a peer.
+    </h1>
+    <p class="text-[0.98rem] text-ink-2 font-light leading-[1.8] max-w-2xl">
+      Aquin answers in 90 seconds, a human in under 20 minutes. 24/7 coverage in 12 Indic languages.
+    </p>
+  </div>
+
+  <div class="mt-6 flex items-center gap-3 flex-wrap">
+    <button id="toggle-form" class="btn-primary inline-flex items-center gap-2">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+      Post doubt
+    </button>
+    <a href="/portal/doubts" class="text-[0.85rem] font-mono uppercase tracking-[0.12em] text-ink-soft hover:text-burn">All</a>
+    {SUBJECTS.map((s) => (
+      <a href={`/portal/doubts?subject=${encodeURIComponent(s)}`}
+         class={`text-[0.78rem] font-mono uppercase tracking-[0.1em] px-2.5 py-1 rounded-full border ${filterSubject.toLowerCase() === s.toLowerCase() ? 'bg-ink text-cream border-ink' : 'bg-white text-ink-soft border-ink/10 hover:border-burn hover:text-burn'}`}>
+        {s}
+      </a>
+    ))}
+  </div>
+</section>
+
+<section class="px-[5vw] pb-6 max-w-4xl mx-auto">
+  {okMsg && (
+    <div class="bg-leaf-bg border border-leaf-border rounded-2xl px-5 py-4 mb-4">
+      <p class="font-display text-[1rem] font-semibold text-leaf m-0">{okMsg}</p>
+      {newDoubtId && <a href={`/portal/doubts/${newDoubtId}`} class="text-leaf font-semibold underline underline-offset-2 text-[0.85rem] inline-block mt-2">Open your doubt &rarr;</a>}
+    </div>
+  )}
+  {errMsg && <div class="bg-burn-pale border border-burn-dim rounded-xl px-4 py-3 mb-4 text-[0.88rem] text-burn font-semibold">{errMsg}</div>}
+
+  <form id="doubt-form" method="POST" class={`bg-white border border-ink/10 rounded-2xl p-6 md:p-8 space-y-5 mb-6 ${okMsg ? '' : 'hidden'}`}>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div>
+        <label class="block text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft font-bold mb-2">Subject <span class="text-burn">*</span></label>
+        <select name="subject" required class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none">
+          <option value="">&mdash; Choose &mdash;</option>
+          {SUBJECTS.map((s) => <option value={s}>{s}</option>)}
+          <option value="quick">Quick (Aquin priority)</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft font-bold mb-2">Language</label>
+        <select name="language" class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none">
+          {LANG_OPTIONS.map((l) => <option value={l.code}>{l.label}</option>)}
+        </select>
+      </div>
+    </div>
+    <div>
+      <label class="block text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft font-bold mb-2">Your doubt <span class="text-burn">*</span></label>
+      <textarea name="body" rows="5" required minlength="15" maxlength="6000" placeholder="Be specific. Paste the question, what you tried, where you got stuck."
+        class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink font-body leading-relaxed resize-y focus:border-burn focus:outline-none"></textarea>
+    </div>
+    <div>
+      <label class="block text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft font-bold mb-2">Urgency</label>
+      <div class="flex gap-2 flex-wrap">
+        <label class="inline-flex items-center gap-2 bg-cream border border-ink/15 rounded-full px-3.5 py-1.5 cursor-pointer">
+          <input type="radio" name="urgency" value="low" class="accent-burn" />
+          <span class="text-[0.85rem] text-ink">Low</span>
+        </label>
+        <label class="inline-flex items-center gap-2 bg-cream border border-ink/15 rounded-full px-3.5 py-1.5 cursor-pointer">
+          <input type="radio" name="urgency" value="med" checked class="accent-burn" />
+          <span class="text-[0.85rem] text-ink">Medium</span>
+        </label>
+        <label class="inline-flex items-center gap-2 bg-cream border border-ink/15 rounded-full px-3.5 py-1.5 cursor-pointer">
+          <input type="radio" name="urgency" value="high" class="accent-burn" />
+          <span class="text-[0.85rem] text-ink">High (Aquin replies instantly)</span>
+        </label>
+      </div>
+    </div>
+    <div class="flex gap-2">
+      <button type="submit" class="btn-primary">Post doubt &rarr;</button>
+      <button type="button" id="cancel-form" class="text-[0.85rem] font-mono uppercase tracking-[0.12em] text-ink-soft hover:text-burn px-3">Cancel</button>
+    </div>
+  </form>
+
+  {feed.length === 0 ? (
+    <div class="bg-cream-2/60 border border-ink/10 rounded-2xl p-8 text-center">
+      <p class="text-[0.95rem] text-ink-soft m-0">
+        {filterSubject ? `No open doubts in ${filterSubject}.` : 'No open doubts on the board. Be the first to ask.'}
+      </p>
+    </div>
+  ) : (
+    <div class="space-y-3">
+      {feed.map((d: any) => {
+        const tone = d.urgency === 'high' ? 'bg-burn-pale text-burn border-burn-dim'
+          : d.urgency === 'low' ? 'bg-cream-2 text-ink-soft border-ink/10'
+          : 'bg-white text-ink-2 border-ink/10';
+        const statusBadge = d.status === 'aquin_answered'
+          ? { label: 'Aquin answered', cls: 'bg-leaf-bg text-leaf border-leaf-border' }
+          : d.status === 'peer_answered'
+          ? { label: 'Peer answered', cls: 'bg-sky-bg text-sky border-sky-border' }
+          : { label: 'Open', cls: 'bg-white text-ink-soft border-ink/15' };
+        return (
+          <a href={`/portal/doubts/${d.id}`} class="block bg-white border border-ink/10 rounded-2xl p-5 hover:border-burn no-underline">
+            <div class="flex justify-between items-start gap-3 flex-wrap mb-2">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="font-mono text-[0.62rem] uppercase tracking-[0.14em] text-burn font-bold">{d.subject}</span>
+                <span class={`font-mono text-[0.58rem] uppercase tracking-[0.14em] font-bold px-2 py-0.5 rounded-full border ${tone}`}>{URGENCY_LABEL[d.urgency] || 'Medium'}</span>
+                <span class={`font-mono text-[0.58rem] uppercase tracking-[0.14em] font-bold px-2 py-0.5 rounded-full border ${statusBadge.cls}`}>{statusBadge.label}</span>
+              </div>
+              <span class="text-[0.72rem] text-ink-soft font-mono">{relTime(d.created_at)}</span>
+            </div>
+            <p class="text-[0.95rem] text-ink leading-relaxed m-0 line-clamp-3 font-body">{d.body}</p>
+            <div class="mt-3 flex items-center gap-3 text-[0.78rem] text-ink-soft font-mono">
+              <span class="inline-flex items-center gap-1">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                {Number(d.reply_count) || 0} {Number(d.reply_count) === 1 ? 'reply' : 'replies'}
+              </span>
+              <span class="inline-flex items-center gap-1">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                {relTime(d.created_at)}
+              </span>
+            </div>
+          </a>
+        );
+      })}
+    </div>
+  )}
+</section>
+
+<script is:inline>
+  (function() {
+    const btn = document.getElementById('toggle-form');
+    const cancel = document.getElementById('cancel-form');
+    const form = document.getElementById('doubt-form');
+    if (btn && form) {
+      btn.addEventListener('click', function() {
+        form.classList.toggle('hidden');
+        if (!form.classList.contains('hidden')) {
+          form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
+    }
+    if (cancel && form) {
+      cancel.addEventListener('click', function() {
+        form.classList.add('hidden');
+      });
+    }
+  })();
+</script>
+</BaseLayout>

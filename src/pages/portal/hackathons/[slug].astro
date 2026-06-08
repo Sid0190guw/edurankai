@@ -1,0 +1,386 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { ensureCommunitySchema } from '@/lib/community';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+await ensureCommunitySchema();
+
+const { slug } = Astro.params;
+if (!slug) return Astro.redirect('/portal/hackathons');
+
+let errorMsg = '';
+let successMsg = '';
+
+// Find the hackathon
+const found = rows(await db.execute(sql`SELECT * FROM hackathons WHERE slug = ${slug} LIMIT 1`));
+const hack = found[0];
+if (!hack) return Astro.redirect('/portal/hackathons');
+
+if (Astro.request.method === 'POST') {
+  if (hack.status !== 'registration_open') {
+    errorMsg = 'Registration is closed for this hackathon.';
+  } else {
+    try {
+      const fd = await Astro.request.formData();
+      const teamName = ((fd.get('team_name') as string) || '').trim();
+      const membersRaw = ((fd.get('members') as string) || '').trim();
+      const title = ((fd.get('title') as string) || '').trim();
+      const summary = ((fd.get('summary') as string) || '').trim();
+      const repoUrl = ((fd.get('repo_url') as string) || '').trim();
+      const demoUrl = ((fd.get('demo_url') as string) || '').trim();
+      const videoUrl = ((fd.get('video_url') as string) || '').trim();
+
+      if (!teamName) {
+        errorMsg = 'Team name is required.';
+      } else if (teamName.length > 200) {
+        errorMsg = 'Team name is too long (max 200 characters).';
+      } else if (!title) {
+        errorMsg = 'A project title is required.';
+      } else if (!summary || summary.length < 40) {
+        errorMsg = 'A project summary of at least 40 characters is required.';
+      } else {
+        const membersList = membersRaw
+          .split(',')
+          .map(s => s.trim())
+          .filter(s => s.length > 0)
+          .slice(0, (hack.max_team_size || 4) - 1);
+        const cap = hack.max_team_size || 4;
+        if (membersList.length + 1 > cap) {
+          errorMsg = `Team size exceeds the cap of ${cap}.`;
+        } else {
+          const membersJson = JSON.stringify(membersList);
+          await db.execute(sql`
+            INSERT INTO hackathon_submissions
+              (hackathon_id, team_name, lead_user_id, members, title, summary, repo_url, demo_url, video_url)
+            VALUES
+              (${hack.id}, ${teamName}, ${user.id}, ${membersJson}::jsonb, ${title}, ${summary},
+               ${repoUrl || null}, ${demoUrl || null}, ${videoUrl || null})
+          `);
+          return Astro.redirect(`/portal/hackathons/${slug}?sent=1`);
+        }
+      }
+    } catch (err: any) {
+      errorMsg = 'Could not save submission: ' + (err?.message || 'Unknown error');
+    }
+  }
+}
+
+const url = new URL(Astro.request.url);
+if (url.searchParams.get('sent') === '1') successMsg = 'Submission received. Best of luck.';
+
+// Submissions list
+let submissions: any[] = [];
+if (hack.status === 'in_progress' || hack.status === 'completed') {
+  submissions = rows(await db.execute(sql`
+    SELECT id, team_name, title, summary, rank, score, repo_url, demo_url, video_url, submitted_at
+    FROM hackathon_submissions
+    WHERE hackathon_id = ${hack.id}
+    ORDER BY (rank IS NULL), rank ASC, score DESC NULLS LAST, submitted_at ASC
+    LIMIT 200
+  `));
+}
+
+const STATUS_LABEL: Record<string, string> = {
+  announced: 'Announced',
+  registration_open: 'Registration open',
+  in_progress: 'In progress',
+  completed: 'Completed'
+};
+const STATUS_TONE: Record<string, string> = {
+  announced: 'tone-ink',
+  registration_open: 'tone-leaf',
+  in_progress: 'tone-burn',
+  completed: 'tone-mute'
+};
+
+function fmtDate(d: any): string {
+  if (!d) return 'To be announced';
+  try {
+    return new Date(d).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
+  } catch (_) { return 'To be announced'; }
+}
+function fmtDateTime(d: any): string {
+  if (!d) return 'To be announced';
+  try {
+    return new Date(d).toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  } catch (_) { return 'To be announced'; }
+}
+function fmtPrize(chf: any): string {
+  if (chf === null || chf === undefined) return 'Prize to be announced';
+  const n = Number(chf);
+  if (!Number.isFinite(n) || n <= 0) return 'Recognition prize';
+  return n.toLocaleString() + ' CHF';
+}
+
+const showRegisterForm = hack.status === 'registration_open';
+const showLeaderboard = (hack.status === 'in_progress' || hack.status === 'completed');
+const cap = hack.max_team_size || 4;
+---
+<BaseLayout title={`${hack.title} | Hackathons`} description={hack.tagline || 'Time-boxed build at EduRankAI.'}>
+  <main class="hk-shell">
+    <a href="/portal/hackathons" class="hk-back">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+      <span>All hackathons</span>
+    </a>
+
+    <section class="hk-hero">
+      <div class="hk-hero-top">
+        <div class="hk-eyebrow">Portal &middot; Hackathon</div>
+        <span class={`hk-pill ${STATUS_TONE[hack.status] || 'tone-ink'}`}>{STATUS_LABEL[hack.status] || hack.status}</span>
+      </div>
+      <h1 class="hk-title">{hack.title}</h1>
+      {hack.tagline ? <p class="hk-sub">{hack.tagline}</p> : null}
+
+      <div class="hk-keystats">
+        <div class="hk-stat">
+          <div class="hk-stat-key">Starts</div>
+          <div class="hk-stat-val">{fmtDateTime(hack.starts_at)}</div>
+        </div>
+        <div class="hk-stat">
+          <div class="hk-stat-key">Ends</div>
+          <div class="hk-stat-val">{fmtDateTime(hack.ends_at)}</div>
+        </div>
+        <div class="hk-stat">
+          <div class="hk-stat-key">Registration closes</div>
+          <div class="hk-stat-val">{fmtDate(hack.registration_deadline)}</div>
+        </div>
+        <div class="hk-stat">
+          <div class="hk-stat-key">Prize pool</div>
+          <div class="hk-stat-val hk-stat-prize">{fmtPrize(hack.prize_pool_chf)}</div>
+        </div>
+        <div class="hk-stat">
+          <div class="hk-stat-key">Max team size</div>
+          <div class="hk-stat-val">{cap}</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="hk-grid-two">
+      <div class="hk-col">
+        <h2 class="hk-h2">Brief</h2>
+        {hack.description ? (
+          <div class="hk-body">{hack.description.split(/\n\n+/).map((p: string) => <p>{p}</p>)}</div>
+        ) : (
+          <div class="hk-body"><p class="hk-mute">A detailed brief will be posted before registration opens.</p></div>
+        )}
+
+        {hack.judges_blurb ? (
+          <div class="hk-block">
+            <h3 class="hk-h3">Judges</h3>
+            <p class="hk-body-p">{hack.judges_blurb}</p>
+          </div>
+        ) : null}
+
+        {hack.rules_url ? (
+          <div class="hk-block">
+            <h3 class="hk-h3">Rules</h3>
+            <p class="hk-body-p">Full rubric, eligibility, IP and conduct policy:</p>
+            <a class="hk-rules-link" href={hack.rules_url} target="_blank" rel="noopener">
+              <span>Read the rulebook</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            </a>
+          </div>
+        ) : null}
+      </div>
+
+      <aside class="hk-col">
+        {successMsg ? <div class="hk-alert hk-alert-ok">{successMsg}</div> : null}
+        {errorMsg ? <div class="hk-alert hk-alert-err">{errorMsg}</div> : null}
+
+        {showRegisterForm ? (
+          <form method="post" class="hk-form">
+            <div class="hk-form-head">
+              <h2 class="hk-h2">Register team</h2>
+              <p class="hk-form-sub">You are registered as the team lead. Add up to {cap - 1} more members by email, separated by commas.</p>
+            </div>
+
+            <label class="hk-field">
+              <span class="hk-label">Team name</span>
+              <input type="text" name="team_name" required maxlength="200" placeholder="e.g. Loka Builders" />
+            </label>
+
+            <label class="hk-field">
+              <span class="hk-label">Members (comma-separated emails)</span>
+              <input type="text" name="members" placeholder="alice@example.com, bob@example.com" />
+              <span class="hk-help">Lead is you. Cap is {cap} total.</span>
+            </label>
+
+            <label class="hk-field">
+              <span class="hk-label">Project title</span>
+              <input type="text" name="title" required maxlength="300" placeholder="What are you building?" />
+            </label>
+
+            <label class="hk-field">
+              <span class="hk-label">Summary</span>
+              <textarea name="summary" required minlength="40" rows="5" placeholder="What problem, who for, how does it work (40+ chars)"></textarea>
+            </label>
+
+            <label class="hk-field">
+              <span class="hk-label">Repository URL</span>
+              <input type="url" name="repo_url" placeholder="https://github.com/..." />
+            </label>
+
+            <label class="hk-field">
+              <span class="hk-label">Demo URL</span>
+              <input type="url" name="demo_url" placeholder="https://your-demo.vercel.app" />
+            </label>
+
+            <label class="hk-field">
+              <span class="hk-label">Video URL</span>
+              <input type="url" name="video_url" placeholder="https://youtube.com/..." />
+            </label>
+
+            <button class="hk-submit" type="submit">Register team</button>
+            <p class="hk-fine">By registering you agree to the hackathon rules and conduct policy.</p>
+          </form>
+        ) : (
+          <div class="hk-form hk-form-locked">
+            <h2 class="hk-h2">Registration</h2>
+            {hack.status === 'announced' ? (
+              <p class="hk-form-sub">Registration opens soon. Bookmark this page; the team-registration form will appear here when it does.</p>
+            ) : hack.status === 'in_progress' ? (
+              <p class="hk-form-sub">The hackathon is in progress and registration is closed. The leaderboard updates as submissions are scored.</p>
+            ) : (
+              <p class="hk-form-sub">This hackathon is complete. Final standings are below.</p>
+            )}
+          </div>
+        )}
+      </aside>
+    </section>
+
+    {showLeaderboard ? (
+      <section class="hk-board">
+        <div class="hk-board-head">
+          <h2 class="hk-h2">{hack.status === 'completed' ? 'Final standings' : 'Submissions'}</h2>
+          <span class="hk-board-count">{submissions.length} {submissions.length === 1 ? 'team' : 'teams'}</span>
+        </div>
+        {submissions.length === 0 ? (
+          <div class="hk-empty-mini">No submissions recorded yet.</div>
+        ) : (
+          <div class="hk-table">
+            <div class="hk-tr hk-th">
+              <div class="hk-c-rank">Rank</div>
+              <div class="hk-c-team">Team and project</div>
+              <div class="hk-c-links">Links</div>
+              <div class="hk-c-score">Score</div>
+            </div>
+            {submissions.map((s: any, i: number) => (
+              <div class="hk-tr">
+                <div class="hk-c-rank">
+                  <span class="hk-rank-num">{s.rank ?? (i + 1)}</span>
+                </div>
+                <div class="hk-c-team">
+                  <div class="hk-team-name">{s.team_name}</div>
+                  {s.title ? <div class="hk-team-title">{s.title}</div> : null}
+                  {s.summary ? <div class="hk-team-summary">{s.summary.length > 220 ? s.summary.slice(0, 220) + '...' : s.summary}</div> : null}
+                </div>
+                <div class="hk-c-links">
+                  {s.repo_url ? <a href={s.repo_url} target="_blank" rel="noopener">Repo</a> : null}
+                  {s.demo_url ? <a href={s.demo_url} target="_blank" rel="noopener">Demo</a> : null}
+                  {s.video_url ? <a href={s.video_url} target="_blank" rel="noopener">Video</a> : null}
+                </div>
+                <div class="hk-c-score">
+                  {s.score !== null && s.score !== undefined ? <span class="hk-score-num">{Number(s.score).toFixed(2)}</span> : <span class="hk-mute">Pending</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    ) : null}
+  </main>
+</BaseLayout>
+
+<style>
+  .hk-shell { max-width: 1180px; margin: 0 auto; padding: 32px 24px 96px; color: #0E0B08; }
+
+  .hk-back { display: inline-flex; align-items: center; gap: 8px; font-family: 'Geist Mono', 'SF Mono', ui-monospace, monospace; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7A6F68; text-decoration: none; margin-bottom: 28px; }
+  .hk-back:hover { color: #0E0B08; }
+
+  .hk-hero { padding: 8px 0 36px; border-bottom: 1px solid rgba(14,11,8,0.10); }
+  .hk-hero-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+  .hk-eyebrow { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #FF4F00; }
+  .hk-pill { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; padding: 5px 10px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+  .tone-ink { color: #2E2520; border-color: rgba(14,11,8,0.20); background: #FAF8F5; }
+  .tone-leaf { color: #1A6B35; border-color: rgba(26,107,53,0.25); background: rgba(26,107,53,0.06); }
+  .tone-burn { color: #FF4F00; border-color: #FFD4BC; background: #FFF3EE; }
+  .tone-mute { color: #7A6F68; border-color: rgba(14,11,8,0.10); background: #FAF8F5; }
+
+  .hk-title { font-family: 'Fraunces', 'Cormorant Garamond', Georgia, serif; font-weight: 400; font-size: clamp(40px, 6vw, 72px); line-height: 1.02; letter-spacing: -0.02em; margin: 0 0 16px; color: #0E0B08; }
+  .hk-sub { font-family: 'DM Sans', system-ui, sans-serif; font-size: 18px; line-height: 1.5; color: #2E2520; margin: 0 0 28px; max-width: 740px; }
+
+  .hk-keystats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; padding-top: 12px; }
+  .hk-stat { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 12px; padding: 14px 16px; }
+  .hk-stat-key { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #7A6F68; margin-bottom: 6px; }
+  .hk-stat-val { font-family: 'DM Sans', system-ui, sans-serif; font-size: 14px; color: #0E0B08; line-height: 1.35; }
+  .hk-stat-prize { color: #1A6B35; font-weight: 500; }
+
+  .hk-grid-two { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 1fr); gap: 32px; padding: 40px 0; }
+  @media (max-width: 880px) { .hk-grid-two { grid-template-columns: 1fr; } }
+  .hk-col { min-width: 0; }
+
+  .hk-h2 { font-family: 'Fraunces', serif; font-weight: 400; font-size: 28px; letter-spacing: -0.01em; margin: 0 0 16px; color: #0E0B08; }
+  .hk-h3 { font-family: 'Fraunces', serif; font-weight: 400; font-size: 20px; letter-spacing: -0.01em; margin: 0 0 8px; color: #0E0B08; }
+
+  .hk-body { font-family: 'DM Sans', system-ui, sans-serif; font-size: 16px; line-height: 1.65; color: #2E2520; }
+  .hk-body p { margin: 0 0 14px; }
+  .hk-body-p { font-family: 'DM Sans', system-ui, sans-serif; font-size: 15px; line-height: 1.6; color: #2E2520; margin: 0 0 8px; }
+  .hk-mute { color: #7A6F68; }
+
+  .hk-block { padding: 20px 0; border-top: 1px solid rgba(14,11,8,0.08); margin-top: 8px; }
+  .hk-rules-link { display: inline-flex; align-items: center; gap: 6px; font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #FF4F00; text-decoration: none; margin-top: 6px; }
+  .hk-rules-link:hover { text-decoration: underline; }
+
+  .hk-form { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 16px; padding: 24px; display: flex; flex-direction: column; gap: 16px; position: sticky; top: 24px; }
+  .hk-form-locked { gap: 8px; }
+  .hk-form-head { display: flex; flex-direction: column; gap: 4px; }
+  .hk-form-sub { font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; color: #7A6F68; margin: 0; line-height: 1.5; }
+
+  .hk-field { display: flex; flex-direction: column; gap: 6px; }
+  .hk-label { font-family: 'Geist Mono', monospace; font-size: 0.62rem; letter-spacing: 0.14em; text-transform: uppercase; color: #7A6F68; }
+  .hk-field input, .hk-field textarea { font-family: 'DM Sans', system-ui, sans-serif; font-size: 14px; color: #0E0B08; padding: 10px 12px; border: 1px solid rgba(14,11,8,0.18); border-radius: 10px; background: #FAF8F5; outline: none; transition: border 0.15s; }
+  .hk-field input:focus, .hk-field textarea:focus { border-color: #FF4F00; background: #fff; }
+  .hk-field textarea { resize: vertical; min-height: 110px; }
+  .hk-help { font-family: 'DM Sans', system-ui, sans-serif; font-size: 12px; color: #7A6F68; }
+
+  .hk-submit { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; background: #0E0B08; color: #FAF8F5; padding: 14px 18px; border: 0; border-radius: 10px; cursor: pointer; transition: background 0.15s; }
+  .hk-submit:hover { background: #FF4F00; }
+  .hk-fine { font-family: 'DM Sans', system-ui, sans-serif; font-size: 12px; color: #7A6F68; margin: 0; }
+
+  .hk-alert { padding: 12px 14px; border-radius: 10px; font-family: 'DM Sans', system-ui, sans-serif; font-size: 14px; margin-bottom: 16px; border: 1px solid; }
+  .hk-alert-ok { background: rgba(26,107,53,0.06); color: #1A6B35; border-color: rgba(26,107,53,0.25); }
+  .hk-alert-err { background: #FFF3EE; color: #FF4F00; border-color: #FFD4BC; }
+
+  .hk-board { padding: 32px 0 0; border-top: 1px solid rgba(14,11,8,0.10); }
+  .hk-board-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+  .hk-board-count { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7A6F68; }
+  .hk-empty-mini { padding: 32px; text-align: center; font-family: 'DM Sans', system-ui, sans-serif; color: #7A6F68; border: 1px dashed rgba(14,11,8,0.20); border-radius: 12px; }
+
+  .hk-table { display: flex; flex-direction: column; background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 16px; overflow: hidden; }
+  .hk-tr { display: grid; grid-template-columns: 70px minmax(0, 1fr) 140px 100px; gap: 16px; padding: 16px 20px; border-bottom: 1px solid rgba(14,11,8,0.08); align-items: start; }
+  .hk-tr:last-child { border-bottom: 0; }
+  .hk-th { background: #FAF8F5; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #7A6F68; padding: 12px 20px; }
+  @media (max-width: 720px) {
+    .hk-tr { grid-template-columns: 50px minmax(0, 1fr) 80px; }
+    .hk-c-score { display: none; }
+    .hk-th .hk-c-score { display: none; }
+  }
+  .hk-c-rank { font-family: 'Fraunces', serif; font-size: 22px; color: #FF4F00; }
+  .hk-rank-num { font-variant-numeric: tabular-nums; }
+  .hk-team-name { font-family: 'Fraunces', serif; font-size: 18px; color: #0E0B08; margin-bottom: 2px; }
+  .hk-team-title { font-family: 'DM Sans', system-ui, sans-serif; font-size: 14px; color: #2E2520; margin-bottom: 4px; }
+  .hk-team-summary { font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; color: #7A6F68; line-height: 1.5; }
+  .hk-c-links { display: flex; flex-direction: column; gap: 4px; }
+  .hk-c-links a { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.04em; color: #FF4F00; text-decoration: none; }
+  .hk-c-links a:hover { text-decoration: underline; }
+  .hk-c-score { font-family: 'Geist Mono', monospace; font-size: 14px; color: #1A6B35; font-variant-numeric: tabular-nums; }
+  .hk-score-num { font-weight: 500; }
+</style>
+</content>
+</invoke>

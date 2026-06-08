@@ -1,0 +1,217 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { ensureCommunitySchema, getClub, listClubPosts } from '@/lib/community';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const user = Astro.locals.user;
+const { slug } = Astro.params;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/clubs/' + slug));
+
+await ensureCommunitySchema();
+
+let club = await getClub(slug as string);
+if (!club) return Astro.redirect('/portal/clubs');
+
+const POST_KINDS = ['discussion', 'announcement', 'question'];
+
+let okMsg = '', errMsg = '';
+let isMember = false;
+
+try {
+  const m = rows(await db.execute(sql`SELECT 1 AS x FROM club_members WHERE club_id = ${club.id} AND user_id = ${user.id} LIMIT 1`));
+  isMember = m.length > 0;
+} catch (_) {}
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('action') as string || '').trim();
+
+    if (action === 'join') {
+      const before = rows(await db.execute(sql`SELECT 1 AS x FROM club_members WHERE club_id = ${club.id} AND user_id = ${user.id} LIMIT 1`));
+      if (before.length === 0) {
+        await db.execute(sql`INSERT INTO club_members (club_id, user_id, role) VALUES (${club.id}, ${user.id}, 'member') ON CONFLICT DO NOTHING`);
+        await db.execute(sql`UPDATE clubs SET member_count = member_count + 1 WHERE id = ${club.id}`);
+        isMember = true;
+        okMsg = 'Welcome to the club.';
+        club = await getClub(slug as string);
+      } else {
+        isMember = true;
+      }
+    } else if (action === 'post') {
+      const title = (fd.get('title') as string || '').trim();
+      const body = (fd.get('body') as string || '').trim();
+      const kind = (fd.get('kind') as string || 'discussion').trim();
+      if (body.length < 20) errMsg = 'Post body must be at least 20 characters.';
+      else if (!POST_KINDS.includes(kind)) errMsg = 'Pick a valid post kind.';
+      else {
+        await db.execute(sql`INSERT INTO club_posts (club_id, user_id, title, body, kind) VALUES (${club.id}, ${user.id}, ${title || null}, ${body}, ${kind})`);
+        await db.execute(sql`UPDATE clubs SET post_count = post_count + 1 WHERE id = ${club.id}`);
+        // Ensure the poster is also a member
+        if (!isMember) {
+          await db.execute(sql`INSERT INTO club_members (club_id, user_id, role) VALUES (${club.id}, ${user.id}, 'member') ON CONFLICT DO NOTHING`);
+          await db.execute(sql`UPDATE clubs SET member_count = member_count + 1 WHERE id = ${club.id}`);
+          isMember = true;
+        }
+        okMsg = 'Posted.';
+        club = await getClub(slug as string);
+      }
+    }
+  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+}
+
+const posts = await listClubPosts(club.id);
+
+// Fetch member display names for post authors
+const authorIds = Array.from(new Set(posts.map((p: any) => p.user_id).filter(Boolean)));
+let authorMap: Record<string, string> = {};
+if (authorIds.length > 0) {
+  try {
+    const ph = authorIds.map((id) => sql`${id}`);
+    let frag: any = ph[0];
+    for (let i = 1; i < ph.length; i++) frag = sql`${frag}, ${ph[i]}`;
+    const r = rows(await db.execute(sql`SELECT id, display_name, email FROM users WHERE id IN (${frag})`));
+    for (const u of r) {
+      authorMap[u.id] = u.display_name || (u.email ? String(u.email).split('@')[0] : 'member');
+    }
+  } catch (_) {}
+}
+
+function relTime(d: any) {
+  if (!d) return '';
+  const t = new Date(d).getTime();
+  const diff = Math.max(0, Date.now() - t);
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  const days = Math.floor(h / 24);
+  if (days < 30) return days + 'd ago';
+  const mo = Math.floor(days / 30);
+  if (mo < 12) return mo + 'mo ago';
+  return Math.floor(mo / 12) + 'y ago';
+}
+
+const kindStyle = (k: string) => {
+  if (k === 'announcement') return 'bg-burn-pale text-burn border-burn-dim';
+  if (k === 'question') return 'bg-leaf-bg text-leaf border-leaf-border';
+  return 'bg-ink/5 text-ink-2 border-ink/10';
+};
+---
+<BaseLayout title={`${club.name} · Clubs · EduRankAI`} description={club.tagline || `${club.name} community on EduRankAI.`}>
+
+<section class="px-[5vw] pt-12 md:pt-16 pb-4 max-w-4xl mx-auto">
+  <p class="text-[0.62rem] font-mono uppercase tracking-[0.18em] text-burn font-bold mb-2">
+    <a href="/portal/clubs" class="hover:underline">Clubs</a>
+    <span class="mx-1 text-ink-soft">/</span>
+    <span class="text-ink-soft">{club.category || 'General'}</span>
+  </p>
+  <div class="flex justify-between items-end flex-wrap gap-3">
+    <div class="max-w-2xl">
+      <h1 class="font-display text-[clamp(2.2rem,4.5vw,3.4rem)] font-semibold text-ink leading-[1.05]">{club.name}</h1>
+      {club.tagline && <p class="text-[1.05rem] text-ink-2 font-light leading-[1.7] mt-2">{club.tagline}</p>}
+    </div>
+    {!isMember ? (
+      <form method="POST" class="m-0">
+        <input type="hidden" name="action" value="join"/>
+        <button type="submit" class="bg-burn text-white px-5 py-2.5 rounded-xl font-bold font-mono text-[0.75rem] uppercase tracking-wider">+ Join club</button>
+      </form>
+    ) : (
+      <span class="inline-flex items-center gap-1.5 bg-leaf-bg border border-leaf-border text-leaf font-mono text-[0.72rem] uppercase tracking-wider px-3 py-1.5 rounded-full">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Member
+      </span>
+    )}
+  </div>
+
+  <div class="flex flex-wrap gap-4 mt-5 text-[0.72rem] font-mono uppercase tracking-wider text-ink-soft">
+    <span class="inline-flex items-center gap-1.5">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      {club.member_count || 0} members
+    </span>
+    <span class="inline-flex items-center gap-1.5">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      {club.post_count || 0} posts
+    </span>
+    <span class="inline-flex items-center gap-1.5 px-2 py-0.5 bg-burn-pale text-burn border border-burn-dim rounded-full">{club.category || 'General'}</span>
+  </div>
+</section>
+
+{club.description && (
+  <section class="px-[5vw] pb-4 max-w-4xl mx-auto">
+    <div class="bg-white border border-ink/10 rounded-2xl p-5">
+      <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft mb-2">About</p>
+      <p class="text-[0.95rem] text-ink-2 leading-[1.7] whitespace-pre-wrap">{club.description}</p>
+    </div>
+  </section>
+)}
+
+<section class="px-[5vw] pb-14 max-w-4xl mx-auto">
+  {okMsg && <div class="bg-leaf-bg border border-leaf-border rounded-xl px-4 py-3 mb-4 text-[0.92rem] text-leaf font-semibold">{okMsg}</div>}
+  {errMsg && <div class="bg-burn-pale border border-burn-dim rounded-xl px-4 py-3 mb-4 text-[0.88rem] text-burn font-semibold">{errMsg}</div>}
+
+  <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-6 mb-6 space-y-3">
+    <input type="hidden" name="action" value="post"/>
+    <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-burn font-bold m-0">Post to the club</p>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <input name="title" type="text" maxlength="300" placeholder="Title (optional)" class="md:col-span-2 bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem]"/>
+      <select name="kind" required class="bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem]">
+        <option value="discussion">Discussion</option>
+        <option value="question">Question</option>
+        <option value="announcement">Announcement</option>
+      </select>
+    </div>
+    <textarea name="body" rows="4" minlength="20" maxlength="6000" required placeholder="Share a question, an idea, a paper, an opportunity..." class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] font-body resize-y"></textarea>
+    <button type="submit" class="bg-burn text-white px-5 py-2.5 rounded-xl font-bold font-mono text-[0.75rem] uppercase tracking-wider">Post</button>
+  </form>
+
+  <div class="flex items-center justify-between mb-4">
+    <h2 class="font-display text-[1.4rem] font-semibold text-ink">Feed</h2>
+    <span class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft">{posts.length} posts</span>
+  </div>
+
+  {posts.length === 0 ? (
+    <div class="text-center py-12 border border-dashed border-ink/15 rounded-2xl">
+      <p class="text-ink-soft font-body text-[0.95rem]">Nothing posted yet.</p>
+      <p class="text-ink-soft font-mono text-[0.72rem] uppercase tracking-wider mt-2">Start the conversation.</p>
+    </div>
+  ) : (
+    <div class="space-y-3">
+      {posts.map((p: any) => (
+        <article class="bg-white border border-ink/10 rounded-2xl p-5">
+          <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+            <div class="flex items-center gap-2">
+              <span class="w-8 h-8 rounded-full bg-ink/8 inline-flex items-center justify-center text-ink-2 font-mono text-[0.7rem] font-bold uppercase">
+                {(authorMap[p.user_id] || 'M').slice(0, 2)}
+              </span>
+              <div>
+                <p class="text-[0.86rem] font-semibold text-ink m-0 leading-tight">{authorMap[p.user_id] || 'member'}</p>
+                <p class="text-[0.68rem] font-mono uppercase tracking-wider text-ink-soft m-0 leading-tight">{relTime(p.created_at)}</p>
+              </div>
+            </div>
+            <span class={`text-[0.62rem] font-mono uppercase tracking-[0.14em] font-bold px-2 py-0.5 rounded-full border ${kindStyle(p.kind || 'discussion')}`}>{p.kind || 'discussion'}</span>
+          </div>
+          {p.title && <h3 class="font-display text-[1.1rem] font-semibold text-ink leading-tight mt-3">{p.title}</h3>}
+          <p class="text-[0.94rem] text-ink-2 mt-2 leading-[1.7] whitespace-pre-wrap">{p.body}</p>
+          <div class="flex items-center gap-4 mt-4 pt-3 border-t border-ink/10 text-[0.72rem] font-mono uppercase tracking-wider text-ink-soft">
+            <span class="inline-flex items-center gap-1.5">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
+              {p.upvotes || 0}
+            </span>
+            <span class="inline-flex items-center gap-1.5">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+              {p.reply_count || 0} replies
+            </span>
+          </div>
+        </article>
+      ))}
+    </div>
+  )}
+</section>
+
+</BaseLayout>

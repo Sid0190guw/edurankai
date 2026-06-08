@@ -1,0 +1,518 @@
+---
+// /portal/parent — parent of a K-12 learner sees attendance, progress,
+// payments, and recent reports for every child linked to their account.
+// Self-bootstraps the parent_child_links table on module load, then renders
+// one card per linked child with a weekly summary up top and a "link a
+// child" form when the parent has no children attached yet.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/parent'));
+
+// Self-bootstrap the parent_child_links table.
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS parent_child_links (
+      id BIGSERIAL PRIMARY KEY,
+      parent_user_id BIGINT NOT NULL,
+      child_user_id BIGINT NOT NULL,
+      relationship TEXT NOT NULL DEFAULT 'parent',
+      is_primary BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (parent_user_id, child_user_id)
+    )
+  `);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_parent_child_links_parent ON parent_child_links(parent_user_id)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_parent_child_links_child ON parent_child_links(child_user_id)`);
+} catch (_) {}
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Handle POST: link a child by email.
+let formError = '';
+let formOk = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const childEmail = String(fd.get('child_email') || '').trim().toLowerCase();
+    const relationship = String(fd.get('relationship') || 'parent').trim();
+    const isPrimary = String(fd.get('is_primary') || 'true') === 'true';
+    if (!childEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(childEmail)) {
+      formError = 'Enter a valid email for the child you want to link.';
+    } else if (!['parent', 'guardian', 'other'].includes(relationship)) {
+      formError = 'Relationship must be parent, guardian, or other.';
+    } else {
+      const found = rows(await db.execute(sql`SELECT id FROM users WHERE email = ${childEmail} LIMIT 1`));
+      if (found.length === 0) {
+        formError = 'No EduRankAI account found for that email. The child must register first, then come back here to link.';
+      } else {
+        const childId = Number((found[0] as any).id);
+        if (childId === Number(user.id)) {
+          formError = 'You cannot link your own account as a child.';
+        } else {
+          try {
+            await db.execute(sql`
+              INSERT INTO parent_child_links (parent_user_id, child_user_id, relationship, is_primary)
+              VALUES (${user.id}, ${childId}, ${relationship}, ${isPrimary})
+              ON CONFLICT (parent_user_id, child_user_id) DO UPDATE
+                SET relationship = EXCLUDED.relationship, is_primary = EXCLUDED.is_primary
+            `);
+            formOk = 'Child linked. Their dashboard is now visible to you below.';
+          } catch (e: any) {
+            formError = 'Could not link child: ' + (e?.message || 'database error');
+          }
+        }
+      }
+    }
+  } catch (e: any) {
+    formError = 'Form error: ' + (e?.message || 'unknown');
+  }
+}
+
+// Fetch every linked child plus their user info.
+type ChildRow = {
+  id: number;
+  child_user_id: number;
+  relationship: string;
+  is_primary: boolean;
+  name: string;
+  email: string;
+  school: string;
+  last_login: string | null;
+};
+let children: ChildRow[] = [];
+try {
+  children = rows(await db.execute(sql`
+    SELECT l.id, l.child_user_id, l.relationship, l.is_primary,
+      COALESCE(u.name, u.email, 'Learner') AS name,
+      u.email,
+      COALESCE(u.organization, '') AS school,
+      u.last_login_at AS last_login
+    FROM parent_child_links l
+    JOIN users u ON u.id = l.child_user_id
+    WHERE l.parent_user_id = ${user.id}
+    ORDER BY l.is_primary DESC, l.created_at ASC
+  `)) as ChildRow[];
+} catch (_) {
+  // Fallback: users table may not have organization / last_login_at columns.
+  try {
+    children = rows(await db.execute(sql`
+      SELECT l.id, l.child_user_id, l.relationship, l.is_primary,
+        COALESCE(u.name, u.email, 'Learner') AS name,
+        u.email,
+        '' AS school,
+        NULL AS last_login
+      FROM parent_child_links l
+      JOIN users u ON u.id = l.child_user_id
+      WHERE l.parent_user_id = ${user.id}
+      ORDER BY l.is_primary DESC, l.created_at ASC
+    `)) as ChildRow[];
+  } catch (_) {}
+}
+
+// Per-child: progress courses, last test, pending fees.
+type CourseRow = { title: string; percent: number };
+type TestRow = { title: string; percentage: number | null; submitted_at: string | null; total_score: number | null; max_score: number | null };
+type FeeRow = { description: string; amount: number; currency: string; created_at: string };
+type ChildDetail = {
+  child: ChildRow;
+  courses: CourseRow[];
+  primaryCourse: string;
+  primaryProgress: number;
+  recentTests: TestRow[];
+  pendingFees: FeeRow[];
+  nextClass: string | null;
+  weeklyClasses: number;
+  weeklyProblems: number;
+  weeklyHours: number;
+  lastTestPct: number | null;
+};
+const details: ChildDetail[] = [];
+
+for (const child of children) {
+  // Progress per course/training. Try a few plausible shapes; never throw.
+  let courses: CourseRow[] = [];
+  try {
+    courses = rows(await db.execute(sql`
+      SELECT COALESCE(t.title, 'Course') AS title,
+        COALESCE(e.progress_percent, 0)::int AS percent
+      FROM training_enrollments e
+      LEFT JOIN trainings t ON t.id = e.training_id
+      WHERE e.user_id = ${child.child_user_id}
+      ORDER BY e.created_at DESC
+      LIMIT 6
+    `)).map((r: any) => ({ title: r.title, percent: Number(r.percent || 0) }));
+  } catch (_) {}
+
+  // Recent test scores from test_attempts (uses candidate_id, not user_id —
+  // codebase convention; we honour both via UNION to be safe).
+  let recentTests: TestRow[] = [];
+  try {
+    recentTests = rows(await db.execute(sql`
+      SELECT COALESCE(t.title, 'Test') AS title,
+        a.percentage::float AS percentage,
+        a.submitted_at,
+        a.total_score, a.max_score
+      FROM test_attempts a
+      LEFT JOIN tests t ON t.id = a.test_id
+      WHERE a.candidate_id = ${child.child_user_id}
+        AND a.status IN ('submitted', 'auto_submitted')
+      ORDER BY a.submitted_at DESC NULLS LAST
+      LIMIT 5
+    `)).map((r: any) => ({
+      title: String(r.title || 'Test'),
+      percentage: r.percentage !== null ? Number(r.percentage) : null,
+      submitted_at: r.submitted_at,
+      total_score: r.total_score !== null ? Number(r.total_score) : null,
+      max_score: r.max_score !== null ? Number(r.max_score) : null
+    }));
+  } catch (_) {}
+
+  // Pending fees. Spec says payment_intents — codebase uses `payments`. Try
+  // both shapes; treat any unpaid row as pending.
+  let pendingFees: FeeRow[] = [];
+  try {
+    pendingFees = rows(await db.execute(sql`
+      SELECT COALESCE(description, purpose, 'Fee') AS description,
+        COALESCE(amount_paise, amount, 0)::bigint AS amount,
+        COALESCE(currency, 'INR') AS currency,
+        created_at
+      FROM payment_intents
+      WHERE user_id = ${child.child_user_id}
+        AND status IN ('created', 'pending', 'unpaid', 'failed')
+      ORDER BY created_at DESC
+      LIMIT 5
+    `)).map((r: any) => ({
+      description: String(r.description || 'Fee'),
+      amount: Number(r.amount || 0),
+      currency: String(r.currency || 'INR'),
+      created_at: r.created_at
+    }));
+  } catch (_) {
+    try {
+      pendingFees = rows(await db.execute(sql`
+        SELECT COALESCE(notes, purpose, 'Fee') AS description,
+          COALESCE(amount_paise, 0)::bigint AS amount,
+          COALESCE(currency, 'INR') AS currency,
+          created_at
+        FROM payments
+        WHERE user_id = ${child.child_user_id}
+          AND status IN ('created', 'pending', 'unpaid', 'failed')
+        ORDER BY created_at DESC
+        LIMIT 5
+      `)).map((r: any) => ({
+        description: String(r.description || 'Fee'),
+        amount: Number(r.amount || 0),
+        currency: String(r.currency || 'INR'),
+        created_at: r.created_at
+      }));
+    } catch (_) {}
+  }
+
+  // Next class (best-effort: scheduled events / live classes).
+  let nextClass: string | null = null;
+  try {
+    const nc = rows(await db.execute(sql`
+      SELECT title, start_at FROM live_classes
+      WHERE user_id = ${child.child_user_id} AND start_at > NOW()
+      ORDER BY start_at ASC LIMIT 1
+    `));
+    if (nc.length > 0) {
+      const r: any = nc[0];
+      nextClass = String(r.title || 'Class') + ' to ' + new Date(r.start_at).toLocaleString('en-IN', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    }
+  } catch (_) {}
+
+  // Weekly summary: attempts in last 7 days, hours studied, problems solved.
+  let weeklyClasses = 0;
+  let weeklyProblems = 0;
+  let weeklyHours = 0;
+  try {
+    const wc = rows(await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM test_attempts
+      WHERE candidate_id = ${child.child_user_id}
+        AND submitted_at >= NOW() - INTERVAL '7 days'
+    `));
+    weeklyProblems = Number((wc[0] as any)?.n || 0);
+  } catch (_) {}
+  try {
+    const wp = rows(await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM practice_sessions
+      WHERE user_id = ${child.child_user_id}
+        AND created_at >= NOW() - INTERVAL '7 days'
+    `));
+    weeklyHours = Math.round((Number((wp[0] as any)?.n || 0) * 0.5) * 10) / 10;
+  } catch (_) {}
+  try {
+    const wcl = rows(await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM live_classes
+      WHERE user_id = ${child.child_user_id}
+        AND start_at >= NOW() - INTERVAL '7 days' AND start_at < NOW()
+    `));
+    weeklyClasses = Number((wcl[0] as any)?.n || 0);
+  } catch (_) {}
+
+  const primaryCourse = courses[0]?.title || 'No active course';
+  const primaryProgress = courses[0]?.percent ?? 0;
+  const lastTestPct = recentTests[0]?.percentage ?? null;
+
+  details.push({
+    child, courses, primaryCourse, primaryProgress,
+    recentTests, pendingFees, nextClass,
+    weeklyClasses, weeklyProblems, weeklyHours, lastTestPct
+  });
+}
+
+// Page-level weekly aggregates (sum across all children).
+const agg = details.reduce((acc, d) => {
+  acc.classes += d.weeklyClasses;
+  acc.problems += d.weeklyProblems;
+  acc.hours += d.weeklyHours;
+  if (d.lastTestPct !== null) acc.testTotal += d.lastTestPct, acc.testCount += 1;
+  return acc;
+}, { classes: 0, problems: 0, hours: 0, testTotal: 0, testCount: 0 });
+const weeklyTestPct = agg.testCount > 0 ? Math.round(agg.testTotal / agg.testCount) : null;
+
+function fmtMoney(amount: number, currency: string): string {
+  const major = currency === 'INR' || currency === 'USD' || currency === 'EUR' || currency === 'CHF' || currency === 'GBP'
+    ? amount / 100 : amount;
+  const sym = currency === 'INR' ? '₹' : currency === 'USD' ? '$' : currency === 'EUR' ? '€' : currency === 'CHF' ? 'CHF ' : currency === 'GBP' ? '£' : currency + ' ';
+  return sym + major.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+}
+function fmtDate(d: any): string {
+  if (!d) return '';
+  try { return new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }); } catch { return ''; }
+}
+function ago(d: any): string {
+  if (!d) return 'never';
+  try {
+    const diff = (Date.now() - new Date(d).getTime()) / 1000;
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+    if (diff < 7 * 86400) return Math.floor(diff / 86400) + 'd ago';
+    return fmtDate(d);
+  } catch { return 'never'; }
+}
+function initial(name: string): string {
+  const t = (name || '').trim();
+  return t ? t[0].toUpperCase() : 'L';
+}
+---
+<BaseLayout title="Parent dashboard — EduRankAI" description="Attendance, progress, payments, and recent reports for every child linked to your EduRankAI account.">
+  <section class="px-[5vw] py-10 md:py-14 max-w-5xl mx-auto">
+
+    <a href="/portal" class="text-[0.78rem] font-mono uppercase tracking-wider text-burn hover:underline no-underline">&lt; Portal home</a>
+
+    <div class="mt-4 mb-8">
+      <p class="text-[0.62rem] font-mono uppercase tracking-[0.18em] text-burn font-bold mb-2">Portal · Parent dashboard</p>
+      <h1 class="font-display text-[clamp(1.9rem,5vw,2.8rem)] font-semibold text-ink leading-[1.12] mb-3">
+        Your child's <em class="not-italic text-burn font-display italic">complete picture</em>.
+      </h1>
+      <p class="text-[0.95rem] text-ink-soft leading-relaxed max-w-2xl">
+        Attendance, progress, payments, recent reports &mdash; across every subject.
+      </p>
+    </div>
+
+    {formError && (
+      <div class="mb-5 bg-[rgba(239,68,68,0.06)] border border-[rgba(239,68,68,0.3)] rounded-xl px-4 py-3 text-[0.86rem] text-[#991b1b]">{formError}</div>
+    )}
+    {formOk && (
+      <div class="mb-5 bg-[rgba(16,185,129,0.08)] border border-[rgba(16,185,129,0.3)] rounded-xl px-4 py-3 text-[0.86rem] text-[#047857]">{formOk}</div>
+    )}
+
+    {children.length === 0 ? (
+      <div>
+        <div class="bg-white border border-ink/10 rounded-2xl p-8 md:p-10 mb-6">
+          <p class="text-[0.62rem] font-mono uppercase tracking-[0.16em] text-burn font-bold mb-3">No children linked yet</p>
+          <h2 class="font-display text-[1.5rem] font-semibold text-ink mb-3 leading-[1.2]">Link your first child to begin.</h2>
+          <p class="text-[0.92rem] text-ink-soft leading-relaxed max-w-xl mb-6">
+            Your child needs an EduRankAI account first. Once they have one, drop their email below and pick the relationship &mdash; their dashboard appears here instantly.
+          </p>
+          <form method="post" class="bg-white border border-ink/10 rounded-2xl p-6 max-w-xl">
+            <div class="mb-4">
+              <label for="child_email" class="block text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft mb-2">Child's email</label>
+              <input id="child_email" name="child_email" type="email" required placeholder="learner@example.com"
+                class="w-full border border-ink/15 rounded-lg px-3 py-2.5 text-[0.92rem] text-ink bg-white focus:outline-none focus:border-burn" />
+            </div>
+            <div class="mb-4">
+              <label for="relationship" class="block text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft mb-2">Relationship</label>
+              <select id="relationship" name="relationship" class="w-full border border-ink/15 rounded-lg px-3 py-2.5 text-[0.92rem] text-ink bg-white focus:outline-none focus:border-burn">
+                <option value="parent">Parent</option>
+                <option value="guardian">Guardian</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+            <div class="mb-5 flex items-center gap-2">
+              <input id="is_primary" name="is_primary" type="checkbox" value="true" checked class="accent-burn" />
+              <label for="is_primary" class="text-[0.85rem] text-ink-soft">I am the primary contact for this child</label>
+            </div>
+            <button type="submit" class="bg-burn text-white border-0 px-5 py-2.5 rounded-lg text-[0.88rem] font-semibold tracking-wide hover:bg-[#e64600] cursor-pointer">
+              Link child
+            </button>
+          </form>
+        </div>
+      </div>
+    ) : (
+      <div>
+        {/* Weekly summary */}
+        <div class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 mb-8">
+          <p class="text-[0.62rem] font-mono uppercase tracking-[0.16em] text-burn font-bold mb-3">This week</p>
+          <p class="font-display text-[1.25rem] md:text-[1.45rem] text-ink leading-[1.35]">
+            <strong class="text-ink font-semibold">{agg.classes}</strong> {agg.classes === 1 ? 'class' : 'classes'} attended, <strong class="text-ink font-semibold">{agg.problems}</strong> {agg.problems === 1 ? 'problem' : 'problems'} solved, <strong class="text-ink font-semibold">{agg.hours}</strong> hours studied{weeklyTestPct !== null ? <>, <strong class="text-ink font-semibold">{weeklyTestPct}%</strong> on the last test</> : null}.
+          </p>
+          {children.length > 1 && (
+            <p class="text-[0.78rem] font-mono uppercase tracking-wider text-ink-soft mt-2">Aggregated across {children.length} children</p>
+          )}
+        </div>
+
+        {/* Child cards */}
+        <div class="space-y-6">
+          {details.map((d) => (
+            <article class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7">
+              <div class="flex items-start gap-4 mb-5">
+                <div class="w-14 h-14 rounded-full bg-burn-pale border border-burn-dim flex items-center justify-center font-display text-[1.5rem] text-burn font-semibold shrink-0">
+                  {initial(d.child.name)}
+                </div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-baseline gap-2 flex-wrap">
+                    <h2 class="font-display text-[1.35rem] text-ink font-semibold leading-tight">{d.child.name}</h2>
+                    <span class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft">{d.child.relationship}{d.child.is_primary ? ' · primary' : ''}</span>
+                  </div>
+                  <p class="text-[0.85rem] text-ink-soft mt-0.5">{d.child.school || 'School not on record'} &middot; last seen {ago(d.child.last_login)}</p>
+                </div>
+              </div>
+
+              {/* Primary course + progress */}
+              <div class="mb-5">
+                <div class="flex items-baseline justify-between mb-1.5">
+                  <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft">Primary course</p>
+                  <p class="text-[0.85rem] text-ink font-semibold">{d.primaryProgress}%</p>
+                </div>
+                <p class="text-[0.95rem] text-ink mb-2">{d.primaryCourse}</p>
+                <div class="h-2 w-full bg-cream-2 rounded-full overflow-hidden">
+                  <div class="h-full bg-burn rounded-full" style={`width: ${Math.max(0, Math.min(100, d.primaryProgress))}%`}></div>
+                </div>
+              </div>
+
+              {/* Courses list */}
+              {d.courses.length > 1 && (
+                <div class="mb-5">
+                  <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft mb-2">All courses</p>
+                  <ul class="space-y-2">
+                    {d.courses.slice(1).map((c) => (
+                      <li class="flex items-center justify-between text-[0.88rem] gap-3">
+                        <span class="text-ink truncate">{c.title}</span>
+                        <span class="text-ink-soft shrink-0">{c.percent}%</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Next class */}
+              {d.nextClass && (
+                <div class="mb-5 bg-burn-pale/60 border border-burn-dim rounded-xl px-4 py-3">
+                  <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-burn font-bold mb-1">Next class</p>
+                  <p class="text-[0.9rem] text-ink">{d.nextClass}</p>
+                </div>
+              )}
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                {/* Recent test scores */}
+                <div>
+                  <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft mb-2">Recent test scores</p>
+                  {d.recentTests.length === 0 ? (
+                    <p class="text-[0.85rem] text-ink-soft italic">No submitted tests yet.</p>
+                  ) : (
+                    <ul class="space-y-2">
+                      {d.recentTests.map((t) => (
+                        <li class="flex items-center justify-between text-[0.86rem] gap-3 border-b border-ink/5 pb-2 last:border-0 last:pb-0">
+                          <div class="min-w-0 flex-1">
+                            <p class="text-ink truncate">{t.title}</p>
+                            <p class="text-[0.72rem] text-ink-soft">{fmtDate(t.submitted_at)}</p>
+                          </div>
+                          <span class="text-ink font-semibold shrink-0">{t.percentage !== null ? Math.round(t.percentage) + '%' : (t.total_score !== null && t.max_score ? t.total_score + '/' + t.max_score : '&mdash;')}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                {/* Pending fees */}
+                <div>
+                  <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft mb-2">Pending fees</p>
+                  {d.pendingFees.length === 0 ? (
+                    <p class="text-[0.85rem] text-[#047857] flex items-center gap-1.5">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                      All clear.
+                    </p>
+                  ) : (
+                    <ul class="space-y-2">
+                      {d.pendingFees.map((f) => (
+                        <li class="flex items-center justify-between text-[0.86rem] gap-3 border-b border-ink/5 pb-2 last:border-0 last:pb-0">
+                          <div class="min-w-0 flex-1">
+                            <p class="text-ink truncate">{f.description}</p>
+                            <p class="text-[0.72rem] text-ink-soft">{fmtDate(f.created_at)}</p>
+                          </div>
+                          <span class="text-burn font-semibold shrink-0">{fmtMoney(f.amount, f.currency)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+
+              {/* Per-child weekly mini */}
+              <div class="mt-5 pt-4 border-t border-ink/5 flex items-center gap-4 flex-wrap text-[0.78rem] font-mono uppercase tracking-wider text-ink-soft">
+                <span class="flex items-center gap-1.5">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
+                  {d.weeklyClasses} classes this week
+                </span>
+                <span class="flex items-center gap-1.5">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+                  {d.weeklyProblems} problems
+                </span>
+                <span class="flex items-center gap-1.5">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                  {d.weeklyHours}h studied
+                </span>
+              </div>
+            </article>
+          ))}
+        </div>
+
+        {/* Add another child */}
+        <div class="mt-10 bg-white border border-ink/10 rounded-2xl p-6 md:p-7">
+          <p class="text-[0.62rem] font-mono uppercase tracking-[0.16em] text-burn font-bold mb-2">Add another child</p>
+          <h3 class="font-display text-[1.25rem] text-ink font-semibold mb-3">Link a second learner.</h3>
+          <p class="text-[0.88rem] text-ink-soft mb-5 max-w-xl leading-relaxed">
+            They will need their own EduRankAI account first. Once linked, their card appears alongside the others.
+          </p>
+          <form method="post" class="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+            <div>
+              <label for="child_email_2" class="block text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft mb-2">Child's email</label>
+              <input id="child_email_2" name="child_email" type="email" required placeholder="learner@example.com"
+                class="w-full border border-ink/15 rounded-lg px-3 py-2.5 text-[0.92rem] text-ink bg-white focus:outline-none focus:border-burn" />
+            </div>
+            <div>
+              <label for="relationship_2" class="block text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft mb-2">Relationship</label>
+              <select id="relationship_2" name="relationship" class="w-full border border-ink/15 rounded-lg px-3 py-2.5 text-[0.92rem] text-ink bg-white focus:outline-none focus:border-burn">
+                <option value="parent">Parent</option>
+                <option value="guardian">Guardian</option>
+                <option value="other">Other</option>
+              </select>
+              <input type="hidden" name="is_primary" value="false" />
+            </div>
+            <button type="submit" class="bg-burn text-white border-0 px-5 py-2.5 rounded-lg text-[0.88rem] font-semibold tracking-wide hover:bg-[#e64600] cursor-pointer">
+              Link child
+            </button>
+          </form>
+        </div>
+      </div>
+    )}
+
+  </section>
+</BaseLayout>
