@@ -26,6 +26,11 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
+      // Prod may already have an older training_modules using sort_order; add
+      // order_in_course so the authoring helpers (which order by it) work.
+      await ex(sql`ALTER TABLE training_modules ADD COLUMN IF NOT EXISTS order_in_course INT DEFAULT 0`);
+      await ex(sql`ALTER TABLE training_modules ADD COLUMN IF NOT EXISTS summary TEXT`);
+      await ex(sql`ALTER TABLE training_modules ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
       await ex(sql`CREATE INDEX IF NOT EXISTS tm_course_idx ON training_modules(course_id, order_in_course)`);
 
       // Per-lesson additions (idempotent ALTER).
