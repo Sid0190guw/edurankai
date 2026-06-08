@@ -1,0 +1,625 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// --- Bootstrap schema (idempotent) ---
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS notes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      owner_user_id UUID,
+      title TEXT,
+      body TEXT,
+      visibility VARCHAR(20) DEFAULT 'private',
+      share_token VARCHAR(80) UNIQUE,
+      course_id UUID,
+      lesson_id UUID,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS note_collaborators (
+      note_id UUID,
+      user_id UUID,
+      permission VARCHAR(20) DEFAULT 'edit',
+      PRIMARY KEY (note_id, user_id)
+    )
+  `);
+} catch (e) {}
+
+let flashMsg = '';
+
+// --- Handle POST ---
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  try {
+    if (action === 'create_note') {
+      const title = String(fd.get('title') || 'Untitled note').trim().slice(0, 240) || 'Untitled note';
+      await db.execute(sql`
+        INSERT INTO notes (owner_user_id, title, body)
+        VALUES (${user.id}, ${title}, ${''})
+      `);
+      flashMsg = 'Note created.';
+    } else if (action === 'delete_note') {
+      const id = String(fd.get('id') || '');
+      if (id) {
+        await db.execute(sql`DELETE FROM notes WHERE id = ${id}::uuid AND owner_user_id = ${user.id}`);
+        await db.execute(sql`DELETE FROM note_collaborators WHERE note_id = ${id}::uuid`);
+        flashMsg = 'Deleted.';
+      }
+    } else if (action === 'share_note') {
+      const id = String(fd.get('id') || '');
+      if (id) {
+        // generate share token
+        const token = 'nt_' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+        await db.execute(sql`
+          UPDATE notes SET share_token = ${token}, visibility = 'shared', updated_at = NOW()
+          WHERE id = ${id}::uuid AND owner_user_id = ${user.id}
+        `);
+        flashMsg = 'Share link ready.';
+      }
+    } else if (action === 'add_collab') {
+      const id = String(fd.get('id') || '');
+      const email = String(fd.get('email') || '').trim().toLowerCase();
+      if (id && email) {
+        const u = rows(await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = ${email} LIMIT 1`));
+        if (u.length) {
+          await db.execute(sql`
+            INSERT INTO note_collaborators (note_id, user_id, permission)
+            VALUES (${id}::uuid, ${u[0].id}::uuid, 'edit')
+            ON CONFLICT (note_id, user_id) DO NOTHING
+          `);
+          flashMsg = 'Collaborator added.';
+        } else {
+          flashMsg = 'No registered user with that email.';
+        }
+      }
+    }
+  } catch (e: any) {
+    flashMsg = 'Error: ' + (e?.message || 'failed');
+  }
+}
+
+// --- Load notes (owned + shared with me) ---
+const myNotes = rows(await db.execute(sql`
+  SELECT n.id, n.title, n.body, n.visibility, n.share_token, n.updated_at, n.created_at, n.owner_user_id,
+         CASE WHEN n.owner_user_id = ${user.id} THEN 'owner' ELSE 'collab' END AS role
+  FROM notes n
+  WHERE n.owner_user_id = ${user.id}
+     OR n.id IN (SELECT note_id FROM note_collaborators WHERE user_id = ${user.id})
+  ORDER BY n.updated_at DESC
+  LIMIT 200
+`));
+
+// collaborators map for each owned note
+const collabs = rows(await db.execute(sql`
+  SELECT nc.note_id, u.email
+  FROM note_collaborators nc
+  LEFT JOIN users u ON u.id = nc.user_id
+  WHERE nc.note_id IN (SELECT id FROM notes WHERE owner_user_id = ${user.id})
+`));
+
+const collabMap: Record<string, string[]> = {};
+for (const c of collabs) {
+  if (!collabMap[c.note_id]) collabMap[c.note_id] = [];
+  if (c.email) collabMap[c.note_id].push(c.email);
+}
+
+// JSON payload for the client
+const notesPayload = myNotes.map((n: any) => ({
+  id: n.id,
+  title: n.title || 'Untitled note',
+  body: n.body || '',
+  visibility: n.visibility,
+  share_token: n.share_token,
+  updated_at: n.updated_at,
+  role: n.role,
+  collabs: collabMap[n.id] || [],
+}));
+---
+<BaseLayout title="Notes" description="Collaborative notes and study scratchpad.">
+<style>
+  body { background: #FAF8F5; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 28px 22px 60px; }
+  .eyebrow { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #FF4F00; font-weight: 700; }
+  h1.page-title { font-family: 'Cormorant Garamond', Georgia, serif; font-size: clamp(28px, 4vw, 42px); font-weight: 600; letter-spacing: -0.02em; margin: 6px 0 6px; color: #0E0B08; }
+  h1.page-title em { color: #FF4F00; font-weight: 500; font-style: italic; }
+  .lede { color: #5b554d; max-width: 700px; margin: 0 0 20px; }
+  .flash { background: #FFF4EE; border: 1px solid #FF4F00; color: #7a2c00; padding: 10px 14px; border-radius: 10px; font-size: 13px; margin: 8px 0 18px; }
+
+  .layout { display: grid; grid-template-columns: 320px 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 880px) { .layout { grid-template-columns: 1fr; } }
+
+  .pane { background: white; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 16px; }
+  .pane h3 { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: #FF4F00; margin: 0 0 12px; font-weight: 700; }
+
+  .new-form { display: flex; gap: 8px; margin-bottom: 12px; }
+  .new-form input { flex: 1; padding: 8px 10px; border: 1px solid rgba(14,11,8,0.18); border-radius: 6px; font-size: 13px; background: #FAF8F5; }
+
+  .btn { background: #FF4F00; color: white; padding: 8px 14px; border-radius: 6px; border: none; cursor: pointer; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.ghost { background: transparent; color: #0E0B08; border: 1px solid rgba(14,11,8,0.18); }
+  .btn.tiny { padding: 5px 9px; font-size: 10px; }
+
+  .sort-bar { display: flex; gap: 6px; margin-bottom: 10px; }
+  .sort-bar button { flex: 1; padding: 5px 6px; border: 1px solid rgba(14,11,8,0.18); background: white; border-radius: 5px; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10px; cursor: pointer; color: #5b554d; }
+  .sort-bar button.active { background: #FF4F00; color: white; border-color: #FF4F00; }
+
+  .note-list { display: flex; flex-direction: column; gap: 6px; max-height: 60vh; overflow-y: auto; }
+  .note-item { padding: 10px 12px; border: 1px solid rgba(14,11,8,0.10); border-radius: 8px; cursor: pointer; background: #FAF8F5; transition: all 0.12s; }
+  .note-item:hover { border-color: #FF4F00; }
+  .note-item.active { background: #FFF4EE; border-color: #FF4F00; }
+  .note-item .ttl { font-family: 'Cormorant Garamond', serif; font-size: 16px; color: #0E0B08; font-weight: 600; line-height: 1.2; }
+  .note-item .meta { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10px; color: #8a847a; margin-top: 3px; display: flex; gap: 8px; align-items: center; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 9px; letter-spacing: 0.06em; }
+  .pill.shared { background: #DCFCE7; color: #14532D; }
+  .pill.private { background: #F1F1EE; color: #5b554d; }
+  .pill.collab { background: #FEF3C7; color: #78350F; }
+
+  .editor-shell { display: flex; flex-direction: column; min-height: 70vh; }
+  .editor-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .editor-head input.title { flex: 1; min-width: 220px; font-family: 'Cormorant Garamond', serif; font-size: 24px; font-weight: 600; padding: 6px 10px; border: 1px solid transparent; background: transparent; color: #0E0B08; border-radius: 6px; }
+  .editor-head input.title:focus { outline: none; border-color: rgba(14,11,8,0.15); background: #FAF8F5; }
+
+  .toolbar { display: flex; gap: 4px; flex-wrap: wrap; padding: 8px; background: #FAF8F5; border: 1px solid rgba(14,11,8,0.10); border-radius: 8px 8px 0 0; border-bottom: none; }
+  .toolbar button { padding: 6px 10px; background: white; border: 1px solid rgba(14,11,8,0.10); border-radius: 5px; cursor: pointer; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; color: #0E0B08; font-weight: 600; min-width: 32px; }
+  .toolbar button:hover { background: #FFF4EE; border-color: #FF4F00; }
+  .toolbar .sep { width: 1px; background: rgba(14,11,8,0.10); margin: 2px 4px; }
+
+  .editor { flex: 1; min-height: 360px; padding: 22px 24px; background: white; border: 1px solid rgba(14,11,8,0.10); border-top: none; border-radius: 0 0 8px 8px; outline: none; font-family: 'Cormorant Garamond', Georgia, serif; font-size: 17px; line-height: 1.6; color: #0E0B08; overflow-y: auto; }
+  .editor:empty:before { content: attr(data-placeholder); color: #b5afa3; }
+  .editor h1 { font-size: 28px; margin: 16px 0 8px; font-weight: 600; }
+  .editor h2 { font-size: 22px; margin: 14px 0 6px; font-weight: 600; }
+  .editor ul, .editor ol { padding-left: 26px; margin: 8px 0; }
+  .editor code { background: #F1F1EE; padding: 1px 5px; border-radius: 3px; font-family: 'Geist Mono', monospace; font-size: 14px; color: #b91c1c; }
+  .editor pre { background: #F1F1EE; padding: 12px; border-radius: 6px; overflow-x: auto; font-family: 'Geist Mono', monospace; font-size: 13px; }
+
+  .footer-bar { margin-top: 10px; display: flex; justify-content: space-between; align-items: center; font-family: 'Geist Mono', monospace; font-size: 11px; color: #5b554d; gap: 12px; flex-wrap: wrap; }
+  .footer-bar .stats span { margin-right: 14px; }
+  .save-state { padding: 3px 8px; border-radius: 999px; background: #F1F1EE; font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; }
+  .save-state.saving { background: #FEF3C7; color: #78350F; }
+  .save-state.saved { background: #DCFCE7; color: #14532D; }
+
+  .share-block { margin-top: 14px; padding: 12px; background: #FAF8F5; border: 1px solid rgba(14,11,8,0.10); border-radius: 8px; }
+  .share-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .share-row input { flex: 1; min-width: 180px; padding: 7px 10px; border: 1px solid rgba(14,11,8,0.18); border-radius: 5px; font-family: 'Geist Mono', monospace; font-size: 11px; background: white; }
+  .collab-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .collab-chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; background: #FEF3C7; color: #78350F; border-radius: 999px; font-family: 'Geist Mono', monospace; font-size: 10px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .empty-state { text-align: center; padding: 60px 20px; color: #8a847a; }
+  .empty-state svg { display: block; margin: 0 auto 16px; opacity: 0.4; }
+</style>
+
+<main class="wrap">
+  <div class="eyebrow">portal · scratchpad</div>
+  <h1 class="page-title">Collaborative <em>notes</em></h1>
+  <p class="lede">A shared surface for lesson notes, study scratchpads, and small writing. Auto-saves to the cloud, exports as markdown, and can be opened up to friends with edit access.</p>
+
+  {flashMsg && <div class="flash">{flashMsg}</div>}
+
+  <div class="layout">
+    <!-- LEFT: notes list -->
+    <aside class="pane">
+      <h3>Your notes</h3>
+      <form method="post" class="new-form">
+        <input type="hidden" name="action" value="create_note" />
+        <input name="title" placeholder="New note title" />
+        <button type="submit" class="btn tiny">Add</button>
+      </form>
+
+      <div class="sort-bar">
+        <button type="button" data-sort="recent" class="active">Recent</button>
+        <button type="button" data-sort="title">Title</button>
+        <button type="button" data-sort="role">Role</button>
+      </div>
+
+      <div id="noteList" class="note-list">
+        {notesPayload.length === 0 && <div style="color:#8a847a; font-size:13px; text-align:center; padding:24px 8px;">No notes yet.</div>}
+      </div>
+    </aside>
+
+    <!-- RIGHT: editor -->
+    <section class="pane">
+      <div id="editorShell" class="editor-shell" style="display:none;">
+        <div class="editor-head">
+          <input id="editorTitle" type="text" class="title" placeholder="Untitled note" />
+          <span id="saveState" class="save-state saved">Saved</span>
+          <div class="actions">
+            <button type="button" id="btnExport" class="btn ghost tiny">Export .md</button>
+            <button type="button" id="btnShare" class="btn ghost tiny">Share</button>
+            <button type="button" id="btnDelete" class="btn ghost tiny" style="color:#b91c1c; border-color:#b91c1c;">Delete</button>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <button type="button" data-cmd="bold" title="Bold"><b>B</b></button>
+          <button type="button" data-cmd="italic" title="Italic"><i>I</i></button>
+          <button type="button" data-cmd="underline" title="Underline"><u>U</u></button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="h1" title="Heading 1">H1</button>
+          <button type="button" data-cmd="h2" title="Heading 2">H2</button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="ul" title="Bullet list">&bull; List</button>
+          <button type="button" data-cmd="ol" title="Numbered list">1. List</button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="code" title="Inline code">&lt;/&gt;</button>
+          <button type="button" data-cmd="pre" title="Code block">{ }</button>
+          <button type="button" data-cmd="quote" title="Quote">&ldquo; &rdquo;</button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="clear" title="Clear formatting">Clear</button>
+        </div>
+
+        <div id="editor" class="editor" contenteditable="true" data-placeholder="Start writing your note here..."></div>
+
+        <div class="footer-bar">
+          <div class="stats">
+            <span>Words: <strong id="statWords">0</strong></span>
+            <span>Chars: <strong id="statChars">0</strong></span>
+            <span>Lines: <strong id="statLines">0</strong></span>
+            <span>Read: <strong id="statRead">0</strong> min</span>
+          </div>
+          <div id="updatedAt"></div>
+        </div>
+
+        <div id="shareBlock" class="share-block" style="display:none;">
+          <div style="font-family:'Geist Mono',monospace; font-size:11px; color:#FF4F00; font-weight:700; text-transform:uppercase; letter-spacing:0.08em;">Share link</div>
+          <div class="share-row">
+            <input id="shareUrl" type="text" readonly />
+            <button type="button" id="btnCopyShare" class="btn tiny">Copy</button>
+          </div>
+          <div style="font-family:'Geist Mono',monospace; font-size:11px; color:#FF4F00; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; margin-top:14px;">Collaborators</div>
+          <form method="post" class="share-row" id="collabForm">
+            <input type="hidden" name="action" value="add_collab" />
+            <input type="hidden" name="id" id="collabNoteId" />
+            <input type="email" name="email" placeholder="friend@example.com" required />
+            <button type="submit" class="btn tiny">Add</button>
+          </form>
+          <div id="collabList" class="collab-list"></div>
+        </div>
+      </div>
+
+      <div id="emptyState" class="empty-state">
+        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="9" y1="13" x2="15" y2="13"/>
+          <line x1="9" y1="17" x2="15" y2="17"/>
+        </svg>
+        <div style="font-family:'Cormorant Garamond',serif; font-size:22px; color:#0E0B08;">No note selected</div>
+        <div style="margin-top:6px;">Create a new note or pick one from the list on the left.</div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script is:inline define:vars={{ notesPayload }}>
+(function () {
+  const state = {
+    notes: notesPayload.slice(),
+    activeId: null,
+    sort: 'recent',
+    saveTimer: null,
+  };
+
+  const list = document.getElementById('noteList');
+  const shell = document.getElementById('editorShell');
+  const empty = document.getElementById('emptyState');
+  const titleEl = document.getElementById('editorTitle');
+  const ed = document.getElementById('editor');
+  const saveState = document.getElementById('saveState');
+  const updatedAt = document.getElementById('updatedAt');
+  const shareBlock = document.getElementById('shareBlock');
+  const shareUrl = document.getElementById('shareUrl');
+  const collabNoteId = document.getElementById('collabNoteId');
+  const collabList = document.getElementById('collabList');
+
+  // ---------- list rendering ----------
+  function sortNotes(arr, mode) {
+    const copy = arr.slice();
+    if (mode === 'title') {
+      copy.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+    } else if (mode === 'role') {
+      copy.sort((a, b) => (a.role || '').localeCompare(b.role || '') || (a.title || '').localeCompare(b.title || ''));
+    } else {
+      copy.sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+    }
+    return copy;
+  }
+
+  function renderList() {
+    list.innerHTML = '';
+    const sorted = sortNotes(state.notes, state.sort);
+    if (sorted.length === 0) {
+      list.innerHTML = '<div style="color:#8a847a; font-size:13px; text-align:center; padding:24px 8px;">No notes yet.</div>';
+      return;
+    }
+    sorted.forEach((n) => {
+      const div = document.createElement('div');
+      div.className = 'note-item' + (n.id === state.activeId ? ' active' : '');
+      div.dataset.id = n.id;
+      const visPill = n.visibility === 'shared' ? '<span class="pill shared">shared</span>' : '<span class="pill private">private</span>';
+      const rolePill = n.role === 'collab' ? '<span class="pill collab">collab</span>' : '';
+      const dt = new Date(n.updated_at);
+      const when = dt.toLocaleDateString() + ' ' + dt.toTimeString().slice(0, 5);
+      div.innerHTML = '<div class="ttl">' + escapeHtml(n.title || 'Untitled') + '</div>' +
+        '<div class="meta">' + when + ' ' + visPill + ' ' + rolePill + '</div>';
+      div.addEventListener('click', () => selectNote(n.id));
+      list.appendChild(div);
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  // ---------- selection ----------
+  function selectNote(id) {
+    const n = state.notes.find((x) => x.id === id);
+    if (!n) return;
+    state.activeId = id;
+    shell.style.display = 'flex';
+    empty.style.display = 'none';
+    titleEl.value = n.title || '';
+    ed.innerHTML = n.body || '';
+    updateStats();
+    refreshShareBlock(n);
+    const dt = new Date(n.updated_at);
+    updatedAt.textContent = 'Updated ' + dt.toLocaleString();
+    saveState.className = 'save-state saved';
+    saveState.textContent = 'Saved';
+    renderList();
+  }
+
+  function refreshShareBlock(n) {
+    collabNoteId.value = n.id;
+    if (n.share_token) {
+      shareBlock.style.display = 'block';
+      shareUrl.value = window.location.origin + '/portal/notes/share/' + n.share_token;
+    } else {
+      shareBlock.style.display = 'none';
+    }
+    collabList.innerHTML = '';
+    (n.collabs || []).forEach((c) => {
+      const chip = document.createElement('span');
+      chip.className = 'collab-chip';
+      chip.textContent = c;
+      collabList.appendChild(chip);
+    });
+  }
+
+  // ---------- stats ----------
+  function updateStats() {
+    const txt = ed.innerText || '';
+    const words = txt.trim() ? txt.trim().split(/\s+/).length : 0;
+    const chars = txt.length;
+    const lines = txt ? txt.split(/\n/).length : 0;
+    document.getElementById('statWords').textContent = words;
+    document.getElementById('statChars').textContent = chars;
+    document.getElementById('statLines').textContent = lines;
+    document.getElementById('statRead').textContent = Math.max(1, Math.ceil(words / 220));
+  }
+
+  // ---------- toolbar ----------
+  document.querySelectorAll('.toolbar button').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      const cmd = btn.dataset.cmd;
+      ed.focus();
+      applyCmd(cmd);
+      scheduleSave();
+      updateStats();
+    });
+  });
+
+  function applyCmd(cmd) {
+    if (cmd === 'bold') document.execCommand('bold');
+    else if (cmd === 'italic') document.execCommand('italic');
+    else if (cmd === 'underline') document.execCommand('underline');
+    else if (cmd === 'h1') document.execCommand('formatBlock', false, 'H1');
+    else if (cmd === 'h2') document.execCommand('formatBlock', false, 'H2');
+    else if (cmd === 'ul') document.execCommand('insertUnorderedList');
+    else if (cmd === 'ol') document.execCommand('insertOrderedList');
+    else if (cmd === 'quote') document.execCommand('formatBlock', false, 'BLOCKQUOTE');
+    else if (cmd === 'code') {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount && !sel.isCollapsed) {
+        const t = sel.toString();
+        document.execCommand('insertHTML', false, '<code>' + escapeHtml(t) + '</code>');
+      }
+    } else if (cmd === 'pre') {
+      document.execCommand('formatBlock', false, 'PRE');
+    } else if (cmd === 'clear') {
+      document.execCommand('removeFormat');
+      document.execCommand('formatBlock', false, 'P');
+    }
+  }
+
+  // ---------- editor input ----------
+  ed.addEventListener('input', () => { scheduleSave(); updateStats(); });
+  titleEl.addEventListener('input', () => { scheduleSave(); });
+
+  function scheduleSave() {
+    if (!state.activeId) return;
+    saveState.className = 'save-state saving';
+    saveState.textContent = 'Saving';
+    if (state.saveTimer) clearTimeout(state.saveTimer);
+    state.saveTimer = setTimeout(saveNow, 1000);
+  }
+
+  async function saveNow() {
+    if (!state.activeId) return;
+    const id = state.activeId;
+    const body = ed.innerHTML;
+    const title = titleEl.value || 'Untitled note';
+    try {
+      const r = await fetch('/api/notes/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, title, body }),
+      });
+      if (r.ok) {
+        saveState.className = 'save-state saved';
+        saveState.textContent = 'Saved';
+        const n = state.notes.find((x) => x.id === id);
+        if (n) {
+          n.title = title;
+          n.body = body;
+          n.updated_at = new Date().toISOString();
+          updatedAt.textContent = 'Updated ' + new Date().toLocaleString();
+          renderList();
+        }
+      } else {
+        saveState.className = 'save-state';
+        saveState.textContent = 'Error';
+      }
+    } catch (e) {
+      saveState.className = 'save-state';
+      saveState.textContent = 'Offline';
+    }
+  }
+
+  // ---------- sort buttons ----------
+  document.querySelectorAll('.sort-bar button').forEach((b) => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('.sort-bar button').forEach((x) => x.classList.remove('active'));
+      b.classList.add('active');
+      state.sort = b.dataset.sort;
+      renderList();
+    });
+  });
+
+  // ---------- share ----------
+  document.getElementById('btnShare').addEventListener('click', async () => {
+    if (!state.activeId) return;
+    const fd = new FormData();
+    fd.set('action', 'share_note');
+    fd.set('id', state.activeId);
+    await fetch(window.location.pathname, { method: 'POST', body: fd });
+    window.location.reload();
+  });
+
+  document.getElementById('btnCopyShare').addEventListener('click', () => {
+    shareUrl.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    const old = document.getElementById('btnCopyShare').textContent;
+    document.getElementById('btnCopyShare').textContent = 'Copied';
+    setTimeout(() => { document.getElementById('btnCopyShare').textContent = old; }, 1400);
+  });
+
+  // ---------- delete ----------
+  document.getElementById('btnDelete').addEventListener('click', () => {
+    if (!state.activeId) return;
+    if (!confirm('Delete this note? This cannot be undone.')) return;
+    const fd = new FormData();
+    fd.set('action', 'delete_note');
+    fd.set('id', state.activeId);
+    fetch(window.location.pathname, { method: 'POST', body: fd }).then(() => window.location.reload());
+  });
+
+  // ---------- markdown export ----------
+  document.getElementById('btnExport').addEventListener('click', () => {
+    if (!state.activeId) return;
+    const n = state.notes.find((x) => x.id === state.activeId);
+    if (!n) return;
+    const md = '# ' + (titleEl.value || n.title || 'Untitled') + '\n\n' + htmlToMarkdown(ed.innerHTML);
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const safe = (titleEl.value || 'note').replace(/[^a-z0-9_-]+/gi, '-').toLowerCase();
+    a.download = safe + '.md';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 300);
+  });
+
+  // ---------- HTML -> Markdown (hand-rolled) ----------
+  function htmlToMarkdown(html) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    return walk(wrap).replace(/\n{3,}/g, '\n\n').trim() + '\n';
+  }
+
+  function walk(node) {
+    let out = '';
+    node.childNodes.forEach((child) => {
+      out += nodeToMd(child);
+    });
+    return out;
+  }
+
+  function nodeToMd(n) {
+    if (n.nodeType === 3) {
+      // text
+      return n.nodeValue.replace(/ /g, ' ');
+    }
+    if (n.nodeType !== 1) return '';
+    const tag = n.tagName.toLowerCase();
+    const inner = walk(n);
+    switch (tag) {
+      case 'h1': return '\n# ' + inner.trim() + '\n\n';
+      case 'h2': return '\n## ' + inner.trim() + '\n\n';
+      case 'h3': return '\n### ' + inner.trim() + '\n\n';
+      case 'h4': return '\n#### ' + inner.trim() + '\n\n';
+      case 'b': case 'strong': return '**' + inner + '**';
+      case 'i': case 'em': return '*' + inner + '*';
+      case 'u': return '<u>' + inner + '</u>';
+      case 's': case 'strike': case 'del': return '~~' + inner + '~~';
+      case 'code': return '`' + inner + '`';
+      case 'pre': {
+        // strip nested code tag formatting
+        const txt = n.innerText || inner;
+        return '\n```\n' + txt + '\n```\n\n';
+      }
+      case 'blockquote': {
+        return '\n' + inner.split('\n').map((l) => '> ' + l).join('\n') + '\n\n';
+      }
+      case 'ul': {
+        let s = '\n';
+        n.querySelectorAll(':scope > li').forEach((li) => {
+          s += '- ' + walk(li).trim() + '\n';
+        });
+        return s + '\n';
+      }
+      case 'ol': {
+        let s = '\n';
+        let i = 1;
+        n.querySelectorAll(':scope > li').forEach((li) => {
+          s += i + '. ' + walk(li).trim() + '\n';
+          i++;
+        });
+        return s + '\n';
+      }
+      case 'li': return inner;
+      case 'a': {
+        const href = n.getAttribute('href') || '';
+        return '[' + inner + '](' + href + ')';
+      }
+      case 'br': return '\n';
+      case 'p': case 'div': return inner + '\n\n';
+      case 'hr': return '\n---\n\n';
+      case 'img': {
+        const src = n.getAttribute('src') || '';
+        const alt = n.getAttribute('alt') || '';
+        return '![' + alt + '](' + src + ')';
+      }
+      default: return inner;
+    }
+  }
+
+  // ---------- init ----------
+  renderList();
+  if (state.notes.length > 0) {
+    selectNote(state.notes[0].id);
+  }
+})();
+</script>
+</BaseLayout>

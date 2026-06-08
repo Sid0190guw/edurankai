@@ -1,0 +1,475 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+function rows(r: any): any[] {
+  return Array.isArray(r) ? r : (r?.rows || []);
+}
+
+const user = Astro.locals.user;
+
+// Self-bootstrap schema (idempotent)
+try {
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS jobs_board (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug VARCHAR(200) UNIQUE,
+    posted_by_user_id UUID,
+    company VARCHAR(200),
+    company_logo_url TEXT,
+    title TEXT,
+    kind VARCHAR(20),
+    location VARCHAR(120),
+    remote_ok BOOLEAN DEFAULT false,
+    salary_range VARCHAR(80),
+    stipend_inr_per_month INT,
+    description TEXT,
+    requirements JSONB DEFAULT '[]'::jsonb,
+    apply_url TEXT,
+    apply_email VARCHAR(200),
+    is_active BOOLEAN DEFAULT true,
+    posted_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ
+  )`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS job_applications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id UUID,
+    user_id UUID,
+    resume_url TEXT,
+    cover_letter TEXT,
+    status VARCHAR(20) DEFAULT 'submitted',
+    applied_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+} catch (_) {}
+
+// Handle POST: posting a new job (logged-in only)
+let postError: string | null = null;
+let postSuccess: string | null = null;
+if (Astro.request.method === 'POST' && user) {
+  try {
+    const fd = await Astro.request.formData();
+    const company = String(fd.get('company') || '').trim().slice(0, 200);
+    const title = String(fd.get('title') || '').trim().slice(0, 300);
+    const kind = String(fd.get('kind') || 'full_time').trim();
+    const location = String(fd.get('location') || '').trim().slice(0, 120);
+    const remoteOk = fd.get('remote_ok') === 'on';
+    const salaryRange = String(fd.get('salary_range') || '').trim().slice(0, 80);
+    const stipendRaw = String(fd.get('stipend_inr_per_month') || '').trim();
+    const stipend = stipendRaw ? Math.max(0, parseInt(stipendRaw, 10) || 0) : null;
+    const description = String(fd.get('description') || '').trim();
+    const requirementsRaw = String(fd.get('requirements') || '');
+    const requirements = requirementsRaw.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 40);
+    const applyUrl = String(fd.get('apply_url') || '').trim().slice(0, 500);
+    const applyEmail = String(fd.get('apply_email') || '').trim().slice(0, 200);
+
+    if (!company || !title) throw new Error('Company and title are required.');
+    if (!applyUrl && !applyEmail) throw new Error('Provide an apply URL or apply email.');
+
+    const validKinds = ['internship', 'full_time', 'contract', 'part_time'];
+    const kindNorm = validKinds.includes(kind) ? kind : 'full_time';
+
+    const baseSlug = (company + '-' + title)
+      .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 140);
+    const slug = baseSlug + '-' + Math.random().toString(36).slice(2, 8);
+
+    await db.execute(sql`INSERT INTO jobs_board (
+      slug, posted_by_user_id, company, title, kind, location, remote_ok,
+      salary_range, stipend_inr_per_month, description, requirements,
+      apply_url, apply_email
+    ) VALUES (
+      ${slug}, ${user.id}, ${company}, ${title}, ${kindNorm}, ${location}, ${remoteOk},
+      ${salaryRange || null}, ${stipend}, ${description}, ${JSON.stringify(requirements)}::jsonb,
+      ${applyUrl || null}, ${applyEmail || null}
+    )`);
+
+    postSuccess = 'Listing posted. It is live on the board now.';
+  } catch (e: any) {
+    postError = e?.message || 'Could not post listing. Try again.';
+  }
+}
+
+// Parse filters from query string
+const qs = new URL(Astro.request.url).searchParams;
+const fKind = qs.get('kind') || '';
+const fLoc = (qs.get('loc') || '').trim();
+const fRemote = qs.get('remote') === '1';
+const fSalary = qs.get('salary') || '';
+const fSince = qs.get('since') || 'all';
+
+const conditions: string[] = ['is_active = true'];
+const params: any[] = [];
+let p = 1;
+if (['internship', 'full_time', 'contract', 'part_time'].includes(fKind)) {
+  conditions.push(`kind = $${p++}`);
+  params.push(fKind);
+}
+if (fLoc) {
+  conditions.push(`LOWER(location) LIKE $${p++}`);
+  params.push('%' + fLoc.toLowerCase() + '%');
+}
+if (fRemote) conditions.push('remote_ok = true');
+if (fSince === '7d') conditions.push("posted_at > NOW() - INTERVAL '7 days'");
+else if (fSince === '30d') conditions.push("posted_at > NOW() - INTERVAL '30 days'");
+
+let jobList: any[] = [];
+try {
+  // Use parameter binding via drizzle sql template for safety
+  let res: any;
+  if (fKind && fLoc) {
+    res = await db.execute(sql`SELECT id, slug, company, company_logo_url, title, kind, location, remote_ok, salary_range, stipend_inr_per_month, posted_at FROM jobs_board WHERE is_active = true AND kind = ${fKind} AND LOWER(location) LIKE ${'%' + fLoc.toLowerCase() + '%'} ${fRemote ? sql`AND remote_ok = true` : sql``} ${fSince === '7d' ? sql`AND posted_at > NOW() - INTERVAL '7 days'` : fSince === '30d' ? sql`AND posted_at > NOW() - INTERVAL '30 days'` : sql``} ORDER BY posted_at DESC LIMIT 100`);
+  } else if (fKind) {
+    res = await db.execute(sql`SELECT id, slug, company, company_logo_url, title, kind, location, remote_ok, salary_range, stipend_inr_per_month, posted_at FROM jobs_board WHERE is_active = true AND kind = ${fKind} ${fRemote ? sql`AND remote_ok = true` : sql``} ${fSince === '7d' ? sql`AND posted_at > NOW() - INTERVAL '7 days'` : fSince === '30d' ? sql`AND posted_at > NOW() - INTERVAL '30 days'` : sql``} ORDER BY posted_at DESC LIMIT 100`);
+  } else if (fLoc) {
+    res = await db.execute(sql`SELECT id, slug, company, company_logo_url, title, kind, location, remote_ok, salary_range, stipend_inr_per_month, posted_at FROM jobs_board WHERE is_active = true AND LOWER(location) LIKE ${'%' + fLoc.toLowerCase() + '%'} ${fRemote ? sql`AND remote_ok = true` : sql``} ${fSince === '7d' ? sql`AND posted_at > NOW() - INTERVAL '7 days'` : fSince === '30d' ? sql`AND posted_at > NOW() - INTERVAL '30 days'` : sql``} ORDER BY posted_at DESC LIMIT 100`);
+  } else {
+    res = await db.execute(sql`SELECT id, slug, company, company_logo_url, title, kind, location, remote_ok, salary_range, stipend_inr_per_month, posted_at FROM jobs_board WHERE is_active = true ${fRemote ? sql`AND remote_ok = true` : sql``} ${fSince === '7d' ? sql`AND posted_at > NOW() - INTERVAL '7 days'` : fSince === '30d' ? sql`AND posted_at > NOW() - INTERVAL '30 days'` : sql``} ORDER BY posted_at DESC LIMIT 100`);
+  }
+  jobList = rows(res);
+
+  // Salary filter post-hoc (string ranges are heterogeneous)
+  if (fSalary === 'paid') {
+    jobList = jobList.filter(j => (j.stipend_inr_per_month && j.stipend_inr_per_month > 0) || (j.salary_range && j.salary_range.trim()));
+  } else if (fSalary === 'high') {
+    jobList = jobList.filter(j => (j.stipend_inr_per_month && j.stipend_inr_per_month >= 50000));
+  }
+} catch (_) {
+  jobList = [];
+}
+
+const totalCount = jobList.length;
+
+function fmtDate(d: any): string {
+  if (!d) return '';
+  try {
+    const dt = new Date(d);
+    const diffMs = Date.now() - dt.getTime();
+    const days = Math.floor(diffMs / 86400000);
+    if (days < 1) return 'Today';
+    if (days === 1) return '1 day ago';
+    if (days < 14) return days + ' days ago';
+    if (days < 60) return Math.floor(days / 7) + ' weeks ago';
+    return dt.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+  } catch (_) { return ''; }
+}
+
+function fmtKind(k: string): string {
+  if (k === 'internship') return 'Internship';
+  if (k === 'full_time') return 'Full-time';
+  if (k === 'part_time') return 'Part-time';
+  if (k === 'contract') return 'Contract';
+  return k;
+}
+
+function fmtPay(j: any): string {
+  if (j.stipend_inr_per_month && j.stipend_inr_per_month > 0) {
+    return 'INR ' + Number(j.stipend_inr_per_month).toLocaleString() + '/mo';
+  }
+  if (j.salary_range) return j.salary_range;
+  return 'Compensation on request';
+}
+
+function initials(name: string): string {
+  if (!name) return '?';
+  return name.split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
+}
+---
+<BaseLayout title="Internships and Jobs | Portal" description="Roles posted by partners, alumni, and the community. Internships, full-time, contract — apply directly.">
+<style>
+  .jb-shell { max-width: 1180px; margin: 0 auto; padding: 48px 24px 96px; }
+  .jb-hero { padding: 24px 0 32px; border-bottom: 1px solid rgba(14,11,8,0.10); margin-bottom: 28px; }
+  .jb-eyebrow { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #FF4F00; font-weight: 700; }
+  .jb-title { font-family: 'Cormorant Garamond', serif; font-size: clamp(28px, 4vw, 42px); font-weight: 600; letter-spacing: -0.02em; color: #0E0B08; margin: 10px 0 12px; line-height: 1.08; }
+  .jb-title em { font-style: italic; font-weight: 500; color: #FF4F00; }
+  .jb-sub { color: #4a4239; max-width: 640px; line-height: 1.55; font-size: 15px; }
+  .jb-hero-row { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; flex-wrap: wrap; }
+  .jb-post-cta { background: #FF4F00; color: #fff; padding: 10px 18px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; border: none; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }
+  .jb-post-cta:hover { background: #d54400; }
+  .jb-post-cta svg { width: 14px; height: 14px; }
+
+  .jb-filters { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 18px 22px; margin-bottom: 28px; display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; align-items: end; }
+  .jb-field { display: flex; flex-direction: column; gap: 6px; }
+  .jb-field label { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #6e655c; font-weight: 700; }
+  .jb-field select, .jb-field input[type="text"] { background: #FAF8F5; border: 1px solid rgba(14,11,8,0.14); border-radius: 6px; padding: 8px 10px; font-size: 13px; color: #0E0B08; font-family: inherit; }
+  .jb-field input[type="text"]:focus, .jb-field select:focus { outline: none; border-color: #FF4F00; }
+  .jb-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #2a2520; user-select: none; cursor: pointer; padding-bottom: 8px; }
+  .jb-check input { accent-color: #FF4F00; width: 16px; height: 16px; }
+  .jb-filter-actions { display: flex; gap: 10px; align-items: center; }
+  .jb-btn { background: #0E0B08; color: #fff; padding: 9px 16px; border-radius: 6px; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; border: none; cursor: pointer; }
+  .jb-btn-ghost { background: transparent; color: #4a4239; border: 1px solid rgba(14,11,8,0.14); }
+  .jb-btn:hover { background: #2a2520; }
+  .jb-btn-ghost:hover { border-color: #0E0B08; color: #0E0B08; }
+
+  .jb-meta-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .jb-count { font-family: 'Geist Mono', monospace; font-size: 11px; color: #6e655c; letter-spacing: 0.06em; }
+  .jb-sort { font-family: 'Geist Mono', monospace; font-size: 11px; color: #6e655c; }
+
+  .jb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  .jb-card { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 20px; text-decoration: none; color: inherit; display: flex; flex-direction: column; gap: 14px; transition: border-color 0.15s, transform 0.15s; }
+  .jb-card:hover { border-color: #FF4F00; transform: translateY(-2px); }
+  .jb-card-head { display: flex; gap: 12px; align-items: flex-start; }
+  .jb-logo { width: 44px; height: 44px; border-radius: 8px; background: #FAF8F5; border: 1px solid rgba(14,11,8,0.10); display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-family: 'Cormorant Garamond', serif; font-size: 18px; font-weight: 600; color: #0E0B08; overflow: hidden; }
+  .jb-logo img { width: 100%; height: 100%; object-fit: cover; }
+  .jb-card-text { flex: 1; min-width: 0; }
+  .jb-company { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.06em; color: #6e655c; text-transform: uppercase; }
+  .jb-jobtitle { font-family: 'Cormorant Garamond', serif; font-size: 20px; font-weight: 600; color: #0E0B08; line-height: 1.2; margin-top: 2px; }
+  .jb-card-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .jb-chip { font-family: 'Geist Mono', monospace; font-size: 10px; padding: 4px 9px; border-radius: 999px; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; }
+  .jb-chip-kind { background: #FF4F00; color: #fff; }
+  .jb-chip-remote { background: #e6f7ee; color: #1c6b3c; }
+  .jb-chip-loc { background: #FAF8F5; color: #4a4239; border: 1px solid rgba(14,11,8,0.10); }
+  .jb-card-foot { display: flex; justify-content: space-between; align-items: center; padding-top: 12px; border-top: 1px solid rgba(14,11,8,0.08); margin-top: auto; }
+  .jb-pay { font-size: 13px; color: #0E0B08; font-weight: 500; }
+  .jb-posted { font-family: 'Geist Mono', monospace; font-size: 10px; color: #8a8278; letter-spacing: 0.04em; }
+
+  .jb-empty { background: #fff; border: 1px dashed rgba(14,11,8,0.18); border-radius: 14px; padding: 56px 24px; text-align: center; }
+  .jb-empty svg { width: 32px; height: 32px; color: #b0a89e; margin-bottom: 12px; }
+  .jb-empty-title { font-family: 'Cormorant Garamond', serif; font-size: 22px; color: #0E0B08; margin-bottom: 6px; }
+  .jb-empty-sub { color: #6e655c; font-size: 14px; }
+
+  /* Posting modal */
+  .jb-modal-back { position: fixed; inset: 0; background: rgba(14,11,8,0.55); display: none; align-items: flex-start; justify-content: center; padding: 60px 20px; z-index: 100; overflow-y: auto; }
+  .jb-modal-back.is-open { display: flex; }
+  .jb-modal { background: #FAF8F5; border-radius: 14px; max-width: 720px; width: 100%; padding: 28px 30px 32px; box-shadow: 0 30px 60px rgba(0,0,0,0.25); }
+  .jb-modal-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 22px; }
+  .jb-modal-title { font-family: 'Cormorant Garamond', serif; font-size: 26px; font-weight: 600; color: #0E0B08; }
+  .jb-modal-title em { font-style: italic; color: #FF4F00; font-weight: 500; }
+  .jb-modal-sub { color: #4a4239; font-size: 13px; margin-top: 4px; }
+  .jb-modal-close { background: transparent; border: none; cursor: pointer; color: #6e655c; padding: 4px; }
+  .jb-modal-close svg { width: 22px; height: 22px; }
+  .jb-form { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .jb-form .jb-field-full { grid-column: 1 / -1; }
+  .jb-form input[type="text"], .jb-form input[type="number"], .jb-form input[type="email"], .jb-form input[type="url"], .jb-form select, .jb-form textarea { background: #fff; border: 1px solid rgba(14,11,8,0.14); border-radius: 6px; padding: 9px 11px; font-size: 13px; color: #0E0B08; font-family: inherit; width: 100%; box-sizing: border-box; }
+  .jb-form textarea { min-height: 120px; resize: vertical; font-family: inherit; line-height: 1.5; }
+  .jb-form textarea.jb-reqs { min-height: 80px; font-family: 'Geist Mono', monospace; font-size: 12px; }
+  .jb-form label { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #6e655c; font-weight: 700; display: block; margin-bottom: 5px; }
+  .jb-form-actions { grid-column: 1 / -1; display: flex; gap: 10px; justify-content: flex-end; margin-top: 8px; }
+  .jb-alert { padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; }
+  .jb-alert-err { background: #fde7e7; color: #8a1f1f; border: 1px solid #f4bcbc; }
+  .jb-alert-ok { background: #e6f7ee; color: #1c6b3c; border: 1px solid #b3e1c8; }
+  .jb-login-prompt { background: #FAF8F5; border: 1px dashed rgba(14,11,8,0.18); border-radius: 10px; padding: 22px; text-align: center; margin: 20px 0; }
+  .jb-login-prompt p { margin: 0 0 12px; color: #4a4239; font-size: 14px; }
+
+  @media (max-width: 640px) {
+    .jb-form { grid-template-columns: 1fr; }
+    .jb-hero-row { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+<main class="jb-shell">
+
+  <section class="jb-hero">
+    <div class="jb-hero-row">
+      <div>
+        <div class="jb-eyebrow">Portal &middot; Internships and Jobs</div>
+        <h1 class="jb-title">Roles that <em>actually fit</em>.</h1>
+        <p class="jb-sub">Internships, full-time, contract and part-time roles posted by partners, alumni, and the wider community. Apply directly. No middleman, no aggregator fees, no scraped-stale listings.</p>
+      </div>
+      <button type="button" class="jb-post-cta" id="jbOpenPostBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Post a role
+      </button>
+    </div>
+  </section>
+
+  {postSuccess && <div class="jb-alert jb-alert-ok">{postSuccess}</div>}
+
+  <form class="jb-filters" method="get" action="/portal/jobs">
+    <div class="jb-field">
+      <label for="kind">Kind</label>
+      <select name="kind" id="kind">
+        <option value="">Any</option>
+        <option value="internship" selected={fKind === 'internship'}>Internship</option>
+        <option value="full_time" selected={fKind === 'full_time'}>Full-time</option>
+        <option value="contract" selected={fKind === 'contract'}>Contract</option>
+        <option value="part_time" selected={fKind === 'part_time'}>Part-time</option>
+      </select>
+    </div>
+    <div class="jb-field">
+      <label for="loc">Location</label>
+      <input type="text" name="loc" id="loc" value={fLoc} placeholder="City or region" />
+    </div>
+    <div class="jb-field">
+      <label for="salary">Salary</label>
+      <select name="salary" id="salary">
+        <option value="">Any</option>
+        <option value="paid" selected={fSalary === 'paid'}>Paid roles only</option>
+        <option value="high" selected={fSalary === 'high'}>50k INR/mo or above</option>
+      </select>
+    </div>
+    <div class="jb-field">
+      <label for="since">Posted within</label>
+      <select name="since" id="since">
+        <option value="all" selected={fSince === 'all'}>All time</option>
+        <option value="7d" selected={fSince === '7d'}>Last 7 days</option>
+        <option value="30d" selected={fSince === '30d'}>Last 30 days</option>
+      </select>
+    </div>
+    <div class="jb-field">
+      <label class="jb-check" for="remote">
+        <input type="checkbox" name="remote" id="remote" value="1" checked={fRemote} />
+        Remote-friendly only
+      </label>
+    </div>
+    <div class="jb-filter-actions">
+      <button type="submit" class="jb-btn">Apply</button>
+      <a href="/portal/jobs" class="jb-btn jb-btn-ghost">Reset</a>
+    </div>
+  </form>
+
+  <div class="jb-meta-row">
+    <div class="jb-count">{totalCount} {totalCount === 1 ? 'role' : 'roles'} listed</div>
+    <div class="jb-sort">Sorted by most recent</div>
+  </div>
+
+  {jobList.length === 0 ? (
+    <section class="jb-empty">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><line x1="2" y1="13" x2="22" y2="13"/></svg>
+      <div class="jb-empty-title">No roles match these filters.</div>
+      <div class="jb-empty-sub">Try widening the location, removing the remote filter, or resetting the form.</div>
+    </section>
+  ) : (
+    <section class="jb-grid">
+      {jobList.map((j: any) => (
+        <a class="jb-card" href={`/portal/jobs/${j.slug}`}>
+          <div class="jb-card-head">
+            <div class="jb-logo">
+              {j.company_logo_url ? <img src={j.company_logo_url} alt="" /> : initials(j.company)}
+            </div>
+            <div class="jb-card-text">
+              <div class="jb-company">{j.company}</div>
+              <div class="jb-jobtitle">{j.title}</div>
+            </div>
+          </div>
+          <div class="jb-card-meta">
+            <span class="jb-chip jb-chip-kind">{fmtKind(j.kind)}</span>
+            {j.location && <span class="jb-chip jb-chip-loc">{j.location}</span>}
+            {j.remote_ok && <span class="jb-chip jb-chip-remote">Remote OK</span>}
+          </div>
+          <div class="jb-card-foot">
+            <div class="jb-pay">{fmtPay(j)}</div>
+            <div class="jb-posted">{fmtDate(j.posted_at)}</div>
+          </div>
+        </a>
+      ))}
+    </section>
+  )}
+
+  <div class="jb-modal-back" id="jbModalBack">
+    <div class="jb-modal" role="dialog" aria-labelledby="jbModalTitle">
+      <div class="jb-modal-head">
+        <div>
+          <div class="jb-modal-title" id="jbModalTitle">Post a <em>role</em></div>
+          <div class="jb-modal-sub">Listing goes live immediately. Keep it accurate &mdash; the community moderates.</div>
+        </div>
+        <button type="button" class="jb-modal-close" id="jbCloseBtn" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      {postError && <div class="jb-alert jb-alert-err">{postError}</div>}
+
+      {user ? (
+        <form class="jb-form" method="post" action="/portal/jobs">
+          <div>
+            <label for="f-company">Company</label>
+            <input type="text" name="company" id="f-company" required maxlength="200" />
+          </div>
+          <div>
+            <label for="f-title">Role title</label>
+            <input type="text" name="title" id="f-title" required maxlength="300" />
+          </div>
+          <div>
+            <label for="f-kind">Kind</label>
+            <select name="kind" id="f-kind">
+              <option value="full_time">Full-time</option>
+              <option value="internship">Internship</option>
+              <option value="contract">Contract</option>
+              <option value="part_time">Part-time</option>
+            </select>
+          </div>
+          <div>
+            <label for="f-location">Location</label>
+            <input type="text" name="location" id="f-location" maxlength="120" placeholder="e.g. Bengaluru or Hybrid - Mumbai" />
+          </div>
+          <div>
+            <label class="jb-check" for="f-remote">
+              <input type="checkbox" name="remote_ok" id="f-remote" />
+              Remote-friendly
+            </label>
+          </div>
+          <div>
+            <label for="f-salary">Salary range (text)</label>
+            <input type="text" name="salary_range" id="f-salary" maxlength="80" placeholder="e.g. 12-18 LPA or competitive" />
+          </div>
+          <div>
+            <label for="f-stipend">Stipend (INR / month, optional)</label>
+            <input type="number" name="stipend_inr_per_month" id="f-stipend" min="0" step="500" placeholder="e.g. 25000" />
+          </div>
+          <div></div>
+          <div class="jb-field-full">
+            <label for="f-desc">Description</label>
+            <textarea name="description" id="f-desc" required placeholder="What the role is about, who fits, what they will work on, team size, tech stack, expectations."></textarea>
+          </div>
+          <div class="jb-field-full">
+            <label for="f-reqs">Requirements (one per line)</label>
+            <textarea name="requirements" id="f-reqs" class="jb-reqs" placeholder={'2+ years of Python\nFamiliarity with PostgreSQL\nBased in IST timezone'}></textarea>
+          </div>
+          <div>
+            <label for="f-apply-url">Apply URL</label>
+            <input type="url" name="apply_url" id="f-apply-url" maxlength="500" placeholder="https://" />
+          </div>
+          <div>
+            <label for="f-apply-email">or Apply email</label>
+            <input type="email" name="apply_email" id="f-apply-email" maxlength="200" placeholder="hiring@company.com" />
+          </div>
+          <div class="jb-form-actions">
+            <button type="button" class="jb-btn jb-btn-ghost" id="jbCancelBtn">Cancel</button>
+            <button type="submit" class="jb-btn" style="background: #FF4F00;">Publish listing</button>
+          </div>
+        </form>
+      ) : (
+        <div class="jb-login-prompt">
+          <p>You need to be signed in to post a role.</p>
+          <a href="/portal/login?next=/portal/jobs" class="jb-btn" style="background: #FF4F00;">Sign in to continue</a>
+        </div>
+      )}
+    </div>
+  </div>
+
+</main>
+<script is:inline>
+(function () {
+  var openBtn = document.getElementById('jbOpenPostBtn');
+  var closeBtn = document.getElementById('jbCloseBtn');
+  var cancelBtn = document.getElementById('jbCancelBtn');
+  var back = document.getElementById('jbModalBack');
+  if (!openBtn || !back) return;
+
+  function open() {
+    back.classList.add('is-open');
+    document.body.style.overflow = 'hidden';
+  }
+  function close() {
+    back.classList.remove('is-open');
+    document.body.style.overflow = '';
+  }
+
+  openBtn.addEventListener('click', open);
+  if (closeBtn) closeBtn.addEventListener('click', close);
+  if (cancelBtn) cancelBtn.addEventListener('click', close);
+  back.addEventListener('click', function (e) {
+    if (e.target === back) close();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && back.classList.contains('is-open')) close();
+  });
+
+  // Auto-open if server flagged an error or success (user just submitted)
+  var hasError = document.querySelector('.jb-alert-err');
+  if (hasError) open();
+
+  // If URL has ?post=1, open the modal
+  var qs = new URLSearchParams(window.location.search);
+  if (qs.get('post') === '1') open();
+})();
+</script>
+</BaseLayout>

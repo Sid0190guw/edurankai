@@ -1,0 +1,468 @@
+---
+// /portal/library — Integrated Library Management System (patron view).
+// Search the catalogue, borrow / reserve physical items, open digital ones,
+// and track your active loans + reservations. All schema is self-bootstrapped
+// so the page never 500s on a fresh DB.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/library'));
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// -- Schema bootstrap (idempotent) -----------------------------------------
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS library_resources (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      isbn VARCHAR(40), kind VARCHAR(20) DEFAULT 'book',
+      title TEXT, authors TEXT, publisher TEXT, year INT,
+      subject VARCHAR(120), language VARCHAR(40) DEFAULT 'en',
+      cover_url TEXT, location_code VARCHAR(40),
+      total_copies INT DEFAULT 1, available_copies INT DEFAULT 1,
+      is_digital BOOLEAN DEFAULT false, digital_url TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS library_loans (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      resource_id UUID, user_id UUID,
+      loaned_at TIMESTAMPTZ DEFAULT NOW(), due_at TIMESTAMPTZ,
+      returned_at TIMESTAMPTZ, status VARCHAR(20) DEFAULT 'active',
+      fine_amount_paise INT DEFAULT 0
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS library_reservations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      resource_id UUID, user_id UUID,
+      reserved_at TIMESTAMPTZ DEFAULT NOW(), notified_at TIMESTAMPTZ,
+      status VARCHAR(20) DEFAULT 'pending'
+    )
+  `);
+} catch (_) {}
+
+// -- Seed a starter catalogue on first visit (only if completely empty) ----
+try {
+  const c = rowsOf(await db.execute(sql`SELECT COUNT(*)::int AS n FROM library_resources`));
+  if ((c[0]?.n || 0) === 0) {
+    const seed = [
+      ['978-0262033848', 'book', 'Introduction to Algorithms', 'Cormen, Leiserson, Rivest, Stein', 'MIT Press', 2009, 'Computer Science', 'STK-CS-001', 4, 4, false, null],
+      ['978-0387310732', 'book', 'Pattern Recognition and Machine Learning', 'Christopher M. Bishop', 'Springer', 2006, 'Computer Science', 'STK-CS-014', 3, 3, false, null],
+      ['978-0201558029', 'book', 'Concrete Mathematics', 'Graham, Knuth, Patashnik', 'Addison-Wesley', 1994, 'Mathematics', 'STK-MA-007', 2, 2, false, null],
+      ['978-0691118802', 'book', 'The Princeton Companion to Mathematics', 'Timothy Gowers (ed.)', 'Princeton University Press', 2008, 'Mathematics', 'STK-MA-022', 2, 2, false, null],
+      ['978-0805390216', 'book', 'Gravitation', 'Misner, Thorne, Wheeler', 'Princeton University Press', 1973, 'Physics', 'STK-PH-003', 2, 2, false, null],
+      ['978-0201021158', 'book', 'The Feynman Lectures on Physics, Vol. I', 'R. P. Feynman', 'Addison-Wesley', 1963, 'Physics', 'STK-PH-001', 3, 3, false, null],
+      ['978-0716743392', 'book', 'Lehninger Principles of Biochemistry', 'Nelson, Cox', 'W. H. Freeman', 2017, 'Biology', 'STK-BI-011', 3, 3, false, null],
+      ['978-0815344322', 'book', 'Molecular Biology of the Cell', 'Alberts et al.', 'Garland Science', 2014, 'Biology', 'STK-BI-002', 2, 2, false, null],
+      ['978-0134093413', 'book', 'Chemistry: The Central Science', 'Brown, LeMay, Bursten', 'Pearson', 2017, 'Chemistry', 'STK-CH-005', 3, 3, false, null],
+      ['978-0073401140', 'book', 'Engineering Mechanics: Statics', 'Hibbeler', 'McGraw-Hill', 2015, 'Engineering', 'STK-EN-019', 4, 4, false, null],
+      ['978-0521635035', 'book', 'A History of Western Philosophy', 'Bertrand Russell', 'Cambridge University Press', 1995, 'Humanities', 'STK-HU-031', 2, 2, false, null],
+      ['978-0199673599', 'book', 'Introduction to Indian Constitutional Law', 'Madhav Khosla', 'Oxford University Press', 2012, 'Law', 'STK-LA-008', 2, 2, false, null],
+      ['978-1591846444', 'book', 'Zero to One', 'Peter Thiel, Blake Masters', 'Crown Business', 2014, 'Business', 'STK-BU-014', 3, 3, false, null],
+      ['978-0140448719', 'book', 'The Bhagavad Gita', 'Trans. Juan Mascaró', 'Penguin Classics', 2003, 'Vedic Studies', 'STK-VD-001', 4, 4, false, null],
+      ['978-8120813434', 'book', 'Sanskrit Manual', 'Roderick S. Bucknell', 'Motilal Banarsidass', 1994, 'Languages', 'STK-LG-016', 2, 2, false, null],
+      [null, 'ebook', 'Open Educational Compendium: Linear Algebra', 'Community Authors', 'Open Press', 2022, 'Mathematics', 'en', null, null, 999, 999, true, '/resources/oer/linear-algebra'],
+      [null, 'ebook', 'Open Compendium: Classical Mechanics Notes', 'Community Authors', 'Open Press', 2023, 'Physics', 'en', null, null, 999, 999, true, '/resources/oer/classical-mechanics'],
+      [null, 'ebook', 'Open Compendium: Data Structures Workbook', 'Community Authors', 'Open Press', 2023, 'Computer Science', 'en', null, null, 999, 999, true, '/resources/oer/data-structures'],
+    ];
+    for (const r of seed) {
+      const isDigital = r[10] as boolean;
+      if (isDigital) {
+        // ebook seeds: [isbn, kind, title, authors, publisher, year, subject, language, cover, location, total, avail, isDigital, digital_url]
+        await db.execute(sql`
+          INSERT INTO library_resources (isbn, kind, title, authors, publisher, year, subject, language, total_copies, available_copies, is_digital, digital_url)
+          VALUES (${null}, ${r[1]}, ${r[2]}, ${r[3]}, ${r[4]}, ${r[5]}, ${r[6]}, 'en', ${r[10] as any}, ${r[11] as any}, true, ${r[13] as any})
+        `);
+      } else {
+        await db.execute(sql`
+          INSERT INTO library_resources (isbn, kind, title, authors, publisher, year, subject, location_code, total_copies, available_copies, is_digital)
+          VALUES (${r[0]}, ${r[1]}, ${r[2]}, ${r[3]}, ${r[4]}, ${r[5]}, ${r[6]}, ${r[7]}, ${r[8]}, ${r[9]}, false)
+        `);
+      }
+    }
+  }
+} catch (_) {}
+
+// -- Form handlers ---------------------------------------------------------
+let flash: { kind: 'ok' | 'err'; text: string } | null = null;
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+
+    if (action === 'borrow') {
+      const rid = String(form.get('resource_id') || '');
+      if (rid) {
+        const rs = rowsOf(await db.execute(sql`SELECT available_copies FROM library_resources WHERE id = ${rid}::uuid`));
+        if (rs.length && (rs[0].available_copies || 0) > 0) {
+          // Two-week loan window
+          await db.execute(sql`
+            INSERT INTO library_loans (resource_id, user_id, due_at, status)
+            VALUES (${rid}::uuid, ${user.id}::uuid, NOW() + INTERVAL '14 days', 'active')
+          `);
+          await db.execute(sql`UPDATE library_resources SET available_copies = available_copies - 1 WHERE id = ${rid}::uuid AND available_copies > 0`);
+          flash = { kind: 'ok', text: 'Borrowed. Due in 14 days. Pick up at the issue desk with your member card.' };
+        } else {
+          flash = { kind: 'err', text: 'No copies available right now. Try reserving instead.' };
+        }
+      }
+    } else if (action === 'reserve') {
+      const rid = String(form.get('resource_id') || '');
+      if (rid) {
+        const existing = rowsOf(await db.execute(sql`
+          SELECT id FROM library_reservations
+          WHERE resource_id = ${rid}::uuid AND user_id = ${user.id}::uuid AND status = 'pending'
+          LIMIT 1
+        `));
+        if (existing.length === 0) {
+          await db.execute(sql`
+            INSERT INTO library_reservations (resource_id, user_id, status)
+            VALUES (${rid}::uuid, ${user.id}::uuid, 'pending')
+          `);
+          flash = { kind: 'ok', text: 'Reserved. We will notify you when a copy is available.' };
+        } else {
+          flash = { kind: 'err', text: 'You already have a pending reservation on this resource.' };
+        }
+      }
+    } else if (action === 'return') {
+      const lid = String(form.get('loan_id') || '');
+      if (lid) {
+        const ls = rowsOf(await db.execute(sql`
+          SELECT id, resource_id, due_at FROM library_loans
+          WHERE id = ${lid}::uuid AND user_id = ${user.id}::uuid AND status = 'active'
+          LIMIT 1
+        `));
+        if (ls.length) {
+          const due = ls[0].due_at ? new Date(ls[0].due_at) : null;
+          const now = new Date();
+          let fine = 0;
+          if (due && now.getTime() > due.getTime()) {
+            const overdueDays = Math.ceil((now.getTime() - due.getTime()) / (1000 * 60 * 60 * 24));
+            // 200 paise (Rs 2) per day overdue, capped at Rs 500
+            fine = Math.min(overdueDays * 200, 50000);
+          }
+          await db.execute(sql`
+            UPDATE library_loans
+            SET returned_at = NOW(), status = 'returned', fine_amount_paise = ${fine}
+            WHERE id = ${lid}::uuid
+          `);
+          await db.execute(sql`UPDATE library_resources SET available_copies = available_copies + 1 WHERE id = ${ls[0].resource_id}::uuid`);
+          flash = fine > 0
+            ? { kind: 'ok', text: 'Returned. A late fine of Rs ' + (fine / 100).toFixed(2) + ' has been recorded against your account.' }
+            : { kind: 'ok', text: 'Returned on time. Thank you.' };
+        }
+      }
+    } else if (action === 'cancel_reservation') {
+      const rid = String(form.get('reservation_id') || '');
+      if (rid) {
+        await db.execute(sql`
+          UPDATE library_reservations SET status = 'cancelled'
+          WHERE id = ${rid}::uuid AND user_id = ${user.id}::uuid AND status = 'pending'
+        `);
+        flash = { kind: 'ok', text: 'Reservation cancelled.' };
+      }
+    }
+  } catch (e: any) {
+    flash = { kind: 'err', text: 'Action failed: ' + (e?.message || 'unknown error') };
+  }
+}
+
+// -- Query: filters --------------------------------------------------------
+const url = new URL(Astro.request.url);
+const q = (url.searchParams.get('q') || '').trim();
+const subject = (url.searchParams.get('subject') || '').trim();
+
+const SUBJECTS = ['Mathematics','Physics','Chemistry','Biology','Computer Science','Engineering','Humanities','Law','Business','Languages','Vedic Studies'];
+
+let resources: any[] = [];
+try {
+  if (q && subject) {
+    const like = '%' + q + '%';
+    resources = rowsOf(await db.execute(sql`
+      SELECT * FROM library_resources
+      WHERE subject = ${subject}
+        AND (title ILIKE ${like} OR authors ILIKE ${like} OR isbn ILIKE ${like} OR subject ILIKE ${like})
+      ORDER BY title ASC LIMIT 80
+    `));
+  } else if (q) {
+    const like = '%' + q + '%';
+    resources = rowsOf(await db.execute(sql`
+      SELECT * FROM library_resources
+      WHERE title ILIKE ${like} OR authors ILIKE ${like} OR isbn ILIKE ${like} OR subject ILIKE ${like}
+      ORDER BY title ASC LIMIT 80
+    `));
+  } else if (subject) {
+    resources = rowsOf(await db.execute(sql`
+      SELECT * FROM library_resources WHERE subject = ${subject} ORDER BY title ASC LIMIT 80
+    `));
+  } else {
+    resources = rowsOf(await db.execute(sql`
+      SELECT * FROM library_resources ORDER BY created_at DESC LIMIT 60
+    `));
+  }
+} catch (_) {}
+
+// -- My loans --------------------------------------------------------------
+let loans: any[] = [];
+try {
+  loans = rowsOf(await db.execute(sql`
+    SELECT l.id, l.loaned_at, l.due_at, l.returned_at, l.status, l.fine_amount_paise,
+      r.title, r.authors, r.location_code, r.is_digital, r.digital_url
+    FROM library_loans l
+    JOIN library_resources r ON r.id = l.resource_id
+    WHERE l.user_id = ${user.id}::uuid AND l.status = 'active'
+    ORDER BY l.due_at ASC
+  `));
+} catch (_) {}
+
+// -- My reservations -------------------------------------------------------
+let reservations: any[] = [];
+try {
+  reservations = rowsOf(await db.execute(sql`
+    SELECT res.id, res.reserved_at, res.status,
+      r.title, r.authors, r.available_copies
+    FROM library_reservations res
+    JOIN library_resources r ON r.id = res.resource_id
+    WHERE res.user_id = ${user.id}::uuid AND res.status = 'pending'
+    ORDER BY res.reserved_at DESC
+  `));
+} catch (_) {}
+
+function fmtDate(d: any): string {
+  if (!d) return '';
+  try { return new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }); } catch { return ''; }
+}
+function daysUntil(d: any): number {
+  if (!d) return 0;
+  try { return Math.ceil((new Date(d).getTime() - Date.now()) / 86400000); } catch { return 0; }
+}
+function initialsOfTitle(t: string): string {
+  if (!t) return 'BK';
+  const parts = String(t).trim().split(/\s+/).filter(p => p.length > 2);
+  if (parts.length === 0) return String(t).slice(0, 2).toUpperCase();
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+function coverHue(t: string): number {
+  if (!t) return 30;
+  let h = 0;
+  for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+---
+<BaseLayout title="Library — EduRankAI" description="Catalogue search, borrow, reserve, return — and manage your loans.">
+<style>
+  body { background: #FAF8F5; }
+  .lib-hero p.eyebrow { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin-bottom: 12px; }
+  .lib-hero h1 { font-family: 'Cormorant Garamond', serif; font-size: clamp(28px, 4vw, 42px); font-weight: 600; color: #0E0B08; letter-spacing: -0.01em; line-height: 1.08; margin: 0 0 14px; }
+  .lib-hero h1 em { font-style: italic; color: #FF4F00; font-weight: 500; }
+  .lib-hero p.lead { color: #4a443d; font-size: 15px; line-height: 1.55; max-width: 640px; margin: 0; }
+
+  .lib-card { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 22px; }
+  .lib-card h3 { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin: 0 0 14px; }
+
+  .lib-search { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .lib-search input[type=text] { flex: 1; min-width: 200px; background: #FAF8F5; border: 1px solid rgba(14,11,8,0.18); color: #0E0B08; padding: 11px 14px; border-radius: 10px; font-size: 14px; font-family: inherit; }
+  .lib-search input[type=text]:focus { outline: none; border-color: #FF4F00; }
+  .btn-primary { background: #FF4F00; color: #fff; border: 0; padding: 10px 18px; border-radius: 10px; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; cursor: pointer; }
+  .btn-primary:hover { background: #e84600; }
+  .btn-primary:disabled { background: #cfc8bf; cursor: not-allowed; }
+  .btn-ghost { background: transparent; color: #0E0B08; border: 1px solid rgba(14,11,8,0.18); padding: 9px 16px; border-radius: 10px; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn-ghost:hover { border-color: #FF4F00; color: #FF4F00; }
+
+  .subj-chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+  .subj-chip { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; padding: 7px 12px; border-radius: 100px; background: #fff; border: 1px solid rgba(14,11,8,0.14); color: #4a443d; text-decoration: none; transition: all .15s; }
+  .subj-chip:hover { border-color: #FF4F00; color: #FF4F00; }
+  .subj-chip.active { background: #FF4F00; color: #fff; border-color: #FF4F00; }
+
+  .grid-resources { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+  .res-card { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  .res-cover { aspect-ratio: 3/4; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #fff; font-family: 'Cormorant Garamond', serif; font-size: 36px; font-weight: 600; letter-spacing: -0.02em; position: relative; overflow: hidden; }
+  .res-cover::after { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: rgba(0,0,0,0.18); }
+  .res-title { font-family: 'Cormorant Garamond', serif; font-size: 17px; font-weight: 600; color: #0E0B08; line-height: 1.18; margin: 0; min-height: 40px; }
+  .res-authors { font-size: 12px; color: #4a443d; line-height: 1.4; margin: 0; }
+  .res-meta { display: flex; justify-content: space-between; align-items: center; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10px; color: #6a635a; text-transform: uppercase; letter-spacing: 0.06em; }
+  .avail-pill { padding: 2px 8px; border-radius: 100px; font-weight: 700; }
+  .avail-yes { background: rgba(16,185,129,0.12); color: #047857; }
+  .avail-no { background: rgba(239,68,68,0.10); color: #991b1b; }
+  .res-actions { display: flex; gap: 6px; margin-top: 4px; }
+  .res-actions form, .res-actions a { flex: 1; }
+  .res-actions button, .res-actions a.btn-primary, .res-actions a.btn-ghost { width: 100%; text-align: center; padding: 8px 10px; font-size: 10.5px; }
+
+  .loan-row { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 12px; padding: 16px; display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .loan-row + .loan-row { margin-top: 10px; }
+  .loan-info { min-width: 0; flex: 1; }
+  .loan-title { font-family: 'Cormorant Garamond', serif; font-size: 18px; font-weight: 600; color: #0E0B08; margin: 0 0 4px; }
+  .loan-meta { font-size: 12.5px; color: #4a443d; }
+  .due-pill { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 10px; font-weight: 700; padding: 3px 10px; border-radius: 100px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .due-ok { background: rgba(16,185,129,0.12); color: #047857; }
+  .due-soon { background: rgba(250,204,21,0.18); color: #92400e; }
+  .due-late { background: rgba(239,68,68,0.12); color: #991b1b; }
+
+  .flash { padding: 12px 16px; border-radius: 10px; font-size: 14px; margin-bottom: 18px; }
+  .flash-ok { background: rgba(16,185,129,0.10); color: #047857; border: 1px solid rgba(16,185,129,0.28); }
+  .flash-err { background: rgba(239,68,68,0.10); color: #991b1b; border: 1px solid rgba(239,68,68,0.28); }
+
+  .empty { padding: 18px; background: #FAF8F5; border: 1px dashed rgba(14,11,8,0.18); border-radius: 10px; color: #4a443d; font-size: 13.5px; }
+  section.lib-section { margin-top: 38px; }
+  section.lib-section > h2 { font-family: 'Cormorant Garamond', serif; font-size: 26px; font-weight: 600; color: #0E0B08; margin: 0 0 16px; }
+  section.lib-section > h2 em { color: #FF4F00; font-weight: 500; }
+</style>
+
+<main class="px-[5vw] py-10 md:py-14 max-w-6xl mx-auto">
+
+  <a href="/portal" class="btn-ghost" style="margin-bottom:18px;">&lt; Portal home</a>
+
+  <header class="lib-hero" style="margin-top:20px;margin-bottom:30px;">
+    <p class="eyebrow">Library</p>
+    <h1>Your <em>shelf</em>.</h1>
+    <p class="lead">Catalogue search across the physical and digital collection. Borrow up to five items at a time, reserve what's checked out, and open ebooks straight from this page. Late fines are calculated at Rs 2 per overdue day, capped at Rs 500.</p>
+  </header>
+
+  {flash && (
+    <div class={'flash ' + (flash.kind === 'ok' ? 'flash-ok' : 'flash-err')}>{flash.text}</div>
+  )}
+
+  {/* --- Search --- */}
+  <div class="lib-card">
+    <h3>Catalogue search</h3>
+    <form method="GET" class="lib-search">
+      <input type="text" name="q" value={q} placeholder="Search by title, author, ISBN or subject" />
+      {subject && <input type="hidden" name="subject" value={subject} />}
+      <button type="submit" class="btn-primary">Search</button>
+      {(q || subject) && <a href="/portal/library" class="btn-ghost">Reset</a>}
+    </form>
+    <div class="subj-chips">
+      <a href={'/portal/library' + (q ? '?q=' + encodeURIComponent(q) : '')} class={'subj-chip' + (!subject ? ' active' : '')}>All subjects</a>
+      {SUBJECTS.map((s) => (
+        <a
+          href={'/portal/library?subject=' + encodeURIComponent(s) + (q ? '&q=' + encodeURIComponent(q) : '')}
+          class={'subj-chip' + (subject === s ? ' active' : '')}
+        >{s}</a>
+      ))}
+    </div>
+  </div>
+
+  {/* --- Resource grid --- */}
+  <section class="lib-section">
+    <h2>{q || subject ? 'Results' : 'Recently added'} <em>&middot; {resources.length}</em></h2>
+    {resources.length === 0 ? (
+      <div class="empty">No matching items in the catalogue. Try a different search or clear the subject filter.</div>
+    ) : (
+      <div class="grid-resources">
+        {resources.map((r) => {
+          const hue = coverHue(r.title || '');
+          const init = initialsOfTitle(r.title || '');
+          const available = (r.available_copies || 0) > 0;
+          return (
+            <div class="res-card">
+              <div class="res-cover" style={'background: linear-gradient(135deg, hsl(' + hue + ', 55%, 38%), hsl(' + ((hue + 40) % 360) + ', 55%, 28%));'}>
+                <span>{init}</span>
+              </div>
+              <p class="res-title">{r.title}</p>
+              <p class="res-authors">{r.authors}{r.year ? ' &middot; ' + r.year : ''}</p>
+              <div class="res-meta">
+                <span>{r.subject || '&mdash;'}</span>
+                {r.is_digital
+                  ? <span class="avail-pill avail-yes">Digital</span>
+                  : <span class={'avail-pill ' + (available ? 'avail-yes' : 'avail-no')}>{r.available_copies}/{r.total_copies}</span>
+                }
+              </div>
+              <div class="res-actions">
+                {r.is_digital ? (
+                  <a href={r.digital_url || '#'} class="btn-primary" target="_blank" rel="noopener">Open</a>
+                ) : available ? (
+                  <form method="POST">
+                    <input type="hidden" name="action" value="borrow" />
+                    <input type="hidden" name="resource_id" value={r.id} />
+                    <button type="submit" class="btn-primary">Borrow</button>
+                  </form>
+                ) : (
+                  <form method="POST">
+                    <input type="hidden" name="action" value="reserve" />
+                    <input type="hidden" name="resource_id" value={r.id} />
+                    <button type="submit" class="btn-ghost" style="border-color:#FF4F00;color:#FF4F00;">Reserve</button>
+                  </form>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    )}
+  </section>
+
+  {/* --- My loans --- */}
+  <section class="lib-section">
+    <h2>My <em>loans</em> &middot; {loans.length}</h2>
+    {loans.length === 0 ? (
+      <div class="empty">No active loans. Borrow a book from the catalogue above and it will appear here.</div>
+    ) : (
+      <div>
+        {loans.map((l) => {
+          const days = daysUntil(l.due_at);
+          const overdue = days * -1 > 0;
+          const dueSoon = !overdue && days * -1 >= -3;
+          const pillClass = overdue ? 'due-late' : (dueSoon ? 'due-soon' : 'due-ok');
+          const pillText = overdue ? (Math.abs(days) + ' days overdue') : (days === 0 ? 'Due today' : ('Due in ' + days + ' days'));
+          return (
+            <div class="loan-row">
+              <div class="loan-info">
+                <p class="loan-title">{l.title}</p>
+                <p class="loan-meta">{l.authors} &middot; Loaned {fmtDate(l.loaned_at)} &middot; {l.location_code ? 'Shelf ' + l.location_code : 'Digital'}</p>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                <span class={'due-pill ' + pillClass}>{pillText}</span>
+                {l.is_digital && l.digital_url && (
+                  <a href={l.digital_url} class="btn-ghost" target="_blank" rel="noopener">Read</a>
+                )}
+                <form method="POST" style="margin:0;">
+                  <input type="hidden" name="action" value="return" />
+                  <input type="hidden" name="loan_id" value={l.id} />
+                  <button type="submit" class="btn-primary">Return</button>
+                </form>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    )}
+  </section>
+
+  {/* --- My reservations --- */}
+  <section class="lib-section">
+    <h2>My <em>reservations</em> &middot; {reservations.length}</h2>
+    {reservations.length === 0 ? (
+      <div class="empty">No pending reservations. When a borrowed book has no copies left you can reserve it &mdash; we'll notify you the moment it's returned.</div>
+    ) : (
+      <div>
+        {reservations.map((res) => (
+          <div class="loan-row">
+            <div class="loan-info">
+              <p class="loan-title">{res.title}</p>
+              <p class="loan-meta">{res.authors} &middot; Reserved {fmtDate(res.reserved_at)} &middot; {res.available_copies > 0 ? 'A copy is now available' : 'Awaiting return'}</p>
+            </div>
+            <div style="display:flex;gap:10px;align-items:center;">
+              <span class="due-pill due-soon">Pending</span>
+              <form method="POST" style="margin:0;">
+                <input type="hidden" name="action" value="cancel_reservation" />
+                <input type="hidden" name="reservation_id" value={res.id} />
+                <button type="submit" class="btn-ghost">Cancel</button>
+              </form>
+            </div>
+          </div>
+        ))}
+      </div>
+    )}
+  </section>
+
+  <p style="margin-top:48px;font-family:'Geist Mono',ui-monospace,monospace;font-size:10.5px;letter-spacing:0.08em;color:#6a635a;text-transform:uppercase;text-align:center;">
+    Maximum 5 concurrent loans &middot; 14-day loan window &middot; Renewable once if no reservations pending
+  </p>
+
+</main>
+</BaseLayout>

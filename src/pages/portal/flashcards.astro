@@ -1,0 +1,602 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// --- Bootstrap schema (idempotent) ---
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS flashcard_decks (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID,
+      title TEXT,
+      subject VARCHAR(120),
+      card_count INT DEFAULT 0,
+      is_public BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS flashcards (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      deck_id UUID,
+      front TEXT,
+      back TEXT,
+      hint TEXT,
+      ease_factor DECIMAL(4,2) DEFAULT 2.5,
+      interval_days INT DEFAULT 1,
+      due_date DATE,
+      repetition_count INT DEFAULT 0,
+      last_reviewed_at TIMESTAMPTZ
+    )
+  `);
+} catch (e) {}
+
+// --- SM-2 helper ---
+function sm2(prevEF: number, prevInterval: number, prevRep: number, quality: number) {
+  let ef = prevEF;
+  let interval = prevInterval;
+  let rep = prevRep;
+  if (quality < 3) {
+    rep = 0;
+    interval = 1;
+  } else {
+    rep = rep + 1;
+    if (rep === 1) interval = 1;
+    else if (rep === 2) interval = 6;
+    else interval = Math.floor(prevInterval * ef);
+  }
+  // EF update (applies always, but clamped at 1.3)
+  const q = quality;
+  ef = ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02));
+  if (ef < 1.3) ef = 1.3;
+  return { ef: Math.round(ef * 100) / 100, interval, rep };
+}
+
+let flashMsg = '';
+
+// --- Handle POST ---
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  try {
+    if (action === 'create_deck') {
+      const title = String(fd.get('title') || '').trim().slice(0, 200);
+      const subject = String(fd.get('subject') || '').trim().slice(0, 120);
+      const isPublic = fd.get('is_public') === 'on';
+      if (title.length >= 2) {
+        await db.execute(sql`
+          INSERT INTO flashcard_decks (user_id, title, subject, is_public)
+          VALUES (${user.id}, ${title}, ${subject || null}, ${isPublic})
+        `);
+        flashMsg = 'Deck created.';
+      }
+    } else if (action === 'add_card') {
+      const deckId = String(fd.get('deck_id') || '');
+      const front = String(fd.get('front') || '').trim();
+      const back = String(fd.get('back') || '').trim();
+      const hint = String(fd.get('hint') || '').trim();
+      if (deckId && front && back) {
+        const today = new Date().toISOString().slice(0, 10);
+        await db.execute(sql`
+          INSERT INTO flashcards (deck_id, front, back, hint, due_date)
+          VALUES (${deckId}, ${front}, ${back}, ${hint || null}, ${today}::date)
+        `);
+        await db.execute(sql`
+          UPDATE flashcard_decks SET card_count = card_count + 1 WHERE id = ${deckId} AND user_id = ${user.id}
+        `);
+        flashMsg = 'Card added.';
+      }
+    } else if (action === 'edit_card') {
+      const cardId = String(fd.get('card_id') || '');
+      const front = String(fd.get('front') || '').trim();
+      const back = String(fd.get('back') || '').trim();
+      const hint = String(fd.get('hint') || '').trim();
+      if (cardId && front && back) {
+        await db.execute(sql`
+          UPDATE flashcards SET front = ${front}, back = ${back}, hint = ${hint || null}
+          WHERE id = ${cardId} AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})
+        `);
+        flashMsg = 'Card updated.';
+      }
+    } else if (action === 'delete_card') {
+      const cardId = String(fd.get('card_id') || '');
+      const deckId = String(fd.get('deck_id') || '');
+      if (cardId && deckId) {
+        await db.execute(sql`
+          DELETE FROM flashcards WHERE id = ${cardId}
+          AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})
+        `);
+        await db.execute(sql`
+          UPDATE flashcard_decks SET card_count = GREATEST(0, card_count - 1) WHERE id = ${deckId} AND user_id = ${user.id}
+        `);
+      }
+    } else if (action === 'delete_deck') {
+      const deckId = String(fd.get('deck_id') || '');
+      if (deckId) {
+        await db.execute(sql`DELETE FROM flashcards WHERE deck_id = ${deckId} AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})`);
+        await db.execute(sql`DELETE FROM flashcard_decks WHERE id = ${deckId} AND user_id = ${user.id}`);
+      }
+    } else if (action === 'review') {
+      const cardId = String(fd.get('card_id') || '');
+      const quality = Math.max(0, Math.min(5, parseInt(String(fd.get('quality') || '0'), 10) || 0));
+      if (cardId) {
+        const cRes = await db.execute(sql`
+          SELECT id, ease_factor, interval_days, repetition_count
+          FROM flashcards
+          WHERE id = ${cardId}
+            AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})
+          LIMIT 1
+        `);
+        const cArr = rows(cRes);
+        if (cArr.length) {
+          const c = cArr[0];
+          const next = sm2(parseFloat(c.ease_factor), parseInt(c.interval_days, 10), parseInt(c.repetition_count, 10), quality);
+          const due = new Date();
+          due.setDate(due.getDate() + next.interval);
+          const dueStr = due.toISOString().slice(0, 10);
+          await db.execute(sql`
+            UPDATE flashcards
+            SET ease_factor = ${next.ef},
+                interval_days = ${next.interval},
+                repetition_count = ${next.rep},
+                due_date = ${dueStr}::date,
+                last_reviewed_at = NOW()
+            WHERE id = ${cardId}
+          `);
+        }
+      }
+    }
+  } catch (e) {}
+  const url = new URL(Astro.request.url);
+  const back = url.searchParams.toString();
+  return Astro.redirect('/portal/flashcards' + (back ? ('?' + back) : ''));
+}
+
+// --- Load data for GET ---
+const url = new URL(Astro.request.url);
+const activeDeckId = url.searchParams.get('deck') || '';
+const view = url.searchParams.get('view') || 'study';
+
+const decksRes = await db.execute(sql`
+  SELECT d.id, d.title, d.subject, d.card_count, d.is_public, d.created_at,
+    (SELECT COUNT(*) FROM flashcards f WHERE f.deck_id = d.id AND f.due_date <= CURRENT_DATE) AS due_today
+  FROM flashcard_decks d
+  WHERE d.user_id = ${user.id}
+  ORDER BY d.created_at DESC
+`);
+const decks = rows(decksRes);
+
+let activeDeck: any = null;
+let deckCards: any[] = [];
+let dueCards: any[] = [];
+
+if (activeDeckId) {
+  const dRes = await db.execute(sql`
+    SELECT id, title, subject, card_count, is_public
+    FROM flashcard_decks
+    WHERE id = ${activeDeckId} AND user_id = ${user.id}
+    LIMIT 1
+  `);
+  const dArr = rows(dRes);
+  activeDeck = dArr[0] || null;
+
+  if (activeDeck) {
+    const cardsRes = await db.execute(sql`
+      SELECT id, front, back, hint, ease_factor, interval_days, repetition_count, due_date, last_reviewed_at
+      FROM flashcards
+      WHERE deck_id = ${activeDeckId}
+      ORDER BY due_date ASC NULLS FIRST, last_reviewed_at ASC NULLS FIRST
+    `);
+    deckCards = rows(cardsRes);
+    dueCards = deckCards.filter((c: any) => {
+      if (!c.due_date) return true;
+      const d = new Date(c.due_date);
+      const t = new Date();
+      d.setHours(0, 0, 0, 0); t.setHours(0, 0, 0, 0);
+      return d.getTime() <= t.getTime();
+    });
+  }
+}
+
+const totalDue = decks.reduce((s: number, d: any) => s + parseInt(d.due_today || 0, 10), 0);
+const totalCards = decks.reduce((s: number, d: any) => s + parseInt(d.card_count || 0, 10), 0);
+---
+
+<BaseLayout title="Flashcards — EduRankAI" description="Spaced-repetition flashcard study with the SM-2 algorithm.">
+<style>
+  body { background: #FAF8F5; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 28px 22px 80px; font-family: 'Inter', system-ui, sans-serif; color: #1a1612; }
+  .eyebrow { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin-bottom: 8px; }
+  h1 { font-family: 'Cormorant Garamond', serif; font-size: clamp(28px, 4vw, 42px); font-weight: 600; letter-spacing: -0.02em; margin: 0 0 6px; color: #0E0B08; }
+  h1 em { font-style: italic; color: #FF4F00; font-weight: 500; }
+  .sub { color: #5b524a; font-size: 14px; max-width: 640px; margin-bottom: 26px; }
+  .stats { display: flex; gap: 18px; margin-bottom: 22px; flex-wrap: wrap; }
+  .stat { background: white; border: 1px solid rgba(14,11,8,0.10); border-radius: 12px; padding: 12px 18px; min-width: 130px; }
+  .stat .k { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #8c8278; }
+  .stat .v { font-family: 'Cormorant Garamond', serif; font-size: 28px; color: #0E0B08; line-height: 1.1; margin-top: 2px; }
+  .stat .v.hot { color: #FF4F00; }
+
+  .grid { display: grid; grid-template-columns: 320px 1fr; gap: 22px; }
+  @media (max-width: 880px) { .grid { grid-template-columns: 1fr; } }
+
+  .card { background: white; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 22px; }
+  .card h3 { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: #FF4F00; margin: 0 0 14px; font-weight: 700; }
+  .card h2 { font-family: 'Cormorant Garamond', serif; font-size: 22px; font-weight: 600; margin: 0 0 8px; color: #0E0B08; }
+
+  .deck-row { display: block; padding: 12px 14px; border-radius: 10px; border: 1px solid rgba(14,11,8,0.08); margin-bottom: 8px; text-decoration: none; color: #0E0B08; background: #FBF9F6; transition: all 0.15s; }
+  .deck-row:hover { border-color: #FF4F00; transform: translateX(2px); }
+  .deck-row.active { background: #FFF1EA; border-color: #FF4F00; }
+  .deck-row .t { font-family: 'Cormorant Garamond', serif; font-size: 18px; line-height: 1.2; color: #0E0B08; }
+  .deck-row .m { font-family: 'Geist Mono', monospace; font-size: 10px; color: #8c8278; margin-top: 4px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .deck-row .m .due { color: #FF4F00; font-weight: 700; }
+
+  .btn { display: inline-block; background: #FF4F00; color: white; padding: 10px 18px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; border: none; cursor: pointer; text-decoration: none; transition: background 0.15s; }
+  .btn:hover { background: #e64600; }
+  .btn.ghost { background: transparent; color: #0E0B08; border: 1px solid rgba(14,11,8,0.18); }
+  .btn.ghost:hover { background: rgba(14,11,8,0.04); border-color: #FF4F00; color: #FF4F00; }
+  .btn.danger { background: transparent; color: #b13a1a; border: 1px solid rgba(177,58,26,0.30); }
+  .btn.danger:hover { background: #fde9e0; }
+
+  label { display: block; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #5b524a; margin: 0 0 6px; font-weight: 700; }
+  input[type=text], textarea, input[type=date] {
+    width: 100%; box-sizing: border-box; background: white; border: 1px solid rgba(14,11,8,0.16);
+    color: #0E0B08; padding: 9px 12px; border-radius: 8px; font-family: 'Inter', sans-serif; font-size: 14px;
+  }
+  input[type=text]:focus, textarea:focus { outline: none; border-color: #FF4F00; }
+  textarea { font-family: 'Cormorant Garamond', serif; font-size: 17px; line-height: 1.4; min-height: 70px; resize: vertical; }
+  .field { margin-bottom: 12px; }
+  .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+  .toggle { display: inline-flex; background: #FBF9F6; border: 1px solid rgba(14,11,8,0.10); border-radius: 8px; padding: 3px; margin-bottom: 18px; }
+  .toggle a { padding: 7px 14px; border-radius: 6px; text-decoration: none; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #5b524a; font-weight: 700; }
+  .toggle a.on { background: white; color: #FF4F00; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+
+  .study-stage { min-height: 380px; display: flex; flex-direction: column; }
+  .progress { height: 6px; background: #F0EBE4; border-radius: 3px; overflow: hidden; margin-bottom: 22px; }
+  .progress > div { height: 100%; background: linear-gradient(90deg, #FF4F00, #ff7e3a); transition: width 0.4s; }
+  .progress-meta { display: flex; justify-content: space-between; font-family: 'Geist Mono', monospace; font-size: 10px; color: #8c8278; letter-spacing: 0.10em; text-transform: uppercase; margin-bottom: 18px; }
+
+  .flashcard {
+    background: linear-gradient(180deg, #FFFCF7 0%, #F8F3EB 100%);
+    border: 1px solid rgba(14,11,8,0.12); border-radius: 16px;
+    padding: 50px 36px; min-height: 220px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center;
+    box-shadow: 0 2px 14px rgba(0,0,0,0.04);
+  }
+  .flashcard.back { background: linear-gradient(180deg, #FFF8F0 0%, #FFEFE0 100%); border-color: rgba(255,79,0,0.22); }
+  .flashcard .label { font-family: 'Geist Mono', monospace; font-size: 9px; letter-spacing: 0.20em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin-bottom: 14px; }
+  .flashcard .face { font-family: 'Cormorant Garamond', serif; font-size: clamp(24px, 4vw, 36px); line-height: 1.25; color: #0E0B08; font-weight: 500; max-width: 640px; }
+  .flashcard .hint { font-family: 'Inter', sans-serif; font-size: 13px; color: #8c8278; margin-top: 14px; font-style: italic; }
+
+  .answer-area { margin-top: 24px; text-align: center; }
+  .reveal-btn {
+    background: #0E0B08; color: white; padding: 12px 28px; border-radius: 10px;
+    font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; border: none; cursor: pointer; transition: background 0.15s;
+  }
+  .reveal-btn:hover { background: #FF4F00; }
+
+  .quality-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-top: 18px; }
+  .quality-btn {
+    border: 1px solid rgba(14,11,8,0.14); background: white; padding: 14px 4px; border-radius: 10px;
+    cursor: pointer; transition: all 0.15s; text-align: center;
+  }
+  .quality-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+  .quality-btn .qn { font-family: 'Cormorant Garamond', serif; font-size: 26px; font-weight: 600; line-height: 1; }
+  .quality-btn .ql { font-family: 'Geist Mono', monospace; font-size: 8px; letter-spacing: 0.10em; text-transform: uppercase; color: #5b524a; margin-top: 6px; }
+  .q0 .qn, .q1 .qn, .q2 .qn { color: #b13a1a; }
+  .q3 .qn { color: #b87a14; }
+  .q4 .qn { color: #5e8a2e; }
+  .q5 .qn { color: #2e7d3a; }
+
+  .empty {
+    text-align: center; padding: 60px 20px; color: #8c8278;
+    font-family: 'Cormorant Garamond', serif; font-size: 20px; font-style: italic;
+  }
+  .empty svg { display: block; margin: 0 auto 14px; color: #c8bfb3; }
+
+  .card-list-row {
+    display: grid; grid-template-columns: 1fr 1fr 140px; gap: 12px; align-items: start;
+    padding: 12px 0; border-bottom: 1px solid rgba(14,11,8,0.06);
+  }
+  .card-list-row:last-child { border-bottom: none; }
+  .card-list-row .ftxt { font-family: 'Cormorant Garamond', serif; font-size: 16px; color: #0E0B08; line-height: 1.3; }
+  .card-list-row .btxt { font-family: 'Cormorant Garamond', serif; font-size: 14px; color: #5b524a; line-height: 1.3; }
+  .card-list-row .meta { font-family: 'Geist Mono', monospace; font-size: 9px; color: #8c8278; letter-spacing: 0.10em; text-align: right; }
+  .card-list-row .actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; }
+  .card-list-row .actions button { background: transparent; border: none; cursor: pointer; padding: 4px; color: #8c8278; }
+  .card-list-row .actions button:hover { color: #FF4F00; }
+
+  .flash-msg { background: #e9f7e9; border: 1px solid #98c498; color: #2e5d2e; padding: 10px 14px; border-radius: 8px; margin-bottom: 18px; font-family: 'Geist Mono', monospace; font-size: 11px; }
+
+  .legend { background: #FBF9F6; border: 1px solid rgba(14,11,8,0.08); border-radius: 8px; padding: 12px 14px; margin-top: 16px; font-size: 12px; color: #5b524a; line-height: 1.5; }
+  .legend strong { color: #0E0B08; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.10em; text-transform: uppercase; }
+
+  details > summary { cursor: pointer; font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #FF4F00; padding: 8px 0; font-weight: 700; }
+  details > summary::-webkit-details-marker { display: none; }
+</style>
+
+<main class="wrap">
+  <div class="eyebrow">Study Tools</div>
+  <h1>Spaced-repetition <em>flashcards</em></h1>
+  <p class="sub">Active recall with the SM-2 algorithm. Each review adjusts the card's ease factor and pushes the next due date out exponentially as you master it.</p>
+
+  {flashMsg && <div class="flash-msg">{flashMsg}</div>}
+
+  <div class="stats">
+    <div class="stat"><div class="k">Decks</div><div class="v">{decks.length}</div></div>
+    <div class="stat"><div class="k">Total cards</div><div class="v">{totalCards}</div></div>
+    <div class="stat"><div class="k">Due today</div><div class={"v " + (totalDue > 0 ? 'hot' : '')}>{totalDue}</div></div>
+  </div>
+
+  <div class="grid">
+    <!-- LEFT: deck list -->
+    <aside class="card">
+      <h3>My decks</h3>
+
+      {decks.length === 0 ? (
+        <p style="color:#8c8278;font-size:13px;margin:0 0 12px;">No decks yet. Create one below.</p>
+      ) : (
+        <div>
+          {decks.map((d: any) => (
+            <a href={`/portal/flashcards?deck=${d.id}&view=study`} class={"deck-row " + (d.id === activeDeckId ? 'active' : '')}>
+              <div class="t">{d.title}</div>
+              <div class="m">
+                {d.subject && <span>{d.subject}</span>}
+                <span>{d.card_count} cards</span>
+                {parseInt(d.due_today || 0, 10) > 0 && <span class="due">{d.due_today} due</span>}
+              </div>
+            </a>
+          ))}
+        </div>
+      )}
+
+      <details style="margin-top:16px;">
+        <summary>+ New deck</summary>
+        <form method="POST" style="margin-top:10px;">
+          <input type="hidden" name="action" value="create_deck" />
+          <div class="field"><label>Title</label><input type="text" name="title" required minlength="2" maxlength="200" /></div>
+          <div class="field"><label>Subject (optional)</label><input type="text" name="subject" maxlength="120" placeholder="e.g. Organic chemistry" /></div>
+          <div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;text-transform:none;letter-spacing:0;font-size:13px;color:#0E0B08;font-family:Inter;font-weight:400;"><input type="checkbox" name="is_public" /> Share publicly (read-only)</label></div>
+          <button type="submit" class="btn">Create deck</button>
+        </form>
+      </details>
+    </aside>
+
+    <!-- RIGHT: study or edit -->
+    <section class="card">
+      {!activeDeck ? (
+        <div class="empty">
+          <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="3" y="5" width="14" height="14" rx="2"/>
+            <path d="M7 9h6M7 13h4"/>
+            <path d="M17 5l3 3v11a2 2 0 0 1-2 2H8"/>
+          </svg>
+          Select a deck from the left, or create one to begin.
+        </div>
+      ) : (
+        <div>
+          <h2>{activeDeck.title}</h2>
+          {activeDeck.subject && <div style="font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.14em;text-transform:uppercase;color:#8c8278;margin-bottom:14px;">{activeDeck.subject}</div>}
+
+          <div class="toggle">
+            <a href={`/portal/flashcards?deck=${activeDeck.id}&view=study`} class={view === 'study' ? 'on' : ''}>Study</a>
+            <a href={`/portal/flashcards?deck=${activeDeck.id}&view=edit`} class={view === 'edit' ? 'on' : ''}>Edit cards</a>
+          </div>
+
+          {view === 'study' ? (
+            <div class="study-stage" id="studyStage" data-cards={JSON.stringify(dueCards.map((c: any) => ({ id: c.id, front: c.front, back: c.back, hint: c.hint || '', interval: c.interval_days, ef: parseFloat(c.ease_factor) })))}>
+              {dueCards.length === 0 ? (
+                <div class="empty">
+                  <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <circle cx="12" cy="12" r="9"/>
+                    <path d="M8 12l3 3 5-6"/>
+                  </svg>
+                  Nothing due right now. {deckCards.length === 0 ? 'Add some cards first.' : 'Come back later or add more cards.'}
+                </div>
+              ) : (
+                <div>
+                  <div class="progress-meta">
+                    <span id="progLabel">Card 1 of {dueCards.length}</span>
+                    <span id="progEf"></span>
+                  </div>
+                  <div class="progress"><div id="progBar" style="width:0%"></div></div>
+
+                  <div class="flashcard" id="cardFace">
+                    <div class="label">Front</div>
+                    <div class="face" id="faceText"></div>
+                    <div class="hint" id="hintText" style="display:none"></div>
+                  </div>
+
+                  <div class="answer-area" id="answerArea">
+                    <button type="button" class="reveal-btn" id="revealBtn">Show answer</button>
+                  </div>
+
+                  <form method="POST" id="reviewForm" style="display:none;margin-top:18px;">
+                    <input type="hidden" name="action" value="review" />
+                    <input type="hidden" name="card_id" id="reviewCardId" />
+                    <input type="hidden" name="quality" id="reviewQuality" />
+                  </form>
+
+                  <div class="quality-grid" id="qualityGrid" style="display:none">
+                    <button type="button" class="quality-btn q0" data-q="0"><div class="qn">0</div><div class="ql">Blackout</div></button>
+                    <button type="button" class="quality-btn q1" data-q="1"><div class="qn">1</div><div class="ql">Wrong</div></button>
+                    <button type="button" class="quality-btn q2" data-q="2"><div class="qn">2</div><div class="ql">Hard</div></button>
+                    <button type="button" class="quality-btn q3" data-q="3"><div class="qn">3</div><div class="ql">OK</div></button>
+                    <button type="button" class="quality-btn q4" data-q="4"><div class="qn">4</div><div class="ql">Good</div></button>
+                    <button type="button" class="quality-btn q5" data-q="5"><div class="qn">5</div><div class="ql">Perfect</div></button>
+                  </div>
+
+                  <div class="legend">
+                    <strong>SM-2 grading</strong><br/>
+                    <b>0-2</b> resets the card to a 1-day interval. <b>3</b> is a passing-but-difficult recall. <b>4-5</b> grow the interval geometrically. Ease factor floor is 1.30.
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div>
+              <h3 style="margin-top:0">Add a card</h3>
+              <form method="POST" style="margin-bottom:20px;">
+                <input type="hidden" name="action" value="add_card" />
+                <input type="hidden" name="deck_id" value={activeDeck.id} />
+                <div class="field-row">
+                  <div class="field"><label>Front</label><textarea name="front" required maxlength="2000" placeholder="Question, term, prompt..."></textarea></div>
+                  <div class="field"><label>Back</label><textarea name="back" required maxlength="2000" placeholder="Answer, definition..."></textarea></div>
+                </div>
+                <div class="field"><label>Hint (optional)</label><input type="text" name="hint" maxlength="400" /></div>
+                <button type="submit" class="btn">Add card</button>
+              </form>
+
+              <h3>All cards ({deckCards.length})</h3>
+              {deckCards.length === 0 ? (
+                <p style="color:#8c8278;font-size:14px;font-style:italic;">No cards in this deck yet.</p>
+              ) : (
+                <div>
+                  {deckCards.map((c: any) => (
+                    <div class="card-list-row">
+                      <div class="ftxt">{c.front}</div>
+                      <div class="btxt">{c.back}</div>
+                      <div>
+                        <div class="meta">
+                          EF {parseFloat(c.ease_factor).toFixed(2)}<br/>
+                          {c.interval_days}d &middot; rep {c.repetition_count}<br/>
+                          {c.due_date ? 'due ' + new Date(c.due_date).toISOString().slice(0,10) : 'new'}
+                        </div>
+                        <div class="actions">
+                          <form method="POST" style="display:inline" onsubmit="return confirm('Delete this card?')">
+                            <input type="hidden" name="action" value="delete_card" />
+                            <input type="hidden" name="card_id" value={c.id} />
+                            <input type="hidden" name="deck_id" value={activeDeck.id} />
+                            <button type="submit" title="Delete card">
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
+                            </button>
+                          </form>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <form method="POST" style="margin-top:24px;border-top:1px solid rgba(14,11,8,0.10);padding-top:18px;" onsubmit="return confirm('Delete the entire deck and all its cards? This cannot be undone.')">
+                <input type="hidden" name="action" value="delete_deck" />
+                <input type="hidden" name="deck_id" value={activeDeck.id} />
+                <button type="submit" class="btn danger">Delete deck</button>
+              </form>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  </div>
+</main>
+
+<script is:inline>
+(function () {
+  var stage = document.getElementById('studyStage');
+  if (!stage) return;
+  var raw = stage.getAttribute('data-cards') || '[]';
+  var cards = [];
+  try { cards = JSON.parse(raw); } catch (e) { cards = []; }
+  if (!cards.length) return;
+
+  var idx = 0;
+  var revealed = false;
+
+  var faceEl = document.getElementById('faceText');
+  var hintEl = document.getElementById('hintText');
+  var cardFace = document.getElementById('cardFace');
+  var label = cardFace ? cardFace.querySelector('.label') : null;
+  var revealBtn = document.getElementById('revealBtn');
+  var grid = document.getElementById('qualityGrid');
+  var answerArea = document.getElementById('answerArea');
+  var progBar = document.getElementById('progBar');
+  var progLabel = document.getElementById('progLabel');
+  var progEf = document.getElementById('progEf');
+  var reviewForm = document.getElementById('reviewForm');
+  var reviewCardId = document.getElementById('reviewCardId');
+  var reviewQuality = document.getElementById('reviewQuality');
+
+  function render() {
+    if (idx >= cards.length) {
+      // Session complete — reload to fetch fresh queue
+      window.location.reload();
+      return;
+    }
+    var c = cards[idx];
+    revealed = false;
+    if (label) label.textContent = 'Front';
+    if (cardFace) cardFace.classList.remove('back');
+    if (faceEl) faceEl.textContent = c.front;
+    if (hintEl) {
+      if (c.hint) { hintEl.textContent = 'Hint: ' + c.hint; hintEl.style.display = ''; }
+      else { hintEl.style.display = 'none'; }
+    }
+    if (revealBtn) revealBtn.style.display = '';
+    if (grid) grid.style.display = 'none';
+    if (answerArea) answerArea.style.display = '';
+    if (progLabel) progLabel.textContent = 'Card ' + (idx + 1) + ' of ' + cards.length;
+    if (progEf) progEf.textContent = 'EF ' + c.ef.toFixed(2) + ' · ' + c.interval + 'd interval';
+    if (progBar) progBar.style.width = ((idx / cards.length) * 100) + '%';
+  }
+
+  function reveal() {
+    revealed = true;
+    var c = cards[idx];
+    if (label) label.textContent = 'Back';
+    if (cardFace) cardFace.classList.add('back');
+    if (faceEl) faceEl.textContent = c.back;
+    if (hintEl) hintEl.style.display = 'none';
+    if (answerArea) answerArea.style.display = 'none';
+    if (grid) grid.style.display = '';
+  }
+
+  function grade(q) {
+    if (!revealed) return;
+    var c = cards[idx];
+    if (reviewCardId) reviewCardId.value = c.id;
+    if (reviewQuality) reviewQuality.value = String(q);
+    // POST asynchronously, then advance locally
+    if (reviewForm) {
+      var fd = new FormData(reviewForm);
+      fetch(window.location.pathname + window.location.search, {
+        method: 'POST',
+        body: fd
+      }).catch(function () {});
+    }
+    idx++;
+    if (progBar) progBar.style.width = ((idx / cards.length) * 100) + '%';
+    setTimeout(render, 180);
+  }
+
+  if (revealBtn) revealBtn.addEventListener('click', reveal);
+  if (grid) {
+    var btns = grid.querySelectorAll('.quality-btn');
+    for (var i = 0; i < btns.length; i++) {
+      (function (b) {
+        b.addEventListener('click', function () {
+          grade(parseInt(b.getAttribute('data-q'), 10));
+        });
+      })(btns[i]);
+    }
+  }
+
+  // Keyboard shortcuts: space to reveal, 0-5 to grade
+  document.addEventListener('keydown', function (e) {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+    if (!revealed && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); reveal(); return; }
+    if (revealed && /^[0-5]$/.test(e.key)) { grade(parseInt(e.key, 10)); }
+  });
+
+  render();
+})();
+</script>
+</BaseLayout>
