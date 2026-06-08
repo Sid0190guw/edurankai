@@ -220,21 +220,36 @@ export async function getCourseProgress(userId: string, courseId: string) {
 // ============ Modules ============
 export async function listModules(courseId: string) {
   await ensureAquintutorAuthoringSchema();
-  return rows(await db.execute(sql`SELECT * FROM training_modules WHERE course_id = ${courseId} ORDER BY order_in_course ASC, created_at ASC`));
+  // Resilient: prod may still carry the legacy training_modules (sort_order)
+  // before the order_in_course column lands. Fall back rather than 500.
+  try {
+    return rows(await db.execute(sql`SELECT * FROM training_modules WHERE course_id = ${courseId} ORDER BY order_in_course ASC, created_at ASC`));
+  } catch {
+    try { return rows(await db.execute(sql`SELECT * FROM training_modules WHERE course_id = ${courseId} ORDER BY created_at ASC`)); }
+    catch { return []; }
+  }
 }
 
 export async function createModule(opts: { courseId: string; title: string; summary?: string; order?: number }) {
   await ensureAquintutorAuthoringSchema();
   let order = opts.order;
   if (order == null) {
-    order = rows(await db.execute(sql`SELECT COALESCE(MAX(order_in_course), -1) + 1 AS o FROM training_modules WHERE course_id = ${opts.courseId}`))[0]?.o ?? 0;
+    try { order = rows(await db.execute(sql`SELECT COALESCE(MAX(order_in_course), -1) + 1 AS o FROM training_modules WHERE course_id = ${opts.courseId}`))[0]?.o ?? 0; }
+    catch { order = 0; }
   }
-  const r = rows(await db.execute(sql`
-    INSERT INTO training_modules (course_id, title, summary, order_in_course)
-    VALUES (${opts.courseId}, ${opts.title}, ${opts.summary || null}, ${order})
-    RETURNING id
-  `));
-  return r[0]?.id;
+  // Try full insert; fall back to the minimal columns if order_in_course/summary are absent.
+  try {
+    const r = rows(await db.execute(sql`
+      INSERT INTO training_modules (course_id, title, summary, order_in_course)
+      VALUES (${opts.courseId}, ${opts.title}, ${opts.summary || null}, ${order})
+      RETURNING id`));
+    return r[0]?.id;
+  } catch {
+    try {
+      const r = rows(await db.execute(sql`INSERT INTO training_modules (course_id, title) VALUES (${opts.courseId}, ${opts.title}) RETURNING id`));
+      return r[0]?.id;
+    } catch { return null; }
+  }
 }
 
 // ============ Discussions ============
