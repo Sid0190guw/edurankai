@@ -1,0 +1,159 @@
+---
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=/aquintutor/admin/teacher');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+async function safeRows(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
+
+const isSuper = user.role === 'admin' || user.role === 'super_admin';
+const viewUserId = (new URL(Astro.request.url).searchParams.get('as')) || user.id;
+
+// Courses this teacher authors/edits.
+let myCourseIds: string[] = [];
+const authored = await safeRows(sql`SELECT course_id FROM training_course_authors WHERE user_id = ${viewUserId}`);
+myCourseIds = authored.map((a: any) => a.course_id);
+// Super-admins with no explicit authorship see all courses (demo convenience).
+const seeAll = isSuper && myCourseIds.length === 0;
+
+let courses: any[] = [];
+if (seeAll) {
+  courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, school FROM training_courses ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 30`);
+} else if (myCourseIds.length) {
+  courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, school FROM training_courses WHERE id = ANY(${myCourseIds}) ORDER BY updated_at DESC NULLS LAST LIMIT 30`);
+}
+const courseIds = courses.map((c: any) => c.id);
+
+// Aggregate stats over the teacher's courses.
+let stats = { courses: courses.length, published: courses.filter((c: any) => c.is_published).length, lessons: 0, students: 0, completions: 0, doubts: 0 };
+if (courseIds.length) {
+  stats.lessons = (await safeRows(sql`SELECT COUNT(*)::int AS c FROM training_lessons WHERE course_id = ANY(${courseIds})`))[0]?.c || 0;
+  stats.students = (await safeRows(sql`SELECT COUNT(DISTINCT user_id)::int AS c FROM training_enrollments WHERE course_id = ANY(${courseIds})`))[0]?.c || 0;
+  stats.completions = (await safeRows(sql`SELECT COUNT(*)::int AS c FROM course_certificates WHERE course_id = ANY(${courseIds})`))[0]?.c || 0;
+  stats.doubts = (await safeRows(sql`SELECT COUNT(*)::int AS c FROM doubts WHERE course_id = ANY(${courseIds}) AND status = 'open'`))[0]?.c || 0;
+}
+
+// Recent enrollments + open doubts for these courses.
+const recentEnroll = courseIds.length ? await safeRows(sql`
+  SELECT e.created_at, e.progress_pct, u.name AS student, c.title AS course
+  FROM training_enrollments e LEFT JOIN users u ON u.id = e.user_id LEFT JOIN training_courses c ON c.id = e.course_id
+  WHERE e.course_id = ANY(${courseIds}) ORDER BY e.created_at DESC LIMIT 15`) : [];
+const openDoubts = courseIds.length ? await safeRows(sql`
+  SELECT d.id, d.status, d.created_at, c.title AS course FROM doubts d LEFT JOIN training_courses c ON c.id = d.course_id
+  WHERE d.course_id = ANY(${courseIds}) ORDER BY d.created_at DESC LIMIT 15`) : [];
+
+function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }); } catch { return '—'; } }
+---
+<AquintutorLayout title="Teacher panel" description="AquinTutor teacher control panel." noindex={true}>
+<style>
+  .tc { max-width: 1280px; margin: 0 auto; padding: 0 28px; }
+  .tc-crumb { border-bottom: 1px solid var(--rule); background: var(--sand-100); margin: 0 -28px; }
+  .tc-crumb-in { max-width: 1280px; margin: 0 auto; padding: 10px 28px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.08em; color: var(--ink-500); }
+  .tc-crumb-in a { color: var(--ink-500); text-decoration: none; }
+  .tc-crumb-in .cur { color: var(--rust); font-weight: 600; }
+  .tc-hero { padding: 40px 0 22px; }
+  .tc-eye { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--rust); font-weight: 700; margin: 0; }
+  .tc-h1 { font-family: 'Fraunces', serif; font-size: clamp(2rem, 4vw, 2.8rem); font-weight: 500; letter-spacing: -0.02em; margin: 8px 0 0; }
+  .tc-h1 em { font-style: italic; color: var(--rust); }
+  .tc-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 8px 0 22px; }
+  .tc-kpi { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; padding: 16px 18px; }
+  .tc-kpi-v { font-family: 'Fraunces', serif; font-size: 28px; font-weight: 500; line-height: 1; }
+  .tc-kpi-l { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-500); margin-top: 7px; font-weight: 600; }
+  .tc-sect-h { font-family: 'Fraunces', serif; font-size: 1.35rem; font-weight: 500; margin: 26px 0 12px; }
+  .tc-sect-h em { font-style: italic; color: var(--rust); }
+  .tc-card { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; overflow: hidden; margin-bottom: 20px; }
+  table.tc-tbl { width: 100%; border-collapse: collapse; }
+  .tc-tbl th { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-500); text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule); font-weight: 700; background: var(--sand-100); }
+  .tc-tbl td { padding: 11px 16px; border-bottom: 1px solid var(--rule); font-size: 13.5px; }
+  .tc-tbl tr:last-child td { border-bottom: none; }
+  .tc-tbl tr:hover td { background: var(--sand-100); }
+  .tc-pill { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; padding: 3px 9px; border-radius: 100px; font-weight: 700; }
+  .tc-pill.green { background: rgba(26,107,53,0.12); color: #1A6B35; }
+  .tc-pill.grey { background: rgba(59,58,48,0.10); color: var(--ink-500); }
+  .tc-pill.amber { background: rgba(176,124,0,0.14); color: #946322; }
+  .tc-btn { background: var(--paper); border: 1px solid var(--rule); color: var(--ink); padding: 5px 12px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 10px; text-decoration: none; font-weight: 600; }
+  .tc-btn:hover { border-color: var(--rust); color: var(--rust); }
+  .tc-empty { padding: 26px; text-align: center; color: var(--ink-500); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .tc-link { color: var(--rust); text-decoration: none; font-weight: 500; }
+  .tc-bar { background: var(--sand-100); border-radius: 100px; height: 6px; overflow: hidden; width: 90px; display: inline-block; vertical-align: middle; }
+  .tc-bar i { display: block; height: 100%; background: var(--rust); }
+</style>
+
+<div class="tc-crumb"><div class="tc-crumb-in"><a href="/aquintutor">AQUINTUTOR</a> <span style="margin:0 8px;">/</span> {isSuper ? <a href="/aquintutor/admin">COMMAND CENTER</a> : 'ADMIN'} <span style="margin:0 8px;">/</span> <span class="cur">TEACHER</span></div></div>
+
+<main class="tc">
+  <div class="tc-hero">
+    <p class="tc-eye">AquinTutor · Teacher panel</p>
+    <h1 class="tc-h1">Your <em>classroom</em>.</h1>
+  </div>
+
+  <div class="tc-kpis">
+    <div class="tc-kpi"><div class="tc-kpi-v">{stats.courses}</div><div class="tc-kpi-l">Courses · {stats.published} live</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{stats.lessons}</div><div class="tc-kpi-l">Lessons</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{stats.students}</div><div class="tc-kpi-l">Students</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{stats.completions}</div><div class="tc-kpi-l">Certificates issued</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{stats.doubts}</div><div class="tc-kpi-l">Open doubts</div></div>
+  </div>
+
+  <h2 class="tc-sect-h">My <em>courses</em></h2>
+  <div class="tc-card">
+  {courses.length === 0 ? <div class="tc-empty">No courses assigned to you yet. {isSuper ? <a href="/admin/aquintutor/courses" class="tc-link">Create one &rarr;</a> : 'Ask an administrator to add you as a course author.'}</div> : (
+    <table class="tc-tbl">
+      <thead><tr><th>Title</th><th>School</th><th>Enrolled</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        {courses.map((c) => (
+          <tr>
+            <td><a href={'/admin/aquintutor/courses/' + c.id + '/edit'} class="tc-link">{c.title}</a></td>
+            <td>{c.school || '—'}</td><td>{c.enrolled}</td>
+            <td>{c.is_published ? <span class="tc-pill green">Live</span> : <span class="tc-pill grey">Draft</span>}</td>
+            <td><a href={'/admin/aquintutor/courses/' + c.id + '/edit'} class="tc-btn">Edit content</a></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )}
+  </div>
+
+  <h2 class="tc-sect-h">Recent <em>enrolments</em></h2>
+  <div class="tc-card">
+  {recentEnroll.length === 0 ? <div class="tc-empty">No enrolments yet.</div> : (
+    <table class="tc-tbl">
+      <thead><tr><th>Student</th><th>Course</th><th>Progress</th><th>Joined</th></tr></thead>
+      <tbody>
+        {recentEnroll.map((e) => (
+          <tr>
+            <td>{e.student || 'Learner'}</td><td>{e.course}</td>
+            <td><span class="tc-bar"><i style={'width:' + (e.progress_pct || 0) + '%'}></i></span> {e.progress_pct || 0}%</td>
+            <td>{fmt(e.created_at)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )}
+  </div>
+
+  <h2 class="tc-sect-h">Doubts to <em>answer</em></h2>
+  <div class="tc-card">
+  {openDoubts.length === 0 ? <div class="tc-empty">No open doubts in your courses.</div> : (
+    <table class="tc-tbl">
+      <thead><tr><th>Reference</th><th>Course</th><th>Status</th><th>Posted</th><th></th></tr></thead>
+      <tbody>
+        {openDoubts.map((d) => (
+          <tr>
+            <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-500);">{String(d.id).slice(0,8)}</td>
+            <td>{d.course || '—'}</td>
+            <td><span class={"tc-pill " + (d.status === 'resolved' ? 'green' : 'amber')}>{d.status}</span></td>
+            <td>{fmt(d.created_at)}</td>
+            <td><a href={'/portal/doubts/' + d.id} class="tc-btn" target="_blank" rel="noopener">Open</a></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )}
+  </div>
+</main>
+</AquintutorLayout>
