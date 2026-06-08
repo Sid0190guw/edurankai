@@ -169,16 +169,129 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
         var isAR = sceneName.indexOf('-ar') >= 0;
         if (!('xr' in navigator)) { alert('WebXR not available in this browser.'); return; }
         var mode = isAR ? 'immersive-ar' : 'immersive-vr';
-        navigator.xr.requestSession(mode, { optionalFeatures: ['hand-tracking', 'local-floor'] }).then(function (session) {
-          alert('XR session started for: ' + sceneName + '\n\nThe full Three.js / WebGL scene loader will render here in the deployed build.');
-          session.end();
-        }).catch(function (e) {
-          alert('Could not start XR session: ' + e.message + '\n\nMake sure your headset is connected and the page is served over HTTPS.');
-        });
+        enterXR(mode, sceneName);
       });
     });
 
-    // ============ Software-rendered caffeine molecule ============
+    // ============ REAL WebXR immersive renderer (hand-written WebGL) ============
+    // No Three.js. Sets up an XRWebGLLayer, runs the XR animation frame loop,
+    // and draws a 3D scene with per-view projection + view matrices straight
+    // from the headset pose. Controllers/hands render as tracked cubes.
+    function m4identity() { return [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; }
+    function m4mul(a, b) { var o = new Array(16); for (var r=0;r<4;r++) for (var c=0;c<4;c++){ var s=0; for (var k=0;k<4;k++) s+=a[k*4+r]*b[c*4+k]; o[c*4+r]=s; } return o; }
+    function m4translate(x,y,z){ var m=m4identity(); m[12]=x;m[13]=y;m[14]=z; return m; }
+    function m4scale(s){ return [s,0,0,0, 0,s,0,0, 0,0,s,0, 0,0,0,1]; }
+    function m4rotY(a){ var c=Math.cos(a),s=Math.sin(a); return [c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]; }
+    function m4rotX(a){ var c=Math.cos(a),s=Math.sin(a); return [1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]; }
+
+    var CUBE_VERTS = new Float32Array([
+      // pos(x,y,z), normal(nx,ny,nz)  — 36 verts
+      -1,-1, 1, 0,0,1,  1,-1, 1, 0,0,1,  1, 1, 1, 0,0,1,  -1,-1, 1, 0,0,1,  1, 1, 1, 0,0,1,  -1, 1, 1, 0,0,1,
+      -1,-1,-1, 0,0,-1, -1, 1,-1, 0,0,-1, 1, 1,-1, 0,0,-1, -1,-1,-1, 0,0,-1, 1, 1,-1, 0,0,-1,  1,-1,-1, 0,0,-1,
+      -1, 1,-1, 0,1,0,  -1, 1, 1, 0,1,0,  1, 1, 1, 0,1,0,  -1, 1,-1, 0,1,0,  1, 1, 1, 0,1,0,   1, 1,-1, 0,1,0,
+      -1,-1,-1, 0,-1,0,  1,-1,-1, 0,-1,0, 1,-1, 1, 0,-1,0, -1,-1,-1, 0,-1,0, 1,-1, 1, 0,-1,0, -1,-1, 1, 0,-1,0,
+       1,-1,-1, 1,0,0,   1, 1,-1, 1,0,0,  1, 1, 1, 1,0,0,   1,-1,-1, 1,0,0,  1, 1, 1, 1,0,0,   1,-1, 1, 1,0,0,
+      -1,-1,-1,-1,0,0,  -1,-1, 1,-1,0,0, -1, 1, 1,-1,0,0,  -1,-1,-1,-1,0,0, -1, 1, 1,-1,0,0,  -1, 1,-1,-1,0,0,
+    ]);
+
+    var xrSession = null, xrRefSpace = null, gl = null, prog = null, vbo = null, attribs = {}, uniforms = {};
+    var sceneObjects = [];
+
+    function buildScene(name) {
+      // Default: caffeine-like molecule as colored cubes + bonds; everything in a 1.2m volume at eye height.
+      var atoms = [
+        [0.0,0.0,0.0,'N'],[1.4,0.0,0.0,'C'],[2.0,1.2,0.0,'N'],[1.0,2.2,0.0,'C'],[-0.3,1.6,0.0,'C'],
+        [-1.6,2.4,0.0,'N'],[-2.4,1.4,0.0,'C'],[-1.6,0.2,0.0,'N'],[1.4,3.5,0.0,'O'],[-3.7,1.4,0.0,'O'],
+        [-2.2,3.7,0.0,'C'],[3.4,1.4,0.0,'C'],[-2.2,-1.1,0.0,'C'],[0.7,-1.3,0.0,'C'],
+      ];
+      var bonds = [[0,1],[1,2],[2,3],[3,4],[4,0],[4,5],[5,6],[6,7],[7,0],[3,8],[6,9],[5,10],[2,11],[7,12],[1,13]];
+      var col = { C:[0.6,0.65,0.72], N:[0.36,0.53,0.78], O:[0.77,0.38,0.42], H:[0.81,0.84,0.87] };
+      var rad = { C:0.10, N:0.11, O:0.11, H:0.07 };
+      var objs = [];
+      var cx=0,cy=0; atoms.forEach(function(a){cx+=a[0];cy+=a[1];}); cx/=atoms.length; cy/=atoms.length;
+      function pos(a){ return [(a[0]-cx)*0.18, (a[1]-cy)*0.18 + 1.4, a[2]*0.18 - 0.6]; }
+      atoms.forEach(function(a){ var p=pos(a); objs.push({ pos:p, scale:rad[a[3]], color:col[a[3]] }); });
+      bonds.forEach(function(b){ var p1=pos(atoms[b[0]]),p2=pos(atoms[b[1]]); var mid=[(p1[0]+p2[0])/2,(p1[1]+p2[1])/2,(p1[2]+p2[2])/2]; objs.push({ pos:mid, scale:0.02, color:[0.5,0.5,0.55] }); });
+      sceneObjects = objs;
+    }
+
+    function glSetup(glCtx) {
+      gl = glCtx;
+      var vs = 'attribute vec3 aPos; attribute vec3 aNorm; uniform mat4 uProj; uniform mat4 uView; uniform mat4 uModel; varying vec3 vNorm; void main(){ vNorm = mat3(uModel)*aNorm; gl_Position = uProj*uView*uModel*vec4(aPos,1.0); }';
+      var fs = 'precision mediump float; varying vec3 vNorm; uniform vec3 uColor; void main(){ vec3 L=normalize(vec3(0.5,0.8,0.6)); float d=max(dot(normalize(vNorm),L),0.0)*0.7+0.3; gl_FragColor=vec4(uColor*d,1.0); }';
+      function sh(t,src){ var s=gl.createShader(t); gl.shaderSource(s,src); gl.compileShader(s); return s; }
+      prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER,vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER,fs)); gl.linkProgram(prog); gl.useProgram(prog);
+      vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo); gl.bufferData(gl.ARRAY_BUFFER, CUBE_VERTS, gl.STATIC_DRAW);
+      attribs.pos = gl.getAttribLocation(prog,'aPos'); attribs.norm = gl.getAttribLocation(prog,'aNorm');
+      uniforms.proj = gl.getUniformLocation(prog,'uProj'); uniforms.view = gl.getUniformLocation(prog,'uView'); uniforms.model = gl.getUniformLocation(prog,'uModel'); uniforms.color = gl.getUniformLocation(prog,'uColor');
+      gl.enable(gl.DEPTH_TEST);
+    }
+
+    var spin = 0;
+    function drawView(proj, view) {
+      gl.useProgram(prog);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.enableVertexAttribArray(attribs.pos); gl.vertexAttribPointer(attribs.pos, 3, gl.FLOAT, false, 24, 0);
+      gl.enableVertexAttribArray(attribs.norm); gl.vertexAttribPointer(attribs.norm, 3, gl.FLOAT, false, 24, 12);
+      gl.uniformMatrix4fv(uniforms.proj, false, proj);
+      gl.uniformMatrix4fv(uniforms.view, false, view);
+      var rot = m4mul(m4rotY(spin), m4rotX(0.2));
+      sceneObjects.forEach(function (o) {
+        var model = m4mul(m4mul(m4translate(o.pos[0], o.pos[1], o.pos[2]), rot), m4scale(o.scale));
+        gl.uniformMatrix4fv(uniforms.model, false, model);
+        gl.uniform3fv(uniforms.color, o.color);
+        gl.drawArrays(gl.TRIANGLES, 0, 36);
+      });
+    }
+
+    function enterXR(mode, sceneName) {
+      if (!('xr' in navigator)) { alert('WebXR is not available in this browser. Open this page in a WebXR browser on a Meta Quest, Pico, or Apple Vision Pro.'); return; }
+      buildScene(sceneName);
+      var glCanvas = document.createElement('canvas');
+      var glCtx = glCanvas.getContext('webgl', { xrCompatible: true }) || glCanvas.getContext('experimental-webgl', { xrCompatible: true });
+      if (!glCtx) { alert('WebGL not available.'); return; }
+      var opts = { optionalFeatures: ['local-floor', 'hand-tracking', 'bounded-floor'] };
+      if (mode === 'immersive-ar') opts.optionalFeatures.push('hit-test');
+      navigator.xr.requestSession(mode, opts).then(function (session) {
+        xrSession = session;
+        glSetup(glCtx);
+        return glCtx.makeXRCompatible ? glCtx.makeXRCompatible().then(function(){ return session; }) : session;
+      }).then(function (session) {
+        session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+        session.requestReferenceSpace('local-floor').catch(function () { return session.requestReferenceSpace('local'); }).then(function (ref) {
+          xrRefSpace = ref;
+          session.requestAnimationFrame(onXRFrame);
+        });
+        session.addEventListener('end', function () { xrSession = null; });
+      }).catch(function (e) {
+        alert('Could not start the immersive session: ' + (e && e.message ? e.message : e) + '\n\nMake sure a headset is connected and the page is on HTTPS.');
+      });
+    }
+
+    function onXRFrame(t, frame) {
+      var session = frame.session;
+      spin += 0.01;
+      session.requestAnimationFrame(onXRFrame);
+      var pose = frame.getViewerPose(xrRefSpace);
+      if (!pose) return;
+      var layer = session.renderState.baseLayer;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+      gl.clearColor(0.03, 0.03, 0.05, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      // controllers / hands as tracked cubes
+      var extra = [];
+      (session.inputSources || []).forEach(function (src) {
+        if (src.gripSpace) { var gp = frame.getPose(src.gripSpace, xrRefSpace); if (gp) extra.push({ pos: [gp.transform.position.x, gp.transform.position.y, gp.transform.position.z], scale: 0.03, color: [0.4, 0.9, 0.98] }); }
+      });
+      var saved = sceneObjects; sceneObjects = saved.concat(extra);
+      pose.views.forEach(function (view) {
+        var vp = layer.getViewport(view);
+        gl.viewport(vp.x, vp.y, vp.width, vp.height);
+        drawView(view.projectionMatrix, view.transform.inverse.matrix);
+      });
+      sceneObjects = saved;
+    }
+
+    // ============ Software-rendered caffeine molecule (2D preview) ============
     var canvas = $('moleculeCanvas'); var ctx = canvas.getContext('2d');
     var W = canvas.width, H = canvas.height;
     // Caffeine atoms — [x, y, z, element]
