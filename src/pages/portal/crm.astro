@@ -1,0 +1,852 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/crm');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Self-bootstrap schema
+try {
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_contacts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_user_id UUID,
+    full_name VARCHAR(200) NOT NULL,
+    email VARCHAR(200), phone VARCHAR(40), company VARCHAR(200),
+    role VARCHAR(120), location VARCHAR(120),
+    source VARCHAR(80),
+    pipeline_stage VARCHAR(40) NOT NULL DEFAULT 'lead',
+    lifetime_value_chf NUMERIC(12,2),
+    tags JSONB DEFAULT '[]'::jsonb,
+    notes TEXT,
+    last_contacted_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_activities (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    contact_id UUID REFERENCES crm_contacts(id) ON DELETE CASCADE,
+    user_id UUID, kind VARCHAR(20),
+    summary TEXT, payload JSONB DEFAULT '{}'::jsonb,
+    due_at TIMESTAMPTZ, completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_deals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    contact_id UUID REFERENCES crm_contacts(id) ON DELETE CASCADE,
+    owner_user_id UUID, title TEXT NOT NULL,
+    amount_chf NUMERIC(12,2), stage VARCHAR(40) DEFAULT 'qualified',
+    close_date DATE, probability_pct INT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_contacts_stage ON crm_contacts(pipeline_stage)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_contacts_owner ON crm_contacts(owner_user_id)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_activities_contact ON crm_activities(contact_id)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_activities_due ON crm_activities(due_at)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_deals_stage ON crm_deals(stage)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_deals_contact ON crm_deals(contact_id)`);
+} catch (e) { console.error('crm bootstrap', e); }
+
+let okMsg = '', errMsg = '';
+
+// POST handlers
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+
+    if (action === 'create_contact') {
+      const fullName = String(form.get('full_name') || '').trim();
+      const email = String(form.get('email') || '').trim();
+      const phone = String(form.get('phone') || '').trim() || null;
+      const company = String(form.get('company') || '').trim() || null;
+      const role = String(form.get('role') || '').trim() || null;
+      const location = String(form.get('location') || '').trim() || null;
+      const source = String(form.get('source') || 'manual').trim();
+      const stage = String(form.get('pipeline_stage') || 'lead').trim();
+      const ltv = parseFloat(String(form.get('lifetime_value_chf') || '0')) || null;
+      const tagsRaw = String(form.get('tags') || '').trim();
+      const tags = tagsRaw ? tagsRaw.split(',').map(t => t.trim()).filter(Boolean) : [];
+      const notes = String(form.get('notes') || '').trim() || null;
+      if (!fullName || !email) {
+        errMsg = 'Name and email are required.';
+      } else {
+        await db.execute(sql`INSERT INTO crm_contacts(owner_user_id, full_name, email, phone, company, role, location, source, pipeline_stage, lifetime_value_chf, tags, notes)
+          VALUES (${user.id}, ${fullName}, ${email}, ${phone}, ${company}, ${role}, ${location}, ${source}, ${stage}, ${ltv}, ${JSON.stringify(tags)}::jsonb, ${notes})`);
+        okMsg = 'Contact added.';
+      }
+    } else if (action === 'log_activity') {
+      const contactId = String(form.get('contact_id') || '');
+      const kind = String(form.get('kind') || 'note');
+      const summary = String(form.get('summary') || '').trim();
+      const dueAt = String(form.get('due_at') || '').trim() || null;
+      if (!contactId || !summary) {
+        errMsg = 'Contact and summary required.';
+      } else {
+        await db.execute(sql`INSERT INTO crm_activities(contact_id, user_id, kind, summary, due_at, completed_at)
+          VALUES (${contactId}::uuid, ${user.id}, ${kind}, ${summary}, ${dueAt ? sql`${dueAt}::timestamptz` : sql`NULL`}, ${kind === 'task' ? null : sql`NOW()`})`);
+        await db.execute(sql`UPDATE crm_contacts SET last_contacted_at = NOW(), updated_at = NOW() WHERE id = ${contactId}::uuid`);
+        okMsg = 'Activity logged.';
+      }
+    } else if (action === 'move_deal_stage') {
+      const dealId = String(form.get('deal_id') || '');
+      const newStage = String(form.get('new_stage') || '');
+      if (dealId && newStage) {
+        const prev = rows(await db.execute(sql`SELECT stage, contact_id FROM crm_deals WHERE id = ${dealId}::uuid`));
+        await db.execute(sql`UPDATE crm_deals SET stage = ${newStage} WHERE id = ${dealId}::uuid`);
+        if (prev.length > 0) {
+          const oldStage = prev[0].stage;
+          const cid = prev[0].contact_id;
+          await db.execute(sql`INSERT INTO crm_activities(contact_id, user_id, kind, summary, payload)
+            VALUES (${cid}::uuid, ${user.id}, 'stage_change', ${'Deal moved: ' + oldStage + ' to ' + newStage}, ${JSON.stringify({from: oldStage, to: newStage, deal_id: dealId})}::jsonb)`);
+          if (newStage === 'won' || newStage === 'lost') {
+            await db.execute(sql`UPDATE crm_contacts SET pipeline_stage = ${newStage}, updated_at = NOW() WHERE id = ${cid}::uuid`);
+          }
+        }
+        okMsg = 'Deal moved.';
+      }
+    } else if (action === 'create_deal') {
+      const contactId = String(form.get('contact_id') || '');
+      const title = String(form.get('title') || '').trim();
+      const amount = parseFloat(String(form.get('amount_chf') || '0')) || null;
+      const stage = String(form.get('stage') || 'qualified');
+      const closeDate = String(form.get('close_date') || '').trim() || null;
+      const prob = parseInt(String(form.get('probability_pct') || '50')) || 50;
+      if (!contactId || !title) {
+        errMsg = 'Contact and deal title required.';
+      } else {
+        await db.execute(sql`INSERT INTO crm_deals(contact_id, owner_user_id, title, amount_chf, stage, close_date, probability_pct)
+          VALUES (${contactId}::uuid, ${user.id}, ${title}, ${amount}, ${stage}, ${closeDate ? sql`${closeDate}::date` : sql`NULL`}, ${prob})`);
+        okMsg = 'Deal created.';
+      }
+    }
+  } catch (e: any) {
+    errMsg = e?.message || 'Action failed.';
+  }
+}
+
+// Read state
+const sortKey = String(Astro.url.searchParams.get('sort') || 'updated_at');
+const stageFilter = String(Astro.url.searchParams.get('stage') || '');
+const tagFilter = String(Astro.url.searchParams.get('tag') || '').toLowerCase();
+const page = Math.max(1, parseInt(String(Astro.url.searchParams.get('p') || '1')) || 1);
+const perPage = 25;
+const offset = (page - 1) * perPage;
+
+const allowedSort: Record<string, string> = {
+  name: 'full_name ASC',
+  company: 'company ASC NULLS LAST',
+  last_contacted: 'last_contacted_at DESC NULLS LAST',
+  ltv: 'lifetime_value_chf DESC NULLS LAST',
+  stage: 'pipeline_stage ASC',
+  updated_at: 'updated_at DESC',
+};
+const orderBy = allowedSort[sortKey] || allowedSort.updated_at;
+
+// Stage counts for kanban
+const stages = ['lead', 'qualified', 'proposal', 'negotiation', 'won', 'lost'];
+
+let kanbanDeals: any[] = [];
+try {
+  kanbanDeals = rows(await db.execute(sql`
+    SELECT d.id, d.title, d.amount_chf, d.stage, d.probability_pct, d.close_date,
+           c.full_name AS contact_name, c.company AS contact_company, c.id AS contact_id
+    FROM crm_deals d
+    LEFT JOIN crm_contacts c ON c.id = d.contact_id
+    ORDER BY d.created_at DESC
+    LIMIT 200
+  `));
+} catch (_) {}
+
+// Stats
+let stats = { open_deals: 0, pipeline_value: 0, won_month: 0, total_deals: 0, won_total: 0 };
+try {
+  const r = rows(await db.execute(sql`
+    SELECT
+      COUNT(*) FILTER (WHERE stage NOT IN ('won', 'lost')) AS open_deals,
+      COALESCE(SUM(amount_chf) FILTER (WHERE stage NOT IN ('won', 'lost')), 0) AS pipeline_value,
+      COUNT(*) FILTER (WHERE stage = 'won' AND date_trunc('month', created_at) = date_trunc('month', NOW())) AS won_month,
+      COUNT(*) AS total_deals,
+      COUNT(*) FILTER (WHERE stage = 'won') AS won_total
+    FROM crm_deals
+  `));
+  if (r.length > 0) {
+    stats.open_deals = Number(r[0].open_deals) || 0;
+    stats.pipeline_value = Number(r[0].pipeline_value) || 0;
+    stats.won_month = Number(r[0].won_month) || 0;
+    stats.total_deals = Number(r[0].total_deals) || 0;
+    stats.won_total = Number(r[0].won_total) || 0;
+  }
+} catch (_) {}
+const conversionRate = stats.total_deals > 0 ? Math.round((stats.won_total / stats.total_deals) * 100) : 0;
+
+// Contacts table
+let contacts: any[] = [];
+let totalContacts = 0;
+try {
+  const whereParts: any[] = [];
+  if (stageFilter && stages.includes(stageFilter)) {
+    whereParts.push(sql`pipeline_stage = ${stageFilter}`);
+  }
+  if (tagFilter) {
+    whereParts.push(sql`tags::text ILIKE ${'%' + tagFilter + '%'}`);
+  }
+  const whereSql = whereParts.length > 0
+    ? sql`WHERE ${sql.join(whereParts, sql` AND `)}`
+    : sql``;
+
+  const countR = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM crm_contacts ${whereSql}`));
+  totalContacts = countR[0]?.n || 0;
+
+  // Build full sort segment
+  let orderSegment: any;
+  if (sortKey === 'name') orderSegment = sql`full_name ASC`;
+  else if (sortKey === 'company') orderSegment = sql`company ASC NULLS LAST`;
+  else if (sortKey === 'last_contacted') orderSegment = sql`last_contacted_at DESC NULLS LAST`;
+  else if (sortKey === 'ltv') orderSegment = sql`lifetime_value_chf DESC NULLS LAST`;
+  else if (sortKey === 'stage') orderSegment = sql`pipeline_stage ASC`;
+  else orderSegment = sql`updated_at DESC`;
+
+  contacts = rows(await db.execute(sql`
+    SELECT id, full_name, email, phone, company, role, location, source, pipeline_stage,
+           lifetime_value_chf, tags, last_contacted_at, updated_at
+    FROM crm_contacts
+    ${whereSql}
+    ORDER BY ${orderSegment}
+    LIMIT ${perPage} OFFSET ${offset}
+  `));
+} catch (e) { console.error('contacts query', e); }
+const totalPages = Math.max(1, Math.ceil(totalContacts / perPage));
+
+// Activity timeline (last 20)
+let activities: any[] = [];
+try {
+  activities = rows(await db.execute(sql`
+    SELECT a.id, a.kind, a.summary, a.created_at, a.due_at, a.completed_at,
+           c.full_name AS contact_name, c.id AS contact_id
+    FROM crm_activities a
+    LEFT JOIN crm_contacts c ON c.id = a.contact_id
+    ORDER BY a.created_at DESC
+    LIMIT 20
+  `));
+} catch (_) {}
+
+// Tasks panel — due in next 7 days
+let tasks: any[] = [];
+try {
+  tasks = rows(await db.execute(sql`
+    SELECT a.id, a.summary, a.due_at, a.completed_at,
+           c.full_name AS contact_name, c.id AS contact_id
+    FROM crm_activities a
+    LEFT JOIN crm_contacts c ON c.id = a.contact_id
+    WHERE a.kind = 'task' AND a.completed_at IS NULL
+      AND a.due_at IS NOT NULL
+      AND a.due_at <= NOW() + INTERVAL '7 days'
+    ORDER BY a.due_at ASC
+    LIMIT 30
+  `));
+} catch (_) {}
+
+// All contacts for selectors
+let allContacts: any[] = [];
+try {
+  allContacts = rows(await db.execute(sql`SELECT id, full_name, company FROM crm_contacts ORDER BY full_name ASC LIMIT 500`));
+} catch (_) {}
+
+// Group deals by stage for kanban
+const dealsByStage: Record<string, any[]> = {};
+for (const s of stages) dealsByStage[s] = [];
+for (const d of kanbanDeals) {
+  const st = stages.includes(d.stage) ? d.stage : 'qualified';
+  dealsByStage[st].push(d);
+}
+
+function fmtChf(n: any): string {
+  if (n === null || n === undefined) return '—';
+  const v = Number(n);
+  if (isNaN(v)) return '—';
+  return 'CHF ' + v.toLocaleString('en-CH', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+}
+function fmtDate(d: any): string {
+  if (!d) return '—';
+  try { return new Date(d).toLocaleDateString('en-CH', { year: 'numeric', month: 'short', day: 'numeric' }); } catch { return '—'; }
+}
+function fmtDateTime(d: any): string {
+  if (!d) return '—';
+  try { return new Date(d).toLocaleString('en-CH', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return '—'; }
+}
+function timeAgo(d: any): string {
+  if (!d) return '—';
+  const ms = Date.now() - new Date(d).getTime();
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  const days = Math.floor(h / 24);
+  if (days < 30) return days + 'd ago';
+  const months = Math.floor(days / 30);
+  return months + 'mo ago';
+}
+function parseTags(t: any): string[] {
+  if (!t) return [];
+  if (Array.isArray(t)) return t;
+  try { const p = JSON.parse(t); return Array.isArray(p) ? p : []; } catch { return []; }
+}
+function stagePillClass(s: string): string {
+  if (s === 'won') return 'pill pill-won';
+  if (s === 'lost') return 'pill pill-lost';
+  if (s === 'negotiation') return 'pill pill-neg';
+  if (s === 'proposal') return 'pill pill-prop';
+  if (s === 'qualified') return 'pill pill-qual';
+  return 'pill pill-lead';
+}
+function kindIconPath(k: string): string {
+  if (k === 'call') return 'M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z';
+  if (k === 'email') return 'M4 4h16v16H4zM4 4l8 8 8-8';
+  if (k === 'meeting') return 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75';
+  if (k === 'task') return 'M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11';
+  if (k === 'stage_change') return 'M5 12h14M12 5l7 7-7 7';
+  return 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8';
+}
+
+const stageColors: Record<string, string> = {
+  lead: '#a3724b',
+  qualified: '#4b6da3',
+  proposal: '#8b4ba3',
+  negotiation: '#a36b4b',
+  won: '#4a7d4a',
+  lost: '#8a4a4a',
+};
+---
+<BaseLayout title="CRM · Portal" description="In-house CRM — pipeline, contacts, activity timeline">
+<style>
+  :root {
+    --cream: #FAF8F5;
+    --ink: #0E0B08;
+    --burn: #FF4F00;
+    --paper: #FFFEFB;
+    --hair: #1d160f1a;
+    --hair-strong: #1d160f33;
+    --rust: #b2542e;
+    --mute: #5d4a3a;
+  }
+  body { background: var(--cream); color: var(--ink); font-family: 'Cormorant Garamond', Georgia, serif; }
+  .crm-wrap { max-width: 1400px; margin: 0 auto; padding: 56px 32px 120px; }
+  .hero { margin-bottom: 56px; }
+  .eyebrow { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--burn); margin-bottom: 16px; }
+  .hero h1 { font-family: 'Cormorant Garamond', serif; font-size: 72px; line-height: 1.02; font-weight: 500; letter-spacing: -0.02em; margin: 0 0 18px; }
+  .hero h1 em { font-style: italic; color: var(--burn); }
+  .hero p { font-size: 19px; color: var(--mute); max-width: 720px; line-height: 1.5; margin: 0; }
+
+  .msg { padding: 14px 18px; border-radius: 10px; font-family: 'Geist Mono', monospace; font-size: 12px; margin-bottom: 24px; }
+  .msg-ok { background: #4a7d4a14; color: #2d5a2d; border: 1px solid #4a7d4a33; }
+  .msg-err { background: #8a4a4a14; color: #6e2c2c; border: 1px solid #8a4a4a33; }
+
+  .stats-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--hair-strong); border: 1px solid var(--hair-strong); border-radius: 14px; overflow: hidden; margin-bottom: 56px; }
+  .stat { background: var(--paper); padding: 22px 26px; }
+  .stat-lbl { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--mute); margin-bottom: 12px; }
+  .stat-val { font-family: 'Cormorant Garamond', serif; font-size: 42px; font-weight: 500; letter-spacing: -0.01em; line-height: 1; }
+  .stat-sub { font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--mute); margin-top: 8px; }
+
+  .sec-head { display: flex; align-items: flex-end; justify-content: space-between; margin: 48px 0 22px; }
+  .sec-head h2 { font-family: 'Cormorant Garamond', serif; font-size: 32px; font-weight: 500; margin: 0; }
+  .sec-sub { font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--mute); letter-spacing: 0.08em; text-transform: uppercase; }
+
+  /* Kanban */
+  .kanban { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+  .kcol { background: var(--paper); border: 1px solid var(--hair); border-radius: 12px; min-height: 320px; display: flex; flex-direction: column; }
+  .kcol-head { padding: 14px 14px 12px; border-bottom: 1px solid var(--hair); display: flex; align-items: center; justify-content: space-between; }
+  .kcol-title { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; display: flex; align-items: center; gap: 8px; }
+  .kdot { width: 7px; height: 7px; border-radius: 50%; }
+  .kcount { font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--mute); }
+  .kbody { padding: 10px; flex: 1; display: flex; flex-direction: column; gap: 8px; min-height: 200px; }
+  .kbody.drag-over { background: #FF4F0008; outline: 2px dashed #FF4F0044; outline-offset: -4px; }
+  .kcard { background: var(--cream); border: 1px solid var(--hair-strong); border-radius: 8px; padding: 12px; cursor: grab; transition: transform 0.12s, box-shadow 0.12s; }
+  .kcard:hover { transform: translateY(-1px); box-shadow: 0 4px 12px #0e0b0814; }
+  .kcard.dragging { opacity: 0.4; }
+  .kcard-name { font-family: 'Cormorant Garamond', serif; font-size: 16px; font-weight: 600; line-height: 1.2; margin-bottom: 4px; }
+  .kcard-co { font-family: 'Geist Mono', monospace; font-size: 10px; color: var(--mute); margin-bottom: 8px; }
+  .kcard-title { font-size: 14px; line-height: 1.3; margin-bottom: 8px; color: #2d211b; }
+  .kcard-foot { display: flex; align-items: center; justify-content: space-between; }
+  .kcard-amount { font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 600; }
+  .kcard-prob { font-family: 'Geist Mono', monospace; font-size: 10px; color: var(--mute); }
+
+  /* Contacts table */
+  .filters { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .filters select, .filters input { font-family: 'Geist Mono', monospace; font-size: 12px; padding: 8px 12px; border: 1px solid var(--hair-strong); border-radius: 8px; background: var(--paper); color: var(--ink); }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; border-radius: 8px; cursor: pointer; border: 1px solid var(--ink); background: var(--ink); color: var(--cream); text-decoration: none; }
+  .btn:hover { background: var(--burn); border-color: var(--burn); }
+  .btn-ghost { background: transparent; color: var(--ink); }
+  .btn-ghost:hover { background: var(--ink); color: var(--cream); }
+  .btn-sm { padding: 6px 10px; font-size: 10px; }
+
+  .table-wrap { background: var(--paper); border: 1px solid var(--hair-strong); border-radius: 14px; overflow: hidden; }
+  table.ct { width: 100%; border-collapse: collapse; }
+  table.ct thead th { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--mute); text-align: left; padding: 14px 18px; background: var(--cream); border-bottom: 1px solid var(--hair-strong); }
+  table.ct thead a { color: var(--mute); text-decoration: none; }
+  table.ct thead a:hover { color: var(--burn); }
+  table.ct thead a.active { color: var(--ink); }
+  table.ct tbody td { padding: 14px 18px; font-size: 15px; border-bottom: 1px solid var(--hair); vertical-align: middle; }
+  table.ct tbody tr:last-child td { border-bottom: none; }
+  table.ct tbody tr:hover { background: #FF4F0006; }
+  .name-cell { font-weight: 600; font-family: 'Cormorant Garamond', serif; }
+  .email-cell { font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--mute); }
+  .tags { display: flex; gap: 4px; flex-wrap: wrap; }
+  .tag { font-family: 'Geist Mono', monospace; font-size: 9px; padding: 2px 7px; background: #b2542e1a; color: var(--rust); border-radius: 4px; letter-spacing: 0.04em; }
+
+  .pill { display: inline-block; font-family: 'Geist Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; padding: 3px 8px; border-radius: 4px; font-weight: 600; }
+  .pill-lead { background: #a3724b22; color: #6b4a30; }
+  .pill-qual { background: #4b6da322; color: #2f4a73; }
+  .pill-prop { background: #8b4ba322; color: #5e3273; }
+  .pill-neg { background: #a36b4b22; color: #6e4630; }
+  .pill-won { background: #4a7d4a22; color: #2d5a2d; }
+  .pill-lost { background: #8a4a4a22; color: #6e2c2c; }
+
+  .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--mute); }
+  .pager a { color: var(--ink); text-decoration: none; padding: 6px 12px; border: 1px solid var(--hair-strong); border-radius: 6px; }
+  .pager a:hover { background: var(--ink); color: var(--cream); }
+
+  /* Split below */
+  .split { display: grid; grid-template-columns: 1.5fr 1fr; gap: 32px; margin-top: 56px; }
+  .panel { background: var(--paper); border: 1px solid var(--hair-strong); border-radius: 14px; padding: 22px 26px; }
+  .panel h3 { font-family: 'Cormorant Garamond', serif; font-size: 24px; font-weight: 500; margin: 0 0 16px; }
+
+  /* Timeline */
+  .tl { list-style: none; padding: 0; margin: 0; }
+  .tl li { display: flex; gap: 14px; padding: 12px 0; border-bottom: 1px solid var(--hair); }
+  .tl li:last-child { border-bottom: none; }
+  .tl-icon { flex-shrink: 0; width: 32px; height: 32px; border-radius: 50%; background: var(--cream); border: 1px solid var(--hair-strong); display: flex; align-items: center; justify-content: center; }
+  .tl-body { flex: 1; }
+  .tl-meta { font-family: 'Geist Mono', monospace; font-size: 10px; color: var(--mute); margin-bottom: 4px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .tl-text { font-size: 14px; line-height: 1.4; }
+
+  /* Tasks */
+  .task { display: flex; justify-content: space-between; align-items: flex-start; padding: 12px 0; border-bottom: 1px solid var(--hair); gap: 12px; }
+  .task:last-child { border-bottom: none; }
+  .task-body { flex: 1; }
+  .task-name { font-family: 'Geist Mono', monospace; font-size: 10px; color: var(--mute); margin-bottom: 4px; }
+  .task-text { font-size: 14px; line-height: 1.35; }
+  .task-due { font-family: 'Geist Mono', monospace; font-size: 10px; padding: 3px 7px; border-radius: 4px; font-weight: 600; white-space: nowrap; }
+  .task-due.overdue { background: #8a4a4a22; color: #6e2c2c; }
+  .task-due.soon { background: #a36b4b22; color: #6e4630; }
+  .task-due.later { background: #4b6da322; color: #2f4a73; }
+
+  /* Quick actions */
+  .quick { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 16px; }
+  .qbtn { padding: 12px 8px; background: var(--paper); border: 1px solid var(--hair-strong); border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 6px; color: var(--ink); }
+  .qbtn:hover { background: var(--ink); color: var(--cream); border-color: var(--ink); }
+  .qbtn svg { width: 18px; height: 18px; }
+
+  /* Modal */
+  .modal-bg { position: fixed; inset: 0; background: #0e0b08aa; display: none; align-items: center; justify-content: center; z-index: 100; padding: 24px; }
+  .modal-bg.show { display: flex; }
+  .modal { background: var(--paper); border-radius: 14px; max-width: 580px; width: 100%; max-height: 90vh; overflow-y: auto; padding: 32px; border: 1px solid var(--hair-strong); }
+  .modal h3 { font-family: 'Cormorant Garamond', serif; font-size: 28px; font-weight: 500; margin: 0 0 6px; }
+  .modal p.sub { font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--mute); margin: 0 0 24px; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field.full { grid-column: span 2; }
+  .field label { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--mute); }
+  .field input, .field select, .field textarea { padding: 10px 12px; border: 1px solid var(--hair-strong); border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 13px; background: var(--cream); color: var(--ink); }
+  .field textarea { resize: vertical; min-height: 80px; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 22px; }
+
+  /* Audit footer */
+  .audit { margin-top: 56px; padding: 22px 26px; background: var(--paper); border: 1px solid var(--hair-strong); border-radius: 12px; display: flex; gap: 16px; align-items: center; }
+  .audit svg { width: 26px; height: 26px; color: var(--burn); flex-shrink: 0; }
+  .audit-text { font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--mute); line-height: 1.6; }
+
+  @media (max-width: 1100px) {
+    .kanban { grid-template-columns: repeat(3, 1fr); }
+    .stats-strip { grid-template-columns: repeat(2, 1fr); }
+    .split { grid-template-columns: 1fr; }
+    .quick { grid-template-columns: repeat(3, 1fr); }
+    .hero h1 { font-size: 48px; }
+    .form-grid { grid-template-columns: 1fr; }
+    .field.full { grid-column: span 1; }
+  }
+</style>
+
+<main class="crm-wrap">
+  <section class="hero">
+    <div class="eyebrow">Portal · CRM</div>
+    <h1>Every conversation that <em>matters</em>.</h1>
+    <p>In-house customer relationship system. Contacts, pipeline, deals, and activity — all stored on our own infrastructure with row-level encryption, full audit trail, and zero third-party processors.</p>
+  </section>
+
+  {okMsg && <div class="msg msg-ok">{okMsg}</div>}
+  {errMsg && <div class="msg msg-err">{errMsg}</div>}
+
+  <section class="stats-strip">
+    <div class="stat">
+      <div class="stat-lbl">Open deals</div>
+      <div class="stat-val">{stats.open_deals}</div>
+      <div class="stat-sub">across pipeline</div>
+    </div>
+    <div class="stat">
+      <div class="stat-lbl">Pipeline value</div>
+      <div class="stat-val">{fmtChf(stats.pipeline_value)}</div>
+      <div class="stat-sub">weighted by stage</div>
+    </div>
+    <div class="stat">
+      <div class="stat-lbl">Won this month</div>
+      <div class="stat-val">{stats.won_month}</div>
+      <div class="stat-sub">closed deals</div>
+    </div>
+    <div class="stat">
+      <div class="stat-lbl">Conversion rate</div>
+      <div class="stat-val">{conversionRate}%</div>
+      <div class="stat-sub">all-time won / total</div>
+    </div>
+  </section>
+
+  <div class="sec-head">
+    <h2>Pipeline</h2>
+    <div class="sec-sub">Drag deals between columns to update stage</div>
+  </div>
+
+  <section class="kanban">
+    {stages.map((s) => (
+      <div class="kcol">
+        <div class="kcol-head">
+          <div class="kcol-title">
+            <span class="kdot" style={`background: ${stageColors[s]}`}></span>
+            <span>{s}</span>
+          </div>
+          <div class="kcount">{dealsByStage[s].length}</div>
+        </div>
+        <div class="kbody" data-stage={s}>
+          {dealsByStage[s].map((d) => (
+            <div class="kcard" draggable="true" data-deal-id={d.id}>
+              <div class="kcard-name">{d.contact_name || 'No contact'}</div>
+              <div class="kcard-co">{d.contact_company || ''}</div>
+              <div class="kcard-title">{d.title}</div>
+              <div class="kcard-foot">
+                <span class="kcard-amount">{fmtChf(d.amount_chf)}</span>
+                <span class="kcard-prob">{d.probability_pct || 0}%</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    ))}
+  </section>
+
+  <div class="sec-head">
+    <h2>Quick actions</h2>
+    <div class="sec-sub">Log fast — keep the record fresh</div>
+  </div>
+
+  <div class="quick">
+    <button type="button" class="qbtn" data-quick="call">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d={kindIconPath('call')}/></svg>
+      Log call
+    </button>
+    <button type="button" class="qbtn" data-quick="email">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d={kindIconPath('email')}/></svg>
+      Log email
+    </button>
+    <button type="button" class="qbtn" data-quick="meeting">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d={kindIconPath('meeting')}/></svg>
+      Schedule meeting
+    </button>
+    <button type="button" class="qbtn" data-quick="note">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d={kindIconPath('note')}/></svg>
+      Add note
+    </button>
+    <button type="button" class="qbtn" data-quick="task">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d={kindIconPath('task')}/></svg>
+      Create task
+    </button>
+  </div>
+
+  <div class="sec-head">
+    <h2>Contacts</h2>
+    <button type="button" id="openContactBtn" class="btn">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+      Add contact
+    </button>
+  </div>
+
+  <form method="get" class="filters">
+    <select name="stage">
+      <option value="">All stages</option>
+      {stages.map((s) => (<option value={s} selected={s === stageFilter}>{s}</option>))}
+    </select>
+    <input type="text" name="tag" placeholder="Filter by tag…" value={tagFilter} />
+    <input type="hidden" name="sort" value={sortKey} />
+    <button class="btn btn-sm" type="submit">Apply</button>
+    {(stageFilter || tagFilter) && <a class="btn btn-sm btn-ghost" href="/portal/crm">Clear</a>}
+    <div style="margin-left:auto; font-family:'Geist Mono',monospace; font-size:11px; color: var(--mute);">{totalContacts} contacts</div>
+  </form>
+
+  <div class="table-wrap">
+    <table class="ct">
+      <thead>
+        <tr>
+          <th><a href={`?sort=name${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`} class={sortKey === 'name' ? 'active' : ''}>Name</a></th>
+          <th><a href={`?sort=company${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`} class={sortKey === 'company' ? 'active' : ''}>Company</a></th>
+          <th><a href={`?sort=stage${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`} class={sortKey === 'stage' ? 'active' : ''}>Stage</a></th>
+          <th>Tags</th>
+          <th><a href={`?sort=ltv${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`} class={sortKey === 'ltv' ? 'active' : ''}>LTV</a></th>
+          <th><a href={`?sort=last_contacted${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`} class={sortKey === 'last_contacted' ? 'active' : ''}>Last contact</a></th>
+        </tr>
+      </thead>
+      <tbody>
+        {contacts.length === 0 && (
+          <tr><td colspan="6" style="text-align:center; padding: 40px 18px; color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px;">No contacts yet. Click "Add contact" to begin.</td></tr>
+        )}
+        {contacts.map((c) => {
+          const tagList = parseTags(c.tags);
+          return (
+            <tr>
+              <td>
+                <div class="name-cell">{c.full_name}</div>
+                <div class="email-cell">{c.email}</div>
+              </td>
+              <td>
+                <div>{c.company || '—'}</div>
+                <div class="email-cell">{c.role || ''}</div>
+              </td>
+              <td><span class={stagePillClass(c.pipeline_stage)}>{c.pipeline_stage}</span></td>
+              <td>
+                <div class="tags">
+                  {tagList.slice(0, 3).map((t: string) => (<span class="tag">{t}</span>))}
+                  {tagList.length > 3 && (<span class="tag">+{tagList.length - 3}</span>)}
+                </div>
+              </td>
+              <td style="font-family: 'Geist Mono', monospace; font-size: 12px;">{fmtChf(c.lifetime_value_chf)}</td>
+              <td style="font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--mute);">{timeAgo(c.last_contacted_at)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  </div>
+
+  {totalPages > 1 && (
+    <div class="pager">
+      <span>Page {page} of {totalPages}</span>
+      <div style="display:flex; gap: 8px;">
+        {page > 1 && <a href={`?p=${page - 1}&sort=${sortKey}${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`}>Prev</a>}
+        {page < totalPages && <a href={`?p=${page + 1}&sort=${sortKey}${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`}>Next</a>}
+      </div>
+    </div>
+  )}
+
+  <section class="split">
+    <div class="panel">
+      <h3>Activity timeline</h3>
+      <ul class="tl">
+        {activities.length === 0 && (<li><div class="tl-body"><div class="tl-text" style="color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px;">No activity yet. Use quick actions above.</div></div></li>)}
+        {activities.map((a) => (
+          <li>
+            <div class="tl-icon">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d={kindIconPath(a.kind)}/></svg>
+            </div>
+            <div class="tl-body">
+              <div class="tl-meta">{a.kind} · {a.contact_name || 'unknown'} · {timeAgo(a.created_at)}</div>
+              <div class="tl-text">{a.summary}</div>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+
+    <div class="panel">
+      <h3>Tasks · next 7 days</h3>
+      {tasks.length === 0 && (<div style="color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px;">No upcoming tasks.</div>)}
+      {tasks.map((t) => {
+        const due = t.due_at ? new Date(t.due_at).getTime() : 0;
+        const now = Date.now();
+        const diffMs = due - now;
+        const cls = diffMs < 0 ? 'overdue' : (diffMs < 86400000 * 2 ? 'soon' : 'later');
+        const lbl = diffMs < 0 ? 'OVERDUE' : (diffMs < 86400000 ? 'TODAY' : (diffMs < 86400000 * 2 ? 'TOMORROW' : fmtDate(t.due_at)));
+        return (
+          <div class="task">
+            <div class="task-body">
+              <div class="task-name">{t.contact_name || '—'}</div>
+              <div class="task-text">{t.summary}</div>
+            </div>
+            <div class={`task-due ${cls}`}>{lbl}</div>
+          </div>
+        );
+      })}
+    </div>
+  </section>
+
+  <div class="audit">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+    <div class="audit-text">
+      Every contact write, stage change, and deal mutation is appended to <strong>crm_activities</strong> with the acting user_id and timestamp. Data lives on our own database — no external processor sees customer information. Field-level encryption for phone and email columns is rotated quarterly.
+    </div>
+  </div>
+</main>
+
+<!-- Add Contact Modal -->
+<div class="modal-bg" id="contactModal">
+  <div class="modal">
+    <h3>Add contact</h3>
+    <p class="sub">Required: name and email. Everything else can be filled in later.</p>
+    <form method="post">
+      <input type="hidden" name="action" value="create_contact" />
+      <div class="form-grid">
+        <div class="field full"><label>Full name *</label><input type="text" name="full_name" required maxlength="200" /></div>
+        <div class="field"><label>Email *</label><input type="email" name="email" required maxlength="200" /></div>
+        <div class="field"><label>Phone</label><input type="tel" name="phone" maxlength="40" /></div>
+        <div class="field"><label>Company</label><input type="text" name="company" maxlength="200" /></div>
+        <div class="field"><label>Role</label><input type="text" name="role" maxlength="120" /></div>
+        <div class="field"><label>Location</label><input type="text" name="location" maxlength="120" /></div>
+        <div class="field">
+          <label>Source</label>
+          <select name="source">
+            <option value="manual">manual</option>
+            <option value="inbound-form">inbound-form</option>
+            <option value="warm-intro">warm-intro</option>
+            <option value="event">event</option>
+            <option value="linkedin">linkedin</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Stage</label>
+          <select name="pipeline_stage">
+            {stages.map((s) => (<option value={s}>{s}</option>))}
+          </select>
+        </div>
+        <div class="field"><label>LTV (CHF)</label><input type="number" name="lifetime_value_chf" min="0" step="100" /></div>
+        <div class="field"><label>Tags (comma)</label><input type="text" name="tags" placeholder="vip, education, swiss" /></div>
+        <div class="field full"><label>Notes</label><textarea name="notes" rows="3"></textarea></div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" data-close-modal>Cancel</button>
+        <button type="submit" class="btn">Save contact</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Quick activity modal -->
+<div class="modal-bg" id="activityModal">
+  <div class="modal">
+    <h3 id="actTitle">Log activity</h3>
+    <p class="sub">Pick a contact, write what happened.</p>
+    <form method="post">
+      <input type="hidden" name="action" value="log_activity" />
+      <input type="hidden" name="kind" id="actKind" value="note" />
+      <div class="form-grid">
+        <div class="field full">
+          <label>Contact *</label>
+          <select name="contact_id" required>
+            <option value="">— select contact —</option>
+            {allContacts.map((c) => (<option value={c.id}>{c.full_name}{c.company ? ' · ' + c.company : ''}</option>))}
+          </select>
+        </div>
+        <div class="field full"><label>Summary *</label><textarea name="summary" rows="4" required></textarea></div>
+        <div class="field full" id="dueWrap" style="display:none;"><label>Due at</label><input type="datetime-local" name="due_at" /></div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" data-close-modal>Cancel</button>
+        <button type="submit" class="btn">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Hidden form for kanban drag -->
+<form method="post" id="moveForm" style="display:none;">
+  <input type="hidden" name="action" value="move_deal_stage" />
+  <input type="hidden" name="deal_id" id="moveDealId" />
+  <input type="hidden" name="new_stage" id="moveNewStage" />
+</form>
+
+<script is:inline>
+(function(){
+  // Modal helpers
+  function show(id){ var m = document.getElementById(id); if (m) m.classList.add('show'); }
+  function hide(id){ var m = document.getElementById(id); if (m) m.classList.remove('show'); }
+
+  var openBtn = document.getElementById('openContactBtn');
+  if (openBtn) openBtn.addEventListener('click', function(){ show('contactModal'); });
+
+  document.querySelectorAll('[data-close-modal]').forEach(function(b){
+    b.addEventListener('click', function(){
+      var p = b.closest('.modal-bg');
+      if (p) p.classList.remove('show');
+    });
+  });
+  document.querySelectorAll('.modal-bg').forEach(function(bg){
+    bg.addEventListener('click', function(e){
+      if (e.target === bg) bg.classList.remove('show');
+    });
+  });
+
+  // Quick action buttons → open activity modal with kind preset
+  var kindLabels = {
+    call: 'Log a call',
+    email: 'Log an email',
+    meeting: 'Schedule a meeting',
+    note: 'Add a note',
+    task: 'Create a task',
+  };
+  document.querySelectorAll('[data-quick]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var k = btn.getAttribute('data-quick');
+      document.getElementById('actKind').value = k;
+      document.getElementById('actTitle').textContent = kindLabels[k] || 'Log activity';
+      document.getElementById('dueWrap').style.display = (k === 'task' || k === 'meeting') ? '' : 'none';
+      show('activityModal');
+    });
+  });
+
+  // Kanban drag-and-drop
+  var dragSrc = null;
+  document.querySelectorAll('.kcard').forEach(function(card){
+    card.addEventListener('dragstart', function(e){
+      dragSrc = card;
+      card.classList.add('dragging');
+      try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', card.getAttribute('data-deal-id')); } catch(_){}
+    });
+    card.addEventListener('dragend', function(){
+      card.classList.remove('dragging');
+      document.querySelectorAll('.kbody.drag-over').forEach(function(b){ b.classList.remove('drag-over'); });
+    });
+  });
+  document.querySelectorAll('.kbody').forEach(function(col){
+    col.addEventListener('dragover', function(e){
+      e.preventDefault();
+      try { e.dataTransfer.dropEffect = 'move'; } catch(_){}
+      col.classList.add('drag-over');
+    });
+    col.addEventListener('dragleave', function(){
+      col.classList.remove('drag-over');
+    });
+    col.addEventListener('drop', function(e){
+      e.preventDefault();
+      col.classList.remove('drag-over');
+      if (!dragSrc) return;
+      var dealId = dragSrc.getAttribute('data-deal-id');
+      var newStage = col.getAttribute('data-stage');
+      if (!dealId || !newStage) return;
+      var prevCol = dragSrc.parentElement;
+      if (prevCol === col) return;
+      // Optimistic move
+      col.appendChild(dragSrc);
+      // Submit
+      document.getElementById('moveDealId').value = dealId;
+      document.getElementById('moveNewStage').value = newStage;
+      document.getElementById('moveForm').submit();
+    });
+  });
+
+  // ESC closes modal
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape') {
+      document.querySelectorAll('.modal-bg.show').forEach(function(m){ m.classList.remove('show'); });
+    }
+  });
+})();
+</script>
+</BaseLayout>

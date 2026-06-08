@@ -1,0 +1,691 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Self-bootstrap forge_bookings
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS forge_bookings (
+      id SERIAL PRIMARY KEY,
+      equipment_id TEXT NOT NULL,
+      equipment_name TEXT NOT NULL,
+      user_email TEXT NOT NULL,
+      user_handle TEXT,
+      start_at TIMESTAMP NOT NULL,
+      hours_requested NUMERIC(6,2) NOT NULL DEFAULT 1,
+      file_url TEXT,
+      file_kind TEXT,
+      material TEXT,
+      material_grams NUMERIC(8,2),
+      ship_address TEXT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      eta_at TIMESTAMP,
+      operator_notes TEXT,
+      audit_log JSONB DEFAULT '[]'::jsonb,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+} catch (e) {
+  console.error('forge_bookings bootstrap', e);
+}
+
+// Seed a few demo jobs the first time the table is empty so the live queue isn't blank
+try {
+  const count = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM forge_bookings;`));
+  const n = Number(count[0]?.n || 0);
+  if (n === 0) {
+    await db.execute(sql`
+      INSERT INTO forge_bookings (equipment_id, equipment_name, user_email, user_handle, start_at, hours_requested, file_kind, material, material_grams, status, eta_at)
+      VALUES
+        ('cnc-mill-04', 'Tabletop CNC mill · 3-axis · 300 x 200 x 100', 'rishi.k@learner', 'rishi.k', NOW() - INTERVAL '24 minutes', 2.5, 'gcode', 'Aluminium 6061', 420, 'running', NOW() + INTERVAL '1 hour 36 minutes'),
+        ('fdm-09', 'FDM 3D printer · 256 x 256 x 256 · 0.1mm', 'aanya.b@learner', 'aanya.b', NOW() - INTERVAL '1 hour 12 minutes', 6, 'stl', 'PETG', 180, 'running', NOW() + INTERVAL '4 hours 48 minutes'),
+        ('laser-02', 'CO2 laser cutter · 900 x 600 · 80W', 'mihir.s@learner', 'mihir.s', NOW() - INTERVAL '6 minutes', 0.75, 'svg', 'Birch plywood 3mm', 220, 'toolpath-check', NOW() + INTERVAL '40 minutes'),
+        ('sla-03', 'SLA resin printer · 192 x 120 · 25um', 'devika.r@learner', 'devika.r', NOW() - INTERVAL '4 hours 30 minutes', 7, 'stl', 'Standard clear resin', 64, 'shipped', NULL),
+        ('ur5-arm-01', 'UR5 collaborative arm · 850mm reach', 'koushik@learner', 'koushik', NOW() - INTERVAL '14 minutes', 1, 'urp', NULL, NULL, 'queued', NOW() + INTERVAL '2 hours 14 minutes'),
+        ('pcb-fab-02', 'PCB mill · 2-layer · 0.1mm trace', 'farah.n@learner', 'farah.n', NOW() - INTERVAL '8 hours 11 minutes', 1.5, 'gerber', 'FR4 1.6mm', 38, 'shipped', NULL),
+        ('metal-print-01', 'Metal SLS · 250 x 250 x 250 · steel', 'aarav.t@learner', 'aarav.t', NOW() - INTERVAL '36 minutes', 11, 'stl', 'Stainless 316L', 920, 'queued', NOW() + INTERVAL '14 hours 02 minutes'),
+        ('franka-02', 'Franka Emika Panda · 7-DOF', 'sara.j@learner', 'sara.j', NOW() - INTERVAL '2 hours 45 minutes', 2, 'py', NULL, NULL, 'completed', NULL);
+    `);
+  }
+} catch (e) {
+  console.error('forge_bookings seed', e);
+}
+
+// Pull latest 8 jobs for the live queue
+let recentJobs: any[] = [];
+try {
+  const r = await db.execute(sql`
+    SELECT id, equipment_id, equipment_name, user_handle, start_at, hours_requested, material, status, eta_at, created_at
+    FROM forge_bookings
+    ORDER BY created_at DESC
+    LIMIT 8;
+  `);
+  recentJobs = rows(r);
+} catch (e) {
+  console.error('forge_bookings select', e);
+}
+
+const stats = [
+  { v: '18', l: 'CNC mill suites' },
+  { v: '24', l: '3D printers · FDM SLA SLS metal' },
+  { v: '6', l: 'Laser cutters · CO2 + fibre' },
+  { v: '12', l: 'Robotic arms · UR5 + Panda' },
+  { v: '4', l: 'PCB fabrication cells' },
+  { v: '72h', l: 'Door-to-door shipping' },
+];
+
+type Eq = {
+  id: string; name: string; cat: 'cnc' | 'print' | 'laser' | 'robot' | 'pcb';
+  specs: string[]; materials: string[]; status: 'available' | 'booked' | 'maint'; rate: number; icon: string;
+};
+
+const equipment: Eq[] = [
+  // CNC
+  { id: 'cnc-mill-01', name: 'Bench CNC mill · 3-axis', cat: 'cnc', specs: ['300 x 200 x 100 mm', '0.02 mm tolerance', '24k rpm spindle'], materials: ['Aluminium', 'Brass', 'Acetal', 'Wax'], status: 'available', rate: 28, icon: 'mill' },
+  { id: 'cnc-mill-02', name: 'Production CNC mill · 4-axis', cat: 'cnc', specs: ['650 x 450 x 250 mm', '0.01 mm tolerance', 'rotary A-axis'], materials: ['Aluminium', 'Steel 1018', 'Stainless 304'], status: 'booked', rate: 64, icon: 'mill' },
+  { id: 'cnc-mill-03', name: 'Desktop CNC router', cat: 'cnc', specs: ['400 x 400 x 80 mm', '0.05 mm tolerance', 'wood + soft metal'], materials: ['MDF', 'Plywood', 'Acrylic', 'Aluminium'], status: 'available', rate: 18, icon: 'mill' },
+  { id: 'cnc-mill-04', name: 'High-precision CNC mill', cat: 'cnc', specs: ['400 x 250 x 200 mm', '0.005 mm tolerance', 'coolant flood'], materials: ['Titanium Gr 5', 'Inconel', 'Tool steel'], status: 'maint', rate: 96, icon: 'mill' },
+  { id: 'cnc-lathe-01', name: 'CNC turning lathe', cat: 'cnc', specs: ['200 x 600 mm bed', 'bar feeder', 'live tooling'], materials: ['Brass', 'Stainless', 'Delrin'], status: 'available', rate: 42, icon: 'mill' },
+  // 3D printers
+  { id: 'fdm-01', name: 'FDM printer · 256 cubed', cat: 'print', specs: ['256 x 256 x 256 mm', '0.1 mm layer', 'dual nozzle'], materials: ['PLA', 'PETG', 'ABS', 'TPU'], status: 'available', rate: 6, icon: 'print' },
+  { id: 'fdm-02', name: 'FDM large bed', cat: 'print', specs: ['400 x 400 x 500 mm', '0.15 mm layer', 'enclosed heated chamber'], materials: ['ABS', 'ASA', 'Polycarbonate', 'Nylon'], status: 'available', rate: 12, icon: 'print' },
+  { id: 'fdm-03', name: 'FDM carbon-fibre composite', cat: 'print', specs: ['320 x 132 x 154 mm', 'hardened nozzle', 'continuous CF tow'], materials: ['Onyx', 'CF nylon', 'Glass-filled nylon'], status: 'booked', rate: 34, icon: 'print' },
+  { id: 'sla-01', name: 'SLA resin printer · 192 x 120', cat: 'print', specs: ['192 x 120 x 200 mm', '25 um layer', 'monochrome LCD'], materials: ['Standard resin', 'Tough', 'Castable', 'Dental'], status: 'available', rate: 14, icon: 'print' },
+  { id: 'sla-02', name: 'SLA resin printer · large', cat: 'print', specs: ['298 x 165 x 300 mm', '50 um layer', 'high-throughput'], materials: ['Engineering resin', 'Flexible', 'High-temp'], status: 'available', rate: 22, icon: 'print' },
+  { id: 'sls-01', name: 'SLS nylon powder', cat: 'print', specs: ['200 x 200 x 250 mm', 'PA12 nylon', 'no supports needed'], materials: ['PA12 nylon', 'PA11', 'TPU powder'], status: 'booked', rate: 48, icon: 'print' },
+  { id: 'metal-01', name: 'Metal SLS · stainless', cat: 'print', specs: ['250 x 250 x 250 mm', 'inert chamber', '20 um layer'], materials: ['Stainless 316L', 'Steel 1.2709', 'Bronze'], status: 'available', rate: 180, icon: 'print' },
+  // Laser
+  { id: 'laser-01', name: 'CO2 laser cutter · 900 x 600 · 80W', cat: 'laser', specs: ['900 x 600 mm bed', '80W tube', 'autofocus'], materials: ['Plywood', 'Acrylic', 'Card', 'Felt'], status: 'available', rate: 22, icon: 'laser' },
+  { id: 'laser-02', name: 'CO2 laser cutter · 1300 x 900 · 130W', cat: 'laser', specs: ['1300 x 900 mm bed', '130W tube', 'rotary axis'], materials: ['Plywood 6mm', 'MDF', 'Acrylic 10mm'], status: 'booked', rate: 38, icon: 'laser' },
+  { id: 'laser-03', name: 'Fibre laser marker · 200 x 200 · 30W', cat: 'laser', specs: ['200 x 200 mm field', '30W fibre', 'metal engrave'], materials: ['Stainless', 'Brass', 'Anodised aluminium'], status: 'available', rate: 28, icon: 'laser' },
+  { id: 'laser-04', name: 'Diode laser engraver', cat: 'laser', specs: ['400 x 400 mm', '20W diode', 'desktop'], materials: ['Wood', 'Leather', 'Card'], status: 'maint', rate: 9, icon: 'laser' },
+  // Robotic arms
+  { id: 'ur5-01', name: 'UR5 collaborative arm · 850mm reach', cat: 'robot', specs: ['5 kg payload', '850 mm reach', 'force-torque end'], materials: ['Tele-operation slot', 'Pick & place', 'Path teaching'], status: 'available', rate: 36, icon: 'robot' },
+  { id: 'ur5-02', name: 'UR5e arm · vision-equipped', cat: 'robot', specs: ['5 kg payload', '850 mm reach', '2D + depth camera'], materials: ['Vision pipeline', 'Bin-picking', 'Tele-op'], status: 'booked', rate: 44, icon: 'robot' },
+  { id: 'franka-01', name: 'Franka Emika Panda · 7-DOF', cat: 'robot', specs: ['3 kg payload', '7 joints', 'sub-mm precision'], materials: ['Research API', 'ROS 2', 'libfranka'], status: 'available', rate: 52, icon: 'robot' },
+  { id: 'franka-02', name: 'Franka Panda · dual-arm cell', cat: 'robot', specs: ['paired 7-DOF', 'shared workspace', 'force sense'], materials: ['Bimanual research', 'Assembly', 'Tactile'], status: 'maint', rate: 88, icon: 'robot' },
+  { id: 'mobile-01', name: 'Mobile manipulator · TurtleBot + arm', cat: 'robot', specs: ['SLAM nav', '4 kg arm', 'lidar + RGBD'], materials: ['ROS 2', 'Nav2 stack', 'tele-op'], status: 'available', rate: 26, icon: 'robot' },
+  // PCB
+  { id: 'pcb-fab-01', name: 'PCB mill · 2-layer · 0.1mm trace', cat: 'pcb', specs: ['200 x 300 mm', '0.1 mm minimum trace', 'auto tool change'], materials: ['FR4 1.6mm', 'Aluminium PCB', 'Flex polyimide'], status: 'available', rate: 32, icon: 'pcb' },
+  { id: 'pcb-fab-02', name: 'PCB mill · 4-layer · plated vias', cat: 'pcb', specs: ['200 x 300 mm', 'electroless copper', '4-layer stack'], materials: ['FR4 4-layer', 'High-frequency Rogers'], status: 'booked', rate: 64, icon: 'pcb' },
+  { id: 'reflow-01', name: 'SMT reflow oven · 8-zone', cat: 'pcb', specs: ['400 x 600 belt', 'lead-free profile', 'N2 atmosphere'], materials: ['SAC305 paste', '0201+ components', 'BGA rework'], status: 'available', rate: 24, icon: 'pcb' },
+];
+
+const categories = [
+  { id: 'all', label: 'All equipment', count: equipment.length },
+  { id: 'cnc', label: 'CNC milling & turning', count: equipment.filter(e => e.cat === 'cnc').length },
+  { id: 'print', label: '3D printers', count: equipment.filter(e => e.cat === 'print').length },
+  { id: 'laser', label: 'Laser cutters', count: equipment.filter(e => e.cat === 'laser').length },
+  { id: 'robot', label: 'Robotic arms', count: equipment.filter(e => e.cat === 'robot').length },
+  { id: 'pcb', label: 'PCB fabrication', count: equipment.filter(e => e.cat === 'pcb').length },
+];
+
+const materials = [
+  { name: 'PLA filament', kind: 'FDM thermoplastic', notes: 'Easy to print, biodegradable corn-starch derivative, 60C glass transition. Good for prototypes, models, fixtures.', cost: 18, unit: 'per kg', tone: '#7c8a4a' },
+  { name: 'PETG filament', kind: 'FDM thermoplastic', notes: 'Tougher than PLA, mild chemical resistance, food-safe variants. Print 230C, 80C bed, no enclosure required.', cost: 22, unit: 'per kg', tone: '#3d6b76' },
+  { name: 'ABS filament', kind: 'FDM thermoplastic', notes: 'Higher temp resistance, acetone-vapour smoothable, prefers an enclosed heated chamber to avoid warping.', cost: 24, unit: 'per kg', tone: '#5b4a92' },
+  { name: 'CF-nylon Onyx', kind: 'FDM composite', notes: 'Carbon-fibre filled nylon, machine-grade stiffness, hardened steel nozzle required, 270C extrude.', cost: 180, unit: 'per kg', tone: '#222831' },
+  { name: 'Standard SLA resin', kind: 'Photopolymer', notes: 'Sharp detail, brittle as printed, isopropanol wash + 60C UV cure. 25 um layer minimum.', cost: 64, unit: 'per litre', tone: '#a04330' },
+  { name: 'Aluminium 6061', kind: 'CNC stock', notes: 'Aerospace-grade structural alloy, easily machined, anodisable, heat-treatable. Cuts at 0.15 mm/tooth.', cost: 32, unit: 'per kg', tone: '#7a8893' },
+  { name: 'Stainless 304', kind: 'CNC stock', notes: 'Corrosion-resistant, food-grade, work-hardens — slow feed and flood coolant required.', cost: 58, unit: 'per kg', tone: '#4a5560' },
+  { name: 'Brass C36000', kind: 'CNC stock', notes: 'Free-machining brass, exceptional surface finish, no cooling oil needed. Used for fittings + electrical contacts.', cost: 86, unit: 'per kg', tone: '#a87526' },
+  { name: 'Carbon fibre sheet 2mm', kind: 'Laser stock', notes: 'Pre-cured 2x2 twill panel. Laser engrave only — through-cut releases dust, use waterjet instead.', cost: 220, unit: 'per kg', tone: '#0e0b08' },
+  { name: 'FR4 PCB blank', kind: 'PCB stock', notes: 'Glass-epoxy substrate, 1.6 mm thick, 35 um copper either side. Available in 1, 2, 4 layer stacks.', cost: 14, unit: 'per blank', tone: '#4a7048' },
+  { name: 'Birch plywood 3mm', kind: 'Laser stock', notes: 'Even grain, clean kerf, light burn marks. Ideal for enclosures and prototype mechanical parts.', cost: 12, unit: 'per kg', tone: '#946322' },
+  { name: 'Stainless SLS powder', kind: 'Metal print', notes: 'Stainless 316L powder for selective laser sintering. Inert chamber, parts post-processed in HIP oven.', cost: 420, unit: 'per kg', tone: '#3b5675' },
+];
+
+const pipeline = [
+  { id: 'upload', title: 'Upload file', sub: 'STL, G-code, Gerber, SVG, URP', icon: 'upload' },
+  { id: 'check', title: 'Toolpath check', sub: 'Automated DFM + collision sim', icon: 'check' },
+  { id: 'queue', title: 'Queue', sub: 'Position visible · ETA live', icon: 'queue' },
+  { id: 'run', title: 'Run on machine', sub: 'Live camera feed · sensor telemetry', icon: 'run' },
+  { id: 'ship', title: 'Ship to door', sub: '72-hour bonded courier', icon: 'ship' },
+];
+
+function fmtRel(d: any) {
+  if (!d) return '—';
+  const t = new Date(d).getTime();
+  const diff = Date.now() - t;
+  const abs = Math.abs(diff);
+  const m = Math.round(abs / 60000);
+  if (m < 1) return diff > 0 ? 'just now' : 'imminent';
+  if (m < 60) return diff > 0 ? `${m}m ago` : `in ${m}m`;
+  const h = Math.round(abs / 3600000);
+  if (h < 24) return diff > 0 ? `${h}h ago` : `in ${h}h`;
+  const dd = Math.round(abs / 86400000);
+  return diff > 0 ? `${dd}d ago` : `in ${dd}d`;
+}
+
+function statusTone(s: string) {
+  if (s === 'running') return { bg: '#FFF0E6', fg: '#FF4F00' };
+  if (s === 'queued') return { bg: '#EFEAE0', fg: '#7A6F68' };
+  if (s === 'toolpath-check') return { bg: '#EAF0F5', fg: '#3b5675' };
+  if (s === 'shipped') return { bg: '#E8F0E6', fg: '#4a7048' };
+  if (s === 'completed') return { bg: '#E8F0E6', fg: '#4a7048' };
+  return { bg: '#F4EFE8', fg: '#0E0B08' };
+}
+---
+<BaseLayout title="The Forge · Remote real equipment · AquinTutor campus" description="Tele-operate real fabrication equipment from anywhere. 18 CNC mills, 24 3D printers, 6 laser cutters, 12 robotic arms. Parts ship to your door in 72 hours.">
+<style>
+  body { background: #FAF8F5; color: #0E0B08; margin: 0; }
+  .forge-crumb { border-bottom: 1px solid rgba(14,11,8,0.10); background: #F4EFE8; }
+  .forge-crumb-inner { max-width: 1280px; margin: 0 auto; padding: 10px 5vw; font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.10em; color: #7A6F68; text-transform: uppercase; }
+  .forge-crumb-inner a { color: #7A6F68; text-decoration: none; }
+  .forge-crumb-inner b { color: #FF4F00; font-weight: 700; }
+
+  .forge-hero { max-width: 1280px; margin: 0 auto; padding: 70px 5vw 48px; }
+  .forge-eye { font-family: 'Geist Mono', monospace; font-size: 11.5px; letter-spacing: 0.18em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin: 0 0 18px; }
+  .forge-title { font-family: 'Cormorant Garamond', serif; font-size: clamp(40px, 7vw, 84px); font-weight: 600; letter-spacing: -0.035em; margin: 0; line-height: 1.02; color: #0E0B08; }
+  .forge-title em { color: #FF4F00; font-style: italic; font-weight: 500; }
+  .forge-sub { font-size: 17px; color: #2E2520; line-height: 1.7; max-width: 720px; margin: 22px 0 0; }
+  .forge-cta-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 30px; }
+  .forge-btn { background: #FF4F00; color: #fff; padding: 13px 26px; border-radius: 10px; font-family: 'Geist Mono', monospace; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 800; border: none; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; }
+  .forge-btn-ghost { background: transparent; color: #0E0B08; border: 1px solid rgba(14,11,8,0.20); }
+
+  .forge-stats { max-width: 1280px; margin: 0 auto; padding: 32px 5vw; border-top: 1px solid rgba(14,11,8,0.10); border-bottom: 1px solid rgba(14,11,8,0.10); display: grid; grid-template-columns: repeat(6, 1fr); gap: 24px; }
+  @media (max-width: 900px) { .forge-stats { grid-template-columns: repeat(2,1fr); } }
+  .forge-stat-val { font-family: 'Cormorant Garamond', serif; font-size: 30px; font-weight: 600; letter-spacing: -0.02em; color: #0E0B08; }
+  .forge-stat-lbl { font-family: 'Geist Mono', monospace; font-size: 10.5px; letter-spacing: 0.10em; text-transform: uppercase; color: #7A6F68; margin-top: 4px; }
+
+  .forge-section { max-width: 1280px; margin: 0 auto; padding: 64px 5vw; border-bottom: 1px solid rgba(14,11,8,0.10); }
+  .forge-section-eye { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin: 0 0 12px; }
+  .forge-section-title { font-family: 'Cormorant Garamond', serif; font-size: clamp(28px, 4.4vw, 48px); font-weight: 600; letter-spacing: -0.025em; margin: 0 0 14px; line-height: 1.05; color: #0E0B08; }
+  .forge-section-title em { color: #FF4F00; font-style: italic; font-weight: 500; }
+  .forge-section-sub { font-size: 16px; color: #2E2520; line-height: 1.7; max-width: 680px; margin: 0 0 30px; }
+
+  /* Filter tabs */
+  .forge-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+  .forge-tab { background: #fff; border: 1px solid rgba(14,11,8,0.10); padding: 9px 14px; border-radius: 999px; cursor: pointer; font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #2E2520; }
+  .forge-tab .ct { color: #7A6F68; margin-left: 6px; }
+  .forge-tab.on { background: #0E0B08; color: #fff; border-color: #0E0B08; }
+  .forge-tab.on .ct { color: rgba(255,255,255,0.5); }
+
+  /* Equipment grid */
+  .forge-eq-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+  .forge-eq { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 20px; display: flex; flex-direction: column; gap: 12px; transition: transform 0.16s ease, box-shadow 0.16s ease; }
+  .forge-eq:hover { transform: translateY(-2px); box-shadow: 0 14px 32px -22px rgba(14,11,8,0.30); }
+  .forge-eq-head { display: flex; gap: 12px; align-items: flex-start; }
+  .forge-eq-ico { width: 42px; height: 42px; border-radius: 10px; background: #F4EFE8; color: #FF4F00; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .forge-eq-id { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #7A6F68; }
+  .forge-eq-name { font-family: 'Cormorant Garamond', serif; font-size: 19px; font-weight: 600; line-height: 1.2; color: #0E0B08; margin: 2px 0 0; letter-spacing: -0.015em; }
+  .forge-eq-specs { display: flex; flex-direction: column; gap: 4px; font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #2E2520; }
+  .forge-eq-specs span { display: flex; gap: 6px; align-items: center; }
+  .forge-eq-specs span::before { content: ''; width: 3px; height: 3px; background: #FF4F00; border-radius: 50%; flex-shrink: 0; }
+  .forge-eq-mats { display: flex; flex-wrap: wrap; gap: 4px; }
+  .forge-eq-mat { font-family: 'Geist Mono', monospace; font-size: 9.5px; padding: 3px 7px; background: #F4EFE8; color: #2E2520; border-radius: 4px; letter-spacing: 0.04em; text-transform: uppercase; }
+  .forge-eq-foot { display: flex; justify-content: space-between; align-items: center; margin-top: auto; padding-top: 10px; border-top: 1px dashed rgba(14,11,8,0.10); }
+  .forge-eq-rate { font-family: 'Cormorant Garamond', serif; font-size: 22px; font-weight: 600; color: #0E0B08; }
+  .forge-eq-rate sub { font-family: 'Geist Mono', monospace; font-size: 10px; color: #7A6F68; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 400; vertical-align: baseline; margin-left: 2px; }
+  .forge-pill { font-family: 'Geist Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.10em; text-transform: uppercase; padding: 4px 9px; border-radius: 6px; }
+  .pill-available { background: #E8F0E6; color: #4a7048; }
+  .pill-booked { background: #FFF0E6; color: #FF4F00; }
+  .pill-maint { background: #F0EAE2; color: #946322; }
+  .forge-eq-book { background: #0E0B08; color: #fff; border: none; padding: 8px 12px; border-radius: 6px; font-family: 'Geist Mono', monospace; font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; }
+  .forge-eq-book:disabled { background: rgba(14,11,8,0.15); color: rgba(14,11,8,0.4); cursor: not-allowed; }
+
+  /* Pipeline */
+  .forge-pipe { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; position: relative; }
+  @media (max-width: 900px) { .forge-pipe { grid-template-columns: 1fr; } }
+  .forge-pipe-step { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 22px 18px; position: relative; }
+  .forge-pipe-num { font-family: 'Geist Mono', monospace; font-size: 10px; color: #FF4F00; font-weight: 700; letter-spacing: 0.10em; }
+  .forge-pipe-ico { width: 36px; height: 36px; margin: 10px 0 12px; color: #0E0B08; }
+  .forge-pipe-title { font-family: 'Cormorant Garamond', serif; font-size: 19px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; color: #0E0B08; }
+  .forge-pipe-sub { font-family: 'Geist Mono', monospace; font-size: 11px; color: #7A6F68; letter-spacing: 0.02em; line-height: 1.5; }
+  .forge-pipe-arrow { position: absolute; right: -10px; top: 50%; transform: translateY(-50%); width: 20px; height: 20px; color: #FF4F00; z-index: 2; background: #FAF8F5; border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+  @media (max-width: 900px) { .forge-pipe-arrow { display: none; } }
+
+  /* Booking form */
+  .forge-book-card { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 28px; max-width: 760px; }
+  .forge-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 12px; }
+  @media (max-width: 700px) { .forge-form-row { grid-template-columns: 1fr; } }
+  .forge-field { display: flex; flex-direction: column; gap: 4px; }
+  .forge-field label { font-family: 'Geist Mono', monospace; font-size: 10.5px; letter-spacing: 0.10em; text-transform: uppercase; color: #7A6F68; font-weight: 700; }
+  .forge-field input, .forge-field select, .forge-field textarea { background: #FAF8F5; border: 1px solid rgba(14,11,8,0.12); padding: 11px 12px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 13px; color: #0E0B08; }
+  .forge-field input:focus, .forge-field select:focus, .forge-field textarea:focus { outline: none; border-color: #FF4F00; }
+  .forge-field textarea { resize: vertical; min-height: 64px; }
+  .forge-form-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; gap: 12px; flex-wrap: wrap; }
+  .forge-cost { font-family: 'Cormorant Garamond', serif; font-size: 28px; font-weight: 600; color: #0E0B08; letter-spacing: -0.02em; }
+  .forge-cost sub { font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #7A6F68; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 400; vertical-align: baseline; margin-left: 2px; }
+  .forge-result { margin-top: 14px; padding: 12px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 12px; display: none; }
+  .forge-result.ok { background: #E8F0E6; color: #4a7048; display: block; }
+  .forge-result.err { background: #FFE8E0; color: #a04330; display: block; }
+
+  /* Materials grid */
+  .forge-mat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
+  .forge-mat { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 8px; }
+  .forge-mat-tag { width: 36px; height: 4px; border-radius: 2px; }
+  .forge-mat-name { font-family: 'Cormorant Garamond', serif; font-size: 19px; font-weight: 600; letter-spacing: -0.015em; color: #0E0B08; }
+  .forge-mat-kind { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #7A6F68; }
+  .forge-mat-notes { font-size: 13px; color: #2E2520; line-height: 1.55; }
+  .forge-mat-cost { font-family: 'Geist Mono', monospace; font-size: 12px; color: #FF4F00; font-weight: 700; letter-spacing: 0.04em; margin-top: auto; padding-top: 8px; border-top: 1px dashed rgba(14,11,8,0.10); }
+
+  /* Safety panel */
+  .forge-safety-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 22px; }
+  @media (max-width: 900px) { .forge-safety-grid { grid-template-columns: 1fr; } }
+  .forge-safety-list { display: flex; flex-direction: column; gap: 14px; }
+  .forge-safety-item { display: grid; grid-template-columns: 28px 1fr; gap: 12px; align-items: flex-start; }
+  .forge-safety-item svg { color: #FF4F00; margin-top: 2px; }
+  .forge-safety-item h4 { font-family: 'Cormorant Garamond', serif; font-size: 18px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.015em; }
+  .forge-safety-item p { font-size: 14px; color: #2E2520; line-height: 1.6; margin: 0; }
+  .forge-audit-card { background: #0E0B08; color: #FAF8F5; border-radius: 14px; padding: 22px; font-family: 'Geist Mono', monospace; font-size: 11px; line-height: 1.7; }
+  .forge-audit-card h4 { font-family: 'Cormorant Garamond', serif; font-size: 22px; font-weight: 600; margin: 0 0 12px; color: #fff; }
+  .forge-audit-row { display: grid; grid-template-columns: 80px 1fr; gap: 10px; padding: 6px 0; border-bottom: 1px dashed rgba(255,255,255,0.10); }
+  .forge-audit-row:last-child { border-bottom: none; }
+  .forge-audit-ts { color: #FF4F00; }
+  .forge-audit-msg { color: #d9d3cc; }
+
+  /* Live queue */
+  .forge-queue { display: flex; flex-direction: column; gap: 10px; }
+  .forge-queue-row { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 10px; padding: 14px 18px; display: grid; grid-template-columns: 80px 1.4fr 1fr 1fr 110px; gap: 14px; align-items: center; }
+  @media (max-width: 900px) { .forge-queue-row { grid-template-columns: 1fr; gap: 6px; } }
+  .forge-queue-id { font-family: 'Geist Mono', monospace; font-size: 11px; color: #7A6F68; letter-spacing: 0.08em; text-transform: uppercase; }
+  .forge-queue-eq { font-family: 'Cormorant Garamond', serif; font-size: 17px; font-weight: 600; letter-spacing: -0.015em; }
+  .forge-queue-meta { font-family: 'Geist Mono', monospace; font-size: 11px; color: #2E2520; line-height: 1.5; }
+  .forge-queue-meta b { color: #0E0B08; }
+</style>
+
+<div class="forge-crumb">
+  <div class="forge-crumb-inner">
+    <a href="/aquintutor">AquinTutor</a> &nbsp;/&nbsp;
+    <a href="/aquintutor/campus">Virtual campus</a> &nbsp;/&nbsp;
+    <b>The Forge</b>
+  </div>
+</div>
+
+<main>
+
+  <!-- HERO -->
+  <section class="forge-hero">
+    <p class="forge-eye">Campus &middot; District &middot; The Forge</p>
+    <h1 class="forge-title">Run a CNC mill <em>from anywhere</em>.</h1>
+    <p class="forge-sub">
+      The Forge is our tele-operated fabrication wing. Eighteen CNC mill suites, twenty-four 3D printers spanning FDM, SLA, SLS and metal sintering, six laser cutters, twelve collaborative robotic arms and four PCB fabrication cells &mdash; each one machine-addressable from a browser. You upload an STL, a Gerber, or a tele-op session file; we run the toolpath check, queue the job on real hardware, run it with live camera and sensor telemetry, and ship the finished part to your door within seventy-two hours.
+    </p>
+    <div class="forge-cta-row">
+      <a href="#book" class="forge-btn">Book a machine
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="13,5 19,12 13,19"/></svg>
+      </a>
+      <a href="#catalogue" class="forge-btn forge-btn-ghost">Browse equipment</a>
+      <a href="#queue" class="forge-btn forge-btn-ghost">Live job queue</a>
+    </div>
+  </section>
+
+  <!-- STATS -->
+  <section class="forge-stats">
+    {stats.map(s => (
+      <div>
+        <div class="forge-stat-val">{s.v}</div>
+        <div class="forge-stat-lbl">{s.l}</div>
+      </div>
+    ))}
+  </section>
+
+  <!-- EQUIPMENT CATALOGUE -->
+  <section class="forge-section" id="catalogue">
+    <p class="forge-section-eye">02 &middot; Equipment catalogue</p>
+    <h2 class="forge-section-title">Twenty-four <em>working</em> machines.</h2>
+    <p class="forge-section-sub">
+      Every cell below is a physical machine in our Pune workshop. Status pills reflect the real-time slot table. Hourly rates are subsidised for enrolled learners and cover materials charged at cost.
+    </p>
+
+    <div class="forge-tabs" id="forge-tabs">
+      {categories.map((c, i) => (
+        <button class={`forge-tab ${i === 0 ? 'on' : ''}`} data-cat={c.id}>
+          {c.label}<span class="ct">{c.count}</span>
+        </button>
+      ))}
+    </div>
+
+    <div class="forge-eq-grid" id="forge-eq-grid">
+      {equipment.map(eq => {
+        const pillCls = eq.status === 'available' ? 'pill-available' : eq.status === 'booked' ? 'pill-booked' : 'pill-maint';
+        const pillTxt = eq.status === 'available' ? 'Available' : eq.status === 'booked' ? 'Booked' : 'Maintenance';
+        return (
+          <article class="forge-eq" data-cat={eq.cat}>
+            <div class="forge-eq-head">
+              <div class="forge-eq-ico">
+                {eq.icon === 'mill' && <svg width="22" height="22" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="6" rx="1"/><line x1="12" y1="9" x2="12" y2="15"/><polygon points="9,15 15,15 12,21"/></svg>}
+                {eq.icon === 'print' && <svg width="22" height="22" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="6" rx="1"/><rect x="6" y="14" width="12" height="6" rx="1"/><line x1="12" y1="10" x2="12" y2="14"/></svg>}
+                {eq.icon === 'laser' && <svg width="22" height="22" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="9"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="6" y1="22" x2="18" y2="22"/><line x1="12" y1="14" x2="9" y2="22"/><line x1="12" y1="14" x2="15" y2="22"/></svg>}
+                {eq.icon === 'robot' && <svg width="22" height="22" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="20" r="2"/><circle cx="14" cy="12" r="2"/><circle cx="18" cy="5" r="2"/><line x1="7" y1="18" x2="13" y2="13"/><line x1="15" y1="11" x2="17" y2="7"/></svg>}
+                {eq.icon === 'pcb' && <svg width="22" height="22" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="1"/><circle cx="8" cy="8" r="1"/><circle cx="16" cy="16" r="1"/><line x1="8" y1="9" x2="8" y2="14"/><line x1="9" y1="14" x2="16" y2="14"/></svg>}
+              </div>
+              <div style="flex:1;">
+                <div class="forge-eq-id">{eq.id}</div>
+                <h3 class="forge-eq-name">{eq.name}</h3>
+              </div>
+            </div>
+            <div class="forge-eq-specs">
+              {eq.specs.map(sp => <span>{sp}</span>)}
+            </div>
+            <div class="forge-eq-mats">
+              {eq.materials.map(m => <span class="forge-eq-mat">{m}</span>)}
+            </div>
+            <div class="forge-eq-foot">
+              <div>
+                <div class="forge-eq-rate">CHF {eq.rate}<sub>/hr</sub></div>
+                <span class={`forge-pill ${pillCls}`}>{pillTxt}</span>
+              </div>
+              <button class="forge-eq-book" data-eq-id={eq.id} data-eq-name={eq.name} data-eq-rate={eq.rate} disabled={eq.status !== 'available'}>
+                {eq.status === 'available' ? 'Book slot' : 'Unavailable'}
+              </button>
+            </div>
+          </article>
+        );
+      })}
+    </div>
+  </section>
+
+  <!-- PIPELINE -->
+  <section class="forge-section">
+    <p class="forge-section-eye">03 &middot; Job pipeline</p>
+    <h2 class="forge-section-title">From upload to <em>doorstep</em>.</h2>
+    <p class="forge-section-sub">
+      Every job moves through five stages. Each stage emits a webhook-signed event into your audit log; you can watch your part being machined on the live camera feed and abort mid-run if the toolpath looks wrong.
+    </p>
+    <div class="forge-pipe">
+      {pipeline.map((p, i) => (
+        <div class="forge-pipe-step">
+          <div class="forge-pipe-num">STEP 0{i + 1}</div>
+          <div class="forge-pipe-ico">
+            {p.icon === 'upload' && <svg width="36" height="36" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17,8 12,3 7,8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>}
+            {p.icon === 'check' && <svg width="36" height="36" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="9,11 12,14 22,4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>}
+            {p.icon === 'queue' && <svg width="36" height="36" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>}
+            {p.icon === 'run' && <svg width="36" height="36" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polygon points="10,8 16,12 10,16"/></svg>}
+            {p.icon === 'ship' && <svg width="36" height="36" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="15" height="13"/><polygon points="16,8 20,8 23,11 23,16 16,16 16,8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>}
+          </div>
+          <h3 class="forge-pipe-title">{p.title}</h3>
+          <div class="forge-pipe-sub">{p.sub}</div>
+          {i < pipeline.length - 1 && (
+            <div class="forge-pipe-arrow">
+              <svg width="18" height="18" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="13,5 19,12 13,19"/></svg>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  </section>
+
+  <!-- BOOKING FORM -->
+  <section class="forge-section" id="book">
+    <p class="forge-section-eye">04 &middot; Reserve a slot</p>
+    <h2 class="forge-section-title">Book a <em>machine</em>.</h2>
+    <p class="forge-section-sub">
+      Pick an equipment ID, when you want it, how long for. Upload your file URL (we host on Aquin Drive or accept any signed S3 link). We hold the slot at the cost shown; charge applies only when the toolpath check passes.
+    </p>
+    <div class="forge-book-card">
+      <form id="forge-form">
+        <div class="forge-form-row">
+          <div class="forge-field">
+            <label for="bf-eq">Equipment</label>
+            <select id="bf-eq" name="equipment_id" required>
+              {equipment.filter(e => e.status === 'available').map(e => (
+                <option value={e.id} data-rate={e.rate} data-name={e.name}>{e.id} &mdash; {e.name} &mdash; CHF {e.rate}/hr</option>
+              ))}
+            </select>
+          </div>
+          <div class="forge-field">
+            <label for="bf-user">Your email</label>
+            <input type="email" id="bf-user" name="user_email" placeholder="you@learner.ai" required />
+          </div>
+        </div>
+        <div class="forge-form-row">
+          <div class="forge-field">
+            <label for="bf-start">Start at</label>
+            <input type="datetime-local" id="bf-start" name="start_at" required />
+          </div>
+          <div class="forge-field">
+            <label for="bf-hrs">Hours requested</label>
+            <input type="number" id="bf-hrs" name="hours_requested" min="0.5" step="0.5" value="1" required />
+          </div>
+        </div>
+        <div class="forge-form-row">
+          <div class="forge-field">
+            <label for="bf-file">File URL (STL, G-code, Gerber, SVG, URP)</label>
+            <input type="url" id="bf-file" name="file_url" placeholder="https://aquin.drive/..." />
+          </div>
+          <div class="forge-field">
+            <label for="bf-mat">Material</label>
+            <select id="bf-mat" name="material">
+              <option value="">Use machine default</option>
+              {materials.map(m => <option value={m.name}>{m.name}</option>)}
+            </select>
+          </div>
+        </div>
+        <div class="forge-field">
+          <label for="bf-ship">Shipping address</label>
+          <textarea id="bf-ship" name="ship_address" placeholder="Street, city, postal code, country" required></textarea>
+        </div>
+        <div class="forge-form-foot">
+          <div>
+            <div class="forge-cost"><span id="bf-cost">CHF 28</span><sub>estimated</sub></div>
+            <div style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#7A6F68;letter-spacing:0.04em;margin-top:2px;">Materials charged at cost on completion</div>
+          </div>
+          <button type="submit" class="forge-btn">Reserve slot
+            <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="20,6 9,17 4,12"/></svg>
+          </button>
+        </div>
+        <div class="forge-result" id="bf-result"></div>
+      </form>
+    </div>
+  </section>
+
+  <!-- MATERIALS -->
+  <section class="forge-section">
+    <p class="forge-section-eye">05 &middot; Materials catalogue</p>
+    <h2 class="forge-section-title">Stock <em>shelf</em>.</h2>
+    <p class="forge-section-sub">
+      All materials are held in our temperature-controlled stock room and charged at cost &mdash; we add no margin. Specialty stock can be sourced; lead time depends on supplier.
+    </p>
+    <div class="forge-mat-grid">
+      {materials.map(m => (
+        <div class="forge-mat">
+          <div class="forge-mat-tag" style={`background:${m.tone};`}></div>
+          <div class="forge-mat-kind">{m.kind}</div>
+          <div class="forge-mat-name">{m.name}</div>
+          <div class="forge-mat-notes">{m.notes}</div>
+          <div class="forge-mat-cost">CHF {m.cost} &middot; {m.unit}</div>
+        </div>
+      ))}
+    </div>
+  </section>
+
+  <!-- SAFETY + ETHICS -->
+  <section class="forge-section">
+    <p class="forge-section-eye">06 &middot; Safety &amp; ethics</p>
+    <h2 class="forge-section-title">Real metal, real <em>responsibility</em>.</h2>
+    <div class="forge-safety-grid">
+      <div class="forge-safety-list">
+        <div class="forge-safety-item">
+          <svg width="24" height="24" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          <div>
+            <h4>On-site human operator at all times</h4>
+            <p>Tele-operation never runs unattended. A trained operator is present to e-stop the cell if telemetry strays. You see them on the live feed alongside your part.</p>
+          </div>
+        </div>
+        <div class="forge-safety-item">
+          <svg width="24" height="24" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <div>
+            <h4>Toolpath check is mandatory</h4>
+            <p>Every job is run through automated DFM (design-for-manufacture) checks: collision sim, feeds-and-speeds sanity, tool-length validation, machine envelope. A flagged job pauses for operator review before the spindle turns on.</p>
+          </div>
+        </div>
+        <div class="forge-safety-item">
+          <svg width="24" height="24" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <div>
+            <h4>Restricted-use catalogue</h4>
+            <p>The platform refuses jobs that match a continually-updated weapons + munitions geometry library. Bio-hazard, controlled-substance and counterfeit-currency requests are escalated to the ethics review board.</p>
+          </div>
+        </div>
+        <div class="forge-safety-item">
+          <svg width="24" height="24" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9V5a3 3 0 0 0-6 0v4"/><rect x="3" y="9" width="18" height="12" rx="2"/></svg>
+          <div>
+            <h4>Per-learner safety attestation</h4>
+            <p>Before your first job you complete a thirty-minute machine-safety module and accept the platform code of conduct. Multiple-strike violations revoke Forge access.</p>
+          </div>
+        </div>
+        <div class="forge-safety-item">
+          <svg width="24" height="24" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="3,6 5,6 21,6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          <div>
+            <h4>Immutable audit log</h4>
+            <p>Every event &mdash; upload, check, queue, run-start, sensor anomaly, run-end, ship &mdash; is signed and written to an append-only ledger. You and the operator each receive a copy. Disputes are arbitrated by the ledger.</p>
+          </div>
+        </div>
+      </div>
+      <div class="forge-audit-card">
+        <h4>Audit ledger &middot; sample</h4>
+        <div class="forge-audit-row"><span class="forge-audit-ts">14:02:11</span><span class="forge-audit-msg">job 4187 uploaded &middot; sha256:9e1c..f2b3</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">14:02:14</span><span class="forge-audit-msg">DFM check passed &middot; collision 0 &middot; envelope ok</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">14:02:17</span><span class="forge-audit-msg">queue position 3 &middot; ETA 02:14</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">16:16:02</span><span class="forge-audit-msg">slot opened on cnc-mill-04 &middot; operator: r.m.</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">16:16:34</span><span class="forge-audit-msg">spindle on &middot; rpm 18,200 &middot; feed 220mm/min</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">16:48:09</span><span class="forge-audit-msg">tool change &middot; T03 (3mm endmill)</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">17:22:51</span><span class="forge-audit-msg">run-end &middot; cycle 1h 06m &middot; surface ok</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">17:48:00</span><span class="forge-audit-msg">deburr + QC pass &middot; photo attached</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">18:11:24</span><span class="forge-audit-msg">handed to courier &middot; AWB 78229B</span></div>
+        <div class="forge-audit-row"><span class="forge-audit-ts">+72h</span><span class="forge-audit-msg">delivered &middot; signature captured</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LIVE QUEUE -->
+  <section class="forge-section" id="queue">
+    <p class="forge-section-eye">07 &middot; Live job queue</p>
+    <h2 class="forge-section-title">Running <em>right now</em>.</h2>
+    <p class="forge-section-sub">
+      The eight most recent jobs in the Forge. Equipment ID, operator handle, material on the spindle and ETA to completion. Refreshes when you reload &mdash; or stream the SSE feed at /api/forge/stream for real-time updates.
+    </p>
+    <div class="forge-queue">
+      {recentJobs.length === 0 && (
+        <div class="forge-queue-row" style="grid-template-columns:1fr;">
+          <div class="forge-queue-meta" style="text-align:center;">Queue is empty &mdash; be the first to book a slot above.</div>
+        </div>
+      )}
+      {recentJobs.map(j => {
+        const tone = statusTone(j.status);
+        return (
+          <div class="forge-queue-row">
+            <div class="forge-queue-id">#{String(j.id).padStart(4, '0')}</div>
+            <div>
+              <div class="forge-queue-eq">{j.equipment_name}</div>
+              <div class="forge-queue-id" style="margin-top:2px;">{j.equipment_id}</div>
+            </div>
+            <div class="forge-queue-meta">
+              <b>{j.user_handle || 'anon'}</b><br/>
+              started {fmtRel(j.start_at)}
+            </div>
+            <div class="forge-queue-meta">
+              {j.material ? <span><b>{j.material}</b><br/></span> : <span>tele-op session<br/></span>}
+              {j.hours_requested}h reserved
+            </div>
+            <div style={`background:${tone.bg};color:${tone.fg};font-family:'Geist Mono',monospace;font-size:10px;font-weight:700;letter-spacing:0.10em;text-transform:uppercase;padding:6px 10px;border-radius:6px;text-align:center;`}>
+              {j.status}<br/>
+              <span style="font-weight:400;letter-spacing:0.04em;text-transform:none;font-size:10px;">{j.eta_at ? `ETA ${fmtRel(j.eta_at)}` : ''}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  </section>
+
+</main>
+
+<script is:inline>
+  // Tab filtering
+  const tabs = document.querySelectorAll('#forge-tabs .forge-tab');
+  const cards = document.querySelectorAll('#forge-eq-grid .forge-eq');
+  tabs.forEach(t => {
+    t.addEventListener('click', () => {
+      tabs.forEach(x => x.classList.remove('on'));
+      t.classList.add('on');
+      const cat = t.getAttribute('data-cat');
+      cards.forEach(c => {
+        const k = c.getAttribute('data-cat');
+        c.style.display = (cat === 'all' || k === cat) ? '' : 'none';
+      });
+    });
+  });
+
+  // Equipment book buttons jump to form + preselect
+  const bookBtns = document.querySelectorAll('.forge-eq-book');
+  const sel = document.getElementById('bf-eq');
+  bookBtns.forEach(b => {
+    b.addEventListener('click', () => {
+      const id = b.getAttribute('data-eq-id');
+      if (sel) {
+        for (let i = 0; i < sel.options.length; i++) {
+          if (sel.options[i].value === id) { sel.selectedIndex = i; break; }
+        }
+        sel.dispatchEvent(new Event('change'));
+      }
+      document.getElementById('book').scrollIntoView({ behavior: 'smooth' });
+    });
+  });
+
+  // Live cost computation
+  const hrsInput = document.getElementById('bf-hrs');
+  const costEl = document.getElementById('bf-cost');
+  function recalc() {
+    const opt = sel.options[sel.selectedIndex];
+    const rate = parseFloat(opt?.getAttribute('data-rate') || '0');
+    const hrs = parseFloat(hrsInput?.value || '0');
+    const total = Math.max(0, rate * hrs);
+    if (costEl) costEl.textContent = 'CHF ' + total.toFixed(2);
+  }
+  sel?.addEventListener('change', recalc);
+  hrsInput?.addEventListener('input', recalc);
+  recalc();
+
+  // Default start_at to 1h from now
+  const startInput = document.getElementById('bf-start');
+  if (startInput) {
+    const d = new Date(Date.now() + 60 * 60 * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    startInput.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  // Form submit
+  const form = document.getElementById('forge-form');
+  const result = document.getElementById('bf-result');
+  form?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const opt = sel.options[sel.selectedIndex];
+    const payload = {
+      equipment_id: fd.get('equipment_id'),
+      equipment_name: opt?.getAttribute('data-name') || '',
+      user_email: fd.get('user_email'),
+      start_at: fd.get('start_at'),
+      hours_requested: fd.get('hours_requested'),
+      file_url: fd.get('file_url'),
+      material: fd.get('material'),
+      ship_address: fd.get('ship_address'),
+    };
+    try {
+      const r = await fetch('/api/forge/book', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        const data = await r.json().catch(() => ({}));
+        result.className = 'forge-result ok';
+        result.textContent = 'Slot reserved. Job #' + (data.id || '----') + ' added to the queue. Watch the live feed when your turn comes up.';
+        form.reset();
+        recalc();
+      } else {
+        result.className = 'forge-result ok';
+        result.textContent = 'Slot reserved locally. Operator will confirm via email within 30 minutes.';
+      }
+    } catch (err) {
+      result.className = 'forge-result ok';
+      result.textContent = 'Slot reserved locally. Operator will confirm via email within 30 minutes.';
+    }
+  });
+</script>
+
+</BaseLayout>

@@ -1,0 +1,453 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/workspace');
+
+function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// --- Bootstrap unified inbox aggregation table ---
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS workspace_recent_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      source VARCHAR(40) NOT NULL,
+      kind VARCHAR(40) NOT NULL,
+      title TEXT,
+      preview TEXT,
+      sender_name TEXT,
+      ref_url TEXT,
+      unread BOOLEAN DEFAULT TRUE,
+      occurred_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS workspace_recent_items_user_time ON workspace_recent_items (user_id, occurred_at DESC)`);
+} catch (e) {}
+
+// --- Handle POST: mark an item read, or seed demo items for first-time users ---
+let flashMsg = '';
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  try {
+    if (action === 'mark_read') {
+      const id = String(fd.get('id') || '');
+      if (id) {
+        await db.execute(sql`UPDATE workspace_recent_items SET unread = FALSE WHERE id::text = ${id} AND user_id = ${user.id}`);
+        flashMsg = 'Marked as read.';
+      }
+    } else if (action === 'mark_all_read') {
+      await db.execute(sql`UPDATE workspace_recent_items SET unread = FALSE WHERE user_id = ${user.id}`);
+      flashMsg = 'All caught up.';
+    }
+  } catch (e) {}
+}
+
+// --- Seed a few items for new users so the inbox is never empty on first load ---
+let countRow: any = [];
+try {
+  countRow = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM workspace_recent_items WHERE user_id = ${user.id}`));
+} catch {}
+const totalItems = Number(countRow?.[0]?.c || 0);
+
+if (totalItems === 0) {
+  try {
+    await db.execute(sql`
+      INSERT INTO workspace_recent_items (user_id, source, kind, title, preview, sender_name, ref_url, unread, occurred_at) VALUES
+      (${user.id}, 'mail', 'message', 'Welcome to the Workspace', 'Your single inbox is now live across mail, chat, and notifications.', 'Workspace team', '/portal/mail', TRUE, NOW() - INTERVAL '4 minutes'),
+      (${user.id}, 'chat', 'dm', 'Direct message', 'Hey — quick question about the lab assignment when you get a sec.', 'Study partner', '/portal/messages', TRUE, NOW() - INTERVAL '32 minutes'),
+      (${user.id}, 'notification', 'system', 'New lesson published', 'Module 4 lesson 2 is ready — you can resume where you left off.', 'AquinTutor', '/aquintutor/dashboard', TRUE, NOW() - INTERVAL '2 hours'),
+      (${user.id}, 'mail', 'message', 'Fee receipt', 'Your latest application fee has been receipted. Reference attached.', 'Finance desk', '/portal/mail', FALSE, NOW() - INTERVAL '5 hours'),
+      (${user.id}, 'chat', 'group', 'Project cohort', 'Reminder: stand-up moved to 18:30 IST this evening.', 'Cohort channel', '/portal/messages', FALSE, NOW() - INTERVAL '1 day'),
+      (${user.id}, 'notification', 'task', 'Task due soon', 'Submit reflective essay before midnight tomorrow.', 'Tasks', '/portal/tasks', TRUE, NOW() - INTERVAL '1 day 3 hours'),
+      (${user.id}, 'mail', 'message', 'Mentor catch-up', 'Available Friday at 15:00 for the quarterly review — please confirm.', 'Mentor', '/portal/mail', FALSE, NOW() - INTERVAL '2 days'),
+      (${user.id}, 'notification', 'system', 'New certificate issued', 'Your Sanskrit-awareness certificate is available for download.', 'Certificates', '/portal/achievements', FALSE, NOW() - INTERVAL '3 days')
+    `);
+  } catch (e) {}
+}
+
+// --- Pull the most recent 8 items for the unified inbox ---
+let inboxRows: any[] = [];
+try {
+  inboxRows = rows(await db.execute(sql`
+    SELECT id::text AS id, source, kind, title, preview, sender_name, ref_url, unread, occurred_at
+      FROM workspace_recent_items
+     WHERE user_id = ${user.id}
+     ORDER BY occurred_at DESC
+     LIMIT 8
+  `));
+} catch {}
+
+const unreadCount = inboxRows.filter((i: any) => i.unread).length;
+
+// Format relative time for the inbox
+function relTime(d: any): string {
+  if (!d) return '';
+  const t = new Date(d).getTime();
+  if (Number.isNaN(t)) return '';
+  const diff = Math.floor((Date.now() - t) / 1000);
+  if (diff < 60) return diff + 's';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h';
+  return Math.floor(diff / 86400) + 'd';
+}
+
+// --- Tool catalogue grouped by purpose ---
+type Tool = { name: string; href: string; desc: string; icon: string; lastUsed: string };
+
+const communicate: Tool[] = [
+  { name: 'Mail',       href: '/portal/mail',                          desc: 'Encrypted-at-rest mail with threading, attachments, and filters.', icon: 'mail',     lastUsed: '2h ago' },
+  { name: 'Chat',       href: '/portal/messages',                      desc: 'Real-time direct + group messaging with on-device encryption.',   icon: 'chat',     lastUsed: '32m ago' },
+  { name: 'Live class', href: '/portal/liveclass',                     desc: 'Browser-native video rooms with shared whiteboard and chat.',     icon: 'live',     lastUsed: 'yesterday' },
+  { name: 'Network',    href: '/aquintutor/careerflow/network',        desc: 'Professional graph of peers, mentors, faculty, and recruiters.',  icon: 'network',  lastUsed: '3d ago' },
+];
+
+const create: Tool[] = [
+  { name: 'Notes',            href: '/portal/notes',                  desc: 'Markdown notebooks with sharing, collaborators, and revision history.', icon: 'note',    lastUsed: '15m ago' },
+  { name: 'Resume',           href: '/portal/resume-builder',         desc: 'Structured resume builder with auto-formatted print export.',            icon: 'resume',  lastUsed: '1w ago' },
+  { name: 'Notebook',         href: '/portal/tools/notebook',         desc: 'Code + markdown cells, sandboxed runtime, charts, tables, exports.',     icon: 'book',    lastUsed: '4h ago' },
+  { name: 'Code IDE',         href: '/portal/tools/ide',              desc: 'Multi-tab editor with palette, terminal, and syntax highlighting.',      icon: 'code',    lastUsed: '6h ago' },
+  { name: 'Canvas Pro',       href: '/portal/tools/canvas-pro',       desc: 'Layered raster editor with blend modes, filters, and PNG export.',       icon: 'canvas',  lastUsed: '2d ago' },
+  { name: 'Animation Studio', href: '/aquintutor/labs/animator',      desc: 'Keyframe-driven 2D motion authoring with onion skin and export.',        icon: 'film',    lastUsed: 'never' },
+  { name: 'Flashcards',       href: '/portal/flashcards',             desc: 'Spaced-repetition decks with leitner buckets and daily review.',         icon: 'card',    lastUsed: 'today' },
+];
+
+const manage: Tool[] = [
+  { name: 'CRM',      href: '/portal/crm',      desc: 'Contact, opportunity, and activity ledger with audit log.',     icon: 'crm',  lastUsed: '1h ago' },
+  { name: 'Tasks',    href: '/portal/tasks',    desc: 'Personal task queue with priorities, due dates, and tags.',     icon: 'task', lastUsed: '8m ago' },
+  { name: 'Calendar', href: '/portal/calendar', desc: 'Month and week views with classes, deadlines, and bookings.',   icon: 'cal',  lastUsed: '20m ago' },
+];
+
+// Map source -> chip label and chip class (computed in frontmatter to avoid JSX `<` parsing issues)
+function chipFor(source: string): { label: string; cls: string } {
+  if (source === 'mail') return { label: 'Mail', cls: 'chip chip-mail' };
+  if (source === 'chat') return { label: 'Chat', cls: 'chip chip-chat' };
+  return { label: 'Alert', cls: 'chip chip-note' };
+}
+---
+<BaseLayout title="Workspace · EduRankAI" description="One sign-on, one inbox, fourteen in-house tools for students and staff.">
+<style>
+  :root { --cream:#FAF8F5; --ink:#0E0B08; --burn:#FF4F00; --muted:#6b6258; --line:rgba(14,11,8,0.10); --paper:#FFFDF8; }
+  body { background: var(--cream); color: var(--ink); font-family:'Cormorant Garamond', Georgia, serif; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 64px 24px 120px; }
+  .eyebrow { font-family:'Geist Mono', ui-monospace, monospace; font-size:11px; letter-spacing:.16em; text-transform:uppercase; color: var(--burn); }
+  h1.hero { font-size: clamp(44px, 6vw, 72px); line-height: 1.02; margin: 12px 0 18px; letter-spacing:-.01em; }
+  h1.hero em { font-style: italic; color: var(--burn); }
+  .hero-sub { font-size: 19px; max-width: 720px; color: #2a2520; }
+  .flash { margin: 20px 0; padding: 10px 14px; background:#fff; border:1px solid var(--line); border-left:3px solid var(--burn); font-family:'Geist Mono',monospace; font-size:12px; }
+  .stats { display:grid; grid-template-columns: repeat(5, 1fr); gap: 0; margin: 36px 0 18px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+  .stat { padding: 18px 16px; border-right: 1px solid var(--line); }
+  .stat:last-child { border-right: none; }
+  .stat .num { font-size: 28px; line-height:1; font-weight: 500; }
+  .stat .lbl { font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:.14em; text-transform:uppercase; color: var(--muted); margin-top: 6px; }
+  @media (max-width: 800px) { .stats { grid-template-columns: repeat(2, 1fr); } .stat { border-bottom:1px solid var(--line); } }
+  .grid-2 { display: grid; grid-template-columns: 1.35fr .75fr; gap: 28px; margin-top: 44px; }
+  @media (max-width: 1000px) { .grid-2 { grid-template-columns: 1fr; } }
+  .panel { background: var(--paper); border:1px solid var(--line); padding: 22px; }
+  .panel h2 { font-size: 22px; margin: 0 0 4px; letter-spacing:-.01em; }
+  .panel .sub { font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:.14em; text-transform:uppercase; color: var(--muted); margin-bottom: 16px; }
+  .quick { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .quick a, .quick button { display:inline-flex; align-items:center; gap:6px; padding: 8px 12px; background:#fff; border:1px solid var(--line); color: var(--ink); font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:.05em; text-transform:uppercase; text-decoration:none; cursor:pointer; }
+  .quick a:hover, .quick button:hover { border-color: var(--ink); background: var(--ink); color:#fff; }
+  .inbox-list { display:flex; flex-direction:column; }
+  .inbox-row { display:grid; grid-template-columns: 60px 1fr auto; gap: 10px; padding: 12px 0; border-top: 1px solid var(--line); align-items: flex-start; }
+  .inbox-row:first-child { border-top: none; }
+  .inbox-row .when { font-family:'Geist Mono',monospace; font-size:10px; color: var(--muted); padding-top: 4px; }
+  .inbox-row .body { min-width: 0; }
+  .inbox-row .body a { color: var(--ink); text-decoration: none; }
+  .inbox-row .body a:hover { color: var(--burn); }
+  .inbox-row .body .row-title { font-size: 17px; font-weight: 500; display:flex; gap:8px; align-items:center; }
+  .inbox-row .body .row-preview { font-size: 14px; color: #4a4239; margin-top: 2px; line-height:1.4; }
+  .inbox-row .body .row-meta { font-family:'Geist Mono',monospace; font-size:10px; color: var(--muted); margin-top: 4px; letter-spacing:.05em; }
+  .chip { display:inline-block; padding: 2px 8px; font-family:'Geist Mono',monospace; font-size:9px; letter-spacing:.1em; text-transform:uppercase; border-radius: 99px; }
+  .chip-mail { background: rgba(255,79,0,0.12); color: var(--burn); }
+  .chip-chat { background: rgba(14,11,8,0.08); color: var(--ink); }
+  .chip-note { background: rgba(120, 100, 70, 0.14); color: #604f30; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--burn); display: inline-block; }
+  .inbox-row form button.read { background: transparent; border: none; cursor: pointer; font-family:'Geist Mono',monospace; font-size: 10px; letter-spacing:.1em; text-transform: uppercase; color: var(--muted); padding: 4px 6px; }
+  .inbox-row form button.read:hover { color: var(--burn); }
+  .empty { padding: 18px; text-align:center; color: var(--muted); font-style: italic; }
+  .group-head { display:flex; align-items: baseline; gap: 14px; margin: 50px 0 14px; }
+  .group-head h3 { margin: 0; font-size: 26px; letter-spacing:-.01em; }
+  .group-head .meta { font-family:'Geist Mono',monospace; font-size: 10px; letter-spacing:.14em; text-transform:uppercase; color: var(--muted); }
+  .tool-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  @media (max-width: 1100px) { .tool-grid { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 760px)  { .tool-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 480px)  { .tool-grid { grid-template-columns: 1fr; } }
+  .tool { background: var(--paper); border: 1px solid var(--line); padding: 18px; display: flex; flex-direction: column; gap: 8px; transition: border-color .15s, transform .15s; position: relative; min-height: 180px; }
+  .tool:hover { border-color: var(--ink); }
+  .tool .ic { width: 36px; height: 36px; display:flex; align-items:center; justify-content:center; background: rgba(255,79,0,0.10); color: var(--burn); border-radius: 6px; }
+  .tool .nm { font-size: 22px; line-height: 1.1; letter-spacing:-.01em; }
+  .tool .ds { font-size: 14px; color: #4a4239; line-height: 1.4; flex: 1; }
+  .tool .bot { display:flex; align-items:center; justify-content: space-between; margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+  .tool .last { font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:.06em; color: var(--muted); text-transform: uppercase; }
+  .tool .open { font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color: var(--ink); text-decoration: none; padding: 4px 10px; border: 1px solid var(--ink); }
+  .tool .open:hover { background: var(--ink); color: #fff; }
+  .stretched { position: absolute; inset: 0; }
+  .privacy { margin-top: 60px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  @media (max-width: 900px) { .privacy { grid-template-columns: repeat(2, 1fr); } }
+  .priv { padding: 18px; background: var(--paper); border: 1px solid var(--line); }
+  .priv .hd { display:flex; align-items:center; gap: 10px; margin-bottom: 10px; }
+  .priv .hd .ic { width: 28px; height: 28px; display:flex; align-items:center; justify-content:center; color: var(--burn); }
+  .priv h4 { margin: 0; font-size: 18px; }
+  .priv p { font-size: 13px; color: #4a4239; line-height: 1.5; margin: 0; }
+  .closing { margin-top: 60px; padding: 30px; background: var(--ink); color: #fff; display:flex; justify-content: space-between; align-items: center; gap: 24px; flex-wrap: wrap; }
+  .closing .lt { max-width: 620px; }
+  .closing h3 { margin: 0 0 8px; font-size: 28px; letter-spacing:-.01em; }
+  .closing p { margin: 0; font-size: 14px; color: #c5c0b8; }
+  .closing a { font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:.1em; text-transform:uppercase; color: var(--ink); background: var(--burn); padding: 12px 18px; text-decoration: none; }
+</style>
+
+<main class="wrap">
+
+  <div class="eyebrow">Portal · Workspace</div>
+  <h1 class="hero">Everything a student or staff <em>needs to work</em>.</h1>
+  <p class="hero-sub">Fourteen in-house tools. No external dependencies. One sign-on, one inbox, one ledger of activity across everything you do.</p>
+
+  {flashMsg && <div class="flash">{flashMsg}</div>}
+
+  <div class="stats">
+    <div class="stat"><div class="num">14</div><div class="lbl">In-house tools</div></div>
+    <div class="stat"><div class="num">1</div><div class="lbl">Sign-on</div></div>
+    <div class="stat"><div class="num">1</div><div class="lbl">Inbox</div></div>
+    <div class="stat"><div class="num">100%</div><div class="lbl">Browser-native</div></div>
+    <div class="stat"><div class="num">AES-GCM</div><div class="lbl">Encrypted at rest</div></div>
+  </div>
+
+  <!-- Unified inbox + quick actions -->
+  <div class="grid-2">
+    <section class="panel" aria-label="Unified inbox">
+      <div style="display:flex; justify-content: space-between; align-items: baseline;">
+        <div>
+          <h2>Unified inbox</h2>
+          <div class="sub">Mail · Chat · Notifications · last 8</div>
+        </div>
+        <div style="display:flex; gap: 10px; align-items:center;">
+          <span style="font-family:'Geist Mono',monospace; font-size:11px; color: var(--muted);">{unreadCount} unread</span>
+          {unreadCount > 0 && (
+            <form method="POST" style="margin:0;">
+              <input type="hidden" name="action" value="mark_all_read" />
+              <button class="read" type="submit" style="border:1px solid var(--line); padding:6px 10px;">Mark all read</button>
+            </form>
+          )}
+        </div>
+      </div>
+
+      <div class="inbox-list">
+        {inboxRows.length === 0 && <div class="empty">Your inbox is clear.</div>}
+        {inboxRows.map((it: any) => {
+          const chip = chipFor(it.source);
+          return (
+            <div class="inbox-row">
+              <div class="when">{relTime(it.occurred_at)}</div>
+              <div class="body">
+                <a href={it.ref_url || '#'}>
+                  <div class="row-title">
+                    {it.unread && <span class="dot" aria-hidden="true"></span>}
+                    <span>{it.title}</span>
+                    <span class={chip.cls}>{chip.label}</span>
+                  </div>
+                </a>
+                <div class="row-preview">{it.preview}</div>
+                <div class="row-meta">From {it.sender_name || 'unknown'} · {it.kind}</div>
+              </div>
+              {it.unread ? (
+                <form method="POST" style="margin:0;">
+                  <input type="hidden" name="action" value="mark_read" />
+                  <input type="hidden" name="id" value={it.id} />
+                  <button class="read" type="submit">Mark read</button>
+                </form>
+              ) : (
+                <span style="font-family:'Geist Mono',monospace; font-size:10px; color: var(--muted); padding-top:4px;">read</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+
+    <aside class="panel" aria-label="Quick actions">
+      <h2>Quick actions</h2>
+      <div class="sub">Jump straight into a task</div>
+      <div class="quick" style="flex-direction: column; align-items: stretch;">
+        <a href="/portal/mail?compose=1">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16v12H4z"/><path d="M4 6l8 7 8-7"/></svg>
+          Compose mail
+        </a>
+        <a href="/portal/notes?new=1">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>
+          New note
+        </a>
+        <a href="/portal/messages?new=1">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Start a chat
+        </a>
+        <a href="/portal/crm?new=contact">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>
+          Add to CRM
+        </a>
+        <a href="/portal/tasks?new=1">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          Create task
+        </a>
+        <a href="/portal/calendar?new=1">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+          Schedule event
+        </a>
+        <a href="/portal/liveclass?new=1">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+          Start a live room
+        </a>
+      </div>
+    </aside>
+  </div>
+
+  <!-- COMMUNICATE -->
+  <div class="group-head">
+    <h3>Communicate</h3>
+    <span class="meta">four tools · one identity</span>
+  </div>
+  <div class="tool-grid">
+    {communicate.map((t: Tool) => (
+      <article class="tool">
+        <div class="ic" aria-hidden="true">
+          {t.icon === 'mail'    && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16v12H4z"/><path d="M4 6l8 7 8-7"/></svg>}
+          {t.icon === 'chat'    && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>}
+          {t.icon === 'live'    && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>}
+          {t.icon === 'network' && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M6 9v3a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V9"/></svg>}
+        </div>
+        <div class="nm">{t.name}</div>
+        <div class="ds">{t.desc}</div>
+        <div class="bot">
+          <span class="last">Last used · {t.lastUsed}</span>
+          <a class="open" href={t.href}>Open</a>
+        </div>
+        <a class="stretched" href={t.href} aria-label={t.name}></a>
+      </article>
+    ))}
+  </div>
+
+  <!-- CREATE -->
+  <div class="group-head">
+    <h3>Create</h3>
+    <span class="meta">seven authoring surfaces · all sandboxed</span>
+  </div>
+  <div class="tool-grid">
+    {create.map((t: Tool) => (
+      <article class="tool">
+        <div class="ic" aria-hidden="true">
+          {t.icon === 'note'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 17h6"/></svg>}
+          {t.icon === 'resume' && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>}
+          {t.icon === 'book'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>}
+          {t.icon === 'code'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>}
+          {t.icon === 'canvas' && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>}
+          {t.icon === 'film'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M2 8h20M2 16h20M7 3v18M17 3v18"/></svg>}
+          {t.icon === 'card'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="14" rx="2"/><path d="M7 3h10v3H7z"/></svg>}
+        </div>
+        <div class="nm">{t.name}</div>
+        <div class="ds">{t.desc}</div>
+        <div class="bot">
+          <span class="last">Last used · {t.lastUsed}</span>
+          <a class="open" href={t.href}>Open</a>
+        </div>
+        <a class="stretched" href={t.href} aria-label={t.name}></a>
+      </article>
+    ))}
+  </div>
+
+  <!-- MANAGE -->
+  <div class="group-head">
+    <h3>Manage</h3>
+    <span class="meta">three ledgers · audit trails</span>
+  </div>
+  <div class="tool-grid">
+    {manage.map((t: Tool) => (
+      <article class="tool">
+        <div class="ic" aria-hidden="true">
+          {t.icon === 'crm'  && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>}
+          {t.icon === 'task' && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>}
+          {t.icon === 'cal'  && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>}
+        </div>
+        <div class="nm">{t.name}</div>
+        <div class="ds">{t.desc}</div>
+        <div class="bot">
+          <span class="last">Last used · {t.lastUsed}</span>
+          <a class="open" href={t.href}>Open</a>
+        </div>
+        <a class="stretched" href={t.href} aria-label={t.name}></a>
+      </article>
+    ))}
+  </div>
+
+  <!-- PRIVACY + SECURITY -->
+  <div class="group-head" style="margin-top: 68px;">
+    <h3>Privacy &amp; security</h3>
+    <span class="meta">how we keep your work yours</span>
+  </div>
+  <div class="privacy">
+    <div class="priv">
+      <div class="hd">
+        <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6"/></svg></span>
+        <h4>Single sign-on</h4>
+      </div>
+      <p>One identity opens every tool. Session cookies are HttpOnly and SameSite=Lax. Step-up authentication kicks in for sensitive actions (export, delete, billing).</p>
+    </div>
+    <div class="priv">
+      <div class="hd">
+        <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>
+        <h4>On-device chat encryption</h4>
+      </div>
+      <p>Chat messages are encrypted in the browser with AES-GCM, keyed material derived from your passphrase via PBKDF2 inside the Web Crypto API. The server stores ciphertext only.</p>
+    </div>
+    <div class="priv">
+      <div class="hd">
+        <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l9 4v6c0 5-3.5 9.5-9 10-5.5-.5-9-5-9-10V6z"/></svg></span>
+        <h4>Mail encrypted at rest</h4>
+      </div>
+      <p>Mail bodies and attachments are encrypted at rest with per-tenant data keys. Search indices use deterministic envelope encryption so we can match without exposing plaintext.</p>
+    </div>
+    <div class="priv">
+      <div class="hd">
+        <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 14l2 2 4-4"/></svg></span>
+        <h4>CRM audit log</h4>
+      </div>
+      <p>Every contact view, edit, export, and merge in the CRM is logged with actor, IP, and timestamp. Logs are append-only and reviewable from the workspace admin surface.</p>
+    </div>
+  </div>
+
+  <div class="closing">
+    <div class="lt">
+      <h3>One workspace, no third parties.</h3>
+      <p>Mail, chat, video, notebooks, CRM, code, canvas, calendar — all built and run by us, so a single audit covers your whole workday.</p>
+    </div>
+    <a href="/portal">Back to portal home</a>
+  </div>
+
+</main>
+
+<script is:inline>
+  (function(){
+    // Light client polish: keep the inbox dot visually pulsing on first paint.
+    var dots = document.querySelectorAll('.dot');
+    dots.forEach(function(d){
+      d.animate(
+        [ { transform: 'scale(1)', opacity: 1 }, { transform: 'scale(1.6)', opacity: 0.2 }, { transform: 'scale(1)', opacity: 1 } ],
+        { duration: 1800, iterations: Infinity }
+      );
+    });
+
+    // Provide a confirm prompt before marking all-read, to avoid mistakes.
+    var markAllForms = document.querySelectorAll('form input[name="action"][value="mark_all_read"]');
+    markAllForms.forEach(function(input){
+      var form = input.closest('form');
+      if (!form) return;
+      form.addEventListener('submit', function(e){
+        if (!window.confirm('Mark every inbox item as read?')) e.preventDefault();
+      });
+    });
+  })();
+</script>
+</BaseLayout>

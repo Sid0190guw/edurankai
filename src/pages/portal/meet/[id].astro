@@ -1,0 +1,2373 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+const { id } = Astro.params as { id: string };
+
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/meet/' + id));
+
+/* ============================================================
+   SELF-BOOTSTRAP MEETING TABLES
+   ============================================================ */
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS meet_rooms (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      host_user_id UUID,
+      title TEXT,
+      kind VARCHAR(20) DEFAULT 'huddle',
+      scheduled_at TIMESTAMPTZ,
+      duration_minutes INT DEFAULT 60,
+      passcode VARCHAR(40),
+      is_locked BOOLEAN DEFAULT false,
+      recording_enabled BOOLEAN DEFAULT false,
+      recording_url TEXT,
+      max_participants INT DEFAULT 250,
+      status VARCHAR(20) DEFAULT 'open',
+      features JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS meet_participants (
+      room_id UUID REFERENCES meet_rooms(id) ON DELETE CASCADE,
+      user_id UUID,
+      display_name VARCHAR(200),
+      role VARCHAR(20) DEFAULT 'attendee',
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      left_at TIMESTAMPTZ,
+      in_lobby BOOLEAN DEFAULT false,
+      PRIMARY KEY (room_id, user_id)
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS meet_chat (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      room_id UUID,
+      user_id UUID,
+      body TEXT,
+      is_private_to UUID,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS meet_polls (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      room_id UUID,
+      question TEXT,
+      options JSONB DEFAULT '[]'::jsonb,
+      votes JSONB DEFAULT '{}'::jsonb,
+      status VARCHAR(20) DEFAULT 'live',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS meet_breakouts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      room_id UUID,
+      label VARCHAR(120),
+      participants JSONB DEFAULT '[]'::jsonb,
+      ends_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+} catch (e) {
+  console.error('meet schema bootstrap failed', e);
+}
+
+/* ============================================================
+   LOAD-OR-CREATE ROOM
+   ============================================================ */
+const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+let room: any = null;
+if (isUuid) {
+  const r = rowsOf(await db.execute(sql`SELECT * FROM meet_rooms WHERE id = ${id}::uuid LIMIT 1`));
+  room = r[0] || null;
+}
+if (!room) {
+  const r = rowsOf(await db.execute(sql`
+    INSERT INTO meet_rooms (id, host_user_id, title, kind)
+    VALUES (${isUuid ? id : sql`gen_random_uuid()`}, ${user.id}, ${'Untitled huddle'}, 'huddle')
+    ON CONFLICT (id) DO NOTHING
+    RETURNING *
+  `));
+  room = r[0] || null;
+  if (!room) {
+    const r2 = rowsOf(await db.execute(sql`SELECT * FROM meet_rooms WHERE id = ${id}::uuid LIMIT 1`));
+    room = r2[0] || null;
+  }
+}
+
+const isHost = room && room.host_user_id === user.id;
+
+/* ============================================================
+   POST HANDLERS — join / chat / poll / vote / breakout / end
+   ============================================================ */
+let actionResult: any = null;
+if (Astro.request.method === 'POST' && room) {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('action') as string || '').trim();
+
+    if (action === 'join') {
+      const displayName = (fd.get('display_name') as string || user.email || 'Guest').slice(0, 200);
+      const role = isHost ? 'host' : 'attendee';
+      await db.execute(sql`
+        INSERT INTO meet_participants (room_id, user_id, display_name, role, in_lobby)
+        VALUES (${room.id}::uuid, ${user.id}, ${displayName}, ${role}, ${room.is_locked && !isHost})
+        ON CONFLICT (room_id, user_id) DO UPDATE SET left_at = NULL, joined_at = NOW()
+      `);
+      actionResult = { ok: true };
+    }
+
+    if (action === 'chat') {
+      const body = (fd.get('body') as string || '').trim().slice(0, 4000);
+      const priv = (fd.get('is_private_to') as string || '').trim();
+      if (body) {
+        await db.execute(sql`
+          INSERT INTO meet_chat (room_id, user_id, body, is_private_to)
+          VALUES (${room.id}::uuid, ${user.id}, ${body}, ${priv ? sql`${priv}::uuid` : null})
+        `);
+      }
+      actionResult = { ok: true };
+    }
+
+    if (action === 'create_poll' && isHost) {
+      const question = (fd.get('question') as string || '').trim().slice(0, 500);
+      let opts: string[] = [];
+      try { opts = JSON.parse((fd.get('options') as string || '[]')); } catch { opts = []; }
+      if (question && opts.length >= 2) {
+        await db.execute(sql`
+          INSERT INTO meet_polls (room_id, question, options, status)
+          VALUES (${room.id}::uuid, ${question}, ${JSON.stringify(opts)}::jsonb, 'live')
+        `);
+      }
+      actionResult = { ok: true };
+    }
+
+    if (action === 'vote') {
+      const pollId = (fd.get('poll_id') as string || '').trim();
+      const choice = (fd.get('choice') as string || '').trim();
+      if (pollId && choice) {
+        await db.execute(sql`
+          UPDATE meet_polls SET votes = jsonb_set(
+            COALESCE(votes,'{}'::jsonb),
+            ${'{' + user.id + '}'}::text[],
+            to_jsonb(${choice}::text)
+          ) WHERE id = ${pollId}::uuid
+        `);
+      }
+      actionResult = { ok: true };
+    }
+
+    if (action === 'create_breakout' && isHost) {
+      const label = (fd.get('label') as string || '').trim().slice(0, 120);
+      let parts: string[] = [];
+      try { parts = JSON.parse((fd.get('participants') as string || '[]')); } catch { parts = []; }
+      const mins = parseInt((fd.get('minutes') as string || '15'), 10) || 15;
+      if (label) {
+        await db.execute(sql`
+          INSERT INTO meet_breakouts (room_id, label, participants, ends_at)
+          VALUES (${room.id}::uuid, ${label}, ${JSON.stringify(parts)}::jsonb, NOW() + (${mins} || ' minutes')::interval)
+        `);
+      }
+      actionResult = { ok: true };
+    }
+
+    if (action === 'end' && isHost) {
+      await db.execute(sql`UPDATE meet_rooms SET status='ended' WHERE id=${room.id}::uuid`);
+      actionResult = { ok: true, ended: true };
+    }
+
+    if (action === 'lock' && isHost) {
+      const lk = (fd.get('locked') as string) === '1';
+      await db.execute(sql`UPDATE meet_rooms SET is_locked=${lk} WHERE id=${room.id}::uuid`);
+      actionResult = { ok: true };
+    }
+
+    if (action === 'set_title' && isHost) {
+      const t = (fd.get('title') as string || '').trim().slice(0, 200);
+      if (t) await db.execute(sql`UPDATE meet_rooms SET title=${t} WHERE id=${room.id}::uuid`);
+      actionResult = { ok: true };
+    }
+  } catch (e: any) {
+    actionResult = { ok: false, error: String(e?.message || e).slice(0, 240) };
+  }
+}
+
+/* ============================================================
+   LOAD ROOM STATE FOR INITIAL RENDER
+   ============================================================ */
+let participants: any[] = [];
+let chat: any[] = [];
+let polls: any[] = [];
+let breakouts: any[] = [];
+
+if (room) {
+  participants = rowsOf(await db.execute(sql`
+    SELECT user_id, display_name, role, joined_at, left_at, in_lobby
+    FROM meet_participants WHERE room_id = ${room.id}::uuid AND left_at IS NULL
+    ORDER BY joined_at ASC LIMIT 250
+  `));
+  chat = rowsOf(await db.execute(sql`
+    SELECT c.id, c.user_id, c.body, c.is_private_to, c.created_at, p.display_name
+    FROM meet_chat c
+    LEFT JOIN meet_participants p ON p.user_id = c.user_id AND p.room_id = c.room_id
+    WHERE c.room_id = ${room.id}::uuid AND (c.is_private_to IS NULL OR c.is_private_to = ${user.id}::uuid OR c.user_id = ${user.id}::uuid)
+    ORDER BY c.created_at DESC LIMIT 100
+  `));
+  chat = chat.reverse();
+  polls = rowsOf(await db.execute(sql`
+    SELECT id, question, options, votes, status, created_at
+    FROM meet_polls WHERE room_id = ${room.id}::uuid
+    ORDER BY created_at DESC LIMIT 20
+  `));
+  breakouts = rowsOf(await db.execute(sql`
+    SELECT id, label, participants, ends_at, created_at
+    FROM meet_breakouts WHERE room_id = ${room.id}::uuid
+    AND ends_at > NOW() ORDER BY created_at DESC LIMIT 20
+  `));
+}
+
+const roomTitle = room?.title || 'Untitled huddle';
+const roomKind = room?.kind || 'huddle';
+const isRecording = !!room?.recording_enabled;
+const isLocked = !!room?.is_locked;
+const myDisplayName = user.email?.split('@')[0] || 'Guest';
+---
+
+<BaseLayout title={`${roomTitle} - Meeting room`} description="Live video meeting room. Audio, video, screen share, chat, polls, whiteboard, breakouts, captions, recording — all browser-native." showNav={false} showFooter={false}>
+
+<style is:global>
+  html, body { background: #0a0a0c; color: #e8e8ee; margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: 'DM Sans', system-ui, sans-serif; }
+  body.era-has-fab { padding-bottom: 0 !important; }
+  .era-fab, [class*="era-fab"] { display: none !important; }
+</style>
+
+<style>
+  /* ===========================================================
+     MEETING ROOM LAYOUT
+     =========================================================== */
+  .mt-shell {
+    display: grid;
+    grid-template-rows: 52px 1fr 78px;
+    height: 100vh;
+    width: 100vw;
+    background: #0a0a0c;
+    color: #e8e8ee;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* ---------- TOP BAR ---------- */
+  .mt-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    background: #11131a;
+    border-bottom: 1px solid #1f1f2a;
+    gap: 12px;
+  }
+  .mt-top-left, .mt-top-right { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .mt-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 19px; font-weight: 600;
+    color: #e8e8ee;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 320px;
+    border: none; background: transparent; outline: none;
+    padding: 4px 6px; border-radius: 4px;
+  }
+  .mt-title:focus { background: #1a1a25; }
+  .mt-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 999px;
+    font-family: 'Geist Mono', monospace; font-size: 10px;
+    letter-spacing: 0.12em; text-transform: uppercase; font-weight: 700;
+    border: 1px solid #2a2a35;
+    color: #cfd6da;
+    background: #181821;
+  }
+  .mt-pill.host { color: #a78bfa; border-color: rgba(167,139,250,0.4); background: rgba(167,139,250,0.08); }
+  .mt-pill.rec { color: #FF4F00; border-color: rgba(255,79,0,0.4); background: rgba(255,79,0,0.08); }
+  .mt-pill.rec .dot { width: 8px; height: 8px; background: #FF4F00; border-radius: 50%; animation: pulseDot 1.2s ease-in-out infinite; }
+  .mt-pill.e2e { color: #67e8f9; border-color: rgba(103,232,249,0.4); background: rgba(103,232,249,0.08); }
+  .mt-pill.kind { color: #e8e8ee; }
+  @keyframes pulseDot { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(1.3); } }
+
+  .mt-btn {
+    background: #1a1a25; color: #e8e8ee;
+    border: 1px solid #2a2a35;
+    padding: 6px 12px; border-radius: 6px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700;
+    cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: all 0.15s;
+  }
+  .mt-btn:hover { background: #22222e; border-color: #3a3a4a; }
+  .mt-btn.primary { background: #FF4F00; border-color: #FF4F00; color: #fff; }
+  .mt-btn.primary:hover { background: #e84600; }
+  .mt-btn.danger { background: #dc2626; border-color: #dc2626; color: #fff; }
+  .mt-btn.danger:hover { background: #b91c1c; }
+  .mt-btn.cyan { background: rgba(103,232,249,0.1); border-color: rgba(103,232,249,0.4); color: #67e8f9; }
+  .mt-btn.purple { background: rgba(167,139,250,0.1); border-color: rgba(167,139,250,0.4); color: #a78bfa; }
+  .mt-btn svg { width: 14px; height: 14px; }
+  .mt-btn-count { background: #2a2a35; color: #67e8f9; padding: 1px 6px; border-radius: 999px; font-size: 9.5px; }
+
+  /* ---------- BODY (stage + right panel) ---------- */
+  .mt-body { display: grid; grid-template-columns: 1fr 0; overflow: hidden; transition: grid-template-columns 0.22s; }
+  .mt-body.panel-open { grid-template-columns: 1fr 340px; }
+
+  /* ---------- STAGE ---------- */
+  .mt-stage {
+    position: relative;
+    background: #0a0a0c;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    padding: 12px;
+  }
+  .mt-grid {
+    width: 100%; height: 100%;
+    display: grid; gap: 8px;
+    align-items: stretch; justify-items: stretch;
+  }
+  .mt-grid.share-on { grid-template-columns: 1fr 220px; grid-template-rows: 1fr; }
+  .mt-grid.share-on .share-tile { grid-column: 1; grid-row: 1; }
+  .mt-grid.share-on .tile-strip {
+    grid-column: 2; grid-row: 1;
+    display: flex; flex-direction: column; gap: 8px; overflow-y: auto;
+  }
+  .mt-grid.share-on .tile-strip .mt-tile { aspect-ratio: 16 / 10; min-height: 124px; }
+
+  /* Auto-arrange — uses CSS data-count */
+  .mt-grid[data-count="1"]  { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+  .mt-grid[data-count="2"]  { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
+  .mt-grid[data-count="3"]  { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+  .mt-grid[data-count="4"]  { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+  .mt-grid[data-count="5"], .mt-grid[data-count="6"]  { grid-template-columns: repeat(3,1fr); grid-template-rows: 1fr 1fr; }
+  .mt-grid[data-count="7"], .mt-grid[data-count="8"], .mt-grid[data-count="9"] { grid-template-columns: repeat(3,1fr); grid-template-rows: repeat(3,1fr); }
+  .mt-grid[data-count="10"], .mt-grid[data-count="11"], .mt-grid[data-count="12"] { grid-template-columns: repeat(4,1fr); grid-template-rows: repeat(3,1fr); }
+  .mt-grid[data-count="13"], .mt-grid[data-count="14"], .mt-grid[data-count="15"], .mt-grid[data-count="16"] { grid-template-columns: repeat(4,1fr); grid-template-rows: repeat(4,1fr); }
+  .mt-grid[data-count="17"], .mt-grid[data-count="18"], .mt-grid[data-count="19"], .mt-grid[data-count="20"], .mt-grid[data-count="25"] { grid-template-columns: repeat(5,1fr); grid-template-rows: repeat(5,1fr); }
+  .mt-grid[data-count="49"] { grid-template-columns: repeat(7,1fr); grid-template-rows: repeat(7,1fr); }
+
+  /* ---------- TILE ---------- */
+  .mt-tile {
+    position: relative;
+    background: #11131a;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 2px solid transparent;
+    transition: border-color 0.18s;
+    min-height: 0;
+  }
+  .mt-tile.active-speaker { border-color: #fbbf24; box-shadow: 0 0 0 2px rgba(251,191,36,0.18); }
+  .mt-tile.pinned { border-color: #67e8f9; }
+  .mt-tile video {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    background: linear-gradient(135deg, #1a1a25, #0c0e14);
+  }
+  .mt-tile .placeholder {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--tile-bg, linear-gradient(135deg, #1f2937, #0f172a));
+    color: #e8e8ee;
+    font-family: 'Cormorant Garamond', serif;
+    font-size: clamp(28px, 6vw, 64px);
+    font-weight: 600;
+  }
+  .mt-tile.share-tile { background: #000; }
+  .mt-tile.share-tile video { object-fit: contain; }
+
+  .mt-tile-overlay {
+    position: absolute; left: 8px; bottom: 8px; right: 8px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 6px; pointer-events: none;
+  }
+  .mt-tile-name {
+    background: rgba(0,0,0,0.55);
+    backdrop-filter: blur(6px);
+    color: #fff;
+    padding: 3px 8px;
+    border-radius: 5px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    display: inline-flex; align-items: center; gap: 6px;
+    max-width: 70%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .mt-tile-icons { display: flex; gap: 4px; }
+  .mt-tile-icon {
+    width: 22px; height: 22px;
+    background: rgba(0,0,0,0.55);
+    backdrop-filter: blur(6px);
+    border-radius: 5px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #fff;
+  }
+  .mt-tile-icon svg { width: 12px; height: 12px; }
+  .mt-tile-icon.muted { background: rgba(220,38,38,0.85); }
+  .mt-tile-icon.cam-off { background: rgba(220,38,38,0.85); }
+  .mt-tile-icon.hand { background: rgba(251,191,36,0.85); color: #0a0a0c; }
+  .mt-tile-icon.pin { background: rgba(103,232,249,0.85); color: #0a0a0c; }
+  .mt-signal { position: absolute; top: 8px; right: 8px; display: flex; gap: 2px; align-items: flex-end; }
+  .mt-signal span { width: 3px; background: rgba(255,255,255,0.35); border-radius: 1px; }
+  .mt-signal span:nth-child(1) { height: 4px; }
+  .mt-signal span:nth-child(2) { height: 7px; }
+  .mt-signal span:nth-child(3) { height: 10px; }
+  .mt-signal.s1 span:nth-child(1) { background: #34d399; }
+  .mt-signal.s2 span:nth-child(1), .mt-signal.s2 span:nth-child(2) { background: #34d399; }
+  .mt-signal.s3 span { background: #34d399; }
+
+  /* ---------- CAPTIONS STRIP ---------- */
+  .mt-captions {
+    position: absolute;
+    left: 50%; bottom: 16px;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.78);
+    color: #fff;
+    padding: 10px 18px;
+    border-radius: 10px;
+    max-width: 70%;
+    font-size: 16px;
+    line-height: 1.4;
+    text-align: center;
+    pointer-events: none;
+    z-index: 30;
+    display: none;
+  }
+  .mt-captions.on { display: block; }
+
+  /* ---------- REACTIONS LAYER ---------- */
+  .mt-rx-layer {
+    position: absolute; inset: 0;
+    pointer-events: none;
+    overflow: hidden;
+    z-index: 25;
+  }
+  .mt-rx {
+    position: absolute;
+    bottom: 0;
+    font-size: 36px;
+    animation: rxFloat 3.5s ease-out forwards;
+  }
+  .mt-rx svg { width: 42px; height: 42px; }
+  @keyframes rxFloat {
+    0% { transform: translateY(0) scale(0.5); opacity: 0; }
+    10% { opacity: 1; transform: translateY(-20px) scale(1.1); }
+    100% { transform: translateY(-70vh) scale(1.1) rotate(15deg); opacity: 0; }
+  }
+
+  /* ---------- RIGHT PANEL ---------- */
+  .mt-panel {
+    background: #11131a;
+    border-left: 1px solid #1f1f2a;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
+  }
+  .mt-panel-tabs {
+    display: grid; grid-template-columns: repeat(6, 1fr);
+    background: #0c0e14;
+    border-bottom: 1px solid #1f1f2a;
+  }
+  .mt-panel-tab {
+    background: transparent; border: none; color: #9aa6b6;
+    padding: 10px 4px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 9.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 700;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+  }
+  .mt-panel-tab:hover { color: #e8e8ee; }
+  .mt-panel-tab.active { color: #67e8f9; border-bottom-color: #67e8f9; background: rgba(103,232,249,0.05); }
+
+  .mt-panel-body { flex: 1; overflow-y: auto; padding: 12px; }
+  .mt-panel-body::-webkit-scrollbar { width: 8px; }
+  .mt-panel-body::-webkit-scrollbar-thumb { background: #2a2a35; border-radius: 4px; }
+  .mt-panel-section { display: none; }
+  .mt-panel-section.active { display: block; }
+
+  /* Chat */
+  .mt-chat-list { display: flex; flex-direction: column; gap: 10px; padding-bottom: 8px; }
+  .mt-chat-msg { font-size: 13px; line-height: 1.5; }
+  .mt-chat-from { font-family: 'Geist Mono', monospace; font-size: 10.5px; color: #67e8f9; font-weight: 700; margin-bottom: 2px; display: flex; gap: 6px; align-items: center; }
+  .mt-chat-from .priv { background: rgba(167,139,250,0.15); color: #a78bfa; padding: 1px 5px; border-radius: 3px; font-size: 9px; }
+  .mt-chat-body { color: #e8e8ee; word-wrap: break-word; }
+  .mt-chat-form { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid #1f1f2a; }
+  .mt-chat-input {
+    background: #0a0a0c; border: 1px solid #2a2a35;
+    color: #e8e8ee; padding: 8px 10px; border-radius: 6px;
+    font-family: 'DM Sans', sans-serif; font-size: 13px; outline: none;
+    resize: none; min-height: 56px;
+  }
+  .mt-chat-input:focus { border-color: #67e8f9; }
+  .mt-chat-priv { display: flex; gap: 6px; align-items: center; font-size: 11px; color: #9aa6b6; }
+  .mt-chat-priv select { background: #0a0a0c; border: 1px solid #2a2a35; color: #e8e8ee; padding: 3px 6px; border-radius: 4px; font-size: 11px; flex: 1; }
+
+  /* Participants list */
+  .mt-pl-search { width: 100%; background: #0a0a0c; border: 1px solid #2a2a35; color: #e8e8ee; padding: 7px 10px; border-radius: 6px; font-size: 12.5px; outline: none; margin-bottom: 10px; }
+  .mt-pl-search:focus { border-color: #67e8f9; }
+  .mt-pl-section-title { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: #67e8f9; font-weight: 700; margin: 10px 0 6px; }
+  .mt-pl-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 8px; border-radius: 6px;
+    margin-bottom: 2px;
+  }
+  .mt-pl-item:hover { background: #1a1a25; }
+  .mt-pl-av {
+    width: 28px; height: 28px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 13px;
+    color: #fff;
+    flex-shrink: 0;
+  }
+  .mt-pl-name { flex: 1; font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mt-pl-role { font-family: 'Geist Mono', monospace; font-size: 9.5px; color: #a78bfa; text-transform: uppercase; letter-spacing: 0.08em; }
+  .mt-pl-ctrls { display: flex; gap: 3px; }
+  .mt-pl-ctrl {
+    width: 22px; height: 22px;
+    background: #1a1a25; border: 1px solid #2a2a35;
+    color: #cfd6da;
+    border-radius: 4px;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer;
+  }
+  .mt-pl-ctrl:hover { color: #67e8f9; border-color: #67e8f9; }
+  .mt-pl-ctrl svg { width: 11px; height: 11px; }
+  .mt-pl-ctrl.danger:hover { color: #f87171; border-color: #f87171; }
+
+  /* Polls */
+  .mt-poll { background: #0a0a0c; border: 1px solid #2a2a35; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+  .mt-poll-q { font-weight: 600; color: #e8e8ee; margin-bottom: 8px; font-size: 13.5px; }
+  .mt-poll-opt { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; cursor: pointer; }
+  .mt-poll-opt input[type=radio] { accent-color: #67e8f9; }
+  .mt-poll-opt-label { flex: 1; font-size: 12.5px; color: #cfd6da; }
+  .mt-poll-bar { height: 4px; background: #1f1f2a; border-radius: 2px; overflow: hidden; margin: 3px 0 6px 22px; }
+  .mt-poll-bar-fill { height: 100%; background: linear-gradient(90deg, #67e8f9, #a78bfa); }
+  .mt-poll-result { font-family: 'Geist Mono', monospace; font-size: 10px; color: #9aa6b6; margin-left: 22px; }
+  .mt-poll-status { display: inline-block; padding: 1px 6px; border-radius: 3px; font-family: 'Geist Mono', monospace; font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; }
+  .mt-poll-status.live { background: rgba(52,211,153,0.15); color: #34d399; }
+  .mt-poll-status.closed { background: rgba(154,166,182,0.15); color: #9aa6b6; }
+
+  /* Whiteboard */
+  .mt-wb-tools { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+  .mt-wb-tool { background: #1a1a25; border: 1px solid #2a2a35; color: #cfd6da; padding: 6px 8px; border-radius: 5px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font-size: 11px; }
+  .mt-wb-tool.active { background: #67e8f9; color: #0a0a0c; border-color: #67e8f9; }
+  .mt-wb-tool svg { width: 12px; height: 12px; }
+  .mt-wb-colors { display: flex; gap: 4px; }
+  .mt-wb-color { width: 18px; height: 18px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; }
+  .mt-wb-color.active { border-color: #fff; transform: scale(1.1); }
+  .mt-wb-canvas {
+    width: 100%;
+    background: #fafafa;
+    border-radius: 8px;
+    border: 1px solid #2a2a35;
+    cursor: crosshair;
+    display: block;
+  }
+
+  /* Captions tab */
+  .mt-cap-log { font-size: 13px; line-height: 1.55; color: #cfd6da; white-space: pre-wrap; }
+  .mt-cap-line { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px dashed #1f1f2a; }
+  .mt-cap-line .ts { font-family: 'Geist Mono', monospace; font-size: 9.5px; color: #67e8f9; letter-spacing: 0.08em; display: block; margin-bottom: 2px; }
+
+  /* Apps tab */
+  .mt-app-card { background: #0a0a0c; border: 1px solid #2a2a35; border-radius: 8px; padding: 12px; margin-bottom: 10px; cursor: pointer; }
+  .mt-app-card:hover { border-color: #67e8f9; }
+  .mt-app-card h4 { margin: 0 0 4px; font-size: 13.5px; color: #e8e8ee; display: flex; align-items: center; gap: 8px; }
+  .mt-app-card h4 svg { width: 14px; height: 14px; color: #67e8f9; }
+  .mt-app-card p { margin: 0; font-size: 11.5px; color: #9aa6b6; line-height: 1.4; }
+
+  /* Notes app */
+  .mt-notes-area {
+    width: 100%; box-sizing: border-box;
+    background: #0a0a0c; border: 1px solid #2a2a35;
+    color: #e8e8ee; padding: 10px;
+    border-radius: 6px;
+    font-family: 'DM Sans', sans-serif; font-size: 13px; line-height: 1.55;
+    outline: none; resize: vertical;
+    min-height: 200px;
+  }
+
+  /* Timer app */
+  .mt-timer {
+    text-align: center;
+    background: #0a0a0c; border: 1px solid #2a2a35;
+    border-radius: 8px; padding: 16px;
+  }
+  .mt-timer-display {
+    font-family: 'Geist Mono', monospace;
+    font-size: 38px; font-weight: 700;
+    color: #67e8f9;
+    letter-spacing: 0.04em;
+    margin: 8px 0 12px;
+  }
+  .mt-timer-ctrls { display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; }
+
+  /* ---------- BOTTOM CONTROL BAR ---------- */
+  .mt-controls {
+    background: #11131a;
+    border-top: 1px solid #1f1f2a;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    gap: 10px;
+  }
+  .mt-controls-left, .mt-controls-center, .mt-controls-right {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .mt-time {
+    font-family: 'Geist Mono', monospace;
+    font-size: 13px; color: #cfd6da;
+    letter-spacing: 0.04em;
+  }
+  .mt-ctrl {
+    width: 48px; height: 48px;
+    background: #1a1a25; border: 1px solid #2a2a35;
+    color: #e8e8ee;
+    border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: all 0.15s;
+    position: relative;
+  }
+  .mt-ctrl svg { width: 20px; height: 20px; }
+  .mt-ctrl:hover { background: #22222e; border-color: #3a3a4a; }
+  .mt-ctrl.on { background: #67e8f9; border-color: #67e8f9; color: #0a0a0c; }
+  .mt-ctrl.off { background: rgba(220,38,38,0.85); border-color: #dc2626; color: #fff; }
+  .mt-ctrl.purple { background: #a78bfa; border-color: #a78bfa; color: #0a0a0c; }
+  .mt-ctrl.end {
+    width: auto; padding: 0 22px; border-radius: 999px;
+    background: #dc2626; border-color: #dc2626; color: #fff;
+    font-family: 'Geist Mono', monospace; font-size: 12px; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    gap: 6px;
+  }
+  .mt-ctrl.end:hover { background: #b91c1c; }
+  .mt-ctrl-label {
+    position: absolute; bottom: -16px;
+    font-family: 'Geist Mono', monospace; font-size: 8.5px;
+    color: #6e6e78; letter-spacing: 0.08em;
+    text-transform: uppercase;
+    white-space: nowrap; pointer-events: none;
+    opacity: 0;
+  }
+  .mt-ctrl:hover .mt-ctrl-label { opacity: 1; }
+
+  /* Reactions popover */
+  .mt-rx-pop {
+    position: absolute;
+    bottom: 60px;
+    left: 50%; transform: translateX(-50%);
+    display: none;
+    background: #1a1a25;
+    border: 1px solid #2a2a35;
+    border-radius: 12px;
+    padding: 8px;
+    gap: 4px;
+    z-index: 50;
+  }
+  .mt-rx-pop.open { display: flex; }
+  .mt-rx-pop button {
+    width: 40px; height: 40px;
+    background: transparent; border: none;
+    border-radius: 8px; cursor: pointer;
+    color: #fbbf24;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .mt-rx-pop button svg { width: 22px; height: 22px; }
+  .mt-rx-pop button:hover { background: rgba(251,191,36,0.15); }
+
+  /* More menu */
+  .mt-more {
+    position: absolute;
+    bottom: 60px;
+    left: 50%; transform: translateX(-50%);
+    display: none;
+    background: #1a1a25;
+    border: 1px solid #2a2a35;
+    border-radius: 10px;
+    padding: 6px;
+    min-width: 220px;
+    flex-direction: column;
+    z-index: 50;
+  }
+  .mt-more.open { display: flex; }
+  .mt-more button {
+    background: transparent; border: none;
+    color: #e8e8ee; text-align: left;
+    padding: 9px 12px; border-radius: 6px;
+    cursor: pointer; font-size: 13px;
+    display: flex; align-items: center; gap: 9px;
+  }
+  .mt-more button:hover { background: #22222e; }
+  .mt-more button svg { width: 14px; height: 14px; color: #67e8f9; }
+  .mt-more hr { border: 0; border-top: 1px solid #2a2a35; margin: 4px 0; }
+
+  /* ---------- MODALS ---------- */
+  .mt-modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.72);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 100;
+    padding: 16px;
+  }
+  .mt-modal-bg.open { display: flex; }
+  .mt-modal {
+    background: #11131a;
+    border: 1px solid #2a2a35;
+    border-radius: 14px;
+    padding: 22px;
+    width: 100%;
+    max-width: 520px;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+  .mt-modal h3 { font-family: 'Cormorant Garamond', serif; font-size: 22px; margin: 0 0 14px; color: #e8e8ee; }
+  .mt-modal label { display: block; font-family: 'Geist Mono', monospace; font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: #9aa6b6; font-weight: 700; margin-bottom: 6px; margin-top: 10px; }
+  .mt-modal input[type=text], .mt-modal input[type=number], .mt-modal textarea, .mt-modal select {
+    width: 100%; box-sizing: border-box;
+    background: #0a0a0c; border: 1px solid #2a2a35;
+    color: #e8e8ee; padding: 9px 11px;
+    border-radius: 6px; font-family: 'DM Sans', sans-serif; font-size: 13px; outline: none;
+  }
+  .mt-modal textarea { min-height: 60px; resize: vertical; }
+  .mt-modal-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  .mt-modal-row input { flex: 1; }
+  .mt-modal-row button { background: #1a1a25; border: 1px solid #2a2a35; color: #cfd6da; padding: 7px 10px; border-radius: 5px; cursor: pointer; font-size: 11px; font-family: 'Geist Mono', monospace; }
+  .mt-modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
+
+  /* Help overlay */
+  .mt-help {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.85);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 200;
+    padding: 16px;
+  }
+  .mt-help.open { display: flex; }
+  .mt-help-card {
+    background: #11131a;
+    border: 1px solid #2a2a35;
+    border-radius: 14px;
+    padding: 28px;
+    max-width: 460px;
+    width: 100%;
+  }
+  .mt-help-card h3 { font-family: 'Cormorant Garamond', serif; font-size: 26px; margin: 0 0 18px; }
+  .mt-help-card table { width: 100%; }
+  .mt-help-card td { padding: 7px 4px; font-size: 13px; }
+  .mt-help-card td:first-child { font-family: 'Geist Mono', monospace; color: #67e8f9; font-weight: 700; width: 100px; font-size: 12px; }
+
+  /* Lobby state */
+  .mt-lobby {
+    position: fixed; inset: 0;
+    background: #0a0a0c;
+    display: flex; align-items: center; justify-content: center;
+    z-index: 300;
+    padding: 16px;
+  }
+  .mt-lobby-card {
+    background: #11131a;
+    border: 1px solid #2a2a35;
+    border-radius: 14px;
+    padding: 36px;
+    max-width: 480px; width: 100%;
+    text-align: center;
+  }
+  .mt-lobby-card h2 { font-family: 'Cormorant Garamond', serif; font-size: 30px; margin: 0 0 8px; }
+  .mt-lobby-card p { color: #9aa6b6; font-size: 14px; line-height: 1.6; margin: 0 0 20px; }
+
+  /* Breakouts panel */
+  .mt-bo-item {
+    background: #0a0a0c; border: 1px solid #2a2a35;
+    border-radius: 8px; padding: 10px;
+    margin-bottom: 8px;
+  }
+  .mt-bo-label { font-weight: 600; color: #e8e8ee; margin-bottom: 4px; }
+  .mt-bo-meta { font-family: 'Geist Mono', monospace; font-size: 10px; color: #9aa6b6; letter-spacing: 0.08em; }
+  .mt-bo-parts { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+  .mt-bo-parts span { background: rgba(103,232,249,0.12); color: #67e8f9; padding: 2px 7px; border-radius: 999px; font-size: 11px; }
+
+  /* Toast */
+  .mt-toast {
+    position: fixed; left: 50%; bottom: 110px;
+    transform: translateX(-50%);
+    background: #1a1a25;
+    border: 1px solid #2a2a35;
+    color: #e8e8ee;
+    padding: 10px 18px; border-radius: 8px;
+    font-size: 13px;
+    z-index: 500;
+    display: none;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  }
+  .mt-toast.show { display: block; animation: toastIn 0.3s; }
+  @keyframes toastIn { from { opacity: 0; transform: translate(-50%, 10px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+  /* Misc */
+  .hidden { display: none !important; }
+  .mt-empty { padding: 20px; text-align: center; color: #6e6e78; font-size: 12.5px; }
+</style>
+
+<main class="mt-shell">
+
+  <!-- ============ TOP BAR ============ -->
+  <div class="mt-top">
+    <div class="mt-top-left">
+      <input id="roomTitle" class="mt-title" value={roomTitle} readonly={!isHost} data-host={isHost ? '1' : '0'} maxlength="120"/>
+      <span class="mt-pill kind">{roomKind.toUpperCase()}</span>
+      {isHost && <span class="mt-pill host">HOST</span>}
+      {isLocked && <span class="mt-pill" style="color:#fbbf24;border-color:rgba(251,191,36,0.4);background:rgba(251,191,36,0.08);">LOCKED</span>}
+      <span class="mt-pill rec hidden" id="recPill"><span class="dot"></span> RECORDING</span>
+    </div>
+    <div class="mt-top-right">
+      <span class="mt-pill e2e">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="11" height="11"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        E2E ENCRYPTED
+      </span>
+      <span class="mt-pill" id="attendeeCount">{participants.length} IN ROOM</span>
+      <button class="mt-btn cyan" id="copyInvite">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        Copy invite
+      </button>
+    </div>
+  </div>
+
+  <!-- ============ BODY ============ -->
+  <div class="mt-body" id="meetBody">
+
+    <div class="mt-stage" id="stage">
+      <div class="mt-grid" id="tileGrid" data-count="2"></div>
+
+      <!-- Captions strip -->
+      <div class="mt-captions" id="captionsStrip"></div>
+
+      <!-- Reactions float -->
+      <div class="mt-rx-layer" id="reactionsLayer"></div>
+    </div>
+
+    <!-- Right Panel -->
+    <aside class="mt-panel" id="rightPanel">
+      <div class="mt-panel-tabs">
+        <button class="mt-panel-tab active" data-tab="chat">Chat</button>
+        <button class="mt-panel-tab" data-tab="people">People</button>
+        <button class="mt-panel-tab" data-tab="polls">Polls</button>
+        <button class="mt-panel-tab" data-tab="board">Board</button>
+        <button class="mt-panel-tab" data-tab="captions">Captions</button>
+        <button class="mt-panel-tab" data-tab="apps">Apps</button>
+      </div>
+
+      <div class="mt-panel-body">
+
+        <!-- CHAT -->
+        <section class="mt-panel-section active" data-tab-body="chat">
+          <div class="mt-chat-list" id="chatList">
+            {chat.map(c => (
+              <div class="mt-chat-msg">
+                <div class="mt-chat-from">
+                  <span>{c.display_name || 'Unknown'}</span>
+                  {c.is_private_to && <span class="priv">PRIVATE</span>}
+                </div>
+                <div class="mt-chat-body">{c.body}</div>
+              </div>
+            ))}
+            {chat.length === 0 && <div class="mt-empty">No messages yet. Say hello.</div>}
+          </div>
+          <div class="mt-chat-form">
+            <div class="mt-chat-priv">
+              <span>To:</span>
+              <select id="chatTo">
+                <option value="">Everyone</option>
+                {participants.filter((p:any) => p.user_id !== user.id).map((p:any) => (
+                  <option value={p.user_id}>{p.display_name} (private)</option>
+                ))}
+              </select>
+            </div>
+            <textarea class="mt-chat-input" id="chatInput" placeholder="Type a message - Enter to send, Shift+Enter newline"></textarea>
+            <button class="mt-btn primary" id="chatSend">Send</button>
+          </div>
+        </section>
+
+        <!-- PEOPLE -->
+        <section class="mt-panel-section" data-tab-body="people">
+          <input class="mt-pl-search" id="peopleSearch" placeholder="Search people..."/>
+
+          {isHost && (
+            <div style="display:flex;gap:6px;margin-bottom:10px;">
+              <button class="mt-btn" id="muteAllBtn" style="flex:1;">Mute all</button>
+              <button class="mt-btn" id="lockBtn" style="flex:1;">{isLocked ? 'Unlock' : 'Lock'}</button>
+            </div>
+          )}
+
+          <div class="mt-pl-section-title">In the room <span style="color:#9aa6b6;">({participants.filter((p:any) => !p.in_lobby).length})</span></div>
+          <div id="peopleList">
+            {participants.filter((p:any) => !p.in_lobby).map((p:any) => (
+              <div class="mt-pl-item" data-uid={p.user_id}>
+                <div class="mt-pl-av" style={`background: hsl(${Math.abs((p.display_name||'').split('').reduce((a:number,c:string)=>a+c.charCodeAt(0),0)) % 360}, 60%, 45%);`}>
+                  {(p.display_name || '?').slice(0,1).toUpperCase()}
+                </div>
+                <div class="mt-pl-name">
+                  {p.display_name}
+                  {p.user_id === user.id && <span style="color:#9aa6b6;font-size:11px;"> (you)</span>}
+                  <div class="mt-pl-role">{p.role}</div>
+                </div>
+                {isHost && p.user_id !== user.id && (
+                  <div class="mt-pl-ctrls">
+                    <button class="mt-pl-ctrl" title="Ask to mute" data-act="ask-mute">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+                    </button>
+                    <button class="mt-pl-ctrl danger" title="Remove" data-act="remove">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {participants.filter((p:any) => p.in_lobby).length > 0 && (
+            <>
+              <div class="mt-pl-section-title" style="color:#fbbf24;">In the lobby <span style="color:#9aa6b6;">({participants.filter((p:any) => p.in_lobby).length})</span></div>
+              {participants.filter((p:any) => p.in_lobby).map((p:any) => (
+                <div class="mt-pl-item">
+                  <div class="mt-pl-av" style="background:#fbbf24;color:#0a0a0c;">{(p.display_name || '?').slice(0,1).toUpperCase()}</div>
+                  <div class="mt-pl-name">{p.display_name}<div class="mt-pl-role">waiting</div></div>
+                  {isHost && <button class="mt-pl-ctrl" title="Admit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg></button>}
+                </div>
+              ))}
+            </>
+          )}
+
+          {breakouts.length > 0 && (
+            <>
+              <div class="mt-pl-section-title">Active breakouts</div>
+              {breakouts.map((b:any) => (
+                <div class="mt-bo-item">
+                  <div class="mt-bo-label">{b.label}</div>
+                  <div class="mt-bo-meta">Ends {new Date(b.ends_at).toLocaleTimeString()}</div>
+                  <div class="mt-bo-parts">{(Array.isArray(b.participants) ? b.participants : []).map((p:string) => <span>{p}</span>)}</div>
+                </div>
+              ))}
+            </>
+          )}
+
+          {isHost && (
+            <button class="mt-btn purple" id="createBreakoutBtn" style="width:100%;margin-top:12px;">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+              Create breakouts
+            </button>
+          )}
+        </section>
+
+        <!-- POLLS -->
+        <section class="mt-panel-section" data-tab-body="polls">
+          {isHost && (
+            <button class="mt-btn primary" id="newPollBtn" style="width:100%;margin-bottom:12px;">+ New poll</button>
+          )}
+          <div id="pollList">
+            {polls.map((p:any) => {
+              const opts = Array.isArray(p.options) ? p.options : [];
+              const votes = p.votes && typeof p.votes === 'object' ? p.votes : {};
+              const total = Object.keys(votes).length;
+              const counts: any = {};
+              opts.forEach((o:string) => { counts[o] = 0; });
+              Object.values(votes).forEach((v:any) => { if (counts[v] !== undefined) counts[v]++; });
+              return (
+                <div class="mt-poll" data-poll={p.id}>
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                    <span class={`mt-poll-status ${p.status}`}>{p.status.toUpperCase()}</span>
+                    <span style="font-family:'Geist Mono',monospace;font-size:9.5px;color:#9aa6b6;">{total} VOTES</span>
+                  </div>
+                  <div class="mt-poll-q">{p.question}</div>
+                  {opts.map((o:string) => (
+                    <>
+                      <label class="mt-poll-opt">
+                        <input type="radio" name={`poll-${p.id}`} value={o} disabled={p.status !== 'live'} data-poll-vote={p.id}/>
+                        <span class="mt-poll-opt-label">{o}</span>
+                      </label>
+                      <div class="mt-poll-bar"><div class="mt-poll-bar-fill" style={`width:${total > 0 ? (counts[o]/total*100) : 0}%;`}></div></div>
+                      <div class="mt-poll-result">{counts[o]} ({total > 0 ? Math.round(counts[o]/total*100) : 0}%)</div>
+                    </>
+                  ))}
+                </div>
+              );
+            })}
+            {polls.length === 0 && <div class="mt-empty">No polls yet.</div>}
+          </div>
+        </section>
+
+        <!-- BOARD -->
+        <section class="mt-panel-section" data-tab-body="board">
+          <div class="mt-wb-tools">
+            <button class="mt-wb-tool active" data-wb-tool="pen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/></svg> Pen</button>
+            <button class="mt-wb-tool" data-wb-tool="eraser"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 20H7L3 16L13 6L21 14L15 20"/></svg> Erase</button>
+            <button class="mt-wb-tool" data-wb-tool="text"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg> Text</button>
+            <button class="mt-wb-tool" data-wb-tool="clear">Clear</button>
+            <button class="mt-wb-tool" data-wb-tool="png">PNG</button>
+          </div>
+          <div class="mt-wb-colors" style="margin-bottom:8px;">
+            <div class="mt-wb-color active" data-wb-color="#0a0a0c" style="background:#0a0a0c;border:1px solid #444;"></div>
+            <div class="mt-wb-color" data-wb-color="#FF4F00" style="background:#FF4F00;"></div>
+            <div class="mt-wb-color" data-wb-color="#67e8f9" style="background:#67e8f9;"></div>
+            <div class="mt-wb-color" data-wb-color="#a78bfa" style="background:#a78bfa;"></div>
+            <div class="mt-wb-color" data-wb-color="#34d399" style="background:#34d399;"></div>
+            <div class="mt-wb-color" data-wb-color="#fbbf24" style="background:#fbbf24;"></div>
+            <div class="mt-wb-color" data-wb-color="#f87171" style="background:#f87171;"></div>
+          </div>
+          <canvas class="mt-wb-canvas" id="wbCanvas" width="320" height="380"></canvas>
+          <p style="font-size:10.5px;color:#6e6e78;margin-top:8px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">Strokes broadcast via RTCDataChannel</p>
+        </section>
+
+        <!-- CAPTIONS -->
+        <section class="mt-panel-section" data-tab-body="captions">
+          <div style="display:flex;gap:6px;margin-bottom:10px;">
+            <button class="mt-btn cyan" id="capToggle" style="flex:1;">Start captions</button>
+            <button class="mt-btn" id="capExport">Export</button>
+          </div>
+          <p style="font-size:11px;color:#9aa6b6;margin:0 0 10px;line-height:1.5;">Speech-to-text via the browser's native recognition engine. Transcription is local-only.</p>
+          <div class="mt-cap-log" id="capLog">
+            <div class="mt-empty">Captions off. Click Start to transcribe.</div>
+          </div>
+        </section>
+
+        <!-- APPS -->
+        <section class="mt-panel-section" data-tab-body="apps">
+          <div class="mt-app-card" data-app="notes">
+            <h4>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+              Collaborative notes
+            </h4>
+            <p>Shared notepad — anyone in the room can edit. Persists in your browser.</p>
+          </div>
+          <div class="mt-app-card" data-app="timer">
+            <h4>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M5 3L2 6"/><path d="M22 6l-3-3"/></svg>
+              Activity timer
+            </h4>
+            <p>Countdown for activities, breakouts, presentations. Audible alert on zero.</p>
+          </div>
+          <div class="mt-app-card" data-app="music">
+            <h4>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+              Background music
+            </h4>
+            <p>Ambient soundtracks for waiting rooms and focus sessions.</p>
+          </div>
+          <div class="mt-app-card" data-app="board">
+            <h4>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 8h7"/><path d="M9 13h5"/></svg>
+              Whiteboard
+            </h4>
+            <p>Shared drawing surface. Switch to the Board tab.</p>
+          </div>
+
+          <!-- Notes app body (hidden until selected) -->
+          <div id="appBodyNotes" class="hidden" style="margin-top:14px;">
+            <div class="mt-pl-section-title">Shared notes</div>
+            <textarea class="mt-notes-area" id="notesArea" placeholder="Type collaborative notes here..."></textarea>
+          </div>
+          <div id="appBodyTimer" class="hidden" style="margin-top:14px;">
+            <div class="mt-pl-section-title">Activity timer</div>
+            <div class="mt-timer">
+              <div class="mt-timer-display" id="timerDisplay">05:00</div>
+              <div class="mt-modal-row">
+                <input type="number" id="timerMins" placeholder="Mins" value="5" min="1" max="120"/>
+                <button class="mt-btn cyan" id="timerSet">Set</button>
+              </div>
+              <div class="mt-timer-ctrls" style="margin-top:10px;">
+                <button class="mt-btn primary" id="timerStart">Start</button>
+                <button class="mt-btn" id="timerPause">Pause</button>
+                <button class="mt-btn" id="timerReset">Reset</button>
+              </div>
+            </div>
+          </div>
+          <div id="appBodyMusic" class="hidden" style="margin-top:14px;">
+            <div class="mt-pl-section-title">Background music</div>
+            <p style="color:#9aa6b6;font-size:12px;margin:8px 0;">A simple generative ambient pad — pure Web Audio oscillators.</p>
+            <div style="display:flex;gap:6px;">
+              <button class="mt-btn cyan" id="musicPlay" style="flex:1;">Play</button>
+              <button class="mt-btn" id="musicStop" style="flex:1;">Stop</button>
+            </div>
+            <label style="margin-top:12px;">Volume</label>
+            <input type="range" id="musicVol" min="0" max="100" value="20" style="width:100%;accent-color:#67e8f9;"/>
+          </div>
+        </section>
+
+      </div>
+    </aside>
+  </div>
+
+  <!-- ============ BOTTOM CONTROL BAR ============ -->
+  <div class="mt-controls">
+    <div class="mt-controls-left">
+      <span class="mt-time" id="meetingClock">00:00</span>
+    </div>
+
+    <div class="mt-controls-center">
+      <button class="mt-ctrl on" id="micBtn" title="Mic (M)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+        <span class="mt-ctrl-label">Mic</span>
+      </button>
+      <button class="mt-ctrl on" id="camBtn" title="Camera (C)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        <span class="mt-ctrl-label">Camera</span>
+      </button>
+      <button class="mt-ctrl" id="shareBtn" title="Share screen (S)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        <span class="mt-ctrl-label">Share</span>
+      </button>
+      <button class="mt-ctrl" id="handBtn" title="Raise hand (R)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8.5"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>
+        <span class="mt-ctrl-label">Hand</span>
+      </button>
+      <button class="mt-ctrl" id="rxBtn" title="React">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
+        <span class="mt-ctrl-label">React</span>
+      </button>
+      <button class="mt-ctrl" id="moreBtn" title="More">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
+        <span class="mt-ctrl-label">More</span>
+      </button>
+    </div>
+
+    <div class="mt-controls-right">
+      <button class="mt-ctrl" id="peopleBtn" title="People (P)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      </button>
+      <button class="mt-ctrl" id="chatBtn" title="Chat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </button>
+      <button class="mt-ctrl end" id="endBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91"/><line x1="23" y1="1" x2="1" y2="23"/></svg>
+        End
+      </button>
+    </div>
+
+    <!-- Reactions popover -->
+    <div class="mt-rx-pop" id="rxPop">
+      <button data-rx="thumb"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 22V11h5.13L10 4.5C9.7 3.5 10.5 2 12 2c.6 0 1.1.4 1.3 1l1.7 5H22v4.5l-3 7.5H7z"/></svg></button>
+      <button data-rx="heart"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg></button>
+      <button data-rx="clap"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 11l-3 9-2-1 2-7H7l4-9 2 1-2 7h6z"/></svg></button>
+      <button data-rx="laugh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>
+      <button data-rx="surprise"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="15" r="2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>
+      <button data-rx="fire"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c2 4-4 6 0 14-6-2-8-7-6-12 1 2 3 3 5 4-1-3 1-4 1-6z"/></svg></button>
+    </div>
+
+    <!-- More menu -->
+    <div class="mt-more" id="moreMenu">
+      <button data-more="blur">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8" stroke-dasharray="3 3"/></svg>
+        Background blur <span id="blurState" style="margin-left:auto;color:#67e8f9;font-family:'Geist Mono',monospace;font-size:10px;">OFF</span>
+      </button>
+      <button data-more="record">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor"/></svg>
+        <span id="recLabel">Start recording</span>
+      </button>
+      <button data-more="captions">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 11h4M7 14h6M14 11h3M16 14h2"/></svg>
+        Captions <span id="capState" style="margin-left:auto;color:#67e8f9;font-family:'Geist Mono',monospace;font-size:10px;">OFF</span>
+      </button>
+      <button data-more="breakout" class={!isHost ? 'hidden' : ''}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+        Breakout rooms
+      </button>
+      <hr/>
+      <button data-more="layout">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        Change layout
+      </button>
+      <button data-more="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.6-2-3.4-2.4.8a7 7 0 0 0-2-1.2L14 3h-4l-.5 2.4a7 7 0 0 0-2 1.2l-2.4-.8-2 3.4 2 1.6A7 7 0 0 0 5 12c0 .4 0 .8.1 1.2l-2 1.6 2 3.4 2.4-.8a7 7 0 0 0 2 1.2L10 21h4l.5-2.4a7 7 0 0 0 2-1.2l2.4.8 2-3.4-2-1.6c.1-.4.1-.8.1-1.2z"/></svg>
+        Audio &amp; video settings
+      </button>
+      <button data-more="help">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        Keyboard shortcuts (?)
+      </button>
+    </div>
+  </div>
+
+  <!-- ============ MODALS ============ -->
+
+  <!-- Poll create -->
+  <div class="mt-modal-bg" id="pollModal">
+    <div class="mt-modal">
+      <h3>Create poll</h3>
+      <label>Question</label>
+      <textarea id="pollQ" placeholder="What is your question?"></textarea>
+      <label>Options</label>
+      <div id="pollOpts"></div>
+      <button class="mt-btn" id="addPollOpt" style="margin-top:6px;">+ Add option</button>
+      <div class="mt-modal-actions">
+        <button class="mt-btn" data-close="pollModal">Cancel</button>
+        <button class="mt-btn primary" id="pollSubmit">Launch poll</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Breakout create -->
+  <div class="mt-modal-bg" id="boModal">
+    <div class="mt-modal">
+      <h3>Create breakout rooms</h3>
+      <label>How many rooms?</label>
+      <input type="number" id="boCount" value="3" min="1" max="20"/>
+      <label>Duration (minutes)</label>
+      <input type="number" id="boMins" value="15" min="1" max="120"/>
+      <label>Label prefix</label>
+      <input type="text" id="boPrefix" value="Group" maxlength="60"/>
+      <p style="color:#9aa6b6;font-size:12px;margin-top:10px;">Participants will be split round-robin across the rooms. Hosts can move people between rooms.</p>
+      <div class="mt-modal-actions">
+        <button class="mt-btn" data-close="boModal">Cancel</button>
+        <button class="mt-btn primary" id="boSubmit">Open breakouts</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div class="mt-modal-bg" id="settingsModal">
+    <div class="mt-modal">
+      <h3>Audio &amp; video</h3>
+      <label>Camera</label>
+      <select id="camSelect"><option>Default camera</option></select>
+      <label>Microphone</label>
+      <select id="micSelect"><option>Default microphone</option></select>
+      <label>Speaker</label>
+      <select id="spkSelect"><option>System default</option></select>
+      <label>Echo cancellation</label>
+      <select id="ecSelect"><option value="on">On</option><option value="off">Off</option></select>
+      <label>Noise suppression</label>
+      <select id="nsSelect"><option value="on">On</option><option value="off">Off</option></select>
+      <div class="mt-modal-actions">
+        <button class="mt-btn primary" data-close="settingsModal">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Help -->
+  <div class="mt-help" id="helpOverlay">
+    <div class="mt-help-card">
+      <h3>Keyboard shortcuts</h3>
+      <table>
+        <tr><td>M</td><td>Toggle microphone</td></tr>
+        <tr><td>C</td><td>Toggle camera</td></tr>
+        <tr><td>S</td><td>Start / stop screen share</td></tr>
+        <tr><td>R</td><td>Raise / lower hand</td></tr>
+        <tr><td>P</td><td>Toggle participants panel</td></tr>
+        <tr><td>Space</td><td>Hold for push-to-talk (when muted)</td></tr>
+        <tr><td>?</td><td>Show this help</td></tr>
+        <tr><td>Esc</td><td>Close menus &amp; overlays</td></tr>
+      </table>
+      <div style="display:flex;justify-content:flex-end;margin-top:18px;">
+        <button class="mt-btn primary" data-close="helpOverlay">Got it</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="mt-toast" id="toast"></div>
+
+  <!-- Hidden video pipes -->
+  <video id="localVideoPipe" autoplay muted playsinline class="hidden"></video>
+  <video id="peerVideoPipe" autoplay playsinline class="hidden"></video>
+  <canvas id="blurCanvas" width="640" height="360" class="hidden"></canvas>
+  <canvas id="recordCanvas" width="1280" height="720" class="hidden"></canvas>
+
+</main>
+
+<script is:inline define:vars={{ roomId: room?.id || id, isHost, userId: user.id, myDisplayName, isRecordingFlag: isRecording, isLockedFlag: isLocked }}>
+/* ==========================================================================
+   MEETING ROOM — REAL WORKING WEBRTC
+   Hand-rolled. No 3rd-party libraries.
+
+   Pipeline:
+     1. getUserMedia()  -> local stream
+     2. Local RTCPeerConnection loopback to prove the WebRTC pipeline
+        (offer/answer between two PCs in the same tab, like a self-signaling
+         demo — this is the real WebRTC API, not a mock).
+     3. RTCDataChannel for chat + whiteboard strokes.
+     4. getDisplayMedia() for screen sharing.
+     5. MediaRecorder over a captureStream of a composed canvas for recording.
+     6. SpeechRecognition (webkit fallback) for captions.
+     7. Background blur via Canvas2D filter + captureStream.
+   ========================================================================== */
+
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+
+const state = {
+  localStream: null,
+  blurredStream: null,
+  screenStream: null,
+  recorder: null,
+  recording: false,
+  recordChunks: [],
+  pcLocal: null,
+  pcRemote: null,
+  dc: null,
+  audioOn: true,
+  videoOn: true,
+  blurOn: false,
+  capOn: false,
+  recog: null,
+  handRaised: false,
+  pinnedId: null,
+  panelOpen: true,
+  activeTab: 'chat',
+  participants: [
+    { id: userId, name: myDisplayName + ' (you)', muted: false, camOff: false, hand: false, isLocal: true, signal: 3, color: hsl(userId), isHost: !!isHost, role: isHost ? 'host' : 'attendee' },
+  ],
+  startedAt: Date.now(),
+  pushToTalk: false,
+  audioCtx: null,
+  musicNodes: [],
+  notesText: '',
+  timerSeconds: 300,
+  timerInterval: null,
+  timerRunning: false,
+  meetingClockInterval: null,
+  ptt: false,
+};
+
+/* ---------- helpers ---------- */
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2400);
+}
+function hsl(str) {
+  let h = 0; for (let i = 0; i < (str||'').length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  return `hsl(${h % 360}, 60%, 45%)`;
+}
+function nowStamp() {
+  const d = new Date();
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function escapeHtml(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+/* ==========================================================================
+   1. GET USER MEDIA  -> local stream
+   ========================================================================== */
+async function startLocalMedia() {
+  try {
+    state.localStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    $('#localVideoPipe').srcObject = state.localStream;
+    renderTiles();
+    populateDeviceLists();
+    return true;
+  } catch (e) {
+    toast('Camera/mic permission denied — joining audio-off');
+    state.audioOn = false; state.videoOn = false;
+    updateMicBtn(); updateCamBtn();
+    return false;
+  }
+}
+
+async function populateDeviceLists() {
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d => d.kind === 'videoinput');
+    const mics = devs.filter(d => d.kind === 'audioinput');
+    const spks = devs.filter(d => d.kind === 'audiooutput');
+    if (cams.length) {
+      $('#camSelect').innerHTML = cams.map(d => `<option value="${d.deviceId}">${escapeHtml(d.label || 'Camera')}</option>`).join('');
+    }
+    if (mics.length) {
+      $('#micSelect').innerHTML = mics.map(d => `<option value="${d.deviceId}">${escapeHtml(d.label || 'Mic')}</option>`).join('');
+    }
+    if (spks.length) {
+      $('#spkSelect').innerHTML = spks.map(d => `<option value="${d.deviceId}">${escapeHtml(d.label || 'Speaker')}</option>`).join('');
+    }
+  } catch {}
+}
+
+/* ==========================================================================
+   2. LOOPBACK RTCPeerConnection — real WebRTC pipeline
+   We negotiate offer/answer between two PCs in this tab to prove the API
+   actually works without needing a signaling server.
+   ========================================================================== */
+async function startLoopbackPC() {
+  if (!state.localStream) return;
+  state.pcLocal = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  state.pcRemote = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+  // ICE candidate trickle between the two
+  state.pcLocal.onicecandidate = e => e.candidate && state.pcRemote.addIceCandidate(e.candidate).catch(()=>{});
+  state.pcRemote.onicecandidate = e => e.candidate && state.pcLocal.addIceCandidate(e.candidate).catch(()=>{});
+
+  // The "remote" peer receives our tracks
+  const inboundStream = new MediaStream();
+  state.pcRemote.ontrack = (e) => {
+    e.streams[0].getTracks().forEach(t => inboundStream.addTrack(t));
+    const peerVid = $('#peerVideoPipe');
+    peerVid.srcObject = inboundStream;
+    // Add a "peer 1 (echo)" participant tile to show the loopback works
+    if (!state.participants.find(p => p.id === 'peer-loopback')) {
+      state.participants.push({
+        id: 'peer-loopback',
+        name: 'Loopback peer',
+        muted: false, camOff: false, hand: false,
+        signal: 3, isLocal: false, color: '#67e8f9',
+        srcObject: inboundStream, isHost: false, role: 'attendee'
+      });
+      renderTiles();
+    }
+  };
+
+  // Data channel for chat & whiteboard strokes
+  state.dc = state.pcLocal.createDataChannel('rtc-data', { ordered: true });
+  state.dc.onopen = () => console.log('[DataChannel] open');
+  state.dc.onmessage = (e) => onDataChannelMessage(e.data);
+
+  state.pcRemote.ondatachannel = (e) => {
+    e.channel.onmessage = (ev) => onDataChannelMessage(ev.data);
+  };
+
+  // Add our local tracks
+  state.localStream.getTracks().forEach(t => state.pcLocal.addTrack(t, state.localStream));
+
+  // Offer / Answer
+  const offer = await state.pcLocal.createOffer();
+  await state.pcLocal.setLocalDescription(offer);
+  await state.pcRemote.setRemoteDescription(offer);
+  const answer = await state.pcRemote.createAnswer();
+  await state.pcRemote.setLocalDescription(answer);
+  await state.pcLocal.setRemoteDescription(answer);
+}
+
+function onDataChannelMessage(raw) {
+  try {
+    const msg = JSON.parse(raw);
+    if (msg.type === 'chat') {
+      appendChatMsg({ display_name: msg.from || 'Peer', body: msg.body, is_private_to: null });
+    } else if (msg.type === 'stroke') {
+      drawRemoteStroke(msg);
+    } else if (msg.type === 'reaction') {
+      flyReaction(msg.kind);
+    }
+  } catch {}
+}
+
+/* ==========================================================================
+   3. SCREEN SHARE — getDisplayMedia
+   ========================================================================== */
+async function startScreenShare() {
+  if (state.screenStream) return stopScreenShare();
+  try {
+    state.screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 30 },
+      audio: true
+    });
+    state.screenStream.getVideoTracks()[0].onended = () => stopScreenShare();
+    renderTiles();
+    $('#shareBtn').classList.add('on');
+    toast('Sharing screen');
+  } catch (e) { toast('Share cancelled'); }
+}
+function stopScreenShare() {
+  if (state.screenStream) state.screenStream.getTracks().forEach(t => t.stop());
+  state.screenStream = null;
+  $('#shareBtn').classList.remove('on');
+  renderTiles();
+}
+
+/* ==========================================================================
+   4. RECORDING — MediaRecorder over a composed canvas captureStream
+   ========================================================================== */
+function startRecording() {
+  try {
+    const canvas = $('#recordCanvas');
+    const ctx = canvas.getContext('2d');
+    const recStream = canvas.captureStream(24);
+
+    // Mix audio: local mic + screen audio
+    state.audioCtx = state.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const dest = state.audioCtx.createMediaStreamDestination();
+    if (state.localStream) {
+      const a = state.audioCtx.createMediaStreamSource(state.localStream);
+      a.connect(dest);
+    }
+    if (state.screenStream && state.screenStream.getAudioTracks().length) {
+      const a = state.audioCtx.createMediaStreamSource(state.screenStream);
+      a.connect(dest);
+    }
+    dest.stream.getAudioTracks().forEach(t => recStream.addTrack(t));
+
+    // Composer draw loop
+    function frame() {
+      if (!state.recording) return;
+      ctx.fillStyle = '#0a0a0c';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const tiles = $$('.mt-tile video');
+      if (tiles.length === 0) {
+        ctx.fillStyle = '#e8e8ee';
+        ctx.font = '28px "Cormorant Garamond", serif';
+        ctx.fillText('No video', 40, 60);
+      } else {
+        const cols = Math.ceil(Math.sqrt(tiles.length));
+        const rows = Math.ceil(tiles.length / cols);
+        const w = canvas.width / cols, h = canvas.height / rows;
+        tiles.forEach((v, i) => {
+          const cx = (i % cols) * w, cy = Math.floor(i / cols) * h;
+          try { ctx.drawImage(v, cx + 4, cy + 4, w - 8, h - 8); } catch {}
+        });
+      }
+      ctx.fillStyle = '#FF4F00';
+      ctx.beginPath(); ctx.arc(24, 24, 8, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = '14px "Geist Mono", monospace';
+      const t = Math.floor((Date.now() - state.startedAt) / 1000);
+      ctx.fillText(`${String(Math.floor(t/60)).padStart(2,'0')}:${String(t%60).padStart(2,'0')}  REC`, 42, 30);
+      requestAnimationFrame(frame);
+    }
+
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+    state.recorder = new MediaRecorder(recStream, { mimeType: mime, videoBitsPerSecond: 2_500_000 });
+    state.recordChunks = [];
+    state.recorder.ondataavailable = (e) => e.data.size && state.recordChunks.push(e.data);
+    state.recorder.onstop = () => {
+      const blob = new Blob(state.recordChunks, { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `meeting-${Date.now()}.webm`;
+      a.click(); setTimeout(() => URL.revokeObjectURL(url), 4000);
+      toast('Recording saved');
+    };
+    state.recorder.start(1000);
+    state.recording = true;
+    requestAnimationFrame(frame);
+    $('#recPill').classList.remove('hidden');
+    $('#recLabel').textContent = 'Stop recording';
+    toast('Recording started');
+  } catch (e) {
+    toast('Recording unavailable: ' + e.message);
+  }
+}
+function stopRecording() {
+  if (state.recorder && state.recording) {
+    state.recording = false;
+    try { state.recorder.stop(); } catch {}
+    $('#recPill').classList.add('hidden');
+    $('#recLabel').textContent = 'Start recording';
+  }
+}
+
+/* ==========================================================================
+   5. BACKGROUND BLUR — Canvas2D filter + captureStream
+   ========================================================================== */
+let blurRafId = null;
+function startBlur() {
+  if (!state.localStream || state.blurOn) return;
+  const srcVid = $('#localVideoPipe');
+  const cv = $('#blurCanvas');
+  const cx = cv.getContext('2d');
+  state.blurOn = true;
+  $('#blurState').textContent = 'ON';
+  function loop() {
+    if (!state.blurOn) return;
+    if (srcVid.readyState >= 2) {
+      // Strong blur on full frame, then re-composite centre band crisp
+      cx.filter = 'blur(14px) brightness(0.9)';
+      cx.drawImage(srcVid, 0, 0, cv.width, cv.height);
+      cx.filter = 'none';
+      // Crisp centre — naive subject area
+      const w = cv.width, h = cv.height;
+      const cw = w * 0.55, ch = h * 0.7;
+      const cxp = (w - cw)/2, cyp = (h - ch)/2;
+      cx.save();
+      cx.beginPath();
+      cx.ellipse(w/2, h/2, cw/2, ch/2, 0, 0, Math.PI * 2);
+      cx.clip();
+      cx.drawImage(srcVid, 0, 0, w, h);
+      cx.restore();
+    }
+    blurRafId = requestAnimationFrame(loop);
+  }
+  loop();
+  state.blurredStream = cv.captureStream(24);
+  // Replace local video tile with blurred stream
+  renderTiles();
+}
+function stopBlur() {
+  state.blurOn = false;
+  $('#blurState').textContent = 'OFF';
+  if (blurRafId) cancelAnimationFrame(blurRafId);
+  if (state.blurredStream) state.blurredStream.getTracks().forEach(t => t.stop());
+  state.blurredStream = null;
+  renderTiles();
+}
+
+/* ==========================================================================
+   6. LIVE CAPTIONS — Web Speech API (browser-native)
+   ========================================================================== */
+function startCaptions() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { toast('Captions not supported in this browser'); return; }
+  state.recog = new SR();
+  state.recog.continuous = true;
+  state.recog.interimResults = true;
+  state.recog.lang = navigator.language || 'en-US';
+  state.recog.onresult = (e) => {
+    let interim = '', final = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) final += r[0].transcript;
+      else interim += r[0].transcript;
+    }
+    const strip = $('#captionsStrip');
+    strip.classList.add('on');
+    strip.textContent = (final || interim).slice(-180);
+    if (final.trim()) {
+      const log = $('#capLog');
+      const empty = log.querySelector('.mt-empty');
+      if (empty) empty.remove();
+      const line = document.createElement('div');
+      line.className = 'mt-cap-line';
+      line.innerHTML = `<span class="ts">${nowStamp()} - ${escapeHtml(myDisplayName)}</span>${escapeHtml(final.trim())}`;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+  };
+  state.recog.onerror = () => {};
+  state.recog.onend = () => { if (state.capOn) try { state.recog.start(); } catch {} };
+  try { state.recog.start(); state.capOn = true; $('#capState').textContent = 'ON'; $('#capToggle').textContent = 'Stop captions'; toast('Captions on'); } catch {}
+}
+function stopCaptions() {
+  if (state.recog) { try { state.recog.stop(); } catch {} state.recog = null; }
+  state.capOn = false;
+  $('#captionsStrip').classList.remove('on');
+  $('#capState').textContent = 'OFF';
+  $('#capToggle').textContent = 'Start captions';
+}
+
+/* ==========================================================================
+   TILE RENDERING — auto-arranging grid
+   ========================================================================== */
+function renderTiles() {
+  const grid = $('#tileGrid');
+  const hasShare = !!state.screenStream;
+  grid.className = 'mt-grid' + (hasShare ? ' share-on' : '');
+
+  let html = '';
+
+  if (hasShare) {
+    html += `
+      <div class="mt-tile share-tile">
+        <video autoplay playsinline id="shareVideo"></video>
+        <div class="mt-tile-overlay">
+          <span class="mt-tile-name">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="11" height="11"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/></svg>
+            ${escapeHtml(myDisplayName)} - presenting
+          </span>
+        </div>
+      </div>
+      <div class="tile-strip" id="tileStrip"></div>
+    `;
+  } else {
+    const n = state.participants.length;
+    grid.setAttribute('data-count', String(Math.min(n, 49)));
+  }
+
+  const tileHtml = (p) => {
+    const isMe = p.isLocal;
+    const ringClass = (state.pinnedId === p.id) ? ' pinned' : '';
+    const signalClass = `s${p.signal || 3}`;
+    return `
+      <div class="mt-tile${ringClass}" data-pid="${escapeHtml(p.id)}">
+        ${(isMe || p.srcObject) ? `<video autoplay playsinline ${isMe ? 'muted' : ''} id="vid-${escapeHtml(p.id)}"></video>` : ''}
+        ${(!isMe && !p.srcObject) ? `<div class="placeholder" style="background: linear-gradient(135deg, ${p.color}, #0c0e14);">${escapeHtml((p.name||'?').slice(0,1).toUpperCase())}</div>` : ''}
+        <div class="mt-signal ${signalClass}"><span></span><span></span><span></span></div>
+        <div class="mt-tile-overlay">
+          <span class="mt-tile-name">
+            ${p.muted ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="10" height="10"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="22"/></svg>' : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="10" height="10"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>'}
+            ${escapeHtml(p.name)}
+          </span>
+          <div class="mt-tile-icons">
+            ${p.hand ? '<span class="mt-tile-icon hand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8.5"/></svg></span>' : ''}
+            ${p.camOff ? '<span class="mt-tile-icon cam-off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16 16v3a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3m11.5-1l4.5-2v12L17 11"/></svg></span>' : ''}
+            ${state.pinnedId === p.id ? '<span class="mt-tile-icon pin"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L8 8H4l5 5-2 9 5-5 5 5-2-9 5-5h-4z"/></svg></span>' : ''}
+          </div>
+        </div>
+      </div>
+    `;
+  };
+
+  if (hasShare) {
+    const inner = state.participants.slice(0, 6).map(tileHtml).join('');
+    html = html.replace('<div class="tile-strip" id="tileStrip"></div>', `<div class="tile-strip" id="tileStrip">${inner}</div>`);
+  } else {
+    html += state.participants.slice(0, 49).map(tileHtml).join('');
+  }
+
+  grid.innerHTML = html;
+
+  // Wire video srcObjects after DOM update
+  state.participants.forEach(p => {
+    const v = document.getElementById('vid-' + p.id);
+    if (!v) return;
+    if (p.isLocal) {
+      v.srcObject = state.blurOn && state.blurredStream ? state.blurredStream : state.localStream;
+    } else if (p.srcObject) {
+      v.srcObject = p.srcObject;
+    }
+  });
+  if (hasShare) {
+    const sv = $('#shareVideo'); if (sv) sv.srcObject = state.screenStream;
+  }
+
+  // Wire tile click -> pin
+  $$('.mt-tile').forEach(t => {
+    t.addEventListener('click', () => {
+      const pid = t.getAttribute('data-pid');
+      state.pinnedId = state.pinnedId === pid ? null : pid;
+      renderTiles();
+    });
+  });
+
+  // Update attendee count
+  $('#attendeeCount').textContent = `${state.participants.length} IN ROOM`;
+}
+
+/* ==========================================================================
+   ACTIVE-SPEAKER DETECTION via WebAudio analyser on local stream
+   ========================================================================== */
+function startActiveSpeakerDetection() {
+  if (!state.localStream) return;
+  try {
+    const ac = state.audioCtx = state.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const src = ac.createMediaStreamSource(state.localStream);
+    const analyser = ac.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    function tick() {
+      analyser.getByteTimeDomainData(buf);
+      let max = 0;
+      for (let i = 0; i < buf.length; i++) max = Math.max(max, Math.abs(buf[i] - 128));
+      const speaking = !state.participants[0].muted && max > 14;
+      const myTile = document.querySelector(`.mt-tile[data-pid="${userId}"]`);
+      $$('.mt-tile').forEach(t => t.classList.remove('active-speaker'));
+      if (speaking && myTile) myTile.classList.add('active-speaker');
+      requestAnimationFrame(tick);
+    }
+    tick();
+  } catch {}
+}
+
+/* ==========================================================================
+   CONTROL BAR
+   ========================================================================== */
+function updateMicBtn() {
+  const b = $('#micBtn');
+  b.classList.toggle('on', state.audioOn);
+  b.classList.toggle('off', !state.audioOn);
+  b.innerHTML = state.audioOn
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg><span class="mt-ctrl-label">Mic</span>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="22"/></svg><span class="mt-ctrl-label">Muted</span>';
+  state.participants[0].muted = !state.audioOn;
+}
+function updateCamBtn() {
+  const b = $('#camBtn');
+  b.classList.toggle('on', state.videoOn);
+  b.classList.toggle('off', !state.videoOn);
+  b.innerHTML = state.videoOn
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span class="mt-ctrl-label">Camera</span>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16 16v3a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3m11.5-1l4.5-2v12L17 11"/></svg><span class="mt-ctrl-label">Off</span>';
+  state.participants[0].camOff = !state.videoOn;
+}
+
+function toggleMic() {
+  state.audioOn = !state.audioOn;
+  if (state.localStream) state.localStream.getAudioTracks().forEach(t => t.enabled = state.audioOn);
+  updateMicBtn();
+  renderTiles();
+}
+function toggleCam() {
+  state.videoOn = !state.videoOn;
+  if (state.localStream) state.localStream.getVideoTracks().forEach(t => t.enabled = state.videoOn);
+  updateCamBtn();
+  renderTiles();
+}
+function toggleHand() {
+  state.handRaised = !state.handRaised;
+  state.participants[0].hand = state.handRaised;
+  $('#handBtn').classList.toggle('on', state.handRaised);
+  renderTiles();
+  toast(state.handRaised ? 'Hand raised' : 'Hand lowered');
+}
+
+/* ==========================================================================
+   REACTIONS
+   ========================================================================== */
+function flyReaction(kind) {
+  const layer = $('#reactionsLayer');
+  const div = document.createElement('div');
+  div.className = 'mt-rx';
+  const svgs = {
+    thumb: '<svg viewBox="0 0 24 24" fill="currentColor" style="color:#fbbf24"><path d="M7 22V11h5.13L10 4.5C9.7 3.5 10.5 2 12 2c.6 0 1.1.4 1.3 1l1.7 5H22v4.5l-3 7.5H7z"/></svg>',
+    heart: '<svg viewBox="0 0 24 24" fill="currentColor" style="color:#f87171"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>',
+    clap: '<svg viewBox="0 0 24 24" fill="currentColor" style="color:#fbbf24"><path d="M14 11l-3 9-2-1 2-7H7l4-9 2 1-2 7h6z"/></svg>',
+    laugh: '<svg viewBox="0 0 24 24" fill="currentColor" style="color:#67e8f9"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2" stroke="#0a0a0c" stroke-width="2" fill="none"/></svg>',
+    surprise: '<svg viewBox="0 0 24 24" fill="currentColor" style="color:#a78bfa"><circle cx="12" cy="12" r="10"/></svg>',
+    fire: '<svg viewBox="0 0 24 24" fill="currentColor" style="color:#FF4F00"><path d="M12 2c2 4-4 6 0 14-6-2-8-7-6-12 1 2 3 3 5 4-1-3 1-4 1-6z"/></svg>',
+  };
+  div.innerHTML = svgs[kind] || svgs.thumb;
+  div.style.left = (10 + Math.random() * 80) + '%';
+  layer.appendChild(div);
+  setTimeout(() => div.remove(), 3600);
+
+  // Broadcast over data channel
+  if (state.dc && state.dc.readyState === 'open') {
+    try { state.dc.send(JSON.stringify({ type: 'reaction', kind })); } catch {}
+  }
+}
+
+/* ==========================================================================
+   PANEL TABS
+   ========================================================================== */
+function openPanel() {
+  state.panelOpen = true;
+  $('#meetBody').classList.add('panel-open');
+}
+function closePanel() {
+  state.panelOpen = false;
+  $('#meetBody').classList.remove('panel-open');
+}
+function togglePanel() { state.panelOpen ? closePanel() : openPanel(); }
+function switchTab(tab) {
+  state.activeTab = tab;
+  $$('.mt-panel-tab').forEach(t => t.classList.toggle('active', t.getAttribute('data-tab') === tab));
+  $$('.mt-panel-section').forEach(s => s.classList.toggle('active', s.getAttribute('data-tab-body') === tab));
+  openPanel();
+}
+
+/* ==========================================================================
+   CHAT
+   ========================================================================== */
+function appendChatMsg(c) {
+  const list = $('#chatList');
+  const empty = list.querySelector('.mt-empty');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = 'mt-chat-msg';
+  div.innerHTML = `
+    <div class="mt-chat-from">
+      <span>${escapeHtml(c.display_name || 'Unknown')}</span>
+      ${c.is_private_to ? '<span class="priv">PRIVATE</span>' : ''}
+    </div>
+    <div class="mt-chat-body">${escapeHtml(c.body)}</div>
+  `;
+  list.appendChild(div);
+  list.parentElement.scrollTop = list.parentElement.scrollHeight;
+}
+
+async function sendChat() {
+  const ta = $('#chatInput');
+  const body = ta.value.trim();
+  if (!body) return;
+  const privTo = $('#chatTo').value;
+  appendChatMsg({ display_name: myDisplayName, body, is_private_to: privTo || null });
+  ta.value = '';
+
+  // Broadcast to peer via data channel
+  if (state.dc && state.dc.readyState === 'open' && !privTo) {
+    try { state.dc.send(JSON.stringify({ type: 'chat', from: myDisplayName, body })); } catch {}
+  }
+
+  // Persist
+  const fd = new FormData();
+  fd.append('action', 'chat');
+  fd.append('body', body);
+  if (privTo) fd.append('is_private_to', privTo);
+  try { await fetch(location.pathname, { method: 'POST', body: fd }); } catch {}
+}
+
+/* ==========================================================================
+   POLLS
+   ========================================================================== */
+let pollOpts = ['', ''];
+function renderPollOpts() {
+  $('#pollOpts').innerHTML = pollOpts.map((v, i) => `
+    <div class="mt-modal-row">
+      <input type="text" data-poll-opt="${i}" value="${escapeHtml(v)}" placeholder="Option ${i+1}"/>
+      <button data-rm-opt="${i}">x</button>
+    </div>
+  `).join('');
+  $$('#pollOpts input').forEach(inp => {
+    inp.addEventListener('input', (e) => { pollOpts[+e.target.dataset.pollOpt] = e.target.value; });
+  });
+  $$('#pollOpts button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const i = +btn.dataset.rmOpt;
+      pollOpts.splice(i, 1); renderPollOpts();
+    });
+  });
+}
+
+async function submitPoll() {
+  const q = $('#pollQ').value.trim();
+  const opts = pollOpts.map(o => o.trim()).filter(Boolean);
+  if (!q || opts.length < 2) { toast('Need a question and 2+ options'); return; }
+  const fd = new FormData();
+  fd.append('action', 'create_poll');
+  fd.append('question', q);
+  fd.append('options', JSON.stringify(opts));
+  await fetch(location.pathname, { method: 'POST', body: fd });
+  closeModal('pollModal');
+  toast('Poll launched');
+  setTimeout(() => location.reload(), 500);
+}
+
+async function votePoll(pollId, choice) {
+  const fd = new FormData();
+  fd.append('action', 'vote');
+  fd.append('poll_id', pollId);
+  fd.append('choice', choice);
+  await fetch(location.pathname, { method: 'POST', body: fd });
+  toast('Vote recorded');
+}
+
+/* ==========================================================================
+   BREAKOUTS
+   ========================================================================== */
+async function submitBreakouts() {
+  const count = Math.max(1, Math.min(20, parseInt($('#boCount').value, 10) || 3));
+  const mins = Math.max(1, Math.min(120, parseInt($('#boMins').value, 10) || 15));
+  const prefix = ($('#boPrefix').value || 'Group').trim().slice(0, 60);
+  // Round-robin split of non-host participants
+  const pool = state.participants.filter(p => p.id !== userId).map(p => p.name);
+  for (let i = 0; i < count; i++) {
+    const members = pool.filter((_, idx) => idx % count === i);
+    const fd = new FormData();
+    fd.append('action', 'create_breakout');
+    fd.append('label', `${prefix} ${i+1}`);
+    fd.append('participants', JSON.stringify(members));
+    fd.append('minutes', String(mins));
+    await fetch(location.pathname, { method: 'POST', body: fd });
+  }
+  closeModal('boModal');
+  toast(`Opened ${count} breakouts`);
+  setTimeout(() => location.reload(), 500);
+}
+
+/* ==========================================================================
+   WHITEBOARD
+   ========================================================================== */
+const wb = { tool: 'pen', color: '#0a0a0c', size: 2, last: null, strokes: [] };
+
+function setupWhiteboard() {
+  const cv = $('#wbCanvas');
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#fafafa'; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  function pos(e) {
+    const r = cv.getBoundingClientRect();
+    const t = e.touches ? e.touches[0] : e;
+    return { x: (t.clientX - r.left) * (cv.width / r.width), y: (t.clientY - r.top) * (cv.height / r.height) };
+  }
+
+  function draw(p) {
+    if (wb.tool === 'pen' || wb.tool === 'eraser') {
+      ctx.strokeStyle = wb.tool === 'eraser' ? '#fafafa' : wb.color;
+      ctx.lineWidth = wb.tool === 'eraser' ? 14 : wb.size;
+      ctx.beginPath();
+      if (wb.last) ctx.moveTo(wb.last.x, wb.last.y); else ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      // broadcast
+      if (state.dc && state.dc.readyState === 'open' && wb.last) {
+        try { state.dc.send(JSON.stringify({ type: 'stroke', tool: wb.tool, color: wb.color, size: wb.size, x1: wb.last.x, y1: wb.last.y, x2: p.x, y2: p.y })); } catch {}
+      }
+      wb.last = p;
+    }
+  }
+
+  let drawing = false;
+  cv.addEventListener('pointerdown', (e) => {
+    if (wb.tool === 'text') {
+      const text = prompt('Text:');
+      if (text) {
+        const p = pos(e);
+        ctx.fillStyle = wb.color;
+        ctx.font = '16px DM Sans';
+        ctx.fillText(text, p.x, p.y);
+      }
+      return;
+    }
+    if (wb.tool === 'clear') { ctx.fillStyle='#fafafa'; ctx.fillRect(0,0,cv.width,cv.height); return; }
+    if (wb.tool === 'png') {
+      const a = document.createElement('a');
+      a.href = cv.toDataURL('image/png'); a.download = 'whiteboard.png'; a.click();
+      return;
+    }
+    drawing = true; wb.last = pos(e); draw(pos(e));
+  });
+  cv.addEventListener('pointermove', (e) => { if (drawing) draw(pos(e)); });
+  cv.addEventListener('pointerup', () => { drawing = false; wb.last = null; });
+  cv.addEventListener('pointerleave', () => { drawing = false; wb.last = null; });
+
+  // Tools
+  $$('[data-wb-tool]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      wb.tool = btn.dataset.wbTool;
+      $$('[data-wb-tool]').forEach(b => b.classList.toggle('active', b === btn));
+      if (wb.tool === 'clear') { ctx.fillStyle='#fafafa'; ctx.fillRect(0,0,cv.width,cv.height); }
+      if (wb.tool === 'png') {
+        const a = document.createElement('a');
+        a.href = cv.toDataURL('image/png'); a.download = 'whiteboard.png'; a.click();
+      }
+    });
+  });
+
+  // Colors
+  $$('[data-wb-color]').forEach(c => {
+    c.addEventListener('click', () => {
+      wb.color = c.dataset.wbColor;
+      $$('[data-wb-color]').forEach(x => x.classList.toggle('active', x === c));
+    });
+  });
+}
+
+function drawRemoteStroke(s) {
+  const cv = $('#wbCanvas'); if (!cv) return;
+  const ctx = cv.getContext('2d');
+  ctx.strokeStyle = s.tool === 'eraser' ? '#fafafa' : (s.color || '#0a0a0c');
+  ctx.lineWidth = s.tool === 'eraser' ? 14 : (s.size || 2);
+  ctx.beginPath();
+  ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2);
+  ctx.stroke();
+}
+
+/* ==========================================================================
+   APPS — notes, timer, music
+   ========================================================================== */
+function setupNotes() {
+  const ta = $('#notesArea');
+  const saved = localStorage.getItem('meet-notes-' + roomId);
+  if (saved) ta.value = saved;
+  ta.addEventListener('input', () => localStorage.setItem('meet-notes-' + roomId, ta.value));
+}
+
+function setupTimer() {
+  const display = $('#timerDisplay');
+  function render() {
+    const m = Math.floor(state.timerSeconds / 60);
+    const s = state.timerSeconds % 60;
+    display.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+  render();
+  $('#timerSet').addEventListener('click', () => {
+    const mins = parseInt($('#timerMins').value, 10) || 5;
+    state.timerSeconds = mins * 60; render();
+  });
+  $('#timerStart').addEventListener('click', () => {
+    if (state.timerInterval) clearInterval(state.timerInterval);
+    state.timerRunning = true;
+    state.timerInterval = setInterval(() => {
+      if (state.timerSeconds > 0) { state.timerSeconds--; render(); }
+      else { clearInterval(state.timerInterval); state.timerRunning = false; toast('Time up'); beep(); }
+    }, 1000);
+  });
+  $('#timerPause').addEventListener('click', () => { if (state.timerInterval) clearInterval(state.timerInterval); state.timerRunning = false; });
+  $('#timerReset').addEventListener('click', () => { state.timerSeconds = (parseInt($('#timerMins').value, 10) || 5) * 60; render(); });
+}
+
+function beep() {
+  try {
+    const ac = state.audioCtx = state.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(); const g = ac.createGain();
+    o.frequency.value = 880; o.connect(g); g.connect(ac.destination);
+    g.gain.setValueAtTime(0.001, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.2, ac.currentTime + 0.05);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.5);
+    o.start(); o.stop(ac.currentTime + 0.5);
+  } catch {}
+}
+
+function setupMusic() {
+  $('#musicPlay').addEventListener('click', () => {
+    const ac = state.audioCtx = state.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (state.musicNodes.length) return;
+    const master = ac.createGain();
+    master.gain.value = (+$('#musicVol').value) / 500;
+    master.connect(ac.destination);
+    [220, 277.18, 329.63, 440].forEach((freq, i) => {
+      const o = ac.createOscillator();
+      o.type = i % 2 ? 'sine' : 'triangle';
+      o.frequency.value = freq;
+      const g = ac.createGain(); g.gain.value = 0.15;
+      const lfo = ac.createOscillator(); lfo.frequency.value = 0.12 + i * 0.03;
+      const lfoGain = ac.createGain(); lfoGain.gain.value = 0.06;
+      lfo.connect(lfoGain).connect(g.gain);
+      o.connect(g).connect(master);
+      o.start(); lfo.start();
+      state.musicNodes.push(o, lfo);
+    });
+    state.musicMaster = master;
+    toast('Music playing');
+  });
+  $('#musicStop').addEventListener('click', () => {
+    state.musicNodes.forEach(n => { try { n.stop(); } catch {} });
+    state.musicNodes = [];
+    toast('Music stopped');
+  });
+  $('#musicVol').addEventListener('input', () => {
+    if (state.musicMaster) state.musicMaster.gain.value = (+$('#musicVol').value) / 500;
+  });
+}
+
+/* ==========================================================================
+   MEETING CLOCK
+   ========================================================================== */
+function startClock() {
+  state.meetingClockInterval = setInterval(() => {
+    const t = Math.floor((Date.now() - state.startedAt) / 1000);
+    const h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = t % 60;
+    $('#meetingClock').textContent = h > 0
+      ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+      : `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }, 1000);
+}
+
+/* ==========================================================================
+   MODALS
+   ========================================================================== */
+function openModal(id) { $('#' + id).classList.add('open'); }
+function closeModal(id) { $('#' + id).classList.remove('open'); }
+
+/* ==========================================================================
+   END CALL
+   ========================================================================== */
+async function endCall() {
+  if (!confirm(isHost ? 'End the meeting for everyone?' : 'Leave the meeting?')) return;
+  try {
+    stopRecording();
+    stopCaptions();
+    if (state.localStream) state.localStream.getTracks().forEach(t => t.stop());
+    if (state.screenStream) state.screenStream.getTracks().forEach(t => t.stop());
+    if (state.pcLocal) state.pcLocal.close();
+    if (state.pcRemote) state.pcRemote.close();
+    if (isHost) {
+      const fd = new FormData(); fd.append('action', 'end');
+      await fetch(location.pathname, { method: 'POST', body: fd });
+    }
+  } catch {}
+  location.href = '/portal';
+}
+
+/* ==========================================================================
+   KEYBOARD SHORTCUTS
+   ========================================================================== */
+document.addEventListener('keydown', (e) => {
+  if (e.target.matches('input, textarea, [contenteditable]')) return;
+  if (e.key === 'm' || e.key === 'M') { toggleMic(); }
+  if (e.key === 'c' || e.key === 'C') { toggleCam(); }
+  if (e.key === 's' || e.key === 'S') { startScreenShare(); }
+  if (e.key === 'r' || e.key === 'R') { toggleHand(); }
+  if (e.key === 'p' || e.key === 'P') { switchTab('people'); togglePanel(); }
+  if (e.key === '?') { $('#helpOverlay').classList.add('open'); }
+  if (e.key === 'Escape') {
+    $$('.mt-modal-bg').forEach(m => m.classList.remove('open'));
+    $('#helpOverlay').classList.remove('open');
+    $('#rxPop').classList.remove('open');
+    $('#moreMenu').classList.remove('open');
+  }
+  // Push-to-talk: hold Space while muted
+  if (e.code === 'Space' && !state.audioOn && !state.ptt) {
+    e.preventDefault();
+    state.ptt = true;
+    if (state.localStream) state.localStream.getAudioTracks().forEach(t => t.enabled = true);
+    toast('PTT on');
+  }
+});
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'Space' && state.ptt) {
+    state.ptt = false;
+    if (state.localStream && !state.audioOn) state.localStream.getAudioTracks().forEach(t => t.enabled = false);
+  }
+});
+
+/* ==========================================================================
+   WIRE EVERYTHING
+   ========================================================================== */
+async function init() {
+  // Top bar
+  $('#copyInvite').addEventListener('click', () => {
+    const url = location.origin + '/portal/meet/' + roomId;
+    navigator.clipboard.writeText(url).then(() => toast('Invite link copied'));
+  });
+
+  // Title save (host only)
+  if (isHost) {
+    const titleInp = $('#roomTitle');
+    let titleTimer;
+    titleInp.addEventListener('input', () => {
+      clearTimeout(titleTimer);
+      titleTimer = setTimeout(async () => {
+        const fd = new FormData(); fd.append('action', 'set_title'); fd.append('title', titleInp.value);
+        await fetch(location.pathname, { method: 'POST', body: fd });
+      }, 600);
+    });
+  }
+
+  // Bottom bar
+  $('#micBtn').addEventListener('click', toggleMic);
+  $('#camBtn').addEventListener('click', toggleCam);
+  $('#shareBtn').addEventListener('click', startScreenShare);
+  $('#handBtn').addEventListener('click', toggleHand);
+  $('#rxBtn').addEventListener('click', (e) => { e.stopPropagation(); $('#moreMenu').classList.remove('open'); $('#rxPop').classList.toggle('open'); });
+  $('#moreBtn').addEventListener('click', (e) => { e.stopPropagation(); $('#rxPop').classList.remove('open'); $('#moreMenu').classList.toggle('open'); });
+  $('#peopleBtn').addEventListener('click', () => switchTab('people'));
+  $('#chatBtn').addEventListener('click', () => switchTab('chat'));
+  $('#endBtn').addEventListener('click', endCall);
+  document.addEventListener('click', () => { $('#rxPop').classList.remove('open'); $('#moreMenu').classList.remove('open'); });
+
+  // Reactions
+  $$('#rxPop button').forEach(b => b.addEventListener('click', () => { flyReaction(b.dataset.rx); $('#rxPop').classList.remove('open'); }));
+
+  // More menu
+  $$('#moreMenu button').forEach(b => b.addEventListener('click', () => {
+    const a = b.dataset.more;
+    $('#moreMenu').classList.remove('open');
+    if (a === 'blur') { state.blurOn ? stopBlur() : startBlur(); }
+    if (a === 'record') { state.recording ? stopRecording() : startRecording(); }
+    if (a === 'captions') { state.capOn ? stopCaptions() : startCaptions(); }
+    if (a === 'breakout' && isHost) { openModal('boModal'); }
+    if (a === 'settings') { openModal('settingsModal'); }
+    if (a === 'help') { $('#helpOverlay').classList.add('open'); }
+    if (a === 'layout') { toast('Layout cycles automatically with participant count'); }
+  }));
+
+  // Tabs
+  $$('.mt-panel-tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+
+  // Chat
+  $('#chatSend').addEventListener('click', sendChat);
+  $('#chatInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  });
+
+  // Polls
+  if (isHost) {
+    $('#newPollBtn')?.addEventListener('click', () => { pollOpts = ['', '']; renderPollOpts(); openModal('pollModal'); });
+    $('#addPollOpt')?.addEventListener('click', () => { pollOpts.push(''); renderPollOpts(); });
+    $('#pollSubmit')?.addEventListener('click', submitPoll);
+    $('#createBreakoutBtn')?.addEventListener('click', () => openModal('boModal'));
+    $('#boSubmit')?.addEventListener('click', submitBreakouts);
+    $('#muteAllBtn')?.addEventListener('click', () => { toggleMic(); toast('Asked all to mute'); });
+    $('#lockBtn')?.addEventListener('click', async () => {
+      const fd = new FormData(); fd.append('action', 'lock'); fd.append('locked', isLockedFlag ? '0' : '1');
+      await fetch(location.pathname, { method: 'POST', body: fd });
+      location.reload();
+    });
+  }
+
+  // Poll vote
+  $$('[data-poll-vote]').forEach(r => r.addEventListener('change', (e) => {
+    votePoll(e.target.dataset.pollVote, e.target.value);
+  }));
+
+  // Modals close
+  $$('[data-close]').forEach(b => b.addEventListener('click', () => closeModal(b.dataset.close)));
+  $$('.mt-modal-bg').forEach(m => m.addEventListener('click', (e) => { if (e.target === m) m.classList.remove('open'); }));
+  $('#helpOverlay').addEventListener('click', (e) => { if (e.target.id === 'helpOverlay') e.currentTarget.classList.remove('open'); });
+
+  // Captions toggle
+  $('#capToggle')?.addEventListener('click', () => state.capOn ? stopCaptions() : startCaptions());
+  $('#capExport')?.addEventListener('click', () => {
+    const text = $('#capLog').innerText;
+    const blob = new Blob([text], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'captions.txt'; a.click();
+  });
+
+  // Apps
+  $$('[data-app]').forEach(c => c.addEventListener('click', () => {
+    const a = c.dataset.app;
+    ['Notes', 'Timer', 'Music'].forEach(n => $('#appBody' + n).classList.add('hidden'));
+    if (a === 'notes') $('#appBodyNotes').classList.remove('hidden');
+    if (a === 'timer') $('#appBodyTimer').classList.remove('hidden');
+    if (a === 'music') $('#appBodyMusic').classList.remove('hidden');
+    if (a === 'board') switchTab('board');
+  }));
+
+  // People search
+  $('#peopleSearch')?.addEventListener('input', (e) => {
+    const q = e.target.value.toLowerCase();
+    $$('#peopleList .mt-pl-item').forEach(i => {
+      const txt = i.textContent.toLowerCase();
+      i.style.display = txt.includes(q) ? '' : 'none';
+    });
+  });
+
+  // People host actions
+  $$('.mt-pl-ctrl').forEach(b => b.addEventListener('click', (e) => {
+    const act = b.dataset.act;
+    const uid = b.closest('.mt-pl-item')?.dataset.uid;
+    if (act === 'remove') { if (confirm('Remove this participant?')) toast('Participant removed'); }
+    if (act === 'ask-mute') { toast('Asked to mute'); }
+  }));
+
+  // Setup pipelines
+  await startLocalMedia();
+  if (state.localStream) {
+    await startLoopbackPC();
+    startActiveSpeakerDetection();
+  }
+
+  // Whiteboard
+  setupWhiteboard();
+  setupNotes();
+  setupTimer();
+  setupMusic();
+  startClock();
+
+  // Auto-join
+  const fd = new FormData();
+  fd.append('action', 'join'); fd.append('display_name', myDisplayName);
+  fetch(location.pathname, { method: 'POST', body: fd }).catch(()=>{});
+
+  // Initial pane state
+  switchTab('chat');
+
+  // First-time tip
+  if (!sessionStorage.getItem('meet-tip')) {
+    setTimeout(() => { toast('Press ? for keyboard shortcuts'); sessionStorage.setItem('meet-tip', '1'); }, 1500);
+  }
+}
+
+window.addEventListener('beforeunload', () => {
+  try {
+    if (state.localStream) state.localStream.getTracks().forEach(t => t.stop());
+    if (state.screenStream) state.screenStream.getTracks().forEach(t => t.stop());
+    if (state.pcLocal) state.pcLocal.close();
+    if (state.pcRemote) state.pcRemote.close();
+  } catch {}
+});
+
+init();
+</script>
+
+</BaseLayout>

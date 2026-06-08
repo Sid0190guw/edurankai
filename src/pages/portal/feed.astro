@@ -1,0 +1,1293 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/feed');
+
+function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// ---------------- Bootstrap schema ----------------
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS feed_posts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      author_user_id UUID NOT NULL,
+      kind VARCHAR(20) NOT NULL DEFAULT 'reel',
+      title TEXT,
+      description TEXT,
+      topic_tags JSONB DEFAULT '[]'::jsonb,
+      media_url TEXT,
+      thumbnail_url TEXT,
+      duration_seconds INT,
+      visibility VARCHAR(20) DEFAULT 'public',
+      course_id UUID,
+      ar_filter_id UUID,
+      engagement_score INT DEFAULT 0,
+      view_count INT DEFAULT 0,
+      like_count INT DEFAULT 0,
+      comment_count INT DEFAULT 0,
+      share_count INT DEFAULT 0,
+      is_pinned BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS feed_likes (
+      post_id UUID NOT NULL REFERENCES feed_posts(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (post_id, user_id)
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS feed_comments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      post_id UUID REFERENCES feed_posts(id) ON DELETE CASCADE,
+      user_id UUID,
+      body TEXT,
+      reply_to UUID,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS feed_view_events (
+      user_id UUID,
+      post_id UUID,
+      watched_pct INT,
+      device VARCHAR(20),
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS ar_filters (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      creator_user_id UUID,
+      slug VARCHAR(120) UNIQUE,
+      name VARCHAR(200),
+      kind VARCHAR(20),
+      preview_url TEXT,
+      code TEXT,
+      use_count INT DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS feed_user_interests (
+      user_id UUID PRIMARY KEY,
+      interests JSONB DEFAULT '[]'::jsonb,
+      follows JSONB DEFAULT '[]'::jsonb,
+      daily_cap_minutes INT DEFAULT 90,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+} catch (e) {}
+
+// ---------------- Seed AR filter catalogue if empty ----------------
+try {
+  const f = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM ar_filters`));
+  if ((f[0]?.n ?? 0) === 0) {
+    const presets = [
+      ['soft-glow', 'Soft Glow', 'face', 'Gentle Gaussian halo around facial features'],
+      ['threshold', 'Ink Stamp', 'face', 'Binary high-contrast etching of the visible scene'],
+      ['rgb-shift', 'Chroma Drift', 'face', 'Channel separation effect with R/G/B offset'],
+      ['anatomy', 'Anatomy Overlay', 'educational-overlay', 'Skull and facial muscle landmarks projected on the camera'],
+      ['math-notation', 'Math Notation', 'educational-overlay', 'Live equation grid and coordinate axes'],
+      ['molecule', 'Molecule Halo', 'educational-overlay', 'Ball-and-stick caffeine molecule orbiting the face'],
+      ['hand-trail', 'Hand Trail', 'hand', 'Particle trail following motion regions'],
+      ['world-grid', 'World Grid', 'world', 'Perspective grid anchored to the scene floor'],
+      ['polar-warp', 'Polar Warp', 'face', 'Radial coordinate warp around the centre'],
+      ['edge-find', 'Edge Find', 'face', 'Sobel edge detection in cyan'],
+    ];
+    for (const p of presets) {
+      await db.execute(sql`
+        INSERT INTO ar_filters (slug, name, kind, code, creator_user_id)
+        VALUES (${p[0]}, ${p[1]}, ${p[2]}, ${p[3]}, ${user.id})
+        ON CONFLICT (slug) DO NOTHING
+      `);
+    }
+  }
+} catch (e) {}
+
+// ---------------- Seed posts if empty ----------------
+try {
+  const p = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM feed_posts`));
+  if ((p[0]?.n ?? 0) === 0) {
+    const reels = [
+      ['Why entropy never decreases — 30 sec', 'reel', ['thermodynamics','physics','jee'], 32, 18400, 2100, 140],
+      ['Solve any integration by parts in 3 steps', 'reel', ['calculus','math','jee'], 41, 31200, 4800, 312],
+      ['What is a transformer attention head?', 'reel', ['ai','transformers','ml'], 58, 12100, 980, 89],
+      ['Spotting a fake proof: the missing axiom', 'reel', ['logic','math','foundations'], 47, 8700, 540, 41],
+      ['Why DNA is right-handed and what would happen if it were not', 'reel', ['biology','biochem'], 39, 21300, 2950, 180],
+      ['Reduce a matrix to row-echelon form, fast', 'reel', ['linear-algebra','math'], 52, 9400, 720, 55],
+      ['Build a NAND gate from two transistors', 'reel', ['electronics','digital'], 44, 14800, 1180, 92],
+      ['What pH actually means (it is not what you think)', 'reel', ['chemistry','acid-base'], 36, 19200, 1620, 121],
+      ['A 60-second proof of the Pythagorean theorem', 'reel', ['geometry','math'], 60, 38700, 5210, 410],
+      ['Why orbitals are not little planets', 'reel', ['quantum','chemistry'], 51, 22100, 2800, 195],
+      ['Difference between weak and strong induction', 'reel', ['discrete','proof'], 43, 6700, 410, 28],
+      ['The fastest way to balance a redox equation', 'reel', ['chemistry','redox'], 38, 11400, 870, 64],
+    ];
+    const clips = [
+      ['Full lecture: Tensor calculus for general relativity', 'clip', ['relativity','tensor','physics'], 3420, 142000, 11200, 980],
+      ['One-hour deep dive: discrete Fourier transform from scratch', 'clip', ['fourier','signal','math'], 3680, 89000, 7100, 540],
+      ['Walkthrough: building a simple operating-system kernel', 'clip', ['os','systems'], 4900, 67000, 5800, 410],
+      ['Organic chemistry exam-prep marathon', 'clip', ['organic','chemistry','exam'], 5400, 102000, 8200, 670],
+      ['Number theory: from Fermat to elliptic curves', 'clip', ['number-theory','math'], 4200, 41000, 3100, 220],
+      ['Microeconomics: indifference curves and utility', 'clip', ['economics','micro'], 3120, 28000, 1900, 120],
+      ['Human physiology: the cardiac cycle in detail', 'clip', ['biology','physiology'], 2880, 56000, 4200, 280],
+      ['Recursion and the call stack, visualised', 'clip', ['programming','cs'], 1980, 73000, 6100, 380],
+    ];
+    const xr = [
+      ['Try the Anatomy Overlay AR filter', 'xr-experience', ['biology','ar'], 0, 4200, 320, 42],
+      ['Floating molecule halo: caffeine in 3D', 'xr-experience', ['chemistry','ar'], 0, 3100, 240, 18],
+      ['Math notation overlay on your study desk', 'xr-experience', ['math','ar'], 0, 5600, 410, 51],
+    ];
+    const all = [...reels, ...clips, ...xr];
+    for (const r of all) {
+      await db.execute(sql`
+        INSERT INTO feed_posts (author_user_id, kind, title, topic_tags, duration_seconds, view_count, like_count, comment_count, engagement_score)
+        VALUES (
+          ${user.id}, ${r[1]}, ${r[0]},
+          ${JSON.stringify(r[2])}::jsonb,
+          ${r[3]}, ${r[4]}, ${r[5]}, ${r[6]},
+          ${Math.floor((r[4] as number)/10 + (r[5] as number)/3)}
+        )
+      `);
+    }
+  }
+} catch (e) {}
+
+// ---------------- Load user interests (or default) ----------------
+let interests: string[] = [];
+let follows: string[] = [];
+let dailyCap = 90;
+try {
+  const r = rows(await db.execute(sql`
+    SELECT interests, follows, daily_cap_minutes FROM feed_user_interests WHERE user_id = ${user.id}
+  `));
+  if (r[0]) {
+    interests = Array.isArray(r[0].interests) ? r[0].interests : (typeof r[0].interests === 'string' ? JSON.parse(r[0].interests) : []);
+    follows = Array.isArray(r[0].follows) ? r[0].follows : (typeof r[0].follows === 'string' ? JSON.parse(r[0].follows) : []);
+    dailyCap = r[0].daily_cap_minutes ?? 90;
+  } else {
+    interests = ['math','physics','ai','chemistry'];
+    await db.execute(sql`
+      INSERT INTO feed_user_interests (user_id, interests, follows)
+      VALUES (${user.id}, ${JSON.stringify(interests)}::jsonb, '[]'::jsonb)
+      ON CONFLICT (user_id) DO NOTHING
+    `);
+  }
+} catch (e) {}
+
+// ---------------- Handle POST ----------------
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+    if (action === 'create_post') {
+      const kind = String(form.get('kind') || 'reel');
+      const title = String(form.get('title') || '').slice(0, 280);
+      const description = String(form.get('description') || '').slice(0, 2000);
+      const tagsRaw = String(form.get('tags') || '');
+      const visibility = String(form.get('visibility') || 'public');
+      const tags = tagsRaw.split(',').map(t => t.trim().toLowerCase()).filter(Boolean).slice(0, 12);
+      if (!title) { errMsg = 'Title is required'; }
+      else {
+        await db.execute(sql`
+          INSERT INTO feed_posts (author_user_id, kind, title, description, topic_tags, visibility)
+          VALUES (${user.id}, ${kind}, ${title}, ${description}, ${JSON.stringify(tags)}::jsonb, ${visibility})
+        `);
+        okMsg = 'Post published';
+      }
+    } else if (action === 'save_interests') {
+      const raw = String(form.get('interests') || '');
+      const list = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean).slice(0, 30);
+      await db.execute(sql`
+        INSERT INTO feed_user_interests (user_id, interests, updated_at)
+        VALUES (${user.id}, ${JSON.stringify(list)}::jsonb, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET interests = EXCLUDED.interests, updated_at = NOW()
+      `);
+      interests = list;
+      okMsg = 'Interests saved';
+    } else if (action === 'like') {
+      const postId = String(form.get('post_id') || '');
+      if (postId) {
+        await db.execute(sql`
+          INSERT INTO feed_likes (post_id, user_id) VALUES (${postId}::uuid, ${user.id})
+          ON CONFLICT DO NOTHING
+        `);
+        await db.execute(sql`UPDATE feed_posts SET like_count = like_count + 1 WHERE id = ${postId}::uuid`);
+      }
+    }
+  } catch (e: any) { errMsg = e?.message || 'Error'; }
+}
+
+// ---------------- Fetch posts ----------------
+const allPosts = rows(await db.execute(sql`
+  SELECT id, kind, title, description, topic_tags, duration_seconds, view_count, like_count, comment_count, share_count, engagement_score, created_at
+  FROM feed_posts ORDER BY created_at DESC LIMIT 200
+`));
+
+// ---------------- Seen post ids today ----------------
+const seenRows = rows(await db.execute(sql`
+  SELECT DISTINCT post_id FROM feed_view_events WHERE user_id = ${user.id} AND created_at > NOW() - INTERVAL '7 days'
+`));
+const seenSet = new Set(seenRows.map((r: any) => r.post_id));
+
+// ---------------- Watched-time today ----------------
+const watchRow = rows(await db.execute(sql`
+  SELECT COALESCE(SUM(watched_pct), 0)::int AS pct_sum
+  FROM feed_view_events WHERE user_id = ${user.id} AND created_at >= CURRENT_DATE
+`));
+const pctSumToday = watchRow[0]?.pct_sum || 0;
+// Rough: assume avg post is 45s, watched_pct of 100 = 45s watched. So minutes ~ pct_sum/100 * 45 / 60
+const minutesToday = Math.floor((pctSumToday / 100) * 45 / 60);
+const watchPct = Math.min(100, Math.floor((minutesToday / dailyCap) * 100));
+const capReached = minutesToday >= dailyCap;
+
+// ---------------- Hand-rolled recommendation scoring ----------------
+function jaccard(a: string[], b: string[]) {
+  if (!a.length || !b.length) return 0;
+  const sa = new Set(a), sb = new Set(b);
+  let inter = 0;
+  sa.forEach(x => { if (sb.has(x)) inter++; });
+  const uni = new Set([...a, ...b]).size;
+  return uni === 0 ? 0 : inter / uni;
+}
+function scorePost(p: any) {
+  const tags = Array.isArray(p.topic_tags) ? p.topic_tags : (typeof p.topic_tags === 'string' ? JSON.parse(p.topic_tags || '[]') : []);
+  const created = new Date(p.created_at).getTime();
+  const ageDays = (Date.now() - created) / (1000 * 60 * 60 * 24);
+  const recency = ageDays < 7 ? 1 : 0.5;
+  const tm = jaccard(tags, interests);
+  const authorFollowed = follows.includes(p.author_user_id) ? 0.3 : 0;
+  const seen = seenSet.has(p.id) ? 1.5 : 0;
+  const score =
+    Math.log((p.view_count || 0) + 1) * 0.4 +
+    Math.log((p.like_count || 0) + 1) * 0.3 +
+    recency +
+    tm * 0.5 +
+    authorFollowed -
+    seen;
+  return { score: Math.round(score * 100) / 100, tags, recency, tm, authorFollowed, seen };
+}
+const scored = allPosts.map((p: any) => ({ ...p, ...scorePost(p) }));
+scored.sort((a: any, b: any) => b.score - a.score);
+
+const reels = scored.filter((p: any) => p.kind === 'reel').slice(0, 20);
+const clips = scored.filter((p: any) => p.kind === 'clip').slice(0, 20);
+const xrPosts = scored.filter((p: any) => p.kind === 'xr-experience').slice(0, 20);
+
+// ---------------- AR filters ----------------
+const filters = rows(await db.execute(sql`
+  SELECT id, slug, name, kind, code, use_count FROM ar_filters ORDER BY use_count DESC, name ASC LIMIT 24
+`));
+
+const safeReels = JSON.stringify(reels);
+const safeClips = JSON.stringify(clips);
+const safeXr = JSON.stringify(xrPosts);
+const safeFilters = JSON.stringify(filters);
+const safeInterests = JSON.stringify(interests);
+---
+<BaseLayout title="Feed - EduRankAI" description="Student media feed with reels, clips and AR experiences">
+<style>
+  body { background: #0a0a0c !important; color: #e8e8ee !important; }
+  body.era-has-fab { padding-bottom: 0 !important; }
+  .feed-root { min-height: 100vh; background: #0a0a0c; color: #e8e8ee; font-family: 'Cormorant Garamond', Georgia, serif; }
+  .feed-top {
+    position: sticky; top: 0; z-index: 30; background: rgba(10,10,12,0.92); backdrop-filter: blur(14px);
+    border-bottom: 1px solid #2a2a35; padding: 14px 22px; display: flex; align-items: center; gap: 18px;
+  }
+  .feed-top h1 { margin: 0; font-size: 26px; font-weight: 500; letter-spacing: -0.01em; }
+  .feed-top h1 span { color: #67e8f9; font-style: italic; }
+  .tabs { display: flex; gap: 6px; margin-left: auto; }
+  .tab {
+    background: transparent; border: 1px solid #2a2a35; color: #c8c8d2;
+    padding: 8px 16px; border-radius: 999px; cursor: pointer; font-family: inherit;
+    font-size: 14px; letter-spacing: 0.02em; transition: all 0.15s;
+  }
+  .tab:hover { border-color: #67e8f9; color: #67e8f9; }
+  .tab.active { background: #67e8f9; color: #0a0a0c; border-color: #67e8f9; font-weight: 600; }
+  .wellbeing {
+    margin: 12px 22px; padding: 12px 16px; background: #11131a;
+    border: 1px solid #2a2a35; border-left: 3px solid #a78bfa; border-radius: 8px;
+    font-size: 13px; color: #c8c8d2; display: flex; align-items: center; gap: 14px;
+  }
+  .wellbeing svg { flex-shrink: 0; color: #a78bfa; }
+  .wb-meter { flex: 1; height: 6px; background: #1a1a22; border-radius: 4px; overflow: hidden; min-width: 140px; }
+  .wb-meter > div { height: 100%; background: linear-gradient(90deg, #67e8f9, #a78bfa); transition: width 0.4s; }
+  .wb-text { font-family: 'Geist Mono', monospace; font-size: 11px; color: #c8c8d2; white-space: nowrap; }
+
+  /* TAB PANELS */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ---------- REELS PANEL (vertical snap scroll) ---------- */
+  .reels-panel {
+    height: calc(100vh - 100px); overflow-y: scroll; scroll-snap-type: y mandatory;
+    scrollbar-width: none; position: relative;
+  }
+  .reels-panel::-webkit-scrollbar { display: none; }
+  .reel {
+    height: calc(100vh - 100px); scroll-snap-align: start;
+    display: flex; justify-content: center; align-items: center; position: relative;
+  }
+  .reel-card {
+    position: relative; width: 380px; height: calc(100vh - 140px); max-height: 760px;
+    background: #11131a; border-radius: 18px; overflow: hidden;
+    border: 1px solid #2a2a35; box-shadow: 0 12px 60px rgba(0,0,0,0.6);
+  }
+  .reel-thumb { position: absolute; inset: 0; }
+  .reel-thumb canvas { width: 100%; height: 100%; display: block; }
+  .reel-overlay {
+    position: absolute; inset: 0; background: linear-gradient(180deg, transparent 50%, rgba(0,0,0,0.85) 100%);
+    pointer-events: none;
+  }
+  .reel-meta {
+    position: absolute; left: 16px; right: 70px; bottom: 18px; z-index: 2;
+  }
+  .reel-meta .rtitle { font-size: 19px; line-height: 1.25; font-weight: 500; margin-bottom: 6px; }
+  .reel-meta .rauth { font-size: 13px; color: #c8c8d2; font-family: 'Geist Mono', monospace; margin-bottom: 6px; }
+  .reel-meta .rtags { display: flex; flex-wrap: wrap; gap: 5px; }
+  .reel-meta .rtags span {
+    background: rgba(167,139,250,0.16); color: #c4b5fd; padding: 3px 8px; border-radius: 6px;
+    font-size: 11px; font-family: 'Geist Mono', monospace;
+  }
+  .reel-side {
+    position: absolute; right: 12px; bottom: 24px; z-index: 3; display: flex; flex-direction: column; gap: 14px;
+  }
+  .rs-btn {
+    background: rgba(20,20,28,0.6); border: 1px solid rgba(255,255,255,0.08); color: #e8e8ee;
+    width: 46px; height: 46px; border-radius: 50%; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; cursor: pointer;
+    transition: all 0.15s; backdrop-filter: blur(4px);
+  }
+  .rs-btn:hover { background: rgba(103,232,249,0.18); border-color: #67e8f9; transform: scale(1.08); }
+  .rs-btn.liked { color: #fb7185; border-color: #fb7185; }
+  .rs-btn svg { width: 22px; height: 22px; }
+  .rs-count { font-size: 10px; font-family: 'Geist Mono', monospace; color: #c8c8d2; margin-top: 2px; text-align: center; }
+  .reel-top-actions {
+    position: absolute; top: 14px; right: 14px; z-index: 3; display: flex; gap: 8px;
+  }
+  .reel-top-actions button {
+    background: rgba(20,20,28,0.5); border: 1px solid rgba(255,255,255,0.1); color: #e8e8ee;
+    width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    cursor: pointer; backdrop-filter: blur(4px);
+  }
+  .why-tip {
+    position: absolute; top: 60px; right: 14px; z-index: 4;
+    background: #11131a; border: 1px solid #2a2a35; border-radius: 10px;
+    padding: 10px 12px; font-size: 11px; color: #c8c8d2; max-width: 230px;
+    font-family: 'Geist Mono', monospace; display: none;
+  }
+  .why-tip.show { display: block; }
+  .why-tip h4 { margin: 0 0 6px 0; color: #67e8f9; font-size: 11px; font-family: inherit; font-weight: 600; }
+  .why-tip .sig { display: flex; justify-content: space-between; margin: 3px 0; }
+  .why-tip .sig span:last-child { color: #67e8f9; }
+
+  /* ---------- CLIPS PANEL ---------- */
+  .clips-panel { padding: 24px; }
+  .filter-bar { display: flex; gap: 10px; margin-bottom: 22px; flex-wrap: wrap; align-items: center; }
+  .filter-bar select, .filter-bar input {
+    background: #11131a; border: 1px solid #2a2a35; color: #e8e8ee; padding: 8px 12px;
+    border-radius: 8px; font-family: inherit; font-size: 14px;
+  }
+  .filter-bar input:focus, .filter-bar select:focus { outline: none; border-color: #67e8f9; }
+  .clip-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 22px;
+  }
+  .clip-card { background: #11131a; border: 1px solid #2a2a35; border-radius: 12px; overflow: hidden; cursor: pointer; transition: all 0.15s; }
+  .clip-card:hover { transform: translateY(-3px); border-color: #67e8f9; }
+  .clip-thumb { width: 100%; aspect-ratio: 16/9; position: relative; background: #06080a; }
+  .clip-thumb canvas { width: 100%; height: 100%; display: block; }
+  .clip-dur {
+    position: absolute; right: 8px; bottom: 8px; background: rgba(0,0,0,0.78);
+    color: #fff; padding: 3px 7px; border-radius: 4px; font-family: 'Geist Mono', monospace; font-size: 11px;
+  }
+  .clip-body { padding: 14px; }
+  .clip-body h3 { margin: 0 0 7px 0; font-size: 17px; line-height: 1.3; font-weight: 500; }
+  .clip-body .meta {
+    font-size: 12px; color: #8a8a99; font-family: 'Geist Mono', monospace;
+  }
+  .clip-body .ctags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 5px; }
+  .clip-body .ctags span {
+    background: rgba(103,232,249,0.12); color: #67e8f9; padding: 2px 7px; border-radius: 6px;
+    font-size: 10px; font-family: 'Geist Mono', monospace;
+  }
+
+  /* ---------- AR PANEL ---------- */
+  .xr-panel { padding: 24px; }
+  .xr-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 18px; }
+  .xr-card {
+    background: #11131a; border: 1px solid #2a2a35; border-radius: 12px; padding: 18px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .xr-preview {
+    width: 100%; aspect-ratio: 4/5; border-radius: 8px; background: #06080a; overflow: hidden;
+    border: 1px solid #2a2a35;
+  }
+  .xr-preview canvas { width: 100%; height: 100%; display: block; }
+  .xr-card h3 { margin: 0; font-size: 18px; font-weight: 500; }
+  .xr-card .kind {
+    font-family: 'Geist Mono', monospace; font-size: 10px; color: #a78bfa;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .xr-card .desc { font-size: 13px; color: #c8c8d2; line-height: 1.45; font-family: inherit; min-height: 36px; }
+  .xr-card button.try {
+    background: #67e8f9; color: #0a0a0c; border: 0; padding: 9px 14px; border-radius: 8px;
+    font-family: inherit; font-weight: 600; cursor: pointer; font-size: 14px;
+  }
+  .xr-card button.try:hover { background: #a78bfa; }
+
+  /* AR live modal */
+  .ar-modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 100; display: none;
+    align-items: center; justify-content: center; flex-direction: column; padding: 20px;
+  }
+  .ar-modal.open { display: flex; }
+  .ar-stage {
+    position: relative; max-width: 640px; width: 100%; aspect-ratio: 3/4;
+    background: #0a0a0c; border-radius: 14px; overflow: hidden; border: 1px solid #2a2a35;
+  }
+  .ar-stage video, .ar-stage canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+  }
+  .ar-stage video { visibility: hidden; }
+  .ar-controls {
+    display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; justify-content: center;
+  }
+  .ar-controls button {
+    background: #11131a; color: #e8e8ee; border: 1px solid #2a2a35; padding: 8px 14px;
+    border-radius: 8px; cursor: pointer; font-family: 'Cormorant Garamond', serif; font-size: 14px;
+  }
+  .ar-controls button.active { background: #67e8f9; color: #0a0a0c; border-color: #67e8f9; }
+  .ar-controls button.close { background: #fb7185; color: #0a0a0c; border-color: #fb7185; }
+  .ar-status { color: #c8c8d2; margin-top: 10px; font-family: 'Geist Mono', monospace; font-size: 12px; min-height: 18px; }
+
+  /* FAB */
+  .feed-fab {
+    position: fixed; right: 26px; bottom: 26px; z-index: 50; width: 56px; height: 56px;
+    border-radius: 50%; background: #67e8f9; color: #0a0a0c; border: 0; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 8px 28px rgba(103, 232, 249, 0.35);
+  }
+  .feed-fab:hover { background: #a78bfa; }
+  .feed-fab svg { width: 26px; height: 26px; }
+
+  /* Create modal */
+  .create-modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; display: none;
+    align-items: center; justify-content: center; padding: 20px;
+  }
+  .create-modal.open { display: flex; }
+  .create-card { background: #11131a; border: 1px solid #2a2a35; border-radius: 14px; padding: 26px; max-width: 540px; width: 100%; }
+  .create-card h2 { margin: 0 0 16px 0; font-size: 26px; font-weight: 500; }
+  .create-card label { display: block; font-size: 12px; color: #8a8a99; margin: 10px 0 4px 0; font-family: 'Geist Mono', monospace; }
+  .create-card input, .create-card select, .create-card textarea {
+    width: 100%; background: #0a0a0c; border: 1px solid #2a2a35; color: #e8e8ee;
+    padding: 9px 12px; border-radius: 7px; font-family: inherit; font-size: 14px;
+  }
+  .create-card textarea { resize: vertical; min-height: 90px; }
+  .create-card .row-btn { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
+  .create-card button {
+    padding: 9px 16px; border-radius: 7px; border: 1px solid #2a2a35; background: #1a1a22;
+    color: #e8e8ee; cursor: pointer; font-family: inherit; font-size: 14px;
+  }
+  .create-card button.primary { background: #67e8f9; color: #0a0a0c; border-color: #67e8f9; font-weight: 600; }
+
+  /* Cap-reached lock screen */
+  .timeup {
+    position: fixed; inset: 0; background: rgba(10,10,12,0.96); z-index: 200; display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 16px; padding: 30px;
+  }
+  .timeup.open { display: flex; }
+  .timeup h2 { font-size: 38px; margin: 0; font-weight: 400; color: #a78bfa; }
+  .timeup p { color: #c8c8d2; max-width: 480px; text-align: center; font-size: 16px; line-height: 1.5; }
+
+  .toast {
+    position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
+    background: #11131a; border: 1px solid #67e8f9; color: #67e8f9;
+    padding: 10px 18px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 13px;
+    z-index: 300; display: none;
+  }
+  .toast.show { display: block; }
+
+  .empty { padding: 60px 20px; text-align: center; color: #8a8a99; font-style: italic; }
+</style>
+
+<div class="feed-root">
+  <div class="feed-top">
+    <h1><span>edu</span>Feed</h1>
+    <div class="tabs">
+      <button class="tab active" data-tab="reels">Reels</button>
+      <button class="tab" data-tab="clips">Clips</button>
+      <button class="tab" data-tab="xr">AR / XR</button>
+      <button class="tab" data-tab="interests">Interests</button>
+    </div>
+  </div>
+
+  <div class="wellbeing">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1v6m0 6v6m11-11h-6m-6 0H1"/></svg>
+    <span>We use engagement signals to recommend, but we cap daily watch time at {dailyCap} min and never show you content optimised purely for outrage.</span>
+    <div class="wb-meter"><div style={`width:${watchPct}%`}></div></div>
+    <span class="wb-text">{minutesToday}m / {dailyCap}m today</span>
+  </div>
+
+  {okMsg && <div class="toast show">{okMsg}</div>}
+  {errMsg && <div class="toast show" style="border-color:#fb7185;color:#fb7185">{errMsg}</div>}
+
+  <!-- REELS PANEL -->
+  <div class="panel active" id="panel-reels">
+    <div class="reels-panel" id="reelsScroll">
+      {reels.length === 0 && <div class="empty">No reels yet. Be the first to post one.</div>}
+      {reels.map((r: any, i: number) => (
+        <div class="reel" data-post-id={r.id} data-idx={i}>
+          <div class="reel-card">
+            <div class="reel-thumb"><canvas data-thumb-seed={i} data-thumb-kind="reel"></canvas></div>
+            <div class="reel-overlay"></div>
+            <div class="reel-top-actions">
+              <button class="why-btn" title="Why am I seeing this?" data-idx={i}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              </button>
+              <button title="More">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+              </button>
+            </div>
+            <div class="why-tip" data-tip={i}>
+              <h4>Why am I seeing this</h4>
+              <div class="sig"><span>Score</span><span>{r.score}</span></div>
+              <div class="sig"><span>Tag match</span><span>{Math.round(r.tm * 100)}%</span></div>
+              <div class="sig"><span>Recency</span><span>{r.recency === 1 ? 'fresh' : 'older'}</span></div>
+              <div class="sig"><span>Author followed</span><span>{r.authorFollowed > 0 ? 'yes' : 'no'}</span></div>
+              <div class="sig"><span>Already seen</span><span>{r.seen > 0 ? 'yes' : 'no'}</span></div>
+            </div>
+            <div class="reel-meta">
+              <div class="rtitle">{r.title}</div>
+              <div class="rauth">by educator · {r.duration_seconds}s</div>
+              <div class="rtags">
+                {(Array.isArray(r.tags) ? r.tags : []).slice(0,4).map((t: string) => <span>#{t}</span>)}
+              </div>
+            </div>
+            <div class="reel-side">
+              <button class="rs-btn like-btn" data-post-id={r.id}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+                <span class="rs-count">{r.like_count}</span>
+              </button>
+              <button class="rs-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                <span class="rs-count">{r.comment_count}</span>
+              </button>
+              <button class="rs-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+                <span class="rs-count">{r.share_count}</span>
+              </button>
+              <button class="rs-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+                <span class="rs-count">save</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  </div>
+
+  <!-- CLIPS PANEL -->
+  <div class="panel" id="panel-clips">
+    <div class="clips-panel">
+      <div class="filter-bar">
+        <input type="text" id="clipSearch" placeholder="Search titles or tags..." />
+        <select id="clipTopic">
+          <option value="">All topics</option>
+          <option>math</option><option>physics</option><option>chemistry</option><option>biology</option>
+          <option>cs</option><option>ai</option><option>economics</option>
+        </select>
+        <select id="clipDur">
+          <option value="">Any duration</option>
+          <option value="short">Under 30 min</option>
+          <option value="long">30 min +</option>
+        </select>
+      </div>
+      <div class="clip-grid" id="clipGrid">
+        {clips.length === 0 && <div class="empty">No long-form clips yet.</div>}
+        {clips.map((c: any, i: number) => (
+          <div class="clip-card" data-tags={(Array.isArray(c.tags) ? c.tags : []).join(',')} data-dur={c.duration_seconds}>
+            <div class="clip-thumb">
+              <canvas data-thumb-seed={i+100} data-thumb-kind="clip"></canvas>
+              <div class="clip-dur">{Math.floor((c.duration_seconds||0)/60)}:{String((c.duration_seconds||0)%60).padStart(2,'0')}</div>
+            </div>
+            <div class="clip-body">
+              <h3>{c.title}</h3>
+              <div class="meta">{c.view_count.toLocaleString()} views · score {c.score}</div>
+              <div class="ctags">
+                {(Array.isArray(c.tags) ? c.tags : []).slice(0,5).map((t: string) => <span>#{t}</span>)}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  </div>
+
+  <!-- XR PANEL -->
+  <div class="panel" id="panel-xr">
+    <div class="xr-panel">
+      <div class="xr-grid" id="xrGrid">
+        {filters.map((f: any, i: number) => (
+          <div class="xr-card" data-filter-slug={f.slug}>
+            <div class="xr-preview"><canvas data-preview-slug={f.slug} data-preview-idx={i}></canvas></div>
+            <div class="kind">{f.kind}</div>
+            <h3>{f.name}</h3>
+            <div class="desc">{f.code}</div>
+            <button class="try" data-try-slug={f.slug}>Try in camera</button>
+          </div>
+        ))}
+      </div>
+    </div>
+  </div>
+
+  <!-- INTERESTS PANEL -->
+  <div class="panel" id="panel-interests">
+    <div style="padding:24px; max-width:680px">
+      <h2 style="font-weight:500; font-size:28px; margin:0 0 10px 0">Your interests</h2>
+      <p style="color:#c8c8d2; margin:0 0 18px 0">Comma-separated tags. We use these to drive the recommendation algorithm.</p>
+      <form method="POST">
+        <input type="hidden" name="action" value="save_interests" />
+        <textarea name="interests" rows="4" style="width:100%; background:#11131a; border:1px solid #2a2a35; color:#e8e8ee; padding:12px; border-radius:8px; font-family:'Geist Mono', monospace; font-size:13px">{interests.join(', ')}</textarea>
+        <button type="submit" style="margin-top:14px; background:#67e8f9; color:#0a0a0c; border:0; padding:10px 18px; border-radius:8px; font-family:inherit; font-weight:600; cursor:pointer; font-size:15px">Save interests</button>
+      </form>
+
+      <h3 style="margin:32px 0 10px 0; font-weight:500">Algorithm transparency</h3>
+      <pre style="background:#11131a; border:1px solid #2a2a35; padding:14px; border-radius:8px; font-size:11px; line-height:1.6; color:#c8c8d2; overflow-x:auto">score = log(views+1) * 0.4
+      + log(likes+1) * 0.3
+      + (recency_days &lt; 7 ? 1 : 0.5)
+      + jaccard(post_tags, your_interests) * 0.5
+      + (author_followed ? 0.3 : 0)
+      - (already_seen ? 1.5 : 0)</pre>
+      <p style="color:#8a8a99; font-size:13px; line-height:1.5; margin-top:14px">No outrage signals, no purely-attention-grabbing weighting, and a hard 90-minute daily cap. You can see the exact score on every reel by tapping the question-mark icon.</p>
+    </div>
+  </div>
+
+  <button class="feed-fab" id="fab" title="New post">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+  </button>
+
+  <!-- Create modal -->
+  <div class="create-modal" id="createModal">
+    <div class="create-card">
+      <h2>Publish to the feed</h2>
+      <form method="POST">
+        <input type="hidden" name="action" value="create_post" />
+        <label>Kind</label>
+        <select name="kind">
+          <option value="reel">Reel (short-form vertical)</option>
+          <option value="clip">Clip (long-form horizontal)</option>
+          <option value="photo">Photo</option>
+          <option value="xr-experience">AR / XR experience</option>
+          <option value="thread">Thread</option>
+        </select>
+        <label>Title</label>
+        <input type="text" name="title" required maxlength="280" />
+        <label>Description</label>
+        <textarea name="description" maxlength="2000"></textarea>
+        <label>Topic tags (comma-separated)</label>
+        <input type="text" name="tags" placeholder="math, integration, jee" />
+        <label>Visibility</label>
+        <select name="visibility">
+          <option value="public">Public</option>
+          <option value="followers">Followers only</option>
+          <option value="course">Course classmates</option>
+          <option value="unlisted">Unlisted</option>
+        </select>
+        <div class="row-btn">
+          <button type="button" id="cancelCreate">Cancel</button>
+          <button type="submit" class="primary">Publish</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- AR modal -->
+  <div class="ar-modal" id="arModal">
+    <div class="ar-stage">
+      <video id="arVideo" autoplay playsinline muted></video>
+      <canvas id="arCanvas"></canvas>
+    </div>
+    <div class="ar-controls">
+      <button class="active" data-fx="soft-glow">Soft Glow</button>
+      <button data-fx="threshold">Threshold</button>
+      <button data-fx="rgb-shift">RGB Shift</button>
+      <button data-fx="edge-find">Edge Find</button>
+      <button data-fx="polar-warp">Polar Warp</button>
+      <button data-fx="anatomy">Anatomy Overlay</button>
+      <button data-fx="math-notation">Math Notation</button>
+      <button data-fx="molecule">Molecule Halo</button>
+      <button data-fx="hand-trail">Hand Trail</button>
+      <button data-fx="world-grid">World Grid</button>
+      <button class="close" id="arClose">Close</button>
+    </div>
+    <div class="ar-status" id="arStatus">Ready</div>
+  </div>
+
+  {capReached && (
+    <div class="timeup open">
+      <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      <h2>Time's up for today</h2>
+      <p>You've reached your daily watch-time cap of {dailyCap} minutes. We do this on purpose. Take a walk, do a problem set, or come back tomorrow.</p>
+      <a href="/portal" style="color:#67e8f9; text-decoration:none; border:1px solid #67e8f9; padding:9px 16px; border-radius:8px; font-family:'Geist Mono', monospace; font-size:13px">Back to portal</a>
+    </div>
+  )}
+</div>
+
+<script is:inline define:vars={{ safeReels, safeClips, safeXr, safeFilters, safeInterests }}>
+(function(){
+  const reels = JSON.parse(safeReels);
+  const clips = JSON.parse(safeClips);
+  const xrPosts = JSON.parse(safeXr);
+  const filters = JSON.parse(safeFilters);
+
+  // -------- TAB SWITCHING --------
+  const tabs = document.querySelectorAll('.tab');
+  const panels = document.querySelectorAll('.panel');
+  tabs.forEach(t => t.addEventListener('click', () => {
+    tabs.forEach(x => x.classList.remove('active'));
+    panels.forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    const id = 'panel-' + t.dataset.tab;
+    const p = document.getElementById(id);
+    if (p) p.classList.add('active');
+  }));
+
+  // -------- ANIMATED CANVAS THUMBNAILS --------
+  function drawReelThumb(canvas, seed) {
+    const w = canvas.width = canvas.clientWidth || 380;
+    const h = canvas.height = canvas.clientHeight || 600;
+    const ctx = canvas.getContext('2d');
+    // hash seed
+    const hue1 = (seed * 47) % 360;
+    const hue2 = (seed * 89 + 120) % 360;
+    const g = ctx.createLinearGradient(0, 0, w, h);
+    g.addColorStop(0, `hsl(${hue1}, 70%, 22%)`);
+    g.addColorStop(1, `hsl(${hue2}, 65%, 14%)`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+    // floating shapes
+    const t = Date.now() / 1000;
+    for (let i = 0; i < 14; i++) {
+      const x = w/2 + Math.cos(t * 0.4 + i + seed) * (w * 0.35);
+      const y = h/2 + Math.sin(t * 0.5 + i * 1.3 + seed) * (h * 0.32);
+      const r = 28 + Math.sin(t + i) * 14;
+      const ng = ctx.createRadialGradient(x, y, 0, x, y, r);
+      ng.addColorStop(0, `hsla(${(hue1 + i * 22) % 360}, 80%, 65%, 0.55)`);
+      ng.addColorStop(1, `hsla(${(hue1 + i * 22) % 360}, 80%, 60%, 0)`);
+      ctx.fillStyle = ng;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    }
+    // grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 12; i++) {
+      ctx.beginPath(); ctx.moveTo(0, (h/12)*i); ctx.lineTo(w, (h/12)*i); ctx.stroke();
+    }
+    // central icon shape
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.beginPath();
+    ctx.arc(w/2, h*0.45, w * 0.18, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawClipThumb(canvas, seed) {
+    const w = canvas.width = canvas.clientWidth || 360;
+    const h = canvas.height = canvas.clientHeight || 200;
+    const ctx = canvas.getContext('2d');
+    const hue1 = (seed * 37) % 360;
+    const hue2 = (seed * 71 + 60) % 360;
+    const g = ctx.createLinearGradient(0, 0, w, h);
+    g.addColorStop(0, `hsl(${hue1}, 60%, 25%)`);
+    g.addColorStop(1, `hsl(${hue2}, 55%, 14%)`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+    // wave-form lines
+    ctx.strokeStyle = `hsla(${hue1}, 90%, 75%, 0.6)`;
+    ctx.lineWidth = 1.5;
+    for (let k = 0; k < 5; k++) {
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const y = h/2 + Math.sin(x * 0.03 + k + seed) * (15 + k * 8);
+        if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    // central play
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.beginPath();
+    ctx.arc(w/2, h/2, 24, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.moveTo(w/2 - 7, h/2 - 9);
+    ctx.lineTo(w/2 + 11, h/2);
+    ctx.lineTo(w/2 - 7, h/2 + 9);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function drawXrPreview(canvas, slug, idx) {
+    const w = canvas.width = canvas.clientWidth || 280;
+    const h = canvas.height = canvas.clientHeight || 350;
+    const ctx = canvas.getContext('2d');
+    const hue = (idx * 47) % 360;
+    const g = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, w);
+    g.addColorStop(0, `hsl(${hue}, 60%, 30%)`);
+    g.addColorStop(1, `hsl(${(hue + 180) % 360}, 40%, 10%)`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+    // face silhouette
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.beginPath(); ctx.ellipse(w/2, h*0.5, w*0.28, h*0.32, 0, 0, Math.PI * 2); ctx.fill();
+    // overlay specific
+    if (slug === 'soft-glow') {
+      const g2 = ctx.createRadialGradient(w/2, h*0.5, 0, w/2, h*0.5, w*0.4);
+      g2.addColorStop(0, 'rgba(255,255,255,0.5)');
+      g2.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g2; ctx.fillRect(0,0,w,h);
+    } else if (slug === 'threshold') {
+      ctx.fillStyle = '#fff';
+      for (let i = 0; i < 1200; i++) {
+        const x = Math.random() * w, y = Math.random() * h;
+        const v = ((x-w/2)*(x-w/2) + (y-h/2)*(y-h/2)) < w*w*0.08 ? 1 : 0;
+        if (v) ctx.fillRect(x, y, 2, 2);
+      }
+    } else if (slug === 'rgb-shift') {
+      ctx.fillStyle = 'rgba(255,0,80,0.4)';
+      ctx.beginPath(); ctx.ellipse(w/2 - 6, h*0.5, w*0.28, h*0.32, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(0,255,200,0.4)';
+      ctx.beginPath(); ctx.ellipse(w/2 + 6, h*0.5, w*0.28, h*0.32, 0, 0, Math.PI * 2); ctx.fill();
+    } else if (slug === 'anatomy') {
+      ctx.strokeStyle = '#67e8f9'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.ellipse(w/2, h*0.45, w*0.22, h*0.27, 0, 0, Math.PI * 2); ctx.stroke();
+      // markers
+      ctx.fillStyle = '#a78bfa';
+      [[w*0.43, h*0.4], [w*0.57, h*0.4], [w/2, h*0.5], [w*0.45, h*0.6], [w*0.55, h*0.6]].forEach(p => {
+        ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, Math.PI*2); ctx.fill();
+      });
+      ctx.font = '10px monospace'; ctx.fillStyle = '#67e8f9';
+      ctx.fillText('orbital', w*0.38, h*0.35);
+      ctx.fillText('zygomatic', w*0.52, h*0.66);
+    } else if (slug === 'math-notation') {
+      ctx.font = '14px monospace'; ctx.fillStyle = '#67e8f9';
+      const eqs = ['∫f(x)dx', 'e^(iπ)+1=0', '∇²φ=ρ', 'Σ1/n²=π²/6', 'a²+b²=c²'];
+      eqs.forEach((e, i) => ctx.fillText(e, 20, 30 + i * 60));
+    } else if (slug === 'molecule') {
+      ctx.strokeStyle = '#a78bfa'; ctx.lineWidth = 1.2;
+      const cx = w/2, cy = h*0.5;
+      const atoms = [[cx,cy],[cx+30,cy-20],[cx+30,cy+20],[cx-30,cy-20],[cx-30,cy+20],[cx,cy-40],[cx,cy+40]];
+      atoms.forEach((a, i) => {
+        if (i > 0) {
+          ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(a[0], a[1]); ctx.stroke();
+        }
+        ctx.fillStyle = i === 0 ? '#67e8f9' : '#a78bfa';
+        ctx.beginPath(); ctx.arc(a[0], a[1], 6, 0, Math.PI*2); ctx.fill();
+      });
+    } else if (slug === 'hand-trail') {
+      for (let i = 0; i < 30; i++) {
+        ctx.fillStyle = `hsla(${(i*12) % 360}, 80%, 60%, ${1 - i/30})`;
+        ctx.beginPath(); ctx.arc(w*0.3 + i*4, h*0.5 - Math.sin(i*0.3)*30, 6, 0, Math.PI*2); ctx.fill();
+      }
+    } else if (slug === 'world-grid') {
+      ctx.strokeStyle = 'rgba(103,232,249,0.5)'; ctx.lineWidth = 1;
+      // perspective grid
+      for (let i = 0; i < 10; i++) {
+        ctx.beginPath();
+        ctx.moveTo(0, h*0.6 + i*15);
+        ctx.lineTo(w, h*0.6 + i*15);
+        ctx.stroke();
+      }
+      for (let i = -10; i < 10; i++) {
+        ctx.beginPath();
+        ctx.moveTo(w/2, h*0.6);
+        ctx.lineTo(w/2 + i * 30, h);
+        ctx.stroke();
+      }
+    } else if (slug === 'polar-warp') {
+      for (let r = 10; r < w/2; r += 14) {
+        ctx.strokeStyle = `hsla(${r * 3}, 80%, 60%, 0.5)`;
+        ctx.beginPath(); ctx.arc(w/2, h/2, r, 0, Math.PI*2); ctx.stroke();
+      }
+    } else if (slug === 'edge-find') {
+      ctx.strokeStyle = '#67e8f9'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.ellipse(w/2, h*0.5, w*0.28, h*0.32, 0, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(w/2-w*0.1, h*0.42, w*0.04, h*0.03, 0, 0, Math.PI*2); ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(w/2+w*0.1, h*0.42, w*0.04, h*0.03, 0, 0, Math.PI*2); ctx.stroke();
+    }
+  }
+
+  // Animate reel thumbnails
+  const reelCanvases = document.querySelectorAll('canvas[data-thumb-kind="reel"]');
+  function loopReels() {
+    reelCanvases.forEach(c => {
+      const seed = parseInt(c.dataset.thumbSeed) || 1;
+      drawReelThumb(c, seed);
+    });
+    requestAnimationFrame(loopReels);
+  }
+  loopReels();
+
+  // Static clip thumbnails
+  document.querySelectorAll('canvas[data-thumb-kind="clip"]').forEach(c => {
+    const seed = parseInt(c.dataset.thumbSeed) || 1;
+    drawClipThumb(c, seed);
+  });
+  // XR previews
+  document.querySelectorAll('canvas[data-preview-slug]').forEach(c => {
+    drawXrPreview(c, c.dataset.previewSlug, parseInt(c.dataset.previewIdx) || 0);
+  });
+
+  // -------- WHY-TIP toggle --------
+  document.querySelectorAll('.why-btn').forEach(b => {
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const idx = b.dataset.idx;
+      const tip = document.querySelector('.why-tip[data-tip="'+idx+'"]');
+      if (tip) tip.classList.toggle('show');
+    });
+  });
+
+  // -------- LIKE buttons (optimistic + POST) --------
+  document.querySelectorAll('.like-btn').forEach(b => {
+    b.addEventListener('click', async () => {
+      if (b.classList.contains('liked')) return;
+      b.classList.add('liked');
+      const c = b.querySelector('.rs-count');
+      if (c) c.textContent = (parseInt(c.textContent) + 1).toString();
+      const fd = new FormData();
+      fd.append('action', 'like');
+      fd.append('post_id', b.dataset.postId);
+      try { await fetch(window.location.pathname, { method: 'POST', body: fd }); } catch(e) {}
+    });
+  });
+
+  // -------- VIEW EVENT logging via IntersectionObserver --------
+  const sentViews = new Set();
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting && e.intersectionRatio > 0.6) {
+        const postId = e.target.dataset.postId;
+        if (postId && !sentViews.has(postId)) {
+          sentViews.add(postId);
+          fetch('/api/feed-view', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ post_id: postId, watched_pct: 100, device: 'web' })
+          }).catch(() => {});
+        }
+      }
+    });
+  }, { threshold: [0.6] });
+  document.querySelectorAll('.reel').forEach(r => io.observe(r));
+
+  // -------- CLIPS FILTERING --------
+  const clipSearch = document.getElementById('clipSearch');
+  const clipTopic = document.getElementById('clipTopic');
+  const clipDur = document.getElementById('clipDur');
+  function filterClips() {
+    const q = (clipSearch.value || '').toLowerCase();
+    const t = clipTopic.value;
+    const d = clipDur.value;
+    document.querySelectorAll('.clip-card').forEach(card => {
+      const tags = (card.dataset.tags || '').toLowerCase();
+      const dur = parseInt(card.dataset.dur) || 0;
+      const title = card.querySelector('h3').textContent.toLowerCase();
+      let show = true;
+      if (q && !title.includes(q) && !tags.includes(q)) show = false;
+      if (t && !tags.includes(t)) show = false;
+      if (d === 'short' && dur >= 1800) show = false;
+      if (d === 'long' && dur < 1800) show = false;
+      card.style.display = show ? '' : 'none';
+    });
+  }
+  clipSearch?.addEventListener('input', filterClips);
+  clipTopic?.addEventListener('change', filterClips);
+  clipDur?.addEventListener('change', filterClips);
+
+  // -------- CREATE FAB / MODAL --------
+  const fab = document.getElementById('fab');
+  const createModal = document.getElementById('createModal');
+  const cancelCreate = document.getElementById('cancelCreate');
+  fab?.addEventListener('click', () => createModal.classList.add('open'));
+  cancelCreate?.addEventListener('click', () => createModal.classList.remove('open'));
+  createModal?.addEventListener('click', (e) => {
+    if (e.target === createModal) createModal.classList.remove('open');
+  });
+
+  // -------- AR MODAL + getUserMedia --------
+  const arModal = document.getElementById('arModal');
+  const arVideo = document.getElementById('arVideo');
+  const arCanvas = document.getElementById('arCanvas');
+  const arStatus = document.getElementById('arStatus');
+  const arClose = document.getElementById('arClose');
+  let arStream = null;
+  let arFx = 'soft-glow';
+  let arRaf = null;
+
+  async function openAr(fx) {
+    arFx = fx;
+    document.querySelectorAll('.ar-controls button[data-fx]').forEach(b => {
+      b.classList.toggle('active', b.dataset.fx === fx);
+    });
+    arModal.classList.add('open');
+    arStatus.textContent = 'Requesting camera...';
+    try {
+      arStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640, height: 480 }, audio: false });
+      arVideo.srcObject = arStream;
+      await arVideo.play();
+      arStatus.textContent = 'Camera live. Effect: ' + fx;
+      runArLoop();
+    } catch (e) {
+      arStatus.textContent = 'Camera unavailable: ' + (e.message || 'permission denied');
+    }
+  }
+
+  function closeAr() {
+    arModal.classList.remove('open');
+    if (arStream) {
+      arStream.getTracks().forEach(t => t.stop());
+      arStream = null;
+    }
+    if (arRaf) { cancelAnimationFrame(arRaf); arRaf = null; }
+  }
+  arClose?.addEventListener('click', closeAr);
+
+  document.querySelectorAll('.ar-controls button[data-fx]').forEach(b => {
+    b.addEventListener('click', () => {
+      arFx = b.dataset.fx;
+      document.querySelectorAll('.ar-controls button[data-fx]').forEach(x => x.classList.toggle('active', x === b));
+      arStatus.textContent = 'Effect: ' + arFx;
+    });
+  });
+
+  document.querySelectorAll('button[data-try-slug]').forEach(b => {
+    b.addEventListener('click', () => openAr(b.dataset.trySlug));
+  });
+
+  // -------- REAL AR EFFECTS --------
+  // Pre-blurred buffer for soft-glow
+  function gaussianBlur(srcData, w, h) {
+    // Separable 3-tap blur approximating gaussian
+    const data = srcData.data;
+    const out = new Uint8ClampedArray(data.length);
+    // horizontal
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y*w + x) * 4;
+        const im = (y*w + Math.max(0, x-1)) * 4;
+        const ip = (y*w + Math.min(w-1, x+1)) * 4;
+        for (let c = 0; c < 3; c++) {
+          out[i+c] = (data[im+c] + 2*data[i+c] + data[ip+c]) / 4;
+        }
+        out[i+3] = data[i+3];
+      }
+    }
+    // vertical
+    const out2 = new Uint8ClampedArray(data.length);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y*w + x) * 4;
+        const im = (Math.max(0, y-1)*w + x) * 4;
+        const ip = (Math.min(h-1, y+1)*w + x) * 4;
+        for (let c = 0; c < 3; c++) {
+          out2[i+c] = (out[im+c] + 2*out[i+c] + out[ip+c]) / 4;
+        }
+        out2[i+3] = out[i+3];
+      }
+    }
+    return new ImageData(out2, w, h);
+  }
+
+  function applyFx(ctx, w, h, fx, t) {
+    // grab frame from video
+    ctx.drawImage(arVideo, 0, 0, w, h);
+    if (fx === 'soft-glow') {
+      const img = ctx.getImageData(0, 0, w, h);
+      const blurred = gaussianBlur(img, w, h);
+      // Composite: original + (blurred * 0.55)
+      const od = img.data, bd = blurred.data;
+      for (let i = 0; i < od.length; i += 4) {
+        od[i] = Math.min(255, od[i] * 0.55 + bd[i] * 0.55);
+        od[i+1] = Math.min(255, od[i+1] * 0.55 + bd[i+1] * 0.55);
+        od[i+2] = Math.min(255, od[i+2] * 0.55 + bd[i+2] * 0.55);
+      }
+      ctx.putImageData(img, 0, 0);
+    } else if (fx === 'threshold') {
+      const img = ctx.getImageData(0, 0, w, h);
+      const d = img.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const lum = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+        const v = lum > 110 ? 255 : 0;
+        d[i] = v; d[i+1] = v; d[i+2] = v;
+      }
+      ctx.putImageData(img, 0, 0);
+    } else if (fx === 'rgb-shift') {
+      const img = ctx.getImageData(0, 0, w, h);
+      const d = img.data;
+      const out = new Uint8ClampedArray(d.length);
+      const dx = 6;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = (y*w + x) * 4;
+          const ir = (y*w + Math.max(0, x - dx)) * 4;
+          const ib = (y*w + Math.min(w-1, x + dx)) * 4;
+          out[i] = d[ir];
+          out[i+1] = d[i+1];
+          out[i+2] = d[ib+2];
+          out[i+3] = 255;
+        }
+      }
+      ctx.putImageData(new ImageData(out, w, h), 0, 0);
+    } else if (fx === 'edge-find') {
+      // Sobel
+      const img = ctx.getImageData(0, 0, w, h);
+      const d = img.data;
+      const lum = new Float32Array(w*h);
+      for (let i = 0; i < w*h; i++) {
+        lum[i] = 0.299*d[i*4] + 0.587*d[i*4+1] + 0.114*d[i*4+2];
+      }
+      const out = new Uint8ClampedArray(d.length);
+      for (let y = 1; y < h-1; y++) {
+        for (let x = 1; x < w-1; x++) {
+          const tl = lum[(y-1)*w + (x-1)], tt = lum[(y-1)*w + x], tr = lum[(y-1)*w + (x+1)];
+          const ll = lum[y*w + (x-1)], rr = lum[y*w + (x+1)];
+          const bl = lum[(y+1)*w + (x-1)], bb = lum[(y+1)*w + x], br = lum[(y+1)*w + (x+1)];
+          const gx = -tl - 2*ll - bl + tr + 2*rr + br;
+          const gy = -tl - 2*tt - tr + bl + 2*bb + br;
+          const g = Math.min(255, Math.sqrt(gx*gx + gy*gy));
+          const i = (y*w + x) * 4;
+          out[i] = 0; out[i+1] = g; out[i+2] = g; out[i+3] = 255;
+        }
+      }
+      ctx.putImageData(new ImageData(out, w, h), 0, 0);
+    } else if (fx === 'polar-warp') {
+      const img = ctx.getImageData(0, 0, w, h);
+      const d = img.data;
+      const out = new Uint8ClampedArray(d.length);
+      const cx = w/2, cy = h/2;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const dx = x - cx, dy = y - cy;
+          const r = Math.sqrt(dx*dx + dy*dy);
+          const a = Math.atan2(dy, dx) + r * 0.005;
+          const sx = Math.floor(cx + Math.cos(a) * r);
+          const sy = Math.floor(cy + Math.sin(a) * r);
+          const i = (y*w + x) * 4;
+          if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+            const j = (sy*w + sx) * 4;
+            out[i] = d[j]; out[i+1] = d[j+1]; out[i+2] = d[j+2]; out[i+3] = 255;
+          }
+        }
+      }
+      ctx.putImageData(new ImageData(out, w, h), 0, 0);
+    } else if (fx === 'anatomy') {
+      // overlay anatomical markers around centre (rough face approximation)
+      ctx.strokeStyle = '#67e8f9'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.ellipse(w/2, h*0.5, w*0.22, h*0.3, 0, 0, Math.PI * 2); ctx.stroke();
+      // landmarks
+      const landmarks = [
+        { x: w*0.41, y: h*0.42, label: 'orbital' },
+        { x: w*0.59, y: h*0.42, label: 'orbital' },
+        { x: w*0.50, y: h*0.50, label: 'nasal' },
+        { x: w*0.42, y: h*0.62, label: 'zygomatic' },
+        { x: w*0.58, y: h*0.62, label: 'zygomatic' },
+        { x: w*0.50, y: h*0.68, label: 'mental' },
+      ];
+      landmarks.forEach(l => {
+        ctx.fillStyle = '#a78bfa';
+        ctx.beginPath(); ctx.arc(l.x, l.y, 4, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#67e8f9';
+        ctx.font = '11px monospace';
+        ctx.fillText(l.label, l.x + 8, l.y);
+      });
+    } else if (fx === 'math-notation') {
+      ctx.strokeStyle = 'rgba(103,232,249,0.25)'; ctx.lineWidth = 0.5;
+      for (let i = 0; i < w; i += 40) {
+        ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, h); ctx.stroke();
+      }
+      for (let i = 0; i < h; i += 40) {
+        ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(w, i); ctx.stroke();
+      }
+      ctx.font = '16px monospace'; ctx.fillStyle = '#67e8f9';
+      const eqs = ['∫f(x)dx', 'e^(iπ)+1=0', '∇²φ=4πρ', 'Σ1/n² = π²/6', 'F = ma'];
+      eqs.forEach((e, i) => {
+        const x = (i * 137 + t * 30) % w;
+        const y = 40 + ((i * 71) % (h - 80));
+        ctx.fillText(e, x, y);
+      });
+    } else if (fx === 'molecule') {
+      const cx = w*0.5, cy = h*0.5;
+      const R = Math.min(w, h) * 0.18;
+      const atoms = [
+        { x: 0, y: 0, z: 0, c: '#67e8f9', r: 8 },
+        { x: 1, y: 0, z: 0.3, c: '#a78bfa', r: 6 },
+        { x: -1, y: 0, z: 0.3, c: '#a78bfa', r: 6 },
+        { x: 0, y: 1, z: -0.4, c: '#fb7185', r: 5 },
+        { x: 0, y: -1, z: -0.4, c: '#fb7185', r: 5 },
+        { x: 0.7, y: 0.7, z: 0, c: '#fbbf24', r: 4 },
+        { x: -0.7, y: -0.7, z: 0, c: '#fbbf24', r: 4 },
+      ];
+      const proj = atoms.map(a => {
+        const ca = Math.cos(t*0.6), sa = Math.sin(t*0.6);
+        const x = a.x * ca - a.z * sa;
+        const z = a.x * sa + a.z * ca;
+        return { x: cx + x * R, y: cy + a.y * R, z, c: a.c, r: a.r * (1 + z*0.3) };
+      }).sort((a,b) => a.z - b.z);
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.5;
+      proj.forEach((p, i) => {
+        if (i > 0) { ctx.beginPath(); ctx.moveTo(proj[0].x, proj[0].y); ctx.lineTo(p.x, p.y); ctx.stroke(); }
+      });
+      proj.forEach(p => {
+        ctx.fillStyle = p.c;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill();
+      });
+    } else if (fx === 'hand-trail') {
+      // detect motion regions by frame differencing — simplified: animate particles in random direction
+      if (!window.__handTrail) window.__handTrail = [];
+      window.__handTrail.push({ x: Math.random()*w, y: Math.random()*h, life: 1, hue: (t*40) % 360 });
+      while (window.__handTrail.length > 40) window.__handTrail.shift();
+      window.__handTrail.forEach(p => {
+        p.life *= 0.96;
+        ctx.fillStyle = `hsla(${p.hue}, 80%, 60%, ${p.life})`;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 8 * p.life, 0, Math.PI*2); ctx.fill();
+      });
+    } else if (fx === 'world-grid') {
+      ctx.strokeStyle = 'rgba(103,232,249,0.55)'; ctx.lineWidth = 1;
+      // horizon-anchored perspective grid (lower half)
+      const horizon = h * 0.45;
+      const offset = (t * 30) % 30;
+      for (let i = 0; i < 14; i++) {
+        const y = horizon + Math.pow(i, 1.6) * 4 + offset;
+        if (y > h) break;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      }
+      for (let i = -10; i <= 10; i++) {
+        ctx.beginPath();
+        ctx.moveTo(w/2, horizon);
+        ctx.lineTo(w/2 + i * 60, h);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function runArLoop() {
+    const w = arCanvas.width = arVideo.videoWidth || 640;
+    const h = arCanvas.height = arVideo.videoHeight || 480;
+    const ctx = arCanvas.getContext('2d');
+    const t = Date.now() / 1000;
+    try { applyFx(ctx, w, h, arFx, t); } catch(e) {}
+    arRaf = requestAnimationFrame(runArLoop);
+  }
+
+  // auto-hide toast after 3s
+  setTimeout(() => document.querySelectorAll('.toast').forEach(t => t.classList.remove('show')), 3200);
+})();
+</script>
+
+</BaseLayout>
+```

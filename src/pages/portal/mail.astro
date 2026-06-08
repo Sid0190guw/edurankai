@@ -1,19 +1,942 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
-import MailClient from '@/components/MailClient.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
 
 const user = Astro.locals.user;
-if (!user) return Astro.redirect('/portal/login');
-// Admins use the admin mail client.
-if (['super_admin', 'hr', 'editor'].includes(user.role)) return Astro.redirect('/admin/mail');
----
-<BaseLayout title="Mail">
-  <div class="portal-mail-wrap">
-    <MailClient user={user} basePath="/portal/mail" />
-  </div>
-</BaseLayout>
+if (!user) return Astro.redirect('/portal/login?next=/portal/mail');
 
-<style is:global>
-  .portal-mail-wrap{ background:#07090d; }
-  .portal-mail-wrap .mailc{ height:100dvh; }
+function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// --- Bootstrap schema (idempotent) ---
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS portal_mail_threads (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      subject TEXT,
+      snippet TEXT,
+      participants JSONB DEFAULT '[]'::jsonb,
+      last_message_at TIMESTAMPTZ DEFAULT NOW(),
+      has_attachments BOOLEAN DEFAULT false,
+      labels JSONB DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS portal_mail_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      thread_id UUID REFERENCES portal_mail_threads(id) ON DELETE CASCADE,
+      from_user_id UUID,
+      from_email VARCHAR(200),
+      to_emails JSONB DEFAULT '[]'::jsonb,
+      cc_emails JSONB DEFAULT '[]'::jsonb,
+      body_html TEXT,
+      body_text TEXT,
+      attachments JSONB DEFAULT '[]'::jsonb,
+      sent_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`ALTER TABLE portal_mail_messages ADD COLUMN IF NOT EXISTS is_encrypted BOOLEAN DEFAULT false`);
+  await db.execute(sql`ALTER TABLE portal_mail_messages ADD COLUMN IF NOT EXISTS ciphertext TEXT`);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS portal_mail_thread_state (
+      user_id UUID,
+      thread_id UUID,
+      is_starred BOOLEAN DEFAULT false,
+      is_archived BOOLEAN DEFAULT false,
+      is_read BOOLEAN DEFAULT false,
+      folder VARCHAR(40) DEFAULT 'inbox',
+      snooze_until TIMESTAMPTZ,
+      PRIMARY KEY (user_id, thread_id)
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS portal_mail_labels (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID,
+      name VARCHAR(80),
+      color VARCHAR(20) DEFAULT '#67e8f9',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS portal_mail_thread_labels (
+      thread_id UUID,
+      label_id UUID,
+      user_id UUID,
+      PRIMARY KEY (thread_id, label_id, user_id)
+    )
+  `);
+} catch (e) {
+  console.error('[mail bootstrap]', e);
+}
+
+// --- POST handlers ---
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+    if (action === 'send') {
+      const subject = String(form.get('subject') || '(no subject)').slice(0, 500);
+      const toRaw = String(form.get('to') || '').trim();
+      const ccRaw = String(form.get('cc') || '').trim();
+      const bccRaw = String(form.get('bcc') || '').trim();
+      const bodyHtml = String(form.get('body_html') || '');
+      const bodyText = String(form.get('body_text') || '');
+      const isEnc = String(form.get('is_encrypted') || '') === '1';
+      const cipher = String(form.get('ciphertext') || '');
+      const attachRaw = String(form.get('attachments') || '[]');
+      const toList = toRaw.split(/[,;\s]+/).filter(Boolean);
+      const ccList = ccRaw.split(/[,;\s]+/).filter(Boolean);
+      const bccList = bccRaw.split(/[,;\s]+/).filter(Boolean);
+      if (!toList.length) { errMsg = 'Need at least one recipient'; }
+      else {
+        const snippet = bodyText.slice(0, 180);
+        const participants = JSON.stringify([user.email, ...toList, ...ccList, ...bccList]);
+        const labels = JSON.stringify([]);
+        const tr = await db.execute(sql`
+          INSERT INTO portal_mail_threads (subject, snippet, participants, last_message_at, has_attachments, labels)
+          VALUES (${subject}, ${snippet}, ${participants}::jsonb, NOW(), ${attachRaw !== '[]'}, ${labels}::jsonb)
+          RETURNING id
+        `);
+        const threadId = rows(tr)[0]?.id;
+        await db.execute(sql`
+          INSERT INTO portal_mail_messages
+            (thread_id, from_user_id, from_email, to_emails, cc_emails, body_html, body_text, attachments, is_encrypted, ciphertext)
+          VALUES
+            (${threadId}, ${user.id}, ${user.email},
+             ${JSON.stringify(toList)}::jsonb, ${JSON.stringify(ccList)}::jsonb,
+             ${isEnc ? '' : bodyHtml}, ${isEnc ? '' : bodyText},
+             ${attachRaw}::jsonb, ${isEnc}, ${isEnc ? cipher : null})
+        `);
+        // sender's state -> sent
+        await db.execute(sql`
+          INSERT INTO portal_mail_thread_state (user_id, thread_id, is_read, folder)
+          VALUES (${user.id}, ${threadId}, true, 'sent')
+          ON CONFLICT (user_id, thread_id) DO UPDATE SET folder = 'sent', is_read = true
+        `);
+        // for each recipient that exists in system, drop in inbox
+        for (const em of [...toList, ...ccList, ...bccList]) {
+          try {
+            const u = await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = LOWER(${em}) LIMIT 1`);
+            const uid = rows(u)[0]?.id;
+            if (uid) {
+              await db.execute(sql`
+                INSERT INTO portal_mail_thread_state (user_id, thread_id, is_read, folder)
+                VALUES (${uid}, ${threadId}, false, 'inbox')
+                ON CONFLICT (user_id, thread_id) DO NOTHING
+              `);
+            }
+          } catch (_) { /* user table shape may differ */ }
+        }
+        okMsg = 'Sent';
+      }
+    } else if (action === 'reply') {
+      const threadId = String(form.get('thread_id') || '');
+      const bodyHtml = String(form.get('body_html') || '');
+      const bodyText = String(form.get('body_text') || '');
+      const isEnc = String(form.get('is_encrypted') || '') === '1';
+      const cipher = String(form.get('ciphertext') || '');
+      if (threadId && bodyText) {
+        const tr = await db.execute(sql`SELECT participants FROM portal_mail_threads WHERE id = ${threadId}::uuid LIMIT 1`);
+        const t = rows(tr)[0];
+        const others = (t?.participants || []).filter((p: string) => p !== user.email);
+        const toJ = JSON.stringify(others);
+        await db.execute(sql`
+          INSERT INTO portal_mail_messages
+            (thread_id, from_user_id, from_email, to_emails, body_html, body_text, is_encrypted, ciphertext)
+          VALUES
+            (${threadId}::uuid, ${user.id}, ${user.email}, ${toJ}::jsonb,
+             ${isEnc ? '' : bodyHtml}, ${isEnc ? '' : bodyText},
+             ${isEnc}, ${isEnc ? cipher : null})
+        `);
+        await db.execute(sql`
+          UPDATE portal_mail_threads
+            SET last_message_at = NOW(), snippet = ${bodyText.slice(0, 180)}
+            WHERE id = ${threadId}::uuid
+        `);
+        okMsg = 'Reply sent';
+      }
+    } else if (action === 'toggle_star') {
+      const threadId = String(form.get('thread_id') || '');
+      await db.execute(sql`
+        INSERT INTO portal_mail_thread_state (user_id, thread_id, is_starred, folder)
+        VALUES (${user.id}, ${threadId}::uuid, true, 'inbox')
+        ON CONFLICT (user_id, thread_id) DO UPDATE SET is_starred = NOT portal_mail_thread_state.is_starred
+      `);
+    } else if (action === 'move') {
+      const threadId = String(form.get('thread_id') || '');
+      const folder = String(form.get('folder') || 'inbox');
+      await db.execute(sql`
+        INSERT INTO portal_mail_thread_state (user_id, thread_id, folder)
+        VALUES (${user.id}, ${threadId}::uuid, ${folder})
+        ON CONFLICT (user_id, thread_id) DO UPDATE SET folder = ${folder}
+      `);
+    } else if (action === 'snooze') {
+      const threadId = String(form.get('thread_id') || '');
+      const until = String(form.get('until') || '');
+      await db.execute(sql`
+        INSERT INTO portal_mail_thread_state (user_id, thread_id, snooze_until)
+        VALUES (${user.id}, ${threadId}::uuid, ${until}::timestamptz)
+        ON CONFLICT (user_id, thread_id) DO UPDATE SET snooze_until = ${until}::timestamptz
+      `);
+    } else if (action === 'create_label') {
+      const name = String(form.get('label_name') || '').slice(0, 80);
+      const color = String(form.get('label_color') || '#67e8f9');
+      if (name) {
+        await db.execute(sql`
+          INSERT INTO portal_mail_labels (user_id, name, color) VALUES (${user.id}, ${name}, ${color})
+        `);
+      }
+    } else if (action === 'apply_label') {
+      const threadId = String(form.get('thread_id') || '');
+      const labelId = String(form.get('label_id') || '');
+      await db.execute(sql`
+        INSERT INTO portal_mail_thread_labels (thread_id, label_id, user_id)
+        VALUES (${threadId}::uuid, ${labelId}::uuid, ${user.id})
+        ON CONFLICT DO NOTHING
+      `);
+    }
+  } catch (e: any) {
+    errMsg = String(e.message || e);
+    console.error('[mail post]', e);
+  }
+}
+
+// --- Query state ---
+const url = new URL(Astro.request.url);
+const folder = url.searchParams.get('folder') || 'inbox';
+const search = url.searchParams.get('q') || '';
+const openId = url.searchParams.get('t') || '';
+const filterFrom = url.searchParams.get('from') || '';
+const filterHasAttach = url.searchParams.get('attach') === '1';
+
+// labels for this user
+const lblRes = await db.execute(sql`
+  SELECT id, name, color FROM portal_mail_labels WHERE user_id = ${user.id} ORDER BY created_at DESC LIMIT 50
+`);
+const labels = rows(lblRes);
+
+// folder counts
+const countRes = await db.execute(sql`
+  SELECT folder, COUNT(*) FILTER (WHERE is_read = false) AS unread, COUNT(*) AS total
+  FROM portal_mail_thread_state WHERE user_id = ${user.id} GROUP BY folder
+`);
+const counts: Record<string, { unread: number; total: number }> = {};
+for (const c of rows(countRes)) counts[c.folder] = { unread: Number(c.unread), total: Number(c.total) };
+
+// thread list - precomputed condition to avoid JSX < parser confusion
+let threadsRes;
+if (folder === 'starred') {
+  threadsRes = await db.execute(sql`
+    SELECT t.id, t.subject, t.snippet, t.participants, t.last_message_at, t.has_attachments,
+           s.is_read, s.is_starred, s.folder
+    FROM portal_mail_threads t
+    JOIN portal_mail_thread_state s ON s.thread_id = t.id
+    WHERE s.user_id = ${user.id} AND s.is_starred = true
+      AND (${search} = '' OR LOWER(COALESCE(t.subject,'')) LIKE LOWER(${'%' + search + '%'}) OR LOWER(COALESCE(t.snippet,'')) LIKE LOWER(${'%' + search + '%'}))
+    ORDER BY t.last_message_at DESC LIMIT 100
+  `);
+} else {
+  threadsRes = await db.execute(sql`
+    SELECT t.id, t.subject, t.snippet, t.participants, t.last_message_at, t.has_attachments,
+           s.is_read, s.is_starred, s.folder
+    FROM portal_mail_threads t
+    JOIN portal_mail_thread_state s ON s.thread_id = t.id
+    WHERE s.user_id = ${user.id} AND s.folder = ${folder}
+      AND (${search} = '' OR LOWER(COALESCE(t.subject,'')) LIKE LOWER(${'%' + search + '%'}) OR LOWER(COALESCE(t.snippet,'')) LIKE LOWER(${'%' + search + '%'}))
+      AND (${filterFrom} = '' OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(t.participants) p WHERE LOWER(p) LIKE LOWER(${'%' + filterFrom + '%'})))
+      AND (${filterHasAttach ? 'y' : 'n'} = 'n' OR t.has_attachments = true)
+    ORDER BY t.last_message_at DESC LIMIT 100
+  `);
+}
+const threads = rows(threadsRes);
+
+// open thread messages
+let openMessages: any[] = [];
+let openThread: any = null;
+if (openId) {
+  const otRes = await db.execute(sql`SELECT * FROM portal_mail_threads WHERE id = ${openId}::uuid LIMIT 1`);
+  openThread = rows(otRes)[0] || null;
+  if (openThread) {
+    const mRes = await db.execute(sql`
+      SELECT id, from_email, to_emails, cc_emails, body_html, body_text, attachments, sent_at, is_encrypted, ciphertext
+      FROM portal_mail_messages WHERE thread_id = ${openId}::uuid ORDER BY sent_at ASC
+    `);
+    openMessages = rows(mRes);
+    await db.execute(sql`
+      UPDATE portal_mail_thread_state SET is_read = true WHERE user_id = ${user.id} AND thread_id = ${openId}::uuid
+    `);
+  }
+}
+
+const folders = [
+  { key: 'inbox', label: 'Inbox' },
+  { key: 'starred', label: 'Starred' },
+  { key: 'sent', label: 'Sent' },
+  { key: 'drafts', label: 'Drafts' },
+  { key: 'archived', label: 'Archive' },
+  { key: 'trash', label: 'Trash' },
+  { key: 'spam', label: 'Spam' },
+];
+
+function fmtTime(t: any) {
+  if (!t) return '';
+  const d = new Date(t);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const diffDays = (now.getTime() - d.getTime()) / 86400000;
+  if (diffDays < 365) return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString();
+}
+
+function senderOf(t: any) {
+  const p = t.participants || [];
+  return (p.find((x: string) => x !== user.email) || p[0] || '').toString();
+}
+function initials(em: string) {
+  return (em || '?').slice(0, 2).toUpperCase();
+}
+
+const threadIdList = threads.map((t: any) => t.id);
+---
+<BaseLayout title="Mail" description="Private mail client">
+<style>
+  :root { color-scheme: dark; }
+  body { background: #0a0a0c !important; color: #e8e8ee !important; margin: 0; font-family: 'Cormorant Garamond', Georgia, serif; }
+  body.era-has-fab #eraFab { display: none !important; }
+  .mail-shell { display: grid; grid-template-columns: 240px 380px 1fr; height: 100vh; overflow: hidden; }
+  .mail-side { background: #0d0e13; border-right: 1px solid #2a2a35; padding: 14px 10px; overflow-y: auto; }
+  .mail-center { background: #0a0a0c; border-right: 1px solid #2a2a35; overflow-y: auto; }
+  .mail-right { background: #0a0a0c; overflow-y: auto; display: flex; flex-direction: column; }
+  .compose-btn { width: 100%; background: linear-gradient(135deg, #a78bfa, #67e8f9); color: #0a0a0c; border: none; padding: 12px; border-radius: 10px; font-family: 'Geist Mono', monospace; font-size: 13px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; letter-spacing: 0.5px; }
+  .compose-btn:hover { filter: brightness(1.1); }
+  .folder-list { margin-top: 16px; display: flex; flex-direction: column; gap: 2px; }
+  .folder-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; color: #c7c7d2; font-family: 'Geist Mono', monospace; font-size: 12px; text-decoration: none; cursor: pointer; }
+  .folder-row:hover { background: #14161e; }
+  .folder-row.active { background: #1a1d29; color: #67e8f9; }
+  .folder-row .grow { flex: 1; }
+  .folder-row .badge { background: #2a2a35; color: #e8e8ee; padding: 1px 7px; border-radius: 10px; font-size: 10px; }
+  .folder-row.active .badge { background: #67e8f9; color: #0a0a0c; }
+  .side-sec { color: #6b6b7d; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 1px; margin: 18px 8px 8px; }
+  .label-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #b6b6c2; cursor: pointer; }
+  .label-row:hover { background: #14161e; }
+  .label-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .center-head { padding: 12px 14px; border-bottom: 1px solid #2a2a35; display: flex; align-items: center; gap: 10px; position: sticky; top: 0; background: #0a0a0c; z-index: 5; }
+  .search-input { flex: 1; background: #11131a; border: 1px solid #2a2a35; color: #e8e8ee; padding: 8px 12px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 12px; }
+  .search-input:focus { outline: none; border-color: #67e8f9; }
+  .filter-btn { background: #11131a; border: 1px solid #2a2a35; color: #c7c7d2; padding: 7px 10px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 11px; cursor: pointer; }
+  .filter-btn:hover { border-color: #67e8f9; }
+  .filter-bar { padding: 8px 14px; border-bottom: 1px solid #1f1f2a; display: none; gap: 8px; background: #0d0e13; }
+  .filter-bar.show { display: flex; }
+  .filter-bar input, .filter-bar label { font-family: 'Geist Mono', monospace; font-size: 11px; color: #c7c7d2; }
+  .filter-bar input[type=text] { background: #11131a; border: 1px solid #2a2a35; color: #e8e8ee; padding: 5px 8px; border-radius: 6px; }
+  .thread-row { display: flex; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #16171f; cursor: pointer; }
+  .thread-row:hover { background: #11131a; }
+  .thread-row.unread { background: #0e1018; }
+  .thread-row.unread .t-sender, .thread-row.unread .t-subject { color: #fff; font-weight: 600; }
+  .thread-row.selected { background: #1a1d29; border-left: 2px solid #67e8f9; padding-left: 12px; }
+  .avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, #a78bfa, #67e8f9); color: #0a0a0c; display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 700; flex-shrink: 0; }
+  .t-main { flex: 1; min-width: 0; }
+  .t-line1 { display: flex; align-items: center; gap: 8px; }
+  .t-sender { color: #c7c7d2; font-family: 'Geist Mono', monospace; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .t-time { color: #6b6b7d; font-family: 'Geist Mono', monospace; font-size: 10px; }
+  .t-subject { color: #e8e8ee; font-family: 'Cormorant Garamond', serif; font-size: 15px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .t-snippet { color: #8a8a96; font-size: 12px; font-family: 'Cormorant Garamond', serif; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .t-chips { display: flex; gap: 4px; margin-top: 4px; }
+  .chip { font-family: 'Geist Mono', monospace; font-size: 9px; padding: 1px 5px; border-radius: 3px; }
+  .star-btn { background: none; border: none; color: #6b6b7d; cursor: pointer; padding: 0; }
+  .star-btn.on { color: #fbbf24; }
+  .right-head { padding: 16px 22px; border-bottom: 1px solid #2a2a35; display: flex; align-items: center; gap: 10px; position: relative; }
+  .right-head h1 { font-family: 'Cormorant Garamond', serif; font-size: 22px; margin: 0; flex: 1; color: #fff; }
+  .icon-btn { background: #11131a; border: 1px solid #2a2a35; color: #c7c7d2; padding: 7px 9px; border-radius: 8px; cursor: pointer; }
+  .icon-btn:hover { border-color: #67e8f9; color: #67e8f9; }
+  .msg-list { padding: 0 22px; flex: 1; }
+  .msg { border-bottom: 1px solid #1f1f2a; padding: 18px 0; }
+  .msg-head { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 12px; }
+  .msg-meta { flex: 1; }
+  .msg-from { color: #fff; font-family: 'Geist Mono', monospace; font-size: 12px; font-weight: 600; }
+  .msg-to { color: #8a8a96; font-size: 11px; font-family: 'Geist Mono', monospace; margin-top: 2px; }
+  .msg-time { color: #6b6b7d; font-size: 11px; font-family: 'Geist Mono', monospace; }
+  .msg-body { color: #d8d8e2; font-family: 'Cormorant Garamond', serif; font-size: 16px; line-height: 1.65; }
+  .msg-body p { margin: 0 0 10px; }
+  .msg-body code { background: #11131a; padding: 1px 5px; border-radius: 4px; font-family: 'Geist Mono', monospace; font-size: 13px; }
+  .msg-body blockquote { border-left: 3px solid #67e8f9; margin: 0; padding-left: 12px; color: #a8a8b4; }
+  .enc-banner { background: #1a1d29; border: 1px solid #a78bfa; color: #a78bfa; padding: 10px; border-radius: 6px; font-family: 'Geist Mono', monospace; font-size: 11px; margin: 8px 0; }
+  .attach-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .attach-chip { background: #11131a; border: 1px solid #2a2a35; padding: 6px 10px; border-radius: 6px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #c7c7d2; display: flex; align-items: center; gap: 6px; }
+  .reply-box { border-top: 1px solid #2a2a35; padding: 16px 22px; background: #0d0e13; position: sticky; bottom: 0; }
+  .reply-toolbar { display: flex; gap: 4px; margin-bottom: 8px; flex-wrap: wrap; }
+  .tb-btn { background: #11131a; border: 1px solid #2a2a35; color: #c7c7d2; padding: 5px 9px; border-radius: 5px; font-family: 'Geist Mono', monospace; font-size: 11px; cursor: pointer; }
+  .tb-btn:hover { border-color: #67e8f9; color: #67e8f9; }
+  .reply-editor { background: #0a0a0c; border: 1px solid #2a2a35; color: #e8e8ee; min-height: 100px; padding: 10px 12px; border-radius: 8px; font-family: 'Cormorant Garamond', serif; font-size: 15px; outline: none; }
+  .reply-editor:focus { border-color: #67e8f9; }
+  .reply-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+  .send-btn { background: linear-gradient(135deg, #a78bfa, #67e8f9); color: #0a0a0c; border: none; padding: 8px 18px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 12px; font-weight: 700; cursor: pointer; }
+  .enc-toggle { display: flex; align-items: center; gap: 6px; color: #a78bfa; font-family: 'Geist Mono', monospace; font-size: 11px; cursor: pointer; }
+  .empty { padding: 60px 22px; text-align: center; color: #6b6b7d; font-family: 'Cormorant Garamond', serif; }
+  .empty svg { opacity: 0.3; margin-bottom: 14px; }
+  .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; z-index: 100; align-items: center; justify-content: center; }
+  .modal-back.show { display: flex; }
+  .modal { background: #0d0e13; border: 1px solid #2a2a35; border-radius: 14px; width: min(720px, 95vw); max-height: 92vh; display: flex; flex-direction: column; overflow: hidden; }
+  .modal-head { padding: 14px 18px; border-bottom: 1px solid #2a2a35; display: flex; align-items: center; }
+  .modal-head h2 { font-family: 'Cormorant Garamond', serif; font-size: 18px; margin: 0; flex: 1; color: #fff; }
+  .modal-body { padding: 14px 18px; overflow-y: auto; flex: 1; }
+  .field { display: flex; gap: 10px; align-items: center; border-bottom: 1px solid #1f1f2a; padding: 8px 0; }
+  .field label { color: #6b6b7d; font-family: 'Geist Mono', monospace; font-size: 11px; width: 50px; }
+  .field input { flex: 1; background: transparent; border: none; color: #e8e8ee; outline: none; font-family: 'Geist Mono', monospace; font-size: 12px; }
+  .compose-editor { min-height: 200px; padding: 12px 0; color: #e8e8ee; font-family: 'Cormorant Garamond', serif; font-size: 15px; outline: none; line-height: 1.6; }
+  .compose-editor:empty:before { content: 'Compose your message...'; color: #4a4a5a; }
+  .modal-foot { padding: 12px 18px; border-top: 1px solid #2a2a35; display: flex; gap: 10px; align-items: center; }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: #1a1d29; border: 1px solid #67e8f9; color: #67e8f9; padding: 10px 16px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 12px; z-index: 200; }
+  .toast.err { border-color: #f87171; color: #f87171; }
+  .kbd-help { position: fixed; bottom: 20px; left: 20px; background: #0d0e13; border: 1px solid #2a2a35; padding: 10px 14px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 10px; color: #6b6b7d; z-index: 50; }
+  .kbd-help kbd { background: #11131a; border: 1px solid #2a2a35; padding: 1px 5px; border-radius: 3px; color: #c7c7d2; margin: 0 2px; }
+  .snooze-pop { position: absolute; background: #0d0e13; border: 1px solid #2a2a35; padding: 10px; border-radius: 8px; z-index: 30; display: none; min-width: 160px; }
+  .snooze-pop.show { display: block; }
+  .snooze-pop button { display: block; width: 100%; background: none; border: none; color: #c7c7d2; text-align: left; padding: 6px 10px; font-family: 'Geist Mono', monospace; font-size: 11px; cursor: pointer; border-radius: 4px; }
+  .snooze-pop button:hover { background: #1a1d29; color: #67e8f9; }
 </style>
+
+<div class="mail-shell">
+  <aside class="mail-side">
+    <button class="compose-btn" id="composeBtn">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+      COMPOSE
+    </button>
+    <div class="folder-list">
+      {folders.map(f => {
+        const c = counts[f.key] || { unread: 0, total: 0 };
+        const active = folder === f.key;
+        return (
+          <a class={"folder-row " + (active ? 'active' : '')} href={`/portal/mail?folder=${f.key}`}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              {f.key === 'inbox' && <path d="M22 12h-6l-2 3h-4l-2-3H2M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/>}
+              {f.key === 'starred' && <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>}
+              {f.key === 'sent' && <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>}
+              {f.key === 'drafts' && <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z M14 2v6h6 M16 13H8 M16 17H8 M10 9H8"/>}
+              {f.key === 'archived' && <path d="M21 8v13H3V8M1 3h22v5H1zM10 12h4"/>}
+              {f.key === 'trash' && <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>}
+              {f.key === 'spam' && <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01"/>}
+            </svg>
+            <span class="grow">{f.label}</span>
+            {c.unread > 0 && <span class="badge">{c.unread}</span>}
+          </a>
+        );
+      })}
+    </div>
+
+    <div class="side-sec">LABELS</div>
+    <div id="labelList">
+      {labels.map((l: any) => (
+        <div class="label-row" data-label-id={l.id}>
+          <div class="label-dot" style={`background: ${l.color}`}></div>
+          <span>{l.name}</span>
+        </div>
+      ))}
+    </div>
+    <div class="label-row" id="newLabelBtn" style="color: #67e8f9; margin-top: 6px;">
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+      <span>Create label</span>
+    </div>
+  </aside>
+
+  <section class="mail-center">
+    <div class="center-head">
+      <form method="get" style="flex: 1; display: flex; gap: 8px;">
+        <input type="hidden" name="folder" value={folder} />
+        <input class="search-input" name="q" value={search} placeholder="Search threads..." />
+      </form>
+      <button class="filter-btn" id="toggleFilter" type="button">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+      </button>
+    </div>
+    <form method="get" class="filter-bar" id="filterBar">
+      <input type="hidden" name="folder" value={folder} />
+      <input type="text" name="from" placeholder="from email..." value={filterFrom} />
+      <label><input type="checkbox" name="attach" value="1" checked={filterHasAttach} /> has attachment</label>
+      <button class="filter-btn" type="submit">Apply</button>
+    </form>
+
+    <div id="threadList">
+      {threads.length === 0 && (
+        <div class="empty">
+          <svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/></svg>
+          <div>No messages here.</div>
+        </div>
+      )}
+      {threads.map((t: any, i: number) => {
+        const sender = senderOf(t);
+        const isOpen = openId === t.id;
+        const cls = 'thread-row' + (t.is_read ? '' : ' unread') + (isOpen ? ' selected' : '');
+        return (
+          <div class={cls} data-thread-id={t.id} data-i={i}>
+            <div class="avatar">{initials(sender)}</div>
+            <div class="t-main">
+              <div class="t-line1">
+                <span class="t-sender">{sender}</span>
+                <span class="t-time">{fmtTime(t.last_message_at)}</span>
+              </div>
+              <div class="t-subject">{t.subject || '(no subject)'}</div>
+              <div class="t-snippet">{t.snippet}</div>
+              <div class="t-chips">
+                {t.has_attachments && <span class="chip" style="background: #2a2a35; color: #c7c7d2;">attach</span>}
+              </div>
+            </div>
+            <form method="post" class="star-form">
+              <input type="hidden" name="action" value="toggle_star" />
+              <input type="hidden" name="thread_id" value={t.id} />
+              <button class={"star-btn " + (t.is_starred ? 'on' : '')} type="submit">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill={t.is_starred ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+              </button>
+            </form>
+          </div>
+        );
+      })}
+    </div>
+  </section>
+
+  <section class="mail-right">
+    {!openThread && (
+      <div class="empty" style="margin: auto;">
+        <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+        <div style="font-size: 18px; margin-bottom: 4px;">Select a conversation</div>
+        <div style="font-size: 12px; font-family: 'Geist Mono', monospace;">or press <kbd style="background: #11131a; padding: 1px 5px; border-radius: 3px;">C</kbd> to compose</div>
+      </div>
+    )}
+
+    {openThread && (
+      <>
+        <div class="right-head">
+          <h1>{openThread.subject || '(no subject)'}</h1>
+          <form method="post" style="display: inline;">
+            <input type="hidden" name="action" value="move" />
+            <input type="hidden" name="thread_id" value={openThread.id} />
+            <input type="hidden" name="folder" value="archived" />
+            <button class="icon-btn" type="submit" title="Archive (E)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8v13H3V8M1 3h22v5H1zM10 12h4"/></svg>
+            </button>
+          </form>
+          <form method="post" style="display: inline;">
+            <input type="hidden" name="action" value="move" />
+            <input type="hidden" name="thread_id" value={openThread.id} />
+            <input type="hidden" name="folder" value="trash" />
+            <button class="icon-btn" type="submit" title="Delete (#)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+            </button>
+          </form>
+          <button class="icon-btn" id="snoozeBtn" type="button" title="Snooze">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </button>
+          <div class="snooze-pop" id="snoozePop" style="top: 60px; right: 22px;">
+            <button data-hours="1">In 1 hour</button>
+            <button data-hours="3">In 3 hours</button>
+            <button data-hours="24">Tomorrow</button>
+            <button data-hours="168">Next week</button>
+          </div>
+        </div>
+
+        <div class="msg-list">
+          {openMessages.map((m: any) => {
+            const toEmails = (m.to_emails || []).join(', ');
+            const ccEmails = (m.cc_emails || []).join(', ');
+            const ccLine = ccEmails ? ' . cc ' + ccEmails : '';
+            const fallbackHtml = '<p>' + String(m.body_text || '').replace(/</g,'&lt;').replace(/\n/g, '<br>') + '</p>';
+            return (
+              <div class="msg">
+                <div class="msg-head">
+                  <div class="avatar">{initials(m.from_email)}</div>
+                  <div class="msg-meta">
+                    <div class="msg-from">{m.from_email}</div>
+                    <div class="msg-to">to {toEmails}{ccLine}</div>
+                  </div>
+                  <div class="msg-time">{fmtTime(m.sent_at)}</div>
+                </div>
+                {m.is_encrypted && (
+                  <div class="enc-banner" data-ciphertext={m.ciphertext}>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: -2px; margin-right: 4px;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+                    Encrypted message - <a href="#" class="decrypt-link" style="color: #67e8f9; text-decoration: underline;">Unlock with passphrase</a>
+                  </div>
+                )}
+                <div class="msg-body" set:html={m.body_html || fallbackHtml}></div>
+                {(m.attachments || []).length > 0 && (
+                  <div class="attach-list">
+                    {(m.attachments || []).map((a: any) => (
+                      <a class="attach-chip" href={a.dataUrl} download={a.name}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                        {a.name}
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <div class="reply-box">
+          <form method="post" id="replyForm">
+            <input type="hidden" name="action" value="reply" />
+            <input type="hidden" name="thread_id" value={openThread.id} />
+            <input type="hidden" name="body_html" id="replyBodyHtml" />
+            <input type="hidden" name="body_text" id="replyBodyText" />
+            <input type="hidden" name="is_encrypted" id="replyIsEnc" value="0" />
+            <input type="hidden" name="ciphertext" id="replyCipher" />
+            <div class="reply-toolbar">
+              <button class="tb-btn" type="button" data-cmd="bold"><b>B</b></button>
+              <button class="tb-btn" type="button" data-cmd="italic"><i>I</i></button>
+              <button class="tb-btn" type="button" data-cmd="underline"><u>U</u></button>
+              <button class="tb-btn" type="button" data-cmd="link">link</button>
+              <button class="tb-btn" type="button" data-cmd="ul">list</button>
+              <button class="tb-btn" type="button" data-cmd="code">code</button>
+              <button class="tb-btn" type="button" data-cmd="quote">quote</button>
+            </div>
+            <div class="reply-editor" id="replyEditor" contenteditable="true"></div>
+            <div class="reply-actions">
+              <button class="send-btn" type="submit">Send Reply</button>
+              <label class="enc-toggle"><input type="checkbox" id="replyEncToggle" /> encrypt</label>
+            </div>
+          </form>
+        </div>
+      </>
+    )}
+  </section>
+</div>
+
+<div class="modal-back" id="composeModal">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>New message</h2>
+      <button class="icon-btn" id="closeCompose" type="button">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <form method="post" id="composeForm" style="display: contents;">
+      <input type="hidden" name="action" value="send" />
+      <input type="hidden" name="body_html" id="composeBodyHtml" />
+      <input type="hidden" name="body_text" id="composeBodyText" />
+      <input type="hidden" name="attachments" id="composeAttachments" value="[]" />
+      <input type="hidden" name="is_encrypted" id="composeIsEnc" value="0" />
+      <input type="hidden" name="ciphertext" id="composeCipher" />
+      <div class="modal-body">
+        <div class="field"><label>To</label><input type="text" name="to" required placeholder="recipient@example.com" /></div>
+        <div class="field"><label>Cc</label><input type="text" name="cc" /></div>
+        <div class="field"><label>Bcc</label><input type="text" name="bcc" /></div>
+        <div class="field"><label>Subject</label><input type="text" name="subject" required /></div>
+        <div class="reply-toolbar" style="margin-top: 10px;">
+          <button class="tb-btn" type="button" data-cmd="bold"><b>B</b></button>
+          <button class="tb-btn" type="button" data-cmd="italic"><i>I</i></button>
+          <button class="tb-btn" type="button" data-cmd="underline"><u>U</u></button>
+          <button class="tb-btn" type="button" data-cmd="link">link</button>
+          <button class="tb-btn" type="button" data-cmd="ul">list</button>
+          <button class="tb-btn" type="button" data-cmd="code">code</button>
+          <button class="tb-btn" type="button" data-cmd="quote">quote</button>
+        </div>
+        <div class="compose-editor" id="composeEditor" contenteditable="true"></div>
+        <div class="attach-list" id="composeAttachList"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="send-btn" type="submit">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align: -2px; margin-right: 4px;"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+          SEND
+        </button>
+        <label class="icon-btn" style="cursor: pointer;">
+          <input type="file" id="composeFile" style="display: none;" multiple />
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+        </label>
+        <label class="enc-toggle"><input type="checkbox" id="composeEncToggle" /> mark as encrypted</label>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-back" id="labelModal">
+  <div class="modal" style="width: min(360px, 90vw);">
+    <div class="modal-head"><h2>Create label</h2></div>
+    <form method="post" style="display: contents;">
+      <input type="hidden" name="action" value="create_label" />
+      <div class="modal-body">
+        <div class="field"><label>Name</label><input type="text" name="label_name" required /></div>
+        <div class="field"><label>Color</label><input type="color" name="label_color" value="#67e8f9" /></div>
+      </div>
+      <div class="modal-foot">
+        <button class="send-btn" type="submit">Create</button>
+        <button class="icon-btn" type="button" id="closeLabelModal">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="kbd-help">
+  <kbd>j</kbd>/<kbd>k</kbd> nav . <kbd>e</kbd> archive . <kbd>#</kbd> trash . <kbd>s</kbd> star . <kbd>r</kbd> reply . <kbd>c</kbd> compose . <kbd>/</kbd> search
+</div>
+
+{okMsg && <div class="toast">{okMsg}</div>}
+{errMsg && <div class="toast err">{errMsg}</div>}
+
+<script is:inline define:vars={{ openId, threadIds: threadIdList }}>
+(function(){
+  document.body.classList.add('era-no-fab');
+
+  const composeBtn = document.getElementById('composeBtn');
+  const composeModal = document.getElementById('composeModal');
+  const closeCompose = document.getElementById('closeCompose');
+  composeBtn && composeBtn.addEventListener('click', () => composeModal.classList.add('show'));
+  closeCompose && closeCompose.addEventListener('click', () => composeModal.classList.remove('show'));
+  composeModal && composeModal.addEventListener('click', (e) => { if (e.target === composeModal) composeModal.classList.remove('show'); });
+
+  const labelModal = document.getElementById('labelModal');
+  const newLabelBtn = document.getElementById('newLabelBtn');
+  const closeLabelModal = document.getElementById('closeLabelModal');
+  newLabelBtn && newLabelBtn.addEventListener('click', () => labelModal.classList.add('show'));
+  closeLabelModal && closeLabelModal.addEventListener('click', () => labelModal.classList.remove('show'));
+  labelModal && labelModal.addEventListener('click', (e) => { if (e.target === labelModal) labelModal.classList.remove('show'); });
+
+  const tf = document.getElementById('toggleFilter');
+  tf && tf.addEventListener('click', () => { document.getElementById('filterBar').classList.toggle('show'); });
+
+  // Rich-text editor commands - hand rolled, no library
+  function applyCmd(editor, cmd) {
+    editor.focus();
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    if (cmd === 'bold') document.execCommand('bold', false);
+    else if (cmd === 'italic') document.execCommand('italic', false);
+    else if (cmd === 'underline') document.execCommand('underline', false);
+    else if (cmd === 'link') {
+      const url = prompt('URL?');
+      if (url) document.execCommand('createLink', false, url);
+    } else if (cmd === 'ul') {
+      document.execCommand('insertUnorderedList', false);
+    } else if (cmd === 'code') {
+      const range = sel.getRangeAt(0);
+      const text = range.toString();
+      if (text) {
+        const code = document.createElement('code');
+        code.textContent = text;
+        range.deleteContents();
+        range.insertNode(code);
+      }
+    } else if (cmd === 'quote') {
+      document.execCommand('formatBlock', false, 'BLOCKQUOTE');
+    }
+  }
+  document.querySelectorAll('.tb-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      const cmd = btn.getAttribute('data-cmd');
+      const tb = btn.closest('.reply-toolbar');
+      const editor = tb.parentElement.querySelector('[contenteditable]');
+      applyCmd(editor, cmd);
+    });
+  });
+
+  // Attachments
+  const attachInput = document.getElementById('composeFile');
+  const attachList = document.getElementById('composeAttachList');
+  const attachHidden = document.getElementById('composeAttachments');
+  const attached = [];
+  attachInput && attachInput.addEventListener('change', (e) => {
+    const files = Array.from(e.target.files || []);
+    for (const f of files) {
+      if (f.size > 5 * 1024 * 1024) { alert('Max 5 MB per file'); continue; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        attached.push({ name: f.name, size: f.size, type: f.type, dataUrl: reader.result });
+        renderAttach();
+      };
+      reader.readAsDataURL(f);
+    }
+  });
+  function renderAttach() {
+    attachList.innerHTML = '';
+    attached.forEach((a, i) => {
+      const chip = document.createElement('div');
+      chip.className = 'attach-chip';
+      chip.innerHTML = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg> ' + a.name + ' <span class="rm" style="cursor:pointer; color:#f87171; margin-left:4px;">x</span>';
+      chip.querySelector('.rm').addEventListener('click', () => { attached.splice(i, 1); renderAttach(); });
+      attachList.appendChild(chip);
+    });
+    attachHidden.value = JSON.stringify(attached);
+  }
+
+  // Crypto - Web Crypto API (PBKDF2 + AES-GCM)
+  async function deriveKey(passphrase, salt) {
+    const enc = new TextEncoder();
+    const baseKey = await crypto.subtle.importKey('raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+      baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+    );
+  }
+  async function encryptPayload(plaintext, passphrase) {
+    const enc = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await deriveKey(passphrase, salt);
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(plaintext));
+    function b64(buf) { return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))); }
+    return b64(salt) + '.' + b64(iv) + '.' + b64(ct);
+  }
+  async function decryptPayload(packed, passphrase) {
+    function fromB64(s) { return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
+    const parts = packed.split('.');
+    const salt = fromB64(parts[0]), iv = fromB64(parts[1]), ct = fromB64(parts[2]);
+    const key = await deriveKey(passphrase, salt);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+    return new TextDecoder().decode(pt);
+  }
+
+  document.querySelectorAll('.decrypt-link').forEach(a => {
+    a.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const banner = a.closest('.enc-banner');
+      const ct = banner.getAttribute('data-ciphertext');
+      const pw = prompt('Enter passphrase to decrypt');
+      if (!pw) return;
+      try {
+        const plain = await decryptPayload(ct, pw);
+        const body = banner.nextElementSibling;
+        body.innerHTML = '<p>' + plain.replace(/</g,'&lt;').replace(/\n/g, '<br>') + '</p>';
+        banner.style.borderColor = '#67e8f9';
+        banner.style.color = '#67e8f9';
+        banner.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: -2px; margin-right: 4px;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg> Decrypted in this browser only';
+      } catch (err) {
+        alert('Decryption failed - wrong passphrase?');
+      }
+    });
+  });
+
+  // Compose submit
+  const composeForm = document.getElementById('composeForm');
+  composeForm && composeForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const editor = document.getElementById('composeEditor');
+    const html = editor.innerHTML;
+    const text = editor.textContent || '';
+    const wantEnc = document.getElementById('composeEncToggle').checked;
+    if (wantEnc) {
+      const pw = prompt('Passphrase to encrypt. Share it with the recipient out of band.');
+      if (!pw) return;
+      const ct = await encryptPayload(text, pw);
+      document.getElementById('composeCipher').value = ct;
+      document.getElementById('composeIsEnc').value = '1';
+      document.getElementById('composeBodyHtml').value = '';
+      document.getElementById('composeBodyText').value = '[encrypted - ' + text.length + ' chars]';
+    } else {
+      document.getElementById('composeBodyHtml').value = html;
+      document.getElementById('composeBodyText').value = text;
+    }
+    composeForm.submit();
+  });
+
+  // Reply submit
+  const replyForm = document.getElementById('replyForm');
+  replyForm && replyForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const editor = document.getElementById('replyEditor');
+    const html = editor.innerHTML;
+    const text = editor.textContent || '';
+    if (!text.trim()) { alert('Empty reply'); return; }
+    const wantEnc = document.getElementById('replyEncToggle').checked;
+    if (wantEnc) {
+      const pw = prompt('Passphrase to encrypt');
+      if (!pw) return;
+      const ct = await encryptPayload(text, pw);
+      document.getElementById('replyCipher').value = ct;
+      document.getElementById('replyIsEnc').value = '1';
+      document.getElementById('replyBodyHtml').value = '';
+      document.getElementById('replyBodyText').value = '[encrypted reply]';
+    } else {
+      document.getElementById('replyBodyHtml').value = html;
+      document.getElementById('replyBodyText').value = text;
+    }
+    replyForm.submit();
+  });
+
+  // Thread row click
+  document.querySelectorAll('.thread-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.star-form')) return;
+      const id = row.getAttribute('data-thread-id');
+      const u = new URL(location.href);
+      u.searchParams.set('t', id);
+      location.href = u.toString();
+    });
+  });
+
+  // Snooze popup
+  const snoozeBtn = document.getElementById('snoozeBtn');
+  const snoozePop = document.getElementById('snoozePop');
+  snoozeBtn && snoozeBtn.addEventListener('click', (e) => { e.stopPropagation(); snoozePop.classList.toggle('show'); });
+  document.addEventListener('click', (e) => { if (snoozePop && !snoozePop.contains(e.target) && e.target !== snoozeBtn) snoozePop.classList.remove('show'); });
+  snoozePop && snoozePop.querySelectorAll('button').forEach(b => {
+    b.addEventListener('click', async () => {
+      const hours = parseInt(b.getAttribute('data-hours') || '1', 10);
+      const until = new Date(Date.now() + hours * 3600 * 1000).toISOString();
+      const fd = new FormData();
+      fd.append('action', 'snooze');
+      fd.append('thread_id', openId);
+      fd.append('until', until);
+      await fetch(location.pathname, { method: 'POST', body: fd });
+      alert('Snoozed until ' + new Date(until).toLocaleString());
+      snoozePop.classList.remove('show');
+    });
+  });
+
+  // Keyboard shortcuts
+  let cursorIdx = threadIds.indexOf(openId);
+  if (cursorIdx < 0) cursorIdx = 0;
+  function navTo(idx) {
+    if (idx < 0 || idx >= threadIds.length) return;
+    const u = new URL(location.href);
+    u.searchParams.set('t', threadIds[idx]);
+    location.href = u.toString();
+  }
+  document.addEventListener('keydown', (e) => {
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+    if (composeModal && composeModal.classList.contains('show')) return;
+    if (labelModal && labelModal.classList.contains('show')) return;
+    if (e.key === 'j') { e.preventDefault(); cursorIdx++; navTo(cursorIdx); }
+    else if (e.key === 'k') { e.preventDefault(); cursorIdx--; navTo(cursorIdx); }
+    else if (e.key === 'c') { e.preventDefault(); composeModal.classList.add('show'); setTimeout(() => document.getElementById('composeEditor').focus(), 50); }
+    else if (e.key === 'r' && openId) { e.preventDefault(); const re = document.getElementById('replyEditor'); re && re.focus(); }
+    else if (e.key === 's' && openId) {
+      e.preventDefault();
+      const fd = new FormData(); fd.append('action', 'toggle_star'); fd.append('thread_id', openId);
+      fetch(location.pathname, { method: 'POST', body: fd }).then(() => location.reload());
+    }
+    else if (e.key === 'e' && openId) {
+      e.preventDefault();
+      const fd = new FormData(); fd.append('action', 'move'); fd.append('thread_id', openId); fd.append('folder', 'archived');
+      fetch(location.pathname, { method: 'POST', body: fd }).then(() => { location.href = '/portal/mail'; });
+    }
+    else if (e.key === '#' && openId) {
+      e.preventDefault();
+      const fd = new FormData(); fd.append('action', 'move'); fd.append('thread_id', openId); fd.append('folder', 'trash');
+      fetch(location.pathname, { method: 'POST', body: fd }).then(() => { location.href = '/portal/mail'; });
+    }
+    else if (e.key === '/') { e.preventDefault(); const si = document.querySelector('.search-input'); si && si.focus(); }
+  });
+
+  // Apply label
+  document.querySelectorAll('#labelList .label-row').forEach(r => {
+    r.addEventListener('click', async () => {
+      if (!openId) { alert('Open a thread first'); return; }
+      const lid = r.getAttribute('data-label-id');
+      const fd = new FormData();
+      fd.append('action', 'apply_label');
+      fd.append('thread_id', openId);
+      fd.append('label_id', lid);
+      await fetch(location.pathname, { method: 'POST', body: fd });
+      r.style.background = '#1a1d29';
+    });
+  });
+
+  setTimeout(() => document.querySelectorAll('.toast').forEach(t => t.style.display = 'none'), 3500);
+})();
+</script>
+</BaseLayout>

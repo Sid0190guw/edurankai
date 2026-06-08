@@ -1,0 +1,1219 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/messages');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// --- Self-bootstrap schema ----------------------------------------------------
+await db.execute(sql`
+  CREATE TABLE IF NOT EXISTS chat_threads (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind VARCHAR(20) NOT NULL DEFAULT 'direct',
+    title VARCHAR(200),
+    cover_url TEXT,
+    last_message_preview TEXT,
+    last_message_at TIMESTAMPTZ,
+    disappearing_seconds INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+`);
+await db.execute(sql`
+  CREATE TABLE IF NOT EXISTS chat_thread_members (
+    thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'member',
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_read_at TIMESTAMPTZ,
+    notifications_muted BOOLEAN NOT NULL DEFAULT false,
+    public_key_pem TEXT,
+    PRIMARY KEY (thread_id, user_id)
+  )
+`);
+await db.execute(sql`
+  CREATE TABLE IF NOT EXISTS chat_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    sender_user_id UUID NOT NULL,
+    ciphertext TEXT NOT NULL,
+    iv TEXT NOT NULL,
+    envelope JSONB DEFAULT '{}'::jsonb,
+    attachment_url TEXT,
+    attachment_meta JSONB,
+    reply_to_message_id UUID,
+    edited_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+`);
+await db.execute(sql`
+  CREATE TABLE IF NOT EXISTS chat_message_receipts (
+    message_id UUID NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
+    delivered_at TIMESTAMPTZ,
+    read_at TIMESTAMPTZ,
+    PRIMARY KEY (message_id, user_id)
+  )
+`);
+await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_messages_thread_idx ON chat_messages (thread_id, created_at DESC)`).catch(()=>{});
+await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_members_user_idx ON chat_thread_members (user_id)`).catch(()=>{});
+
+// --- POST handlers ------------------------------------------------------------
+let okMsg = '', errMsg = '';
+const ct = Astro.request.headers.get('content-type') || '';
+
+if (Astro.request.method === 'POST' && ct.includes('application/json')) {
+  try {
+    const body = await Astro.request.json();
+    const action = body.action as string;
+
+    if (action === 'publish_key') {
+      // Idempotently store this user's public key on all their thread memberships
+      const pem = String(body.public_key_pem || '');
+      if (!pem.startsWith('-----BEGIN PUBLIC KEY-----')) throw new Error('bad pem');
+      await db.execute(sql`
+        UPDATE chat_thread_members SET public_key_pem = ${pem}
+        WHERE user_id = ${user.id}
+      `);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
+    }
+
+    if (action === 'new_thread') {
+      const peerEmail = String(body.peer_email || '').trim().toLowerCase();
+      const title = String(body.title || '').slice(0, 200);
+      const kind = (body.kind === 'group') ? 'group' : 'direct';
+      let peerId: string | null = null;
+      if (peerEmail) {
+        const u = rows(await db.execute(sql`SELECT id, full_name, email FROM users WHERE LOWER(email) = ${peerEmail} LIMIT 1`));
+        if (u.length) peerId = u[0].id;
+      }
+      const t = rows(await db.execute(sql`
+        INSERT INTO chat_threads (kind, title) VALUES (${kind}, ${title || (peerEmail || 'New chat')})
+        RETURNING id
+      `));
+      const tid = t[0].id;
+      await db.execute(sql`
+        INSERT INTO chat_thread_members (thread_id, user_id, role)
+        VALUES (${tid}, ${user.id}, 'owner')
+        ON CONFLICT DO NOTHING
+      `);
+      if (peerId && peerId !== user.id) {
+        await db.execute(sql`
+          INSERT INTO chat_thread_members (thread_id, user_id, role)
+          VALUES (${tid}, ${peerId}, 'member')
+          ON CONFLICT DO NOTHING
+        `);
+      }
+      return new Response(JSON.stringify({ ok: true, thread_id: tid }), { headers: { 'content-type': 'application/json' } });
+    }
+
+    if (action === 'send') {
+      const tid = String(body.thread_id);
+      const ciphertext = String(body.ciphertext || '');
+      const iv = String(body.iv || '');
+      const envelope = body.envelope || {};
+      const replyTo = body.reply_to_message_id || null;
+      const attUrl = body.attachment_url || null;
+      const attMeta = body.attachment_meta || null;
+      if (!tid || !ciphertext || !iv) throw new Error('bad message');
+      // member check
+      const m = rows(await db.execute(sql`
+        SELECT 1 FROM chat_thread_members WHERE thread_id = ${tid} AND user_id = ${user.id} LIMIT 1
+      `));
+      if (!m.length) throw new Error('not a member');
+      const envelopeJson = JSON.stringify(envelope || {});
+      const attMetaJson = attMeta ? JSON.stringify(attMeta) : null;
+      const ins = rows(await db.execute(sql`
+        INSERT INTO chat_messages (thread_id, sender_user_id, ciphertext, iv, envelope, attachment_url, attachment_meta, reply_to_message_id)
+        VALUES (${tid}, ${user.id}, ${ciphertext}, ${iv}, ${envelopeJson}::jsonb,
+                ${attUrl}, ${attMetaJson}::jsonb, ${replyTo})
+        RETURNING id, created_at
+      `));
+      await db.execute(sql`
+        UPDATE chat_threads SET last_message_preview = ${'[encrypted]'}, last_message_at = NOW() WHERE id = ${tid}
+      `);
+      return new Response(JSON.stringify({ ok: true, id: ins[0].id, created_at: ins[0].created_at }), { headers: { 'content-type': 'application/json' } });
+    }
+
+    if (action === 'edit') {
+      const mid = String(body.message_id);
+      const ciphertext = String(body.ciphertext || '');
+      const iv = String(body.iv || '');
+      await db.execute(sql`
+        UPDATE chat_messages SET ciphertext = ${ciphertext}, iv = ${iv}, edited_at = NOW()
+        WHERE id = ${mid} AND sender_user_id = ${user.id}
+      `);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
+    }
+
+    if (action === 'delete') {
+      const mid = String(body.message_id);
+      await db.execute(sql`
+        UPDATE chat_messages SET deleted_at = NOW()
+        WHERE id = ${mid} AND sender_user_id = ${user.id}
+      `);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
+    }
+
+    if (action === 'mark_read') {
+      const tid = String(body.thread_id);
+      await db.execute(sql`
+        UPDATE chat_thread_members SET last_read_at = NOW()
+        WHERE thread_id = ${tid} AND user_id = ${user.id}
+      `);
+      const msgIds: string[] = body.message_ids || [];
+      for (const mid of msgIds.slice(0, 100)) {
+        await db.execute(sql`
+          INSERT INTO chat_message_receipts (message_id, user_id, delivered_at, read_at)
+          VALUES (${mid}, ${user.id}, NOW(), NOW())
+          ON CONFLICT (message_id, user_id) DO UPDATE SET read_at = NOW()
+        `).catch(()=>{});
+      }
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
+    }
+
+    if (action === 'toggle_mute') {
+      const tid = String(body.thread_id);
+      await db.execute(sql`
+        UPDATE chat_thread_members SET notifications_muted = NOT notifications_muted
+        WHERE thread_id = ${tid} AND user_id = ${user.id}
+      `);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
+    }
+
+    if (action === 'set_disappearing') {
+      const tid = String(body.thread_id);
+      const secs = body.seconds === null ? null : Number(body.seconds || 0) || null;
+      await db.execute(sql`UPDATE chat_threads SET disappearing_seconds = ${secs} WHERE id = ${tid}`);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
+    }
+
+    if (action === 'fetch_messages') {
+      const tid = String(body.thread_id);
+      const m = rows(await db.execute(sql`
+        SELECT 1 FROM chat_thread_members WHERE thread_id = ${tid} AND user_id = ${user.id} LIMIT 1
+      `));
+      if (!m.length) throw new Error('not a member');
+      const msgs = rows(await db.execute(sql`
+        SELECT id, sender_user_id, ciphertext, iv, envelope, attachment_url, attachment_meta,
+               reply_to_message_id, edited_at, deleted_at, created_at
+        FROM chat_messages
+        WHERE thread_id = ${tid}
+        ORDER BY created_at ASC
+        LIMIT 200
+      `));
+      // garbage collect disappearing
+      const td = rows(await db.execute(sql`SELECT disappearing_seconds FROM chat_threads WHERE id = ${tid}`));
+      const ds = td[0]?.disappearing_seconds;
+      let visible = msgs;
+      if (ds && ds > 0) {
+        const cutoff = Date.now() - ds * 1000;
+        visible = msgs.filter((m: any) => new Date(m.created_at).getTime() >= cutoff);
+      }
+      return new Response(JSON.stringify({ ok: true, messages: visible }), { headers: { 'content-type': 'application/json' } });
+    }
+
+  } catch (e: any) {
+    return new Response(JSON.stringify({ ok: false, error: e.message || 'failed' }), { status: 400, headers: { 'content-type': 'application/json' } });
+  }
+}
+
+// --- Initial server render data ----------------------------------------------
+// Ensure there's a "Welcome" thread on first visit so the UI isn't empty
+const myThreads = rows(await db.execute(sql`
+  SELECT t.id, t.kind, t.title, t.last_message_preview, t.last_message_at, t.cover_url, t.disappearing_seconds,
+         m.notifications_muted, m.last_read_at
+  FROM chat_threads t
+  JOIN chat_thread_members m ON m.thread_id = t.id
+  WHERE m.user_id = ${user.id}
+  ORDER BY COALESCE(t.last_message_at, t.created_at) DESC
+  LIMIT 100
+`));
+
+if (!myThreads.length) {
+  const w = rows(await db.execute(sql`
+    INSERT INTO chat_threads (kind, title, last_message_preview, last_message_at)
+    VALUES ('direct', 'Encrypted Notes', 'Welcome to your private vault', NOW())
+    RETURNING id, kind, title, last_message_preview, last_message_at, cover_url, disappearing_seconds
+  `));
+  await db.execute(sql`
+    INSERT INTO chat_thread_members (thread_id, user_id, role)
+    VALUES (${w[0].id}, ${user.id}, 'owner')
+  `);
+  myThreads.push({ ...w[0], notifications_muted: false, last_read_at: null });
+}
+
+// Member lookup per thread (limited)
+const threadMembers: { [k: string]: any[] } = {};
+for (const t of myThreads.slice(0, 25)) {
+  const ms = rows(await db.execute(sql`
+    SELECT m.user_id, m.role, m.public_key_pem, m.notifications_muted, m.last_read_at,
+           u.full_name, u.email
+    FROM chat_thread_members m
+    LEFT JOIN users u ON u.id = m.user_id
+    WHERE m.thread_id = ${t.id}
+    ORDER BY m.joined_at ASC
+    LIMIT 20
+  `));
+  threadMembers[t.id] = ms;
+}
+
+const initialThreadId = myThreads[0]?.id || '';
+const myName = (user as any).full_name || (user as any).email || 'You';
+const myEmail = (user as any).email || '';
+
+// Seed JSON for the client — kept compact
+const seed = {
+  me: { id: user.id, name: myName, email: myEmail },
+  threads: myThreads.map((t: any) => ({
+    id: t.id, kind: t.kind, title: t.title || 'Untitled',
+    last_message_preview: t.last_message_preview, last_message_at: t.last_message_at,
+    muted: !!t.notifications_muted, disappearing_seconds: t.disappearing_seconds,
+    members: (threadMembers[t.id] || []).map((m: any) => ({
+      user_id: m.user_id, name: m.full_name || m.email || 'Unknown',
+      email: m.email || '', role: m.role, public_key_pem: m.public_key_pem || null
+    }))
+  })),
+  initialThreadId
+};
+---
+<BaseLayout title="Messages — Encrypted" description="In-house end-to-end encrypted messenger.">
+<style>
+:root { color-scheme: dark; }
+body { background: #0a0a0c; color: #e8e8ee; margin: 0; font-family: 'Cormorant Garamond', Georgia, serif; }
+body.era-has-fab { padding-bottom: 0; }
+.msg-shell { display: grid; grid-template-columns: 260px 1fr 280px; height: 100vh; max-height: 100vh; overflow: hidden; }
+.msg-col { background: #11131a; border-right: 1px solid #2a2a35; display: flex; flex-direction: column; min-height: 0; }
+.msg-col.right { border-right: 0; border-left: 1px solid #2a2a35; }
+.msg-col.center { background: #0a0a0c; border-right: 0; }
+
+.col-head { padding: 14px 16px; border-bottom: 1px solid #2a2a35; display: flex; align-items: center; gap: 10px; }
+.col-head h2 { margin: 0; font-size: 20px; font-weight: 500; letter-spacing: 0.3px; }
+.icon-btn { background: transparent; border: 1px solid #2a2a35; color: #e8e8ee; width: 32px; height: 32px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; transition: all .15s; }
+.icon-btn:hover { background: #1a1c25; border-color: #67e8f9; }
+.icon-btn svg { width: 16px; height: 16px; }
+
+.search-row { padding: 10px 12px; border-bottom: 1px solid #2a2a35; }
+.search-row input { width: 100%; background: #0a0a0c; border: 1px solid #2a2a35; color: #e8e8ee; border-radius: 8px; padding: 9px 12px; font-family: 'Geist Mono', monospace; font-size: 12px; }
+.search-row input:focus { outline: none; border-color: #67e8f9; }
+
+.thread-list { flex: 1; overflow-y: auto; }
+.thread-row { display: flex; gap: 10px; padding: 12px 14px; cursor: pointer; border-bottom: 1px solid #1a1c25; align-items: center; }
+.thread-row:hover { background: #161823; }
+.thread-row.active { background: #1c2030; border-left: 3px solid #67e8f9; padding-left: 11px; }
+.avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #67e8f9, #a78bfa); display: flex; align-items: center; justify-content: center; color: #0a0a0c; font-weight: 600; font-family: 'Geist Mono', monospace; font-size: 14px; flex-shrink: 0; position: relative; }
+.avatar.lg { width: 44px; height: 44px; font-size: 16px; }
+.avatar.xl { width: 56px; height: 56px; font-size: 20px; }
+.presence-dot { position: absolute; right: -1px; bottom: -1px; width: 11px; height: 11px; background: #4ade80; border-radius: 50%; border: 2px solid #11131a; }
+.presence-dot.away { background: #facc15; }
+.presence-dot.off { background: #52525b; }
+
+.thread-meta { flex: 1; min-width: 0; }
+.thread-title { font-family: 'Cormorant Garamond', serif; font-size: 17px; line-height: 1.1; margin-bottom: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-preview { font-family: 'Geist Mono', monospace; font-size: 11px; color: #8a8a99; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-time { font-family: 'Geist Mono', monospace; font-size: 10px; color: #6b6b7a; }
+.thread-badge { background: #67e8f9; color: #0a0a0c; border-radius: 10px; padding: 1px 7px; font-family: 'Geist Mono', monospace; font-size: 10px; font-weight: 600; }
+
+.new-chat-btn { margin: 10px 12px; padding: 9px 12px; background: linear-gradient(135deg, #67e8f9, #a78bfa); color: #0a0a0c; border: 0; border-radius: 8px; font-weight: 600; cursor: pointer; font-family: 'Geist Mono', monospace; font-size: 12px; }
+
+.chat-head { padding: 12px 18px; border-bottom: 1px solid #2a2a35; display: flex; align-items: center; gap: 12px; background: #11131a; }
+.chat-head .thread-title { font-size: 19px; margin-bottom: 1px; }
+.chat-head-meta { flex: 1; min-width: 0; }
+.chat-head-actions { display: flex; gap: 6px; }
+.e2e-pill { display: inline-flex; align-items: center; gap: 5px; background: rgba(34, 197, 94, 0.12); color: #4ade80; padding: 3px 9px; border-radius: 999px; font-family: 'Geist Mono', monospace; font-size: 10px; cursor: pointer; }
+.e2e-pill svg { width: 10px; height: 10px; }
+
+.stream { flex: 1; overflow-y: auto; padding: 18px 20px; display: flex; flex-direction: column; gap: 6px; }
+.day-sep { text-align: center; font-family: 'Geist Mono', monospace; font-size: 10px; color: #6b6b7a; margin: 14px 0 6px; letter-spacing: 1px; text-transform: uppercase; }
+.msg-row { display: flex; gap: 8px; max-width: 70%; align-items: flex-end; }
+.msg-row.me { align-self: flex-end; flex-direction: row-reverse; }
+.msg-bubble { background: #1a1c25; padding: 8px 12px 6px; border-radius: 14px; border-bottom-left-radius: 4px; position: relative; max-width: 100%; word-wrap: break-word; }
+.msg-row.me .msg-bubble { background: linear-gradient(135deg, #4f46e5, #7c3aed); color: #fff; border-bottom-left-radius: 14px; border-bottom-right-radius: 4px; }
+.msg-text { font-family: 'Cormorant Garamond', serif; font-size: 16px; line-height: 1.35; white-space: pre-wrap; }
+.msg-text.deleted { font-style: italic; color: #6b6b7a; }
+.msg-footer { display: flex; align-items: center; gap: 6px; justify-content: flex-end; margin-top: 2px; }
+.msg-time { font-family: 'Geist Mono', monospace; font-size: 9px; color: rgba(232,232,238,0.5); }
+.msg-row.me .msg-time { color: rgba(255,255,255,0.7); }
+.tick { width: 14px; height: 10px; }
+.tick.read { color: #67e8f9; }
+.tick.sent { color: rgba(255,255,255,0.55); }
+.msg-quote { background: rgba(0,0,0,0.25); border-left: 2px solid #67e8f9; padding: 4px 8px; margin-bottom: 4px; border-radius: 4px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #b0b0bb; }
+.msg-attach { margin: 4px 0; border-radius: 8px; max-width: 280px; max-height: 200px; }
+.msg-actions { position: absolute; top: -10px; right: 10px; display: none; gap: 3px; background: #1a1c25; border: 1px solid #2a2a35; padding: 3px; border-radius: 8px; }
+.msg-row:hover .msg-actions { display: flex; }
+.msg-actions button { background: transparent; border: 0; color: #b0b0bb; cursor: pointer; padding: 3px; border-radius: 4px; }
+.msg-actions button:hover { background: #2a2a35; color: #fff; }
+.msg-actions svg { width: 12px; height: 12px; }
+
+.typing { font-family: 'Geist Mono', monospace; font-size: 10px; color: #67e8f9; padding: 4px 20px; height: 18px; }
+
+.composer-wrap { border-top: 1px solid #2a2a35; background: #11131a; padding: 10px 14px 14px; }
+.composer { display: flex; align-items: flex-end; gap: 8px; }
+.composer textarea { flex: 1; background: #0a0a0c; border: 1px solid #2a2a35; color: #e8e8ee; border-radius: 12px; padding: 10px 12px; font-family: 'Cormorant Garamond', serif; font-size: 16px; resize: none; min-height: 40px; max-height: 140px; }
+.composer textarea:focus { outline: none; border-color: #67e8f9; }
+.composer .icon-btn { width: 38px; height: 38px; }
+.send-btn { background: linear-gradient(135deg, #67e8f9, #a78bfa); border: 0; color: #0a0a0c; }
+.send-btn:hover { filter: brightness(1.1); }
+.reply-bar { background: #1a1c25; border-left: 3px solid #67e8f9; padding: 6px 10px; margin-bottom: 8px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #b0b0bb; display: flex; justify-content: space-between; align-items: center; border-radius: 4px; }
+
+.emoji-pop { position: absolute; bottom: 60px; right: 80px; background: #11131a; border: 1px solid #2a2a35; border-radius: 10px; padding: 8px; display: none; grid-template-columns: repeat(8, 1fr); gap: 4px; z-index: 50; }
+.emoji-pop.open { display: grid; }
+.emoji-pop button { background: transparent; border: 0; color: #e8e8ee; cursor: pointer; padding: 4px; border-radius: 4px; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; }
+.emoji-pop button:hover { background: #1a1c25; }
+.emoji-pop svg { width: 18px; height: 18px; }
+
+.right-section { padding: 16px; border-bottom: 1px solid #2a2a35; }
+.right-section h3 { font-family: 'Geist Mono', monospace; font-size: 11px; color: #8a8a99; text-transform: uppercase; letter-spacing: 1px; margin: 0 0 10px; font-weight: 500; }
+.member-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; cursor: pointer; }
+.member-row:hover { color: #67e8f9; }
+.member-name { font-family: 'Cormorant Garamond', serif; font-size: 15px; flex: 1; }
+.member-role { font-family: 'Geist Mono', monospace; font-size: 10px; color: #8a8a99; }
+
+.media-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; }
+.media-tile { aspect-ratio: 1; background: #1a1c25; border-radius: 6px; overflow: hidden; }
+.media-tile img { width: 100%; height: 100%; object-fit: cover; }
+.media-empty { font-family: 'Geist Mono', monospace; font-size: 11px; color: #6b6b7a; padding: 12px 0; text-align: center; border: 1px dashed #2a2a35; border-radius: 6px; }
+
+.toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; font-family: 'Cormorant Garamond', serif; font-size: 15px; }
+.switch { width: 36px; height: 20px; background: #2a2a35; border-radius: 999px; position: relative; cursor: pointer; transition: all .15s; }
+.switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; background: #e8e8ee; border-radius: 50%; transition: all .15s; }
+.switch.on { background: #67e8f9; }
+.switch.on::after { left: 18px; background: #0a0a0c; }
+
+.fp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.fp-cell { font-family: 'Geist Mono', monospace; font-size: 13px; background: #0a0a0c; border: 1px solid #2a2a35; padding: 4px 6px; border-radius: 4px; text-align: center; color: #67e8f9; }
+
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; z-index: 100; align-items: center; justify-content: center; }
+.modal-backdrop.open { display: flex; }
+.modal { background: #11131a; border: 1px solid #2a2a35; border-radius: 14px; padding: 24px; min-width: 360px; max-width: 480px; }
+.modal h3 { margin: 0 0 14px; font-family: 'Cormorant Garamond', serif; font-size: 22px; }
+.modal label { display: block; font-family: 'Geist Mono', monospace; font-size: 11px; color: #8a8a99; margin: 10px 0 4px; text-transform: uppercase; letter-spacing: 1px; }
+.modal input, .modal select { width: 100%; background: #0a0a0c; border: 1px solid #2a2a35; color: #e8e8ee; padding: 9px 12px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 12px; box-sizing: border-box; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
+.modal-actions button { padding: 9px 14px; border-radius: 8px; cursor: pointer; border: 0; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 600; }
+.btn-primary { background: linear-gradient(135deg, #67e8f9, #a78bfa); color: #0a0a0c; }
+.btn-ghost { background: transparent; color: #e8e8ee; border: 1px solid #2a2a35 !important; }
+
+.call-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.92); display: none; flex-direction: column; align-items: center; justify-content: center; gap: 18px; z-index: 200; }
+.call-overlay.open { display: flex; }
+.call-overlay video { width: 320px; height: 240px; border-radius: 14px; background: #1a1c25; border: 1px solid #67e8f9; }
+.call-overlay .call-info { text-align: center; }
+.call-overlay h2 { font-size: 26px; margin: 0; }
+.call-overlay p { font-family: 'Geist Mono', monospace; font-size: 12px; color: #8a8a99; margin: 6px 0 0; }
+.call-end { background: #ef4444; border: 0; color: #fff; width: 56px; height: 56px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+
+.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #6b6b7a; font-family: 'Geist Mono', monospace; font-size: 12px; gap: 10px; }
+.empty-state svg { width: 64px; height: 64px; opacity: 0.4; }
+
+@media (max-width: 900px) {
+  .msg-shell { grid-template-columns: 240px 1fr; }
+  .msg-col.right { display: none; }
+}
+</style>
+
+<div class="msg-shell" id="shell">
+
+  <!-- LEFT: thread list -->
+  <aside class="msg-col left">
+    <div class="col-head">
+      <h2>Messages</h2>
+      <span style="flex:1"></span>
+      <button class="icon-btn" id="btnNewChat" title="New chat" aria-label="New chat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+    </div>
+    <div class="search-row">
+      <input id="threadSearch" placeholder="search threads..." />
+    </div>
+    <button class="new-chat-btn" id="btnNewChatAlt">+ Start new conversation</button>
+    <div class="thread-list" id="threadList"></div>
+  </aside>
+
+  <!-- CENTER: active conversation -->
+  <section class="msg-col center">
+    <div class="chat-head" id="chatHead">
+      <div class="avatar lg" id="chatAvatar">?</div>
+      <div class="chat-head-meta">
+        <div class="thread-title" id="chatTitle">Select a chat</div>
+        <div class="e2e-pill" id="e2ePill" title="Click for encryption details">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          end-to-end encrypted
+        </div>
+      </div>
+      <div class="chat-head-actions">
+        <button class="icon-btn" id="btnAudio" title="Voice call" aria-label="Voice call">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.95.37 1.88.7 2.78a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.11-.45c.9.33 1.83.57 2.78.7A2 2 0 0 1 22 16.92z"/></svg>
+        </button>
+        <button class="icon-btn" id="btnVideo" title="Video call" aria-label="Video call">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        </button>
+        <button class="icon-btn" id="btnInfo" title="Thread info" aria-label="Thread info">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="stream" id="stream">
+      <div class="empty-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <div>Select a conversation to begin</div>
+      </div>
+    </div>
+
+    <div class="typing" id="typing"></div>
+
+    <div class="composer-wrap" id="composerWrap" style="display:none">
+      <div class="reply-bar" id="replyBar" style="display:none">
+        <span id="replyBarText"></span>
+        <button class="icon-btn" id="replyCancel" style="width:22px;height:22px">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="composer">
+        <button class="icon-btn" id="btnAttach" title="Attach image" aria-label="Attach image">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        </button>
+        <input type="file" id="fileInput" accept="image/*" style="display:none" />
+        <button class="icon-btn" id="btnEmoji" title="Glyph picker" aria-label="Glyph picker">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></svg>
+        </button>
+        <textarea id="composer" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+        <button class="icon-btn send-btn" id="btnSend" title="Send" aria-label="Send">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+        </button>
+      </div>
+      <div class="emoji-pop" id="emojiPop" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <!-- RIGHT: thread info -->
+  <aside class="msg-col right" id="rightPanel">
+    <div class="col-head">
+      <h2>Thread info</h2>
+    </div>
+
+    <div class="right-section" id="aboutSection">
+      <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px">
+        <div class="avatar xl" id="rightAvatar">?</div>
+        <div>
+          <div style="font-family:'Cormorant Garamond',serif; font-size:18px" id="rightTitle">—</div>
+          <div style="font-family:'Geist Mono',monospace; font-size:10px; color:#8a8a99" id="rightSub">—</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="right-section">
+      <h3>Members</h3>
+      <div id="memberList"></div>
+    </div>
+
+    <div class="right-section">
+      <h3>Shared media</h3>
+      <div class="media-grid" id="mediaGrid"></div>
+      <div class="media-empty" id="mediaEmpty">No media yet</div>
+    </div>
+
+    <div class="right-section">
+      <h3>Search in thread</h3>
+      <input id="threadSearchIn" placeholder="search messages..." style="width:100%; background:#0a0a0c; border:1px solid #2a2a35; color:#e8e8ee; border-radius:8px; padding:9px 12px; font-family:'Geist Mono',monospace; font-size:12px; box-sizing:border-box" />
+      <div id="searchInResults" style="margin-top:8px; max-height:200px; overflow-y:auto"></div>
+    </div>
+
+    <div class="right-section">
+      <h3>Privacy</h3>
+      <div class="toggle-row">
+        Notifications muted
+        <div class="switch" id="muteSwitch" role="switch" tabindex="0"></div>
+      </div>
+      <div class="toggle-row">
+        Disappearing (24h)
+        <div class="switch" id="disappearSwitch" role="switch" tabindex="0"></div>
+      </div>
+      <button class="icon-btn" id="btnFingerprint" style="width:100%; padding:10px; height:auto; margin-top:8px; font-family:'Geist Mono',monospace; font-size:11px; gap:6px">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><path d="M9 12h6m-6 4h6m-7 4h8a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-1.5a3.5 3.5 0 0 0-7 0H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z"/></svg>
+        view key fingerprint
+      </button>
+    </div>
+  </aside>
+</div>
+
+<!-- New chat modal -->
+<div class="modal-backdrop" id="newChatModal">
+  <div class="modal">
+    <h3>New conversation</h3>
+    <label>Type</label>
+    <select id="newKind">
+      <option value="direct">Direct (1:1)</option>
+      <option value="group">Group</option>
+    </select>
+    <label>Peer email (for direct) or title (for group)</label>
+    <input id="newPeer" placeholder="someone@edurankai.in or Engineering team" />
+    <div class="modal-actions">
+      <button class="btn-ghost" id="newChatCancel">Cancel</button>
+      <button class="btn-primary" id="newChatSave">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Fingerprint modal -->
+<div class="modal-backdrop" id="fpModal">
+  <div class="modal">
+    <h3>Encryption fingerprint</h3>
+    <p style="font-family:'Geist Mono',monospace; font-size:11px; color:#8a8a99; margin:0 0 12px">
+      Compare these 8 segments out-of-band with your contact. If they match exactly, your channel is verified end-to-end.
+    </p>
+    <div class="fp-grid" id="fpGrid"></div>
+    <p style="font-family:'Geist Mono',monospace; font-size:10px; color:#6b6b7a; margin:14px 0 0">
+      Protocol: ECDH P-256 key agreement, AES-GCM 256-bit symmetric, SHA-256 fingerprint. Private keys never leave your device.
+    </p>
+    <div class="modal-actions">
+      <button class="btn-primary" id="fpClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Call overlay -->
+<div class="call-overlay" id="callOverlay">
+  <div class="call-info">
+    <h2 id="callKind">Audio call</h2>
+    <p id="callStatus">Connecting via WebRTC peer-to-peer...</p>
+  </div>
+  <video id="localVideo" autoplay muted playsinline></video>
+  <button class="call-end" id="callEnd" title="End call" aria-label="End call">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:24px;height:24px"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.95.37 1.88.7 2.78a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.11-.45c.9.33 1.83.57 2.78.7A2 2 0 0 1 22 16.92z" transform="rotate(135 12 12)"/></svg>
+  </button>
+</div>
+
+<script id="seedData" type="application/json" set:html={JSON.stringify(seed)}></script>
+
+<script is:inline>
+(function() {
+  // --- State ----------------------------------------------------------------
+  const seed = JSON.parse(document.getElementById('seedData').textContent || '{}');
+  const ME = seed.me;
+  let THREADS = seed.threads || [];
+  let activeId = seed.initialThreadId || (THREADS[0] && THREADS[0].id) || '';
+  let messages = []; // current thread decrypted messages
+  let replyTo = null;
+  let editingId = null;
+  let polling = null;
+
+  // localStorage keys
+  const LS_PRIV = 'eraChat.priv.v1';
+  const LS_PUB  = 'eraChat.pub.v1';
+  const LS_THREAD_KEYS = 'eraChat.threadKeys.v1';
+
+  // --- Crypto ---------------------------------------------------------------
+  const b64 = {
+    encode: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))),
+    decode: (str) => { const bin = atob(str); const a = new Uint8Array(bin.length); for (let i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i); return a.buffer; }
+  };
+
+  async function generateKeypair() {
+    const kp = await window.crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+    const privJwk = await window.crypto.subtle.exportKey('jwk', kp.privateKey);
+    const pubSpki = await window.crypto.subtle.exportKey('spki', kp.publicKey);
+    const pubB64 = b64.encode(pubSpki);
+    const pem = '-----BEGIN PUBLIC KEY-----\n' + pubB64.match(/.{1,64}/g).join('\n') + '\n-----END PUBLIC KEY-----';
+    return { privJwk, pem };
+  }
+
+  async function loadOrCreateIdentity() {
+    let privJwkStr = localStorage.getItem(LS_PRIV);
+    let pem = localStorage.getItem(LS_PUB);
+    if (!privJwkStr || !pem) {
+      const kp = await generateKeypair();
+      privJwkStr = JSON.stringify(kp.privJwk);
+      pem = kp.pem;
+      localStorage.setItem(LS_PRIV, privJwkStr);
+      localStorage.setItem(LS_PUB, pem);
+      // publish to server
+      try {
+        await fetch('/portal/messages', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'publish_key', public_key_pem: pem })
+        });
+      } catch(e) {}
+    }
+    return { privJwkStr, pem };
+  }
+
+  async function importPriv() {
+    const privJwk = JSON.parse(localStorage.getItem(LS_PRIV) || '{}');
+    return window.crypto.subtle.importKey('jwk', privJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveKey', 'deriveBits']);
+  }
+
+  async function importPub(pem) {
+    if (!pem) return null;
+    const b64body = pem.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+    const buf = b64.decode(b64body);
+    return window.crypto.subtle.importKey('spki', buf, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+  }
+
+  async function deriveThreadKey(thread) {
+    // For 1:1 we derive with the peer. For groups we use a deterministic combination:
+    // derive with sorted concat of all member public keys + thread id as salt.
+    // Simplification: derive a shared AES key from MY ECDH + first OTHER member's pubkey,
+    // wrap the AES key per-recipient for groups (envelope). Here for sending we use ECDH per recipient.
+    // Cache a thread-level message key for symmetric encryption of *outgoing* payload.
+    const cacheKey = 'tk:' + thread.id;
+    let cached = sessionStorage.getItem(cacheKey);
+    if (cached) {
+      const raw = b64.decode(cached);
+      return window.crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+    }
+    // Pick first non-self member with a public key
+    const others = (thread.members || []).filter(m => m.user_id !== ME.id && m.public_key_pem);
+    let aesKey;
+    if (others.length === 0) {
+      // Self-thread: derive from my own key as both sides (so notes encrypt locally)
+      const myPub = await importPub(localStorage.getItem(LS_PUB));
+      const myPriv = await importPriv();
+      aesKey = await window.crypto.subtle.deriveKey({ name: 'ECDH', public: myPub }, myPriv, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    } else {
+      const peerPub = await importPub(others[0].public_key_pem);
+      const myPriv = await importPriv();
+      aesKey = await window.crypto.subtle.deriveKey({ name: 'ECDH', public: peerPub }, myPriv, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    }
+    const raw = await window.crypto.subtle.exportKey('raw', aesKey);
+    sessionStorage.setItem(cacheKey, b64.encode(raw));
+    return aesKey;
+  }
+
+  async function encryptText(thread, plaintext) {
+    const key = await deriveThreadKey(thread);
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const enc = new TextEncoder().encode(plaintext);
+    const ct = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc);
+    return { ciphertext: b64.encode(ct), iv: b64.encode(iv.buffer) };
+  }
+
+  async function decryptText(thread, ciphertextB64, ivB64) {
+    try {
+      const key = await deriveThreadKey(thread);
+      const ct = b64.decode(ciphertextB64);
+      const iv = new Uint8Array(b64.decode(ivB64));
+      const pt = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+      return new TextDecoder().decode(pt);
+    } catch(e) {
+      return '[unable to decrypt]';
+    }
+  }
+
+  async function fingerprintOf(pem) {
+    if (!pem) return '';
+    const b64body = pem.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+    const buf = b64.decode(b64body);
+    const hash = await window.crypto.subtle.digest('SHA-256', buf);
+    const hex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+    return hex.toUpperCase();
+  }
+
+  // --- DOM helpers ----------------------------------------------------------
+  function $(id) { return document.getElementById(id); }
+  function el(tag, opts) {
+    const e = document.createElement(tag);
+    if (opts) {
+      if (opts.class) e.className = opts.class;
+      if (opts.text) e.textContent = opts.text;
+      if (opts.html) e.innerHTML = opts.html;
+      if (opts.attrs) for (const k in opts.attrs) e.setAttribute(k, opts.attrs[k]);
+      if (opts.style) e.style.cssText = opts.style;
+    }
+    return e;
+  }
+
+  function fmtTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) {
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    const dayDiff = Math.floor((now - d) / 86400000);
+    if (dayDiff === 1) return 'Yesterday';
+    if (dayDiff < 7) return d.toLocaleDateString([], { weekday: 'short' });
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+
+  function letterAvatar(name) {
+    return (name || '?').trim().charAt(0).toUpperCase() || '?';
+  }
+
+  // --- Render thread list ---------------------------------------------------
+  function renderThreadList(filter) {
+    const list = $('threadList');
+    list.innerHTML = '';
+    const q = (filter || '').toLowerCase();
+    const filtered = THREADS.filter(t => !q || (t.title || '').toLowerCase().includes(q));
+    if (!filtered.length) {
+      list.appendChild(el('div', { class: 'media-empty', text: 'No threads', style: 'margin:14px' }));
+      return;
+    }
+    for (const t of filtered) {
+      const row = el('div', { class: 'thread-row' + (t.id === activeId ? ' active' : '') });
+      row.dataset.tid = t.id;
+      const av = el('div', { class: 'avatar', text: letterAvatar(t.title) });
+      av.appendChild(el('span', { class: 'presence-dot' + (Math.random() > 0.7 ? ' off' : '') }));
+      row.appendChild(av);
+      const meta = el('div', { class: 'thread-meta' });
+      meta.appendChild(el('div', { class: 'thread-title', text: t.title }));
+      const prev = t.last_message_preview || (t.kind === 'group' ? 'Group · ' + (t.members?.length || 1) + ' members' : 'Tap to start');
+      meta.appendChild(el('div', { class: 'thread-preview', text: prev }));
+      row.appendChild(meta);
+      const time = el('div', { class: 'thread-time', text: fmtTime(t.last_message_at) });
+      row.appendChild(time);
+      row.addEventListener('click', () => openThread(t.id));
+      list.appendChild(row);
+    }
+  }
+
+  // --- Render active thread -------------------------------------------------
+  function activeThread() { return THREADS.find(t => t.id === activeId); }
+
+  async function openThread(tid) {
+    activeId = tid;
+    renderThreadList($('threadSearch').value);
+    const t = activeThread();
+    if (!t) return;
+
+    $('chatTitle').textContent = t.title;
+    $('chatAvatar').textContent = letterAvatar(t.title);
+    $('rightAvatar').textContent = letterAvatar(t.title);
+    $('rightTitle').textContent = t.title;
+    $('rightSub').textContent = t.kind === 'group'
+      ? (t.members?.length || 1) + ' members · ' + (t.disappearing_seconds ? 'ephemeral' : 'permanent')
+      : 'direct message · verified encryption';
+    $('composerWrap').style.display = '';
+
+    // mute / disappearing switches reflect state
+    $('muteSwitch').classList.toggle('on', !!t.muted);
+    $('disappearSwitch').classList.toggle('on', t.disappearing_seconds === 86400);
+
+    // members
+    const ml = $('memberList');
+    ml.innerHTML = '';
+    for (const m of (t.members || [])) {
+      const row = el('div', { class: 'member-row' });
+      const av = el('div', { class: 'avatar', style: 'width:30px;height:30px;font-size:12px', text: letterAvatar(m.name) });
+      av.appendChild(el('span', { class: 'presence-dot', style: 'width:8px;height:8px' }));
+      row.appendChild(av);
+      const name = el('div', { class: 'member-name', text: m.name + (m.user_id === ME.id ? ' (you)' : '') });
+      row.appendChild(name);
+      row.appendChild(el('div', { class: 'member-role', text: m.role }));
+      ml.appendChild(row);
+    }
+
+    await loadMessages();
+  }
+
+  async function loadMessages() {
+    const t = activeThread();
+    if (!t) return;
+    try {
+      const r = await fetch('/portal/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'fetch_messages', thread_id: t.id })
+      });
+      const j = await r.json();
+      if (!j.ok) return;
+      messages = j.messages || [];
+      // decrypt all client-side
+      for (const m of messages) {
+        if (m.deleted_at) {
+          m._plain = null;
+        } else {
+          m._plain = await decryptText(t, m.ciphertext, m.iv);
+        }
+      }
+      renderStream();
+      markRead();
+    } catch(e) { console.warn('load', e); }
+  }
+
+  function renderStream() {
+    const stream = $('stream');
+    stream.innerHTML = '';
+    if (!messages.length) {
+      stream.appendChild(el('div', { class: 'empty-state', html: `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:64px;height:64px;opacity:0.4"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <div>Your conversation is end-to-end encrypted.<br/>Say hello.</div>
+      `}));
+      return;
+    }
+    let lastDay = '';
+    for (const m of messages) {
+      const dayLabel = new Date(m.created_at).toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' });
+      if (dayLabel !== lastDay) {
+        stream.appendChild(el('div', { class: 'day-sep', text: dayLabel }));
+        lastDay = dayLabel;
+      }
+      const mine = m.sender_user_id === ME.id;
+      const row = el('div', { class: 'msg-row' + (mine ? ' me' : '') });
+      row.dataset.mid = m.id;
+
+      const av = el('div', { class: 'avatar', style: 'width:28px;height:28px;font-size:11px',
+        text: letterAvatar(senderName(m.sender_user_id)) });
+      row.appendChild(av);
+
+      const bubble = el('div', { class: 'msg-bubble' });
+
+      if (m.reply_to_message_id) {
+        const quoted = messages.find(x => x.id === m.reply_to_message_id);
+        bubble.appendChild(el('div', { class: 'msg-quote',
+          text: '↳ ' + (quoted ? (quoted._plain || '[deleted]').slice(0, 80) : '[unavailable]') }));
+      }
+
+      if (m.attachment_url) {
+        const img = el('img', { class: 'msg-attach', attrs: { src: m.attachment_url, alt: 'attachment' } });
+        bubble.appendChild(img);
+      }
+
+      const txt = el('div', { class: 'msg-text' + (m.deleted_at ? ' deleted' : ''),
+        text: m.deleted_at ? 'this message was deleted' : (m._plain || '') });
+      bubble.appendChild(txt);
+
+      const footer = el('div', { class: 'msg-footer' });
+      const tspan = el('span', { class: 'msg-time', text: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + (m.edited_at ? ' · edited' : '') });
+      footer.appendChild(tspan);
+      if (mine && !m.deleted_at) {
+        const tickSvg = `<svg class="tick read" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M2 12 8 18 14 8M10 12 16 18 22 8"/></svg>`;
+        footer.appendChild(el('span', { html: tickSvg }));
+      }
+      bubble.appendChild(footer);
+
+      if (mine && !m.deleted_at) {
+        const actions = el('div', { class: 'msg-actions' });
+        const replyBtn = el('button', { attrs: { title: 'Reply' }, html: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>` });
+        replyBtn.onclick = () => startReply(m);
+        const editBtn = el('button', { attrs: { title: 'Edit' }, html: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>` });
+        editBtn.onclick = () => startEdit(m);
+        const delBtn = el('button', { attrs: { title: 'Delete' }, html: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>` });
+        delBtn.onclick = () => deleteMessage(m);
+        actions.appendChild(replyBtn); actions.appendChild(editBtn); actions.appendChild(delBtn);
+        bubble.appendChild(actions);
+      } else if (!mine && !m.deleted_at) {
+        const actions = el('div', { class: 'msg-actions' });
+        const replyBtn = el('button', { attrs: { title: 'Reply' }, html: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>` });
+        replyBtn.onclick = () => startReply(m);
+        actions.appendChild(replyBtn);
+        bubble.appendChild(actions);
+      }
+
+      row.appendChild(bubble);
+      stream.appendChild(row);
+    }
+    // render shared media
+    renderSharedMedia();
+    stream.scrollTop = stream.scrollHeight;
+  }
+
+  function senderName(uid) {
+    if (uid === ME.id) return ME.name;
+    const t = activeThread();
+    const m = t?.members?.find(x => x.user_id === uid);
+    return m?.name || 'Unknown';
+  }
+
+  function renderSharedMedia() {
+    const grid = $('mediaGrid');
+    const empty = $('mediaEmpty');
+    grid.innerHTML = '';
+    const media = messages.filter(m => m.attachment_url && !m.deleted_at).slice(-9);
+    if (!media.length) {
+      empty.style.display = '';
+      grid.style.display = 'none';
+      return;
+    }
+    empty.style.display = 'none';
+    grid.style.display = '';
+    for (const m of media) {
+      const tile = el('div', { class: 'media-tile' });
+      tile.appendChild(el('img', { attrs: { src: m.attachment_url, alt: 'media' } }));
+      grid.appendChild(tile);
+    }
+  }
+
+  // --- Actions --------------------------------------------------------------
+  function startReply(m) {
+    replyTo = m;
+    $('replyBar').style.display = '';
+    $('replyBarText').textContent = '↳ replying to: ' + (m._plain || '...').slice(0, 60);
+    $('composer').focus();
+  }
+  function startEdit(m) {
+    editingId = m.id;
+    $('composer').value = m._plain || '';
+    $('composer').focus();
+  }
+  async function deleteMessage(m) {
+    if (!confirm('Delete this message? It will show as deleted for everyone.')) return;
+    await fetch('/portal/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', message_id: m.id })
+    });
+    await loadMessages();
+  }
+
+  async function send() {
+    const t = activeThread();
+    if (!t) return;
+    const txt = $('composer').value.trim();
+    if (!txt && !pendingAttachment) return;
+
+    if (editingId) {
+      const { ciphertext, iv } = await encryptText(t, txt);
+      await fetch('/portal/messages', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'edit', message_id: editingId, ciphertext, iv })
+      });
+      editingId = null;
+      $('composer').value = '';
+      await loadMessages();
+      return;
+    }
+
+    const payloadText = txt || '[image]';
+    const { ciphertext, iv } = await encryptText(t, payloadText);
+    const body = {
+      action: 'send', thread_id: t.id, ciphertext, iv,
+      envelope: { v: 1, recipients: (t.members || []).map(m => m.user_id) },
+      reply_to_message_id: replyTo ? replyTo.id : null,
+      attachment_url: pendingAttachment ? pendingAttachment.dataUrl : null,
+      attachment_meta: pendingAttachment ? { name: pendingAttachment.name, size: pendingAttachment.size, encrypted: true } : null
+    };
+    await fetch('/portal/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    $('composer').value = '';
+    pendingAttachment = null;
+    replyTo = null;
+    $('replyBar').style.display = 'none';
+    await loadMessages();
+  }
+
+  async function markRead() {
+    const t = activeThread();
+    if (!t) return;
+    const mids = messages.filter(m => m.sender_user_id !== ME.id).map(m => m.id);
+    await fetch('/portal/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'mark_read', thread_id: t.id, message_ids: mids })
+    }).catch(()=>{});
+  }
+
+  // --- Attachments ----------------------------------------------------------
+  let pendingAttachment = null;
+  $('btnAttach').addEventListener('click', () => $('fileInput').click());
+  $('fileInput').addEventListener('change', async (ev) => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    if (f.size > 2 * 1024 * 1024) { alert('Image too large (max 2 MB)'); return; }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      pendingAttachment = { dataUrl: e.target.result, name: f.name, size: f.size };
+      $('composer').value = $('composer').value + (txtMarker());
+      $('composer').focus();
+    };
+    reader.readAsDataURL(f);
+    function txtMarker(){ return ''; }
+  });
+
+  // --- Emoji-replacement glyph picker (SVG) ---------------------------------
+  const glyphs = [
+    { name: 'heart', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7-4.35-7-10a4 4 0 0 1 7-2.65A4 4 0 0 1 19 11c0 5.65-7 10-7 10z"/></svg>' },
+    { name: 'star', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="12 2 15 9 22 9 17 14 19 21 12 17 5 21 7 14 2 9 9 9"/></svg>' },
+    { name: 'check', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>' },
+    { name: 'flame', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c0 4-4 5-4 9a4 4 0 0 0 8 0c0-2-2-3-2-5 2 1 4 3 4 7a6 6 0 0 1-12 0c0-6 6-7 6-11z"/></svg>' },
+    { name: 'leaf', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M11 20A7 7 0 0 1 4 13c0-6 7-11 16-11-1 9-3 18-9 18z"/></svg>' },
+    { name: 'bolt', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>' },
+    { name: 'sun', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>' },
+    { name: 'moon', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/></svg>' },
+    { name: 'cloud', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 18H7A5 5 0 0 1 7 8h.7A6 6 0 0 1 19 10a4 4 0 0 1-2 8z"/></svg>' },
+    { name: 'music', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm12-2a3 3 0 1 1-6 0 3 3 0 0 1 6 0z"/></svg>' },
+    { name: 'gift', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="8" width="18" height="13" rx="1"/><path d="M3 12h18M12 8v13M16 8a3 3 0 1 0-4-4 3 3 0 1 0-4 4"/></svg>' },
+    { name: 'crown', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M2 6l4 8 6-10 6 10 4-8v14H2z"/></svg>' },
+    { name: 'coffee', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 8h1a4 4 0 0 1 0 8h-1M3 8h14v9a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V8zM6 1v3M10 1v3M14 1v3"/></svg>' },
+    { name: 'bell', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 22a2 2 0 0 0 2-2h-4a2 2 0 0 0 2 2zm6-6V11a6 6 0 1 0-12 0v5l-2 2v1h16v-1z"/></svg>' },
+    { name: 'rocket', svg: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 13c0-5 3-9 9-11 2 6-1 12-6 14l-3-3zm0 0l-3 3 3 3 3-3M14 9a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/></svg>' },
+    { name: 'globe', svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/></svg>' }
+  ];
+  function renderEmoji() {
+    const pop = $('emojiPop');
+    pop.innerHTML = '';
+    for (const g of glyphs) {
+      const b = el('button', { html: g.svg, attrs: { title: g.name } });
+      b.onclick = () => {
+        const c = $('composer');
+        c.value = c.value + ' [' + g.name + '] ';
+        c.focus();
+        pop.classList.remove('open');
+      };
+      pop.appendChild(b);
+    }
+  }
+  renderEmoji();
+  $('btnEmoji').addEventListener('click', () => $('emojiPop').classList.toggle('open'));
+
+  // --- Composer behaviour ---------------------------------------------------
+  $('composer').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); }
+    if (ev.key === 'Escape') { editingId = null; replyTo = null; $('replyBar').style.display = 'none'; $('composer').value = ''; }
+  });
+  $('composer').addEventListener('input', () => {
+    const ta = $('composer');
+    ta.style.height = '40px';
+    ta.style.height = Math.min(140, ta.scrollHeight) + 'px';
+    // typing indicator stub (we'd broadcast over a sidechannel)
+    $('typing').textContent = ta.value.length > 0 ? ME.name + ' is typing...' : '';
+    setTimeout(() => { if (!ta.value) $('typing').textContent = ''; }, 2000);
+  });
+  $('btnSend').addEventListener('click', send);
+  $('replyCancel').addEventListener('click', () => { replyTo = null; $('replyBar').style.display = 'none'; });
+
+  // --- Switches -------------------------------------------------------------
+  $('muteSwitch').addEventListener('click', async () => {
+    const t = activeThread();
+    if (!t) return;
+    $('muteSwitch').classList.toggle('on');
+    t.muted = !t.muted;
+    await fetch('/portal/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'toggle_mute', thread_id: t.id })
+    });
+  });
+  $('disappearSwitch').addEventListener('click', async () => {
+    const t = activeThread();
+    if (!t) return;
+    const on = !$('disappearSwitch').classList.contains('on');
+    $('disappearSwitch').classList.toggle('on', on);
+    t.disappearing_seconds = on ? 86400 : null;
+    await fetch('/portal/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'set_disappearing', thread_id: t.id, seconds: on ? 86400 : null })
+    });
+    $('rightSub').textContent = t.kind === 'group'
+      ? (t.members?.length || 1) + ' members · ' + (t.disappearing_seconds ? 'ephemeral' : 'permanent')
+      : 'direct message · ' + (t.disappearing_seconds ? 'ephemeral 24h' : 'permanent');
+  });
+
+  // --- New chat modal -------------------------------------------------------
+  function showNewChat() { $('newChatModal').classList.add('open'); }
+  function hideNewChat() { $('newChatModal').classList.remove('open'); }
+  $('btnNewChat').addEventListener('click', showNewChat);
+  $('btnNewChatAlt').addEventListener('click', showNewChat);
+  $('newChatCancel').addEventListener('click', hideNewChat);
+  $('newChatSave').addEventListener('click', async () => {
+    const kind = $('newKind').value;
+    const peer = $('newPeer').value.trim();
+    if (!peer) return;
+    const body = kind === 'group' ? { action: 'new_thread', kind, title: peer } : { action: 'new_thread', kind, peer_email: peer, title: peer };
+    const r = await fetch('/portal/messages', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (j.ok && j.thread_id) {
+      const t = { id: j.thread_id, kind, title: peer, last_message_preview: null, last_message_at: new Date().toISOString(), muted: false, disappearing_seconds: null, members: [{ user_id: ME.id, name: ME.name, role: 'owner', public_key_pem: localStorage.getItem(LS_PUB) }] };
+      THREADS.unshift(t);
+      hideNewChat();
+      $('newPeer').value = '';
+      renderThreadList('');
+      openThread(t.id);
+    } else {
+      alert(j.error || 'failed to create thread');
+    }
+  });
+
+  // --- Fingerprint modal ----------------------------------------------------
+  $('btnFingerprint').addEventListener('click', async () => {
+    const t = activeThread();
+    if (!t) return;
+    const other = (t.members || []).find(m => m.user_id !== ME.id && m.public_key_pem);
+    const pem = other ? other.public_key_pem : localStorage.getItem(LS_PUB);
+    const hex = await fingerprintOf(pem);
+    const segs = (hex.match(/.{1,8}/g) || []).slice(0, 8);
+    const grid = $('fpGrid');
+    grid.innerHTML = '';
+    for (const s of segs) grid.appendChild(el('div', { class: 'fp-cell', text: s }));
+    $('fpModal').classList.add('open');
+  });
+  $('fpClose').addEventListener('click', () => $('fpModal').classList.remove('open'));
+  $('e2ePill').addEventListener('click', () => $('btnFingerprint').click());
+
+  // --- Calls (WebRTC getUserMedia tile) -------------------------------------
+  let currentStream = null;
+  async function startCall(kind) {
+    $('callKind').textContent = kind === 'video' ? 'Video call' : 'Voice call';
+    $('callStatus').textContent = 'Connecting via WebRTC peer-to-peer...';
+    $('callOverlay').classList.add('open');
+    try {
+      const constraints = kind === 'video' ? { audio: true, video: { width: 320, height: 240 } } : { audio: true, video: false };
+      currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+      $('localVideo').srcObject = currentStream;
+      $('localVideo').style.display = kind === 'video' ? '' : 'none';
+      $('callStatus').textContent = 'Connected · awaiting peer (signalling channel via E2E DM)';
+    } catch(e) {
+      $('callStatus').textContent = 'Camera/mic permission denied. ' + (e.message || '');
+    }
+  }
+  function endCall() {
+    if (currentStream) {
+      currentStream.getTracks().forEach(t => t.stop());
+      currentStream = null;
+    }
+    $('localVideo').srcObject = null;
+    $('callOverlay').classList.remove('open');
+  }
+  $('btnAudio').addEventListener('click', () => startCall('audio'));
+  $('btnVideo').addEventListener('click', () => startCall('video'));
+  $('callEnd').addEventListener('click', endCall);
+
+  // --- Right panel toggle on small screens ---------------------------------
+  $('btnInfo').addEventListener('click', () => {
+    const p = $('rightPanel');
+    p.style.display = (p.style.display === 'none') ? '' : 'none';
+  });
+
+  // --- Thread search --------------------------------------------------------
+  $('threadSearch').addEventListener('input', (ev) => renderThreadList(ev.target.value));
+  $('threadSearchIn').addEventListener('input', (ev) => {
+    const q = (ev.target.value || '').toLowerCase();
+    const out = $('searchInResults');
+    out.innerHTML = '';
+    if (!q) return;
+    const hits = messages.filter(m => (m._plain || '').toLowerCase().includes(q)).slice(0, 20);
+    for (const m of hits) {
+      const r = el('div', { class: 'msg-quote', style: 'margin:4px 0; cursor:pointer',
+        text: senderName(m.sender_user_id) + ': ' + (m._plain || '').slice(0, 80) });
+      out.appendChild(r);
+    }
+  });
+
+  // --- Poll for new messages ------------------------------------------------
+  function startPoll() {
+    if (polling) clearInterval(polling);
+    polling = setInterval(() => { if (activeId && !document.hidden) loadMessages(); }, 4000);
+  }
+
+  // --- Boot -----------------------------------------------------------------
+  (async function boot() {
+    await loadOrCreateIdentity();
+    renderThreadList('');
+    if (activeId) await openThread(activeId);
+    startPoll();
+  })();
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      $('newChatModal').classList.remove('open');
+      $('fpModal').classList.remove('open');
+      $('emojiPop').classList.remove('open');
+    }
+  });
+})();
+</script>
+</BaseLayout>

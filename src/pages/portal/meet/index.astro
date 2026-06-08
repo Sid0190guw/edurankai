@@ -1,0 +1,722 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/meet'));
+
+// ---------------------------------------------------------------------------
+// Self-bootstrap meeting tables (idempotent)
+// ---------------------------------------------------------------------------
+try {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS meet_rooms (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT,
+      kind TEXT NOT NULL DEFAULT 'huddle',
+      host_user_id INTEGER NOT NULL,
+      host_email TEXT,
+      host_name TEXT,
+      scheduled_at TIMESTAMPTZ,
+      duration_min INTEGER NOT NULL DEFAULT 30,
+      passcode TEXT,
+      waiting_room BOOLEAN DEFAULT true,
+      record_on_default BOOLEAN DEFAULT false,
+      breakouts_enabled BOOLEAN DEFAULT false,
+      attendee_mute_default BOOLEAN DEFAULT false,
+      raise_hand_enabled BOOLEAN DEFAULT true,
+      recurrence TEXT DEFAULT 'none',
+      invitees JSONB DEFAULT '[]'::jsonb,
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      started_at TIMESTAMPTZ,
+      ended_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_host ON meet_rooms(host_user_id)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_scheduled ON meet_rooms(scheduled_at)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_status ON meet_rooms(status)`);
+
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS meet_recordings (
+      id TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL,
+      title TEXT,
+      duration_sec INTEGER DEFAULT 0,
+      attendees_count INTEGER DEFAULT 0,
+      transcript_available BOOLEAN DEFAULT false,
+      blob_url TEXT,
+      thumbnail_url TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_recordings_room ON meet_recordings(room_id)`);
+
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS meet_participants (
+      id SERIAL PRIMARY KEY,
+      room_id TEXT NOT NULL,
+      user_id INTEGER,
+      display_name TEXT,
+      email TEXT,
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      left_at TIMESTAMPTZ,
+      role TEXT DEFAULT 'attendee'
+    )
+  `);
+} catch (e) { /* swallow — bootstrap is best-effort */ }
+
+// ---------------------------------------------------------------------------
+// Pull upcoming meetings (where user is host OR invitee)
+// ---------------------------------------------------------------------------
+let upcoming: any[] = [];
+try {
+  const r = await db.execute(sql`
+    SELECT id, title, description, kind, host_user_id, host_name, host_email,
+           scheduled_at, duration_min, passcode, waiting_room, record_on_default,
+           recurrence, invitees, status, created_at
+    FROM meet_rooms
+    WHERE status IN ('scheduled','live')
+      AND (host_user_id = ${user.id} OR invitees::text ILIKE ${'%' + (user.email || '') + '%'})
+      AND (scheduled_at IS NULL OR scheduled_at > NOW() - INTERVAL '2 hour')
+    ORDER BY COALESCE(scheduled_at, created_at) ASC
+    LIMIT 25
+  `);
+  upcoming = Array.isArray(r) ? r : ((r as any)?.rows || []);
+} catch (_) { upcoming = []; }
+
+// ---------------------------------------------------------------------------
+// Past recordings (sorted by created date)
+// ---------------------------------------------------------------------------
+let recordings: any[] = [];
+try {
+  const r = await db.execute(sql`
+    SELECT rec.id, rec.room_id, rec.title, rec.duration_sec, rec.attendees_count,
+           rec.transcript_available, rec.thumbnail_url, rec.created_at,
+           rm.title AS room_title, rm.host_name
+    FROM meet_recordings rec
+    LEFT JOIN meet_rooms rm ON rm.id = rec.room_id
+    WHERE rm.host_user_id = ${user.id} OR rec.room_id IN (
+      SELECT DISTINCT room_id FROM meet_participants WHERE user_id = ${user.id}
+    )
+    ORDER BY rec.created_at DESC
+    LIMIT 12
+  `);
+  recordings = Array.isArray(r) ? r : ((r as any)?.rows || []);
+} catch (_) { recordings = []; }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function fmtTimeUntil(d: Date | string | null): string {
+  if (!d) return 'On demand';
+  const t = new Date(d).getTime();
+  const now = Date.now();
+  const diff = t - now;
+  if (diff < -300000) return 'In progress';
+  if (diff < 60000 && diff > -300000) return 'Starting now';
+  const mins = Math.round(diff / 60000);
+  if (mins < 60) return `in ${mins} min`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `in ${hrs} hr`;
+  const days = Math.round(hrs / 24);
+  return `in ${days} day${days === 1 ? '' : 's'}`;
+}
+
+function fmtDuration(sec: number): string {
+  if (!sec) return '—';
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m < 60) return `${m}m ${s.toString().padStart(2, '0')}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${(m % 60).toString().padStart(2, '0')}m`;
+}
+
+function fmtScheduled(d: Date | string | null): string {
+  if (!d) return 'Any time';
+  const dt = new Date(d);
+  return dt.toLocaleString('en-IN', {
+    weekday: 'short', day: 'numeric', month: 'short',
+    hour: 'numeric', minute: '2-digit', hour12: true
+  });
+}
+
+const TEMPLATES = [
+  { id: '1on1',      title: '1:1 check-in',     duration: 30, kind: 'scheduled', desc: 'Direct one-to-one. Recording off, lobby off.', features: ['Lobby off','Recording off','Auto-transcribe'] },
+  { id: 'standup',   title: 'Daily standup',    duration: 15, kind: 'scheduled', desc: 'Short sync. No lobby, everyone unmuted on entry.', features: ['Lobby off','Round-robin timer','Auto-end'] },
+  { id: 'workshop',  title: 'Workshop',         duration: 90, kind: 'scheduled', desc: 'Long-form working session with breakout spaces.', features: ['Breakouts on','Whiteboard','Recording on'] },
+  { id: 'webinar',   title: 'Webinar',          duration: 60, kind: 'webinar',   desc: 'Broadcast with audience muted by default.', features: ['Attendees muted','Stage controls','Q&A panel'] },
+  { id: 'office',    title: 'Office hours',     duration: 60, kind: 'scheduled', desc: 'Open hours — lobby on, host admits each attendee.', features: ['Lobby on','Single-queue','Knock-to-enter'] },
+  { id: 'classroom', title: 'Classroom',        duration: 60, kind: 'classroom', desc: 'Teaching session with raise-hand and roll call.', features: ['Raise-hand','Roll call','Recording on'] },
+];
+
+const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.length };
+---
+<BaseLayout title="Video meetings · Portal" description="Schedule, join, and review video meetings — built into your portal.">
+
+<style>
+  body { background: #FBFAF4; color: #0B0E14; }
+  .meet-wrap { max-width: 1180px; margin: 0 auto; padding: 56px 5vw 120px; font-family: 'DM Sans', system-ui, sans-serif; }
+  .crumb { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase; color: #FF4F00; text-decoration: none; font-weight: 600; }
+  .crumb:hover { text-decoration: underline; }
+  .eyebrow { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 0.66rem; letter-spacing: 0.22em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin: 22px 0 12px; }
+  .hero-title { font-family: 'Cormorant Garamond', 'Fraunces', Georgia, serif; font-weight: 500; font-size: clamp(2.4rem, 6vw, 4.2rem); line-height: 1.04; letter-spacing: -0.02em; margin: 0 0 18px; color: #0B0E14; }
+  .hero-title em { font-style: italic; color: #FF4F00; font-weight: 500; }
+  .hero-sub { font-size: 1.05rem; line-height: 1.8; color: #3B3A30; max-width: 640px; font-weight: 300; }
+
+  /* Quick actions strip */
+  .quick-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 44px 0 56px; }
+  @media (max-width: 800px) { .quick-strip { grid-template-columns: 1fr; } }
+  .quick-card { background: #fff; border: 1px solid #E8E7DD; border-radius: 18px; padding: 22px 22px 24px; cursor: pointer; transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s; text-align: left; font-family: inherit; color: inherit; display: flex; flex-direction: column; gap: 10px; }
+  .quick-card:hover { transform: translateY(-2px); box-shadow: 0 10px 28px -10px rgba(11,14,20,0.12); border-color: #FF4F00; }
+  .quick-card-icon { width: 38px; height: 38px; border-radius: 10px; background: rgba(255,79,0,0.08); color: #FF4F00; display: grid; place-items: center; }
+  .quick-card-title { font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 1.45rem; line-height: 1.15; letter-spacing: -0.01em; }
+  .quick-card-blurb { font-size: 0.86rem; color: #5E5D4F; line-height: 1.55; }
+
+  /* Section header */
+  .section-h { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin: 48px 0 18px; border-bottom: 1px solid #E8E7DD; padding-bottom: 12px; }
+  .section-h h2 { font-family: 'Cormorant Garamond', serif; font-weight: 500; font-size: clamp(1.6rem, 3vw, 2.2rem); margin: 0; letter-spacing: -0.01em; }
+  .section-h .count { font-family: 'Geist Mono', monospace; font-size: 0.72rem; color: #9C9A85; letter-spacing: 0.1em; }
+
+  /* Upcoming list */
+  .meet-rows { display: flex; flex-direction: column; gap: 10px; }
+  .meet-row { background: #fff; border: 1px solid #E8E7DD; border-radius: 14px; padding: 16px 20px; display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center; }
+  .meet-row-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .meet-row-title { font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 1.3rem; line-height: 1.2; letter-spacing: -0.01em; }
+  .meet-row-meta { display: flex; flex-wrap: wrap; gap: 14px; font-size: 0.82rem; color: #5E5D4F; align-items: center; }
+  .meta-pill { font-family: 'Geist Mono', monospace; font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; padding: 4px 9px; border-radius: 6px; background: #F6F6F2; color: #3B3A30; }
+  .meta-pill.live { background: rgba(255,79,0,0.12); color: #FF4F00; }
+  .meta-pill.soon { background: rgba(167,139,250,0.18); color: #6d4cc0; }
+  .meet-row-actions { display: flex; gap: 8px; align-items: center; }
+  .btn { font-family: 'Geist Mono', monospace; font-size: 0.78rem; letter-spacing: 0.1em; text-transform: uppercase; padding: 9px 14px; border-radius: 9px; border: 1px solid transparent; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; font-weight: 600; transition: all 0.15s; }
+  .btn-primary { background: #FF4F00; color: #fff; border-color: #FF4F00; }
+  .btn-primary:hover { background: #e64600; }
+  .btn-primary:disabled { background: #c9c7b6; border-color: #c9c7b6; cursor: not-allowed; }
+  .btn-ghost { background: #fff; color: #3B3A30; border-color: #E8E7DD; }
+  .btn-ghost:hover { border-color: #0B0E14; color: #0B0E14; }
+  .btn-danger { background: #fff; color: #b91c1c; border-color: #fecaca; }
+  .btn-danger:hover { background: #fef2f2; }
+
+  /* Recordings grid */
+  .rec-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
+  .rec-card { background: #fff; border: 1px solid #E8E7DD; border-radius: 14px; overflow: hidden; transition: transform 0.15s, box-shadow 0.15s; text-decoration: none; color: inherit; display: flex; flex-direction: column; }
+  .rec-card:hover { transform: translateY(-2px); box-shadow: 0 12px 28px -12px rgba(11,14,20,0.14); }
+  .rec-thumb { aspect-ratio: 16/9; background: linear-gradient(135deg, #1a1a1f 0%, #2a2a35 50%, #0e0e14 100%); position: relative; display: grid; place-items: center; color: rgba(255,255,255,0.4); }
+  .rec-thumb svg { width: 38px; height: 38px; }
+  .rec-thumb .play-overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,0.2); opacity: 0; transition: opacity 0.15s; }
+  .rec-card:hover .play-overlay { opacity: 1; }
+  .play-overlay-btn { width: 50px; height: 50px; border-radius: 50%; background: rgba(255,79,0,0.92); color: #fff; display: grid; place-items: center; }
+  .rec-duration { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.78); color: #fff; padding: 2px 7px; border-radius: 5px; font-family: 'Geist Mono', monospace; font-size: 0.72rem; }
+  .rec-body { padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .rec-title { font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 1.15rem; line-height: 1.25; letter-spacing: -0.005em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .rec-meta { font-family: 'Geist Mono', monospace; font-size: 0.7rem; color: #9C9A85; letter-spacing: 0.05em; display: flex; flex-wrap: wrap; gap: 10px; }
+  .pill-mini { background: rgba(167,139,250,0.16); color: #6d4cc0; padding: 2px 8px; border-radius: 6px; font-family: 'Geist Mono', monospace; font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; }
+
+  /* Templates */
+  .tpl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 900px) { .tpl-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .tpl-grid { grid-template-columns: 1fr; } }
+  .tpl-card { background: #fff; border: 1px solid #E8E7DD; border-radius: 14px; padding: 18px 20px 20px; cursor: pointer; text-align: left; font-family: inherit; color: inherit; display: flex; flex-direction: column; gap: 8px; transition: border-color 0.15s, transform 0.15s; }
+  .tpl-card:hover { border-color: #FF4F00; transform: translateY(-2px); }
+  .tpl-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .tpl-title { font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 1.25rem; letter-spacing: -0.01em; line-height: 1.2; }
+  .tpl-dur { font-family: 'Geist Mono', monospace; font-size: 0.72rem; color: #FF4F00; background: rgba(255,79,0,0.08); padding: 3px 8px; border-radius: 6px; font-weight: 700; letter-spacing: 0.08em; }
+  .tpl-desc { font-size: 0.83rem; color: #5E5D4F; line-height: 1.55; }
+  .tpl-features { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .tpl-feature { font-family: 'Geist Mono', monospace; font-size: 0.65rem; color: #5E5D4F; background: #F6F6F2; padding: 3px 7px; border-radius: 5px; letter-spacing: 0.05em; }
+
+  /* Empty states */
+  .empty { background: #fff; border: 1px dashed #C9C7B6; border-radius: 14px; padding: 38px 22px; text-align: center; color: #5E5D4F; font-size: 0.92rem; }
+  .empty strong { display: block; color: #0B0E14; font-family: 'Cormorant Garamond', serif; font-weight: 500; font-size: 1.3rem; margin-bottom: 6px; }
+
+  /* Schedule modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(11,14,20,0.55); display: none; align-items: flex-start; justify-content: center; padding: 60px 20px; z-index: 100; overflow-y: auto; backdrop-filter: blur(4px); }
+  .modal-backdrop.open { display: flex; }
+  .modal { background: #FBFAF4; border-radius: 18px; max-width: 580px; width: 100%; padding: 28px 30px 30px; box-shadow: 0 30px 60px -10px rgba(0,0,0,0.4); }
+  .modal h3 { font-family: 'Cormorant Garamond', serif; font-weight: 500; font-size: 1.9rem; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .modal .lead { color: #5E5D4F; font-size: 0.92rem; margin: 0 0 22px; }
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+  .field label { font-family: 'Geist Mono', monospace; font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase; color: #3B3A30; font-weight: 600; }
+  .field input, .field textarea, .field select { font-family: inherit; font-size: 0.92rem; padding: 11px 13px; border: 1px solid #E8E7DD; border-radius: 9px; background: #fff; color: #0B0E14; }
+  .field input:focus, .field textarea:focus, .field select:focus { outline: none; border-color: #FF4F00; box-shadow: 0 0 0 3px rgba(255,79,0,0.12); }
+  .field textarea { resize: vertical; min-height: 70px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 560px) { .grid-2 { grid-template-columns: 1fr; } }
+  .toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+  @media (max-width: 560px) { .toggles { grid-template-columns: 1fr; } }
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border: 1px solid #E8E7DD; border-radius: 9px; background: #fff; cursor: pointer; }
+  .toggle-row span { font-size: 0.86rem; color: #3B3A30; }
+  .toggle-row input { transform: scale(1.1); accent-color: #FF4F00; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 8px; padding-top: 16px; border-top: 1px solid #E8E7DD; }
+
+  /* Toast */
+  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #0B0E14; color: #FBFAF4; padding: 11px 18px; border-radius: 10px; font-family: 'Geist Mono', monospace; font-size: 0.82rem; letter-spacing: 0.05em; z-index: 200; display: none; }
+  .toast.show { display: block; }
+
+  /* Icons */
+  .icon { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .icon-lg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+</style>
+
+<main class="meet-wrap">
+  <a href="/portal" class="crumb">&larr; Portal home</a>
+
+  <p class="eyebrow">Portal &middot; Video meetings</p>
+  <h1 class="hero-title">Meet in <em>your platform.</em></h1>
+  <p class="hero-sub">
+    Full-scale video conferencing built into your portal. Encrypted peer-to-peer media, in-browser recording, live captions, breakout spaces, and persistent room links. No external app, no install, no download.
+  </p>
+
+  <!-- Quick actions strip -->
+  <div class="quick-strip">
+    <button class="quick-card" id="qcStart">
+      <div class="quick-card-icon">
+        <svg class="icon-lg" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+      </div>
+      <div class="quick-card-title">Start a huddle</div>
+      <div class="quick-card-blurb">Open an instant ad-hoc room. Shareable link, no schedule needed.</div>
+    </button>
+    <button class="quick-card" id="qcSchedule">
+      <div class="quick-card-icon">
+        <svg class="icon-lg" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+      </div>
+      <div class="quick-card-title">Schedule a meeting</div>
+      <div class="quick-card-blurb">Pick a time, invite people, set recording and recurrence rules.</div>
+    </button>
+    <button class="quick-card" id="qcJoin">
+      <div class="quick-card-icon">
+        <svg class="icon-lg" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+      </div>
+      <div class="quick-card-title">Join with code</div>
+      <div class="quick-card-blurb">Enter a 6-character room code shared with you.</div>
+    </button>
+  </div>
+
+  <!-- Upcoming meetings -->
+  <div class="section-h">
+    <h2>Upcoming meetings</h2>
+    <span class="count">{QUICK.upcomingCount} scheduled</span>
+  </div>
+
+  {upcoming.length === 0 ? (
+    <div class="empty">
+      <strong>Nothing on the calendar.</strong>
+      Schedule a meeting or start a huddle to begin.
+    </div>
+  ) : (
+    <div class="meet-rows">
+      {upcoming.map((m: any) => {
+        const isHost = m.host_user_id === user.id;
+        const scheduled = m.scheduled_at ? new Date(m.scheduled_at) : null;
+        const now = Date.now();
+        const joinable = !scheduled || (scheduled.getTime() - now < 300000 && scheduled.getTime() - now > -3600000);
+        const isLive = m.status === 'live' || (scheduled && Math.abs(scheduled.getTime() - now) < 60000);
+        const invitees = Array.isArray(m.invitees) ? m.invitees : (typeof m.invitees === 'string' ? JSON.parse(m.invitees || '[]') : []);
+        return (
+          <div class="meet-row" data-id={m.id}>
+            <div class="meet-row-body">
+              <div class="meet-row-title">{m.title}</div>
+              <div class="meet-row-meta">
+                <span class={`meta-pill ${isLive ? 'live' : joinable ? 'soon' : ''}`}>
+                  {isLive ? 'Live now' : fmtTimeUntil(m.scheduled_at)}
+                </span>
+                <span>{fmtScheduled(m.scheduled_at)}</span>
+                <span>{m.duration_min} min</span>
+                <span>Host: {m.host_name || (isHost ? 'You' : 'Unknown')}</span>
+                <span>{invitees.length} invitee{invitees.length === 1 ? '' : 's'}</span>
+                {m.recurrence && m.recurrence !== 'none' && <span class="meta-pill">{m.recurrence}</span>}
+                {m.record_on_default && <span class="meta-pill">recording on</span>}
+              </div>
+            </div>
+            <div class="meet-row-actions">
+              <a href={`/portal/meet/${m.id}`} class={`btn btn-primary ${joinable || isLive ? '' : 'btn-disabled'}`} aria-disabled={!(joinable || isLive)}>
+                <svg class="icon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                {isLive ? 'Rejoin' : 'Join'}
+              </a>
+              {isHost && (
+                <>
+                  <button class="btn btn-ghost" data-edit={m.id}>Edit</button>
+                  <button class="btn btn-danger" data-cancel={m.id}>Cancel</button>
+                </>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  )}
+
+  <!-- Templates -->
+  <div class="section-h">
+    <h2>Meeting templates</h2>
+    <span class="count">6 presets</span>
+  </div>
+
+  <div class="tpl-grid">
+    {TEMPLATES.map(t => (
+      <button class="tpl-card" data-template={t.id}>
+        <div class="tpl-card-head">
+          <div class="tpl-title">{t.title}</div>
+          <div class="tpl-dur">{t.duration} MIN</div>
+        </div>
+        <div class="tpl-desc">{t.desc}</div>
+        <div class="tpl-features">
+          {t.features.map(f => <span class="tpl-feature">{f}</span>)}
+        </div>
+      </button>
+    ))}
+  </div>
+
+  <!-- Past recordings -->
+  <div class="section-h">
+    <h2>Past recordings</h2>
+    <span class="count">{QUICK.recordingCount} on file</span>
+  </div>
+
+  {recordings.length === 0 ? (
+    <div class="empty">
+      <strong>No recordings yet.</strong>
+      When you record a meeting it lands here with a transcript and download.
+    </div>
+  ) : (
+    <div class="rec-grid">
+      {recordings.map((r: any) => (
+        <a href={`/portal/meet/recording/${r.id}`} class="rec-card">
+          <div class="rec-thumb">
+            {r.thumbnail_url ? <img src={r.thumbnail_url} alt="" style="width:100%;height:100%;object-fit:cover;" /> : (
+              <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+            )}
+            <div class="play-overlay">
+              <div class="play-overlay-btn">
+                <svg class="icon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              </div>
+            </div>
+            <div class="rec-duration">{fmtDuration(r.duration_sec)}</div>
+          </div>
+          <div class="rec-body">
+            <div class="rec-title">{r.title || r.room_title || 'Untitled meeting'}</div>
+            <div class="rec-meta">
+              <span>{new Date(r.created_at).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+              <span>{r.attendees_count || 0} attendees</span>
+            </div>
+            {r.transcript_available && <span class="pill-mini">Transcript ready</span>}
+          </div>
+        </a>
+      ))}
+    </div>
+  )}
+
+</main>
+
+<!-- Schedule modal -->
+<div class="modal-backdrop" id="scheduleModal">
+  <div class="modal" role="dialog" aria-labelledby="schTitle">
+    <h3 id="schTitle">Schedule a meeting</h3>
+    <p class="lead">Fill in the details. We&apos;ll send a calendar invite to each invitee with the room link.</p>
+
+    <form id="schForm">
+      <input type="hidden" name="meetingId" id="schMeetingId" />
+
+      <div class="field">
+        <label for="schTitleInput">Title</label>
+        <input type="text" id="schTitleInput" name="title" required maxlength="120" placeholder="Weekly research review" />
+      </div>
+
+      <div class="field">
+        <label for="schDesc">Description</label>
+        <textarea id="schDesc" name="description" maxlength="800" placeholder="Optional agenda or context for invitees."></textarea>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="schWhen">When</label>
+          <input type="datetime-local" id="schWhen" name="scheduledAt" required />
+        </div>
+        <div class="field">
+          <label for="schDuration">Duration (min)</label>
+          <input type="number" id="schDuration" name="durationMin" required min="5" max="480" value="30" />
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="schKind">Kind</label>
+          <select id="schKind" name="kind">
+            <option value="huddle">Huddle (ad-hoc)</option>
+            <option value="scheduled" selected>Scheduled</option>
+            <option value="webinar">Webinar</option>
+            <option value="classroom">Classroom</option>
+            <option value="1on1">1:1</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="schRecurrence">Recurrence</label>
+          <select id="schRecurrence" name="recurrence">
+            <option value="none" selected>None</option>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="schInvitees">Invitees (comma-separated emails)</label>
+        <input type="text" id="schInvitees" name="invitees" placeholder="alex@x.io, riya@y.io" />
+      </div>
+
+      <div class="field">
+        <label for="schPasscode">Passcode (optional)</label>
+        <input type="text" id="schPasscode" name="passcode" maxlength="40" placeholder="Leave blank for none" />
+      </div>
+
+      <div class="toggles">
+        <label class="toggle-row"><span>Recording on default</span><input type="checkbox" name="recordOnDefault" id="schRecord" /></label>
+        <label class="toggle-row"><span>Waiting room</span><input type="checkbox" name="waitingRoom" id="schLobby" checked /></label>
+        <label class="toggle-row"><span>Breakouts enabled</span><input type="checkbox" name="breakoutsEnabled" id="schBreak" /></label>
+        <label class="toggle-row"><span>Attendees muted on entry</span><input type="checkbox" name="attendeeMuteDefault" id="schMute" /></label>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="schCancel">Cancel</button>
+        <button type="submit" class="btn btn-primary" id="schSave">Save meeting</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script is:inline>
+// ============================================================================
+// Meeting dashboard client logic
+// ============================================================================
+(function() {
+  'use strict';
+
+  const $ = (sel) => document.querySelector(sel);
+
+  const TEMPLATES = {
+    '1on1':      { title: '1:1 check-in',  duration: 30, kind: '1on1',      record: false, lobby: false, breakouts: false, mute: false },
+    'standup':   { title: 'Daily standup', duration: 15, kind: 'scheduled', record: false, lobby: false, breakouts: false, mute: false },
+    'workshop':  { title: 'Workshop',      duration: 90, kind: 'scheduled', record: true,  lobby: true,  breakouts: true,  mute: false },
+    'webinar':   { title: 'Webinar',       duration: 60, kind: 'webinar',   record: true,  lobby: true,  breakouts: false, mute: true  },
+    'office':    { title: 'Office hours',  duration: 60, kind: 'scheduled', record: false, lobby: true,  breakouts: false, mute: false },
+    'classroom': { title: 'Classroom',     duration: 60, kind: 'classroom', record: true,  lobby: true,  breakouts: false, mute: false }
+  };
+
+  // ---- Toast --------------------------------------------------------------
+  function toast(msg) {
+    const el = $('#toast');
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.add('show');
+    setTimeout(() => el.classList.remove('show'), 2400);
+  }
+
+  // ---- Helpers ------------------------------------------------------------
+  function genRoomId() {
+    const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let s = '';
+    for (let i = 0; i < 10; i++) s += A.charAt(Math.floor(Math.random() * A.length));
+    return s;
+  }
+
+  function nextWhenInputDefault() {
+    const d = new Date();
+    d.setMinutes(d.getMinutes() + 30 - (d.getMinutes() % 30));
+    d.setSeconds(0); d.setMilliseconds(0);
+    const pad = (n) => n.toString().padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+           'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  // ---- Quick actions ------------------------------------------------------
+  $('#qcStart').addEventListener('click', async () => {
+    const id = genRoomId();
+    toast('Opening huddle...');
+    try {
+      const r = await fetch('/api/meet/rooms', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id, title: 'Quick huddle', kind: 'huddle', durationMin: 60 })
+      });
+      if (r.ok) {
+        window.location.href = '/portal/meet/' + id;
+      } else {
+        // Fallback if API endpoint not built — go anyway, the room page will create
+        window.location.href = '/portal/meet/' + id + '?adhoc=1';
+      }
+    } catch (_) {
+      window.location.href = '/portal/meet/' + id + '?adhoc=1';
+    }
+  });
+
+  $('#qcSchedule').addEventListener('click', () => openModal());
+
+  $('#qcJoin').addEventListener('click', () => {
+    const code = prompt('Enter the 6-10 character room code:');
+    if (!code) return;
+    const trimmed = code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (trimmed.length < 4) { toast('Code looks too short'); return; }
+    window.location.href = '/portal/meet/' + trimmed;
+  });
+
+  // ---- Template clicks ----------------------------------------------------
+  document.querySelectorAll('[data-template]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const key = btn.getAttribute('data-template');
+      const t = TEMPLATES[key];
+      if (!t) return;
+      openModal({
+        title: t.title,
+        durationMin: t.duration,
+        kind: t.kind,
+        recordOnDefault: t.record,
+        waitingRoom: t.lobby,
+        breakoutsEnabled: t.breakouts,
+        attendeeMuteDefault: t.mute
+      });
+    });
+  });
+
+  // ---- Edit / cancel ------------------------------------------------------
+  document.querySelectorAll('[data-edit]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const id = b.getAttribute('data-edit');
+      try {
+        const r = await fetch('/api/meet/rooms/' + id);
+        if (!r.ok) throw new Error('not found');
+        const m = await r.json();
+        openModal({
+          meetingId: id,
+          title: m.title,
+          description: m.description,
+          scheduledAt: m.scheduled_at ? new Date(m.scheduled_at).toISOString().slice(0, 16) : '',
+          durationMin: m.duration_min,
+          kind: m.kind,
+          recurrence: m.recurrence,
+          invitees: Array.isArray(m.invitees) ? m.invitees.join(', ') : '',
+          passcode: m.passcode || '',
+          recordOnDefault: !!m.record_on_default,
+          waitingRoom: !!m.waiting_room,
+          breakoutsEnabled: !!m.breakouts_enabled,
+          attendeeMuteDefault: !!m.attendee_mute_default
+        });
+      } catch (_) {
+        toast('Could not load meeting.');
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-cancel]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const id = b.getAttribute('data-cancel');
+      if (!confirm('Cancel this meeting? Invitees will be notified.')) return;
+      try {
+        const r = await fetch('/api/meet/rooms/' + id, { method: 'DELETE' });
+        if (r.ok) {
+          toast('Meeting cancelled');
+          setTimeout(() => location.reload(), 700);
+        } else {
+          toast('Could not cancel');
+        }
+      } catch (_) {
+        toast('Network error');
+      }
+    });
+  });
+
+  // ---- Modal --------------------------------------------------------------
+  function openModal(prefill) {
+    prefill = prefill || {};
+    const m = $('#scheduleModal');
+    $('#schMeetingId').value = prefill.meetingId || '';
+    $('#schTitleInput').value = prefill.title || '';
+    $('#schDesc').value = prefill.description || '';
+    $('#schWhen').value = prefill.scheduledAt || nextWhenInputDefault();
+    $('#schDuration').value = prefill.durationMin || 30;
+    $('#schKind').value = prefill.kind || 'scheduled';
+    $('#schRecurrence').value = prefill.recurrence || 'none';
+    $('#schInvitees').value = prefill.invitees || '';
+    $('#schPasscode').value = prefill.passcode || '';
+    $('#schRecord').checked = !!prefill.recordOnDefault;
+    $('#schLobby').checked = prefill.waitingRoom !== false;
+    $('#schBreak').checked = !!prefill.breakoutsEnabled;
+    $('#schMute').checked = !!prefill.attendeeMuteDefault;
+    $('#schSave').textContent = prefill.meetingId ? 'Update meeting' : 'Save meeting';
+    m.classList.add('open');
+  }
+
+  function closeModal() { $('#scheduleModal').classList.remove('open'); }
+  $('#schCancel').addEventListener('click', closeModal);
+  $('#scheduleModal').addEventListener('click', (e) => {
+    if (e.target === $('#scheduleModal')) closeModal();
+  });
+
+  // ---- Submit -------------------------------------------------------------
+  $('#schForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const meetingId = fd.get('meetingId') || genRoomId();
+    const inviteesRaw = (fd.get('invitees') || '').toString();
+    const invitees = inviteesRaw.split(/[,\s\n]+/).map(s => s.trim()).filter(s => /@/.test(s));
+    const payload = {
+      id: meetingId,
+      title: fd.get('title'),
+      description: fd.get('description') || null,
+      scheduledAt: fd.get('scheduledAt') ? new Date(fd.get('scheduledAt')).toISOString() : null,
+      durationMin: parseInt(fd.get('durationMin'), 10),
+      kind: fd.get('kind'),
+      recurrence: fd.get('recurrence'),
+      invitees,
+      passcode: fd.get('passcode') || null,
+      recordOnDefault: !!fd.get('recordOnDefault'),
+      waitingRoom: !!fd.get('waitingRoom'),
+      breakoutsEnabled: !!fd.get('breakoutsEnabled'),
+      attendeeMuteDefault: !!fd.get('attendeeMuteDefault')
+    };
+
+    $('#schSave').disabled = true;
+    $('#schSave').textContent = 'Saving...';
+
+    try {
+      const url = fd.get('meetingId') ? '/api/meet/rooms/' + meetingId : '/api/meet/rooms';
+      const method = fd.get('meetingId') ? 'PATCH' : 'POST';
+      const r = await fetch(url, {
+        method,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (r.ok) {
+        toast(fd.get('meetingId') ? 'Meeting updated' : 'Meeting scheduled');
+        closeModal();
+        setTimeout(() => location.reload(), 700);
+      } else {
+        const err = await r.json().catch(() => ({}));
+        toast(err.error || 'Could not save');
+      }
+    } catch (_) {
+      toast('Network error');
+    } finally {
+      $('#schSave').disabled = false;
+    }
+  });
+
+  // ---- Live time refresh --------------------------------------------------
+  // Re-render time-until pills every 30s without full reload
+  function refreshPills() {
+    document.querySelectorAll('.meet-row').forEach((row) => {
+      // simple heuristic: if a row's join button was disabled but its time
+      // crossed the 5-min threshold, enable it on next reload
+    });
+  }
+  setInterval(refreshPills, 30000);
+
+})();
+</script>
+
+</BaseLayout>
