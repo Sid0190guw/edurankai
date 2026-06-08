@@ -281,4 +281,23 @@ export const BLOCK_KINDS = {
   divider:       { label: 'Divider',         defaults: {} },
   quote:         { label: 'Quote',           defaults: { text: '', attribution: '' } },
   latex:         { label: 'LaTeX',           defaults: { tex: '' } },
+  // ---- connectors: embed an interactive surface directly in the lesson -------
+  embed_lab:       { label: 'Lab connector',       defaults: { slug: 'pendulum', height: 620, caption: '' } },
+  embed_simulator: { label: 'Simulator connector', defaults: { target: 'quantum/composer', height: 700, caption: '' } },
+  embed_test:      { label: 'Test connector',      defaults: { slug: '', label: 'Take the test', mode: 'button' } },
+  embed_liveclass: { label: 'Live class connector',defaults: { roomId: '', label: 'Join the live class' } },
+  embed_animation: { label: 'Animation studio',    defaults: { scene: '', height: 640, caption: '' } },
 } as const;
+
+// Catalogue the connectors can pick from (kept here so the editor + player agree).
+export const LAB_CATALOGUE = [
+  'pendulum','projectile','optics','circuit','logic-gates','titration','periodic',
+  'molecular','genetics','ecosystem','plot','linear-algebra','sorting','pathfinding',
+  'neural-net','fourier','animator',
+];
+export const SIMULATOR_CATALOGUE = [
+  { target: 'quantum/composer', label: 'Quantum circuit composer' },
+  { target: 'hpc/simulator',    label: 'HPC job simulator' },
+  { target: 'labs/neural-net',  label: 'Neural network playground' },
+  { target: 'labs/circuit',     label: 'Circuit builder' },
+];
