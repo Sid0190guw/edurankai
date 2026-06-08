@@ -8,12 +8,16 @@ import { sql } from 'drizzle-orm';
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 let ready: Promise<void> | null = null;
+// Run one statement, swallow its error so a single failure never aborts the
+// rest of the bootstrap. (Previously all statements shared one try-block, so
+// one early ALTER failure skipped every later ALTER and left columns missing.)
+async function ex(q: any): Promise<void> { try { await db.execute(q); } catch (_) {} }
 export function ensureAquintutorAuthoringSchema(): Promise<void> {
   if (ready) return ready;
   ready = (async () => {
-    try {
+    {
       // Modules — sections inside a course.
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS training_modules (
+      await ex(sql`CREATE TABLE IF NOT EXISTS training_modules (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         course_id UUID NOT NULL REFERENCES training_courses(id) ON DELETE CASCADE,
         title VARCHAR(300) NOT NULL,
@@ -22,28 +26,28 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS tm_course_idx ON training_modules(course_id, order_in_course)`);
+      await ex(sql`CREATE INDEX IF NOT EXISTS tm_course_idx ON training_modules(course_id, order_in_course)`);
 
       // Per-lesson additions (idempotent ALTER).
-      await db.execute(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS module_id UUID`);
-      await db.execute(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'draft'`);
-      await db.execute(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS lesson_kind VARCHAR(20) DEFAULT 'lesson'`);
-      await db.execute(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS preview_allowed BOOLEAN DEFAULT false`);
-      await db.execute(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS order_in_module INT DEFAULT 0`);
-      await db.execute(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS estimated_minutes INT DEFAULT 10`);
-      await db.execute(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ`);
+      await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS module_id UUID`);
+      await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'draft'`);
+      await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS lesson_kind VARCHAR(20) DEFAULT 'lesson'`);
+      await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS preview_allowed BOOLEAN DEFAULT false`);
+      await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS order_in_module INT DEFAULT 0`);
+      await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS estimated_minutes INT DEFAULT 10`);
+      await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ`);
 
       // Course additions.
-      await db.execute(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS cover_image_url TEXT`);
-      await db.execute(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS target_audience TEXT`);
-      await db.execute(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS learning_outcomes JSONB`);
-      await db.execute(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS prerequisites TEXT`);
-      await db.execute(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS total_minutes INT DEFAULT 0`);
-      await db.execute(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS school VARCHAR(80)`);
-      await db.execute(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS difficulty VARCHAR(20) DEFAULT 'beginner'`);
+      await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS cover_image_url TEXT`);
+      await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS target_audience TEXT`);
+      await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS learning_outcomes JSONB`);
+      await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS prerequisites TEXT`);
+      await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS total_minutes INT DEFAULT 0`);
+      await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS school VARCHAR(80)`);
+      await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS difficulty VARCHAR(20) DEFAULT 'beginner'`);
 
       // Lesson blocks — the editorial primitives. Each block has a kind and a JSONB content payload.
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS training_lesson_blocks (
+      await ex(sql`CREATE TABLE IF NOT EXISTS training_lesson_blocks (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         lesson_id UUID NOT NULL REFERENCES training_lessons(id) ON DELETE CASCADE,
         kind VARCHAR(30) NOT NULL,
@@ -53,10 +57,10 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS tlb_lesson_idx ON training_lesson_blocks(lesson_id, position)`);
+      await ex(sql`CREATE INDEX IF NOT EXISTS tlb_lesson_idx ON training_lesson_blocks(lesson_id, position)`);
 
       // Authoring — assign authors / editors / reviewers per course.
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS training_course_authors (
+      await ex(sql`CREATE TABLE IF NOT EXISTS training_course_authors (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         course_id UUID NOT NULL REFERENCES training_courses(id) ON DELETE CASCADE,
         user_id UUID NOT NULL,
@@ -67,7 +71,7 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
       )`);
 
       // Lesson versions — auto-snapshot on publish.
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS training_lesson_versions (
+      await ex(sql`CREATE TABLE IF NOT EXISTS training_lesson_versions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         lesson_id UUID NOT NULL REFERENCES training_lessons(id) ON DELETE CASCADE,
         version INT NOT NULL,
@@ -78,10 +82,10 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
         notes TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS tlv_lesson_idx ON training_lesson_versions(lesson_id, version DESC)`);
+      await ex(sql`CREATE INDEX IF NOT EXISTS tlv_lesson_idx ON training_lesson_versions(lesson_id, version DESC)`);
 
       // Per-user lesson progress.
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS training_lesson_progress (
+      await ex(sql`CREATE TABLE IF NOT EXISTS training_lesson_progress (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL,
         lesson_id UUID NOT NULL REFERENCES training_lessons(id) ON DELETE CASCADE,
@@ -93,10 +97,10 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
         last_position_seconds INT DEFAULT 0,
         UNIQUE(user_id, lesson_id)
       )`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS tlp_user_idx ON training_lesson_progress(user_id, course_id)`);
+      await ex(sql`CREATE INDEX IF NOT EXISTS tlp_user_idx ON training_lesson_progress(user_id, course_id)`);
 
       // Per-lesson discussions (threaded by parent_id).
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS training_lesson_discussions (
+      await ex(sql`CREATE TABLE IF NOT EXISTS training_lesson_discussions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         lesson_id UUID NOT NULL REFERENCES training_lessons(id) ON DELETE CASCADE,
         user_id UUID NOT NULL,
@@ -107,10 +111,10 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS tld_lesson_idx ON training_lesson_discussions(lesson_id, created_at DESC)`);
+      await ex(sql`CREATE INDEX IF NOT EXISTS tld_lesson_idx ON training_lesson_discussions(lesson_id, created_at DESC)`);
 
       // Inline-quiz attempts (a block of kind=mcq is one question; this records attempts).
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS training_quiz_attempts (
+      await ex(sql`CREATE TABLE IF NOT EXISTS training_quiz_attempts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL,
         lesson_id UUID NOT NULL,
@@ -119,9 +123,8 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
         is_correct BOOLEAN,
         attempted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS tqa_user_lesson_idx ON training_quiz_attempts(user_id, lesson_id)`);
-    } catch (_) {}
-  })();
+      await ex(sql`CREATE INDEX IF NOT EXISTS tqa_user_lesson_idx ON training_quiz_attempts(user_id, lesson_id)`);
+    }  })();
   return ready;
 }
 
