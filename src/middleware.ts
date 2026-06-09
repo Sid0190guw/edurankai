@@ -103,6 +103,16 @@ function isProtected(path: string): boolean {
   return false;
 }
 
+// Individual virtual-lab pages require a signed-in account to OPEN. The labs
+// catalogue (/aquintutor/labs) stays public for discovery; opening any specific
+// lab (/aquintutor/labs/<slug>) needs sign-in. Embedded labs inside a lesson
+// still load because the signed-in learner's cookie rides the same-origin frame.
+function isGatedLab(path: string): boolean {
+  if (!path) return false;
+  if (path === '/aquintutor/labs' || path === '/aquintutor/labs/') return false;
+  return path.startsWith('/aquintutor/labs/');
+}
+
 async function hasFaceEnrolled(userId: string): Promise<boolean> {
   try {
     const r = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`);
@@ -143,6 +153,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   if (!token) {
     context.locals.user = null;
     context.locals.session = null;
+    if (isGatedLab(path)) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
     return next();
   }
   const result = await validateSessionToken(token);
@@ -150,6 +161,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
     clearSessionCookie(context.cookies);
     context.locals.user = null;
     context.locals.session = null;
+    if (isGatedLab(path)) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
     return next();
   }
   setSessionCookie(context.cookies, token, result.session.expiresAt);
