@@ -1,9 +1,10 @@
-// src/lib/email.ts - Resend HTTP API integration
-// Sign up at https://resend.com (free 100/day, 3000/month)
-// Set RESEND_API_KEY env var in Vercel
-// Set EMAIL_FROM env var (default: noreply@edurankai.in - requires domain verification)
-
-const RESEND_API = 'https://api.resend.com/emails';
+// src/lib/email.ts - high-level transactional email.
+// ALL outbound mail now goes through our OWN SMTP server (mail-transport.ts /
+// Mail Settings). No third-party HTTP API. Configure the mail server at
+// /admin/mail/settings; from-name/address come from there (env EMAIL_FROM is a
+// last-resort default).
+import { sendExternal } from '@/lib/mail-transport';
+import { getMailConfig } from '@/lib/mail';
 
 export interface EmailParams {
   to: string | string[];
@@ -14,43 +15,22 @@ export interface EmailParams {
 }
 
 export async function sendEmail(params: EmailParams): Promise<{ ok: boolean; id?: string; error?: string }> {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) {
-    console.log('[email] RESEND_API_KEY not set, skipping email:', params.subject, 'to', params.to);
-    return { ok: false, error: 'Email not configured' };
-  }
-
-  const from = process.env.EMAIL_FROM || 'EduRankAI <noreply@edurankai.in>';
-
+  let from = process.env.EMAIL_FROM || 'EduRankAI <noreply@edurankai.in>';
   try {
-    const resp = await fetch(RESEND_API, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        from,
-        to: Array.isArray(params.to) ? params.to : [params.to],
-        subject: params.subject,
-        html: params.html,
-        text: params.text,
-        reply_to: params.replyTo,
-      }),
-    });
+    const c = await getMailConfig();
+    if (c.fromAddress) from = (c.fromName ? c.fromName + ' ' : '') + '<' + c.fromAddress + '>';
+  } catch (_) { /* fall back to env default */ }
 
-    if (!resp.ok) {
-      const err = await resp.text();
-      console.error('[email] Resend error:', resp.status, err);
-      return { ok: false, error: err };
-    }
-
-    const data = await resp.json() as any;
-    return { ok: true, id: data.id };
-  } catch (e: any) {
-    console.error('[email] Exception:', e.message);
-    return { ok: false, error: e.message };
-  }
+  const r = await sendExternal({
+    from,
+    to: params.to,
+    subject: params.subject,
+    html: params.html,
+    text: params.text,
+    replyTo: params.replyTo,
+  });
+  if (!r.ok) console.log('[email] not sent (' + (r.error || 'no transport') + '):', params.subject, 'to', params.to);
+  return { ok: r.ok, id: r.id, error: r.error };
 }
 
 // Branded email template wrapper

@@ -2,7 +2,7 @@
 // Config comes from the DB (UI-editable, /admin/mail/settings) and falls back to
 // environment vars. Priority: SMTP (your VPS) -> Resend HTTP API -> log only.
 import nodemailer from 'nodemailer';
-import { getMailConfig } from '@/lib/mail';
+import { getMailConfig, logOutbound } from '@/lib/mail';
 
 export interface SendExternalParams {
   from: string;          // "Name <addr@edurankai.in>"
@@ -23,8 +23,7 @@ export interface SendResult { ok: boolean; provider: 'smtp' | 'resend' | 'none';
 export async function transportStatus(): Promise<{ mode: 'smtp' | 'resend' | 'none'; detail: string }> {
   const c = await getMailConfig();
   if (c.smtpHost) return { mode: 'smtp', detail: `${c.smtpHost}:${c.smtpPort}` };
-  if (c.resendApiKey) return { mode: 'resend', detail: 'Resend HTTP API' };
-  return { mode: 'none', detail: 'No outbound transport configured' };
+  return { mode: 'none', detail: 'No SMTP transport configured (set it in Mail Settings)' };
 }
 
 export interface VerifySmtpParams {
@@ -68,65 +67,65 @@ export async function verifySmtp(p: VerifySmtpParams): Promise<{ ok: boolean; de
   }
 }
 
+// Own SMTP only (your VPS). NO third-party HTTP API. Transient failures are
+// retried with backoff; every attempt's final outcome is logged to email_logs.
 export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
   const c = await getMailConfig();
+  const toStr = Array.isArray(p.to) ? p.to.join(', ') : p.to;
 
-  if (c.smtpHost) {
+  if (!c.smtpHost) {
+    await logOutbound({ messageId: p.messageId || '', to: toStr, from: p.from, subject: p.subject, status: 'no_transport', provider: 'none', error: 'No SMTP configured' }).catch(() => {});
+    return { ok: false, provider: 'none', error: 'No SMTP transport configured (add your mail server in Mail Settings)' };
+  }
+
+  // Port-driven secure mode: 465 = implicit TLS, 587 = STARTTLS.
+  const port = c.smtpPort || 587;
+  const secure = port === 465 ? true : port === 587 ? false : !!c.smtpSecure;
+  const transport = nodemailer.createTransport({
+    host: c.smtpHost,
+    port,
+    secure,
+    auth: c.smtpUser ? { user: c.smtpUser, pass: c.smtpPass } : undefined,
+    tls: { rejectUnauthorized: !(c.smtpInsecure || process.env.SMTP_INSECURE === 'true') },
+    connectionTimeout: 15000,
+    greetingTimeout: 10000,
+    socketTimeout: 30000,
+    pool: true,
+    maxConnections: 3,
+  });
+
+  const mail = {
+    from: p.from,
+    to: toStr,
+    cc: p.cc && p.cc.length ? p.cc.join(', ') : undefined,
+    bcc: p.bcc && p.bcc.length ? p.bcc.join(', ') : undefined,
+    subject: p.subject,
+    html: p.html,
+    text: p.text,
+    replyTo: p.replyTo,
+    messageId: p.messageId,
+    inReplyTo: p.inReplyTo,
+    attachments: (p.attachments || []).map((a) => ({ filename: a.filename, path: a.href || a.path })),
+  };
+
+  // Retry transient failures (greylisting, timeouts, dropped connections).
+  const delays = [0, 1500, 4000];
+  let lastErr = 'SMTP error';
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (delays[attempt]) await new Promise((r) => setTimeout(r, delays[attempt]));
     try {
-      // Port-driven secure mode: 465 = implicit TLS, 587 = STARTTLS, anything
-      // else honours the saved checkbox.
-      const port = c.smtpPort || 587;
-      const secure = port === 465 ? true : port === 587 ? false : !!c.smtpSecure;
-      const transport = nodemailer.createTransport({
-        host: c.smtpHost,
-        port,
-        secure,
-        auth: c.smtpUser ? { user: c.smtpUser, pass: c.smtpPass } : undefined,
-        tls: { rejectUnauthorized: !(c.smtpInsecure || process.env.SMTP_INSECURE === 'true') },
-        connectionTimeout: 15000,
-        greetingTimeout: 10000,
-        socketTimeout: 30000,
-      });
-      const info = await transport.sendMail({
-        from: p.from,
-        to: Array.isArray(p.to) ? p.to.join(', ') : p.to,
-        cc: p.cc && p.cc.length ? p.cc.join(', ') : undefined,
-        bcc: p.bcc && p.bcc.length ? p.bcc.join(', ') : undefined,
-        subject: p.subject,
-        html: p.html,
-        text: p.text,
-        replyTo: p.replyTo,
-        messageId: p.messageId,
-        inReplyTo: p.inReplyTo,
-        attachments: (p.attachments || []).map(a => ({ filename: a.filename, path: a.href || a.path })),
-      });
+      const info = await transport.sendMail(mail);
+      await logOutbound({ messageId: info.messageId || p.messageId || '', to: toStr, from: p.from, subject: p.subject, status: 'sent', provider: 'smtp', error: null }).catch(() => {});
+      try { transport.close(); } catch (_) {}
       return { ok: true, provider: 'smtp', id: info.messageId };
     } catch (e: any) {
-      console.error('[mail-transport] SMTP send failed:', e?.message);
-      return { ok: false, provider: 'smtp', error: e?.message || 'SMTP error' };
+      lastErr = (e?.message || 'SMTP error').toString();
+      const transient = /timeout|etimedout|econnreset|econnrefused|esocket|greylist|\b4(2[0-9]|5[0-9])\b/i.test(lastErr);
+      if (!transient) break; // permanent failure -> don't keep retrying
     }
   }
-
-  if (c.resendApiKey) {
-    try {
-      const resp = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${c.resendApiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: p.from || c.fromAddress || 'EduRankAI <noreply@edurankai.in>',
-          to: Array.isArray(p.to) ? p.to : [p.to],
-          cc: p.cc && p.cc.length ? p.cc : undefined,
-          bcc: p.bcc && p.bcc.length ? p.bcc : undefined,
-          subject: p.subject, html: p.html, text: p.text, reply_to: p.replyTo,
-        }),
-      });
-      if (!resp.ok) return { ok: false, provider: 'resend', error: await resp.text() };
-      const data = await resp.json() as any;
-      return { ok: true, provider: 'resend', id: data.id };
-    } catch (e: any) {
-      return { ok: false, provider: 'resend', error: e?.message || 'Resend error' };
-    }
-  }
-
-  return { ok: false, provider: 'none', error: 'No outbound transport configured (add SMTP details in Mail Settings)' };
+  try { transport.close(); } catch (_) {}
+  console.error('[mail-transport] SMTP send failed after retries:', lastErr);
+  await logOutbound({ messageId: p.messageId || '', to: toStr, from: p.from, subject: p.subject, status: 'failed', provider: 'smtp', error: lastErr }).catch(() => {});
+  return { ok: false, provider: 'smtp', error: lastErr };
 }
