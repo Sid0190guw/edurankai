@@ -26,6 +26,56 @@ export function isLlmConfigured(): boolean {
   return !!process.env.ANTHROPIC_API_KEY;
 }
 
+export interface GeneratedQuestion { prompt: string; topics: string[]; }
+
+// Generate interview / test questions from uploaded source material. Accepts raw
+// text, a base64 PDF, or a base64 image (Claude reads PDFs and images natively),
+// so an admin can upload a document in almost any format. Returns [] if no key.
+export async function generateInterviewQuestions(opts: {
+  sourceText?: string; pdfBase64?: string; imageBase64?: string; imageMime?: string;
+  count?: number; lang?: string; role?: string;
+}): Promise<GeneratedQuestion[]> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return [];
+  const lang = languageName(opts.lang || 'en-IN');
+  const n = Math.max(1, Math.min(30, opts.count || 8));
+  const roleLine = opts.role ? ` The interview is for the role: ${opts.role}.` : '';
+  const system = `You are an expert interviewer and examiner.${roleLine} From the provided source material, write ${n} clear, standalone interview/test questions in ${lang}. Mix recall, conceptual-understanding and applied/scenario questions appropriate to the material's level. Each question must be answerable from the material or reasonable domain knowledge. Return ONLY a JSON array; each element is an object {"prompt": "<the question>", "topics": ["topic1","topic2"]}. No prose, no markdown fences.`;
+
+  let content: any;
+  if (opts.pdfBase64) {
+    content = [
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: opts.pdfBase64 } },
+      { type: 'text', text: `Generate ${n} interview/test questions in ${lang} from this document. Return ONLY the JSON array.` },
+    ];
+  } else if (opts.imageBase64) {
+    content = [
+      { type: 'image', source: { type: 'base64', media_type: opts.imageMime || 'image/png', data: opts.imageBase64 } },
+      { type: 'text', text: `Generate ${n} interview/test questions in ${lang} from this image. Return ONLY the JSON array.` },
+    ];
+  } else {
+    content = `Source material:\n\n${(opts.sourceText || '').slice(0, 80000)}\n\nGenerate ${n} interview/test questions in ${lang}. Return ONLY the JSON array.`;
+  }
+
+  try {
+    const resp = await fetch(CLAUDE_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: MODEL, max_tokens: 3000, system, messages: [{ role: 'user', content }] }),
+    });
+    if (!resp.ok) { console.error('generateInterviewQuestions: api error', resp.status, await resp.text().catch(() => '')); return []; }
+    const data = await resp.json() as any;
+    let text = (data.content?.[0]?.text || '').trim();
+    const m = text.match(/\[[\s\S]*\]/);
+    const arr = JSON.parse(m ? m[0] : text);
+    if (!Array.isArray(arr)) return [];
+    return arr.map((q: any) => ({
+      prompt: String(q?.prompt || q?.question || '').trim().slice(0, 1000),
+      topics: Array.isArray(q?.topics) ? q.topics.map((t: any) => String(t).trim()).filter(Boolean).slice(0, 8) : [],
+    })).filter((q: GeneratedQuestion) => q.prompt);
+  } catch (e: any) { console.error('generateInterviewQuestions:', e?.message || e); return []; }
+}
+
 interface FollowUpInput {
   seed: string;
   candidateAnswer: string;
