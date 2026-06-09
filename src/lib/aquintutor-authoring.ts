@@ -356,6 +356,8 @@ export const LAB_CATALOGUE = [
   'logic-bench','eee-bench','cro-bench','optics-bench','titration-bench',
   'vlsi','eee','cybersecurity','ai-ml','robotics','mechanical',
   'fluid-bench','reaction-bench','biotech-bench','dsa-bench',
+  'signals-systems','control-systems','dsp','os','networks','machines','structural','numerical',
+  'fluid-bench','reaction-bench','biotech-bench','dsa-bench',
   // foundational simulators
   'pendulum','projectile','optics','circuit','logic-gates','titration','periodic',
   'molecular','genetics','ecosystem','plot','linear-algebra','sorting','pathfinding',
