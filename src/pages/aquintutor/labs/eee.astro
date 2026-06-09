@@ -106,7 +106,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
       <h1 class="eee-title">Circuits &amp; <em>networks</em> virtual lab.</h1>
     </div>
   </div>
-  <p class="eee-lede">Eight self-contained experiments — from Ohm's law to op-amp integrators — in the Virtual Labs format. Each opens with an aim, the underlying theory and equations, a numbered procedure, a genuinely-computing interactive simulator, a marked self-assessment quiz and references. The engine is a hand-rolled Modified Nodal Analysis (MNA) solver with Gaussian elimination, implicit transient integrators and a complex-impedance AC sweep — nothing is pre-baked.</p>
+  <p class="eee-lede">Eleven self-contained experiments — from Ohm's law to graduate control systems and transistor biasing — in the Virtual Labs format. Each opens with an aim, the underlying theory and equations, a numbered procedure, a genuinely-computing interactive simulator, a marked self-assessment quiz and references. The engine is a hand-rolled Modified Nodal Analysis (MNA) solver with Gaussian elimination, implicit transient integrators, a complex-impedance AC sweep, a Durand-Kerner complex polynomial root finder, RK4 state-space step integration and large-signal device models — nothing is pre-baked.</p>
 
   <div class="eee-shell">
     <aside>
@@ -1385,6 +1385,765 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
   }
 
   // ==================================================================
+  // PART 4b — GRADUATE CONTROL-SYSTEMS KERNEL
+  //   complex polynomial roots (Durand-Kerner), transfer-function
+  //   step response via controllable-canonical state space + RK4,
+  //   second-order metrics, BJT/MOSFET device models.
+  //   (all hand-rolled, no libraries)
+  // ==================================================================
+
+  // parse a comma/space separated coefficient string into a number array,
+  // highest power first. Returns null on parse failure / empty.
+  function parseCoeffs(str) {
+    if (!str) { return null; }
+    var raw = str.replace(/,/g, ' ').split(/\s+/);
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      if (raw[i] === '') { continue; }
+      var v = parseFloat(raw[i]);
+      if (!isFinite(v)) { return null; }
+      out.push(v);
+    }
+    // strip leading zeros (reduces order) but keep at least one term
+    while (out.length > 1 && out[0] === 0) { out.shift(); }
+    return out.length ? out : null;
+  }
+
+  // evaluate a real-coefficient polynomial (highest power first) at complex z.
+  function polyEvalC(coeffs, z) {
+    var acc = { re: 0, im: 0 };
+    for (var i = 0; i < coeffs.length; i++) {
+      acc = cadd(cmul(acc, z), { re: coeffs[i], im: 0 });
+    }
+    return acc;
+  }
+
+  // Durand-Kerner (Weierstrass) simultaneous root finder for a real polynomial.
+  // Returns an array of {re, im} roots (degree = coeffs.length - 1).
+  function polyRoots(coeffsIn) {
+    var coeffs = coeffsIn.slice(0);
+    while (coeffs.length > 1 && coeffs[0] === 0) { coeffs.shift(); }
+    var n = coeffs.length - 1;
+    if (n <= 0) { return []; }
+    // normalise to monic
+    var lead = coeffs[0];
+    var mono = [];
+    for (var i = 0; i < coeffs.length; i++) { mono.push(coeffs[i] / lead); }
+    if (n === 1) { return [{ re: -mono[1], im: 0 }]; }
+    if (n === 2) {
+      // closed form for robustness on the quadratic case
+      var b = mono[1], c = mono[2];
+      var disc = b * b - 4 * c;
+      if (disc >= 0) {
+        var sq = Math.sqrt(disc);
+        return [{ re: (-b + sq) / 2, im: 0 }, { re: (-b - sq) / 2, im: 0 }];
+      }
+      var sqi = Math.sqrt(-disc) / 2;
+      return [{ re: -b / 2, im: sqi }, { re: -b / 2, im: -sqi }];
+    }
+    // general case: spread initial guesses on a circle (Aberth-style seed)
+    var roots = [];
+    var radius = 1 + Math.abs(mono[mono.length - 1]);
+    for (i = 0; i < n; i++) {
+      var ang = (2 * Math.PI * i / n) + 0.4;
+      roots.push({ re: radius * Math.cos(ang) * 0.6, im: radius * Math.sin(ang) * 0.6 });
+    }
+    for (var it = 0; it < 300; it++) {
+      var maxDelta = 0;
+      for (i = 0; i < n; i++) {
+        var num = polyEvalC(mono, roots[i]);
+        var den = { re: 1, im: 0 };
+        for (var j = 0; j < n; j++) {
+          if (j === i) { continue; }
+          den = cmul(den, { re: roots[i].re - roots[j].re, im: roots[i].im - roots[j].im });
+        }
+        if (cabs(den) < 1e-30) { den = { re: 1e-30, im: 0 }; }
+        var delta = cdiv(num, den);
+        roots[i] = { re: roots[i].re - delta.re, im: roots[i].im - delta.im };
+        var dm = cabs(delta);
+        if (dm > maxDelta) { maxDelta = dm; }
+      }
+      if (maxDelta < 1e-12) { break; }
+    }
+    // snap near-zero imaginary parts to real
+    for (i = 0; i < n; i++) { if (Math.abs(roots[i].im) < 1e-9) { roots[i].im = 0; } }
+    return roots;
+  }
+
+  // multiply two real-coefficient polynomials (highest power first).
+  function polyMul(a, b) {
+    var out = [];
+    var i, j;
+    for (i = 0; i < a.length + b.length - 1; i++) { out[i] = 0; }
+    for (i = 0; i < a.length; i++) {
+      for (j = 0; j < b.length; j++) { out[i + j] += a[i] * b[j]; }
+    }
+    return out;
+  }
+
+  // add two real-coefficient polynomials (highest power first), aligned at the constant term.
+  function polyAdd(a, b) {
+    var na = a.length, nb = b.length, n = Math.max(na, nb);
+    var out = [];
+    for (var i = 0; i < n; i++) {
+      var av = (i < n - na) ? 0 : a[i - (n - na)];
+      var bv = (i < n - nb) ? 0 : b[i - (n - nb)];
+      out.push(av + bv);
+    }
+    return out;
+  }
+
+  // Step response of a strictly/properly-proper TF num(s)/den(s) by
+  // converting den to controllable-canonical state space and integrating
+  // with classical RK4, then y = C x + D u. Returns {t:[],y:[]}.
+  function stepResponseTF(num, den, tEnd, steps) {
+    var d = den.slice(0);
+    while (d.length > 1 && d[0] === 0) { d.shift(); }
+    var n = d.length - 1; // system order
+    if (n < 1) { return { t: [0], y: [0] }; }
+    var a0 = d[0];
+    // monic denominator: s^n + a_{n-1} s^{n-1} + ... + a_0
+    var aMono = [];
+    for (var i = 0; i < d.length; i++) { aMono.push(d[i] / a0); }
+    // numerator padded to length n+1 (coeffs b_n..b_0), scaled by 1/a0
+    var b = num.slice(0);
+    while (b.length > d.length) { b.shift(); } // drop excess (improper) — keep proper
+    var bPad = [];
+    for (i = 0; i < (n + 1) - b.length; i++) { bPad.push(0); }
+    for (i = 0; i < b.length; i++) { bPad.push(b[i] / a0); }
+    // bPad indexed 0..n where bPad[0] is s^n coeff (feedthrough), bPad[k] -> s^{n-k}
+    var Dfeed = bPad[0];
+    // controllable canonical form rows: x' = A x + B u, with companion A.
+    // a coefficients (monic): aMono[1..n] correspond to s^{n-1}..s^0
+    var aco = [];
+    for (i = 1; i <= n; i++) { aco.push(aMono[i]); } // aco[0]=a_{n-1} ... aco[n-1]=a_0
+    // state derivative function
+    function deriv(x, u) {
+      var dx = [];
+      for (var r = 0; r < n - 1; r++) { dx.push(x[r + 1]); }
+      var last = u;
+      for (var c = 0; c < n; c++) { last -= aco[n - 1 - c] * x[c]; }
+      dx.push(last);
+      return dx;
+    }
+    // output C x + D u, with C_k = b_{n-k} - b_n * a_{n-k}
+    function output(x, u) {
+      var y = Dfeed * u;
+      for (var k = 0; k < n; k++) {
+        var Ck = bPad[n - k] - Dfeed * aMono[n - k];
+        y += Ck * x[k];
+      }
+      return y;
+    }
+    var x = [];
+    for (i = 0; i < n; i++) { x.push(0); }
+    var dt = tEnd / steps;
+    var ts = [], ys = [];
+    var u = 1; // unit step
+    ts.push(0); ys.push(output(x, u));
+    for (var s = 1; s <= steps; s++) {
+      // RK4
+      var k1 = deriv(x, u);
+      var x2 = []; for (i = 0; i < n; i++) { x2.push(x[i] + 0.5 * dt * k1[i]); }
+      var k2 = deriv(x2, u);
+      var x3 = []; for (i = 0; i < n; i++) { x3.push(x[i] + 0.5 * dt * k2[i]); }
+      var k3 = deriv(x3, u);
+      var x4 = []; for (i = 0; i < n; i++) { x4.push(x[i] + dt * k3[i]); }
+      var k4 = deriv(x4, u);
+      for (i = 0; i < n; i++) { x[i] += (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]); }
+      ts.push(s * dt); ys.push(output(x, u));
+    }
+    return { t: ts, y: ys };
+  }
+
+  // dominant-pole second-order metrics from a closed-loop pole set + DC gain.
+  // returns {wn, zeta, os, ts, tr, kdc} (os = percent overshoot, ts = 2% settling).
+  function secondOrderMetrics(poles, dcGain) {
+    // find the dominant complex pair (closest to imaginary axis, with imag part)
+    var best = null;
+    for (var i = 0; i < poles.length; i++) {
+      var p = poles[i];
+      if (Math.abs(p.im) > 1e-7 && p.re < 0) {
+        if (!best || Math.abs(p.re) < Math.abs(best.re)) { best = p; }
+      }
+    }
+    var out = { wn: NaN, zeta: NaN, os: NaN, ts: NaN, tr: NaN, kdc: dcGain };
+    if (best) {
+      var wn = Math.sqrt(best.re * best.re + best.im * best.im);
+      var zeta = -best.re / wn;
+      out.wn = wn; out.zeta = zeta;
+      if (zeta > 0 && zeta < 1) {
+        out.os = 100 * Math.exp(-Math.PI * zeta / Math.sqrt(1 - zeta * zeta));
+        out.ts = 4 / (zeta * wn); // 2% criterion
+      } else { out.os = 0; out.ts = 4 / Math.abs(best.re); }
+    } else {
+      // all-real poles: use the slowest (least-negative) for settling
+      var slow = null;
+      for (i = 0; i < poles.length; i++) {
+        if (poles[i].re < 0 && (!slow || poles[i].re > slow.re)) { slow = poles[i]; }
+      }
+      if (slow) { out.ts = 4 / Math.abs(slow.re); out.wn = Math.abs(slow.re); out.zeta = 1; out.os = 0; }
+    }
+    return out;
+  }
+
+  // ---- EXP 9: Transfer functions, pole-zero & step response -------
+  function controls_tf() {
+    return '' +
+      '<div class="eee-panel">' +
+        '<h3>Transfer function G(s) = N(s) / D(s)</h3>' +
+        '<p class="eee-note" style="margin-top:0">Enter coefficients highest power first, space or comma separated. Up to 3rd order.</p>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Numerator N(s) coefficients</span>' +
+          '<input type="text" id="tfNum" value="25"></div>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Denominator D(s) coefficients</span>' +
+          '<input type="text" id="tfDen" value="1 4 25"></div>' +
+        '<div style="display:flex;gap:6px;margin-top:8px;">' +
+          '<button class="eee-btn" id="tfGo">Compute</button>' +
+          '<button class="eee-btn ghost" id="tfP1">2nd order</button>' +
+          '<button class="eee-btn ghost" id="tfP2">3rd order</button>' +
+        '</div>' +
+        '<p id="tfReadout" class="eee-note"></p>' +
+        '<div class="eee-ctrlrow" style="margin-top:6px;"><span class="eee-lbl">View</span>' +
+          '<select id="tfView"><option value="both">Pole-zero + step</option><option value="pz">Pole-zero map only</option><option value="step">Step response only</option></select></div>' +
+      '</div>';
+  }
+  function wire_tf() {
+    $('tfGo').addEventListener('click', render_tf);
+    $('tfNum').addEventListener('change', render_tf);
+    $('tfDen').addEventListener('change', render_tf);
+    $('tfView').addEventListener('change', render_tf);
+    $('tfP1').addEventListener('click', function () { $('tfNum').value = '25'; $('tfDen').value = '1 4 25'; render_tf(); });
+    $('tfP2').addEventListener('click', function () { $('tfNum').value = '100'; $('tfDen').value = '1 6 25 100'; render_tf(); });
+    render_tf();
+  }
+  function render_tf() {
+    var num = parseCoeffs($('tfNum').value);
+    var den = parseCoeffs($('tfDen').value);
+    var msg = $('tfReadout');
+    var s = clearStage();
+    if (!num || !den) {
+      msg.innerHTML = '<span class="eee-err">Enter valid numeric coefficients for N(s) and D(s).</span>';
+      s.appendChild(txt('Invalid coefficients.', 450, 270, '#fca5a5', 13, 'middle'));
+      $('resTable').innerHTML = ''; $('bigReadout').innerHTML = '';
+      return;
+    }
+    if (den.length - 1 > 3 || num.length - 1 > 3) {
+      msg.innerHTML = '<span class="eee-err">Keep order at 3 or below for this experiment.</span>';
+      s.appendChild(txt('Order too high (max 3).', 450, 270, '#fca5a5', 13, 'middle'));
+      $('resTable').innerHTML = ''; $('bigReadout').innerHTML = '';
+      return;
+    }
+    var poles = polyRoots(den);
+    var zeros = (num.length > 1) ? polyRoots(num) : [];
+    // DC gain G(0) = N(0)/D(0)
+    var dcGain = den[den.length - 1] !== 0 ? num[num.length - 1] / den[den.length - 1] : Infinity;
+    // stability: all poles strictly in LHP
+    var stable = true, marginal = false;
+    for (var i = 0; i < poles.length; i++) {
+      if (poles[i].re > 1e-9) { stable = false; }
+      else if (Math.abs(poles[i].re) <= 1e-9) { marginal = true; }
+    }
+    var metrics = secondOrderMetrics(poles, dcGain);
+
+    // pick a time window from the dominant settling time (fallback if unstable)
+    var tWin = isFinite(metrics.ts) && metrics.ts > 0 ? metrics.ts * 1.5 : 10;
+    if (!stable) { tWin = 8; }
+    if (tWin > 200) { tWin = 200; }
+    var resp = stepResponseTF(num, den, tWin, 700);
+
+    var stab = stable ? 'STABLE (all poles in LHP)' : (marginal ? 'MARGINALLY STABLE (pole on jw-axis)' : 'UNSTABLE (pole in RHP)');
+    msg.innerHTML = '<span class="' + (stable ? 'eee-ok' : 'eee-err') + '">' + stab + '</span>. ' +
+      'DC gain G(0) = ' + (isFinite(dcGain) ? dcGain.toFixed(3) : 'inf') + '. ' +
+      'wn = ' + (isFinite(metrics.wn) ? metrics.wn.toFixed(3) + ' rad/s' : '--') +
+      ', zeta = ' + (isFinite(metrics.zeta) ? metrics.zeta.toFixed(3) : '--') +
+      ', %OS = ' + (isFinite(metrics.os) ? metrics.os.toFixed(2) + '%' : '--') +
+      ', ts(2%) = ' + (isFinite(metrics.ts) ? metrics.ts.toFixed(3) + ' s' : '--') + '.';
+
+    var view = $('tfView').value;
+    if (view === 'pz') { drawPoleZero(s, poles, zeros, 60, 870, 30, 480); }
+    else if (view === 'step') { drawStep(s, resp, dcGain, metrics, 60, 870, 30, 480); }
+    else {
+      drawPoleZero(s, poles, zeros, 60, 455, 30, 480);
+      drawStep(s, resp, dcGain, metrics, 480, 870, 30, 480);
+    }
+    $('stageCap').textContent = 'Poles/zeros via Durand-Kerner root finding; step response by controllable-canonical state space integrated with RK4.';
+
+    $('bigReadout').innerHTML = '<div class="eee-bigval">' + (isFinite(metrics.zeta) ? metrics.zeta.toFixed(3) : '--') + ' <span>damping ratio zeta</span></div>';
+    var h = '<tr><th>Quantity</th><th style="text-align:right">Value</th></tr>';
+    h += '<tr><td class="nm">Stability</td><td class="' + (stable ? 'vc' : 'va') + '">' + (stable ? 'stable' : (marginal ? 'marginal' : 'unstable')) + '</td></tr>';
+    h += '<tr><td class="nm">wn</td><td class="vp">' + (isFinite(metrics.wn) ? metrics.wn.toFixed(3) + ' rad/s' : '--') + '</td></tr>';
+    h += '<tr><td class="nm">zeta</td><td class="vc">' + (isFinite(metrics.zeta) ? metrics.zeta.toFixed(3) : '--') + '</td></tr>';
+    h += '<tr><td class="nm">% overshoot</td><td class="va">' + (isFinite(metrics.os) ? metrics.os.toFixed(2) + ' %' : '--') + '</td></tr>';
+    h += '<tr><td class="nm">ts (2%)</td><td class="vp">' + (isFinite(metrics.ts) ? metrics.ts.toFixed(3) + ' s' : '--') + '</td></tr>';
+    h += '<tr><td class="nm">DC gain</td><td class="vc">' + (isFinite(dcGain) ? dcGain.toFixed(3) : 'inf') + '</td></tr>';
+    var ph = '';
+    for (i = 0; i < poles.length; i++) { ph += (i ? '; ' : '') + cplxStr(poles[i]); }
+    h += '<tr><td class="nm">Poles</td><td class="vp" style="font-size:9.5px">' + ph + '</td></tr>';
+    $('resTable').innerHTML = h;
+  }
+  function cplxStr(z) {
+    if (Math.abs(z.im) < 1e-7) { return z.re.toFixed(3); }
+    return z.re.toFixed(3) + (z.im >= 0 ? ' + j' : ' - j') + Math.abs(z.im).toFixed(3);
+  }
+  function drawPoleZero(s, poles, zeros, L, Rr, T, B) {
+    var W = Rr - L, H = B - T;
+    s.appendChild(svgEl('rect', { x: L, y: T, width: W, height: H, fill: '#070709', stroke: '#2a2a35' }));
+    // auto-scale from all roots
+    var maxR = 1;
+    var all = poles.concat(zeros);
+    for (var i = 0; i < all.length; i++) {
+      maxR = Math.max(maxR, Math.abs(all[i].re), Math.abs(all[i].im));
+    }
+    maxR = maxR * 1.25;
+    var cx = L + W * 0.5, cy = T + H * 0.5;
+    var sx = (W * 0.42) / maxR, sy = (H * 0.42) / maxR;
+    // axes
+    s.appendChild(svgEl('line', { x1: L + 6, y1: cy, x2: Rr - 6, y2: cy, stroke: '#2a2a35', 'stroke-width': 1 }));
+    s.appendChild(svgEl('line', { x1: cx, y1: T + 6, x2: cx, y2: B - 6, stroke: '#2a2a35', 'stroke-width': 1 }));
+    // shade RHP (unstable region)
+    s.appendChild(svgEl('rect', { x: cx, y: T, width: Rr - cx, height: H, fill: '#fca5a5', opacity: 0.05 }));
+    s.appendChild(txt('Re(s)', Rr - 8, cy - 6, '#6b7280', 10, 'end'));
+    s.appendChild(txt('Im(s)', cx + 6, T + 14, '#6b7280', 10));
+    s.appendChild(txt('LHP (stable)', L + 8, B - 8, '#86efac', 10));
+    s.appendChild(txt('RHP', Rr - 8, B - 8, '#fca5a5', 10, 'end'));
+    function PX(re) { return cx + re * sx; }
+    function PY(im) { return cy - im * sy; }
+    // zeros as circles
+    for (i = 0; i < zeros.length; i++) {
+      s.appendChild(svgEl('circle', { cx: PX(zeros[i].re), cy: PY(zeros[i].im), r: 7, fill: 'none', stroke: '#67e8f9', 'stroke-width': 2 }));
+    }
+    // poles as crosses
+    for (i = 0; i < poles.length; i++) {
+      var px = PX(poles[i].re), py = PY(poles[i].im);
+      var col = poles[i].re > 1e-9 ? '#fca5a5' : (Math.abs(poles[i].re) <= 1e-9 ? '#fbbf24' : '#a78bfa');
+      s.appendChild(svgEl('line', { x1: px - 6, y1: py - 6, x2: px + 6, y2: py + 6, stroke: col, 'stroke-width': 2.4 }));
+      s.appendChild(svgEl('line', { x1: px - 6, y1: py + 6, x2: px + 6, y2: py - 6, stroke: col, 'stroke-width': 2.4 }));
+    }
+    s.appendChild(txt('Pole-zero map  (x pole, o zero)', L + 8, T + 16, '#9aa6b6', 11));
+  }
+  function drawStep(s, resp, dcGain, metrics, L, Rr, T, B) {
+    var W = Rr - L, H = B - T;
+    s.appendChild(svgEl('rect', { x: L, y: T, width: W, height: H, fill: '#070709', stroke: '#2a2a35' }));
+    var n = resp.t.length;
+    var tEnd = resp.t[n - 1] || 1;
+    var ymin = 0, ymax = 0;
+    for (var i = 0; i < n; i++) { if (resp.y[i] > ymax) { ymax = resp.y[i]; } if (resp.y[i] < ymin) { ymin = resp.y[i]; } }
+    if (ymax <= ymin) { ymax = ymin + 1; }
+    var pad = (ymax - ymin) * 0.1;
+    ymax += pad; ymin -= pad;
+    function px(t) { return L + (t / tEnd) * W; }
+    function py(y) { return B - ((y - ymin) / (ymax - ymin)) * H; }
+    // gridlines
+    for (i = 0; i <= 5; i++) {
+      var gy = T + H * i / 5;
+      s.appendChild(svgEl('line', { x1: L, y1: gy, x2: Rr, y2: gy, stroke: '#161821', 'stroke-width': 1 }));
+    }
+    // final value line
+    if (isFinite(dcGain)) {
+      s.appendChild(svgEl('line', { x1: L, y1: py(dcGain), x2: Rr, y2: py(dcGain), stroke: '#2a2a35', 'stroke-width': 1, 'stroke-dasharray': '4 4' }));
+      s.appendChild(txt('y(inf)=' + dcGain.toFixed(2), Rr - 4, py(dcGain) - 4, '#6b7280', 9.5, 'end'));
+    }
+    if (py(0) > T && py(0) < B) { s.appendChild(svgEl('line', { x1: L, y1: py(0), x2: Rr, y2: py(0), stroke: '#2a2a35', 'stroke-width': 1 })); }
+    var dpath = '';
+    for (i = 0; i < n; i++) { dpath += (i === 0 ? 'M' : 'L') + px(resp.t[i]).toFixed(1) + ' ' + py(resp.y[i]).toFixed(1) + ' '; }
+    s.appendChild(svgEl('path', { d: dpath, fill: 'none', stroke: '#67e8f9', 'stroke-width': 2.2 }));
+    // settling-time marker
+    if (isFinite(metrics.ts) && metrics.ts <= tEnd) {
+      var mx = px(metrics.ts);
+      s.appendChild(svgEl('line', { x1: mx, y1: T, x2: mx, y2: B, stroke: '#fbbf24', 'stroke-width': 1.2, 'stroke-dasharray': '3 3' }));
+      s.appendChild(txt('ts=' + metrics.ts.toFixed(2) + 's', mx + 4, T + 28, '#fbbf24', 9.5));
+    }
+    s.appendChild(txt('Unit-step response y(t)', L + 8, T + 16, '#67e8f9', 11));
+    s.appendChild(txt('t -> ' + tEnd.toFixed(2) + 's', Rr - 4, B + 16, '#6b7280', 10, 'end'));
+  }
+
+  // ---- EXP 10: Root locus & closed-loop control -------------------
+  function controls_rl() {
+    return '' +
+      '<div class="eee-panel">' +
+        '<h3>Plant G(s) = N(s) / D(s)</h3>' +
+        '<p class="eee-note" style="margin-top:0">Coefficients highest power first. The closed loop is G_c = K*C*G / (1 + K*C*G).</p>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Plant numerator</span>' +
+          '<input type="text" id="rlNum" value="1"></div>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Plant denominator</span>' +
+          '<input type="text" id="rlDen" value="1 3 2 0"></div>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Controller</span>' +
+          '<select id="rlCtrl"><option value="p">Proportional (K only)</option><option value="pid">PID (Kp,Ki,Kd)</option><option value="lead">Lead (s+z)/(s+p)</option></select></div>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Gain K <b id="rlKL" class="eee-val">2.00</b></span>' +
+          '<input type="range" id="rlK" min="0.01" max="40" step="0.01" value="2"></div>' +
+        '<div id="rlPidBox" style="display:none">' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">Ki <b id="rlKiL" class="eee-val">1.0</b></span><input type="range" id="rlKi" min="0" max="20" step="0.1" value="1"></div>' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">Kd <b id="rlKdL" class="eee-val">0.5</b></span><input type="range" id="rlKd" min="0" max="10" step="0.1" value="0.5"></div>' +
+        '</div>' +
+        '<div id="rlLeadBox" style="display:none">' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">Lead zero z <b id="rlZL" class="eee-val">1.0</b></span><input type="range" id="rlZ" min="0.1" max="10" step="0.1" value="1"></div>' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">Lead pole p <b id="rlPL" class="eee-val">8.0</b></span><input type="range" id="rlP" min="1" max="40" step="0.5" value="8"></div>' +
+        '</div>' +
+        '<p id="rlReadout" class="eee-note"></p>' +
+      '</div>';
+  }
+  function wire_rl() {
+    var ids = ['rlNum', 'rlDen', 'rlCtrl', 'rlK', 'rlKi', 'rlKd', 'rlZ', 'rlP'];
+    for (var i = 0; i < ids.length; i++) {
+      var el = $(ids[i]);
+      el.addEventListener('input', render_rl);
+      el.addEventListener('change', render_rl);
+    }
+    render_rl();
+  }
+  // build controller numerator/denominator polynomials for the chosen mode.
+  function controllerCG(mode, K, Ki, Kd, z, p) {
+    // returns {num, den} for C(s) (without the overall gain K applied where noted)
+    if (mode === 'pid') {
+      // C(s) = (Kd s^2 + Kp s + Ki)/s, with Kp = K
+      return { num: [Kd, K, Ki], den: [1, 0] };
+    } else if (mode === 'lead') {
+      // C(s) = K (s + z)/(s + p)
+      return { num: [K, K * z], den: [1, p] };
+    }
+    // proportional
+    return { num: [K], den: [1] };
+  }
+  function render_rl() {
+    var Pnum = parseCoeffs($('rlNum').value);
+    var Pden = parseCoeffs($('rlDen').value);
+    var mode = $('rlCtrl').value;
+    var K = parseFloat($('rlK').value);
+    var Ki = parseFloat($('rlKi').value), Kd = parseFloat($('rlKd').value);
+    var z = parseFloat($('rlZ').value), p = parseFloat($('rlP').value);
+    $('rlKL').textContent = K.toFixed(2);
+    $('rlKiL').textContent = Ki.toFixed(1); $('rlKdL').textContent = Kd.toFixed(1);
+    $('rlZL').textContent = z.toFixed(1); $('rlPL').textContent = p.toFixed(1);
+    $('rlPidBox').style.display = (mode === 'pid') ? '' : 'none';
+    $('rlLeadBox').style.display = (mode === 'lead') ? '' : 'none';
+
+    var msg = $('rlReadout');
+    var s = clearStage();
+    if (!Pnum || !Pden) {
+      msg.innerHTML = '<span class="eee-err">Enter valid plant coefficients.</span>';
+      s.appendChild(txt('Invalid plant.', 450, 270, '#fca5a5', 13, 'middle'));
+      $('resTable').innerHTML = ''; $('bigReadout').innerHTML = '';
+      return;
+    }
+
+    // ROOT LOCUS for the proportional case uses the bare plant G; for PID/lead
+    // we sweep the overall gain multiplier of the chosen controller structure.
+    // Open loop L(s) = C(s)*G(s); closed-loop char eqn = Cden*Gden + Cnum*Gnum = 0.
+    function closedPolesAt(kk) {
+      var c = controllerCG(mode, kk, Ki, Kd, z, p);
+      var openNum = polyMul(c.num, Pnum);
+      var openDen = polyMul(c.den, Pden);
+      var charPoly = polyAdd(openDen, openNum); // 1 + L = 0  ->  Den + Num = 0
+      return { poles: polyRoots(charPoly), openNum: openNum, openDen: openDen };
+    }
+
+    // draw the locus by sweeping gain 0..Kmax
+    var Kmax = 40;
+    var nK = 160;
+    var loci = []; // array per branch
+    var degree = closedPolesAt(0.001).poles.length;
+    for (var bi = 0; bi < degree; bi++) { loci.push([]); }
+    for (var ki = 0; ki <= nK; ki++) {
+      var kv = (ki / nK) * Kmax + 1e-4;
+      var pr = closedPolesAt(kv).poles;
+      // simple nearest-branch assignment for continuity
+      var used = [];
+      for (var bj = 0; bj < degree; bj++) { used.push(false); }
+      for (var lb = 0; lb < loci.length; lb++) {
+        var prev = loci[lb].length ? loci[lb][loci[lb].length - 1] : null;
+        var bestIdx = -1, bestD = 1e30;
+        for (var q = 0; q < pr.length; q++) {
+          if (used[q]) { continue; }
+          var d = prev ? Math.hypot(pr[q].re - prev.re, pr[q].im - prev.im) : (lb === q ? 0 : 1e-3 * q);
+          if (d < bestD) { bestD = d; bestIdx = q; }
+        }
+        if (bestIdx >= 0) { used[bestIdx] = true; loci[lb].push(pr[bestIdx]); }
+      }
+    }
+
+    var atK = closedPolesAt(K);
+    var clPoles = atK.poles;
+    var stable = true;
+    for (var i = 0; i < clPoles.length; i++) { if (clPoles[i].re > 1e-9) { stable = false; } }
+
+    // closed-loop transfer function for step: T = openNum / (openDen + openNum)
+    var Tnum = atK.openNum.slice(0);
+    var Tden = polyAdd(atK.openDen, atK.openNum);
+    var dcGain = Tden[Tden.length - 1] !== 0 ? Tnum[Tnum.length - 1] / Tden[Tden.length - 1] : Infinity;
+    var metrics = secondOrderMetrics(clPoles, dcGain);
+    var tWin = isFinite(metrics.ts) && metrics.ts > 0 ? metrics.ts * 1.4 : 12;
+    if (!stable) { tWin = 8; }
+    if (tWin > 200) { tWin = 200; }
+    var resp = stepResponseTF(Tnum, Tden, tWin, 700);
+
+    msg.innerHTML = '<span class="' + (stable ? 'eee-ok' : 'eee-err') + '">' + (stable ? 'Closed loop STABLE at K=' + K.toFixed(2) : 'Closed loop UNSTABLE at K=' + K.toFixed(2)) + '</span>. ' +
+      'zeta = ' + (isFinite(metrics.zeta) ? metrics.zeta.toFixed(3) : '--') +
+      ', %OS = ' + (isFinite(metrics.os) ? metrics.os.toFixed(1) + '%' : '--') +
+      ', ts = ' + (isFinite(metrics.ts) ? metrics.ts.toFixed(2) + ' s' : '--') + '.';
+
+    // draw locus (left) + step (right)
+    drawLocus(s, loci, clPoles, 60, 455, 30, 480);
+    drawStep(s, resp, dcGain, metrics, 480, 870, 30, 480);
+    $('stageCap').textContent = 'Root locus: closed-loop poles of 1+K*C*G found by root-finding the characteristic polynomial across K; step response of the closed loop at the chosen K.';
+
+    $('bigReadout').innerHTML = '<div class="eee-bigval">' + (isFinite(metrics.os) ? metrics.os.toFixed(1) : '--') + '%<span> overshoot at K=' + K.toFixed(1) + '</span></div>';
+    var h = '<tr><th>Quantity</th><th style="text-align:right">Value</th></tr>';
+    h += '<tr><td class="nm">Stability</td><td class="' + (stable ? 'vc' : 'va') + '">' + (stable ? 'stable' : 'unstable') + '</td></tr>';
+    h += '<tr><td class="nm">zeta</td><td class="vc">' + (isFinite(metrics.zeta) ? metrics.zeta.toFixed(3) : '--') + '</td></tr>';
+    h += '<tr><td class="nm">% overshoot</td><td class="va">' + (isFinite(metrics.os) ? metrics.os.toFixed(2) + ' %' : '--') + '</td></tr>';
+    h += '<tr><td class="nm">ts (2%)</td><td class="vp">' + (isFinite(metrics.ts) ? metrics.ts.toFixed(3) + ' s' : '--') + '</td></tr>';
+    h += '<tr><td class="nm">DC gain</td><td class="vc">' + (isFinite(dcGain) ? dcGain.toFixed(3) : 'inf') + '</td></tr>';
+    var ph = '';
+    for (i = 0; i < clPoles.length; i++) { ph += (i ? '; ' : '') + cplxStr(clPoles[i]); }
+    h += '<tr><td class="nm">CL poles</td><td class="vp" style="font-size:9.5px">' + ph + '</td></tr>';
+    $('resTable').innerHTML = h;
+  }
+  function drawLocus(s, loci, clPoles, L, Rr, T, B) {
+    var W = Rr - L, H = B - T;
+    s.appendChild(svgEl('rect', { x: L, y: T, width: W, height: H, fill: '#070709', stroke: '#2a2a35' }));
+    var maxR = 1;
+    var lb, q;
+    for (lb = 0; lb < loci.length; lb++) {
+      for (q = 0; q < loci[lb].length; q++) {
+        maxR = Math.max(maxR, Math.abs(loci[lb][q].re), Math.abs(loci[lb][q].im));
+      }
+    }
+    maxR = maxR * 1.2;
+    var cx = L + W * 0.62, cy = T + H * 0.5;
+    var sc = Math.min((W * 0.55) / maxR, (H * 0.42) / maxR);
+    s.appendChild(svgEl('line', { x1: L + 6, y1: cy, x2: Rr - 6, y2: cy, stroke: '#2a2a35', 'stroke-width': 1 }));
+    s.appendChild(svgEl('line', { x1: cx, y1: T + 6, x2: cx, y2: B - 6, stroke: '#2a2a35', 'stroke-width': 1 }));
+    s.appendChild(svgEl('rect', { x: cx, y: T, width: Rr - cx, height: H, fill: '#fca5a5', opacity: 0.05 }));
+    function PX(re) { return cx + re * sc; }
+    function PY(im) { return cy - im * sc; }
+    var cols = ['#67e8f9', '#a78bfa', '#fbbf24', '#86efac'];
+    for (lb = 0; lb < loci.length; lb++) {
+      var col = cols[lb % cols.length];
+      var dpath = '';
+      for (q = 0; q < loci[lb].length; q++) {
+        dpath += (q === 0 ? 'M' : 'L') + PX(loci[lb][q].re).toFixed(1) + ' ' + PY(loci[lb][q].im).toFixed(1) + ' ';
+      }
+      s.appendChild(svgEl('path', { d: dpath, fill: 'none', stroke: col, 'stroke-width': 1.6, opacity: 0.85 }));
+      // open-loop pole start = x at K~0
+      if (loci[lb].length) {
+        var p0 = loci[lb][0];
+        s.appendChild(svgEl('line', { x1: PX(p0.re) - 5, y1: PY(p0.im) - 5, x2: PX(p0.re) + 5, y2: PY(p0.im) + 5, stroke: col, 'stroke-width': 1.6 }));
+        s.appendChild(svgEl('line', { x1: PX(p0.re) - 5, y1: PY(p0.im) + 5, x2: PX(p0.re) + 5, y2: PY(p0.im) - 5, stroke: col, 'stroke-width': 1.6 }));
+      }
+    }
+    // chosen-K closed-loop poles as filled squares
+    for (var i = 0; i < clPoles.length; i++) {
+      var fc = clPoles[i].re > 1e-9 ? '#fca5a5' : '#e8e8ee';
+      s.appendChild(svgEl('rect', { x: PX(clPoles[i].re) - 4, y: PY(clPoles[i].im) - 4, width: 8, height: 8, fill: fc, stroke: '#0a0a0c', 'stroke-width': 1 }));
+    }
+    s.appendChild(txt('Root locus  (x start K=0, square = chosen K)', L + 8, T + 16, '#9aa6b6', 10.5));
+    s.appendChild(txt('Re(s)', Rr - 8, cy - 6, '#6b7280', 10, 'end'));
+  }
+
+  // ---- EXP 11: BJT / MOSFET characteristics & biasing ------------
+  function controls_dev() {
+    return '' +
+      '<div class="eee-panel">' +
+        '<h3>Device & model</h3>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Device</span>' +
+          '<select id="dvType"><option value="bjt">BJT (Ic vs Vce, stepped Ib)</option><option value="mos">N-MOSFET (Id vs Vds, stepped Vgs)</option></select></div>' +
+        '<div id="dvBjt">' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">beta (hFE) <b id="dvBetaL" class="eee-val">100</b></span><input type="range" id="dvBeta" min="20" max="300" step="5" value="100"></div>' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">VA Early (V) <b id="dvVaL" class="eee-val">80</b></span><input type="range" id="dvVa" min="20" max="200" step="5" value="80"></div>' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">Base resistor Rb (kohm) <b id="dvRbL" class="eee-val">220</b></span><input type="range" id="dvRb" min="50" max="1000" step="10" value="220"></div>' +
+        '</div>' +
+        '<div id="dvMos" style="display:none">' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">Vth (V) <b id="dvVthL" class="eee-val">1.0</b></span><input type="range" id="dvVth" min="0.4" max="3" step="0.1" value="1"></div>' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">k = un Cox W/L (mA/V^2) <b id="dvKL" class="eee-val">2.0</b></span><input type="range" id="dvK" min="0.2" max="8" step="0.1" value="2"></div>' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">lambda (1/V) <b id="dvLamL" class="eee-val">0.02</b></span><input type="range" id="dvLam" min="0" max="0.1" step="0.005" value="0.02"></div>' +
+          '<div class="eee-ctrlrow"><span class="eee-lbl">Gate bias Vgs op (V) <b id="dvVgsL" class="eee-val">2.0</b></span><input type="range" id="dvVgs" min="0.5" max="5" step="0.1" value="2"></div>' +
+        '</div>' +
+        '<h3 style="margin-top:14px">Bias / load line</h3>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Vcc / Vdd (V) <b id="dvVccL" class="eee-val">10.0</b></span><input type="range" id="dvVcc" min="3" max="20" step="0.5" value="10"></div>' +
+        '<div class="eee-ctrlrow"><span class="eee-lbl">Rc / Rd (ohm) <b id="dvRcL" class="eee-val">1000</b></span><input type="range" id="dvRc" min="100" max="5000" step="50" value="1000"></div>' +
+        '<p id="dvReadout" class="eee-note"></p>' +
+      '</div>';
+  }
+  function wire_dev() {
+    var ids = ['dvType', 'dvBeta', 'dvVa', 'dvRb', 'dvVth', 'dvK', 'dvLam', 'dvVgs', 'dvVcc', 'dvRc'];
+    for (var i = 0; i < ids.length; i++) {
+      $(ids[i]).addEventListener('input', render_dev);
+      $(ids[i]).addEventListener('change', render_dev);
+    }
+    render_dev();
+  }
+  function render_dev() {
+    var type = $('dvType').value;
+    $('dvBjt').style.display = (type === 'bjt') ? '' : 'none';
+    $('dvMos').style.display = (type === 'mos') ? '' : 'none';
+    var Vcc = parseFloat($('dvVcc').value), Rc = parseFloat($('dvRc').value);
+    $('dvVccL').textContent = Vcc.toFixed(1); $('dvRcL').textContent = Rc.toFixed(0);
+
+    var s = clearStage();
+    var L = 80, Rr = 720, T = 30, B = 470;
+    var W = Rr - L, H = B - T;
+    s.appendChild(svgEl('rect', { x: L, y: T, width: W, height: H, fill: '#070709', stroke: '#2a2a35' }));
+
+    var Vmax = Vcc * 1.05;
+    var Imax;
+    var curves = [];       // each curve: {label, col, pts:[{v,i}]}
+    var modelFn;           // i = modelFn(vce/vds, stepValue)
+    var stepVals = [];
+    var qVce, qIc, region, readout;
+    var device;
+
+    if (type === 'bjt') {
+      var beta = parseFloat($('dvBeta').value);
+      var Va = parseFloat($('dvVa').value);
+      var Rb = parseFloat($('dvRb').value) * 1e3;
+      $('dvBetaL').textContent = beta.toFixed(0); $('dvVaL').textContent = Va.toFixed(0); $('dvRbL').textContent = (Rb / 1e3).toFixed(0);
+      device = 'BJT';
+      // operating Ib from base bias: assume Vbb = Vcc, Vbe ~ 0.7
+      var Vbe = 0.7;
+      var IbOp = Math.max(0, (Vcc - Vbe) / Rb);
+      // stepped base currents (uA)
+      var ibSteps = [10e-6, 20e-6, 30e-6, 40e-6, 50e-6];
+      stepVals = ibSteps;
+      var VceSat = 0.2;
+      // Ic model: cutoff (Ib=0) -> 0; saturation (Vce<VceSat) linear ramp; active -> beta*Ib*(1+Vce/Va)
+      modelFn = function (vce, ib) {
+        var icActive = beta * ib * (1 + vce / Va);
+        if (vce < VceSat) { return icActive * (vce / VceSat); } // soft knee in saturation
+        return icActive;
+      };
+      // Imax from top curve at Vce=Vmax
+      Imax = beta * ibSteps[ibSteps.length - 1] * (1 + Vmax / Va) * 1.1;
+      // Q-point: solve load line Vce = Vcc - Ic*Rc with active model Ic = beta*Ib*(1+Vce/Va)
+      // beta*Ib*(1+Vce/Va) = (Vcc - Vce)/Rc  ->  linear in Vce
+      var g = beta * IbOp;
+      // g*(1+Vce/Va) = (Vcc-Vce)/Rc  -> g + g*Vce/Va = Vcc/Rc - Vce/Rc
+      // Vce*(g/Va + 1/Rc) = Vcc/Rc - g
+      var Vce = (Vcc / Rc - g) / (g / Va + 1 / Rc);
+      if (Vce < VceSat) {
+        // device saturated: Ic limited by load line, Vce ~ VceSat
+        qVce = VceSat; qIc = (Vcc - VceSat) / Rc; region = 'SATURATION';
+      } else if (IbOp <= 0) {
+        qVce = Vcc; qIc = 0; region = 'CUTOFF';
+      } else {
+        qVce = Vce; qIc = (Vcc - Vce) / Rc; region = 'ACTIVE (forward)';
+      }
+      qVce = Math.max(0, Math.min(qVce, Vcc));
+      readout = 'BJT Ebers-Moll active region: Ic = beta*Ib*(1 + Vce/VA). Ib_op = (Vcc - 0.7)/Rb = ' + (IbOp * 1e6).toFixed(1) + ' uA. Load line: Vce = Vcc - Ic*Rc. Q-point at (' + qVce.toFixed(2) + ' V, ' + (qIc * 1e3).toFixed(2) + ' mA), region: ' + region + '.';
+    } else {
+      var Vth = parseFloat($('dvVth').value);
+      var kk = parseFloat($('dvK').value) * 1e-3; // A/V^2
+      var lam = parseFloat($('dvLam').value);
+      var VgsOp = parseFloat($('dvVgs').value);
+      $('dvVthL').textContent = Vth.toFixed(1); $('dvKL').textContent = (kk * 1e3).toFixed(1); $('dvLamL').textContent = lam.toFixed(3); $('dvVgsL').textContent = VgsOp.toFixed(1);
+      device = 'MOSFET';
+      stepVals = [];
+      // pick 5 stepped Vgs values from Vth+0.5 up
+      for (var sv = 0; sv < 5; sv++) { stepVals.push(Vth + 0.5 + sv * 0.8); }
+      // Id square-law: cutoff Vgs<Vth ->0; triode Vds<Vov -> k(Vov*Vds - Vds^2/2); sat -> 0.5 k Vov^2 (1+lam Vds)
+      modelFn = function (vds, vgs) {
+        var vov = vgs - Vth;
+        if (vov <= 0) { return 0; }
+        if (vds < vov) { return kk * (vov * vds - 0.5 * vds * vds); } // triode
+        return 0.5 * kk * vov * vov * (1 + lam * vds); // saturation
+      };
+      var vovTop = stepVals[stepVals.length - 1] - Vth;
+      Imax = 0.5 * kk * vovTop * vovTop * (1 + lam * Vmax) * 1.1;
+      // Q-point at operating Vgs: solve Id = (Vdd - Vds)/Rd with saturation model
+      var vov2 = VgsOp - Vth;
+      if (vov2 <= 0) { qVce = Vcc; qIc = 0; region = 'CUTOFF'; }
+      else {
+        // assume saturation: Id = 0.5 k vov^2 (1+lam Vds), load line Id=(Vdd-Vds)/Rd
+        // 0.5 k vov^2 (1+lam Vds) = (Vdd - Vds)/Rd
+        var Idsat0 = 0.5 * kk * vov2 * vov2;
+        // 0.5kvov^2 + 0.5kvov^2 lam Vds = Vdd/Rd - Vds/Rd
+        var Vds = (Vcc / Rc - Idsat0) / (Idsat0 * lam + 1 / Rc);
+        if (Vds < vov2) {
+          // triode: solve k(vov*Vds - Vds^2/2) = (Vdd-Vds)/Rd  -> quadratic in Vds
+          // -(k/2)Vds^2 + (k vov + 1/Rd)Vds - Vdd/Rd = 0
+          var A2 = -0.5 * kk, B2 = kk * vov2 + 1 / Rc, C2 = -Vcc / Rc;
+          var disc = B2 * B2 - 4 * A2 * C2;
+          var root = disc >= 0 ? (-B2 + Math.sqrt(disc)) / (2 * A2) : vov2 * 0.5;
+          // take physical root in [0, vov2]
+          var root2 = disc >= 0 ? (-B2 - Math.sqrt(disc)) / (2 * A2) : vov2 * 0.5;
+          Vds = (root >= 0 && root <= vov2) ? root : root2;
+          qVce = Math.max(0, Math.min(Vds, Vcc)); qIc = (Vcc - qVce) / Rc; region = 'TRIODE (linear)';
+        } else {
+          qVce = Math.max(0, Math.min(Vds, Vcc)); qIc = (Vcc - qVce) / Rc; region = 'SATURATION (active)';
+        }
+      }
+      readout = 'MOSFET square law: saturation Id = 0.5 k (Vgs-Vth)^2 (1+lambda*Vds), triode Id = k[(Vgs-Vth)Vds - Vds^2/2]. Operating Vgs = ' + VgsOp.toFixed(2) + ' V. Load line Id = (Vdd - Vds)/Rd. Q-point at (' + qVce.toFixed(2) + ' V, ' + (qIc * 1e3).toFixed(2) + ' mA), region: ' + region + '.';
+    }
+
+    Imax = Imax || 1e-3;
+    function px(v) { return L + (v / Vmax) * W; }
+    function py(ic) { return B - (ic / Imax) * H; }
+    // axis grid
+    var gi;
+    for (gi = 0; gi <= 5; gi++) {
+      var gx = L + W * gi / 5;
+      s.appendChild(svgEl('line', { x1: gx, y1: T, x2: gx, y2: B, stroke: '#161821', 'stroke-width': 1 }));
+      s.appendChild(txt((Vmax * gi / 5).toFixed(1), gx, B + 15, '#6b7280', 9, 'middle'));
+    }
+    for (gi = 0; gi <= 5; gi++) {
+      var gy = T + H * gi / 5;
+      s.appendChild(svgEl('line', { x1: L, y1: gy, x2: Rr, y2: gy, stroke: '#161821', 'stroke-width': 1 }));
+      s.appendChild(txt((Imax * (5 - gi) / 5 * 1e3).toFixed(1), L - 6, gy + 3, '#6b7280', 9, 'end'));
+    }
+    // region shading (BJT): saturation knee near Vce small; cutoff at bottom
+    if (type === 'bjt') {
+      s.appendChild(svgEl('rect', { x: L, y: T, width: px(0.2) - L, height: H, fill: '#fbbf24', opacity: 0.06 }));
+      s.appendChild(txt('SAT', L + 4, T + 28, '#fbbf24', 9));
+      s.appendChild(txt('ACTIVE', (L + Rr) / 2, T + 28, '#86efac', 10, 'middle'));
+    }
+
+    // family of curves
+    var cols = ['#67e8f9', '#a78bfa', '#fbbf24', '#86efac', '#f472b6'];
+    var npts = 120;
+    for (var c = 0; c < stepVals.length; c++) {
+      var dpath = '';
+      for (var k = 0; k <= npts; k++) {
+        var v = (k / npts) * Vmax;
+        var ic = modelFn(v, stepVals[c]);
+        if (ic < 0) { ic = 0; }
+        dpath += (k === 0 ? 'M' : 'L') + px(v).toFixed(1) + ' ' + py(ic).toFixed(1) + ' ';
+      }
+      var col = cols[c % cols.length];
+      s.appendChild(svgEl('path', { d: dpath, fill: 'none', stroke: col, 'stroke-width': 1.8 }));
+      var lblTxt = (type === 'bjt') ? ('Ib=' + (stepVals[c] * 1e6).toFixed(0) + 'uA') : ('Vgs=' + stepVals[c].toFixed(1) + 'V');
+      var endY = py(modelFn(Vmax, stepVals[c]));
+      s.appendChild(txt(lblTxt, Rr + 4, endY + 3, col, 9, 'start'));
+    }
+
+    // DC load line: Ic = (Vcc - Vce)/Rc  -> from (Vcc,0) to (0, Vcc/Rc)
+    var iAxis = Vcc / Rc;
+    s.appendChild(svgEl('line', { x1: px(Vcc), y1: py(0), x2: px(0), y2: py(iAxis), stroke: '#f87171', 'stroke-width': 2, 'stroke-dasharray': '6 4' }));
+    s.appendChild(txt('Load line', px(Vcc * 0.5) + 6, py(iAxis * 0.5) - 6, '#f87171', 10));
+
+    // Q-point marker
+    var qx = px(qVce), qy = py(qIc);
+    s.appendChild(svgEl('circle', { cx: qx, cy: qy, r: 6, fill: '#fff', stroke: '#f87171', 'stroke-width': 2 }));
+    s.appendChild(svgEl('line', { x1: qx, y1: qy, x2: qx, y2: B, stroke: '#fff', 'stroke-width': 0.8, 'stroke-dasharray': '2 3', opacity: 0.5 }));
+    s.appendChild(svgEl('line', { x1: L, y1: qy, x2: qx, y2: qy, stroke: '#fff', 'stroke-width': 0.8, 'stroke-dasharray': '2 3', opacity: 0.5 }));
+    s.appendChild(txt('Q (' + qVce.toFixed(2) + 'V, ' + (qIc * 1e3).toFixed(2) + 'mA)', qx + 8, qy - 6, '#fff', 10));
+
+    s.appendChild(txt((type === 'bjt' ? 'Vce (V) ->' : 'Vds (V) ->'), Rr - 4, B + 30, '#9aa6b6', 10, 'end'));
+    s.appendChild(txt((type === 'bjt' ? 'Ic (mA)' : 'Id (mA)'), L - 30, T + 4, '#9aa6b6', 10));
+
+    $('dvReadout').textContent = readout;
+    $('stageCap').textContent = 'Output characteristic family from the ' + device + ' large-signal model, overlaid with the DC load line; the marked Q-point is the simultaneous solution of device curve and load line.';
+
+    $('bigReadout').innerHTML = '<div class="eee-bigval">' + region.split(' ')[0] + '<span> Q-point region</span></div>';
+    var h = '<tr><th>Quantity</th><th style="text-align:right">Value</th></tr>';
+    h += '<tr><td class="nm">Vcc / Vdd</td><td class="vc">' + Vcc.toFixed(1) + ' V</td></tr>';
+    h += '<tr><td class="nm">Rc / Rd</td><td class="vc">' + Rc.toFixed(0) + ' ohm</td></tr>';
+    h += '<tr><td class="nm">Q: Vce/Vds</td><td class="vp">' + qVce.toFixed(3) + ' V</td></tr>';
+    h += '<tr><td class="nm">Q: Ic/Id</td><td class="vp">' + (qIc * 1e3).toFixed(3) + ' mA</td></tr>';
+    h += '<tr><td class="nm">Saturation I (Vce=0)</td><td class="va">' + (iAxis * 1e3).toFixed(2) + ' mA</td></tr>';
+    h += '<tr><td class="nm">Region</td><td class="va" style="font-size:9.5px">' + region + '</td></tr>';
+    $('resTable').innerHTML = h;
+  }
+
+  // ==================================================================
   // PART 5 — EXPERIMENT DEFINITIONS (content + sim wiring)
   // ==================================================================
   var EXPS = [
@@ -1603,6 +2362,87 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
         { q: 'For an op-amp integrator, the output is proportional to the input’s:', opts: ['Derivative', 'Time integral', 'Square', 'Reciprocal'], correct: 1, expl: 'Vout = -(1/RC) integral Vin dt — the time integral of the input.' }
       ],
       controls: controls_op, wire: wire_op
+    },
+    {
+      title: 'Transfer functions, pole-zero & step response',
+      sub: 'Enter N(s)/D(s); map poles/zeros, integrate the step response, report stability and metrics',
+      aim: '<p>To analyse a linear time-invariant system given by its transfer function G(s) = N(s)/D(s): to locate the poles and zeros in the complex s-plane, compute the unit-step response, and extract the stability, natural frequency, damping ratio, percent overshoot and settling time.</p>',
+      theory: '<p>A transfer function is the Laplace-domain ratio of output to input, G(s) = N(s)/D(s). The roots of D(s) are the <b>poles</b> and the roots of N(s) are the <b>zeros</b>. A system is asymptotically stable if and only if every pole lies strictly in the open left half-plane (negative real part). A pole on the imaginary axis is marginally stable; any pole in the right half-plane makes the system unstable. For a dominant complex-conjugate pair s = -zeta*wn +/- j*wn*sqrt(1-zeta^2), the natural frequency wn is the pole magnitude and the damping ratio zeta is the cosine of the angle from the negative real axis. These set the percent overshoot and the 2% settling time. Here the poles/zeros are found numerically by the Durand-Kerner method, and the step response is integrated by converting D(s) to controllable-canonical state space and stepping with fourth-order Runge-Kutta.</p>',
+      eqs: 'Transfer function:  <span class="k">G(s) = N(s) / D(s)</span>\nPoles: roots of D(s)   Zeros: roots of N(s)\nStability:  all poles have Re(s) less than 0  (left half-plane)\nStandard 2nd order:  G = wn^2 / (s^2 + 2 zeta wn s + wn^2)\nNatural freq:  wn = |pole|,  Damping:  zeta = -Re(pole)/wn\nPercent overshoot:  %OS = 100 exp(-pi zeta / sqrt(1 - zeta^2))\nSettling time (2%):  ts ≈ 4 / (zeta wn)\nDC gain:  G(0) = N(0)/D(0)',
+      proc: [
+        'Enter the numerator coefficients of N(s), highest power first (e.g. 25).',
+        'Enter the denominator coefficients of D(s), highest power first (e.g. 1 4 25 for s^2 + 4s + 25).',
+        'Press Compute to find the poles and zeros and integrate the step response.',
+        'Read the pole-zero map: crosses are poles, circles are zeros; the right half-plane is shaded.',
+        'Check the stability verdict and the natural frequency, damping ratio, %OS and settling time.',
+        'Switch the view to compare the pole locations against the shape of the step response.'
+      ],
+      refs: [
+        '<b>Nise, N. S.</b> Control Systems Engineering, 8th ed. Wiley, Ch. 4 (time response) & Ch. 6 (stability).',
+        '<b>Ogata, K.</b> Modern Control Engineering, 5th ed. Pearson, Ch. 5 (transient & steady-state response).',
+        '<b>Franklin, Powell & Emami-Naeini.</b> Feedback Control of Dynamic Systems, 7th ed. Pearson, Ch. 3.'
+      ],
+      quiz: [
+        { q: 'A continuous-time LTI system is asymptotically stable if and only if all of its poles lie:', opts: ['On the imaginary axis', 'In the right half-plane', 'Strictly in the left half-plane', 'At the origin'], correct: 2, expl: 'Stability requires every pole to have a strictly negative real part (open left half-plane).' },
+        { q: 'For G(s) = 25/(s^2 + 4s + 25), the damping ratio zeta is:', opts: ['0.2', '0.4', '0.8', '1.0'], correct: 1, expl: 'wn = sqrt(25) = 5, and 2 zeta wn = 4 -> zeta = 4/(2*5) = 0.4.' },
+        { q: 'Increasing the damping ratio zeta (kept below 1) makes the percent overshoot:', opts: ['Increase', 'Decrease', 'Stay constant', 'Become negative'], correct: 1, expl: '%OS = 100 exp(-pi zeta/sqrt(1-zeta^2)) decreases monotonically as zeta rises.' },
+        { q: 'The zeros of a transfer function are the roots of:', opts: ['The denominator D(s)', 'The numerator N(s)', 'N(s)+D(s)', 'The characteristic equation'], correct: 1, expl: 'Zeros are values of s that make N(s) = 0; poles make D(s) = 0.' }
+      ],
+      controls: controls_tf, wire: wire_tf
+    },
+    {
+      title: 'Root locus & closed-loop control',
+      sub: 'Sweep gain K over 1+K*C*G=0; pick K, add PID or lead, watch the poles move',
+      aim: '<p>To construct the root locus of a feedback system — the path of the closed-loop poles as the loop gain K varies — by directly root-finding the characteristic equation 1 + K*C(s)*G(s) = 0, and to study how a chosen gain, a PID controller or a lead compensator reshapes the closed-loop poles, the step response and the stability.</p>',
+      theory: '<p>For a unity-feedback loop with open-loop transfer L(s) = K*C(s)*G(s), the closed-loop poles are the roots of the characteristic equation 1 + L(s) = 0, i.e. D_open(s) + N_open(s) = 0. As K sweeps from 0 to infinity the roots trace continuous branches — the root locus. Branches begin at the open-loop poles (K = 0) and end at the open-loop zeros or at infinity. The locus crossing into the right half-plane marks the gain at which the loop becomes unstable. A PID controller C(s) = (Kd s^2 + Kp s + Ki)/s adds an integrator (eliminating steady-state error) and a zero pair; a lead compensator C(s) = K(s+z)/(s+p) with the zero z closer to the origin than the pole p pulls the locus leftward to improve damping. Here every closed-loop pole at every gain is obtained by Durand-Kerner root-finding of the actual characteristic polynomial — nothing is approximated by asymptote rules.</p>',
+      eqs: 'Open loop:  <span class="k">L(s) = K C(s) G(s)</span>\nCharacteristic eqn:  1 + L(s) = 0  ->  D_open(s) + N_open(s) = 0\nClosed loop:  T(s) = L / (1 + L) = N_open / (D_open + N_open)\nPID controller:  C(s) = (Kd s^2 + Kp s + Ki) / s\nLead controller:  C(s) = K (s + z) / (s + p),  z less than p\nStability bound: gain K where a locus branch crosses the jw-axis',
+      proc: [
+        'Enter the plant numerator and denominator coefficients (highest power first).',
+        'Select the controller: proportional, PID, or lead.',
+        'Watch the root-locus branches drawn as the gain is swept from 0 to its maximum.',
+        'Move the gain K slider; the filled squares mark the closed-loop poles at that K.',
+        'Read the closed-loop step response, damping, overshoot and settling time at the chosen K.',
+        'For PID or lead, adjust the controller parameters and observe the poles migrate and the response/stability change.'
+      ],
+      refs: [
+        '<b>Nise, N. S.</b> Control Systems Engineering, 8th ed. Wiley, Ch. 8 (root locus) & Ch. 9 (design via root locus).',
+        '<b>Ogata, K.</b> Modern Control Engineering, 5th ed. Pearson, Ch. 6 (root-locus analysis & design).',
+        '<b>Dorf & Bishop.</b> Modern Control Systems, 13th ed. Pearson, Ch. 7.'
+      ],
+      quiz: [
+        { q: 'The branches of a root locus start (at K = 0) at the:', opts: ['Open-loop zeros', 'Open-loop poles', 'Closed-loop zeros', 'Origin'], correct: 1, expl: 'At K = 0 the closed-loop poles coincide with the open-loop poles; they end at the open-loop zeros or infinity.' },
+        { q: 'A system goes unstable when a root-locus branch crosses into the:', opts: ['Left half-plane', 'Origin', 'Right half-plane', 'Imaginary axis from the left'], correct: 2, expl: 'Crossing the jw-axis into the right half-plane gives a pole with positive real part — instability.' },
+        { q: 'The main benefit of the integral term in a PID controller is to:', opts: ['Add damping', 'Eliminate steady-state error', 'Increase bandwidth only', 'Reduce the order'], correct: 1, expl: 'Integral action drives the steady-state error to zero by adding a pole at the origin (a type increase).' },
+        { q: 'A lead compensator (s+z)/(s+p) typically has:', opts: ['z greater than p', 'z = p', 'z less than p', 'p = 0'], correct: 2, expl: 'In a lead network the zero is closer to the origin than the pole (z less than p), adding phase lead and improving damping.' }
+      ],
+      controls: controls_rl, wire: wire_rl
+    },
+    {
+      title: 'BJT / MOSFET characteristics & biasing',
+      sub: 'Output curve family, DC load line, Q-point and operating-region shading',
+      aim: '<p>To plot the output characteristic family of a bipolar transistor (Ic versus Vce for stepped base current Ib) or an n-channel MOSFET (Id versus Vds for stepped gate voltage Vgs) from its large-signal model, overlay the DC load line of a bias circuit, and determine the quiescent operating point (Q-point) and its region.</p>',
+      theory: '<p>In the BJT forward-active region the collector current follows Ic = beta*Ib*(1 + Vce/VA), where beta is the current gain and VA is the Early voltage producing the slight upward slope; for Vce below about 0.2 V the device saturates and Ic collapses, while Ib = 0 gives cutoff. For the n-MOSFET the square-law model gives Id = 0.5*k*(Vgs - Vth)^2*(1 + lambda*Vds) in saturation and Id = k[(Vgs - Vth)Vds - Vds^2/2] in triode, with cutoff for Vgs below the threshold Vth. The bias network sets a DC load line Vce = Vcc - Ic*Rc (or Vds = Vdd - Id*Rd): a straight line from (Vcc, 0) to (0, Vcc/Rc). The intersection of the device curve for the operating input with the load line is the Q-point, which must sit in the active/saturation region for linear amplification.</p>',
+      eqs: 'BJT active:  <span class="k">Ic = beta Ib (1 + Vce/VA)</span>\nBJT base bias:  Ib = (Vcc - 0.7) / Rb\nMOSFET sat:  Id = 0.5 k (Vgs - Vth)^2 (1 + lambda Vds)\nMOSFET triode:  Id = k[(Vgs - Vth) Vds - Vds^2 / 2]\nLoad line:  Vce = Vcc - Ic Rc   (Id, Vds, Rd for MOSFET)\nQ-point: device curve intersect load line',
+      proc: [
+        'Choose the BJT or the n-MOSFET device.',
+        'Set the model parameters (beta and Early voltage, or k, Vth and lambda).',
+        'Set the supply Vcc/Vdd and the collector/drain resistor Rc/Rd to fix the load line.',
+        'Set the base resistor Rb (BJT) or the gate bias Vgs (MOSFET) to choose the operating input.',
+        'Read the Q-point marked where the operating device curve meets the load line.',
+        'Confirm the reported region (cutoff, active/saturation, or saturation/triode) matches its position.'
+      ],
+      refs: [
+        '<b>Sedra & Smith.</b> Microelectronic Circuits, 7th ed. Oxford, Ch. 6 (BJT) & Ch. 5 (MOSFET) — characteristics and biasing.',
+        '<b>Razavi, B.</b> Fundamentals of Microelectronics, 2nd ed. Wiley, Ch. 4–6.',
+        '<b>Boylestad & Nashelsky.</b> Electronic Devices and Circuit Theory, 11th ed. Pearson, Ch. 4 (DC biasing) & load-line analysis.'
+      ],
+      quiz: [
+        { q: 'In the BJT forward-active region, the collector current is approximately:', opts: ['Ic = Vce/Rc', 'Ic = beta * Ib', 'Ic = Vbe/Rb', 'Ic = 0'], correct: 1, expl: 'In forward-active, Ic = beta*Ib (with a mild Early-effect slope from the 1 + Vce/VA term).' },
+        { q: 'A DC load line for a common-emitter stage runs between the points:', opts: ['(0,0) and (Vcc, Vcc/Rc)', '(Vcc, 0) and (0, Vcc/Rc)', '(0, Vcc) and (Vcc, 0) only', '(Vcc, Vcc) and (0,0)'], correct: 1, expl: 'Vce = Vcc - Ic*Rc gives x-intercept (Vcc, 0) and y-intercept (0, Vcc/Rc).' },
+        { q: 'An n-MOSFET operates in saturation (active) when:', opts: ['Vgs less than Vth', 'Vds less than Vgs - Vth', 'Vds greater than or equal to Vgs - Vth and Vgs greater than Vth', 'Vds = 0'], correct: 2, expl: 'Saturation needs Vgs above Vth and Vds at least the overdrive Vgs - Vth; below that it is in triode.' },
+        { q: 'For undistorted linear amplification, the Q-point of a BJT amplifier should lie in the:', opts: ['Cutoff region', 'Saturation region', 'Active region', 'Breakdown region'], correct: 2, expl: 'Linear small-signal gain requires the device biased in the forward-active region.' }
+      ],
+      controls: controls_dev, wire: wire_dev
     }
   ];
 
