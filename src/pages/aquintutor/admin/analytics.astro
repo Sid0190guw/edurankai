@@ -1,0 +1,192 @@
+---
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=/aquintutor/admin/analytics');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+const isAdmin = user.role === 'admin' || user.role === 'super_admin';
+if (!isAdmin) return Astro.redirect('/aquintutor');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+async function safeRows(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
+async function one(q: any): Promise<any> { const r = await safeRows(q); return r[0] || {}; }
+
+// Funnel
+const totalLearners = (await one(sql`SELECT COUNT(DISTINCT user_id)::int AS n FROM training_enrollments`)).n || 0;
+const totalEnroll = (await one(sql`SELECT COUNT(*)::int AS n FROM training_enrollments`)).n || 0;
+const started = (await one(sql`SELECT COUNT(*)::int AS n FROM training_enrollments WHERE COALESCE(progress_pct,0) > 0`)).n || 0;
+const half = (await one(sql`SELECT COUNT(*)::int AS n FROM training_enrollments WHERE COALESCE(progress_pct,0) >= 50`)).n || 0;
+const done = (await one(sql`SELECT COUNT(*)::int AS n FROM training_enrollments WHERE COALESCE(progress_pct,0) >= 100`)).n || 0;
+const certified = ((await one(sql`SELECT COUNT(*)::int AS n FROM course_certificates`)).n || 0);
+const activeWeek = (await one(sql`SELECT COUNT(DISTINCT user_id)::int AS n FROM training_enrollments WHERE last_accessed_at > NOW() - INTERVAL '7 days'`)).n || 0;
+const avgProgress = Math.round((await one(sql`SELECT AVG(COALESCE(progress_pct,0))::numeric AS a FROM training_enrollments`)).a || 0);
+const completionRate = totalEnroll ? Math.round((done / totalEnroll) * 100) : 0;
+
+// Course performance
+const coursePerf = await safeRows(sql`
+  SELECT c.title, c.slug, c.is_published,
+    COUNT(e.*)::int AS enrolled,
+    ROUND(AVG(COALESCE(e.progress_pct,0)))::int AS avg_progress,
+    SUM(CASE WHEN COALESCE(e.progress_pct,0) >= 100 THEN 1 ELSE 0 END)::int AS completed
+  FROM training_courses c LEFT JOIN training_enrollments e ON e.course_id = c.id
+  GROUP BY c.id, c.title, c.slug, c.is_published
+  ORDER BY enrolled DESC NULLS LAST LIMIT 20`);
+
+// Health distribution buckets (by progress + recency)
+const buckets = await safeRows(sql`
+  SELECT
+    SUM(CASE WHEN COALESCE(progress_pct,0) >= 70 THEN 1 ELSE 0 END)::int AS thriving,
+    SUM(CASE WHEN COALESCE(progress_pct,0) >= 30 AND COALESCE(progress_pct,0) < 70 THEN 1 ELSE 0 END)::int AS ontrack,
+    SUM(CASE WHEN COALESCE(progress_pct,0) < 30 THEN 1 ELSE 0 END)::int AS atrisk
+  FROM training_enrollments`);
+const dist = buckets[0] || { thriving: 0, ontrack: 0, atrisk: 0 };
+const distTotal = (dist.thriving || 0) + (dist.ontrack || 0) + (dist.atrisk || 0) || 1;
+
+// At-risk learners (low progress + stale or never accessed)
+const atRisk = await safeRows(sql`
+  SELECT u.name, u.email, c.title AS course, COALESCE(e.progress_pct,0) AS progress, e.last_accessed_at, e.enrolled_at
+  FROM training_enrollments e LEFT JOIN users u ON u.id = e.user_id LEFT JOIN training_courses c ON c.id = e.course_id
+  WHERE COALESCE(e.progress_pct,0) < 30 AND (e.last_accessed_at IS NULL OR e.last_accessed_at < NOW() - INTERVAL '10 days')
+  ORDER BY e.enrolled_at DESC LIMIT 20`);
+
+function pct(n: number) { return Math.round((n / Math.max(1, totalEnroll)) * 100); }
+function fmt(d: any) { try { return d ? new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) : 'never'; } catch { return '—'; } }
+const funnel = [
+  { label: 'Enrolled', n: totalEnroll, color: '#3b5675' },
+  { label: 'Started', n: started, color: '#5b4a92' },
+  { label: 'Halfway', n: half, color: '#946322' },
+  { label: 'Completed', n: done, color: '#1A6B35' },
+  { label: 'Certified', n: certified, color: '#a0421e' },
+];
+const maxF = Math.max.apply(null, funnel.map((f) => f.n)) || 1;
+---
+<AquintutorLayout title="Cohort analytics" description="Enrollment funnel, course completion, learner-health distribution, and at-risk learners." noindex={true}>
+<style>
+  .an { max-width: 1280px; margin: 0 auto; padding: 0 28px; }
+  .an-crumb { border-bottom: 1px solid var(--rule); background: var(--sand-100); margin: 0 -28px; }
+  .an-crumb-in { max-width: 1280px; margin: 0 auto; padding: 10px 28px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.08em; color: var(--ink-500); }
+  .an-crumb-in a { color: var(--ink-500); text-decoration: none; } .an-crumb-in .cur { color: var(--rust); font-weight: 600; }
+  .an-hero { padding: 40px 0 18px; }
+  .an-eye { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--rust); font-weight: 700; margin: 0; }
+  .an-h1 { font-family: 'Fraunces', serif; font-size: clamp(2rem, 4vw, 2.8rem); font-weight: 500; letter-spacing: -0.02em; margin: 8px 0 0; }
+  .an-h1 em { font-style: italic; color: var(--rust); }
+  .an-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 14px 0 22px; }
+  .an-kpi { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; padding: 16px 18px; }
+  .an-kpi-v { font-family: 'Fraunces', serif; font-size: 30px; font-weight: 600; line-height: 1; }
+  .an-kpi-l { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-500); margin-top: 6px; font-weight: 700; }
+  .an-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; } @media (max-width: 860px) { .an-grid { grid-template-columns: 1fr; } }
+  .an-card { background: var(--paper); border: 1px solid var(--rule); border-radius: 16px; padding: 22px; margin-bottom: 16px; }
+  .an-card h2 { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-500); font-weight: 700; margin: 0 0 16px; }
+  /* funnel */
+  .an-fn { display: flex; flex-direction: column; gap: 8px; }
+  .an-fn-row { display: grid; grid-template-columns: 90px 1fr 64px; gap: 10px; align-items: center; }
+  .an-fn-row label { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink); font-weight: 700; }
+  .an-fn-bar { height: 30px; border-radius: 7px; display: flex; align-items: center; padding-left: 10px; color: #fff; font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700; min-width: 30px; }
+  .an-fn-row span { font-family: 'JetBrains Mono', monospace; font-size: 11px; text-align: right; color: var(--ink-500); }
+  /* health donut */
+  .an-donut { display: flex; align-items: center; gap: 18px; }
+  .an-legend div { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; }
+  .an-legend .sw { width: 12px; height: 12px; border-radius: 3px; }
+  table.an-tbl { width: 100%; border-collapse: collapse; }
+  .an-tbl th { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-500); text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--rule); font-weight: 700; background: var(--sand-100); }
+  .an-tbl td { padding: 10px 14px; border-bottom: 1px solid var(--rule); font-size: 13px; } .an-tbl tr:last-child td { border-bottom: none; }
+  .an-mini { background: var(--sand-100); height: 7px; border-radius: 100px; overflow: hidden; width: 100px; display: inline-block; vertical-align: middle; }
+  .an-mini i { display: block; height: 100%; background: #1A6B35; }
+  .an-pill { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: 100px; font-weight: 700; }
+  .an-pill.red { background: rgba(160,66,30,0.12); color: var(--rust); } .an-pill.amber { background: rgba(176,124,0,0.14); color: #946322; }
+  .an-empty { padding: 24px; text-align: center; color: var(--ink-500); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+</style>
+
+<div class="an-crumb"><div class="an-crumb-in"><a href="/aquintutor">AQUINTUTOR</a> <span style="margin:0 8px;">/</span> <a href="/aquintutor/admin">COMMAND CENTER</a> <span style="margin:0 8px;">/</span> <span class="cur">COHORT ANALYTICS</span></div></div>
+
+<main class="an">
+  <div class="an-hero">
+    <p class="an-eye">AquinTutor · Cohort analytics</p>
+    <h1 class="an-h1">Who's <em>thriving</em>, who needs a nudge.</h1>
+  </div>
+
+  <div class="an-kpis">
+    <div class="an-kpi"><div class="an-kpi-v">{totalLearners}</div><div class="an-kpi-l">Learners</div></div>
+    <div class="an-kpi"><div class="an-kpi-v">{activeWeek}</div><div class="an-kpi-l">Active this week</div></div>
+    <div class="an-kpi"><div class="an-kpi-v">{totalEnroll}</div><div class="an-kpi-l">Enrolments</div></div>
+    <div class="an-kpi"><div class="an-kpi-v">{avgProgress}%</div><div class="an-kpi-l">Avg progress</div></div>
+    <div class="an-kpi"><div class="an-kpi-v">{completionRate}%</div><div class="an-kpi-l">Completion rate</div></div>
+    <div class="an-kpi"><div class="an-kpi-v">{certified}</div><div class="an-kpi-l">Certificates</div></div>
+  </div>
+
+  <div class="an-grid">
+    <div class="an-card">
+      <h2>Engagement funnel</h2>
+      <div class="an-fn">
+        {funnel.map((f) => (
+          <div class="an-fn-row">
+            <label>{f.label}</label>
+            <div class="an-fn-bar" style={'width:' + Math.max(8, (f.n / maxF) * 100) + '%;background:' + f.color + ';'}>{f.n}</div>
+            <span>{pct(f.n)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+
+    <div class="an-card">
+      <h2>Learner health distribution</h2>
+      <div class="an-donut">
+        <svg width="150" height="150" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#EBE6DA" stroke-width="4"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#1A6B35" stroke-width="4" stroke-dasharray={`${(dist.thriving/distTotal)*100} 100`} transform="rotate(-90 18 18)"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#946322" stroke-width="4" stroke-dasharray={`${(dist.ontrack/distTotal)*100} 100`} stroke-dashoffset={`-${(dist.thriving/distTotal)*100}`} transform="rotate(-90 18 18)"/>
+          <circle cx="18" cy="18" r="15.9" fill="none" stroke="#a0421e" stroke-width="4" stroke-dasharray={`${(dist.atrisk/distTotal)*100} 100`} stroke-dashoffset={`-${((dist.thriving+dist.ontrack)/distTotal)*100}`} transform="rotate(-90 18 18)"/>
+        </svg>
+        <div class="an-legend">
+          <div><span class="sw" style="background:#1A6B35;"></span> Thriving · {dist.thriving || 0} ({Math.round((dist.thriving/distTotal)*100)}%)</div>
+          <div><span class="sw" style="background:#946322;"></span> On track · {dist.ontrack || 0} ({Math.round((dist.ontrack/distTotal)*100)}%)</div>
+          <div><span class="sw" style="background:#a0421e;"></span> At risk · {dist.atrisk || 0} ({Math.round((dist.atrisk/distTotal)*100)}%)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h2 style="font-family:'Fraunces',serif;font-size:1.4rem;font-weight:500;margin:26px 0 12px;">Course <em style="font-style:italic;color:var(--rust);">performance</em></h2>
+  <div class="an-card" style="padding:0;">
+    {coursePerf.length === 0 ? <div class="an-empty">No course data yet.</div> : (
+      <table class="an-tbl">
+        <thead><tr><th>Course</th><th>Enrolled</th><th>Avg progress</th><th>Completed</th><th>Completion</th><th>Status</th></tr></thead>
+        <tbody>
+          {coursePerf.map((c) => (
+            <tr>
+              <td><a href={'/aquintutor/courses/' + c.slug} class="cc-link" style="color:var(--rust);text-decoration:none;">{c.title}</a></td>
+              <td>{c.enrolled || 0}</td>
+              <td><span class="an-mini"><i style={'width:' + (c.avg_progress || 0) + '%'}></i></span> {c.avg_progress || 0}%</td>
+              <td>{c.completed || 0}</td>
+              <td>{c.enrolled ? Math.round(((c.completed || 0) / c.enrolled) * 100) : 0}%</td>
+              <td>{c.is_published ? <span class="an-pill" style="background:rgba(26,107,53,0.1);color:#1A6B35;">Live</span> : <span class="an-pill amber">Draft</span>}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )}
+  </div>
+
+  <h2 style="font-family:'Fraunces',serif;font-size:1.4rem;font-weight:500;margin:26px 0 12px;">At-risk <em style="font-style:italic;color:var(--rust);">learners</em> <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-500);font-weight:600;">low progress · stale 10+ days</span></h2>
+  <div class="an-card" style="padding:0;">
+    {atRisk.length === 0 ? <div class="an-empty">No at-risk learners — everyone is moving. </div> : (
+      <table class="an-tbl">
+        <thead><tr><th>Learner</th><th>Course</th><th>Progress</th><th>Last seen</th></tr></thead>
+        <tbody>
+          {atRisk.map((a) => (
+            <tr>
+              <td>{a.name || 'Learner'}<br/><span style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--ink-500);">{a.email}</span></td>
+              <td>{a.course || '—'}</td>
+              <td><span class="an-pill red">{a.progress || 0}%</span></td>
+              <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-500);">{fmt(a.last_accessed_at)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )}
+  </div>
+  <div style="height:50px;"></div>
+</main>
+</AquintutorLayout>
