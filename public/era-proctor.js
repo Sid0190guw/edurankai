@@ -22,6 +22,20 @@
   var cfg = null;
   var stopped = false;
 
+  // Demo / presentation kill-switch: silence all camera proctoring (no webcam
+  // preview, no detection) during a live demo. Toggle via URL (?proctor=off /
+  // ?proctor=on, which sticks for the session) or localStorage 'era_proctor_off'.
+  function proctorOff() {
+    try {
+      var s = (location.search || '');
+      if (s.indexOf('proctor=off') >= 0) { try { localStorage.setItem('era_proctor_off', '1'); } catch (e) {} }
+      if (s.indexOf('proctor=on') >= 0) { try { localStorage.removeItem('era_proctor_off'); } catch (e) {} }
+      if (window.ERA_PROCTOR_OFF) return true;
+      if (localStorage.getItem('era_proctor_off') === '1') return true;
+    } catch (e) {}
+    return false;
+  }
+
   function logEvent(type, severity, detail) {
     if (stopped) return;
     queue.push({ type: type, severity: severity || 'info', detail: detail || {}, clientTs: new Date().toISOString() });
@@ -147,6 +161,13 @@
       console.warn('eraProctor.start: postUrl and id are required');
       return;
     }
+    if (proctorOff()) {
+      // Demo mode — attach nothing, take no camera. The session simply records
+      // that proctoring was paused so the log is honest about it.
+      logEvent('proctoring_paused_demo', 'info', {});
+      flush();
+      return;
+    }
     logEvent('session_listeners_attached', 'info', { ua: navigator.userAgent.slice(0, 200) });
 
     // Tab + window listeners
@@ -180,8 +201,12 @@
             var pill = document.createElement('div');
             pill.id = 'eraProctorPill';
             pill.style.cssText = 'position:fixed;bottom:18px;right:18px;background:rgba(0,0,0,0.85);border:1px solid rgba(255,255,255,0.15);border-radius:12px;padding:6px 8px;z-index:55;display:flex;align-items:center;gap:8px;font-family:system-ui,sans-serif;';
-            pill.innerHTML = '<video id="eraProctorVideo" autoplay muted playsinline style="width:52px;height:52px;border-radius:8px;object-fit:cover;transform:scaleX(-1);background:#000;"></video><div style="color:#fff;font-size:10px;line-height:1.3;"><p style="margin:0;font-weight:700;color:#10b981;">&#9679; LIVE</p><p style="margin:1px 0 0;color:rgba(255,255,255,0.6);font-size:9px;">monitored — no recording</p></div>';
+            pill.innerHTML = '<video id="eraProctorVideo" autoplay muted playsinline style="width:52px;height:52px;border-radius:8px;object-fit:cover;transform:scaleX(-1);background:#000;"></video>'
+              + '<div style="color:#fff;font-size:10px;line-height:1.3;"><p style="margin:0;font-weight:700;color:#10b981;">&#9679; LIVE</p><p style="margin:1px 0 0;color:rgba(255,255,255,0.6);font-size:9px;">monitored — no recording</p></div>'
+              + '<button id="eraProctorHide" title="Hide preview (monitoring continues)" style="background:transparent;border:none;color:rgba(255,255,255,0.55);font-size:15px;line-height:1;cursor:pointer;padding:0 2px;">&times;</button>';
             document.body.appendChild(pill);
+            var hideBtn = document.getElementById('eraProctorHide');
+            if (hideBtn) hideBtn.addEventListener('click', function () { pill.style.display = 'none'; });
             videoEl = document.getElementById('eraProctorVideo');
           }
           if (videoEl) videoEl.srcObject = stream;
