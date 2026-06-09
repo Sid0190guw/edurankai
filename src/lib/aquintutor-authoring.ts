@@ -350,6 +350,10 @@ export const BLOCK_KINDS = {
 
 // Catalogue the connectors can pick from (kept here so the editor + player agree).
 export const LAB_CATALOGUE = [
+  // hands-on benches + engineering workbenches (lead the list)
+  'logic-bench','eee-bench','cro-bench','optics-bench','titration-bench',
+  'vlsi','eee','cybersecurity','ai-ml','robotics','mechanical',
+  // foundational simulators
   'pendulum','projectile','optics','circuit','logic-gates','titration','periodic',
   'molecular','genetics','ecosystem','plot','linear-algebra','sorting','pathfinding',
   'neural-net','fourier','animator',
