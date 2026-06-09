@@ -13,6 +13,57 @@ function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 async function safeRows(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
 async function one(q: any): Promise<any> { const r = await safeRows(q); return r[0] || {}; }
 
+// ---- date range + drill-down params ----
+const aUrl = new URL(Astro.request.url);
+const RANGES: { [k: string]: number } = { '7': 7, '30': 30, '90': 90, '365': 365 };
+const rangeKey = RANGES[aUrl.searchParams.get('range') || '30'] ? (aUrl.searchParams.get('range') || '30') : '30';
+const days = RANGES[rangeKey];
+const drillSlug = (aUrl.searchParams.get('course') || '').trim();
+const nowMs = Date.now();
+const cutoff = new Date(nowMs - days * 86400000).toISOString();
+const prevCutoff = new Date(nowMs - 2 * days * 86400000).toISOString();
+function anQs(o: { [k: string]: string | null }) {
+  const p = new URLSearchParams();
+  const m: { [k: string]: string } = { range: rangeKey, course: drillSlug };
+  for (const k of Object.keys(m)) { const ov = o[k]; const v = ov === undefined ? m[k] : (ov === null ? '' : ov); if (v) p.set(k, v); }
+  const s = p.toString(); return '/aquintutor/admin/analytics' + (s ? '?' + s : '');
+}
+
+// ---- period deltas (this window vs the previous equal window) ----
+const enrNow = (await one(sql`SELECT COUNT(*)::int AS n FROM training_enrollments WHERE enrolled_at >= ${cutoff}::timestamptz`)).n || 0;
+const enrPrev = (await one(sql`SELECT COUNT(*)::int AS n FROM training_enrollments WHERE enrolled_at >= ${prevCutoff}::timestamptz AND enrolled_at < ${cutoff}::timestamptz`)).n || 0;
+const certNow = (await one(sql`SELECT COUNT(*)::int AS n FROM course_certificates WHERE issued_at >= ${cutoff}::timestamptz`)).n || 0;
+const certPrev = (await one(sql`SELECT COUNT(*)::int AS n FROM course_certificates WHERE issued_at >= ${prevCutoff}::timestamptz AND issued_at < ${cutoff}::timestamptz`)).n || 0;
+const actNow = (await one(sql`SELECT COUNT(DISTINCT user_id)::int AS n FROM training_enrollments WHERE last_accessed_at >= ${cutoff}::timestamptz`)).n || 0;
+const actPrev = (await one(sql`SELECT COUNT(DISTINCT user_id)::int AS n FROM training_enrollments WHERE last_accessed_at >= ${prevCutoff}::timestamptz AND last_accessed_at < ${cutoff}::timestamptz`)).n || 0;
+function delta(now: number, prev: number) { const d = now - prev; const pc = prev > 0 ? Math.round((d / prev) * 100) : (now > 0 ? 100 : 0); return { d, pc, up: d >= 0 }; }
+const dEnr = delta(enrNow, enrPrev), dCert = delta(certNow, certPrev), dAct = delta(actNow, actPrev);
+
+// ---- time series (enrolments + certificates over the window) ----
+const enrSeries = await safeRows(sql`SELECT to_char(date_trunc('day', enrolled_at),'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM training_enrollments WHERE enrolled_at >= ${cutoff}::timestamptz GROUP BY 1`);
+const certSeries = await safeRows(sql`SELECT to_char(date_trunc('day', issued_at),'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM course_certificates WHERE issued_at >= ${cutoff}::timestamptz GROUP BY 1`);
+const enrByDay: { [k: string]: number } = {}; enrSeries.forEach((r: any) => { if (r.d) enrByDay[r.d] = r.n || 0; });
+const certByDay: { [k: string]: number } = {}; certSeries.forEach((r: any) => { if (r.d) certByDay[r.d] = r.n || 0; });
+// build buckets across the window (daily up to ~45 points, else weekly)
+const bucketDays = days <= 45 ? 1 : 7;
+const nBuckets = Math.ceil(days / bucketDays);
+const series: { label: string; enroll: number; cert: number }[] = [];
+const startMid = new Date(nowMs); startMid.setHours(0, 0, 0, 0);
+for (let b = nBuckets - 1; b >= 0; b--) {
+  let enroll = 0, cert = 0; let lbl = '';
+  for (let k = 0; k < bucketDays; k++) {
+    const dayOffset = b * bucketDays + (bucketDays - 1 - k);
+    const dt = new Date(startMid.getTime() - dayOffset * 86400000);
+    const key = dt.toISOString().slice(0, 10);
+    enroll += enrByDay[key] || 0; cert += certByDay[key] || 0;
+    if (k === 0) lbl = dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+  }
+  series.push({ label: lbl, enroll, cert });
+}
+const maxSeries = Math.max(1, ...series.map((s) => Math.max(s.enroll, s.cert)));
+const seriesEnrTotal = series.reduce((s, x) => s + x.enroll, 0);
+const seriesCertTotal = series.reduce((s, x) => s + x.cert, 0);
+
 // Funnel
 const totalLearners = (await one(sql`SELECT COUNT(DISTINCT user_id)::int AS n FROM training_enrollments`)).n || 0;
 const totalEnroll = (await one(sql`SELECT COUNT(*)::int AS n FROM training_enrollments`)).n || 0;
@@ -50,6 +101,29 @@ const atRisk = await safeRows(sql`
   FROM training_enrollments e LEFT JOIN users u ON u.id = e.user_id LEFT JOIN training_courses c ON c.id = e.course_id
   WHERE COALESCE(e.progress_pct,0) < 30 AND (e.last_accessed_at IS NULL OR e.last_accessed_at < NOW() - INTERVAL '10 days')
   ORDER BY e.enrolled_at DESC LIMIT 20`);
+
+// ---- course drill-down (when ?course=slug) ----
+let drill: any = null;
+if (drillSlug) {
+  const head = await one(sql`
+    SELECT c.id, c.title, c.slug, c.is_published,
+      COUNT(e.*)::int AS enrolled,
+      ROUND(AVG(COALESCE(e.progress_pct,0)))::int AS avg_progress,
+      SUM(CASE WHEN COALESCE(e.progress_pct,0) >= 100 THEN 1 ELSE 0 END)::int AS completed,
+      SUM(CASE WHEN COALESCE(e.progress_pct,0) > 0 AND COALESCE(e.progress_pct,0) < 100 THEN 1 ELSE 0 END)::int AS in_progress,
+      SUM(CASE WHEN COALESCE(e.progress_pct,0) = 0 THEN 1 ELSE 0 END)::int AS not_started
+    FROM training_courses c LEFT JOIN training_enrollments e ON e.course_id = c.id
+    WHERE c.slug = ${drillSlug} GROUP BY c.id, c.title, c.slug, c.is_published`);
+  if (head && head.id) {
+    const learners = await safeRows(sql`
+      SELECT u.name, u.email, COALESCE(e.progress_pct,0) AS progress, e.enrolled_at, e.last_accessed_at
+      FROM training_enrollments e LEFT JOIN users u ON u.id = e.user_id
+      WHERE e.course_id = ${head.id} ORDER BY e.last_accessed_at DESC NULLS LAST, e.enrolled_at DESC LIMIT 100`);
+    drill = { ...head, learners };
+  } else {
+    drill = { notFound: true, slug: drillSlug };
+  }
+}
 
 function pct(n: number) { return Math.round((n / Math.max(1, totalEnroll)) * 100); }
 function fmt(d: any) { try { return d ? new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) : 'never'; } catch { return '—'; } }
@@ -97,6 +171,33 @@ const maxF = Math.max.apply(null, funnel.map((f) => f.n)) || 1;
   .an-pill { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: 100px; font-weight: 700; }
   .an-pill.red { background: rgba(160,66,30,0.12); color: var(--rust); } .an-pill.amber { background: rgba(176,124,0,0.14); color: #946322; }
   .an-empty { padding: 24px; text-align: center; color: var(--ink-500); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  /* range filter + export toolbar */
+  .an-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 20px; }
+  .an-chip { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; padding: 7px 14px; border-radius: 999px; text-decoration: none; border: 1px solid var(--rule); color: var(--ink-500); background: var(--paper); }
+  .an-chip.on { background: var(--ink); color: var(--sand-50); border-color: var(--ink); }
+  .an-export { margin-left: auto; display: flex; gap: 8px; }
+  .an-export button { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--rule); background: var(--paper); color: var(--ink); cursor: pointer; }
+  .an-export button:hover { border-color: var(--rust); color: var(--rust); }
+  /* delta badge */
+  .an-delta { font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; margin-top: 7px; display: inline-flex; align-items: center; gap: 3px; }
+  .an-delta.up { color: #1A6B35; } .an-delta.down { color: var(--rust); }
+  /* time series */
+  .an-series { display: flex; align-items: flex-end; gap: 3px; height: 140px; margin-top: 6px; }
+  .an-series-col { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; min-width: 0; }
+  .an-series-e { background: linear-gradient(180deg, #5b7aa8, #3b5675); border-radius: 3px 3px 0 0; min-height: 2px; }
+  .an-series-c { background: linear-gradient(180deg, #d97757, #a0421e); border-radius: 3px 3px 0 0; min-height: 0; }
+  .an-series-x { display: flex; justify-content: space-between; margin-top: 6px; font-family: 'JetBrains Mono', monospace; font-size: 9px; color: var(--ink-500); }
+  .an-series-leg { display: flex; gap: 16px; margin-top: 10px; font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--ink-500); }
+  .an-series-leg span { display: inline-flex; align-items: center; gap: 6px; }
+  .an-series-leg i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+  .an-drill { background: var(--paper); border: 1px solid var(--rust); border-radius: 16px; padding: 22px; margin-bottom: 18px; }
+  .an-drill-close { float: right; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--rust); text-decoration: none; font-weight: 700; }
+  .an-drill-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin: 14px 0 18px; }
+  .an-drill-kpi { background: var(--sand-100); border-radius: 12px; padding: 12px 14px; }
+  .an-drill-kpi b { font-family: 'Fraunces', serif; font-size: 24px; font-weight: 600; display: block; line-height: 1; }
+  .an-drill-kpi small { font-family: 'JetBrains Mono', monospace; font-size: 8.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-500); font-weight: 700; }
+  .an-row-link { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--ink-500); text-decoration: none; font-weight: 700; }
+  .an-row-link:hover { color: var(--rust); }
 </style>
 
 <div class="an-crumb"><div class="an-crumb-in"><a href="/aquintutor">AQUINTUTOR</a> <span style="margin:0 8px;">/</span> <a href="/aquintutor/admin">COMMAND CENTER</a> <span style="margin:0 8px;">/</span> <span class="cur">COHORT ANALYTICS</span></div></div>
@@ -107,6 +208,55 @@ const maxF = Math.max.apply(null, funnel.map((f) => f.n)) || 1;
     <h1 class="an-h1">Who's <em>thriving</em>, who needs a nudge.</h1>
   </div>
 
+  <div class="an-toolbar">
+    <span style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.12em;text-transform:uppercase;color:var(--ink-500);font-weight:700;">Window</span>
+    <a href={anQs({ range: '7' })} class={'an-chip' + (rangeKey === '7' ? ' on' : '')}>7 days</a>
+    <a href={anQs({ range: '30' })} class={'an-chip' + (rangeKey === '30' ? ' on' : '')}>30 days</a>
+    <a href={anQs({ range: '90' })} class={'an-chip' + (rangeKey === '90' ? ' on' : '')}>90 days</a>
+    <a href={anQs({ range: '365' })} class={'an-chip' + (rangeKey === '365' ? ' on' : '')}>1 year</a>
+    <div class="an-export">
+      <button type="button" id="exportCourses">Export courses CSV</button>
+      <button type="button" id="exportRisk">Export at-risk CSV</button>
+    </div>
+  </div>
+
+  {drill && (
+    <div class="an-drill">
+      <a href={anQs({ course: null })} class="an-drill-close">Close drill-down &times;</a>
+      {drill.notFound ? (
+        <p style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--ink-500);margin:0;">No course found for "{drill.slug}".</p>
+      ) : (
+        <>
+          <p class="an-eye" style="margin:0;">Drill-down</p>
+          <h2 style="font-family:'Fraunces',serif;font-size:1.5rem;font-weight:500;margin:6px 0 0;">{drill.title}</h2>
+          <div class="an-drill-kpis">
+            <div class="an-drill-kpi"><b>{drill.enrolled || 0}</b><small>Enrolled</small></div>
+            <div class="an-drill-kpi"><b>{drill.avg_progress || 0}%</b><small>Avg progress</small></div>
+            <div class="an-drill-kpi"><b>{drill.completed || 0}</b><small>Completed</small></div>
+            <div class="an-drill-kpi"><b>{drill.in_progress || 0}</b><small>In progress</small></div>
+            <div class="an-drill-kpi"><b>{drill.not_started || 0}</b><small>Not started</small></div>
+            <div class="an-drill-kpi"><b>{drill.enrolled ? Math.round(((drill.completed || 0) / drill.enrolled) * 100) : 0}%</b><small>Completion</small></div>
+          </div>
+          <div style="overflow-x:auto;">
+            <table class="an-tbl">
+              <thead><tr><th>Learner</th><th>Progress</th><th>Enrolled</th><th>Last seen</th></tr></thead>
+              <tbody>
+                {drill.learners.length === 0 ? <tr><td colspan="4" class="an-empty">No enrolments yet.</td></tr> : drill.learners.map((l: any) => (
+                  <tr>
+                    <td>{l.name || 'Learner'}<br/><span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--ink-500);">{l.email}</span></td>
+                    <td><span class="an-mini"><i style={'width:' + (l.progress || 0) + '%'}></i></span> {l.progress || 0}%</td>
+                    <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-500);">{fmt(l.enrolled_at)}</td>
+                    <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-500);">{fmt(l.last_accessed_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  )}
+
   <div class="an-kpis">
     <div class="an-kpi"><div class="an-kpi-v">{totalLearners}</div><div class="an-kpi-l">Learners</div></div>
     <div class="an-kpi"><div class="an-kpi-v">{activeWeek}</div><div class="an-kpi-l">Active this week</div></div>
@@ -114,6 +264,43 @@ const maxF = Math.max.apply(null, funnel.map((f) => f.n)) || 1;
     <div class="an-kpi"><div class="an-kpi-v">{avgProgress}%</div><div class="an-kpi-l">Avg progress</div></div>
     <div class="an-kpi"><div class="an-kpi-v">{completionRate}%</div><div class="an-kpi-l">Completion rate</div></div>
     <div class="an-kpi"><div class="an-kpi-v">{certified}</div><div class="an-kpi-l">Certificates</div></div>
+  </div>
+
+  {/* period KPIs with deltas vs the previous equal window */}
+  <div class="an-kpis">
+    <div class="an-kpi">
+      <div class="an-kpi-v">{enrNow}</div>
+      <div class="an-kpi-l">New enrolments · {days}d</div>
+      <div class={'an-delta ' + (dEnr.up ? 'up' : 'down')}>{dEnr.up ? '▲' : '▼'} {Math.abs(dEnr.d)} ({dEnr.up ? '+' : ''}{dEnr.pc}% vs prev)</div>
+    </div>
+    <div class="an-kpi">
+      <div class="an-kpi-v">{actNow}</div>
+      <div class="an-kpi-l">Active learners · {days}d</div>
+      <div class={'an-delta ' + (dAct.up ? 'up' : 'down')}>{dAct.up ? '▲' : '▼'} {Math.abs(dAct.d)} ({dAct.up ? '+' : ''}{dAct.pc}% vs prev)</div>
+    </div>
+    <div class="an-kpi">
+      <div class="an-kpi-v">{certNow}</div>
+      <div class="an-kpi-l">Certificates · {days}d</div>
+      <div class={'an-delta ' + (dCert.up ? 'up' : 'down')}>{dCert.up ? '▲' : '▼'} {Math.abs(dCert.d)} ({dCert.up ? '+' : ''}{dCert.pc}% vs prev)</div>
+    </div>
+  </div>
+
+  {/* time series */}
+  <div class="an-card">
+    <h2>Enrolments &amp; certificates over {days <= 45 ? 'day' : 'week'}s — last {days} days</h2>
+    <div class="an-series">
+      {series.map((s) => (
+        <div class="an-series-col" title={s.label + ' · ' + s.enroll + ' enrolled · ' + s.cert + ' certified'}>
+          <div class="an-series-c" style={'height:' + Math.round((s.cert / maxSeries) * 130) + 'px'}></div>
+          <div class="an-series-e" style={'height:' + Math.round((s.enroll / maxSeries) * 130) + 'px'}></div>
+        </div>
+      ))}
+    </div>
+    <div class="an-series-x"><span>{series[0]?.label || ''}</span><span>{series[series.length - 1]?.label || 'now'}</span></div>
+    <div class="an-series-leg">
+      <span><i style="background:#3b5675;"></i> Enrolments · {seriesEnrTotal} in window</span>
+      <span><i style="background:#a0421e;"></i> Certificates · {seriesCertTotal} in window</span>
+    </div>
   </div>
 
   <div class="an-grid">
@@ -156,7 +343,7 @@ const maxF = Math.max.apply(null, funnel.map((f) => f.n)) || 1;
         <tbody>
           {coursePerf.map((c) => (
             <tr>
-              <td><a href={'/aquintutor/courses/' + c.slug} class="cc-link" style="color:var(--rust);text-decoration:none;">{c.title}</a></td>
+              <td><a href={'/aquintutor/courses/' + c.slug} class="cc-link" style="color:var(--rust);text-decoration:none;">{c.title}</a><br/><a href={anQs({ course: c.slug })} class="an-row-link">Drill down &rarr;</a></td>
               <td>{c.enrolled || 0}</td>
               <td><span class="an-mini"><i style={'width:' + (c.avg_progress || 0) + '%'}></i></span> {c.avg_progress || 0}%</td>
               <td>{c.completed || 0}</td>
@@ -189,4 +376,35 @@ const maxF = Math.max.apply(null, funnel.map((f) => f.n)) || 1;
   </div>
   <div style="height:50px;"></div>
 </main>
+
+<script type="application/json" id="csvCourses" set:html={JSON.stringify(coursePerf.map((c: any) => ({ course: c.title, enrolled: c.enrolled || 0, avg_progress_pct: c.avg_progress || 0, completed: c.completed || 0, completion_pct: c.enrolled ? Math.round(((c.completed || 0) / c.enrolled) * 100) : 0, status: c.is_published ? 'Live' : 'Draft' })))} />
+<script type="application/json" id="csvRisk" set:html={JSON.stringify(atRisk.map((a: any) => ({ learner: a.name || 'Learner', email: a.email || '', course: a.course || '', progress_pct: a.progress || 0, last_seen: a.last_accessed_at || '', enrolled_at: a.enrolled_at || '' })))} />
+<script is:inline>
+  (function () {
+    function toCsv(rows) {
+      if (!rows.length) return '';
+      var cols = Object.keys(rows[0]);
+      var esc = function (v) { v = (v == null ? '' : String(v)); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+      var lines = [cols.join(',')];
+      rows.forEach(function (r) { lines.push(cols.map(function (c) { return esc(r[c]); }).join(',')); });
+      return lines.join('\n');
+    }
+    function download(id, name) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var rows = [];
+      try { rows = JSON.parse(el.textContent || '[]'); } catch (e) { rows = []; }
+      if (!rows.length) { alert('Nothing to export yet.'); return; }
+      var blob = new Blob([toCsv(rows)], { type: 'text/csv;charset=utf-8;' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = name; document.body.appendChild(a); a.click();
+      document.body.removeChild(a); URL.revokeObjectURL(url);
+    }
+    var bc = document.getElementById('exportCourses');
+    var br = document.getElementById('exportRisk');
+    if (bc) bc.addEventListener('click', function () { download('csvCourses', 'course-performance.csv'); });
+    if (br) br.addEventListener('click', function () { download('csvRisk', 'at-risk-learners.csv'); });
+  })();
+</script>
 </AquintutorLayout>
