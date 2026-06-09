@@ -110,7 +110,12 @@ function isProtected(path: string): boolean {
 function isGatedLab(path: string): boolean {
   if (!path) return false;
   if (path === '/aquintutor/labs' || path === '/aquintutor/labs/') return false;
-  return path.startsWith('/aquintutor/labs/');
+  // Every individual lab + the advanced simulators require sign-in so the work
+  // can't be copied by anonymous visitors. The catalogue index stays public.
+  return path.startsWith('/aquintutor/labs/')
+    || path.startsWith('/aquintutor/quantum/')
+    || path.startsWith('/aquintutor/hpc/')
+    || path.startsWith('/aquintutor/teach');
 }
 
 async function hasFaceEnrolled(userId: string): Promise<boolean> {
