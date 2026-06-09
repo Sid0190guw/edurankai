@@ -1,0 +1,268 @@
+---
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/aquintutor/login?next=' + encodeURIComponent('/aquintutor/progress'));
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+async function safeRows(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
+
+// XP + streak
+let xp: any = { totalXp: 0, level: 1, streakDays: 0, longestStreak: 0, xpToNextLevel: 100, levelProgress: 0 };
+try { const { getUserXp } = await import('@/lib/xp'); xp = await getUserXp(user.id); } catch (_) {}
+
+// Enrollments with progress
+const enrollments = await safeRows(sql`
+  SELECT e.progress_pct, e.enrolled_at, e.last_accessed_at,
+    c.slug, c.title, c.subtitle, c.school, c.difficulty, c.category,
+    (SELECT COUNT(*)::int FROM training_lessons WHERE course_id = c.id) AS total_lessons
+  FROM training_enrollments e LEFT JOIN training_courses c ON e.course_id = c.id
+  WHERE e.user_id = ${user.id} ORDER BY e.last_accessed_at DESC NULLS LAST, e.enrolled_at DESC LIMIT 12`);
+
+// Certificates
+let certs = await safeRows(sql`SELECT cert_number, course_title, issued_at, block_hash FROM course_certificates WHERE user_id = ${user.id} ORDER BY issued_at DESC LIMIT 12`);
+
+// Recommended (published, not enrolled)
+const enrolledSlugs = new Set(enrollments.map((e: any) => e.slug));
+let recommended = (await safeRows(sql`SELECT slug, title, subtitle, school, difficulty FROM training_courses WHERE is_published = true ORDER BY COALESCE(enrolled_count,0) DESC, created_at DESC LIMIT 16`))
+  .filter((c: any) => !enrolledSlugs.has(c.slug)).slice(0, 6);
+
+// ---- derived metrics ----
+const totalCourses = enrollments.length;
+const completed = enrollments.filter((e: any) => (e.progress_pct || 0) >= 100).length;
+const inProgress = enrollments.filter((e: any) => (e.progress_pct || 0) > 0 && (e.progress_pct || 0) < 100).length;
+const avgProgress = totalCourses ? Math.round(enrollments.reduce((s: number, e: any) => s + (e.progress_pct || 0), 0) / totalCourses) : 0;
+
+// recency (days since last access of any course)
+let daysSince = 99;
+const lastAccess = enrollments.map((e: any) => e.last_accessed_at).filter(Boolean).map((d: any) => new Date(d).getTime()).sort((a, b) => b - a)[0];
+if (lastAccess) daysSince = Math.floor((Date.now() - lastAccess) / 86400000);
+
+// Gainsight-style learning health score (0-100): engagement + momentum + completion + recency
+const sStreak = Math.min(100, (xp.streakDays || 0) * 8);             // 12-day streak = 96
+const sMomentum = avgProgress;                                       // average course progress
+const sCompletion = totalCourses ? Math.round((completed / totalCourses) * 100) : 0;
+const sRecency = daysSince <= 1 ? 100 : daysSince <= 3 ? 80 : daysSince <= 7 ? 55 : daysSince <= 14 ? 30 : 10;
+const health = Math.round(sStreak * 0.25 + sMomentum * 0.3 + sCompletion * 0.25 + sRecency * 0.2);
+const healthBand = health >= 75 ? { label: 'Thriving', color: '#1A6B35' } : health >= 50 ? { label: 'On track', color: '#946322' } : health >= 25 ? { label: 'Needs a nudge', color: '#a0421e' } : { label: 'At risk', color: '#a0421e' };
+
+// competency by category
+const catMap: { [k: string]: { sum: number; n: number } } = {};
+enrollments.forEach((e: any) => { const k = e.category || e.school || 'General'; catMap[k] = catMap[k] || { sum: 0, n: 0 }; catMap[k].sum += (e.progress_pct || 0); catMap[k].n++; });
+const competencies = Object.entries(catMap).map(([k, v]) => ({ name: k, pct: Math.round(v.sum / v.n) })).sort((a, b) => b.pct - a.pct).slice(0, 6);
+
+const firstName = (user.name || '').split(' ')[0] || 'there';
+function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }); } catch { return ''; } }
+// health ring geometry
+const R = 70, CIRC = 2 * Math.PI * R, healthOffset = CIRC * (1 - health / 100);
+---
+<AquintutorLayout title="My progress" description="Your learning health, progress, competencies, certificates, and what to learn next.">
+<style>
+  .pg { max-width: 1280px; margin: 0 auto; padding: 0 28px; }
+  .pg-crumb { border-bottom: 1px solid var(--rule); background: var(--sand-100); margin: 0 -28px; }
+  .pg-crumb-in { max-width: 1280px; margin: 0 auto; padding: 10px 28px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.08em; color: var(--ink-500); }
+  .pg-crumb-in a { color: var(--ink-500); text-decoration: none; } .pg-crumb-in .cur { color: var(--rust); font-weight: 600; }
+  .pg-hero { padding: 40px 0 8px; }
+  .pg-eye { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--rust); font-weight: 700; margin: 0; }
+  .pg-h1 { font-family: 'Fraunces', serif; font-size: clamp(2rem, 4vw, 3rem); font-weight: 500; letter-spacing: -0.02em; margin: 8px 0 0; }
+  .pg-h1 em { font-style: italic; color: var(--rust); }
+
+  .pg-top { display: grid; grid-template-columns: 320px 1fr; gap: 18px; margin: 24px 0; }
+  @media (max-width: 860px) { .pg-top { grid-template-columns: 1fr; } }
+  .pg-card { background: var(--paper); border: 1px solid var(--rule); border-radius: 18px; padding: 22px; }
+  .pg-card h2 { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-500); font-weight: 700; margin: 0 0 14px; }
+
+  /* health gauge */
+  .pg-health { display: flex; flex-direction: column; align-items: center; }
+  .pg-gauge { position: relative; width: 180px; height: 180px; }
+  .pg-gauge svg { transform: rotate(-90deg); }
+  .pg-gauge-num { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .pg-gauge-v { font-family: 'Fraunces', serif; font-size: 48px; font-weight: 600; line-height: 1; }
+  .pg-gauge-l { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; font-weight: 700; margin-top: 4px; }
+  .pg-health-bars { width: 100%; margin-top: 18px; }
+  .pg-hb { display: grid; grid-template-columns: 80px 1fr 36px; gap: 8px; align-items: center; margin: 7px 0; }
+  .pg-hb label { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-500); font-weight: 700; }
+  .pg-hb-track { background: var(--sand-100); height: 7px; border-radius: 100px; overflow: hidden; }
+  .pg-hb-fill { height: 100%; border-radius: 100px; background: var(--rust); }
+  .pg-hb span { font-family: 'JetBrains Mono', monospace; font-size: 11px; text-align: right; color: var(--ink); font-weight: 700; }
+
+  .pg-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  @media (max-width: 600px) { .pg-stats { grid-template-columns: repeat(2, 1fr); } }
+  .pg-stat { background: var(--sand-100); border: 1px solid rgba(14,11,8,0.06); border-radius: 14px; padding: 16px; }
+  .pg-stat-v { font-family: 'Fraunces', serif; font-size: 32px; font-weight: 600; line-height: 1; color: var(--ink); }
+  .pg-stat-l { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-500); margin-top: 6px; font-weight: 700; }
+  .pg-comp { margin-top: 16px; }
+  .pg-comp-row { display: grid; grid-template-columns: 130px 1fr 40px; gap: 10px; align-items: center; margin: 8px 0; }
+  .pg-comp-row label { font-size: 13px; color: var(--ink); }
+  .pg-comp-track { background: var(--sand-100); height: 9px; border-radius: 100px; overflow: hidden; }
+  .pg-comp-fill { height: 100%; background: linear-gradient(90deg, #a0421e, #d97757); border-radius: 100px; }
+  .pg-comp-row span { font-family: 'JetBrains Mono', monospace; font-size: 11px; text-align: right; font-weight: 700; color: var(--rust); }
+
+  .pg-sect-h { font-family: 'Fraunces', serif; font-size: 1.5rem; font-weight: 500; margin: 30px 0 14px; letter-spacing: -0.01em; }
+  .pg-sect-h em { font-style: italic; color: var(--rust); }
+  .pg-courses { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .pg-course { background: var(--paper); border: 1px solid var(--rule); border-radius: 16px; padding: 18px; display: flex; gap: 16px; align-items: center; text-decoration: none; color: inherit; transition: all .18s; }
+  .pg-course:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(14,11,8,0.07); border-color: var(--rust); }
+  .pg-ring { position: relative; width: 64px; height: 64px; flex-shrink: 0; }
+  .pg-ring svg { transform: rotate(-90deg); }
+  .pg-ring-t { fill: none; stroke: var(--sand-100); stroke-width: 7; }
+  .pg-ring-f { fill: none; stroke: #1A6B35; stroke-width: 7; stroke-linecap: round; }
+  .pg-ring-v { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 700; }
+  .pg-course-t { font-family: 'Cormorant Garamond', serif; font-size: 19px; font-weight: 600; line-height: 1.2; }
+  .pg-course-m { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--ink-500); margin-top: 3px; }
+  .pg-empty { padding: 28px; text-align: center; color: var(--ink-500); font-family: 'JetBrains Mono', monospace; font-size: 13px; background: var(--paper); border: 1px solid var(--rule); border-radius: 16px; }
+  .pg-empty a { color: var(--rust); }
+
+  .pg-cert { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--rule); }
+  .pg-cert:last-child { border-bottom: none; }
+  .pg-cert a { color: var(--rust); text-decoration: none; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; }
+  .pg-cert-badge { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: #1A6B35; background: rgba(26,107,53,0.1); padding: 2px 8px; border-radius: 100px; font-weight: 700; }
+
+  .pg-pulse { background: linear-gradient(135deg, var(--ink), #2E2520); color: #fff; border-radius: 18px; padding: 24px; margin-top: 18px; }
+  .pg-pulse h3 { font-family: 'Cormorant Garamond', serif; font-size: 24px; margin: 0 0 6px; font-weight: 600; }
+  .pg-pulse p { color: #c5c0b8; font-size: 14px; margin: 0 0 16px; }
+  .pg-pulse-faces { display: flex; gap: 8px; }
+  .pg-pulse-faces button { flex: 1; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #fff; padding: 12px; border-radius: 12px; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .pg-pulse-faces button:hover { background: rgba(255,255,255,0.18); }
+  .pg-rec { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .pg-rec-card { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; padding: 16px; text-decoration: none; color: inherit; }
+  .pg-rec-card:hover { border-color: var(--rust); }
+  .pg-rec-t { font-family: 'Cormorant Garamond', serif; font-size: 18px; font-weight: 600; line-height: 1.2; }
+  .pg-rec-m { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--ink-500); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+</style>
+
+<div class="pg-crumb"><div class="pg-crumb-in"><a href="/aquintutor">AQUINTUTOR</a> <span style="margin:0 8px;">/</span> <a href="/aquintutor/dashboard">DASHBOARD</a> <span style="margin:0 8px;">/</span> <span class="cur">MY PROGRESS</span></div></div>
+
+<main class="pg">
+  <div class="pg-hero">
+    <p class="pg-eye">AquinTutor · Learning health</p>
+    <h1 class="pg-h1">Where you stand, <em>{firstName}</em>.</h1>
+  </div>
+
+  <div class="pg-top">
+    {/* Gainsight-style health gauge */}
+    <div class="pg-card pg-health">
+      <h2 style="align-self:flex-start;">Learning health score</h2>
+      <div class="pg-gauge">
+        <svg width="180" height="180"><circle cx="90" cy="90" r="70" fill="none" stroke="#EBE6DA" stroke-width="14"/><circle cx="90" cy="90" r="70" fill="none" stroke={healthBand.color} stroke-width="14" stroke-linecap="round" stroke-dasharray={CIRC} stroke-dashoffset={healthOffset}/></svg>
+        <div class="pg-gauge-num"><div class="pg-gauge-v" style={'color:' + healthBand.color}>{health}</div><div class="pg-gauge-l" style={'color:' + healthBand.color}>{healthBand.label}</div></div>
+      </div>
+      <div class="pg-health-bars">
+        <div class="pg-hb"><label>Momentum</label><div class="pg-hb-track"><div class="pg-hb-fill" style={'width:' + sMomentum + '%'}></div></div><span>{sMomentum}</span></div>
+        <div class="pg-hb"><label>Streak</label><div class="pg-hb-track"><div class="pg-hb-fill" style={'width:' + sStreak + '%'}></div></div><span>{sStreak}</span></div>
+        <div class="pg-hb"><label>Completion</label><div class="pg-hb-track"><div class="pg-hb-fill" style={'width:' + sCompletion + '%'}></div></div><span>{sCompletion}</span></div>
+        <div class="pg-hb"><label>Recency</label><div class="pg-hb-track"><div class="pg-hb-fill" style={'width:' + sRecency + '%'}></div></div><span>{sRecency}</span></div>
+      </div>
+    </div>
+
+    {/* stats + competency */}
+    <div>
+      <div class="pg-card">
+        <h2>This term</h2>
+        <div class="pg-stats">
+          <div class="pg-stat"><div class="pg-stat-v">{totalCourses}</div><div class="pg-stat-l">Courses</div></div>
+          <div class="pg-stat"><div class="pg-stat-v">{completed}</div><div class="pg-stat-l">Completed</div></div>
+          <div class="pg-stat"><div class="pg-stat-v">{xp.streakDays || 0}</div><div class="pg-stat-l">Day streak</div></div>
+          <div class="pg-stat"><div class="pg-stat-v">L{xp.level || 1}</div><div class="pg-stat-l">{xp.totalXp || 0} XP</div></div>
+        </div>
+        {competencies.length > 0 && (
+          <div class="pg-comp">
+            <h2 style="margin:18px 0 10px;">Competency by area</h2>
+            {competencies.map((c) => (
+              <div class="pg-comp-row"><label>{c.name}</label><div class="pg-comp-track"><div class="pg-comp-fill" style={'width:' + c.pct + '%'}></div></div><span>{c.pct}%</span></div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Gainsight-style NPS / pulse */}
+      <div class="pg-pulse">
+        <h3>How's your learning going?</h3>
+        <p>One tap. We use it to tune what we recommend — never to grade you.</p>
+        <div class="pg-pulse-faces" id="pulse">
+          <button data-v="1">Struggling</button>
+          <button data-v="2">Okay</button>
+          <button data-v="3">Good</button>
+          <button data-v="4">Great</button>
+          <button data-v="5">Flying</button>
+        </div>
+        <p id="pulseThanks" style="display:none;margin-top:12px;color:#86efac;">Thanks — noted. Keep going.</p>
+      </div>
+    </div>
+  </div>
+
+  {/* Continue learning — Skilljar-style cards with progress rings */}
+  <h2 class="pg-sect-h">Continue <em>learning</em></h2>
+  {enrollments.length === 0 ? (
+    <div class="pg-empty">You have not enrolled in a course yet. <a href="/aquintutor/courses">Browse the catalogue &rarr;</a></div>
+  ) : (
+    <div class="pg-courses">
+      {enrollments.map((e) => {
+        const r = 27, circ = 2 * Math.PI * r, off = circ * (1 - (e.progress_pct || 0) / 100);
+        return (
+          <a href={'/aquintutor/courses/' + e.slug} class="pg-course">
+            <div class="pg-ring">
+              <svg width="64" height="64"><circle class="pg-ring-t" cx="32" cy="32" r={r}/><circle class="pg-ring-f" cx="32" cy="32" r={r} stroke-dasharray={circ} stroke-dashoffset={off}/></svg>
+              <div class="pg-ring-v">{e.progress_pct || 0}%</div>
+            </div>
+            <div style="min-width:0;">
+              <div class="pg-course-t">{e.title}</div>
+              <div class="pg-course-m">{(e.school || e.category || 'Course')} · {e.total_lessons || 0} lessons · last {e.last_accessed_at ? fmt(e.last_accessed_at) : 'not started'}</div>
+            </div>
+          </a>
+        );
+      })}
+    </div>
+  )}
+
+  {/* Certificates */}
+  <h2 class="pg-sect-h">Your <em>credentials</em></h2>
+  <div class="pg-card" style="padding:0;">
+    {certs.length === 0 ? (
+      <div class="pg-empty" style="border:none;">Complete a course to earn a blockchain-verifiable certificate.</div>
+    ) : (
+      certs.map((c) => (
+        <div class="pg-cert">
+          <div>
+            <div style="font-family:'Cormorant Garamond',serif;font-size:18px;font-weight:600;">{c.course_title}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-500);margin-top:2px;">{c.cert_number} · {fmt(c.issued_at)}</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;">
+            {c.block_hash && <span class="pg-cert-badge">On ledger</span>}
+            <a href={'/verify/' + c.cert_number}>Verify &rarr;</a>
+          </div>
+        </div>
+      ))
+    )}
+  </div>
+
+  {/* Recommendations */}
+  {recommended.length > 0 && (
+    <>
+      <h2 class="pg-sect-h">Recommended <em>next</em></h2>
+      <div class="pg-rec">
+        {recommended.map((c) => (
+          <a href={'/aquintutor/courses/' + c.slug} class="pg-rec-card">
+            <div class="pg-rec-t">{c.title}</div>
+            <div class="pg-rec-m">{(c.school || 'Course')} · {c.difficulty || 'all levels'}</div>
+          </a>
+        ))}
+      </div>
+    </>
+  )}
+  <div style="height:50px;"></div>
+</main>
+
+<script is:inline>
+  document.querySelectorAll('#pulse button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      document.getElementById('pulseThanks').style.display = 'block';
+      document.querySelectorAll('#pulse button').forEach(function (x) { x.style.opacity = '0.4'; });
+      b.style.opacity = '1'; b.style.background = 'rgba(134,239,172,0.25)';
+      try { fetch('/api/activity/log', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: 'pulse', stage: 'learn', type: 'learning_pulse', detail: 'pulse=' + b.getAttribute('data-v') }) }); } catch (e) {}
+    });
+  });
+</script>
+</AquintutorLayout>
