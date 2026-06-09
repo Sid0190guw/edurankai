@@ -11,6 +11,23 @@ let pendingUserId = '';
 let pendingUserName = '';
 let faceDescriptor = '';
 
+// Server-side face verification helpers. The browser's match is advisory; the
+// authoritative comparison happens HERE so the face 2FA cannot be bypassed by
+// forging the success POST.
+const FACE_2FA_THRESHOLD = 0.55;
+function euclid(a: number[], b: number[]): number {
+  let s = 0; const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) { const d = (a[i] || 0) - (b[i] || 0); s += d * d; }
+  return Math.sqrt(s);
+}
+function normDesc(d: any): number[] | null {
+  if (d == null) return null;
+  if (typeof d === 'string') { try { return normDesc(JSON.parse(d)); } catch { return null; } }
+  if (Array.isArray(d)) return d.map(Number);
+  if (typeof d === 'object') return Object.keys(d).sort((a, b) => Number(a) - Number(b)).map((k) => Number(d[k]));
+  return null;
+}
+
 // Check face pending cookie
 const pendingId = Astro.cookies.get('portal_face_pending')?.value || '';
 
@@ -36,6 +53,7 @@ if (Astro.request.method === 'POST') {
 
   if (action === 'face_verified') {
     const userId = fd2.get('user_id') as string;
+    const liveRaw = (fd2.get('live_descriptor') as string) || '';
     if (userId === pendingId) {
       try {
         const { db } = await import('@/lib/db');
@@ -44,16 +62,36 @@ if (Astro.request.method === 'POST') {
         const { setSessionCookie } = await import('@/lib/auth/cookie');
         const { eq } = await import('drizzle-orm');
         const { sql } = await import('drizzle-orm');
-        await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
-        const token = generateSessionToken();
-        const session = await createSession(token, userId, {
-          userAgent: Astro.request.headers.get('user-agent') || undefined,
-          ipAddress: Astro.clientAddress
-        });
-        setSessionCookie(Astro.cookies, token, session.expiresAt);
-        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, userId));
-        Astro.cookies.delete('portal_face_pending', { path: '/' });
-        return Astro.redirect('/portal?enrolled=1');
+
+        // AUTHORITATIVE server-side match: fetch the enrolled descriptor and
+        // compare it to the freshly-captured one. Never trust the client's claim.
+        const fdRow = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`);
+        const fdr = Array.isArray(fdRow) ? fdRow : (fdRow?.rows || []);
+        const stored = normDesc((fdr[0] as any)?.face_descriptor);
+        let live: number[] | null = null;
+        try { live = normDesc(JSON.parse(liveRaw)); } catch { live = null; }
+        const dist = (stored && live && stored.length === 128 && live.length === 128) ? euclid(stored, live) : 99;
+        const matched = dist < FACE_2FA_THRESHOLD;
+        // Audit the 2FA attempt alongside the document/identity records.
+        await db.execute(sql`
+          INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
+          VALUES (${userId}, ${''}, ${pendingUserName || ''}, 'face_login', ${Number.isFinite(dist) ? dist : null}, ${matched}, ${matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
+        `).catch(() => {});
+
+        if (!matched) {
+          errorMsg = 'Face not recognised (distance ' + (Number.isFinite(dist) ? dist.toFixed(3) : 'n/a') + '). Try again in better light, or use your password.';
+        } else {
+          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
+          const token = generateSessionToken();
+          const session = await createSession(token, userId, {
+            userAgent: Astro.request.headers.get('user-agent') || undefined,
+            ipAddress: Astro.clientAddress
+          });
+          setSessionCookie(Astro.cookies, token, session.expiresAt);
+          await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, userId));
+          Astro.cookies.delete('portal_face_pending', { path: '/' });
+          return Astro.redirect('/portal?enrolled=1');
+        }
       } catch(e: any) { errorMsg = 'Login error. Please try again.'; }
     } else {
       errorMsg = 'Session mismatch. Please login again.';
@@ -256,6 +294,7 @@ if (Astro.request.method === 'POST') {
   <form id="faceSuccessForm" method="POST" style="display:none;">
     <input type="hidden" name="action" value="face_verified"/>
     <input type="hidden" name="user_id" value={pendingUserId}/>
+    <input type="hidden" name="live_descriptor" id="liveDescriptorField" value=""/>
   </form>
 )}
 
@@ -282,6 +321,7 @@ if (pwToggle && pwInput) {
   var ovalRing = document.getElementById('ovalRing');
   var verified = false;
   var attempts = 0;
+  var lastLiveDescriptor = null;
 
   function setStatus(msg, color) {
     camStatus.innerHTML = '<span style="background:rgba(0,0,0,0.75);color:' + (color||'#fff') + ';font-size:12px;padding:4px 14px;border-radius:100px;">' + msg + '</span>';
@@ -373,6 +413,7 @@ if (pwToggle && pwInput) {
     var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
       .withFaceLandmarks(true).withFaceDescriptor();
     if (!det) return false;
+    lastLiveDescriptor = det.descriptor;
     try {
       var stored = JSON.parse(storedDescriptor);
       // Handle all possible formats: array, {0:x,1:y...}, or nested
@@ -400,6 +441,10 @@ if (pwToggle && pwInput) {
     verifyBtn.style.background = '#10b981';
     ovalRing.style.borderColor = 'rgba(16,185,129,0.9)';
     setTimeout(function() {
+      try {
+        var f = document.getElementById('liveDescriptorField');
+        if (f && lastLiveDescriptor) f.value = JSON.stringify(Array.prototype.slice.call(lastLiveDescriptor));
+      } catch (e) {}
       document.getElementById('faceSuccessForm').submit();
     }, 600);
   }

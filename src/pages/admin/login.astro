@@ -17,6 +17,21 @@ async function startSession(userId: string, req: Request, ip: string | undefined
   setSessionCookie(cookies, token, session.expiresAt);
 }
 
+// Authoritative server-side face match — the browser result is never trusted.
+const FACE_2FA_THRESHOLD = 0.55;
+function euclid(a: number[], b: number[]): number {
+  let s = 0; const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) { const d = (a[i] || 0) - (b[i] || 0); s += d * d; }
+  return Math.sqrt(s);
+}
+function normDesc(d: any): number[] | null {
+  if (d == null) return null;
+  if (typeof d === 'string') { try { return normDesc(JSON.parse(d)); } catch { return null; } }
+  if (Array.isArray(d)) return d.map(Number);
+  if (typeof d === 'object') return Object.keys(d).sort((a, b) => Number(a) - Number(b)).map((k) => Number(d[k]));
+  return null;
+}
+
 // Already logged in?
 if (Astro.locals.user) {
   return Astro.redirect('/admin');
@@ -82,14 +97,33 @@ if (Astro.request.method === 'POST') {
       }
     }
   } else if (action === 'face_verified') {
-    // Face verified client-side ' complete login
+    // The browser does a live face scan, but the AUTHORITATIVE comparison is here:
+    // we re-fetch the enrolled descriptor and match it server-side. A forged POST
+    // with no/!matching descriptor cannot grant an admin session.
     const userId = fd2.get('user_id') as string;
+    const liveRaw = (fd2.get('live_descriptor') as string) || '';
     if (userId === pendingId) {
-      // Update last used
-      await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`).catch(() => {});
-      await startSession(userId, Astro.request, Astro.clientAddress, Astro.cookies);
-      Astro.cookies.delete('face_pending_user', { path: '/' });
-      return Astro.redirect('/admin');
+      try {
+        const fdRow = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`);
+        const fdr = Array.isArray(fdRow) ? fdRow : (fdRow?.rows || []);
+        const stored = normDesc((fdr[0] as any)?.face_descriptor);
+        let live: number[] | null = null;
+        try { live = normDesc(JSON.parse(liveRaw)); } catch { live = null; }
+        const dist = (stored && live && stored.length === 128 && live.length === 128) ? euclid(stored, live) : 99;
+        const matched = dist < FACE_2FA_THRESHOLD;
+        await db.execute(sql`
+          INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
+          VALUES (${userId}, ${''}, ${pendingUserName || ''}, 'face_login', ${Number.isFinite(dist) ? dist : null}, ${matched}, ${matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
+        `).catch(() => {});
+        if (!matched) {
+          errorMsg = 'Face not recognised (distance ' + (Number.isFinite(dist) ? dist.toFixed(3) : 'n/a') + '). Try again, or use your password.';
+        } else {
+          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`).catch(() => {});
+          await startSession(userId, Astro.request, Astro.clientAddress, Astro.cookies);
+          Astro.cookies.delete('face_pending_user', { path: '/' });
+          return Astro.redirect('/admin');
+        }
+      } catch (e: any) { errorMsg = 'Login error. Please try again.'; }
     } else {
       errorMsg = 'Session mismatch. Please try again.';
       Astro.cookies.delete('face_pending_user', { path: '/' });
@@ -177,6 +211,7 @@ if (Astro.request.method === 'POST') {
         <form method="POST" style="display:none;" id="successForm">
           <input type="hidden" name="action" value="face_verified" />
           <input type="hidden" name="user_id" value={pendingUserId} />
+          <input type="hidden" name="live_descriptor" id="liveDescriptorField" value="" />
         </form>
 
         <form method="POST">
@@ -196,6 +231,7 @@ if (Astro.request.method === 'POST') {
     var loadingProg = document.getElementById('loadingProg');
     var successForm = document.getElementById('successForm');
     var verified = false;
+    var lastLiveDescriptor = null;
 
     function setStatus(msg, color) {
       statusEl.innerHTML = '<span style="background:rgba(0,0,0,0.75);color:' + (color||'#fff') + ';font-size:11px;padding:3px 10px;border-radius:100px;">' + msg + '</span>';
@@ -270,6 +306,7 @@ if (Astro.request.method === 'POST') {
       var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
         .withFaceLandmarks(true).withFaceDescriptor();
       if (!det) return false;
+      lastLiveDescriptor = det.descriptor;
       var stored = JSON.parse(storedDescriptor);
       var storedArr = Array.isArray(stored) ? stored : Object.values(stored);
       var storedFloat = new Float32Array(storedArr);
@@ -282,7 +319,13 @@ if (Astro.request.method === 'POST') {
       setStatus('Face verified! Logging in...', '#10b981');
       verifyBtn.textContent = 'Verified!';
       verifyBtn.style.background = '#10b981';
-      setTimeout(function() { successForm.submit(); }, 800);
+      setTimeout(function() {
+        try {
+          var f = document.getElementById('liveDescriptorField');
+          if (f && lastLiveDescriptor) f.value = JSON.stringify(Array.prototype.slice.call(lastLiveDescriptor));
+        } catch (e) {}
+        successForm.submit();
+      }, 800);
     }
 
     init().catch(function(e) { setStatus('Camera error: ' + e.message, '#ef4444'); });
