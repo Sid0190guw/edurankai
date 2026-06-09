@@ -193,6 +193,50 @@ export async function requestReview(lessonId: string) {
   await db.execute(sql`UPDATE training_lessons SET status = 'in_review', updated_at = NOW() WHERE id = ${lessonId}`);
 }
 
+// ============ Version history ============
+// Snapshot the current blocks as a new version (without changing publish status).
+export async function saveVersion(opts: { lessonId: string; byUserId?: string; byName?: string; notes?: string }) {
+  await ensureAquintutorAuthoringSchema();
+  const blocks = await listBlocks(opts.lessonId);
+  const v = rows(await db.execute(sql`SELECT COALESCE(MAX(version), 0) + 1 AS v FROM training_lesson_versions WHERE lesson_id = ${opts.lessonId}`))[0]?.v || 1;
+  const r = rows(await db.execute(sql`
+    INSERT INTO training_lesson_versions (lesson_id, version, blocks_snapshot, edited_by_user_id, edited_by_name, notes)
+    VALUES (${opts.lessonId}, ${v}, ${JSON.stringify(blocks)}::jsonb, ${opts.byUserId || null}, ${opts.byName || null}, ${opts.notes || 'Manual save'})
+    RETURNING id, version, created_at
+  `));
+  return { version: v, ...(r[0] || {}), blockCount: blocks.length };
+}
+
+export async function listVersions(lessonId: string) {
+  await ensureAquintutorAuthoringSchema();
+  return rows(await db.execute(sql`
+    SELECT id, version, edited_by_name, notes, created_at,
+      jsonb_array_length(COALESCE(blocks_snapshot, '[]'::jsonb)) AS block_count
+    FROM training_lesson_versions WHERE lesson_id = ${lessonId} ORDER BY version DESC LIMIT 50`));
+}
+
+// Restore a version: snapshot the current state first (so restore is reversible), then
+// replace all current blocks with the snapshot's blocks. Returns the new block set.
+export async function restoreVersion(opts: { lessonId: string; versionId: string; byUserId?: string; byName?: string }) {
+  await ensureAquintutorAuthoringSchema();
+  const snapRow = rows(await db.execute(sql`SELECT version, blocks_snapshot FROM training_lesson_versions WHERE id = ${opts.versionId} AND lesson_id = ${opts.lessonId} LIMIT 1`))[0];
+  if (!snapRow) throw new Error('version not found');
+  // Snapshot current state before we overwrite it.
+  await saveVersion({ lessonId: opts.lessonId, byUserId: opts.byUserId, byName: opts.byName, notes: 'Auto-snapshot before restore of v' + snapRow.version });
+  let snap = snapRow.blocks_snapshot;
+  if (typeof snap === 'string') { try { snap = JSON.parse(snap); } catch { snap = []; } }
+  if (!Array.isArray(snap)) snap = [];
+  await db.execute(sql`DELETE FROM training_lesson_blocks WHERE lesson_id = ${opts.lessonId}`);
+  for (let i = 0; i < snap.length; i++) {
+    const b: any = snap[i];
+    await db.execute(sql`
+      INSERT INTO training_lesson_blocks (lesson_id, kind, position, content)
+      VALUES (${opts.lessonId}, ${b.kind}, ${i}, ${JSON.stringify(b.content || {})}::jsonb)`);
+  }
+  await db.execute(sql`UPDATE training_lessons SET updated_at = NOW() WHERE id = ${opts.lessonId}`);
+  return await listBlocks(opts.lessonId);
+}
+
 // ============ Progress ============
 export async function markLessonComplete(opts: { userId: string; lessonId: string; courseId?: string; timeSpentSeconds?: number }) {
   await ensureAquintutorAuthoringSchema();
