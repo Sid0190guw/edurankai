@@ -208,7 +208,13 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // panel: any signed-in role WITHOUT the admin.access permission is bounced off
   // the main EduRankAI admin to /aquintutor/admin. Internal staff (super_admin,
   // hr, editor, ...) all hold admin.access, so this only affects partner scopes.
-  if (result.user.role !== 'applicant' && (path === '/admin' || path.startsWith('/admin/')) && path !== '/admin/login' && path !== '/admin/logout' && !can(result.user as any, 'admin.access')) {
+  // ...except the AquinTutor course-authoring tools (/admin/aquintutor/*), which
+  // partners + teachers legitimately use to build their own courses. Everything
+  // else under /admin (applicants, HR, finance, mail, etc.) stays off-limits.
+  if (result.user.role !== 'applicant' && (path === '/admin' || path.startsWith('/admin/'))
+      && path !== '/admin/login' && path !== '/admin/logout'
+      && !path.startsWith('/admin/aquintutor/')
+      && !can(result.user as any, 'admin.access')) {
     const r = result.user.role as string;
     const dest = r === 'teacher' ? '/aquintutor/admin/teacher'
       : r === 'technical_moderator' ? '/aquintutor/admin/moderator'

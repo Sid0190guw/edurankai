@@ -9,69 +9,143 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 async function safeRows(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
+const isSuper = user.role === 'admin' || user.role === 'super_admin';
 
-let flash = '';
+// -- POST handler ----------------------------------------------------------
+// All review actions are self-contained: a moderator stays inside
+// /aquintutor/admin and never touches the main /admin console. Every action
+// is a human decision — automated flags below are advisory only and never
+// auto-penalise anyone.
+let okMsg = '', errMsg = '';
 if (Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
-    const entity = String(fd.get('entity') || ''), action = String(fd.get('action') || ''), id = String(fd.get('id') || '');
+    const entity = String(fd.get('entity') || '');
+    const action = String(fd.get('action') || '');
+    const id = String(fd.get('id') || '');
+    const userId = String(fd.get('user_id') || '');
     if (!id) throw new Error('missing id');
-    if (entity === 'doubt' && action === 'resolve') await db.execute(sql`UPDATE doubts SET status = 'resolved' WHERE id = ${id}`);
-    else if (entity === 'doubt' && action === 'delete') await db.execute(sql`DELETE FROM doubts WHERE id = ${id}`);
-    else if (entity === 'feed' && action === 'remove') await db.execute(sql`DELETE FROM feed_posts WHERE id = ${id}`);
-    else if (entity === 'feed' && action === 'pin') await db.execute(sql`UPDATE feed_posts SET is_pinned = true WHERE id = ${id}`);
-    else if (entity === 'club' && action === 'hide') await db.execute(sql`UPDATE clubs SET is_active = false WHERE id = ${id}`);
-    else throw new Error('unknown');
-    flash = entity + ' · ' + action + ' done';
-  } catch (e: any) { flash = 'Error: ' + String(e?.message || e).slice(0, 120); }
+
+    if (entity === 'identity' && action === 'approve') {
+      await db.execute(sql`UPDATE identity_verifications SET verdict = 'verified' WHERE id = ${id}`);
+      if (userId) await db.execute(sql`UPDATE users SET identity_verified = true, photo_verified = true WHERE id = ${userId}`);
+      okMsg = 'Identity verification approved. Candidate marked verified.';
+    } else if (entity === 'identity' && action === 'reject') {
+      await db.execute(sql`UPDATE identity_verifications SET verdict = 'rejected' WHERE id = ${id}`);
+      okMsg = 'Identity verification rejected. The candidate may re-attempt.';
+    } else if (entity === 'discussion' && action === 'hide') {
+      // Guarded: the column may not exist yet on older DBs — add it if missing,
+      // then hide. A missing table degrades to the catch below (no 500).
+      await db.execute(sql`ALTER TABLE discussions ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN DEFAULT false`);
+      await db.execute(sql`UPDATE discussions SET is_hidden = true WHERE id = ${id}`);
+      okMsg = 'Discussion post hidden from the community feed.';
+    } else {
+      throw new Error('unknown action');
+    }
+  } catch (e: any) {
+    errMsg = 'Action failed: ' + String(e?.message || e).slice(0, 140);
+  }
 }
 
-const doubts = await safeRows(sql`SELECT id, status, created_at, subject FROM doubts ORDER BY (status='open') DESC, created_at DESC LIMIT 30`);
-const feed = await safeRows(sql`SELECT id, kind, COALESCE(title,'(untitled)') AS title, COALESCE(view_count,0) AS views, COALESCE(like_count,0) AS likes, is_pinned FROM feed_posts ORDER BY created_at DESC LIMIT 25`);
-const clubs = await safeRows(sql`SELECT id, slug, name, COALESCE(member_count,0) AS members, is_active FROM clubs ORDER BY created_at DESC LIMIT 20`);
-// Proctoring integrity events (advisory only — humans decide).
-const integrity = await safeRows(sql`SELECT event_type, severity, COUNT(*)::int AS n FROM test_attempt_events GROUP BY event_type, severity ORDER BY n DESC LIMIT 14`);
+// -- Review data -----------------------------------------------------------
+// 1. Identity verification queue (pending verdicts) joined to the user so we
+//    can render the selfie + account status alongside the submitted ID image.
+const idQueue = await safeRows(sql`
+  SELECT v.id, v.user_id, v.email, v.claimed_name, v.id_card_blob_url,
+         v.face_match_distance, v.created_at, v.metadata,
+         u.name AS user_name, u.photo_url AS user_photo, u.identity_verified
+  FROM identity_verifications v
+  LEFT JOIN users u ON v.user_id = u.id
+  WHERE v.verdict = 'pending'
+  ORDER BY v.created_at DESC
+  LIMIT 40
+`);
+for (const row of idQueue) {
+  let meta: any = row.metadata;
+  if (typeof meta === 'string') { try { meta = JSON.parse(meta); } catch { meta = null; } }
+  row._idDoc = row.id_card_blob_url || (meta && meta.idDocUrl) || '';
+  row._selfie = row.user_photo || (meta && (meta.selfie || meta.selfieDataUrl)) || '';
+}
 
+// 2. Interview sessions to review — read-only here. Riskiest + most recent
+//    first. We surface a transcript count inline rather than linking out.
+const sessions = await safeRows(sql`
+  SELECT s.id, s.template_id, s.candidate_name, s.candidate_email, s.status,
+         COALESCE(s.risk_score, 0) AS risk_score, s.started_at, s.id_doc_url,
+         (SELECT COUNT(*)::int FROM ai_interview_transcript t WHERE t.session_id = s.id) AS turns
+  FROM ai_interview_sessions s
+  ORDER BY COALESCE(s.risk_score, 0) DESC, s.started_at DESC
+  LIMIT 20
+`);
+
+// 3. Discussion moderation — recent visible posts joined to their author.
+const discussions = await safeRows(sql`
+  SELECT d.id, d.user_id, d.body, d.category, d.parent_id, d.created_at,
+         u.name AS author_name, u.email AS author_email, u.role AS author_role
+  FROM discussions d
+  LEFT JOIN users u ON d.user_id = u.id
+  WHERE d.is_hidden IS NOT TRUE
+  ORDER BY d.created_at DESC
+  LIMIT 25
+`);
+
+// A session counts as "high risk" once its advisory score clears 60.
+const HIGH_RISK = 60;
 const kpi = {
-  openDoubts: doubts.filter((d: any) => d.status === 'open').length,
-  feed: feed.length,
-  flaggedClubs: clubs.filter((c: any) => !c.is_active).length,
-  integrityEvents: integrity.reduce((s: number, e: any) => s + (e.n || 0), 0),
+  pendingId: idQueue.length,
+  highRisk: sessions.filter((s: any) => Number(s.risk_score || 0) >= HIGH_RISK).length,
+  proctorFlags: sessions.reduce((sum: number, s: any) => sum + Number(s.risk_score || 0), 0),
+  posts: discussions.length,
 };
-function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }); } catch { return '—'; } }
-const isSuper = user.role === 'admin' || user.role === 'super_admin';
+
+function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }); } catch { return '-'; } }
+function snippet(t: any, n = 90) { const s = String(t || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '...' : (s || '(empty)'); }
+function riskBand(n: number) { return n >= HIGH_RISK ? 'red' : n >= 30 ? 'amber' : 'green'; }
+function statusPill(s: string) { return s === 'completed' ? 'green' : s === 'in_progress' ? 'amber' : s === 'abandoned' ? 'red' : 'grey'; }
 ---
-<AquintutorLayout title="Moderator panel" description="AquinTutor content + integrity moderation." noindex={true}>
+<AquintutorLayout title="Technical moderator" description="AquinTutor identity, interview and community review console." noindex={true}>
 <style>
   .md { max-width: 1280px; margin: 0 auto; padding: 0 28px; }
   .md-crumb { border-bottom: 1px solid var(--rule); background: var(--sand-100); margin: 0 -28px; }
   .md-crumb-in { max-width: 1280px; margin: 0 auto; padding: 10px 28px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.08em; color: var(--ink-500); }
   .md-crumb-in a { color: var(--ink-500); text-decoration: none; } .md-crumb-in .cur { color: var(--rust); font-weight: 600; }
-  .md-hero { padding: 40px 0 18px; }
+  .md-hero { padding: 40px 0 14px; }
   .md-eye { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--rust); font-weight: 700; margin: 0; }
   .md-h1 { font-family: 'Fraunces', serif; font-size: clamp(2rem, 4vw, 2.8rem); font-weight: 500; letter-spacing: -0.02em; margin: 8px 0 0; }
   .md-h1 em { font-style: italic; color: var(--rust); }
-  .md-flash { padding: 10px 16px; border-radius: 10px; margin-bottom: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px; background: rgba(26,107,53,0.08); border: 1px solid rgba(26,107,53,0.35); color: #1A6B35; }
-  .md-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 8px 0 22px; }
+  .md-sub { font-size: 13.5px; color: var(--ink-500); margin: 10px 0 0; max-width: 640px; line-height: 1.55; }
+  .md-flash { padding: 11px 16px; border-radius: 10px; margin-bottom: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .md-flash.ok { background: rgba(26,107,53,0.08); border: 1px solid rgba(26,107,53,0.35); color: #1A6B35; }
+  .md-flash.err { background: rgba(160,66,30,0.08); border: 1px solid rgba(160,66,30,0.4); color: var(--rust); }
+  .md-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 14px 0 22px; }
   .md-kpi { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; padding: 16px 18px; }
   .md-kpi-v { font-family: 'Fraunces', serif; font-size: 28px; font-weight: 500; line-height: 1; }
   .md-kpi-l { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-500); margin-top: 7px; font-weight: 600; }
-  .md-sect-h { font-family: 'Fraunces', serif; font-size: 1.35rem; font-weight: 500; margin: 26px 0 12px; }
+  .md-sect-h { font-family: 'Fraunces', serif; font-size: 1.35rem; font-weight: 500; margin: 30px 0 6px; }
   .md-sect-h em { font-style: italic; color: var(--rust); }
-  .md-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; } @media (max-width: 900px) { .md-grid { grid-template-columns: 1fr; } }
-  .md-card { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; overflow: hidden; margin-bottom: 16px; }
+  .md-sect-sub { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--ink-500); margin: 0 0 12px; letter-spacing: 0.02em; }
+  .md-card { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; overflow: hidden; margin-bottom: 18px; }
   table.md-tbl { width: 100%; border-collapse: collapse; }
   .md-tbl th { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-500); text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--rule); font-weight: 700; background: var(--sand-100); }
-  .md-tbl td { padding: 10px 14px; border-bottom: 1px solid var(--rule); font-size: 13px; }
+  .md-tbl td { padding: 11px 14px; border-bottom: 1px solid var(--rule); font-size: 13px; vertical-align: middle; }
   .md-tbl tr:last-child td { border-bottom: none; }
-  .md-pill { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: 100px; font-weight: 700; }
+  .md-pill { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: 100px; font-weight: 700; white-space: nowrap; }
   .md-pill.green { background: rgba(26,107,53,0.12); color: #1A6B35; } .md-pill.amber { background: rgba(176,124,0,0.14); color: #946322; }
   .md-pill.red { background: rgba(160,66,30,0.12); color: var(--rust); } .md-pill.grey { background: rgba(59,58,48,0.10); color: var(--ink-500); }
-  .md-acts { display: flex; gap: 5px; flex-wrap: wrap; }
-  .md-btn { background: var(--paper); border: 1px solid var(--rule); color: var(--ink); padding: 4px 10px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 10px; cursor: pointer; font-weight: 600; }
+  .md-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .md-btn { background: var(--paper); border: 1px solid var(--rule); color: var(--ink); padding: 5px 11px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 10px; cursor: pointer; font-weight: 600; }
   .md-btn.go { border-color: rgba(26,107,53,0.45); color: #1A6B35; } .md-btn.warn { border-color: rgba(160,66,30,0.45); color: var(--rust); }
+  .md-btn:hover { background: var(--sand-100); }
   form.inline { display: inline; margin: 0; }
-  .md-empty { padding: 22px; text-align: center; color: var(--ink-500); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .md-empty { padding: 26px; text-align: center; color: var(--ink-500); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .md-thumbs { display: flex; gap: 8px; align-items: center; }
+  .md-thumb { width: 66px; height: 44px; object-fit: cover; border-radius: 6px; border: 1px solid var(--rule); display: block; background: var(--sand-100); }
+  .md-thumb.sq { width: 44px; height: 44px; }
+  .md-thumb-x { width: 66px; height: 44px; border-radius: 6px; border: 1px dashed var(--rule); display: flex; align-items: center; justify-content: center; font-family: 'JetBrains Mono', monospace; font-size: 8px; color: var(--ink-500); background: var(--sand-100); }
+  .md-tlabel { font-family: 'JetBrains Mono', monospace; font-size: 8px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-500); margin: 0 0 3px; font-weight: 600; }
+  .md-name { font-weight: 600; color: var(--ink); }
+  .md-meta { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--ink-500); margin-top: 2px; }
+  .md-mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   .md-note { background: rgba(176,124,0,0.08); border: 1px solid rgba(176,124,0,0.3); border-radius: 12px; padding: 14px 18px; font-size: 13px; color: #6b4e0e; line-height: 1.6; margin-bottom: 18px; }
 </style>
 
@@ -79,76 +153,142 @@ const isSuper = user.role === 'admin' || user.role === 'super_admin';
 
 <main class="md">
   <div class="md-hero">
-    <p class="md-eye">AquinTutor · Moderation &amp; integrity</p>
-    <h1 class="md-h1">Keep it <em>clean</em>.</h1>
+    <p class="md-eye">AquinTutor &middot; Technical moderation</p>
+    <h1 class="md-h1">Review, in <em>context</em>.</h1>
+    <p class="md-sub">Identity verifications, interview integrity and the community feed — all reviewed and decided here, by a person.</p>
   </div>
 
-  {flash && <div class="md-flash">{flash}</div>}
+  {okMsg && <div class="md-flash ok">{okMsg}</div>}
+  {errMsg && <div class="md-flash err">{errMsg}</div>}
 
-  <div class="md-note">Integrity signals below are <strong>advisory only</strong>. Automated flags never penalise a learner automatically — a human reviews the full context and decides. False positives can cause real harm.</div>
+  <div class="md-note"><strong>Advisory only.</strong> A moderator reviews the full context and decides — nothing on this page is auto-penalised. Match distances, risk scores and proctoring flags are machine signals to inform your judgement, never to act on their own. False positives can cause real harm, so when in doubt, approve and ask.</div>
 
   <div class="md-kpis">
-    <div class="md-kpi"><div class="md-kpi-v">{kpi.openDoubts}</div><div class="md-kpi-l">Open doubts</div></div>
-    <div class="md-kpi"><div class="md-kpi-v">{kpi.feed}</div><div class="md-kpi-l">Feed posts</div></div>
-    <div class="md-kpi"><div class="md-kpi-v">{kpi.flaggedClubs}</div><div class="md-kpi-l">Hidden clubs</div></div>
-    <div class="md-kpi"><div class="md-kpi-v">{kpi.integrityEvents}</div><div class="md-kpi-l">Integrity events</div></div>
+    <div class="md-kpi"><div class="md-kpi-v">{kpi.pendingId}</div><div class="md-kpi-l">Pending ID checks</div></div>
+    <div class="md-kpi"><div class="md-kpi-v">{kpi.highRisk}</div><div class="md-kpi-l">High-risk sessions</div></div>
+    <div class="md-kpi"><div class="md-kpi-v">{kpi.proctorFlags}</div><div class="md-kpi-l">Proctoring score (sum)</div></div>
+    <div class="md-kpi"><div class="md-kpi-v">{kpi.posts}</div><div class="md-kpi-l">Recent discussion posts</div></div>
   </div>
 
-  <div class="md-grid">
-    <div>
-      <h2 class="md-sect-h">Doubt <em>queue</em></h2>
-      <div class="md-card">
-      {doubts.length === 0 ? <div class="md-empty">No doubts.</div> : (
-        <table class="md-tbl"><thead><tr><th>Subject</th><th>Posted</th><th>Status</th><th></th></tr></thead><tbody>
-          {doubts.map((d) => (
-            <tr>
-              <td>{d.subject || String(d.id).slice(0,8)}</td><td>{fmt(d.created_at)}</td>
-              <td><span class={"md-pill " + (d.status === 'resolved' ? 'green' : 'amber')}>{d.status}</span></td>
-              <td><div class="md-acts">
-                {d.status !== 'resolved' && <form class="inline" method="POST"><input type="hidden" name="entity" value="doubt"/><input type="hidden" name="action" value="resolve"/><input type="hidden" name="id" value={d.id}/><button class="md-btn go">Resolve</button></form>}
-                <form class="inline" method="POST" onsubmit="return confirm('Delete?')"><input type="hidden" name="entity" value="doubt"/><input type="hidden" name="action" value="delete"/><input type="hidden" name="id" value={d.id}/><button class="md-btn warn">Delete</button></form>
-              </div></td>
-            </tr>
-          ))}
-        </tbody></table>
-      )}
-      </div>
-    </div>
-
-    <div>
-      <h2 class="md-sect-h">Feed <em>posts</em></h2>
-      <div class="md-card">
-      {feed.length === 0 ? <div class="md-empty">No posts.</div> : (
-        <table class="md-tbl"><thead><tr><th>Post</th><th>Kind</th><th>Views</th><th></th></tr></thead><tbody>
-          {feed.map((f) => (
-            <tr>
-              <td>{f.title}{f.is_pinned && <span class="md-pill grey" style="margin-left:6px;">pin</span>}</td>
-              <td><span class="md-pill grey">{f.kind}</span></td><td>{f.views}</td>
-              <td><div class="md-acts">
-                {!f.is_pinned && <form class="inline" method="POST"><input type="hidden" name="entity" value="feed"/><input type="hidden" name="action" value="pin"/><input type="hidden" name="id" value={f.id}/><button class="md-btn">Pin</button></form>}
-                <form class="inline" method="POST" onsubmit="return confirm('Remove?')"><input type="hidden" name="entity" value="feed"/><input type="hidden" name="action" value="remove"/><input type="hidden" name="id" value={f.id}/><button class="md-btn warn">Remove</button></form>
-              </div></td>
-            </tr>
-          ))}
-        </tbody></table>
-      )}
-      </div>
-    </div>
-  </div>
-
-  <h2 class="md-sect-h">Integrity <em>signals</em> · advisory</h2>
+  <h2 class="md-sect-h">Identity <em>verification</em> queue</h2>
+  <p class="md-sect-sub">Pending verdicts &middot; compare the government ID with the live selfie before deciding</p>
   <div class="md-card">
-  {integrity.length === 0 ? <div class="md-empty">No proctoring events recorded yet.</div> : (
-    <table class="md-tbl"><thead><tr><th>Event type</th><th>Severity</th><th>Count</th></tr></thead><tbody>
-      {integrity.map((e) => (
-        <tr>
-          <td style="font-family:'JetBrains Mono',monospace;font-size:12px;">{e.event_type}</td>
-          <td><span class={"md-pill " + (e.severity === 'high' ? 'red' : e.severity === 'medium' ? 'amber' : 'grey')}>{e.severity || 'low'}</span></td>
-          <td>{e.n}</td>
-        </tr>
-      ))}
-    </tbody></table>
+  {idQueue.length === 0 ? <div class="md-empty">No pending identity verifications. The queue is clear.</div> : (
+    <table class="md-tbl">
+      <thead><tr><th>Documents</th><th>Claimed name</th><th>Email</th><th>Match dist.</th><th>Submitted</th><th>Decision</th></tr></thead>
+      <tbody>
+        {idQueue.map((v) => (
+          <tr>
+            <td>
+              <div class="md-thumbs">
+                <div>
+                  <p class="md-tlabel">ID</p>
+                  {v._idDoc
+                    ? <a href={v._idDoc} target="_blank" rel="noopener" title="Open ID document"><img src={v._idDoc} alt="ID document" class="md-thumb" /></a>
+                    : <div class="md-thumb-x">no img</div>}
+                </div>
+                <div>
+                  <p class="md-tlabel">Selfie</p>
+                  {v._selfie
+                    ? <a href={v._selfie} target="_blank" rel="noopener" title="Open selfie"><img src={v._selfie} alt="Selfie" class="md-thumb sq" /></a>
+                    : <div class="md-thumb-x" style="width:44px;">none</div>}
+                </div>
+              </div>
+            </td>
+            <td>
+              <span class="md-name">{v.claimed_name || v.user_name || '(unnamed)'}</span>
+              <div class="md-meta">{v.identity_verified ? 'account verified' : 'not yet verified'}</div>
+            </td>
+            <td class="md-mono" style="color:var(--ink-500);">{v.email || '-'}</td>
+            <td class="md-mono">{v.face_match_distance != null ? 'd=' + parseFloat(v.face_match_distance).toFixed(3) : '-'}</td>
+            <td class="md-mono" style="color:var(--ink-500);">{fmt(v.created_at)}</td>
+            <td>
+              <div class="md-acts">
+                <form class="inline" method="POST">
+                  <input type="hidden" name="entity" value="identity" />
+                  <input type="hidden" name="action" value="approve" />
+                  <input type="hidden" name="id" value={v.id} />
+                  <input type="hidden" name="user_id" value={v.user_id || ''} />
+                  <button class="md-btn go" type="submit">Approve</button>
+                </form>
+                <form class="inline" method="POST" onsubmit="return confirm('Reject this identity verification? The candidate can re-attempt.')">
+                  <input type="hidden" name="entity" value="identity" />
+                  <input type="hidden" name="action" value="reject" />
+                  <input type="hidden" name="id" value={v.id} />
+                  <button class="md-btn warn" type="submit">Reject</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   )}
   </div>
+
+  <h2 class="md-sect-h">Interview sessions to <em>review</em></h2>
+  <p class="md-sect-sub">Riskiest and most recent first &middot; read-only &middot; risk is advisory, never a verdict</p>
+  <div class="md-card">
+  {sessions.length === 0 ? <div class="md-empty">No interview sessions recorded yet.</div> : (
+    <table class="md-tbl">
+      <thead><tr><th>ID doc</th><th>Candidate</th><th>Status</th><th>Risk</th><th>Turns</th><th>Started</th></tr></thead>
+      <tbody>
+        {sessions.map((s) => (
+          <tr>
+            <td>
+              {s.id_doc_url
+                ? <a href={s.id_doc_url} target="_blank" rel="noopener" title="Open ID document"><img src={s.id_doc_url} alt="ID document" class="md-thumb" /></a>
+                : <div class="md-thumb-x">no img</div>}
+            </td>
+            <td>
+              <span class="md-name">{s.candidate_name || s.candidate_email || 'Anonymous'}</span>
+              <div class="md-meta">{s.candidate_email || ('session ' + String(s.id).slice(0, 8))}</div>
+            </td>
+            <td><span class={'md-pill ' + statusPill(s.status)}>{s.status || 'unknown'}</span></td>
+            <td>
+              <span class={'md-pill ' + riskBand(Number(s.risk_score || 0))}>{Number(s.risk_score || 0)}</span>
+            </td>
+            <td class="md-mono">{s.turns ?? 0}</td>
+            <td class="md-mono" style="color:var(--ink-500);">{fmt(s.started_at)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )}
+  </div>
+
+  <h2 class="md-sect-h">Community <em>moderation</em></h2>
+  <p class="md-sect-sub">Recent discussion posts &middot; hide anything off-topic, abusive or unsafe</p>
+  <div class="md-card">
+  {discussions.length === 0 ? <div class="md-empty">No discussion posts to moderate.</div> : (
+    <table class="md-tbl">
+      <thead><tr><th>Author</th><th>Category</th><th>Post</th><th>Posted</th><th></th></tr></thead>
+      <tbody>
+        {discussions.map((d) => (
+          <tr>
+            <td>
+              <span class="md-name">{d.author_name || d.author_email || '(unknown)'}</span>
+              {d.parent_id && <span class="md-pill grey" style="margin-left:6px;">reply</span>}
+              <div class="md-meta">{d.author_role || 'member'}</div>
+            </td>
+            <td><span class="md-pill grey">{d.category || 'general'}</span></td>
+            <td style="max-width:360px;">{snippet(d.body)}</td>
+            <td class="md-mono" style="color:var(--ink-500);">{fmt(d.created_at)}</td>
+            <td>
+              <form class="inline" method="POST" onsubmit="return confirm('Hide this post from the community feed?')">
+                <input type="hidden" name="entity" value="discussion" />
+                <input type="hidden" name="action" value="hide" />
+                <input type="hidden" name="id" value={d.id} />
+                <button class="md-btn warn" type="submit">Hide</button>
+              </form>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )}
+  </div>
+
+  <div class="md-note" style="margin:8px 0 50px;">Decisions here are logged as your own. If a signal looks alarming but the context is innocent, that is exactly the case this console exists for — a human, looking at the whole picture, deciding fairly.</div>
 </main>
 </AquintutorLayout>

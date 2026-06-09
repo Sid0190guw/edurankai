@@ -14,103 +14,183 @@ const isSuper = user.role === 'admin' || user.role === 'super_admin';
 const viewUserId = (new URL(Astro.request.url).searchParams.get('as')) || user.id;
 
 // Courses this teacher authors/edits.
-let myCourseIds: string[] = [];
 const authored = await safeRows(sql`SELECT course_id FROM training_course_authors WHERE user_id = ${viewUserId}`);
-myCourseIds = authored.map((a: any) => a.course_id);
+const myCourseIds: string[] = authored.map((a: any) => a.course_id);
 // Super-admins with no explicit authorship see all courses (demo convenience).
 const seeAll = isSuper && myCourseIds.length === 0;
 
 let courses: any[] = [];
 if (seeAll) {
-  courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, school FROM training_courses ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 30`);
+  courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, created_at FROM training_courses ORDER BY created_at DESC LIMIT 40`);
 } else if (myCourseIds.length) {
-  courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, school FROM training_courses WHERE id = ANY(${myCourseIds}) ORDER BY updated_at DESC NULLS LAST LIMIT 30`);
+  courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, created_at FROM training_courses WHERE id = ANY(${myCourseIds}) ORDER BY created_at DESC LIMIT 40`);
 }
 const courseIds = courses.map((c: any) => c.id);
 
-// Aggregate stats over the teacher's courses.
-let stats = { courses: courses.length, published: courses.filter((c: any) => c.is_published).length, lessons: 0, students: 0, completions: 0, doubts: 0 };
-if (courseIds.length) {
-  stats.lessons = (await safeRows(sql`SELECT COUNT(*)::int AS c FROM training_lessons WHERE course_id = ANY(${courseIds})`))[0]?.c || 0;
-  stats.students = (await safeRows(sql`SELECT COUNT(DISTINCT user_id)::int AS c FROM training_enrollments WHERE course_id = ANY(${courseIds})`))[0]?.c || 0;
-  stats.completions = (await safeRows(sql`SELECT COUNT(*)::int AS c FROM course_certificates WHERE course_id = ANY(${courseIds})`))[0]?.c || 0;
-  stats.doubts = (await safeRows(sql`SELECT COUNT(*)::int AS c FROM doubts WHERE course_id = ANY(${courseIds}) AND status = 'open'`))[0]?.c || 0;
-}
+// Per-course rollups: lessons, distinct students, avg progress, completion %.
+const lessonCounts = courseIds.length ? await safeRows(sql`
+  SELECT course_id, COUNT(*)::int AS c FROM training_lessons WHERE course_id = ANY(${courseIds}) GROUP BY course_id`) : [];
+const studentCounts = courseIds.length ? await safeRows(sql`
+  SELECT course_id, COUNT(DISTINCT user_id)::int AS c, COALESCE(ROUND(AVG(NULLIF(progress_pct,0)))::int,0) AS avg_prog,
+         COUNT(*) FILTER (WHERE progress_pct >= 100)::int AS done
+  FROM training_enrollments WHERE course_id = ANY(${courseIds}) GROUP BY course_id`) : [];
+const certCounts = courseIds.length ? await safeRows(sql`
+  SELECT course_id, COUNT(*)::int AS c FROM course_certificates WHERE course_id = ANY(${courseIds}) GROUP BY course_id`) : [];
 
-// Recent enrollments + open doubts for these courses.
-const recentEnroll = courseIds.length ? await safeRows(sql`
-  SELECT e.created_at, e.progress_pct, u.name AS student, c.title AS course
-  FROM training_enrollments e LEFT JOIN users u ON u.id = e.user_id LEFT JOIN training_courses c ON c.id = e.course_id
-  WHERE e.course_id = ANY(${courseIds}) ORDER BY e.created_at DESC LIMIT 15`) : [];
-const openDoubts = courseIds.length ? await safeRows(sql`
-  SELECT d.id, d.status, d.created_at, c.title AS course FROM doubts d LEFT JOIN training_courses c ON c.id = d.course_id
-  WHERE d.course_id = ANY(${courseIds}) ORDER BY d.created_at DESC LIMIT 15`) : [];
+const lessonBy: Record<string, number> = {};
+lessonCounts.forEach((r: any) => { lessonBy[r.course_id] = r.c; });
+const studentBy: Record<string, any> = {};
+studentCounts.forEach((r: any) => { studentBy[r.course_id] = r; });
+const certBy: Record<string, number> = {};
+certCounts.forEach((r: any) => { certBy[r.course_id] = r.c; });
+
+// Decorate each course with its rollups.
+const myCourses = courses.map((c: any) => {
+  const s = studentBy[c.id] || {};
+  const students = s.c || 0;
+  const avgProg = s.avg_prog || 0;
+  const done = s.done || 0;
+  const completion = students ? Math.round((done / students) * 100) : 0;
+  return {
+    ...c,
+    lessons: lessonBy[c.id] || 0,
+    students,
+    avgProg,
+    completion,
+    certs: certBy[c.id] || 0,
+  };
+});
+
+// KPI rollups.
+const totalLessons = myCourses.reduce((s: number, c: any) => s + c.lessons, 0);
+const totalStudents = courseIds.length ? ((await safeRows(sql`SELECT COUNT(DISTINCT user_id)::int AS c FROM training_enrollments WHERE course_id = ANY(${courseIds})`))[0]?.c || 0) : 0;
+const totalCerts = myCourses.reduce((s: number, c: any) => s + c.certs, 0);
+const avgCompletion = courseIds.length ? ((await safeRows(sql`SELECT COALESCE(ROUND(AVG(NULLIF(progress_pct,0)))::int,0) AS c FROM training_enrollments WHERE course_id = ANY(${courseIds})`))[0]?.c || 0) : 0;
+
+// Lessons needing attention (draft / in_review).
+const attention = courseIds.length ? await safeRows(sql`
+  SELECT l.id, l.course_id, l.module_id, l.title, l.status, c.title AS course
+  FROM training_lessons l LEFT JOIN training_courses c ON c.id = l.course_id
+  WHERE l.course_id = ANY(${courseIds}) AND l.status IN ('draft','in_review')
+  ORDER BY l.status DESC, l.order_in_module ASC NULLS LAST LIMIT 25`) : [];
+
+// Student roster / cohort — most recent 30 learners.
+const roster = courseIds.length ? await safeRows(sql`
+  SELECT u.name AS student, u.email, c.title AS course, COALESCE(e.progress_pct,0) AS progress_pct, e.last_accessed_at
+  FROM training_enrollments e
+  LEFT JOIN users u ON u.id = e.user_id
+  LEFT JOIN training_courses c ON c.id = e.course_id
+  WHERE e.course_id = ANY(${courseIds})
+  ORDER BY e.last_accessed_at DESC NULLS LAST LIMIT 30`) : [];
+
+// Discussions / doubts to answer — recent learner posts on my lessons.
+const discussions = courseIds.length ? await safeRows(sql`
+  SELECT d.id, d.lesson_id, d.body, d.created_at, d.is_instructor,
+         u.name AS asker, l.title AS lesson, l.course_id AS course_id, c.title AS course
+  FROM training_lesson_discussions d
+  LEFT JOIN training_lessons l ON l.id = d.lesson_id
+  LEFT JOIN training_courses c ON c.id = l.course_id
+  LEFT JOIN users u ON u.id = d.user_id
+  WHERE l.course_id = ANY(${courseIds})
+  ORDER BY d.created_at DESC LIMIT 15`) : [];
 
 function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }); } catch { return '—'; } }
+function snip(s: any, n = 90) { const t = String(s || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n) + '…' : (t || '—'); }
+function statusPill(s: string) { return s === 'in_review' ? 'amber' : 'grey'; }
 ---
-<AquintutorLayout title="Teacher panel" description="AquinTutor teacher control panel." noindex={true}>
+<AquintutorLayout title="Teacher console" description="AquinTutor teacher authoring and cohort console." noindex={true}>
 <style>
   .tc { max-width: 1280px; margin: 0 auto; padding: 0 28px; }
   .tc-crumb { border-bottom: 1px solid var(--rule); background: var(--sand-100); margin: 0 -28px; }
   .tc-crumb-in { max-width: 1280px; margin: 0 auto; padding: 10px 28px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.08em; color: var(--ink-500); }
   .tc-crumb-in a { color: var(--ink-500); text-decoration: none; }
   .tc-crumb-in .cur { color: var(--rust); font-weight: 600; }
-  .tc-hero { padding: 40px 0 22px; }
+  .tc-hero { padding: 40px 0 18px; display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
   .tc-eye { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--rust); font-weight: 700; margin: 0; }
   .tc-h1 { font-family: 'Fraunces', serif; font-size: clamp(2rem, 4vw, 2.8rem); font-weight: 500; letter-spacing: -0.02em; margin: 8px 0 0; }
   .tc-h1 em { font-style: italic; color: var(--rust); }
+  .tc-hero-actions { display: flex; gap: 10px; flex-wrap: wrap; }
   .tc-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 8px 0 22px; }
   .tc-kpi { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; padding: 16px 18px; }
   .tc-kpi-v { font-family: 'Fraunces', serif; font-size: 28px; font-weight: 500; line-height: 1; }
   .tc-kpi-l { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-500); margin-top: 7px; font-weight: 600; }
   .tc-sect-h { font-family: 'Fraunces', serif; font-size: 1.35rem; font-weight: 500; margin: 26px 0 12px; }
   .tc-sect-h em { font-style: italic; color: var(--rust); }
+  .tc-sect-h .n { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink-500); font-weight: 600; margin-left: 8px; }
   .tc-card { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; overflow: hidden; margin-bottom: 20px; }
   table.tc-tbl { width: 100%; border-collapse: collapse; }
   .tc-tbl th { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-500); text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule); font-weight: 700; background: var(--sand-100); }
-  .tc-tbl td { padding: 11px 16px; border-bottom: 1px solid var(--rule); font-size: 13.5px; }
+  .tc-tbl td { padding: 11px 16px; border-bottom: 1px solid var(--rule); font-size: 13.5px; vertical-align: middle; }
   .tc-tbl tr:last-child td { border-bottom: none; }
   .tc-tbl tr:hover td { background: var(--sand-100); }
-  .tc-pill { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; padding: 3px 9px; border-radius: 100px; font-weight: 700; }
+  .tc-pill { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; padding: 3px 9px; border-radius: 100px; font-weight: 700; white-space: nowrap; }
   .tc-pill.green { background: rgba(26,107,53,0.12); color: #1A6B35; }
   .tc-pill.grey { background: rgba(59,58,48,0.10); color: var(--ink-500); }
   .tc-pill.amber { background: rgba(176,124,0,0.14); color: #946322; }
-  .tc-btn { background: var(--paper); border: 1px solid var(--rule); color: var(--ink); padding: 5px 12px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 10px; text-decoration: none; font-weight: 600; }
+  .tc-btn { background: var(--paper); border: 1px solid var(--rule); color: var(--ink); padding: 5px 12px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 10px; text-decoration: none; font-weight: 600; white-space: nowrap; }
   .tc-btn:hover { border-color: var(--rust); color: var(--rust); }
+  .tc-btn + .tc-btn { margin-left: 6px; }
+  .tc-cta { background: var(--rust); border: none; color: #fff; padding: 9px 18px; border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; text-decoration: none; display: inline-block; }
+  .tc-cta.ghost { background: var(--paper); color: var(--ink); border: 1px solid var(--rule); }
+  .tc-cta.ghost:hover { border-color: var(--rust); color: var(--rust); }
   .tc-empty { padding: 26px; text-align: center; color: var(--ink-500); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   .tc-link { color: var(--rust); text-decoration: none; font-weight: 500; }
-  .tc-bar { background: var(--sand-100); border-radius: 100px; height: 6px; overflow: hidden; width: 90px; display: inline-block; vertical-align: middle; }
+  .tc-bar { background: var(--sand-100); border-radius: 100px; height: 6px; overflow: hidden; width: 90px; display: inline-block; vertical-align: middle; margin-right: 6px; }
   .tc-bar i { display: block; height: 100%; background: var(--rust); }
+  .tc-disc { padding: 14px 16px; border-bottom: 1px solid var(--rule); }
+  .tc-disc:last-child { border-bottom: none; }
+  .tc-disc:hover { background: var(--sand-100); }
+  .tc-disc-top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .tc-disc-who { font-weight: 600; font-size: 13.5px; }
+  .tc-disc-meta { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--ink-500); }
+  .tc-disc-body { font-size: 13px; color: var(--ink); margin: 5px 0 6px; line-height: 1.4; }
+  .tc-disc-ctx { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--ink-500); }
+  .tc-mut { color: var(--ink-500); }
 </style>
 
 <div class="tc-crumb"><div class="tc-crumb-in"><a href="/aquintutor">AQUINTUTOR</a> <span style="margin:0 8px;">/</span> {isSuper ? <a href="/aquintutor/admin">COMMAND CENTER</a> : 'ADMIN'} <span style="margin:0 8px;">/</span> <span class="cur">TEACHER</span></div></div>
 
 <main class="tc">
   <div class="tc-hero">
-    <p class="tc-eye">AquinTutor · Teacher panel</p>
-    <h1 class="tc-h1">Your <em>classroom</em>.</h1>
+    <div>
+      <p class="tc-eye">AquinTutor · Teacher console</p>
+      <h1 class="tc-h1">Your <em>classroom</em>.</h1>
+    </div>
+    <div class="tc-hero-actions">
+      <a href={'/portal/meet/teacher-' + viewUserId} class="tc-cta" target="_blank" rel="noopener">Start a live class</a>
+      <a href="/aquintutor/teach" class="tc-cta ghost">Live teaching canvas</a>
+      <a href="/admin/aquintutor/courses" class="tc-cta ghost">+ New course</a>
+    </div>
   </div>
 
   <div class="tc-kpis">
-    <div class="tc-kpi"><div class="tc-kpi-v">{stats.courses}</div><div class="tc-kpi-l">Courses · {stats.published} live</div></div>
-    <div class="tc-kpi"><div class="tc-kpi-v">{stats.lessons}</div><div class="tc-kpi-l">Lessons</div></div>
-    <div class="tc-kpi"><div class="tc-kpi-v">{stats.students}</div><div class="tc-kpi-l">Students</div></div>
-    <div class="tc-kpi"><div class="tc-kpi-v">{stats.completions}</div><div class="tc-kpi-l">Certificates issued</div></div>
-    <div class="tc-kpi"><div class="tc-kpi-v">{stats.doubts}</div><div class="tc-kpi-l">Open doubts</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{myCourses.length}</div><div class="tc-kpi-l">Courses authored</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{totalLessons}</div><div class="tc-kpi-l">Lessons</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{totalStudents}</div><div class="tc-kpi-l">Students enrolled</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{avgCompletion}%</div><div class="tc-kpi-l">Avg completion</div></div>
+    <div class="tc-kpi"><div class="tc-kpi-v">{totalCerts}</div><div class="tc-kpi-l">Certificates issued</div></div>
   </div>
 
-  <h2 class="tc-sect-h">My <em>courses</em></h2>
+  <h2 class="tc-sect-h">My <em>courses</em><span class="n">{myCourses.length}</span></h2>
   <div class="tc-card">
-  {courses.length === 0 ? <div class="tc-empty">No courses assigned to you yet. {isSuper ? <a href="/admin/aquintutor/courses" class="tc-link">Create one &rarr;</a> : 'Ask an administrator to add you as a course author.'}</div> : (
+  {myCourses.length === 0 ? (
+    <div class="tc-empty">No courses authored under your account yet. {isSuper ? <a href="/admin/aquintutor/courses" class="tc-link">Create one &rarr;</a> : 'Ask an administrator to add you as a course author.'}</div>
+  ) : (
     <table class="tc-tbl">
-      <thead><tr><th>Title</th><th>School</th><th>Enrolled</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th>Title</th><th>Lessons</th><th>Students</th><th>Avg progress</th><th>Completion</th><th>Status</th><th></th></tr></thead>
       <tbody>
-        {courses.map((c) => (
+        {myCourses.map((c) => (
           <tr>
             <td><a href={'/admin/aquintutor/courses/' + c.id + '/edit'} class="tc-link">{c.title}</a></td>
-            <td>{c.school || '—'}</td><td>{c.enrolled}</td>
+            <td>{c.lessons}</td>
+            <td>{c.students}</td>
+            <td><span class="tc-bar"><i style={'width:' + (c.avgProg || 0) + '%'}></i></span>{c.avgProg}%</td>
+            <td>{c.completion}%</td>
             <td>{c.is_published ? <span class="tc-pill green">Live</span> : <span class="tc-pill grey">Draft</span>}</td>
-            <td><a href={'/admin/aquintutor/courses/' + c.id + '/edit'} class="tc-btn">Edit content</a></td>
+            <td>
+              <a href={'/admin/aquintutor/courses/' + c.id + '/edit'} class="tc-btn">Edit content</a>
+              {c.slug ? <a href={'/aquintutor/courses/' + c.slug} class="tc-btn" target="_blank" rel="noopener">View</a> : null}
+            </td>
           </tr>
         ))}
       </tbody>
@@ -118,17 +198,20 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { da
   )}
   </div>
 
-  <h2 class="tc-sect-h">Recent <em>enrolments</em></h2>
+  <h2 class="tc-sect-h">Lessons needing <em>attention</em><span class="n">{attention.length}</span></h2>
   <div class="tc-card">
-  {recentEnroll.length === 0 ? <div class="tc-empty">No enrolments yet.</div> : (
+  {attention.length === 0 ? (
+    <div class="tc-empty">Every lesson is published. Nothing waiting in draft or review.</div>
+  ) : (
     <table class="tc-tbl">
-      <thead><tr><th>Student</th><th>Course</th><th>Progress</th><th>Joined</th></tr></thead>
+      <thead><tr><th>Lesson</th><th>Course</th><th>Status</th><th></th></tr></thead>
       <tbody>
-        {recentEnroll.map((e) => (
+        {attention.map((l) => (
           <tr>
-            <td>{e.student || 'Learner'}</td><td>{e.course}</td>
-            <td><span class="tc-bar"><i style={'width:' + (e.progress_pct || 0) + '%'}></i></span> {e.progress_pct || 0}%</td>
-            <td>{fmt(e.created_at)}</td>
+            <td>{l.title || 'Untitled lesson'}</td>
+            <td class="tc-mut">{l.course || '—'}</td>
+            <td><span class={'tc-pill ' + statusPill(l.status)}>{String(l.status).replace('_', ' ')}</span></td>
+            <td><a href={'/admin/aquintutor/courses/' + l.course_id + '/lessons/' + l.id + '/edit'} class="tc-btn">Edit lesson</a></td>
           </tr>
         ))}
       </tbody>
@@ -136,24 +219,59 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { da
   )}
   </div>
 
-  <h2 class="tc-sect-h">Doubts to <em>answer</em></h2>
+  <h2 class="tc-sect-h">Student <em>cohort</em><span class="n">last 30</span></h2>
   <div class="tc-card">
-  {openDoubts.length === 0 ? <div class="tc-empty">No open doubts in your courses.</div> : (
+  {roster.length === 0 ? (
+    <div class="tc-empty">No learners enrolled yet. Once students join your courses, they appear here.</div>
+  ) : (
     <table class="tc-tbl">
-      <thead><tr><th>Reference</th><th>Course</th><th>Status</th><th>Posted</th><th></th></tr></thead>
+      <thead><tr><th>Learner</th><th>Email</th><th>Course</th><th>Progress</th><th>Last active</th></tr></thead>
       <tbody>
-        {openDoubts.map((d) => (
+        {roster.map((s) => (
           <tr>
-            <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-500);">{String(d.id).slice(0,8)}</td>
-            <td>{d.course || '—'}</td>
-            <td><span class={"tc-pill " + (d.status === 'resolved' ? 'green' : 'amber')}>{d.status}</span></td>
-            <td>{fmt(d.created_at)}</td>
-            <td><a href={'/portal/doubts/' + d.id} class="tc-btn" target="_blank" rel="noopener">Open</a></td>
+            <td>{s.student || 'Learner'}</td>
+            <td class="tc-mut" style="font-family:'JetBrains Mono',monospace;font-size:11.5px;">{s.email || '—'}</td>
+            <td class="tc-mut">{s.course || '—'}</td>
+            <td><span class="tc-bar"><i style={'width:' + (s.progress_pct || 0) + '%'}></i></span>{s.progress_pct || 0}%</td>
+            <td class="tc-mut">{s.last_accessed_at ? fmt(s.last_accessed_at) : '—'}</td>
           </tr>
         ))}
       </tbody>
     </table>
   )}
   </div>
+
+  <h2 class="tc-sect-h">Doubts to <em>answer</em><span class="n">{discussions.length}</span></h2>
+  <div class="tc-card">
+  {discussions.length === 0 ? (
+    <div class="tc-empty">No open discussions on your lessons. When a learner asks a question, it shows up here for you to reply.</div>
+  ) : (
+    discussions.map((d) => (
+      <div class="tc-disc">
+        <div class="tc-disc-top">
+          <span class="tc-disc-who">{d.asker || 'Learner'} {d.is_instructor ? <span class="tc-pill amber" style="margin-left:6px;">Instructor</span> : null}</span>
+          <span class="tc-disc-meta">{fmt(d.created_at)}</span>
+        </div>
+        <div class="tc-disc-body">{snip(d.body, 160)}</div>
+        <div class="tc-disc-ctx">
+          {(d.course || '—') + ' · ' + (d.lesson || 'lesson')}
+          {d.course_id && d.lesson_id ? <a href={'/admin/aquintutor/courses/' + d.course_id + '/lessons/' + d.lesson_id + '/edit'} class="tc-link" style="margin-left:10px;">Reply in lesson &rarr;</a> : null}
+        </div>
+      </div>
+    ))
+  )}
+  </div>
+
+  <h2 class="tc-sect-h">Teach <em>live</em></h2>
+  <div class="tc-card" style="padding:22px;">
+    <p class="tc-mut" style="margin:0 0 16px;font-size:13.5px;line-height:1.5;">Run a live session in your own WebRTC room — no third-party conferencing. Share the link with your cohort, or sketch problems on the teaching canvas in real time.</p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <a href={'/portal/meet/teacher-' + viewUserId} class="tc-cta" target="_blank" rel="noopener">Start a live class</a>
+      <a href="/aquintutor/teach" class="tc-cta ghost">Live teaching canvas</a>
+      <a href="/admin/aquintutor/courses" class="tc-cta ghost">+ New course</a>
+    </div>
+  </div>
+
+  <div style="height:40px;"></div>
 </main>
 </AquintutorLayout>

@@ -18,20 +18,67 @@ const myCourseIds = authored.map((a: any) => a.course_id);
 const seeAll = isSuper && myCourseIds.length === 0;
 
 let courses: any[] = [];
-if (seeAll) courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, COALESCE(price_inr_paise,0) AS price FROM training_courses ORDER BY created_at DESC LIMIT 30`);
-else if (myCourseIds.length) courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, COALESCE(price_inr_paise,0) AS price FROM training_courses WHERE id = ANY(${myCourseIds}) ORDER BY created_at DESC LIMIT 30`);
+if (seeAll) courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, COALESCE(price_inr_paise,0) AS price, category, school, created_at FROM training_courses ORDER BY created_at DESC LIMIT 40`);
+else if (myCourseIds.length) courses = await safeRows(sql`SELECT id, slug, title, is_published, COALESCE(enrolled_count,0) AS enrolled, COALESCE(price_inr_paise,0) AS price, category, school, created_at FROM training_courses WHERE id = ANY(${myCourseIds}) ORDER BY created_at DESC LIMIT 40`);
 const courseIds = courses.map((c: any) => c.id);
 
-const myApplications = await safeRows(sql`SELECT id, org_name, intended_course_title, tier, status, created_at FROM partnership_applications WHERE (user_id = ${viewUserId} OR contact_email = ${(user as any).email || ''}) ORDER BY created_at DESC LIMIT 10`);
+const myApplications = await safeRows(sql`SELECT id, org_name, contact_email, intended_course_title, tier, status, created_at FROM partnership_applications WHERE (user_id = ${viewUserId} OR contact_email = ${(user as any).email || ''}) ORDER BY created_at DESC LIMIT 10`);
 
-let totalEnroll = 0, totalCerts = 0, grossInr = 0;
+// Per-course rollups (enrolments, avg progress, completion, avg rating, review counts).
+let perCourse = new Map<any, any>();
+let recentEnrol: any[] = [];
+let reviews: any[] = [];
+let totalEnroll = 0, totalCerts = 0, grossInr = 0, avgRatingAll = 0, activeWeek = 0;
+
 if (courseIds.length) {
+  const enrolStats = await safeRows(sql`
+    SELECT course_id,
+           COUNT(*)::int AS enrolled,
+           ROUND(AVG(COALESCE(progress_pct,0))::numeric, 0)::int AS avg_progress,
+           COUNT(*) FILTER (WHERE COALESCE(progress_pct,0) >= 100)::int AS completed
+    FROM training_enrollments WHERE course_id = ANY(${courseIds}) GROUP BY course_id`);
+  const ratingStats = await safeRows(sql`
+    SELECT course_id,
+           ROUND(AVG(rating)::numeric, 1) AS avg_rating,
+           COUNT(*)::int AS review_count
+    FROM training_reviews WHERE course_id = ANY(${courseIds}) GROUP BY course_id`);
+  for (const c of courses) perCourse.set(c.id, { enrolled: Number(c.enrolled) || 0, avg_progress: 0, completed: 0, avg_rating: null, review_count: 0 });
+  for (const r of enrolStats) { const m = perCourse.get(r.course_id); if (m) { m.enrolled = Number(r.enrolled) || m.enrolled; m.avg_progress = Number(r.avg_progress) || 0; m.completed = Number(r.completed) || 0; } }
+  for (const r of ratingStats) { const m = perCourse.get(r.course_id); if (m) { m.avg_rating = r.avg_rating != null ? Number(r.avg_rating) : null; m.review_count = Number(r.review_count) || 0; } }
+
   totalEnroll = (await safeRows(sql`SELECT COUNT(*)::int AS c FROM training_enrollments WHERE course_id = ANY(${courseIds})`))[0]?.c || 0;
   totalCerts = (await safeRows(sql`SELECT COUNT(*)::int AS c FROM course_certificates WHERE course_id = ANY(${courseIds})`))[0]?.c || 0;
-  grossInr = courses.reduce((s: number, c: any) => s + (Number(c.price) || 0) * (Number(c.enrolled) || 0), 0);
+  avgRatingAll = Number((await safeRows(sql`SELECT ROUND(AVG(rating)::numeric, 1) AS a FROM training_reviews WHERE course_id = ANY(${courseIds})`))[0]?.a) || 0;
+  activeWeek = (await safeRows(sql`SELECT COUNT(DISTINCT user_id)::int AS c FROM training_enrollments WHERE course_id = ANY(${courseIds}) AND last_accessed_at > NOW() - INTERVAL '7 days'`))[0]?.c || 0;
+  grossInr = courses.reduce((s: number, c: any) => s + (Number(c.price) || 0) * ((perCourse.get(c.id)?.enrolled) || 0), 0);
+
+  recentEnrol = await safeRows(sql`
+    SELECT u.name, u.email, c.title AS course, c.slug AS slug, COALESCE(e.progress_pct,0) AS progress, e.enrolled_at
+    FROM training_enrollments e
+    JOIN training_courses c ON c.id = e.course_id
+    LEFT JOIN users u ON u.id = e.user_id
+    WHERE e.course_id = ANY(${courseIds})
+    ORDER BY e.enrolled_at DESC NULLS LAST LIMIT 20`);
+
+  reviews = await safeRows(sql`
+    SELECT r.rating, r.review, r.created_at, c.title AS course, c.slug AS slug
+    FROM training_reviews r
+    JOIN training_courses c ON c.id = r.course_id
+    WHERE r.course_id = ANY(${courseIds})
+    ORDER BY r.created_at DESC LIMIT 10`);
 }
+
 const grossChf = Math.round(grossInr / 100 / 95); // rough INR paise -> CHF display
-function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }); } catch { return '—'; } }
+const revShareInr = Math.round(grossInr * 0.15); // 15% partnership revenue share, pre-tax
+function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }); } catch { return '-'; } }
+function inr(paise: any) { const n = Number(paise) || 0; return n ? '₹' + (n / 100).toLocaleString('en-IN', { maximumFractionDigits: 0 }) : 'Free'; }
+function chf(paise: any) { return Math.round((Number(paise) || 0) / 100 / 95); }
+function slugify(s: any) { return String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, ''); }
+function stars(n: any) { const r = Math.round(Number(n) || 0); return '★'.repeat(Math.max(0, Math.min(5, r))) + '☆'.repeat(Math.max(0, 5 - Math.min(5, r))); }
+
+// Brand academy slug: prefer the partner's school/org name across their catalogue.
+const academyName = courses.find((c: any) => c.school)?.school || myApplications[0]?.org_name || '';
+const academySlug = slugify(academyName);
 ---
 <AquintutorLayout title="Partner panel" description="AquinTutor partner hosting console." noindex={true}>
 <style>
@@ -43,7 +90,8 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { da
   .pt-eye { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--rust); font-weight: 700; margin: 0; }
   .pt-h1 { font-family: 'Fraunces', serif; font-size: clamp(2rem, 4vw, 2.8rem); font-weight: 500; letter-spacing: -0.02em; margin: 8px 0 0; }
   .pt-h1 em { font-style: italic; color: var(--rust); }
-  .pt-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 8px 0 22px; }
+  .pt-sub { font-family: 'Inter Tight', sans-serif; font-size: 14px; color: var(--ink-500); margin: 10px 0 0; max-width: 640px; line-height: 1.6; }
+  .pt-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 18px 0 22px; }
   .pt-kpi { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; padding: 16px 18px; }
   .pt-kpi-v { font-family: 'Fraunces', serif; font-size: 28px; font-weight: 500; line-height: 1; }
   .pt-kpi-l { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-500); margin-top: 7px; font-weight: 600; }
@@ -51,20 +99,32 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { da
   .pt-card { background: var(--paper); border: 1px solid var(--rule); border-radius: 14px; overflow: hidden; margin-bottom: 20px; }
   table.pt-tbl { width: 100%; border-collapse: collapse; }
   .pt-tbl th { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-500); text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule); font-weight: 700; background: var(--sand-100); }
-  .pt-tbl td { padding: 11px 16px; border-bottom: 1px solid var(--rule); font-size: 13.5px; } .pt-tbl tr:last-child td { border-bottom: none; }
+  .pt-tbl td { padding: 11px 16px; border-bottom: 1px solid var(--rule); font-size: 13.5px; vertical-align: top; } .pt-tbl tr:last-child td { border-bottom: none; }
+  .pt-tbl td.num, .pt-tbl th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pt-tbl tfoot td { background: var(--sand-100); font-weight: 700; }
+  .pt-mut { color: var(--ink-500); font-size: 11.5px; font-family: 'JetBrains Mono', monospace; }
+  .pt-stars { color: var(--rust); letter-spacing: 1px; font-size: 13px; }
+  .pt-snip { color: var(--ink-700, #3B3A30); font-size: 13px; line-height: 1.55; max-width: 460px; display: inline-block; }
+  .pt-bar { height: 6px; background: rgba(59,58,48,0.10); border-radius: 100px; overflow: hidden; width: 90px; margin-top: 4px; }
+  .pt-bar > i { display: block; height: 100%; background: var(--rust); border-radius: 100px; }
   .pt-pill { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; padding: 3px 9px; border-radius: 100px; font-weight: 700; }
   .pt-pill.green { background: rgba(26,107,53,0.12); color: #1A6B35; } .pt-pill.grey { background: rgba(59,58,48,0.10); color: var(--ink-500); } .pt-pill.amber { background: rgba(176,124,0,0.14); color: #946322; } .pt-pill.red { background: rgba(160,66,30,0.12); color: var(--rust); }
   .pt-btn { background: var(--rust); border: none; color: #fff; padding: 9px 18px; border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; text-decoration: none; display: inline-block; }
+  .pt-btn.ghost { background: transparent; color: var(--rust); border: 1px solid var(--rule); }
+  .pt-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 50px; }
   .pt-link { color: var(--rust); text-decoration: none; font-weight: 500; }
   .pt-empty { padding: 26px; text-align: center; color: var(--ink-500); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .pt-note { background: var(--sand-100); border-top: 1px solid var(--rule); padding: 13px 16px; font-family: 'Inter Tight', sans-serif; font-size: 12.5px; color: var(--ink-500); line-height: 1.6; }
+  .pt-note strong { color: var(--rust); }
 </style>
 
 <div class="pt-crumb"><div class="pt-crumb-in"><a href="/aquintutor">AQUINTUTOR</a> <span style="margin:0 8px;">/</span> {isSuper ? <a href="/aquintutor/admin">COMMAND CENTER</a> : 'ADMIN'} <span style="margin:0 8px;">/</span> <span class="cur">PARTNER</span></div></div>
 
 <main class="pt">
   <div class="pt-hero">
-    <p class="pt-eye">AquinTutor · Partner console</p>
+    <p class="pt-eye">AquinTutor &middot; Partner console</p>
     <h1 class="pt-h1">Your <em>catalogue</em>.</h1>
+    <p class="pt-sub">{seeAll ? 'Showing the full catalogue (you author no courses yet).' : 'Your hosted courses, learners, reviews and revenue at a glance.'}</p>
   </div>
 
   <div class="pt-kpis">
@@ -72,6 +132,8 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { da
     <div class="pt-kpi"><div class="pt-kpi-v">{totalEnroll}</div><div class="pt-kpi-l">Total enrolments</div></div>
     <div class="pt-kpi"><div class="pt-kpi-v">{totalCerts}</div><div class="pt-kpi-l">Certificates issued</div></div>
     <div class="pt-kpi"><div class="pt-kpi-v">~CHF {grossChf}</div><div class="pt-kpi-l">Gross (pre-tax)</div></div>
+    <div class="pt-kpi"><div class="pt-kpi-v">{avgRatingAll ? avgRatingAll.toFixed(1) : '-'}</div><div class="pt-kpi-l">Avg rating</div></div>
+    <div class="pt-kpi"><div class="pt-kpi-v">{activeWeek}</div><div class="pt-kpi-l">Active this week</div></div>
   </div>
 
   <h2 class="pt-sect-h">My <em>partnership</em></h2>
@@ -101,15 +163,47 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { da
     <div class="pt-empty">No hosted courses yet. Once your partnership is approved, your courses appear here. <a href="/aquintutor/partnerships" class="pt-link">Apply &rarr;</a></div>
   ) : (
     <table class="pt-tbl">
-      <thead><tr><th>Course</th><th>Price</th><th>Enrolled</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th>Course</th><th class="num">Price</th><th class="num">Enrolled</th><th class="num">Avg progress</th><th class="num">Completion</th><th class="num">Rating</th><th>Status</th><th></th></tr></thead>
       <tbody>
-        {courses.map((c) => (
+        {courses.map((c) => {
+          const m = perCourse.get(c.id) || { enrolled: 0, avg_progress: 0, completed: 0, avg_rating: null, review_count: 0 };
+          const completionPct = m.enrolled ? Math.round((m.completed / m.enrolled) * 100) : 0;
+          return (
           <tr>
-            <td><a href={'/admin/aquintutor/courses/' + c.id + '/edit'} class="pt-link">{c.title}</a></td>
-            <td>{c.price ? '₹' + (c.price / 100).toFixed(0) : 'Free'}</td>
-            <td>{c.enrolled}</td>
+            <td><a href={'/admin/aquintutor/courses/' + c.id + '/edit'} class="pt-link">{c.title}</a><div class="pt-mut">{c.category || c.school || 'Course'}</div></td>
+            <td class="num">{inr(c.price)}</td>
+            <td class="num">{m.enrolled}</td>
+            <td class="num">{m.avg_progress}%<div class="pt-bar"><i style={'width:' + Math.min(100, m.avg_progress) + '%'}></i></div></td>
+            <td class="num">{completionPct}%</td>
+            <td class="num">{m.avg_rating != null ? m.avg_rating.toFixed(1) : '-'} <span class="pt-mut">({m.review_count})</span></td>
             <td>{c.is_published ? <span class="pt-pill green">Live</span> : <span class="pt-pill grey">Draft</span>}</td>
-            <td><a href={'/aquintutor/courses/' + c.slug} class="pt-link" target="_blank" rel="noopener">View</a></td>
+            <td>
+              <a href={'/aquintutor/courses/' + c.slug} class="pt-link" target="_blank" rel="noopener">View</a>
+              <span style="color:var(--rule);margin:0 6px;">&middot;</span>
+              <a href={'/aquintutor/admin/analytics?course=' + c.slug} class="pt-link">Cohort</a>
+            </td>
+          </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  )}
+  </div>
+
+  <h2 class="pt-sect-h">Recent <em>enrolments</em></h2>
+  <div class="pt-card">
+  {recentEnrol.length === 0 ? (
+    <div class="pt-empty">No enrolments across your courses yet.</div>
+  ) : (
+    <table class="pt-tbl">
+      <thead><tr><th>Learner</th><th>Course</th><th>Enrolled</th><th class="num">Progress</th></tr></thead>
+      <tbody>
+        {recentEnrol.map((e) => (
+          <tr>
+            <td>{e.name || 'Learner'}<div class="pt-mut">{e.email || ''}</div></td>
+            <td><a href={'/aquintutor/courses/' + e.slug} class="pt-link">{e.course}</a></td>
+            <td>{fmt(e.enrolled_at)}</td>
+            <td class="num">{Number(e.progress) || 0}%</td>
           </tr>
         ))}
       </tbody>
@@ -117,6 +211,79 @@ function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { da
   )}
   </div>
 
-  <div style="margin:8px 0 50px;"><a href="/aquintutor/partnerships" class="pt-btn">Host another course &rarr;</a></div>
+  <h2 class="pt-sect-h">Recent <em>reviews</em></h2>
+  <div class="pt-card">
+  {reviews.length === 0 ? (
+    <div class="pt-empty">No reviews on your courses yet.</div>
+  ) : (
+    <table class="pt-tbl">
+      <thead><tr><th>Rating</th><th>Review</th><th>Course</th><th>Date</th></tr></thead>
+      <tbody>
+        {reviews.map((r) => (
+          <tr>
+            <td><span class="pt-stars">{stars(r.rating)}</span></td>
+            <td><span class="pt-snip">{r.review ? (String(r.review).length > 160 ? String(r.review).slice(0, 160) + '…' : r.review) : <span class="pt-mut">(no comment)</span>}</span></td>
+            <td><a href={'/aquintutor/courses/' + r.slug} class="pt-link">{r.course}</a></td>
+            <td>{fmt(r.created_at)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )}
+  </div>
+
+  <h2 class="pt-sect-h">Revenue <em>&amp; share</em></h2>
+  <div class="pt-card">
+  {courses.length === 0 ? (
+    <div class="pt-empty">No revenue to report yet.</div>
+  ) : (
+    <table class="pt-tbl">
+      <thead><tr><th>Course</th><th class="num">Price</th><th class="num">Enrolled</th><th class="num">Gross (INR)</th><th class="num">~CHF</th></tr></thead>
+      <tbody>
+        {courses.map((c) => {
+          const enrolled = (perCourse.get(c.id)?.enrolled) || 0;
+          const gross = (Number(c.price) || 0) * enrolled;
+          return (
+          <tr>
+            <td>{c.title}</td>
+            <td class="num">{inr(c.price)}</td>
+            <td class="num">{enrolled}</td>
+            <td class="num">{inr(gross)}</td>
+            <td class="num">~{chf(gross)}</td>
+          </tr>
+          );
+        })}
+      </tbody>
+      <tfoot>
+        <tr>
+          <td>Total gross (pre-tax)</td>
+          <td class="num"></td>
+          <td class="num">{totalEnroll}</td>
+          <td class="num">{inr(grossInr)}</td>
+          <td class="num">~{grossChf}</td>
+        </tr>
+      </tfoot>
+    </table>
+  )}
+    <div class="pt-note">
+      Per the agreed partnership terms, the partnership <strong>revenue share is 15% of total fees per additional course</strong>, exclusive of taxes.
+      On current gross, that is approximately <strong>{inr(revShareInr)}</strong> (~CHF {chf(revShareInr)}). Figures are indicative and pre-tax; final settlement follows the signed agreement.
+    </div>
+  </div>
+
+  <h2 class="pt-sect-h">Your <em>academy</em></h2>
+  <div class="pt-card">
+    <div class="pt-note" style="border-top:none;">
+      {academySlug
+        ? <span>Your branded academy page is live at <a class="pt-link" href={'/academy/' + academySlug} target="_blank" rel="noopener">/academy/{academySlug}</a>. Share it with your community to drive enrolments straight into your catalogue.</span>
+        : <span>Your branded academy page activates once a school or organisation name is on file. Add it in your partnership application or course settings.</span>}
+    </div>
+  </div>
+
+  <div class="pt-actions">
+    {academySlug && <a href={'/academy/' + academySlug} class="pt-btn ghost" target="_blank" rel="noopener">View academy &rarr;</a>}
+    <a href="/admin/aquintutor/courses" class="pt-btn ghost">+ New course</a>
+    <a href="/aquintutor/partnerships" class="pt-btn">Host another course &rarr;</a>
+  </div>
 </main>
 </AquintutorLayout>
