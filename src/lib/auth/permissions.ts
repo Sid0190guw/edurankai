@@ -58,7 +58,13 @@ const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'products.view', 'products.edit',
     'content.view', 'content.edit'
   ],
-  applicant: []
+  applicant: [],
+  // AquinTutor-scoped roles hold NO main-admin permission (no admin.access), so
+  // the middleware confines them to /aquintutor/admin. Their abilities live in
+  // their own panels (partner = host courses, teacher = author, moderator = review).
+  partner: [],
+  teacher: [],
+  technical_moderator: []
 };
 
 export function can(user: User | null, perm: Permission): boolean {
@@ -84,7 +90,10 @@ export const ROLE_LABELS: Record<User['role'], string> = {
   department_head: 'Department Head',
   marketing: 'Marketing',
   editor: 'Editor',
-  applicant: 'Applicant'
+  applicant: 'Applicant',
+  partner: 'AquinTutor Partner',
+  teacher: 'AquinTutor Teacher',
+  technical_moderator: 'AquinTutor Moderator'
 };
 
 // Roles that need a department assignment

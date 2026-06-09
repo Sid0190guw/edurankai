@@ -209,7 +209,11 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // the main EduRankAI admin to /aquintutor/admin. Internal staff (super_admin,
   // hr, editor, ...) all hold admin.access, so this only affects partner scopes.
   if (result.user.role !== 'applicant' && (path === '/admin' || path.startsWith('/admin/')) && path !== '/admin/login' && path !== '/admin/logout' && !can(result.user as any, 'admin.access')) {
-    return new Response(null, { status: 302, headers: { Location: '/aquintutor/admin' } });
+    const r = result.user.role as string;
+    const dest = r === 'teacher' ? '/aquintutor/admin/teacher'
+      : r === 'technical_moderator' ? '/aquintutor/admin/moderator'
+      : '/aquintutor/admin/partner';
+    return new Response(null, { status: 302, headers: { Location: dest } });
   }
 
   // Permission gate: a user assigned a custom role only reaches sections that
