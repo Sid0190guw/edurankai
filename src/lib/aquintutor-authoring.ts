@@ -50,6 +50,8 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
       await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS total_minutes INT DEFAULT 0`);
       await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS school VARCHAR(80)`);
       await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS difficulty VARCHAR(20) DEFAULT 'beginner'`);
+      // Per-course attached virtual labs (array of lab slugs) surfaced on the course Labs tab.
+      await ex(sql`ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS featured_labs JSONB DEFAULT '[]'::jsonb`);
 
       // Lesson blocks — the editorial primitives. Each block has a kind and a JSONB content payload.
       await ex(sql`CREATE TABLE IF NOT EXISTS training_lesson_blocks (
@@ -353,6 +355,7 @@ export const LAB_CATALOGUE = [
   // hands-on benches + engineering workbenches (lead the list)
   'logic-bench','eee-bench','cro-bench','optics-bench','titration-bench',
   'vlsi','eee','cybersecurity','ai-ml','robotics','mechanical',
+  'fluid-bench','reaction-bench','biotech-bench','dsa-bench',
   // foundational simulators
   'pendulum','projectile','optics','circuit','logic-gates','titration','periodic',
   'molecular','genetics','ecosystem','plot','linear-algebra','sorting','pathfinding',
@@ -361,6 +364,42 @@ export const LAB_CATALOGUE = [
 export const SIMULATOR_CATALOGUE = [
   { target: 'quantum/composer', label: 'Quantum circuit composer' },
   { target: 'hpc/simulator',    label: 'HPC job simulator' },
+  { target: 'teach',            label: 'Live teaching canvas (real-time animation)' },
+  { target: 'labs/animator',    label: 'Animation studio' },
   { target: 'labs/neural-net',  label: 'Neural network playground' },
   { target: 'labs/circuit',     label: 'Circuit builder' },
 ];
+
+// Display names for every embeddable lab — shared by the course editor's lab
+// picker and the student course "Labs" tab so they always agree.
+export const LAB_LABELS: { [slug: string]: string } = {
+  'logic-bench': 'Digital Logic Workbench', 'eee-bench': 'Analog Electronics Workbench',
+  'cro-bench': 'Oscilloscope + Function Gen', 'optics-bench': 'Optical Bench', 'titration-bench': 'Titration Bench',
+  'vlsi': 'VLSI & Digital Design', 'eee': 'Electrical & Electronics', 'cybersecurity': 'Cybersecurity',
+  'ai-ml': 'AI & Machine Learning', 'robotics': 'Robotics & AI', 'mechanical': 'Mechanical Engineering',
+  'fluid-bench': 'Fluid Mechanics & Hydraulics', 'reaction-bench': 'Chemical Reaction Engineering',
+  'biotech-bench': 'Molecular Biology', 'dsa-bench': 'Data Structures & Algorithms',
+  'pendulum': 'Pendulum & SHM', 'projectile': 'Projectile Motion', 'optics': 'Ray Optics',
+  'circuit': 'Circuit Builder', 'logic-gates': 'Logic Gate Builder', 'titration': 'Acid-Base Titration',
+  'periodic': 'Periodic Table', 'molecular': 'Molecular Viewer', 'genetics': 'Punnett Square',
+  'ecosystem': 'Predator-Prey', 'plot': 'Function Plotter', 'linear-algebra': 'Matrix Transforms',
+  'sorting': 'Sorting Visualiser', 'pathfinding': 'Path-finding', 'neural-net': 'Neural Network Playground',
+  'fourier': 'Fourier Series', 'animator': 'Animation Studio',
+};
+export function labLabel(slug: string): string { return LAB_LABELS[slug] || slug; }
+
+// Per-course featured virtual labs (slug array). Bootstrapped column on training_courses.
+export async function getCourseLabs(courseId: string): Promise<string[]> {
+  await ensureAquintutorAuthoringSchema();
+  try {
+    const r = rows(await db.execute(sql`SELECT featured_labs FROM training_courses WHERE id = ${courseId} LIMIT 1`));
+    let v: any = r[0]?.featured_labs;
+    if (typeof v === 'string') { try { v = JSON.parse(v); } catch { v = []; } }
+    return Array.isArray(v) ? v.filter((s) => typeof s === 'string') : [];
+  } catch { return []; }
+}
+export async function setCourseLabs(courseId: string, slugs: string[]): Promise<void> {
+  await ensureAquintutorAuthoringSchema();
+  const clean = Array.from(new Set((slugs || []).filter((s) => typeof s === 'string' && LAB_LABELS[s]))).slice(0, 40);
+  await db.execute(sql`UPDATE training_courses SET featured_labs = ${JSON.stringify(clean)}::jsonb, updated_at = NOW() WHERE id = ${courseId}`);
+}
