@@ -53,8 +53,63 @@ const catMap: { [k: string]: { sum: number; n: number } } = {};
 enrollments.forEach((e: any) => { const k = e.category || e.school || 'General'; catMap[k] = catMap[k] || { sum: 0, n: 0 }; catMap[k].sum += (e.progress_pct || 0); catMap[k].n++; });
 const competencies = Object.entries(catMap).map(([k, v]) => ({ name: k, pct: Math.round(v.sum / v.n) })).sort((a, b) => b.pct - a.pct).slice(0, 6);
 
+// ---- daily activity (last 84 days) for heatmap + trend ----
+const DAYS = 84;
+// pull per-day counts from every signal we have; each guarded so a missing table just contributes nothing
+const aDaily = await safeRows(sql`SELECT to_char(created_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM activity_events WHERE user_id = ${user.id} AND created_at > now() - interval '84 days' GROUP BY 1`);
+const lDaily = await safeRows(sql`SELECT to_char(completed_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM training_lesson_progress WHERE user_id = ${user.id} AND completed_at IS NOT NULL AND completed_at > now() - interval '84 days' GROUP BY 1`);
+const lDaily2 = lDaily.length ? [] : await safeRows(sql`SELECT to_char(created_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM training_lesson_completions WHERE user_id = ${user.id} AND created_at > now() - interval '84 days' GROUP BY 1`);
+const certDaily = await safeRows(sql`SELECT to_char(issued_at,'YYYY-MM-DD') AS d, COUNT(*)::int AS n FROM course_certificates WHERE user_id = ${user.id} AND issued_at > now() - interval '84 days' GROUP BY 1`);
+
+const activityMap: { [k: string]: number } = {};   // all signals — heatmap intensity
+const lessonMap: { [k: string]: number } = {};      // lesson completions only — trend + goal
+[aDaily, lDaily, lDaily2, certDaily].forEach((arr: any[]) => arr.forEach((r: any) => { if (!r.d) return; activityMap[r.d] = (activityMap[r.d] || 0) + (r.n || 0); }));
+[lDaily, lDaily2].forEach((arr: any[]) => arr.forEach((r: any) => { if (!r.d) return; lessonMap[r.d] = (lessonMap[r.d] || 0) + (r.n || 0); }));
+
+// calendar cells, oldest -> newest, aligned to week columns (Sun start)
+const todayMid = new Date(); todayMid.setHours(0, 0, 0, 0);
+const flat: { date: string; count: number; dow: number }[] = [];
+for (let i = DAYS - 1; i >= 0; i--) { const dt = new Date(todayMid.getTime() - i * 86400000); const key = dt.toISOString().slice(0, 10); flat.push({ date: key, count: activityMap[key] || 0, dow: dt.getDay() }); }
+const weeks: ({ date: string; count: number } | null)[][] = [];
+let wcol: ({ date: string; count: number } | null)[] = [];
+for (let p = 0; p < flat[0].dow; p++) wcol.push(null);
+flat.forEach((c) => { wcol.push({ date: c.date, count: c.count }); if (wcol.length === 7) { weeks.push(wcol); wcol = []; } });
+if (wcol.length) { while (wcol.length < 7) wcol.push(null); weeks.push(wcol); }
+const maxCount = Math.max(1, ...flat.map((c) => c.count));
+function level(n: number) { if (n <= 0) return 0; return Math.min(4, Math.max(1, Math.ceil((n / maxCount) * 4))); }
+const heatColors = ['#EBE6DA', 'rgba(160,66,30,0.30)', 'rgba(160,66,30,0.52)', 'rgba(160,66,30,0.76)', '#A0421E'];
+const activeDays = flat.filter((c) => c.count > 0).length;
+// current activity streak (consecutive active days ending today or yesterday)
+let actStreak = 0; for (let i = flat.length - 1; i >= 0; i--) { if (flat[i].count > 0) actStreak++; else if (i < flat.length - 1) break; }
+
+// weekly lesson trend (12 buckets aligned to the heatmap week columns)
+const weeklyLessons = weeks.map((col) => col.reduce((s, cell) => s + (cell ? (lessonMap[cell.date] || 0) : 0), 0));
+const maxWeekly = Math.max(1, ...weeklyLessons);
+const totalLessonsDone = Object.values(lessonMap).reduce((s, n) => s + n, 0);
+
+// this-week goal data (real progress; target persisted client-side)
+const last7 = flat.slice(-7);
+const lessonsThisWeek = last7.reduce((s, c) => s + (lessonMap[c.date] || 0), 0);
+const activeThisWeek = last7.filter((c) => c.count > 0).length;
+
+// skill radar geometry (reuse competencies; need >=3 axes) — fully precomputed so the
+// template uses only simple expressions (nested arrow-with-block bodies break esbuild's JSX).
+const radar = competencies.slice(0, 6);
+const RC = { cx: 130, cy: 122, r: 92 };
+function radarPt(i: number, frac: number, n: number) {
+  const ang = (Math.PI * 2 * i) / n - Math.PI / 2;
+  return { x: RC.cx + Math.cos(ang) * RC.r * frac, y: RC.cy + Math.sin(ang) * RC.r * frac };
+}
+const radarN = radar.length || 1;
+const radarRings = [0.25, 0.5, 0.75, 1].map((f) => radar.map((_c, i) => { const p = radarPt(i, f, radarN); return p.x.toFixed(1) + ',' + p.y.toFixed(1); }).join(' '));
+const radarAxes = radar.map((_c, i) => radarPt(i, 1, radarN));
+const radarLabels = radar.map((c, i) => { const p = radarPt(i, 1.14, radarN); return { x: p.x, y: p.y, name: (c.name || '').slice(0, 10) }; });
+const radarDots = radar.map((c, i) => { const p = radarPt(i, Math.max(0.04, (c.pct || 0) / 100), radarN); return { x: p.x, y: p.y }; });
+const radarPoly = radarDots.map((p) => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ');
+
 const firstName = (user.name || '').split(' ')[0] || 'there';
 function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }); } catch { return ''; } }
+function monthLabel(key: string) { try { return new Date(key + 'T00:00:00').toLocaleDateString('en-IN', { month: 'short' }); } catch { return ''; } }
 // health ring geometry
 const R = 70, CIRC = 2 * Math.PI * R, healthOffset = CIRC * (1 - health / 100);
 ---
@@ -131,6 +186,35 @@ const R = 70, CIRC = 2 * Math.PI * R, healthOffset = CIRC * (1 - health / 100);
   .pg-rec-card:hover { border-color: var(--rust); }
   .pg-rec-t { font-family: 'Cormorant Garamond', serif; font-size: 18px; font-weight: 600; line-height: 1.2; }
   .pg-rec-m { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--ink-500); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+
+  /* analytics row: heatmap + radar + trend + goal */
+  .pg-analytics { display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px; margin: 18px 0; }
+  @media (max-width: 900px) { .pg-analytics { grid-template-columns: 1fr; } }
+  .pg-heat-wrap { overflow-x: auto; padding-bottom: 4px; }
+  .pg-heat { display: inline-flex; gap: 3px; }
+  .pg-heat-col { display: flex; flex-direction: column; gap: 3px; }
+  .pg-heat-cell { width: 13px; height: 13px; border-radius: 3px; }
+  .pg-heat-months { display: flex; gap: 3px; margin-bottom: 6px; font-family: 'JetBrains Mono', monospace; font-size: 9px; color: var(--ink-500); }
+  .pg-heat-legend { display: flex; align-items: center; gap: 6px; margin-top: 12px; font-family: 'JetBrains Mono', monospace; font-size: 9.5px; color: var(--ink-500); }
+  .pg-heat-legend i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+  .pg-mini-stats { display: flex; gap: 22px; margin-top: 14px; }
+  .pg-mini-v { font-family: 'Fraunces', serif; font-size: 22px; font-weight: 600; line-height: 1; color: var(--ink); }
+  .pg-mini-l { font-family: 'JetBrains Mono', monospace; font-size: 8.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-500); margin-top: 4px; font-weight: 700; }
+
+  .pg-trend { display: flex; align-items: flex-end; gap: 4px; height: 96px; margin-top: 6px; }
+  .pg-trend-bar { flex: 1; background: linear-gradient(180deg, #d97757, #a0421e); border-radius: 4px 4px 0 0; min-height: 3px; position: relative; transition: opacity .15s; }
+  .pg-trend-bar:hover { opacity: 0.75; }
+  .pg-trend-x { display: flex; justify-content: space-between; margin-top: 6px; font-family: 'JetBrains Mono', monospace; font-size: 9px; color: var(--ink-500); }
+
+  .pg-goal-ring { position: relative; width: 132px; height: 132px; margin: 4px auto 0; }
+  .pg-goal-ring svg { transform: rotate(-90deg); }
+  .pg-goal-num { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .pg-goal-v { font-family: 'Fraunces', serif; font-size: 30px; font-weight: 600; line-height: 1; color: var(--ink); }
+  .pg-goal-l { font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-500); margin-top: 4px; font-weight: 700; }
+  .pg-goal-ctl { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 14px; }
+  .pg-goal-ctl button { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--rule); background: var(--sand-100); color: var(--ink); font-size: 17px; cursor: pointer; line-height: 1; }
+  .pg-goal-ctl button:hover { border-color: var(--rust); color: var(--rust); }
+  .pg-goal-ctl span { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--ink); font-weight: 700; min-width: 92px; text-align: center; }
 </style>
 
 <div class="pg-crumb"><div class="pg-crumb-in"><a href="/aquintutor">AQUINTUTOR</a> <span style="margin:0 8px;">/</span> <a href="/aquintutor/dashboard">DASHBOARD</a> <span style="margin:0 8px;">/</span> <span class="cur">MY PROGRESS</span></div></div>
@@ -190,6 +274,84 @@ const R = 70, CIRC = 2 * Math.PI * R, healthOffset = CIRC * (1 - health / 100);
         </div>
         <p id="pulseThanks" style="display:none;margin-top:12px;color:#86efac;">Thanks — noted. Keep going.</p>
       </div>
+    </div>
+  </div>
+
+  {/* Activity heatmap + skill radar */}
+  <div class="pg-analytics">
+    <div class="pg-card">
+      <h2>Activity — last 12 weeks</h2>
+      <div class="pg-heat-wrap">
+        <div class="pg-heat">
+          {weeks.map((col) => (
+            <div class="pg-heat-col">
+              {col.map((cell) => (
+                cell
+                  ? <div class="pg-heat-cell" style={'background:' + heatColors[level(cell.count)]} title={cell.date + ' · ' + cell.count + ' action' + (cell.count === 1 ? '' : 's')}></div>
+                  : <div class="pg-heat-cell" style="background:transparent;"></div>
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+      <div class="pg-heat-legend">
+        <span>Less</span>
+        {heatColors.map((c) => (<i style={'background:' + c}></i>))}
+        <span>More</span>
+        <span style="margin-left:auto;">{maxCount} max / day</span>
+      </div>
+      <div class="pg-mini-stats">
+        <div><div class="pg-mini-v">{activeDays}</div><div class="pg-mini-l">Active days</div></div>
+        <div><div class="pg-mini-v">{actStreak}</div><div class="pg-mini-l">Day streak</div></div>
+        <div><div class="pg-mini-v">{totalLessonsDone}</div><div class="pg-mini-l">Lessons done</div></div>
+      </div>
+    </div>
+
+    <div class="pg-card">
+      <h2>Skill radar</h2>
+      {radar.length >= 3 ? (
+        <div style="display:flex; justify-content:center;">
+          <svg width="260" height="244" viewBox="0 0 260 244">
+            {radarRings.map((pts) => (<polygon points={pts} fill="none" stroke="var(--rule)" stroke-width="1" />))}
+            {radarAxes.map((p) => (<line x1={RC.cx} y1={RC.cy} x2={p.x} y2={p.y} stroke="var(--rule)" stroke-width="1" />))}
+            <polygon points={radarPoly} fill="rgba(160,66,30,0.18)" stroke="var(--rust)" stroke-width="2" />
+            {radarLabels.map((l) => (<text x={l.x} y={l.y} text-anchor="middle" dominant-baseline="middle" style="font-family:'JetBrains Mono',monospace;font-size:8.5px;fill:var(--ink-500);">{l.name}</text>))}
+            {radarDots.map((p) => (<circle cx={p.x} cy={p.y} r="3" fill="var(--rust)" />))}
+          </svg>
+        </div>
+      ) : (
+        <p style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--ink-500);padding:20px 0;">Enrol across a few areas to build your skill radar. {radar.length} of 3 areas so far.</p>
+      )}
+    </div>
+  </div>
+
+  {/* Weekly trend + goal */}
+  <div class="pg-analytics" style="grid-template-columns:1.4fr 1fr;">
+    <div class="pg-card">
+      <h2>Lessons completed per week</h2>
+      <div class="pg-trend">
+        {weeklyLessons.map((n) => (<div class="pg-trend-bar" style={'height:' + Math.round((n / maxWeekly) * 100) + '%'} title={n + ' lesson' + (n === 1 ? '' : 's')}></div>))}
+      </div>
+      <div class="pg-trend-x">
+        <span>{weeks[0] && weeks[0].find(Boolean) ? monthLabel((weeks[0].find(Boolean) as any).date) : ''}</span>
+        <span>now</span>
+      </div>
+    </div>
+
+    <div class="pg-card" style="text-align:center;">
+      <h2>Weekly goal</h2>
+      <div class="pg-goal-ring" id="goalRing"
+        data-done={lessonsThisWeek}
+        data-active={activeThisWeek}>
+        <svg width="132" height="132"><circle cx="66" cy="66" r="56" fill="none" stroke="#EBE6DA" stroke-width="11"/><circle id="goalArc" cx="66" cy="66" r="56" fill="none" stroke="#1A6B35" stroke-width="11" stroke-linecap="round" stroke-dasharray={(2 * Math.PI * 56).toFixed(1)} stroke-dashoffset={(2 * Math.PI * 56).toFixed(1)}/></svg>
+        <div class="pg-goal-num"><div class="pg-goal-v" id="goalText">{lessonsThisWeek}/5</div><div class="pg-goal-l">this week</div></div>
+      </div>
+      <div class="pg-goal-ctl">
+        <button type="button" id="goalDown" aria-label="Lower goal">&minus;</button>
+        <span id="goalLabel">Goal: 5 lessons</span>
+        <button type="button" id="goalUp" aria-label="Raise goal">+</button>
+      </div>
+      <p style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--ink-500);margin:12px 0 0;">{activeThisWeek} active day{activeThisWeek === 1 ? '' : 's'} in the last 7</p>
     </div>
   </div>
 
@@ -256,6 +418,27 @@ const R = 70, CIRC = 2 * Math.PI * R, healthOffset = CIRC * (1 - health / 100);
 </main>
 
 <script is:inline>
+  (function () {
+    var ring = document.getElementById('goalRing');
+    if (!ring) return;
+    var done = parseInt(ring.getAttribute('data-done') || '0', 10);
+    var arc = document.getElementById('goalArc');
+    var text = document.getElementById('goalText');
+    var label = document.getElementById('goalLabel');
+    var C = 2 * Math.PI * 56;
+    function goal() { var g = parseInt(localStorage.getItem('era_weekly_goal') || '5', 10); return (g >= 1 && g <= 30) ? g : 5; }
+    function paint() {
+      var g = goal();
+      var frac = Math.max(0, Math.min(1, done / g));
+      arc.setAttribute('stroke-dashoffset', (C * (1 - frac)).toFixed(1));
+      arc.setAttribute('stroke', frac >= 1 ? '#1A6B35' : '#a0421e');
+      text.textContent = done + '/' + g;
+      label.textContent = 'Goal: ' + g + ' lesson' + (g === 1 ? '' : 's');
+    }
+    document.getElementById('goalUp').addEventListener('click', function () { localStorage.setItem('era_weekly_goal', String(Math.min(30, goal() + 1))); paint(); });
+    document.getElementById('goalDown').addEventListener('click', function () { localStorage.setItem('era_weekly_goal', String(Math.max(1, goal() - 1))); paint(); });
+    paint();
+  })();
   document.querySelectorAll('#pulse button').forEach(function (b) {
     b.addEventListener('click', function () {
       document.getElementById('pulseThanks').style.display = 'block';
