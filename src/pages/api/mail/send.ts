@@ -8,6 +8,7 @@ import { sql } from 'drizzle-orm';
 import { deliverMessage, parseAddressList, getMailboxAddress, logOutbound, getMailConfig } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
 import { expandGroupTokens } from '@/lib/mail-groups';
+import { getSignature, scheduleMessage, rewriteLinksForTracking } from '@/lib/mail-advanced';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -53,6 +54,26 @@ export const POST: APIRoute = async ({ request, locals }) => {
     ? body.attachments.filter((a: any) => a && a.url).map((a: any) => ({ filename: a.filename || 'attachment', url: a.url, mime: a.mime, size: a.size }))
     : [];
 
+  // Append the composer's signature (unless this is a no-signature send).
+  if (body.signature !== false) {
+    try {
+      const sig = await getSignature(user.id);
+      if (sig.on && sig.html) {
+        bodyHtml = bodyHtml + '<br/><br/><div class="era-sig">' + sig.html + '</div>';
+        bodyText = bodyText + '\n\n' + sig.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      }
+    } catch (_) {}
+  }
+
+  // Scheduled send: stash it and return; the scheduled-send cron delivers it.
+  const schedRaw = body.scheduledAt ? new Date(body.scheduledAt) : null;
+  if (schedRaw && !isNaN(schedRaw.getTime()) && schedRaw.getTime() > Date.now() + 30000) {
+    try {
+      const sid = await scheduleMessage({ userId: user.id, to, cc, bcc, subject, bodyHtml, bodyText, threadId: body.threadId || null, inReplyTo: body.inReplyTo || null, scheduledAt: schedRaw });
+      return json({ ok: true, scheduled: true, scheduledId: sid, scheduledAt: schedRaw.toISOString() });
+    } catch (e: any) { return json({ ok: false, error: 'could not schedule: ' + (e?.message || e) }, 500); }
+  }
+
   try {
     const fromEmail = await getMailboxAddress(user.id);
     const fromName = user.name || fromEmail;
@@ -86,7 +107,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
       // recipient opens. Inserted at the bottom of the HTML so it loads after
       // body content; falls through silently if their client blocks images.
       const trackingPixel = `<img src="https://edurankai.in/api/mail/track/${result.messageId}.gif" width="1" height="1" alt="" style="display:none;border:0;width:1px;height:1px;" />`;
-      const htmlWithPixel = (bodyHtml || '') + trackingPixel;
+      // Rewrite links through the click redirector so opens AND clicks are measured.
+      const htmlTracked = rewriteLinksForTracking(bodyHtml || '', result.messageId);
+      const htmlWithPixel = htmlTracked + trackingPixel;
       const send = await sendExternal({
         from: envFrom,
         to: extTo.length ? extTo : (extCc[0] ? extCc : extBcc),
