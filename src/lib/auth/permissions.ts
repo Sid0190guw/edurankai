@@ -63,7 +63,9 @@ const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
 
 export function can(user: User | null, perm: Permission): boolean {
   if (!user || !user.isActive) return false;
-  return PERMS_BY_ROLE[user.role].includes(perm);
+  // Roles not in the matrix (e.g. a partner/teacher scope) get NO built-in
+  // permissions — they are confined to their own panel, never the main admin.
+  return (PERMS_BY_ROLE[user.role] || []).includes(perm);
 }
 
 export function requireAdmin(user: User | null): User {

@@ -3,7 +3,7 @@ import { validateSessionToken } from '@/lib/auth/session';
 import { readSessionCookie, setSessionCookie, clearSessionCookie } from '@/lib/auth/cookie';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { getViewableSectionKeys } from '@/lib/auth/permissions';
+import { getViewableSectionKeys, can } from '@/lib/auth/permissions';
 
 // Map an /admin/* path to its permission section key (longest-prefix wins).
 // Universal/auth paths (dashboard, mail, notifications, login, logout) are not
@@ -202,6 +202,14 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // panel. Central guard (complements per-page checks).
   if (result.user.role === 'applicant' && path !== '/admin/login' && (path === '/admin' || path.startsWith('/admin/'))) {
     return new Response(null, { status: 302, headers: { Location: '/portal' } });
+  }
+
+  // AquinTutor partner / teacher / moderator scopes are confined to their own
+  // panel: any signed-in role WITHOUT the admin.access permission is bounced off
+  // the main EduRankAI admin to /aquintutor/admin. Internal staff (super_admin,
+  // hr, editor, ...) all hold admin.access, so this only affects partner scopes.
+  if (result.user.role !== 'applicant' && (path === '/admin' || path.startsWith('/admin/')) && path !== '/admin/login' && path !== '/admin/logout' && !can(result.user as any, 'admin.access')) {
+    return new Response(null, { status: 302, headers: { Location: '/aquintutor/admin' } });
   }
 
   // Permission gate: a user assigned a custom role only reaches sections that
