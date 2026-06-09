@@ -1,0 +1,163 @@
+---
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureAquintutorAuthoringSchema } from '@/lib/aquintutor-authoring';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=/aquintutor/admin/courses');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+const isSuper = user.role === 'admin' || user.role === 'super_admin';
+
+await ensureAquintutorAuthoringSchema();
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+async function safeRows(q: any): Promise<any[]> { try { return rowsOf(await db.execute(q)); } catch { return []; } }
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('action') as string) || 'create';
+    if (action === 'create') {
+      const slug = ((fd.get('slug') as string) || '').trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 120);
+      const title = ((fd.get('title') as string) || '').trim().slice(0, 300);
+      const school = ((fd.get('school') as string) || '').trim().slice(0, 80) || null;
+      const difficulty = (fd.get('difficulty') as string) || 'beginner';
+      const r = rowsOf(await db.execute(sql`
+        INSERT INTO training_courses (slug, title, school, difficulty, access_type, is_published, created_at, updated_at)
+        VALUES (${slug}, ${title}, ${school}, ${difficulty}, 'both', false, NOW(), NOW())
+        ON CONFLICT (slug) DO NOTHING
+        RETURNING id
+      `));
+      if (r[0]?.id) {
+        // Record the creator as the course author so their partner / teacher
+        // console automatically scopes to this course (end-to-end ownership).
+        await db.execute(sql`
+          INSERT INTO training_course_authors (course_id, user_id, role)
+          VALUES (${r[0].id}, ${user.id}, 'author')
+          ON CONFLICT (course_id, user_id) DO NOTHING
+        `).catch(() => {});
+        okMsg = 'Course created.';
+        return Astro.redirect('/aquintutor/admin/courses/' + r[0].id + '/edit');
+      }
+      else errMsg = 'A course with that slug already exists.';
+    } else if (action === 'publish') {
+      const id = fd.get('id') as string;
+      await db.execute(sql`UPDATE training_courses SET is_published = true, updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Published.';
+    } else if (action === 'unpublish') {
+      const id = fd.get('id') as string;
+      await db.execute(sql`UPDATE training_courses SET is_published = false, updated_at = NOW() WHERE id = ${id}`);
+      okMsg = 'Unpublished.';
+    } else if (action === 'delete') {
+      const id = fd.get('id') as string;
+      await db.execute(sql`DELETE FROM training_courses WHERE id = ${id}`);
+      okMsg = 'Deleted.';
+    }
+  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+}
+
+const url = new URL(Astro.request.url);
+const filterPub = url.searchParams.get('pub') || '';
+const filterSchool = url.searchParams.get('school') || '';
+
+// Author scoping: a partner / teacher only ever sees the courses they author.
+// Super admins see every course. Non-super authors with no courses see an
+// empty state, never the whole catalogue.
+let authoredIds: any[] = [];
+if (!isSuper) {
+  authoredIds = (await safeRows(sql`SELECT course_id FROM training_course_authors WHERE user_id = ${user.id}`)).map((a: any) => a.course_id);
+}
+
+// Defensive: the rich query references columns added by the self-bootstrap
+// (training_lessons.status, training_courses.school). If a prod schema is
+// missing them we fall back to a minimal query so the page never 500s.
+let courses: any[] = [];
+if (isSuper || authoredIds.length > 0) {
+  const scopeClause = isSuper ? sql`` : sql`AND c.id = ANY(${authoredIds})`;
+  try {
+    courses = rowsOf(await db.execute(sql`
+      SELECT c.*,
+        (SELECT COUNT(*)::int FROM training_modules WHERE course_id = c.id) AS module_count,
+        (SELECT COUNT(*)::int FROM training_lessons WHERE course_id = c.id) AS lesson_count,
+        (SELECT COUNT(*)::int FROM training_lessons WHERE course_id = c.id AND status = 'published') AS published_count
+      FROM training_courses c
+      WHERE 1=1
+        ${scopeClause}
+        ${filterPub === '1' ? sql`AND c.is_published = true` : sql``}
+        ${filterPub === '0' ? sql`AND c.is_published = false` : sql``}
+        ${filterSchool ? sql`AND c.school = ${filterSchool}` : sql``}
+      ORDER BY c.created_at DESC LIMIT 200
+    `));
+  } catch (_) {
+    try {
+      courses = rowsOf(await db.execute(sql`
+        SELECT c.*, 0 AS module_count, 0 AS lesson_count, 0 AS published_count
+        FROM training_courses c
+        WHERE 1=1
+          ${scopeClause}
+          ${filterPub === '1' ? sql`AND c.is_published = true` : sql``}
+          ${filterPub === '0' ? sql`AND c.is_published = false` : sql``}
+        ORDER BY c.created_at DESC LIMIT 200
+      `));
+    } catch (_) { courses = []; }
+  }
+}
+
+let schools: any[] = [];
+try { schools = rowsOf(await db.execute(sql`SELECT DISTINCT school FROM training_courses WHERE school IS NOT NULL ORDER BY school`)); } catch (_) { schools = []; }
+
+function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }); } catch { return ''; } }
+---
+<AquintutorLayout title="AquinTutor Courses" noindex={true}>
+<div style="padding:14px 16px 80px;max-width:1280px;margin:0 auto;">
+  <a href="/aquintutor/admin" style="font-size:11.5px;color:#9aa6b6;text-decoration:none;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">COMMAND CENTER / AQUINTUTOR</a>
+  <p style="font-size:10.5px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:10px 0 0;font-family:'Geist Mono',monospace;font-weight:700;">AquinTutor · Authoring</p>
+  <h1 style="font-size:24px;color:#fff;margin:6px 0 4px;font-weight:700;">Courses</h1>
+  <p style="font-size:13px;color:#9aa6b6;margin:0 0 18px;">Full-scale course authoring. Modules · lessons · block-based content · versions · review workflow · published.</p>
+
+  {okMsg && <div style="background:rgba(74,222,128,0.10);border:1px solid rgba(74,222,128,0.32);color:#86efac;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{okMsg}</div>}
+  {errMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{errMsg}</div>}
+
+  <details open style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:0;margin-bottom:18px;">
+    <summary style="cursor:pointer;padding:14px 18px;font-size:13px;color:#FF7040;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;font-family:'Geist Mono',monospace;list-style:none;">+ New course</summary>
+    <form method="POST" style="padding:0 18px 18px;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+      <input type="hidden" name="action" value="create" />
+      <div style="grid-column:span 2;"><label style="font-size:10.5px;color:#9aa6b6;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;">Title *</label><input name="title" required maxlength="300" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;" /></div>
+      <div><label style="font-size:10.5px;color:#9aa6b6;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;">Slug *</label><input name="slug" required maxlength="120" pattern="[a-z0-9-]+" placeholder="quantum-computing-foundations" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;font-family:'Geist Mono',monospace;" /></div>
+      <div><label style="font-size:10.5px;color:#9aa6b6;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;">School</label><input name="school" maxlength="80" placeholder="Computing, Quantum, Sanskrit, ..." style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;" /></div>
+      <div><label style="font-size:10.5px;color:#9aa6b6;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;">Difficulty</label>
+        <select name="difficulty" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;"><option value="beginner">Beginner</option><option value="intermediate">Intermediate</option><option value="advanced">Advanced</option></select>
+      </div>
+      <button type="submit" style="grid-column:span 2;background:#FF4F00;color:#fff;border:none;padding:10px 22px;border-radius:8px;font-size:12.5px;font-weight:800;cursor:pointer;letter-spacing:0.04em;text-transform:uppercase;font-family:'Geist Mono',monospace;justify-self:start;">Create course</button>
+    </form>
+  </details>
+
+  <form method="GET" style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+    <select name="pub" style="background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;"><option value="">All</option><option value="1" selected={filterPub==='1'}>Published</option><option value="0" selected={filterPub==='0'}>Draft</option></select>
+    {schools.length > 0 && <select name="school" style="background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;"><option value="">All schools</option>{schools.map((s: any) => <option value={s.school} selected={s.school === filterSchool}>{s.school}</option>)}</select>}
+    <button type="submit" style="background:#15151a;border:1px solid #2a2a2f;color:#FF7040;padding:9px 16px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;">Filter</button>
+  </form>
+
+  {courses.length === 0 ? (<div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:36px;text-align:center;color:#6e6e78;font-size:13px;">No courses yet. Create your first.</div>) : (
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      {courses.map((c: any) => (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:14px 18px;display:grid;grid-template-columns:1.6fr 1.2fr 100px 100px 100px 120px;gap:12px;align-items:center;">
+          <div>
+            <p style="font-size:13.5px;color:#fff;font-weight:700;margin:0;">{c.title}</p>
+            <p style="font-size:10.5px;color:#9aa6b6;margin:2px 0 0;font-family:'Geist Mono',monospace;">{c.slug} · {c.school || 'no school'}</p>
+          </div>
+          <p style="font-size:11.5px;color:#cfd6da;margin:0;"><span style="color:#9aa6b6;">{c.module_count}</span> modules · <span style="color:#9aa6b6;">{c.lesson_count}</span> lessons · <span style="color:#86efac;">{c.published_count}</span> published</p>
+          <span style={`background:${c.is_published ? 'rgba(134,239,172,0.18)' : 'rgba(251,191,36,0.18)'};color:${c.is_published ? '#86efac' : '#fbbf24'};font-size:10px;font-weight:700;padding:3px 8px;border-radius:100px;text-align:center;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;`}>{c.is_published ? 'Live' : 'Draft'}</span>
+          <p style="font-size:10.5px;color:#67e8f9;margin:0;font-family:'Geist Mono',monospace;">{c.difficulty}</p>
+          <p style="font-size:10.5px;color:#6e6e78;margin:0;font-family:'Geist Mono',monospace;">{fmt(c.created_at)}</p>
+          <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;">
+            <a href={'/aquintutor/admin/courses/' + c.id + '/edit'} style="background:#1045BB;color:#fff;border:none;padding:5px 10px;border-radius:5px;font-size:10.5px;font-weight:700;text-decoration:none;font-family:'Geist Mono',monospace;">Edit</a>
+            <form method="POST" style="display:inline;"><input type="hidden" name="action" value={c.is_published ? 'unpublish' : 'publish'} /><input type="hidden" name="id" value={c.id} /><button type="submit" style={`background:${c.is_published ? 'rgba(251,191,36,0.18)' : 'rgba(134,239,172,0.18)'};color:${c.is_published ? '#fbbf24' : '#86efac'};border:none;padding:5px 10px;border-radius:5px;font-size:10.5px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;`}>{c.is_published ? 'Unpub' : 'Publish'}</button></form>
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+</AquintutorLayout>

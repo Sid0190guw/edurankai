@@ -1,0 +1,184 @@
+---
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureAquintutorAuthoringSchema, listModules, createModule, LAB_CATALOGUE, labLabel, getCourseLabs, setCourseLabs } from '@/lib/aquintutor-authoring';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + Astro.url.pathname);
+if (user.role === 'applicant') return Astro.redirect('/portal');
+const isSuper = user.role === 'admin' || user.role === 'super_admin';
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/aquintutor/admin/courses');
+
+await ensureAquintutorAuthoringSchema();
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+async function safeRows(q: any): Promise<any[]> { try { return rowsOf(await db.execute(q)); } catch { return []; } }
+
+// Author scoping: a non-super user may only manage a course they author.
+if (!isSuper) {
+  const owns = await safeRows(sql`SELECT 1 FROM training_course_authors WHERE course_id = ${id} AND user_id = ${user.id} LIMIT 1`);
+  if (owns.length === 0) return Astro.redirect('/aquintutor/admin/courses');
+}
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = (fd.get('action') as string) || '';
+    if (action === 'save_meta') {
+      await db.execute(sql`
+        UPDATE training_courses
+        SET title = ${fd.get('title') as string},
+          subtitle = ${(fd.get('subtitle') as string) || null},
+          category = ${(fd.get('category') as string) || null},
+          school = ${(fd.get('school') as string) || null},
+          difficulty = ${(fd.get('difficulty') as string) || 'beginner'},
+          target_audience = ${(fd.get('target_audience') as string) || null},
+          prerequisites = ${(fd.get('prerequisites') as string) || null},
+          cover_image_url = ${(fd.get('cover_image_url') as string) || null},
+          total_minutes = ${parseInt(fd.get('total_minutes') as string, 10) || 0},
+          updated_at = NOW()
+        WHERE id = ${id}
+      `);
+      okMsg = 'Course meta saved.';
+    } else if (action === 'save_labs') {
+      const labs = fd.getAll('labs').map((v) => String(v));
+      await setCourseLabs(id, labs);
+      okMsg = labs.length + ' virtual lab' + (labs.length === 1 ? '' : 's') + ' attached to this course.';
+    } else if (action === 'add_module') {
+      const title = ((fd.get('module_title') as string) || '').trim().slice(0, 300);
+      const summary = ((fd.get('module_summary') as string) || '').trim().slice(0, 2000) || undefined;
+      if (title) { await createModule({ courseId: id, title, summary }); okMsg = 'Module added.'; }
+      else errMsg = 'Module title is required.';
+    } else if (action === 'add_lesson') {
+      const moduleId = (fd.get('module_id') as string) || '';
+      const title = ((fd.get('lesson_title') as string) || '').trim().slice(0, 300);
+      if (title && moduleId) {
+        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 120) + '-' + Math.random().toString(36).slice(2, 6);
+        const ord = rowsOf(await db.execute(sql`SELECT COALESCE(MAX(order_in_module), -1) + 1 AS o FROM training_lessons WHERE module_id = ${moduleId}`))[0]?.o || 0;
+        await db.execute(sql`
+          INSERT INTO training_lessons (course_id, module_id, slug, title, status, lesson_kind, order_in_module, estimated_minutes, created_at, updated_at)
+          VALUES (${id}, ${moduleId}, ${slug}, ${title}, 'draft', 'lesson', ${ord}, 10, NOW(), NOW())
+        `);
+        okMsg = 'Lesson added.';
+      }
+    }
+  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+}
+
+const course = rowsOf(await db.execute(sql`SELECT * FROM training_courses WHERE id = ${id} LIMIT 1`))[0] as any;
+if (!course) return Astro.redirect('/aquintutor/admin/courses');
+
+const attachedLabs = await getCourseLabs(id);
+const attachedSet = new Set(attachedLabs);
+const modules = await listModules(id);
+const lessonsByModule: { [k: string]: any[] } = {};
+for (const m of modules) {
+  try {
+    lessonsByModule[m.id] = rowsOf(await db.execute(sql`SELECT * FROM training_lessons WHERE module_id = ${m.id} ORDER BY order_in_module ASC, created_at ASC`));
+  } catch {
+    try { lessonsByModule[m.id] = rowsOf(await db.execute(sql`SELECT * FROM training_lessons WHERE module_id = ${m.id} ORDER BY created_at ASC`)); }
+    catch { lessonsByModule[m.id] = []; }
+  }
+}
+---
+<AquintutorLayout title={'Edit · ' + course.title} noindex={true}>
+<div style="padding:14px 16px 80px;max-width:1280px;margin:0 auto;">
+  <a href="/aquintutor/admin/courses" style="font-size:11.5px;color:#9aa6b6;text-decoration:none;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">← All courses</a>
+
+  <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:18px;margin-top:14px;">
+
+    {/* LEFT: meta */}
+    <div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:14px;">
+          <div>
+            <p style="font-size:10.5px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;font-family:'Geist Mono',monospace;font-weight:700;">Course meta</p>
+            <h1 style="font-size:20px;color:#fff;margin:4px 0 4px;font-weight:700;">{course.title}</h1>
+            <p style="font-size:10.5px;color:#9aa6b6;margin:0;font-family:'Geist Mono',monospace;">{course.slug} · {modules.length} modules · {Object.values(lessonsByModule).flat().length} lessons</p>
+          </div>
+          <a href={'/aquintutor/courses/' + course.slug} target="_blank" style="background:#15151a;border:1px solid #2a2a2f;color:#67e8f9;padding:7px 14px;border-radius:6px;font-size:11px;font-weight:700;text-decoration:none;font-family:'Geist Mono',monospace;">Preview ↗</a>
+        </div>
+
+        {okMsg && <div style="background:rgba(74,222,128,0.10);border:1px solid rgba(74,222,128,0.32);color:#86efac;border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:12px;">{okMsg}</div>}
+        {errMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:12px;">{errMsg}</div>}
+
+        <form method="POST" style="display:grid;gap:10px;">
+          <input type="hidden" name="action" value="save_meta" />
+          <div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Title</label><input name="title" value={course.title} maxlength="300" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;" /></div>
+          <div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Subtitle</label><input name="subtitle" value={course.subtitle || ''} maxlength="400" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;" /></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+            <div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Category</label><input name="category" value={course.category || ''} style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;" /></div>
+            <div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">School</label><input name="school" value={course.school || ''} style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;" /></div>
+            <div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Difficulty</label><select name="difficulty" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;"><option value="beginner" selected={course.difficulty==='beginner'}>Beginner</option><option value="intermediate" selected={course.difficulty==='intermediate'}>Intermediate</option><option value="advanced" selected={course.difficulty==='advanced'}>Advanced</option></select></div>
+          </div>
+          <div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Cover image URL</label><input name="cover_image_url" value={course.cover_image_url || ''} maxlength="500" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;font-family:'Geist Mono',monospace;" /></div>
+          <div style="display:grid;grid-template-columns:1fr 100px;gap:10px;"><div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Target audience</label><input name="target_audience" value={course.target_audience || ''} style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;" /></div><div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Total min</label><input name="total_minutes" type="number" value={course.total_minutes || 0} style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;" /></div></div>
+          <div><label style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;">Prerequisites</label><textarea name="prerequisites" rows="2" style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;margin-top:5px;font-family:'Inter Tight',sans-serif;resize:vertical;">{course.prerequisites || ''}</textarea></div>
+          <button type="submit" style="background:#1045BB;color:#fff;border:none;padding:9px 18px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;letter-spacing:0.04em;text-transform:uppercase;font-family:'Geist Mono',monospace;justify-self:start;">Save meta</button>
+        </form>
+      </div>
+    </div>
+
+    {/* RIGHT: modules + lessons */}
+    <div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;">
+        <p style="font-size:10.5px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 10px;font-family:'Geist Mono',monospace;font-weight:700;">Modules & lessons</p>
+
+        <form method="POST" style="display:grid;grid-template-columns:1fr 100px;gap:6px;margin-bottom:14px;">
+          <input type="hidden" name="action" value="add_module" />
+          <input name="module_title" placeholder="New module title" required style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:7px 10px;border-radius:5px;font-size:11.5px;" />
+          <button type="submit" style="background:#FF4F00;color:#fff;border:none;padding:7px 12px;border-radius:5px;font-size:11px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;">+ Module</button>
+        </form>
+
+        {modules.length === 0 ? (<p style="font-size:12px;color:#6e6e78;text-align:center;padding:20px;">No modules yet.</p>) : (
+          <div style="display:flex;flex-direction:column;gap:10px;">
+            {modules.map((m: any, mi: number) => (
+              <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:12px;">
+                <p style="font-size:12.5px;color:#fff;font-weight:700;margin:0 0 8px;">{mi + 1}. {m.title}</p>
+                <div style="display:flex;flex-direction:column;gap:4px;">
+                  {(lessonsByModule[m.id] || []).map((l: any, li: number) => (
+                    <a href={'/aquintutor/admin/courses/' + id + '/lessons/' + l.id + '/edit'} style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:5px;padding:7px 10px;display:flex;justify-content:space-between;align-items:center;gap:8px;text-decoration:none;color:#cfd6da;">
+                      <span style="font-size:11.5px;">{mi + 1}.{li + 1} {l.title}</span>
+                      <span style={`font-size:9px;font-weight:700;padding:2px 6px;border-radius:100px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;color:${l.status==='published'?'#86efac':l.status==='in_review'?'#fbbf24':'#9aa6b6'};background:${l.status==='published'?'rgba(134,239,172,0.16)':l.status==='in_review'?'rgba(251,191,36,0.16)':'rgba(154,166,182,0.12)'};`}>{l.status}</span>
+                    </a>
+                  ))}
+                </div>
+                <form method="POST" style="display:grid;grid-template-columns:1fr 90px;gap:6px;margin-top:8px;">
+                  <input type="hidden" name="action" value="add_lesson" />
+                  <input type="hidden" name="module_id" value={m.id} />
+                  <input name="lesson_title" placeholder="New lesson title" required style="background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:6px 8px;border-radius:4px;font-size:11px;" />
+                  <button type="submit" style="background:#67e8f918;border:1px solid #67e8f9;color:#67e8f9;padding:6px 10px;border-radius:4px;font-size:10.5px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;">+ Lesson</button>
+                </form>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  </div>
+
+  {/* VIRTUAL LABS — attach any labs to this course; they appear on the course Labs tab */}
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px;margin-top:18px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">
+      <p style="font-size:10.5px;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;font-family:'Geist Mono',monospace;font-weight:700;">Virtual labs · add to this course</p>
+      <span style="font-size:10.5px;color:#9aa6b6;font-family:'Geist Mono',monospace;">{attachedLabs.length} attached</span>
+    </div>
+    <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 12px;line-height:1.5;">Tick any labs to attach them to this course. They appear in the learner's <strong style="color:#cfd6da;">Labs</strong> tab and can be opened straight from the course. (To embed a lab inside a specific lesson, use the lesson editor's <strong style="color:#cfd6da;">Lab connector</strong> block.)</p>
+    <form method="POST">
+      <input type="hidden" name="action" value="save_labs" />
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:6px;">
+        {LAB_CATALOGUE.map((slug: string) => (
+          <label style={'display:flex;align-items:center;gap:8px;background:#08080a;border:1px solid ' + (attachedSet.has(slug) ? '#67e8f9' : '#1a1a1f') + ';border-radius:6px;padding:8px 10px;cursor:pointer;'}>
+            <input type="checkbox" name="labs" value={slug} checked={attachedSet.has(slug)} style="accent-color:#67e8f9;" />
+            <span style="font-size:11.5px;color:#cfd6da;">{labLabel(slug)}</span>
+          </label>
+        ))}
+      </div>
+      <button type="submit" style="margin-top:12px;background:#1045BB;color:#fff;border:none;padding:9px 18px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;letter-spacing:0.04em;text-transform:uppercase;font-family:'Geist Mono',monospace;">Save attached labs</button>
+    </form>
+  </div>
+</div>
+</AquintutorLayout>
