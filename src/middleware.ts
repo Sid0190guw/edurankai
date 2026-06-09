@@ -149,11 +149,24 @@ export const onRequest = defineMiddleware(async (context, next) => {
     }
   }
 
+  // Partner LMS embedding: a valid signed embed_token lets a specific lab load
+  // without a login (used by universities iframing our labs via the v1 API).
+  async function gatedLabAllowedByEmbed(): Promise<boolean> {
+    if (!isGatedLab(path)) return false;
+    try {
+      const tok = new URL(context.request.url).searchParams.get('embed_token') || '';
+      if (!tok) return false;
+      const slug = path.split('/').filter(Boolean).pop() || '';
+      const { verifyEmbedToken } = await import('@/lib/api-keys');
+      return verifyEmbedToken(slug, tok);
+    } catch (_) { return false; }
+  }
+
   const token = readSessionCookie(context.cookies);
   if (!token) {
     context.locals.user = null;
     context.locals.session = null;
-    if (isGatedLab(path)) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
+    if (isGatedLab(path) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
     return next();
   }
   const result = await validateSessionToken(token);
@@ -161,7 +174,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
     clearSessionCookie(context.cookies);
     context.locals.user = null;
     context.locals.session = null;
-    if (isGatedLab(path)) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
+    if (isGatedLab(path) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
     return next();
   }
   setSessionCookie(context.cookies, token, result.session.expiresAt);
