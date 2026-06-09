@@ -90,7 +90,10 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   if (!newPassword || newPassword.length < 8) return json({ ok: false, error: 'Password must be 8+ characters' }, 400);
   if (newPassword.length > 200) return json({ ok: false, error: 'Password too long' }, 400);
   if (!Array.isArray(descriptor) || descriptor.length !== 128) return json({ ok: false, error: 'Invalid face descriptor (need 128 floats)' }, 400);
-  if (!Number.isFinite(matchDistanceRaw) || matchDistanceRaw < 0 || matchDistanceRaw > 2) return json({ ok: false, error: 'Invalid match distance' }, 400);
+  // Auto-match is advisory: it may be absent (no face detectable on the ID, or the
+  // models did not load). A present, in-range distance under threshold is an instant
+  // self-serve pass; anything else routes to manual review rather than dead-ending.
+  const hasMatch = Number.isFinite(matchDistanceRaw) && matchDistanceRaw >= 0 && matchDistanceRaw <= 2;
 
   // ID type + number must be present and the number must structurally match
   // the chosen ID type (no junk/empty IDs).
@@ -101,8 +104,8 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   // ID image storage is best-effort (the face match + ID number are the actual
   // verification). If blob storage is unavailable the image URL may be empty.
 
-  // Don't allow the user to "verify" with a face that doesn't match the ID
-  const matchPassed = matchDistanceRaw <= FACE_MATCH_THRESHOLD;
+  // Instant self-serve verify only when the auto-match is present AND passes.
+  const matchPassed = hasMatch && matchDistanceRaw <= FACE_MATCH_THRESHOLD;
 
   try {
     // Find user
@@ -132,13 +135,29 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
       return json({ ok: false, error: 'Name does not match the account on file.' }, 400);
     }
 
-    // Face match
+    // Face match — when it doesn't auto-pass we DON'T dead-end. We securely save
+    // the documents (ID image + selfie) and route to manual review, so a human
+    // evaluator can compare the ID face to the selfie. Nothing is auto-penalised.
     if (!matchPassed) {
+      const meta = JSON.stringify({ selfie: selfieDataUrl || null, matchDistance: hasMatch ? matchDistanceRaw : null, autoMatch: hasMatch ? 'below_threshold' : 'unavailable' });
       await db.execute(sql`
-        INSERT INTO identity_verifications (user_id, email, claimed_name, claimed_dob, id_card_type, face_match_distance, face_match_passed, verdict, reject_reason, ip_address, user_agent)
-        VALUES (${user.id}, ${email}, ${claimedName}, ${claimedDob}, ${idCardType || null}, ${matchDistanceRaw}, false, 'rejected', 'face on ID does not match selfie', ${ip || null}, ${ua})
+        INSERT INTO identity_verifications (user_id, email, claimed_name, claimed_dob, id_card_type, id_card_blob_url, face_match_distance, face_match_passed, verdict, reject_reason, metadata, ip_address, user_agent)
+        VALUES (${user.id}, ${email}, ${claimedName}, ${claimedDob}, ${idCardType || null}, ${idCardBlobUrl}, ${hasMatch ? matchDistanceRaw : null}, false, 'pending', ${hasMatch ? 'auto-match below threshold - manual review' : 'no auto-match - manual review'}, ${meta}::jsonb, ${ip || null}, ${ua})
       `).catch(() => {});
-      return json({ ok: false, error: 'Face on ID does not match the live selfie (distance ' + matchDistanceRaw.toFixed(3) + '). Try better lighting, no glasses/mask, hold ID steady.' }, 400);
+      // Stash the documents on the user record too, so the reviewer always has them.
+      await db.execute(sql`
+        UPDATE users SET
+          id_doc_url = COALESCE(${idCardBlobUrl}, id_doc_url),
+          photo_url = COALESCE(${selfieDataUrl || null}, photo_url),
+          id_card_type = COALESCE(${idCardType || null}, id_card_type),
+          id_number = COALESCE(${idNumber}, id_number),
+          updated_at = NOW()
+        WHERE id = ${user.id}
+      `).catch(() => {});
+      const why = hasMatch
+        ? 'We could not automatically match your face to the ID (distance ' + matchDistanceRaw.toFixed(3) + ').'
+        : 'We could not run the automatic face match.';
+      return json({ ok: true, reviewPending: true, message: why + ' Your documents have been securely submitted for manual review - our team will verify and email you. You can also retry with brighter, even lighting and no glasses or mask.' });
     }
 
     // ===== PASS - commit identity =====
