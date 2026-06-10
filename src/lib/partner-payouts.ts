@@ -77,16 +77,17 @@ export async function listAllPayouts(status?: string): Promise<any[]> {
   `).catch(() => [] as any));
 }
 
-export async function decidePayout(id: string, status: 'approved' | 'paid' | 'rejected', adminId: string, note?: string, paidRef?: string): Promise<{ ok: boolean; error?: string }> {
+export async function decidePayout(id: string, status: 'approved' | 'paid' | 'rejected', adminId: string, note?: string, paidRef?: string): Promise<{ ok: boolean; error?: string; partnerUserId?: string; amountPaise?: number }> {
   await ensurePayoutSchema();
   try {
-    await db.execute(sql`
+    const r = rows(await db.execute(sql`
       UPDATE partner_payouts
       SET status = ${status}, decided_by = ${adminId}, decided_at = NOW(),
           note = COALESCE(${note || null}, note), paid_ref = COALESCE(${paidRef || null}, paid_ref)
       WHERE id = ${id}
-    `);
-    return { ok: true };
+      RETURNING partner_user_id, amount_paise
+    `));
+    return { ok: true, partnerUserId: r[0]?.partner_user_id, amountPaise: Number(r[0]?.amount_paise) || 0 };
   } catch (e: any) { return { ok: false, error: String(e?.message || e).slice(0, 160) }; }
 }
 
