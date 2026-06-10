@@ -1,0 +1,145 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { ensureMailSchema, getMailboxAddress } from '@/lib/mail';
+import { campaignStats } from '@/lib/mail-advanced';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+await ensureMailSchema();
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const myAddress = await getMailboxAddress(user.id).catch(() => '');
+
+// All outbound messages this user sent (most recent first).
+const sends = rows(await db.execute(sql`
+  SELECT id, subject, created_at
+  FROM mail_messages
+  WHERE from_user_id = ${user.id} AND direction = 'outbound'
+  ORDER BY created_at DESC LIMIT 400
+`).catch(() => [] as any));
+
+const allIds: string[] = sends.map((s: any) => s.id);
+
+// Recipients per message + delivery status, in one pass each.
+const recipMap: Record<string, number> = {};
+const deliv: Record<string, number> = { sent: 0, failed: 0, other: 0 };
+if (allIds.length) {
+  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_recipients WHERE message_id = ANY(${allIds}) GROUP BY message_id`).catch(() => [] as any))) {
+    recipMap[r.message_id] = Number(r.c) || 0;
+  }
+  for (const r of rows(await db.execute(sql`SELECT status, COUNT(*)::int AS c FROM email_logs WHERE message_id = ANY(${allIds}) GROUP BY status`).catch(() => [] as any))) {
+    const s = (r.status || '').toLowerCase();
+    if (s === 'sent') deliv.sent += Number(r.c) || 0;
+    else if (s === 'failed' || s === 'no_transport') deliv.failed += Number(r.c) || 0;
+    else deliv.other += Number(r.c) || 0;
+  }
+}
+
+// Group sends into campaigns by subject.
+const campMap = new Map<string, { subject: string; ids: string[]; recipients: number; firstAt: string; lastAt: string }>();
+for (const s of sends) {
+  const key = (s.subject || '(no subject)').trim() || '(no subject)';
+  let c = campMap.get(key);
+  if (!c) { c = { subject: key, ids: [], recipients: 0, firstAt: s.created_at, lastAt: s.created_at }; campMap.set(key, c); }
+  c.ids.push(s.id);
+  c.recipients += recipMap[s.id] || 0;
+  if (new Date(s.created_at) > new Date(c.lastAt)) c.lastAt = s.created_at;
+  if (new Date(s.created_at) < new Date(c.firstAt)) c.firstAt = s.created_at;
+}
+const campaigns = Array.from(campMap.values()).sort((a, b) => new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime()).slice(0, 30);
+
+// Per-campaign open/click stats.
+const stats: any[] = [];
+let tOpens = 0, tClicks = 0, tOpenedMsgs = 0, tClickedMsgs = 0;
+for (const c of campaigns) {
+  const st = await campaignStats(c.ids).catch(() => ({ opens: 0, clicks: 0, openedMsgs: 0, clickedMsgs: 0 }));
+  tOpens += st.opens; tClicks += st.clicks; tOpenedMsgs += st.openedMsgs; tClickedMsgs += st.clickedMsgs;
+  stats.push({ ...c, ...st });
+}
+
+const totalSends = sends.length;
+const totalRecipients = Object.values(recipMap).reduce((a, b) => a + b, 0);
+function pct(n: number, d: number): string { return d > 0 ? Math.round((n / d) * 100) + '%' : '-'; }
+function fmt(d: any): string { return d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' }) : '-'; }
+---
+<AdminLayout title="Mail analytics" activeNav="mail">
+  <section class="page">
+    <div class="page-head">
+      <p class="eyebrow">Mail</p>
+      <h1>Campaign analytics</h1>
+      <p class="sub">Delivery, opens and clicks for everything sent from <span class="mono">{myAddress}</span>. <a href="/admin/mail">Back to inbox</a></p>
+    </div>
+
+    <div class="kpis">
+      <div class="kpi"><span class="kn">{totalSends}</span><span class="kl">Messages sent</span></div>
+      <div class="kpi"><span class="kn">{totalRecipients}</span><span class="kl">Recipients</span></div>
+      <div class="kpi"><span class="kn">{deliv.sent}</span><span class="kl">Delivered</span><span class="ks ok">{pct(deliv.sent, deliv.sent + deliv.failed)} of attempts</span></div>
+      <div class="kpi"><span class="kn">{deliv.failed}</span><span class="kl">Failed / no transport</span></div>
+      <div class="kpi"><span class="kn">{tOpenedMsgs}</span><span class="kl">Opened messages</span><span class="ks">{pct(tOpenedMsgs, totalSends)} open rate</span></div>
+      <div class="kpi"><span class="kn">{tClickedMsgs}</span><span class="kl">Clicked messages</span><span class="ks">{pct(tClickedMsgs, totalSends)} click rate</span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>By campaign (grouped by subject)</h2><span class="muted">latest 30</span></div>
+      {stats.length === 0 ? (
+        <p class="empty">Nothing sent yet. Compose and send from the <a href="/admin/mail">inbox</a> to start tracking.</p>
+      ) : (
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Subject</th><th>Sends</th><th>Recipients</th><th>Opens</th><th>Open rate</th><th>Clicks</th><th>Click rate</th><th>Last sent</th></tr>
+            </thead>
+            <tbody>
+              {stats.map((s: any) => (
+                <tr>
+                  <td class="subj" title={s.subject}>{s.subject}</td>
+                  <td>{s.ids.length}</td>
+                  <td>{s.recipients}</td>
+                  <td>{s.opens} <span class="dim">/ {s.openedMsgs} msg</span></td>
+                  <td><span class="rate">{pct(s.openedMsgs, s.ids.length)}</span></td>
+                  <td>{s.clicks} <span class="dim">/ {s.clickedMsgs} msg</span></td>
+                  <td><span class="rate">{pct(s.clickedMsgs, s.ids.length)}</span></td>
+                  <td class="dim">{fmt(s.lastAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p class="hint">Opens are counted by the tracking pixel; clicks by link-redirect tracking. Rates are per message (a message can have many recipients). Some mail clients block the pixel, so true opens may be higher.</p>
+    </div>
+  </section>
+
+  <style>
+    .page { max-width: 1000px; margin: 0 auto; padding: 4px 2px 40px; }
+    .page-head { margin-bottom: 18px; }
+    .eyebrow { font-size: 0.62rem; font-family: monospace; text-transform: uppercase; letter-spacing: 0.15em; color: #FF4F00; font-weight: 700; margin: 0 0 4px; }
+    .page-head h1 { font-size: 1.5rem; font-weight: 600; color: #100b08; margin: 0 0 4px; }
+    .sub { font-size: 0.86rem; color: #6a635c; margin: 0; }
+    .sub a { color: #FF4F00; text-decoration: none; }
+    .mono { font-family: monospace; color: #4a443e; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .kpi { background: #fff; border: 1px solid rgba(14,11,8,0.1); border-radius: 12px; padding: 16px 16px; display: flex; flex-direction: column; gap: 2px; }
+    .kn { font-size: 1.7rem; font-weight: 700; color: #100b08; line-height: 1; }
+    .kl { font-size: 0.74rem; color: #8a8078; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
+    .ks { font-size: 0.72rem; color: #FF4F00; font-weight: 600; margin-top: 3px; }
+    .ks.ok { color: #047857; }
+    .card { background: #fff; border: 1px solid rgba(14,11,8,0.1); border-radius: 14px; padding: 18px 20px; }
+    .card-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; }
+    .card-head h2 { font-size: 1.02rem; font-weight: 600; color: #100b08; margin: 0; }
+    .muted { font-size: 0.74rem; color: #a99e94; }
+    .empty { color: #8a8078; font-size: 0.88rem; padding: 14px 0; }
+    .empty a { color: #FF4F00; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    th { text-align: left; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.07em; color: #9a8f86; font-weight: 700; padding: 8px 10px; border-bottom: 1px solid rgba(14,11,8,0.1); white-space: nowrap; }
+    td { padding: 10px 10px; border-bottom: 1px solid rgba(14,11,8,0.05); color: #2b2620; vertical-align: top; }
+    .subj { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+    .dim { color: #a99e94; font-size: 0.78rem; }
+    .rate { font-weight: 700; color: #100b08; }
+    .hint { font-size: 0.74rem; color: #a99e94; margin: 12px 0 0; line-height: 1.5; }
+  </style>
+</AdminLayout>
