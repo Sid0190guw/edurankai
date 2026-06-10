@@ -20,6 +20,13 @@ async function ensureSchema() {
       attachment_url TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   } catch (_) {}
+  // Bookkeeping columns the thread relies on — self-heal so the request list
+  // never errors (and silently hides) on a DB missing them.
+  for (const q of [
+    sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ`,
+    sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS unread_applicant INT NOT NULL DEFAULT 0`,
+    sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS unread_admin INT NOT NULL DEFAULT 0`,
+  ]) { try { await db.execute(q); } catch (_) {} }
 }
 
 export type RequestType = 'visvambhara_access' | 'fee_waiver';
@@ -154,7 +161,7 @@ export async function listApplicantRequests(userId: string) {
   let waivers: any[] = [];
   try {
     waivers = rows(await db.execute(sql`
-      SELECT id, 'fee_waiver' AS kind, status, reason AS subject,
+      SELECT id, 'fee_waiver' AS kind, status, situation_note AS subject,
         COALESCE(last_message_at, created_at) AS last_message_at,
         COALESCE(unread_applicant, 0) AS unread, created_at
       FROM application_fee_waivers
