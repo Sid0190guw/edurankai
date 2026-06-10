@@ -28,7 +28,7 @@ function toBase64(buf: Uint8Array): string {
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
   if (!user || user.role === 'applicant') return json({ ok: false, error: 'Admins only' }, 403);
-  if (!isLlmConfigured()) return json({ ok: false, error: 'Question generation needs ANTHROPIC_API_KEY set on the server. You can still add questions manually.' }, 503);
+  if (!isLlmConfigured()) return json({ ok: false, error: 'Automatic question generation is currently unavailable - please add your questions manually.' }, 503);
 
   let form: FormData;
   try { form = await request.formData(); } catch { return json({ ok: false, error: 'Expected form data' }, 400); }

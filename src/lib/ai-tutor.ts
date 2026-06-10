@@ -89,7 +89,7 @@ export async function continueConversation(opts: {
 
   let reply: string;
   if (!apiKey) {
-    reply = `(AI tutor is not configured. Set ANTHROPIC_API_KEY in env to enable conversational practice in ${LANGS[language] || language}.)`;
+    reply = `The live conversational tutor for ${LANGS[language] || language} is being set up and will be available soon. Until then, keep practising with the lessons and assessments.`;
   } else {
     try {
       const resp = await fetch(CLAUDE_API, {

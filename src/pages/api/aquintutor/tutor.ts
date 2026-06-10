@@ -17,7 +17,7 @@ function json(d: any, s = 200) {
 export const POST: APIRoute = async ({ request, locals }) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return json({ ok: false, error: 'AI tutor is not configured yet. The admin needs to set ANTHROPIC_API_KEY.' }, 503);
+    return json({ ok: false, error: 'The course tutor is being set up and will be available soon.' }, 503);
   }
 
   let body: any = {};
