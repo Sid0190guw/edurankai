@@ -324,12 +324,12 @@
 
     // Topic chip clicks — route to internal pages instead of waiting on a human
     var TOPIC_ROUTES = {
-      application_status: { url: '/portal/applications', message: 'I want to check the status of my application.' },
+      application_status: { url: '/portal', message: 'I want to check the status of my application.' },
       open_roles:         { url: '/careers',             message: 'Show me current open roles.' },
       submit_work:        { url: '/portal/submissions/new', message: 'I want to submit my original work.' },
       test_help:          { url: '/aquintutor/tests',    message: 'I need help with a test or proctoring.' },
-      verify_cert:        { url: '/credentials/',        message: 'I want to verify a credential.' },
-      payment:            { url: '/portal/payments',     message: 'I have a question about a payment or refund.' },
+      verify_cert:        { url: '/credentials',        message: 'I want to verify a credential.' },
+      payment:            { url: '/portal/requests',     message: 'I have a question about a payment or refund.' },
       ca_report:          { url: '/portal/submissions/new', message: 'I want to submit my Campus Ambassador report.' },
       ca_perks:           { url: '/careers/campus-ambassador', message: 'Tell me about Campus Ambassador perks and rewards.' },
     };
