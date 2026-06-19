@@ -93,6 +93,20 @@ export const POST: APIRoute = async ({ request, locals }) => {
         } catch (_) {}
       }
 
+      // Universal account credit: if the applicant's wallet covers the fee, pay
+      // from credit (works even if card payments aren't configured) - no charge.
+      {
+        const feeChfC = resolveApplicationFeeChf({ roleFee: intentRow.role_fee, level: intentRow.level });
+        const fxC = await convertToInrPaise('CHF', feeChfC * 100);
+        const { coverWithCredit } = await import('@/lib/account-credit');
+        const cov = await coverWithCredit({ userId: user.id, amountPaise: fxC.paise, purpose: 'application_fee_intent', referenceType: 'application_intent', referenceId: intentRow.id, email: intentRow.email || user.email || '', label: 'Application fee' });
+        if (cov.covered) {
+          let appIdC = cov.applicationId;
+          if (!appIdC) { const aC = rowsOf(await db.execute(sql`SELECT id FROM applications WHERE applicant_user_id = ${user.id} ORDER BY created_at DESC LIMIT 1`).catch(() => []))[0] as any; appIdC = aC?.id; }
+          return json({ ok: true, alreadyPaid: true, paidWithCredit: true, redirect: appIdC ? '/apply/confirmation?id=' + appIdC : '/portal' });
+        }
+      }
+
       if (!isConfigured()) return json({ ok: false, error: 'Payments not yet configured.' }, 503);
 
       const feeChf = resolveApplicationFeeChf({ roleFee: intentRow.role_fee, level: intentRow.level });
@@ -165,6 +179,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
           if (rec.reconciled) return json({ ok: true, alreadyPaid: true, redirect: confirmUrl });
         } catch (_) {}
       }
+    }
+
+    // Universal account credit: cover the fee from the applicant's wallet if it
+    // is enough (no card charge, works even if Razorpay isn't configured).
+    {
+      const feeChfC = resolveApplicationFeeChf({ roleFee: app.role_fee, level: app.level });
+      const fxC = await convertToInrPaise('CHF', feeChfC * 100);
+      const { coverWithCredit } = await import('@/lib/account-credit');
+      const cov = await coverWithCredit({ userId: user.id, amountPaise: fxC.paise, purpose: 'application_fee', referenceType: 'application', referenceId: app.id, email: app.email || user.email || '', label: 'Application fee' });
+      if (cov.covered) return json({ ok: true, alreadyPaid: true, paidWithCredit: true, redirect: confirmUrl });
     }
 
     if (!isConfigured()) {

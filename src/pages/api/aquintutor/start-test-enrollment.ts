@@ -92,6 +92,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
     }
     const receipt = 'qt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 
+    // Universal account credit: pay the test fee from the wallet if it covers it.
+    {
+      const { coverWithCredit } = await import('@/lib/account-credit');
+      const cov = await coverWithCredit({ userId: user.id, amountPaise, purpose: 'test_enrollment', referenceType: 'test', referenceId: test.id, email: user.email || '', label: 'Test: ' + (test.title || test.slug || '') });
+      if (cov.covered) return json({ ok: true, paid: true, paidWithCredit: true, redirect: runUrl });
+    }
+
     const result = await createOrder({
       amountPaise,
       currency: 'INR',

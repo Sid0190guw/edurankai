@@ -1,0 +1,125 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { grantCredit, getCreditBalance, getCreditLedger } from '@/lib/account-credit';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const isSuper = user.role === 'admin' || user.role === 'super_admin';
+if (!isSuper) return Astro.redirect('/admin');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+let okMsg = '', errMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const email = ((fd.get('email') as string) || '').trim().toLowerCase();
+  const amountRs = Math.round(Number(fd.get('amount') || 0));
+  const reason = ((fd.get('reason') as string) || '').trim();
+  try {
+    if (!email) throw new Error('Email required');
+    if (!amountRs) throw new Error('Amount (INR) required');
+    const u = rows(await db.execute(sql`SELECT id, name FROM users WHERE lower(email) = ${email} LIMIT 1`))[0] as any;
+    if (!u) throw new Error('No account with that email');
+    const r = await grantCredit(u.id, amountRs * 100, reason || ('Granted by ' + (user.name || 'admin')), user.id);
+    if (!r.ok) throw new Error(r.error || 'Could not grant');
+    okMsg = 'Granted Rs ' + amountRs.toLocaleString('en-IN') + ' to ' + (u.name || email) + '. New balance: Rs ' + Math.round((r.balance || 0) / 100).toLocaleString('en-IN') + '.';
+  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 200); }
+}
+
+// Optional lookup of a single account's balance + ledger.
+const url = new URL(Astro.request.url);
+const lookup = (url.searchParams.get('email') || '').trim().toLowerCase();
+let lookupUser: any = null, balance = 0, ledger: any[] = [];
+if (lookup) {
+  lookupUser = rows(await db.execute(sql`SELECT id, name, email FROM users WHERE lower(email) = ${lookup} LIMIT 1`).catch(() => []))[0] as any;
+  if (lookupUser) { balance = await getCreditBalance(lookupUser.id); ledger = await getCreditLedger(lookupUser.id, 50); }
+}
+
+// Accounts that currently hold a positive balance.
+let holders: any[] = [];
+try {
+  holders = rows(await db.execute(sql`
+    SELECT u.email, u.name, SUM(l.delta_paise)::bigint AS bal
+    FROM account_credit_ledger l JOIN users u ON u.id = l.user_id
+    GROUP BY u.email, u.name HAVING SUM(l.delta_paise) > 0
+    ORDER BY bal DESC LIMIT 100
+  `));
+} catch (_) {}
+
+function inr(p: any) { return 'Rs ' + Math.round((Number(p) || 0) / 100).toLocaleString('en-IN'); }
+function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return '-'; } }
+---
+<AdminLayout title="Account credit" activeNav="">
+  <section style="max-width:860px;margin:0 auto;padding:6px 2px 48px;">
+    <p style="font-size:11px;font-family:monospace;text-transform:uppercase;letter-spacing:0.15em;color:#FF4F00;font-weight:700;margin:0 0 4px;">Finance</p>
+    <h1 style="font-size:1.5rem;font-weight:600;color:#100b08;margin:0 0 4px;">Account credit (universal wallet)</h1>
+    <p style="font-size:0.86rem;color:#6a635c;margin:0 0 18px;">Grant credit to any account. It is spendable on <strong>any</strong> paid flow across all products - application fee, tests, and more - and is applied automatically at checkout before any card charge.</p>
+
+    {okMsg && <div style="background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;border-radius:10px;padding:10px 14px;font-size:0.85rem;margin-bottom:14px;">{okMsg}</div>}
+    {errMsg && <div style="background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:10px;padding:10px 14px;font-size:0.85rem;margin-bottom:14px;">{errMsg}</div>}
+
+    <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:14px;padding:20px;margin-bottom:18px;">
+      <h2 style="font-size:1.05rem;font-weight:600;margin:0 0 12px;">Grant credit</h2>
+      <form method="post" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+        <label style="flex:2;min-width:220px;font-size:0.78rem;color:#6a635c;">Account email
+          <input name="email" type="email" required placeholder="applicant@example.com" style="width:100%;margin-top:4px;border:1px solid rgba(14,11,8,0.15);border-radius:9px;padding:9px 12px;font-size:0.9rem;" />
+        </label>
+        <label style="flex:1;min-width:120px;font-size:0.78rem;color:#6a635c;">Amount (INR)
+          <input name="amount" type="number" min="1" required placeholder="500" style="width:100%;margin-top:4px;border:1px solid rgba(14,11,8,0.15);border-radius:9px;padding:9px 12px;font-size:0.9rem;" />
+        </label>
+        <label style="flex:2;min-width:200px;font-size:0.78rem;color:#6a635c;">Reason (optional)
+          <input name="reason" type="text" placeholder="Scholarship / waiver / goodwill" style="width:100%;margin-top:4px;border:1px solid rgba(14,11,8,0.15);border-radius:9px;padding:9px 12px;font-size:0.9rem;" />
+        </label>
+        <button type="submit" style="background:#FF4F00;color:#fff;border:0;border-radius:9px;padding:10px 22px;font-weight:700;font-size:0.86rem;cursor:pointer;">Grant</button>
+      </form>
+      <form method="get" style="margin-top:12px;display:flex;gap:8px;">
+        <input name="email" type="email" value={lookup} placeholder="Look up a balance by email" style="flex:1;border:1px solid rgba(14,11,8,0.15);border-radius:9px;padding:8px 11px;font-size:0.85rem;" />
+        <button type="submit" style="background:#f2ece4;color:#4a443e;border:0;border-radius:9px;padding:8px 16px;font-weight:600;font-size:0.84rem;cursor:pointer;">Look up</button>
+      </form>
+    </div>
+
+    {lookup && (
+      <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:14px;padding:20px;margin-bottom:18px;">
+        {!lookupUser ? <p style="color:#b91c1c;font-size:0.88rem;margin:0;">No account with email {lookup}.</p> : (
+          <>
+            <h2 style="font-size:1.05rem;font-weight:600;margin:0 0 2px;">{lookupUser.name || lookupUser.email}</h2>
+            <p style="font-size:0.82rem;color:#8a8078;margin:0 0 10px;">{lookupUser.email} &middot; Balance: <strong style="color:#FF4F00;">{inr(balance)}</strong></p>
+            {ledger.length > 0 && (
+              <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
+                <thead><tr style="text-align:left;color:#9a8f86;font-size:0.66rem;text-transform:uppercase;letter-spacing:0.05em;"><th style="padding:6px 8px;">When</th><th style="padding:6px 8px;">Change</th><th style="padding:6px 8px;">Reason</th></tr></thead>
+                <tbody>
+                  {ledger.map((l: any) => (
+                    <tr style="border-top:1px solid rgba(14,11,8,0.06);">
+                      <td style="padding:6px 8px;color:#8a8078;">{fmt(l.created_at)}</td>
+                      <td style={'padding:6px 8px;font-weight:700;' + (Number(l.delta_paise) >= 0 ? 'color:#047857;' : 'color:#b91c1c;')}>{Number(l.delta_paise) >= 0 ? '+' : ''}{inr(l.delta_paise)}</td>
+                      <td style="padding:6px 8px;color:#4a443e;">{l.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
+        )}
+      </div>
+    )}
+
+    <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:14px;padding:20px;">
+      <h2 style="font-size:1.05rem;font-weight:600;margin:0 0 12px;">Accounts with a balance</h2>
+      {holders.length === 0 ? <p style="color:#a99e94;font-size:0.86rem;margin:0;">No credit granted yet.</p> : (
+        <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+          <thead><tr style="text-align:left;color:#9a8f86;font-size:0.66rem;text-transform:uppercase;letter-spacing:0.05em;"><th style="padding:7px 8px;">Account</th><th style="padding:7px 8px;">Balance</th></tr></thead>
+          <tbody>
+            {holders.map((h: any) => (
+              <tr style="border-top:1px solid rgba(14,11,8,0.06);">
+                <td style="padding:8px;"><a href={'/admin/credits?email=' + encodeURIComponent(h.email)} style="color:#100b08;text-decoration:none;">{h.name || h.email}<span style="display:block;font-size:0.74rem;color:#a99e94;">{h.email}</span></a></td>
+                <td style="padding:8px;font-weight:700;color:#FF4F00;">{inr(h.bal)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  </section>
+</AdminLayout>
