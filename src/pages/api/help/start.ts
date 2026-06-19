@@ -89,6 +89,15 @@ export const POST: APIRoute = async ({ request, cookies, locals }) => {
           updated_at = NOW()
         WHERE id = ${conv.id}
       `);
+      // Notify admins of the new help conversation (push + email).
+      try {
+        const { sendPushToAdmins } = await import('@/lib/push');
+        await sendPushToAdmins({ type: 'help_message', title: 'New help chat: ' + (name || 'visitor'), body: String(initialMessage).slice(0, 160), url: '/admin/help', tag: 'help-' + conv.id });
+      } catch (_) {}
+      try {
+        const { sendEmail } = await import('@/lib/email');
+        await sendEmail({ to: 'hr@edurankai.in', subject: 'New help chat from ' + (name || 'a visitor'), html: '<p><strong>' + (name || 'A visitor') + '</strong> started a help chat:</p><blockquote>' + String(initialMessage).replace(/[<>]/g, '') + '</blockquote><p><a href="https://edurankai.in/admin/help">Open the help inbox</a></p>', text: (name || 'A visitor') + ': ' + initialMessage + '\n\nOpen: https://edurankai.in/admin/help' });
+      } catch (_) {}
     }
 
     // Return the conversation + recent messages

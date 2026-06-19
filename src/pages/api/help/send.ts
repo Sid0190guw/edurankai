@@ -43,6 +43,27 @@ export const POST: APIRoute = async ({ request, cookies }) => {
       WHERE id = ${conv.id}
     `);
 
+    // Notify admins immediately - help messages must never sit unseen.
+    try {
+      const { sendPushToAdmins } = await import('@/lib/push');
+      await sendPushToAdmins({
+        type: 'help_message',
+        title: 'Help message: ' + (conv.visitor_name || 'visitor'),
+        body: txt.slice(0, 160),
+        url: '/admin/help',
+        tag: 'help-' + conv.id,
+      });
+    } catch (_) {}
+    try {
+      const { sendEmail } = await import('@/lib/email');
+      await sendEmail({
+        to: 'hr@edurankai.in',
+        subject: 'Help message from ' + (conv.visitor_name || 'a visitor'),
+        html: '<p><strong>' + (conv.visitor_name || 'A visitor') + '</strong> wrote in the help chat:</p><blockquote>' + txt.replace(/[<>]/g, '') + '</blockquote><p><a href="https://edurankai.in/admin/help">Open the help inbox</a></p>',
+        text: (conv.visitor_name || 'A visitor') + ': ' + txt + '\n\nOpen: https://edurankai.in/admin/help',
+      });
+    } catch (_) {}
+
     return json({ ok: true, message: mRows[0] });
   } catch (e: any) {
     return json({ ok: false, error: e?.message || 'db error' }, 500);
