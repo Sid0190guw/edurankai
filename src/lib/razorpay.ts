@@ -112,6 +112,25 @@ export async function fetchPayment(paymentId: string): Promise<any | null> {
   }
 }
 
+// Fetch all payment attempts against an order. Used by reconciliation to find
+// a payment that was captured at Razorpay but never recorded here (browser
+// closed before /verify AND the webhook never fired). Returns [] on any error.
+export async function fetchOrderPayments(orderId: string): Promise<any[]> {
+  const creds = getCreds();
+  if (!creds || !orderId) return [];
+  try {
+    const resp = await fetch(RZP_API + '/orders/' + encodeURIComponent(orderId) + '/payments', {
+      method: 'GET',
+      headers: { 'Authorization': authHeader(creds.keyId, creds.keySecret) },
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return Array.isArray(data?.items) ? data.items : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 // Public key for the browser checkout - safe to expose.
 export function getPublicKeyId(): string | null {
   return process.env.RAZORPAY_KEY_ID || null;

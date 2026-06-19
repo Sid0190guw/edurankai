@@ -5,8 +5,45 @@
 
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { fetchOrderPayments } from '@/lib/razorpay';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Reconcile ONE order against Razorpay. The webhook + browser /verify are the
+// fast paths; this is the backstop for when BOTH miss (tab closed before
+// /verify AND no webhook configured/fired). If Razorpay shows a captured (or
+// authorized) payment for this order but our row isn't 'paid', mark it paid and
+// apply the downstream effects. This is what stops a "paid but lost" application
+// and the retry double-charge (the next order-start call settles the old one
+// instead of charging again). Idempotent.
+export async function reconcileOrder(orderId: string): Promise<{ reconciled: boolean; applicationId?: string }> {
+  if (!orderId) return { reconciled: false };
+  const pays = await fetchOrderPayments(orderId);
+  const cap = pays.find((p: any) => p.status === 'captured' || p.status === 'authorized');
+  if (!cap) return { reconciled: false };
+  await db.execute(sql`
+    UPDATE payments SET status = 'paid', razorpay_payment_id = COALESCE(${cap.id || null}, razorpay_payment_id), updated_at = NOW()
+    WHERE order_id = ${orderId} AND status NOT IN ('paid', 'refunded')
+  `).catch(() => {});
+  const r = await applyPaidEffects(orderId, cap.id || null);
+  return { reconciled: true, applicationId: (r && (r as any).applicationId) || undefined };
+}
+
+// Scan recent unsettled payments and reconcile each (cron backstop).
+export async function reconcilePending(limit = 150): Promise<{ scanned: number; reconciled: number }> {
+  const pend = rows(await db.execute(sql`
+    SELECT order_id FROM payments
+    WHERE status IN ('created', 'attempted', 'authorized') AND order_id IS NOT NULL
+      AND created_at > NOW() - INTERVAL '14 days'
+      AND created_at < NOW() - INTERVAL '3 minutes'
+    ORDER BY created_at DESC LIMIT ${limit}
+  `).catch(() => []));
+  let reconciled = 0;
+  for (const p of pend) {
+    try { const r = await reconcileOrder((p as any).order_id); if (r.reconciled) reconciled++; } catch (_) {}
+  }
+  return { scanned: pend.length, reconciled };
+}
 
 export async function applyPaidEffects(orderId: string, paymentId: string | null): Promise<{ applicationId?: string } | void> {
   if (!orderId) return;

@@ -68,6 +68,31 @@ export const POST: APIRoute = async ({ request, locals }) => {
         return json({ ok: true, alreadyPaid: true, redirect: appId2 ? '/apply/confirmation?id=' + appId2 : '/portal' });
       }
 
+      // Webhook-independent double-charge guard: an earlier order for this intent
+      // may have been CAPTURED at Razorpay without us recording it (tab closed
+      // before /verify, webhook off). Reconcile those against Razorpay BEFORE
+      // creating a new order; if one already captured, settle it and send the
+      // applicant to confirmation instead of charging a second time.
+      const priorOrders = rowsOf(await db.execute(sql`
+        SELECT order_id FROM payments
+        WHERE reference_id = ${intentRow.id} AND status IN ('created','attempted','authorized') AND order_id IS NOT NULL
+        ORDER BY created_at DESC LIMIT 5
+      `).catch(() => []));
+      for (const po of priorOrders) {
+        try {
+          const { reconcileOrder } = await import('@/lib/payment-effects');
+          const rec = await reconcileOrder((po as any).order_id);
+          if (rec.reconciled) {
+            let appId3 = rec.applicationId;
+            if (!appId3) {
+              const a3 = rowsOf(await db.execute(sql`SELECT id FROM applications WHERE applicant_user_id = ${user.id} ORDER BY created_at DESC LIMIT 1`).catch(() => []))[0] as any;
+              appId3 = a3?.id;
+            }
+            return json({ ok: true, alreadyPaid: true, redirect: appId3 ? '/apply/confirmation?id=' + appId3 : '/portal' });
+          }
+        } catch (_) {}
+      }
+
       if (!isConfigured()) return json({ ok: false, error: 'Payments not yet configured.' }, 503);
 
       const feeChf = resolveApplicationFeeChf({ roleFee: intentRow.role_fee, level: intentRow.level });
@@ -122,6 +147,24 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const confirmUrl = '/apply/confirmation?id=' + app.id;
     if (app.fee_paid) {
       return json({ ok: true, alreadyPaid: true, redirect: confirmUrl });
+    }
+
+    // Webhook-independent double-charge guard for the direct app-fee path: settle
+    // any already-captured order for this application before charging again.
+    {
+      const rowsOf2 = (r: any) => (Array.isArray(r) ? r : (r?.rows || []));
+      const priorOrders = rowsOf2(await db.execute(sql`
+        SELECT order_id FROM payments
+        WHERE reference_id = ${app.id} AND status IN ('created','attempted','authorized') AND order_id IS NOT NULL
+        ORDER BY created_at DESC LIMIT 5
+      `).catch(() => []));
+      for (const po of priorOrders) {
+        try {
+          const { reconcileOrder } = await import('@/lib/payment-effects');
+          const rec = await reconcileOrder((po as any).order_id);
+          if (rec.reconciled) return json({ ok: true, alreadyPaid: true, redirect: confirmUrl });
+        } catch (_) {}
+      }
     }
 
     if (!isConfigured()) {
