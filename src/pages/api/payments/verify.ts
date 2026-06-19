@@ -55,17 +55,29 @@ export const POST: APIRoute = async ({ request }) => {
   // Shared with the webhook so a payment completes regardless of which path
   // confirms it first; idempotent.
   let applicationId: string | undefined;
+  let materialiseFailed = false;
   if (captured) {
     try {
       const { applyPaidEffects } = await import('@/lib/payment-effects');
       const r = await applyPaidEffects(orderId, paymentId);
       applicationId = (r && (r as any).applicationId) || undefined;
+      materialiseFailed = !!(r && (r as any).failed);
     } catch (e: any) {
       console.error('[payments] paid effects failed:', e?.message);
+      materialiseFailed = true;
     }
   }
 
-  return json({ ok: true, status: captured ? 'paid' : 'attempted', applicationId });
+  // `pending`: payment captured but no application row yet (materialisation
+  // failed or is being retried by the webhook). The UI shows a "payment
+  // received, finalising" message instead of a broken confirmation page.
+  return json({
+    ok: true,
+    status: captured ? 'paid' : 'attempted',
+    applicationId,
+    pending: captured && !applicationId,
+    materialiseFailed,
+  });
 };
 
 function json(data: any, status = 200) {

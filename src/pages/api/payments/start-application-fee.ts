@@ -43,6 +43,31 @@ export const POST: APIRoute = async ({ request, locals }) => {
       `);
       const intentRow = (Array.isArray(intentRows) ? intentRows : (intentRows?.rows || []))[0] as any;
       if (!intentRow) return json({ ok: false, error: 'Application intent not found' }, 404);
+
+      // IDEMPOTENCY (prevents the double-charge): if this intent already has a
+      // captured payment, do NOT create a new order. Re-run the materialisation
+      // (in case it failed the first time) and send the applicant to their
+      // confirmation instead of charging again.
+      const rowsOf = (r: any) => (Array.isArray(r) ? r : (r?.rows || []));
+      const priorPaid = rowsOf(await db.execute(sql`
+        SELECT order_id, razorpay_payment_id FROM payments
+        WHERE reference_id = ${intentRow.id} AND status IN ('paid','captured','authorized')
+        ORDER BY updated_at DESC LIMIT 1
+      `).catch(() => []))[0] as any;
+      if (priorPaid) {
+        let appId2: string | undefined;
+        try {
+          const { applyPaidEffects } = await import('@/lib/payment-effects');
+          const r2 = await applyPaidEffects(priorPaid.order_id, priorPaid.razorpay_payment_id || null);
+          appId2 = (r2 && (r2 as any).applicationId) || undefined;
+        } catch (_) {}
+        if (!appId2) {
+          const a2 = rowsOf(await db.execute(sql`SELECT id FROM applications WHERE applicant_user_id = ${user.id} ORDER BY created_at DESC LIMIT 1`).catch(() => []))[0] as any;
+          appId2 = a2?.id;
+        }
+        return json({ ok: true, alreadyPaid: true, redirect: appId2 ? '/apply/confirmation?id=' + appId2 : '/portal' });
+      }
+
       if (!isConfigured()) return json({ ok: false, error: 'Payments not yet configured.' }, 503);
 
       const feeChf = resolveApplicationFeeChf({ roleFee: intentRow.role_fee, level: intentRow.level });

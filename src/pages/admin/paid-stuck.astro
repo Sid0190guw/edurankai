@@ -1,0 +1,99 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const isSuper = ['admin', 'super_admin'].includes(user.role);
+if (!isSuper) return Astro.redirect('/admin');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Self-heal the columns so the page never errors on a fresh DB.
+try {
+  await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS materialise_error TEXT`);
+  await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS paid_order_id TEXT`);
+} catch (_) {}
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const intentId = (fd.get('intent_id') as string) || '';
+    const orderId = (fd.get('order_id') as string) || '';
+    if (orderId) {
+      const { applyPaidEffects } = await import('@/lib/payment-effects');
+      const r = await applyPaidEffects(orderId, null);
+      if (r && (r as any).applicationId) okMsg = 'Recovered — application created.';
+      else if (r && (r as any).failed) errMsg = 'Still failing. Check the error and fix the data.';
+      else okMsg = 'Processed.';
+    } else if (intentId) {
+      errMsg = 'No paid order recorded for this intent.';
+    }
+  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 200); }
+}
+
+let stuck: any[] = [];
+try {
+  stuck = rows(await db.execute(sql`
+    SELECT i.id, i.email, i.first_name, i.last_name, i.role_title_snapshot, i.created_at,
+           i.materialise_error, i.paid_order_id,
+           p.razorpay_payment_id, p.amount_paise, p.updated_at AS paid_at
+    FROM application_intents i
+    LEFT JOIN payments p ON p.reference_id = i.id AND p.status IN ('paid','captured','authorized')
+    WHERE i.paid_order_id IS NOT NULL OR p.id IS NOT NULL
+    ORDER BY i.created_at DESC LIMIT 100
+  `));
+} catch (_) {}
+
+function fmt(d: any) { try { return d ? new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '-'; } catch { return '-'; } }
+function inr(p: any) { return '₹' + ((Number(p) || 0) / 100).toLocaleString('en-IN', { maximumFractionDigits: 0 }); }
+---
+<AdminLayout title="Paid - stuck applications" activeNav="">
+  <section style="max-width:980px;margin:0 auto;padding:6px 4px 44px;">
+    <p style="font-size:11px;font-family:monospace;text-transform:uppercase;letter-spacing:0.14em;color:#FF4F00;font-weight:700;margin:0 0 4px;">Payments</p>
+    <h1 style="font-size:1.5rem;font-weight:600;color:#100b08;margin:0 0 4px;">Paid, but application not saved</h1>
+    <p style="font-size:0.86rem;color:#6a635c;margin:0 0 18px;">Applicants who paid the fee but whose application row failed to materialise. Each row keeps the captured payment, so a one-click retry re-creates the application without re-charging.</p>
+
+    {okMsg && <div style="background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;border-radius:9px;padding:9px 13px;font-size:13px;margin-bottom:13px;">{okMsg}</div>}
+    {errMsg && <div style="background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:9px;padding:9px 13px;font-size:13px;margin-bottom:13px;">{errMsg}</div>}
+
+    {stuck.length === 0 ? (
+      <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:12px;padding:30px;text-align:center;color:#8a8078;font-size:0.9rem;">No stuck paid applications. Everyone who paid has an application.</div>
+    ) : (
+      <div style="background:#fff;border:1px solid rgba(14,11,8,0.1);border-radius:12px;overflow:hidden;">
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead><tr style="text-align:left;">
+              <th style="padding:10px 12px;border-bottom:1px solid rgba(14,11,8,0.1);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#9a8f86;">Applicant</th>
+              <th style="padding:10px 12px;border-bottom:1px solid rgba(14,11,8,0.1);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#9a8f86;">Paid</th>
+              <th style="padding:10px 12px;border-bottom:1px solid rgba(14,11,8,0.1);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#9a8f86;">Error</th>
+              <th style="padding:10px 12px;border-bottom:1px solid rgba(14,11,8,0.1);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#9a8f86;">Action</th>
+            </tr></thead>
+            <tbody>
+              {stuck.map((s: any) => (
+                <tr style="border-bottom:1px solid rgba(14,11,8,0.05);vertical-align:top;">
+                  <td style="padding:11px 12px;">
+                    <strong>{((s.first_name || '') + ' ' + (s.last_name || '')).trim() || 'Applicant'}</strong>
+                    <span style="display:block;font-size:12px;color:#8a8078;">{s.email}</span>
+                    <span style="display:block;font-size:11.5px;color:#9a8f86;">{s.role_title_snapshot || ''}</span>
+                  </td>
+                  <td style="padding:11px 12px;">{s.amount_paise ? inr(s.amount_paise) : '-'}<span style="display:block;font-size:11px;color:#a99e94;">{fmt(s.paid_at)}</span></td>
+                  <td style="padding:11px 12px;max-width:300px;"><code style="font-size:11px;color:#b91c1c;word-break:break-word;">{s.materialise_error || 'unknown'}</code></td>
+                  <td style="padding:11px 12px;">
+                    <form method="post">
+                      <input type="hidden" name="intent_id" value={s.id} />
+                      <input type="hidden" name="order_id" value={s.paid_order_id || ''} />
+                      <button type="submit" style="background:#FF4F00;color:#fff;border:0;border-radius:7px;padding:7px 14px;font-size:12.5px;font-weight:600;cursor:pointer;">Retry &amp; create</button>
+                    </form>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    )}
+  </section>
+</AdminLayout>

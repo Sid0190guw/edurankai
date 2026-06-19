@@ -78,7 +78,7 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
         fee_paid, fee_paid_at, fee_waiver_granted, fee_waiver_reason
       ) VALUES (
         ${d.applicationNumber || null}, ${d.roleId || null}, ${intent.user_id},
-        ${d.firstName || ''}, ${d.lastName || ''}, ${d.email || ''}, ${d.phone || null},
+        ${d.firstName || ''}, ${d.lastName || ''}, ${d.email || (intent.email || '')}, ${d.phone || ''},
         ${d.city || ''}, ${d.linkedin || null},
         ${d.portfolioUrl || ''}, ${d.photoUrl || null}, ${d.dob || null}, ${d.birthTime || null}, ${d.birthPlace || null},
         ${d.departmentSnapshot || null}, ${d.roleTitleSnapshot || ''}, ${d.level || null}, ${d.openToOther ?? false},

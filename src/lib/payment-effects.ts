@@ -43,7 +43,7 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
           programme_choice, programme_engagement_note, programme_engagement_url
         ) VALUES (
           ${d.applicationNumber || null}, ${d.roleId || null}, ${intent.user_id},
-          ${d.firstName || ''}, ${d.lastName || ''}, ${d.email || ''}, ${d.phone || null},
+          ${d.firstName || ''}, ${d.lastName || ''}, ${d.email || (intent.email || '')}, ${d.phone || ''},
           ${d.city || ''}, ${d.linkedin || null},
           ${d.portfolioUrl || ''}, ${d.photoUrl || null}, ${d.dob || null}, ${d.birthTime || null}, ${d.birthPlace || null},
           ${d.departmentSnapshot || null}, ${d.roleTitleSnapshot || ''}, ${d.level || null}, ${d.openToOther ?? false},
@@ -70,7 +70,28 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
         const name = ((d.firstName || '') + ' ' + (d.lastName || '')).trim() || d.email || 'Applicant';
         if (newAppId) await pushNotify.newApplication(name, d.roleTitleSnapshot || 'a role', newAppId);
       } catch (_) {}
-    } catch (e) { /* leave intent in place — admin or user can retry */ }
+    } catch (e: any) {
+      // CRITICAL: payment is already captured but the application row failed to
+      // materialise. Do NOT silently swallow — log it, keep the intent for
+      // retry, and alert admins so the paid applicant is never lost.
+      console.error('[payments] application materialise FAILED for intent', intent.id, 'order', orderId, '-', e?.message || e);
+      try {
+        await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS materialise_error TEXT`);
+        await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS paid_order_id TEXT`);
+        await db.execute(sql`UPDATE application_intents SET materialise_error = ${String(e?.message || e).slice(0, 500)}, paid_order_id = ${orderId} WHERE id = ${intent.id}`);
+      } catch (_) {}
+      try {
+        const { sendPushToAdmins } = await import('@/lib/push');
+        await sendPushToAdmins({
+          type: 'paid_application_stuck',
+          title: 'Paid application needs recovery',
+          body: ((d.firstName || '') + ' ' + (d.lastName || '')).trim() + ' paid but their application did not save. Recover it in admin.',
+          url: '/admin/paid-stuck',
+          tag: 'paid-stuck-' + intent.id,
+        });
+      } catch (_) {}
+      return { applicationId: undefined, failed: true } as any;
+    }
     return { applicationId: newAppId };
   }
 
