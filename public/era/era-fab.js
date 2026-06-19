@@ -28,7 +28,7 @@
     fab.id = 'eraFab';
     fab.setAttribute('aria-label', 'Open quick actions');
     fab.innerHTML = '<svg id="fabIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="6" cy="12" r="1.5" fill="currentColor"/><circle cx="18" cy="12" r="1.5" fill="currentColor"/></svg>';
-    fab.style.cssText = 'position:fixed;bottom:16px;right:16px;width:48px;height:48px;background:#FF4F00;border:none;border-radius:50%;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(255,79,0,0.45);z-index:9990;transition:transform 0.2s, box-shadow 0.2s;';
+    fab.style.cssText = 'position:fixed;bottom:16px;left:16px;width:48px;height:48px;background:#FF4F00;border:none;border-radius:50%;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(255,79,0,0.45);z-index:9990;transition:transform 0.2s, box-shadow 0.2s;';
     fab.onmouseenter = function() { fab.style.transform = 'scale(1.08)'; };
     fab.onmouseleave = function() { fab.style.transform = open ? 'rotate(45deg)' : 'scale(1)'; };
     fab.onclick = toggle;
@@ -37,7 +37,7 @@
     // Menu container (stacks above FAB)
     menu = document.createElement('div');
     menu.id = 'eraFabMenu';
-    menu.style.cssText = 'position:fixed;bottom:76px;right:16px;z-index:9989;display:flex;flex-direction:column;gap:10px;align-items:flex-end;pointer-events:none;';
+    menu.style.cssText = 'position:fixed;bottom:76px;left:16px;z-index:9989;display:flex;flex-direction:column;gap:10px;align-items:flex-start;pointer-events:none;';
     document.body.appendChild(menu);
   }
 
@@ -47,10 +47,10 @@
     items.forEach(function(item, idx) {
       var delay = (items.length - idx - 1) * 40;
       html += '<div class="era-fab-item" data-key="' + item.key + '" style="display:flex;align-items:center;gap:10px;opacity:0;transform:translateY(10px) scale(0.85);transition:opacity 0.2s ' + delay + 'ms, transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) ' + delay + 'ms;pointer-events:auto;">'
+            + '<button class="era-fab-btn" data-key="' + item.key + '" style="width:42px;height:42px;background:' + (item.color || '#15151a') + ';border:1px solid rgba(255,255,255,0.1);border-radius:50%;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(0,0,0,0.3);" title="' + item.label + '">' + item.icon + '</button>'
             + '<span style="background:rgba(15,15,20,0.95);backdrop-filter:blur(10px);color:#fff;font-size:12px;font-weight:600;padding:6px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.08);white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.3);">' + item.label
             + (item.shortcut ? ' <kbd style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);border-radius:3px;padding:0 5px;font-size:10px;margin-left:4px;font-family:monospace;color:rgba(255,255,255,0.7);">' + item.shortcut + '</kbd>' : '')
             + '</span>'
-            + '<button class="era-fab-btn" data-key="' + item.key + '" style="width:42px;height:42px;background:' + (item.color || '#15151a') + ';border:1px solid rgba(255,255,255,0.1);border-radius:50%;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(0,0,0,0.3);" title="' + item.label + '">' + item.icon + '</button>'
             + '</div>';
     });
     menu.innerHTML = html;
