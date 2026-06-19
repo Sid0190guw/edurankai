@@ -63,6 +63,10 @@ export const POST: APIRoute = async ({ request, cookies }) => {
         text: (conv.visitor_name || 'A visitor') + ': ' + txt + '\n\nOpen: https://edurankai.in/admin/help',
       });
     } catch (_) {}
+    try {
+      const { notifyAllAdmins } = await import('@/lib/notify');
+      await notifyAllAdmins({ title: 'Help message from ' + (conv.visitor_name || 'a visitor'), body: txt.slice(0, 160), type: 'message', actionUrl: '/admin/help', entityType: 'help_conversation', entityId: conv.id });
+    } catch (_) {}
 
     return json({ ok: true, message: mRows[0] });
   } catch (e: any) {
