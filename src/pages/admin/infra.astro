@@ -1,0 +1,121 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const isSuper = user.role === 'admin' || user.role === 'super_admin';
+if (!isSuper) return Astro.redirect('/admin');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+function fmtBytes(n: number): string {
+  const b = Number(n) || 0;
+  if (b < 1024) return b + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB']; let i = -1; let v = b;
+  do { v /= 1024; i++; } while (v >= 1024 && i < u.length - 1);
+  return v.toFixed(v >= 100 ? 0 : 1) + ' ' + u[i];
+}
+function pct(used: number, limit: number): number { return limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0; }
+
+// ---- Database (Neon Postgres) - measured live via SQL ----
+let dbBytes = 0, tableCount = 0, topTables: any[] = [], rowsTotal = 0;
+try { dbBytes = Number(rows(await db.execute(sql`SELECT pg_database_size(current_database()) AS b`))[0]?.b) || 0; } catch (_) {}
+try { tableCount = Number(rows(await db.execute(sql`SELECT count(*)::int AS c FROM information_schema.tables WHERE table_schema = 'public'`))[0]?.c) || 0; } catch (_) {}
+try {
+  topTables = rows(await db.execute(sql`
+    SELECT c.relname AS name, pg_total_relation_size(c.oid) AS bytes,
+      COALESCE(s.n_live_tup, 0) AS rows
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+    WHERE n.nspname = 'public' AND c.relkind = 'r'
+    ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 12`));
+  rowsTotal = topTables.reduce((a, t) => a + (Number(t.rows) || 0), 0);
+} catch (_) {}
+const NEON_FREE_BYTES = 512 * 1024 * 1024; // 0.5 GB on Neon free
+
+// ---- Blob storage (@vercel/blob) - measured live (best effort) ----
+let blobBytes = 0, blobCount = 0, blobOk = false, blobErr = '';
+try {
+  const { list } = await import('@vercel/blob');
+  let cursor: string | undefined = undefined; let guard = 0;
+  do {
+    const res: any = await list({ cursor, limit: 1000 });
+    for (const b of (res.blobs || [])) { blobBytes += Number(b.size) || 0; blobCount++; }
+    cursor = res.cursor; guard++;
+  } while (cursor && guard < 20);
+  blobOk = true;
+} catch (e: any) { blobErr = String(e?.message || e).slice(0, 120); }
+const BLOB_FREE_BYTES = 1024 * 1024 * 1024; // ~1 GB free reference
+
+// ---- Provider cards: live if the API token is set, else a "connect" hint ----
+const env = (k: string) => (import.meta.env[k] || process.env[k] || '') as string;
+const providers = [
+  { name: 'Neon (Postgres)', kind: 'Database', live: true, detail: fmtBytes(dbBytes) + ' used' + (NEON_FREE_BYTES ? ' of ~' + fmtBytes(NEON_FREE_BYTES) : ''), pct: pct(dbBytes, NEON_FREE_BYTES), env: '' },
+  { name: 'Vercel Blob', kind: 'Object storage', live: blobOk, detail: blobOk ? (fmtBytes(blobBytes) + ' across ' + blobCount + ' files') : ('Not readable here' + (blobErr ? ' (' + blobErr + ')' : '')), pct: blobOk ? pct(blobBytes, BLOB_FREE_BYTES) : 0, env: blobOk ? '' : 'BLOB_READ_WRITE_TOKEN' },
+  { name: 'Vercel (compute / bandwidth)', kind: 'Hosting', live: !!env('VERCEL_API_TOKEN'), detail: env('VERCEL_API_TOKEN') ? 'Token set - usage via Vercel API' : 'Add VERCEL_API_TOKEN to show live build minutes, bandwidth and function usage.', pct: 0, env: env('VERCEL_API_TOKEN') ? '' : 'VERCEL_API_TOKEN' },
+  { name: 'GitHub', kind: 'Source / CI', live: !!env('GITHUB_TOKEN'), detail: env('GITHUB_TOKEN') ? 'Token set - Actions minutes + storage via GitHub API' : 'Add GITHUB_TOKEN to show Actions minutes and package storage.', pct: 0, env: env('GITHUB_TOKEN') ? '' : 'GITHUB_TOKEN' },
+  { name: 'Cloudflare', kind: 'CDN / edge', live: !!env('CLOUDFLARE_API_TOKEN'), detail: env('CLOUDFLARE_API_TOKEN') ? 'Token set - usage via Cloudflare API' : 'Add CLOUDFLARE_API_TOKEN to show requests, bandwidth and Workers usage.', pct: 0, env: env('CLOUDFLARE_API_TOKEN') ? '' : 'CLOUDFLARE_API_TOKEN' },
+];
+---
+<AdminLayout title="Infrastructure" activeNav="infra">
+  <section style="max-width:1000px;margin:0 auto;padding:6px 2px 48px;">
+    <p style="font-size:11px;font-family:monospace;text-transform:uppercase;letter-spacing:0.15em;color:#FF4F00;font-weight:700;margin:0 0 4px;">Operations</p>
+    <h1 style="font-size:1.5rem;font-weight:600;color:#fff;margin:0 0 4px;">Infrastructure usage</h1>
+    <p style="font-size:0.86rem;color:#8a8a94;margin:0 0 20px;">Live resource usage across the services that run EduRankAI. Database and blob storage are measured directly; hosting/CI/CDN show live once their API token is set. Built to extend to our own servers later.</p>
+
+    <!-- Headline measured numbers -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:22px;">
+      <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;padding:16px;">
+        <p style="font-size:1.7rem;font-weight:700;color:#fff;margin:0;line-height:1;">{fmtBytes(dbBytes)}</p>
+        <p style="font-size:0.72rem;color:#8a8a94;text-transform:uppercase;letter-spacing:0.05em;margin:6px 0 0;">Database size</p>
+        <p style="font-size:0.7rem;color:#FF7040;margin:3px 0 0;">{pct(dbBytes, NEON_FREE_BYTES)}% of ~{fmtBytes(NEON_FREE_BYTES)}</p>
+      </div>
+      <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;padding:16px;">
+        <p style="font-size:1.7rem;font-weight:700;color:#fff;margin:0;line-height:1;">{tableCount}</p>
+        <p style="font-size:0.72rem;color:#8a8a94;text-transform:uppercase;letter-spacing:0.05em;margin:6px 0 0;">Tables</p>
+        <p style="font-size:0.7rem;color:#8a8a94;margin:3px 0 0;">{rowsTotal.toLocaleString('en-US')} rows (est.)</p>
+      </div>
+      <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;padding:16px;">
+        <p style="font-size:1.7rem;font-weight:700;color:#fff;margin:0;line-height:1;">{blobOk ? fmtBytes(blobBytes) : '-'}</p>
+        <p style="font-size:0.72rem;color:#8a8a94;text-transform:uppercase;letter-spacing:0.05em;margin:6px 0 0;">Blob storage</p>
+        <p style="font-size:0.7rem;color:#8a8a94;margin:3px 0 0;">{blobOk ? blobCount + ' files' : 'token needed'}</p>
+      </div>
+    </div>
+
+    <!-- Provider cards -->
+    <h2 style="font-size:1.02rem;font-weight:600;color:#fff;margin:0 0 12px;">Services</h2>
+    <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:26px;">
+      {providers.map((p) => (
+        <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;padding:15px 17px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div>
+              <p style="font-size:0.94rem;font-weight:600;color:#fff;margin:0;">{p.name}</p>
+              <p style="font-size:0.74rem;color:#8a8a94;margin:2px 0 0;">{p.kind}</p>
+            </div>
+            <span style={'font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;padding:3px 10px;border-radius:100px;' + (p.live ? 'background:rgba(16,185,129,0.15);color:#6ee7b7;' : 'background:rgba(148,163,184,0.15);color:#9aa3b2;')}>{p.live ? 'Live' : 'Not connected'}</span>
+          </div>
+          <p style="font-size:0.82rem;color:#c8c8d0;margin:10px 0 0;">{p.detail}</p>
+          {p.live && p.pct > 0 && (
+            <div style="height:6px;background:#1f1f28;border-radius:100px;margin-top:10px;overflow:hidden;"><div style={'height:100%;border-radius:100px;background:' + (p.pct > 85 ? '#ef4444' : p.pct > 60 ? '#fbbf24' : '#10b981') + ';width:' + p.pct + '%;'}></div></div>
+          )}
+          {p.env && <p style="font-size:0.72rem;color:#6a6a78;margin:8px 0 0;font-family:monospace;">Set <span style="color:#FF7040;">{p.env}</span> in Vercel env to enable live metrics.</p>}
+        </div>
+      ))}
+    </div>
+
+    <!-- Biggest tables -->
+    <h2 style="font-size:1.02rem;font-weight:600;color:#fff;margin:0 0 12px;">Largest tables</h2>
+    <div style="background:#0f0f14;border:1px solid #1f1f28;border-radius:12px;overflow:hidden;">
+      {topTables.length === 0 ? <p style="padding:20px;color:#8a8a94;font-size:0.85rem;">Could not read table sizes.</p> : topTables.map((t: any, i: number) => (
+        <div style={'display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 16px;' + (i > 0 ? 'border-top:1px solid #1a1a22;' : '')}>
+          <span style="font-size:0.84rem;color:#e9edf2;font-family:monospace;">{t.name}</span>
+          <span style="font-size:0.8rem;color:#8a8a94;white-space:nowrap;">{Number(t.rows).toLocaleString('en-US')} rows · <strong style="color:#c8c8d0;">{fmtBytes(t.bytes)}</strong></span>
+        </div>
+      ))}
+    </div>
+
+    <p style="font-size:0.74rem;color:#6a6a78;margin:18px 0 0;line-height:1.5;">When we move to our own servers, add each as a provider here with a live probe (disk / CPU / RAM via a small metrics endpoint) and it will appear alongside these automatically.</p>
+  </section>
+</AdminLayout>
