@@ -71,25 +71,34 @@ export function currencyFor(countryOrIso: string | null | undefined): Currency {
   return USD;
 }
 
-// Convert an INR-paise amount to CHF and the applicant's local currency.
+// The platform base currency. Defaults to CHF; change it by setting
+// WALLET_BASE_CURRENCY (e.g. 'USD', 'EUR', 'INR') in the environment.
+export function baseCurrency(): string {
+  return ((typeof process !== 'undefined' && process.env && process.env.WALLET_BASE_CURRENCY) || 'CHF').toUpperCase();
+}
+
+// Convert an INR-paise amount to the base currency and the applicant's local one.
 export async function walletAmounts(inrPaise: number, country: string | null | undefined): Promise<{
-  inr: number; chf: number; chfLabel: string; local: number; localLabel: string; localCode: string; localSymbol: string; baseChf: boolean;
+  inr: number; base: number; baseCode: string; baseLabel: string; chf: number; chfLabel: string;
+  local: number; localLabel: string; localCode: string; localSymbol: string;
 }> {
   const inr = (Number(inrPaise) || 0) / 100;
   const cur = currencyFor(country);
-  let chfRate = 95; // sensible fallback (INR per CHF)
-  try { chfRate = (await fxRateToInr('CHF')).rate || 95; } catch (_) {}
-  const chf = inr / (chfRate || 95);
-  let local = inr;
-  if (cur.code !== 'INR') {
-    try { const r = (await fxRateToInr(cur.code)).rate; if (r > 0) local = inr / r; } catch (_) { local = inr; }
-  }
+  const BASE = baseCurrency();
   const nf = (n: number, d = 2) => n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  const zeroDp = (c: string) => ['JPY', 'KRW', 'VND', 'IDR'].includes(c);
+  // base currency amount
+  let base = inr;
+  if (BASE !== 'INR') { try { const r = (await fxRateToInr(BASE)).rate; if (r > 0) base = inr / r; } catch (_) { base = inr / (BASE === 'CHF' ? 95 : 1); } }
+  // local currency amount
+  let local = inr;
+  if (cur.code !== 'INR') { try { const r = (await fxRateToInr(cur.code)).rate; if (r > 0) local = inr / r; } catch (_) { local = inr; } }
+  const baseLabel = (BASE === 'INR' ? '₹' : BASE + ' ') + nf(base, zeroDp(BASE) ? 0 : 2);
   return {
-    inr, chf,
-    chfLabel: 'CHF ' + nf(chf),
+    inr,
+    base, baseCode: BASE, baseLabel,
+    chf: base, chfLabel: baseLabel,
     local, localCode: cur.code, localSymbol: cur.symbol,
-    localLabel: cur.symbol + nf(local, cur.code === 'JPY' || cur.code === 'KRW' || cur.code === 'VND' || cur.code === 'IDR' ? 0 : 2),
-    baseChf: true,
+    localLabel: (cur.code === 'INR' ? '₹' : cur.symbol) + nf(local, zeroDp(cur.code) ? 0 : 2),
   };
 }
