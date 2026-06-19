@@ -23,6 +23,14 @@ export const POST: APIRoute = async ({ locals }) => {
     if (!u) return json({ ok: false, error: 'User not found' }, 404);
     if (u.access_status === 'approved' || u.reg_fee_paid) return json({ ok: true, alreadyPaid: true, redirect: '/portal' });
 
+    // Universal account credit: cover the registration fee from the wallet.
+    {
+      const fxC = await convertToInrPaise('CHF', REGISTRATION_FEE_CHF * 100);
+      const { coverWithCredit } = await import('@/lib/account-credit');
+      const cov = await coverWithCredit({ userId: u.id, amountPaise: fxC.paise, purpose: 'registration_fee', referenceType: 'user', referenceId: u.id, email: u.email || '', label: 'Registration fee' });
+      if (cov.covered) return json({ ok: true, alreadyPaid: true, paidWithCredit: true, redirect: '/portal' });
+    }
+
     if (!isConfigured()) return json({ ok: false, error: 'Payments not yet configured. You can request a fee waiver instead.' }, 503);
 
     const fx = await convertToInrPaise('CHF', REGISTRATION_FEE_CHF * 100);

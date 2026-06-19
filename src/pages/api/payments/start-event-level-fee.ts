@@ -53,6 +53,14 @@ export const POST: APIRoute = async ({ request, locals }) => {
     `))[0] as any;
     if (prog?.fee_paid) return json({ ok: true, alreadyPaid: true, redirect: panelUrl });
 
+    // Universal account credit: cover the event-level fee from the wallet.
+    {
+      const fxC = await convertToInrPaise('CHF', feeChf * 100);
+      const { coverWithCredit } = await import('@/lib/account-credit');
+      const cov = await coverWithCredit({ userId: user.id, amountPaise: fxC.paise, purpose: 'event_level', referenceType: 'event_level', referenceId: prog.id, email: reg.participant_email || user.email || '', label: 'Event level fee' });
+      if (cov.covered) return json({ ok: true, alreadyPaid: true, paidWithCredit: true, redirect: panelUrl });
+    }
+
     if (!isConfigured()) return json({ ok: false, error: 'Payments not yet configured. Contact hr@edurankai.in.' }, 503);
 
     const fx = await convertToInrPaise('CHF', feeChf * 100);

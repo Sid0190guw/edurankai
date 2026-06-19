@@ -14,11 +14,25 @@ const PASS_INR_PAISE = 10000; // 100 INR
 export const POST: APIRoute = async ({ locals }) => {
   const user = (locals as any).user;
   if (!user) return json({ ok: false, error: 'unauthorised' }, 401);
+
+  await ensureToolPassSchema();
+
+  // Universal account credit: activate the day pass straight from the wallet
+  // (no card charge, works even if Razorpay isn't configured).
+  try {
+    const { getCreditBalance, grantCredit } = await import('@/lib/account-credit');
+    if ((await getCreditBalance(user.id)) >= PASS_INR_PAISE) {
+      await grantCredit(user.id, -PASS_INR_PAISE, 'Paid with credit: Tool day pass');
+      const { activatePass } = await import('@/lib/tool-pass');
+      await activatePass({ userId: user.id, orderId: 'CREDIT', paymentId: 'credit', signature: 'credit' });
+      return json({ ok: true, paidWithCredit: true });
+    }
+  } catch (_) {}
+
   const keyId = import.meta.env.RAZORPAY_KEY_ID || import.meta.env.PUBLIC_RAZORPAY_KEY_ID;
   const secret = import.meta.env.RAZORPAY_KEY_SECRET;
   if (!keyId || !secret) return json({ ok: false, error: 'Razorpay not configured' }, 500);
 
-  await ensureToolPassSchema();
   try {
     const auth = Buffer.from(keyId + ':' + secret).toString('base64');
     const r = await fetch('https://api.razorpay.com/v1/orders', {
