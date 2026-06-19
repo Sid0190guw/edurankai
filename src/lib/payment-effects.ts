@@ -29,6 +29,26 @@ export async function reconcileOrder(orderId: string): Promise<{ reconciled: boo
   return { reconciled: true, applicationId: (r && (r as any).applicationId) || undefined };
 }
 
+// Reconcile just ONE user's recent unsettled orders. Cheap to call on page
+// load (the portal / confirmation): the SELECT is trivial when nothing is
+// pending, and only hits Razorpay when the user actually has an open order.
+// This is what flips a "paid but still pending" application to submitted the
+// moment the applicant returns, without waiting for the daily cron.
+export async function reconcileUserPending(userId: string): Promise<number> {
+  if (!userId) return 0;
+  const pend = rows(await db.execute(sql`
+    SELECT order_id FROM payments
+    WHERE user_id = ${userId} AND status IN ('created', 'attempted', 'authorized') AND order_id IS NOT NULL
+      AND created_at > NOW() - INTERVAL '7 days'
+    ORDER BY created_at DESC LIMIT 8
+  `).catch(() => []));
+  let n = 0;
+  for (const p of pend) {
+    try { const r = await reconcileOrder((p as any).order_id); if (r.reconciled) n++; } catch (_) {}
+  }
+  return n;
+}
+
 // Scan recent unsettled payments and reconcile each (cron backstop).
 export async function reconcilePending(limit = 150): Promise<{ scanned: number; reconciled: number }> {
   const pend = rows(await db.execute(sql`
