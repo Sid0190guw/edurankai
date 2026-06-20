@@ -128,9 +128,43 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
         if (newAppId) await pushNotify.newApplication(name, d.roleTitleSnapshot || 'a role', newAppId);
       } catch (_) {}
     } catch (e: any) {
-      // CRITICAL: payment is already captured but the application row failed to
-      // materialise. Do NOT silently swallow — log it, keep the intent for
-      // retry, and alert admins so the paid applicant is never lost.
+      // The full insert failed (usually a bad date or an over-long field in the
+      // applicant's data). RETRY with a minimal, type-safe insert so a PAID
+      // application is never lost — risky typed columns are nulled and the full
+      // submission is preserved in raw_submission for later backfill.
+      try {
+        const appNum = (d.applicationNumber && String(d.applicationNumber)) || ('ERA-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase());
+        const cut = (v: any, n: number) => (v == null ? null : String(v).slice(0, n));
+        const insMin = rows(await db.execute(sql`
+          INSERT INTO applications (
+            application_number, role_id, applicant_user_id,
+            first_name, last_name, email, phone, city,
+            department_snapshot, role_title_snapshot, level,
+            tech_skills, why_era, why_role, why_ai_edu, source, status, raw_submission,
+            fee_paid, fee_payment_id, fee_paid_at
+          ) VALUES (
+            ${appNum}, ${d.roleId || null}, ${intent.user_id},
+            ${cut(d.firstName, 100) || ''}, ${cut(d.lastName, 100) || ''}, ${cut(d.email || intent.email, 200) || ''}, ${cut(d.phone, 40) || ''}, ${cut(d.city, 100)},
+            ${cut(d.departmentSnapshot, 120)}, ${cut(d.roleTitleSnapshot, 200) || ''}, ${cut(d.level, 60)},
+            ${JSON.stringify(d.techSkills || {})}::jsonb, ${d.whyERA || null}, ${d.whyRole || null}, ${d.whyAIEdu || null}, ${cut(d.source, 60)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb,
+            true, ${paymentId}, NOW()
+          ) RETURNING id
+        `));
+        const minId = insMin[0]?.id as string | undefined;
+        if (minId) {
+          await db.execute(sql`UPDATE payments SET reference_id = ${minId}, reference_type = 'application' WHERE order_id = ${orderId}`).catch(() => {});
+          await db.execute(sql`DELETE FROM application_intents WHERE id = ${intent.id}`).catch(() => {});
+          try {
+            const { sendPushToAdmins } = await import('@/lib/push');
+            const nm = ((d.firstName || '') + ' ' + (d.lastName || '')).trim() || d.email || 'Applicant';
+            await sendPushToAdmins({ type: 'application_recovered', title: 'Paid application saved (recovered)', body: nm + ' is now in review. A couple of fields may need backfill.', url: '/admin/applications/' + minId, tag: 'recovered-' + minId });
+          } catch (_) {}
+          return { applicationId: minId };
+        }
+      } catch (e2: any) {
+        console.error('[payments] minimal materialise ALSO failed for intent', intent.id, '-', e2?.message || e2);
+      }
+      // Both inserts failed — keep the intent + alert so the paid applicant is never lost.
       console.error('[payments] application materialise FAILED for intent', intent.id, 'order', orderId, '-', e?.message || e);
       try {
         await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS materialise_error TEXT`);
