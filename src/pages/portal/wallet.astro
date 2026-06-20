@@ -4,6 +4,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { getCreditBalance, getCreditLedger } from '@/lib/account-credit';
 import { walletAmounts, currencyFor } from '@/lib/local-currency';
+import { isConfigured } from '@/lib/razorpay';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/wallet'));
@@ -22,6 +23,8 @@ const balancePaise = await getCreditBalance(user.id).catch(() => 0);
 const w = await walletAmounts(balancePaise, country);
 const cur = currencyFor(country);
 const ledger = await getCreditLedger(user.id, 50).catch(() => []);
+const paymentsReady = isConfigured();
+const QUICK = [100, 500, 1000, 2000];
 
 function fmt(d: any) { try { return new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return '-'; } }
 function signed(paise: any) {
@@ -47,9 +50,30 @@ function signed(paise: any) {
       <p class="text-[0.72rem] text-white/45 mt-4">{w.baseCode} is our base currency. {cur.code === 'INR' ? 'Held and settled in INR.' : 'Converted from INR at the live ECB rate; the actual charge is always in INR via Razorpay.'}</p>
     </div>
 
+    <!-- Add money -->
+    {paymentsReady && (
+      <div class="bg-white border border-ink/10 rounded-2xl p-5 mb-6">
+        <p class="text-[0.66rem] font-mono uppercase tracking-[0.15em] text-burn font-bold mb-2">Add money</p>
+        <p class="text-[0.84rem] text-ink-soft mb-3">Top up your wallet. Credit is usable for <strong>any</strong> EduRankAI fee or product, and is refundable.</p>
+        <div class="flex gap-2 flex-wrap mb-3">
+          {QUICK.map((a) => (
+            <button type="button" class="wal-chip" data-amt={a}>&#8377;{a.toLocaleString('en-IN')}</button>
+          ))}
+        </div>
+        <div class="flex gap-2 items-stretch">
+          <div class="flex items-center border border-ink/15 rounded-lg px-3 flex-1 bg-white focus-within:border-burn">
+            <span class="text-ink-soft">&#8377;</span>
+            <input id="walAmt" type="number" min="10" inputmode="numeric" placeholder="Amount" class="flex-1 px-2 py-2.5 outline-none bg-transparent text-[0.95rem]" />
+          </div>
+          <button id="walAddBtn" type="button" class="bg-burn hover:bg-burn/90 text-white font-semibold px-5 rounded-lg text-[0.9rem] whitespace-nowrap">Add money</button>
+        </div>
+        <p id="walMsg" class="text-[0.8rem] mt-2 min-h-[1.1em] text-ink-soft"></p>
+      </div>
+    )}
+
     {balancePaise <= 0 && (
       <div class="bg-cream-2 border border-ink/10 rounded-xl p-5 mb-6 text-[0.86rem] text-ink-soft leading-relaxed">
-        Your wallet is empty right now. If you paid a fee but your application didn't go through, it appears here automatically once we reconcile the payment - this page checks every time you open it. Questions? <a href="mailto:hr@edurankai.in" class="text-burn font-semibold">hr@edurankai.in</a>
+        If you paid a fee but your application didn't go through, it appears here automatically once we reconcile the payment - this page checks every time you open it. Questions? <a href="mailto:hr@edurankai.in" class="text-burn font-semibold">hr@edurankai.in</a>
       </div>
     )}
 
@@ -76,4 +100,49 @@ function signed(paise: any) {
       <a href="/portal/profile" class="text-[0.84rem] text-burn hover:underline">Your profile &rarr;</a>
     </div>
   </section>
+
+  {paymentsReady && (
+    <>
+      <script is:inline src="https://checkout.razorpay.com/v1/checkout.js"></script>
+      <script is:inline define:vars={{ uName: user.name || '', uEmail: user.email || '' }}>
+        (function () {
+          var amt = document.getElementById('walAmt');
+          var btn = document.getElementById('walAddBtn');
+          var msg = document.getElementById('walMsg');
+          if (!btn) return;
+          document.querySelectorAll('.wal-chip').forEach(function (c) {
+            c.addEventListener('click', function () { amt.value = c.getAttribute('data-amt'); amt.focus(); });
+          });
+          btn.addEventListener('click', function () {
+            var v = Math.round(Number(amt.value) || 0);
+            if (v < 10) { msg.textContent = 'Enter at least Rs 10.'; return; }
+            btn.disabled = true; msg.textContent = 'Starting...';
+            fetch('/api/payments/wallet-recharge', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ amountInr: v }) })
+              .then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (!d.ok) { btn.disabled = false; msg.textContent = d.error || 'Could not start.'; return; }
+                var rzp = new Razorpay({
+                  key: d.keyId, amount: d.amountPaise, currency: d.currency, order_id: d.orderId,
+                  name: 'EduRankAI', description: 'Wallet top-up', prefill: { name: uName, email: uEmail }, theme: { color: '#FF4F00' },
+                  handler: function (resp) {
+                    msg.textContent = 'Confirming...';
+                    fetch('/api/payments/verify', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ razorpay_order_id: resp.razorpay_order_id, razorpay_payment_id: resp.razorpay_payment_id, razorpay_signature: resp.razorpay_signature }) })
+                      .then(function (r) { return r.json(); })
+                      .then(function () { msg.textContent = 'Added to your wallet. Updating...'; setTimeout(function () { location.reload(); }, 1000); })
+                      .catch(function () { location.reload(); });
+                  },
+                });
+                rzp.open(); btn.disabled = false; msg.textContent = 'Complete the payment in the popup.';
+              })
+              .catch(function () { btn.disabled = false; msg.textContent = 'Network error - try again.'; });
+          });
+        })();
+      </script>
+    </>
+  )}
+
+  <style>
+    .wal-chip { font-size: 0.84rem; font-weight: 600; color: #2b2620; background: #f2ece4; border: 1px solid rgba(14,11,8,0.1); border-radius: 100px; padding: 6px 14px; cursor: pointer; }
+    .wal-chip:hover { border-color: #FF4F00; color: #FF4F00; }
+  </style>
 </BaseLayout>

@@ -277,4 +277,21 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
     } catch (_) {}
     return;
   }
+
+  // Wallet recharge -> add the paid amount to the user's account credit.
+  // Idempotent on the order id so webhook + verify + reconcile never double-credit.
+  if (pay.purpose === 'wallet_recharge' || pay.reference_type === 'wallet') {
+    try {
+      const dup = rows(await db.execute(sql`SELECT 1 FROM account_credit_ledger WHERE ref_id = ${orderId} LIMIT 1`).catch(() => []));
+      if (!dup.length) {
+        const amt = Number(rows(await db.execute(sql`SELECT amount_paise FROM payments WHERE order_id = ${orderId} LIMIT 1`))[0]?.amount_paise) || 0;
+        if (amt > 0) {
+          const { ensureCreditSchema } = await import('@/lib/account-credit');
+          await ensureCreditSchema();
+          await db.execute(sql`INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id) VALUES (${pay.user_id || pay.reference_id}, ${amt}, 'Wallet top-up', 'recharge', ${orderId})`).catch(() => {});
+        }
+      }
+    } catch (_) {}
+    return;
+  }
 }
