@@ -9,6 +9,14 @@ import { fetchOrderPayments } from '@/lib/razorpay';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// Defensive coercion — a single malformed field (an over-long string, a
+// non-numeric score, a level outside the enum) must never sink a PAID
+// application's insert and push it into the stuck-recovery path.
+const APP_LEVELS = ['C-Level', 'Lead', 'Senior', 'Mid', 'Junior', 'Intern', 'Apprentice'];
+function cut(v: any, n: number): string | null { return v == null || v === '' ? null : String(v).slice(0, n); }
+function intOrNull(v: any): number | null { const n = Number(v); return Number.isFinite(n) ? Math.trunc(n) : null; }
+function levelOrNull(v: any): string | null { return APP_LEVELS.includes(v) ? v : null; }
+
 // Reconcile ONE order against Razorpay. The webhook + browser /verify are the
 // fast paths; this is the backstop for when BOTH miss (tab closed before
 // /verify AND no webhook configured/fired). If Razorpay shows a captured (or
@@ -108,6 +116,16 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
       await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS programme_engagement_note TEXT`);
       await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS programme_engagement_url TEXT`);
     } catch (_) {}
+
+    // Validate FK targets and the level enum BEFORE inserting. A stale role_id, a
+    // missing user, or a level outside role_level are the usual reasons the insert
+    // blew up — sanitize them so the application lands cleanly on the FIRST try
+    // (these are also reused by the fallbacks below).
+    let roleIdSafe: any = null;
+    try { if (d.roleId) { const rr = rows(await db.execute(sql`SELECT 1 FROM roles WHERE id = ${d.roleId} LIMIT 1`)); roleIdSafe = rr.length ? d.roleId : null; } } catch (_) {}
+    let userIdSafe: any = intent.user_id || null;
+    try { if (userIdSafe) { const uu = rows(await db.execute(sql`SELECT 1 FROM users WHERE id = ${userIdSafe} LIMIT 1`)); if (!uu.length) userIdSafe = null; } } catch (_) {}
+
     try {
       const inserted = rows(await db.execute(sql`
         INSERT INTO applications (
@@ -123,19 +141,19 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
           fee_paid, fee_payment_id, fee_paid_at,
           programme_choice, programme_engagement_note, programme_engagement_url
         ) VALUES (
-          ${d.applicationNumber || null}, ${d.roleId || null}, ${intent.user_id},
-          ${d.firstName || ''}, ${d.lastName || ''}, ${d.email || (intent.email || '')}, ${d.phone || ''},
-          ${d.city || ''}, ${d.linkedin || null},
-          ${d.portfolioUrl || ''}, ${d.photoUrl || null}, ${d.dob || null}, ${d.birthTime || null}, ${d.birthPlace || null},
-          ${d.departmentSnapshot || null}, ${d.roleTitleSnapshot || ''}, ${d.level || null}, ${d.openToOther ?? false},
-          ${d.education || null}, ${d.fieldOfStudy || null}, ${d.institution || null}, ${d.experienceBand || null}, ${d.experienceDescription || null},
-          ${d.duolingoScore || null}, ${d.duolingoScreenshotUrl || null}, ${JSON.stringify(d.techSkills || {})}::jsonb,
+          ${cut(d.applicationNumber, 20)}, ${roleIdSafe}, ${userIdSafe},
+          ${cut(d.firstName, 100) || ''}, ${cut(d.lastName, 100) || ''}, ${cut(d.email || intent.email, 255) || ''}, ${cut(d.phone, 50) || ''},
+          ${cut(d.city, 200) || ''}, ${d.linkedin || null},
+          ${d.portfolioUrl || ''}, ${d.photoUrl || null}, ${cut(d.dob, 20)}, ${cut(d.birthTime, 20)}, ${cut(d.birthPlace, 200)},
+          ${cut(d.departmentSnapshot, 200)}, ${cut(d.roleTitleSnapshot, 200) || ''}, ${levelOrNull(d.level)}, ${d.openToOther ?? false},
+          ${cut(d.education, 100)}, ${cut(d.fieldOfStudy, 200)}, ${cut(d.institution, 300)}, ${cut(d.experienceBand, 50)}, ${d.experienceDescription || null},
+          ${intOrNull(d.duolingoScore)}, ${d.duolingoScreenshotUrl || null}, ${JSON.stringify(d.techSkills || {})}::jsonb,
           ${d.whyERA || null}, ${d.whyRole || null}, ${d.whyAIEdu || null}, ${d.intersection || null}, ${d.ambitious || null},
-          ${d.ethicsExperience || null}, ${d.ethicsIdeal || null}, ${d.availability || null}, ${d.engagementType || null}, ${d.remoteComfort || null},
-          ${d.compensation || null}, ${d.source || null}, 'submitted', ${JSON.stringify(d.rawSubmission || {})}::jsonb,
+          ${d.ethicsExperience || null}, ${d.ethicsIdeal || null}, ${cut(d.availability, 100)}, ${cut(d.engagementType, 100)}, ${cut(d.remoteComfort, 100)},
+          ${cut(d.compensation, 200)}, ${cut(d.source, 100)}, 'submitted', ${JSON.stringify(d.rawSubmission || {})}::jsonb,
           ${d.ipAddress || null}, ${d.userAgent || null},
           true, ${paymentId}, NOW(),
-          ${d.programmeChoice || null}, ${d.programmeEngagementNote || null}, ${d.programmeEngagementUrl || null}
+          ${cut(d.programmeChoice, 80)}, ${d.programmeEngagementNote || null}, ${d.programmeEngagementUrl || null}
         )
         RETURNING id
       `));
@@ -158,11 +176,8 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
       // submission is preserved in raw_submission for later backfill.
       try {
         // ALWAYS a fresh unique number (a reused one collides on a reattempt).
+        // roleIdSafe / userIdSafe / cut() are validated once above and reused here.
         const appNum = 'ERA-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 7).toUpperCase();
-        const cut = (v: any, n: number) => (v == null ? null : String(v).slice(0, n));
-        // Validate role_id — a stale/deleted role would fail the FK constraint.
-        let roleIdSafe: any = null;
-        try { if (d.roleId) { const rr = rows(await db.execute(sql`SELECT 1 FROM roles WHERE id = ${d.roleId} LIMIT 1`)); roleIdSafe = rr.length ? d.roleId : null; } } catch (_) { roleIdSafe = null; }
         // NOTE: every NOT-NULL column (first_name, last_name, email, phone, city,
         // portfolio_url) MUST be supplied here or the insert fails outright. `level`
         // is dropped on purpose — it is an enum, and a value outside role_level is
@@ -176,8 +191,8 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
             tech_skills, why_era, why_role, why_ai_edu, source, status, raw_submission,
             fee_paid, fee_payment_id, fee_paid_at
           ) VALUES (
-            ${appNum}, ${roleIdSafe}, ${intent.user_id},
-            ${cut(d.firstName, 100) || ''}, ${cut(d.lastName, 100) || ''}, ${cut(d.email || intent.email, 200) || ''}, ${cut(d.phone, 40) || ''}, ${cut(d.city, 200) || ''}, ${d.portfolioUrl || ''},
+            ${appNum}, ${roleIdSafe}, ${userIdSafe},
+            ${cut(d.firstName, 100) || ''}, ${cut(d.lastName, 100) || ''}, ${cut(d.email || intent.email, 255) || ''}, ${cut(d.phone, 50) || ''}, ${cut(d.city, 200) || ''}, ${d.portfolioUrl || ''},
             ${cut(d.departmentSnapshot, 120)}, ${cut(d.roleTitleSnapshot, 200) || ''},
             ${JSON.stringify(d.techSkills || {})}::jsonb, ${d.whyERA || null}, ${d.whyRole || null}, ${d.whyAIEdu || null}, ${cut(d.source, 60)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb,
             true, ${paymentId}, NOW()
@@ -208,8 +223,8 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
               first_name, last_name, email, phone, city, portfolio_url,
               role_title_snapshot, status, raw_submission, fee_paid, fee_payment_id, fee_paid_at
             ) VALUES (
-              ${bareNum}, ${intent.user_id},
-              ${(d.firstName || '').toString().slice(0, 100)}, ${(d.lastName || '').toString().slice(0, 100)}, ${(d.email || intent.email || 'unknown@edurankai.in').toString().slice(0, 200)}, ${(d.phone || '').toString().slice(0, 40)}, ${(d.city || '').toString().slice(0, 200)}, ${(d.portfolioUrl || '').toString()},
+              ${bareNum}, ${userIdSafe},
+              ${(d.firstName || '').toString().slice(0, 100)}, ${(d.lastName || '').toString().slice(0, 100)}, ${(d.email || intent.email || 'unknown@edurankai.in').toString().slice(0, 200)}, ${(d.phone || '').toString().slice(0, 50)}, ${(d.city || '').toString().slice(0, 200)}, ${(d.portfolioUrl || '').toString()},
               ${(d.roleTitleSnapshot || 'Application').toString().slice(0, 200)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb, true, ${paymentId}, NOW()
             ) RETURNING id`));
           const bareId = insBare[0]?.id as string | undefined;
