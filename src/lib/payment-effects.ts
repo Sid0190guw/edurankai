@@ -157,8 +157,12 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
       // application is never lost — risky typed columns are nulled and the full
       // submission is preserved in raw_submission for later backfill.
       try {
-        const appNum = (d.applicationNumber && String(d.applicationNumber)) || ('ERA-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase());
+        // ALWAYS a fresh unique number (a reused one collides on a reattempt).
+        const appNum = 'ERA-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 7).toUpperCase();
         const cut = (v: any, n: number) => (v == null ? null : String(v).slice(0, n));
+        // Validate role_id — a stale/deleted role would fail the FK constraint.
+        let roleIdSafe: any = null;
+        try { if (d.roleId) { const rr = rows(await db.execute(sql`SELECT 1 FROM roles WHERE id = ${d.roleId} LIMIT 1`)); roleIdSafe = rr.length ? d.roleId : null; } } catch (_) { roleIdSafe = null; }
         const insMin = rows(await db.execute(sql`
           INSERT INTO applications (
             application_number, role_id, applicant_user_id,
@@ -167,7 +171,7 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
             tech_skills, why_era, why_role, why_ai_edu, source, status, raw_submission,
             fee_paid, fee_payment_id, fee_paid_at
           ) VALUES (
-            ${appNum}, ${d.roleId || null}, ${intent.user_id},
+            ${appNum}, ${roleIdSafe}, ${intent.user_id},
             ${cut(d.firstName, 100) || ''}, ${cut(d.lastName, 100) || ''}, ${cut(d.email || intent.email, 200) || ''}, ${cut(d.phone, 40) || ''}, ${cut(d.city, 100)},
             ${cut(d.departmentSnapshot, 120)}, ${cut(d.roleTitleSnapshot, 200) || ''}, ${cut(d.level, 60)},
             ${JSON.stringify(d.techSkills || {})}::jsonb, ${d.whyERA || null}, ${d.whyRole || null}, ${d.whyAIEdu || null}, ${cut(d.source, 60)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb,
@@ -186,9 +190,27 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
           return { applicationId: minId };
         }
       } catch (e2: any) {
-        console.error('[payments] minimal materialise ALSO failed for intent', intent.id, '-', e2?.message || e2);
+        // Last resort: a BARE insert with only the columns that cannot be null,
+        // role_id omitted, every detail kept in raw_submission. Practically cannot
+        // fail unless the schema itself is broken.
+        try {
+          const bareNum = 'ERA-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
+          const insBare = rows(await db.execute(sql`
+            INSERT INTO applications (application_number, applicant_user_id, email, role_title_snapshot, status, raw_submission, fee_paid, fee_payment_id, fee_paid_at)
+            VALUES (${bareNum}, ${intent.user_id}, ${(d.email || intent.email || 'unknown@edurankai.in').toString().slice(0, 200)}, ${(d.roleTitleSnapshot || 'Application').toString().slice(0, 200)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb, true, ${paymentId}, NOW())
+            RETURNING id`));
+          const bareId = insBare[0]?.id as string | undefined;
+          if (bareId) {
+            await db.execute(sql`UPDATE payments SET reference_id = ${bareId}, reference_type = 'application' WHERE order_id = ${orderId}`).catch(() => {});
+            await db.execute(sql`DELETE FROM application_intents WHERE id = ${intent.id}`).catch(() => {});
+            try { const { sendPushToAdmins } = await import('@/lib/push'); await sendPushToAdmins({ type: 'application_recovered', title: 'Paid application saved (recovered)', body: (((d.firstName || '') + ' ' + (d.lastName || '')).trim() || d.email || 'Applicant') + ' is now in review (recovered - a few fields need backfill).', url: '/admin/applications/' + bareId, tag: 'recovered-' + bareId }); } catch (_) {}
+            return { applicationId: bareId };
+          }
+        } catch (e3: any) {
+          console.error('[payments] BARE materialise also failed for intent', intent.id, '-', e3?.message || e3);
+        }
       }
-      // Both inserts failed — keep the intent + alert so the paid applicant is never lost.
+      // All inserts failed — keep the intent + alert so the paid applicant is never lost.
       console.error('[payments] application materialise FAILED for intent', intent.id, 'order', orderId, '-', e?.message || e);
       try {
         await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS materialise_error TEXT`);
@@ -200,7 +222,7 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
         await sendPushToAdmins({
           type: 'paid_application_stuck',
           title: 'Paid application needs recovery',
-          body: ((d.firstName || '') + ' ' + (d.lastName || '')).trim() + ' paid but their application did not save. Recover it in admin.',
+          body: (((d.firstName || '') + ' ' + (d.lastName || '')).trim() || d.email || 'Applicant') + ' paid but the application did not save. Error: ' + String(e?.message || e).slice(0, 110),
           url: '/admin/paid-stuck',
           tag: 'paid-stuck-' + intent.id,
         });
