@@ -129,7 +129,14 @@ export async function previewCoupon(code: string, userId: string, intentId?: str
   if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return { ok: false, error: 'this code has expired' };
   if (row.used_count >= row.max_uses) return { ok: false, error: 'this code has been fully redeemed' };
   if (row.bound_user_id && row.bound_user_id !== userId) return { ok: false, error: 'this code is bound to a different account' };
-  if (row.bound_intent_id && intentId && row.bound_intent_id !== intentId) return { ok: false, error: 'this code is bound to a different application' };
+  // Intent binding is advisory once a coupon is tied to a user: that applicant
+  // may have abandoned the original intent and started a fresh application (new
+  // intent id). The user binding is the real security boundary, so only enforce
+  // the intent match for a pure intent-scoped code (no user binding). This fixes
+  // the "this code is bound to a different application" rejection.
+  if (row.bound_intent_id && intentId && row.bound_intent_id !== intentId && !(row.bound_user_id && row.bound_user_id === userId)) {
+    return { ok: false, error: 'this code is bound to a different application' };
+  }
 
   // Per-user single-redeem: if this user already redeemed THIS coupon, block.
   const dup = rows(await db.execute(sql`
