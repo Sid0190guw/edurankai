@@ -18,7 +18,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
   const action = (body.action || '').toString();
-  const threadIds: string[] = []
+  const threadIds: string[] = ([] as string[])
     .concat(body.threadId ? [body.threadId] : [])
     .concat(Array.isArray(body.threadIds) ? body.threadIds : []);
   if (!threadIds.length) return json({ ok: false, error: 'threadId(s) required' }, 400);

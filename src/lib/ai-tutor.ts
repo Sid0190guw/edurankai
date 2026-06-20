@@ -117,7 +117,7 @@ export async function continueConversation(opts: {
   const xpDelta = 4; // 4 XP per learner turn
   await db.execute(sql`
     UPDATE ai_conversations SET
-      messages = ${sql.json(messages)},
+      messages = ${JSON.stringify(messages)}::jsonb,
       turn_count = turn_count + 1,
       xp_awarded = xp_awarded + ${xpDelta}
     WHERE id = ${conv.id}

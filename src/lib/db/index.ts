@@ -16,7 +16,15 @@ if (!connectionString) {
 }
 
 const client = postgres(connectionString, { prepare: false });
-export const db = drizzle(client, { schema });
+
+// postgres-js's execute() resolves to a plain array (a RowList), never a
+// { rows } object. Because that return type IS an array, `Array.isArray(r)`
+// narrows the defensive `r?.rows || []` fallback branch to `never`, so every
+// such normalize site fails to typecheck (TS2339 "rows on never"). Raw-SQL
+// results are inherently dynamic, so we type execute() as `any` — matching how
+// the codebase already consumes it via the rows()/Array.isArray helpers.
+const _db = drizzle(client, { schema });
+export const db = _db as Omit<typeof _db, 'execute'> & { execute: (query: any) => Promise<any> };
 export { schema };
 
 // Compatibility: getDb is no longer needed but exported as no-op

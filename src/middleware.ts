@@ -8,7 +8,7 @@ import { getViewableSectionKeys, can } from '@/lib/auth/permissions';
 // Map an /admin/* path to its permission section key (longest-prefix wins).
 // Universal/auth paths (dashboard, mail, notifications, login, logout) are not
 // listed -> never gated. Unmapped admin paths fall through (allowed).
-const PATH_SECTION: [string, string][] = [
+const PATH_SECTION: [string, string][] = ([
   ['/admin/applications', 'applications'],
   ['/admin/help', 'messages'],
   ['/admin/messages', 'dms'],
@@ -58,7 +58,7 @@ const PATH_SECTION: [string, string][] = [
   ['/admin/audit', 'audit'],
   ['/admin/settings', 'settings'],
   ['/admin/diagnostics', 'settings'],
-].sort((a, b) => b[0].length - a[0].length);
+] as [string, string][]).sort((a, b) => b[0].length - a[0].length);
 
 function resolveAdminSection(path: string): string | null {
   for (const [prefix, key] of PATH_SECTION) {

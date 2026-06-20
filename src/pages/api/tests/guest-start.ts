@@ -63,7 +63,7 @@ export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
     const receipt = 'gqt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
     const result = await createOrder({
       amountPaise: fx.paise, currency: 'INR', receipt,
-      notes: { purpose: 'test_enrollment', guest: 'true', testSlug: test.slug, name, email, phone: ph.e164 },
+      notes: { purpose: 'test_enrollment', guest: 'true', testSlug: test.slug, name, email, phone: ph.e164 || '' },
     });
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
     await db.execute(sql`

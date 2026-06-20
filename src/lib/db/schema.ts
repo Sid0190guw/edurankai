@@ -9,6 +9,8 @@ import { sql } from 'drizzle-orm';
 
 export const userRoleEnum = pgEnum('user_role', [
   'super_admin', 'hr', 'editor', 'applicant',
+  // Admin-scoped roles (DB values added via scripts/fix-user-role-enum.mjs).
+  'recruiter', 'reviewer', 'department_head', 'marketing',
   // AquinTutor-scoped roles: confined to /aquintutor/admin, never the main admin.
   'partner', 'teacher', 'technical_moderator'
 ]);

@@ -41,7 +41,7 @@ export async function verifyImap(p: ImapTestParams): Promise<{ ok: boolean; deta
   try {
     await client.connect();
     const list: string[] = [];
-    for await (const m of client.list()) list.push(m.path);
+    for (const m of await client.list()) list.push(m.path);
     await client.logout();
     return { ok: true, detail: `Connected to ${p.host}:${port}. Found ${list.length} folders.`, mailboxes: list.slice(0, 10) };
   } catch (e: any) {
