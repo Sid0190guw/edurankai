@@ -164,12 +164,36 @@ if (Astro.request.method === 'POST') {
         userAgent: ua,
       };
 
-      const intentRows = await db.execute(sql`
-        INSERT INTO application_intents (user_id, role_id, role_title_snapshot, department_snapshot, level, email, first_name, last_name, data)
-        VALUES (${user.id}, ${role?.id || null}, ${roleTitle || null}, ${deptName || null}, ${roleLevel || null}, ${intentData.email || null}, ${intentData.firstName || null}, ${intentData.lastName || null}, ${JSON.stringify(intentData)}::jsonb)
-        RETURNING id
-      `);
-      const intentId = ((Array.isArray(intentRows) ? intentRows : (intentRows as any)?.rows || []) as any[])[0]?.id;
+      // Reuse an existing UNPAID intent for the same role instead of creating a
+      // duplicate (applicants often re-walk the form). Avoids the "wall of
+      // fee-pending" pile-up. Never touch one that already has a paid payment.
+      let intentId: string | undefined;
+      try {
+        const exRows = await db.execute(sql`
+          SELECT i.id FROM application_intents i
+          WHERE i.user_id = ${user.id}
+            AND ${role?.id ? sql`i.role_id = ${role.id}` : sql`COALESCE(i.role_title_snapshot,'') = ${roleTitle || ''}`}
+            AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.reference_id = i.id AND p.status = 'paid')
+          ORDER BY i.created_at DESC LIMIT 1
+        `);
+        intentId = ((Array.isArray(exRows) ? exRows : (exRows as any)?.rows || []) as any[])[0]?.id;
+      } catch (_) {}
+      if (intentId) {
+        await db.execute(sql`
+          UPDATE application_intents SET
+            role_id = ${role?.id || null}, role_title_snapshot = ${roleTitle || null}, department_snapshot = ${deptName || null},
+            level = ${roleLevel || null}, email = ${intentData.email || null}, first_name = ${intentData.firstName || null},
+            last_name = ${intentData.lastName || null}, data = ${JSON.stringify(intentData)}::jsonb, created_at = NOW()
+          WHERE id = ${intentId}
+        `).catch(() => {});
+      } else {
+        const intentRows = await db.execute(sql`
+          INSERT INTO application_intents (user_id, role_id, role_title_snapshot, department_snapshot, level, email, first_name, last_name, data)
+          VALUES (${user.id}, ${role?.id || null}, ${roleTitle || null}, ${deptName || null}, ${roleLevel || null}, ${intentData.email || null}, ${intentData.firstName || null}, ${intentData.lastName || null}, ${JSON.stringify(intentData)}::jsonb)
+          RETURNING id
+        `);
+        intentId = ((Array.isArray(intentRows) ? intentRows : (intentRows as any)?.rows || []) as any[])[0]?.id;
+      }
 
       // Notify admins the moment the applicant completes the form (pre-payment),
       // so the team sees who is applying + what they filled even before the fee
