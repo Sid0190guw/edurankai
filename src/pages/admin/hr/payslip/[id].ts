@@ -33,7 +33,7 @@ export const GET: APIRoute = async ({ params, locals }) => {
 
     function fmt(n: any) {
       if (!n || n == 0) return '0.00';
-      return parseFloat(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      return parseFloat(n).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', minimumFractionDigits: 2, maximumFractionDigits: 2 });
     }
 
     const html = `<!DOCTYPE html>

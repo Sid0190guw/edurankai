@@ -85,7 +85,7 @@ export async function walletAmounts(inrPaise: number, country: string | null | u
   const inr = (Number(inrPaise) || 0) / 100;
   const cur = currencyFor(country);
   const BASE = baseCurrency();
-  const nf = (n: number, d = 2) => n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  const nf = (n: number, d = 2) => n.toLocaleString('en-US', { timeZone: 'Asia/Kolkata', minimumFractionDigits: d, maximumFractionDigits: d });
   const zeroDp = (c: string) => ['JPY', 'KRW', 'VND', 'IDR'].includes(c);
   // base currency amount
   let base = inr;
