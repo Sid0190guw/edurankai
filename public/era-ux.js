@@ -22,20 +22,7 @@
     barTick();
   } catch (e) {}
 
-  // 2. Back-to-top
-  try {
-    var btt = document.createElement('button');
-    btt.id = 'era-back-to-top'; btt.type = 'button';
-    btt.setAttribute('aria-label', 'Back to top');
-    btt.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
-    document.body.appendChild(btt);
-    btt.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' }); });
-    var bttTick = function () { btt.classList.toggle('show', (window.scrollY || 0) > 600); };
-    window.addEventListener('scroll', bttTick, { passive: true });
-    bttTick();
-  } catch (e) {}
-
-  // 3. Header elevation on scroll (sticky/fixed headers only)
+  // 2. Header elevation on scroll (sticky/fixed headers only)
   try {
     var heads = document.querySelectorAll('header');
     var hTick = function () {
