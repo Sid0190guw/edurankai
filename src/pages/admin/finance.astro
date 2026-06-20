@@ -14,23 +14,40 @@ const url = new URL(Astro.request.url);
 const fPurpose = url.searchParams.get('purpose') || '';
 const fStatus = url.searchParams.get('status') || '';
 
-// KPIs (paid only, INR settlement amounts)
-let kpi = { collectedPaise: 0, paidCount: 0, attempts: 0, failed: 0 };
+// KPIs — separate real cash IN from waived / credit-settled fees (which are NOT
+// fresh money). coverWithCredit() writes a status='paid' row with an order_id like
+// 'CREDIT-...' when a fee is settled from wallet credit (an already-counted recharge
+// or an admin comp/waiver), so those must NOT inflate "fund received".
+let kpi = { cashPaise: 0, creditPaise: 0, cashCount: 0, creditCount: 0, attempts: 0, failed: 0, waivedApps: 0 };
 let byPurpose: any[] = [];
 let recent: any[] = [];
 let hasTable = true;
+const NOT_CREDIT = sql`COALESCE(order_id,'') NOT LIKE 'CREDIT-%'`;
+const IS_CREDIT = sql`order_id LIKE 'CREDIT-%'`;
 try {
   const k = rows(await db.execute(sql`
     SELECT
-      COALESCE(SUM(amount_paise) FILTER (WHERE status='paid'),0)::bigint AS collected,
-      COUNT(*) FILTER (WHERE status='paid')::int AS paid,
+      COALESCE(SUM(amount_paise) FILTER (WHERE status='paid' AND ${NOT_CREDIT}),0)::bigint AS cash,
+      COALESCE(SUM(amount_paise) FILTER (WHERE status='paid' AND ${IS_CREDIT}),0)::bigint AS credit,
+      COUNT(*) FILTER (WHERE status='paid' AND ${NOT_CREDIT})::int AS cash_count,
+      COUNT(*) FILTER (WHERE status='paid' AND ${IS_CREDIT})::int AS credit_count,
       COUNT(*)::int AS total,
       COUNT(*) FILTER (WHERE status IN ('signature_mismatch','failed'))::int AS failed
     FROM payments`))[0] as any;
-  kpi = { collectedPaise: Number(k?.collected || 0), paidCount: k?.paid || 0, attempts: k?.total || 0, failed: k?.failed || 0 };
+  kpi = {
+    cashPaise: Number(k?.cash || 0), creditPaise: Number(k?.credit || 0),
+    cashCount: k?.cash_count || 0, creditCount: k?.credit_count || 0,
+    attempts: k?.total || 0, failed: k?.failed || 0, waivedApps: 0,
+  };
+  // True fee waivers (coupon / admin approval) never create a payment row, so
+  // count them straight off the applications table.
+  try {
+    const w = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM applications WHERE fee_waiver_granted = true`))[0] as any;
+    kpi.waivedApps = Number(w?.n || 0);
+  } catch (_) {}
   byPurpose = rows(await db.execute(sql`
-    SELECT purpose, COUNT(*) FILTER (WHERE status='paid')::int AS paid_count,
-           COALESCE(SUM(amount_paise) FILTER (WHERE status='paid'),0)::bigint AS paid_paise,
+    SELECT purpose, COUNT(*) FILTER (WHERE status='paid' AND ${NOT_CREDIT})::int AS paid_count,
+           COALESCE(SUM(amount_paise) FILTER (WHERE status='paid' AND ${NOT_CREDIT}),0)::bigint AS paid_paise,
            COUNT(*)::int AS total
     FROM payments GROUP BY purpose ORDER BY paid_paise DESC`));
   recent = rows(await db.execute(sql`
@@ -40,7 +57,7 @@ try {
     ORDER BY created_at DESC LIMIT 100`));
 } catch (e) { hasTable = false; }
 
-const inr = (paise: number) => '₹' + (Number(paise) / 100).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', maximumFractionDigits: 0 });
+const inr = (paise: number) => '₹' + (Number(paise) / 100).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 const fmt = (d: any) => d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) : '-';
 const STATUS_COLOR: Record<string, string> = { paid: '#6ee7b7', created: '#8a8a94', attempted: '#fbbf24', failed: '#fca5a5', signature_mismatch: '#fca5a5' };
 const PURPOSES = ['', 'application_fee', 'registration_fee', 'event_level', 'test_enrollment', 'event', 'course_premium', 'donation', 'other'];
@@ -66,12 +83,14 @@ const paymentsReady = isConfigured();
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px;">
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
-        <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Collected (paid)</p>
-        <p style="font-size:24px;font-weight:800;color:#6ee7b7;margin:0;">{inr(kpi.collectedPaise)}</p>
+        <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Fund received (cash)</p>
+        <p style="font-size:24px;font-weight:800;color:#6ee7b7;margin:0;">{inr(kpi.cashPaise)}</p>
+        <p style="font-size:10px;color:#6e6e78;margin:4px 0 0;">{kpi.cashCount} real payment(s)</p>
       </div>
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
-        <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Paid transactions</p>
-        <p style="font-size:24px;font-weight:800;color:#fff;margin:0;">{kpi.paidCount}</p>
+        <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Fee waived / credit-settled</p>
+        <p style="font-size:24px;font-weight:800;color:#fbbf24;margin:0;">{inr(kpi.creditPaise)}</p>
+        <p style="font-size:10px;color:#6e6e78;margin:4px 0 0;">{kpi.waivedApps} app(s) waived &middot; {kpi.creditCount} credit-settled &middot; not counted as funds</p>
       </div>
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
         <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 6px;">Total records</p>
