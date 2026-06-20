@@ -126,6 +126,33 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
     let userIdSafe: any = intent.user_id || null;
     try { if (userIdSafe) { const uu = rows(await db.execute(sql`SELECT 1 FROM users WHERE id = ${userIdSafe} LIMIT 1`)); if (!uu.length) userIdSafe = null; } } catch (_) {}
 
+    // Duplicate guard: if this applicant already has an application for this exact
+    // role, a second paid intent is a duplicate retry — do NOT create another row
+    // (that is the pile-up admins saw). Attach the payment to the existing app,
+    // drop the intent, flag the extra charge, and let an admin decide refund/credit
+    // — never auto-touch money.
+    if (roleIdSafe && userIdSafe) {
+      const dupe = rows(await db.execute(sql`
+        SELECT id FROM applications
+        WHERE applicant_user_id = ${userIdSafe} AND role_id = ${roleIdSafe}
+        ORDER BY created_at ASC LIMIT 1
+      `).catch(() => []))[0] as any;
+      if (dupe?.id) {
+        await db.execute(sql`UPDATE payments SET reference_id = ${dupe.id}, reference_type = 'application' WHERE order_id = ${orderId}`).catch(() => {});
+        await db.execute(sql`DELETE FROM application_intents WHERE id = ${intent.id}`).catch(() => {});
+        try {
+          await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS duplicate_of_application UUID`);
+          await db.execute(sql`UPDATE payments SET duplicate_of_application = ${dupe.id} WHERE order_id = ${orderId}`);
+        } catch (_) {}
+        try {
+          const { sendPushToAdmins } = await import('@/lib/push');
+          const nm = ((d.firstName || '') + ' ' + (d.lastName || '')).trim() || d.email || 'Applicant';
+          await sendPushToAdmins({ type: 'duplicate_application_fee', title: 'Duplicate application fee', body: nm + ' paid again for a role they already applied to — review for refund/credit.', url: '/admin/applications/' + dupe.id, tag: 'dup-fee-' + orderId });
+        } catch (_) {}
+        return { applicationId: dupe.id, duplicate: true } as any;
+      }
+    }
+
     try {
       const inserted = rows(await db.execute(sql`
         INSERT INTO applications (
