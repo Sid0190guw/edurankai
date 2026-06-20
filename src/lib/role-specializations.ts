@@ -4,12 +4,13 @@
 // the whole role) as positions fill. Self-bootstrapping schema.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 function slugify(s: string): string { return String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 140); }
 
-export async function ensureSpecSchema(): Promise<void> {
-  try {
+export function ensureSpecSchema(): Promise<void> {
+  return ensureOnce('role_specializations', async () => {
     await db.execute(sql`CREATE TABLE IF NOT EXISTS role_specializations (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       role_id UUID NOT NULL,
@@ -26,7 +27,7 @@ export async function ensureSpecSchema(): Promise<void> {
     await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS specialization_name VARCHAR(160)`);
     await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS specialization_id UUID`).catch(() => {});
     await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS specialization_name VARCHAR(160)`).catch(() => {});
-  } catch (_) {}
+  });
 }
 
 export async function listForRole(roleId: string, openOnly = false): Promise<any[]> {

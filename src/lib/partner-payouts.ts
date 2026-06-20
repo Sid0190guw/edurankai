@@ -3,11 +3,12 @@
 // table so it works without a manual migration.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-export async function ensurePayoutSchema(): Promise<void> {
-  try {
+export function ensurePayoutSchema(): Promise<void> {
+  return ensureOnce('partner_payouts', async () => {
     await db.execute(sql`CREATE TABLE IF NOT EXISTS partner_payouts (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       partner_user_id UUID NOT NULL,
@@ -22,7 +23,7 @@ export async function ensurePayoutSchema(): Promise<void> {
       decided_at TIMESTAMPTZ
     )`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS partner_payouts_user_idx ON partner_payouts(partner_user_id, requested_at DESC)`);
-  } catch (_) {}
+  });
 }
 
 export interface PayoutSummary { earned: number; paid: number; pending: number; available: number; }

@@ -2,6 +2,7 @@
 // Top 5 promote; bottom 5 demote; rest hold. Tier 1 = Bronze, tier 5 = Diamond.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
@@ -16,8 +17,8 @@ export const COHORT_SIZE = 30;
 export const PROMOTE_TOP = 5;
 export const DEMOTE_BOTTOM = 5;
 
-async function ensureSchema() {
-  try {
+function ensureSchema(): Promise<void> {
+  return ensureOnce('leagues', async () => {
     await db.execute(sql`CREATE TABLE IF NOT EXISTS leagues (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tier VARCHAR(20) NOT NULL,
       tier_level INTEGER NOT NULL, week_start DATE NOT NULL, cohort_number INTEGER NOT NULL DEFAULT 1,
@@ -32,7 +33,7 @@ async function ensureSchema() {
       UNIQUE(league_id, user_id))`);
     await db.execute(sql`ALTER TABLE user_xp ADD COLUMN IF NOT EXISTS league_tier INTEGER NOT NULL DEFAULT 1`);
     await db.execute(sql`ALTER TABLE user_xp ADD COLUMN IF NOT EXISTS current_league_id UUID`);
-  } catch (_) {}
+  });
 }
 
 export async function ensureUserInLeague(userId: string): Promise<{ leagueId: string; tier: number; cohort: number; rank: number; memberCount: number } | null> {

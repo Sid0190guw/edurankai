@@ -9,11 +9,12 @@
 // coupon" gives spendable credit everywhere. Self-bootstrapping schema.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-export async function ensureCreditSchema(): Promise<void> {
-  try {
+export function ensureCreditSchema(): Promise<void> {
+  return ensureOnce('account_credit_ledger', async () => {
     await db.execute(sql`CREATE TABLE IF NOT EXISTS account_credit_ledger (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID NOT NULL,
@@ -25,7 +26,7 @@ export async function ensureCreditSchema(): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS acl_user_idx ON account_credit_ledger(user_id, created_at DESC)`);
-  } catch (_) {}
+  });
 }
 
 export async function getCreditBalance(userId: string): Promise<number> {

@@ -3,17 +3,18 @@
 // deduction %, base currency, etc.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-async function ensure(): Promise<void> {
-  try {
+function ensure(): Promise<void> {
+  return ensureOnce('platform_settings', async () => {
     await db.execute(sql`CREATE TABLE IF NOT EXISTS platform_settings (
       key VARCHAR(80) PRIMARY KEY,
       value TEXT,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
-  } catch (_) {}
+  });
 }
 
 export async function getSetting(key: string, def = ''): Promise<string> {
