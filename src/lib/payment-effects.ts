@@ -46,6 +46,19 @@ export async function reconcileUserPending(userId: string): Promise<number> {
   for (const p of pend) {
     try { const r = await reconcileOrder((p as any).order_id); if (r.reconciled) n++; } catch (_) {}
   }
+  // PAID-but-stuck: payment captured but the application never materialised
+  // (reference still points at the intent). Re-run the effects (now with the
+  // type-safe fallback insert) so it lands.
+  try {
+    const stuck = rows(await db.execute(sql`
+      SELECT order_id FROM payments
+      WHERE user_id = ${userId} AND status = 'paid' AND reference_type = 'application_intent' AND order_id IS NOT NULL
+      ORDER BY created_at DESC LIMIT 8
+    `).catch(() => []));
+    for (const s of stuck) {
+      try { const r = await applyPaidEffects((s as any).order_id, null); if (r && (r as any).applicationId) n++; } catch (_) {}
+    }
+  } catch (_) {}
   return n;
 }
 
@@ -62,6 +75,17 @@ export async function reconcilePending(limit = 150): Promise<{ scanned: number; 
   for (const p of pend) {
     try { const r = await reconcileOrder((p as any).order_id); if (r.reconciled) reconciled++; } catch (_) {}
   }
+  // Also re-materialise any PAID-but-stuck applications across all users.
+  try {
+    const stuck = rows(await db.execute(sql`
+      SELECT order_id FROM payments
+      WHERE status = 'paid' AND reference_type = 'application_intent' AND order_id IS NOT NULL
+      ORDER BY created_at DESC LIMIT ${limit}
+    `).catch(() => []));
+    for (const s of stuck) {
+      try { const r = await applyPaidEffects((s as any).order_id, null); if (r && (r as any).applicationId) reconciled++; } catch (_) {}
+    }
+  } catch (_) {}
   return { scanned: pend.length, reconciled };
 }
 
