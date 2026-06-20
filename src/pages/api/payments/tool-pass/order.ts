@@ -24,7 +24,7 @@ export const POST: APIRoute = async ({ locals }) => {
     if ((await getCreditBalance(user.id)) >= PASS_INR_PAISE) {
       await grantCredit(user.id, -PASS_INR_PAISE, 'Paid with credit: Tool day pass');
       const { activatePass } = await import('@/lib/tool-pass');
-      await activatePass({ userId: user.id, orderId: 'CREDIT', paymentId: 'credit', signature: 'credit' });
+      await activatePass({ userId: user.id, orderId: 'CREDIT-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), paymentId: 'credit', signature: 'credit' });
       return json({ ok: true, paidWithCredit: true });
     }
   } catch (_) {}
