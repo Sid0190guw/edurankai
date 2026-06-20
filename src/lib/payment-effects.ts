@@ -163,17 +163,22 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
         // Validate role_id — a stale/deleted role would fail the FK constraint.
         let roleIdSafe: any = null;
         try { if (d.roleId) { const rr = rows(await db.execute(sql`SELECT 1 FROM roles WHERE id = ${d.roleId} LIMIT 1`)); roleIdSafe = rr.length ? d.roleId : null; } } catch (_) { roleIdSafe = null; }
+        // NOTE: every NOT-NULL column (first_name, last_name, email, phone, city,
+        // portfolio_url) MUST be supplied here or the insert fails outright. `level`
+        // is dropped on purpose — it is an enum, and a value outside role_level is
+        // the most common reason the full insert above failed; nulling it lets the
+        // application land while raw_submission keeps the original value.
         const insMin = rows(await db.execute(sql`
           INSERT INTO applications (
             application_number, role_id, applicant_user_id,
-            first_name, last_name, email, phone, city,
-            department_snapshot, role_title_snapshot, level,
+            first_name, last_name, email, phone, city, portfolio_url,
+            department_snapshot, role_title_snapshot,
             tech_skills, why_era, why_role, why_ai_edu, source, status, raw_submission,
             fee_paid, fee_payment_id, fee_paid_at
           ) VALUES (
             ${appNum}, ${roleIdSafe}, ${intent.user_id},
-            ${cut(d.firstName, 100) || ''}, ${cut(d.lastName, 100) || ''}, ${cut(d.email || intent.email, 200) || ''}, ${cut(d.phone, 40) || ''}, ${cut(d.city, 100)},
-            ${cut(d.departmentSnapshot, 120)}, ${cut(d.roleTitleSnapshot, 200) || ''}, ${cut(d.level, 60)},
+            ${cut(d.firstName, 100) || ''}, ${cut(d.lastName, 100) || ''}, ${cut(d.email || intent.email, 200) || ''}, ${cut(d.phone, 40) || ''}, ${cut(d.city, 200) || ''}, ${d.portfolioUrl || ''},
+            ${cut(d.departmentSnapshot, 120)}, ${cut(d.roleTitleSnapshot, 200) || ''},
             ${JSON.stringify(d.techSkills || {})}::jsonb, ${d.whyERA || null}, ${d.whyRole || null}, ${d.whyAIEdu || null}, ${cut(d.source, 60)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb,
             true, ${paymentId}, NOW()
           ) RETURNING id
@@ -195,10 +200,18 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
         // fail unless the schema itself is broken.
         try {
           const bareNum = 'ERA-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
+          // Includes EVERY NOT-NULL column with a safe '' default and touches no
+          // enum / FK / date-typed column — so it cannot fail on bad applicant data.
           const insBare = rows(await db.execute(sql`
-            INSERT INTO applications (application_number, applicant_user_id, email, role_title_snapshot, status, raw_submission, fee_paid, fee_payment_id, fee_paid_at)
-            VALUES (${bareNum}, ${intent.user_id}, ${(d.email || intent.email || 'unknown@edurankai.in').toString().slice(0, 200)}, ${(d.roleTitleSnapshot || 'Application').toString().slice(0, 200)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb, true, ${paymentId}, NOW())
-            RETURNING id`));
+            INSERT INTO applications (
+              application_number, applicant_user_id,
+              first_name, last_name, email, phone, city, portfolio_url,
+              role_title_snapshot, status, raw_submission, fee_paid, fee_payment_id, fee_paid_at
+            ) VALUES (
+              ${bareNum}, ${intent.user_id},
+              ${(d.firstName || '').toString().slice(0, 100)}, ${(d.lastName || '').toString().slice(0, 100)}, ${(d.email || intent.email || 'unknown@edurankai.in').toString().slice(0, 200)}, ${(d.phone || '').toString().slice(0, 40)}, ${(d.city || '').toString().slice(0, 200)}, ${(d.portfolioUrl || '').toString()},
+              ${(d.roleTitleSnapshot || 'Application').toString().slice(0, 200)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb, true, ${paymentId}, NOW()
+            ) RETURNING id`));
           const bareId = insBare[0]?.id as string | undefined;
           if (bareId) {
             await db.execute(sql`UPDATE payments SET reference_id = ${bareId}, reference_type = 'application' WHERE order_id = ${orderId}`).catch(() => {});
@@ -207,26 +220,38 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
             return { applicationId: bareId };
           }
         } catch (e3: any) {
-          console.error('[payments] BARE materialise also failed for intent', intent.id, '-', e3?.message || e3);
+          console.error('[payments] BARE materialise also failed for intent', intent.id, '-', (e3 as any)?.cause?.message || e3?.message || e3);
         }
       }
-      // All inserts failed — keep the intent + alert so the paid applicant is never lost.
-      console.error('[payments] application materialise FAILED for intent', intent.id, 'order', orderId, '-', e?.message || e);
+      // All inserts failed — keep the intent + alert so the paid applicant is never
+      // lost. drizzle wraps the underlying Postgres error in `.cause`; the bare
+      // `.message` is only the failed SQL text, so surface `.cause` for diagnosis.
+      const realErr = String((e as any)?.cause?.message || e?.message || e);
+      console.error('[payments] application materialise FAILED for intent', intent.id, 'order', orderId, '-', realErr);
+      let alreadyFlagged = false;
       try {
         await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS materialise_error TEXT`);
         await db.execute(sql`ALTER TABLE application_intents ADD COLUMN IF NOT EXISTS paid_order_id TEXT`);
-        await db.execute(sql`UPDATE application_intents SET materialise_error = ${String(e?.message || e).slice(0, 500)}, paid_order_id = ${orderId} WHERE id = ${intent.id}`);
+        const prev = rows(await db.execute(sql`SELECT materialise_error FROM application_intents WHERE id = ${intent.id} LIMIT 1`))[0] as any;
+        alreadyFlagged = !!(prev && prev.materialise_error);
+        await db.execute(sql`UPDATE application_intents SET materialise_error = ${realErr.slice(0, 500)}, paid_order_id = ${orderId} WHERE id = ${intent.id}`);
       } catch (_) {}
-      try {
-        const { sendPushToAdmins } = await import('@/lib/push');
-        await sendPushToAdmins({
-          type: 'paid_application_stuck',
-          title: 'Paid application needs recovery',
-          body: (((d.firstName || '') + ' ' + (d.lastName || '')).trim() || d.email || 'Applicant') + ' paid but the application did not save. Error: ' + String(e?.message || e).slice(0, 110),
-          url: '/admin/paid-stuck',
-          tag: 'paid-stuck-' + intent.id,
-        });
-      } catch (_) {}
+      // Alert admins only on the FIRST failure for this intent. reconcileUserPending
+      // (every portal page load) and reconcilePending (cron) both re-run this path,
+      // so without the guard each pass re-sends and buries admins under duplicate
+      // "needs recovery" notifications — exactly the pile-up that was happening.
+      if (!alreadyFlagged) {
+        try {
+          const { sendPushToAdmins } = await import('@/lib/push');
+          await sendPushToAdmins({
+            type: 'paid_application_stuck',
+            title: 'Paid application needs recovery',
+            body: (((d.firstName || '') + ' ' + (d.lastName || '')).trim() || d.email || 'Applicant') + ' paid but the application did not save. Error: ' + realErr.slice(0, 110),
+            url: '/admin/paid-stuck',
+            tag: 'paid-stuck-' + intent.id,
+          });
+        } catch (_) {}
+      }
       return { applicationId: undefined, failed: true } as any;
     }
     return { applicationId: newAppId };
