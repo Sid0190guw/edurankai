@@ -43,15 +43,17 @@
     // Menu container (stacks above FAB)
     menu = document.createElement('div');
     menu.id = 'eraFabMenu';
-    menu.style.cssText = 'position:fixed;bottom:76px;left:16px;z-index:9989;display:flex;flex-direction:column;gap:10px;align-items:flex-start;pointer-events:none;';
+    menu.style.cssText = 'position:fixed;bottom:76px;left:16px;z-index:9989;display:flex;flex-direction:column;gap:10px;align-items:flex-start;pointer-events:none;max-height:calc(100vh - 96px);overflow-y:auto;overflow-x:visible;padding:2px;';
     document.body.appendChild(menu);
   }
 
   function renderMenu() {
     if (!menu) return;
+    // Higher `order` renders nearer the FAB (easiest thumb reach) and pops in first.
+    var ordered = items.slice().sort(function(a, b) { return (a.order || 0) - (b.order || 0); });
     var html = '';
-    items.forEach(function(item, idx) {
-      var delay = (items.length - idx - 1) * 40;
+    ordered.forEach(function(item, idx) {
+      var delay = (ordered.length - idx - 1) * 40;
       html += '<div class="era-fab-item" data-key="' + item.key + '" style="display:flex;align-items:center;gap:10px;opacity:0;transform:translateY(10px) scale(0.85);transition:opacity 0.2s ' + delay + 'ms, transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) ' + delay + 'ms;pointer-events:auto;">'
             + '<button class="era-fab-btn" data-key="' + item.key + '" style="width:42px;height:42px;background:' + (item.color || '#15151a') + ';border:1px solid rgba(255,255,255,0.1);border-radius:50%;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(0,0,0,0.3);" title="' + item.label + '">' + item.icon + '</button>'
             + '<span style="background:rgba(15,15,20,0.95);backdrop-filter:blur(10px);color:#fff;font-size:12px;font-weight:600;padding:6px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.08);white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.3);">' + item.label
