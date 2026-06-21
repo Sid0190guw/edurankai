@@ -27,7 +27,9 @@
     fab = document.createElement('button');
     fab.id = 'eraFab';
     fab.setAttribute('aria-label', 'Open quick actions');
-    fab.innerHTML = '<svg id="fabIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="6" cy="12" r="1.5" fill="currentColor"/><circle cx="18" cy="12" r="1.5" fill="currentColor"/></svg>';
+    // Dharma-chakra motif (hub + ring + 8 spokes) — advanced, on-brand, and it
+    // rotates elegantly when the menu opens.
+    fab.innerHTML = '<svg id="fabIcon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/><path d="M12 3v3.6M12 17.4V21M3 12h3.6M17.4 12H21M5.64 5.64l2.55 2.55M15.81 15.81l2.55 2.55M18.36 5.64l-2.55 2.55M8.19 15.81l-2.55 2.55"/></svg>';
     fab.style.cssText = 'position:fixed;bottom:16px;left:16px;width:48px;height:48px;background:#FF4F00;border:none;border-radius:50%;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(255,79,0,0.45);z-index:9990;transition:transform 0.2s, box-shadow 0.2s;';
     fab.onmouseenter = function() { fab.style.transform = 'scale(1.08)'; };
     fab.onmouseleave = function() { fab.style.transform = open ? 'rotate(45deg)' : 'scale(1)'; };
