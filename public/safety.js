@@ -48,17 +48,20 @@
     document.body.appendChild(overlay);
   }
 
-  // ── 2. REPORT BUTTON ─────────────────────────────────────────────────
-  // Add a floating report button on portal pages
+  // ── 2. REPORT — folded into the single FAB menu (no standalone pill) ──
+  function eraFabAdd(item) {
+    var E = (window.ERA = window.ERA || {});
+    if (E.FAB && E.FAB.add) E.FAB.add(item);
+    else { (E._fabQueue = E._fabQueue || []).push(item); }
+  }
   if (window.location.pathname.startsWith('/portal')) {
-    var reportBtn = document.createElement('button');
-    reportBtn.innerHTML = `
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>
-      Report
-    `;
-    reportBtn.style.cssText = 'position:fixed;bottom:80px;left:16px;background:#15151a;border:1px solid #1a1a1f;color:#6e6e78;font-size:11px;font-weight:600;padding:6px 12px;border-radius:100px;cursor:pointer;display:flex;align-items:center;gap:5px;z-index:40;';
-    reportBtn.onclick = function() { showReportModal(); };
-    document.body.appendChild(reportBtn);
+    eraFabAdd({
+      key: 'report',
+      label: 'Report a concern',
+      color: '#15151a',
+      icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>',
+      onClick: function() { showReportModal(); }
+    });
   }
 
   function showReportModal() {

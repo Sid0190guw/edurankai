@@ -37,19 +37,19 @@
     { timeout: 3000, maximumAge: 60000 }
   );
 
-  // ── 2. SOS Button ─────────────────────────────────────────────────────
-  var sosBtn = document.createElement('button');
-  sosBtn.id = 'sosBtn';
-  sosBtn.innerHTML = `
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-      <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-      <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
-    </svg>
-    SOS
-  `;
-  sosBtn.style.cssText = 'position:fixed;bottom:80px;right:16px;background:#ef4444;border:none;color:#fff;font-size:12px;font-weight:800;padding:8px 14px;border-radius:100px;cursor:pointer;display:flex;align-items:center;gap:5px;z-index:50;box-shadow:0 4px 16px rgba(239,68,68,0.4);letter-spacing:0.05em;';
-  sosBtn.onclick = function() { triggerSOS(); };
-  document.body.appendChild(sosBtn);
+  // ── 2. SOS — folded into the single FAB menu (kept red, no standalone) ─
+  function eraFabAdd(item) {
+    var E = (window.ERA = window.ERA || {});
+    if (E.FAB && E.FAB.add) E.FAB.add(item);
+    else { (E._fabQueue = E._fabQueue || []).push(item); }
+  }
+  eraFabAdd({
+    key: 'sos',
+    label: 'Emergency SOS',
+    color: '#ef4444',
+    icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+    onClick: function() { triggerSOS(); }
+  });
 
   function triggerSOS() {
     if (lastLat && lastLon) {

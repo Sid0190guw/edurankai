@@ -127,6 +127,7 @@
           // If widget is closed but admin replied, show unread dot
           if (!widgetEl.classList.contains('era-help-open') && d.messages.some(function(m) { return m.sender_role === 'admin'; })) {
             if (unreadDot) unreadDot.style.display = 'block';
+            if (window.ERA && window.ERA.FAB && window.ERA.FAB.setBadge) window.ERA.FAB.setBadge(true);
           }
         }
       })
@@ -136,6 +137,7 @@
   function openWidget() {
     widgetEl.classList.add('era-help-open');
     if (unreadDot) unreadDot.style.display = 'none';
+    if (window.ERA && window.ERA.FAB && window.ERA.FAB.setBadge) window.ERA.FAB.setBadge(false);
     try { localStorage.setItem(STORAGE_KEY, '1'); } catch (_) {}
     // If we already have intake + conversation, go straight to chat
     if (intake && conversationId) {
@@ -176,7 +178,7 @@
     if (document.getElementById('eraHelpWidget')) return;
     var styleEl = el('style', null,
       '#eraHelpWidget{position:fixed;bottom:max(16px,env(safe-area-inset-bottom,16px));right:16px;z-index:9990;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif;}' +
-      '#eraHelpLauncher{width:54px;height:54px;border-radius:50%;background:#FF4F00;border:none;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 8px 22px rgba(255,79,0,0.42);transition:transform 0.15s;position:relative;}' +
+      '#eraHelpLauncher{display:none;width:54px;height:54px;border-radius:50%;background:#FF4F00;border:none;color:#fff;cursor:pointer;align-items:center;justify-content:center;box-shadow:0 8px 22px rgba(255,79,0,0.42);transition:transform 0.15s;position:relative;}' +
       '#eraHelpLauncher:hover{transform:translateY(-2px);}' +
       '#eraHelpUnread{display:none;position:absolute;top:6px;right:6px;width:10px;height:10px;border-radius:50%;background:#fff;border:2px solid #FF4F00;}' +
       '#eraHelpPanel{display:none;position:fixed;bottom:max(80px,env(safe-area-inset-bottom,16px) + 80px);right:16px;width:360px;max-width:calc(100vw - 32px);height:540px;max-height:calc(100vh - 120px);background:#0a0a0c;border:1px solid #1a1a1f;border-radius:16px;overflow:hidden;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.6);}' +
@@ -315,6 +317,16 @@
     widgetEl.appendChild(panel);
     widgetEl.appendChild(launcher);
     document.body.appendChild(widgetEl);
+
+    // Folded into the single FAB menu instead of a separate corner bubble.
+    (function () {
+      function eraFabAdd(item) { var E = (window.ERA = window.ERA || {}); if (E.FAB && E.FAB.add) E.FAB.add(item); else { (E._fabQueue = E._fabQueue || []).push(item); } }
+      eraFabAdd({
+        key: 'help-chat', label: 'Live chat', color: '#FF4F00',
+        icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
+        onClick: function () { openWidget(); }
+      });
+    })();
 
     launcher.addEventListener('click', function() {
       if (widgetEl.classList.contains('era-help-open')) closeWidget();

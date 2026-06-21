@@ -34,6 +34,12 @@
     fab.onclick = toggle;
     document.body.appendChild(fab);
 
+    // Unread badge dot — folded-in widgets (e.g. live chat) toggle it via ERA.FAB.setBadge
+    var fbadge = document.createElement('span');
+    fbadge.id = 'eraFabBadge';
+    fbadge.style.cssText = 'position:absolute;top:-1px;right:-1px;width:12px;height:12px;border-radius:50%;background:#ef4444;border:2px solid #100b08;display:none;';
+    fab.appendChild(fbadge);
+
     // Menu container (stacks above FAB)
     menu = document.createElement('div');
     menu.id = 'eraFabMenu';
@@ -119,8 +125,18 @@
       items = items.filter(function(x) { return x.key !== key; });
     },
     open: openMenu,
-    close: close
+    close: close,
+    setBadge: function(show) {
+      var b = document.getElementById('eraFabBadge');
+      if (b) b.style.display = show ? 'block' : 'none';
+    }
   };
+
+  // Load-order safety: register anything queued before this script defined ERA.FAB.
+  if (global.ERA._fabQueue && global.ERA._fabQueue.length) {
+    global.ERA._fabQueue.forEach(function(i) { global.ERA.FAB.add(i); });
+    global.ERA._fabQueue = [];
+  }
 
   // Auto-init on load
   if (document.readyState === 'loading') {
