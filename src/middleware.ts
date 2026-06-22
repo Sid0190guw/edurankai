@@ -126,6 +126,23 @@ async function hasFaceEnrolled(userId: string): Promise<boolean> {
   } catch (_) { return false; }
 }
 
+// Public pages safe to edge-cache for ANONYMOUS visitors so repeat hits are served
+// from the CDN and never touch Neon. Excludes auth, forms (contact/apply/waiver),
+// portal, and admin — those stay dynamic/private. Signed-in users never hit this
+// path (they carry a session token), and Vary:Cookie keeps the two apart.
+const PUBLIC_CACHEABLE_EXACT = new Set([
+  '/', '/careers', '/about', '/research', '/team', '/ecosystem',
+  '/developers', '/faq', '/accessibility', '/policy', '/hei', '/events',
+]);
+function isPublicCacheable(path: string): boolean {
+  if (!path) return false;
+  if (PUBLIC_CACHEABLE_EXACT.has(path)) return true;
+  if (path.startsWith('/policy/')) return true;
+  // Public role-detail pages (job descriptions); the two form pages stay dynamic.
+  if (/^\/careers\/[^/]+$/.test(path) && path !== '/careers/fee-waiver' && path !== '/careers/hr-support') return true;
+  return false;
+}
+
 export const onRequest = defineMiddleware(async (context, next) => {
   const path = new URL(context.request.url).pathname;
 
@@ -172,6 +189,13 @@ export const onRequest = defineMiddleware(async (context, next) => {
     context.locals.user = null;
     context.locals.session = null;
     if (isGatedLab(path) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
+    // Anonymous + public page -> let the CDN cache it so repeat hits never touch Neon.
+    if (context.request.method === 'GET' && isPublicCacheable(path)) {
+      const res = await next();
+      res.headers.set('Cache-Control', 'public, max-age=0, s-maxage=300, stale-while-revalidate=900');
+      res.headers.set('Vary', 'Cookie');
+      return res;
+    }
     return next();
   }
   const result = await validateSessionToken(token);
