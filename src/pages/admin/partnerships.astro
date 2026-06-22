@@ -1,0 +1,124 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Self-bootstrap so the page works before any application/payment exists.
+try {
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS partnership_applications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID, partner_kind VARCHAR(40) NOT NULL DEFAULT 'institution',
+    org_name VARCHAR(300) NOT NULL, contact_name VARCHAR(200), contact_email VARCHAR(200) NOT NULL,
+    contact_phone VARCHAR(40), country VARCHAR(80), website_url TEXT,
+    intended_course_title TEXT NOT NULL, intended_course_summary TEXT NOT NULL,
+    target_learners TEXT, existing_content TEXT, co_branding TEXT,
+    tier VARCHAR(20) NOT NULL DEFAULT 'starter', status VARCHAR(20) NOT NULL DEFAULT 'submitted',
+    signed_msa_at TIMESTAMPTZ, approved_at TIMESTAMPTZ, reviewer_notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS starter_fee_paid BOOLEAN NOT NULL DEFAULT false`);
+  await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS fee_payment_id TEXT`);
+  await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS fee_paid_at TIMESTAMPTZ`);
+} catch (_) {}
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const id = (fd.get('id') as string || '').trim();
+    const status = (fd.get('status') as string || '').trim();
+    const note = (fd.get('reviewer_notes') as string || '').trim() || null;
+    const VALID = ['submitted', 'reviewing', 'approved', 'declined', 'onboarded'];
+    if (!id || !VALID.includes(status)) { errMsg = 'A valid application and status are required.'; }
+    else {
+      await db.execute(sql`UPDATE partnership_applications
+        SET status = ${status}, reviewer_notes = COALESCE(${note}, reviewer_notes),
+            approved_at = CASE WHEN ${status} = 'approved' AND approved_at IS NULL THEN NOW() ELSE approved_at END,
+            updated_at = NOW()
+        WHERE id = ${id}`);
+      okMsg = 'Updated.';
+    }
+  } catch (e: any) { errMsg = String(e?.cause?.message || e?.message || e).slice(0, 200); }
+}
+
+let apps: any[] = [];
+try {
+  apps = rows(await db.execute(sql`
+    SELECT a.*,
+      (SELECT p.amount_paise FROM payments p WHERE p.reference_id = a.id::text AND p.purpose = 'partnership_starter' AND p.status = 'paid' ORDER BY p.created_at DESC LIMIT 1) AS paid_amount
+    FROM partnership_applications a
+    ORDER BY a.created_at DESC LIMIT 200`));
+} catch (_) {}
+
+const counts = {
+  total: apps.length,
+  pending: apps.filter((a) => ['submitted', 'reviewing'].includes(a.status)).length,
+  paid: apps.filter((a) => a.paid_amount || a.starter_fee_paid).length,
+};
+const STATUS_COLOR: Record<string, string> = { submitted: '#fbbf24', reviewing: '#60a5fa', approved: '#34d399', declined: '#f87171', onboarded: '#10b981' };
+const STATUSES = ['submitted', 'reviewing', 'approved', 'declined', 'onboarded'];
+const inr = (p: any) => '₹' + ((Number(p) || 0) / 100).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+const fmt = (d: any) => { try { return d ? new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' }) : '-'; } catch { return '-'; } };
+---
+<AdminLayout title="Partnerships" activeNav="">
+  <div style="max-width:1100px;margin:0 auto;padding:22px 18px 80px;">
+    <p style="font-size:11px;font-family:'Geist Mono',monospace;text-transform:uppercase;letter-spacing:0.14em;color:#FF7040;font-weight:700;margin:0 0 4px;">AquinTutor</p>
+    <h1 style="font-size:1.5rem;font-weight:700;color:#fff;margin:0 0 4px;">Partnership applications</h1>
+    <p style="font-size:0.86rem;color:#9aa6b6;margin:0 0 18px;">Review, approve, and onboard course partners. Starter applicants pay a one-time CHF 100 (held in escrow until you verify them) — refunds are issued from <a href="/admin/finance" style="color:#FF7040;">Finance</a>.</p>
+
+    {okMsg && <div style="background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7;border-radius:9px;padding:9px 13px;font-size:13px;margin-bottom:13px;">{okMsg}</div>}
+    {errMsg && <div style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.4);color:#fca5a5;border-radius:9px;padding:9px 13px;font-size:13px;margin-bottom:13px;">{errMsg}</div>}
+
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:18px;">
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;"><p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 5px;">Applications</p><p style="font-size:24px;font-weight:800;color:#fff;margin:0;">{counts.total}</p></div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;"><p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 5px;">Awaiting review</p><p style="font-size:24px;font-weight:800;color:#fbbf24;margin:0;">{counts.pending}</p></div>
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;"><p style="font-size:10px;color:#6e6e78;text-transform:uppercase;font-family:monospace;margin:0 0 5px;">Starter fee paid</p><p style="font-size:24px;font-weight:800;color:#34d399;margin:0;">{counts.paid}</p></div>
+    </div>
+
+    {apps.length === 0 ? (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:30px;text-align:center;color:#6e6e78;font-size:0.9rem;">No partnership applications yet.</div>
+    ) : (
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        {apps.map((a: any) => {
+          const color = STATUS_COLOR[a.status] || '#6e6e78';
+          const paid = !!(a.paid_amount || a.starter_fee_paid);
+          return (
+            <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;">
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+                <div style="min-width:0;flex:1;">
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:3px;">
+                    <strong style="font-size:15px;color:#fff;">{a.org_name}</strong>
+                    <span style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;padding:2px 8px;border-radius:100px;background:rgba(255,112,64,0.15);color:#FF7040;">{a.tier}</span>
+                    <span style={`font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;padding:2px 8px;border-radius:100px;background:${color}22;color:${color};`}>{a.status}</span>
+                    {a.tier === 'starter' && (paid
+                      ? <span style="font-size:9px;font-weight:700;text-transform:uppercase;padding:2px 8px;border-radius:100px;background:rgba(52,211,153,0.15);color:#34d399;">{a.paid_amount ? inr(a.paid_amount) + ' paid' : 'fee paid'}</span>
+                      : <span style="font-size:9px;font-weight:700;text-transform:uppercase;padding:2px 8px;border-radius:100px;background:rgba(251,191,36,0.12);color:#fbbf24;">CHF 100 unpaid</span>)}
+                  </div>
+                  <p style="font-size:12.5px;color:#c8c3b8;margin:0 0 2px;">{a.partner_kind} &middot; {a.contact_name || '-'} &middot; <a href={`mailto:${a.contact_email}`} style="color:#9aa6b6;">{a.contact_email}</a>{a.contact_phone ? ' · ' + a.contact_phone : ''}{a.country ? ' · ' + a.country : ''}</p>
+                  <p style="font-size:13.5px;color:#fff;font-weight:600;margin:6px 0 2px;">{a.intended_course_title}</p>
+                  <p style="font-size:12.5px;color:#9aa6b6;line-height:1.55;margin:0;white-space:pre-line;">{a.intended_course_summary}</p>
+                  {a.website_url && <p style="font-size:12px;margin:5px 0 0;"><a href={a.website_url} target="_blank" rel="noopener" style="color:#FF7040;">{a.website_url}</a></p>}
+                  {a.co_branding && <p style="font-size:12px;color:#6e6e78;margin:5px 0 0;">Co-branding: {a.co_branding}</p>}
+                </div>
+                <span style="font-size:11px;color:#6e6e78;font-family:monospace;white-space:nowrap;">{fmt(a.created_at)}</span>
+              </div>
+              <form method="POST" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid #1a1a1f;">
+                <input type="hidden" name="id" value={a.id} />
+                <select name="status" style="background:#15151a;border:1px solid #2a3038;color:#f4f1ea;padding:6px 10px;border-radius:7px;font-size:12.5px;">
+                  {STATUSES.map((s) => <option value={s} selected={a.status === s}>{s}</option>)}
+                </select>
+                <input name="reviewer_notes" value={a.reviewer_notes || ''} placeholder="Reviewer notes (optional)" style="flex:1;min-width:180px;background:#15151a;border:1px solid #2a3038;color:#f4f1ea;padding:6px 10px;border-radius:7px;font-size:12.5px;" />
+                <button type="submit" style="background:#FF4F00;color:#fff;border:0;border-radius:7px;padding:7px 16px;font-size:12.5px;font-weight:700;cursor:pointer;">Save</button>
+              </form>
+            </div>
+          );
+        })}
+      </div>
+    )}
+  </div>
+</AdminLayout>
