@@ -489,8 +489,22 @@
       lastTs = localStorage.getItem(LAST_TS_KEY) || null;
     } catch (_) {}
 
-    // Always poll (whether open or closed) so we can show unread dot
-    pollTimer = setInterval(poll, 5000);
+    // Poll adaptively and PAUSE when the tab is hidden, so an idle background tab
+    // never keeps the database awake (lets Neon scale to zero). Faster only while
+    // the chat is actually open; slow when closed; effectively off when hidden.
+    function nextPollDelay() {
+      if (document.hidden) return 300000;
+      return widgetEl.classList.contains('era-help-open') ? 8000 : 45000;
+    }
+    function scheduleNextPoll() {
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(function () { if (!document.hidden) poll(); scheduleNextPoll(); }, nextPollDelay());
+    }
+    scheduleNextPoll();
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && conversationId) { poll(); }
+      scheduleNextPoll();
+    });
 
     // Bootstrap conversation only for returning visitors who have intake on file.
     // First-time visitors will start their conversation when they submit the intake form.
