@@ -191,10 +191,14 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // pending = approved for applicants. This catches every race / fallback
   // path where the post-signup UPDATE didn't fire, so admins never have to
   // hand-click Approve on applicant accounts ever again.
-  if (result.user.role === 'applicant') {
+  // Run the promote at most ONCE per user per browser (cookie guard) instead of a
+  // write on every request. Already-approved applicants then make zero writes on
+  // navigation, so Neon can stay suspended. The WHERE clause still no-ops safely.
+  if (result.user.role === 'applicant' && context.cookies.get('era_appr')?.value !== result.user.id) {
     try {
       await db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE id = ${result.user.id} AND access_status = 'pending'`);
     } catch (_) { /* never block the request on this */ }
+    try { context.cookies.set('era_appr', result.user.id, { path: '/', maxAge: 60 * 60 * 24 * 30, httpOnly: true, sameSite: 'lax' }); } catch (_) {}
   }
   context.locals.session = result.session;
 
