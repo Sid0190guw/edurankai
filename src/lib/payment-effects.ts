@@ -316,6 +316,22 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
     return { applicationId: pay.reference_id };
   }
 
+  // AquinTutor partnership Starter fee (one-time CHF 100) -> mark the partnership
+  // application's starter fee paid so the team can onboard. Self-bootstrapping cols.
+  if (pay.purpose === 'partnership_starter' || pay.reference_type === 'partnership_application') {
+    try {
+      await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS starter_fee_paid BOOLEAN NOT NULL DEFAULT false`);
+      await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS fee_payment_id TEXT`);
+      await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS fee_paid_at TIMESTAMPTZ`);
+      await db.execute(sql`UPDATE partnership_applications SET starter_fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), updated_at = NOW() WHERE id = ${pay.reference_id}`);
+    } catch (_) {}
+    try {
+      const { sendPushToAdmins } = await import('@/lib/push');
+      await sendPushToAdmins({ type: 'partnership_starter_paid', title: 'Partnership Starter fee paid', body: 'A partner paid the one-time CHF 100 Starter fee — ready to verify and onboard.', url: '/admin/finance', tag: 'pship-' + pay.reference_id });
+    } catch (_) {}
+    return { applicationId: pay.reference_id };
+  }
+
   // 1 CHF registration/activation fee -> approve the user's account.
   if (pay.purpose === 'registration_fee' || pay.reference_type === 'user') {
     await db.execute(sql`
