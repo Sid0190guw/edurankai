@@ -63,6 +63,14 @@ export async function getCheckoutSettings(): Promise<CheckoutSettings> {
   };
 }
 
+// Per-step content overrides for the 6-step application flow. Keyed by step
+// number ("1".."6"); any blank field falls back to the step's built-in copy.
+export interface StepOverride { title?: string; subtitle?: string; intro?: string; }
+export async function getApplyStepsSettings(): Promise<Record<string, StepOverride>> {
+  const v = await getRaw('apply_steps');
+  return (v && typeof v === 'object') ? v : {};
+}
+
 export async function saveSettings(key: string, value: any): Promise<void> {
   await ensure();
   await db.execute(sql`
