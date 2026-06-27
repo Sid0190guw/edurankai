@@ -12,17 +12,25 @@ function json(d: any, s = 200) {
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
-async function ensureTable() {
-  try {
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title TEXT NOT NULL, body TEXT,
-      type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
-      entity_type TEXT, entity_id TEXT,
-      is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT NOW())`);
-  } catch (_) {}
+// Memoise the DDL so we don't fire CREATE TABLE IF NOT EXISTS on every poll
+// (every admin hits this endpoint every 15s — that DDL chatter keeps Neon awake
+// and burns compute for nothing). One ensure per server process is enough.
+let tableReady: Promise<void> | null = null;
+function ensureTable(): Promise<void> {
+  if (tableReady) return tableReady;
+  tableReady = (async () => {
+    try {
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL, body TEXT,
+        type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
+        entity_type TEXT, entity_id TEXT,
+        is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW())`);
+    } catch (_) { tableReady = null; }
+  })();
+  return tableReady;
 }
 
 export const GET: APIRoute = async ({ locals }) => {

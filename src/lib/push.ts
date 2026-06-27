@@ -6,6 +6,7 @@ import webpush from 'web-push';
 import { db } from '@/lib/db';
 import { pushSubscriptions, notificationPreferences, users } from '@/lib/db/schema';
 import { eq, inArray, and, ne } from 'drizzle-orm';
+import { roleCanReceive } from '@/lib/notify-audience';
 
 // Configure web-push with VAPID keys
 const VAPID_PUBLIC = import.meta.env.VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY || '';
@@ -88,9 +89,23 @@ async function persistNotification(userId: string, p: PushPayload) {
   try {
     const { sql } = await import('drizzle-orm');
     await ensureNotificationsTable();
+    // De-dupe: only insert if an IDENTICAL notification (same user/type/title/
+    // body/url) hasn't landed in the last 2 minutes. This kills the 2-3x
+    // duplicates from retried handlers (payment verify + recovery sweep, page
+    // re-renders, double POSTs) while still allowing genuinely different
+    // messages — distinct body/title pass straight through.
     await db.execute(sql`
       INSERT INTO notifications (user_id, title, body, type, action_url)
-      VALUES (${userId}, ${p.title}, ${p.body}, ${p.type}, ${p.url})
+      SELECT ${userId}, ${p.title}, ${p.body}, ${p.type}, ${p.url}
+      WHERE NOT EXISTS (
+        SELECT 1 FROM notifications
+        WHERE user_id = ${userId}
+          AND type = ${p.type}
+          AND title = ${p.title}
+          AND COALESCE(body, '') = COALESCE(${p.body}, '')
+          AND COALESCE(action_url, '') = COALESCE(${p.url}, '')
+          AND created_at > NOW() - INTERVAL '2 minutes'
+      )
     `);
   } catch (e) { /* silent — never block delivery */ }
 }
@@ -107,13 +122,15 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
   try {
     // Admins only — applicants share the users table, must be excluded so
     // sendPushToAdmins doesn't fan out admin events to candidates' inboxes.
-    const adminUsers = await db.select({ id: users.id })
+    const adminUsers = await db.select({ id: users.id, role: users.role })
       .from(users)
       .where(and(eq(users.isActive, true), ne(users.role, 'applicant' as any)));
 
+    // Scope by role: only the people responsible for THIS kind of event get it
+    // (HR/recruiting for applications, etc.). super_admin always receives.
     const adminIds = adminUsers
-      .map(u => u.id)
-      .filter(id => id !== excludeUserId);
+      .filter(u => u.id !== excludeUserId && roleCanReceive(u.role as any, payload.type))
+      .map(u => u.id);
 
     if (adminIds.length === 0) return;
 

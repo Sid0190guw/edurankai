@@ -10,17 +10,23 @@ function json(d: any, s = 200) {
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
-async function ensureTable() {
-  try {
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title TEXT NOT NULL, body TEXT,
-      type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
-      entity_type TEXT, entity_id TEXT,
-      is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT NOW())`);
-  } catch (_) {}
+// Memoised so the 20s portal poll doesn't re-run DDL on every request.
+let tableReady: Promise<void> | null = null;
+function ensureTable(): Promise<void> {
+  if (tableReady) return tableReady;
+  tableReady = (async () => {
+    try {
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL, body TEXT,
+        type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
+        entity_type TEXT, entity_id TEXT,
+        is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW())`);
+    } catch (_) { tableReady = null; }
+  })();
+  return tableReady;
 }
 
 export const GET: APIRoute = async ({ locals }) => {
