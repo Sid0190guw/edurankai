@@ -4,28 +4,7 @@
 // abuse review, attaching the user id when one is present. Best-effort: a
 // storage failure never blocks the user from downloading their resume.
 import type { APIRoute } from 'astro';
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
-
-let ready: Promise<void> | null = null;
-function ensure(): Promise<void> {
-  if (ready) return ready;
-  ready = (async () => {
-    try {
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS resume_submissions (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-        email TEXT,
-        full_name TEXT,
-        template TEXT,
-        data JSONB NOT NULL,
-        ip TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS resume_submissions_created_idx ON resume_submissions(created_at DESC)`);
-    } catch (_) { ready = null; }
-  })();
-  return ready;
-}
+import { saveResume } from '@/lib/resume';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -46,11 +25,7 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
   const template = (body.template || '').toString().slice(0, 40) || null;
 
   try {
-    await ensure();
-    await db.execute(sql`
-      INSERT INTO resume_submissions (user_id, email, full_name, template, data, ip)
-      VALUES (${user?.id || null}, ${email}, ${fullName}, ${template}, ${serialized}::jsonb, ${clientAddress || null})
-    `);
+    await saveResume({ userId: user?.id || null, email, fullName, template, data, ip: clientAddress || null });
   } catch (_) { /* never block the download */ }
   return json({ ok: true });
 };
