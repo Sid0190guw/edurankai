@@ -7,6 +7,8 @@ import { db } from '@/lib/db';
 import { pushSubscriptions, notificationPreferences, users } from '@/lib/db/schema';
 import { eq, inArray, and, ne } from 'drizzle-orm';
 import { roleCanReceive } from '@/lib/notify-audience';
+import { metaFor, vibrationFor, isHighPriority, type NotifPriority } from '@/lib/notification-catalog';
+import { ensureNotificationsSchema } from '@/lib/notifications-schema';
 
 // Configure web-push with VAPID keys
 const VAPID_PUBLIC = import.meta.env.VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY || '';
@@ -25,6 +27,29 @@ export interface PushPayload {
   body: string;
   url: string;
   tag?: string;
+  // Rich-notification extras (all optional; auto-filled from the catalogue).
+  category?: string;
+  priority?: NotifPriority;
+  image?: string;                 // large banner image
+  icon?: string;
+  badge?: string;
+  actions?: { action: string; title: string; url?: string }[];
+}
+
+// Build the full payload the service worker renders: fills category/priority
+// from the catalogue, derives requireInteraction + vibration from priority.
+function enrichPayload(p: PushPayload) {
+  const meta = metaFor(p.type);
+  const priority = p.priority || meta.priority;
+  return {
+    ...p,
+    category: p.category || meta.category,
+    priority,
+    icon: p.icon || '/era/icon-192.png',
+    badge: p.badge || '/era/badge-72.png',
+    requireInteraction: isHighPriority(priority),
+    vibrate: vibrationFor(priority),
+  };
 }
 
 // ── Canonical notification catalogue ────────────────────────────────────────
@@ -88,15 +113,18 @@ function ensureNotificationsTable(): Promise<void> {
 async function persistNotification(userId: string, p: PushPayload) {
   try {
     const { sql } = await import('drizzle-orm');
-    await ensureNotificationsTable();
+    await ensureNotificationsSchema();
+    const meta = metaFor(p.type);
+    const category = p.category || meta.category;
+    const priority = p.priority || meta.priority;
     // De-dupe: only insert if an IDENTICAL notification (same user/type/title/
     // body/url) hasn't landed in the last 2 minutes. This kills the 2-3x
     // duplicates from retried handlers (payment verify + recovery sweep, page
     // re-renders, double POSTs) while still allowing genuinely different
     // messages — distinct body/title pass straight through.
     await db.execute(sql`
-      INSERT INTO notifications (user_id, title, body, type, action_url)
-      SELECT ${userId}, ${p.title}, ${p.body}, ${p.type}, ${p.url}
+      INSERT INTO notifications (user_id, title, body, type, action_url, category, priority)
+      SELECT ${userId}, ${p.title}, ${p.body}, ${p.type}, ${p.url}, ${category}, ${priority}
       WHERE NOT EXISTS (
         SELECT 1 FROM notifications
         WHERE user_id = ${userId}
@@ -167,7 +195,7 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
 
     if (subs.length === 0) return;
 
-    const pushData = JSON.stringify(payload);
+    const pushData = JSON.stringify(enrichPayload(payload));
 
     // Send to all subscriptions in parallel
     await Promise.allSettled(
@@ -205,7 +233,7 @@ export async function sendPushToUser(userId: string, payload: PushPayload): Prom
   try {
     const subs = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId));
     if (subs.length === 0) return;
-    const pushData = JSON.stringify(payload);
+    const pushData = JSON.stringify(enrichPayload(payload));
     await Promise.allSettled(
       subs.map(async (sub) => {
         try {
