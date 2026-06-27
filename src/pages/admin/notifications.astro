@@ -5,10 +5,14 @@ import { sql } from 'drizzle-orm';
 import { NOTIFICATION_TYPES } from '@/lib/push';
 import { notificationPreferences } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
+import { CATEGORY_META, metaFor } from '@/lib/notification-catalog';
+import { ensureNotificationsSchema } from '@/lib/notifications-schema';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
+
+await ensureNotificationsSchema();
 
 // Load this admin's saved opt-out map so toggles render their real state.
 let savedPrefs: Record<string, boolean> = {};
@@ -43,6 +47,15 @@ if (Astro.request.method === 'POST') {
     } else if (action === 'delete_notif') {
       const notifId = fd.get('id') as string;
       await db.execute(sql`DELETE FROM notifications WHERE id = ${notifId} AND user_id = ${user.id}`);
+    } else if (action === 'archive') {
+      const notifId = fd.get('id') as string;
+      await db.execute(sql`UPDATE notifications SET is_archived = true, is_read = true, read_at = COALESCE(read_at, NOW()) WHERE id = ${notifId} AND user_id = ${user.id}`);
+    } else if (action === 'unarchive') {
+      const notifId = fd.get('id') as string;
+      await db.execute(sql`UPDATE notifications SET is_archived = false WHERE id = ${notifId} AND user_id = ${user.id}`);
+    } else if (action === 'archive_all_read') {
+      await db.execute(sql`UPDATE notifications SET is_archived = true WHERE user_id = ${user.id} AND is_read = true AND COALESCE(is_archived, false) = false`);
+      okMsg = 'Archived all read notifications.';
     } else if (action === 'clear_all_read') {
       await db.execute(sql`DELETE FROM notifications WHERE user_id = ${user.id} AND is_read = true`);
       okMsg = 'Cleared all read notifications.';
@@ -53,35 +66,70 @@ if (Astro.request.method === 'POST') {
 const url = new URL(Astro.request.url);
 const tab = url.searchParams.get('tab') || 'inbox';
 const filter = url.searchParams.get('filter') || 'all';
+const view = url.searchParams.get('view') || 'inbox';       // inbox | archived
+const category = url.searchParams.get('category') || 'all';
+const q = (url.searchParams.get('q') || '').trim();
 
-// Load notifications
+// Build the filtered history query (server-side; no polling).
 let notifications: any[] = [];
 let unreadCount = 0;
 try {
-  const whereClause = filter === 'unread' ? sql`AND is_read = false` : filter === 'read' ? sql`AND is_read = true` : sql``;
+  const conds = [sql`user_id = ${user.id}`];
+  conds.push(view === 'archived' ? sql`is_archived = true` : sql`COALESCE(is_archived, false) = false`);
+  if (filter === 'unread') conds.push(sql`is_read = false`);
+  else if (filter === 'read') conds.push(sql`is_read = true`);
+  if (category !== 'all') conds.push(sql`category = ${category}`);
+  if (q) conds.push(sql`(title ILIKE ${'%' + q + '%'} OR body ILIKE ${'%' + q + '%'})`);
   const r = await db.execute(sql`
     SELECT * FROM notifications
-    WHERE user_id = ${user.id} ${whereClause}
+    WHERE ${sql.join(conds, sql` AND `)}
     ORDER BY created_at DESC
-    LIMIT 50
+    LIMIT 100
   `);
   notifications = Array.isArray(r) ? r : (r?.rows || []);
-  const uc = await db.execute(sql`SELECT COUNT(*)::int as n FROM notifications WHERE user_id = ${user.id} AND is_read = false`);
+  const uc = await db.execute(sql`SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = ${user.id} AND is_read = false AND COALESCE(is_archived, false) = false`);
   const ucRows = Array.isArray(uc) ? uc : (uc?.rows || []);
   unreadCount = Number((ucRows[0] as any)?.n) || 0;
 } catch(e) {}
 
-// Notification type config
-const TYPE_CONFIG: Record<string, { color: string; icon: string; bg: string }> = {
-  application: { color: '#FF7040', icon: '📋', bg: 'rgba(255,112,64,0.1)' },
-  hire: { color: '#10b981', icon: '🎉', bg: 'rgba(16,185,129,0.1)' },
-  leave: { color: '#fbbf24', icon: '📅', bg: 'rgba(251,191,36,0.1)' },
-  message: { color: '#60a5fa', icon: '💬', bg: 'rgba(96,165,250,0.1)' },
-  offer: { color: '#a78bfa', icon: '📄', bg: 'rgba(167,139,250,0.1)' },
-  payroll: { color: '#34d399', icon: '💰', bg: 'rgba(52,211,153,0.1)' },
-  system: { color: '#6e6e78', icon: '⚙️', bg: 'rgba(110,110,120,0.1)' },
-  info: { color: '#6e6e78', icon: '🔔', bg: 'rgba(110,110,120,0.1)' },
+// Category icon glyphs (no emoji — inline SVG injected into <svg> via set:html).
+const ICONS: Record<string, string> = {
+  briefcase: '<rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>',
+  message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  wallet: '<path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/>',
+  calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/>',
+  book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+  building: '<rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4M8 6h.01M16 6h.01M8 10h.01M16 10h.01M8 14h.01M16 14h.01"/>',
+  bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
 };
+const PRIORITY_COLOR: Record<string, string> = { critical: '#ef4444', high: '#f59e0b', medium: '#6e6e78', low: '#4b4b54' };
+
+function metaForRow(n: any) {
+  const fallback = metaFor(n.type);
+  const catKey = (n.category && (CATEGORY_META as any)[n.category]) ? n.category : fallback.category;
+  const cat = (CATEGORY_META as any)[catKey] || CATEGORY_META.system;
+  const priority = n.priority || fallback.priority;
+  return { cat, catKey, priority };
+}
+
+// Date buckets for grouped history.
+function groupOf(d: any): string {
+  const date = new Date(d); const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startYest = new Date(startToday); startYest.setDate(startYest.getDate() - 1);
+  const startWeek = new Date(startToday); startWeek.setDate(startWeek.getDate() - 7);
+  const startMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  if (date >= startToday) return 'Today';
+  if (date >= startYest) return 'Yesterday';
+  if (date >= startWeek) return 'This Week';
+  if (date >= startMonth) return 'This Month';
+  return 'Older';
+}
+const GROUP_ORDER = ['Today', 'Yesterday', 'This Week', 'This Month', 'Older'];
+const grouped: Record<string, any[]> = {};
+for (const n of notifications) { const g = groupOf(n.created_at); (grouped[g] = grouped[g] || []).push(n); }
+const activeGroups = GROUP_ORDER.filter((g) => grouped[g] && grouped[g].length);
 
 function timeAgo(d: any) {
   if (!d) return '';
@@ -125,69 +173,121 @@ function timeAgo(d: any) {
 
   {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
 
-  <!-- INBOX TAB -->
+  <!-- INBOX TAB (Notification Center) -->
   {tab === 'inbox' && (
     <div style="padding:12px 16px;">
-      <!-- Filter pills -->
-      <div style="display:flex;gap:6px;margin-bottom:12px;">
+      <!-- Search -->
+      <form method="GET" style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+        <input type="hidden" name="tab" value="inbox" />
+        <input type="hidden" name="view" value={view} />
+        <input type="hidden" name="filter" value={filter} />
+        {category !== 'all' && <input type="hidden" name="category" value={category} />}
+        <div style="flex:1;min-width:180px;display:flex;align-items:center;gap:8px;background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:7px 11px;">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          <input type="text" name="q" value={q} placeholder="Search notifications..." style="flex:1;background:transparent;border:0;outline:0;color:#fff;font-size:13px;" />
+        </div>
+        <button type="submit" style="background:#FF4F00;border:none;color:#fff;font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;cursor:pointer;">Search</button>
+        {(q || category !== 'all' || filter !== 'all') && (
+          <a href={`?tab=inbox&view=${view}`} style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:12px;text-decoration:none;padding:7px 12px;border-radius:8px;display:inline-flex;align-items:center;">Clear</a>
+        )}
+      </form>
+
+      <!-- View toggle + bulk actions -->
+      <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center;">
+        {[['inbox','Inbox'],['archived','Archived']].map(([v,l]) => (
+          <a href={`?tab=inbox&view=${v}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:5px 12px;border-radius:100px;${view === v ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;'}`}>{l}</a>
+        ))}
+        <div style="flex:1;"></div>
+        {notifications.length > 0 && view === 'inbox' && (
+          <form method="POST" style="display:flex;gap:6px;">
+            <button name="action" value="mark_all_read" type="submit" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:11px;padding:5px 10px;border-radius:100px;cursor:pointer;">Mark all read</button>
+            <button name="action" value="archive_all_read" type="submit" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:11px;padding:5px 10px;border-radius:100px;cursor:pointer;">Archive read</button>
+          </form>
+        )}
+      </div>
+
+      <!-- Read/unread filter -->
+      <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;">
         {[['all','All'],['unread',`Unread (${unreadCount})`],['read','Read']].map(([v,l]) => (
-          <a href={`?tab=inbox&filter=${v}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:5px 12px;border-radius:100px;${filter === v ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;'}`}>{l}</a>
+          <a href={`?tab=inbox&view=${view}&filter=${v}${category!=='all'?`&category=${category}`:''}${q?`&q=${encodeURIComponent(q)}`:''}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:5px 12px;border-radius:100px;${filter === v ? 'background:#1f1f26;color:#fff;border:1px solid #2a2a32;' : 'background:#0f0f14;border:1px solid #1a1a1f;color:#8a8a94;'}`}>{l}</a>
+        ))}
+      </div>
+
+      <!-- Category chips -->
+      <div style="display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;">
+        <a href={`?tab=inbox&view=${view}&filter=${filter}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:4px 11px;border-radius:100px;${category==='all'?'background:#FF4F00;color:#fff;':'background:#0f0f14;border:1px solid #1a1a1f;color:#8a8a94;'}`}>All</a>
+        {Object.entries(CATEGORY_META).map(([key, c]) => (
+          <a href={`?tab=inbox&view=${view}&filter=${filter}&category=${key}`} style={`display:inline-flex;align-items:center;gap:5px;text-decoration:none;font-size:11px;font-weight:600;padding:4px 11px;border-radius:100px;${category===key?`background:${c.color}22;border:1px solid ${c.color};color:${c.color};`:'background:#0f0f14;border:1px solid #1a1a1f;color:#8a8a94;'}`}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" set:html={ICONS[c.icon] || ICONS.bell}></svg>
+            {c.label}
+          </a>
         ))}
       </div>
 
       {notifications.length === 0 && (
         <div style="text-align:center;padding:48px;color:#6e6e78;">
-          <p style="font-size:32px;margin-bottom:8px;">🔔</p>
-          <p style="font-size:13px;">{filter === 'unread' ? 'No unread notifications.' : 'No notifications yet.'}</p>
-          <p style="font-size:12px;margin-top:4px;color:#6e6e78;">Notifications appear here when applications are submitted, status changes, leave is requested, and more.</p>
+          <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#3a3a42" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin:0 auto 10px;display:block;"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+          <p style="font-size:13px;">{view === 'archived' ? 'Nothing archived.' : (q || category !== 'all' || filter === 'unread') ? 'No notifications match this filter.' : 'No notifications yet.'}</p>
         </div>
       )}
 
-      <div style="display:flex;flex-direction:column;gap:6px;">
-        {notifications.map((n: any) => {
-          const cfg = TYPE_CONFIG[n.type] || TYPE_CONFIG['info'];
-          return (
-            <div style={`background:${n.is_read ? '#0f0f14' : '#0f0f14'};border:1px solid ${n.is_read ? '#1a1a1f' : '#FF4F0033'};border-radius:12px;overflow:hidden;${n.is_read ? 'opacity:0.75;' : ''}`}>
-              <div style="padding:12px 14px;display:flex;align-items:flex-start;gap:10px;">
-                <!-- Icon -->
-                <div style={`width:38px;height:38px;border-radius:10px;background:${cfg.bg};display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;`}>
-                  {cfg.icon}
-                </div>
-                <!-- Content -->
-                <div style="flex:1;min-width:0;">
-                  <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">
-                    <p style={`font-size:13px;font-weight:${n.is_read ? '500' : '600'};color:${n.is_read ? '#8a8a94' : '#fff'};margin:0;`}>{n.title}</p>
-                    <span style="font-size:10px;color:#6e6e78;flex-shrink:0;font-family:'Geist Mono',monospace;">{timeAgo(n.created_at)}</span>
+      {activeGroups.map((g) => (
+        <div style="margin-bottom:18px;">
+          <p style="font-size:10px;font-family:'Geist Mono',monospace;letter-spacing:0.14em;text-transform:uppercase;color:#6e6e78;margin:0 0 8px;font-weight:700;">{g}</p>
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            {grouped[g].map((n: any) => {
+              const m = metaForRow(n);
+              const isHi = m.priority === 'critical' || m.priority === 'high';
+              return (
+                <div style={`background:#0f0f14;border:1px solid ${n.is_read ? '#1a1a1f' : m.cat.color + '44'};border-radius:12px;overflow:hidden;${n.is_read ? 'opacity:0.72;' : ''}`}>
+                  <div style="padding:12px 14px;display:flex;align-items:flex-start;gap:10px;">
+                    <div style={`width:38px;height:38px;border-radius:10px;background:${m.cat.color}1a;color:${m.cat.color};display:flex;align-items:center;justify-content:center;flex-shrink:0;`}>
+                      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" set:html={ICONS[m.cat.icon] || ICONS.bell}></svg>
+                    </div>
+                    <div style="flex:1;min-width:0;">
+                      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">
+                        <p style={`font-size:13px;font-weight:${n.is_read ? '500' : '600'};color:${n.is_read ? '#a0a0a8' : '#fff'};margin:0;`}>{n.title}</p>
+                        <span style="font-size:10px;color:#6e6e78;flex-shrink:0;font-family:'Geist Mono',monospace;">{timeAgo(n.created_at)}</span>
+                      </div>
+                      {n.body && <p style="font-size:12px;color:#8a8a94;margin:3px 0 0;line-height:1.45;">{n.body}</p>}
+                      <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+                        <span style={`font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:${m.cat.color};`}>{m.cat.label}</span>
+                        {isHi && <span style={`font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:${PRIORITY_COLOR[m.priority]};background:${PRIORITY_COLOR[m.priority]}1f;padding:1px 7px;border-radius:100px;`}>{m.priority}</span>}
+                        {!n.is_read && <span style="width:6px;height:6px;background:#FF4F00;border-radius:50%;display:inline-block;"></span>}
+                      </div>
+                    </div>
                   </div>
-                  {n.body && <p style="font-size:12px;color:#6e6e78;margin:3px 0 0;line-height:1.4;">{n.body}</p>}
-                  {!n.is_read && <div style="width:6px;height:6px;background:#FF4F00;border-radius:50%;display:inline-block;margin-top:4px;"></div>}
+                  <div style="border-top:1px solid #1a1a1f;padding:6px 14px;display:flex;gap:6px;">
+                    {n.action_url && (
+                      <a href={n.action_url} style={`flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:${m.cat.color};text-decoration:none;font-size:11px;font-weight:600;padding:6px;border-radius:6px;`}>View</a>
+                    )}
+                    {!n.is_read && (
+                      <form method="POST" style="flex:1;">
+                        <input type="hidden" name="action" value="mark_read" />
+                        <input type="hidden" name="id" value={n.id} />
+                        <button type="submit" style="width:100%;background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:11px;padding:6px;border-radius:6px;cursor:pointer;">Mark read</button>
+                      </form>
+                    )}
+                    {view === 'archived' ? (
+                      <form method="POST">
+                        <input type="hidden" name="action" value="unarchive" />
+                        <input type="hidden" name="id" value={n.id} />
+                        <button type="submit" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:11px;padding:6px 10px;border-radius:6px;cursor:pointer;">Unarchive</button>
+                      </form>
+                    ) : (
+                      <form method="POST">
+                        <input type="hidden" name="action" value="archive" />
+                        <input type="hidden" name="id" value={n.id} />
+                        <button type="submit" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:11px;padding:6px 10px;border-radius:6px;cursor:pointer;">Archive</button>
+                      </form>
+                    )}
+                  </div>
                 </div>
-              </div>
-
-              <!-- Actions -->
-              <div style="border-top:1px solid #1a1a1f;padding:6px 14px;display:flex;gap:6px;">
-                {n.action_url && (
-                  <a href={n.action_url} style="flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#FF7040;text-decoration:none;font-size:11px;font-weight:600;padding:6px;border-radius:6px;">
-                    View →
-                  </a>
-                )}
-                {!n.is_read && (
-                  <form method="POST" style="flex:1;">
-                    <input type="hidden" name="action" value="mark_read" />
-                    <input type="hidden" name="id" value={n.id} />
-                    <button type="submit" style="width:100%;background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:11px;padding:6px;border-radius:6px;cursor:pointer;">Mark read</button>
-                  </form>
-                )}
-                <form method="POST">
-                  <input type="hidden" name="action" value="delete_notif" />
-                  <input type="hidden" name="id" value={n.id} />
-                  <button type="submit" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);color:#fca5a5;font-size:11px;padding:6px 10px;border-radius:6px;cursor:pointer;">Del</button>
-                </form>
-              </div>
-            </div>
-          );
-        })}
-      </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
     </div>
   )}
 
