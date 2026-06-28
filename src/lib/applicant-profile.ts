@@ -14,20 +14,25 @@ import { ensureOnce } from '@/lib/ensure-once';
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
 export function ensureApplicantProfileSchema(): Promise<void> {
-  return ensureOnce('applicant_profiles_v1', async () => {
+  // v2: the table may already exist from Phase 1 with only `common`, in which
+  // case CREATE TABLE IF NOT EXISTS adds nothing — so ALTER each column in too,
+  // or saves silently fail on the missing columns.
+  return ensureOnce('applicant_profiles_v2', async () => {
     await db.execute(sql`CREATE TABLE IF NOT EXISTS applicant_profiles (
       user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       common JSONB NOT NULL DEFAULT '{}'::jsonb,
-      headline TEXT,
-      bio TEXT,
-      skills TEXT[],
-      links JSONB,
-      experience JSONB,
-      education JSONB,
-      is_public BOOLEAN NOT NULL DEFAULT false,
-      slug VARCHAR(60) UNIQUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS headline TEXT`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS bio TEXT`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS skills TEXT[]`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS links JSONB`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS experience JSONB`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS education JSONB`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS sections JSONB`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT false`);
+    await db.execute(sql`ALTER TABLE applicant_profiles ADD COLUMN IF NOT EXISTS slug VARCHAR(60)`);
+    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS applicant_profiles_slug_uq ON applicant_profiles (slug) WHERE slug IS NOT NULL`);
   });
 }
 
