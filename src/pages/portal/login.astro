@@ -47,11 +47,56 @@ if (pendingId) {
   } catch(e) {}
 }
 
+// Authenticator (TOTP) pending — password was correct, awaiting the code.
+const tfaPendingId = Astro.cookies.get('portal_tfa_pending')?.value || '';
+let requireTotp = false;
+let tfaPendingName = '';
+if (tfaPendingId && !pendingId) {
+  requireTotp = true;
+  try {
+    const { db } = await import('@/lib/db');
+    const { users } = await import('@/lib/db/schema');
+    const { eq } = await import('drizzle-orm');
+    const u = await db.select({ name: users.name }).from(users).where(eq(users.id, tfaPendingId)).limit(1);
+    tfaPendingName = u[0]?.name || '';
+  } catch (_) {}
+}
+
 if (Astro.request.method === 'POST') {
   const fd2 = await Astro.request.formData();
   const action = fd2.get('action') as string;
 
-  if (action === 'face_verified') {
+  if (action === 'tfa_verify') {
+    const userId = (fd2.get('user_id') as string) || '';
+    const code = ((fd2.get('code') as string) || '').trim();
+    if (!userId || userId !== tfaPendingId) {
+      errorMsg = 'Session expired. Please sign in again.';
+      Astro.cookies.delete('portal_tfa_pending', { path: '/' });
+      requireTotp = false;
+    } else {
+      const { verifyLoginCode } = await import('@/lib/auth/twofactor');
+      const ok = await verifyLoginCode(userId, code);
+      if (!ok) {
+        errorMsg = 'That code is not right. Use the current code from your authenticator app, or a backup code.';
+      } else {
+        const { db } = await import('@/lib/db');
+        const { users } = await import('@/lib/db/schema');
+        const { generateSessionToken, createSession } = await import('@/lib/auth/session');
+        const { setSessionCookie } = await import('@/lib/auth/cookie');
+        const { eq } = await import('drizzle-orm');
+        const token = generateSessionToken();
+        const session = await createSession(token, userId, { userAgent: Astro.request.headers.get('user-agent') || undefined, ipAddress: Astro.clientAddress });
+        setSessionCookie(Astro.cookies, token, session.expiresAt);
+        const u2 = await db.select({ role: users.role }).from(users).where(eq(users.id, userId)).limit(1);
+        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, userId));
+        Astro.cookies.delete('portal_tfa_pending', { path: '/' });
+        return Astro.redirect(u2[0]?.role === 'applicant' ? '/portal' : '/admin');
+      }
+    }
+  } else if (action === 'cancel_tfa') {
+    Astro.cookies.delete('portal_tfa_pending', { path: '/' });
+    return Astro.redirect('/portal/login');
+  } else if (action === 'face_verified') {
     const userId = fd2.get('user_id') as string;
     const liveRaw = (fd2.get('live_descriptor') as string) || '';
     if (userId === pendingId) {
@@ -152,6 +197,10 @@ if (Astro.request.method === 'POST') {
           const valid = await verifyPassword(user.passwordHash, password);
           if (!valid) {
             errorMsg = 'Invalid email or password.';
+          } else if (await (async () => { const { isTotpEnabled } = await import('@/lib/auth/twofactor'); return isTotpEnabled(user.id); })()) {
+            // Authenticator 2FA enabled (any role) — challenge before a session.
+            Astro.cookies.set('portal_tfa_pending', user.id, { path: '/', httpOnly: true, maxAge: 300, sameSite: 'lax' });
+            return Astro.redirect('/portal/login');
           } else {
             // Face 2FA: applicants log in directly with password; staff
             // (admin/HR/editor) still get the face-scan challenge on the
@@ -204,8 +253,9 @@ if (Astro.request.method === 'POST') {
 <section style="padding: 48px 20px; max-width: 480px; margin: 0 auto;">
   <div style="text-align:center;margin-bottom:28px;">
     <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.15em;color:#DC5000;margin-bottom:8px;">Applicant Portal</p>
-    <h1 style="font-size:28px;font-weight:700;color:#111;margin:0;">{requireFace ? 'Verify your face' : 'Sign in'}</h1>
+    <h1 style="font-size:28px;font-weight:700;color:#111;margin:0;">{requireFace ? 'Verify your face' : requireTotp ? 'Enter your code' : 'Sign in'}</h1>
     {requireFace && <p style="font-size:14px;color:#6b7280;margin:8px 0 0;">Welcome back, <strong>{pendingUserName}</strong></p>}
+    {requireTotp && <p style="font-size:14px;color:#6b7280;margin:8px 0 0;">Welcome back{tfaPendingName ? ', ' : ''}<strong>{tfaPendingName}</strong> — enter the 6-digit code from your authenticator app.</p>}
   </div>
 
   {errorMsg && (
@@ -214,7 +264,26 @@ if (Astro.request.method === 'POST') {
     </div>
   )}
 
-  {!requireFace && (
+  {requireTotp && (
+    <div style="background:#fff;border:1px solid rgba(0,0,0,0.1);border-radius:16px;padding:24px;max-width:420px;margin:0 auto;">
+      <form method="POST" style="display:flex;flex-direction:column;gap:16px;">
+        <input type="hidden" name="action" value="tfa_verify"/>
+        <input type="hidden" name="user_id" value={tfaPendingId}/>
+        <div>
+          <label style="display:block;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6b7280;margin-bottom:6px;">Authenticator code</label>
+          <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="12" placeholder="123456" autofocus required style="width:100%;padding:12px 14px;border:1px solid rgba(0,0,0,0.15);border-radius:8px;font-size:18px;letter-spacing:0.18em;text-align:center;outline:none;background:#fafaf9;"/>
+        </div>
+        <button type="submit" style="background:#DC5000;color:#fff;border:none;font-size:15px;font-weight:700;padding:13px;border-radius:8px;cursor:pointer;">Verify</button>
+      </form>
+      <p style="font-size:12px;color:#6b7280;margin:14px 0 0;text-align:center;">Lost your phone? Enter one of your <strong>backup codes</strong> above.</p>
+      <form method="POST" style="text-align:center;margin-top:10px;">
+        <input type="hidden" name="action" value="cancel_tfa"/>
+        <button type="submit" style="background:transparent;border:none;color:#6b7280;font-size:13px;font-weight:600;cursor:pointer;text-decoration:underline;">Use a different account</button>
+      </form>
+    </div>
+  )}
+
+  {!requireFace && !requireTotp && (
     <div style="background:#fff;border:1px solid rgba(0,0,0,0.1);border-radius:16px;padding:24px;">
       <form method="POST" style="display:flex;flex-direction:column;gap:18px;">
         <input type="hidden" name="login_method" value="email"/>
@@ -269,7 +338,7 @@ if (Astro.request.method === 'POST') {
     </div>
   )}
 
-  {!requireFace && (
+  {!requireFace && !requireTotp && (
     <p style="text-align:center;font-size:14px;color:#6b7280;margin-top:20px;">
       New here? <a href="/portal/signup" style="color:#DC5000;font-weight:600;text-decoration:none;">Create an account</a>
     </p>

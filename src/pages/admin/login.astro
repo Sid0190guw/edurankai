@@ -58,6 +58,18 @@ if (pendingId) {
   } catch(e) {}
 }
 
+// Authenticator (TOTP) verification phase — password OK, awaiting the code.
+const tfaPendingId = Astro.cookies.get('admin_tfa_pending')?.value || '';
+let requireTotp = false;
+let tfaPendingName = '';
+if (tfaPendingId && !pendingId) {
+  requireTotp = true;
+  try {
+    const u = await db.select({ name: users.name }).from(users).where(eq(users.id, tfaPendingId)).limit(1);
+    tfaPendingName = u[0]?.name || '';
+  } catch (e) {}
+}
+
 if (Astro.request.method === 'POST') {
   const fd2 = await Astro.request.formData();
   const action = fd2.get('action') as string;
@@ -77,6 +89,12 @@ if (Astro.request.method === 'POST') {
           errorMsg = 'Account is inactive. Contact admin.';
         } else {
           const u = found[0];
+          // Authenticator 2FA takes priority — challenge before any session.
+          const { isTotpEnabled } = await import('@/lib/auth/twofactor');
+          if (await isTotpEnabled(u.id)) {
+            Astro.cookies.set('admin_tfa_pending', u.id, { path: '/', httpOnly: true, maxAge: 300, sameSite: 'lax' });
+            return Astro.redirect('/admin/login');
+          }
           // Check if face enrolled
           const faceCheck = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${u.id} AND is_active = true LIMIT 1`);
           const faceRows = Array.isArray(faceCheck) ? faceCheck : (faceCheck?.rows || []);
@@ -129,6 +147,27 @@ if (Astro.request.method === 'POST') {
       Astro.cookies.delete('face_pending_user', { path: '/' });
       requireFace = false;
     }
+  } else if (action === 'tfa_verify') {
+    const userId = (fd2.get('user_id') as string) || '';
+    const code = ((fd2.get('code') as string) || '').trim();
+    if (!userId || userId !== tfaPendingId) {
+      errorMsg = 'Session expired. Please sign in again.';
+      Astro.cookies.delete('admin_tfa_pending', { path: '/' });
+      requireTotp = false;
+    } else {
+      const { verifyLoginCode } = await import('@/lib/auth/twofactor');
+      const ok = await verifyLoginCode(userId, code);
+      if (!ok) {
+        errorMsg = 'That code is not right. Use the current code from your authenticator app, or a backup code.';
+      } else {
+        await startSession(userId, Astro.request, Astro.clientAddress, Astro.cookies);
+        Astro.cookies.delete('admin_tfa_pending', { path: '/' });
+        return Astro.redirect('/admin');
+      }
+    }
+  } else if (action === 'cancel_tfa') {
+    Astro.cookies.delete('admin_tfa_pending', { path: '/' });
+    return Astro.redirect('/admin/login');
   } else if (action === 'cancel_face') {
     Astro.cookies.delete('face_pending_user', { path: '/' });
     return Astro.redirect('/admin/login');
@@ -166,7 +205,27 @@ if (Astro.request.method === 'POST') {
 
     {errorMsg && <div class="error">{errorMsg}</div>}
 
-    {!requireFace ? (
+    {requireTotp ? (
+      <!-- Authenticator (TOTP) code -->
+      <div>
+        <p style="text-align:center;font-size:13px;color:#8a8a94;margin-bottom:4px;">Welcome back,</p>
+        <p style="text-align:center;font-size:16px;font-weight:600;color:#fff;margin-bottom:18px;">{tfaPendingName}</p>
+        <form method="POST">
+          <input type="hidden" name="action" value="tfa_verify" />
+          <input type="hidden" name="user_id" value={tfaPendingId} />
+          <div class="field">
+            <label class="label">6-digit code from your authenticator app</label>
+            <input name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="12" class="input" placeholder="123456" required autofocus style="text-align:center;letter-spacing:0.18em;font-size:18px;" />
+          </div>
+          <button type="submit" class="btn">Verify</button>
+        </form>
+        <p style="text-align:center;margin-top:12px;font-size:12px;color:#6e6e78;">Lost your phone? Enter a <strong style="color:#8a8a94;">backup code</strong> instead.</p>
+        <form method="POST">
+          <input type="hidden" name="action" value="cancel_tfa" />
+          <button type="submit" style="width:100%;background:none;border:none;color:#6e6e78;font-size:12px;cursor:pointer;padding:8px;">Use different account</button>
+        </form>
+      </div>
+    ) : !requireFace ? (
       <!-- Password login -->
       <form method="POST">
         <input type="hidden" name="action" value="password_login" />
