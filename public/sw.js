@@ -3,18 +3,65 @@
 // (browsers consider the SW updated if the file bytes differ).
 // v4: forced invalidation to clear black-screen state caused by a stale
 // pre-Astro-build worker that was still installed on some devices.
-const CACHE = 'edurankai-v5';
+// v6: add offline support (installed PWA works without a connection).
+const CACHE = 'edurankai-v6';
+const STATIC_CACHE = 'edurankai-static-v6';
+const PAGE_CACHE = 'edurankai-pages-v6';
+// Pre-cache a couple of useful pages so the very first offline launch works.
+const PRECACHE = ['/', '/resume'];
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
+  e.waitUntil(caches.open(PAGE_CACHE).then((c) => c.addAll(PRECACHE).catch(() => {})));
 });
 
 self.addEventListener('activate', (e) => {
-  // Drop every old cache so stale SWs on existing devices get evicted.
+  // Keep the current caches; evict everything older so stale SWs get cleaned up.
+  const keep = [CACHE, STATIC_CACHE, PAGE_CACHE];
   e.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
+      Promise.all(keys.filter((k) => keep.indexOf(k) < 0).map((k) => caches.delete(k)))
     ).then(() => self.clients.claim())
+  );
+});
+
+// Offline strategy (conservative — never serves stale private data):
+//   - /api, /admin, /portal      -> network only (dynamic / per-user)
+//   - cross-origin (CDN, fonts)  -> passthrough, no caching
+//   - static (/era, /_astro, assets) -> cache-first
+//   - other GET pages            -> network-first, fall back to cache, then a
+//                                   simple offline page.
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+  let url;
+  try { url = new URL(req.url); } catch (_) { return; }
+  if (url.origin !== self.location.origin) return;
+  const path = url.pathname;
+
+  if (path.startsWith('/api/') || path.startsWith('/admin') || path.startsWith('/portal')) return;
+
+  const isStatic = path.startsWith('/era/') || path.startsWith('/_astro/') ||
+    /\.(css|js|svg|woff2?|png|jpg|jpeg|gif|webp|ico|json|txt)$/i.test(path);
+
+  if (isStatic) {
+    event.respondWith(
+      caches.match(req).then((hit) => hit || fetch(req).then((resp) => {
+        if (resp && resp.ok) { const copy = resp.clone(); caches.open(STATIC_CACHE).then((c) => c.put(req, copy)); }
+        return resp;
+      }).catch(() => hit))
+    );
+    return;
+  }
+
+  event.respondWith(
+    fetch(req).then((resp) => {
+      if (resp && resp.ok && resp.type === 'basic') { const copy = resp.clone(); caches.open(PAGE_CACHE).then((c) => c.put(req, copy)); }
+      return resp;
+    }).catch(() => caches.match(req).then((hit) => hit || new Response(
+      '<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Offline — EduRankAI</title><body style="font-family:system-ui,sans-serif;text-align:center;padding:48px 24px;background:#faf8f3;color:#1a1a1a;"><h1 style="font-weight:700;">You are offline</h1><p style="color:#6b6b6b;">This page is not saved for offline use yet. Reconnect and try again.</p><a href="/" style="color:#FF4F00;font-weight:600;">Go to homepage</a></body>',
+      { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+    )))
   );
 });
 
