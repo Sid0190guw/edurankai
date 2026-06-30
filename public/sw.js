@@ -3,12 +3,12 @@
 // (browsers consider the SW updated if the file bytes differ).
 // v4: forced invalidation to clear black-screen state caused by a stale
 // pre-Astro-build worker that was still installed on some devices.
-// v6: add offline support (installed PWA works without a connection).
-const CACHE = 'edurankai-v6';
-const STATIC_CACHE = 'edurankai-static-v6';
-const PAGE_CACHE = 'edurankai-pages-v6';
+// v7: offline support + portal pages cached so employees can work offline.
+const CACHE = 'edurankai-v7';
+const STATIC_CACHE = 'edurankai-static-v7';
+const PAGE_CACHE = 'edurankai-pages-v7';
 // Pre-cache a couple of useful pages so the very first offline launch works.
-const PRECACHE = ['/', '/resume'];
+const PRECACHE = ['/', '/resume', '/portal/worklog'];
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
@@ -26,7 +26,9 @@ self.addEventListener('activate', (e) => {
 });
 
 // Offline strategy (conservative — never serves stale private data):
-//   - /api, /admin, /portal      -> network only (dynamic / per-user)
+//   - /api, /admin               -> network only (dynamic / admin-private)
+//   - /portal pages              -> network-first + cache so employees can work
+//                                   offline; per-device only (their own login).
 //   - cross-origin (CDN, fonts)  -> passthrough, no caching
 //   - static (/era, /_astro, assets) -> cache-first
 //   - other GET pages            -> network-first, fall back to cache, then a
@@ -39,7 +41,9 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
   const path = url.pathname;
 
-  if (path.startsWith('/api/') || path.startsWith('/admin') || path.startsWith('/portal')) return;
+  // API and the admin panel stay online-only (admin data must never be served
+  // from a stale cache). Portal pages are cached for offline employee work.
+  if (path.startsWith('/api/') || path.startsWith('/admin')) return;
 
   const isStatic = path.startsWith('/era/') || path.startsWith('/_astro/') ||
     /\.(css|js|svg|woff2?|png|jpg|jpeg|gif|webp|ico|json|txt)$/i.test(path);
