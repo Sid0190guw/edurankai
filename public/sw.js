@@ -6,9 +6,11 @@
 // v7: offline support + portal pages cached so employees can work offline.
 // v8: wider precache (careers, ecosystem) so the installed app opens more
 //     surfaces offline and repeat visits skip the server (lower DB compute).
-const CACHE = 'edurankai-v8';
-const STATIC_CACHE = 'edurankai-static-v8';
-const PAGE_CACHE = 'edurankai-pages-v8';
+// v9: pages are stale-while-revalidate — cached copy paints instantly,
+//     network refreshes in the background (speed on slow networks + offline).
+const CACHE = 'edurankai-v9';
+const STATIC_CACHE = 'edurankai-static-v9';
+const PAGE_CACHE = 'edurankai-pages-v9';
 // Pre-cache a couple of useful pages so the very first offline launch works.
 const PRECACHE = ['/', '/resume', '/portal/worklog', '/careers', '/ecosystem'];
 
@@ -27,14 +29,16 @@ self.addEventListener('activate', (e) => {
   );
 });
 
-// Offline strategy (conservative — never serves stale private data):
+// Offline strategy:
 //   - /api, /admin               -> network only (dynamic / admin-private)
-//   - /portal pages              -> network-first + cache so employees can work
-//                                   offline; per-device only (their own login).
 //   - cross-origin (CDN, fonts)  -> passthrough, no caching
 //   - static (/era, /_astro, assets) -> cache-first
-//   - other GET pages            -> network-first, fall back to cache, then a
-//                                   simple offline page.
+//   - pages (incl. /portal)      -> STALE-WHILE-REVALIDATE: a cached copy is
+//     served INSTANTLY and refreshed in the background. Repeat visits render
+//     immediately even on slow networks, offline "just works" for any page
+//     seen before, and background refreshes are absorbed by the CDN edge
+//     cache instead of waking the database. The cache is per-device (the
+//     user's own last view), so nobody ever sees anyone else's data.
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
@@ -60,15 +64,29 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  event.respondWith(
-    fetch(req).then((resp) => {
-      if (resp && resp.ok && resp.type === 'basic') { const copy = resp.clone(); caches.open(PAGE_CACHE).then((c) => c.put(req, copy)); }
+  event.respondWith((async () => {
+    const cached = await caches.match(req);
+    const refresh = fetch(req).then((resp) => {
+      if (resp && resp.ok && resp.type === 'basic') {
+        const copy = resp.clone();
+        caches.open(PAGE_CACHE).then((c) => c.put(req, copy));
+      }
       return resp;
-    }).catch(() => caches.match(req).then((hit) => hit || new Response(
-      '<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Offline — EduRankAI</title><body style="font-family:system-ui,sans-serif;text-align:center;padding:48px 24px;background:#faf8f3;color:#1a1a1a;"><h1 style="font-weight:700;">You are offline</h1><p style="color:#6b6b6b;">This page is not saved for offline use yet. Reconnect and try again.</p><a href="/" style="color:#FF4F00;font-weight:600;">Go to homepage</a></body>',
-      { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-    )))
-  );
+    });
+    if (cached) {
+      // Instant paint from cache; the network copy lands for the next visit.
+      event.waitUntil(refresh.catch(() => {}));
+      return cached;
+    }
+    try {
+      return await refresh;
+    } catch (_) {
+      return new Response(
+        '<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Offline — EduRankAI</title><body style="font-family:system-ui,sans-serif;text-align:center;padding:48px 24px;background:#faf8f3;color:#1a1a1a;"><h1 style="font-weight:700;">You are offline</h1><p style="color:#6b6b6b;">This page is not saved for offline use yet. Reconnect and try again.</p><a href="/" style="color:#FF4F00;font-weight:600;">Go to homepage</a></body>',
+        { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+      );
+    }
+  })());
 });
 
 // Push: render a RICH notification from the server payload — banner image,

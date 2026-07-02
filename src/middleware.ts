@@ -133,11 +133,14 @@ async function hasFaceEnrolled(userId: string): Promise<boolean> {
 const PUBLIC_CACHEABLE_EXACT = new Set([
   '/', '/careers', '/about', '/research', '/team', '/ecosystem',
   '/developers', '/faq', '/accessibility', '/policy', '/hei', '/events',
+  '/resume',
 ]);
 function isPublicCacheable(path: string): boolean {
   if (!path) return false;
   if (PUBLIC_CACHEABLE_EXACT.has(path)) return true;
   if (path.startsWith('/policy/')) return true;
+  // Public venture/product detail pages — content is the same for everyone.
+  if (/^\/ecosystem\/[^/]+$/.test(path)) return true;
   // Public role-detail pages (job descriptions); the two form pages stay dynamic.
   if (/^\/careers\/[^/]+$/.test(path) && path !== '/careers/fee-waiver' && path !== '/careers/hr-support') return true;
   return false;
