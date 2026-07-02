@@ -69,16 +69,30 @@ const engagementInfo: Record<string, string> = {
 };
 const engagementText = engagementInfo[r.engagementType] || '';
 
-// Parse "up to ₹120 LPA + equity" -> { max: 12000000 }. Conservative: only the
-// upper bound is structured, since the salary text is positioned that way.
-function parseLpa(text: string | null | undefined): number | null {
+// Parse the freeform salary text into a structured range for Google Jobs.
+// Understands both "up to ₹120 LPA + equity" and "INR 20,00,000 - 40,00,000
+// per annum" (Indian digit grouping). Monthly stipends are never structured.
+function parseSalaryINR(text: string | null | undefined): { min: number | null; max: number | null } | null {
   if (!text) return null;
-  const m = String(text).match(/(\d+(?:\.\d+)?)\s*LPA/i);
-  if (!m) return null;
-  const lpa = parseFloat(m[1]);
-  return Number.isFinite(lpa) ? Math.round(lpa * 100000) : null;
+  const s = String(text);
+  if (/month/i.test(s)) return null;
+  const lpa = s.match(/(\d+(?:\.\d+)?)\s*LPA/i);
+  if (lpa) {
+    const v = parseFloat(lpa[1]);
+    return Number.isFinite(v) ? { min: null, max: Math.round(v * 100000) } : null;
+  }
+  if (!/INR|₹|Rs\.?/i.test(s)) return null;
+  const nums = (s.match(/\d[\d,]{4,}/g) || [])
+    .map((n) => parseInt(n.replace(/,/g, ''), 10))
+    .filter((n) => Number.isFinite(n) && n >= 100000);
+  if (!nums.length) return null;
+  return { min: nums.length > 1 ? Math.min(...nums) : null, max: Math.max(...nums) };
 }
-const salaryMaxINR = parseLpa(r.salary);
+const salaryRange = parseSalaryINR(r.salary);
+const salaryMaxINR = salaryRange?.max ?? null;
+// On-site roles (e.g. Kolkata finance) must not be marked TELECOMMUTE, or
+// Google flags the listing. Remote is the default posture elsewhere.
+const isRemoteRole = !r.location || /remote|hybrid|worldwide|your campus|field/i.test(r.location);
 
 const expByLevel: Record<string, number> = {
   'C-Level': 12, 'Lead': 8, 'Senior': 5, 'Mid': 3, 'Junior': 1, 'Intern': 0, 'Apprentice': 0,
@@ -120,22 +134,24 @@ const jobPostingSchema: any = {
   },
   jobLocation: {
     '@type': 'Place',
-    address: { '@type': 'PostalAddress', addressCountry: 'IN', addressRegion: 'Remote / Worldwide' },
+    address: isRemoteRole
+      ? { '@type': 'PostalAddress', addressCountry: 'IN', addressRegion: 'Remote / Worldwide' }
+      : { '@type': 'PostalAddress', addressCountry: 'IN', addressLocality: r.location },
   },
-  jobLocationType: 'TELECOMMUTE',
-  applicantLocationRequirements: { '@type': 'Country', name: 'Any' },
 };
+if (isRemoteRole) {
+  jobPostingSchema.jobLocationType = 'TELECOMMUTE';
+  jobPostingSchema.applicantLocationRequirements = { '@type': 'Country', name: 'Any' };
+}
 // Intern + Apprentice compensation is NOT published — stipend is discussed at
 // the offer stage. JSON-LD baseSalary is only emitted for permanent roles.
 if (salaryMaxINR && r.level !== 'Intern' && r.level !== 'Apprentice') {
+  const salaryValue: any = { '@type': 'QuantitativeValue', maxValue: salaryMaxINR, unitText: 'YEAR' };
+  if (salaryRange?.min && salaryRange.min !== salaryMaxINR) salaryValue.minValue = salaryRange.min;
   jobPostingSchema.baseSalary = {
     '@type': 'MonetaryAmount',
     currency: 'INR',
-    value: {
-      '@type': 'QuantitativeValue',
-      maxValue: salaryMaxINR,
-      unitText: 'YEAR',
-    },
+    value: salaryValue,
   };
 }
 

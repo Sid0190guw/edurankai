@@ -77,7 +77,7 @@ export const PRODUCTS = [
     statusVariant: 'planning',
     href: '/ecosystem/sambandh',
     external: false,
-    description: 'Sanskrit for relationship. The connection layer for collaborative learning communities — purposeful matching between learners, educators, mentors, and peer cohorts. Designed around outcomes (did this connection actually help the learner), not engagement metrics.'
+    description: 'India’s only dating platform where every profile is verified by government ID and every profession is cross-checked — no fake doctors, no fake engineers, no catfish. Open intent, anonymous-first chat, and a reputation score shaped by real behaviour.'
   },
   {
     name: 'Sancharan',
@@ -85,7 +85,7 @@ export const PRODUCTS = [
     statusVariant: 'planning',
     href: '/ecosystem/sancharan',
     external: false,
-    description: 'Sanskrit for movement. A communication infrastructure for educational organisations — structured, asynchronous-first, attention-respecting. Now shipping as the in-house secure end-to-end encrypted chat at /portal/messages, built on the Web Crypto API with per-conversation derived keys.'
+    description: 'Journeys, reimagined. A consumer travel venture being built carefully in India for every kind of journey that matters — weekend trips, family vacations, pilgrimages, heritage circuits, educational tours, corporate offsites. No dark patterns, hidden fees, or fake urgency.'
   },
   {
     name: 'Sampark',
@@ -93,7 +93,7 @@ export const PRODUCTS = [
     statusVariant: 'planning',
     href: '/ecosystem/sampark',
     external: false,
-    description: 'Sanskrit for contact. The bridge between learning and the working world — internships, projects, and real-world application. Built as a learning-design problem, not a matching market, so both learners and host organisations genuinely benefit.'
+    description: 'A modern CRM and communication platform — every customer conversation, contact, and transaction in a single encrypted workspace. Lead-capture forms, instant messaging, video calls, pipeline, and integrated payments, without leaving the app.'
   },
   {
     name: 'Foundational Models',

@@ -4,9 +4,70 @@ import { db } from '@/lib/db';
 import { roles, departments } from '@/lib/db/schema';
 import { can } from '@/lib/auth/permissions';
 import { desc, eq, asc, ilike, and, or, SQL } from 'drizzle-orm';
+import { CATALOG_DEPARTMENTS, ROLE_CATALOG } from '@/data/role-catalog';
+import { getProductOptions, setRoleProducts, setRoleOpenings } from '@/lib/role-products';
+import { logAudit } from '@/lib/audit';
 
 const user = Astro.locals.user!;
 const canEdit = can(user, 'roles.edit');
+
+// Gap-filling import of the canonical role catalog. Idempotent and edit-safe:
+// a catalog role is inserted ONLY if no existing role shares its slug or its
+// normalized title (case/punctuation/plural-insensitive) — most roles were
+// hand-written in this panel already and must never be duplicated or touched.
+let importMsg = '';
+const normTitle = (s: string) =>
+  (s || '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(Boolean).map((w) => w.replace(/s$/, '')).join('');
+
+if (Astro.request.method === 'POST' && canEdit) {
+  const fd = await Astro.request.formData();
+  if (fd.get('_action') === 'import_catalog') {
+    try {
+      for (const d of CATALOG_DEPARTMENTS) {
+        await db.insert(departments).values({ id: d.id, name: d.name, icon: d.icon, description: d.description, sortOrder: 50 }).onConflictDoNothing();
+      }
+      const existing = await db.select({ slug: roles.slug, title: roles.title }).from(roles);
+      const haveSlugs = new Set(existing.map((r) => r.slug));
+      const haveTitles = new Set(existing.map((r) => normTitle(r.title)));
+      const productOptions = await getProductOptions();
+      const added: string[] = [];
+      let skipped = 0;
+      for (const c of ROLE_CATALOG) {
+        if (haveSlugs.has(c.slug) || haveTitles.has(normTitle(c.title))) { skipped++; continue; }
+        const inserted = await db.insert(roles).values({
+          slug: c.slug,
+          departmentId: c.departmentId,
+          title: c.title,
+          level: c.level,
+          function: c.function,
+          engagementType: c.engagementType,
+          location: c.location,
+          duration: c.duration,
+          salary: c.salary,
+          about: c.about,
+          responsibilities: c.responsibilities as string[],
+          skills: c.skills as string[],
+          eligibility: c.eligibility as string[],
+          isOpen: true,
+          isFeatured: !!c.isFeatured,
+          sortOrder: 50,
+        }).returning({ id: roles.id });
+        if (c.productMatch) {
+          const tags = productOptions.filter((p) => p.slug.includes(c.productMatch!) || p.name.toLowerCase().includes(c.productMatch!)).map((p) => p.slug);
+          if (tags.length) await setRoleProducts(inserted[0].id, tags);
+        }
+        if (c.openings) await setRoleOpenings(inserted[0].id, c.openings);
+        added.push(c.title);
+      }
+      await logAudit({ userId: user.id, action: 'role.import_catalog', entity: 'role', entityId: 'catalog', diff: { added, skipped }, ipAddress: Astro.clientAddress });
+      importMsg = added.length
+        ? 'Imported ' + added.length + ' new role' + (added.length === 1 ? '' : 's') + ' (' + skipped + ' already present, untouched): ' + added.join(' · ')
+        : 'Nothing to import — all ' + skipped + ' catalog roles already exist. Your roles were not touched.';
+    } catch (e: any) {
+      importMsg = 'Import failed: ' + (e?.cause?.message || e?.message || 'unknown error');
+    }
+  }
+}
 
 const url = new URL(Astro.request.url);
 const q = url.searchParams.get('q') || '';
@@ -44,9 +105,18 @@ const featuredCount = rolesList.filter(r => r.isFeatured).length;
         <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Roles</h1>
       </div>
       {canEdit && (
-        <a href="/admin/roles/new" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:12px;padding:8px 14px;border-radius:8px;text-decoration:none;">+ New Role</a>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <form method="POST" onsubmit="return confirm('Import the built-in role catalog? Only roles you do not already have will be added — existing roles are never changed.');" style="margin:0;">
+            <input type="hidden" name="_action" value="import_catalog" />
+            <button type="submit" style="background:#15151a;border:1px solid #2a2a30;color:#e8e8ee;font-weight:600;font-size:12px;padding:8px 14px;border-radius:8px;cursor:pointer;">Import catalog ({ROLE_CATALOG.length})</button>
+          </form>
+          <a href="/admin/roles/new" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:12px;padding:8px 14px;border-radius:8px;text-decoration:none;">+ New Role</a>
+        </div>
       )}
     </div>
+    {importMsg && (
+      <div style="margin:0 0 12px;background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.25);color:#93c5fd;border-radius:8px;padding:9px 12px;font-size:12px;line-height:1.5;">{importMsg}</div>
+    )}
 
     <!-- Stats -->
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;">

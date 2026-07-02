@@ -1,21 +1,49 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
-import { listResumes, deleteResume } from '@/lib/resume';
+import { listResumes, deleteResume, deleteResumes, deleteAllResumes, exportResumes } from '@/lib/resume';
+import { logAudit } from '@/lib/audit';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role !== 'super_admin') return Astro.redirect('/admin');
 
+const url = new URL(Astro.request.url);
+const q = (url.searchParams.get('q') || '').trim();
+
+// CSV export of the current filter — the "own the data" path.
+if (url.searchParams.get('export') === 'csv') {
+  const all = await exportResumes(q);
+  const esc = (v: any) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const head = 'id,full_name,email,phone,linkedin,template,level,account,created_at,summary';
+  const lines = all.map((r) => [r.id, r.full_name, r.email, r.phone, r.linkedin, r.template, r.level, r.user_id ? 'account' : 'guest', r.created_at ? new Date(r.created_at).toISOString() : '', r.summary].map(esc).join(','));
+  return new Response([head, ...lines].join('\n'), {
+    headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="resume-submissions.csv"' },
+  });
+}
+
 let okMsg = '';
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
-  if (fd.get('_action') === 'delete' && fd.get('id')) {
-    try { await deleteResume(fd.get('id') as string); okMsg = 'Resume deleted.'; } catch (_) {}
-  }
+  const action = fd.get('_action');
+  try {
+    if (action === 'delete' && fd.get('id')) {
+      await deleteResume(fd.get('id') as string);
+      okMsg = 'Resume deleted.';
+      await logAudit({ userId: user.id, action: 'resume.delete', entity: 'resume_submission', entityId: String(fd.get('id')), ipAddress: Astro.clientAddress });
+    } else if (action === 'delete_selected') {
+      const ids = fd.getAll('ids').map((v) => String(v)).filter(Boolean);
+      const n = await deleteResumes(ids);
+      okMsg = n + ' submission' + (n === 1 ? '' : 's') + ' deleted.';
+      await logAudit({ userId: user.id, action: 'resume.bulk_delete', entity: 'resume_submission', entityId: 'bulk', diff: { count: n }, ipAddress: Astro.clientAddress });
+    } else if (action === 'delete_all') {
+      const scope = String(fd.get('q') || '').trim();
+      const n = await deleteAllResumes(scope);
+      okMsg = n + ' submission' + (n === 1 ? '' : 's') + ' deleted' + (scope ? ' (matching "' + scope + '")' : '') + '.';
+      await logAudit({ userId: user.id, action: 'resume.delete_all', entity: 'resume_submission', entityId: 'all', diff: { count: n, filter: scope }, ipAddress: Astro.clientAddress });
+    }
+  } catch (_) { okMsg = ''; }
 }
 
-const url = new URL(Astro.request.url);
-const q = (url.searchParams.get('q') || '').trim();
 const items = await listResumes(q);
 const fmt = (d: any) => d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '-';
 ---
@@ -25,43 +53,87 @@ const fmt = (d: any) => d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asi
       <div class="admin-page-title-block">
         <div class="admin-page-eyebrow">Tools</div>
         <h1 class="admin-page-title">Resume Submissions</h1>
-        <p class="admin-page-sub">Every resume generated with the public builder — captured for quality &amp; security. Super-admin only. {items.length} total.</p>
+        <p class="admin-page-sub">Every resume generated with the public builder — captured for quality &amp; security. Super-admin only. {items.length} shown.</p>
       </div>
     </div>
 
     {okMsg && <div style="margin:0 0 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
 
-    <form method="GET" style="display:flex;gap:8px;margin-bottom:16px;max-width:460px;">
-      <input type="text" name="q" value={q} placeholder="Search name, email, title..." style="flex:1;background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;" />
-      <button type="submit" style="background:#FF4F00;border:none;color:#fff;font-size:13px;font-weight:600;padding:9px 16px;border-radius:8px;cursor:pointer;">Search</button>
-      {q && <a href="/admin/resumes" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:13px;text-decoration:none;padding:9px 14px;border-radius:8px;display:inline-flex;align-items:center;">Clear</a>}
-    </form>
+    <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center;">
+      <form method="GET" style="display:flex;gap:8px;flex:1;min-width:260px;max-width:460px;">
+        <input type="text" name="q" value={q} placeholder="Search name, email, title..." style="flex:1;background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;outline:none;" />
+        <button type="submit" style="background:#FF4F00;border:none;color:#fff;font-size:13px;font-weight:600;padding:9px 16px;border-radius:8px;cursor:pointer;">Search</button>
+        {q && <a href="/admin/resumes" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:13px;text-decoration:none;padding:9px 14px;border-radius:8px;display:inline-flex;align-items:center;">Clear</a>}
+      </form>
+      <a href={'/admin/resumes?export=csv' + (q ? '&q=' + encodeURIComponent(q) : '')} style="background:#15151a;border:1px solid #1a1a1f;color:#e8e8ee;font-size:13px;text-decoration:none;padding:9px 14px;border-radius:8px;font-weight:600;">Export CSV</a>
+      <form method="POST" onsubmit={'return confirm(\'Delete ALL ' + (q ? 'submissions matching this search' : items.length + ' submissions') + '? This cannot be undone.\');'}>
+        <input type="hidden" name="_action" value="delete_all" />
+        <input type="hidden" name="q" value={q} />
+        <button type="submit" style="font-size:13px;color:#fca5a5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);padding:9px 14px;border-radius:8px;cursor:pointer;font-weight:600;">{q ? 'Delete all matching' : 'Delete all'}</button>
+      </form>
+    </div>
 
     {items.length === 0 ? (
-      <div style="text-align:center;padding:48px;color:#6e6e78;font-size:13px;">No resume submissions yet.</div>
+      <div style="text-align:center;padding:48px;color:#6e6e78;font-size:13px;">No resume submissions{q ? ' match this search' : ' yet'}.</div>
     ) : (
-      <div style="display:flex;flex-direction:column;gap:8px;">
-        {items.map((r) => (
-          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:13px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-            <div style="flex:1;min-width:200px;">
-              <p style="font-size:14px;font-weight:600;color:#fff;margin:0;">{r.full_name || '(no name)'}
-                {r.user_id
-                  ? <span style="font-size:9px;font-weight:700;text-transform:uppercase;color:#60a5fa;background:rgba(96,165,250,0.12);padding:2px 7px;border-radius:100px;margin-left:8px;">Account</span>
-                  : <span style="font-size:9px;font-weight:700;text-transform:uppercase;color:#6e6e78;background:rgba(110,110,120,0.12);padding:2px 7px;border-radius:100px;margin-left:8px;">Guest</span>}
-              </p>
-              <p style="font-size:12px;color:#8a8a94;margin:3px 0 0;">{r.email || 'no email'} · {r.template || '-'}{r.level ? ' · ' + r.level : ''} · {fmt(r.created_at)}</p>
+      <form method="POST" id="bulkForm" onsubmit="return confirm('Delete the selected submissions? This cannot be undone.');">
+        <input type="hidden" name="_action" value="delete_selected" />
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+          <label style="display:inline-flex;align-items:center;gap:7px;font-size:12px;color:#8a8a94;cursor:pointer;">
+            <input type="checkbox" id="selAll" style="width:15px;height:15px;accent-color:#FF4F00;" /> Select all
+          </label>
+          <button type="submit" id="bulkDeleteBtn" disabled style="font-size:12px;color:#fca5a5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);padding:7px 12px;border-radius:7px;cursor:pointer;font-weight:600;opacity:0.45;">Delete selected (<span id="selCount">0</span>)</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          {items.map((r) => (
+            <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:13px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+              <input type="checkbox" name="ids" value={r.id} class="rowCheck" style="width:15px;height:15px;accent-color:#FF4F00;flex-shrink:0;" />
+              <div style="flex:1;min-width:200px;">
+                <p style="font-size:14px;font-weight:600;color:#fff;margin:0;">{r.full_name || '(no name)'}
+                  {r.user_id
+                    ? <span style="font-size:9px;font-weight:700;text-transform:uppercase;color:#60a5fa;background:rgba(96,165,250,0.12);padding:2px 7px;border-radius:100px;margin-left:8px;">Account</span>
+                    : <span style="font-size:9px;font-weight:700;text-transform:uppercase;color:#6e6e78;background:rgba(110,110,120,0.12);padding:2px 7px;border-radius:100px;margin-left:8px;">Guest</span>}
+                </p>
+                <p style="font-size:12px;color:#8a8a94;margin:3px 0 0;">{r.email || 'no email'} · {r.template || '-'}{r.level ? ' · ' + r.level : ''} · {fmt(r.created_at)}</p>
+              </div>
+              <div style="display:flex;gap:6px;align-items:center;">
+                <a href={'/admin/resumes/' + r.id} style="font-size:12px;color:#FF7040;text-decoration:none;padding:7px 12px;border:1px solid #1a1a1f;border-radius:7px;font-weight:600;">View / edit</a>
+                <button type="submit" form={'del-' + r.id} style="font-size:12px;color:#fca5a5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);padding:7px 12px;border-radius:7px;cursor:pointer;">Delete</button>
+              </div>
             </div>
-            <div style="display:flex;gap:6px;align-items:center;">
-              <a href={'/admin/resumes/' + r.id} style="font-size:12px;color:#FF7040;text-decoration:none;padding:7px 12px;border:1px solid #1a1a1f;border-radius:7px;font-weight:600;">View / edit</a>
-              <form method="POST" onsubmit="return confirm('Delete this submission?');">
-                <input type="hidden" name="_action" value="delete" />
-                <input type="hidden" name="id" value={r.id} />
-                <button type="submit" style="font-size:12px;color:#fca5a5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);padding:7px 12px;border-radius:7px;cursor:pointer;">Delete</button>
-              </form>
-            </div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      </form>
     )}
+    {items.map((r) => (
+      <form method="POST" id={'del-' + r.id} onsubmit="return confirm('Delete this submission?');" style="display:none;">
+        <input type="hidden" name="_action" value="delete" />
+        <input type="hidden" name="id" value={r.id} />
+      </form>
+    ))}
   </div>
+
+  <script is:inline>
+    (function () {
+      var all = document.getElementById('selAll');
+      var btn = document.getElementById('bulkDeleteBtn');
+      var count = document.getElementById('selCount');
+      if (!all || !btn) return;
+      function checks() { return Array.prototype.slice.call(document.querySelectorAll('.rowCheck')); }
+      function refresh() {
+        var n = checks().filter(function (c) { return c.checked; }).length;
+        count.textContent = String(n);
+        btn.disabled = n === 0;
+        btn.style.opacity = n === 0 ? '0.45' : '1';
+      }
+      all.addEventListener('change', function () {
+        checks().forEach(function (c) { c.checked = all.checked; });
+        refresh();
+      });
+      document.addEventListener('change', function (e) {
+        if (e.target && e.target.classList && e.target.classList.contains('rowCheck')) refresh();
+      });
+      refresh();
+    })();
+  </script>
 </AdminLayout>

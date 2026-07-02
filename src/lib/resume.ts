@@ -74,3 +74,41 @@ export async function deleteResume(id: string): Promise<void> {
   await ensureResumeSchema();
   await db.execute(sql`DELETE FROM resume_submissions WHERE id = ${id}`);
 }
+
+export async function deleteResumes(ids: string[]): Promise<number> {
+  if (!ids.length) return 0;
+  await ensureResumeSchema();
+  const r = await db.execute(sql`DELETE FROM resume_submissions WHERE id::text = ANY(${ids}::text[]) RETURNING id`);
+  return rows(r).length;
+}
+
+/** Delete every submission matching the current search filter ('' = truly all). */
+export async function deleteAllResumes(q = ''): Promise<number> {
+  await ensureResumeSchema();
+  const like = '%' + q + '%';
+  const r = await db.execute(sql`
+    DELETE FROM resume_submissions
+    ${q ? sql`WHERE email ILIKE ${like} OR full_name ILIKE ${like} OR COALESCE(data->>'title','') ILIKE ${like}` : sql``}
+    RETURNING id
+  `);
+  return rows(r).length;
+}
+
+/** Full rows for CSV export (respects the same search filter as the list). */
+export async function exportResumes(q = ''): Promise<any[]> {
+  try {
+    await ensureResumeSchema();
+    const like = '%' + q + '%';
+    const r = await db.execute(sql`
+      SELECT id, user_id, email, full_name, template, created_at,
+             COALESCE(data->>'level','') AS level,
+             COALESCE(data->>'phone','') AS phone,
+             COALESCE(data->>'linkedin','') AS linkedin,
+             COALESCE(data->>'summary','') AS summary
+      FROM resume_submissions
+      ${q ? sql`WHERE email ILIKE ${like} OR full_name ILIKE ${like} OR COALESCE(data->>'title','') ILIKE ${like}` : sql``}
+      ORDER BY created_at DESC LIMIT 2000
+    `);
+    return rows(r);
+  } catch { return []; }
+}
