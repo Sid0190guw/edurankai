@@ -5,6 +5,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { getMailConfig, saveMailConfig, ensureMailSchema, clearMailField } from '@/lib/mail';
 import { getImapConfig, saveImapConfig } from '@/lib/mail-imap';
+import { verifySmtp } from '@/lib/mail-transport';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -52,6 +53,36 @@ if (Astro.request.method === 'POST') {
         await clearMailField('from_address');
         okMsg = 'SMTP settings cleared. The mail system is now offline until you re-save.';
       } catch (e: any) { errMsg = 'Clear failed: ' + (e?.message || 'error'); }
+    } else if (action === 'use_imap_for_smtp') {
+      // One click to sendable: your inbound mailbox already authenticates, so
+      // reuse the same account for outbound. The SMTP server is derived from
+      // the IMAP host (imap.x -> smtp.x), the right port is auto-detected by
+      // verifying 587/STARTTLS then 465/TLS, and NOTHING is saved unless the
+      // server actually accepts the login.
+      const ic = await getImapConfig();
+      if (!ic.host || !ic.user || !ic.pass) {
+        errMsg = 'Inbound (IMAP) is not configured yet — fill and save the IMAP form below first, then click this again.';
+      } else {
+        const derived = /^imap\./i.test(ic.host) ? ic.host.replace(/^imap\./i, 'smtp.') : ic.host;
+        const hosts = derived === ic.host ? [ic.host] : [derived, ic.host];
+        const attempts: { host: string; port: number; secure: boolean }[] = [];
+        for (const h of hosts) { attempts.push({ host: h, port: 587, secure: false }, { host: h, port: 465, secure: true }); }
+        let saved = false, lastDetail = '';
+        for (const a of attempts) {
+          const v = await verifySmtp({ host: a.host, port: a.port, user: ic.user, pass: ic.pass, secure: a.secure });
+          if (v.ok) {
+            await saveMailConfig({
+              smtpHost: a.host, smtpPort: a.port, smtpUser: ic.user, smtpPass: ic.pass,
+              smtpSecure: a.secure, fromAddress: ic.user,
+            });
+            okMsg = 'Sending is LIVE — ' + v.detail + '. From address set to ' + ic.user + '. Now use "Send a test email" below to confirm it lands in an inbox.';
+            saved = true;
+            break;
+          }
+          lastDetail = v.detail + (v.hint ? ' — ' + v.hint : '');
+        }
+        if (!saved) errMsg = 'The mail server refused SMTP login with the inbound credentials (tried ' + hosts.join(', ') + ' on 587 and 465). Last error: ' + lastDetail + ' Many providers need a separate app password for SMTP — create one and use the manual form below.';
+      }
     } else if (action === 'save_imap') {
       const pass = (fd.get('imap_pass') as string || '').trim();
       await saveImapConfig({
@@ -113,6 +144,19 @@ const imapHasPass = !!imap.pass;
         <span id="verifyStatus" style="font-size:11.5px;color:var(--o-mid,#8a8a94);align-self:center;flex:1;min-width:200px;"></span>
       </div>
     </div>
+
+    <!-- One-click: reuse the working inbound account for sending -->
+    {imap.host && imap.user && (
+      <form method="POST" class="admin-card" style="margin-bottom:16px;border-color:rgba(255,79,0,0.35);">
+        <input type="hidden" name="_action" value="use_imap_for_smtp" />
+        <div class="admin-card-title" style="margin-bottom:6px;">Make sending work in one click</div>
+        <p style="font-size:12.5px;color:var(--o-mid,#8a8a94);margin:0 0 12px;line-height:1.65;">
+          Your inbound mailbox (<b style="color:#d8d8de;">{imap.user}</b> on <b style="color:#d8d8de;">{imap.host}</b>) already signs in successfully.
+          This reuses the same account for outbound: the SMTP server and port are detected automatically, the login is verified first, and nothing is saved unless it works.
+        </p>
+        <button type="submit" class="admin-btn-primary" style="padding:10px 22px;">Use my inbound mailbox for sending</button>
+      </form>
+    )}
 
     <!-- Provider presets -->
     <div class="admin-card" style="margin-bottom:16px;">

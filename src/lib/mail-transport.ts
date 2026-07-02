@@ -94,15 +94,29 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     maxConnections: 3,
   });
 
+  // Providers reject or spam-folder a From that doesn't match the account we
+  // authenticate as (sender-address enforcement). Keep the caller's display
+  // name but normalize the address to the configured from_address; the
+  // caller's intended address becomes Reply-To so responses still route.
+  let fromHeader = p.from;
+  let replyTo = p.replyTo;
+  const m = /^(.*?)<\s*([^>]+)\s*>\s*$/.exec(p.from || '');
+  const callerName = (m ? m[1] : '').trim().replace(/"/g, '') || c.fromName || 'EduRankAI';
+  const callerAddr = (m ? m[2] : p.from || '').trim();
+  if (c.fromAddress && callerAddr && callerAddr.toLowerCase() !== c.fromAddress.toLowerCase()) {
+    fromHeader = callerName + ' <' + c.fromAddress + '>';
+    if (!replyTo) replyTo = callerAddr;
+  }
+
   const mail = {
-    from: p.from,
+    from: fromHeader,
     to: toStr,
     cc: p.cc && p.cc.length ? p.cc.join(', ') : undefined,
     bcc: p.bcc && p.bcc.length ? p.bcc.join(', ') : undefined,
     subject: p.subject,
     html: p.html,
     text: p.text,
-    replyTo: p.replyTo,
+    replyTo,
     messageId: p.messageId,
     inReplyTo: p.inReplyTo,
     attachments: (p.attachments || []).map((a) => ({ filename: a.filename, path: a.href || a.path })),
@@ -115,7 +129,7 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     if (delays[attempt]) await new Promise((r) => setTimeout(r, delays[attempt]));
     try {
       const info = await transport.sendMail(mail);
-      await logOutbound({ messageId: info.messageId || p.messageId || '', to: toStr, from: p.from, subject: p.subject, status: 'sent', provider: 'smtp', error: null }).catch(() => {});
+      await logOutbound({ messageId: info.messageId || p.messageId || '', to: toStr, from: fromHeader, subject: p.subject, status: 'sent', provider: 'smtp', error: null }).catch(() => {});
       try { transport.close(); } catch (_) {}
       return { ok: true, provider: 'smtp', id: info.messageId };
     } catch (e: any) {
@@ -126,6 +140,6 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
   }
   try { transport.close(); } catch (_) {}
   console.error('[mail-transport] SMTP send failed after retries:', lastErr);
-  await logOutbound({ messageId: p.messageId || '', to: toStr, from: p.from, subject: p.subject, status: 'failed', provider: 'smtp', error: lastErr }).catch(() => {});
+  await logOutbound({ messageId: p.messageId || '', to: toStr, from: fromHeader, subject: p.subject, status: 'failed', provider: 'smtp', error: lastErr }).catch(() => {});
   return { ok: false, provider: 'smtp', error: lastErr };
 }
