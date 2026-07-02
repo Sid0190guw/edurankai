@@ -1,18 +1,46 @@
+// Single source of truth for the homepage (the stale home.js twin that used
+// to shadow this file at import time is deleted — Vite resolves .js before
+// .ts, so edits here never rendered while it existed).
 export const HERO = {
-  headline: 'Frontier AI,',
-  headlineEm: 'shipped.',
-  description: 'EduRankAI is a Bharat-built frontier AI lab. Twelve products live or in active build — a virtual university (AquinTutor) with verifiable credentials, the HEI Truth Report on Indian higher education, gamified assessments with anti-cheat instrumentation, a workspace of fourteen in-house tools (mail, chat, CRM, IDE, notebook, animation studio, resume builder, ...), a student feed with engagement-shaped but well-being-capped recommendations, an end-to-end encrypted secure messenger, proctoring infrastructure (ATLAS) sold to other platforms, frontier research projects (Akasha-Q × Viśvambhara), and a safety platform (karate.support). Every product designed to WCAG 2.1 AA, mobile-first 44px touch targets, indexed for Google rich results, and free where it matters.'
+  eyebrow: 'A frontier AI research lab',
+  headline: 'Foundational models for',
+  headlineEm: 'how humanity learns.',
+  description: 'EduRankAI is a research lab building the next generation of reasoning systems — models that learn from principles, adapt across domains, and reason in ways closer to how humans actually do. Built in Bharat. Open to the world.'
 };
 
 export const MISSION = {
-  eyebrow: 'Mission',
-  title: 'Education, rebuilt from <em>first principles.</em>',
+  eyebrow: 'The research',
+  title: 'Intelligence, rebuilt from <em>first principles.</em>',
   body: [
-    'Traditional education measures memorisation, rewards conformity, treats every learner as identical input. We are building the opposite - AI systems that develop whole humans across five dimensions: physical, mental, emotional, social, spiritual.',
-    'AquinTutor is the first proof: a self-paced virtual institution with six schools, verifiable credentials at public URLs, AI tutoring grounded in course content, and pricing that starts at ₹1 because access is the point. The HEI Truth Report is the second: independent investigative scoring on Indian universities, built on RTI evidence, not paid placements.',
-    'Every venture in the ecosystem is in production today, with the next layer (Sambandh, Sancharan, Sampark, foundational-model research) advancing on a public roadmap. No mystery boxes. No demos that do not ship.'
+    'Today\'s frontier models are extraordinary, but they learn in ways no human does. They memorise patterns over trillions of tokens. They reason without understanding. They scale, but they do not think.',
+    'EduRankAI is building the next architectural leap — foundational models that reason from principles, learn from experience, and adapt across domains. Not bigger versions of what exists. A different kind of mind entirely.',
+    'Our long-term thesis: superintelligence will not emerge from scaling alone. It will emerge from architectures that mirror how the most curious humans have always learned — by asking deeper questions than the answers in front of them.'
   ]
 };
+
+export const PILLARS = [
+  {
+    eyebrow: 'Research',
+    title: 'Foundational Models',
+    description: 'Reasoning-first architectures designed for the next decade of compute. The work that anchors everything else at EduRankAI.',
+    href: '/research',
+    cta: 'Read the thesis'
+  },
+  {
+    eyebrow: 'Applied AI',
+    title: 'Holistic Education Index',
+    description: 'A new way to rank universities. Grounded in education research, not citation cartels. Currently in academic advisory review.',
+    href: '/ecosystem/hei',
+    cta: 'See the methodology'
+  },
+  {
+    eyebrow: 'Careers',
+    title: 'Open roles',
+    description: 'We are hiring across every level, from senior leadership to research interns. Remote-first. Every application read personally.',
+    href: '/careers',
+    cta: 'View open roles'
+  }
+];
 
 export const PRODUCTS = [
   {

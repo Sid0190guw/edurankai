@@ -4,11 +4,13 @@
 // v4: forced invalidation to clear black-screen state caused by a stale
 // pre-Astro-build worker that was still installed on some devices.
 // v7: offline support + portal pages cached so employees can work offline.
-const CACHE = 'edurankai-v7';
-const STATIC_CACHE = 'edurankai-static-v7';
-const PAGE_CACHE = 'edurankai-pages-v7';
+// v8: wider precache (careers, ecosystem) so the installed app opens more
+//     surfaces offline and repeat visits skip the server (lower DB compute).
+const CACHE = 'edurankai-v8';
+const STATIC_CACHE = 'edurankai-static-v8';
+const PAGE_CACHE = 'edurankai-pages-v8';
 // Pre-cache a couple of useful pages so the very first offline launch works.
-const PRECACHE = ['/', '/resume', '/portal/worklog'];
+const PRECACHE = ['/', '/resume', '/portal/worklog', '/careers', '/ecosystem'];
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
