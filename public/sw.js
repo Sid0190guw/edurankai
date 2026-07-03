@@ -13,11 +13,14 @@
 //      Now fresh HTML wins whenever the network answers; the cache (and the
 //      precached home as a last resort) only serves when the network is dead
 //      or slower than 3.5s — which is exactly offline / flaky-network time.
-const CACHE = 'edurankai-v10';
-const STATIC_CACHE = 'edurankai-static-v10';
-const PAGE_CACHE = 'edurankai-pages-v10';
+// v11: precache the aerospace labs so the engineering tools work fully
+//      offline (they are self-contained pages with zero runtime API calls).
+const CACHE = 'edurankai-v11';
+const STATIC_CACHE = 'edurankai-static-v11';
+const PAGE_CACHE = 'edurankai-pages-v11';
 // Pre-cache a couple of useful pages so the very first offline launch works.
-const PRECACHE = ['/', '/resume', '/portal/worklog', '/careers', '/ecosystem'];
+const PRECACHE = ['/', '/resume', '/portal/worklog', '/careers', '/ecosystem',
+  '/aquintutor/labs', '/aquintutor/labs/flight-sim', '/aquintutor/labs/cad-bench', '/aquintutor/labs/vesper-bench'];
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
