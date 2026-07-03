@@ -13,6 +13,7 @@ import { sql } from 'drizzle-orm';
 import { createOrder, getPublicKeyId, isConfigured } from '@/lib/razorpay';
 import { convertToInrPaise } from '@/lib/fx';
 import { resolveApplicationFeeChf } from '@/lib/application-fee';
+import { computeCheckout, breakdownForNotes } from '@/lib/checkout-summary';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -93,13 +94,15 @@ export const POST: APIRoute = async ({ request, locals }) => {
         } catch (_) {}
       }
 
-      // Universal account credit: if the applicant's wallet covers the fee, pay
-      // from credit (works even if card payments aren't configured) - no charge.
+      // Holistic amount: base fee minus any active admin offer. Computed once
+      // here and reused for both the wallet-cover path and the card order.
+      const co = await computeCheckout({ roleFee: intentRow.role_fee, level: intentRow.level });
+
+      // Universal account credit: if the applicant's wallet covers the (net)
+      // fee, pay from credit (works even if card payments aren't configured).
       {
-        const feeChfC = resolveApplicationFeeChf({ roleFee: intentRow.role_fee, level: intentRow.level });
-        const fxC = await convertToInrPaise('CHF', feeChfC * 100);
         const { coverWithCredit } = await import('@/lib/account-credit');
-        const cov = await coverWithCredit({ userId: user.id, amountPaise: fxC.paise, purpose: 'application_fee_intent', referenceType: 'application_intent', referenceId: intentRow.id, email: intentRow.email || user.email || '', label: 'Application fee' });
+        const cov = await coverWithCredit({ userId: user.id, amountPaise: co.netInrPaise, purpose: 'application_fee_intent', referenceType: 'application_intent', referenceId: intentRow.id, email: intentRow.email || user.email || '', label: 'Application fee' });
         if (cov.covered) {
           let appIdC = cov.applicationId;
           if (!appIdC) { const aC = rowsOf(await db.execute(sql`SELECT id FROM applications WHERE applicant_user_id = ${user.id} ORDER BY created_at DESC LIMIT 1`).catch(() => []))[0] as any; appIdC = aC?.id; }
@@ -109,10 +112,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
       if (!isConfigured()) return json({ ok: false, error: 'Payments not yet configured.' }, 503);
 
-      const feeChf = resolveApplicationFeeChf({ roleFee: intentRow.role_fee, level: intentRow.level });
-      const fx = await convertToInrPaise('CHF', feeChf * 100);
-      const amountPaise = fx.paise;
+      const feeChf = co.baseChf;
+      const amountPaise = co.netInrPaise;
       const receipt = 'appint_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+      const bd = breakdownForNotes(co);
 
       const result = await createOrder({
         amountPaise, currency: 'INR', receipt,
@@ -120,7 +123,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
           purpose: 'application_fee_intent',
           intentId: intentRow.id, userId: user.id,
           email: intentRow.email || user.email || '',
-          feeChf: feeChf.toString(), fxRate: fx.rate.toString(), fxDate: fx.date,
+          feeChf: feeChf.toString(), fxRate: co.fxRate.toString(), fxDate: co.fxDate,
         },
       });
       if (!result.ok) return json({ ok: false, error: result.error }, 502);
@@ -132,14 +135,14 @@ export const POST: APIRoute = async ({ request, locals }) => {
         ) VALUES (
           ${result.order.id}, ${amountPaise}, 'INR', 'created', 'application_fee_intent',
           'application_intent', ${intentRow.id}, ${user.id}, ${intentRow.email || user.email || 'unknown@edurankai.in'},
-          ${sql.raw("'" + JSON.stringify({ receipt, intentId: intentRow.id, feeChf, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")}
+          ${sql.raw("'" + JSON.stringify({ receipt, intentId: intentRow.id, feeChf, fxRate: co.fxRate, fxDate: co.fxDate, fxLive: co.fxLive, breakdown: bd }).replace(/'/g, "''") + "'::jsonb")}
         )
       `).catch(() => {});
 
       const candidateName = ((intentRow.first_name || '') + ' ' + (intentRow.last_name || '')).trim();
       return json({
         ok: true, orderId: result.order.id, keyId: getPublicKeyId(),
-        amountPaise, currency: 'INR', feeChf, fxRate: fx.rate, fxDate: fx.date,
+        amountPaise, currency: 'INR', feeChf, fxRate: co.fxRate, fxDate: co.fxDate,
         roleTitle: intentRow.role_title_snapshot || '',
         prefill: { name: candidateName, email: intentRow.email || user.email || '' },
       });

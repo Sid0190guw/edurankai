@@ -95,6 +95,16 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
     const newId = ins[0]?.id as string | undefined;
     if (newId) {
       await db.execute(sql`DELETE FROM application_intents WHERE id = ${intent.id}`).catch(() => {});
+      // A waived application still gets a receipt: record a 0-value "paid" row
+      // flagged as a waiver so /receipt/[order] can render it and say so.
+      if (opts.waiverGranted) {
+        const orderId = 'WAIVER-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+        const notes = JSON.stringify({ waiver: true, waiverReason: opts.waiverReason || 'Application fee waived', breakdown: { baseInrPaise: 0, offerDiscountPaise: 0, netInrPaise: 0 } }).replace(/'/g, "''");
+        await db.execute(sql`
+          INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
+          VALUES (${orderId}, 0, 'INR', 'paid', 'application_fee_waived', 'application', ${newId}, ${intent.user_id}, ${d.email || intent.email || ''}, ${sql.raw("'" + notes + "'::jsonb")})
+        `).catch(() => {});
+      }
     }
     return newId || null;
   } catch (e) { return null; }
