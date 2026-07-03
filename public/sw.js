@@ -15,12 +15,13 @@
 //      or slower than 3.5s — which is exactly offline / flaky-network time.
 // v11: precache the aerospace labs so the engineering tools work fully
 //      offline (they are self-contained pages with zero runtime API calls).
-const CACHE = 'edurankai-v11';
-const STATIC_CACHE = 'edurankai-static-v11';
-const PAGE_CACHE = 'edurankai-pages-v11';
+const CACHE = 'edurankai-v12';
+const STATIC_CACHE = 'edurankai-static-v12';
+const PAGE_CACHE = 'edurankai-pages-v12';
 // Pre-cache a couple of useful pages so the very first offline launch works.
 const PRECACHE = ['/', '/resume', '/portal/worklog', '/careers', '/ecosystem',
-  '/aquintutor/labs', '/aquintutor/labs/flight-sim', '/aquintutor/labs/cad-bench', '/aquintutor/labs/vesper-bench'];
+  '/aquintutor/labs', '/aquintutor/labs/flight-sim', '/aquintutor/labs/cad-bench', '/aquintutor/labs/vesper-bench',
+  '/aquintutor/labs/cad-studio'];
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
