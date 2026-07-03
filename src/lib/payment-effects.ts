@@ -131,10 +131,17 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
     // (that is the pile-up admins saw). Attach the payment to the existing app,
     // drop the intent, flag the extra charge, and let an admin decide refund/credit
     // — never auto-touch money.
-    if (roleIdSafe && userIdSafe) {
+    const dupeEmail = String(d.email || intent.email || '').trim().toLowerCase();
+    if (roleIdSafe && (userIdSafe || dupeEmail)) {
+      // Match by user id OR email: guest applicants have no user id, and the
+      // user-id-only guard let their duplicate rows through.
       const dupe = rows(await db.execute(sql`
         SELECT id FROM applications
-        WHERE applicant_user_id = ${userIdSafe} AND role_id = ${roleIdSafe}
+        WHERE role_id = ${roleIdSafe}
+          AND (
+            (${userIdSafe}::uuid IS NOT NULL AND applicant_user_id = ${userIdSafe})
+            OR (${dupeEmail} <> '' AND LOWER(email) = ${dupeEmail})
+          )
         ORDER BY created_at ASC LIMIT 1
       `).catch(() => []))[0] as any;
       if (dupe?.id) {
@@ -195,6 +202,29 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
         const { pushNotify } = await import('@/lib/push');
         const name = ((d.firstName || '') + ' ' + (d.lastName || '')).trim() || d.email || 'Applicant';
         if (newAppId) await pushNotify.newApplication(name, d.roleTitleSnapshot || 'a role', newAppId);
+      } catch (_) {}
+      // Email the payment receipt (view/print at /receipt/<order>). Best-effort:
+      // a mail failure must never affect the payment flow.
+      try {
+        const rcptEmail = String(d.email || intent.email || '').trim();
+        if (newAppId && rcptEmail) {
+          const { sendExternal } = await import('@/lib/mail-transport');
+          const link = 'https://edurankai.in/receipt/' + encodeURIComponent(orderId) + '?e=' + encodeURIComponent(rcptEmail.toLowerCase());
+          const nm = ((d.firstName || '') + ' ' + (d.lastName || '')).trim();
+          await sendExternal({
+            from: 'EduRankAI <connect@edurankai.in>',
+            to: rcptEmail,
+            subject: 'Payment received — your EduRankAI receipt',
+            html: '<div style="font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:32px 24px;color:#1a1a1a;">'
+              + '<p style="font-size:13px;letter-spacing:2px;text-transform:uppercase;color:#FF4F00;margin:0 0 18px;">EduRankAI</p>'
+              + '<h1 style="font-size:21px;font-weight:600;margin:0 0 14px;">Payment received' + (nm ? ', ' + nm : '') + '.</h1>'
+              + '<p style="font-size:15px;line-height:1.7;margin:0 0 10px;">Your application fee has been received and your application is confirmed. Your receipt is ready — you can view, download, or print it any time:</p>'
+              + '<a href="' + link + '" style="display:inline-block;background:#FF4F00;color:#ffffff;text-decoration:none;font-size:15px;font-weight:600;padding:12px 22px;border-radius:8px;margin:8px 0 18px;">View my receipt</a>'
+              + '<p style="font-size:12.5px;color:#8a8a8a;line-height:1.6;margin:0;">Questions about this payment? Reply to this email quoting your receipt link.</p>'
+              + '</div>',
+            text: 'Payment received. View your receipt: ' + link,
+          });
+        }
       } catch (_) {}
     } catch (e: any) {
       // The full insert failed (usually a bad date or an over-long field in the

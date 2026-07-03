@@ -93,7 +93,7 @@ async function run(): Promise<{ ok: boolean; sent: number; skipped: number }> {
         : 'Pick up where you left off — your EduRankAI application';
       try {
         const res = await sendExternal({
-          from: 'EduRankAI Careers <hr@edurankai.in>',
+          from: 'EduRankAI Careers <connect@edurankai.in>',
           to: c.email,
           subject,
           html: emailHtml(String(c.first_name || ''), step, isFinal),

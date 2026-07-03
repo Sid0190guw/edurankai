@@ -6,11 +6,16 @@
 // v7: offline support + portal pages cached so employees can work offline.
 // v8: wider precache (careers, ecosystem) so the installed app opens more
 //     surfaces offline and repeat visits skip the server (lower DB compute).
-// v9: pages are stale-while-revalidate — cached copy paints instantly,
-//     network refreshes in the background (speed on slow networks + offline).
-const CACHE = 'edurankai-v9';
-const STATIC_CACHE = 'edurankai-static-v9';
-const PAGE_CACHE = 'edurankai-pages-v9';
+// v9: pages were stale-while-revalidate.
+// v10: navigations are network-first with a 3.5s timeout. Serving stale HTML
+//      first (v9) broke pages right after a deploy: the old HTML referenced
+//      hashed CSS/JS that no longer existed, so the site rendered unstyled.
+//      Now fresh HTML wins whenever the network answers; the cache (and the
+//      precached home as a last resort) only serves when the network is dead
+//      or slower than 3.5s — which is exactly offline / flaky-network time.
+const CACHE = 'edurankai-v10';
+const STATIC_CACHE = 'edurankai-static-v10';
+const PAGE_CACHE = 'edurankai-pages-v10';
 // Pre-cache a couple of useful pages so the very first offline launch works.
 const PRECACHE = ['/', '/resume', '/portal/worklog', '/careers', '/ecosystem'];
 
@@ -65,7 +70,6 @@ self.addEventListener('fetch', (event) => {
   }
 
   event.respondWith((async () => {
-    const cached = await caches.match(req);
     const refresh = fetch(req).then((resp) => {
       if (resp && resp.ok && resp.type === 'basic') {
         const copy = resp.clone();
@@ -73,14 +77,23 @@ self.addEventListener('fetch', (event) => {
       }
       return resp;
     });
-    if (cached) {
-      // Instant paint from cache; the network copy lands for the next visit.
-      event.waitUntil(refresh.catch(() => {}));
-      return cached;
-    }
     try {
-      return await refresh;
+      // Fresh HTML wins whenever the network answers in time; the cache only
+      // takes over when the connection is dead or slower than 3.5 seconds.
+      return await Promise.race([
+        refresh,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('sw-timeout')), 3500)),
+      ]);
     } catch (_) {
+      refresh.catch(() => {}); // let the background fetch settle silently
+      const hit = await caches.match(req, { ignoreSearch: true });
+      if (hit) return hit;
+      // An installed app must always open: fall back to the precached home
+      // for any navigation we have no exact cache for.
+      if (req.mode === 'navigate') {
+        const home = await caches.match('/', { ignoreSearch: true });
+        if (home) return home;
+      }
       return new Response(
         '<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Offline — EduRankAI</title><body style="font-family:system-ui,sans-serif;text-align:center;padding:48px 24px;background:#faf8f3;color:#1a1a1a;"><h1 style="font-weight:700;">You are offline</h1><p style="color:#6b6b6b;">This page is not saved for offline use yet. Reconnect and try again.</p><a href="/" style="color:#FF4F00;font-weight:600;">Go to homepage</a></body>',
         { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
