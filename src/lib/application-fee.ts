@@ -6,24 +6,34 @@
 
 export type RoleLevel = 'C-Level' | 'Lead' | 'Senior' | 'Mid' | 'Junior' | 'Intern' | 'Apprentice' | string | null | undefined;
 
+// Policy (announced 2026-07): internships and apprenticeships carry NO
+// application fee. This is enforced centrally here so every surface (fee
+// display, pay page, submission) agrees no matter what a role row says.
+export function isFeeExempt(level: RoleLevel): boolean {
+  const l = (level || '').toString();
+  return l === 'Intern' || l === 'Apprentice';
+}
+
 // Fallback for any role missing application_fee_amount. Aligned with the
-// current scale: Intern/Junior 1, Mid 5, Senior 10, Lead 50, C-Level 100.
+// current scale: Junior 1, Mid 5, Senior 10, Lead 50, C-Level 100.
+// Intern / Apprentice are free (fee-exempt) regardless.
 export function applicationFeeChf(level: RoleLevel): number {
-  switch ((level || 'Intern')) {
+  if (isFeeExempt(level)) return 0;
+  switch ((level || 'Junior')) {
     case 'C-Level':              return 100;
     case 'Lead':                 return 50;
     case 'Senior':               return 10;
     case 'Mid':                  return 5;
     case 'Junior':
-    case 'Intern':
-    case 'Apprentice':
     default:                     return 1;
   }
 }
 
 // Resolve the fee in CHF for an application: per-role amount if present,
-// otherwise the level-tiered default.
+// otherwise the level-tiered default. Interns/apprentices are always 0, even
+// if a stale role row carries an application_fee_amount.
 export function resolveApplicationFeeChf(opts: { roleFee?: number | string | null; level?: RoleLevel }): number {
+  if (isFeeExempt(opts.level)) return 0;
   if (opts.roleFee != null && opts.roleFee !== '') {
     const n = Number(opts.roleFee);
     if (Number.isFinite(n) && n > 0) return n;
