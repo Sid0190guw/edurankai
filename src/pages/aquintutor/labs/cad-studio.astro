@@ -82,6 +82,16 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
         <button type="button" class="cs-btn" data-add="cone">Cone</button>
         <button type="button" class="cs-btn" data-add="tube">Tube</button>
       </div>
+      <div class="cs-cat">Sketches (Phase 2)</div>
+      <div class="cs-addrow">
+        <select id="skPlane" style="background:#11131a;color:#e8e8ee;border:1px solid #2a2a35;border-radius:6px;padding:5px;font-size:10px;">
+          <option value="XZ">Top (XZ)</option>
+          <option value="XY">Front (XY)</option>
+          <option value="YZ">Right (YZ)</option>
+        </select>
+        <button type="button" class="cs-btn" id="skNew">New sketch</button>
+      </div>
+      <div id="skList"></div>
       <div class="cs-cat">Feature history</div>
       <div id="csTree"></div>
       <div class="cs-cat" style="margin-top:12px;">Selected feature</div>
@@ -91,6 +101,20 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
       <canvas id="glCanvas"></canvas>
       <div class="cs-measure" id="csMeasure"></div>
       <div class="cs-hint">drag: rotate &middot; wheel/pinch: zoom &middot; shift-drag: pan &middot; every edit regenerates the solid</div>
+      <div id="skEditor" style="position:absolute;inset:0;background:#0b0d13;display:none;">
+        <canvas id="skCanvas" style="position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:crosshair;"></canvas>
+        <div style="position:absolute;left:10px;top:10px;display:flex;gap:5px;flex-wrap:wrap;">
+          <button type="button" class="cs-btn sk-tool on" data-tool="select">Select</button>
+          <button type="button" class="cs-btn sk-tool" data-tool="line">Line</button>
+          <button type="button" class="cs-btn sk-tool" data-tool="circle">Circle</button>
+          <button type="button" class="cs-btn sk-tool" data-tool="dim">Dimension</button>
+          <button type="button" class="cs-btn sk-tool" data-tool="h">Horizontal</button>
+          <button type="button" class="cs-btn sk-tool" data-tool="v">Vertical</button>
+          <button type="button" class="cs-btn sk-tool" data-tool="delete">Delete</button>
+          <button type="button" class="cs-btn" id="skFinish" style="background:#FF4F00;color:#fff;border-color:#FF4F00;">Finish sketch</button>
+        </div>
+        <div id="skStatus" style="position:absolute;left:12px;bottom:10px;font-family:'Geist Mono',monospace;font-size:10.5px;color:#89a;pointer-events:none;text-shadow:0 1px 2px #000;"></div>
+      </div>
     </div>
     <div class="cs-right">
       <h3>Document</h3>
@@ -308,8 +332,192 @@ var PARAM_DEFS = {
   sphere:   [['r','Radius',2,120,20,0.5]],
   cone:     [['r','Base radius',2,120,18,0.5],['h','Height',4,240,36,1]],
   tube:     [['ro','Outer radius',3,120,16,0.5],['ri','Inner radius',1,118,10,0.5],['h','Height',2,240,30,1]],
+  extrude:  [['depth','Depth',1,240,20,1]],
+  revolve:  [['angle','Angle (deg)',15,360,360,5]],
 };
 var XFORM_DEFS = [['x','Pos X',-200,200,0,1],['y','Pos Y',-200,200,0,1],['z','Pos Z',-200,200,0,1],['rx','Rot X (deg)',-180,180,0,5],['ry','Rot Y (deg)',-180,180,0,5],['rz','Rot Z (deg)',-180,180,0,5]];
+
+// ============================ PHASE 2: constrained sketcher ============================
+// Sketch model: points in (u,v) mm, line/circle entities, constraints solved
+// by iterative sequential projection (position-based) - the same family of
+// numeric solvers used by lightweight parametric tools.
+var SKETCHES = [], SKID = 1, curSketch = null;
+function newSketch(plane){
+  var s = { id:SKID++, name:'Sketch ' + SKID, plane:plane, offset:0, points:[], lines:[], circles:[], cons:[], _pid:1 };
+  SKETCHES.push(s);
+  return s;
+}
+function skPt(s, u, v){ var p = { id:s._pid++, u:u, v:v }; s.points.push(p); return p; }
+function skP(s, id){ return s.points.find(function(p){ return p.id === id; }); }
+
+function solveSketch(s){
+  for (var it=0; it<220; it++){
+    s.cons.forEach(function(c){
+      if (c.type === 'h'){
+        var l = s.lines.find(function(x){ return x.id === c.a; }); if (!l) return;
+        var p1 = skP(s, l.p1), p2 = skP(s, l.p2), m = (p1.v + p2.v)/2;
+        p1.v = m; p2.v = m;
+      } else if (c.type === 'v'){
+        var l = s.lines.find(function(x){ return x.id === c.a; }); if (!l) return;
+        var p1 = skP(s, l.p1), p2 = skP(s, l.p2), m = (p1.u + p2.u)/2;
+        p1.u = m; p2.u = m;
+      } else if (c.type === 'dist'){
+        var l = s.lines.find(function(x){ return x.id === c.a; }); if (!l) return;
+        var p1 = skP(s, l.p1), p2 = skP(s, l.p2);
+        var du = p2.u - p1.u, dv = p2.v - p1.v, d = Math.hypot(du, dv) || 1e-6;
+        var err = (c.value - d)/d/2;
+        p1.u -= du*err; p1.v -= dv*err; p2.u += du*err; p2.v += dv*err;
+      } else if (c.type === 'radius'){
+        var ci = s.circles.find(function(x){ return x.id === c.a; }); if (ci) ci.r = c.value;
+      }
+    });
+  }
+}
+// closed-loop detection: every profile point must join exactly two lines.
+function sketchLoops(s){
+  var adj = {};
+  s.lines.forEach(function(l){ (adj[l.p1] = adj[l.p1] || []).push(l); (adj[l.p2] = adj[l.p2] || []).push(l); });
+  var used = {}, loops = [];
+  s.lines.forEach(function(start){
+    if (used[start.id]) return;
+    var loop = [start.p1], cur = start.p2, curLine = start; used[start.id] = true;
+    var guard = 0;
+    while (cur !== start.p1 && guard++ < 500){
+      loop.push(cur);
+      var next = (adj[cur] || []).find(function(l){ return !used[l.id]; });
+      if (!next) { loop = null; break; }
+      used[next.id] = true;
+      cur = next.p1 === cur ? next.p2 : next.p1;
+      curLine = next;
+    }
+    if (loop && cur === start.p1 && loop.length >= 3) loops.push(loop.map(function(id){ var p = skP(s, id); return [p.u, p.v]; }));
+  });
+  s.circles.forEach(function(c){
+    var ctr = skP(s, c.c), pts = [];
+    for (var i=0;i<24;i++){ var a = i/24*2*Math.PI; pts.push([ctr.u + c.r*Math.cos(a), ctr.v + c.r*Math.sin(a)]); }
+    loops.push(pts);
+  });
+  return loops;
+}
+function signedArea(loop){ var a = 0; for (var i=0;i<loop.length;i++){ var p = loop[i], q = loop[(i+1)%loop.length]; a += p[0]*q[1] - q[0]*p[1]; } return a/2; }
+function pointInLoop(pt, loop){
+  var inside = false;
+  for (var i=0, j=loop.length-1; i<loop.length; j=i++){
+    if ((loop[i][1] > pt[1]) !== (loop[j][1] > pt[1]) &&
+        pt[0] < (loop[j][0]-loop[i][0]) * (pt[1]-loop[i][1]) / (loop[j][1]-loop[i][1]) + loop[i][0]) inside = !inside;
+  }
+  return inside;
+}
+// ear-clipping triangulation of a simple (possibly concave) CCW polygon
+function earClip(loop){
+  var idx = loop.map(function(_, i){ return i; }), tris = [], guard = 0;
+  function convex(a, b, c){ return (loop[b][0]-loop[a][0])*(loop[c][1]-loop[a][1]) - (loop[b][1]-loop[a][1])*(loop[c][0]-loop[a][0]) > 0; }
+  function inTri(p, a, b, c){
+    function sgn(p1, p2, p3){ return (p1[0]-p3[0])*(p2[1]-p3[1]) - (p2[0]-p3[0])*(p1[1]-p3[1]); }
+    var d1 = sgn(p, loop[a], loop[b]), d2 = sgn(p, loop[b], loop[c]), d3 = sgn(p, loop[c], loop[a]);
+    return !(((d1<0)||(d2<0)||(d3<0)) && ((d1>0)||(d2>0)||(d3>0)));
+  }
+  while (idx.length > 3 && guard++ < 2000){
+    var clipped = false;
+    for (var i=0;i<idx.length;i++){
+      var a = idx[(i+idx.length-1)%idx.length], b = idx[i], c = idx[(i+1)%idx.length];
+      if (!convex(a, b, c)) continue;
+      var ear = true;
+      for (var k=0;k<idx.length;k++){
+        var m = idx[k];
+        if (m === a || m === b || m === c) continue;
+        if (inTri(loop[m], a, b, c)){ ear = false; break; }
+      }
+      if (ear){ tris.push([a, b, c]); idx.splice(i, 1); clipped = true; break; }
+    }
+    if (!clipped) break;
+  }
+  if (idx.length === 3) tris.push([idx[0], idx[1], idx[2]]);
+  return tris;
+}
+// sketch-plane (u,v,w) -> world
+function planeMap(plane, offset){
+  if (plane === 'XY') return function(u, v, w){ return [u, v, offset + w]; };
+  if (plane === 'YZ') return function(u, v, w){ return [offset + w, v, u]; };
+  return function(u, v, w){ return [u, offset + w, v]; }; // XZ (top)
+}
+function extrudeSketch(s, depth){
+  var loops = sketchLoops(s).map(function(l){ return signedArea(l) < 0 ? l.slice().reverse() : l; });
+  if (!loops.length) return [];
+  // outer loops = not contained in any other; the rest are holes
+  var outers = [], holes = [];
+  loops.forEach(function(l, i){
+    var inside = loops.some(function(o, j){ return j !== i && pointInLoop(l[0], o); });
+    (inside ? holes : outers).push(l);
+  });
+  var toW = planeMap(s.plane, s.offset);
+  function prism(loop){
+    var polys = [], n = loop.length;
+    for (var i=0;i<n;i++){
+      var a = loop[i], b = loop[(i+1)%n];
+      var q = [toW(a[0],a[1],0), toW(b[0],b[1],0), toW(b[0],b[1],depth), toW(a[0],a[1],depth)];
+      var nm = vNorm(vCross(vSub(q[1],q[0]), vSub(q[3],q[0])));
+      polys.push(new Poly(q.map(function(p){ return new Vtx(p, nm.slice()); })));
+    }
+    var capN = vNorm(vSub(toW(0,0,1), toW(0,0,0)));
+    earClip(loop).forEach(function(t){
+      var top = [loop[t[0]], loop[t[1]], loop[t[2]]].map(function(p){ return new Vtx(toW(p[0],p[1],depth), capN.slice()); });
+      var bot = [loop[t[2]], loop[t[1]], loop[t[0]]].map(function(p){ return new Vtx(toW(p[0],p[1],0), vMul(capN,-1)); });
+      polys.push(new Poly(top), new Poly(bot));
+    });
+    return polys;
+  }
+  var solid = null;
+  outers.forEach(function(l){ var pr = prism(l); solid = solid ? csgUnion(solid, pr) : pr; });
+  holes.forEach(function(l){ if (solid) solid = csgSubtract(solid, prism(l)); });
+  return solid || [];
+}
+function revolveSketch(s, angleDeg){
+  // revolve the profile around the sketch v-axis (u = 0); profile must sit at u >= 0
+  var loops = sketchLoops(s);
+  if (!loops.length) return [];
+  var toW = planeMap(s.plane, s.offset);
+  var axisO = toW(0, 0, 0), axisD = vNorm(vSub(toW(0, 1, 0), axisO));
+  var uD = vNorm(vSub(toW(1, 0, 0), axisO)), wD = vNorm(vSub(toW(0, 0, 1), axisO));
+  var SEG = 28, ang = Math.max(0.05, Math.min(2*Math.PI, angleDeg*Math.PI/180));
+  function place(u, v, th){
+    var r = Math.max(0, u);
+    return vAdd(vAdd(axisO, vMul(axisD, v)), vAdd(vMul(uD, r*Math.cos(th)), vMul(wD, r*Math.sin(th))));
+  }
+  var polys = [];
+  loops.forEach(function(loop){
+    if (signedArea(loop) < 0) loop = loop.slice().reverse();
+    for (var i=0;i<loop.length;i++){
+      var a = loop[i], b = loop[(i+1)%loop.length];
+      for (var st=0; st<SEG; st++){
+        var t1 = st/SEG*ang, t2 = (st+1)/SEG*ang;
+        var q = [place(a[0],a[1],t1), place(b[0],b[1],t1), place(b[0],b[1],t2), place(a[0],a[1],t2)];
+        // drop degenerate quads on the axis
+        if (vLen(vSub(q[0],q[1])) < 1e-4 && vLen(vSub(q[2],q[3])) < 1e-4) continue;
+        var verts = [];
+        if (vLen(vSub(q[0],q[3])) < 1e-4) verts = [q[0],q[1],q[2]];
+        else if (vLen(vSub(q[1],q[2])) < 1e-4) verts = [q[0],q[1],q[3]];
+        else verts = q;
+        var nm = vNorm(vCross(vSub(verts[1],verts[0]), vSub(verts[2],verts[0])));
+        if (!isFinite(nm[0])) continue;
+        polys.push(new Poly(verts.map(function(p){ return new Vtx(p.slice(), nm.slice()); })));
+      }
+    }
+    if (ang < 2*Math.PI - 1e-3){
+      // end caps for partial revolves
+      var capT = earClip(loop);
+      [0, ang].forEach(function(th, k){
+        capT.forEach(function(t){
+          var pts = [loop[t[0]], loop[t[1]], loop[t[2]]].map(function(p){ return place(p[0], p[1], th); });
+          if (k === 0) pts.reverse();
+          var nm = vNorm(vCross(vSub(pts[1],pts[0]), vSub(pts[2],pts[0])));
+          if (isFinite(nm[0])) polys.push(new Poly(pts.map(function(p){ return new Vtx(p, nm.slice()); })));
+        });
+      });
+    }
+  });
+  return polys;
+}
 
 // ============================ document / feature model ============================
 var FID = 1;
@@ -329,7 +537,14 @@ var features = defaultDoc(), selected = null, SOLID = [];
 var undoStack = [];
 function snapshot(){ undoStack.push(JSON.stringify(features)); if (undoStack.length > 30) undoStack.shift(); }
 function makeFeatureSolid(f){
-  var polys = PRIMS[f.type](f.p);
+  var polys;
+  if (f.type === 'extrude' || f.type === 'revolve'){
+    var sk = SKETCHES.find(function(x){ return x.id === f.sketchId; });
+    if (!sk) return [];
+    polys = f.type === 'extrude' ? extrudeSketch(sk, f.p.depth) : revolveSketch(sk, f.p.angle);
+  } else {
+    polys = PRIMS[f.type](f.p);
+  }
   var rx = f.p.rx*Math.PI/180, ry = f.p.ry*Math.PI/180, rz = f.p.rz*Math.PI/180;
   polys.forEach(function(poly){
     poly.v.forEach(function(v){
@@ -611,19 +826,27 @@ document.querySelectorAll('[data-add]').forEach(function(b){
 // ============================ documents ============================
 var LSKEY = 'aqt_cad_docs';
 function docs(){ try { return JSON.parse(localStorage.getItem(LSKEY) || '{}'); } catch(_) { return {}; } }
+function loadDocObj(doc){
+  var f = Array.isArray(doc) ? doc : (doc.features || []);
+  var sk = Array.isArray(doc) ? [] : (doc.sketches || []);
+  snapshot(); features = f; SKETCHES = sk; selected = null;
+  FID = features.length ? Math.max.apply(null, features.map(function(x){ return x.id; })) + 1 : 1;
+  SKID = SKETCHES.length ? Math.max.apply(null, SKETCHES.map(function(x){ return x.id; })) + 1 : 1;
+  regen(); drawParams(); drawSkList();
+}
 document.getElementById('dSave').addEventListener('click', function(){
-  var all = docs(); all[document.getElementById('docName').value || 'untitled'] = features;
+  var all = docs(); all[document.getElementById('docName').value || 'untitled'] = { features:features, sketches:SKETCHES };
   try { localStorage.setItem(LSKEY, JSON.stringify(all)); this.textContent = 'Saved'; var b = this; setTimeout(function(){ b.textContent = 'Save'; }, 900); } catch(_){}
 });
 document.getElementById('dLoad').addEventListener('click', function(){
   var all = docs(), names = Object.keys(all);
   if (!names.length){ alert('No saved documents on this device yet.'); return; }
   var pick = prompt('Open which document?\n\n' + names.join('\n'), names[names.length-1]);
-  if (pick && all[pick]){ snapshot(); features = all[pick]; FID = Math.max.apply(null, features.map(function(f){ return f.id; })) + 1; selected = null; document.getElementById('docName').value = pick; regen(); drawParams(); }
+  if (pick && all[pick]){ loadDocObj(all[pick]); document.getElementById('docName').value = pick; }
 });
 document.getElementById('dDown').addEventListener('click', function(){
   var a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([JSON.stringify({ name:document.getElementById('docName').value, features:features }, null, 1)], { type:'application/json' }));
+  a.href = URL.createObjectURL(new Blob([JSON.stringify({ name:document.getElementById('docName').value, features:features, sketches:SKETCHES }, null, 1)], { type:'application/json' }));
   a.download = (document.getElementById('docName').value || 'part') + '.cad.json';
   document.body.appendChild(a); a.click();
   setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 400);
@@ -633,7 +856,108 @@ document.getElementById('dNew').addEventListener('click', function(){
   snapshot(); features = defaultDoc(); selected = null; document.getElementById('docName').value = 'part-' + Math.floor(Math.random()*900+100); regen(); drawParams();
 });
 
-regen(); resize();
+// ============================ PHASE 2 UI: 2D sketch editor ============================
+var skTool = 'select', skView = { ox:0, oy:0, s:2.4 };
+var skc = document.getElementById('skCanvas'), sctx = skc ? skc.getContext('2d') : null;
+var skW = 0, skH = 0, skPending = null, skDragPt = null, skPan = null, skMouse = { px:0, py:0 };
+function round5(x){ return Math.round(x*2)/2; }
+function skResize(){ if (!skc) return; skW = skc.clientWidth; skH = skc.clientHeight; skc.width = skW*DPR; skc.height = skH*DPR; sctx.setTransform(DPR,0,0,DPR,0,0); skDraw(); }
+window.addEventListener('resize', skResize);
+function s2w(px, py){ return { u:(px - skW/2 - skView.ox)/skView.s, v:-(py - skH/2 - skView.oy)/skView.s }; }
+function w2s(u, v){ return { x: skW/2 + skView.ox + u*skView.s, y: skH/2 + skView.oy - v*skView.s }; }
+function w2s2(pid){ var p = skP(curSketch, pid); return w2s(p.u, p.v); }
+function skSnap(u, v){ var best = null, bd = 9/skView.s; curSketch.points.forEach(function(p){ var d = Math.hypot(p.u-u, p.v-v); if (d < bd){ bd = d; best = p; } }); return best; }
+function distToSeg(px, py, a, b){ var A = w2s(a.u,a.v), B = w2s(b.u,b.v), dx = B.x-A.x, dy = B.y-A.y; var t = ((px-A.x)*dx + (py-A.y)*dy)/(dx*dx+dy*dy||1); t = Math.max(0, Math.min(1, t)); return Math.hypot(px-(A.x+dx*t), py-(A.y+dy*t)); }
+function pickLine(px, py){ var best = null, bd = 7; curSketch.lines.forEach(function(l){ var d = distToSeg(px, py, skP(curSketch,l.p1), skP(curSketch,l.p2)); if (d < bd){ bd = d; best = l; } }); return best; }
+function pickCircle(px, py){ var best = null, bd = 8; curSketch.circles.forEach(function(c){ var ctr = skP(curSketch,c.c), s = w2s(ctr.u,ctr.v); var d = Math.abs(Math.hypot(px-s.x, py-s.y) - c.r*skView.s); if (d < bd){ bd = d; best = c; } }); return best; }
+function skStatus(){ var el = document.getElementById('skStatus'); if (!el) return; var tips = { select:'Drag points to move. Set dimensions/constraints, then Finish.', line:'Click to chain connected points; click an existing point to close the loop.', circle:'Click centre, then click for radius.', dim:'Click a line to set its length, or a circle for its radius.', h:'Click a line to force it horizontal.', v:'Click a line to force it vertical.', delete:'Click a line or circle to remove it.' }; el.textContent = (curSketch ? curSketch.name + ' (' + curSketch.plane + ') - ' : '') + (tips[skTool] || ''); }
+function openSketch(s){ curSketch = s; document.getElementById('skEditor').style.display = 'block'; skView = { ox:0, oy:0, s:2.4 }; skPending = null; skResize(); skStatus(); }
+function closeSketch(){ document.getElementById('skEditor').style.display = 'none'; curSketch = null; drawSkList(); render(); }
+
+function skDraw(){
+  if (!sctx || !curSketch) return;
+  sctx.fillStyle = '#0b0d13'; sctx.fillRect(0, 0, skW, skH);
+  var g = 10*skView.s, o = w2s(0, 0);
+  sctx.strokeStyle = 'rgba(120,130,150,0.09)'; sctx.lineWidth = 1;
+  for (var x = o.x % g; x < skW; x += g){ sctx.beginPath(); sctx.moveTo(x, 0); sctx.lineTo(x, skH); sctx.stroke(); }
+  for (var y = o.y % g; y < skH; y += g){ sctx.beginPath(); sctx.moveTo(0, y); sctx.lineTo(skW, y); sctx.stroke(); }
+  sctx.strokeStyle = 'rgba(103,232,249,0.30)'; sctx.beginPath(); sctx.moveTo(0, o.y); sctx.lineTo(skW, o.y); sctx.moveTo(o.x, 0); sctx.lineTo(o.x, skH); sctx.stroke();
+  curSketch.circles.forEach(function(c){ var ctr = skP(curSketch, c.c), s = w2s(ctr.u, ctr.v); sctx.strokeStyle = '#FF9066'; sctx.lineWidth = 1.8; sctx.beginPath(); sctx.arc(s.x, s.y, c.r*skView.s, 0, 2*Math.PI); sctx.stroke(); });
+  curSketch.lines.forEach(function(l){ var a = w2s2(l.p1), b = w2s2(l.p2); sctx.strokeStyle = '#FF7040'; sctx.lineWidth = 2; sctx.beginPath(); sctx.moveTo(a.x, a.y); sctx.lineTo(b.x, b.y); sctx.stroke();
+    var mid = { x:(a.x+b.x)/2, y:(a.y+b.y)/2 };
+    var hv = curSketch.cons.find(function(c){ return c.a === l.id && (c.type === 'h' || c.type === 'v'); });
+    if (hv){ sctx.fillStyle = '#67e8f9'; sctx.font = '9px monospace'; sctx.fillText(hv.type.toUpperCase(), mid.x+3, mid.y+11); }
+  });
+  curSketch.cons.forEach(function(c){
+    if (c.type === 'dist'){ var l = curSketch.lines.find(function(x){ return x.id === c.a; }); if (!l) return; var a = w2s2(l.p1), b = w2s2(l.p2); sctx.fillStyle = '#fde68a'; sctx.font = '10px monospace'; sctx.fillText(c.value.toFixed(0), (a.x+b.x)/2+4, (a.y+b.y)/2-4); }
+    else if (c.type === 'radius'){ var ci = curSketch.circles.find(function(x){ return x.id === c.a; }); if (!ci) return; var ctr = skP(curSketch, ci.c), s = w2s(ctr.u, ctr.v); sctx.fillStyle = '#fde68a'; sctx.font = '10px monospace'; sctx.fillText('R' + c.value.toFixed(0), s.x+4, s.y-4); }
+  });
+  curSketch.points.forEach(function(p){ var s = w2s(p.u, p.v); sctx.fillStyle = (skPending && skPending.id === p.id) ? '#FF4F00' : '#d9f9e8'; sctx.fillRect(s.x-2.5, s.y-2.5, 5, 5); });
+  if (skPending && skTool === 'line' && !skPending.c){ var a = w2s(skPending.u, skPending.v); sctx.strokeStyle = 'rgba(255,112,64,0.5)'; sctx.setLineDash([4,3]); sctx.beginPath(); sctx.moveTo(a.x, a.y); sctx.lineTo(skMouse.px, skMouse.py); sctx.stroke(); sctx.setLineDash([]); }
+  if (skPending && skPending.c && skTool === 'circle'){ var s2 = w2s(skPending.c.u, skPending.c.v); var r = Math.hypot(skMouse.px-s2.x, skMouse.py-s2.y); sctx.strokeStyle = 'rgba(255,144,102,0.5)'; sctx.setLineDash([4,3]); sctx.beginPath(); sctx.arc(s2.x, s2.y, r, 0, 2*Math.PI); sctx.stroke(); sctx.setLineDash([]); }
+}
+
+if (skc){
+  document.querySelectorAll('.sk-tool').forEach(function(b){
+    b.addEventListener('click', function(){ document.querySelectorAll('.sk-tool').forEach(function(x){ x.classList.remove('on'); }); b.classList.add('on'); skTool = b.getAttribute('data-tool'); skPending = null; skStatus(); skDraw(); });
+  });
+  document.getElementById('skFinish').addEventListener('click', function(){ solveSketch(curSketch); closeSketch(); });
+  skc.addEventListener('pointerdown', function(e){
+    var rect = skc.getBoundingClientRect(), px = e.clientX-rect.left, py = e.clientY-rect.top, w = s2w(px, py);
+    if (e.shiftKey){ skPan = { x:e.clientX, y:e.clientY }; return; }
+    if (skTool === 'line'){
+      var p = skSnap(w.u, w.v) || skPt(curSketch, round5(w.u), round5(w.v));
+      if (skPending && !skPending.c){ curSketch.lines.push({ id:curSketch._pid++, p1:skPending.id, p2:p.id }); }
+      skPending = p;
+    } else if (skTool === 'circle'){
+      if (!skPending){ var c = skSnap(w.u, w.v) || skPt(curSketch, round5(w.u), round5(w.v)); skPending = { c:c }; }
+      else { var r = Math.hypot(w.u-skPending.c.u, w.v-skPending.c.v); curSketch.circles.push({ id:curSketch._pid++, c:skPending.c.id, r:Math.max(1, r) }); skPending = null; }
+    } else if (skTool === 'dim'){
+      var l = pickLine(px, py);
+      if (l){ var p1 = skP(curSketch,l.p1), p2 = skP(curSketch,l.p2); var val = prompt('Length (mm):', Math.hypot(p2.u-p1.u, p2.v-p1.v).toFixed(1)); if (val){ curSketch.cons.push({ type:'dist', a:l.id, value:parseFloat(val) }); solveSketch(curSketch); } }
+      else { var ci = pickCircle(px, py); if (ci){ var v2 = prompt('Radius (mm):', ci.r.toFixed(1)); if (v2){ curSketch.cons.push({ type:'radius', a:ci.id, value:parseFloat(v2) }); solveSketch(curSketch); } } }
+    } else if (skTool === 'h' || skTool === 'v'){
+      var l2 = pickLine(px, py); if (l2){ curSketch.cons = curSketch.cons.filter(function(c){ return !(c.a === l2.id && (c.type === 'h' || c.type === 'v')); }); curSketch.cons.push({ type:skTool, a:l2.id }); solveSketch(curSketch); }
+    } else if (skTool === 'delete'){
+      var l3 = pickLine(px, py); if (l3){ curSketch.lines = curSketch.lines.filter(function(x){ return x !== l3; }); curSketch.cons = curSketch.cons.filter(function(c){ return c.a !== l3.id; }); }
+      else { var c3 = pickCircle(px, py); if (c3){ curSketch.circles = curSketch.circles.filter(function(x){ return x !== c3; }); curSketch.cons = curSketch.cons.filter(function(c){ return c.a !== c3.id; }); } }
+    } else { var pp = skSnap(w.u, w.v); if (pp) skDragPt = pp; }
+    skDraw();
+  });
+  skc.addEventListener('pointermove', function(e){
+    var rect = skc.getBoundingClientRect(); skMouse = { px:e.clientX-rect.left, py:e.clientY-rect.top };
+    if (skPan){ skView.ox += e.clientX-skPan.x; skView.oy += e.clientY-skPan.y; skPan = { x:e.clientX, y:e.clientY }; skDraw(); return; }
+    if (skDragPt){ var w = s2w(skMouse.px, skMouse.py); skDragPt.u = round5(w.u); skDragPt.v = round5(w.v); solveSketch(curSketch); skDraw(); }
+    else if (skPending) skDraw();
+  });
+  skc.addEventListener('pointerup', function(){ skPan = null; skDragPt = null; });
+  skc.addEventListener('wheel', function(e){ e.preventDefault(); var rect = skc.getBoundingClientRect(); skView.s = Math.max(0.4, Math.min(24, skView.s * (1 - Math.sign(e.deltaY)*0.1))); skDraw(); }, { passive:false });
+}
+
+document.getElementById('skNew').addEventListener('click', function(){ var s = newSketch(document.getElementById('skPlane').value); openSketch(s); });
+function drawSkList(){
+  var host = document.getElementById('skList'); if (!host) return; host.innerHTML = '';
+  SKETCHES.forEach(function(s){
+    var loops = sketchLoops(s).length;
+    var d = document.createElement('div'); d.style.cssText = 'border:1px solid #2a2a35;border-radius:8px;padding:7px 9px;margin-bottom:5px;font-size:11px;';
+    d.innerHTML = '<div style="display:flex;justify-content:space-between;"><b style="color:#fff;">' + s.name + '</b><span style="color:#788;">' + s.plane + ' &middot; ' + loops + ' loop' + (loops===1?'':'s') + '</span></div>';
+    var row = document.createElement('div'); row.style.cssText = 'display:flex;gap:4px;margin-top:6px;flex-wrap:wrap;';
+    [['Edit',null],['Extrude','extrude'],['Revolve','revolve']].forEach(function(act){
+      var btn = document.createElement('button'); btn.className = 'cs-btn'; btn.textContent = act[0]; btn.style.fontSize = '9px'; btn.style.padding = '4px 8px';
+      btn.addEventListener('click', function(){
+        if (!act[1]){ openSketch(s); return; }
+        snapshot();
+        var f = { id:FID++, type:act[1], op:'add', name:act[0] + ' ' + s.name, sketchId:s.id, p:{ x:0, y:0, z:0, rx:0, ry:0, rz:0 } };
+        f.p[act[1] === 'extrude' ? 'depth' : 'angle'] = act[1] === 'extrude' ? 20 : 360;
+        features.push(f); selected = f.id; regen(); drawParams();
+      });
+      row.appendChild(btn);
+    });
+    d.appendChild(row); host.appendChild(d);
+  });
+}
+
+regen(); resize(); drawSkList();
 document.getElementById('tFit').click();
 })();
 </script>
