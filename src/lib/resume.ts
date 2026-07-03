@@ -75,6 +75,57 @@ export async function deleteResume(id: string): Promise<void> {
   await db.execute(sql`DELETE FROM resume_submissions WHERE id = ${id}`);
 }
 
+// ---- Public share links (/r/[slug]) ----------------------------------------
+// A share creates its own submission row with a random slug; the owner can
+// let it expire (default 90 days). View count is honest and increment-only.
+let shareReady: Promise<void> | null = null;
+function ensureShareColumns(): Promise<void> {
+  if (shareReady) return shareReady;
+  shareReady = (async () => {
+    try {
+      await ensureResumeSchema();
+      await db.execute(sql`ALTER TABLE resume_submissions ADD COLUMN IF NOT EXISTS share_slug TEXT`);
+      await db.execute(sql`ALTER TABLE resume_submissions ADD COLUMN IF NOT EXISTS share_expires TIMESTAMPTZ`);
+      await db.execute(sql`ALTER TABLE resume_submissions ADD COLUMN IF NOT EXISTS share_views INT NOT NULL DEFAULT 0`);
+      await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS resume_share_slug_idx ON resume_submissions(share_slug) WHERE share_slug IS NOT NULL`);
+    } catch (_) { shareReady = null; }
+  })();
+  return shareReady;
+}
+
+function randomSlug(): string {
+  const abc = 'abcdefghjkmnpqrstuvwxyz23456789'; // no confusable chars
+  let s = '';
+  for (let i = 0; i < 10; i++) s += abc[Math.floor(Math.random() * abc.length)];
+  return s;
+}
+
+export async function createResumeShare(opts: { userId?: string | null; email?: string | null; fullName?: string | null; template?: string | null; data: any; days?: number }): Promise<string | null> {
+  await ensureShareColumns();
+  const slug = randomSlug();
+  const days = Math.min(365, Math.max(1, Number(opts.days) || 90));
+  const r = await db.execute(sql`
+    INSERT INTO resume_submissions (user_id, email, full_name, template, data, share_slug, share_expires)
+    VALUES (${opts.userId || null}, ${opts.email || null}, ${opts.fullName || null}, ${opts.template || null},
+            ${JSON.stringify(opts.data || {})}::jsonb, ${slug}, NOW() + (${days} || ' days')::interval)
+    RETURNING share_slug
+  `);
+  return rows(r)[0]?.share_slug || null;
+}
+
+/** Fetch a live shared resume by slug and count the view. Null = missing/expired. */
+export async function getSharedResume(slug: string): Promise<any | null> {
+  try {
+    await ensureShareColumns();
+    const r = await db.execute(sql`
+      UPDATE resume_submissions SET share_views = share_views + 1
+      WHERE share_slug = ${slug} AND (share_expires IS NULL OR share_expires > NOW())
+      RETURNING full_name, template, data, share_views, created_at
+    `);
+    return rows(r)[0] || null;
+  } catch { return null; }
+}
+
 export async function deleteResumes(ids: string[]): Promise<number> {
   if (!ids.length) return 0;
   await ensureResumeSchema();
