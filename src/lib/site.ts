@@ -1,7 +1,7 @@
 export const SITE = {
   name: 'EduRankAI',
   domain: 'edurankai.in',
-  url: 'https://www.edurankai.in',
+  url: 'https://edurankai.in',
   tagline: 'Frontier Educational Intelligence',
   description:
     'EduRankAI is a frontier AI educational intelligence company building ASI-oriented foundational models, advanced reasoning systems, and autonomous learning architectures to transform how humanity learns, researches, and discovers.',

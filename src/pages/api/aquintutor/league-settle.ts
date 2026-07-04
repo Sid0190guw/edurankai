@@ -68,7 +68,7 @@ async function settleLastWeek(): Promise<{ ok: boolean; settled: number; promote
             + (result === 'promoted'
                 ? '<p style="font-size:15px;color:#10b981;line-height:1.6;"><b>You\'re now in ' + newLabel + ' League.</b> Your weekly competition just got tougher (and the rewards bigger).</p>'
                 : '<p style="font-size:15px;color:#5b5b5b;line-height:1.6;">You\'ve dropped to <b>' + newLabel + ' League</b>. One good practice week and you\'re back up.</p>')
-            + '<p style="text-align:center;margin:24px 0;"><a href="https://www.edurankai.in/aquintutor/league" style="background:#d97757;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:700;">See your new league →</a></p>'
+            + '<p style="text-align:center;margin:24px 0;"><a href="https://edurankai.in/aquintutor/league" style="background:#d97757;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:700;">See your new league →</a></p>'
             + '</div>';
           const tlib = await import('@/lib/mail-transport').catch(() => ({} as any));
           const sendExternal = (tlib as any).sendExternal;

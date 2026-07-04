@@ -5,7 +5,7 @@ import type { APIRoute } from 'astro';
 const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-4-20250514';
 
-const FAQ_SYSTEM = `You are the EduRankAI Help Assistant - a friendly FAQ and support bot for www.edurankai.in.
+const FAQ_SYSTEM = `You are the EduRankAI Help Assistant - a friendly FAQ and support bot for edurankai.in.
 
 WHAT YOU KNOW (the only things you should answer about):
 
@@ -16,7 +16,7 @@ WHAT YOU KNOW (the only things you should answer about):
    - Founded 2024, based in India
 
 2. APPLICATION PROCESS (for job applicants):
-   - Browse open roles at www.edurankai.in/careers
+   - Browse open roles at edurankai.in/careers
    - Click "Apply" on any role
    - Fill out application with personal details, education, experience
    - You get an application number (format: ERA-XXXXX)

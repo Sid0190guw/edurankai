@@ -67,7 +67,7 @@ async function run(): Promise<{ ok: boolean; nudged: number; skipped: number }> 
           const html = '<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;">'
             + '<h2 style="color:#d97757;font-family:Georgia,serif;font-weight:500;font-size:22px;">🔥 Don\'t break your ' + c.streak_days + '-day streak</h2>'
             + '<p style="font-size:15px;color:#333;line-height:1.6;">Hi ' + (c.name || 'there') + ',<br><br>You\'ve been building a learning streak. A 5-minute practice round tonight keeps it alive — or use a streak freeze from the shop if you can\'t.</p>'
-            + '<p style="text-align:center;margin:24px 0;"><a href="https://www.edurankai.in/aquintutor/practice/sanskrit-awareness" style="background:#d97757;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:700;">Practise now →</a></p>'
+            + '<p style="text-align:center;margin:24px 0;"><a href="https://edurankai.in/aquintutor/practice/sanskrit-awareness" style="background:#d97757;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:700;">Practise now →</a></p>'
             + '<p style="font-size:12px;color:#888;">AquinTutor by EduRankAI · You receive this because you have an active streak.</p></div>';
           await sendExternal({
             from: 'AquinTutor <hr@edurankai.in>',

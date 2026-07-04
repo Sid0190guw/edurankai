@@ -145,7 +145,7 @@
     var hx = MARGIN, topY = PAGE_H - 34;
     doc.textAt('EduRankAI', hx, topY, 22, 'bold', [1, 1, 1]);
     doc.textAt('AI Research and Technology  |  Guwahati, Assam, India', hx, topY - 18, 8.5, 'helv', [0.7, 0.7, 0.72]);
-    doc.textAt('hr@edurankai.in  |  www.edurankai.in', hx, topY - 31, 8.5, 'helv', [0.6, 0.6, 0.62]);
+    doc.textAt('hr@edurankai.in  |  edurankai.in', hx, topY - 31, 8.5, 'helv', [0.6, 0.6, 0.62]);
     // right column
     var rcW = 200, rcX = PAGE_W - MARGIN - rcW;
     doc.textAt('REFERENCE', rcX, topY, 7, 'bold', [0.55, 0.55, 0.6], 'right', rcW);

@@ -182,7 +182,7 @@
     doc.rect(0, doc.H - bandH, W, bandH, DARK);
     doc.textAt('EduRankAI', MARGIN, doc.H - 38, 20, 'bold', [1, 1, 1]);
     doc.textAt((d.organiser || 'AI Research and Technology  |  Guwahati, Assam, India'), MARGIN, doc.H - 56, 8.5, 'helv', [0.7, 0.7, 0.72]);
-    doc.textAt('hr@edurankai.in  |  www.edurankai.in', MARGIN, doc.H - 69, 8.5, 'helv', [0.6, 0.6, 0.62]);
+    doc.textAt('hr@edurankai.in  |  edurankai.in', MARGIN, doc.H - 69, 8.5, 'helv', [0.6, 0.6, 0.62]);
     var rcW = 200, rcX = W - MARGIN - rcW;
     doc.textAt('SERIAL', rcX, doc.H - 38, 7, 'bold', [0.55, 0.55, 0.6], 'right', rcW);
     doc.textAt(d.serial || '', rcX, doc.H - 52, 10, 'cour', [1, 1, 1], 'right', rcW);

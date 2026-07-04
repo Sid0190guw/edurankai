@@ -136,7 +136,7 @@ export async function issueCertificate(opts: { userId: string; courseId: string;
           (user_id, course_id, course_title, cert_number, grade, verification_url,
            holder_name, issuer, issued_at, issued_at_iso, content_hash, prev_hash, block_hash, chain_index, signature, signing_key_id)
         VALUES (${opts.userId}, ${opts.courseId}, ${opts.courseTitle}, ${certNumber}, ${opts.grade || null},
-           ${'https://www.edurankai.in/verify/' + certNumber},
+           ${'https://edurankai.in/verify/' + certNumber},
            ${holderName}, ${issuer}, ${issued_at_iso}::timestamptz, ${issued_at_iso}, ${contentHash}, ${prevHash}, ${blockH}, ${chainIndex}, ${sig}, ${key.id})
         RETURNING id, cert_number, block_hash
       `));
@@ -146,7 +146,7 @@ export async function issueCertificate(opts: { userId: string; courseId: string;
         try {
           const ins = rows(await db.execute(sql`
             INSERT INTO course_certificates (user_id, course_id, course_title, cert_number, grade, verification_url, holder_name, issuer, issued_at, issued_at_iso, content_hash, signature, signing_key_id)
-            VALUES (${opts.userId}, ${opts.courseId}, ${opts.courseTitle}, ${certNumber}, ${opts.grade || null}, ${'https://www.edurankai.in/verify/' + certNumber}, ${holderName}, ${issuer}, ${issued_at_iso}::timestamptz, ${issued_at_iso}, ${contentHash}, ${sig}, ${key.id})
+            VALUES (${opts.userId}, ${opts.courseId}, ${opts.courseTitle}, ${certNumber}, ${opts.grade || null}, ${'https://edurankai.in/verify/' + certNumber}, ${holderName}, ${issuer}, ${issued_at_iso}::timestamptz, ${issued_at_iso}, ${contentHash}, ${sig}, ${key.id})
             RETURNING id, cert_number`));
           return { id: ins[0].id, certNumber: ins[0].cert_number, alreadyIssued: false };
         } catch { return null; }

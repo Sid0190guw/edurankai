@@ -11,7 +11,7 @@ export default defineConfig({
     ? vercel()
     : node({ mode: 'standalone' }),
   integrations: [tailwind({ applyBaseStyles: false })],
-  site: 'https://www.edurankai.in',
+  site: 'https://edurankai.in',
   security: { checkOrigin: false },
   server: { port: 4321, host: true }
 });
