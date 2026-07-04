@@ -8,7 +8,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { createOrder, getPublicKeyId, isConfigured } from '@/lib/razorpay';
 import { convertToInrPaise } from '@/lib/fx';
-import { getFounder, createServicePending, directConnectHref } from '@/lib/founder';
+import { getFounder, createServicePending, directConnectHref, isSlotAvailable } from '@/lib/founder';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -27,9 +27,14 @@ export const POST: APIRoute = async ({ request }) => {
   const note = (b.note || '').toString().slice(0, 1000);
 
   const f = await getFounder();
-  if (kind === 'text' && !f.connectNumber) return json({ ok: false, error: 'The direct line is not available right now.' }, 400);
   const priceChf = kind === 'text' ? f.textPriceChf : f.consultPriceChf;
   const gated = kind === 'text' ? f.gateText : f.gateConsult;
+  // Consultancy must land on a real open slot — re-check server-side so two
+  // people cannot pay for the same time.
+  if (kind === 'consult' && preferred) {
+    if (!(await isSlotAvailable(preferred))) return json({ ok: false, error: 'That time was just taken. Please pick another slot.' }, 409);
+  }
+  if (kind === 'consult' && !preferred) return json({ ok: false, error: 'Please choose a time slot.' }, 400);
 
   // Free path
   if (!gated || priceChf <= 0 || !isConfigured()) {

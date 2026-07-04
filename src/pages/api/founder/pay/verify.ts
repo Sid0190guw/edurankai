@@ -34,6 +34,8 @@ export const POST: APIRoute = async ({ request }) => {
     const f = await getFounder();
     if (!booking) return json({ ok: true, kind: '', message: 'Payment received.' });
     if (booking.kind === 'text') {
+      // Message is delivered either way (it's stored + shown in the console). If
+      // a direct-line number is configured, also hand back the deep link.
       return json({ ok: true, kind: 'text', revealHref: directConnectHref(f.connectNumber, f.connectMessage), label: f.connectLabel });
     }
     const title = 'Consultation with ' + (f.name || 'Founder');
