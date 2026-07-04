@@ -69,6 +69,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
       <button type="button" class="cs-btn" id="tSect">Section</button>
       <button type="button" class="cs-btn" id="tMeas">Measure</button>
       <button type="button" class="cs-btn" id="tStl">STL</button>
+      <button type="button" class="cs-btn" id="tDraw">Drawing</button>
       <button type="button" class="cs-btn" id="tFit">Fit</button>
     </div>
   </div>
@@ -101,6 +102,16 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
       <canvas id="glCanvas"></canvas>
       <div class="cs-measure" id="csMeasure"></div>
       <div class="cs-hint">drag: rotate &middot; wheel/pinch: zoom &middot; shift-drag: pan &middot; every edit regenerates the solid</div>
+      <div id="drawSheet" style="position:absolute;inset:0;background:#2b2e35;display:none;flex-direction:column;z-index:5;">
+        <div style="display:flex;gap:6px;padding:8px 10px;background:#11131a;border-bottom:1px solid #2a2a35;align-items:center;">
+          <button type="button" class="cs-btn" id="drawPrint" style="background:#FF4F00;color:#fff;border-color:#FF4F00;">Print / PDF</button>
+          <button type="button" class="cs-btn" id="drawClose">Close</button>
+          <span style="font-family:'Geist Mono',monospace;font-size:10px;color:#89a;">Third-angle multiview &middot; visible edges solid, hidden dashed &middot; dimensions in mm</span>
+        </div>
+        <div style="flex:1;overflow:auto;display:flex;align-items:flex-start;justify-content:center;padding:14px;">
+          <canvas id="drawCanvas" style="background:#fff;box-shadow:0 8px 40px rgba(0,0,0,0.5);max-width:100%;height:auto;"></canvas>
+        </div>
+      </div>
       <div id="skEditor" style="position:absolute;inset:0;background:#0b0d13;display:none;">
         <canvas id="skCanvas" style="position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:crosshair;"></canvas>
         <div style="position:absolute;left:10px;top:10px;display:flex;gap:5px;flex-wrap:wrap;">
@@ -956,6 +967,153 @@ function drawSkList(){
     d.appendChild(row); host.appendChild(d);
   });
 }
+
+// ============================ 2D DRAWING / DOCUMENTATION ============================
+// Orthographic multiview generated from the solid: front / top / right + iso,
+// aligned and to a common scale, with hidden-line removal (edges occluded by
+// faces render dashed), overall dimensions, and an engineering title block.
+var C30 = 0.8660254, S30 = 0.5;
+var DVIEWS = {
+  front: { proj:function(p){ return [p[0], p[1]]; }, depth:function(p){ return p[2]; } },
+  top:   { proj:function(p){ return [p[0], p[2]]; }, depth:function(p){ return p[1]; } },
+  right: { proj:function(p){ return [-p[2], p[1]]; }, depth:function(p){ return p[0]; } },
+  iso:   { proj:function(p){ return [(p[0]-p[2])*C30, (p[0]+p[2])*S30 - p[1]]; }, depth:function(p){ return p[0]+p[1]+p[2]; } },
+};
+function uniqueEdges(){
+  var map = {}, out = [];
+  SOLID.forEach(function(poly){
+    for (var i=0;i<poly.v.length;i++){
+      var a = poly.v[i].p, b = poly.v[(i+1)%poly.v.length].p;
+      if (vLen(vSub(a,b)) < 0.02) continue;
+      var ka = a.map(function(x){ return Math.round(x*50)/50; }).join(','), kb = b.map(function(x){ return Math.round(x*50)/50; }).join(',');
+      var k = ka < kb ? ka+'|'+kb : kb+'|'+ka;
+      if (!map[k]){ map[k] = 1; out.push([a, b]); }
+    }
+  });
+  return out;
+}
+function coverDepth(tri, u, v){
+  var a = tri[0], b = tri[1], c = tri[2];
+  var d00 = b[0]-a[0], d01 = b[1]-a[1], d10 = c[0]-a[0], d11 = c[1]-a[1], d20 = u-a[0], d21 = v-a[1];
+  var den = d00*d11 - d10*d01; if (Math.abs(den) < 1e-9) return null;
+  var w1 = (d20*d11 - d10*d21)/den, w2 = (d00*d21 - d20*d01)/den, w0 = 1-w1-w2;
+  if (w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4) return null;
+  return w0*a[2] + w1*b[2] + w2*c[2];
+}
+function makeDrawing(){
+  triangulate();
+  if (!BB) massProps(0);
+  var cvD = document.getElementById('drawCanvas'), c = cvD.getContext('2d');
+  var SW = 1123, SH = 794, R = 2; // A4 landscape @ ~96dpi, 2x for crisp print
+  cvD.width = SW*R; cvD.height = SH*R; cvD.style.width = SW + 'px';
+  c.setTransform(R, 0, 0, R, 0, 0);
+  c.fillStyle = '#fff'; c.fillRect(0, 0, SW, SH);
+  c.strokeStyle = '#111'; c.lineWidth = 1.4; c.strokeRect(14, 14, SW-28, SH-28);
+
+  var edges = uniqueEdges();
+  var mn = BB.mn, mx = BB.mx, dx = mx[0]-mn[0], dy = mx[1]-mn[1], dz = mx[2]-mn[2];
+  var tbH = 120, gap = 46, ox0 = 54, oy0 = 54;
+  var availW = (SW-28) * 0.60 - ox0, availH = SH - oy0 - tbH - 40;
+  var s = Math.min((availW - gap) / (dx + dz || 1), (availH - gap) / (dy + dz || 1));
+  s = Math.max(0.2, Math.min(s, 6));
+
+  // precompute projected triangles per view for occlusion
+  function triSet(view){ return TRIS.map(function(t){ return t.map(function(p){ var q = view.proj(p); return [q[0], q[1], view.depth(p)]; }); }); }
+  function drawView(view, ox, oy, umin, vmax, label){
+    var tris = triSet(view), eps = Math.max(0.15, (dx+dy+dz)*0.0016);
+    function S(u, v){ return [ox + (u-umin)*s, oy + (vmax-v)*s]; }
+    function visibleAt(p){
+      var q = view.proj(p), d = view.depth(p);
+      for (var i=0;i<tris.length;i++){ var dd = coverDepth(tris[i], q[0], q[1]); if (dd != null && dd > d + eps) return false; }
+      return true;
+    }
+    var solid = [], hidden = [];
+    edges.forEach(function(e){
+      var vis = false;
+      for (var t=0.2; t<=0.8; t+=0.3){ if (visibleAt([e[0][0]+(e[1][0]-e[0][0])*t, e[0][1]+(e[1][1]-e[0][1])*t, e[0][2]+(e[1][2]-e[0][2])*t])){ vis = true; break; } }
+      var A = view.proj(e[0]), B = view.proj(e[1]);
+      (vis ? solid : hidden).push([S(A[0],A[1]), S(B[0],B[1])]);
+    });
+    c.strokeStyle = '#8a8f98'; c.lineWidth = 0.6; c.setLineDash([3,2.5]);
+    hidden.forEach(function(l){ c.beginPath(); c.moveTo(l[0][0], l[0][1]); c.lineTo(l[1][0], l[1][1]); c.stroke(); });
+    c.setLineDash([]); c.strokeStyle = '#111'; c.lineWidth = 1.1;
+    solid.forEach(function(l){ c.beginPath(); c.moveTo(l[0][0], l[0][1]); c.lineTo(l[1][0], l[1][1]); c.stroke(); });
+    c.fillStyle = '#FF4F00'; c.font = 'bold 11px "Geist Mono", monospace';
+    c.fillText(label, ox, oy - 12);
+  }
+  var Wf = dx*s, Hf = dy*s, Ht = dz*s, Wr = dz*s;
+  // Front (top-left), Top (below front), Right (right of front), Iso (bottom-right)
+  drawView(DVIEWS.front, ox0, oy0, mn[0], mx[1], 'FRONT');
+  drawView(DVIEWS.top,   ox0, oy0 + Hf + gap, mn[0], mx[2], 'TOP');
+  drawView(DVIEWS.right, ox0 + Wf + gap, oy0, -mx[2], mx[1], 'RIGHT');
+  // overall dimensions (simple witness + text)
+  c.strokeStyle = '#c0392b'; c.fillStyle = '#c0392b'; c.lineWidth = 0.7; c.font = '10px "Geist Mono", monospace';
+  function dimH(x1, x2, y, val){ c.beginPath(); c.moveTo(x1,y); c.lineTo(x2,y); c.stroke(); c.beginPath(); c.moveTo(x1,y-3);c.lineTo(x1,y+3); c.moveTo(x2,y-3);c.lineTo(x2,y+3); c.stroke(); c.fillText(val.toFixed(1), (x1+x2)/2-10, y-4); }
+  function dimV(y1, y2, x, val){ c.beginPath(); c.moveTo(x,y1); c.lineTo(x,y2); c.stroke(); c.beginPath(); c.moveTo(x-3,y1);c.lineTo(x+3,y1); c.moveTo(x-3,y2);c.lineTo(x+3,y2); c.stroke(); c.save(); c.translate(x-4,(y1+y2)/2+10); c.rotate(-Math.PI/2); c.fillText(val.toFixed(1),0,0); c.restore(); }
+  dimH(ox0, ox0+Wf, oy0 + Hf + 16, dx);
+  dimV(oy0, oy0+Hf, ox0 - 16, dy);
+  dimH(ox0 + Wf + gap, ox0 + Wf + gap + Wr, oy0 + Hf + 16, dz);
+
+  // ISO view bottom-right
+  var isoPts = [];
+  edges.forEach(function(e){ isoPts.push(DVIEWS.iso.proj(e[0]), DVIEWS.iso.proj(e[1])); });
+  if (isoPts.length){
+    var iu = isoPts.map(function(p){return p[0];}), iv = isoPts.map(function(p){return p[1];});
+    var iumin = Math.min.apply(null,iu), iumax = Math.max.apply(null,iu), ivmin = Math.min.apply(null,iv), ivmax = Math.max.apply(null,iv);
+    var isoW = SW - 28 - (ox0 + Wf + gap + Wr) - 30, isoH = SH - tbH - oy0 - 40;
+    var regX = ox0 + Wf + gap + Wr + 40, regY = oy0 + Hf + gap;
+    var is = Math.min((SW - 40 - regX)/((iumax-iumin)||1), (SH - tbH - 30 - regY)/((ivmax-ivmin)||1)) * 0.9;
+    is = Math.max(0.2, Math.min(is, s));
+    var cx = regX + ((SW-40-regX) - (iumax-iumin)*is)/2, cy = regY;
+    var trisI = triSet(DVIEWS.iso), epsI = Math.max(0.15, (dx+dy+dz)*0.0016);
+    function SI(u,v){ return [cx + (u-iumin)*is, cy + (v-ivmin)*is]; }
+    edges.forEach(function(e){
+      var vis = false;
+      for (var t=0.2;t<=0.8;t+=0.3){ var P=[e[0][0]+(e[1][0]-e[0][0])*t, e[0][1]+(e[1][1]-e[0][1])*t, e[0][2]+(e[1][2]-e[0][2])*t]; var q=DVIEWS.iso.proj(P), d=DVIEWS.iso.depth(P), occ=false; for(var i=0;i<trisI.length;i++){ var dd=coverDepth(trisI[i],q[0],q[1]); if(dd!=null&&dd>d+epsI){occ=true;break;} } if(!occ){vis=true;break;} }
+      var A=DVIEWS.iso.proj(e[0]), B=DVIEWS.iso.proj(e[1]), a=SI(A[0],A[1]), b=SI(B[0],B[1]);
+      c.strokeStyle = vis ? '#111' : '#9aa0a8'; c.lineWidth = vis ? 1.1 : 0.6; c.setLineDash(vis?[]:[3,2.5]);
+      c.beginPath(); c.moveTo(a[0],a[1]); c.lineTo(b[0],b[1]); c.stroke();
+    });
+    c.setLineDash([]); c.fillStyle = '#FF4F00'; c.font = 'bold 11px "Geist Mono", monospace'; c.fillText('ISOMETRIC', regX, regY - 12);
+  }
+
+  // ---- title block ----
+  var tbY = SH - tbH - 14, tbX = 14, tbW = SW - 28;
+  c.strokeStyle = '#111'; c.lineWidth = 1.2; c.strokeRect(tbX, tbY, tbW, tbH);
+  var matSel = document.getElementById('csMat'); var matName = matSel.options[matSel.selectedIndex].text;
+  var scaleRatio = s >= 3.7795 ? (Math.round(s/3.7795*10)/10) + ':1' : '1:' + (Math.round(3.7795/s*10)/10);
+  var rows = [
+    ['PART', document.getElementById('docName').value || 'part'],
+    ['MATERIAL', matName.replace(/\s*\([^)]*\)/, '')],
+    ['MASS', document.getElementById('mMass').textContent],
+    ['BOUNDING BOX', dx.toFixed(1) + ' x ' + dy.toFixed(1) + ' x ' + dz.toFixed(1) + ' mm'],
+    ['SCALE', scaleRatio + '  ·  UNITS mm'],
+    ['DATE', new Date().toISOString().slice(0,10)],
+  ];
+  c.font = '9px "Geist Mono", monospace';
+  var colW = (tbW - 220) / 3;
+  rows.forEach(function(r, i){
+    var col = i % 3, row = Math.floor(i / 3);
+    var x = tbX + 12 + col*colW, y = tbY + 26 + row*46;
+    c.fillStyle = '#888'; c.fillText(r[0], x, y);
+    c.fillStyle = '#111'; c.font = 'bold 13px "Inter", sans-serif'; c.fillText(String(r[1]).slice(0, 26), x, y + 18); c.font = '9px "Geist Mono", monospace';
+  });
+  c.fillStyle = '#111'; c.font = 'bold 15px "Cormorant Garamond", Georgia, serif';
+  c.fillText('EduRankAI', tbX + tbW - 190, tbY + 34);
+  c.fillStyle = '#FF4F00'; c.font = '10px "Geist Mono", monospace';
+  c.fillText('CAD STUDIO', tbX + tbW - 190, tbY + 52);
+  c.fillStyle = '#888'; c.font = '8px "Geist Mono", monospace';
+  c.fillText('Third-angle projection', tbX + tbW - 190, tbY + 74);
+  c.strokeStyle = '#111'; c.lineWidth = 0.8; c.strokeRect(tbX + tbW - 205, tbY, 205, tbH);
+}
+document.getElementById('tDraw').addEventListener('click', function(){ regen(); makeDrawing(); document.getElementById('drawSheet').style.display = 'flex'; });
+document.getElementById('drawClose').addEventListener('click', function(){ document.getElementById('drawSheet').style.display = 'none'; });
+document.getElementById('drawPrint').addEventListener('click', function(){
+  var url = document.getElementById('drawCanvas').toDataURL('image/png');
+  var w = window.open('', '_blank'); if (!w){ alert('Allow pop-ups to print the drawing.'); return; }
+  w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>' + (document.getElementById('docName').value || 'part') + ' - drawing</title><style>@page{size:A4 landscape;margin:0}html,body{margin:0}img{width:100%;height:auto;display:block}</style></head><body><img src="' + url + '"></body></html>');
+  w.document.close(); setTimeout(function(){ try { w.focus(); w.print(); } catch(_){} }, 350);
+});
 
 regen(); resize(); drawSkList();
 document.getElementById('tFit').click();
