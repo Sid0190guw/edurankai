@@ -6,7 +6,9 @@ export const SITE = {
   description:
     'EduRankAI is a frontier AI educational intelligence company building ASI-oriented foundational models, advanced reasoning systems, and autonomous learning architectures to transform how humanity learns, researches, and discovers.',
   emails: {
-    general: 'connect.edurankai@gmail.com',
+    // General / non-HR contact. hr@ is reserved for careers, applications,
+    // offers and HR matters only.
+    general: 'connect@edurankai.in',
     hr: 'hr@edurankai.in'
   },
   socials: {
