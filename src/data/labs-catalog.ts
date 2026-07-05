@@ -16,6 +16,7 @@ export const LABS: LabEntry[] = [
   { slug: 'nn-playground', title: 'Neural Network Playground', category: 'AI / ML', flagship: true, blurb: 'Train a real MLP live — hand-written backpropagation, decision boundary, per-neuron activations, loss curves.' },
   { slug: 'exploit-sandbox', title: 'Exploit Sandbox', category: 'Cybersecurity', flagship: true, blurb: 'A real stack buffer-overflow range: ret2win control-flow hijack; defeat stack canaries, NX and ASLR.' },
   { slug: 'mcu-emulator', title: 'MCU Emulator', category: 'Embedded Systems', flagship: true, blurb: 'Program an 8-bit microcontroller in assembly with memory-mapped GPIO — write code, drive real LEDs and buttons.' },
+  { slug: 'dsp-lab', title: 'DSP Spectrum Lab', category: 'Signals / DSP', flagship: true, blurb: 'Real-time FFT oscilloscope, spectrum analyser and spectrogram with a windowed-sinc FIR filter designer and mic input.' },
   { slug: 'cad-studio', title: 'CAD Studio', category: 'Aerospace / CAD', flagship: true, blurb: 'Parametric solid modeler with true BSP-CSG booleans, a constrained sketcher, mass properties and orthographic drawings.' },
   { slug: 'cad-assembly', title: 'CAD Assembly', category: 'Aerospace / CAD', flagship: true, blurb: 'Multi-part assemblies with a real interference check (AABB + Monte-Carlo clash volume) and mass roll-up.' },
   { slug: 'cad-fea', title: 'CAD FEA', category: 'Aerospace / CAD', flagship: true, blurb: 'Real 2-D plane-stress finite-element analysis: von Mises field, deflection, yield safety factor, stress concentration.' },

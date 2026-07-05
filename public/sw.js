@@ -15,13 +15,13 @@
 //      or slower than 3.5s — which is exactly offline / flaky-network time.
 // v11: precache the aerospace labs so the engineering tools work fully
 //      offline (they are self-contained pages with zero runtime API calls).
-const CACHE = 'edurankai-v18';
-const STATIC_CACHE = 'edurankai-static-v18';
-const PAGE_CACHE = 'edurankai-pages-v18';
+const CACHE = 'edurankai-v19';
+const STATIC_CACHE = 'edurankai-static-v19';
+const PAGE_CACHE = 'edurankai-pages-v19';
 // Pre-cache a couple of useful pages so the very first offline launch works.
 const PRECACHE = ['/', '/resume', '/portal/worklog', '/careers', '/ecosystem',
   '/aquintutor/labs', '/aquintutor/labs/flight-sim', '/aquintutor/labs/cad-bench', '/aquintutor/labs/vesper-bench',
-  '/aquintutor/labs/cad-studio', '/aquintutor/labs/cad-assembly', '/aquintutor/labs/cad-fea', '/aquintutor/labs/nn-playground', '/aquintutor/labs/exploit-sandbox', '/aquintutor/labs/mcu-emulator', '/aquintutor/labs/quantum-lab'];
+  '/aquintutor/labs/cad-studio', '/aquintutor/labs/cad-assembly', '/aquintutor/labs/cad-fea', '/aquintutor/labs/nn-playground', '/aquintutor/labs/exploit-sandbox', '/aquintutor/labs/mcu-emulator', '/aquintutor/labs/quantum-lab', '/aquintutor/labs/dsp-lab'];
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();
