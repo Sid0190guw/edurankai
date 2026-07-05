@@ -12,7 +12,7 @@ export const GET: APIRoute = async ({ url }) => {
     embed: {
       iframe: origin + '/aquintutor/labs/{slug}?embed=1',
       sdk: origin + '/era-labs-embed.js',
-      lti: 'LTI 1.3 launch available on request',
+      lti: { version: '1.1', launchUrl: origin + '/api/lti/launch', customParam: 'lab=<slug>', gradePassback: 'LTI Basic Outcomes (replaceResult)' },
       events: 'postMessage: { source:"era-lab", type:"ready|progress|complete", slug, ... }',
     },
     count: LABS.length,
