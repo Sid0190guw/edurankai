@@ -1,0 +1,114 @@
+---
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { listWithdrawals, decideWithdrawal, payWithdrawal, credit } from '@/lib/hr-wallet';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const role = (user.role || '').toLowerCase();
+const canView = role === 'super_admin' || role === 'admin' || role.indexOf('hr') >= 0;
+if (!canView) return Astro.redirect('/admin');
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+let flash = '';
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action');
+  try {
+    if (action === 'decide') { const r = await decideWithdrawal(fd.get('id') as string, user, (fd.get('decision') as string) === 'approved' ? 'approved' : 'rejected', (fd.get('note') as string) || ''); flash = r.ok ? 'Decision recorded.' : 'Error: ' + r.error; }
+    else if (action === 'pay') { const r = await payWithdrawal(fd.get('id') as string, user, (fd.get('manual_ref') as string || '').trim() || undefined); flash = r.ok ? ('Paid. Ref ' + (r.ref || '—')) : 'Error: ' + r.error; }
+    else if (action === 'disburse') { const amt = parseFloat(fd.get('amount') as string || '0'); const emp = fd.get('employee_id') as string; if (emp && amt > 0) { await credit(emp, amt, (fd.get('kind') as string) || 'salary', (fd.get('note') as string) || 'Salary credit', user.id); flash = 'Credited ₹' + amt.toLocaleString('en-IN') + ' to wallet.'; } else flash = 'Pick an employee and amount.'; }
+  } catch (e: any) { flash = 'Error: ' + (e?.message || 'failed'); }
+  return Astro.redirect('/admin/hr/wallet?msg=' + encodeURIComponent(flash));
+}
+
+const all = await listWithdrawals({});
+const pending = all.filter((w: any) => w.status === 'pending');
+const approved = all.filter((w: any) => w.status === 'approved');
+const settled = all.filter((w: any) => w.status === 'paid' || w.status === 'rejected' || w.status === 'failed').slice(0, 20);
+let employees: any[] = [];
+try { employees = rowsOf(await db.execute(sql`SELECT id, full_name, employee_code, designation FROM hr_employees WHERE is_active = true ORDER BY full_name ASC LIMIT 500`)); } catch (_) {}
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const inr = (n: any) => '₹' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const rzxReady = !!process.env.RAZORPAYX_ACCOUNT_NUMBER;
+---
+<AdminLayout title="Wallet & payouts" activeNav="">
+  <div class="admin-page" style="max-width:1000px;">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">HR Management · Payroll</div>
+      <h1 class="admin-page-title">Wallet &amp; payouts</h1>
+      <p class="admin-page-sub">Disburse salary into employee wallets, and approve &amp; release withdrawal requests. Withdrawals need approval from a reporting manager, HR head, admin or super-admin before payout.</p>
+    </div></div>
+
+    {msg && <div style="margin:0 0 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{msg}</div>}
+
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px 18px;margin-bottom:18px;font-size:12.5px;color:#cfd6da;line-height:1.7;">
+      Payout channel: {rzxReady ? <span style="color:#86efac;font-weight:700;">RazorpayX Payouts — automatic on release</span> : <span style="color:#fbbf24;font-weight:700;">manual settlement</span>}. {rzxReady ? '' : 'Set RAZORPAYX_ACCOUNT_NUMBER to enable automatic bank payouts; until then, pay from your bank and record the UTR/reference on release.'}
+    </div>
+
+    <!-- Disburse salary -->
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:18px;margin-bottom:18px;">
+      <div style="font-weight:700;color:#fff;font-size:14px;margin-bottom:12px;">Credit a wallet</div>
+      <form method="POST" style="display:grid;grid-template-columns:1.6fr 1fr 1fr 2fr auto;gap:10px;align-items:end;">
+        <input type="hidden" name="action" value="disburse"/>
+        <div><label class="fl">Employee</label><select name="employee_id" class="fi" required><option value="">Select…</option>{employees.map((e: any) => (<option value={e.id}>{e.full_name} · {e.employee_code}</option>))}</select></div>
+        <div><label class="fl">Amount ₹</label><input name="amount" type="number" step="0.01" min="1" class="fi" required/></div>
+        <div><label class="fl">Kind</label><select name="kind" class="fi"><option value="salary">Salary</option><option value="bonus">Bonus</option><option value="reimbursement">Reimbursement</option><option value="adjustment">Adjustment</option></select></div>
+        <div><label class="fl">Note</label><input name="note" class="fi" placeholder="e.g. June 2026 net salary"/></div>
+        <button class="wbtn" style="background:#22c07e;">Credit</button>
+      </form>
+    </div>
+
+    <!-- Pending approvals -->
+    <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#c2410c;font-weight:700;margin:0 0 10px;">Pending approval · {pending.length}</h2>
+    {pending.length === 0 && <p style="color:#8a8a94;font-size:13px;margin-bottom:20px;">No withdrawals waiting.</p>}
+    {pending.map((w: any) => (
+      <div class="wrow">
+        <div style="flex:1;">
+          <div style="color:#fff;font-weight:700;">{w.full_name || 'Employee'} · {inr(w.amount)}</div>
+          <div style="color:#8a8a94;font-size:12px;">{w.employee_code} · {w.designation} · to {w.bank_holder || w.upi_id || '—'} {w.bank_acc ? '(' + ('••••' + String(w.bank_acc).slice(-4)) + (w.ifsc ? ', ' + w.ifsc : '') + ')' : ''}{w.note ? ' · ' + w.note : ''}</div>
+        </div>
+        <form method="POST" style="display:flex;gap:6px;align-items:center;">
+          <input type="hidden" name="action" value="decide"/><input type="hidden" name="id" value={w.id}/>
+          <input name="note" class="fi" style="width:150px;" placeholder="reason (optional)"/>
+          <button name="decision" value="approved" class="wbtn" style="background:#2563eb;">Approve</button>
+          <button name="decision" value="rejected" class="wbtn" style="background:transparent;border:1px solid #444;color:#fca5a5;">Reject</button>
+        </form>
+      </div>
+    ))}
+
+    <!-- Approved: ready to pay -->
+    <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#2563eb;font-weight:700;margin:24px 0 10px;">Approved · ready to pay · {approved.length}</h2>
+    {approved.length === 0 && <p style="color:#8a8a94;font-size:13px;margin-bottom:20px;">Nothing to release.</p>}
+    {approved.map((w: any) => (
+      <div class="wrow">
+        <div style="flex:1;"><div style="color:#fff;font-weight:700;">{w.full_name} · {inr(w.amount)}</div><div style="color:#8a8a94;font-size:12px;">approved by {w.decided_by_role} · to {w.bank_holder || w.upi_id || '—'}</div></div>
+        <form method="POST" style="display:flex;gap:6px;align-items:center;">
+          <input type="hidden" name="action" value="pay"/><input type="hidden" name="id" value={w.id}/>
+          {!rzxReady && <input name="manual_ref" class="fi" style="width:150px;" placeholder="UTR / reference"/>}
+          <button class="wbtn" style="background:#22c07e;">{rzxReady ? 'Release via RazorpayX' : 'Mark paid'}</button>
+        </form>
+      </div>
+    ))}
+
+    <!-- Settled -->
+    {settled.length > 0 && (<div>
+      <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#8a8a94;font-weight:700;margin:24px 0 10px;">Recent</h2>
+      {settled.map((w: any) => (
+        <div class="wrow" style="opacity:.7;">
+          <div style="flex:1;"><div style="color:#cfd6da;">{w.full_name} · {inr(w.amount)}</div><div style="color:#8a8a94;font-size:12px;">{w.status}{w.payout_ref ? ' · ' + w.payout_ref : ''}</div></div>
+          <span style={`font-family:'Geist Mono',monospace;font-size:10px;font-weight:700;text-transform:uppercase;color:${w.status==='paid'?'#86efac':'#fca5a5'};`}>{w.status}</span>
+        </div>
+      ))}
+    </div>)}
+  </div>
+
+  <style>
+    .fl{ display:block;font-size:10px;color:#8a8a94;text-transform:uppercase;letter-spacing:0.08em;font-weight:700;margin-bottom:4px; }
+    .fi{ background:#08080b;border:1px solid #262630;border-radius:7px;padding:8px 10px;color:#fff;font-size:13px;outline:none;font-family:inherit;width:100%; }
+    .wbtn{ border:none;border-radius:7px;padding:8px 14px;color:#fff;font-size:12px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;white-space:nowrap; }
+    .wrow{ display:flex;align-items:center;gap:12px;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;margin-bottom:8px;flex-wrap:wrap; }
+    @media(max-width:720px){ form[style*="grid-template-columns"]{ grid-template-columns:1fr !important; } }
+  </style>
+</AdminLayout>

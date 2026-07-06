@@ -1,0 +1,144 @@
+---
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { getBalance, listTxns, listBankAccounts, addBankAccount, requestWithdrawal, listWithdrawals } from '@/lib/hr-wallet';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+let employee: any = null;
+try {
+  employee = rowsOf(await db.execute(sql`SELECT * FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
+    || rowsOf(await db.execute(sql`SELECT * FROM hr_employees WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email}) AND is_active = true LIMIT 1`))[0] || null;
+  if (employee && !employee.user_id) await db.execute(sql`UPDATE hr_employees SET user_id = ${user.id} WHERE id = ${employee.id}`).catch(() => {});
+} catch (_) {}
+
+let flash = '';
+if (Astro.request.method === 'POST' && employee) {
+  const fd = await Astro.request.formData();
+  const action = fd.get('action');
+  if (action === 'add_bank') {
+    const holder = (fd.get('holder') as string || '').trim();
+    const acc = (fd.get('account_number') as string || '').trim();
+    const ifsc = (fd.get('ifsc') as string || '').trim();
+    if (holder && acc && (ifsc || fd.get('upi_id'))) { await addBankAccount(employee.id, { holder, account_number: acc, ifsc, bank_name: (fd.get('bank_name') as string || ''), upi_id: (fd.get('upi_id') as string || '') }); flash = 'Bank account saved.'; }
+    else flash = 'Account holder, number and IFSC (or a UPI id) are required.';
+  } else if (action === 'request_withdrawal') {
+    const amount = parseFloat(fd.get('amount') as string || '0');
+    const bankId = (fd.get('bank_account_id') as string || '') || null;
+    const r = await requestWithdrawal(employee.id, amount, bankId, (fd.get('note') as string || ''));
+    flash = r.ok ? 'Withdrawal requested — pending approval.' : (r.error || 'Could not request.');
+  }
+  return Astro.redirect('/portal/employee/wallet?msg=' + encodeURIComponent(flash));
+}
+
+const bal = employee ? await getBalance(employee.id) : { balance: 0, currency: 'INR', pending: 0, available: 0 };
+const txns = employee ? await listTxns(employee.id, 20) : [];
+const banks = employee ? await listBankAccounts(employee.id) : [];
+const withdrawals = employee ? await listWithdrawals({ employeeId: employee.id }) : [];
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const inr = (n: any) => '₹' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const statusColor: Record<string, string> = { pending: '#d97706', approved: '#2563eb', paid: '#059669', rejected: '#dc2626', failed: '#dc2626' };
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>My wallet</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;} body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:40px;color:#1a1510;}
+    .top{background:#12100c;height:54px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;position:sticky;top:0;z-index:40;}
+    .wrap{max-width:560px;margin:0 auto;padding:16px 14px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:8px 0 4px;}
+    input,select{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;font-family:inherit;color:#1a1510;outline:none;}
+    input:focus,select:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;}
+    .btn-dark{background:#12100c;} .btn-full{width:100%;}
+    .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .ledger{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f2ece0;}
+    .ledger:last-child{border-bottom:none;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:3px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;}
+    a{color:#c2410c;}
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee" style="color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:8px;font-size:14px;">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>My HR</a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Wallet</span>
+  <span style="font-size:11px;color:#9a8f7d;">{employee?.full_name || user.name}</span>
+</nav>
+<div class="wrap">
+  {msg && <div style="background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:11px 14px;font-size:13px;margin-bottom:14px;">{msg}</div>}
+
+  {!employee && (<div class="card" style="text-align:center;padding:34px;"><p style="font-weight:600;">No employee profile linked</p><p style="font-size:13px;color:#6b6255;margin-top:6px;">Ask HR to link your account.</p></div>)}
+
+  {employee && (<div>
+    <div class="card" style="background:linear-gradient(160deg,#1a1510,#2b241b);color:#faf6ef;border:none;">
+      <h3 style="color:rgba(250,246,239,.6);">Available balance</h3>
+      <div style="font-family:'Fraunces',serif;font-size:44px;font-weight:600;line-height:1;">{inr(bal.available)}</div>
+      <div style="display:flex;gap:22px;margin-top:14px;font-size:12px;">
+        <div><div style="color:rgba(250,246,239,.55);font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;">In wallet</div><div style="font-weight:700;margin-top:2px;">{inr(bal.balance)}</div></div>
+        <div><div style="color:rgba(250,246,239,.55);font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;">Pending withdrawal</div><div style="font-weight:700;margin-top:2px;color:#fbbf24;">{inr(bal.pending)}</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Withdraw to bank</h3>
+      {banks.length === 0
+        ? <p style="font-size:13px;color:#6b6255;">Connect a bank account below before you can withdraw.</p>
+        : (<form method="POST">
+            <input type="hidden" name="action" value="request_withdrawal"/>
+            <label>Amount (max {inr(bal.available)})</label>
+            <input name="amount" type="number" step="0.01" min="1" max={bal.available} required placeholder="0.00"/>
+            <label>To account</label>
+            <select name="bank_account_id" required>{banks.map((b: any) => (<option value={b.id}>{b.holder} · {b.account_masked || b.upi_id} {b.is_primary ? '(primary)' : ''}</option>))}</select>
+            <label>Note (optional)</label>
+            <input name="note" placeholder="e.g. advance against June salary"/>
+            <button class="btn btn-full" style="margin-top:12px;">Request withdrawal</button>
+            <p style="font-size:11.5px;color:#9a8f7d;margin-top:8px;line-height:1.5;">Withdrawals are approved by your reporting manager, HR or an administrator, then paid to your bank via the payment gateway.</p>
+          </form>)}
+    </div>
+
+    {withdrawals.length > 0 && (<div class="card"><h3>Your withdrawals</h3>
+      {withdrawals.map((w: any) => (
+        <div class="ledger">
+          <div><div style="font-weight:600;">{inr(w.amount)}</div><div style="font-size:11px;color:#9a8f7d;">{new Date(w.requested_at).toLocaleDateString('en-IN',{day:'numeric',month:'short'})}{w.note ? ' · ' + w.note : ''}</div></div>
+          <span class="pill" style={`color:${statusColor[w.status]||'#6b6255'};background:${(statusColor[w.status]||'#6b6255')}18;`}>{w.status}</span>
+        </div>
+      ))}
+    </div>)}
+
+    <div class="card"><h3>Bank accounts</h3>
+      {banks.map((b: any) => (
+        <div class="ledger"><div><div style="font-weight:600;">{b.bank_name || 'Bank'} · {b.account_masked || b.upi_id}</div><div style="font-size:11px;color:#9a8f7d;">{b.holder}{b.ifsc ? ' · ' + b.ifsc : ''}</div></div>{b.is_primary && <span class="pill" style="color:#059669;background:#05966918;">primary</span>}</div>
+      ))}
+      <details style="margin-top:12px;"><summary style="font-size:13px;color:#c2410c;cursor:pointer;font-weight:600;">+ Add / change bank account</summary>
+        <form method="POST" style="margin-top:10px;">
+          <input type="hidden" name="action" value="add_bank"/>
+          <label>Account holder name</label><input name="holder" required value={employee.full_name || ''}/>
+          <div class="row2"><div><label>Account number</label><input name="account_number" required inputmode="numeric"/></div><div><label>IFSC</label><input name="ifsc" style="text-transform:uppercase;"/></div></div>
+          <div class="row2"><div><label>Bank name</label><input name="bank_name" placeholder="e.g. State Bank of India"/></div><div><label>UPI id (optional)</label><input name="upi_id" placeholder="name@bank"/></div></div>
+          <button class="btn btn-dark btn-full" style="margin-top:12px;">Save bank account</button>
+        </form>
+      </details>
+    </div>
+
+    <div class="card"><h3>Transactions</h3>
+      {txns.length === 0 && <p style="font-size:13px;color:#6b6255;">No transactions yet. Salary and reimbursements appear here.</p>}
+      {txns.map((t: any) => (
+        <div class="ledger">
+          <div><div style="font-weight:600;text-transform:capitalize;">{t.kind}{t.note ? ' · ' + t.note : ''}</div><div style="font-size:11px;color:#9a8f7d;">{new Date(t.created_at).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}</div></div>
+          <div style={`font-weight:700;font-family:'JetBrains Mono',monospace;color:${t.direction==='credit'?'#059669':'#dc2626'};`}>{t.direction === 'credit' ? '+' : '−'}{inr(t.amount)}</div>
+        </div>
+      ))}
+    </div>
+  </div>)}
+</div>
+</body>
+</html>
