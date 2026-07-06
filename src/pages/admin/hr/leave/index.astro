@@ -1,369 +1,68 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
-import { db } from '@/lib/db';
-import { sql as sqlExpr } from 'drizzle-orm';
+import { listLeave, decideLeave } from '@/lib/hr-leave';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+const role = (user.role || '').toLowerCase();
+if (!(role === 'super_admin' || role === 'admin' || role.indexOf('hr') >= 0)) return Astro.redirect('/admin');
 
-let errorMsg = '';
-let successMsg = '';
-
+let flash = '';
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
-  const action = fd.get('action') as string;
-
-  try {
-    if (action === 'approve' || action === 'reject') {
-      const requestId = fd.get('requestId') as string;
-      const notes = (fd.get('reviewerNotes') as string || '').trim();
-      const newStatus = action === 'approve' ? 'approved' : 'rejected';
-
-      // Get the leave request
-      const lr = await db.execute(sqlExpr`SELECT * FROM hr_leave_requests WHERE id = ${requestId} LIMIT 1`);
-      const _lrRows = Array.isArray(lr) ? lr : (lr?.rows || []);
-      if (_lrRows.length > 0) {
-        const req = _lrRows[0] as any;
-
-        await db.execute(sqlExpr`
-          UPDATE hr_leave_requests SET
-            status = ${newStatus},
-            reviewed_at = NOW(),
-            reviewer_notes = ${notes || null}
-          WHERE id = ${requestId}
-        `);
-
-        // If approved, deduct from leave balance
-        if (action === 'approve') {
-          const year = new Date(req.start_date).getFullYear();
-          const existing = await db.execute(sqlExpr`
-            SELECT * FROM hr_leave_balances
-            WHERE employee_id = ${req.employee_id} AND leave_type_id = ${req.leave_type_id} AND year = ${year}
-            LIMIT 1
-          `);
-          if ((Array.isArray(existing) ? existing : (existing?.rows || [])).length > 0) {
-            await db.execute(sqlExpr`
-              UPDATE hr_leave_balances SET used = used + ${req.days}
-              WHERE employee_id = ${req.employee_id} AND leave_type_id = ${req.leave_type_id} AND year = ${year}
-            `);
-          }
-        }
-        successMsg = `Leave request ${newStatus}.`;
-      }
-    } else if (action === 'allocate') {
-      const employeeId = fd.get('employeeId') as string;
-      const leaveTypeId = fd.get('leaveTypeId') as string;
-      const year = parseInt(fd.get('year') as string || String(new Date().getFullYear()));
-      const allocated = parseFloat(fd.get('allocated') as string || '0');
-
-      await db.execute(sqlExpr`
-        INSERT INTO hr_leave_balances (employee_id, leave_type_id, year, allocated, used)
-        VALUES (${employeeId}, ${leaveTypeId}, ${year}, ${allocated}, 0)
-        ON CONFLICT (employee_id, leave_type_id, year)
-        DO UPDATE SET allocated = ${allocated}
-      `);
-      successMsg = 'Leave balance updated.';
-    } else if (action === 'bulk_allocate') {
-      const leaveTypeId = fd.get('leaveTypeId') as string;
-      const year = parseInt(fd.get('year') as string || String(new Date().getFullYear()));
-      const allocated = parseFloat(fd.get('allocated') as string || '0');
-
-      // Get all active employees
-      const emps = await db.execute(sqlExpr`SELECT id FROM hr_employees WHERE is_active = true`);
-      const _empRows = (Array.isArray(emps) ? emps : (emps?.rows || [])) as any[];
-      for (const emp of _empRows) {
-        await db.execute(sqlExpr`
-          INSERT INTO hr_leave_balances (employee_id, leave_type_id, year, allocated, used)
-          VALUES (${emp.id}, ${leaveTypeId}, ${year}, ${allocated}, 0)
-          ON CONFLICT (employee_id, leave_type_id, year)
-          DO NOTHING
-        `);
-      }
-      successMsg = `Leave allocated to ${_empRows.length} active employees.`;
-    }
-  } catch (err: any) {
-    errorMsg = 'Error: ' + (err.message || 'Unknown');
+  if (fd.get('action') === 'decide') {
+    const r = await decideLeave(fd.get('id') as string, user, (fd.get('decision') as string) === 'approved' ? 'approved' : 'rejected', (fd.get('note') as string) || '');
+    flash = r.ok ? 'Decision recorded.' : 'Error: ' + r.error;
   }
+  return Astro.redirect('/admin/hr/leave?msg=' + encodeURIComponent(flash));
 }
 
-const url = new URL(Astro.request.url);
-const tab = url.searchParams.get('tab') || 'requests';
-const statusFilter = url.searchParams.get('status') || 'pending';
-const year = parseInt(url.searchParams.get('year') || String(new Date().getFullYear()));
-
-// Leave requests
-const requests = await db.execute(sqlExpr`
-  SELECT lr.*, 
-    e.full_name as employee_name, e.employee_code, e.designation,
-    lt.name as leave_name, lt.code as leave_code, lt.is_paid
-  FROM hr_leave_requests lr
-  JOIN hr_employees e ON lr.employee_id = e.id
-  JOIN hr_leave_types lt ON lr.leave_type_id = lt.id
-  WHERE (${statusFilter === 'all'} OR lr.status = ${statusFilter})
-  ORDER BY lr.applied_at DESC
-  LIMIT 50
-`);
-
-// Leave types
-const leaveTypes = await db.execute(sqlExpr`SELECT * FROM hr_leave_types WHERE is_active = true ORDER BY name`);
-
-// Employees for allocation
-const employees = await db.execute(sqlExpr`SELECT id, full_name, employee_code FROM hr_employees WHERE is_active = true ORDER BY full_name LIMIT 200`);
-
-// Summary stats
-const stats = await db.execute(sqlExpr`
-  SELECT 
-    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-    COUNT(*) FILTER (WHERE status = 'approved') as approved,
-    COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
-    COUNT(*) as total
-  FROM hr_leave_requests
-  WHERE applied_at >= NOW() - INTERVAL '30 days'
-`);
-const _statsRows = Array.isArray(stats) ? stats : (stats?.rows || []);
-const s = (_statsRows[0] || {}) as any;
-
-function formatDate(d: any) {
-  if (!d) return '—';
-  return new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
-}
+const all = await listLeave({});
+const pending = all.filter((l: any) => l.status === 'pending');
+const recent = all.filter((l: any) => l.status !== 'pending').slice(0, 25);
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const fmt = (d: any) => new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+const statusColor: Record<string, string> = { approved: '#86efac', rejected: '#fca5a5', cancelled: '#8a8a94' };
 ---
-<AdminLayout title="Leave Management — HRMS" activeNav="hr">
-<div style="padding-bottom:80px;">
+<AdminLayout title="Leave approvals" activeNav="">
+  <div class="admin-page" style="max-width:1000px;">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">HR Management · Time off</div>
+      <h1 class="admin-page-title">Leave approvals</h1>
+      <p class="admin-page-sub">Approve or reject leave requests. Reporting managers, HR heads, admins and super-admins can decide.</p>
+    </div></div>
+    {msg && <div style="margin:0 0 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{msg}</div>}
 
-  <!-- Header -->
-  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:16px;position:sticky;top:0;z-index:10;">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-      <div>
-        <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">HRMS · Leave</p>
-        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">Leave Management</h1>
-      </div>
-      <button onclick="document.getElementById('allocModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:12px;padding:8px 14px;border-radius:8px;cursor:pointer;">
-        + Allocate
-      </button>
-    </div>
-
-    <!-- Stats -->
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px;">
-      {[
-        { label: 'Pending', value: s.pending, color: '#fbbf24' },
-        { label: 'Approved', value: s.approved, color: '#10b981' },
-        { label: 'Rejected', value: s.rejected, color: '#ef4444' },
-        { label: 'Total (30d)', value: s.total, color: '#fff' },
-      ].map(stat => (
-        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:8px;text-align:center;">
-          <p style={`font-size:18px;font-weight:700;color:${stat.color};margin:0;line-height:1;`}>{stat.value}</p>
-          <p style="font-size:9px;color:#6e6e78;margin:2px 0 0;text-transform:uppercase;letter-spacing:0.08em;">{stat.label}</p>
+    <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#c2410c;font-weight:700;margin:0 0 10px;">Pending · {pending.length}</h2>
+    {pending.length === 0 && <p style="color:#8a8a94;font-size:13px;margin-bottom:20px;">No leave requests waiting.</p>}
+    {pending.map((l: any) => (
+      <div class="lrow">
+        <div style="flex:1;">
+          <div style="color:#fff;font-weight:700;">{l.full_name || 'Employee'} · <span style="text-transform:capitalize;">{l.leave_type}</span> · {l.days}d</div>
+          <div style="color:#8a8a94;font-size:12px;">{l.employee_code} · {fmt(l.start_date)} – {fmt(l.end_date)}{l.reason ? ' · ' + l.reason : ''}</div>
         </div>
-      ))}
-    </div>
-
-    <!-- Tab nav -->
-    <div style="display:flex;gap:4px;">
-      {[['requests','Requests'],['allocate','Allocate'],['types','Leave Types']].map(([t, label]) => (
-        <a href={`?tab=${t}`} style={`text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;${tab === t ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;color:#8a8a94;'}`}>{label}</a>
-      ))}
-    </div>
-  </div>
-
-  {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
-  {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
-
-  <!-- REQUESTS TAB -->
-  {tab === 'requests' && (
-    <div style="padding:12px 16px;">
-      <!-- Filter -->
-      <div style="display:flex;gap:6px;margin-bottom:12px;overflow-x:auto;">
-        {[['pending','Pending'],['approved','Approved'],['rejected','Rejected'],['all','All']].map(([v,l]) => (
-          <a href={`?tab=requests&status=${v}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:5px 12px;border-radius:100px;white-space:nowrap;${statusFilter === v ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;'}`}>{l}</a>
-        ))}
-      </div>
-
-      <div style="display:flex;flex-direction:column;gap:8px;">
-        {(Array.isArray(requests) ? requests : (requests?.rows || [])).length === 0 && (
-          <div style="text-align:center;padding:48px;color:#6e6e78;">
-            <p style="font-size:32px;margin-bottom:8px;">📋</p>
-            <p style="font-size:13px;">No {statusFilter} leave requests</p>
-          </div>
-        )}
-        {(Array.isArray(requests) ? requests : (requests?.rows || [])).map((lr: any) => (
-          <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
-            <div style="padding:12px 14px;">
-              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:10px;">
-                <div>
-                  <p style="font-size:14px;font-weight:600;color:#fff;margin:0;">{lr.employee_name}</p>
-                  <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;font-family:'Geist Mono',monospace;">{lr.employee_code}</p>
-                </div>
-                <span style={`font-size:10px;font-weight:700;padding:3px 8px;border-radius:100px;text-transform:uppercase;flex-shrink:0;${lr.status === 'approved' ? 'background:rgba(16,185,129,0.15);color:#6ee7b7;' : lr.status === 'rejected' ? 'background:rgba(239,68,68,0.15);color:#fca5a5;' : 'background:rgba(251,191,36,0.15);color:#fbbf24;'}`}>
-                  {lr.status}
-                </span>
-              </div>
-              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px;">
-                <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
-                  <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Leave Type</p>
-                  <p style="font-size:12px;font-weight:500;color:#d8d8de;margin:2px 0 0;">{lr.leave_name} <span style="font-family:'Geist Mono',monospace;font-size:10px;color:#6e6e78;">({lr.leave_code})</span></p>
-                </div>
-                <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
-                  <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Duration</p>
-                  <p style="font-size:12px;font-weight:500;color:#d8d8de;margin:2px 0 0;">{lr.days} day{lr.days > 1 ? 's' : ''} {lr.is_paid ? '✓ Paid' : '✗ Unpaid'}</p>
-                </div>
-                <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
-                  <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">From</p>
-                  <p style="font-size:12px;font-weight:500;color:#d8d8de;margin:2px 0 0;">{formatDate(lr.start_date)}</p>
-                </div>
-                <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
-                  <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">To</p>
-                  <p style="font-size:12px;font-weight:500;color:#d8d8de;margin:2px 0 0;">{formatDate(lr.end_date)}</p>
-                </div>
-              </div>
-              {lr.reason && <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;padding:8px;background:#15151a;border-radius:6px;font-style:italic;">"{lr.reason}"</p>}
-              {lr.reviewer_notes && <p style="font-size:11px;color:#6e6e78;margin:0 0 8px;">Reviewer note: {lr.reviewer_notes}</p>}
-              <p style="font-size:10px;color:#6e6e78;margin:0;">Applied {formatDate(lr.applied_at)}</p>
-            </div>
-            {lr.status === 'pending' && (
-              <div style="border-top:1px solid #1a1a1f;padding:10px 14px;display:flex;flex-direction:column;gap:8px;">
-                <input id={`note-${lr.id}`} type="text" placeholder="Optional reviewer note..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:7px 10px;color:#fff;font-size:12px;outline:none;" />
-                <div style="display:flex;gap:8px;">
-                  <form method="POST" style="flex:1;">
-                    <input type="hidden" name="action" value="approve" />
-                    <input type="hidden" name="requestId" value={lr.id} />
-                    <input type="hidden" name="reviewerNotes" id={`rnote-approve-${lr.id}`} value="" />
-                    <button type="submit" onclick={`document.getElementById('rnote-approve-${lr.id}').value=document.getElementById('note-${lr.id}').value`} style="width:100%;background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-weight:600;font-size:13px;padding:9px;border-radius:8px;cursor:pointer;">
-                      ✓ Approve
-                    </button>
-                  </form>
-                  <form method="POST" style="flex:1;">
-                    <input type="hidden" name="action" value="reject" />
-                    <input type="hidden" name="requestId" value={lr.id} />
-                    <input type="hidden" name="reviewerNotes" id={`rnote-reject-${lr.id}`} value="" />
-                    <button type="submit" onclick={`document.getElementById('rnote-reject-${lr.id}').value=document.getElementById('note-${lr.id}').value`} style="width:100%;background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-weight:600;font-size:13px;padding:9px;border-radius:8px;cursor:pointer;">
-                      ✗ Reject
-                    </button>
-                  </form>
-                </div>
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  )}
-
-  <!-- ALLOCATE TAB -->
-  {tab === 'allocate' && (
-    <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
-      <!-- Bulk allocation -->
-      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
-        <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 4px;">Bulk Allocate</p>
-        <p style="font-size:11px;color:#6e6e78;margin:0 0 12px;">Allocate leave to all active employees at once</p>
-        <form method="POST" style="display:flex;flex-direction:column;gap:10px;">
-          <input type="hidden" name="action" value="bulk_allocate" />
-          <div>
-            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Leave Type</label>
-            <select name="leaveTypeId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
-              {(Array.isArray(leaveTypes) ? leaveTypes : (leaveTypes?.rows || [])).map((lt: any) => (
-                <option value={lt.id}>{lt.name} ({lt.code}) · Default: {lt.days_per_year}d/yr</option>
-              ))}
-            </select>
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-            <div>
-              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Year</label>
-              <input type="number" name="year" value={year} min="2024" max="2030" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-            </div>
-            <div>
-              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Days</label>
-              <input type="number" name="allocated" step="0.5" min="0" placeholder="12" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-            </div>
-          </div>
-          <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:13px;padding:11px;border-radius:8px;cursor:pointer;">Allocate to All Active Employees</button>
+        <form method="POST" style="display:flex;gap:6px;align-items:center;">
+          <input type="hidden" name="action" value="decide"/><input type="hidden" name="id" value={l.id}/>
+          <input name="note" class="lfi" placeholder="note (optional)"/>
+          <button name="decision" value="approved" class="lbtn" style="background:#22c07e;">Approve</button>
+          <button name="decision" value="rejected" class="lbtn" style="background:transparent;border:1px solid #444;color:#fca5a5;">Reject</button>
         </form>
       </div>
+    ))}
 
-      <!-- Individual allocation -->
-      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px;">
-        <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 4px;">Individual Allocation</p>
-        <p style="font-size:11px;color:#6e6e78;margin:0 0 12px;">Override leave balance for a specific employee</p>
-        <form method="POST" style="display:flex;flex-direction:column;gap:10px;">
-          <input type="hidden" name="action" value="allocate" />
-          <div>
-            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Employee</label>
-            <select name="employeeId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
-              {(Array.isArray(employees) ? employees : (employees?.rows || [])).map((e: any) => (
-                <option value={e.id}>{e.full_name} ({e.employee_code})</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Leave Type</label>
-            <select name="leaveTypeId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
-              {(Array.isArray(leaveTypes) ? leaveTypes : (leaveTypes?.rows || [])).map((lt: any) => (
-                <option value={lt.id}>{lt.name} ({lt.code})</option>
-              ))}
-            </select>
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-            <div>
-              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Year</label>
-              <input type="number" name="year" value={year} min="2024" max="2030" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-            </div>
-            <div>
-              <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Days</label>
-              <input type="number" name="allocated" step="0.5" min="0" placeholder="12" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-            </div>
-          </div>
-          <button type="submit" style="width:100%;background:#15151a;border:1px solid #1a1a1f;color:#fff;font-weight:600;font-size:13px;padding:11px;border-radius:8px;cursor:pointer;">Set Individual Balance</button>
-        </form>
-      </div>
-    </div>
-  )}
-
-  <!-- LEAVE TYPES TAB -->
-  {tab === 'types' && (
-    <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
-      {(Array.isArray(leaveTypes) ? leaveTypes : (leaveTypes?.rows || [])).map((lt: any) => (
-        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-            <div>
-              <span style="font-size:13px;font-weight:600;color:#fff;">{lt.name}</span>
-              <span style="font-family:'Geist Mono',monospace;font-size:10px;color:#6e6e78;margin-left:8px;background:#15151a;padding:2px 6px;border-radius:4px;">{lt.code}</span>
-            </div>
-            <span style={`font-size:10px;font-weight:600;padding:2px 8px;border-radius:100px;${lt.is_paid ? 'background:rgba(16,185,129,0.15);color:#6ee7b7;' : 'background:rgba(239,68,68,0.15);color:#fca5a5;'}`}>
-              {lt.is_paid ? 'Paid' : 'Unpaid'}
-            </span>
-          </div>
-          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;">
-            <div style="background:#15151a;border-radius:6px;padding:5px 8px;text-align:center;">
-              <p style="font-size:14px;font-weight:700;color:#fff;margin:0;">{lt.days_per_year}</p>
-              <p style="font-size:9px;color:#6e6e78;margin:0;">days/year</p>
-            </div>
-            <div style="background:#15151a;border-radius:6px;padding:5px 8px;text-align:center;">
-              <p style="font-size:14px;font-weight:700;color:#fff;margin:0;">{lt.min_notice_days}</p>
-              <p style="font-size:9px;color:#6e6e78;margin:0;">notice days</p>
-            </div>
-            <div style="background:#15151a;border-radius:6px;padding:5px 8px;text-align:center;">
-              <p style="font-size:12px;font-weight:600;color:#fff;margin:0;">{lt.is_carry_forward ? '✓' : '✗'}</p>
-              <p style="font-size:9px;color:#6e6e78;margin:0;">carry fwd</p>
-            </div>
-          </div>
-          {lt.description && <p style="font-size:11px;color:#6e6e78;margin:8px 0 0;font-style:italic;">{lt.description}</p>}
+    {recent.length > 0 && (<div>
+      <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#8a8a94;font-weight:700;margin:24px 0 10px;">Recent</h2>
+      {recent.map((l: any) => (
+        <div class="lrow" style="opacity:.75;">
+          <div style="flex:1;"><div style="color:#cfd6da;">{l.full_name} · <span style="text-transform:capitalize;">{l.leave_type}</span> · {l.days}d</div><div style="color:#8a8a94;font-size:12px;">{fmt(l.start_date)} – {fmt(l.end_date)}{l.decided_by_role ? ' · by ' + l.decided_by_role : ''}</div></div>
+          <span style={`font-family:'Geist Mono',monospace;font-size:10px;font-weight:700;text-transform:uppercase;color:${statusColor[l.status]||'#8a8a94'};`}>{l.status}</span>
         </div>
       ))}
-    </div>
-  )}
-</div>
-
-<!-- Bulk Allocate Modal (floating) -->
-<div id="allocModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:100;align-items:flex-end;justify-content:center;">
-  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;padding:20px;">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
-      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">Quick Allocate Leave</h2>
-      <button onclick="document.getElementById('allocModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
-    </div>
-    <p style="font-size:12px;color:#6e6e78;margin:0 0 16px;">Use the Allocate tab for more options.</p>
-    <a href="?tab=allocate" style="display:block;width:100%;text-align:center;background:#FF4F00;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:12px;border-radius:10px;">Go to Allocate Tab</a>
+    </div>)}
   </div>
-</div>
-
+  <style>
+    .lfi{ background:#08080b;border:1px solid #262630;border-radius:7px;padding:8px 10px;color:#fff;font-size:13px;outline:none;font-family:inherit;width:150px; }
+    .lbtn{ border:none;border-radius:7px;padding:8px 14px;color:#fff;font-size:12px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;white-space:nowrap; }
+    .lrow{ display:flex;align-items:center;gap:12px;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;margin-bottom:8px;flex-wrap:wrap; }
+  </style>
 </AdminLayout>
