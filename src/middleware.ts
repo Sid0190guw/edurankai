@@ -107,8 +107,12 @@ function isProtected(path: string): boolean {
 // catalogue (/aquintutor/labs) stays public for discovery; opening any specific
 // lab (/aquintutor/labs/<slug>) needs sign-in. Embedded labs inside a lesson
 // still load because the signed-in learner's cookie rides the same-origin frame.
+// TEMPORARY: the labs are open to everyone (no sign-in) while we gather user
+// feedback. Flip LABS_PUBLIC back to false to restore the login gate.
+const LABS_PUBLIC = true;
 function isGatedLab(path: string): boolean {
   if (!path) return false;
+  if (LABS_PUBLIC) return path.startsWith('/aquintutor/teach'); // keep only the teacher console gated
   if (path === '/aquintutor/labs' || path === '/aquintutor/labs/') return false;
   // Every individual lab + the advanced simulators require sign-in so the work
   // can't be copied by anonymous visitors. The catalogue index stays public.
