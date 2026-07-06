@@ -44,11 +44,13 @@ if (Astro.request.method === 'POST') {
     const locationName = (fd.get('location_name') as string || '').trim() || null;
     const workMode = fd.get('work_mode') as string || 'remote';
     const note = (fd.get('note') as string || '').trim() || null;
+    const facePhoto = (fd.get('face_photo') as string || '').slice(0, 300000) || null;
 
     try {
+      await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_photo TEXT`).catch(() => {});
       await db.execute(sql`
-        INSERT INTO hr_clock_events (employee_id, event_type, lat, lon, accuracy, location_name, work_mode, note, ip_address, device_info)
-        VALUES (${employee.id}, ${eventType}, ${lat}, ${lon}, ${accuracy}, ${locationName}, ${workMode}, ${note},
+        INSERT INTO hr_clock_events (employee_id, event_type, lat, lon, accuracy, location_name, work_mode, note, face_photo, ip_address, device_info)
+        VALUES (${employee.id}, ${eventType}, ${lat}, ${lon}, ${accuracy}, ${locationName}, ${workMode}, ${note}, ${facePhoto},
           ${Astro.clientAddress}, ${Astro.request.headers.get('user-agent')?.substring(0,200) || null})
       `);
 
@@ -537,10 +539,50 @@ function setF(form,n,v){ var el=form.querySelector('[name="'+n+'"]'); if(el) el.
 function fill(form,p){ var c=p.coords; setF(form,'lat',c.latitude); setF(form,'lon',c.longitude); setF(form,'accuracy',Math.round(c.accuracy));
   setF(form,'location_name','±'+Math.round(c.accuracy)+'m · '+c.latitude.toFixed(5)+', '+c.longitude.toFixed(5)); }
 
+// Attach the captured selfie to the form (creates the hidden field on demand).
+function setFace(form,data){ var el=form.querySelector('[name="face_photo"]');
+  if(!el){ el=document.createElement('input'); el.type='hidden'; el.name='face_photo'; form.appendChild(el); } el.value=data; }
+
+// Face check-in: take a quick selfie with the front camera as attendance proof.
+// Advisory only — a human verifies it later; if the camera is denied or missing
+// the clock still proceeds (we never block someone from marking attendance).
+function captureFace(form, cb){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ cb(); return; }
+  var settled=false; function done(){ if(settled) return; settled=true; cb(); }
+  navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user', width:{ideal:480}, height:{ideal:480} }, audio:false })
+  .then(function(stream){
+    var ov=document.createElement('div');
+    ov.style.cssText='position:fixed;inset:0;z-index:100000;background:rgba(10,12,20,.85);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:20px;';
+    ov.innerHTML=''+
+      '<div style="background:#fff;border-radius:18px;max-width:340px;width:100%;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.5);font-family:system-ui,sans-serif;">'+
+      '<div style="padding:14px 16px;border-bottom:1px solid #f0f0f0;"><p style="margin:0;font-size:14px;font-weight:700;color:#111;">Face check-in</p>'+
+      '<p style="margin:3px 0 0;font-size:11.5px;color:#6b7280;">Look at the camera and capture to confirm it’s you.</p></div>'+
+      '<div style="position:relative;background:#000;aspect-ratio:1;overflow:hidden;">'+
+      '<video autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;transform:scaleX(-1);"></video>'+
+      '<div style="position:absolute;inset:14%;border:2px dashed rgba(255,255,255,.55);border-radius:50%;pointer-events:none;"></div></div>'+
+      '<div style="padding:12px 16px 16px;display:flex;flex-direction:column;gap:8px;">'+
+      '<button type="button" data-cap style="width:100%;background:#10b981;color:#fff;border:none;font-size:14px;font-weight:700;padding:13px;border-radius:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;">'+
+      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>Capture &amp; continue</button>'+
+      '<button type="button" data-skip style="width:100%;background:none;border:none;color:#9ca3af;font-size:12px;cursor:pointer;padding:4px;">Skip camera</button></div></div>';
+    document.body.appendChild(ov);
+    var video=ov.querySelector('video'); video.srcObject=stream;
+    function cleanup(){ try{ stream.getTracks().forEach(function(t){t.stop();}); }catch(_){} if(ov.parentNode) ov.parentNode.removeChild(ov); }
+    ov.querySelector('[data-cap]').onclick=function(){
+      var vw=video.videoWidth||480, vh=video.videoHeight||480;
+      var w=240, h=Math.max(1, Math.round(vh*(w/vw)));
+      var cv=document.createElement('canvas'); cv.width=w; cv.height=h;
+      try{ cv.getContext('2d').drawImage(video,0,0,w,h); setFace(form, cv.toDataURL('image/jpeg',0.6)); }catch(_){}
+      cleanup(); done();
+    };
+    ov.querySelector('[data-skip]').onclick=function(){ cleanup(); done(); };
+    setTimeout(function(){ if(!settled){} }, 60000); // leave modal open until the user acts
+  })
+  .catch(function(){ done(); }); // no permission / no camera -> clock in without a photo
+}
+
 // Robust submit — captures GPS, never hangs (hard fallback), no external calls.
-function submitClock(formId){
-  var form=document.getElementById(formId); if(!form) return;
-  var btn=form.querySelector('button'); if(btn){ btn.disabled=true; btn.textContent='Recording…'; }
+function finishClock(form){
+  var btn=form.querySelector('button.clock-btn'); if(btn){ btn.disabled=true; btn.textContent='Recording…'; }
   var done=false; function go(){ if(done) return; done=true; form.submit(); }
   var fallback=setTimeout(go, 13000); // never leave the button stuck
   if(lastPos){ fill(form,lastPos); }
@@ -550,6 +592,12 @@ function submitClock(formId){
     function(){ if(!lastPos) setF(form,'location_name','location unavailable'); clearTimeout(fallback); go(); },
     GEO_OPTS
   );
+}
+
+// Clock in/out by face: take the selfie first, then record GPS and submit.
+function submitClock(formId){
+  var form=document.getElementById(formId); if(!form) return;
+  captureFace(form, function(){ finishClock(form); });
 }
 </script>
 </body>
