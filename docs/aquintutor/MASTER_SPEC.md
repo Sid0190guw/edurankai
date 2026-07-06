@@ -79,7 +79,7 @@ These are hard constraints. Any feature that violates one is a defect.
 |----|----------|--------|-----------------------|
 | Q1 | Does AquinTutor get its own domain (`aquintutor.ai`) and auth realm, or remain a path on edurankai.in? | §17.4 domain routing | Remain a path; single auth. |
 | Q2 | For paid AI Micro-Tutor, which provider/model and who funds tokens? | §13.4 | Feature stays disabled behind a flag. |
-| Q3 | Parent accounts: separate login linked to a child, or a "guardian view" toggle on one account? | §2.13 dashboards | Guardian view toggle on the learner account. |
+| Q3 | ~~Parent accounts: separate login vs guardian toggle?~~ **RESOLVED** — implemented as a learner-minted read-only **share link** (`/aquintutor/shared-progress/[token]`); no viewer account, revocable. | — | Done. |
 | Q4 | Institutional (B2B) seat licensing billing: self-serve or sales-assisted only? | §2.16, §13.5 | Sales-assisted (CTA to `connect@edurankai.in`). |
 
 ### 0.7 Document conventions
@@ -402,13 +402,16 @@ Routes/assets: `/labs` (licensing page), `/api/labs/catalog.json`, `public/era-l
 
 **Security.** Sandboxed iframe; CORS on catalog; per-consumer shared secret; timing-safe signature comparison. **Analytics.** `embed_loaded{slug,host}`, `lti_launch{consumer}`, `lti_score_sent{consumer,score}`.
 
-### 2.13 Parent / Teacher Dashboards **[Planned] (reads existing logs)**
+### 2.13 Verified-progress hub + Parent / Teacher view **[Built]**
 
-**Purpose.** Show **verified** progress (never vanity hours) to a guardian or teacher.
+**Purpose.** Show **verified** progress (never vanity hours) to the learner and, via a shareable read-only link, to a guardian or teacher.
 
-**Business logic.** Aggregate `aq_mastery` (mastered/verified counts), `aq_verify_log`, `aq_teachback_log` per learner. Surface "completed but **unverified**" explicitly. Guardian access model per Q3 (default: guardian view toggle).
+**Built implementation.**
+- `src/lib/aquintutor-summary.ts:getVerifiedSummary(userId)` aggregates every tier signal: `aq_mastery` (verified / growing / mastered-but-unverified), `aq_verify_log` (recent exit tickets), `aq_teachback_log`, `aq_srs_card` (recall due/mature/total), `aq_ref` + `aq_thesis_step` (research), `aq_atelier_evidence` (credential). Every query guarded so a missing table contributes nothing. Takes **any** `userId`, so the guardian view reuses it unchanged.
+- **Owner view** `/aquintutor/mastery`: leads with skills-verified; flags "marked done but not yet verified" as a warning (completing ≠ understanding); renders via the shared `components/aquintutor/VerifiedSummary.astro`.
+- **Guardian/teacher view:** the learner mints an unguessable read-only token (`aq_progress_share`) at `/aquintutor/mastery` and shares `/aquintutor/shared-progress/[token]` — no account needed for the viewer, revocable any time. This resolves **Q3** in favour of a share-link model (no fragile account-linking).
 
-**UI.** Per-child card: tier, goals, mastered/verified counts, recent exit-ticket outcomes, backlog status. **Analytics.** `dashboard_viewed{role}`.
+**API.** `GET/POST /api/aquintutor/progress-share` (create/list/revoke). **Analytics.** `dashboard_viewed{role}`, `share_created`, `share_revoked`.
 
 ### 2.14 Offline-First Learning (PWA) **[Built]**
 
@@ -466,6 +469,11 @@ Hero → **stage picker band** ("Who's learning?") with 8 tier cards (each → `
 | Knowledge Graph | `/aquintutor/knowledge-graph` | node locked/open/mastered; panel learn/mastered/locked |
 | Backlog Recovery | `/aquintutor/backlog` | setup, diagnostic, results, recovery, done |
 | Tots | `/aquintutor/tots` | home, 3 games, finish |
+| Recall (SRS) | `/aquintutor/recall` | due queue, reveal, grade, caught-up |
+| Research desk | `/aquintutor/research-workspace` | refs list/add/edit, cite, thesis tracker |
+| Credential path | `/aquintutor/credential-path` | track picker, competency logbook, portfolio-ready |
+| Verified progress | `/aquintutor/mastery` | summary + share-link management; empty |
+| Shared progress (guardian) | `/aquintutor/shared-progress/[token]` | read-only; invalid/revoked notice |
 | Courses / Lessons / Player | `/aquintutor/courses/[slug]`, `/learn/[lesson]`, `/player` | list, detail, playing, completed |
 | Practice Hub | `/aquintutor/practice-hub`, `/practice/[slug]` | idle, attempting, streak |
 | Tests / Exams | `/aquintutor/tests`, `/test/[slug]`, `/test/[slug]/run`, `/result`, `/exams` | preflight, running (timed), submitted, result |
@@ -641,6 +649,16 @@ Forward-only update rule (verbatim intent): `state = CASE WHEN new_rank > existi
 | `total` | INT | nullable |
 | `transcript` | TEXT | ≤ 2000 chars |
 | `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT NOW() |
+
+### 5.2b Tier-signature entities (existing) **[Built]**
+
+All self-bootstrapping (create themselves at runtime on first request; no manual migration).
+
+- **`aq_srs_card`** (Tutor / Recall): PK (`user_id`,`card_id`); `deck`, `ease REAL` (2.5), `interval_days INT`, `reps INT`, `lapses INT`, `due_at TIMESTAMPTZ`. SM-2 scheduler in `src/lib/aquintutor-srs.ts:schedule()` (shared by API + client previews).
+- **`aq_ref`** (Research): PK `id` UUID; `user_id`, `title`, `authors`, `year INT`, `venue`, `url`, `tags`, `status` (`to-read`/`reading`/`read`/`cited`), `notes`; index (`user_id`,`created_at DESC`).
+- **`aq_thesis_step`** (Research): PK (`user_id`,`step_key`); `done BOOLEAN`. Steps are the fixed `THESIS_STEPS` list (11).
+- **`aq_atelier_evidence`** (Atelier): PK (`user_id`,`track`,`competency_key`); `demonstrated BOOLEAN`, `evidence TEXT`.
+- **`aq_progress_share`** (guardian view): PK `token`; `user_id`, `label`, `created_at`, `revoked_at`. Unguessable token; revoke = set `revoked_at`.
 
 ### 5.3 Supporting entities (existing / referenced) **[Built/Partial]**
 
@@ -828,6 +846,10 @@ LTI 1.1 provider. `launch` verifies OAuth 1.0 HMAC-SHA1 signatures against `lti_
 | Method | URL | Auth | Purpose |
 |--------|-----|------|---------|
 | POST | `/api/aquintutor/learn` | session | profiles/mastery/verify/teachback |
+| GET/POST | `/api/aquintutor/srs` | session | Recall: seed deck, due queue, SM-2 grade |
+| GET/POST | `/api/aquintutor/research` | session | references (CRUD) + thesis steps |
+| GET/POST | `/api/aquintutor/atelier` | session | credential competencies + evidence |
+| GET/POST | `/api/aquintutor/progress-share` | session | create/list/revoke read-only share links |
 | GET | `/api/labs/catalog.json` | none (CORS) | labs product catalog |
 | POST | `/api/lti/launch` | OAuth1 | LTI tool launch |
 | POST | `/api/lti/score` | OAuth1 | LTI grade passback |
@@ -1143,12 +1165,12 @@ This section narrates the finished product from open to close, per scenario, so 
 
 - Where a paid add-on applies (never for core school-age learning framed by price), Razorpay handles the order; the server verifies the HMAC signature before granting entitlement; CHF is converted to INR paise. Test on the deployed site (keys are prod-only).
 
-### 18.9 What "done" means for the remaining tiers
+### 18.9 Post-school tiers — all shipped
 
-- **Tutor:** spaced-repetition review engine + internship/coding tracks (reuse labs/tests). **[Planned]**
-- **Research:** literature/methods workspace + thesis milestones. **[Planned]**
-- **Atelier:** trade simulations + industry credential paths. **[Planned]**
-- Each must ship with a **signature** experience (like the four school-age tiers already have), not a re-skinned course player.
+- **Tutor:** spaced-repetition Recall engine (SM-2), server-persisted, at `/aquintutor/recall`. **[Built]** Internship/coding tracks reuse labs/tests. **[Planned]**
+- **Research:** literature + thesis workspace (reference manager with APA/IEEE/BibTeX export + 11-stage thesis tracker) at `/aquintutor/research-workspace`. **[Built]**
+- **Atelier:** credential path + competency evidence logbook (4 trade tracks) at `/aquintutor/credential-path`. **[Built]**
+- All eight tiers now ship a genuine **signature** experience, not a re-skinned course player. Remaining depth (bespoke trade simulations, internship pipelines) is roadmap.
 
 ---
 
@@ -1192,9 +1214,11 @@ This section narrates the finished product from open to close, per scenario, so 
 | Sub-Juniors | Homework Helper (never-answer) + exit ticket + planner | `/aquintutor/homework` | Built |
 | Juniors | Boards+JEE knowledge graph (DAG) | `/aquintutor/knowledge-graph` | Built |
 | Scholars | Backlog Recovery (diagnostic → surgical path) | `/aquintutor/backlog` | Built |
-| Tutor | Spaced-repetition + coding/internship tracks | — | Planned |
-| Research | Literature/thesis workspace | — | Planned |
-| Atelier | Trade simulations + credentials | — | Planned |
+| Tutor | Spaced-repetition Recall engine (SM-2) | `/aquintutor/recall` | Built |
+| Research | Literature + thesis workspace (APA/IEEE/BibTeX) | `/aquintutor/research-workspace` | Built |
+| Atelier | Credential path + competency logbook | `/aquintutor/credential-path` | Built |
+
+**Cross-tier surfaces (Built):** verified-progress hub `/aquintutor/mastery`; guardian/teacher read-only share `/aquintutor/shared-progress/[token]`.
 
 ---
 
