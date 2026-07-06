@@ -17,29 +17,29 @@ export interface Achievement {
 
 export const ACHIEVEMENTS: Achievement[] = [
   // Streak
-  { id: 'streak-3',   name: 'Three in a row',    description: 'Maintain a 3-day streak',  icon: '🔥', tier: 'bronze',   category: 'streak', threshold: 3 },
-  { id: 'streak-7',   name: 'A full week',       description: 'Maintain a 7-day streak',  icon: '🔥', tier: 'silver',   category: 'streak', threshold: 7 },
-  { id: 'streak-30',  name: 'A month strong',    description: 'Maintain a 30-day streak', icon: '🔥', tier: 'gold',     category: 'streak', threshold: 30 },
-  { id: 'streak-100', name: 'A hundred days',    description: 'Maintain a 100-day streak',icon: '🔥', tier: 'platinum', category: 'streak', threshold: 100 },
+  { id: 'streak-3',   name: 'Three in a row',    description: 'Maintain a 3-day streak',  icon: 'flame', tier: 'bronze',   category: 'streak', threshold: 3 },
+  { id: 'streak-7',   name: 'A full week',       description: 'Maintain a 7-day streak',  icon: 'flame', tier: 'silver',   category: 'streak', threshold: 7 },
+  { id: 'streak-30',  name: 'A month strong',    description: 'Maintain a 30-day streak', icon: 'flame', tier: 'gold',     category: 'streak', threshold: 30 },
+  { id: 'streak-100', name: 'A hundred days',    description: 'Maintain a 100-day streak',icon: 'flame', tier: 'platinum', category: 'streak', threshold: 100 },
   // XP
-  { id: 'xp-100',     name: 'First hundred',     description: 'Earn 100 XP',              icon: '⚡', tier: 'bronze',   category: 'xp',     threshold: 100 },
-  { id: 'xp-1000',    name: 'Centurion',         description: 'Earn 1,000 XP',            icon: '⚡', tier: 'silver',   category: 'xp',     threshold: 1000 },
-  { id: 'xp-5000',    name: 'Scholar',           description: 'Earn 5,000 XP',            icon: '⚡', tier: 'gold',     category: 'xp',     threshold: 5000 },
-  { id: 'xp-20000',   name: 'Master',            description: 'Earn 20,000 XP',           icon: '⚡', tier: 'platinum', category: 'xp',     threshold: 20000 },
+  { id: 'xp-100',     name: 'First hundred',     description: 'Earn 100 XP',              icon: 'zap', tier: 'bronze',   category: 'xp',     threshold: 100 },
+  { id: 'xp-1000',    name: 'Centurion',         description: 'Earn 1,000 XP',            icon: 'zap', tier: 'silver',   category: 'xp',     threshold: 1000 },
+  { id: 'xp-5000',    name: 'Scholar',           description: 'Earn 5,000 XP',            icon: 'zap', tier: 'gold',     category: 'xp',     threshold: 5000 },
+  { id: 'xp-20000',   name: 'Master',            description: 'Earn 20,000 XP',           icon: 'zap', tier: 'platinum', category: 'xp',     threshold: 20000 },
   // Tests
-  { id: 'test-1',     name: 'First test',        description: 'Submit your first official test', icon: '📝', tier: 'bronze', category: 'tests', threshold: 1 },
-  { id: 'test-5',     name: 'Five tests',        description: 'Submit five official tests',      icon: '📝', tier: 'silver', category: 'tests', threshold: 5 },
-  { id: 'test-passed-3', name: 'Triple pass',    description: 'Pass three tests with ≥60%',      icon: '🎯', tier: 'silver', category: 'tests', threshold: 3 },
-  { id: 'test-perfect',  name: 'Flawless',       description: 'Score 100% on any test',          icon: '💎', tier: 'gold',   category: 'tests', threshold: 100 },
+  { id: 'test-1',     name: 'First test',        description: 'Submit your first official test', icon: 'filetext', tier: 'bronze', category: 'tests', threshold: 1 },
+  { id: 'test-5',     name: 'Five tests',        description: 'Submit five official tests',      icon: 'filetext', tier: 'silver', category: 'tests', threshold: 5 },
+  { id: 'test-passed-3', name: 'Triple pass',    description: 'Pass three tests with ≥60%',      icon: 'target', tier: 'silver', category: 'tests', threshold: 3 },
+  { id: 'test-perfect',  name: 'Flawless',       description: 'Score 100% on any test',          icon: 'gem', tier: 'gold',   category: 'tests', threshold: 100 },
   // Practice
-  { id: 'practice-10',  name: 'Limber',          description: 'Complete 10 practice rounds',     icon: '🏃', tier: 'bronze', category: 'practice', threshold: 10 },
-  { id: 'practice-50',  name: 'Daily learner',   description: 'Complete 50 practice rounds',     icon: '🏃', tier: 'silver', category: 'practice', threshold: 50 },
+  { id: 'practice-10',  name: 'Limber',          description: 'Complete 10 practice rounds',     icon: 'trending', tier: 'bronze', category: 'practice', threshold: 10 },
+  { id: 'practice-50',  name: 'Daily learner',   description: 'Complete 50 practice rounds',     icon: 'trending', tier: 'silver', category: 'practice', threshold: 50 },
   // Courses
-  { id: 'course-1',  name: 'First completion',   description: 'Complete one course end-to-end',  icon: '🎓', tier: 'silver', category: 'courses', threshold: 1 },
-  { id: 'course-3',  name: 'Three courses',      description: 'Complete three courses',          icon: '🎓', tier: 'gold',   category: 'courses', threshold: 3 },
+  { id: 'course-1',  name: 'First completion',   description: 'Complete one course end-to-end',  icon: 'graduation', tier: 'silver', category: 'courses', threshold: 1 },
+  { id: 'course-3',  name: 'Three courses',      description: 'Complete three courses',          icon: 'graduation', tier: 'gold',   category: 'courses', threshold: 3 },
   // Daily challenge perfect
-  { id: 'daily-1',   name: 'First daily',        description: 'Complete one daily challenge',     icon: '🎯', tier: 'bronze', category: 'practice', threshold: 1 },
-  { id: 'daily-perfect-5', name: 'Sharp shooter', description: 'Hit 5 perfect daily challenges',  icon: '🎯', tier: 'gold',   category: 'practice', threshold: 5 },
+  { id: 'daily-1',   name: 'First daily',        description: 'Complete one daily challenge',     icon: 'target', tier: 'bronze', category: 'practice', threshold: 1 },
+  { id: 'daily-perfect-5', name: 'Sharp shooter', description: 'Hit 5 perfect daily challenges',  icon: 'target', tier: 'gold',   category: 'practice', threshold: 5 },
 ];
 
 export interface UserAchievement extends Achievement { earned: boolean; progress: number }

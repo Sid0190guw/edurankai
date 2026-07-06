@@ -61,9 +61,9 @@ async function settleLastWeek(): Promise<{ ok: boolean; settled: number; promote
         if (u && u.email && result !== 'hold') {
           const oldTier = TIER_LABEL[L.tier_level] || 'Bronze';
           const newLabel = TIER_LABEL[newTier] || 'Bronze';
-          const subj = result === 'promoted' ? '🎉 Promoted to ' + newLabel + ' League!' : 'Demoted to ' + newLabel + ' — get back in the race';
+          const subj = result === 'promoted' ? 'Promoted to ' + newLabel + ' League!' : 'Demoted to ' + newLabel + ' — get back in the race';
           const html = '<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;">'
-            + '<h2 style="color:#d97757;font-family:Georgia,serif;font-size:22px;">' + (result === 'promoted' ? '🎉' : '🔽') + ' ' + subj + '</h2>'
+            + '<h2 style="color:#d97757;font-family:Georgia,serif;font-size:22px;">' + subj + '</h2>'
             + '<p style="font-size:15px;color:#333;line-height:1.6;">Hi ' + (u.name || 'there') + ',<br><br>You finished <b>#' + rank + ' of ' + n + '</b> in your ' + oldTier + ' League cohort with <b>' + m.week_xp + ' XP</b> last week.</p>'
             + (result === 'promoted'
                 ? '<p style="font-size:15px;color:#10b981;line-height:1.6;"><b>You\'re now in ' + newLabel + ' League.</b> Your weekly competition just got tougher (and the rewards bigger).</p>'

@@ -336,7 +336,7 @@ export const pushNotify = {
   offerSigned: (candidateName: string, roleName: string, appId: string) =>
     sendPushToAdmins({
       type: 'offer_signed',
-      title: '🎉 Offer Accepted',
+      title: 'Offer Accepted',
       body: `${candidateName} signed their offer for ${roleName}`,
       url: `/admin/applications/${appId}`,
       tag: `offer-signed-${appId}`

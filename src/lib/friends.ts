@@ -54,7 +54,7 @@ export async function acceptInvite(currentUserId: string, code: string): Promise
     WHERE ic.code = ${c} LIMIT 1
   `))[0] as any;
   if (!owner) return { ok: false, error: 'Code not found' };
-  if (owner.id === currentUserId) return { ok: false, error: 'That\'s your own invite code 🙂' };
+  if (owner.id === currentUserId) return { ok: false, error: 'That\'s your own invite code.' };
 
   // Insert both directions; ignore conflicts
   await db.execute(sql`

@@ -7,11 +7,11 @@ import { ensureOnce } from '@/lib/ensure-once';
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const TIERS = [
-  { level: 1, name: 'Bronze',   emoji: '🥉', color: '#b45309' },
-  { level: 2, name: 'Silver',   emoji: '🥈', color: '#94a3b8' },
-  { level: 3, name: 'Gold',     emoji: '🥇', color: '#facc15' },
-  { level: 4, name: 'Sapphire', emoji: '💎', color: '#3b82f6' },
-  { level: 5, name: 'Diamond',  emoji: '💠', color: '#22d3ee' },
+  { level: 1, name: 'Bronze',   icon: 'medal', color: '#b45309' },
+  { level: 2, name: 'Silver',   icon: 'medal', color: '#94a3b8' },
+  { level: 3, name: 'Gold',     icon: 'medal', color: '#facc15' },
+  { level: 4, name: 'Sapphire', icon: 'gem',   color: '#3b82f6' },
+  { level: 5, name: 'Diamond',  icon: 'gem',   color: '#22d3ee' },
 ];
 export const COHORT_SIZE = 30;
 export const PROMOTE_TOP = 5;
