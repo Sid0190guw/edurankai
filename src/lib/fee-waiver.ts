@@ -63,6 +63,40 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
   const intent = rows(await db.execute(sql`SELECT * FROM application_intents WHERE id = ${intentId} LIMIT 1`))[0] as any;
   if (!intent) return null;
   const d = (intent.data || {}) as any;
+
+  // Idempotency / duplicate guard — mirrors payment-effects: NEVER create a
+  // second application for the same role + applicant. If one already exists
+  // (e.g. created by a payment, or a double-click / re-approval), attach the
+  // waiver to it, drop the intent, and return the existing id. This is what
+  // stops the "one submitted + one reviewing" duplicate rows.
+  const roleIdSafe = d.roleId || null;
+  const userIdSafe = intent.user_id || null;
+  const dupeEmail = String(d.email || intent.email || '').trim().toLowerCase();
+  if (roleIdSafe && (userIdSafe || dupeEmail)) {
+    const dupe = rows(await db.execute(sql`
+      SELECT id FROM applications
+      WHERE role_id = ${roleIdSafe}
+        AND (
+          (${userIdSafe}::uuid IS NOT NULL AND applicant_user_id = ${userIdSafe})
+          OR (${dupeEmail} <> '' AND LOWER(email) = ${dupeEmail})
+        )
+      ORDER BY created_at ASC LIMIT 1
+    `).catch(() => []))[0] as any;
+    if (dupe?.id) {
+      if (opts.waiverGranted) {
+        await db.execute(sql`
+          UPDATE applications
+          SET fee_waiver_granted = true,
+              fee_waiver_reason = COALESCE(${opts.waiverReason || null}, fee_waiver_reason),
+              fee_paid_at = COALESCE(fee_paid_at, NOW())
+          WHERE id = ${dupe.id}
+        `).catch(() => {});
+      }
+      await db.execute(sql`DELETE FROM application_intents WHERE id = ${intent.id}`).catch(() => {});
+      return dupe.id as string;
+    }
+  }
+
   try {
     const ins = rows(await db.execute(sql`
       INSERT INTO applications (
