@@ -116,14 +116,16 @@ export function normalizeEmail(e: string): string {
 // Split a comma/semicolon/newline separated address list into emails (strips display names)
 export function parseAddressList(input: string | string[] | undefined): string[] {
   if (!input) return [];
-  const raw = Array.isArray(input) ? input.join(',') : input;
+  const raw = Array.isArray(input) ? input.join('\n') : input;
   const out: string[] = [];
-  for (let part of raw.split(/[,;\n]+/)) {
-    part = part.trim();
-    if (!part) continue;
-    const m = part.match(/<([^>]+)>/);
-    const email = normalizeEmail(m ? m[1] : part);
-    if (email && /.+@.+\..+/.test(email) && !out.includes(email)) out.push(email);
+  // Gmail-style: pull EVERY email address found anywhere in the text, no matter
+  // the delimiter (comma, semicolon, space, newline) or surrounding words. So a
+  // pasted blob — even with names or nonsense mixed in — just extracts the
+  // addresses and ignores the rest. Handles "Name <a@x.com>" too.
+  const re = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
+  for (const m of raw.match(re) || []) {
+    const email = normalizeEmail(m);
+    if (email && !out.includes(email)) out.push(email);
   }
   return out;
 }
