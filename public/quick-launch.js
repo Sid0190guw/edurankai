@@ -51,4 +51,19 @@
   btn.addEventListener('click', open);
   ov.addEventListener('click', close);
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+
+  // Avoid two quick-access UIs on one screen: on desktop, the home page already
+  // shows the #qaRail side rail, so this floating launcher is redundant there and
+  // its open sheet reads as an overlap. Hide the launcher only when the rail is
+  // present AND we're at desktop width; keep it on mobile and on desktop
+  // sub-pages that have no rail.
+  function syncVisibility() {
+    var hasRail = !!document.getElementById('qaRail');
+    var desktop = window.matchMedia('(min-width:1024px)').matches;
+    var hide = hasRail && desktop;
+    btn.style.display = hide ? 'none' : '';
+    if (hide) close();
+  }
+  syncVisibility();
+  window.addEventListener('resize', syncVisibility);
 })();
