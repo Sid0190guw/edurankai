@@ -7,11 +7,15 @@
 export type RoleLevel = 'C-Level' | 'Lead' | 'Senior' | 'Mid' | 'Junior' | 'Intern' | 'Apprentice' | string | null | undefined;
 
 // Policy (announced 2026-07): internships and apprenticeships carry NO
-// application fee. This is enforced centrally here so every surface (fee
-// display, pay page, submission) agrees no matter what a role row says.
-export function isFeeExempt(level: RoleLevel): boolean {
+// application fee — no payment gateway ever appears for them. Enforced
+// centrally here so every surface (fee display, pay page, submission) agrees
+// no matter what a role row says. We match on BOTH the seniority level AND the
+// engagement type, because a role can be an internship at any titled level.
+export function isFeeExempt(level: RoleLevel, engagementType?: string | null): boolean {
   const l = (level || '').toString();
-  return l === 'Intern' || l === 'Apprentice';
+  const e = (engagementType || '').toString();
+  return l === 'Intern' || l === 'Apprentice'
+    || e === 'Internship' || e === 'Apprenticeship';
 }
 
 // Fallback for any role missing application_fee_amount. Aligned with the
@@ -32,8 +36,8 @@ export function applicationFeeChf(level: RoleLevel): number {
 // Resolve the fee in CHF for an application: per-role amount if present,
 // otherwise the level-tiered default. Interns/apprentices are always 0, even
 // if a stale role row carries an application_fee_amount.
-export function resolveApplicationFeeChf(opts: { roleFee?: number | string | null; level?: RoleLevel }): number {
-  if (isFeeExempt(opts.level)) return 0;
+export function resolveApplicationFeeChf(opts: { roleFee?: number | string | null; level?: RoleLevel; engagementType?: string | null }): number {
+  if (isFeeExempt(opts.level, opts.engagementType)) return 0;
   if (opts.roleFee != null && opts.roleFee !== '') {
     const n = Number(opts.roleFee);
     if (Number.isFinite(n) && n > 0) return n;
