@@ -1,0 +1,235 @@
+---
+// /admin/mail/templates — create, edit and manage reusable email templates
+// (marketing + transactional). Each template has a name/key, subject, an HTML
+// body edited with a live preview, and {{variables}} that get filled at send
+// time. Load a template straight into the composer to blast it to a group.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// Self-bootstrap so a fresh DB (or Supabase) has the table.
+await db.execute(sql`CREATE TABLE IF NOT EXISTS email_templates (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  template_key text NOT NULL,
+  subject text NOT NULL,
+  body_html text NOT NULL DEFAULT '',
+  body_text text,
+  description text,
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+)`).catch(() => {});
+
+function slugify(s: string) { return (s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60); }
+function htmlToText(h: string) { return (h || '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim(); }
+
+let okMsg = '', errMsg = '';
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = fd.get('_action') as string;
+    if (action === 'save') {
+      const id = (fd.get('id') as string || '').trim();
+      const name = (fd.get('template_key') as string || '').trim();
+      const subject = (fd.get('subject') as string || '').trim();
+      const bodyHtml = (fd.get('body_html') as string || '').trim();
+      const description = (fd.get('description') as string || '').trim() || null;
+      const bodyText = htmlToText(bodyHtml) || null;
+      if (!name || !subject || !bodyHtml) {
+        errMsg = 'Name, subject and body are all required.';
+      } else if (id) {
+        await db.execute(sql`UPDATE email_templates SET template_key=${slugify(name)}, subject=${subject}, body_html=${bodyHtml}, body_text=${bodyText}, description=${description}, updated_at=now() WHERE id=${id}`);
+        okMsg = 'Template updated.';
+      } else {
+        await db.execute(sql`INSERT INTO email_templates (template_key, subject, body_html, body_text, description) VALUES (${slugify(name)}, ${subject}, ${bodyHtml}, ${bodyText}, ${description})`);
+        okMsg = 'Template created.';
+      }
+    } else if (action === 'delete') {
+      await db.execute(sql`DELETE FROM email_templates WHERE id=${(fd.get('id') as string || '').trim()}`);
+      okMsg = 'Template deleted.';
+    } else if (action === 'toggle') {
+      await db.execute(sql`UPDATE email_templates SET is_active = NOT is_active, updated_at=now() WHERE id=${(fd.get('id') as string || '').trim()}`);
+      okMsg = 'Template visibility updated.';
+    } else if (action === 'duplicate') {
+      const id = (fd.get('id') as string || '').trim();
+      const t = rowsOf(await db.execute(sql`SELECT template_key, subject, body_html, body_text, description FROM email_templates WHERE id=${id} LIMIT 1`))[0] as any;
+      if (t) await db.execute(sql`INSERT INTO email_templates (template_key, subject, body_html, body_text, description) VALUES (${t.template_key + '_copy'}, ${t.subject}, ${t.body_html}, ${t.body_text}, ${t.description})`);
+      okMsg = 'Template duplicated.';
+    }
+  } catch (e: any) { errMsg = 'Failed: ' + (e?.cause?.message || e?.message || 'error'); }
+}
+
+const templates = rowsOf(await db.execute(sql`SELECT id, template_key, subject, body_html, description, is_active, updated_at FROM email_templates ORDER BY updated_at DESC`));
+const VARS = ['first_name', 'last_name', 'full_name', 'email', 'role_title', 'company', 'link'];
+---
+<AdminLayout title="Email Templates" activeNav="mail">
+  <style>
+    .tpl-wrap { padding: 18px; max-width: 1300px; }
+    .tpl-grid { display: grid; grid-template-columns: 320px minmax(0,1fr); gap: 18px; align-items: start; }
+    @media (max-width: 900px) { .tpl-grid { grid-template-columns: 1fr; } }
+    .tpl-card { background: var(--o-panel2,#141418); border: 1px solid var(--o-stroke,#26262e); border-radius: 12px; }
+    .tpl-item { padding: 12px 14px; border-bottom: 1px solid var(--o-stroke,#26262e); cursor: pointer; transition: background .1s; }
+    .tpl-item:hover { background: rgba(255,255,255,0.03); }
+    .tpl-item:last-child { border-bottom: none; }
+    .tpl-name { font-size: 13px; font-weight: 600; color: #fff; }
+    .tpl-sub { font-size: 11.5px; color: #8a8a94; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tpl-badge { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 100px; text-transform: uppercase; letter-spacing: .05em; }
+    .lbl { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: #8a8a94; display: block; margin-bottom: 5px; }
+    .inp { width: 100%; background: #fff; color: #17181d; border: 1.5px solid #cbd0da; border-radius: 8px; padding: 9px 11px; font-size: 13.5px; }
+    .inp:focus { border-color: #FF6A3D; outline: none; box-shadow: 0 0 0 3px rgba(255,106,61,.2); }
+    .editor { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 1050px) { .editor { grid-template-columns: 1fr; } }
+    .code { width: 100%; min-height: 320px; background: #0d0e13; color: #e6e7ec; border: 1px solid #2a2a33; border-radius: 8px; padding: 11px; font-family: 'Geist Mono', ui-monospace, monospace; font-size: 12.5px; line-height: 1.55; resize: vertical; }
+    .prev { min-height: 320px; background: #fff; border: 1px solid #cbd0da; border-radius: 8px; overflow: auto; }
+    .prev iframe { width: 100%; height: 100%; min-height: 320px; border: 0; }
+    .tbtn { background: #262832; border: 1px solid #3a3c48; color: #e6e7ec; font-size: 11.5px; font-weight: 600; padding: 5px 9px; border-radius: 6px; cursor: pointer; }
+    .tbtn:hover { background: #30323e; }
+    .var { background: rgba(255,106,61,.12); border: 1px solid rgba(255,106,61,.3); color: #FF7040; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 100px; cursor: pointer; }
+    .var:hover { background: rgba(255,106,61,.2); }
+    .prim { background: #FF6A3D; color: #fff; border: none; font-weight: 700; padding: 9px 20px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+    .prim:hover { background: #ff5a28; }
+    .ghost { background: #262832; color: #e6e7ec; border: 1px solid #3a3c48; font-weight: 600; padding: 9px 16px; border-radius: 8px; cursor: pointer; font-size: 12.5px; }
+  </style>
+
+  <div class="tpl-wrap">
+    <div class="admin-page-header" style="margin-bottom:16px;">
+      <div class="admin-page-eyebrow">Mail</div>
+      <h1 class="admin-page-title">Email Templates</h1>
+      <p class="admin-page-sub">Build reusable emails for marketing and updates. Edit the HTML with a live preview, use <code style="color:#FF7040;">{'{{variables}}'}</code> that fill in at send time, then load a template into the composer to send it to a group.</p>
+    </div>
+
+    {okMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:12.5px;padding:10px 14px;border-radius:8px;margin-bottom:14px;">{okMsg}</div>}
+    {errMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:12.5px;padding:10px 14px;border-radius:8px;margin-bottom:14px;">{errMsg}</div>}
+
+    <div class="tpl-grid">
+      <!-- List -->
+      <div>
+        <button type="button" class="prim" style="width:100%;margin-bottom:12px;" onclick="tplNew()">+ New template</button>
+        <div class="tpl-card">
+          {templates.length === 0 && <div style="padding:20px;text-align:center;color:#6e6e78;font-size:12.5px;">No templates yet. Create your first one.</div>}
+          {templates.map((t: any) => (
+            <div class="tpl-item" onclick={`tplLoad(${JSON.stringify(JSON.stringify(t)).replace(/"/g, '&quot;')})`}>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                <span class="tpl-name">{t.template_key}</span>
+                <span class={'tpl-badge'} style={t.is_active ? 'background:rgba(16,185,129,.15);color:#6ee7b7;' : 'background:rgba(148,163,184,.15);color:#94a3b8;'}>{t.is_active ? 'active' : 'off'}</span>
+              </div>
+              <div class="tpl-sub">{t.subject}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <!-- Editor -->
+      <form method="POST" class="tpl-card" style="padding:16px;" id="tplForm">
+        <input type="hidden" name="_action" value="save" />
+        <input type="hidden" name="id" id="f_id" value="" />
+
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:14px;">
+          <span id="f_title" style="font-size:15px;font-weight:700;color:#fff;">New template</span>
+          <div style="display:flex;gap:8px;">
+            <button type="button" class="ghost" id="dupBtn" style="display:none;" onclick="tplAction('duplicate')">Duplicate</button>
+            <button type="button" class="ghost" id="toggleBtn" style="display:none;" onclick="tplAction('toggle')">Toggle active</button>
+            <button type="button" class="ghost" id="delBtn" style="display:none;color:#fca5a5;border-color:rgba(239,68,68,.3);" onclick="if(confirm('Delete this template?'))tplAction('delete')">Delete</button>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+          <div><label class="lbl">Template name</label><input class="inp" name="template_key" id="f_key" placeholder="e.g. diwali_offer" required /></div>
+          <div><label class="lbl">Description (optional)</label><input class="inp" name="description" id="f_desc" placeholder="internal note" /></div>
+        </div>
+        <div style="margin-bottom:12px;"><label class="lbl">Subject line</label><input class="inp" name="subject" id="f_subject" placeholder="e.g. A special update for {{first_name}}" required /></div>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">
+          <label class="lbl" style="margin:0;">Body (HTML) &amp; live preview</label>
+          <div style="display:flex;gap:5px;flex-wrap:wrap;">
+            <button type="button" class="tbtn" onclick="ins('<h2 style=\'font-family:Georgia,serif;color:#111;\'>Heading</h2>')">H</button>
+            <button type="button" class="tbtn" onclick="ins('<p style=\'font-size:15px;line-height:1.6;color:#333;\'>Your text here.</p>')">P</button>
+            <button type="button" class="tbtn" onclick="wrap('<strong>','</strong>')">B</button>
+            <button type="button" class="tbtn" onclick="ins('<a href=\'{{link}}\'>Link text</a>')">Link</button>
+            <button type="button" class="tbtn" onclick="ins('<a href=\'{{link}}\' style=\'display:inline-block;background:#FF4F00;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:700;\'>Button</a>')">Button</button>
+            <button type="button" class="tbtn" onclick="ins('<img src=\'https://\' alt=\'\' style=\'max-width:100%;\' />')">Img</button>
+            <button type="button" class="tbtn" onclick="ins('<hr style=\'border:none;border-top:1px solid #eee;margin:20px 0;\' />')">HR</button>
+          </div>
+        </div>
+        <div style="margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+          <span style="font-size:10.5px;color:#8a8a94;">Insert variable:</span>
+          {VARS.map((v) => <span class="var" onclick={`ins('{{${v}}}')`}>{'{{' + v + '}}'}</span>)}
+        </div>
+
+        <div class="editor">
+          <textarea class="code" name="body_html" id="f_body" placeholder="<p>Hi {{first_name}}, ...</p>" oninput="renderPrev()"></textarea>
+          <div class="prev"><iframe id="prevFrame" title="preview"></iframe></div>
+        </div>
+
+        <div style="display:flex;gap:10px;margin-top:14px;align-items:center;">
+          <button type="submit" class="prim">Save template</button>
+          <button type="button" class="ghost" onclick="tplNew()">Clear</button>
+          <a href="/admin/mail" class="ghost" style="text-decoration:none;">Go to composer</a>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- hidden helper forms for delete/toggle/duplicate -->
+  <form method="POST" id="actionForm" style="display:none;"><input type="hidden" name="_action" id="a_action" /><input type="hidden" name="id" id="a_id" /></form>
+
+  <script is:inline>
+    var cur = null;
+    function renderPrev() {
+      var html = document.getElementById('f_body').value || '<p style="color:#999;font-family:sans-serif;padding:16px;">Preview appears here…</p>';
+      var f = document.getElementById('prevFrame');
+      f.srcdoc = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:16px;font-family:Arial,sans-serif;">' + html + '</body></html>';
+    }
+    function tplNew() {
+      cur = null;
+      document.getElementById('f_id').value = '';
+      document.getElementById('f_key').value = '';
+      document.getElementById('f_desc').value = '';
+      document.getElementById('f_subject').value = '';
+      document.getElementById('f_body').value = '';
+      document.getElementById('f_title').textContent = 'New template';
+      ['dupBtn','toggleBtn','delBtn'].forEach(function(id){ document.getElementById(id).style.display = 'none'; });
+      renderPrev();
+    }
+    function tplLoad(json) {
+      var t = JSON.parse(json);
+      cur = t;
+      document.getElementById('f_id').value = t.id;
+      document.getElementById('f_key').value = t.template_key || '';
+      document.getElementById('f_desc').value = t.description || '';
+      document.getElementById('f_subject').value = t.subject || '';
+      document.getElementById('f_body').value = t.body_html || '';
+      document.getElementById('f_title').textContent = 'Editing: ' + t.template_key;
+      ['dupBtn','toggleBtn','delBtn'].forEach(function(id){ document.getElementById(id).style.display = 'inline-block'; });
+      renderPrev();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    function tplAction(action) {
+      if (!cur) return;
+      document.getElementById('a_action').value = action;
+      document.getElementById('a_id').value = cur.id;
+      document.getElementById('actionForm').submit();
+    }
+    function ins(text) {
+      var ta = document.getElementById('f_body');
+      var s = ta.selectionStart, e = ta.selectionEnd;
+      ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+      ta.focus(); ta.selectionStart = ta.selectionEnd = s + text.length;
+      renderPrev();
+    }
+    function wrap(a, b) {
+      var ta = document.getElementById('f_body');
+      var s = ta.selectionStart, e = ta.selectionEnd;
+      var sel = ta.value.slice(s, e) || 'text';
+      ta.value = ta.value.slice(0, s) + a + sel + b + ta.value.slice(e);
+      ta.focus(); renderPrev();
+    }
+    renderPrev();
+  </script>
+</AdminLayout>
