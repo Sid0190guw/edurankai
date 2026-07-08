@@ -19,6 +19,7 @@ export const SITE = {
 
 export const NAV_PRIMARY = [
   { label: 'HEI', href: '/hei' },
+  { label: 'AquinTutor', href: '/aquintutor' },
   { label: 'Research', href: '/research' },
   { label: 'Ecosystem', href: '/ecosystem' },
   { label: 'Careers', href: '/careers' },
