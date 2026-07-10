@@ -284,6 +284,16 @@ export const pushApplicant = {
       tag: `offer-${appId}`,
       requireInteraction: true,
     } as any),
+
+  taskDeadlineReminder: (applicantUserId: string, roleTitle: string, appId: string, hoursLeft: '24h' | '6h') =>
+    sendPushToUser(applicantUserId, {
+      type: 'applicant_task_deadline',
+      title: hoursLeft === '24h' ? 'Task due in 1 day' : 'Task due in 6 hours',
+      body: `Your task for ${roleTitle} is due soon — submit from your application.`,
+      url: `/portal/applications/${appId}`,
+      tag: `task-deadline-${hoursLeft}-${appId}`,
+      requireInteraction: true,
+    } as any),
 };
 
 // Convenience wrappers for each notification type
