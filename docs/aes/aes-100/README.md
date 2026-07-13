@@ -51,7 +51,9 @@ Requirement-ID prefixes: `BOOT-` (bootstrap), `LIFE-` (lifecycle),
 | VIII.42 | Trust, Privacy & Intervention Governance | `ch42-trust-intervention.md` | `public/aquin-intervention.js` | 7 |
 | VIII.44 | Safety Intelligence & Guardian Alert | `ch44-safety-intelligence.md` | `public/aquin-safety.js` | 7 |
 | VIII.45 | Future Prediction & Preventive Intelligence | `ch45-future-prediction.md` | `public/aquin-prediction.js` | 7 |
+| IX.46 | Educational Life Graph | `ch46-life-graph.md` | `public/aquin-lifegraph.js` | 7 |
 | IX.48-49 | Self-Evolution + Impact Evaluation | `ch48-49-self-evolution-impact.md` | `public/aquin-evolution.js` | 7 |
+| XI.52 | Mission Orchestration | *(= Vol I Ch16)* | `public/aquin-mission.js` | 5 |
 | X.50 | Autonomous Research | *(= Vol I Ch16)* | `public/aquin-research.js` | 7 |
 | X.51 | Simulation & Scenario | *(= Vol I Ch13 + Ch45)* | `public/aquin-simulation.js` | 6 |
 
