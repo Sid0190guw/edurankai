@@ -57,6 +57,7 @@ Requirement-ID prefixes: `BOOT-` (bootstrap), `LIFE-` (lifecycle),
 | XI.52 | Mission Orchestration | *(= Vol I Ch16)* | `public/aquin-mission.js` | 5 |
 | XII.53 | Educational Civilization (federation) | `ch53-civilization.md` | `public/aquin-civilization.js` | 6 |
 | XIII.55 | Universal Reasoning | *(= cognition + consistency)* | `public/aquin-cognition.js` | 7 |
+| XIII.56 | Meta-Cognition & Reflective Intelligence | `ch56-metacognition.md` | `public/aquin-metacognition.js` | 7 |
 | X.50 | Autonomous Research | *(= Vol I Ch16)* | `public/aquin-research.js` | 7 |
 | X.51 | Simulation & Scenario | *(= Vol I Ch13 + Ch45)* | `public/aquin-simulation.js` | 6 |
 
