@@ -62,6 +62,7 @@ Requirement-ID prefixes: `BOOT-` (bootstrap), `LIFE-` (lifecycle),
 | XV.58 | Constitutional Runtime & Governance Kernel | `ch58-constitution.md` | `public/aquin-constitution.js` | 10 |
 | XV.59 | Educational World Model (situational awareness) | `ch59-worldmodel.md` | `public/aquin-worldmodel.js` | 6 |
 | XV.60 | Educational Time Intelligence | `ch60-time.md` | `public/aquin-time.js` | 7 |
+| XV.61 | Educational Intent Intelligence | `ch61-intent.md` | `public/aquin-intent.js` | 7 |
 | X.50 | Autonomous Research | *(= Vol I Ch16)* | `public/aquin-research.js` | 7 |
 | X.51 | Simulation & Scenario | *(= Vol I Ch13 + Ch45)* | `public/aquin-simulation.js` | 6 |
 
