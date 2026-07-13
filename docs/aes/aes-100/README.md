@@ -47,6 +47,7 @@ Requirement-ID prefixes: `BOOT-` (bootstrap), `LIFE-` (lifecycle),
 | I.5 | Runtime Event Bus | *(= Vol I Ch 4)* | `public/aquin-bus.js` | 5 |
 | I.6 | Runtime Command Engine | `ch06-runtime-command.md` | `public/aquin-command.js` | 7 |
 | I.7 | Multi-Tenant Educational Runtime | `ch07-shared-device-runtime.md` | `public/aquin-device.js` | 7 |
+| II.9 | Holistic Learner Support (AI Mentor) | `ch09-holistic-learner-support.md` | `public/aquin-mentor.js` | 8 |
 
 > Method note (from the Chief Architect): we do **not** attempt to write a
 > 3,500-page manual in one pass. We engineer one chapter to production quality —
