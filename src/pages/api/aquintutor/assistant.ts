@@ -7,6 +7,7 @@
 import type { APIRoute } from 'astro';
 import { getConfig, isReady, chatStream, logUsage, logTrainingExample } from '@/lib/llm/gateway';
 import { sanitizeMessages } from '@/lib/llm/guardrails';
+import { aquinReply } from '@/lib/aquin-brain';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function sse(o: any): string { return 'data: ' + JSON.stringify(o) + '\n\n'; }
@@ -20,9 +21,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user || null;
   const cfg = await getConfig();
   let use = cfg;
+  let deterministic = false;
   if (!isReady(cfg)) {
     if (cfg.claudeApiKey) use = { ...cfg, enabled: true, provider: 'claude', maxTokens: Math.max(cfg.maxTokens, 700) };
-    else return j({ error: "Aquin's assistant is coming online." }, 503);
+    // No LLM configured: instead of "coming online", answer with the deterministic
+    // engine brain (real platform Q&A + Socratic coaching). The assistant WORKS today.
+    else deterministic = true;
   }
 
   let b: any = {};
@@ -37,6 +41,18 @@ export const POST: APIRoute = async ({ request, locals }) => {
     async start(controller) {
       const enc = new TextEncoder();
       const send = (o: any) => { try { controller.enqueue(enc.encode(sse(o))); } catch (_) {} };
+
+      // Deterministic engine brain (no LLM): stream a real answer word by word.
+      if (deterministic) {
+        const reply = aquinReply(messages);
+        const words = reply.text.split(' ');
+        for (let i = 0; i < words.length; i++) { send({ t: (i ? ' ' : '') + words[i] }); await new Promise((r) => setTimeout(r, 12)); }
+        send({ done: true });
+        await logUsage(user?.id || null, 'assistant-brain', cfg, promptChars, reply.text.length, Date.now() - t0, 'ok-deterministic');
+        try { controller.close(); } catch (_) {}
+        return;
+      }
+
       const res = await chatStream(sys, messages, use, (tok) => send({ t: tok }), request.signal);
       if (!res.ok) {
         send({ error: res.error || "Aquin couldn't respond just now." });
