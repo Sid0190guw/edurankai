@@ -57,7 +57,13 @@
     return null;
   }
 
-  function createKnowledgeStore() {
+  function createKnowledgeStore(cfg) {
+    cfg = cfg || {};
+    // COMPOSITION WITH Ch 2: K = <C,R> where C are Chapter-2 Concepts. If a Concept
+    // validator is available (injected, or window.AquinConcept.validateConcept), K
+    // stores ONLY structurally-valid Ch-2 Concepts — the seven dimensions. Without
+    // one, K runs standalone and accepts simpler concept records.
+    var conceptValidator = cfg.conceptValidator || (typeof window !== 'undefined' && window.AquinConcept && window.AquinConcept.validateConcept) || null;
     // bitemporal storage. Each concept id maps to an append-only list of versions;
     // each version has a VALID interval [validFrom, validTo) and a txTime.
     var concepts = {};        // id -> [ versionObj... ]  (append-only, INV-3)
@@ -78,6 +84,13 @@
       var lv = violation(spec, FORBIDDEN_LEARNER);
       if (lv) throw new Error('K rejects learner state in knowledge (INV-4): forbidden key "' + lv + '"');
 
+      // COMPOSITION WITH Ch 2: K stores only structurally-valid Chapter-2 Concepts
+      // (unless running standalone with no validator).
+      if (conceptValidator && (spec.representations || spec.dimensions)) {
+        var cerrs = conceptValidator(spec);
+        if (cerrs && cerrs.length) throw new Error('K stores only valid Ch-2 Concepts: ' + cerrs[0]);
+      }
+
       var vFrom = opts.validFrom != null ? opts.validFrom : now();
       var history = concepts[spec.id] || (concepts[spec.id] = []);
       // INV-2: identity is immutable — updates keep the same id; only representation changes.
@@ -87,9 +100,12 @@
       if (open) { open.validTo = vFrom; priorVersion = open.version; }
       var version = {
         id: spec.id, kind: 'concept',
-        label: spec.label != null ? spec.label : spec.id,       // representation (mutable)
-        definition: spec.definition || null,                    // representation (mutable)
-        dimensions: spec.dimensions || null,                    // Ch 2 detail lives here
+        label: spec.label != null ? spec.label
+          : (spec.representations && spec.representations.en && spec.representations.en.name) || spec.id, // representation (mutable)
+        representations: spec.representations || null,          // Ch 2: per-language representations
+        definition: spec.definition
+          || (spec.dimensions && spec.dimensions.semantic && spec.dimensions.semantic.definition) || null,
+        dimensions: spec.dimensions || null,                    // Ch 2: the seven dimensions
         validFrom: vFrom, validTo: null,                        // VALID time axis
         txTime: now(),                                          // TRANSACTION time axis
         version: priorVersion + 1,
