@@ -19,16 +19,33 @@ explicitly-declared implementation phase.
 AI appears only in Part IV — *after* the theory and mathematics, never before.
 
 ### Part I — Educational Theory  *(the "what", grounded in learning science)*
-1. **What is Education?**  ← the root; every later definition depends on it
+Chapters received so far. **[code]** = a real, Node-tested implementation exists.
+1. What is Education?
 2. What is Knowledge?
-3. What is a Concept?
-4. What is an Educational Relationship?
-5. What is Understanding?
-6. What is Learning?
-7. What is Educational Evidence?
+3. What is a Concept? **[code]**
+4. What is an Educational Relationship? **[code]**
+5. What is Understanding? **[code]**
+6. What is Learning? **[code]**
+7. What is Educational Evidence? **[code]**
 8. What is Educational Memory?
 9. What is Educational Reasoning?
 10. What is Educational Intelligence?
+11. What is an Educational Objective? **[code]**
+12. What is Educational Adaptation? **[code]**
+13. What is Educational Perception?
+14. What is Educational Planning?  *(core in Mission runtime)*
+15. What is Educational Orchestration?  *(core in Mission runtime)*
+16. What is an Educational Mission? **[code]**
+17. What is Educational Knowledge Acquisition?
+18. What is Educational Truth? **[code]**
+19. What is Educational Consistency? **[code]**
+20. What is Educational Evolution?
+21. What is Educational Governance?
+22. What is an Educational Intelligence Society?
+23. What is Collective Educational Cognition?
+24. What is Educational Creativity?
+25. What is the Educational World Model?
+26. What is Educational Prediction?
 
 ### Part II — Computational Theory  *(the "how it computes")*
 Information → Educational Information → Semantic Information → Knowledge
@@ -96,9 +113,11 @@ spec-level algorithms → subsystem contract. **No invented computer science.**
 |---|---|---|
 | Ch 1 What is Education? | Part I spec | drafted (`ch01-what-is-education.md`) |
 | Ch 2 What is Knowledge? | Part I spec | drafted (`ch02-knowledge.md`) |
-| Ch 3 Concept · Ch 4 Relationship | Part I spec **+ real code** | `public/aquin-concept.js`, Node-tested (11) |
-| Ch 5 Understanding · 6 Learning · 7 Evidence · 11 Objective · 12 Adaptation | Part I spec **+ real code** | `public/aquin-understanding.js`, Node-tested (9) |
-| Ch 1 Education · 8 Memory · 9 Reasoning · 10 Intelligence · 13 Perception · 14 Planning · 15 Orchestration | Part I spec | queued (build one brick at a time) |
+| Ch 3 Concept · 4 Relationship | **real code** | `public/aquin-concept.js`, Node-tested (11) |
+| Ch 5 Understanding · 6 Learning · 7 Evidence · 11 Objective · 12 Adaptation | **real code** | `public/aquin-understanding.js`, Node-tested (9) |
+| Ch 16 Mission (+14 Planning/15 Orchestration core) | **real code** | `public/aquin-mission.js`, Node-tested (5) — drives Concept+Learner end-to-end |
+| Ch 18 Truth · 19 Consistency | **real code** | `public/aquin-consistency.js`, Node-tested (6) — solves the Bernoulli/viscosity case |
+| Ch 1, 8, 9, 10, 13, 17, 20–26 | spec/queued | build one brick at a time |
 | Parts II–V | architecture | queued |
 | AES-001 kernel / resolver | Part V prototype | `public/aquin-kernel.js`, `aquin-resolver.js` (reference, unpushed) |
 
