@@ -87,3 +87,29 @@ All of AES-000 Ch 2–8 and every AES-001+ runtime.
 - Global vs institutional K divergence (institutions localize confidence/edges
   without forking identities) — specified in Ch 4 §provenance; distribution
   mechanics deferred.
+
+---
+
+## NOW IMPLEMENTED AS CODE — `public/aquin-knowledge.js`
+
+Chapter 1 is no longer only a spec: the `KnowledgeStore` implements and enforces
+every clause, Node-tested (11 checks). Instruction → code → proof:
+
+- **K = ⟨C,R⟩, typed property multigraph** — Concepts + first-class TYPED
+  Relationships; multigraph verified (2 different typed edges between the same pair).
+- **INV-1 Presentation independence** — `putConcept`/`relate` reject
+  `FORBIDDEN_PRESENTATION` keys recursively (`color` rejected in test).
+- **INV-2 Identity stability** — `id` immutable across edits; only representation
+  changes (Bernoulli v1→v2, same id).
+- **INV-3 Non-destructive, bitemporal** — edits close the prior valid interval and
+  append a new version with lineage; `getConcept(id,{at})` and `versionAt(t)`
+  reconstruct historical K (Mar="v1", Sep="v2").
+- **INV-4 Meaning/learner separation** — `FORBIDDEN_LEARNER` keys rejected
+  (`mastery` rejected).
+- **INV-5 Reasoning externality** — the store has no `reason`/`infer`/`teach`;
+  reasoning is a separate subsystem that consumes the read model.
+- **Subsystem contract** — `getConcept · relations · subgraph · versionAt` all
+  implemented with valid-time semantics.
+
+Harness: `knowledge_test.js` (11/11). This is Chapter 1 built line by line, not
+paraphrased into an engine.
