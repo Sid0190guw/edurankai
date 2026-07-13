@@ -43,14 +43,14 @@ Chapters received so far. **[code]** = a real, Node-tested implementation exists
 21. What is Educational Governance?
 22. What is an Educational Intelligence Society?
 23. What is Collective Educational Cognition?
-24. What is Educational Creativity?
+24. What is Educational Creativity? **[code]**
 25. What is the Educational World Model?
 26. What is Educational Prediction?
 27. What is Educational Decision Making?
 28. What is Educational Execution? **[code]**
 29. What is Educational Verification?  *(core in Execution)*
 30. What is Educational Self-Improvement?
-31. What is Educational Wisdom?  ← **Part I milestone: foundations span Perception → Wisdom**
+31. What is Educational Wisdom? **[code]**  ← **Part I milestone: Perception → Wisdom, now all real code**
 
 > **AES-000 Part I milestone (Ch 31).** The constitutional theory is complete
 > end-to-end. Next: Parts II–V move from *what Educational Intelligence is* to
@@ -128,7 +128,9 @@ spec-level algorithms → subsystem contract. **No invented computer science.**
 | Ch 16 Mission (+14 Planning/15 Orchestration core) | **real code** | `public/aquin-mission.js`, Node-tested (5) — drives Concept+Learner end-to-end |
 | Ch 18 Truth · 19 Consistency | **real code** | `public/aquin-consistency.js`, Node-tested (6) — solves the Bernoulli/viscosity case |
 | Ch 28 Execution (+29 verify core) | **real code** | `public/aquin-execution.js`, Node-tested (6) — decision->execute->verified transformation |
-| Ch 1, 8, 9, 10, 13, 17, 20–27, 29–30 | spec/queued | build one brick at a time |
+| Ch 8 Memory · 9 Reasoning · 13 Perception · 17 Acquisition · 25 World-Model · 26 Prediction | **real code** | aquin-{memory,reasoner,cognition,perception,ingest,worldmodel,prediction}.js |
+| Ch 20 Evolution · 21 Governance · 22 Society · 23 Collective · 24 Creativity · 30 Self-Improve · 31 Wisdom | **real code** | aquin-{evolution,eok,agents,collective,creativity,wisdom}.js |
+| Ch 2 Knowledge (KnowledgeStore) | **real code** | aquin-knowledge.js, Node-tested (11) + composed with Ch3 Concept |
 | Parts II–V | architecture | queued |
 
 **Closed loop now runs in code:** Objective -> Decision (Learner.adapt) ->
