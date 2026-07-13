@@ -86,11 +86,42 @@ export function aquinReply(messages: Array<{ role: string; content: string }>): 
 
   const looksGraded = SOLVE_INTENT.test(t) && (/\d/.test(t) || t.length > 24);
 
-  // 1) SOCRATIC COACHING — an explicit solve request, or a concept that clearly
-  //    dominates any platform match (so "what is the probability of…" coaches).
-  if (looksGraded || (hintScore > 0 && hintScore >= kbScore)) {
-    if (bestHint && hintScore > 0) return { text: bestHint.method + ' (I will coach you step by step — I will not just give the final answer.)', source: 'coach', matched: bestHint.keys[0] };
-    return { text: 'Let\'s work it through, not around. What is the core principle or formula this problem is testing? Write down what you know and what you are solving for — then tell me your first step and I will check it.', source: 'coach' };
+  // Detect an IN-PROGRESS coaching session so a keyword-less follow-up ("a=2, b=-5")
+  // doesn't drop out of coaching. Look back over earlier user turns for the concept
+  // we were already coaching, and carry it forward.
+  const userMsgs = messages.filter((m) => m.role === 'user');
+  let carriedHint: Hint | null = null, wasCoaching = false;
+  for (let i = 0; i < userMsgs.length - 1; i++) {
+    const tt = userMsgs[i].content.toLowerCase();
+    let h: Hint | null = null, hs = 0;
+    for (const hh of HINTS) { const sc = scoreKeys(tt, hh.keys); if (sc > hs) { hs = sc; h = hh; } }
+    if (hs > 0) { carriedHint = h; wasCoaching = true; }
+    else if (SOLVE_INTENT.test(tt) && (/\d/.test(tt) || tt.length > 24)) wasCoaching = true;
+  }
+
+  // 1) SOCRATIC COACHING — a solve request or dominant concept (start), OR a
+  //    continuation of a coaching session (a follow-up with no clear platform
+  //    question). A genuine multi-turn loop, not one canned hint: it opens with the
+  //    method, then scaffolds FORWARD — checking an attempt when the learner shows
+  //    working, nudging for the next step when they don't.
+  const startNow = looksGraded || (hintScore > 0 && hintScore >= kbScore);
+  const continuing = wasCoaching && kbScore === 0 && !startNow;
+  if (startNow || continuing) {
+    const activeHint = (hintScore > 0 ? bestHint : null) || carriedHint;
+    const userTurns = userMsgs.length;
+    const showedAttempt = /[=×÷^]|\b(i got|i think|answer is|is it|so\s|therefore|because)\b/i.test(raw) || /\d\s*[+\-*/]\s*\d/.test(raw) || /[a-z]\s*=\s*-?\d/i.test(raw);
+    const key = activeHint ? activeHint.keys[0] : undefined;
+
+    // First contact on the problem -> give the method (the Socratic opener).
+    if (userTurns <= 1) {
+      if (activeHint && hintScore > 0) return { text: activeHint.method + ' Work that step and tell me what you get — I will check it, not hand you the answer.', source: 'coach', matched: key };
+      return { text: "Let's work it through, not around. What principle or formula is this problem testing? Write down what you know and what you're solving for, then tell me your first step.", source: 'coach' };
+    }
+    // Later turns -> scaffold based on whether they've shown working.
+    if (showedAttempt) {
+      return { text: "Good — you're working it, which is the whole point. Check that step against the rule you're using: does every term balance, and are the units consistent? If it holds, carry it to the next step and tell me the result; if something looks off, tell me which line and we'll fix it together.", source: 'coach', matched: key };
+    }
+    return { text: (activeHint ? activeHint.method + ' ' : '') + "Try just the next single step and show me your working — even a wrong line helps, because it shows me exactly where to step in. What do you get?", source: 'coach', matched: key };
   }
 
   // 2) PLATFORM question -> best knowledge-base answer (real retrieval)
