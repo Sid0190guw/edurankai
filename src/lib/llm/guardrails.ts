@@ -26,6 +26,35 @@ export function systemPrompt(mode: TutorMode, c: LlmConfig): string {
   return c.systemPreamble ? base + '\n' + c.systemPreamble.slice(0, 4000) : base;
 }
 
+// AI Execution Contract (output validation) — the server twin of the Socratic
+// guarantee in public/aquin-ai-runtime.js. The system prompt TELLS the model not to
+// hand over answers; this VERIFIES the completed response actually didn't. In
+// socratic-tutor mode, if the learner posed a solve-this problem and the reply
+// states a final answer, it is flagged (for an advisory nudge + audit/training),
+// so the guarantee is enforced on the way OUT, not merely requested on the way in.
+// HONEST SCOPE: a precision-oriented heuristic (no full NLU); it errs toward NOT
+// flagging concept explanations, and never blocks — it flags + logs.
+const SOLVE_INTENT = /\b(solve|calculate|evaluate|compute|determine|find (?:the )?\w+|how (?:much|many)|what(?:'s| is) the (?:answer|value|result))\b/i;
+const ANSWER_LEAK = [
+  /(?:the\s+)?(?:final\s+)?answer\s+is\b/i,
+  /\b(?:so|thus|therefore|hence)\s*,?\s*[a-z]?\s*=\s*-?\d/i,
+  /\banswer\s*[:=]\s*-?\d/i,
+  /\\boxed\s*\{/,
+  /=\s*-?\d+(?:\.\d+)?\s*(?:units|m\/s|kg|n|j|m|s)?\s*[.!\n]*$/i,
+];
+
+export function detectAnswerLeak(mode: TutorMode, lastUserText: string, responseText: string): { leaked: boolean; reason?: string } {
+  if (mode !== 'socratic-tutor') return { leaked: false };
+  const u = String(lastUserText || '');
+  const r = String(responseText || '');
+  // must look like a problem the learner is meant to SOLVE (intent + a number present)
+  const looksGraded = SOLVE_INTENT.test(u) && /\d/.test(u);
+  if (!looksGraded) return { leaked: false };
+  const hit = ANSWER_LEAK.find((re) => re.test(r));
+  if (hit) return { leaked: true, reason: 'response states a final answer to a solve-this problem (Socratic contract: hint, don’t hand over)' };
+  return { leaked: false };
+}
+
 // Sanitize + cap the conversation the client sends.
 export function sanitizeMessages(raw: any): ChatMessage[] {
   if (!Array.isArray(raw)) return [];

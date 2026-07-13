@@ -5,7 +5,7 @@
 // exchange feeds AquinTutor's own model.
 import type { APIRoute } from 'astro';
 import { getConfig, isReady, chatStream, logUsage, logTrainingExample, underRateLimit } from '@/lib/llm/gateway';
-import { systemPrompt, sanitizeMessages, type TutorMode } from '@/lib/llm/guardrails';
+import { systemPrompt, sanitizeMessages, detectAnswerLeak, type TutorMode } from '@/lib/llm/guardrails';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function sse(o: any): string { return 'data: ' + JSON.stringify(o) + '\n\n'; }
@@ -37,8 +37,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
         send({ error: res.error || 'The tutor could not respond.' });
         await logUsage(user.id, 'tutor-' + mode, cfg, promptChars, 0, Date.now() - t0, 'error');
       } else {
+        // AI Execution Contract: verify the completed reply honoured the Socratic
+        // guarantee (didn't hand over the answer). Non-blocking: advise + audit.
+        const lastUser = messages.filter((m) => m.role === 'user').slice(-1)[0]?.content || '';
+        const leak = detectAnswerLeak(mode, lastUser, res.text);
+        if (leak.leaked) send({ advisory: 'Heads up — try the next step yourself before checking. Learning sticks when you reach the answer, not when it’s handed to you.' });
         send({ done: true });
-        await logUsage(user.id, 'tutor-' + mode, cfg, promptChars, res.text.length, Date.now() - t0, 'ok', res.promptTokens, res.completionTokens);
+        await logUsage(user.id, 'tutor-' + mode, cfg, promptChars, res.text.length, Date.now() - t0, leak.leaked ? 'ok-answer-leak' : 'ok', res.promptTokens, res.completionTokens);
         await logTrainingExample(user.id, 'tutor-' + mode, cfg, sys, messages, res.text);
       }
       try { controller.close(); } catch (_) {}
