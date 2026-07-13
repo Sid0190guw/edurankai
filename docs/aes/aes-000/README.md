@@ -46,7 +46,7 @@ Chapters received so far. **[code]** = a real, Node-tested implementation exists
 24. What is Educational Creativity? **[code]**
 25. What is the Educational World Model?
 26. What is Educational Prediction?
-27. What is Educational Decision Making?
+27. What is Educational Decision Making? **[code]**
 28. What is Educational Execution? **[code]**
 29. What is Educational Verification?  *(core in Execution)*
 30. What is Educational Self-Improvement?
