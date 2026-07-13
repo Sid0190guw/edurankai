@@ -55,6 +55,8 @@ Requirement-ID prefixes: `BOOT-` (bootstrap), `LIFE-` (lifecycle),
 | IX.47 | Collective Educational Intelligence | `ch47-collective-intelligence.md` | `public/aquin-collective.js` | 6 |
 | IX.48-49 | Self-Evolution + Impact Evaluation | `ch48-49-self-evolution-impact.md` | `public/aquin-evolution.js` | 7 |
 | XI.52 | Mission Orchestration | *(= Vol I Ch16)* | `public/aquin-mission.js` | 5 |
+| XII.53 | Educational Civilization (federation) | `ch53-civilization.md` | `public/aquin-civilization.js` | 6 |
+| XIII.55 | Universal Reasoning | *(= cognition + consistency)* | `public/aquin-cognition.js` | 7 |
 | X.50 | Autonomous Research | *(= Vol I Ch16)* | `public/aquin-research.js` | 7 |
 | X.51 | Simulation & Scenario | *(= Vol I Ch13 + Ch45)* | `public/aquin-simulation.js` | 6 |
 
