@@ -83,16 +83,17 @@
   // ---- Ch 5+6: ingest evidence -> Bayesian update -> CSTs ----------------
   LearnerModel.prototype.observe = function (evidenceSpec) {
     var ev = (evidenceSpec && evidenceSpec.targets) ? evidenceSpec : makeEvidence(evidenceSpec);
-    ev.targets = ev.targets || {};
-    ev.misconceptionTargets = ev.misconceptionTargets || {};
+    // read defaults locally — never mutate the (possibly frozen/immutable) evidence
+    var targets = ev.targets || {};
+    var mcTargets = ev.misconceptionTargets || {};
     var v = this.validate(ev);
     if (!v.ok) return { accepted: false, reasons: v.reasons, csts: [] };
     var cell = this._cell(ev.conceptId, ev.context);
     var w = 1.0 * clamp01(ev.obsConfidence, 0.8) * qualityScore(ev.quality); // ECD weight
     var made = [], self = this;
 
-    Object.keys(ev.targets).forEach(function (dim) {
-      var dir = ev.targets[dim] >= 0 ? 1 : -1, cd = cell.dims[dim];
+    Object.keys(targets).forEach(function (dim) {
+      var dir = targets[dim] >= 0 ? 1 : -1, cd = cell.dims[dim];
       var beforeMean = cd.a / (cd.a + cd.b), beforeMass = cd.a + cd.b;
       if (dir > 0) { cd.a += w; cd.reinf++; } else { cd.b += w; }
       cd.lastT = ev.time;
@@ -107,8 +108,8 @@
       made.push({ conceptId: ev.conceptId, context: ev.context, dim: dim, kind: kind, deltaMean: +(afterMean - beforeMean).toFixed(4), direction: dir, confidenceAfter: +(1 - 1 / (cd.a + cd.b)).toFixed(3), evidenceId: ev.id, time: ev.time });
     });
 
-    Object.keys(ev.misconceptionTargets).forEach(function (mcId) {
-      var dir = ev.misconceptionTargets[mcId] >= 0 ? 1 : -1;
+    Object.keys(mcTargets).forEach(function (mcId) {
+      var dir = mcTargets[mcId] >= 0 ? 1 : -1;
       if (!cell.mc[mcId]) cell.mc[mcId] = { a: self.prior, b: self.prior, lastT: null };
       var m = cell.mc[mcId], before = m.a / (m.a + m.b);
       if (dir > 0) m.a += w; else m.b += w;            // +1 = evidence learner HOLDS it
