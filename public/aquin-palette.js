@@ -57,6 +57,14 @@
     focus: { hex: '#1D5E8C', glyph: 'target', label: 'Focus now', valence: 0.3, arousal: 0.45, why: 'blue = calm focus, lowers arousal, supports sustained attention' }
   };
 
+  // ---- DARK-SURFACE variants (same psychology, brighter for a dark background) ----
+  // The learner classroom is dark; a filled meter is a GRAPHICAL element (WCAG
+  // 1.4.11 => >=3:1 vs the dark track). Same meaning, verified against dark bg.
+  var STATES_DARK = {
+    mastered: '#3DDC84', proficient: '#54C98A', learning: '#FF8A4C', review: '#F2C14E',
+    struggling: '#E8A13A', misconception: '#BB93FF', locked: '#8A8F98', focus: '#5AB0F0'
+  };
+
   // ---- per-tier MOOD: arousal ramps with age; younger => softer/calmer surfaces ----
   // returns a saturation/lightness bias applied to accents for that learner tier.
   var TIER_MOODS = {
@@ -69,6 +77,20 @@
   };
 
   function stateFor(name) { return STATES[name] || STATES.locked; }
+  // resolve a state's colour for a theme ('light'|'dark'); returns hex + glyph + label
+  function stateColor(name, theme) {
+    var s = STATES[name] || STATES.locked;
+    var hex = theme === 'dark' ? (STATES_DARK[name] || STATES_DARK.locked) : s.hex;
+    return { hex: hex, glyph: s.glyph, label: s.label, why: s.why };
+  }
+  // map a 0..1 mastery value to the psychologically-correct learning state
+  function stateForMastery(m) {
+    if (m >= 0.9) return 'mastered';
+    if (m >= 0.75) return 'proficient';
+    if (m >= 0.5) return 'learning';
+    if (m >= 0.3) return 'review';
+    return 'struggling';
+  }
 
   // emit CSS custom properties for a given background (defaults to paper)
   function toCSSVars(bg) {
@@ -90,8 +112,9 @@
   }
 
   window.AquinPalette = {
-    BRAND: BRAND, STATES: STATES, TIER_MOODS: TIER_MOODS,
+    BRAND: BRAND, STATES: STATES, STATES_DARK: STATES_DARK, TIER_MOODS: TIER_MOODS,
     contrastRatio: contrastRatio, relLuminance: relLuminance, meetsAA: meetsAA,
-    stateFor: stateFor, toCSSVars: toCSSVars, auditContrast: auditContrast
+    stateFor: stateFor, stateColor: stateColor, stateForMastery: stateForMastery,
+    toCSSVars: toCSSVars, auditContrast: auditContrast
   };
 })();
