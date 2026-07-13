@@ -5,6 +5,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { targetDifficultyFromHistory } from '@/lib/irt';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -28,20 +29,28 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (!t) return json({ ok: false, error: 'Test not found or unpublished' }, 404);
     if (!t.practice_enabled) return json({ ok: false, error: 'Practice mode is disabled for this test' }, 403);
 
-    // Adaptive sampling: prefer questions whose empirical difficulty matches
-    // the user's recent accuracy. Also de-prioritise questions the user has
-    // seen recently. Falls back to pure random when no stats exist.
+    // Adaptive sampling via Item Response Theory: estimate the learner's ability
+    // (theta) from their real answer history — each past response paired with that
+    // question's empirical difficulty — then target the difficulty that is MAXIMALLY
+    // INFORMATIVE at their ability (for the 2PL that is difficulty == ability). This
+    // replaces the old "miss-rate + 0.1" heuristic with a real psychometric estimate.
+    // De-prioritises recently-seen questions and falls back to 0.5 when no history.
     let targetDifficulty = 0.5;
+    let abilityTheta: number | null = null;
     if (user) {
       try {
-        const ar = rows(await db.execute(sql`
-          SELECT AVG(CASE WHEN last_correct THEN 0 ELSE 1 END)::numeric AS missed
-          FROM user_question_history
-          WHERE user_id = ${user.id} AND last_seen_at > NOW() - INTERVAL '14 days'
-        `))[0] as any;
-        if (ar && ar.missed != null) {
-          // Aim for ~25% above the user's miss rate so questions feel slightly stretching.
-          targetDifficulty = Math.min(0.85, Math.max(0.2, Number(ar.missed) + 0.1));
+        const hist = rows(await db.execute(sql`
+          SELECT h.last_correct, COALESCE(s.empirical_difficulty, 0.5)::float8 AS emp
+          FROM user_question_history h
+          LEFT JOIN question_stats s ON s.question_id = h.question_id
+          WHERE h.user_id = ${user.id} AND h.last_seen_at > NOW() - INTERVAL '30 days'
+          ORDER BY h.last_seen_at DESC
+          LIMIT 40
+        `)).map((r: any) => ({ correct: !!r.last_correct, emp: Number(r.emp) }));
+        if (hist.length) {
+          const est = targetDifficultyFromHistory(hist);
+          targetDifficulty = est.targetDifficulty;
+          abilityTheta = est.theta;
         }
       } catch (_) {}
     }
@@ -89,7 +98,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       marks: q.marks,
     }));
 
-    return json({ ok: true, sessionId, testTitle: t.title, questions: out });
+    return json({ ok: true, sessionId, testTitle: t.title, questions: out, ability: abilityTheta, targetDifficulty });
   } catch (e: any) {
     return json({ ok: false, error: e?.message || 'server error' }, 500);
   }
