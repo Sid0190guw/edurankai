@@ -134,6 +134,15 @@ spec-level algorithms → subsystem contract. **No invented computer science.**
 **Closed loop now runs in code:** Objective -> Decision (Learner.adapt) ->
 Execution Contract -> governed Action -> Evidence -> Understanding update ->
 Verify (Concept State Transformation) — across `aquin-{concept,understanding,mission,execution}.js`.
+
+**AES-001 systems layer begun:** `public/aquin-eok.js` — the Educational
+Operating Kernel (Ch 1, +Runtime/Runtime-Domain core Ch 2/3). Every engine above
+plugs into it as a constitutional **Runtime Domain**; the only way to change
+educational reality is `submit(transaction)`, which runs the governance gate
+(denies fabricated evidence / non-advisory proctoring / ungranted authority),
+consistency-gates truth, returns an immutable Runtime Object, and appends to the
+ledger. Node-tested (9). *(Distinct from the earlier boot prototype
+`aquin-kernel.js`, which is the low-level runtime bootstrap.)*
 | AES-001 kernel / resolver | Part V prototype | `public/aquin-kernel.js`, `aquin-resolver.js` (reference, unpushed) |
 
 > Reference prototypes (kernel/resolver) predate the Part-ordering above; they
