@@ -46,7 +46,7 @@ Requirement-ID prefixes: `BOOT-` (bootstrap), `LIFE-` (lifecycle),
 | I.4 | Runtime Domain Execution | *(embodied in Lifecycle + Scheduler + Command)* | — | — |
 | I.5 | Runtime Event Bus | *(= Vol I Ch 4)* | `public/aquin-bus.js` | 5 |
 | I.6 | Runtime Command Engine | `ch06-runtime-command.md` | `public/aquin-command.js` | 7 |
-| I.7 | Shared Device Runtime | `ch07-shared-device-runtime.md` | `public/aquin-device.js` | — |
+| I.7 | Multi-Tenant Educational Runtime | `ch07-shared-device-runtime.md` | `public/aquin-device.js` | 7 |
 
 > Method note (from the Chief Architect): we do **not** attempt to write a
 > 3,500-page manual in one pass. We engineer one chapter to production quality —
