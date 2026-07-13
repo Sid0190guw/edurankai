@@ -6,6 +6,7 @@
 import type { APIRoute } from 'astro';
 import { getConfig, isReady, chatStream, logUsage, logTrainingExample, underRateLimit } from '@/lib/llm/gateway';
 import { systemPrompt, sanitizeMessages, detectAnswerLeak, type TutorMode } from '@/lib/llm/guardrails';
+import { aquinReply } from '@/lib/aquin-brain';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function sse(o: any): string { return 'data: ' + JSON.stringify(o) + '\n\n'; }
@@ -15,7 +16,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
   if (!user) return j({ error: 'Sign in first' }, 401);
 
   const cfg = await getConfig();
-  if (!isReady(cfg)) return j({ error: 'The tutor is not switched on yet.' }, 503);
+  const deterministic = !isReady(cfg);   // no LLM -> deterministic engine brain (Socratic coach), not a 503
   if (!(await underRateLimit(user.id, 30, 60))) return j({ error: 'Slow down a moment and try again.' }, 429);
 
   let b: any = {};
@@ -32,6 +33,18 @@ export const POST: APIRoute = async ({ request, locals }) => {
     async start(controller) {
       const enc = new TextEncoder();
       const send = (o: any) => { try { controller.enqueue(enc.encode(sse(o))); } catch (_) {} };
+
+      // No LLM configured: the deterministic engine brain coaches Socratically.
+      if (deterministic) {
+        const reply = aquinReply(messages);
+        const words = reply.text.split(' ');
+        for (let i = 0; i < words.length; i++) { send({ t: (i ? ' ' : '') + words[i] }); await new Promise((r) => setTimeout(r, 12)); }
+        send({ done: true });
+        await logUsage(user.id, 'tutor-' + mode, cfg, promptChars, reply.text.length, Date.now() - t0, 'ok-deterministic');
+        try { controller.close(); } catch (_) {}
+        return;
+      }
+
       const res = await chatStream(sys, messages, cfg, (tok) => send({ t: tok }), request.signal);
       if (!res.ok) {
         send({ error: res.error || 'The tutor could not respond.' });
