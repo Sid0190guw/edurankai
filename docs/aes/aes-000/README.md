@@ -20,7 +20,7 @@ AI appears only in Part IV — *after* the theory and mathematics, never before.
 
 ### Part I — Educational Theory  *(the "what", grounded in learning science)*
 Chapters received so far. **[code]** = a real, Node-tested implementation exists.
-1. What is Education?
+1. What is Education? **[code]**
 2. What is Knowledge?
 3. What is a Concept? **[code]**
 4. What is an Educational Relationship? **[code]**
@@ -29,7 +29,7 @@ Chapters received so far. **[code]** = a real, Node-tested implementation exists
 7. What is Educational Evidence? **[code]**
 8. What is Educational Memory?
 9. What is Educational Reasoning?
-10. What is Educational Intelligence?
+10. What is Educational Intelligence? **[code]**
 11. What is an Educational Objective? **[code]**
 12. What is Educational Adaptation? **[code]**
 13. What is Educational Perception?
