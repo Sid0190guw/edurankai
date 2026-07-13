@@ -61,6 +61,7 @@ Requirement-ID prefixes: `BOOT-` (bootstrap), `LIFE-` (lifecycle),
 | XIV.57 | Multi-Agent Educational Society | `ch57-agents.md` | `public/aquin-agents.js` | 6 |
 | XV.58 | Constitutional Runtime & Governance Kernel | `ch58-constitution.md` | `public/aquin-constitution.js` | 10 |
 | XV.59 | Educational World Model (situational awareness) | `ch59-worldmodel.md` | `public/aquin-worldmodel.js` | 6 |
+| XV.60 | Educational Time Intelligence | `ch60-time.md` | `public/aquin-time.js` | 7 |
 | X.50 | Autonomous Research | *(= Vol I Ch16)* | `public/aquin-research.js` | 7 |
 | X.51 | Simulation & Scenario | *(= Vol I Ch13 + Ch45)* | `public/aquin-simulation.js` | 6 |
 
