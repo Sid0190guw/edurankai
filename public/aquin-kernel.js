@@ -240,7 +240,7 @@
     register: function (mod) {
       if (!mod || !mod.id || typeof mod.init !== 'function') throw new Error('register(mod): needs {id, init, deps?, healthCheck?}');
       if (this.state !== 'idle') throw new Error('register must happen before boot()');
-      modules.push({ id: mod.id, deps: mod.deps || [], phase: mod.phase || 2, init: mod.init, healthCheck: mod.healthCheck || null, dispose: mod.dispose || null });
+      modules.push({ id: mod.id, deps: mod.deps || [], optionalDeps: mod.optionalDeps || [], category: mod.category || null, priority: mod.priority || 0, version: mod.version || '1.0.0', degradation: mod.degradation || null, phase: mod.phase || 2, init: mod.init, healthCheck: mod.healthCheck || null, dispose: mod.dispose || null });
       return this;
     },
     get: function (id) { return instances[id]; },
@@ -295,17 +295,39 @@
           phase('capability');
           self.capabilities = await analyzeCapabilities(log);
 
-          // PHASE 2 — GRAPH: build DAG, detect cycles, topo-sort.
+          // PHASE 2 — GRAPH: delegate planning to the Dependency Resolution
+          // Engine (Ch 1.2, window.AquinResolver) when present; else use the
+          // built-in topological sort. The plan is immutable & reproducible.
           phase('graph');
           var ctx = { snapshot: snapshot, identity: self.identity, capabilities: self.capabilities, log: log, get: self.get };
-          var order = topoSort(modules);
+          var byId = {}; modules.forEach(function (mm) { byId[mm.id] = mm; });
+          var levels = null, order = null;
+          if (typeof window !== 'undefined' && window.AquinResolver) {
+            var manifests = modules.map(function (mm) { return { id: mm.id, version: mm.version, category: mm.category, priority: mm.priority, deps: mm.deps, optionalDeps: mm.optionalDeps, degradation: mm.degradation }; });
+            var planned = window.AquinResolver.plan(manifests);   // throws on cycle / invalid manifest
+            report.plan = { levels: planned.levels, hash: planned.hash, resolver: window.AquinResolver.version };
+            if (planned.diagnostics && planned.diagnostics.length) report.validation = report.validation.concat(planned.diagnostics);
+            self._graph = planned.graph;
+            levels = planned.levels;
+            log('info', 'resolver', 'plan', { levels: planned.levels.length, hash: planned.hash });
+          } else {
+            order = topoSort(modules);
+          }
 
-          // PHASE 3 — INIT modules in dependency order.
+          // PHASE 3 — INIT. With levels: init each level's independent modules in
+          // PARALLEL, levels strictly in order. Without a resolver: sequential
+          // topological order. Teardown (kernel-owned) works for either path.
           phase('init');
-          for (var m = 0; m < order.length; m++) {
-            var mod = order[m];
-            try { instances[mod.id] = await mod.init(ctx); initedOrder.push(mod); log('info', mod.id, 'init.ok'); }
+          var initOne = async function (mod, level) {
+            try { instances[mod.id] = await mod.init(ctx); initedOrder.push(mod); log('info', mod.id, 'init.ok', level != null ? { level: level } : null); }
             catch (initErr) { var msg = 'Module "' + mod.id + '" failed to initialize: ' + String(initErr && initErr.message || initErr); log('fatal', mod.id, 'init.failed', { error: msg }); throw { code: 'MODULE_INIT_FAILED', module: mod.id, error: initErr, message: msg }; }
+          };
+          if (levels) {
+            for (var L = 0; L < levels.length; L++) {
+              await Promise.all(levels[L].map(function (id) { return initOne(byId[id], L); }));
+            }
+          } else {
+            for (var mi = 0; mi < order.length; mi++) await initOne(order[mi]);
           }
 
           // PHASE 4 — HEALTH: every mandatory module must report healthy.

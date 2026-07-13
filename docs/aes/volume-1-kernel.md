@@ -1,8 +1,8 @@
 # AES Volume 1 — Educational Operating Kernel
 
-**STATUS: implemented (Ch 1.1) · in progress (Ch 1.2).** Backed by
-`public/aquin-kernel.js` (and `public/aquin-resolver.js` for 1.2). Every claim
-here is verifiable against that source and the Node test harness.
+**STATUS: implemented (Ch 1.1 + Ch 1.2).** Backed by `public/aquin-kernel.js`
+and `public/aquin-resolver.js`. Every claim here is verifiable against that
+source and the Node test harnesses.
 
 > **Engineering Decision 001 (the user's standard, adopted).** First-principles,
 > 100M-learner scale, 30-year maintainability, implementation-grade detail. One
@@ -67,10 +67,46 @@ Phases (all logged with a Runtime Session Id):
 
 ## Chapter 1.2 — Runtime Dependency Resolution Engine  `window.AquinResolver`
 
-The second subsystem. It does not initialize modules directly — it computes an
-**immutable, reproducible execution plan** the kernel executes. See the source
-for the typed-edge manifest model, non-terminating graph validation
-diagnostics, parallel **startup levels**, lifecycle state events, live impact
-analysis, graceful-degradation policies (rendering→simplified, animation→
-diagrams, translation→original language, simulation→recorded), and the Runtime
-Stability Score. *(This chapter is being written as it is built.)*
+The second subsystem. It **never initializes modules directly** — it computes an
+**immutable, reproducible execution plan** the kernel executes. Given identical
+manifests it always produces an identical plan (verified: shuffled input → same
+`planHash`); random ordering is prohibited.
+
+- **Typed dependency edges** — each dep is `mandatory | strong | optional | weak`
+  with a version constraint + reason; only *blocking* edges constrain ordering
+  and cycle detection, so a missing *optional* dep degrades to a warning, not a
+  failure.
+- **Manifest validation** (non-terminating, full diagnostics) — rejects
+  duplicate ids, invalid mandatory dependency references, and **semver version
+  conflicts** (`^`, `~`, `>=`, `<=`, `>`, `<`, exact), collecting every issue
+  before aborting.
+- **Graph validation** — cycle detection with the exact chain trace + duplicate
+  edge detection; never auto-resolves.
+- **Startup levels** — `level(id) = 1 + max(level(blocking deps))`, so a level's
+  modules cannot depend on one another and **init in parallel**. The kernel
+  runs each level with `Promise.all`; levels run strictly in order. Verified:
+  `L0 config → L1 {security,storage,render} → L2 {animation,simulation,
+  translation} → L3 teacher`, level-1 modules starting with a 0 ms gap.
+- **Lifecycle state events** — `created → queued → initializing → healthy |
+  degraded | failed …`, emitted immutably for a live dependency graph.
+- **Live impact analysis** — `computeImpact(graph,id)` returns the directly and
+  transitively affected modules + affected categories (reverse reachability
+  over blocking edges). Verified: failing `render-rt` ⇒ `{animation, teacher}`.
+- **Graceful degradation** — *educational continuity before computational
+  perfection*: rendering→simplified renderer, animation→static diagram,
+  translation→original language, simulation→recorded playback, knowledge→cached
+  snapshot, assessment→defer-and-queue. `degrade(graph,id)` isolates the branch
+  and keeps teaching alive.
+- **Runtime Stability Score** (0–100) — weighted with **educational continuity
+  highest (0.35)**, then init success, availability, recovery, restart
+  frequency, dependency violations. Verified: perfect=100, degraded=69.
+
+**Kernel integration:** when `AquinResolver` is present, the kernel's GRAPH
+phase calls `plan(manifests)` (cycle/validation now surface here) and the INIT
+phase executes the levels in parallel; without it, the kernel falls back to its
+own topological sort. Teardown stays kernel-owned for either path.
+
+**Test evidence** (`scratchpad/resolver_test.js`, `integration_test.js`):
+levels, determinism, cycle trace, 3 manifest diagnostics (duplicate/invalid-ref/
+version-conflict), impact analysis, degradation, stability (100/69), parallel
+execution, and integrated kernel boot (`resolver=1.2.0`, level-1 gap 0 ms).
