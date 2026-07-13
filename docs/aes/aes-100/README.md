@@ -64,6 +64,7 @@ Requirement-ID prefixes: `BOOT-` (bootstrap), `LIFE-` (lifecycle),
 | XV.60 | Educational Time Intelligence | `ch60-time.md` | `public/aquin-time.js` | 7 |
 | XV.61 | Educational Intent Intelligence | `ch61-intent.md` | `public/aquin-intent.js` | 7 |
 | XV.62 | Educational Value & Ethics Intelligence | `ch62-ethics.md` | `public/aquin-ethics.js` | 8 |
+| XV.63 | Educational Context Intelligence | `ch63-context.md` | `public/aquin-context.js` | 7 |
 | X.50 | Autonomous Research | *(= Vol I Ch16)* | `public/aquin-research.js` | 7 |
 | X.51 | Simulation & Scenario | *(= Vol I Ch13 + Ch45)* | `public/aquin-simulation.js` | 6 |
 
