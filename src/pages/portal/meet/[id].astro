@@ -1330,6 +1330,7 @@ const myDisplayName = user.email?.split('@')[0] || 'Guest';
 <script src="/aquin-bkt.js" is:inline></script>
 <script src="/aquin-palette.js" is:inline></script>
 <script src="/aquintutor-animator-engine.js" is:inline></script>
+<script src="/meet-mesh.js" is:inline></script>
 <script is:inline define:vars={{ roomId: room?.id || id, isHost, userId: user.id, myDisplayName, isRecordingFlag: isRecording, isLockedFlag: isLocked }}>
 /* ==========================================================================
    MEETING ROOM — REAL WORKING WEBRTC
@@ -1492,6 +1493,38 @@ async function startLoopbackPC() {
   const answer = await state.pcRemote.createAnswer();
   await state.pcRemote.setLocalDescription(answer);
   await state.pcLocal.setRemoteDescription(answer);
+}
+
+// Real multi-peer MESH — every participant who opens this room connects to every other
+// over WebRTC (signaling via /api/portal/meet/<room>/signal). Falls back to the loopback
+// demo if the mesh client or signaling isn't available, so the room never breaks.
+function startMesh() {
+  if (!window.AquinMesh || !state.localStream) return startLoopbackPC();
+  const stream = (state.blurOn && state.blurredStream) ? state.blurredStream : state.localStream;
+  state.mesh = window.AquinMesh.join({
+    roomId: roomId, peerId: userId, name: myDisplayName, localStream: stream,
+    onPeerStream: (pid, s) => {
+      let p = state.participants.find(x => x.id === pid);
+      if (!p) state.participants.push({ id: pid, name: 'Participant', muted: false, camOff: false, hand: false, signal: 3, isLocal: false, color: hsl(pid), srcObject: s, isHost: false, role: 'attendee' });
+      else p.srcObject = s;
+      renderTiles();
+    },
+    onPeerLeave: (pid) => { state.participants = state.participants.filter(x => x.id !== pid); renderTiles(); },
+    onData: (from, payload) => onDataChannelMessage(JSON.stringify(payload)),
+    onRoster: (list) => {
+      (list || []).forEach(r => { const p = state.participants.find(x => x.id === r.peerId); if (p && r.name) p.name = r.name; });
+      const live = new Set((list || []).map(r => r.peerId).concat([userId]));
+      state.participants = state.participants.filter(x => x.isLocal || live.has(x.id) || x.srcObject);
+      renderTiles();
+    }
+  });
+}
+
+// Send an app-level message (chat, whiteboard stroke, reaction) to everyone — over the
+// mesh if it's live (reaches real peers), else the loopback data channel.
+function sendData(obj) {
+  if (state.mesh) { try { state.mesh.broadcast(obj); } catch {} return; }
+  if (state.dc && state.dc.readyState === 'open') { try { state.dc.send(JSON.stringify(obj)); } catch {} }
 }
 
 function onDataChannelMessage(raw) {
@@ -1874,10 +1907,8 @@ function flyReaction(kind) {
   layer.appendChild(div);
   setTimeout(() => div.remove(), 3600);
 
-  // Broadcast over data channel
-  if (state.dc && state.dc.readyState === 'open') {
-    try { state.dc.send(JSON.stringify({ type: 'reaction', kind })); } catch {}
-  }
+  // Broadcast to real peers (mesh) or loopback
+  sendData({ type: 'reaction', kind });
 }
 
 /* ==========================================================================
@@ -1927,10 +1958,8 @@ async function sendChat() {
   appendChatMsg({ display_name: myDisplayName, body, is_private_to: privTo || null });
   ta.value = '';
 
-  // Broadcast to peer via data channel
-  if (state.dc && state.dc.readyState === 'open' && !privTo) {
-    try { state.dc.send(JSON.stringify({ type: 'chat', from: myDisplayName, body })); } catch {}
-  }
+  // Broadcast to peers (mesh) or loopback — private messages stay local
+  if (!privTo) sendData({ type: 'chat', from: myDisplayName, body });
 
   // Persist
   const fd = new FormData();
@@ -2033,10 +2062,8 @@ function setupWhiteboard() {
       if (wb.last) ctx.moveTo(wb.last.x, wb.last.y); else ctx.moveTo(p.x, p.y);
       ctx.lineTo(p.x, p.y);
       ctx.stroke();
-      // broadcast
-      if (state.dc && state.dc.readyState === 'open' && wb.last) {
-        try { state.dc.send(JSON.stringify({ type: 'stroke', tool: wb.tool, color: wb.color, size: wb.size, x1: wb.last.x, y1: wb.last.y, x2: p.x, y2: p.y })); } catch {}
-      }
+      // broadcast to peers (mesh) or loopback
+      if (wb.last) sendData({ type: 'stroke', tool: wb.tool, color: wb.color, size: wb.size, x1: wb.last.x, y1: wb.last.y, x2: p.x, y2: p.y });
       wb.last = p;
     }
   }
@@ -2446,7 +2473,7 @@ async function init() {
   // Setup pipelines
   await startLocalMedia();
   if (state.localStream) {
-    await startLoopbackPC();
+    startMesh();
     startActiveSpeakerDetection();
   }
 
@@ -2475,6 +2502,7 @@ async function init() {
 
 window.addEventListener('beforeunload', () => {
   try {
+    if (state.mesh) state.mesh.leave();
     if (state.localStream) state.localStream.getTracks().forEach(t => t.stop());
     if (state.screenStream) state.screenStream.getTracks().forEach(t => t.stop());
     if (state.pcLocal) state.pcLocal.close();
