@@ -46,6 +46,16 @@ Chapters received so far. **[code]** = a real, Node-tested implementation exists
 24. What is Educational Creativity?
 25. What is the Educational World Model?
 26. What is Educational Prediction?
+27. What is Educational Decision Making?
+28. What is Educational Execution? **[code]**
+29. What is Educational Verification?  *(core in Execution)*
+30. What is Educational Self-Improvement?
+31. What is Educational Wisdom?  ← **Part I milestone: foundations span Perception → Wisdom**
+
+> **AES-000 Part I milestone (Ch 31).** The constitutional theory is complete
+> end-to-end. Next: Parts II–V move from *what Educational Intelligence is* to
+> *how AquinTutor is engineered* (computational theory, mathematics, AI runtime,
+> operating system). Six foundation chapters already run as real, tested code.
 
 ### Part II — Computational Theory  *(the "how it computes")*
 Information → Educational Information → Semantic Information → Knowledge
@@ -117,8 +127,13 @@ spec-level algorithms → subsystem contract. **No invented computer science.**
 | Ch 5 Understanding · 6 Learning · 7 Evidence · 11 Objective · 12 Adaptation | **real code** | `public/aquin-understanding.js`, Node-tested (9) |
 | Ch 16 Mission (+14 Planning/15 Orchestration core) | **real code** | `public/aquin-mission.js`, Node-tested (5) — drives Concept+Learner end-to-end |
 | Ch 18 Truth · 19 Consistency | **real code** | `public/aquin-consistency.js`, Node-tested (6) — solves the Bernoulli/viscosity case |
-| Ch 1, 8, 9, 10, 13, 17, 20–26 | spec/queued | build one brick at a time |
+| Ch 28 Execution (+29 verify core) | **real code** | `public/aquin-execution.js`, Node-tested (6) — decision->execute->verified transformation |
+| Ch 1, 8, 9, 10, 13, 17, 20–27, 29–30 | spec/queued | build one brick at a time |
 | Parts II–V | architecture | queued |
+
+**Closed loop now runs in code:** Objective -> Decision (Learner.adapt) ->
+Execution Contract -> governed Action -> Evidence -> Understanding update ->
+Verify (Concept State Transformation) — across `aquin-{concept,understanding,mission,execution}.js`.
 | AES-001 kernel / resolver | Part V prototype | `public/aquin-kernel.js`, `aquin-resolver.js` (reference, unpushed) |
 
 > Reference prototypes (kernel/resolver) predate the Part-ordering above; they
