@@ -6,6 +6,32 @@ import { sql } from 'drizzle-orm';
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 
+// Self-bootstrap: hei_crawlers had no CREATE TABLE anywhere in the repo, so on any
+// environment without the manual migration every action here failed silently.
+try {
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS hei_crawlers (
+    id SERIAL PRIMARY KEY,
+    code VARCHAR(40) NOT NULL UNIQUE,
+    name VARCHAR(200) NOT NULL,
+    description TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    sources_count INTEGER NOT NULL DEFAULT 0,
+    records_24h INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+} catch (_) {}
+
+// live miner state (written by the daily cron /api/cron/hei-refresh)
+let minerState: any = null, storedCount = 0;
+try {
+  const ms = await db.execute(sql`SELECT country, next_offset, last_run_at, last_report FROM hei_miner_state WHERE id = 'default'`);
+  minerState = (Array.isArray(ms) ? ms : (ms as any)?.rows || [])[0] || null;
+} catch (_) {}
+try {
+  const sc = await db.execute(sql`SELECT COUNT(*)::int AS c FROM hei_institutions`);
+  storedCount = ((Array.isArray(sc) ? sc : (sc as any)?.rows || [])[0] as any)?.c || 0;
+} catch (_) {}
+
 let okMsg = '', errorMsg = '';
 
 if (Astro.request.method === 'POST') {
@@ -69,6 +95,44 @@ function timeAgo(d: any) {
     <p style="font-size:11px;color:#6e6e78;margin:4px 0 0;">{crawlers.filter((c:any)=>c.status==='active').length} active pipelines - {crawlers.length} total</p>
   </div>
 
+  <!-- ONE-CLICK DATA MINER: pulls live university records from the open public
+       knowledge graph and upserts them (unpublished) into hei_institutions. -->
+  <div style="margin:16px;background:#0d1117;border:1px solid #67e8f9;border-radius:12px;padding:16px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+      <div>
+        <p style="font-size:10px;font-family:monospace;color:#67e8f9;letter-spacing:0.1em;text-transform:uppercase;margin:0 0 3px;font-weight:700;">Automated pipeline - live source</p>
+        <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">One-click university data miner</h2>
+      </div>
+      <span style="font-size:11px;color:#8a8a94;font-family:monospace;">{storedCount} institutions stored</span>
+    </div>
+    <p style="font-size:11.5px;color:#8a8a94;line-height:1.6;margin:0 0 12px;max-width:760px;">
+      Pulls real, structured university records (name, city, country, website, founding year, student count) from an open public knowledge graph that is edited continuously - so a change made moments ago is picked up. Records are stored <b style="color:#fbbf24;">unpublished</b>: a human reviews and publishes them from Institutions. The daily pipeline advances a rolling window automatically, so data keeps refreshing without anyone clicking.
+    </p>
+    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
+      <div><label style="font-size:10px;color:#8a8a94;font-family:monospace;text-transform:uppercase;">Country</label><br/>
+        <select id="mineCountry" style="background:#15151a;border:1px solid #1a1a1f;color:#fff;padding:7px 9px;border-radius:6px;font-size:12px;margin-top:3px;">
+          <option value="India">India</option><option value="all">All (worldwide)</option>
+          <option value="United States">United States</option><option value="United Kingdom">United Kingdom</option>
+          <option value="Canada">Canada</option><option value="Australia">Australia</option>
+          <option value="Germany">Germany</option><option value="Singapore">Singapore</option>
+          <option value="Nepal">Nepal</option><option value="Sri Lanka">Sri Lanka</option>
+        </select></div>
+      <div><label style="font-size:10px;color:#8a8a94;font-family:monospace;text-transform:uppercase;">Batch</label><br/>
+        <input id="mineLimit" type="number" value="50" min="1" max="200" style="width:80px;background:#15151a;border:1px solid #1a1a1f;color:#fff;padding:7px 9px;border-radius:6px;font-size:12px;margin-top:3px;" /></div>
+      <div><label style="font-size:10px;color:#8a8a94;font-family:monospace;text-transform:uppercase;">Offset</label><br/>
+        <input id="mineOffset" type="number" value="0" min="0" style="width:90px;background:#15151a;border:1px solid #1a1a1f;color:#fff;padding:7px 9px;border-radius:6px;font-size:12px;margin-top:3px;" /></div>
+      <button id="mineCheck" type="button" style="background:#15151a;border:1px solid #26344d;color:#cfd6da;font-size:12px;font-weight:600;padding:8px 12px;border-radius:7px;cursor:pointer;">How many exist?</button>
+      <button id="mineRun" type="button" style="background:#FF4F00;border:none;color:#fff;font-size:12px;font-weight:700;padding:8px 16px;border-radius:7px;cursor:pointer;">Mine now</button>
+      <button id="mineAll" type="button" style="background:#0d1117;border:1px solid #FF4F00;color:#FF7040;font-size:12px;font-weight:700;padding:8px 14px;border-radius:7px;cursor:pointer;">Mine continuously</button>
+    </div>
+    <pre id="mineOut" style="margin:12px 0 0;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:11px;font-size:11px;color:#cfd6da;font-family:monospace;white-space:pre-wrap;max-height:260px;overflow:auto;">Ready. "Mine now" pulls one batch. "Mine continuously" keeps paging until you stop.</pre>
+    {minerState && (
+      <p style="font-size:10.5px;color:#6e6e78;font-family:monospace;margin:8px 0 0;">
+        Daily pipeline - last run {minerState.last_run_at ? new Date(minerState.last_run_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'never'} - next offset {minerState.next_offset} - country {minerState.country}
+      </p>
+    )}
+  </div>
+
   {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
 
@@ -129,4 +193,57 @@ function timeAgo(d: any) {
     </form>
   </div>
 </div>
+
+<script is:inline>
+(function(){
+  var out=document.getElementById('mineOut');
+  var runBtn=document.getElementById('mineRun'), allBtn=document.getElementById('mineAll'), chkBtn=document.getElementById('mineCheck');
+  if(!out||!runBtn) return;
+  var stop=false;
+  function log(s){ out.textContent = s + '\n' + out.textContent; }
+  function opts(){ return { country:(document.getElementById('mineCountry')||{}).value||'India',
+    limit:parseInt((document.getElementById('mineLimit')||{}).value,10)||50,
+    offset:parseInt((document.getElementById('mineOffset')||{}).value,10)||0 }; }
+
+  chkBtn && chkBtn.addEventListener('click', function(){
+    var o=opts(); out.textContent='Checking upstream...';
+    fetch('/api/admin/hei/mine?country='+encodeURIComponent(o.country)).then(function(r){return r.json();}).then(function(j){
+      out.textContent = j.ok ? ('Upstream available: '+j.upstreamAvailable+' universities ('+j.country+')\nStored here: '+j.storedHere) : ('Error: '+j.error);
+    }).catch(function(){ out.textContent='Network error.'; });
+  });
+
+  function runOnce(o){
+    return fetch('/api/admin/hei/mine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})
+      .then(function(r){return r.json();})
+      .then(function(j){
+        if(!j.ok){ log('ERROR ['+(j.stage||'run')+']: '+j.error); return null; }
+        log('offset '+j.offset+': mined '+j.mined+' | inserted '+j.inserted+' | updated '+j.updated+' | skipped '+j.skipped+' ('+j.ms+'ms)'
+            + (j.errors && j.errors.length ? '\n   first errors: '+j.errors.join('; ') : ''));
+        return j;
+      });
+  }
+
+  runBtn.addEventListener('click', function(){
+    var o=opts(); runBtn.disabled=true; runBtn.textContent='Mining...';
+    runOnce(o).then(function(j){
+      if(j) document.getElementById('mineOffset').value=j.nextOffset;
+      runBtn.disabled=false; runBtn.textContent='Mine now';
+    });
+  });
+
+  allBtn.addEventListener('click', function(){
+    if(allBtn.dataset.running==='1'){ stop=true; return; }
+    stop=false; allBtn.dataset.running='1'; allBtn.textContent='Stop';
+    var o=opts();
+    (function loop(){
+      if(stop){ allBtn.dataset.running=''; allBtn.textContent='Mine continuously'; log('Stopped.'); return; }
+      runOnce(o).then(function(j){
+        if(!j || j.mined===0){ allBtn.dataset.running=''; allBtn.textContent='Mine continuously'; log(j? 'Done - upstream returned no more records.' : 'Stopped on error.'); return; }
+        o.offset=j.nextOffset; document.getElementById('mineOffset').value=o.offset;
+        setTimeout(loop, 1200);   // be a good citizen: pace requests to the public endpoint
+      });
+    })();
+  });
+})();
+</script>
 </HeiAdminLayout>
