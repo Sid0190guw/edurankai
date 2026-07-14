@@ -27,6 +27,8 @@
     return uni > 0 ? inter / uni : 0;
   }
   function cx(box) { return box[0] + box[2] / 2; }
+  function cyf(box) { return box[1] + box[3] / 2; }
+  function inZone(pt, z) { return pt[0] >= z[0] && pt[0] <= z[0] + z[2] && pt[1] >= z[1] && pt[1] <= z[1] + z[3]; }
 
   function createTracker(cfg) {
     cfg = cfg || {};
@@ -50,11 +52,11 @@
           if (best >= 0) {
             var d = detections[best]; used[best] = true; var dt = Math.max(1, frame - t.lastObsFrame);
             t.vel = [(d.box[0] - t.box[0]) / dt, (d.box[1] - t.box[1]) / dt];   // update velocity from the gap
-            t.box = d.box; t.age = 0; t.hits++; t.lastObsFrame = frame; t.trajectory.push({ frame: frame, cx: cx(d.box) });
+            t.box = d.box; t.age = 0; t.hits++; t.lastObsFrame = frame; t.trajectory.push({ frame: frame, cx: cx(d.box), cy: cyf(d.box) });
           } else { t.age++; }
         });
         // unmatched detections -> new tracks
-        detections.forEach(function (d, di) { if (used[di]) return; var id = 't' + (nextId++); tracks[id] = { id: id, box: d.box, vel: [0, 0], age: 0, hits: 1, firstFrame: frame, lastObsFrame: frame, trajectory: [{ frame: frame, cx: cx(d.box) }] }; rec('new-track', { id: id }); });
+        detections.forEach(function (d, di) { if (used[di]) return; var id = 't' + (nextId++); tracks[id] = { id: id, box: d.box, vel: [0, 0], age: 0, hits: 1, firstFrame: frame, lastObsFrame: frame, trajectory: [{ frame: frame, cx: cx(d.box), cy: cyf(d.box) }] }; rec('new-track', { id: id }); });
         // drop tracks lost longer than maxAge
         Object.keys(tracks).forEach(function (id) { if (tracks[id].age > maxAge) { rec('drop', { id: id }); delete tracks[id]; } });
         return T.active();
@@ -67,7 +69,38 @@
         var t = tracks[id]; if (!t || t.trajectory.length < 2) return { crossed: false };
         for (var i = 1; i < t.trajectory.length; i++) { var a = t.trajectory[i - 1].cx, b = t.trajectory[i].cx; if ((a < lineX && b >= lineX) || (a > lineX && b <= lineX)) return { crossed: true, direction: b > a ? 'right' : 'left', atFrame: t.trajectory[i].frame }; }
         return { crossed: false };
-      }
+      },
+
+      // --- Ch94 deepening: zone events, dwell/loiter, spatial + temporal reasoning ---
+      // enter/exit as a track's centre crosses a zone [x,y,w,h] boundary across frames
+      zoneEvents: function (id, zone) {
+        var t = tracks[id]; if (!t) return [];
+        var events = [], wasIn = false;
+        t.trajectory.forEach(function (p, i) { var isIn = inZone([p.cx, p.cy], zone); if (i === 0) { wasIn = isIn; if (isIn) events.push({ event: 'enter', frame: p.frame }); return; } if (isIn && !wasIn) events.push({ event: 'enter', frame: p.frame }); if (!isIn && wasIn) events.push({ event: 'exit', frame: p.frame }); wasIn = isIn; });
+        return events;
+      },
+      dwellTime: function (id, zone) { var t = tracks[id]; if (!t) return 0; return t.trajectory.filter(function (p) { return inZone([p.cx, p.cy], zone); }).length; },
+      loitering: function (id, zone, minFrames) { return T.dwellTime(id, zone) >= (minFrames || 5); },
+
+      // spatial relations from box geometry
+      spatialRelations: function (boxes) {
+        var rels = []; var keys = Object.keys(boxes);
+        for (var i = 0; i < keys.length; i++) for (var j = i + 1; j < keys.length; j++) {
+          var A = boxes[keys[i]], B = boxes[keys[j]], r = [];
+          if (cx(A) < cx(B)) r.push('left-of'); else if (cx(A) > cx(B)) r.push('right-of');
+          if (cyf(A) < cyf(B)) r.push('above'); else if (cyf(A) > cyf(B)) r.push('below');
+          if (iou(A, B) > 0) r.push('overlaps');
+          rels.push({ a: keys[i], b: keys[j], relations: r });
+        }
+        return rels;
+      },
+      // depth ordering: bigger box = nearer (supplied box size as a depth proxy)
+      depthOrder: function (boxes) { return Object.keys(boxes).map(function (k) { return { id: k, area: boxes[k][2] * boxes[k][3] }; }).sort(function (a, b) { return b.area - a.area; }).map(function (o, i) { return { id: o.id, depthRank: i, nearer: i === 0 }; }); },
+
+      // temporal reasoning
+      chronology: function () { return Object.keys(tracks).map(function (id) { return { id: id, firstFrame: tracks[id].firstFrame }; }).sort(function (a, b) { return a.firstFrame - b.firstFrame; }); },
+      duration: function (id) { var t = tracks[id]; return t ? (t.lastObsFrame - t.firstFrame + 1) : 0; },
+      cooccurrence: function (idA, idB) { var a = tracks[idA], b = tracks[idB]; if (!a || !b) return 0; var fa = {}; a.trajectory.forEach(function (p) { fa[p.frame] = 1; }); return b.trajectory.filter(function (p) { return fa[p.frame]; }).length; }
     };
     return T;
   }

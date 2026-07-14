@@ -25,7 +25,7 @@
   function createStudio(cfg) {
     cfg = cfg || {};
     var forbidden = cfg.forbidden || ['malware', 'weapon', 'self-harm'];
-    var assets = {}, seq = 0, prov = [];
+    var assets = {}, promptVersions = {}, seq = 0, prov = [];
     function rec(op, d) { prov.push({ op: op, at: Date.now(), detail: d || null }); }
 
     function policyCheck(req) {
@@ -77,7 +77,32 @@
         if (a.status === 'pending-approval') return { ok: false, reason: 'high-impact asset awaits human approval before publishing' };
         a.status = 'published'; rec('publish', { id: assetId }); return { ok: true, status: 'published', watermark: a.watermark };
       },
-      asset: function (id) { return assets[id]; }
+      asset: function (id) { return assets[id]; },
+
+      // --- Ch95 deepening: harmful-content detection, copyright similarity, evaluation, prompt versions ---
+      detectHarmful: function (text, lexicon) {
+        var lex = lexicon || { violence: ['weapon', 'kill', 'bomb'], malware: ['malware', 'ransomware', 'exploit'], selfHarm: ['self-harm', 'suicide'] };
+        var t = String(text).toLowerCase(), hits = [];
+        Object.keys(lex).forEach(function (cat) { var m = lex[cat].filter(function (w) { return t.indexOf(w) !== -1; }); if (m.length) hits.push({ category: cat, terms: m }); });
+        return { harmful: hits.length > 0, categories: hits, severity: hits.length >= 2 ? 'high' : (hits.length ? 'medium' : 'none') };
+      },
+      // copyright / near-duplicate detection via token-Jaccard against a corpus
+      similarityCheck: function (text, corpus, threshold) {
+        threshold = threshold != null ? threshold : 0.5;
+        function toks(s) { var o = {}; (String(s).toLowerCase().match(/[a-z0-9]+/g) || []).forEach(function (w) { o[w] = 1; }); return o; }
+        var a = toks(text), best = { score: 0, index: -1 };
+        (corpus || []).forEach(function (c, i) { var b = toks(c), inter = 0, uni = {}; Object.keys(a).forEach(function (k) { uni[k] = 1; if (b[k]) inter++; }); Object.keys(b).forEach(function (k) { uni[k] = 1; }); var j = inter / Object.keys(uni).length; if (j > best.score) best = { score: +j.toFixed(4), index: i }; });
+        return { maxSimilarity: best.score, matchIndex: best.index, flagged: best.score >= threshold };
+      },
+      // factuality = fraction of claims grounded in cited sources; consistency = simple agreement proxy
+      evaluateAsset: function (spec) {
+        var claims = spec.claims || [], sources = (spec.sources || []).join(' ').toLowerCase();
+        var grounded = claims.filter(function (c) { return c.evidence && sources.indexOf(String(c.evidence).toLowerCase()) !== -1; }).length;
+        var factuality = claims.length ? +(grounded / claims.length).toFixed(4) : 1;
+        return { factuality: factuality, groundedClaims: grounded, totalClaims: claims.length, consistency: factuality >= 0.99 ? 1 : +(0.5 + factuality / 2).toFixed(4) };
+      },
+      // prompt version registry (content-hash) so every generation traces to a prompt version
+      promptVersion: function (prompt) { var h = fnv1a(String(prompt)); promptVersions[h] = (promptVersions[h] || { hash: h, prompt: String(prompt).slice(0, 400), uses: 0 }); promptVersions[h].uses++; return { version: h, uses: promptVersions[h].uses }; }
     };
     return S;
   }
