@@ -30,7 +30,7 @@
   };
 
   function createSpeech() {
-    var speakers = {}, prov = [];
+    var speakers = {}, audioIndex = {}, prov = [];
     function rec(op, d) { prov.push({ op: op, at: Date.now(), detail: d || null }); }
 
     var S = {
@@ -77,6 +77,45 @@
             return { intent: intent, reply: reply, context: JSON.parse(JSON.stringify(context)) };
           }
         };
+      },
+
+      // --- Ch92 deepening: VAD, emotion, audio-embedding retrieval, unsupervised diarization ---
+      // Voice Activity Detection: mark speech vs silence from per-frame energy (mean + k*std)
+      vad: function (frames, opts) {
+        opts = opts || {}; var energy = frames.map(function (f) { return Array.isArray(f) ? Math.sqrt(f.reduce(function (a, b) { return a + b * b; }, 0) / f.length) : Math.abs(f); });
+        var m = energy.reduce(function (a, b) { return a + b; }, 0) / energy.length;
+        var sd = Math.sqrt(energy.reduce(function (a, b) { return a + (b - m) * (b - m); }, 0) / energy.length);
+        var thr = opts.threshold != null ? opts.threshold : m + (opts.k != null ? opts.k : 0.5) * sd;
+        var segs = [], cur = null;
+        energy.forEach(function (e, i) { if (e >= thr) { if (!cur) cur = { start: i, end: i }; else cur.end = i; } else if (cur) { segs.push(cur); cur = null; } });
+        if (cur) segs.push(cur);
+        return { threshold: +thr.toFixed(4), speechSegments: segs, speechFrames: energy.filter(function (e) { return e >= thr; }).length };
+      },
+      // emotion distribution from supplied prosodic features [energy, pitchVar, speechRate, pauseRatio]
+      emotion: function (features) {
+        var f = features || [0, 0, 0, 0];
+        var w = { engaged: [0.6, 0.2, 0.5, -0.4], confused: [-0.2, 0.5, -0.3, 0.6], frustrated: [0.5, 0.6, 0.4, -0.1], neutral: [0.1, -0.2, 0.0, 0.1] };
+        var raw = {}, keys = Object.keys(w), mx = -Infinity;
+        keys.forEach(function (k) { var s = 0; for (var i = 0; i < f.length; i++) s += (w[k][i] || 0) * f[i]; raw[k] = s; if (s > mx) mx = s; });
+        var exp = {}, sum = 0; keys.forEach(function (k) { exp[k] = Math.exp(raw[k] - mx); sum += exp[k]; });
+        var dist = {}, top = keys[0]; keys.forEach(function (k) { dist[k] = +(exp[k] / sum).toFixed(4); if (dist[k] > dist[top]) top = k; });
+        return { emotion: top, scores: dist };
+      },
+      indexAudio: function (id, embedding) { audioIndex[id] = embedding; return this; },
+      searchAudio: function (queryEmbedding, topK) { return Object.keys(audioIndex).map(function (id) { return { id: id, score: +cos(queryEmbedding, audioIndex[id]).toFixed(4) }; }).sort(function (a, b) { return b.score - a.score; }).slice(0, topK || 5); },
+      // unsupervised diarization: cluster turn embeddings when speakers are NOT enrolled
+      cluster: function (turns, threshold) {
+        threshold = threshold != null ? threshold : 0.6; var clusters = [];
+        var labels = turns.map(function (t) {
+          var best = -1, bestS = threshold;
+          clusters.forEach(function (c, ci) { var s = cos(t.embedding, c.centroid); if (s >= bestS) { bestS = s; best = ci; } });
+          if (best < 0) { clusters.push({ centroid: t.embedding.slice(), members: [t.embedding] }); return clusters.length - 1; }
+          var c = clusters[best]; c.members.push(t.embedding);
+          for (var i = 0; i < c.centroid.length; i++) c.centroid[i] = c.members.reduce(function (a, v) { return a + v[i]; }, 0) / c.members.length;
+          return best;
+        });
+        rec('cluster', { turns: turns.length, speakers: clusters.length });
+        return { speakerCount: clusters.length, labels: labels };
       }
     };
     return S;

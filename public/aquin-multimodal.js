@@ -21,7 +21,7 @@
   function cos(a, b) { var d = 0, na = 0, nb = 0; for (var i = 0; i < a.length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; } return (na && nb) ? d / (Math.sqrt(na) * Math.sqrt(nb)) : 0; }
 
   function createMultimodal() {
-    var items = {}, prov = [];
+    var items = {}, memory = [], prov = [];
     function rec(op, d) { prov.push({ op: op, at: Date.now(), detail: d || null }); }
 
     var M = {
@@ -53,6 +53,24 @@
       rag: function (queryVector, topK) {
         var hits = M.search(queryVector, { topK: topK || 4 });
         return { retrieved: hits.length, context: hits.map(function (h) { return '[' + h.modality + ':' + h.id + '] ' + (h.meta.text || h.meta.caption || h.id); }), passages: hits, note: 'cross-modal retrieval is real; the generative model that consumes this context is a declared substrate' };
+      },
+
+      // --- Ch93 deepening: cross-modal memory + bidirectional retrieval eval ---
+      remember: function (id, modality, vector, meta) { memory.push({ id: id, modality: modality, vector: vector, meta: meta || {} }); rec('remember', { id: id }); return this; },
+      recall: function (queryVector, topK) { return memory.map(function (m) { return { id: m.id, modality: m.modality, score: +cos(queryVector, m.vector).toFixed(4), meta: m.meta }; }).sort(function (a, b) { return b.score - a.score; }).slice(0, topK || 5); },
+
+      // recall@1 for text->image AND image->text over aligned (text,image) vector pairs
+      retrievalEval: function (pairs) {
+        function r1(dir) {
+          var correct = 0;
+          for (var i = 0; i < pairs.length; i++) {
+            var q = dir === 't2i' ? pairs[i].text : pairs[i].image, best = -1, bestS = -Infinity;
+            for (var j = 0; j < pairs.length; j++) { var cand = dir === 't2i' ? pairs[j].image : pairs[j].text; var s = cos(q, cand); if (s > bestS) { bestS = s; best = j; } }
+            if (best === i) correct++;
+          }
+          return +(correct / pairs.length).toFixed(4);
+        }
+        return { textToImageRecall1: r1('t2i'), imageToTextRecall1: r1('i2t') };
       }
     };
     return M;
