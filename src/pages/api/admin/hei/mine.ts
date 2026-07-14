@@ -82,6 +82,22 @@ export const POST: APIRoute = async ({ request, locals }) => {
     }
   }
 
+  // REAL telemetry. The other rows in hei_crawlers carry hand-typed counters (the only
+  // writer is the manual "Update" form), which the HEI dashboard then sums as if it were
+  // measured. This row is written ONLY by an actual run: records_24h is what this miner
+  // truly wrote in the last 24h, and updated_at is a real last-run time.
+  try {
+    await db.execute(sql`INSERT INTO hei_crawlers (code, name, description, status, sources_count, records_24h, updated_at)
+      VALUES ('KG', 'Knowledge graph (live)', 'Open public knowledge graph via SPARQL. Counters below are measured from real runs, not entered by hand.', 'active', 1, ${inserted + updated}, NOW())
+      ON CONFLICT (code) DO UPDATE SET
+        records_24h = CASE WHEN hei_crawlers.updated_at > NOW() - INTERVAL '24 hours'
+                           THEN hei_crawlers.records_24h + ${inserted + updated}
+                           ELSE ${inserted + updated} END,
+        sources_count = 1,
+        status = 'active',
+        updated_at = NOW()`);
+  } catch (_) { /* telemetry must never fail the run */ }
+
   return j({
     ok: true, country, requested: limit, offset, mined: mined.length,
     inserted, updated, skipped, errors,
