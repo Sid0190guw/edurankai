@@ -46,8 +46,16 @@
     var dpTolerance = cfg.parityTolerance != null ? cfg.parityTolerance : 0.1;
     var psiThreshold = cfg.psiThreshold != null ? cfg.psiThreshold : 0.2;
     var services = {};       // id -> governance profile
+    var cases = {};          // caseId -> human-oversight case
+    var monitors = {};       // serviceId -> rolling monitoring window
     var audit = [];
     function rec(op, d) { audit.push({ op: op, at: Date.now(), detail: d || null }); }
+
+    // monitoring thresholds: a rolling metric crossing its threshold raises a review flag
+    var DEFAULT_THRESH = { violationRate: 0.05, hallucinationRate: 0.02, drift: psiThreshold, latency: 2000 };
+    var monThresh = cfg.monitorThresholds || {};
+    function threshOf(k) { return monThresh[k] != null ? monThresh[k] : DEFAULT_THRESH[k]; }
+    var monWindow = cfg.monitorWindow != null ? cfg.monitorWindow : 20;
 
     // ---- risk classification -> required controls ----
     function classifyRisk(spec) {
@@ -105,6 +113,144 @@
       return { decision: decision, safe: decision === 'allow', actions: actions, reasons: reasons, unsupportedClaims: unsupported.length };
     }
 
+    // ---- EXPLAINABILITY: assemble a real reasoning trace from a decision's inputs ----
+    function explain(decision) {
+      decision = decision || {};
+      // evidence: explicit list, else derived from claim objects, else empty
+      var evidence = decision.evidence || decision.retrievedEvidence ||
+        (decision.claims || []).map(function (c) { return c && c.evidence != null ? String(c.evidence) : String(c); });
+      var conf = decision.confidence != null ? decision.confidence : null;
+      var band = conf == null ? 'unknown' : (conf >= 0.85 ? 'high' : (conf >= confFloor ? 'moderate' : 'low'));
+      var policies = decision.policies || decision.policyReferences || [];
+      var sources = decision.sources || decision.knowledgeSources || [];
+      var path = decision.path || decision.executionPath || decision.steps || [];
+      var outcome = decision.outcome != null ? decision.outcome : (decision.decision != null ? decision.decision : (decision.result != null ? decision.result : 'n/a'));
+      var summary = 'Decision "' + outcome + '" derived from ' + evidence.length + ' evidence item(s) across ' +
+        sources.length + ' knowledge source(s); confidence ' + (conf == null ? 'n/a' : conf + ' (' + band + ')') +
+        '; governed by ' + policies.length + ' policy reference(s) over ' + path.length + ' execution step(s).';
+      rec('explain', { outcome: outcome, evidence: evidence.length, confidenceBand: band, policies: policies.length });
+      return {
+        retrievedEvidence: evidence, confidence: conf, confidenceBand: band,
+        policyReferences: policies, knowledgeSources: sources, executionPath: path,
+        decisionSummary: summary
+      };
+    }
+
+    // ---- HUMAN OVERSIGHT: a real case state machine open -> under-review -> resolved/overridden ----
+    var CASE_FLOW = {
+      'open': ['under-review', 'overridden'],
+      'under-review': ['resolved', 'overridden'],
+      'resolved': ['under-review', 'overridden'],   // appeal reopens a resolved case
+      'overridden': []
+    };
+    function caseStep(c, to) {
+      var allowed = CASE_FLOW[c.state] || [];
+      if (allowed.indexOf(to) < 0) return false;
+      c.history.push({ from: c.state, to: to, at: Date.now() });
+      c.state = to;
+      return true;
+    }
+    function getCase(caseId) {
+      return cases[caseId] || (cases[caseId] = { caseId: caseId, state: 'open', history: [], reason: null, verdict: null, reviewer: null, appeals: 0, serviceId: null, authorizedBy: null });
+    }
+    function escalateToHuman(caseId, reason) {
+      var c = getCase(caseId); if (reason != null) c.reason = reason;
+      var moved = caseStep(c, 'under-review');    // route the case to a human reviewer
+      rec('escalate', { caseId: caseId, reason: c.reason, state: c.state });
+      return { ok: true, caseId: caseId, state: c.state, escalated: moved || c.state === 'under-review', reason: c.reason };
+    }
+    function humanReview(caseId, verdict, reviewer) {
+      var c = cases[caseId]; if (!c) return { ok: false, reason: 'no case ' + caseId };
+      if (c.state !== 'under-review') return { ok: false, reason: 'case ' + caseId + ' is not under review (state ' + c.state + ')' };
+      c.verdict = verdict; c.reviewer = reviewer || 'unknown';
+      caseStep(c, 'resolved');
+      rec('human-review', { caseId: caseId, verdict: verdict, reviewer: c.reviewer });
+      return { ok: true, caseId: caseId, state: c.state, verdict: c.verdict, reviewer: c.reviewer };
+    }
+    function appeal(caseId) {
+      var c = cases[caseId]; if (!c) return { ok: false, reason: 'no case ' + caseId };
+      if (c.state !== 'resolved') return { ok: false, reason: 'only resolved cases can be appealed (state ' + c.state + ')' };
+      c.appeals += 1;
+      caseStep(c, 'under-review');   // reopens for re-review
+      rec('appeal', { caseId: caseId, appeals: c.appeals });
+      return { ok: true, caseId: caseId, state: c.state, appeals: c.appeals };
+    }
+    function emergencyOverride(serviceId, reason, authorizer) {
+      if (!authorizer) return { ok: false, reason: 'emergency override requires a named authorizer' };
+      var caseId = 'override:' + serviceId + ':' + Date.now() + ':' + Math.floor(Math.random() * 1e6);
+      var c = getCase(caseId); c.serviceId = serviceId; c.reason = reason != null ? reason : null; c.authorizedBy = authorizer;
+      c.history.push({ from: c.state, to: 'overridden', at: Date.now() });  // emergency power: forces override from any state
+      c.state = 'overridden';
+      var svc = services[serviceId];
+      if (svc) { svc.state = 'review'; svc.overridden = true; svc.overriddenBy = authorizer; svc.needsReview = true; }
+      rec('emergency-override', { service: serviceId, caseId: caseId, authorizedBy: authorizer, reason: c.reason });
+      return { ok: true, caseId: caseId, service: serviceId, state: 'overridden', authorizedBy: authorizer, reason: c.reason };
+    }
+
+    // ---- CONTINUOUS MONITORING: rolling metrics vs thresholds -> review flag ----
+    function monitor(serviceId, metrics) {
+      metrics = metrics || {};
+      var m = monitors[serviceId] || (monitors[serviceId] = { samples: [], rolling: {}, flagged: false });
+      m.samples.push({ at: Date.now(), metrics: metrics });
+      if (m.samples.length > monWindow) m.samples.shift();   // bounded rolling window
+      var keys = ['violationRate', 'hallucinationRate', 'drift', 'latency'];
+      var rolling = {}, breaches = [];
+      keys.forEach(function (k) {
+        var vals = m.samples.map(function (s) { return s.metrics[k]; }).filter(function (v) { return v != null; });
+        if (!vals.length) return;
+        var avg = vals.reduce(function (a, b) { return a + b; }, 0) / vals.length;
+        rolling[k] = +avg.toFixed(4);
+        var t = threshOf(k);
+        if (t != null && avg > t) breaches.push({ metric: k, rolling: rolling[k], threshold: t });
+      });
+      m.rolling = rolling; m.flagged = breaches.length > 0;
+      if (m.flagged) { var svc = services[serviceId]; if (svc) svc.needsReview = true; }
+      rec('monitor', { service: serviceId, flagged: m.flagged, breaches: breaches.length });
+      return { service: serviceId, flagged: m.flagged, reviewFlag: m.flagged, breaches: breaches, rolling: rolling, samples: m.samples.length };
+    }
+
+    // ---- AUDIT QUERY: filter the append-only trail by op / service / time window ----
+    function auditQuery(filter) {
+      filter = filter || {};
+      return audit.filter(function (e) {
+        if (filter.op && e.op !== filter.op) return false;
+        if (filter.since != null && e.at < filter.since) return false;
+        if (filter.until != null && e.at > filter.until) return false;
+        if (filter.service) {
+          var d = e.detail || {};
+          var sid = d.service != null ? d.service : (d.serviceId != null ? d.serviceId : d.id);
+          if (sid !== filter.service) return false;
+        }
+        return true;
+      }).slice();
+    }
+
+    // ---- COMPLIANCE REPORT: controls satisfied, approvals, open cases, monitoring status ----
+    function complianceReport(serviceId) {
+      var s = services[serviceId]; if (!s) return { ok: false, reason: 'no service ' + serviceId };
+      var required = s.requiredControls || [];
+      var controlsStatus = {}, satisfied = [], missing = [];
+      required.forEach(function (c) { var ok = !!s.satisfied[c]; controlsStatus[c] = ok; (ok ? satisfied : missing).push(c); });
+      var allCases = Object.keys(cases).map(function (k) { return cases[k]; });
+      var openCases = allCases.filter(function (c) { return c.state === 'open' || c.state === 'under-review'; });
+      var overrides = allCases.filter(function (c) { return c.state === 'overridden' && c.serviceId === serviceId; });
+      var mon = monitors[serviceId] || null;
+      var report = {
+        ok: true, service: serviceId, risk: s.risk, lifecycleState: s.state,
+        controlsRequired: required.slice(), controlsSatisfied: satisfied, missingControls: missing, controlsStatus: controlsStatus,
+        approvedBy: s.approvedBy || null, certified: !!s.certified,
+        openCaseCount: openCases.length,
+        openCases: openCases.map(function (c) { return { caseId: c.caseId, state: c.state, reason: c.reason }; }),
+        overrides: overrides.map(function (c) { return { caseId: c.caseId, authorizedBy: c.authorizedBy, reason: c.reason }; }),
+        monitoring: mon ? { rolling: mon.rolling, flagged: mon.flagged, samples: mon.samples.length } : { status: 'no monitoring data' },
+        needsReview: !!s.needsReview
+      };
+      // compliant = all controls satisfied, certified, no monitoring breach, not currently overridden
+      report.compliant = missing.length === 0 && !!s.certified && !(mon && mon.flagged) && !s.overridden;
+      rec('compliance-report', { service: serviceId, compliant: report.compliant, missing: missing.length });
+      return report;
+    }
+
     var LIFECYCLE = ['design', 'development', 'evaluation', 'certification', 'deployment', 'monitoring', 'review', 'retirement'];
 
     var G = {
@@ -123,7 +269,17 @@
         if (needsHuman && !s.approvedBy) return { certified: false, reason: 'human approval required for ' + s.risk + '-risk service' };
         s.certified = true; rec('certify', { id: id }); return { certified: true, risk: s.risk, approvedBy: s.approvedBy };
       },
-      service: function (id) { return services[id]; }
+      service: function (id) { return services[id]; },
+      // explainability + human oversight + monitoring + audit/compliance (Ch85 deepening)
+      explain: explain,
+      escalateToHuman: escalateToHuman,
+      humanReview: humanReview,
+      appeal: appeal,
+      emergencyOverride: emergencyOverride,
+      "case": function (id) { return cases[id]; },
+      monitor: monitor,
+      auditQuery: auditQuery,
+      complianceReport: complianceReport
     };
     return G;
   }
