@@ -68,7 +68,37 @@
       discover: function (query) { var q = (query || '').toLowerCase(); return Object.keys(features).map(function (k) { return features[k]; }).filter(function (f) { return f.id.toLowerCase().indexOf(q) !== -1 || f.tags.some(function (t) { return t.toLowerCase().indexOf(q) !== -1; }); }).map(function (f) { return { id: f.id, owner: f.owner, tags: f.tags, state: f.state }; }); },
 
       transition: function (id, to) { var f = features[id]; var order = ['design', 'serving', 'deprecated', 'retired']; if (!f) return { ok: false }; if (order.indexOf(to) <= order.indexOf(f.state)) return { ok: false, reason: 'cannot move ' + f.state + ' -> ' + to }; f.state = to; return { ok: true, state: to }; },
-      feature: function (id) { return features[id]; }
+      feature: function (id) { return features[id]; },
+
+      // --- Ch87 deepening: streaming windows, reconcile, richer quality, multi-hop lineage ---
+      // POINT-IN-TIME-CORRECT windowed aggregate: only events in (asOf-windowMs, asOf]
+      windowAggregate: function (id, entity, windowMs, asOf, fn) {
+        fn = fn || 'avg';
+        var rows = log(id).filter(function (r) { return r.entity === entity && r.eventTime <= asOf && r.eventTime > asOf - windowMs && r.value != null; });
+        var vals = rows.map(function (r) { return r.value; });
+        var count = vals.length, sum = vals.reduce(function (a, b) { return a + b; }, 0);
+        var res = { count: count, sum: +sum.toFixed(4), avg: count ? +(sum / count).toFixed(4) : null, max: count ? Math.max.apply(null, vals) : null, min: count ? Math.min.apply(null, vals) : null };
+        return { feature: id, entity: entity, windowMs: windowMs, asOf: asOf, value: res[fn], stats: res };
+      },
+      // online vs point-in-time offline agreement (extends skew)
+      reconcile: function (entity, id, asOf) { var s = F.skew(entity, id, asOf); return { entity: entity, feature: id, consistent: !s.skew, online: s.online, offlineAsOf: s.offlineAsOf }; },
+      // richer quality: add validity (within allowed numeric range) + consistency (1 - normalised stddev)
+      qualityPlus: function (id, opts) {
+        opts = opts || {}; var base = F.quality(id); var rows = log(id).filter(function (r) { return r.value != null; });
+        var valid = rows.length, invalid = 0;
+        if (opts.min != null || opts.max != null) rows.forEach(function (r) { if ((opts.min != null && r.value < opts.min) || (opts.max != null && r.value > opts.max)) invalid++; });
+        var nums = rows.map(function (r) { return typeof r.value === 'number' ? r.value : null; }).filter(function (v) { return v != null; });
+        var consistency = 1; if (nums.length > 1) { var m = nums.reduce(function (a, b) { return a + b; }, 0) / nums.length; var sd = Math.sqrt(nums.reduce(function (a, b) { return a + (b - m) * (b - m); }, 0) / nums.length); consistency = m ? Math.max(0, 1 - Math.min(1, sd / Math.abs(m))) : 1; }
+        base.validity = rows.length ? +((rows.length - invalid) / rows.length).toFixed(4) : 1;
+        base.consistency = +consistency.toFixed(4);
+        return base;
+      },
+      // multi-hop lineage: features whose sources are OTHER features -> full dependency graph
+      lineageGraph: function (id, depth) {
+        depth = depth || 8; var edges = [], seen = {};
+        (function walk(fid, d) { if (d > depth || seen[fid]) return; seen[fid] = true; var f = features[fid]; if (!f) return; (f.sources || []).forEach(function (s) { edges.push({ from: s, to: fid, via: f.transform || 'identity' }); if (features[s]) walk(s, d + 1); }); })(id, 0);
+        return { feature: id, edges: edges, roots: edges.filter(function (e) { return !features[e.from]; }).map(function (e) { return e.from; }) };
+      }
     };
     return F;
   }

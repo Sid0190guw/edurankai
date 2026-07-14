@@ -100,7 +100,37 @@
         if (signals.newData && signals.newData >= (signals.newDataThreshold || 1000)) reasons.push('sufficient new data (' + signals.newData + ')');
         return { retrain: reasons.length > 0, reasons: reasons };
       },
-      model: function (id) { return models[id]; }
+      model: function (id) { return models[id]; },
+
+      // --- Ch86 deepening: calibration, feature importance, CI/CD pipeline, canary/rollback ---
+      // Expected Calibration Error: bin by predicted prob, compare confidence to accuracy
+      calibration: function (rows, bins) {
+        // ECE: in each score-bin compare mean predicted prob to the FRACTION of positives
+        bins = bins || 10; var buckets = []; for (var i = 0; i < bins; i++) buckets.push({ n: 0, conf: 0, pos: 0 });
+        rows.forEach(function (r) { var b = Math.min(bins - 1, Math.floor(r.score * bins)); buckets[b].n++; buckets[b].conf += r.score; buckets[b].pos += (r.label === 1 ? 1 : 0); });
+        var ece = 0, N = rows.length;
+        buckets.forEach(function (b) { if (!b.n) return; var fracPos = b.pos / b.n, conf = b.conf / b.n; ece += (b.n / N) * Math.abs(fracPos - conf); });
+        return { ece: +ece.toFixed(4), bins: bins };
+      },
+      // feature importance via |correlation| of each feature column with the label
+      featureImportance: function (dataRows, features) {
+        function corr(xs, ys) { var n = xs.length, mx = xs.reduce(function (a, b) { return a + b; }, 0) / n, my = ys.reduce(function (a, b) { return a + b; }, 0) / n, sxy = 0, sx = 0, sy = 0; for (var i = 0; i < n; i++) { var dx = xs[i] - mx, dy = ys[i] - my; sxy += dx * dy; sx += dx * dx; sy += dy * dy; } return (sx && sy) ? sxy / Math.sqrt(sx * sy) : 0; }
+        var ys = dataRows.map(function (r) { return r.label; });
+        return features.map(function (f) { return { feature: f, importance: +Math.abs(corr(dataRows.map(function (r) { return r.x[f]; }), ys)).toFixed(4) }; }).sort(function (a, b) { return b.importance - a.importance; });
+      },
+      // CI/CD stage pipeline: run gates in order, stop + report at the first failure
+      pipeline: function (modelId, stages) {
+        var results = [];
+        for (var i = 0; i < stages.length; i++) { var st = stages[i]; var passed = false; try { passed = !!st.check(); } catch (e) { passed = false; } results.push({ stage: st.name, passed: passed }); if (!passed) { rec('pipeline', { model: modelId, failedAt: st.name }); return { ok: false, failedStage: st.name, stages: results }; } }
+        rec('pipeline', { model: modelId, ok: true }); return { ok: true, stages: results };
+      },
+      // canary: promote only if the canary score stays within guardrail of the live score, else rollback
+      canary: function (modelId, liveScore, canaryScore, guardrail) {
+        guardrail = guardrail != null ? guardrail : 0.05;
+        if (canaryScore >= liveScore - guardrail) { rec('canary', { model: modelId, action: 'promote' }); return { ok: true, action: 'promote', liveScore: liveScore, canaryScore: canaryScore }; }
+        rec('canary', { model: modelId, action: 'rollback' }); return { ok: false, action: 'rollback', reason: 'canary ' + canaryScore + ' fell more than guardrail ' + guardrail + ' below live ' + liveScore, liveScore: liveScore, canaryScore: canaryScore };
+      },
+      compareRuns: function (a, b, metric) { metric = metric || 'f1'; var av = a[metric], bv = b[metric]; return { metric: metric, winner: av === bv ? 'tie' : (av > bv ? 'A' : 'B'), delta: +(Math.abs(av - bv)).toFixed(4), a: av, b: bv }; }
     };
     return R;
   }
