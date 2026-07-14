@@ -23,6 +23,17 @@ const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
 const BATCH = 100;
+// Each run sweeps as many batches as its time budget allows, then saves the offset for
+// tomorrow (one batch/day would take ~22 days for India and ~222 worldwide — frozen, not
+// continuous).
+//
+// WHY 8s AND NOT MORE: Vercel's default serverless limit is 10s. Raising it means setting
+// maxDuration globally in astro.config, and if that ever exceeds the plan ceiling EVERY
+// deploy fails — not worth the risk for a background refresh. So this cron is deliberately
+// an INCREMENTAL top-up. Bulk loading is done from /admin/hei/crawlers -> "Mine
+// continuously", which pages through the whole set from the browser in ~2 min (India) with
+// no serverless limit at all. If maxDuration is ever raised, only this number changes.
+const BUDGET_MS = 8000;
 const COUNTRY = 'India';   // the index is Bharat-first; widen by editing hei_miner_state.country
 
 async function ensureState() {
@@ -52,31 +63,41 @@ export const GET: APIRoute = async ({ request }) => {
     const total = await countUniversities(country);
     if (total > 0 && offset >= total) offset = 0;              // wrap: start the sweep again
 
-    const mined = await mineUniversities({ country, limit: BATCH, offset });
-    let inserted = 0, updated = 0, skipped = 0;
-    for (const m of mined) {
-      if (!m.name) { skipped++; continue; }
-      try {
-        const r = rows(await db.execute(sql`
-          INSERT INTO hei_institutions (slug, name, tier, country, city, website_url, established_year, student_count, is_published, created_at, updated_at)
-          VALUES (${slugify(m.name)}, ${m.name}, 'university', ${m.country || country}, ${m.city}, ${m.websiteUrl}, ${m.establishedYear}, ${m.studentCount}, false, NOW(), NOW())
-          ON CONFLICT (slug) DO UPDATE SET
-            name             = EXCLUDED.name,
-            country          = COALESCE(EXCLUDED.country, hei_institutions.country),
-            city             = COALESCE(EXCLUDED.city, hei_institutions.city),
-            website_url      = COALESCE(EXCLUDED.website_url, hei_institutions.website_url),
-            established_year = COALESCE(EXCLUDED.established_year, hei_institutions.established_year),
-            student_count    = COALESCE(EXCLUDED.student_count, hei_institutions.student_count),
-            updated_at       = NOW()
-          RETURNING (xmax = 0) AS inserted`));
-        if (rows(r)[0]?.inserted) inserted++; else updated++;
-      } catch { skipped++; }
+    const startOffset = offset;
+    let inserted = 0, updated = 0, skipped = 0, mined = 0, batches = 0;
+
+    // keep sweeping until the time budget is spent (or the sweep completes)
+    while (Date.now() - started < BUDGET_MS) {
+      const batch = await mineUniversities({ country, limit: BATCH, offset });
+      batches++;
+      if (!batch.length) { offset = 0; break; }               // reached the end -> wrap
+      mined += batch.length;
+      for (const m of batch) {
+        if (!m.name) { skipped++; continue; }
+        try {
+          const r = rows(await db.execute(sql`
+            INSERT INTO hei_institutions (slug, name, tier, country, city, website_url, established_year, student_count, is_published, created_at, updated_at)
+            VALUES (${slugify(m.name)}, ${m.name}, 'university', ${m.country || country}, ${m.city}, ${m.websiteUrl}, ${m.establishedYear}, ${m.studentCount}, false, NOW(), NOW())
+            ON CONFLICT (slug) DO UPDATE SET
+              name             = EXCLUDED.name,
+              country          = COALESCE(EXCLUDED.country, hei_institutions.country),
+              city             = COALESCE(EXCLUDED.city, hei_institutions.city),
+              website_url      = COALESCE(EXCLUDED.website_url, hei_institutions.website_url),
+              established_year = COALESCE(EXCLUDED.established_year, hei_institutions.established_year),
+              student_count    = COALESCE(EXCLUDED.student_count, hei_institutions.student_count),
+              updated_at       = NOW()
+            RETURNING (xmax = 0) AS inserted`));
+          if (rows(r)[0]?.inserted) inserted++; else updated++;
+        } catch { skipped++; }
+      }
+      offset += BATCH;
+      if (total > 0 && offset >= total) { offset = 0; break; }  // completed a full sweep
     }
 
-    const nextOffset = mined.length ? offset + BATCH : 0;      // nothing returned -> restart sweep
-    const report = { country, total, offset, mined: mined.length, inserted, updated, skipped, ms: Date.now() - started };
+    const nextOffset = offset;
+    const report = { country, total, startOffset, batches, mined, inserted, updated, skipped, ms: Date.now() - started };
     await db.execute(sql`UPDATE hei_miner_state SET next_offset = ${nextOffset}, last_run_at = NOW(), last_report = ${JSON.stringify(report)}::jsonb WHERE id = 'default'`);
-    return j({ ok: true, ...report, nextOffset, sweepProgress: total ? Math.min(100, Math.round((nextOffset / total) * 100)) + '%' : 'n/a' });
+    return j({ ok: true, ...report, nextOffset, sweepProgress: total ? Math.min(100, Math.round((nextOffset / total) * 100)) + '%' : 'n/a', wrapped: nextOffset === 0 });
   } catch (e: any) {
     return j({ ok: false, error: e?.cause?.message || e?.message || 'refresh failed', ms: Date.now() - started }, 200);
   }
