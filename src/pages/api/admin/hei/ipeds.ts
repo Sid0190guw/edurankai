@@ -51,22 +51,30 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const slice = all.slice(offset, offset + limit);
   if (b.dryRun) return j({ ok: true, dryRun: true, year, total: all.length, offset, sliceSize: slice.length, sample: slice.slice(0, 10), ms: Date.now() - started });
 
+  // The survey files (enrolment, graduation) key on UNITID, so the directory must store it
+  // or the metrics can never be joined to an institution. Idempotent bootstrap.
+  try {
+    await db.execute(sql`ALTER TABLE hei_institutions ADD COLUMN IF NOT EXISTS ipeds_unit_id TEXT`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS hei_institutions_ipeds_idx ON hei_institutions(ipeds_unit_id)`);
+  } catch (_) {}
+
   let inserted = 0, updated = 0, skipped = 0;
   const errors: string[] = [];
   for (const r of slice) {
     if (!r.name) { skipped++; continue; }
     try {
       const res = rows(await db.execute(sql`
-        INSERT INTO hei_institutions (slug, name, tier, country, city, state_region, website_url, type, is_published, created_at, updated_at)
-        VALUES (${slugify(r.name)}, ${r.name}, 'university', 'United States', ${r.city}, ${r.state}, ${r.websiteUrl}, ${r.control}, false, NOW(), NOW())
+        INSERT INTO hei_institutions (slug, name, tier, country, city, state_region, website_url, type, ipeds_unit_id, is_published, created_at, updated_at)
+        VALUES (${slugify(r.name)}, ${r.name}, 'university', 'United States', ${r.city}, ${r.state}, ${r.websiteUrl}, ${r.control}, ${r.unitId || null}, false, NOW(), NOW())
         ON CONFLICT (slug) DO UPDATE SET
-          name         = EXCLUDED.name,
-          country      = COALESCE(EXCLUDED.country, hei_institutions.country),
-          city         = COALESCE(EXCLUDED.city, hei_institutions.city),
-          state_region = COALESCE(EXCLUDED.state_region, hei_institutions.state_region),
-          website_url  = COALESCE(EXCLUDED.website_url, hei_institutions.website_url),
-          type         = COALESCE(EXCLUDED.type, hei_institutions.type),
-          updated_at   = NOW()
+          name          = EXCLUDED.name,
+          country       = COALESCE(EXCLUDED.country, hei_institutions.country),
+          city          = COALESCE(EXCLUDED.city, hei_institutions.city),
+          state_region  = COALESCE(EXCLUDED.state_region, hei_institutions.state_region),
+          website_url   = COALESCE(EXCLUDED.website_url, hei_institutions.website_url),
+          type          = COALESCE(EXCLUDED.type, hei_institutions.type),
+          ipeds_unit_id = COALESCE(EXCLUDED.ipeds_unit_id, hei_institutions.ipeds_unit_id),
+          updated_at    = NOW()
         RETURNING (xmax = 0) AS inserted`));
       if (rows(res)[0]?.inserted) inserted++; else updated++;
     } catch (e: any) {

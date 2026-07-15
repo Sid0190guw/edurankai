@@ -93,6 +93,67 @@ export function parseIpedsHd(csv: string): IpedsRow[] {
   return rows;
 }
 
+/** Fetch + unzip any IPEDS data file (e.g. HD2023, DRVEF2023) as raw CSV text. */
+export async function fetchIpedsCsv(fileName: string, timeoutMs = 45000): Promise<string> {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${BASE}/${fileName}.zip`, { headers: { 'User-Agent': UA }, signal: ctrl.signal });
+    if (!res.ok) throw new Error('source responded ' + res.status + ' for ' + fileName);
+    const entry = unzipFirst(Buffer.from(await res.arrayBuffer()));
+    if (!entry) throw new Error(fileName + ' is not a readable zip');
+    return entry.data.toString('latin1');
+  } finally { clearTimeout(to); }
+}
+
+// IPEDS writes '.' (and variants) for "not applicable / not reported". Turning that into 0
+// would silently invent a 0% graduation rate, so it must become null.
+function num(v: string | undefined): number | null {
+  const s = (v ?? '').trim();
+  if (!s || /^\.+$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Generic: map a derived file into { unitId -> picked columns }. Pure. */
+export function parseByUnitId(csv: string, cols: string[]): Map<string, Record<string, number | null>> {
+  const out = new Map<string, Record<string, number | null>>();
+  const lines = csv.split(/\r?\n/);
+  if (!lines.length) return out;
+  const hdr = parseCsvLine(lines[0]).map((h) => h.replace(/^(?:﻿|ï»¿)/, '').trim().toUpperCase());
+  const iId = hdr.indexOf('UNITID');
+  if (iId < 0) return out;
+  const want = cols.map((c) => ({ c, i: hdr.indexOf(c.toUpperCase()) })).filter((x) => x.i >= 0);
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const f = parseCsvLine(lines[i]);
+    const id = (f[iId] || '').trim();
+    if (!id) continue;
+    const rec: Record<string, number | null> = {};
+    for (const w of want) rec[w.c] = num(f[w.i]);
+    out.set(id, rec);
+  }
+  return out;
+}
+
+export interface IpedsMetric { unitId: string; enrollment: number | null; gradRate: number | null; }
+
+/** Enrollment (DRVEF) + graduation rate (DRVGR) merged by unit id. */
+export async function fetchIpedsMetrics(year = 2023): Promise<IpedsMetric[]> {
+  const [efCsv, grCsv] = await Promise.all([fetchIpedsCsv('DRVEF' + year), fetchIpedsCsv('DRVGR' + year)]);
+  const ef = parseByUnitId(efCsv, ['ENRTOT']);
+  const gr = parseByUnitId(grCsv, ['GRRTTOT']);
+  const ids = new Set<string>([...ef.keys(), ...gr.keys()]);
+  const out: IpedsMetric[] = [];
+  for (const id of ids) {
+    const enrollment = ef.get(id)?.ENRTOT ?? null;
+    const gradRate = gr.get(id)?.GRRTTOT ?? null;
+    if (enrollment == null && gradRate == null) continue;
+    out.push({ unitId: id, enrollment, gradRate });
+  }
+  return out;
+}
+
 /** Fetch + unzip + parse the HD directory for a year. */
 export async function fetchIpeds(year = 2023, timeoutMs = 45000): Promise<IpedsRow[]> {
   const ctrl = new AbortController();
