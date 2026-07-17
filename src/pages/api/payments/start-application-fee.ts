@@ -36,7 +36,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (intentId && !appId) {
       const intentRows = await db.execute(sql`
         SELECT i.id, i.role_id, i.level, i.email, i.first_name, i.last_name, i.role_title_snapshot,
-               r.application_fee_amount AS role_fee
+               r.application_fee_amount AS role_fee, r.engagement_type AS role_engagement
         FROM application_intents i
         LEFT JOIN roles r ON i.role_id = r.id
         WHERE i.id = ${intentId} AND i.user_id = ${user.id}
@@ -96,7 +96,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
       // Holistic amount: base fee minus any active admin offer. Computed once
       // here and reused for both the wallet-cover path and the card order.
-      const co = await computeCheckout({ roleFee: intentRow.role_fee, level: intentRow.level });
+      const co = await computeCheckout({ roleFee: intentRow.role_fee, level: intentRow.level, engagementType: intentRow.role_engagement });
 
       // Universal account credit: if the applicant's wallet covers the (net)
       // fee, pay from credit (works even if card payments aren't configured).
@@ -151,7 +151,8 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const a = await db.execute(sql`
       SELECT a.id, a.level, a.fee_paid, a.first_name, a.last_name, a.email,
              a.role_title_snapshot,
-             r.application_fee_amount AS role_fee, r.application_fee_currency AS role_fee_ccy
+             r.application_fee_amount AS role_fee, r.application_fee_currency AS role_fee_ccy,
+             r.engagement_type AS role_engagement
       FROM applications a
       LEFT JOIN roles r ON a.role_id = r.id
       WHERE a.id = ${appId} AND a.applicant_user_id = ${user.id}
@@ -187,7 +188,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     // Universal account credit: cover the fee from the applicant's wallet if it
     // is enough (no card charge, works even if Razorpay isn't configured).
     {
-      const feeChfC = resolveApplicationFeeChf({ roleFee: app.role_fee, level: app.level });
+      const feeChfC = resolveApplicationFeeChf({ roleFee: app.role_fee, level: app.level, engagementType: app.role_engagement });
       const fxC = await convertToInrPaise('CHF', feeChfC * 100);
       const { coverWithCredit } = await import('@/lib/account-credit');
       const cov = await coverWithCredit({ userId: user.id, amountPaise: fxC.paise, purpose: 'application_fee', referenceType: 'application', referenceId: app.id, email: app.email || user.email || '', label: 'Application fee' });
@@ -201,7 +202,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     // Authoritative fee: per-role amount (CHF) if set on the seeded role,
     // otherwise the level-tiered fallback. Currency is always treated as CHF
     // even if a different one is stored, until we add multi-currency settle.
-    const feeChf = resolveApplicationFeeChf({ roleFee: app.role_fee, level: app.level });
+    const feeChf = resolveApplicationFeeChf({ roleFee: app.role_fee, level: app.level, engagementType: app.role_engagement });
     const fx = await convertToInrPaise('CHF', feeChf * 100);
     const amountPaise = fx.paise;
     const receipt = 'appfee_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);

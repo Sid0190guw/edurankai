@@ -45,8 +45,8 @@ export interface CheckoutBreakdown {
   fxLive: boolean;
 }
 
-export async function computeCheckout(opts: { roleFee?: number | string | null; level?: RoleLevel; userId?: string | null }): Promise<CheckoutBreakdown> {
-  const exempt = isFeeExempt(opts.level);
+export async function computeCheckout(opts: { roleFee?: number | string | null; level?: RoleLevel; engagementType?: string | null; userId?: string | null }): Promise<CheckoutBreakdown> {
+  const exempt = isFeeExempt(opts.level, opts.engagementType);   // exempt by level OR engagement (internship/apprenticeship)
   const baseChf = resolveApplicationFeeChf(opts);         // 0 when exempt
   const fx = await convertToInrPaise('CHF', baseChf * 100);
   const base = fx.paise;
