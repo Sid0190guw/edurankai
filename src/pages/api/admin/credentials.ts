@@ -22,6 +22,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (b.action === 'issue') {
       if (!b.userId || !b.courseObjId) return j({ ok: false, error: 'userId + courseObjId required' }, 400);
       const r = await issueCredential(String(b.userId), String(b.courseObjId), user.id);
+      if (r.ok) { try { const { notify, notifyGuardians } = await import('@/lib/edu-notify'); await notify(String(b.userId), { type: 'credential', title: 'A credential was issued to you', body: 'Your course credential is ready to view and share.', link: '/credentials/course/' + r.code }); await notifyGuardians(String(b.userId), { title: 'A credential was issued to your linked learner', link: '/credentials/course/' + r.code }); } catch { /* notify best-effort */ } }
       return j(r.ok ? { ok: true, code: r.code } : { ok: false, error: r.error });
     }
     if (b.action === 'revoke') {

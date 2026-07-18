@@ -18,6 +18,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const app = await getApplication(appId);
   if (!app) return j({ ok: false, error: 'application not found' }, 404);
   if (!canDecide(app.status)) return j({ ok: false, error: 'already decided' }, 200);
-  try { await recordDecision(appId, decision, String(b.reason || ''), user.id); return j({ ok: true }); }
-  catch (e: any) { return j({ ok: false, error: e?.cause?.message || e?.message || 'error' }, 200); }
+  try {
+    await recordDecision(appId, decision, String(b.reason || ''), user.id);
+    try { const { notify } = await import('@/lib/edu-notify'); await notify(app.user_id, { type: 'admission', title: 'Admission decision: ' + decision, body: String(b.reason || ''), link: '/aquintutor/admission' }); } catch { /* notify best-effort */ }
+    return j({ ok: true });
+  } catch (e: any) { return j({ ok: false, error: e?.cause?.message || e?.message || 'error' }, 200); }
 };
