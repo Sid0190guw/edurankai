@@ -1,13 +1,15 @@
 ---
 // /admin/rbac — Kernel Permission Engine console (Prompt 2b, admin surface).
-// Gated by the engine: must hold 'manage' for rbac (superadmin or registrar). Shows the
-// seeded roles + capabilities, lets you assign/remove roles (+ student stage + guardian
-// links), and shows the append-only audit log. Real backend (/api/admin/rbac + rbac_*).
+// Gated by the engine itself: must hold 'manage' for rbac (superadmin via 'administer', or
+// registrar). Roles + capabilities (live toggle, create role), users + roles (search, stage,
+// guardian links, minor-block state), and a searchable/filterable append-only audit log.
+// Real backend only (/api/admin/rbac + rbac_* tables). Near-zero client JS (one inline script).
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { can, ensureRbacSchema, seedRbac } from '@/lib/rbac';
-import { SEED_ROLES, STAGES, resolveRoleCapabilities, isMinorStage } from '@/lib/rbac/roles';
+import { SEED_ROLES, STAGES, isMinorStage } from '@/lib/rbac/roles';
+import { CORE_CAPABILITIES } from '@/lib/rbac/capabilities';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -21,72 +23,144 @@ await ensureRbacSchema();
 let roleCount = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM rbac_roles`))[0]?.c || 0;
 if (roleCount === 0) { await seedRbac(); roleCount = SEED_ROLES.length; }
 
-const dbRoles = rows(await db.execute(sql`SELECT r.key, r.surface, r.color, r.inherits,
+const dbRoles = rows(await db.execute(sql`SELECT r.key, r.surface, r.color, r.is_system, r.inherits,
     COALESCE(array_agg(rc.capability) FILTER (WHERE rc.capability IS NOT NULL), '{}') AS caps
   FROM rbac_roles r LEFT JOIN rbac_role_capabilities rc ON rc.role_key = r.key
-  GROUP BY r.key, r.surface, r.color, r.inherits ORDER BY r.surface, r.key`));
+  GROUP BY r.key, r.surface, r.color, r.is_system, r.inherits ORDER BY r.surface, r.key`));
 
-// users + their assigned rbac roles/stage
+// resolve inheritance from LIVE db rows (reflects toggles + newly-created roles)
+const roleMap = new Map(dbRoles.map((r: any) => [r.key, r]));
+function resolvedCaps(key: string, seen = new Set<string>()): Set<string> {
+  const s = new Set<string>();
+  if (seen.has(key)) return s; seen.add(key);
+  const r: any = roleMap.get(key); if (!r) return s;
+  for (const c of r.caps) s.add(c);
+  for (const p of (r.inherits || [])) for (const c of resolvedCaps(p, seen)) s.add(c);
+  return s;
+}
+
+// users (searchable) + their rbac roles/stage
+const uq = (Astro.url.searchParams.get('u') || '').trim();
 const users = rows(await db.execute(sql`SELECT u.id, u.email, u.name, u.role,
     COALESCE(json_agg(json_build_object('role', ur.role_key, 'stage', ur.stage)) FILTER (WHERE ur.role_key IS NOT NULL), '[]') AS rbac
   FROM users u LEFT JOIN rbac_user_roles ur ON ur.user_id = u.id
-  GROUP BY u.id, u.email, u.name, u.role ORDER BY u.name LIMIT 100`));
+  ${uq ? sql`WHERE u.name ILIKE ${'%' + uq + '%'} OR u.email ILIKE ${'%' + uq + '%'}` : sql``}
+  GROUP BY u.id, u.email, u.name, u.role ORDER BY u.name LIMIT 60`));
+
+// which minors already have a guardian (to compute the block state)
+const guardedSet = new Set(rows(await db.execute(sql`SELECT DISTINCT minor_user_id FROM rbac_guardian_links`)).map((r: any) => r.minor_user_id));
+function minorBlocked(u: any): boolean {
+  return (u.rbac || []).some((a: any) => a.role === 'student' && isMinorStage(a.stage)) && !guardedSet.has(u.id);
+}
 
 const guardians = rows(await db.execute(sql`SELECT gl.guardian_user_id, gl.minor_user_id, g.name AS guardian_name, m.name AS minor_name
   FROM rbac_guardian_links gl LEFT JOIN users g ON g.id = gl.guardian_user_id LEFT JOIN users m ON m.id = gl.minor_user_id ORDER BY gl.created_at DESC LIMIT 50`));
 
+// audit: search + decision + date range + pagination
 const q = (Astro.url.searchParams.get('q') || '').trim();
+const dec = (Astro.url.searchParams.get('dec') || '').trim();
+const from = (Astro.url.searchParams.get('from') || '').trim();
+const to = (Astro.url.searchParams.get('to') || '').trim();
+const ap = Math.max(0, parseInt(Astro.url.searchParams.get('ap') || '0', 10) || 0);
+const PER = 50;
+const conds: any[] = [];
+if (q) conds.push(sql`(a.capability ILIKE ${'%' + q + '%'} OR a.resource ILIKE ${'%' + q + '%'} OR a.reason ILIKE ${'%' + q + '%'} OR u.name ILIKE ${'%' + q + '%'})`);
+if (dec === 'allow') conds.push(sql`a.allow = true`);
+if (dec === 'deny') conds.push(sql`a.allow = false`);
+if (/^\d{4}-\d{2}-\d{2}$/.test(from)) conds.push(sql`a.at >= ${from}::date`);
+if (/^\d{4}-\d{2}-\d{2}$/.test(to)) conds.push(sql`a.at < (${to}::date + interval '1 day')`);
+const where = conds.length ? sql`WHERE ${sql.join(conds, sql` AND `)}` : sql``;
+const auditTotal = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id ${where}`))[0]?.c || 0;
 const audit = rows(await db.execute(sql`SELECT a.*, u.name AS user_name FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id
-  ${q ? sql`WHERE a.capability ILIKE ${'%' + q + '%'} OR a.resource ILIKE ${'%' + q + '%'} OR a.reason ILIKE ${'%' + q + '%'} OR u.name ILIKE ${'%' + q + '%'}` : sql``}
-  ORDER BY a.at DESC LIMIT 100`));
+  ${where} ORDER BY a.at DESC LIMIT ${PER} OFFSET ${ap * PER}`));
+function qs(over: Record<string, any> = {}) {
+  const p = new URLSearchParams();
+  if (uq) p.set('u', uq); if (q) p.set('q', q); if (dec) p.set('dec', dec); if (from) p.set('from', from); if (to) p.set('to', to); if (ap) p.set('ap', String(ap));
+  for (const k in over) { const v = over[k]; if (v === '' || v == null) p.delete(k); else p.set(k, String(v)); }
+  return '?' + p.toString();
+}
 
 const ALL_ROLE_KEYS = SEED_ROLES.map((r) => r.key);
 const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;margin-bottom:16px;';
-const IN = 'background:#15151a;border:1px solid #1a1a1f;color:#fff;padding:7px 9px;border-radius:6px;font-size:12px;';
+const IN = 'background:#15151a;border:1px solid #26262c;color:#fff;padding:7px 9px;border-radius:6px;font-size:12px;';
+const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;";
 function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch { return '-'; } }
 ---
 <AdminLayout title="Permission Engine" activeNav="rbac">
-  <div style="max-width:1100px;margin:0 auto;padding:24px;">
+  <div style="max-width:1120px;margin:0 auto;padding:24px;">
     <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px;">Kernel Permission Engine</p>
     <h1 style="font-size:22px;font-weight:800;color:#fff;margin:0;">Roles, capabilities &amp; access</h1>
-    <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;max-width:760px;line-height:1.55;">Capability-based RBAC enforced on both surfaces. Every access decision is audited below. {roleCount} roles seeded.</p>
+    <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;max-width:780px;line-height:1.55;">Capability-based RBAC enforced on both surfaces; every access decision is audited below. {roleCount} roles seeded. Your own view is at <a href="/aquintutor/access" style="color:#FF7040;">/aquintutor/access</a>.</p>
     <div id="msg" style="display:none;margin:12px 0;padding:9px 13px;border-radius:8px;font-size:13px;"></div>
 
     <!-- ROLES & CAPABILITIES -->
     <div style={CARD}>
-      <p style="font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;">Roles &amp; capabilities</p>
-      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px;">
-        {dbRoles.map((r: any) => (
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <p style={HD + 'margin:0;'}>Roles &amp; capabilities</p>
+        <div><button id="reseedBtn" type="button" style="background:none;border:1px solid #26262c;color:#8a8a94;font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer;">Seed default roles</button>
+        <button id="newRoleBtn" type="button" style="background:#15151a;border:1px solid #26262c;color:#cfd6da;font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer;margin-left:4px;">+ New role</button></div>
+      </div>
+
+      <form id="newRoleForm" style="display:none;background:#08080a;border:1px solid #26262c;border-radius:10px;padding:12px;margin-bottom:12px;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
+          <div><label style="font-size:10px;color:#8a8a94;">Key</label><br/><input id="nrKey" placeholder="e.g. lab_assistant" style={IN} /></div>
+          <div><label style="font-size:10px;color:#8a8a94;">Surface</label><br/><select id="nrSurface" style={IN}><option value="main">main</option><option value="admin">admin</option></select></div>
+          <div style="flex:1;min-width:180px;"><label style="font-size:10px;color:#8a8a94;">Description</label><br/><input id="nrDesc" style={IN + 'width:100%;'} /></div>
+        </div>
+        <div style="margin-top:8px;"><span style="font-size:10px;color:#8a8a94;">Capabilities:</span>
+          {CORE_CAPABILITIES.map((c) => (<label style="font-size:11px;color:#cfd6da;margin:0 8px 0 4px;display:inline-block;"><input type="checkbox" class="nrCap" value={c} /> {c}</label>))}
+        </div>
+        <button id="nrSave" type="button" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;margin-top:8px;">Create role</button>
+      </form>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:10px;">
+        {dbRoles.map((r: any) => {
+          const resolved = resolvedCaps(r.key);
+          return (
           <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:11px 13px;">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
               <b style="font-size:13px;color:#fff;">{r.key}</b>
-              <span style="font-size:9px;font-family:'Geist Mono',monospace;text-transform:uppercase;color:#8a8a94;border:1px solid #26262c;border-radius:100px;padding:2px 7px;">{r.surface}</span>
+              <span style="font-size:9px;font-family:'Geist Mono',monospace;text-transform:uppercase;color:#8a8a94;border:1px solid #26262c;border-radius:100px;padding:2px 7px;">{r.surface}{r.is_system ? '' : ' · custom'}</span>
             </div>
             {r.inherits?.length ? <div style="font-size:10.5px;color:#8a8a94;margin-top:3px;">inherits: {r.inherits.join(', ')}</div> : null}
             <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:7px;">
-              {[...resolveRoleCapabilities(r.key)].map((c: string) => (
-                <span style={'font-size:10px;font-family:Geist Mono,monospace;padding:2px 6px;border-radius:5px;' + (r.caps.includes(c) ? 'background:rgba(255,79,0,0.14);color:#FF7040;' : 'background:#15151a;color:#6e6e78;')}>{c}</span>
-              ))}
+              {CORE_CAPABILITIES.map((c) => {
+                const own = r.caps.includes(c);
+                const inherited = !own && resolved.has(c);
+                const st = own ? 'background:rgba(255,79,0,0.16);color:#FF7040;border:1px solid rgba(255,79,0,0.4);'
+                  : inherited ? 'background:#101014;color:#6e6e78;border:1px solid #1a1a1f;'
+                  : 'background:#0a0a0c;color:#4a4a52;border:1px solid #141418;';
+                return inherited
+                  ? <span style={'font-size:10px;font-family:Geist Mono,monospace;padding:2px 6px;border-radius:5px;' + st} title="inherited from a parent role">{c}</span>
+                  : <button type="button" class="capToggle" data-role={r.key} data-cap={c} data-on={own ? '0' : '1'} style={'cursor:pointer;font-size:10px;font-family:Geist Mono,monospace;padding:2px 6px;border-radius:5px;' + st}>{c}</button>;
+              })}
             </div>
-          </div>
-        ))}
+          </div>);
+        })}
       </div>
-      <p style="font-size:10.5px;color:#6e6e78;margin:9px 0 0;">Solid = own capability. Faded = inherited. <button id="reseedBtn" type="button" style="background:none;border:1px solid #26262c;color:#8a8a94;font-size:11px;padding:3px 9px;border-radius:6px;cursor:pointer;margin-left:6px;">Re-seed roster</button></p>
+      <p style="font-size:10.5px;color:#6e6e78;margin:9px 0 0;">Solid = own capability (click to remove). Dim = click to add. Faded &amp; non-clickable = inherited from a parent role.</p>
     </div>
 
     <!-- USERS & ROLES -->
     <div style={CARD}>
-      <p style="font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;">Users &amp; roles</p>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <p style={HD + 'margin:0;'}>Users &amp; roles</p>
+        <form method="GET" style="display:flex;gap:6px;"><input name="u" value={uq} placeholder="search name / email" style={IN + 'width:220px;max-width:55vw;'} /><button type="submit" style="background:#15151a;border:1px solid #26262c;color:#cfd6da;font-size:11px;padding:6px 11px;border-radius:6px;cursor:pointer;">Search</button></form>
+      </div>
       <div style="overflow-x:auto;">
         <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
           <thead><tr style="color:#8a8a94;font-size:10px;text-transform:uppercase;font-family:'Geist Mono',monospace;text-align:left;">
-            <th style="padding:6px 8px;">User</th><th style="padding:6px 8px;">RBAC roles</th><th style="padding:6px 8px;min-width:280px;">Assign</th>
+            <th style="padding:6px 8px;">User</th><th style="padding:6px 8px;">RBAC roles</th><th style="padding:6px 8px;min-width:290px;">Assign</th>
           </tr></thead>
           <tbody>
             {users.map((u: any) => (
               <tr style="border-top:1px solid #15151a;">
-                <td style="padding:8px;"><div style="color:#fff;font-weight:600;">{u.name}</div><div style="color:#6e6e78;font-size:11px;">{u.email} · {u.role}</div></td>
-                <td style="padding:8px;">
+                <td style="padding:8px;vertical-align:top;">
+                  <div style="color:#fff;font-weight:600;">{u.name}</div>
+                  <div style="color:#6e6e78;font-size:11px;">{u.email} · {u.role}</div>
+                  {minorBlocked(u) ? <div style="margin-top:5px;font-size:10.5px;color:#fca5a5;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:5px;padding:3px 7px;display:inline-block;">MINOR &mdash; no guardian linked; sensitive actions blocked</div> : null}
+                </td>
+                <td style="padding:8px;vertical-align:top;">
                   {(u.rbac || []).map((a: any) => (
                     <span style="display:inline-flex;align-items:center;gap:4px;background:#15151a;border:1px solid #26262c;border-radius:100px;padding:2px 4px 2px 9px;margin:2px;font-size:11px;color:#cfd6da;">
                       {a.role}{a.stage ? ' · ' + a.stage : ''}{a.role === 'student' && isMinorStage(a.stage) ? ' (minor)' : ''}
@@ -94,7 +168,7 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
                     </span>
                   ))}
                 </td>
-                <td style="padding:8px;">
+                <td style="padding:8px;vertical-align:top;">
                   <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;">
                     <select class="asg-role" data-user={u.id} style={IN}>{ALL_ROLE_KEYS.map((k) => <option value={k}>{k}</option>)}</select>
                     <select class="asg-stage" data-user={u.id} style={IN}><option value="">(stage)</option>{STAGES.map((s) => <option value={s}>{s}</option>)}</select>
@@ -103,6 +177,7 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
                 </td>
               </tr>
             ))}
+            {users.length === 0 ? <tr><td colspan="3" style="padding:16px;text-align:center;color:#6e6e78;">No users match &ldquo;{uq}&rdquo;.</td></tr> : null}
           </tbody>
         </table>
       </div>
@@ -110,7 +185,7 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
 
     <!-- GUARDIAN LINKS -->
     <div style={CARD}>
-      <p style="font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;">Guardian links (required for minor accounts)</p>
+      <p style={HD}>Guardian links (required for minor accounts)</p>
       <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:end;margin-bottom:10px;">
         <div><label style="font-size:10px;color:#8a8a94;">Guardian</label><br/><select id="gGuardian" style={IN}>{users.map((u: any) => <option value={u.id}>{u.name}</option>)}</select></div>
         <div><label style="font-size:10px;color:#8a8a94;">Minor student</label><br/><select id="gMinor" style={IN}>{users.map((u: any) => <option value={u.id}>{u.name}</option>)}</select></div>
@@ -119,7 +194,7 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
       {guardians.length === 0 ? <p style="font-size:12px;color:#6e6e78;margin:0;">No guardian links yet.</p> :
         guardians.map((g: any) => (
           <div style="font-size:12.5px;color:#cfd6da;padding:4px 0;border-bottom:1px solid #15151a;display:flex;justify-content:space-between;align-items:center;gap:8px;">
-            <span><b style="color:#fff;">{g.guardian_name}</b> &rarr; oversees &rarr; <b style="color:#fff;">{g.minor_name}</b></span>
+            <span><b style="color:#fff;">{g.guardian_name}</b> &mdash; oversees &mdash; <b style="color:#fff;">{g.minor_name}</b></span>
             <button class="g-unlink" data-g={g.guardian_user_id} data-m={g.minor_user_id} type="button" style="background:rgba(239,68,68,0.12);color:#fca5a5;border:1px solid rgba(239,68,68,0.3);font-size:10px;padding:2px 8px;border-radius:5px;cursor:pointer;">unlink</button>
           </div>
         ))}
@@ -128,17 +203,24 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
     <!-- AUDIT LOG -->
     <div style={CARD}>
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
-        <p style="font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0;">Permission audit log (append-only)</p>
-        <form method="GET" style="display:flex;gap:6px;"><input name="q" value={q} placeholder="search capability / resource / reason / user" style={IN + 'width:280px;max-width:60vw;'} /><button type="submit" style="background:#15151a;border:1px solid #26262c;color:#cfd6da;font-size:11px;padding:6px 11px;border-radius:6px;cursor:pointer;">Search</button></form>
+        <p style={HD + 'margin:0;'}>Permission audit log (append-only) &middot; {auditTotal} rows</p>
+        <form method="GET" style="display:flex;gap:6px;flex-wrap:wrap;">
+          <input name="u" value={uq} type="hidden" />
+          <input name="q" value={q} placeholder="capability / resource / reason / user" style={IN + 'width:230px;max-width:55vw;'} />
+          <select name="dec" style={IN}><option value="">all</option><option value="allow" selected={dec === 'allow'}>allow</option><option value="deny" selected={dec === 'deny'}>deny</option></select>
+          <input name="from" value={from} type="date" style={IN} title="from date" />
+          <input name="to" value={to} type="date" style={IN} title="to date" />
+          <button type="submit" style="background:#15151a;border:1px solid #26262c;color:#cfd6da;font-size:11px;padding:6px 11px;border-radius:6px;cursor:pointer;">Filter</button>
+        </form>
       </div>
       <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:11.5px;font-family:'Geist Mono',monospace;">
         <thead><tr style="color:#8a8a94;font-size:9px;text-transform:uppercase;text-align:left;"><th style="padding:5px 8px;">When</th><th style="padding:5px 8px;">User</th><th style="padding:5px 8px;">Cap</th><th style="padding:5px 8px;">Resource</th><th style="padding:5px 8px;">Decision</th><th style="padding:5px 8px;">Stage / reason</th></tr></thead>
         <tbody>
-          {audit.length === 0 ? <tr><td colspan="6" style="padding:16px;text-align:center;color:#6e6e78;font-family:sans-serif;">No audit rows yet — they appear as access decisions are made.</td></tr> :
+          {audit.length === 0 ? <tr><td colspan="6" style="padding:16px;text-align:center;color:#6e6e78;font-family:sans-serif;">No audit rows match. They appear as access decisions are made.</td></tr> :
             audit.map((a: any) => (
               <tr style="border-top:1px solid #15151a;">
                 <td style="padding:5px 8px;color:#8a8a94;white-space:nowrap;">{fmt(a.at)}</td>
-                <td style="padding:5px 8px;color:#cfd6da;">{a.user_name || (a.user_id ? a.user_id.slice(0, 8) : 'anon')}</td>
+                <td style="padding:5px 8px;color:#cfd6da;">{a.user_name || (a.user_id ? String(a.user_id).slice(0, 8) : 'anon')}</td>
                 <td style="padding:5px 8px;color:#cfd6da;">{a.capability}</td>
                 <td style="padding:5px 8px;color:#8a8a94;">{a.resource}</td>
                 <td style={'padding:5px 8px;font-weight:700;color:' + (a.allow ? '#6ee7b7' : '#fca5a5') + ';'}>{a.allow ? 'ALLOW' : 'DENY'}</td>
@@ -147,6 +229,13 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
             ))}
         </tbody>
       </table></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-size:11.5px;color:#8a8a94;">
+        <span>Page {ap + 1} of {Math.max(1, Math.ceil(auditTotal / PER))}</span>
+        <span style="display:flex;gap:8px;">
+          {ap > 0 ? <a href={qs({ ap: ap - 1 })} style="color:#cfd6da;border:1px solid #26262c;padding:4px 10px;border-radius:6px;text-decoration:none;">&larr; Prev</a> : null}
+          {(ap + 1) * PER < auditTotal ? <a href={qs({ ap: ap + 1 })} style="color:#cfd6da;border:1px solid #26262c;padding:4px 10px;border-radius:6px;text-decoration:none;">Next &rarr;</a> : null}
+        </span>
+      </div>
     </div>
   </div>
 
@@ -157,10 +246,17 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
       function post(body) {
         return fetch('/api/admin/rbac', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           .then(function (r) { return r.json(); })
-          .then(function (j) { if (j.ok) { flash('Saved.', true); setTimeout(function () { location.reload(); }, 500); } else { flash(j.error || 'Failed', false); } return j; })
+          .then(function (j) { if (j.ok) { flash('Saved.', true); setTimeout(function () { location.reload(); }, 450); } else { flash(j.error || 'Failed', false); } return j; })
           .catch(function () { flash('Network error', false); });
       }
       document.getElementById('reseedBtn').addEventListener('click', function () { post({ action: 'seed' }); });
+      var nrf = document.getElementById('newRoleForm');
+      document.getElementById('newRoleBtn').addEventListener('click', function () { nrf.style.display = nrf.style.display === 'none' ? 'block' : 'none'; });
+      document.getElementById('nrSave').addEventListener('click', function () {
+        var caps = Array.prototype.slice.call(document.querySelectorAll('.nrCap:checked')).map(function (c) { return c.value; });
+        post({ action: 'createRole', key: document.getElementById('nrKey').value, surface: document.getElementById('nrSurface').value, description: document.getElementById('nrDesc').value, capabilities: caps });
+      });
+      document.querySelectorAll('.capToggle').forEach(function (b) { b.addEventListener('click', function () { post({ action: 'toggleCap', roleKey: b.getAttribute('data-role'), capability: b.getAttribute('data-cap'), on: b.getAttribute('data-on') === '1' }); }); });
       document.querySelectorAll('.asg-btn').forEach(function (b) {
         b.addEventListener('click', function () {
           var u = b.getAttribute('data-user');

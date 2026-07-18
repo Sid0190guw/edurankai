@@ -14,4 +14,5 @@ export { enforce, can, requireCapability, requireAdminRole, ForbiddenError, type
 export {
   ensureRbacSchema, seedRbac, resolvePrincipal, writeAudit, createGrant, transitionGrant,
 } from './store';
+export { accessSummary, CAPABILITY_LABELS, type AccessSummary } from './access';
 export * from './schema';

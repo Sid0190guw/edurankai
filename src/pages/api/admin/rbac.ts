@@ -7,9 +7,11 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { can, ensureRbacSchema, seedRbac } from '@/lib/rbac';
 import { SEED_ROLES, STAGES } from '@/lib/rbac/roles';
+import { isCapability } from '@/lib/rbac/capabilities';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 const ROLE_KEYS = SEED_ROLES.map((r) => r.key);
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
@@ -62,6 +64,31 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (action === 'unlinkGuardian') {
       await db.execute(sql`DELETE FROM rbac_guardian_links WHERE guardian_user_id = ${String(b.guardianUserId)} AND minor_user_id = ${String(b.minorUserId)}`);
       return j({ ok: true });
+    }
+
+    if (action === 'toggleCap') {
+      const roleKey = String(b.roleKey || ''), cap = String(b.capability || '');
+      if (!roleKey || !isCapability(cap)) return j({ ok: false, error: 'valid roleKey + capability required' }, 400);
+      const exists = rows(await db.execute(sql`SELECT 1 FROM rbac_roles WHERE key = ${roleKey} LIMIT 1`)).length > 0;
+      if (!exists) return j({ ok: false, error: 'unknown role' }, 400);
+      if (b.on) await db.execute(sql`INSERT INTO rbac_role_capabilities (role_key, capability) VALUES (${roleKey}, ${cap}) ON CONFLICT DO NOTHING`);
+      else await db.execute(sql`DELETE FROM rbac_role_capabilities WHERE role_key = ${roleKey} AND capability = ${cap}`);
+      return j({ ok: true });
+    }
+
+    if (action === 'createRole') {
+      const key = String(b.key || '').trim().toLowerCase();
+      const surface = b.surface === 'admin' || b.surface === 'main' ? b.surface : '';
+      if (!/^[a-z][a-z0-9_]{1,30}$/.test(key)) return j({ ok: false, error: 'key must be lowercase a-z0-9_ (2-31 chars)' }, 400);
+      if (!surface) return j({ ok: false, error: 'surface must be admin or main' }, 400);
+      const caps: string[] = Array.isArray(b.capabilities) ? b.capabilities.filter((c: any) => isCapability(String(c))) : [];
+      const inherits: string[] = Array.isArray(b.inherits) ? b.inherits.filter((x: any) => ROLE_KEYS.includes(String(x))) : [];
+      const dup = rows(await db.execute(sql`SELECT 1 FROM rbac_roles WHERE key = ${key} LIMIT 1`)).length > 0;
+      if (dup) return j({ ok: false, error: 'a role with that key already exists' }, 400);
+      await db.execute(sql`INSERT INTO rbac_roles (key, surface, description, color, is_system, inherits)
+        VALUES (${key}, ${surface}, ${String(b.description || '')}, 'orange', false, ${inherits})`);
+      for (const c of caps) await db.execute(sql`INSERT INTO rbac_role_capabilities (role_key, capability) VALUES (${key}, ${c}) ON CONFLICT DO NOTHING`);
+      return j({ ok: true, created: key });
     }
 
     return j({ ok: false, error: 'unknown action' }, 400);
