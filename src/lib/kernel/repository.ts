@@ -102,6 +102,30 @@ export class KernelRepository {
       if (patch.permissions) o.permissions = patch.permissions;
     });
   }
+  /** Edit a NOT-yet-published object in place (draft authoring): no version bump, no transition. */
+  async editDraft(id: string, patch: UpdatePatch = {}): Promise<KernelObject> {
+    const o = await this.load(id);
+    if (['published', 'referenced', 'archived', 'deleted'].includes(o.lifecycleState)) throw new Error(`editDraft not allowed in state "${o.lifecycleState}"; use updateObject`);
+    o.updatedAt = nowISO();
+    if (patch.data) o.data = { ...(o.data as Record<string, unknown>), ...patch.data };
+    if (patch.metadata) o.metadata = { ...o.metadata, ...patch.metadata };
+    if (patch.learningMetadata) o.learningMetadata = { ...o.learningMetadata, ...patch.learningMetadata };
+    if (patch.securityLabels) o.securityLabels = patch.securityLabels;
+    if (patch.permissions) o.permissions = patch.permissions;
+    await this.store.updateObject(o);
+    return o;
+  }
+
+  /** Merge presentational metadata (e.g. ordering) in any non-deleted state, without a transition. */
+  async patchMeta(id: string, metaPatch: Record<string, unknown>): Promise<KernelObject> {
+    const o = await this.load(id);
+    if (o.lifecycleState === 'deleted') throw new Error('object is deleted');
+    o.metadata = { ...o.metadata, ...metaPatch };
+    o.updatedAt = nowISO();
+    await this.store.updateObject(o);
+    return o;
+  }
+
   /** published | referenced | updated -> archived. */
   archiveObject(id: string): Promise<KernelObject> { return this.transition(id, 'archived', (o) => { o.archivedAt = nowISO(); }); }
   /** archived -> deleted (soft delete: the row remains, state = deleted). */
