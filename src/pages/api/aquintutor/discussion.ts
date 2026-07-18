@@ -21,6 +21,8 @@ async function participationOk(userId: string): Promise<boolean> {
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
   if (!user?.id) return j({ ok: false, error: 'sign in required' }, 401);
+  const { featureEnabled } = await import('@/lib/observability');
+  if (!(await featureEnabled('community'))) return j({ ok: false, error: 'the discussion feature is currently disabled' }, 403);
   let b: any = {}; try { b = await request.json(); } catch { return j({ ok: false, error: 'bad json' }, 400); }
   // report is allowed for everyone; posting/creating requires participation rights
   if (b.action !== 'report' && !(await participationOk(user.id))) return j({ ok: false, error: 'a guardian must enable community participation for your account' }, 403);

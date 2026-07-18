@@ -14,6 +14,8 @@ function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
   if (!user?.id) return j({ ok: false, error: 'sign in required' }, 401);
+  const { featureEnabled } = await import('@/lib/observability');
+  if (!(await featureEnabled('ai_tutor'))) return j({ ok: false, error: 'The AI tutor is currently turned off.' }, 200);
   if (!(await underRateLimit(user.id, 20, 60))) return j({ ok: false, error: 'Please slow down a moment and try again.' }, 429);
 
   let b: any = {}; try { b = await request.json(); } catch { return j({ ok: false, error: 'bad json' }, 400); }
