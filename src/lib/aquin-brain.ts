@@ -13,7 +13,7 @@ const KB: KBEntry[] = [
   { keys: ['virtual lab', 'labs', 'lab', 'simulation', 'experiment', 'practical'],
     answer: 'The Virtual Labs are hands-on, in-browser simulations — you build and run the real thing, not watch a video. Flagships include transformer self-attention, RSA and secp256k1 cryptanalysis, a pipelined RISC CPU, a variational quantum eigensolver, a z-plane filter designer and a PID control lab. Open them at /aquintutor/labs.' },
   { keys: ['stage', 'stages', 'age', 'grade', 'pre-kg', 'phd', 'tots', 'level'],
-    answer: 'AquinTutor follows one learner across eight stages: Tots, Primary, Sub-Juniors, Juniors, Scholars, Tutor (undergraduate), Research (postgraduate) and Atelier (vocational) — pre-KG all the way to PhD and into working life. Set your path at /aquintutor/onboarding.' },
+    answer: 'AquinTutor supports one learner across eight stages: Tots, Primary, Sub-Juniors, Juniors, Scholars, Tutor, Research and Atelier — the earliest years through advanced research and into working life. Set your path at /aquintutor/onboarding.' },
   { keys: ['homework', 'helper', 'tutor', 'stuck', 'coach', 'ask aquin', 'ai tutor'],
     answer: 'The Homework Helper coaches you to the answer with questions and hints — it never hands over the solution to something you are meant to solve, because a skill has to be proven, not watched. Open it at /aquintutor/ai-tutor.' },
   { keys: ['knowledge map', 'knowledge graph', 'concept map', 'dependency', 'unlock'],
@@ -41,7 +41,7 @@ const KB: KBEntry[] = [
   { keys: ['free', 'cost', 'price', 'fee', 'pay', 'subscription'],
     answer: 'You can start practising without a sign-up wall — open a problem and go. For account details and specific plans, sign in at /aquintutor/login or ask on the relevant page.' },
   { keys: ['what is', 'about', 'how does', 'how it works', 'aquintutor', 'platform', 'overview'],
-    answer: 'AquinTutor is a verified-learning institution that follows one learner from pre-KG to PhD and into vocational life. Instead of watching content, you prove skills: adaptive practice measures real mastery, the knowledge graph sequences what to learn, and every credential is earned. Ask me about the Virtual Labs, the Knowledge Graph, Practice, or tell me a concept you are stuck on.' },
+    answer: 'AquinTutor is the technology platform behind partner universities — the partner university awards any qualification, AquinTutor does not. It supports one learner across their whole education, from the earliest years through advanced research and into working life. Instead of watching content, you prove skills: adaptive practice measures real mastery, the knowledge graph sequences what to learn, and every certificate of completion is earned. Ask me about the Virtual Labs, the Knowledge Graph, Practice, or tell me a concept you are stuck on.' },
 ];
 
 // concept-level Socratic hints (method + first step, never the answer)
