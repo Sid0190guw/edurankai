@@ -14,6 +14,9 @@ function inlineMd(s: string): string {
   // s is already HTML-escaped. Apply inline rules on the escaped text.
   let t = s;
   t = t.replace(/`([^`]+)`/g, (_m, c) => `<code>${c}</code>`);
+  // images ![alt](http|https|/path) — restrict scheme; rendered before links. Sizing/format is
+  // applied later by the render policy (rewriteMedia) per the student's tier.
+  t = t.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|\/[^\s)]*)\)/g, (_m, alt, src) => `<img alt="${alt}" src="${src}">`);
   // links [text](http|https|/path) — restrict scheme to prevent javascript: etc.
   t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]*)\)/g, (_m, txt, href) => `<a href="${href}" rel="noopener">${txt}</a>`);
   t = t.replace(/\*\*([^*]+)\*\*/g, (_m, c) => `<strong>${c}</strong>`);
