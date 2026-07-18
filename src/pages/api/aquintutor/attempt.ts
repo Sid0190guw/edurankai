@@ -36,6 +36,8 @@ export const POST: APIRoute = async ({ request, locals }) => {
       try { await ensureProctorSchema(); await db.execute(sql`UPDATE edu_attempts SET proctor_session_id = ${proctorSessionId} WHERE id = ${attemptId}`); } catch { /* proctoring optional */ }
     }
     const r = await submitAttempt(attemptId, responses);
+    // Gamification (Prompt 15): an OFFICIAL pass awards XP once per assessment (idempotent ledger).
+    if (mode === 'official' && r.passed) { try { const { awardXp } = await import('@/lib/xp-ledger'); await awardXp(user.id, 'assessment_pass', assessmentId); } catch { /* best-effort */ } }
     // practice returns per-item feedback; official hides it (pct + state only)
     return j({ ok: true, attemptId, pct: r.pct, passed: r.passed, state: r.state, needsManual: r.needsManual, feedback: mode === 'practice' ? r.perItem : undefined });
   } catch (e: any) { return j({ ok: false, error: e?.cause?.message || e?.message || 'server error' }, 200); }

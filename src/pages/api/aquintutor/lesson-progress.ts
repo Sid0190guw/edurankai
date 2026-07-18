@@ -5,6 +5,7 @@ import type { APIRoute } from 'astro';
 import { can } from '@/lib/rbac';
 import { contentService } from '@/lib/kernel-content';
 import { completeLesson } from '@/lib/edu-runtime';
+import { awardXp } from '@/lib/xp-ledger';
 
 function back(next: string) { return new Response(null, { status: 303, headers: { Location: next } }); }
 
@@ -23,5 +24,6 @@ export const POST: APIRoute = async ({ request, locals }) => {
   if (!gate.allow) return back('/aquintutor/courses?locked=1');
 
   try { await completeLesson(user.id, koId, seconds); } catch (e) { /* best-effort */ }
+  try { await awardXp(user.id, 'lesson_complete', koId); } catch (e) { /* gamification best-effort, idempotent */ }
   return back(next);
 };
