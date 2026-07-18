@@ -5,6 +5,9 @@ import type { APIRoute } from 'astro';
 import { can } from '@/lib/rbac';
 import { createPgKernel } from '@/lib/kernel';
 import { startAttempt, submitAttempt } from '@/lib/assessment';
+import { ensureProctorSchema } from '@/lib/proctor';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -27,6 +30,11 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   try {
     const attemptId = await startAttempt(user.id, assessmentId, mode);
+    // Link an ATLAS proctoring session to this official attempt (Prompt 11), if one was run.
+    const proctorSessionId = String(b.proctorSessionId || '');
+    if (mode === 'official' && proctorSessionId) {
+      try { await ensureProctorSchema(); await db.execute(sql`UPDATE edu_attempts SET proctor_session_id = ${proctorSessionId} WHERE id = ${attemptId}`); } catch { /* proctoring optional */ }
+    }
     const r = await submitAttempt(attemptId, responses);
     // practice returns per-item feedback; official hides it (pct + state only)
     return j({ ok: true, attemptId, pct: r.pct, passed: r.passed, state: r.state, needsManual: r.needsManual, feedback: mode === 'practice' ? r.perItem : undefined });
