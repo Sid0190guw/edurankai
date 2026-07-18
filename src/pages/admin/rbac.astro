@@ -1,0 +1,177 @@
+---
+// /admin/rbac — Kernel Permission Engine console (Prompt 2b, admin surface).
+// Gated by the engine: must hold 'manage' for rbac (superadmin or registrar). Shows the
+// seeded roles + capabilities, lets you assign/remove roles (+ student stage + guardian
+// links), and shows the append-only audit log. Real backend (/api/admin/rbac + rbac_*).
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { can, ensureRbacSchema, seedRbac } from '@/lib/rbac';
+import { SEED_ROLES, STAGES, resolveRoleCapabilities, isMinorStage } from '@/lib/rbac/roles';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const gate = await can(user, 'manage', { type: 'rbac' });
+if (!gate.allow) return Astro.redirect('/admin');
+
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+await ensureRbacSchema();
+
+// self-heal: seed the roster on first visit if empty
+let roleCount = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM rbac_roles`))[0]?.c || 0;
+if (roleCount === 0) { await seedRbac(); roleCount = SEED_ROLES.length; }
+
+const dbRoles = rows(await db.execute(sql`SELECT r.key, r.surface, r.color, r.inherits,
+    COALESCE(array_agg(rc.capability) FILTER (WHERE rc.capability IS NOT NULL), '{}') AS caps
+  FROM rbac_roles r LEFT JOIN rbac_role_capabilities rc ON rc.role_key = r.key
+  GROUP BY r.key, r.surface, r.color, r.inherits ORDER BY r.surface, r.key`));
+
+// users + their assigned rbac roles/stage
+const users = rows(await db.execute(sql`SELECT u.id, u.email, u.name, u.role,
+    COALESCE(json_agg(json_build_object('role', ur.role_key, 'stage', ur.stage)) FILTER (WHERE ur.role_key IS NOT NULL), '[]') AS rbac
+  FROM users u LEFT JOIN rbac_user_roles ur ON ur.user_id = u.id
+  GROUP BY u.id, u.email, u.name, u.role ORDER BY u.name LIMIT 100`));
+
+const guardians = rows(await db.execute(sql`SELECT gl.guardian_user_id, gl.minor_user_id, g.name AS guardian_name, m.name AS minor_name
+  FROM rbac_guardian_links gl LEFT JOIN users g ON g.id = gl.guardian_user_id LEFT JOIN users m ON m.id = gl.minor_user_id ORDER BY gl.created_at DESC LIMIT 50`));
+
+const q = (Astro.url.searchParams.get('q') || '').trim();
+const audit = rows(await db.execute(sql`SELECT a.*, u.name AS user_name FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id
+  ${q ? sql`WHERE a.capability ILIKE ${'%' + q + '%'} OR a.resource ILIKE ${'%' + q + '%'} OR a.reason ILIKE ${'%' + q + '%'} OR u.name ILIKE ${'%' + q + '%'}` : sql``}
+  ORDER BY a.at DESC LIMIT 100`));
+
+const ALL_ROLE_KEYS = SEED_ROLES.map((r) => r.key);
+const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;margin-bottom:16px;';
+const IN = 'background:#15151a;border:1px solid #1a1a1f;color:#fff;padding:7px 9px;border-radius:6px;font-size:12px;';
+function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch { return '-'; } }
+---
+<AdminLayout title="Permission Engine" activeNav="rbac">
+  <div style="max-width:1100px;margin:0 auto;padding:24px;">
+    <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px;">Kernel Permission Engine</p>
+    <h1 style="font-size:22px;font-weight:800;color:#fff;margin:0;">Roles, capabilities &amp; access</h1>
+    <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;max-width:760px;line-height:1.55;">Capability-based RBAC enforced on both surfaces. Every access decision is audited below. {roleCount} roles seeded.</p>
+    <div id="msg" style="display:none;margin:12px 0;padding:9px 13px;border-radius:8px;font-size:13px;"></div>
+
+    <!-- ROLES & CAPABILITIES -->
+    <div style={CARD}>
+      <p style="font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;">Roles &amp; capabilities</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px;">
+        {dbRoles.map((r: any) => (
+          <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:11px 13px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+              <b style="font-size:13px;color:#fff;">{r.key}</b>
+              <span style="font-size:9px;font-family:'Geist Mono',monospace;text-transform:uppercase;color:#8a8a94;border:1px solid #26262c;border-radius:100px;padding:2px 7px;">{r.surface}</span>
+            </div>
+            {r.inherits?.length ? <div style="font-size:10.5px;color:#8a8a94;margin-top:3px;">inherits: {r.inherits.join(', ')}</div> : null}
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:7px;">
+              {[...resolveRoleCapabilities(r.key)].map((c: string) => (
+                <span style={'font-size:10px;font-family:Geist Mono,monospace;padding:2px 6px;border-radius:5px;' + (r.caps.includes(c) ? 'background:rgba(255,79,0,0.14);color:#FF7040;' : 'background:#15151a;color:#6e6e78;')}>{c}</span>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <p style="font-size:10.5px;color:#6e6e78;margin:9px 0 0;">Solid = own capability. Faded = inherited. <button id="reseedBtn" type="button" style="background:none;border:1px solid #26262c;color:#8a8a94;font-size:11px;padding:3px 9px;border-radius:6px;cursor:pointer;margin-left:6px;">Re-seed roster</button></p>
+    </div>
+
+    <!-- USERS & ROLES -->
+    <div style={CARD}>
+      <p style="font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;">Users &amp; roles</p>
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+          <thead><tr style="color:#8a8a94;font-size:10px;text-transform:uppercase;font-family:'Geist Mono',monospace;text-align:left;">
+            <th style="padding:6px 8px;">User</th><th style="padding:6px 8px;">RBAC roles</th><th style="padding:6px 8px;min-width:280px;">Assign</th>
+          </tr></thead>
+          <tbody>
+            {users.map((u: any) => (
+              <tr style="border-top:1px solid #15151a;">
+                <td style="padding:8px;"><div style="color:#fff;font-weight:600;">{u.name}</div><div style="color:#6e6e78;font-size:11px;">{u.email} · {u.role}</div></td>
+                <td style="padding:8px;">
+                  {(u.rbac || []).map((a: any) => (
+                    <span style="display:inline-flex;align-items:center;gap:4px;background:#15151a;border:1px solid #26262c;border-radius:100px;padding:2px 4px 2px 9px;margin:2px;font-size:11px;color:#cfd6da;">
+                      {a.role}{a.stage ? ' · ' + a.stage : ''}{a.role === 'student' && isMinorStage(a.stage) ? ' (minor)' : ''}
+                      <button class="rm-role" data-user={u.id} data-role={a.role} type="button" style="background:none;border:none;color:#fca5a5;cursor:pointer;font-size:13px;line-height:1;">&times;</button>
+                    </span>
+                  ))}
+                </td>
+                <td style="padding:8px;">
+                  <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;">
+                    <select class="asg-role" data-user={u.id} style={IN}>{ALL_ROLE_KEYS.map((k) => <option value={k}>{k}</option>)}</select>
+                    <select class="asg-stage" data-user={u.id} style={IN}><option value="">(stage)</option>{STAGES.map((s) => <option value={s}>{s}</option>)}</select>
+                    <button class="asg-btn" data-user={u.id} type="button" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:700;padding:6px 11px;border-radius:6px;cursor:pointer;">Assign</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- GUARDIAN LINKS -->
+    <div style={CARD}>
+      <p style="font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;">Guardian links (required for minor accounts)</p>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:end;margin-bottom:10px;">
+        <div><label style="font-size:10px;color:#8a8a94;">Guardian</label><br/><select id="gGuardian" style={IN}>{users.map((u: any) => <option value={u.id}>{u.name}</option>)}</select></div>
+        <div><label style="font-size:10px;color:#8a8a94;">Minor student</label><br/><select id="gMinor" style={IN}>{users.map((u: any) => <option value={u.id}>{u.name}</option>)}</select></div>
+        <button id="gLink" type="button" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:700;padding:7px 12px;border-radius:6px;cursor:pointer;">Link</button>
+      </div>
+      {guardians.length === 0 ? <p style="font-size:12px;color:#6e6e78;margin:0;">No guardian links yet.</p> :
+        guardians.map((g: any) => (
+          <div style="font-size:12.5px;color:#cfd6da;padding:4px 0;border-bottom:1px solid #15151a;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+            <span><b style="color:#fff;">{g.guardian_name}</b> &rarr; oversees &rarr; <b style="color:#fff;">{g.minor_name}</b></span>
+            <button class="g-unlink" data-g={g.guardian_user_id} data-m={g.minor_user_id} type="button" style="background:rgba(239,68,68,0.12);color:#fca5a5;border:1px solid rgba(239,68,68,0.3);font-size:10px;padding:2px 8px;border-radius:5px;cursor:pointer;">unlink</button>
+          </div>
+        ))}
+    </div>
+
+    <!-- AUDIT LOG -->
+    <div style={CARD}>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
+        <p style="font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0;">Permission audit log (append-only)</p>
+        <form method="GET" style="display:flex;gap:6px;"><input name="q" value={q} placeholder="search capability / resource / reason / user" style={IN + 'width:280px;max-width:60vw;'} /><button type="submit" style="background:#15151a;border:1px solid #26262c;color:#cfd6da;font-size:11px;padding:6px 11px;border-radius:6px;cursor:pointer;">Search</button></form>
+      </div>
+      <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:11.5px;font-family:'Geist Mono',monospace;">
+        <thead><tr style="color:#8a8a94;font-size:9px;text-transform:uppercase;text-align:left;"><th style="padding:5px 8px;">When</th><th style="padding:5px 8px;">User</th><th style="padding:5px 8px;">Cap</th><th style="padding:5px 8px;">Resource</th><th style="padding:5px 8px;">Decision</th><th style="padding:5px 8px;">Stage / reason</th></tr></thead>
+        <tbody>
+          {audit.length === 0 ? <tr><td colspan="6" style="padding:16px;text-align:center;color:#6e6e78;font-family:sans-serif;">No audit rows yet — they appear as access decisions are made.</td></tr> :
+            audit.map((a: any) => (
+              <tr style="border-top:1px solid #15151a;">
+                <td style="padding:5px 8px;color:#8a8a94;white-space:nowrap;">{fmt(a.at)}</td>
+                <td style="padding:5px 8px;color:#cfd6da;">{a.user_name || (a.user_id ? a.user_id.slice(0, 8) : 'anon')}</td>
+                <td style="padding:5px 8px;color:#cfd6da;">{a.capability}</td>
+                <td style="padding:5px 8px;color:#8a8a94;">{a.resource}</td>
+                <td style={'padding:5px 8px;font-weight:700;color:' + (a.allow ? '#6ee7b7' : '#fca5a5') + ';'}>{a.allow ? 'ALLOW' : 'DENY'}</td>
+                <td style="padding:5px 8px;color:#8a8a94;">{a.stage} · {a.reason}</td>
+              </tr>
+            ))}
+        </tbody>
+      </table></div>
+    </div>
+  </div>
+
+  <script is:inline>
+    (function () {
+      var msg = document.getElementById('msg');
+      function flash(t, ok) { msg.style.display = 'block'; msg.textContent = t; msg.style.background = ok ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)'; msg.style.color = ok ? '#6ee7b7' : '#fca5a5'; }
+      function post(body) {
+        return fetch('/api/admin/rbac', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+          .then(function (r) { return r.json(); })
+          .then(function (j) { if (j.ok) { flash('Saved.', true); setTimeout(function () { location.reload(); }, 500); } else { flash(j.error || 'Failed', false); } return j; })
+          .catch(function () { flash('Network error', false); });
+      }
+      document.getElementById('reseedBtn').addEventListener('click', function () { post({ action: 'seed' }); });
+      document.querySelectorAll('.asg-btn').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var u = b.getAttribute('data-user');
+          var role = document.querySelector('.asg-role[data-user="' + u + '"]').value;
+          var stage = document.querySelector('.asg-stage[data-user="' + u + '"]').value;
+          post({ action: 'assignRole', userId: u, roleKey: role, stage: stage || undefined });
+        });
+      });
+      document.querySelectorAll('.rm-role').forEach(function (b) { b.addEventListener('click', function () { post({ action: 'removeRole', userId: b.getAttribute('data-user'), roleKey: b.getAttribute('data-role') }); }); });
+      document.getElementById('gLink').addEventListener('click', function () { post({ action: 'linkGuardian', guardianUserId: document.getElementById('gGuardian').value, minorUserId: document.getElementById('gMinor').value }); });
+      document.querySelectorAll('.g-unlink').forEach(function (b) { b.addEventListener('click', function () { post({ action: 'unlinkGuardian', guardianUserId: b.getAttribute('data-g'), minorUserId: b.getAttribute('data-m') }); }); });
+    })();
+  </script>
+</AdminLayout>
