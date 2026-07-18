@@ -1,40 +1,44 @@
 ---
-// /aquintutor/lesson/[id] — KnowledgeObject (lesson) view (Prompt 3, main surface).
-// Server-side gated: unpublished drafts are visible only to staff (write capability); the
-// securityLabel is enforced via can() (deny -> redirect, not merely hidden). Renders concept,
-// body (markdown), equations (LaTeX), worked examples, and prerequisite links. Zero client JS.
+// /aquintutor/lesson/[id] — KnowledgeObject (lesson) view (Prompt 3 + Prompt 4 runtime).
+// Starting the lesson runs the Educational Runtime (ordered pipeline + trace): it authorizes,
+// estimates context, picks the served variant (language/accessibility), emits a render tier,
+// and surfaces unmastered prerequisites. Drafts are staff-only; denied -> redirect. Zero client JS.
 export const prerender = false;
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
-import { can } from '@/lib/rbac';
 import { contentService } from '@/lib/kernel-content';
+import { startLesson } from '@/lib/edu-runtime';
 import { mdLite, latexToHtml, EQUATION_CSS } from '@/lib/content-render';
 
 const user = Astro.locals.user;
 const id = Astro.params.id!;
-const view = await contentService().getUnitView(id).catch(() => null);
-if (!view) return new Response('Lesson not found', { status: 404 });
+const { view, assembled, isStaff } = await startLesson(user, id, Astro.request);
+if (!view || !assembled) return new Response('Lesson not found', { status: 404 });
 
 const unit: any = view.unit;
-const data = unit.data as any;
-const labels = unit.securityLabels || ['public'];
-const isStaff = (await can(user, 'write', { type: 'KnowledgeObject' })).allow;
-
-// draft visibility: only staff may see a not-yet-published unit
 if (unit.lifecycleState !== 'published' && !isStaff) return Astro.redirect('/aquintutor/courses');
-// securityLabel gate (audited)
-const gate = await can(user, 'read', { type: 'KnowledgeObject', securityLabels: labels });
-if (!gate.allow) return Astro.redirect('/aquintutor/courses?locked=' + encodeURIComponent(labels.join(',')));
+if (assembled.outcome === 'denied') return Astro.redirect('/aquintutor/courses?locked=' + encodeURIComponent((unit.securityLabels || []).join(',')));
 
-const lm = unit.learningMetadata || {};
+// render the SERVED unit (a language/accessibility variant if the runtime chose one)
+const servedId = assembled.servedUnitId || id;
+const renderView = servedId === id ? view : ((await contentService().getUnitView(servedId).catch(() => null)) || view);
+const data: any = renderView.unit.data;
+const lm: any = renderView.unit.learningMetadata || {};
 const equations = Array.isArray(data.equations) ? data.equations : [];
 const examples = Array.isArray(data.examples) ? data.examples : [];
 const course = view.courses[0];
+const plan = assembled.renderPlan;
+const labels = unit.securityLabels || ['public'];
+const unmet = assembled.prerequisites.filter((p) => !p.mastered);
+const canComplete = !!user?.id && unit.lifecycleState === 'published';
+const justCompleted = Astro.url.searchParams.get('done') === '1';
+const rootFont = 16 * (plan.fontScale || 1);
 ---
 <AquintutorLayout title={data.title}>
   <style set:html={EQUATION_CSS}></style>
-  <main style="max-width:760px;margin:0 auto;padding:44px 22px 80px;">
+  <main data-render-tier={plan.tier} style={'max-width:760px;margin:0 auto;padding:44px 22px 80px;font-size:' + rootFont + 'px;' + (plan.highContrast ? 'filter:contrast(1.15);' : '')}>
     {course ? <a href={'/aquintutor/lesson-index/' + course.id} style="font-family:'Inter Tight',sans-serif;font-size:13px;color:var(--rust,#b3541e);text-decoration:none;">&larr; {course.title}</a> : null}
     {unit.lifecycleState !== 'published' ? <p style="font-family:'Geist Mono',monospace;font-size:11px;color:#b3541e;margin:8px 0 0;">DRAFT &middot; {unit.lifecycleState} &middot; visible to staff only</p> : null}
+    {isStaff ? <p style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#8a8478;margin:6px 0 0;">runtime: served tier <b>{plan.tier}</b>{assembled.language !== 'en' ? ' · lang ' + assembled.language : ''} · trace saved</p> : null}
     <h1 style="font-family:Fraunces,serif;font-size:32px;font-weight:600;color:var(--ink,#1a1712);margin:10px 0 8px;line-height:1.15;">{data.title}</h1>
 
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:22px;font-family:'Inter Tight',sans-serif;font-size:12px;color:#6b6455;">
@@ -44,10 +48,15 @@ const course = view.courses[0];
       <span style="border:1px solid var(--line,#e6e1d6);border-radius:100px;padding:3px 11px;">{labels[0]}</span>
     </div>
 
-    {view.prerequisites.length ? (
+    {unmet.length ? (
+      <div style="background:#fff8ef;border:1px solid #f0d9b4;border-radius:12px;padding:14px 18px;margin-bottom:24px;">
+        <p style="font-family:'Inter Tight',sans-serif;font-size:13px;color:#8a5a1a;margin:0 0 6px;font-weight:600;">Recommended first &mdash; you haven't mastered these prerequisites yet</p>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">{unmet.map((p) => <a href={'/aquintutor/lesson/' + p.id} style="font-family:'Inter Tight',sans-serif;font-size:13.5px;color:var(--ink,#1a1712);text-decoration:none;border-bottom:1px solid #d9a441;">{p.title}</a>)}</div>
+      </div>
+    ) : assembled.prerequisites.length ? (
       <div style="background:#faf8f2;border:1px solid var(--line,#e6e1d6);border-radius:12px;padding:14px 18px;margin-bottom:24px;">
-        <p style="font-family:'Inter Tight',sans-serif;font-size:12px;color:#6b6455;margin:0 0 6px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;">Prerequisites</p>
-        <div style="display:flex;flex-wrap:wrap;gap:8px;">{view.prerequisites.map((p) => <a href={'/aquintutor/lesson/' + p.id} style="font-family:'Inter Tight',sans-serif;font-size:13.5px;color:var(--ink,#1a1712);text-decoration:none;border-bottom:1px solid var(--rust,#b3541e);">{p.title}</a>)}</div>
+        <p style="font-family:'Inter Tight',sans-serif;font-size:12px;color:#6b6455;margin:0 0 6px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;">Prerequisites (mastered)</p>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">{assembled.prerequisites.map((p) => <a href={'/aquintutor/lesson/' + p.id} style="font-family:'Inter Tight',sans-serif;font-size:13.5px;color:var(--ink,#1a1712);text-decoration:none;border-bottom:1px solid var(--rust,#b3541e);">{p.title}</a>)}</div>
       </div>
     ) : null}
 
@@ -76,12 +85,21 @@ const course = view.courses[0];
         ))}
       </section>
     ) : null}
+
+    {justCompleted ? <p style="margin-top:28px;font-family:'Inter Tight',sans-serif;font-size:14px;color:#2f7d5b;background:#eef8f1;border:1px solid #bfe3cd;border-radius:10px;padding:12px 16px;">Saved &mdash; your mastery was updated and this lesson is marked complete.</p> :
+      canComplete ? (
+      <form method="POST" action="/api/aquintutor/lesson-progress" style="margin-top:32px;">
+        <input type="hidden" name="koId" value={id} />
+        <input type="hidden" name="next" value={'/aquintutor/lesson/' + id + '?done=1'} />
+        <button type="submit" style="background:var(--ink,#1a1712);color:var(--sand-50,#fbfaf4);border:none;border-radius:10px;padding:12px 24px;font-family:'Inter Tight',sans-serif;font-size:14px;font-weight:600;cursor:pointer;">Mark complete</button>
+      </form>
+    ) : null}
   </main>
 
   <style is:global>
-    .lesson-body{font-family:'Inter Tight',sans-serif;font-size:16px;line-height:1.7;color:#2a251d;}
+    .lesson-body{font-family:'Inter Tight',sans-serif;line-height:1.7;color:#2a251d;}
     .lesson-body h2,.lesson-body h3,.lesson-body h4{font-family:Fraunces,serif;color:var(--ink,#1a1712);margin:1.4em 0 .5em;line-height:1.25;}
-    .lesson-body h2{font-size:22px;} .lesson-body h3{font-size:18px;}
+    .lesson-body h2{font-size:1.4em;} .lesson-body h3{font-size:1.15em;}
     .lesson-body p{margin:0 0 1em;} .lesson-body ul,.lesson-body ol{margin:0 0 1em 1.3em;} .lesson-body li{margin:.25em 0;}
     .lesson-body code{font-family:'Geist Mono',monospace;font-size:.9em;background:rgba(0,0,0,0.05);padding:2px 6px;border-radius:4px;}
     .lesson-body a{color:var(--rust,#b3541e);} .lesson-body blockquote{border-left:3px solid var(--line,#e6e1d6);margin:0 0 1em;padding:.2em 1em;color:#6b6455;}
