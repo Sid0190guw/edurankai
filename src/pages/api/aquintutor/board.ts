@@ -32,6 +32,15 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const sceneId = await sceneService().saveScene(spec, b.koId ? String(b.koId) : null, String(user.id));
       return j({ ok: true, sceneId, issues });
     }
+    if (b.action === 'fire-scene') {
+      const { spec } = normalizeScene(b.spec);            // validate + repair before broadcast
+      let sceneId: string | undefined;
+      if (b.save) sceneId = await sceneService().saveScene(spec, b.koId ? String(b.koId) : null, String(user.id)).catch(() => undefined);
+      let seq = 0;
+      // broadcast over the A1b channel: the SPEC rides in params.scene (structured JSON, NOT pixels)
+      if (b.session) seq = await fireBoardEvent(String(b.session), { templateId: 'scene', params: { scene: spec }, playState: 'playing', timelinePos: 0 }, String(user.id)).catch(() => 0);
+      return j({ ok: true, seq, sceneId, objects: spec.objects.length });
+    }
     return j({ ok: false, error: 'unknown action' }, 400);
   } catch (e: any) { return j({ ok: false, error: e?.cause?.message || e?.message || 'server error' }, 200); }
 };

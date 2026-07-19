@@ -52,5 +52,11 @@ ok('lite dispatch returns svg2d and did NOT call the WebGL adapter', litOut.rend
 const richOut = S.render(null, { objects: [{ id: 'a', type: 'sphere' }] }, 'rich');
 ok('rich dispatch without DOM still falls back safely (no crash)', richOut.renderer === 'svg2d' && glCalled === false);   // container null -> safe 2D, no GL
 
+console.log('\n== A3a-2: a scene broadcast carries the SPEC (not pixels) over the A1b channel ==');
+const scenePayload = { templateId: 'scene', params: { scene: { title: 'Solar', objects: [{ id: 'sun', type: 'sphere' }, { id: 'e', type: 'sphere', motion: { type: 'orbit' } }] } }, playState: 'playing', timelinePos: 0 };
+ok('the scene rides in params.scene (structured JSON)', scenePayload.templateId === 'scene' && scenePayload.params.scene.objects.length === 2);
+ok('payload has no frame/image/video field (not a video/screenshare)', !/"(frame|image|video|dataUrl|png|jpeg)"/.test(JSON.stringify(scenePayload)));
+ok('a lite student would render that same scene via 2D (no WebGL)', S.rendererFor('lite') === 'svg2d' && S.usesWebGL('lite') === false);
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);
