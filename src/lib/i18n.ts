@@ -62,6 +62,39 @@ export function coverage(locale: string): { total: number; translated: number; p
   return { total: baseKeys.length, translated, pct: baseKeys.length ? Math.round((translated / baseKeys.length) * 100) : 0, missing };
 }
 
+// ---- admin-managed string overrides (Prompt AP3b): edit/add locale strings without a code change ----
+export function mergeStrings(base: Record<string, string>, overrides: Record<string, string>): Record<string, string> {
+  return { ...(base || {}), ...(overrides || {}) };
+}
+export function coverageMerged(locale: string, overrides: Record<string, string>): { total: number; translated: number; pct: number; missing: string[] } {
+  const baseKeys = Object.keys(STRINGS[BASE_LOCALE] || {});
+  const merged = mergeStrings(STRINGS[locale] || {}, overrides || {});
+  const missing = baseKeys.filter((k) => typeof merged[k] !== 'string');
+  const translated = baseKeys.length - missing.length;
+  return { total: baseKeys.length, translated, pct: baseKeys.length ? Math.round((translated / baseKeys.length) * 100) : 0, missing };
+}
+
+const I18N_DDL = `CREATE TABLE IF NOT EXISTS edu_i18n_strings (locale text NOT NULL, key text NOT NULL, value text NOT NULL, updated_by text, updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (locale, key))`;
+let _ready = false;
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+async function ctx() { const { db } = await import('@/lib/db'); const { sql } = await import('drizzle-orm'); if (!_ready) { await db.execute(sql.raw(I18N_DDL)); _ready = true; } return { db, sql }; }
+export async function getStringOverrides(locale: string): Promise<Record<string, string>> {
+  const { db, sql } = await ctx();
+  const out: Record<string, string> = {};
+  for (const r of rows(await db.execute(sql`SELECT key, value FROM edu_i18n_strings WHERE locale = ${locale}`))) out[String(r.key)] = String(r.value);
+  return out;
+}
+export async function setStringOverride(locale: string, key: string, value: string, by: string): Promise<void> {
+  const { db, sql } = await ctx();
+  await db.execute(sql`INSERT INTO edu_i18n_strings (locale, key, value, updated_by, updated_at) VALUES (${locale}, ${key}, ${value.slice(0, 2000)}, ${by}, now())
+    ON CONFLICT (locale, key) DO UPDATE SET value = EXCLUDED.value, updated_by = ${by}, updated_at = now()`);
+}
+/** Load a locale's effective strings = static base + DB overrides. Pages that want live-editable copy use this. */
+export async function loadStrings(locale: string): Promise<Record<string, string>> {
+  const overrides = await getStringOverrides(locale).catch(() => ({}));
+  return mergeStrings(STRINGS[locale] || {}, overrides);
+}
+
 // ---- locale-aware formatting (built-in Intl) ----
 export function formatDate(d: Date | string | number, locale: string): string { try { return new Intl.DateTimeFormat(locale, { dateStyle: 'medium' }).format(new Date(d)); } catch { return String(d); } }
 export function formatNumber(n: number, locale: string): string { try { return new Intl.NumberFormat(locale).format(n); } catch { return String(n); } }

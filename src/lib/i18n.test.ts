@@ -2,7 +2,7 @@
 // UI i18n (Prompt AP3a): t() resolves a locale string, falls back to the base locale, and MARKS
 // untranslated keys (never blank); RTL locales flip direction; coverage is honest; formatting is
 // locale-aware.
-import { t, dir, isRTL, coverage, formatDate, formatNumber, BASE_LOCALE, supported } from './i18n';
+import { t, dir, isRTL, coverage, formatDate, formatNumber, BASE_LOCALE, supported, mergeStrings, coverageMerged } from './i18n';
 
 let pass = 0, fail = 0;
 const ok = (n: string, c: boolean, extra?: unknown) => { console.log((c ? '  ok  ' : 'FAIL  ') + n + (extra != null ? '  ' + JSON.stringify(extra) : '')); c ? pass++ : fail++; };
@@ -22,6 +22,12 @@ const covAr = coverage('ar');
 ok('Arabic coverage < 100% and lists the missing keys', covAr.pct < 100 && covAr.missing.includes('nav.recordings'), covAr.pct);
 ok('base locale is 100%', coverage('en').pct === 100);
 ok('a fully-absent locale is 0% (all missing, none invented)', coverage('zz').pct === 0 && coverage('zz').translated === 0);
+
+console.log('\n== AP3b: admin string overrides raise coverage (no code change) ==');
+ok('an override fills a missing key', mergeStrings({}, { 'nav.recordings': 'रिकॉर्डिंग्स' })['nav.recordings'] === 'रिकॉर्डिंग्स');
+const before = coverage('ar').pct;
+const after = coverageMerged('ar', coverage('ar').missing.reduce((o: any, k) => (o[k] = 'x', o), {} as any));
+ok('overriding all missing keys reaches 100%', after.pct === 100 && after.pct > before, [before, after.pct]);
 
 console.log('\n== locale-aware formatting (Intl) ==');
 ok('numbers format per locale', typeof formatNumber(12345.6, 'en') === 'string' && formatNumber(12345.6, 'en').includes(','));
