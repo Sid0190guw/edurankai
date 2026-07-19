@@ -12,25 +12,32 @@ const PAY_DDL = [
   )`,
   `CREATE INDEX IF NOT EXISTS edu_course_payments_user_idx ON edu_course_payments (user_id, course_obj_id)`,
   `CREATE INDEX IF NOT EXISTS edu_course_payments_order_idx ON edu_course_payments (order_id)`,
+  `ALTER TABLE edu_course_payments ADD COLUMN IF NOT EXISTS needs_guardian boolean NOT NULL DEFAULT false`,
 ];
 let _ready = false;
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 async function ctx() { const { db } = await import('@/lib/db'); const { sql } = await import('drizzle-orm'); if (!_ready) { for (const d of PAY_DDL) await db.execute(sql.raw(d)); _ready = true; } return { db, sql }; }
 
-export async function recordOrder(userId: string, courseObjId: string | null, planId: string, orderId: string, amountPaise: number, mode: string, authorizedBy?: string | null): Promise<number> {
+export async function recordOrder(userId: string, courseObjId: string | null, planId: string, orderId: string, amountPaise: number, mode: string, opts: { needsGuardian?: boolean } = {}): Promise<number> {
   const { db, sql } = await ctx();
-  const r = rows(await db.execute(sql`INSERT INTO edu_course_payments (user_id, course_obj_id, plan, order_id, amount_paise, mode, authorized_by, status)
-    VALUES (${userId}, ${courseObjId}, ${planId}, ${orderId}, ${amountPaise}, ${mode}, ${authorizedBy || null}, 'created') RETURNING id`));
+  const r = rows(await db.execute(sql`INSERT INTO edu_course_payments (user_id, course_obj_id, plan, order_id, amount_paise, mode, status, needs_guardian)
+    VALUES (${userId}, ${courseObjId}, ${planId}, ${orderId}, ${amountPaise}, ${mode}, 'created', ${!!opts.needsGuardian}) RETURNING id`));
   return Number(r[0]?.id || 0);
+}
+/** A guardian authorizes a minor's pending order (child-safety: a minor can't pay unilaterally). */
+export async function authorizeGuardian(orderId: string, guardianId: string): Promise<void> {
+  const { db, sql } = await ctx();
+  await db.execute(sql`UPDATE edu_course_payments SET authorized_by = ${guardianId}, needs_guardian = false, updated_at = now() WHERE order_id = ${orderId}`);
 }
 export async function paymentByOrder(orderId: string): Promise<any | null> {
   const { db, sql } = await ctx();
   return rows(await db.execute(sql`SELECT * FROM edu_course_payments WHERE order_id = ${orderId} ORDER BY id DESC LIMIT 1`))[0] || null;
 }
 /** Mark a payment captured and UNLOCK the course enrolment. */
-export async function markPaid(orderId: string, paymentId: string): Promise<{ ok: boolean; courseObjId: string | null; userId: string | null }> {
+export async function markPaid(orderId: string, paymentId: string): Promise<{ ok: boolean; courseObjId: string | null; userId: string | null; error?: string }> {
   const { db, sql } = await ctx();
   const row = await paymentByOrder(orderId); if (!row) return { ok: false, courseObjId: null, userId: null };
+  if (row.needs_guardian && !row.authorized_by) return { ok: false, courseObjId: null, userId: null, error: 'awaiting guardian authorization' };   // child-safety gate
   await db.execute(sql`UPDATE edu_course_payments SET status = 'paid', payment_id = ${paymentId}, updated_at = now() WHERE order_id = ${orderId}`);
   if (row.course_obj_id) { try { const { enrolInCourse } = await import('@/lib/enrolment'); await enrolInCourse(String(row.user_id), String(row.course_obj_id), null); } catch {} }
   return { ok: true, courseObjId: row.course_obj_id ? String(row.course_obj_id) : null, userId: String(row.user_id) };
@@ -65,6 +72,10 @@ export async function courseAccess(userId: string, courseObjId: string): Promise
 export async function myPayments(userId: string): Promise<any[]> {
   const { db, sql } = await ctx();
   return rows(await db.execute(sql`SELECT id, course_obj_id, plan, amount_paise, currency, status, mode, created_at FROM edu_course_payments WHERE user_id = ${userId} ORDER BY id DESC LIMIT 50`));
+}
+export async function paymentById(id: number): Promise<any | null> {
+  const { db, sql } = await ctx();
+  return rows(await db.execute(sql`SELECT * FROM edu_course_payments WHERE id = ${id} LIMIT 1`))[0] || null;
 }
 export async function allPayments(limit = 100): Promise<any[]> {
   const { db, sql } = await ctx();

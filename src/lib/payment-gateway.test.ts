@@ -2,7 +2,7 @@
 // Payments (Prompt AP5): plans + pricing; access is unlocked ONLY by a captured, non-refunded payment
 // (or a free plan); with no keys the gateway runs in a labelled SANDBOX (never a real charge); provider
 // keys come from env, never hardcoded.
-import { PLANS, planById, amountPaise, unlockedByPayment, getGateway, gatewayMode, SANDBOX_TOKEN } from './payment-gateway';
+import { PLANS, planById, amountPaise, unlockedByPayment, getGateway, gatewayMode, SANDBOX_TOKEN, requiresGuardianAuth, revenuePaise } from './payment-gateway';
 import { readFileSync } from 'node:fs';
 
 let pass = 0, fail = 0;
@@ -19,6 +19,13 @@ ok('failed -> locked', unlockedByPayment('failed', planById('course')) === false
 ok('refunded -> re-locked', unlockedByPayment('refunded', planById('course')) === false);
 ok('created (pending) -> still locked', unlockedByPayment('created', planById('course')) === false);
 ok('free plan -> unlocked without payment', unlockedByPayment(null, planById('free')) === true);
+
+console.log('\n== AP5b: a minor needs guardian authorization to pay; revenue is real-only ==');
+ok('a minor paying a paid plan requires guardian auth', requiresGuardianAuth(true, planById('course')) === true);
+ok('a minor on the free plan does NOT', requiresGuardianAuth(true, planById('free')) === false);
+ok('an adult never needs guardian auth', requiresGuardianAuth(false, planById('course')) === false);
+const rev = revenuePaise([{ status: 'paid', amount_paise: 49900, mode: 'live' }, { status: 'paid', amount_paise: 99900, mode: 'sandbox' }, { status: 'failed', amount_paise: 49900, mode: 'live' }, { status: 'refunded', amount_paise: 49900, mode: 'live' }]);
+ok('revenue counts ONLY captured payments, splits live vs test', rev.live === 49900 && rev.sandbox === 99900 && rev.total === 149800, rev);
 
 console.log('\n== sandbox mode is honest (no keys configured in this test env) ==');
 delete process.env.RAZORPAY_KEY_ID; delete process.env.RAZORPAY_KEY_SECRET;

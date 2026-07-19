@@ -23,6 +23,17 @@ export function unlockedByPayment(status: PaymentStatus | null, plan: Plan | nul
   return status === 'paid';
 }
 
+/** A minor may not pay directly — a paid plan needs guardian authorization first (child-safety). */
+export function requiresGuardianAuth(isMinor: boolean, plan: Plan | null): boolean {
+  return !!isMinor && !!plan && plan.kind !== 'free';
+}
+/** Total revenue (paise) from REAL captured payments only — never fabricated. */
+export function revenuePaise(payments: { status: string; amount_paise: number; mode?: string }[]): { total: number; live: number; sandbox: number } {
+  let total = 0, live = 0, sandbox = 0;
+  for (const p of payments || []) { if (p.status !== 'paid') continue; const a = Number(p.amount_paise) || 0; total += a; if (p.mode === 'sandbox' || p.mode === 'comp') sandbox += a; else live += a; }
+  return { total, live, sandbox };
+}
+
 export interface GatewayOrder { id: string; amount: number; currency: string; keyId: string | null }
 export interface PaymentGateway {
   mode: 'live' | 'sandbox';
