@@ -92,6 +92,31 @@
     return { value: Math.min(0.85, light.score), usable: true, reason: light.reason };
   }
 
+  // ---- best-effort stroke recognition (Prompt A4b): a GESTURE, not confident OCR ----
+  // Recognises a pointing/selection gesture (circle), an underline, or general marks + WHERE they
+  // are (centroid) — always with a low, honest confidence. The teacher confirms/corrects the value;
+  // handwriting digits are never silently guessed. Pure.
+  function bboxOf(pts) {
+    var minX = 1, minY = 1, maxX = 0, maxY = 0;
+    for (var i = 0; i < pts.length; i++) { var p = pts[i]; if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0]; if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1]; }
+    return { x: minX, y: minY, w: Math.max(0, maxX - minX), h: Math.max(0, maxY - minY) };
+  }
+  function recognizeStrokes(strokes) {
+    var all = []; (strokes || []).forEach(function (s) { for (var i = 0; i < s.length; i++) all.push(s[i]); });
+    if (all.length < 2) return { kind: 'none', confidence: 0, centroid: null, bbox: null, reason: 'no strokes' };
+    var bb = bboxOf(all), cx = bb.x + bb.w / 2, cy = bb.y + bb.h / 2;
+    // longest stroke drives the gesture guess
+    var longest = strokes[0]; for (var k = 0; k < strokes.length; k++) if (strokes[k].length > longest.length) longest = strokes[k];
+    var a = longest[0], z = longest[longest.length - 1], span = bboxOf(longest);
+    var closeDist = Math.sqrt(Math.pow(a[0] - z[0], 2) + Math.pow(a[1] - z[1], 2));
+    var diag = Math.sqrt(span.w * span.w + span.h * span.h) || 1;
+    if (longest.length >= 8 && closeDist < diag * 0.25 && span.w > 0.05 && span.h > 0.05)
+      return { kind: 'circle', confidence: 0.5, centroid: [cx, cy], bbox: bb, reason: 'a circled/selected region' };
+    if (span.w > 0.12 && span.h < span.w * 0.25)
+      return { kind: 'underline', confidence: 0.45, centroid: [cx, cy], bbox: bb, reason: 'an underline / horizontal mark' };
+    return { kind: 'marks', confidence: 0.35, centroid: [cx, cy], bbox: bb, reason: 'writing detected — please confirm what it says' };
+  }
+
   // ---- DOM/canvas helpers (guarded; no-op in Node) ----
   function frameToGray(video, canvas, w, h) {
     if (typeof document === 'undefined') return null;
@@ -105,7 +130,7 @@
     computeHomography: computeHomography, applyHomography: applyHomography,
     brightnessStats: brightnessStats, lightingQuality: lightingQuality,
     diffMask: diffMask, gridCenters: gridCenters, chainStrokes: chainStrokes, maskToStrokes: maskToStrokes,
-    captureConfidence: captureConfidence, frameToGray: frameToGray,
+    captureConfidence: captureConfidence, recognizeStrokes: recognizeStrokes, frameToGray: frameToGray,
   };
   if (typeof window !== 'undefined') window.AquinVision = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

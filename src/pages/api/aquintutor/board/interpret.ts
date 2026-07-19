@@ -39,13 +39,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
   } catch { /* fall through to rule-based */ }
   if (!suggestion) suggestion = buildSuggestion(text);   // deterministic fallback (no AI needed)
 
+  // A4b: a board reading/correction is tagged 'physical' / 'physical-correction' so the admin
+  // capture inspector can show recognition confidence + corrections.
+  const origin = b.origin === 'physical' ? 'physical' : b.origin === 'physical-correction' ? 'physical-correction' : null;
   let detectionId = 0;
   if (session) detectionId = await logDetection(session, String(user.id), {
     transcript: text,
     templateId: suggestion ? suggestion.templateId : null,
     params: suggestion ? suggestion.params : {},
     confidence: suggestion ? suggestion.confidence : 0,
-    source: suggestion ? suggestion.source : (usedLlm ? 'llm' : 'rule'),
+    source: origin || (suggestion ? suggestion.source : (usedLlm ? 'llm' : 'rule')),
     fired: false,
   }).catch(() => 0);
 

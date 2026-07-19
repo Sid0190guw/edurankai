@@ -140,6 +140,11 @@ export async function recentDetections(sessionId: string, limit = 12): Promise<D
   const { db, sql } = await ctx();
   return rows(await db.execute(sql`SELECT * FROM edu_board_detections WHERE session_id = ${sessionId} ORDER BY id DESC LIMIT ${limit}`)).map(toDetection);
 }
+/** Recent physical-board captures + AI compositions across all sessions (Prompt A4b admin inspector). */
+export async function recentCaptureDetections(limit = 20): Promise<Detection[]> {
+  const { db, sql } = await ctx();
+  return rows(await db.execute(sql`SELECT * FROM edu_board_detections WHERE source IN ('physical', 'physical-correction', 'compose') ORDER BY id DESC LIMIT ${limit}`)).map(toDetection);
+}
 
 export async function sessionInspector(sessionId: string): Promise<{ participants: Participant[]; fires: BoardEvent[]; totalFires: number; online: number; detections: Detection[] }> {
   const { db, sql } = await ctx();

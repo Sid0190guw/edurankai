@@ -45,6 +45,16 @@ ok('poor lighting -> not usable', V.captureConfidence({ level: 'poor', score: 0.
 ok('nothing on board -> not usable', V.captureConfidence({ level: 'good', score: 0.9, reason: 'clear' }, 0).usable === false);
 ok('good lighting + some ink -> usable, bounded confidence', (() => { const c = V.captureConfidence({ level: 'good', score: 0.9, reason: 'clear' }, 0.01); return c.usable && c.value <= 0.85; })());
 
+console.log('\n== A4b: best-effort gesture recognition (low, honest confidence + centroid) ==');
+const circle = [[0.4, 0.3], [0.5, 0.28], [0.6, 0.34], [0.62, 0.46], [0.55, 0.55], [0.45, 0.56], [0.38, 0.48], [0.39, 0.36], [0.41, 0.31]];
+const rc = V.recognizeStrokes([circle]);
+ok('a closed loop is read as a circle/selection gesture', rc.kind === 'circle' && rc.confidence <= 0.6, rc.kind);
+ok('recognition reports WHERE (a centroid to point at)', Array.isArray(rc.centroid) && rc.centroid[0] > 0.4 && rc.centroid[0] < 0.6);
+const under = [[0.2, 0.5], [0.4, 0.5], [0.6, 0.51], [0.8, 0.5]];
+ok('a horizontal stroke -> underline', V.recognizeStrokes([under]).kind === 'underline');
+ok('scattered writing -> marks (confirm, never silently guess)', V.recognizeStrokes([[[0.5, 0.5], [0.52, 0.55]]]).kind === 'marks');
+ok('confidence is always low/honest (<=0.6), never fabricated-high', [rc, V.recognizeStrokes([under])].every((r: any) => r.confidence <= 0.6));
+
 console.log('\n== A4: the ink broadcast is vector strokes, NOT raw video (privacy) ==');
 const inkPayload = { templateId: 'ink', params: { strokes: V.maskToStrokes(dm.indices, W, Hh, { cell: 4 }), source: 'physical' }, playState: 'static' };
 ok('carries vector strokes under params.strokes', inkPayload.templateId === 'ink' && Array.isArray(inkPayload.params.strokes));
