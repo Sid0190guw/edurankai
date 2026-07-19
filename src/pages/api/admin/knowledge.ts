@@ -20,7 +20,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const svc = contentService();
 
   // capability required per action
-  const need: Record<string, string> = { ensureCourse: 'create', createUnit: 'create', editUnit: 'write', attachUnit: 'write', addPrerequisite: 'write', publishUnit: 'execute', archiveUnit: 'execute' };
+  const need: Record<string, string> = { ensureCourse: 'create', createUnit: 'create', editUnit: 'write', attachUnit: 'write', addPrerequisite: 'write', publishUnit: 'execute', archiveUnit: 'execute', ensureConcept: 'create', addConceptPrerequisite: 'write' };
   const cap = need[action];
   if (!cap) return j({ ok: false, error: 'unknown action' }, 400);
   const decision = await can(user, cap as any, { type: 'KnowledgeObject' });
@@ -61,7 +61,19 @@ export const POST: APIRoute = async ({ request, locals }) => {
     }
     if (action === 'addPrerequisite') {
       if (!b.unitId || !b.prerequisiteUnitId || b.unitId === b.prerequisiteUnitId) return j({ ok: false, error: 'distinct unitId + prerequisiteUnitId required' }, 400);
-      await svc.addPrerequisite(String(b.unitId), String(b.prerequisiteUnitId));
+      try { await svc.addPrerequisite(String(b.unitId), String(b.prerequisiteUnitId)); }
+      catch (e: any) { if (/cycle/i.test(e?.message || '')) return j({ ok: false, error: 'would create a prerequisite cycle' }, 409); throw e; }
+      return j({ ok: true });
+    }
+    if (action === 'ensureConcept') {
+      if (!b.name) return j({ ok: false, error: 'name required' }, 400);
+      const c = await svc.ensureConcept(String(b.name), b.description ? String(b.description) : undefined);
+      return j({ ok: true, id: c.id });
+    }
+    if (action === 'addConceptPrerequisite') {
+      if (!b.conceptId || !b.prerequisiteConceptId || b.conceptId === b.prerequisiteConceptId) return j({ ok: false, error: 'distinct conceptId + prerequisiteConceptId required' }, 400);
+      try { await svc.addConceptPrerequisite(String(b.conceptId), String(b.prerequisiteConceptId)); }
+      catch (e: any) { if (/cycle/i.test(e?.message || '')) return j({ ok: false, error: 'would create a prerequisite cycle' }, 409); throw e; }
       return j({ ok: true });
     }
     if (action === 'publishUnit') {

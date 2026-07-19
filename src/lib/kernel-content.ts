@@ -5,6 +5,7 @@
 // Publishing walks the real lifecycle created -> validated -> indexed -> published.
 import { KernelRepository, createPgKernel } from '@/lib/kernel';
 import type { KernelObject, Equation, WorkedExample, SecurityLabel, LearningMetadata } from '@/lib/kernel';
+import { loadPrerequisiteDag, wouldCreateCycle } from '@/lib/knowledge-graph';
 
 export interface UnitInput {
   title: string;
@@ -68,9 +69,29 @@ export class ContentService {
     await this.repo.addRelationship(unitId, 'part_of', courseObjId, { order });
     await this.repo.patchMeta(unitId, { order });
   }
-  /** Add a prerequisite: prereq -[prerequisite_of]-> unit. */
+  /** Add a prerequisite: prereq -[prerequisite_of]-> unit. Rejects self- and cycle-forming links
+   *  (Block 02) before hitting the kernel's own edge guard, with a stable message the API maps to 409. */
   async addPrerequisite(unitId: string, prerequisiteUnitId: string): Promise<void> {
+    if (unitId === prerequisiteUnitId) throw new Error('a unit cannot be its own prerequisite');
+    const dag = await loadPrerequisiteDag({ nodeType: 'KnowledgeObject' });
+    if (wouldCreateCycle(dag, prerequisiteUnitId, unitId)) throw new Error('would create a prerequisite cycle');
     await this.repo.addRelationship(prerequisiteUnitId, 'prerequisite_of', unitId);
+  }
+
+  // ---- ConceptObject authoring (Block 02: the concept-level prerequisite graph) ----
+  /** Idempotently get/create a ConceptObject by name. */
+  async ensureConcept(name: string, description?: string): Promise<KernelObject> {
+    const existing = (await this.repo.listByType('ConceptObject')).find((o) => String((o.data as any)?.name) === name);
+    if (existing) return existing;
+    const c = await this.repo.createObject({ type: 'ConceptObject', data: { name, description } });
+    return c as unknown as KernelObject;
+  }
+  /** Add a concept-level prerequisite: prereq -[prerequisite_of]-> concept. Cycle-guarded. */
+  async addConceptPrerequisite(conceptId: string, prerequisiteConceptId: string): Promise<void> {
+    if (conceptId === prerequisiteConceptId) throw new Error('a concept cannot be its own prerequisite');
+    const dag = await loadPrerequisiteDag({ nodeType: 'ConceptObject' });
+    if (wouldCreateCycle(dag, prerequisiteConceptId, conceptId)) throw new Error('would create a prerequisite cycle');
+    await this.repo.addRelationship(prerequisiteConceptId, 'prerequisite_of', conceptId);
   }
 
   /** Units of a course, ordered. `onlyPublished` filters to the published lifecycle state. */

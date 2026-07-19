@@ -3,7 +3,7 @@
 // (see repository.validateObject); a payload that does not match its type is rejected
 // before the object can advance.
 import { z } from 'zod';
-import { OBJECT_TYPES, type ObjectType } from './types';
+import { OBJECT_TYPES, LIFECYCLE_STATES, SYNC_STATES, type ObjectType, type RelationshipType } from './types';
 
 const equation = z.object({ latex: z.string().min(1), caption: z.string().optional() });
 const example = z.object({ prompt: z.string().min(1), solution: z.string().min(1) });
@@ -13,6 +13,7 @@ export const DATA_SCHEMAS = {
     conceptId: z.string().nullable().optional(),
     title: z.string().min(1),
     body: z.string().optional(),
+    objectives: z.array(z.string()).optional(),   // Block 02
     equations: z.array(equation).optional(),
     examples: z.array(example).optional(),
     industry: z.array(z.string()).optional(),
@@ -48,4 +49,57 @@ export function validateObjectData(type: ObjectType, data: unknown): unknown {
     throw new ValidationError(type, res.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`));
   }
   return res.data;
+}
+
+// ==========================================================================
+// Block 01 — envelope-level validation (the whole object shell, not just its
+// `data` payload). Used when accepting an object over the wire or reading a row
+// from an untrusted store; NOT on the hot create/lifecycle path.
+// ==========================================================================
+export const PERMISSION_SCHEMA = z.object({
+  subject: z.string().min(1),                        // an object id OR a role token (see access.ts)
+  roles: z.array(z.enum(['read', 'write', 'publish'])),
+});
+
+export const LEARNING_METADATA_SCHEMA = z.object({
+  difficulty: z.number().min(0).max(1).optional(),
+  estimatedMinutes: z.number().nonnegative().optional(),
+  languages: z.array(z.string()).optional(),         // BCP-47
+  accessibilityVariants: z.array(z.string()).optional(),
+}).strict();
+
+/** Validates the whole envelope shape. */
+export const ENVELOPE_SCHEMA = z.object({
+  id: z.string().uuid(),
+  type: z.enum(OBJECT_TYPES),
+  version: z.number().int().positive(),
+  owner: z.string().uuid().nullable(),
+  permissions: z.array(PERMISSION_SCHEMA),
+  metadata: z.record(z.unknown()),
+  learningMetadata: LEARNING_METADATA_SCHEMA,
+  securityLabels: z.array(z.string()),
+  synchronizationState: z.enum(SYNC_STATES),
+  lifecycleState: z.enum(LIFECYCLE_STATES),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  archivedAt: z.string().nullable(),
+});
+
+/** Throws ValidationError if `env` is not a well-formed envelope. */
+export function validateEnvelope(env: unknown): void {
+  const res = ENVELOPE_SCHEMA.safeParse(env);
+  if (!res.success) {
+    throw new ValidationError(
+      ((env as { type?: string })?.type as ObjectType) ?? ('KnowledgeObject' as ObjectType),
+      res.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`),
+    );
+  }
+}
+
+/** Thrown when an edge violates the (fromType)-[rel]->(toType) grammar (see types.EDGE_GRAMMAR). */
+export class EdgeGrammarError extends Error {
+  constructor(public fromType: ObjectType, public rel: RelationshipType, public toType: ObjectType) {
+    super(`illegal edge: ${fromType} -[${rel}]-> ${toType} is not permitted by the edge grammar`);
+    this.name = 'EdgeGrammarError';
+  }
 }

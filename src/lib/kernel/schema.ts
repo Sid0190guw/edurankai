@@ -6,7 +6,7 @@
 // (this repo's dominant pattern), so they exist on first use even without a migration. To
 // create them via the ORM instead, add `export * from '@/lib/kernel/schema'` to
 // src/lib/db/schema.ts and run `npm run db:push`.
-import { pgTable, uuid, text, integer, jsonb, timestamp, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, integer, jsonb, timestamp, index, uniqueIndex } from 'drizzle-orm/pg-core';
 
 export const kernelObjects = pgTable('kernel_objects', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -42,6 +42,18 @@ export const kernelEdges = pgTable('kernel_edges', {
   typeIdx: index('kernel_edges_type_idx').on(t.type),
 }));
 
+// Block 01 — immutable version snapshots (spec "Version / Roll back / Merge"). One row per
+// (object, version); the pre-mutation object is snapshotted on every updateObject/rollback.
+export const kernelObjectVersions = pgTable('kernel_object_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  objectId: uuid('object_id').notNull(),
+  version: integer('version').notNull(),
+  snapshot: jsonb('snapshot').notNull(),           // full KernelObject at that version
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  objVerIdx: uniqueIndex('kernel_object_versions_obj_ver_idx').on(t.objectId, t.version),
+}));
+
 // Raw DDL used by the self-bootstrap path (store.ts) — kept in sync with the tables above.
 export const KERNEL_DDL = [
   `CREATE TABLE IF NOT EXISTS kernel_objects (
@@ -72,4 +84,12 @@ export const KERNEL_DDL = [
   `CREATE INDEX IF NOT EXISTS kernel_edges_from_idx ON kernel_edges (from_id)`,
   `CREATE INDEX IF NOT EXISTS kernel_edges_to_idx ON kernel_edges (to_id)`,
   `CREATE INDEX IF NOT EXISTS kernel_edges_type_idx ON kernel_edges (type)`,
+  `CREATE TABLE IF NOT EXISTS kernel_object_versions (
+     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     object_id UUID NOT NULL,
+     version INTEGER NOT NULL,
+     snapshot JSONB NOT NULL,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS kernel_object_versions_obj_ver_idx
+     ON kernel_object_versions (object_id, version)`,
 ];

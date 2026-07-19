@@ -11,9 +11,9 @@
 import type { LifecycleState } from './types';
 
 export const TRANSITIONS: Record<LifecycleState, LifecycleState[]> = {
-  created:    ['validated'],
-  validated:  ['indexed'],
-  indexed:    ['published'],
+  created:    ['validated', 'archived'],   // Block 08: + discard (retire a never-published draft)
+  validated:  ['indexed', 'archived'],     // + discard
+  indexed:    ['published', 'archived'],    // + discard
   published:  ['referenced', 'updated', 'archived'],
   referenced: ['updated', 'archived'],
   updated:    ['indexed', 'published', 'archived'],   // an updated object re-enters the pipeline
