@@ -39,6 +39,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
       if (b.session) seq = await fireBoardEvent(String(b.session), { templateId: 'ink', params: { strokes, source: b.source === 'physical' ? 'physical' : 'pen' }, playState: 'static', timelinePos: 0 }, String(user.id)).catch(() => 0);
       return j({ ok: true, seq, strokes: strokes.length });   // structured vectors, never pixels/video
     }
+    if (b.action === 'fire-slide') {
+      // H3: a structured text slide (title + bullets) over the fan-out — NOT an image/video
+      const slide = { title: String(b.slide?.title || '').slice(0, 200), bullets: Array.isArray(b.slide?.bullets) ? b.slide.bullets.slice(0, 12).map((x: any) => String(x).slice(0, 200)) : [] };
+      let seq = 0;
+      if (b.session) seq = await fireBoardEvent(String(b.session), { templateId: 'slide', params: { slide }, playState: 'static', timelinePos: 0 }, String(user.id)).catch(() => 0);
+      return j({ ok: true, seq });
+    }
     if (b.action === 'fire-scene') {
       const { spec } = normalizeScene(b.spec);            // validate + repair before broadcast
       let sceneId: string | undefined;
