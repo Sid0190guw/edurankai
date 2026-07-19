@@ -32,6 +32,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const sceneId = await sceneService().saveScene(spec, b.koId ? String(b.koId) : null, String(user.id));
       return j({ ok: true, sceneId, issues });
     }
+    if (b.action === 'fire-ink') {
+      // physical-board (A4) or pen ink: broadcast VECTOR strokes only. Reject anything image-like.
+      const strokes = Array.isArray(b.strokes) ? b.strokes.slice(0, 400).map((s: any) => Array.isArray(s) ? s.slice(0, 400).map((p: any) => [Number(p[0]) || 0, Number(p[1]) || 0]) : []).filter((s: any) => s.length) : [];
+      let seq = 0;
+      if (b.session) seq = await fireBoardEvent(String(b.session), { templateId: 'ink', params: { strokes, source: b.source === 'physical' ? 'physical' : 'pen' }, playState: 'static', timelinePos: 0 }, String(user.id)).catch(() => 0);
+      return j({ ok: true, seq, strokes: strokes.length });   // structured vectors, never pixels/video
+    }
     if (b.action === 'fire-scene') {
       const { spec } = normalizeScene(b.spec);            // validate + repair before broadcast
       let sceneId: string | undefined;

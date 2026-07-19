@@ -1,0 +1,111 @@
+---
+// /aquintutor/board/physical?session=SID — physical-board capture (Prompt A4a, main, faculty-gated).
+// A teacher points a camera at an ORDINARY whiteboard/blackboard. Processed LOCALLY: 4-corner
+// calibration -> homography, a lighting quality check, frame-differencing to find NEW marker strokes,
+// vectorized into normalized polylines broadcast as INK over the SAME A1b channel. Raw video NEVER
+// leaves the device (only structured strokes are sent). Poor lighting degrades to speech-only.
+export const prerender = false;
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { can } from '@/lib/rbac';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/aquintutor/login?next=/aquintutor/board/physical');
+const gate = await can(user, 'write', { type: 'AnimationObject' });
+if (!gate.allow) return Astro.redirect('/aquintutor/hub');
+const sessionId = (Astro.url.searchParams.get('session') || ('board-' + user.id)).trim();
+---
+<AquintutorLayout title="Physical board capture">
+  <main style="max-width:760px;margin:0 auto;padding:32px 22px 80px;">
+    <p style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--rust,#b3541e);margin:0 0 8px;">Physical board</p>
+    <h1 style="font-family:Fraunces,serif;font-size:26px;font-weight:600;color:var(--ink,#1a1712);margin:0 0 4px;line-height:1.15;">Capture your real whiteboard</h1>
+    <p style="font-family:'Inter Tight',sans-serif;font-size:13px;color:#6b6455;margin:0 0 12px;">Point a camera at the board. What you write is turned into vector ink and sent to students — your video never leaves this device. Speech (the mic) stays your main way to trigger animations; the board just adds what you write.</p>
+    <div id="err" style="display:none;margin:0 0 12px;padding:9px 13px;border-radius:8px;background:#fdecec;color:#9b2c2c;font-size:13px;"></div>
+
+    <div style="position:relative;background:#000;border-radius:14px;overflow:hidden;">
+      <video id="cam" playsinline muted style="display:block;width:100%;height:auto;"></video>
+      <svg id="overlay" style="position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;"></svg>
+    </div>
+    <canvas id="work" width="480" height="300" style="display:none;"></canvas>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;">
+      <button id="start" type="button" style="background:var(--ink,#1a1712);color:var(--sand-50,#fbfaf4);border:none;border-radius:9px;padding:9px 16px;font-family:'Inter Tight',sans-serif;font-size:13.5px;font-weight:600;cursor:pointer;">Start camera</button>
+      <button id="baseline" type="button" disabled style="background:#fff;border:1px solid var(--line,#e6e1d6);border-radius:9px;padding:9px 14px;font-family:'Inter Tight',sans-serif;font-size:13px;cursor:pointer;opacity:0.5;">Set baseline (blank board)</button>
+      <button id="capture" type="button" disabled style="background:var(--rust,#b3541e);color:#fff;border:none;border-radius:9px;padding:9px 16px;font-family:'Inter Tight',sans-serif;font-size:13.5px;font-weight:700;cursor:pointer;opacity:0.5;">Start capturing</button>
+    </div>
+    <p id="step" style="font-family:'Inter Tight',sans-serif;font-size:13px;color:#6b6455;margin:12px 0 0;">1. Start the camera, then tap the four corners of your board (top-left first, clockwise).</p>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-family:'Inter Tight',sans-serif;font-size:12.5px;">
+      <span id="light" style="color:#8a8378;">Lighting: —</span>
+      <span id="conf" style="color:#8a8378;">Confidence: —</span>
+      <span id="sent" style="color:#8a8378;">Strokes sent: 0</span>
+    </div>
+  </main>
+
+  <script src="/aquin-board-vision.js" defer></script>
+  <script is:inline define:vars={{ sessionId }}>
+    (function () {
+      function ready(fn) { if (window.AquinVision) fn(); else setTimeout(function () { ready(fn); }, 50); }
+      ready(function () {
+        var V = window.AquinVision, cam = document.getElementById('cam'), overlay = document.getElementById('overlay'), work = document.getElementById('work');
+        var GW = 64, GH = 40, corners = [], Hinv = null, baseline = null, capturing = false, sentCount = 0, timer = null;
+        var errB = document.getElementById('err'), stepEl = document.getElementById('step');
+        function err(t) { errB.style.display = 'block'; errB.textContent = t; }
+
+        document.getElementById('start').addEventListener('click', function () {
+          navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false })
+            .then(function (stream) { cam.srcObject = stream; cam.play(); stepEl.textContent = '2. Tap the four corners of your board on the image (top-left first, clockwise).'; })
+            .catch(function (e) { err('Camera unavailable: ' + (e && e.name || 'denied') + '. You can still teach with speech only.'); });
+        });
+
+        overlay.addEventListener('click', function (e) {
+          if (corners.length >= 4) return;
+          var r = overlay.getBoundingClientRect();
+          corners.push([(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]);
+          var c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+          c.setAttribute('cx', ((e.clientX - r.left) / r.width * 100) + '%'); c.setAttribute('cy', ((e.clientY - r.top) / r.height * 100) + '%'); c.setAttribute('r', '6'); c.setAttribute('fill', '#b3541e');
+          overlay.appendChild(c);
+          if (corners.length === 4) {
+            // inverse homography: unit board square -> normalized frame coords
+            Hinv = V.computeHomography([[0, 0], [1, 0], [1, 1], [0, 1]], corners);
+            stepEl.textContent = '3. Wipe the board clean, then Set baseline. After that, Start capturing.';
+            var b = document.getElementById('baseline'); b.disabled = false; b.style.opacity = '1';
+          }
+        });
+
+        function sampleGrid() {
+          var w = work.width, h = work.height, ctx = work.getContext('2d');
+          ctx.drawImage(cam, 0, 0, w, h);
+          var data = ctx.getImageData(0, 0, w, h).data, grid = new Uint8ClampedArray(GW * GH);
+          for (var gy = 0; gy < GH; gy++) for (var gx = 0; gx < GW; gx++) {
+            var f = V.applyHomography(Hinv, [(gx + 0.5) / GW, (gy + 0.5) / GH]);   // -> normalized frame
+            var px = Math.max(0, Math.min(w - 1, (f[0] * w) | 0)), py = Math.max(0, Math.min(h - 1, (f[1] * h) | 0)), i = (py * w + px) * 4;
+            grid[gy * GW + gx] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
+          }
+          return grid;
+        }
+
+        document.getElementById('baseline').addEventListener('click', function () {
+          if (!Hinv) return; baseline = sampleGrid();
+          var c = document.getElementById('capture'); c.disabled = false; c.style.opacity = '1';
+          stepEl.textContent = '4. Baseline set. Start capturing — write on the board and students see your ink.';
+        });
+
+        document.getElementById('capture').addEventListener('click', function () {
+          capturing = !capturing; this.textContent = capturing ? 'Stop capturing' : 'Start capturing';
+          if (capturing) timer = setInterval(tick, 1500); else { clearInterval(timer); timer = null; }
+        });
+
+        function tick() {
+          if (!baseline || !Hinv) return;
+          var grid = sampleGrid(), stats = V.brightnessStats(grid), light = V.lightingQuality(stats);
+          document.getElementById('light').textContent = 'Lighting: ' + light.level + ' (' + light.reason + ')';
+          var dm = V.diffMask(baseline, grid, 38), conf = V.captureConfidence(light, dm.changedRatio);
+          document.getElementById('conf').textContent = 'Confidence: ' + Math.round(conf.value * 100) + '%' + (conf.usable ? '' : ' — ' + conf.reason);
+          if (!conf.usable) { stepEl.textContent = 'Recognition is unreliable right now (' + conf.reason + ') — teaching by speech only until it improves.'; return; }
+          var strokes = V.maskToStrokes(dm.indices, GW, GH, { cell: 2, maxGap: 0.09, maxPoints: 600 });
+          fetch('/api/aquintutor/board', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'fire-ink', session: sessionId, source: 'physical', strokes: strokes }) })
+            .then(function (r) { return r.json(); }).then(function (j) { if (j.ok) { sentCount += j.strokes; document.getElementById('sent').textContent = 'Strokes sent: ' + sentCount; } });
+        }
+      });
+    })();
+  </script>
+</AquintutorLayout>
