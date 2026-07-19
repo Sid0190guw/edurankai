@@ -64,6 +64,9 @@
   // ---- tier -> renderer selection (Prompt 5) ----
   function rendererFor(tier) { return tier === 'lite' ? 'svg2d' : 'webgl'; }   // rich/standard = WebGL
   function usesWebGL(tier) { return tier !== 'lite'; }                         // lite NEVER loads Three.js
+  // AP4: honor reduced-motion — a reduced-motion user gets the STATIC 2D keyframe, never animation.
+  function prefersReduced() { return typeof matchMedia !== 'undefined' && !!matchMedia('(prefers-reduced-motion: reduce)').matches; }
+  function effectiveTier(tier, reduceMotion) { return (reduceMotion || prefersReduced()) ? 'lite' : tier; }
   function tierQuality(tier) { return { bloom: tier === 'rich', shadows: tier !== 'lite', envMap: tier === 'rich', maxLights: tier === 'rich' ? 4 : 2, particleCap: tier === 'rich' ? 2000 : tier === 'standard' ? 400 : 60 }; }
 
   // ---- build a resolved scene model both renderers consume (PURE) ----
@@ -131,6 +134,7 @@
   // ---- top-level dispatch: pick the renderer by tier. WebGL hook is optional (lite never calls it). ----
   function render(container, spec, tier, opts) {
     var model = buildModel(spec);
+    tier = effectiveTier(tier, opts && opts.reduceMotion);   // AP4: reduced-motion -> lite/static
     if (usesWebGL(tier) && typeof window !== 'undefined' && window.AquinSceneGL && typeof document !== 'undefined' && container) {
       window.AquinSceneGL.render(container, model, { tier: tier, quality: tierQuality(tier), palette: model.palette });
       return { renderer: 'webgl', nodes: model.nodes.length };
@@ -143,7 +147,7 @@
     primitives: function () { return Object.keys(PRIMITIVES).map(function (k) { return { type: k, kind: PRIMITIVES[k].kind, params: PRIMITIVES[k].params }; }); },
     motions: function () { return MOTIONS.slice(); },
     trajectory: trajectory, buildModel: buildModel, motionAt: motionAt,
-    rendererFor: rendererFor, usesWebGL: usesWebGL, tierQuality: tierQuality,
+    rendererFor: rendererFor, usesWebGL: usesWebGL, tierQuality: tierQuality, effectiveTier: effectiveTier,
     renderSVG2D: renderSVG2D, render: render,
   };
   if (typeof window !== 'undefined') window.AquinScene = api;
