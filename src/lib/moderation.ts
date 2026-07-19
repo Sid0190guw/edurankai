@@ -63,10 +63,12 @@ async function ctx() {
   return { db, sql };
 }
 
-export async function enqueueIncident(surface: string, roomId: string | null, userId: string | null, res: ScreenResult, opts: { reporter?: string | null; status?: string } = {}): Promise<number> {
+export async function enqueueIncident(surface: string, roomId: string | null, userId: string | null, res: ScreenResult, opts: { reporter?: string | null; status?: string; minimize?: boolean } = {}): Promise<number> {
   const { db, sql } = await ctx();
+  // AP2b child-safety: for a minor we DATA-MINIMIZE — store the category/severity, not the message text
+  const stored = opts.minimize ? '[minimized]' : res.redacted;
   const r = rows(await db.execute(sql`INSERT INTO edu_mod_queue (surface, room_id, user_id, redacted, severity, categories, status, reporter)
-    VALUES (${surface}, ${roomId}, ${userId}, ${res.redacted}, ${res.severity}, ${res.categories as any}, ${opts.status || 'pending'}, ${opts.reporter || null}) RETURNING id`));
+    VALUES (${surface}, ${roomId}, ${userId}, ${stored}, ${res.severity}, ${res.categories as any}, ${opts.status || 'pending'}, ${opts.reporter || null}) RETURNING id`));
   return Number(r[0]?.id || 0);
 }
 export async function listQueue(status = 'pending', limit = 50): Promise<any[]> {

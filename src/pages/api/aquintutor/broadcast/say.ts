@@ -8,7 +8,10 @@ import { can } from '@/lib/rbac';
 import { underRateLimit } from '@/lib/llm/gateway';
 import { fireBoardEvent } from '@/lib/board-session';
 import { recordVote, raiseHand } from '@/lib/broadcast';
-import { screenMessage, enqueueIncident, roomModerationState } from '@/lib/moderation';
+import { screenMessage, enqueueIncident, roomModerationState, isSafetyEvent } from '@/lib/moderation';
+import { resolvePrincipal } from '@/lib/rbac';
+import { accessSummary } from '@/lib/rbac/access';
+import { notifyGuardians } from '@/lib/edu-notify';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 const ALLOWED = new Set(['chat', 'reaction', 'hand', 'vote', 'poll', 'report']);
@@ -36,11 +39,14 @@ export const POST: APIRoute = async ({ request, locals }) => {
       if (modState.removed) return j({ ok: false, error: 'you have been removed from this session' }, 403);
       if (modState.muted) return j({ ok: false, error: 'you are muted' }, 403);
     }
-    // AP2: screen chat BEFORE it fans out. severe -> blocked + queued; flagged -> queued for review + sent
+    // AP2b: stage-aware screening. A minor author -> strict mode (blocks mild + unmoderated contact);
+    // a safety event escalates to the linked guardian; a minor's incident is data-minimized.
     if (msg.kind === 'chat') {
-      const res = screenMessage(String(msg.body || ''));
-      if (!res.allowed) { await enqueueIncident('broadcast', session, uid, res, { status: 'blocked' }).catch(() => {}); return j({ ok: false, error: 'message blocked by moderation', severity: res.severity }); }
-      if (res.flagged) await enqueueIncident('broadcast', session, uid, res).catch(() => {});
+      let isMinor = false; try { isMinor = accessSummary(await resolvePrincipal(user)).isMinor; } catch {}
+      const res = screenMessage(String(msg.body || ''), { strict: isMinor });
+      if (isSafetyEvent(res, isMinor)) await notifyGuardians(uid, { title: 'Safety alert', body: 'A flagged message in a live session was blocked and logged for review.', link: '/aquintutor/access' }).catch(() => {});
+      if (!res.allowed) { await enqueueIncident('broadcast', session, uid, res, { status: 'blocked', minimize: isMinor }).catch(() => {}); return j({ ok: false, error: 'message blocked by moderation', severity: res.severity }); }
+      if (res.flagged) await enqueueIncident('broadcast', session, uid, res, { minimize: isMinor }).catch(() => {});
     }
 
     if (msg.kind === 'vote') await recordVote(id, String(msg.pollId || ''), uid, Number(msg.option) || 0).catch(() => {});
