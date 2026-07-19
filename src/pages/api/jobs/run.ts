@@ -3,7 +3,7 @@
 // admin (administer). Idempotent + retrying, so a repeat run never double-sends. Reports a summary.
 import type { APIRoute } from 'astro';
 import { can } from '@/lib/rbac';
-import { processJobs, queueHealth } from '@/lib/job-queue';
+import { processJobs, queueHealth, retryFailed } from '@/lib/job-queue';
 import { HANDLERS } from '@/lib/job-handlers';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
@@ -17,6 +17,7 @@ async function authorized(url: URL, locals: any): Promise<boolean> {
 
 const handle = async (url: URL, locals: any) => {
   if (!(await authorized(url, locals))) return j({ ok: false, error: 'unauthorized' }, 403);
+  if (url.searchParams.get('action') === 'retry') { const n = await retryFailed(); return j({ ok: true, requeued: n, health: await queueHealth() }); }
   const limit = Math.min(100, Number(url.searchParams.get('limit')) || 25);
   try {
     let total = { processed: 0, done: 0, retried: 0, failed: 0 };

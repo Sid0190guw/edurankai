@@ -15,6 +15,15 @@ export function jobOutcome(attempts: number, maxAttempts: number, ok: boolean): 
   return shouldRetry(attempts, maxAttempts) ? 'retry' : 'failed';
 }
 
+// ---- pure batching + rate-limiting (Prompt AP6b): don't flood a user ----
+export function rateLimited(recentCount: number, maxPerWindow: number): boolean { return recentCount >= maxPerWindow; }
+/** Collapse many notifications for one user into a single digest (title + body). Pure. */
+export function digestSummary(items: { title: string }[]): { title: string; body: string } | null {
+  if (!items || items.length === 0) return null;
+  if (items.length === 1) return { title: items[0].title, body: '' };
+  return { title: items.length + ' updates', body: items.slice(0, 6).map((i) => '• ' + i.title).join('\n') + (items.length > 6 ? '\n…and ' + (items.length - 6) + ' more' : '') };
+}
+
 export type JobStatus = 'pending' | 'processing' | 'done' | 'failed';
 export interface Job { id: number; kind: string; payload: any; attempts: number; maxAttempts: number }
 
@@ -86,6 +95,18 @@ export async function queueHealth(): Promise<{ pending: number; processing: numb
   const m: any = { pending: 0, processing: 0, failed: 0, done: 0 };
   for (const row of r) m[String(row.status)] = Number(row.c);
   return m;
+}
+/** Requeue failed jobs (admin recovery) — resets attempts so they run again. */
+export async function retryFailed(): Promise<number> {
+  const { db, sql } = await ctx();
+  const r = rows(await db.execute(sql`UPDATE edu_jobs SET status = 'pending', attempts = 0, run_after = now(), updated_at = now() WHERE status = 'failed' RETURNING id`));
+  return r.length;
+}
+/** Count a user's recent notify jobs in a window (for rate-limiting / batching). */
+export async function recentNotifyCount(userId: string, windowMinutes = 60): Promise<number> {
+  const { db, sql } = await ctx();
+  const r = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM edu_jobs WHERE kind = 'notify' AND payload->>'userId' = ${userId} AND created_at > now() - (${windowMinutes} || ' minutes')::interval`));
+  return Number(r[0]?.c || 0);
 }
 export async function recentJobLog(limit = 50): Promise<any[]> {
   const { db, sql } = await ctx();

@@ -1,12 +1,17 @@
 // src/lib/job-handlers.ts — job kinds + their delivery handlers (Prompt AP6). Notifications are
 // ENQUEUED (idempotent) and delivered by the worker (in-app + email via the Prompt-18 pipeline,
 // optional push) with retries + a delivery log. enqueueNotify() is the reliable send path callers use.
-import { enqueue, dedupKey, logDelivery, type JobHandler } from '@/lib/job-queue';
+import { enqueue, dedupKey, logDelivery, rateLimited, recentNotifyCount, type JobHandler } from '@/lib/job-queue';
 
-/** Reliable notification: enqueue instead of sending inline. Idempotent via a dedup key. */
+const NOTIFY_CAP_PER_HOUR = 12;
+
+/** Reliable notification: enqueue instead of sending inline. Idempotent via a dedup key, and
+ *  rate-limited per user (over the hourly cap it is DEFERRED, not dropped — avoids floods). */
 export async function enqueueNotify(userId: string, n: { type: string; title: string; body?: string; link?: string; dedup?: string }): Promise<number | null> {
   const key = dedupKey('notify', [userId, n.type, n.dedup || n.title]);
-  return enqueue('notify', { userId, ...n }, { dedupKey: key, maxAttempts: 5 });
+  const recent = await recentNotifyCount(userId, 60).catch(() => 0);
+  const runAfterMs = rateLimited(recent, NOTIFY_CAP_PER_HOUR) ? 60 * 60 * 1000 : 0;   // over cap -> defer an hour
+  return enqueue('notify', { userId, ...n }, { dedupKey: key, maxAttempts: 5, runAfterMs });
 }
 export async function enqueueGuardianAlert(minorId: string, n: { title: string; body?: string; link?: string; dedup?: string }): Promise<number | null> {
   return enqueue('notify-guardians', { minorId, ...n }, { dedupKey: dedupKey('gd', [minorId, n.dedup || n.title]), maxAttempts: 5 });
