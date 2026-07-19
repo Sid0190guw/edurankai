@@ -69,8 +69,14 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
   // (e.g. created by a payment, or a double-click / re-approval), attach the
   // waiver to it, drop the intent, and return the existing id. This is what
   // stops the "one submitted + one reviewing" duplicate rows.
-  const roleIdSafe = d.roleId || null;
-  const userIdSafe = intent.user_id || null;
+  // Validate FK targets BEFORE inserting (mirrors payment-effects.ts). A stale
+  // role_id or a missing user is the usual reason the insert blew up — and because
+  // the failure was swallowed below, the applicant silently stayed "awaiting fee"
+  // forever. Sanitize so the application lands on the FIRST try.
+  let roleIdSafe: any = d.roleId || null;
+  try { if (roleIdSafe) { const rr = rows(await db.execute(sql`SELECT 1 FROM roles WHERE id = ${roleIdSafe} LIMIT 1`)); if (!rr.length) roleIdSafe = null; } } catch (_) { roleIdSafe = null; }
+  let userIdSafe: any = intent.user_id || null;
+  try { if (userIdSafe) { const uu = rows(await db.execute(sql`SELECT 1 FROM users WHERE id = ${userIdSafe} LIMIT 1`)); if (!uu.length) userIdSafe = null; } } catch (_) { userIdSafe = null; }
   const dupeEmail = String(d.email || intent.email || '').trim().toLowerCase();
   if (roleIdSafe && (userIdSafe || dupeEmail)) {
     const dupe = rows(await db.execute(sql`
@@ -111,7 +117,7 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
         compensation, source, status, raw_submission, ip_address, user_agent,
         fee_paid, fee_paid_at, fee_waiver_granted, fee_waiver_reason
       ) VALUES (
-        ${d.applicationNumber || null}, ${d.roleId || null}, ${intent.user_id},
+        ${d.applicationNumber || null}, ${roleIdSafe}, ${userIdSafe},
         ${d.firstName || ''}, ${d.lastName || ''}, ${d.email || (intent.email || '')}, ${d.phone || ''},
         ${d.city || ''}, ${d.linkedin || null},
         ${d.portfolioUrl || ''}, ${d.photoUrl || null}, ${d.dob || null}, ${d.birthTime || null}, ${d.birthPlace || null},
@@ -141,5 +147,10 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
       }
     }
     return newId || null;
-  } catch (e) { return null; }
+  } catch (e) {
+    // NEVER fail silently: a swallowed error here left applicants stuck at
+    // "awaiting fee" with no trace. Record it so it shows in /admin/hardening.
+    try { const { trackError } = await import('@/lib/logger'); await trackError('application.materialise_failed', e, { intentId, roleIdSafe, userIdSafe, email: dupeEmail }); } catch (_) {}
+    return null;
+  }
 }
