@@ -1062,6 +1062,17 @@ const myDisplayName = user.email?.split('@')[0] || 'Guest';
               <div id="haScene3d" style="display:none;"></div>
             </div>
             <p id="haStatus" style="font-size:10.5px;color:#6e6e78;margin-top:6px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;">Spec broadcast — no video. You render it locally.</p>
+            <div id="haBreakout" style="display:none;font-size:12px;color:#fbbf24;margin-top:8px;padding:8px;background:#1a1608;border-radius:6px;"></div>
+            {isHost && (
+              <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                <span style="font-size:11px;color:#9aa6b6;">Breakouts:</span>
+                <input id="boCount" type="number" min="2" max="20" value="2" title="number of rooms" style="width:52px;font-size:12px;padding:4px 6px;border-radius:6px;background:#15151b;color:#d6d6de;border:1px solid #26262e;" />
+                <input id="boTimer" type="number" min="0" max="3600" placeholder="secs" title="timer (optional)" style="width:64px;font-size:12px;padding:4px 6px;border-radius:6px;background:#15151b;color:#d6d6de;border:1px solid #26262e;" />
+                <button class="mt-btn" id="boOpen" style="font-size:11px;">Open (even split)</button>
+                <button class="mt-btn" id="boAnnounce" style="font-size:11px;">Announce</button>
+                <button class="mt-btn" id="boClose" style="font-size:11px;">Close all</button>
+              </div>
+            )}
           </div>
         </section>
 
@@ -1362,6 +1373,7 @@ const myDisplayName = user.email?.split('@')[0] || 'Guest';
 <script src="/aquin-anim-templates.js" is:inline></script>
 <script src="/aquin-scene-engine.js" is:inline></script>
 <script src="/aquin-huddle-anim.js" is:inline></script>
+<script src="/aquin-room-transport.js" is:inline></script>
 <SceneGL />
 <script is:inline define:vars={{ roomId: room?.id || id, isHost, userId: user.id, myDisplayName, isRecordingFlag: isRecording, isLockedFlag: isLocked, sceneSpecs }}>
 /* ==========================================================================
@@ -1384,6 +1396,9 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
 const state = {
+  roomId: roomId,          // H2: the mesh room I'm currently in (base room, or a breakout sub-room)
+  classMode: false,
+  presenters: [],
   localStream: null,
   blurredStream: null,
   screenStream: null,
@@ -1534,7 +1549,7 @@ function startMesh() {
   if (!window.AquinMesh || !state.localStream) return startLoopbackPC();
   const stream = (state.blurOn && state.blurredStream) ? state.blurredStream : state.localStream;
   state.mesh = window.AquinMesh.join({
-    roomId: roomId, peerId: userId, name: myDisplayName, localStream: stream,
+    roomId: (state.roomId || roomId), peerId: userId, name: myDisplayName, localStream: stream,
     onPeerStream: (pid, s) => {
       let p = state.participants.find(x => x.id === pid);
       if (!p) state.participants.push({ id: pid, name: 'Participant', muted: false, camOff: false, hand: false, signal: 3, isLocal: false, color: hsl(pid), srcObject: s, isHost: false, role: 'attendee' });
@@ -1602,7 +1617,50 @@ function haGrantPresenter(peerId) {
 // audited fire: presenter/host fires -> render+broadcast locally, and record a server-side audit
 function haFire(kind, payload, summary) {
   if (!window.huddleAnim || !window.huddleAnim.fire(kind, payload)) return;
-  fetch('/api/portal/meet/' + encodeURIComponent(roomId) + '/anim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'fire', kind: kind, summary: summary }) }).catch(() => {});
+  fetch('/api/portal/meet/' + encodeURIComponent(state.roomId) + '/anim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'fire', kind: kind, summary: summary }) }).catch(() => {});
+}
+
+/* H2: switch which SMALL mesh room I'm in (main <-> a breakout) via the transport interface. */
+function switchMeshRoom(newId) {
+  if (state.roomId === newId) return;
+  if (state.mesh) { try { state.mesh.leave(); } catch {} state.mesh = null; }
+  state.participants = state.participants.filter(p => p.isLocal);   // drop peers from the old room
+  renderTiles();
+  state.roomId = newId; window.huddleAnim = null;                   // re-init the board for the new room
+  startMesh(); initHuddleAnim();
+  const T = window.AquinRoomTransport;
+  toast(T && T.isBreakoutId(newId) ? 'Joined your breakout' : 'Back in the main room');
+}
+function breakoutBase() { return window.AquinRoomTransport ? window.AquinRoomTransport.baseOf(roomId) : roomId; }
+function pollBreakouts() {
+  fetch('/api/portal/meet/' + encodeURIComponent(breakoutBase()) + '/breakout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'state' }) })
+    .then(r => r.json()).then(renderBreakoutBanner).catch(() => {});
+}
+function renderBreakoutBanner(j) {
+  const el = document.getElementById('haBreakout'), T = window.AquinRoomTransport; if (!el || !j || !j.ok || !T) return;
+  const base = breakoutBase();
+  if (j.open && j.myIndex >= 0) {
+    const target = T.breakoutRoomId(base, j.myIndex), inIt = state.roomId === target;
+    const timer = j.endsAt ? ' - ends ' + new Date(j.endsAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    el.innerHTML = '';
+    const label = document.createElement('span'); label.textContent = 'Breakout ' + ((j.labels && j.labels[j.myIndex]) || (j.myIndex + 1)) + timer + (j.announcement ? ' - "' + j.announcement + '"' : '') + '  ';
+    const btn = document.createElement('button'); btn.className = 'mt-btn'; btn.style.fontSize = '11px'; btn.textContent = inIt ? 'Leave breakout' : 'Join breakout';
+    btn.addEventListener('click', () => switchMeshRoom(inIt ? base : target));
+    el.appendChild(label); el.appendChild(btn); el.style.display = 'block';
+  } else if (j.closed && T.isBreakoutId(state.roomId)) { switchMeshRoom(base); el.style.display = 'none'; }
+  else el.style.display = 'none';
+}
+function haOpenBreakouts() {
+  const T = window.AquinRoomTransport, count = parseInt((document.getElementById('boCount') || {}).value, 10) || 2;
+  const ids = state.participants.map(p => p.id).filter(id => id !== userId && !p_isLocalId(id));
+  const rooms = T.assignParticipants(ids, count, 'even'), labels = rooms.map((_, i) => 'Room ' + (i + 1));
+  const seconds = parseInt((document.getElementById('boTimer') || {}).value, 10) || 0;
+  fetch('/api/portal/meet/' + encodeURIComponent(breakoutBase()) + '/breakout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'open', rooms, labels, seconds }) })
+    .then(r => r.json()).then(j => { toast(j.ok ? ('Opened ' + j.rooms + ' breakouts') : (j.error || 'failed')); pollBreakouts(); });
+}
+function p_isLocalId(id) { const p = state.participants.find(x => x.id === id); return p && p.isLocal; }
+function haBreakoutAction(action, extra) {
+  return fetch('/api/portal/meet/' + encodeURIComponent(breakoutBase()) + '/breakout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ action }, extra || {})) }).then(r => r.json());
 }
 
 /* H1: render a broadcast animation SPEC locally at MY tier (rich WebGL / standard / lite 2D). */
@@ -1640,8 +1698,18 @@ function initHuddleAnim() {
   var rp = document.getElementById('haRequestPresent');
   if (rp) rp.addEventListener('click', function () { sendData({ type: 'aquin-present-req', from: userId, name: myDisplayName }); rp.textContent = 'Request sent'; rp.disabled = true; });
   // report my tier so the admin inspector shows per-participant quality
-  fetch('/api/portal/meet/' + encodeURIComponent(roomId) + '/anim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'presence', tier: tier }) }).catch(function () {});
+  fetch('/api/portal/meet/' + encodeURIComponent(state.roomId) + '/anim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'presence', tier: tier }) }).catch(function () {});
 }
+// H2: breakout controls (host) + polling for everyone — wired once
+var _breakoutWired = false;
+function initBreakouts() {
+  if (_breakoutWired) return; _breakoutWired = true;
+  var bo = document.getElementById('boOpen'); if (bo) bo.addEventListener('click', haOpenBreakouts);
+  var ba = document.getElementById('boAnnounce'); if (ba) ba.addEventListener('click', function () { var t = prompt('Announce to all breakouts:'); if (t) haBreakoutAction('announce', { text: t }).then(pollBreakouts); });
+  var bc = document.getElementById('boClose'); if (bc) bc.addEventListener('click', function () { haBreakoutAction('close').then(function () { pollBreakouts(); }); });
+  pollBreakouts(); setInterval(pollBreakouts, 4000);
+}
+if (typeof document !== 'undefined') { if (document.readyState !== 'loading') initBreakouts(); else document.addEventListener('DOMContentLoaded', initBreakouts); }
 if (typeof document !== 'undefined') { if (document.readyState !== 'loading') initHuddleAnim(); else document.addEventListener('DOMContentLoaded', initHuddleAnim); }
 
 /* ==========================================================================
