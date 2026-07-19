@@ -62,6 +62,19 @@ const BOARD_DDL = [
     last_seen timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (session_id, user_id)
   )`,
+  `CREATE TABLE IF NOT EXISTS edu_board_detections (
+    id bigserial PRIMARY KEY,
+    session_id text NOT NULL,
+    actor text,
+    transcript text NOT NULL DEFAULT '',
+    template_id text,
+    params jsonb NOT NULL DEFAULT '{}',
+    confidence double precision NOT NULL DEFAULT 0,
+    source text NOT NULL DEFAULT 'rule',
+    fired boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS edu_board_detections_session_idx ON edu_board_detections (session_id, id)`,
 ];
 let _ready = false;
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
@@ -106,10 +119,33 @@ export async function touchParticipant(sessionId: string, userId: string): Promi
   await db.execute(sql`UPDATE edu_board_participants SET last_seen = now() WHERE session_id = ${sessionId} AND user_id = ${userId}`);
 }
 
-export async function sessionInspector(sessionId: string): Promise<{ participants: Participant[]; fires: BoardEvent[]; totalFires: number; online: number }> {
+export interface Detection { id: number; transcript: string; templateId: string | null; params: any; confidence: number; source: string; fired: boolean; at: string }
+function toDetection(r: any): Detection {
+  return { id: Number(r.id), transcript: String(r.transcript || ''), templateId: r.template_id ? String(r.template_id) : null, params: safeJson(r.params), confidence: Number(r.confidence || 0), source: String(r.source || 'rule'), fired: !!r.fired, at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString() };
+}
+
+/** Log a speech->board detection (Prompt A2). Returns its id so the client can mark it fired. */
+export async function logDetection(sessionId: string, actor: string | null, d: { transcript: string; templateId: string | null; params: any; confidence: number; source: string; fired?: boolean }): Promise<number> {
+  const { db, sql } = await ctx();
+  const r = rows(await db.execute(sql`INSERT INTO edu_board_detections (session_id, actor, transcript, template_id, params, confidence, source, fired)
+    VALUES (${sessionId}, ${actor}, ${d.transcript || ''}, ${d.templateId}, ${JSON.stringify(d.params || {})}::jsonb, ${d.confidence || 0}, ${d.source || 'rule'}, ${!!d.fired})
+    RETURNING id`));
+  return Number(r[0]?.id || 0);
+}
+export async function markDetectionFired(id: number): Promise<void> {
+  const { db, sql } = await ctx();
+  await db.execute(sql`UPDATE edu_board_detections SET fired = true WHERE id = ${id}`);
+}
+export async function recentDetections(sessionId: string, limit = 12): Promise<Detection[]> {
+  const { db, sql } = await ctx();
+  return rows(await db.execute(sql`SELECT * FROM edu_board_detections WHERE session_id = ${sessionId} ORDER BY id DESC LIMIT ${limit}`)).map(toDetection);
+}
+
+export async function sessionInspector(sessionId: string): Promise<{ participants: Participant[]; fires: BoardEvent[]; totalFires: number; online: number; detections: Detection[] }> {
   const { db, sql } = await ctx();
   const participants = participantView(rows(await db.execute(sql`SELECT * FROM edu_board_participants WHERE session_id = ${sessionId} ORDER BY joined_at ASC`)));
   const fires = rows(await db.execute(sql`SELECT * FROM edu_board_events WHERE session_id = ${sessionId} ORDER BY seq DESC LIMIT 10`)).map(toBroadcast);
   const totalFires = Number(rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM edu_board_events WHERE session_id = ${sessionId}`))[0]?.c || 0);
-  return { participants, fires, totalFires, online: participants.filter((p) => p.online).length };
+  const detections = await recentDetections(sessionId, 12).catch(() => []);
+  return { participants, fires, totalFires, online: participants.filter((p) => p.online).length, detections };
 }

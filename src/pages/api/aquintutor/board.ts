@@ -5,7 +5,7 @@
 import type { APIRoute } from 'astro';
 import { can } from '@/lib/rbac';
 import { animationService, isTemplate } from '@/lib/animation';
-import { fireBoardEvent } from '@/lib/board-session';
+import { fireBoardEvent, markDetectionFired } from '@/lib/board-session';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -23,6 +23,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const id = await animationService().createInstance(String(b.templateId), b.params || {}, b.koId ? String(b.koId) : null, user.id);
       let seq = 0;
       if (b.session) seq = await fireBoardEvent(String(b.session), { templateId: String(b.templateId), params: b.params || {}, playState: b.playState || 'playing', timelinePos: Number(b.timelinePos) || 0 }, String(user.id)).catch(() => 0);
+      if (b.detectionId) await markDetectionFired(Number(b.detectionId)).catch(() => {});   // speech-fired (A2)
       return j({ ok: true, instanceId: id, seq });   // seq>0 => broadcast to the live session
     }
     return j({ ok: false, error: 'unknown action' }, 400);
