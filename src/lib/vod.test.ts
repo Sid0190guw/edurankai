@@ -2,7 +2,7 @@
 // Recording & VOD (Prompt AP1): a recording captures the ordered SPEC timeline (never baked pixels),
 // so replay re-renders at the viewer's tier; a VOD asset is a kernel object linked to a course +
 // access-gated by securityLabels; the storage interface is swap-ready with a dev fallback.
-import { buildTimeline, labelAllows, VodService, broadcastSession } from './vod';
+import { buildTimeline, labelAllows, specAt, VodService, broadcastSession } from './vod';
 import { memoryStore, storageKey, getStore } from './storage';
 import { createKernel } from '@/lib/kernel';
 import type { BoardEvent } from './board-session';
@@ -25,6 +25,12 @@ ok('relative offsets from the first event', tl.timeline[0].tMs === 0 && tl.timel
 ok('duration = last offset', tl.durationMs === 20000);
 ok('chapters at scene/slide changes', tl.chapters.length === 2 && tl.chapters[0].label === 'Intro' && tl.chapters[1].label === 'Atom');
 ok('the timeline is SPEC, not pixels (no frame/video/image field)', !/"(frame|video|image|pixels|dataUrl|mp4)"/.test(JSON.stringify(tl.timeline)));
+
+console.log('\n== replay seek (scrub): the spec at a position is the last event before it ==');
+ok('before start -> nothing', specAt(tl.timeline, -5) === null);
+ok('at t=0 -> the first slide', specAt(tl.timeline, 0)!.kind === 'slide');
+ok('mid (t=12s) -> the scene that started at 10s', specAt(tl.timeline, 12000)!.kind === 'scene');
+ok('past the end -> the last spec', specAt(tl.timeline, 999999)!.kind === 'template');
 
 console.log('\n== securityLabels gate access (pure) ==');
 ok('public/unlabelled is visible', labelAllows([], {}) && labelAllows(['public'], {}));

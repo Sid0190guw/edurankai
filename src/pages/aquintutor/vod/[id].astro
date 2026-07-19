@@ -1,0 +1,89 @@
+---
+// /aquintutor/vod/[id] — VOD player (Prompt AP1b). Replays the recorded SPEC timeline and RE-RENDERS
+// the animations at the viewer's Prompt-5 tier (never baked pixels) with scrub / resume / chapters.
+// Access is gated server-side by the asset's securityLabels; faculty always, learners only when it's
+// published and the labels allow. Optional media (audio/video) plays synced when a store is provisioned.
+export const prerender = false;
+import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import SceneGL from '@/components/SceneGL.astro';
+import { can } from '@/lib/rbac';
+import { vodService, labelAllows } from '@/lib/vod';
+
+const user = Astro.locals.user;
+const { id } = Astro.params as { id: string };
+if (!user) return Astro.redirect('/aquintutor/login?next=' + encodeURIComponent('/aquintutor/vod/' + id));
+const faculty = (await can(user, 'write', { type: 'AnimationObject' })).allow;
+await can(user, 'read', { type: 'AnimationObject' });   // audit the view
+const vod = await vodService().get(id).catch(() => null);
+if (!vod) return Astro.redirect('/aquintutor/vod');
+// label gate: faculty always; learners need it published + labels satisfied (signed-in => enrolled)
+const allowed = faculty || (vod.published && labelAllows(vod.labels, { enrolled: true, examMode: false }));
+const payload = { timeline: vod.data.timeline, chapters: vod.data.chapters, durationMs: vod.data.durationMs, mediaUrl: vod.data.mediaUrl };
+---
+<AquintutorLayout title={vod.title}>
+  <main style="max-width:820px;margin:0 auto;padding:32px 22px 80px;">
+    <p style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--rust,#b3541e);margin:0 0 8px;">Recording</p>
+    <h1 style="font-family:Fraunces,serif;font-size:26px;font-weight:600;color:var(--ink,#1a1712);margin:0 0 4px;">{vod.title}</h1>
+    {!allowed ? (
+      <p style="font-family:'Inter Tight',sans-serif;font-size:14px;color:#9b2c2c;margin:16px 0;">This recording isn't available to your account{vod.labels.includes('enrolled-only') ? ' (enrolled learners only)' : ''}.</p>
+    ) : (
+      <div>
+        <p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#6b6455;margin:0 0 14px;">Animations re-render on your device at your own quality — this is the spec timeline, not a flat video.</p>
+        <div style="background:#fff;border:1px solid var(--line,#e6e1d6);border-radius:14px;overflow:hidden;">
+          {payload.mediaUrl && <video id="vodVideo" src={payload.mediaUrl} style="display:block;width:100%;" controls></video>}
+          <svg id="anim" viewBox="0 0 320 200" style="display:none;width:100%;height:auto;aspect-ratio:16/10;"></svg>
+          <div id="sceneStage" style="display:none;background:#0e0f13;min-height:120px;"></div>
+          <div id="slide" style="display:none;padding:26px 28px;min-height:120px;"><h2 id="slideTitle" style="font-family:Fraunces,serif;font-size:22px;color:var(--ink,#1a1712);margin:0 0 14px;"></h2><ul id="slideBullets" style="font-family:'Inter Tight',sans-serif;font-size:16px;color:#3a352c;line-height:1.7;margin:0;padding-left:20px;"></ul></div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:12px;">
+          <button id="playBtn" type="button" style="background:var(--ink,#1a1712);color:#fff;border:none;border-radius:9px;padding:9px 18px;font-family:'Inter Tight',sans-serif;font-size:14px;font-weight:600;cursor:pointer;">Play</button>
+          <input id="scrub" type="range" min="0" max={payload.durationMs} value="0" style="flex:1;" />
+          <span id="tpos" style="font-family:'Geist Mono',monospace;font-size:12px;color:#8a8378;min-width:70px;">0:00</span>
+        </div>
+        <div id="chapters" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;"></div>
+      </div>
+    )}
+  </main>
+
+  {allowed && (
+    <div>
+      <script src="/aquin-anim-templates.js" defer></script>
+      <script src="/aquin-scene-engine.js" defer></script>
+      <script src="/aquin-huddle-anim.js" defer></script>
+      <SceneGL />
+      <script is:inline define:vars={{ id, payload }}>
+        (function () {
+          function ready(fn) { if (window.AquinScene && window.AquinAnim && window.AquinHuddleAnim) fn(); else setTimeout(function () { ready(fn); }, 50); }
+          ready(function () {
+            var tl = payload.timeline || [], dur = payload.durationMs || 0;
+            var tier = window.AquinHuddleAnim.pickTier(window.AquinHuddleAnim.browserSignals());
+            var anim = document.getElementById('anim'), sceneStage = document.getElementById('sceneStage'), slide = document.getElementById('slide');
+            var scrub = document.getElementById('scrub'), tpos = document.getElementById('tpos'), video = document.getElementById('vodVideo');
+            var playing = false, raf = null, startClock = 0, startPos = 0, lastKey = null;
+            function specAt(ms) { var cur = null; for (var i = 0; i < tl.length; i++) { if (tl[i].tMs <= ms) cur = tl[i]; else break; } return cur; }
+            function showOnly(el) { [anim, sceneStage, slide].forEach(function (x) { x.style.display = x === el ? 'block' : 'none'; }); }
+            function fmt(ms) { var s = Math.floor(ms / 1000); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+            function renderAt(ms) {
+              var e = specAt(ms); tpos.textContent = fmt(ms) + ' / ' + fmt(dur);
+              var key = e ? (e.tMs + ':' + e.templateId) : null; if (key === lastKey) return; lastKey = key;
+              if (!e) { showOnly(anim); return; }
+              if (e.kind === 'scene') { showOnly(sceneStage); window.AquinScene.render(sceneStage, e.params.scene, tier); }
+              else if (e.kind === 'slide') { showOnly(slide); document.getElementById('slideTitle').textContent = (e.params.slide && e.params.slide.title) || ''; var ul = document.getElementById('slideBullets'); ul.innerHTML = ''; ((e.params.slide && e.params.slide.bullets) || []).forEach(function (b) { var li = document.createElement('li'); li.textContent = b; ul.appendChild(li); }); }
+              else if (e.kind === 'ink') { showOnly(anim); while (anim.firstChild) anim.removeChild(anim.firstChild); (e.params.strokes || []).forEach(function (s) { if (!s.length) return; var pl = document.createElementNS('http://www.w3.org/2000/svg', 'polyline'); pl.setAttribute('points', s.map(function (p) { return (p[0] * 320) + ',' + (p[1] * 200); }).join(' ')); pl.setAttribute('fill', 'none'); pl.setAttribute('stroke', '#1a1712'); pl.setAttribute('stroke-width', '2'); anim.appendChild(pl); }); }
+              else { showOnly(anim); if (window.AquinAnim.get(e.templateId)) window.AquinAnim.renderSVG(anim, { templateId: e.templateId, params: e.params, playState: 'playing', timelinePos: 0.5 }, tier); }
+            }
+            function setPos(ms) { ms = Math.max(0, Math.min(dur, ms)); scrub.value = ms; renderAt(ms); localStorage.setItem('vodpos:' + id, String(ms)); if (video) try { video.currentTime = ms / 1000; } catch (e) {} }
+            function tick() { if (!playing) return; var ms = startPos + (performance.now() - startClock); if (ms >= dur) { pause(); setPos(dur); return; } setPos(ms); raf = requestAnimationFrame(tick); }
+            function play() { playing = true; document.getElementById('playBtn').textContent = 'Pause'; startClock = performance.now(); startPos = Number(scrub.value); if (video) try { video.play(); } catch (e) {} raf = requestAnimationFrame(tick); }
+            function pause() { playing = false; document.getElementById('playBtn').textContent = 'Play'; if (raf) cancelAnimationFrame(raf); if (video) try { video.pause(); } catch (e) {} }
+            document.getElementById('playBtn').addEventListener('click', function () { playing ? pause() : play(); });
+            scrub.addEventListener('input', function () { pause(); setPos(Number(scrub.value)); });
+            (payload.chapters || []).forEach(function (c) { var b = document.createElement('button'); b.textContent = c.label + ' (' + fmt(c.tMs) + ')'; b.style.cssText = 'background:#fff;border:1px solid #e6e1d6;border-radius:100px;padding:4px 12px;font-family:Inter Tight,sans-serif;font-size:12px;cursor:pointer;'; b.addEventListener('click', function () { pause(); setPos(c.tMs); }); document.getElementById('chapters').appendChild(b); });
+            var resume = Number(localStorage.getItem('vodpos:' + id) || 0);
+            setPos(resume > 0 && resume < dur ? resume : 0);   // resume where you left off
+          });
+        })();
+      </script>
+    </div>
+  )}
+</AquintutorLayout>

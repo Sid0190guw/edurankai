@@ -36,6 +36,13 @@ export function buildTimeline(events: BoardEvent[]): VodTimeline {
   return { timeline, durationMs, chapters, mediaUrl: null };
 }
 
+/** Replay seek (pure): the spec to show at position tMs = the last event at/before it. Null before start. */
+export function specAt(timeline: TimelineEntry[], tMs: number): TimelineEntry | null {
+  let cur: TimelineEntry | null = null;
+  for (const e of timeline || []) { if (e.tMs <= tMs) cur = e; else break; }
+  return cur;
+}
+
 /** Pure access check: does a viewer's context satisfy the asset's securityLabels? */
 export function labelAllows(labels: SecurityLabel[], ctx: { enrolled?: boolean; examMode?: boolean }): boolean {
   const ls = labels || [];
