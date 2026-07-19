@@ -44,5 +44,19 @@ console.log('\n== H1b seam: presenter hand-off flips drive rights ==');
 viewer.setCanDrive(true);
 ok('granting presenter lets a former viewer fire', viewer.fire('template', { templateId: 'sine', params: {} }) === true);
 
+console.log('\n== H1b: room-role drive gate (host OR granted presenter) ==');
+ok('host can drive', H.canDriveInRoom({ isHost: true, userId: 'u1', presenters: [] }) === true);
+ok('granted presenter can drive', H.canDriveInRoom({ isHost: false, userId: 'u2', presenters: ['u2'] }) === true);
+ok('a plain participant cannot drive', H.canDriveInRoom({ isHost: false, userId: 'u3', presenters: ['u2'] }) === false);
+
+console.log('\n== H1b class mode: a big room renders only a few cameras ==');
+const room = [{ id: 'host', isHost: true }, { id: 'me', isLocal: true }, { id: 'spk', role: 'attendee' }, { id: 'pres', role: 'attendee' }];
+for (let i = 0; i < 30; i++) room.push({ id: 's' + i, role: 'attendee' } as any);
+const vis = H.classModeVisible(room, { classMode: true, activeSpeaker: 'spk', presenters: ['pres'], maxStudents: 0 });
+ok('class mode keeps host + self + active speaker + presenter only', vis.length === 4 && vis.some((p: any) => p.id === 'host') && vis.some((p: any) => p.id === 'spk') && vis.some((p: any) => p.id === 'pres'), vis.length);
+ok('a 34-person room does NOT render all 34 cameras', vis.length < room.length);
+ok('class mode OFF renders everyone', H.classModeVisible(room, { classMode: false }).length === room.length);
+ok('maxStudents cap admits a bounded number of extra student cams', H.classModeVisible(room, { classMode: true, activeSpeaker: 'spk', presenters: ['pres'], maxStudents: 3 }).length === 7);
+
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

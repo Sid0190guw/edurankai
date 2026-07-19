@@ -46,7 +46,25 @@
     return api;
   }
 
-  var mod = { pickTier: pickTier, browserSignals: browserSignals, buildAnimMsg: buildAnimMsg, buildReq: buildReq, create: create };
+  // H1b: can this participant drive the board? (host OR granted presenter). Pure + server-mirrored.
+  function canDriveInRoom(opts) { opts = opts || {}; return !!(opts.isHost || (opts.presenters && opts.presenters.indexOf(opts.userId) >= 0)); }
+
+  // H1b class mode (webinar-style): which cameras to render so a big room stays fast. Always keep
+  // yourself, the host, granted presenters, and the active speaker; cap extra student cameras.
+  function classModeVisible(participants, opts) {
+    opts = opts || {}; participants = participants || [];
+    if (!opts.classMode) return participants;
+    var presenters = opts.presenters || [], cap = opts.maxStudents == null ? 0 : opts.maxStudents;
+    var kept = [], extra = 0;
+    participants.forEach(function (p) {
+      var priority = p.isLocal || p.isHost || p.role === 'host' || presenters.indexOf(p.id) >= 0 || p.id === opts.activeSpeaker;
+      if (priority) kept.push(p);
+      else if (extra < cap) { kept.push(p); extra++; }
+    });
+    return kept;
+  }
+
+  var mod = { pickTier: pickTier, browserSignals: browserSignals, buildAnimMsg: buildAnimMsg, buildReq: buildReq, create: create, canDriveInRoom: canDriveInRoom, classModeVisible: classModeVisible };
   if (typeof window !== 'undefined') window.AquinHuddleAnim = mod;
   if (typeof module !== 'undefined' && module.exports) module.exports = mod;
 })();
