@@ -1,0 +1,126 @@
+---
+// SceneGL.astro — the WebGL adapter (Prompt A3a). Registers window.AquinSceneGL, which the pure
+// engine (public/aquin-scene-engine.js) calls ONLY on rich/standard tiers. Three.js is loaded via
+// dynamic import() INSIDE render(), so it becomes its own lazy chunk that a lite client never
+// fetches. Quality: sRGB + ACES Filmic tone mapping, PCFSoft shadows, hemisphere + key + warm/cool
+// rim lights, a PMREM environment map (RoomEnvironment) for PBR reflections, subtle bloom on rich,
+// a grid floor + shadow-catcher + fog, and a dependency-free auto-orbit + pointer drag/zoom camera.
+---
+<script>
+  type Vec3 = [number, number, number];
+  let THREE: any = null, RoomEnvironment: any = null, post: any = null;
+
+  async function ensureThree(quality: any) {
+    if (!THREE) THREE = await import('three');
+    if (!RoomEnvironment) RoomEnvironment = (await import('three/examples/jsm/environments/RoomEnvironment.js')).RoomEnvironment;
+    if (quality && quality.bloom && !post) {
+      const ec = await import('three/examples/jsm/postprocessing/EffectComposer.js');
+      const rp = await import('three/examples/jsm/postprocessing/RenderPass.js');
+      const up = await import('three/examples/jsm/postprocessing/UnrealBloomPass.js');
+      post = { EffectComposer: ec.EffectComposer, RenderPass: rp.RenderPass, UnrealBloomPass: up.UnrealBloomPass };
+    }
+    return THREE;
+  }
+
+  function geom(T: any, node: any) {
+    const s = node.size, n = typeof s === 'number' ? s : 1;
+    const dim = Array.isArray(s) ? s : [n, n, n];
+    switch (node.type) {
+      case 'box': case 'plane': return node.type === 'plane' ? new T.PlaneGeometry(dim[0] * 2, dim[1] * 2) : new T.BoxGeometry(dim[0], dim[1], dim[2]);
+      case 'cylinder': return new T.CylinderGeometry(n * 0.6, n * 0.6, n * 1.6, 32);
+      case 'cone': return new T.ConeGeometry(n * 0.8, n * 1.6, 32);
+      case 'torus': return new T.TorusGeometry(n, n * 0.32, 24, 48);
+      case 'ring': return new T.RingGeometry(n * 0.7, n, 48);
+      default: return new T.SphereGeometry(n, 40, 28);   // sphere + physics bodies + arrow head fallback
+    }
+  }
+
+  function labelSprite(T: any, text: string, color: string) {
+    const c = document.createElement('canvas'); c.width = 256; c.height = 64; const ctx = c.getContext('2d')!;
+    ctx.fillStyle = color || '#ffffff'; ctx.font = '600 34px Inter Tight, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText((text || '').slice(0, 24), 128, 32);
+    const tex = new T.CanvasTexture(c); tex.colorSpace = T.SRGBColorSpace;
+    const spr = new T.Sprite(new T.SpriteMaterial({ map: tex, transparent: true })); spr.scale.set(3, 0.75, 1); return spr;
+  }
+
+  (window as any).AquinSceneGL = {
+    usesWebGL(tier: string) { return tier !== 'lite'; },
+    async render(container: HTMLElement, model: any, opts: any) {
+      const q = (opts && opts.quality) || { bloom: false, shadows: true, envMap: false, maxLights: 2 };
+      const T = await ensureThree(q);
+      let st = (container as any).__aquinGL;
+      if (!st) {
+        const renderer = new T.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+        renderer.outputColorSpace = T.SRGBColorSpace; renderer.toneMapping = T.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
+        renderer.shadowMap.enabled = q.shadows; renderer.shadowMap.type = T.PCFSoftShadowMap;
+        const w = container.clientWidth || 640, h = Math.round(w * 0.6);
+        renderer.setSize(w, h); container.appendChild(renderer.domElement); renderer.domElement.style.width = '100%'; renderer.domElement.style.height = 'auto';
+
+        const scene = new T.Scene(); scene.background = new T.Color('#0e0f13'); scene.fog = new T.Fog('#0e0f13', 22, 60);
+        const pmrem = new T.PMREMGenerator(renderer);
+        if (q.envMap) scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+        scene.add(new T.HemisphereLight('#bcd4ff', '#20160f', 0.6));
+        const key = new T.DirectionalLight('#fff4e6', 2.2); key.position.set(6, 10, 6); key.castShadow = q.shadows;
+        key.shadow.mapSize.set(1024, 1024); key.shadow.camera.near = 1; key.shadow.camera.far = 40; scene.add(key);
+        const warm = new T.DirectionalLight('#ff9d5c', 0.6); warm.position.set(-8, 3, -4); scene.add(warm);
+        const cool = new T.DirectionalLight('#5c9dff', 0.5); cool.position.set(4, 2, -8); scene.add(cool);
+
+        const grid = new T.GridHelper(60, 60, 0x2a2d36, 0x1b1d24); (grid.material as any).transparent = true; (grid.material as any).opacity = 0.4; grid.position.y = -0.01; scene.add(grid);
+        const catcher = new T.Mesh(new T.PlaneGeometry(80, 80), new T.ShadowMaterial({ opacity: 0.28 })); catcher.rotation.x = -Math.PI / 2; catcher.receiveShadow = q.shadows; scene.add(catcher);
+
+        const camera = new T.PerspectiveCamera(45, w / h, 0.1, 200);
+        st = { T, renderer, scene, camera, pmrem, group: null, nodes: [], theta: 0.6, phi: 0.9, dist: 12, target: new T.Vector3(0, 1, 0), auto: true, raf: 0, drag: false, lx: 0, ly: 0 };
+        (container as any).__aquinGL = st;
+
+        // dependency-free orbit + zoom
+        const dom = renderer.domElement;
+        dom.style.touchAction = 'none'; dom.style.cursor = 'grab';
+        dom.addEventListener('pointerdown', (e: any) => { st.drag = true; st.auto = false; st.lx = e.clientX; st.ly = e.clientY; dom.style.cursor = 'grabbing'; });
+        window.addEventListener('pointerup', () => { st.drag = false; dom.style.cursor = 'grab'; });
+        window.addEventListener('pointermove', (e: any) => { if (!st.drag) return; st.theta -= (e.clientX - st.lx) * 0.01; st.phi = Math.max(0.2, Math.min(1.4, st.phi - (e.clientY - st.ly) * 0.01)); st.lx = e.clientX; st.ly = e.clientY; });
+        dom.addEventListener('wheel', (e: any) => { e.preventDefault(); st.dist = Math.max(3, Math.min(80, st.dist + Math.sign(e.deltaY) * 1.2)); }, { passive: false });
+        window.addEventListener('resize', () => { const nw = container.clientWidth || w, nh = Math.round(nw * 0.6); st.renderer.setSize(nw, nh); st.camera.aspect = nw / nh; st.camera.updateProjectionMatrix(); });
+
+        if (q.bloom && post) { st.composer = new post.EffectComposer(renderer); st.composer.addPass(new post.RenderPass(scene, camera)); const bloom = new post.UnrealBloomPass(new T.Vector2(w, h), 0.55, 0.7, 0.85); st.composer.addPass(bloom); }
+      }
+
+      // (re)build the object group from the model
+      if (st.group) { st.scene.remove(st.group); st.group.traverse((o: any) => { o.geometry && o.geometry.dispose && o.geometry.dispose(); o.material && o.material.dispose && o.material.dispose(); }); }
+      const group = new T.Group(); st.nodes = [];
+      model.nodes.forEach((node: any) => {
+        let mesh: any;
+        if (node.type === 'label') { mesh = labelSprite(T, node.text, node.color); }
+        else if (node.type === 'line' && node.points && node.points.length > 1) { const g = new T.BufferGeometry().setFromPoints(node.points.map((p: Vec3) => new T.Vector3(p[0], p[1], p[2]))); mesh = new T.Line(g, new T.LineBasicMaterial({ color: node.color })); }
+        else if (node.type === 'particles') { const N = Math.min(2000, node.count || 200); const arr = new Float32Array(N * 3); for (let i = 0; i < N; i++) { arr[i * 3] = (Math.random() - 0.5) * 6; arr[i * 3 + 1] = Math.random() * 5; arr[i * 3 + 2] = (Math.random() - 0.5) * 6; } const g = new T.BufferGeometry(); g.setAttribute('position', new T.BufferAttribute(arr, 3)); mesh = new T.Points(g, new T.PointsMaterial({ color: node.color, size: 0.06 })); }
+        else {
+          const m = node.material || {};
+          const mat = new T.MeshStandardMaterial({ color: node.color, metalness: m.metalness ?? 0.1, roughness: m.roughness ?? 0.6, emissive: new T.Color(node.color).multiplyScalar(m.emissive || 0), transparent: (m.opacity ?? 1) < 1, opacity: m.opacity ?? 1 });
+          mesh = new T.Mesh(geom(T, node), mat); mesh.castShadow = q.shadows; mesh.receiveShadow = q.shadows;
+          if (node.path && node.path.length > 1) { const g = new T.BufferGeometry().setFromPoints(node.path.map((p: Vec3) => new T.Vector3(p[0], p[1], p[2]))); group.add(new T.Line(g, new T.LineBasicMaterial({ color: node.color, transparent: true, opacity: 0.4 }))); }
+        }
+        mesh.position.set(node.position[0], node.position[1], node.position[2]);
+        mesh.userData.node = node; group.add(mesh); st.nodes.push(mesh);
+      });
+      st.scene.add(group); st.group = group;
+      if (model.camera) { st.dist = model.camera.distance || st.dist; st.auto = model.camera.autoRotate !== false; if (model.camera.target) st.target.set(model.camera.target[0], model.camera.target[1], model.camera.target[2]); }
+
+      const clock = new T.Clock();
+      cancelAnimationFrame(st.raf);
+      const loop = () => {
+        st.raf = requestAnimationFrame(loop);
+        const t = clock.getElapsedTime();
+        const A = (window as any).AquinScene;
+        st.nodes.forEach((mesh: any) => { const node = mesh.userData.node; if (A && node) { const mo = A.motionAt(node, t); mesh.position.set(mo.position[0], mo.position[1], mo.position[2]); mesh.rotation.set(mo.rotation[0], mo.rotation[1], mo.rotation[2]); mesh.scale.setScalar(mo.scale || 1); } });
+        if (st.auto) st.theta += 0.0025;
+        st.camera.position.set(st.target.x + st.dist * Math.sin(st.phi) * Math.cos(st.theta), st.target.y + st.dist * Math.cos(st.phi), st.target.z + st.dist * Math.sin(st.phi) * Math.sin(st.theta));
+        st.camera.lookAt(st.target);
+        if (st.composer) st.composer.render(); else st.renderer.render(st.scene, st.camera);
+      };
+      loop();
+      return { renderer: 'webgl', nodes: st.nodes.length };
+    },
+    dispose(container: HTMLElement) { const st = (container as any).__aquinGL; if (st) { cancelAnimationFrame(st.raf); st.renderer.dispose(); container.innerHTML = ''; (container as any).__aquinGL = null; } },
+  };
+</script>
