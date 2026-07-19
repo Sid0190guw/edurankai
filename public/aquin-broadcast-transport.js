@@ -21,6 +21,18 @@
   }
   function sessionId(broadcastId) { return 'bcast-' + broadcastId; }   // rides the board fan-out channel
 
+  // ---- H3b: viewer interactions over the CHEAP pub/sub (chat/reaction/hand/poll) — never video ----
+  function buildChat(from, body) { return { kind: 'chat', from: String(from || 'Viewer').slice(0, 40), body: String(body || '').slice(0, 300) }; }
+  function buildReaction(r) { return { kind: 'reaction', reaction: String(r || 'clap').slice(0, 16) }; }
+  function buildHand(from) { return { kind: 'hand', from: String(from || 'Viewer').slice(0, 40) }; }
+  function buildVote(pollId, option) { return { kind: 'vote', pollId: String(pollId), option: Number(option) }; }
+  // classify an inbound fire that is a viewer interaction (vs an animation spec/slide)
+  function classifyViewerMsg(ev) {
+    if (!ev || ev.templateId !== 'bcast-msg' || !ev.params) return null;
+    var k = ev.params.kind;
+    return (k === 'chat' || k === 'reaction' || k === 'hand' || k === 'poll' || k === 'vote') ? k : null;
+  }
+
   // ---- Fanout adapter: implement the interface over the board fire API + SSE stream ----
   function createFanoutTransport(o) {
     o = o || {};
@@ -35,6 +47,13 @@
       },
       // publish a slide (structured text — not an image/video) over the same channel
       publishSlide: function (id, slide) { return fire(sessionId(id), { action: 'fire-slide', slide: buildSlide(slide) }); },
+      // H3b viewer interactions (cheap pub/sub) via the read-allowed 'say' endpoint
+      say: function (id, msg) { return fetch('/api/aquintutor/broadcast/say', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id, msg: msg }) }).then(function (r) { return r.json(); }); },
+      chat: function (id, from, body) { return this.say(id, buildChat(from, body)); },
+      react: function (id, r) { return this.say(id, buildReaction(r)); },
+      raiseHand: function (id, from) { return this.say(id, buildHand(from)); },
+      vote: function (id, pollId, option) { return this.say(id, buildVote(pollId, option)); },
+      publishPoll: function (id, poll) { return this.say(id, { kind: 'poll', pollId: String(poll.pollId), question: String(poll.question || '').slice(0, 200), options: (poll.options || []).slice(0, 6).map(function (o) { return String(o).slice(0, 80); }) }); },
       // a VIEWER subscribes by PULLING the SSE stream — it never opens a WebRTC publish connection
       viewerSubscribe: function (id, handlers) {
         if (typeof EventSource === 'undefined') return { close: function () {} };
@@ -43,7 +62,9 @@
         var es = new EventSource('/api/aquintutor/board/stream?session=' + encodeURIComponent(sessionId(id)) + (qp ? '&' + qp : ''));
         es.addEventListener('ready', function (e) { if (handlers.onReady) handlers.onReady(JSON.parse(e.data)); });
         es.addEventListener('fire', function (e) {
-          var ev = JSON.parse(e.data), kind = classifyFire(ev);
+          var ev = JSON.parse(e.data), vmsg = classifyViewerMsg(ev);
+          if (vmsg) { if (handlers.onViewerMsg) handlers.onViewerMsg(vmsg, ev.params); return; }
+          var kind = classifyFire(ev);
           if (kind === 'slide' && handlers.onSlide) handlers.onSlide(ev.params && ev.params.slide);
           else if (handlers.onSpec) handlers.onSpec(ev, kind);
         });
@@ -53,7 +74,7 @@
     };
   }
 
-  var mod = { buildSpecMsg: buildSpecMsg, buildSlide: buildSlide, classifyFire: classifyFire, sessionId: sessionId, createFanoutTransport: createFanoutTransport };
+  var mod = { buildSpecMsg: buildSpecMsg, buildSlide: buildSlide, classifyFire: classifyFire, sessionId: sessionId, createFanoutTransport: createFanoutTransport, buildChat: buildChat, buildReaction: buildReaction, buildHand: buildHand, buildVote: buildVote, classifyViewerMsg: classifyViewerMsg };
   if (typeof window !== 'undefined') window.AquinBroadcast = mod;
   if (typeof module !== 'undefined' && module.exports) module.exports = mod;
 })();

@@ -11,6 +11,14 @@ const BCAST_DDL = [
     low_bitrate boolean NOT NULL DEFAULT true, live boolean NOT NULL DEFAULT false,
     started_at timestamptz, stopped_at timestamptz, created_at timestamptz NOT NULL DEFAULT now()
   )`,
+  `CREATE TABLE IF NOT EXISTS edu_broadcast_votes (
+    broadcast_id text NOT NULL, poll_id text NOT NULL, user_id text NOT NULL, option int NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (broadcast_id, poll_id, user_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS edu_broadcast_hands (
+    broadcast_id text NOT NULL, user_id text NOT NULL, name text, raised_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (broadcast_id, user_id)
+  )`,
 ];
 let _ready = false;
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
@@ -62,4 +70,29 @@ export async function listLive(limit = 30): Promise<Broadcast[]> {
 export async function recentBroadcasts(limit = 20): Promise<any[]> {
   const { db, sql } = await ctx();
   return rows(await db.execute(sql`SELECT id, host, title, low_bitrate, live, started_at, stopped_at FROM edu_broadcasts ORDER BY created_at DESC LIMIT ${limit}`));
+}
+
+// ---- H3b: poll votes (one per viewer) + raised hands (host pulls into an interactive room) ----
+export async function recordVote(broadcastId: string, pollId: string, userId: string, option: number): Promise<void> {
+  const { db, sql } = await ctx();
+  await db.execute(sql`INSERT INTO edu_broadcast_votes (broadcast_id, poll_id, user_id, option) VALUES (${broadcastId}, ${pollId}, ${userId}, ${option})
+    ON CONFLICT (broadcast_id, poll_id, user_id) DO UPDATE SET option = ${option}, created_at = now()`);
+}
+export async function pollTally(broadcastId: string, pollId: string): Promise<Record<number, number>> {
+  const { db, sql } = await ctx();
+  const r = rows(await db.execute(sql`SELECT option, COUNT(*)::int AS c FROM edu_broadcast_votes WHERE broadcast_id = ${broadcastId} AND poll_id = ${pollId} GROUP BY option`));
+  const out: Record<number, number> = {}; for (const row of r) out[Number(row.option)] = Number(row.c); return out;
+}
+export async function raiseHand(broadcastId: string, userId: string, name: string): Promise<void> {
+  const { db, sql } = await ctx();
+  await db.execute(sql`INSERT INTO edu_broadcast_hands (broadcast_id, user_id, name) VALUES (${broadcastId}, ${userId}, ${name.slice(0, 60)})
+    ON CONFLICT (broadcast_id, user_id) DO UPDATE SET raised_at = now()`);
+}
+export async function listHands(broadcastId: string): Promise<{ userId: string; name: string }[]> {
+  const { db, sql } = await ctx();
+  return rows(await db.execute(sql`SELECT user_id, name FROM edu_broadcast_hands WHERE broadcast_id = ${broadcastId} ORDER BY raised_at DESC LIMIT 50`)).map((r: any) => ({ userId: String(r.user_id), name: String(r.name || 'Viewer') }));
+}
+export async function clearHand(broadcastId: string, userId: string): Promise<void> {
+  const { db, sql } = await ctx();
+  await db.execute(sql`DELETE FROM edu_broadcast_hands WHERE broadcast_id = ${broadcastId} AND user_id = ${userId}`);
 }
