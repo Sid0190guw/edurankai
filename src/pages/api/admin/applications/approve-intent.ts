@@ -8,7 +8,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { materialiseFromIntent } from '@/lib/fee-waiver';
+import { materialiseFromIntent, lastMaterialiseError } from '@/lib/fee-waiver';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -30,7 +30,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (!intent) return json({ ok: false, error: 'No such pending application (it may already be approved).' }, 404);
 
     const appId = await materialiseFromIntent(intentId, { paid: false, waiverGranted: true, waiverReason: reason });
-    if (!appId) return json({ ok: false, error: 'Could not create the application. Check /admin/hardening for the recorded error.' });
+    if (!appId) {
+      // Admins are trusted — show the REAL database reason so this is diagnosable
+      // in one click instead of vanishing (that is what kept applicants stuck).
+      const why = lastMaterialiseError();
+      return json({ ok: false, error: why ? ('Could not create the application: ' + why) : 'Could not create the application (no reason recorded). See /admin/hardening.' });
+    }
 
     // Audit who approved it (best effort — never block the approval).
     try {

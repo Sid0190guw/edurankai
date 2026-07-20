@@ -59,7 +59,13 @@ export async function getWaiverForIntent(intentId: string, userId: string) {
 
 // Materialise an application row from an intent — same shape used by
 // payment-effects on Razorpay capture. Returns the new application id.
+// The reason the last materialisation failed, so an admin surface can show WHY
+// instead of a generic "could not create" (this class of failure was invisible before).
+let _lastError: string | null = null;
+export function lastMaterialiseError(): string | null { return _lastError; }
+
 export async function materialiseFromIntent(intentId: string, opts: { paid: boolean; waiverGranted: boolean; waiverReason?: string }): Promise<string | null> {
+  _lastError = null;
   const intent = rows(await db.execute(sql`SELECT * FROM application_intents WHERE id = ${intentId} LIMIT 1`))[0] as any;
   if (!intent) return null;
   const d = (intent.data || {}) as any;
@@ -77,6 +83,30 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
   try { if (roleIdSafe) { const rr = rows(await db.execute(sql`SELECT 1 FROM roles WHERE id = ${roleIdSafe} LIMIT 1`)); if (!rr.length) roleIdSafe = null; } } catch (_) { roleIdSafe = null; }
   let userIdSafe: any = intent.user_id || null;
   try { if (userIdSafe) { const uu = rows(await db.execute(sql`SELECT 1 FROM users WHERE id = ${userIdSafe} LIMIT 1`)); if (!uu.length) userIdSafe = null; } } catch (_) { userIdSafe = null; }
+
+  // application_number is varchar(20) UNIQUE. A re-submitted applicant can carry a
+  // number another application already took (they re-walk the form and the number is
+  // regenerated from the same max), which made the INSERT blow up on the unique index.
+  // Truncate to 20 and mint a fresh unique one whenever it is missing or taken.
+  let appNumSafe: string | null = (d.applicationNumber ? String(d.applicationNumber).slice(0, 20) : null);
+  try {
+    let taken = false;
+    if (appNumSafe) taken = rows(await db.execute(sql`SELECT 1 FROM applications WHERE application_number = ${appNumSafe} LIMIT 1`)).length > 0;
+    if (!appNumSafe || taken) {
+      const yearPrefix = 'ERA' + new Date().getFullYear();
+      const maxRow = rows(await db.execute(sql`SELECT application_number AS n FROM applications WHERE application_number LIKE ${yearPrefix + '%'} ORDER BY application_number DESC LIMIT 1`))[0] as any;
+      let next = 1;
+      if (maxRow?.n) { const parsed = parseInt(String(maxRow.n).substring(yearPrefix.length), 10); if (Number.isFinite(parsed)) next = parsed + 1; }
+      let candidate = (yearPrefix + String(next).padStart(5, '0')).slice(0, 20);
+      // guarantee uniqueness even under a race / odd historical formats
+      for (let i = 0; i < 5; i++) {
+        const clash = rows(await db.execute(sql`SELECT 1 FROM applications WHERE application_number = ${candidate} LIMIT 1`)).length > 0;
+        if (!clash) break;
+        next += 1; candidate = (yearPrefix + String(next).padStart(5, '0')).slice(0, 20);
+      }
+      appNumSafe = candidate;
+    }
+  } catch (_) { appNumSafe = null; }   // nullable column — better null than a blown insert
   const dupeEmail = String(d.email || intent.email || '').trim().toLowerCase();
   if (roleIdSafe && (userIdSafe || dupeEmail)) {
     const dupe = rows(await db.execute(sql`
@@ -117,7 +147,7 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
         compensation, source, status, raw_submission, ip_address, user_agent,
         fee_paid, fee_paid_at, fee_waiver_granted, fee_waiver_reason
       ) VALUES (
-        ${d.applicationNumber || null}, ${roleIdSafe}, ${userIdSafe},
+        ${appNumSafe}, ${roleIdSafe}, ${userIdSafe},
         ${d.firstName || ''}, ${d.lastName || ''}, ${d.email || (intent.email || '')}, ${d.phone || ''},
         ${d.city || ''}, ${d.linkedin || null},
         ${d.portfolioUrl || ''}, ${d.photoUrl || null}, ${d.dob || null}, ${d.birthTime || null}, ${d.birthPlace || null},
@@ -147,10 +177,12 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
       }
     }
     return newId || null;
-  } catch (e) {
+  } catch (e: any) {
     // NEVER fail silently: a swallowed error here left applicants stuck at
-    // "awaiting fee" with no trace. Record it so it shows in /admin/hardening.
-    try { const { trackError } = await import('@/lib/logger'); await trackError('application.materialise_failed', e, { intentId, roleIdSafe, userIdSafe, email: dupeEmail }); } catch (_) {}
+    // "awaiting fee" with no trace. Record it so it shows in /admin/hardening,
+    // and keep the reason retrievable so the admin UI can show WHY it failed.
+    _lastError = String(e?.cause?.message || e?.message || e || 'unknown error').slice(0, 300);
+    try { const { trackError } = await import('@/lib/logger'); await trackError('application.materialise_failed', e, { intentId, roleIdSafe, userIdSafe, appNumSafe, email: dupeEmail }); } catch (_) {}
     return null;
   }
 }
