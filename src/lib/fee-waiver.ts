@@ -133,6 +133,21 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
     }
   }
 
+  const cut = (v: any, n: number) => (v == null ? null : String(v).slice(0, n));
+  // Shared post-insert work: drop the intent + write the 0-value waiver receipt.
+  const finalise = async (newId: string): Promise<string> => {
+    await db.execute(sql`DELETE FROM application_intents WHERE id = ${intent.id}`).catch(() => {});
+    if (opts.waiverGranted) {
+      const orderId = 'WAIVER-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      const notes = JSON.stringify({ waiver: true, waiverReason: opts.waiverReason || 'Application fee waived' });
+      await db.execute(sql`
+        INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
+        VALUES (${orderId}, 0, 'INR', 'paid', 'application_fee_waived', 'application', ${newId}, ${userIdSafe}, ${d.email || intent.email || null}, ${notes}::jsonb)
+      `).catch(() => {});
+    }
+    return newId;
+  };
+
   try {
     const ins = rows(await db.execute(sql`
       INSERT INTO applications (
@@ -178,11 +193,50 @@ export async function materialiseFromIntent(intentId: string, opts: { paid: bool
     }
     return newId || null;
   } catch (e: any) {
-    // NEVER fail silently: a swallowed error here left applicants stuck at
-    // "awaiting fee" with no trace. Record it so it shows in /admin/hardening,
-    // and keep the reason retrievable so the admin UI can show WHY it failed.
     _lastError = String(e?.cause?.message || e?.message || e || 'unknown error').slice(0, 300);
-    try { const { trackError } = await import('@/lib/logger'); await trackError('application.materialise_failed', e, { intentId, roleIdSafe, userIdSafe, appNumSafe, email: dupeEmail }); } catch (_) {}
+    // FALLBACK 1 (minimal): mirrors payment-effects. `level` is dropped on purpose —
+    // it is an enum, and a value outside role_level is the most common reason the rich
+    // insert fails. Every NOT-NULL column is supplied; raw_submission keeps everything.
+    try {
+      const insMin = rows(await db.execute(sql`
+        INSERT INTO applications (
+          application_number, role_id, applicant_user_id,
+          first_name, last_name, email, phone, city, portfolio_url,
+          department_snapshot, role_title_snapshot,
+          tech_skills, why_era, why_role, why_ai_edu, source, status, raw_submission,
+          fee_paid, fee_paid_at, fee_waiver_granted, fee_waiver_reason
+        ) VALUES (
+          ${appNumSafe}, ${roleIdSafe}, ${userIdSafe},
+          ${cut(d.firstName, 100) || ''}, ${cut(d.lastName, 100) || ''}, ${cut(d.email || intent.email, 255) || ''}, ${cut(d.phone, 50) || ''}, ${cut(d.city, 120) || ''}, ${cut(d.portfolioUrl, 500) || ''},
+          ${cut(d.departmentSnapshot, 120)}, ${cut(d.roleTitleSnapshot, 200) || ''},
+          ${JSON.stringify(d.techSkills || {})}::jsonb, ${d.whyERA || null}, ${d.whyRole || null}, ${d.whyAIEdu || null}, ${cut(d.source, 120)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb,
+          false, NOW(), ${opts.waiverGranted}, ${opts.waiverReason || null}
+        ) RETURNING id`));
+      const minId = insMin[0]?.id as string | undefined;
+      if (minId) { try { const { trackError } = await import('@/lib/logger'); await trackError('application.materialise_recovered_minimal', e, { intentId, appId: minId }); } catch (_) {} return await finalise(minId); }
+    } catch (e2: any) {
+      // FALLBACK 2 (bare): only columns that cannot be null; no enum, no FK, no dates.
+      // Practically cannot fail unless the schema itself is broken.
+      try {
+        const bareNum = 'ERA-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
+        const insBare = rows(await db.execute(sql`
+          INSERT INTO applications (
+            application_number, applicant_user_id,
+            first_name, last_name, email, phone, city, portfolio_url,
+            role_title_snapshot, status, raw_submission, fee_paid, fee_waiver_granted, fee_waiver_reason
+          ) VALUES (
+            ${bareNum}, ${userIdSafe},
+            ${(d.firstName || '').toString().slice(0, 100)}, ${(d.lastName || '').toString().slice(0, 100)}, ${(d.email || intent.email || '').toString().slice(0, 255)}, ${(d.phone || '').toString().slice(0, 50)}, ${(d.city || '').toString().slice(0, 120)}, ${(d.portfolioUrl || '').toString().slice(0, 500)},
+            ${(d.roleTitleSnapshot || 'Application').toString().slice(0, 200)}, 'submitted', ${JSON.stringify(d.rawSubmission || d)}::jsonb, false, ${opts.waiverGranted}, ${opts.waiverReason || null}
+          ) RETURNING id`));
+        const bareId = insBare[0]?.id as string | undefined;
+        if (bareId) { try { const { trackError } = await import('@/lib/logger'); await trackError('application.materialise_recovered_bare', e2, { intentId, appId: bareId }); } catch (_) {} return await finalise(bareId); }
+      } catch (e3: any) {
+        _lastError = String(e3?.cause?.message || e3?.message || e3 || 'unknown error').slice(0, 300);
+      }
+    }
+    // Every insert failed — keep the intent (never lose the applicant) + record why.
+    try { const { trackError } = await import('@/lib/logger'); await trackError('application.materialise_failed', e, { intentId, roleIdSafe, userIdSafe, appNumSafe, email: dupeEmail, reason: _lastError }); } catch (_) {}
     return null;
   }
 }
