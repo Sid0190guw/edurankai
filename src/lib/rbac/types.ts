@@ -1,4 +1,5 @@
 // src/lib/rbac/types.ts — permission model + lifecycle + evaluation I/O types.
+import { z } from 'zod';
 import type { Capability } from './capabilities';
 import type { Stage } from './roles';
 
@@ -66,6 +67,7 @@ export interface Principal {
   hasGuardian?: boolean;                  // a linked guardian exists (for minor accounts)
   trustLevel?: 'low' | 'normal' | 'high';
   grants?: PermissionGrant[];             // explicit grants targeting this user
+  capabilityTokens?: CapabilityToken[];   // already-validated bearer tokens presented this request (Block 10)
 }
 export interface ResourceRef {
   id?: string;
@@ -74,6 +76,7 @@ export interface ResourceRef {
   securityLabels?: SecurityLabel[];
   state?: string;                         // lifecycleState
   institutionId?: string | null;
+  flags?: string[];                       // hard-policy flags, e.g. 'kernel-locked' (Block 10 Tier 0)
 }
 export interface EvalContext {
   now?: Date;
@@ -85,8 +88,96 @@ export interface EvalContext {
 export interface Decision {
   allow: boolean;
   reason: string;
-  stage: string;                          // which pipeline stage produced the decision
+  stage: string;                          // which policy tier / pipeline stage produced the decision
   matchedGrant?: string | null;
   capability: Capability;
   resource: string;
 }
+
+// ==========================================================================
+// Block 10 — capability tokens (delegated, scoped, revocable authority).
+// ==========================================================================
+export interface CapabilityScope {
+  institutionId?: string | null;
+  namespace?: string | null;
+  node?: string | null;
+  missionId?: string | null;
+  timeWindow?: { startHour?: number; endHour?: number };
+}
+
+export const CAPABILITY_TOKEN_STATES = [
+  'issued', 'activated', 'delegated', 'suspended', 'revoked', 'archived', 'destroyed',
+] as const;
+export type CapabilityTokenState = (typeof CAPABILITY_TOKEN_STATES)[number];
+
+export const TOKEN_TRANSITIONS: Record<CapabilityTokenState, CapabilityTokenState[]> = {
+  issued:    ['activated', 'delegated', 'suspended', 'revoked'],
+  activated: ['delegated', 'suspended', 'revoked'],
+  delegated: ['suspended', 'revoked'],
+  suspended: ['activated', 'revoked'],
+  revoked:   ['archived'],
+  archived:  ['destroyed'],
+  destroyed: [],
+};
+/** A token participates in validation only while LIVE. */
+export const LIVE_TOKEN_STATES: CapabilityTokenState[] = ['issued', 'activated', 'delegated'];
+
+export interface CapabilityToken {
+  tokenId: string;
+  ownerIdentity: string;
+  issuedBy: string | null;
+  targetResource: string;                 // id | 'type:<T>' | '*'
+  allowedOperations: Capability[];        // subset of registered capabilities, or ['*']
+  scope: CapabilityScope;
+  delegatedFrom: string | null;
+  delegationDepth: number;                // remaining re-delegations
+  status: CapabilityTokenState;
+  version: number;
+  expiresAt: string | null;               // ISO
+}
+
+export interface TokenValidation {
+  valid: boolean;
+  reason: string;
+  token?: CapabilityToken;
+}
+
+// ---- zod schemas (API + delegation input validation) ----
+export const capabilityScopeSchema = z.object({
+  institutionId: z.string().nullish(),
+  namespace: z.string().nullish(),
+  node: z.string().nullish(),
+  missionId: z.string().nullish(),
+  timeWindow: z.object({
+    startHour: z.number().int().min(0).max(23).optional(),
+    endHour: z.number().int().min(1).max(24).optional(),
+  }).optional(),
+}).strict();
+
+export const issueTokenSchema = z.object({
+  ownerIdentity: z.string().uuid(),
+  targetResource: z.string().min(1),
+  allowedOperations: z.array(z.string().min(1)).min(1),
+  scope: capabilityScopeSchema.default({}),
+  maxDelegationDepth: z.number().int().min(0).max(8).default(0),
+  expiresAt: z.string().datetime().nullish(),
+  reason: z.string().max(500).optional(),
+});
+
+export const checkRequestSchema = z.object({
+  capability: z.string().min(1),
+  resource: z.object({
+    id: z.string().optional(),
+    type: z.string().optional(),
+    ownerId: z.string().nullish(),
+    securityLabels: z.array(z.string()).optional(),
+    state: z.string().optional(),
+    institutionId: z.string().nullish(),
+    flags: z.array(z.string()).optional(),
+  }).default({}),
+  context: z.object({
+    sensitive: z.boolean().optional(),
+    institutionId: z.string().nullish(),
+    location: z.string().optional(),
+  }).default({}),
+});

@@ -23,6 +23,7 @@ export type SynchronizationState = (typeof SYNC_STATES)[number];
 // ---- typed relationship edges between objects ----
 export const RELATIONSHIP_TYPES = [
   'prerequisite_of', 'part_of', 'assesses', 'references', 'translation_of', 'variant_of',
+  'related_to',   // Block 02: soft "see also" link — NOT part of the prerequisite DAG
 ] as const;
 export type RelationshipType = (typeof RELATIONSHIP_TYPES)[number];
 
@@ -98,6 +99,7 @@ export interface KnowledgeObjectData {
   conceptId?: string | null;           // -> a ConceptObject (also mirrored as a `part_of`/`references` edge)
   title: string;
   body?: string;                       // the teaching content
+  objectives?: string[];               // Block 02: learning objectives (inline)
   equations?: Equation[];              // inline
   examples?: WorkedExample[];          // inline
   industry?: string[];                 // inline real-world links
@@ -122,3 +124,72 @@ export interface ObjectDataMap {
 export function isObjectType(v: unknown): v is ObjectType {
   return typeof v === 'string' && (OBJECT_TYPES as readonly string[]).includes(v);
 }
+
+// ==========================================================================
+// Block 01 additions — capability actor, edge grammar, sync-state machine.
+// ==========================================================================
+
+/** The identity a capability check runs against (see access.ts). `roleTokens` bridge to
+ *  src/lib/rbac; the exact token format is pinned by that block (e.g. 'role:<slug>'). */
+export interface KernelActor {
+  id: string | null;               // a Student/Faculty/University object id (or user id)
+  roleTokens?: string[];           // e.g. ['role:faculty', 'role:admin', 'university:<uuid>']
+  enrolledObjectIds?: string[];    // objects this actor is enrolled in (for 'enrolled-only')
+}
+
+// Legal (fromType) -[relationship]-> (toType) triples. Anything not listed is rejected by
+// isEdgeLegal (enforced in repository.addRelationship). Mirrors the wiring that
+// buildKnowledgeObject() and the content/media adapters (kernel-content, vod, animation,
+// scene-spec, assessment) actually emit.
+export const EDGE_GRAMMAR: Record<RelationshipType, ReadonlyArray<readonly [ObjectType, ObjectType]>> = {
+  prerequisite_of: [
+    ['ConceptObject', 'KnowledgeObject'],
+    ['KnowledgeObject', 'KnowledgeObject'],
+    ['ConceptObject', 'ConceptObject'],
+    ['CourseObject', 'CourseObject'],
+  ],
+  part_of: [
+    ['KnowledgeObject', 'ConceptObject'],
+    ['ConceptObject', 'CourseObject'],
+    ['KnowledgeObject', 'CourseObject'],
+  ],
+  assesses: [
+    ['AssessmentObject', 'KnowledgeObject'],
+    ['AssessmentObject', 'ConceptObject'],
+    ['AssessmentObject', 'CourseObject'],
+  ],
+  references: [
+    ['KnowledgeObject', 'AnimationObject'],
+    ['KnowledgeObject', 'LaboratoryObject'],
+    ['KnowledgeObject', 'SimulationObject'],
+    ['KnowledgeObject', 'ResearchObject'],
+    ['CourseObject', 'AnimationObject'],     // vod.ts: a Course-linked recording (VOD) stored as AnimationObject
+  ],
+  translation_of: [
+    ['KnowledgeObject', 'KnowledgeObject'],
+    ['AssessmentObject', 'AssessmentObject'],
+  ],
+  variant_of: [
+    ['KnowledgeObject', 'KnowledgeObject'],
+    ['AnimationObject', 'AnimationObject'],
+  ],
+  related_to: [   // soft "see also"; excluded from the prerequisite DAG
+    ['ConceptObject', 'ConceptObject'],
+    ['KnowledgeObject', 'KnowledgeObject'],
+    ['KnowledgeObject', 'ConceptObject'],
+    ['ConceptObject', 'KnowledgeObject'],
+  ],
+} as const;
+
+export function isEdgeLegal(fromType: ObjectType, rel: RelationshipType, toType: ObjectType): boolean {
+  return EDGE_GRAMMAR[rel].some(([f, t]) => f === fromType && t === toType);
+}
+
+// Sync-state machine (distinct from the lifecycle machine in lifecycle.ts). A stale
+// optimistic write can flag a conflict from any live state (see repository.updateObject).
+export const SYNC_TRANSITIONS: Record<SynchronizationState, SynchronizationState[]> = {
+  synced:   ['dirty', 'conflict'],
+  dirty:    ['pending', 'synced', 'conflict'],
+  pending:  ['synced', 'conflict', 'dirty'],
+  conflict: ['dirty', 'synced'],
+};

@@ -69,6 +69,52 @@ export const rbacAudit = pgTable('rbac_audit', {
   at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({ userIdx: index('rbac_audit_user_idx').on(t.userId), atIdx: index('rbac_audit_at_idx').on(t.at) }));
 
+// Block 10 — delegated, scoped, revocable capability tokens (KCMS). The opaque bearer
+// secret is returned once at issue time; only its sha256 is stored (mirrors auth/session.ts).
+export const rbacCapabilityTokens = pgTable('rbac_capability_tokens', {
+  tokenId: uuid('token_id').primaryKey().defaultRandom(),
+  ownerIdentity: uuid('owner_identity').notNull(),
+  issuedBy: uuid('issued_by'),
+  targetResource: text('target_resource').notNull(),
+  allowedOperations: text('allowed_operations').array().notNull().default([]),
+  scope: jsonb('scope').notNull().default({}),
+  delegatedFrom: uuid('delegated_from'),
+  delegationDepth: integer('delegation_depth').notNull().default(0),
+  status: text('status').notNull().default('issued'),
+  version: integer('version').notNull().default(1),
+  secretHash: text('secret_hash').notNull(),
+  reason: text('reason'),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  ownerIdx: index('rbac_captok_owner_idx').on(t.ownerIdentity),
+  hashIdx: index('rbac_captok_hash_idx').on(t.secretHash),
+  parentIdx: index('rbac_captok_parent_idx').on(t.delegatedFrom),
+}));
+
+export const RBAC_TOKENS_DDL = [
+  `CREATE TABLE IF NOT EXISTS rbac_capability_tokens (
+     token_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     owner_identity UUID NOT NULL,
+     issued_by UUID,
+     target_resource TEXT NOT NULL,
+     allowed_operations TEXT[] NOT NULL DEFAULT '{}',
+     scope JSONB NOT NULL DEFAULT '{}'::jsonb,
+     delegated_from UUID,
+     delegation_depth INTEGER NOT NULL DEFAULT 0,
+     status TEXT NOT NULL DEFAULT 'issued',
+     version INTEGER NOT NULL DEFAULT 1,
+     secret_hash TEXT NOT NULL,
+     reason TEXT,
+     expires_at TIMESTAMPTZ,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+  `CREATE INDEX IF NOT EXISTS rbac_captok_owner_idx  ON rbac_capability_tokens (owner_identity)`,
+  `CREATE INDEX IF NOT EXISTS rbac_captok_hash_idx   ON rbac_capability_tokens (secret_hash)`,
+  `CREATE INDEX IF NOT EXISTS rbac_captok_parent_idx ON rbac_capability_tokens (delegated_from)`,
+];
+
 export const RBAC_DDL = [
   `CREATE TABLE IF NOT EXISTS rbac_capabilities (key TEXT PRIMARY KEY, description TEXT)`,
   `CREATE TABLE IF NOT EXISTS rbac_roles (key TEXT PRIMARY KEY, surface TEXT NOT NULL, description TEXT, color TEXT NOT NULL DEFAULT 'orange', is_system BOOLEAN NOT NULL DEFAULT true, inherits TEXT[] NOT NULL DEFAULT '{}')`,

@@ -6,7 +6,7 @@
 //    the production store.
 // The repository (repository.ts) is written against the interface, so the exact same
 // lifecycle/composition logic is proven in memory and runs on Postgres unchanged.
-import type { KernelObject, ObjectType, RelationshipEdge } from './types';
+import type { KernelObject, ObjectType, RelationshipEdge, RelationshipType } from './types';
 
 export interface KernelStore {
   insertObject(obj: KernelObject): Promise<void>;
@@ -16,6 +16,11 @@ export interface KernelStore {
   insertEdge(edge: RelationshipEdge): Promise<void>;
   edgesFrom(id: string): Promise<RelationshipEdge[]>;
   edgesTo(id: string): Promise<RelationshipEdge[]>;
+  // Block 01 — read all edges of a type (cycle guard) + version snapshots (rollback/merge).
+  edgesOfType(type: RelationshipType): Promise<RelationshipEdge[]>;
+  insertVersion(snapshot: KernelObject): Promise<void>;           // idempotent per (objectId, version)
+  getVersion(objectId: string, version: number): Promise<KernelObject | null>;
+  listVersions(objectId: string): Promise<Array<{ version: number; createdAt: string }>>;
 }
 
 function clone<T>(v: T): T {
@@ -26,6 +31,7 @@ function clone<T>(v: T): T {
 export class InMemoryKernelStore implements KernelStore {
   private objects = new Map<string, KernelObject>();
   private edges: RelationshipEdge[] = [];
+  private versions: Array<{ objectId: string; version: number; snapshot: KernelObject; createdAt: string }> = [];
 
   async insertObject(obj: KernelObject): Promise<void> {
     if (this.objects.has(obj.id)) throw new Error(`object ${obj.id} already exists`);
@@ -45,6 +51,18 @@ export class InMemoryKernelStore implements KernelStore {
   async insertEdge(edge: RelationshipEdge): Promise<void> { this.edges.push(clone(edge)); }
   async edgesFrom(id: string): Promise<RelationshipEdge[]> { return this.edges.filter((e) => e.fromId === id).map(clone); }
   async edgesTo(id: string): Promise<RelationshipEdge[]> { return this.edges.filter((e) => e.toId === id).map(clone); }
+  async edgesOfType(type: RelationshipType): Promise<RelationshipEdge[]> { return this.edges.filter((e) => e.type === type).map(clone); }
+  async insertVersion(snapshot: KernelObject): Promise<void> {
+    if (this.versions.some((v) => v.objectId === snapshot.id && v.version === snapshot.version)) return;   // idempotent
+    this.versions.push({ objectId: snapshot.id, version: snapshot.version, snapshot: clone(snapshot), createdAt: new Date().toISOString() });
+  }
+  async getVersion(objectId: string, version: number): Promise<KernelObject | null> {
+    const v = this.versions.find((x) => x.objectId === objectId && x.version === version);
+    return v ? clone(v.snapshot) : null;
+  }
+  async listVersions(objectId: string): Promise<Array<{ version: number; createdAt: string }>> {
+    return this.versions.filter((v) => v.objectId === objectId).sort((a, b) => a.version - b.version).map((v) => ({ version: v.version, createdAt: v.createdAt }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,5 +140,25 @@ export class PgKernelStore implements KernelStore {
   async edgesTo(id: string): Promise<RelationshipEdge[]> {
     const { db, sql } = await this.ctx();
     return rows(await db.execute(sql`SELECT * FROM kernel_edges WHERE to_id = ${id}`)).map(rowToEdge);
+  }
+  async edgesOfType(type: RelationshipType): Promise<RelationshipEdge[]> {
+    const { db, sql } = await this.ctx();
+    return rows(await db.execute(sql`SELECT * FROM kernel_edges WHERE type = ${type}`)).map(rowToEdge);
+  }
+  async insertVersion(snapshot: KernelObject): Promise<void> {
+    const { db, sql } = await this.ctx();
+    await db.execute(sql`INSERT INTO kernel_object_versions (object_id, version, snapshot)
+      VALUES (${snapshot.id}, ${snapshot.version}, ${JSON.stringify(snapshot)}::jsonb)
+      ON CONFLICT (object_id, version) DO NOTHING`);
+  }
+  async getVersion(objectId: string, version: number): Promise<KernelObject | null> {
+    const { db, sql } = await this.ctx();
+    const r = rows(await db.execute(sql`SELECT snapshot FROM kernel_object_versions WHERE object_id = ${objectId} AND version = ${version} LIMIT 1`))[0];
+    return r ? (r.snapshot as KernelObject) : null;
+  }
+  async listVersions(objectId: string): Promise<Array<{ version: number; createdAt: string }>> {
+    const { db, sql } = await this.ctx();
+    return rows(await db.execute(sql`SELECT version, created_at FROM kernel_object_versions WHERE object_id = ${objectId} ORDER BY version ASC`))
+      .map((r: any) => ({ version: Number(r.version), createdAt: new Date(r.created_at).toISOString() }));
   }
 }

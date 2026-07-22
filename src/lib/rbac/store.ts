@@ -4,8 +4,8 @@
 // touches login, sessions, users, team_roles, or user_role_assignments.
 import { CORE_CAPABILITIES, type Capability } from './capabilities';
 import { SEED_ROLES, resolveRoleCapabilities, type SeedRole } from './roles';
-import { RBAC_DDL } from './schema';
-import { assertPermissionTransition, type PermissionGrant, type PermissionState, type Principal } from './types';
+import { RBAC_DDL, RBAC_TOKENS_DDL } from './schema';
+import { assertPermissionTransition, type CapabilityToken, type PermissionGrant, type PermissionState, type Principal } from './types';
 import type { AuditEntry } from './guard';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
@@ -26,7 +26,7 @@ async function ctx() {
 export async function ensureRbacSchema(): Promise<void> {
   if (bootstrapped) return;
   const { db, sql } = await ctx();
-  for (const ddl of RBAC_DDL) await db.execute(sql.raw(ddl));
+  for (const ddl of [...RBAC_DDL, ...RBAC_TOKENS_DDL]) await db.execute(sql.raw(ddl));
   bootstrapped = true;
 }
 
@@ -63,8 +63,10 @@ async function loadRoleGraph(): Promise<SeedRole[]> {
   } catch { return SEED_ROLES; }
 }
 
-/** Resolve a full Principal from the existing auth user object (locals.user) or null. */
-export async function resolvePrincipal(user: any): Promise<Principal> {
+/** Resolve a full Principal from the existing auth user object (locals.user) or null.
+ *  `presentedTokens` (e.g. from an `x-capability-token` header) are validated and the live
+ *  ones attached to `Principal.capabilityTokens` for engine Tier 4. */
+export async function resolvePrincipal(user: any, presentedTokens: string[] = []): Promise<Principal> {
   const graph = await loadRoleGraph();
   const capsFor = (keys: string[]) => {
     const s = new Set<Capability>();
@@ -104,7 +106,21 @@ export async function resolvePrincipal(user: any): Promise<Principal> {
   if (!roleKeys.length) roleKeys = ['applicant'];   // signed-in but unassigned -> minimal role
   roleKeys = [...new Set(roleKeys)];
 
-  return { userId, sessionValid: true, roles: roleKeys, capabilities: capsFor(roleKeys), stage: stage as any, hasGuardian, grants };
+  // Attach any presented bearer capability tokens that validate as live (engine Tier 4).
+  let capabilityTokens: CapabilityToken[] | undefined;
+  if (presentedTokens.length) {
+    try {
+      const { resolveToken } = await import('./tokens');
+      const live: CapabilityToken[] = [];
+      for (const raw of presentedTokens) {
+        const t = await resolveToken(raw);   // liveness/expiry only; engine matches op/resource/scope
+        if (t) live.push(t);
+      }
+      if (live.length) capabilityTokens = live;
+    } catch { /* token store unreachable -> no tokens attached */ }
+  }
+
+  return { userId, sessionValid: true, roles: roleKeys, capabilities: capsFor(roleKeys), stage: stage as any, hasGuardian, grants, capabilityTokens };
 }
 
 export async function writeAudit(e: AuditEntry): Promise<void> {

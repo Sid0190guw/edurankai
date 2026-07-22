@@ -4,6 +4,7 @@
 // push local dirty up + pull server changes down, and set synchronizationState=conflict when BOTH
 // sides changed (never a silent overwrite). Reconciles the objects Prompt 6 enqueues on reconnect.
 import type { RelationshipType } from '@/lib/kernel';
+import type { ProgressEntry } from '@/lib/offline/manifest-schema';
 
 // Content-dependency relationship types along which a change PROPAGATES. `part_of` is structural
 // grouping (siblings in a course) and is intentionally EXCLUDED so unrelated units aren't synced.
@@ -41,14 +42,42 @@ export function reconcile(local: LocalMeta, server: ServerMeta): { action: SyncA
   return { action: 'conflict' };                                        // BOTH sides changed
 }
 
-export type ConflictPolicy = 'server-wins' | 'local-wins' | 'higher-version';
-/** Deterministic conflict resolution. Returns the winner + the new (bumped) version. */
-export function resolveConflictDecision(local: LocalMeta, server: ServerMeta, policy: ConflictPolicy = 'server-wins'): { winner: 'server' | 'local'; newVersion: number } {
+export type ConflictPolicy = 'server-wins' | 'local-wins' | 'higher-version' | 'last-writer-wins';
+export const CONFLICT_POLICIES: ConflictPolicy[] = ['server-wins', 'local-wins', 'higher-version', 'last-writer-wins'];
+
+/** Deterministic conflict resolution. Returns the winner + the new (bumped) version.
+ *  `last-writer-wins` compares `updatedAt` (ISO); if either side lacks a clock it falls back
+ *  to higher-version so the decision stays deterministic. */
+export function resolveConflictDecision(
+  local: LocalMeta & { updatedAt?: string },
+  server: ServerMeta & { updatedAt?: string },
+  policy: ConflictPolicy = 'server-wins',
+): { winner: 'server' | 'local'; newVersion: number } {
   let winner: 'server' | 'local';
   if (policy === 'local-wins') winner = 'local';
   else if (policy === 'higher-version') winner = local.version >= server.version ? 'local' : 'server';
-  else winner = 'server';
+  else if (policy === 'last-writer-wins') {
+    if (local.updatedAt && server.updatedAt) winner = Date.parse(local.updatedAt) >= Date.parse(server.updatedAt) ? 'local' : 'server';
+    else winner = local.version >= server.version ? 'local' : 'server';   // no clock -> higher-version fallback
+  } else winner = 'server';
   return { winner, newVersion: Math.max(local.version, server.version) + 1 };
+}
+
+/** Monotonic merge of two progress snapshots — progress never regresses, so there is no loser.
+ *  timeSpentSec uses max (not sum) to stay idempotent under offline replay (see spec §5.6). */
+export function mergeProgress(a: ProgressEntry, b: ProgressEntry): ProgressEntry {
+  const maxISO = (x: string, y: string) => (Date.parse(x || '') >= Date.parse(y || '') ? x : y);
+  const score = (() => {
+    const scores = [a.score, b.score].filter((s): s is number => typeof s === 'number');
+    return scores.length ? Math.max(...scores) : undefined;
+  })();
+  return {
+    koId: a.koId,
+    completed: !!a.completed || !!b.completed,
+    ...(score !== undefined ? { score } : {}),
+    timeSpentSec: Math.max(a.timeSpentSec ?? 0, b.timeSpentSec ?? 0),
+    updatedAt: maxISO(a.updatedAt, b.updatedAt),
+  };
 }
 
 // ============================ DB layer (self-bootstrapping, additive) ============================

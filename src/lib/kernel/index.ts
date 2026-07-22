@@ -6,12 +6,17 @@
 //
 // Later prompts (adapters onto training_*/users, AI tutoring, rendering, offline sync)
 // build on this surface without changing it.
-export * from './types';
+export * from './types';   // incl. KernelActor, EDGE_GRAMMAR, isEdgeLegal, SYNC_TRANSITIONS
 export { TRANSITIONS, canTransition, assertTransition, LifecycleError, OPERATION_TARGET } from './lifecycle';
-export { DATA_SCHEMAS, validateObjectData, ValidationError } from './validation';
+export {
+  DATA_SCHEMAS, validateObjectData, ValidationError,
+  PERMISSION_SCHEMA, LEARNING_METADATA_SCHEMA, ENVELOPE_SCHEMA, validateEnvelope, EdgeGrammarError,
+} from './validation';
+export { topoOrder, wouldCycle, CycleError, type DagResult } from './graph';
+export { can, readable } from './access';
 export { type KernelStore, InMemoryKernelStore, PgKernelStore } from './store';
-export { KernelRepository, type CreateInput, type UpdatePatch, type ObjectGraph } from './repository';
-export { kernelObjects, kernelEdges, KERNEL_DDL } from './schema';
+export { KernelRepository, StaleWriteError, type CreateInput, type UpdatePatch, type ObjectGraph } from './repository';
+export { kernelObjects, kernelEdges, kernelObjectVersions, KERNEL_DDL } from './schema';
 
 // Convenience factory: default to the in-memory store; pass PgKernelStore for production.
 import { KernelRepository } from './repository';

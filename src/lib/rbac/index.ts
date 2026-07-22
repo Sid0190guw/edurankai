@@ -16,3 +16,11 @@ export {
 } from './store';
 export { accessSummary, CAPABILITY_LABELS, type AccessSummary } from './access';
 export * from './schema';
+
+// Block 10 — capability tokens, per-object ACL enforcement, policy ladder.
+export {
+  generateTokenSecret, hashTokenSecret, issueToken, validateToken, resolveToken,
+  delegateToken, revokeToken, listTokens, tokenCovers, resourceMatches, scopeMatches,
+} from './tokens';
+export { aclToGrants, resolveInheritedGrants, canObject, type ObjectAclEntry } from './objectAcl';
+export { POLICY_TIERS, KERNEL_LOCK_FLAG, MAX_INHERITANCE_DEPTH, type PolicyTier } from './policy';

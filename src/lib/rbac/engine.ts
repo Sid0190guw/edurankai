@@ -12,6 +12,8 @@ import {
   type Principal, type ResourceRef, type EvalContext, type Decision,
   type PermissionGrant, LIVE_PERMISSION_STATES,
 } from './types';
+import { KERNEL_LOCK_FLAG } from './policy';
+import { tokenCovers } from './tokens';
 
 function deny(stage: string, reason: string, cap: Capability, res: string, matched?: string | null): Decision {
   return { allow: false, reason, stage, capability: cap, resource: res, matchedGrant: matched ?? null };
@@ -58,46 +60,53 @@ function labelAdmits(label: string, p: Principal): boolean {
 export function evaluate(p: Principal, capability: Capability, resource: ResourceRef = {}, ctx: EvalContext = {}): Decision {
   const resTok = resource.id || (resource.type ? `type:${resource.type}` : '*');
 
-  // 1. Resolve Identity
-  if (!p || p.userId === undefined) return deny('resolve-identity', 'no identity', capability, resTok);
-  // 2. Verify Session
-  if (p.userId !== null && !p.sessionValid) return deny('verify-session', 'session invalid or expired', capability, resTok);
-  // 3. Verify Authorization (must hold at least one role; anonymous is treated as guest)
-  const roles = p.roles.length ? p.roles : ['guest'];
-  // 4. Validate Capability
-  if (!isCapability(capability)) return deny('validate-capability', `unknown capability "${capability}"`, capability, resTok);
+  // ---- TIER 0: kernel policy (hard invariants) ----
+  if (!p || p.userId === undefined) return deny('kernel-policy', 'no identity', capability, resTok);
+  if (p.userId !== null && !p.sessionValid) return deny('kernel-policy', 'session invalid or expired', capability, resTok);
+  if (!isCapability(capability)) return deny('kernel-policy', `unknown capability "${capability}"`, capability, resTok);
+  if (resource.flags?.includes(KERNEL_LOCK_FLAG)) return deny('kernel-policy', 'resource is kernel-locked', capability, resTok);
+  const roles = p.roles.length ? p.roles : ['guest'];   // anonymous is treated as guest
 
-  // 5. Load Permission Context: explicit grants applicable here, split by effect, sorted by priority.
+  // Load applicable grants (central + object-ACL + inherited), split by effect, sorted by priority.
   const applicable = (p.grants ?? []).filter((g) => grantApplies(g, p, capability, resource, ctx))
     .sort((a, b) => b.priority - a.priority);
   const denies = applicable.filter((g) => g.effect === 'deny');
   const allows = applicable.filter((g) => g.effect === 'allow');
 
-  // Explicit DENY overrides everything (spec: explicit deny overrides allow).
-  if (denies.length) return deny('apply-constraints', 'explicit deny grant', capability, resTok, denies[0].permissionId);
+  // ---- TIER 1: explicit deny (overrides everything, incl. administer) ----
+  if (denies.length) return deny('explicit-deny', 'explicit deny grant', capability, resTok, denies[0].permissionId);
 
-  // 6. Evaluate Rules
+  // ---- TIER 2: administrative override ----
   const superadmin = p.capabilities.has(ADMINISTER);
-  const hasCapByRole = superadmin || p.capabilities.has(capability);
-  const hasCapByGrant = allows.length > 0;
-  if (!hasCapByRole && !hasCapByGrant) return deny('evaluate-rules', `no role capability or grant for "${capability}"`, capability, resTok);
+  if (superadmin) return allow('administrative-override', 'administer', capability, resTok, null);
 
-  // Security-label gating (skip for superadmin).
-  if (!superadmin && resource.securityLabels?.length) {
+  // Which tier authorizes this allow (if any).
+  const grantAllows = allows.filter((g) => !(g.flags ?? []).includes('inherited'));
+  const inheritedAllows = allows.filter((g) => (g.flags ?? []).includes('inherited'));
+  const hasGrant = grantAllows.length > 0;                                                   // TIER 3
+  const hasToken = (p.capabilityTokens ?? []).some((t) => tokenCovers(t, capability, resource, ctx)); // TIER 4
+  const hasInherited = inheritedAllows.length > 0;                                            // TIER 5
+  const hasRole = roles.length > 0 && p.capabilities.has(capability);                         // TIER 6
+
+  if (!(hasGrant || hasToken || hasInherited || hasRole)) {
+    return deny('default-deny', `no grant, token, inherited permission, or role capability for "${capability}"`, capability, resTok);
+  }
+
+  // ---- constraints apply to every non-admin allow path ----
+  if (resource.securityLabels?.length) {
     const admitted = resource.securityLabels.every((l) => labelAdmits(l, p));
-    if (!admitted) return deny('evaluate-rules', `security label(s) ${resource.securityLabels.join(',')} not admitted`, capability, resTok);
+    if (!admitted) return deny('apply-constraints', `security label(s) ${resource.securityLabels.join(',')} not admitted`, capability, resTok);
   }
-
-  // Ownership rule for mutating capabilities (write/delete): non-owners need manage/administer.
-  if (!superadmin && (capability === 'write' || capability === 'delete') && resource.ownerId != null && resource.ownerId !== p.userId) {
-    if (!p.capabilities.has('manage')) return deny('evaluate-rules', 'not owner and lacks manage', capability, resTok);
+  if ((capability === 'write' || capability === 'delete') && resource.ownerId != null && resource.ownerId !== p.userId) {
+    if (!p.capabilities.has('manage')) return deny('apply-constraints', 'not owner and lacks manage', capability, resTok);
   }
-
-  // 7. Apply Constraints: minor accounts need a guardian for sensitive actions.
   if (isMinorStage(p.stage) && ctx.sensitive && !p.hasGuardian) {
     return deny('apply-constraints', 'minor account without a linked guardian is blocked from a sensitive action', capability, resTok);
   }
 
-  // 8. Return Decision
-  return allow('return-decision', hasCapByGrant && !hasCapByRole ? 'explicit allow grant' : (superadmin ? 'administer' : 'role capability'), capability, resTok, allows[0]?.permissionId ?? null);
+  // ---- decision: the highest matched tier wins ----
+  if (hasGrant)     return allow('explicit-grant', 'explicit allow grant', capability, resTok, grantAllows[0].permissionId);
+  if (hasToken)     return allow('capability-token', 'capability token', capability, resTok, null);
+  if (hasInherited) return allow('inherited', 'inherited grant', capability, resTok, inheritedAllows[0].permissionId);
+  return allow('role-default', 'role capability', capability, resTok, null);
 }
