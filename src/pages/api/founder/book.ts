@@ -15,8 +15,10 @@ export const POST: APIRoute = async ({ request }) => {
   const durationMin = [15, 30, 45, 60].includes(Number(b.durationMin)) ? Number(b.durationMin) : 30;
   let preferred: string | null = null;
   if (b.preferred) { const d = new Date(b.preferred); if (!isNaN(d.getTime())) preferred = d.toISOString(); }
+  const rawDocs = (b.docsUrl || '').toString().trim().slice(0, 500);
+  const docsUrl = /^https?:\/\/\S+\.\S+/.test(rawDocs) ? rawDocs : null;
   try {
-    await addBooking({ name, email, phone: (b.phone || '').toString().slice(0, 40), preferred, durationMin, note: (b.note || '').toString().slice(0, 1000) });
+    await addBooking({ name, email, phone: (b.phone || '').toString().slice(0, 40), preferred, durationMin, note: (b.note || '').toString().slice(0, 1000), docsUrl });
     return json({ ok: true });
   } catch (e: any) { return json({ ok: false, error: e?.cause?.message || e?.message || 'failed' }, 500); }
 };

@@ -51,6 +51,7 @@ export function ensureFounderSchema(): Promise<void> {
       await db.execute(sql`ALTER TABLE founder_bookings ADD COLUMN IF NOT EXISTS paid BOOLEAN NOT NULL DEFAULT false`);
       await db.execute(sql`ALTER TABLE founder_bookings ADD COLUMN IF NOT EXISTS amount_paise INT`);
       await db.execute(sql`ALTER TABLE founder_bookings ADD COLUMN IF NOT EXISTS currency TEXT`);
+      await db.execute(sql`ALTER TABLE founder_bookings ADD COLUMN IF NOT EXISTS docs_url TEXT`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS founder_bookings_created_idx ON founder_bookings(created_at DESC)`);
     } catch (_) { ready = null; }
   })();
@@ -196,14 +197,14 @@ export async function isSlotAvailable(iso: string): Promise<boolean> {
 // the payment can be linked to it and finalised on verify.
 export async function createServicePending(o: {
   kind: 'text' | 'consult'; name: string; email: string; phone?: string;
-  preferred?: string | null; durationMin?: number; note?: string;
+  preferred?: string | null; durationMin?: number; note?: string; docsUrl?: string | null;
   orderId?: string | null; amountPaise?: number; currency?: string; paid?: boolean;
 }): Promise<string> {
   await ensureFounderSchema();
   const r = rows(await db.execute(sql`
-    INSERT INTO founder_bookings (kind, name, email, phone, preferred, duration_min, note, order_id, amount_paise, currency, paid)
+    INSERT INTO founder_bookings (kind, name, email, phone, preferred, duration_min, note, docs_url, order_id, amount_paise, currency, paid)
     VALUES (${o.kind}, ${o.name}, ${o.email}, ${o.phone || null}, ${o.preferred || null}, ${o.durationMin || 30},
-            ${o.note || null}, ${o.orderId || null}, ${o.amountPaise || null}, ${o.currency || null}, ${!!o.paid})
+            ${o.note || null}, ${o.docsUrl || null}, ${o.orderId || null}, ${o.amountPaise || null}, ${o.currency || null}, ${!!o.paid})
     RETURNING id`));
   return r[0]?.id;
 }
@@ -239,10 +240,10 @@ export function directConnectHref(number: string, message: string): string {
   return 'https://wa.me/' + digits + (message ? '?text=' + encodeURIComponent(message) : '');
 }
 
-export async function addBooking(b: { name: string; email: string; phone?: string; preferred?: string | null; durationMin?: number; note?: string }): Promise<void> {
+export async function addBooking(b: { name: string; email: string; phone?: string; preferred?: string | null; durationMin?: number; note?: string; docsUrl?: string | null }): Promise<void> {
   await ensureFounderSchema();
-  await db.execute(sql`INSERT INTO founder_bookings (name, email, phone, preferred, duration_min, note)
-    VALUES (${b.name}, ${b.email}, ${b.phone || null}, ${b.preferred || null}, ${b.durationMin || 30}, ${b.note || null})`);
+  await db.execute(sql`INSERT INTO founder_bookings (name, email, phone, preferred, duration_min, note, docs_url)
+    VALUES (${b.name}, ${b.email}, ${b.phone || null}, ${b.preferred || null}, ${b.durationMin || 30}, ${b.note || null}, ${b.docsUrl || null})`);
 }
 
 export async function listBookings(limit = 200): Promise<any[]> {

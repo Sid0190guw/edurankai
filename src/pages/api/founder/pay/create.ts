@@ -25,6 +25,9 @@ export const POST: APIRoute = async ({ request }) => {
   if (b.preferred) { const d = new Date(b.preferred); if (!isNaN(d.getTime())) preferred = d.toISOString(); }
   const phone = (b.phone || '').toString().slice(0, 40);
   const note = (b.note || '').toString().slice(0, 1000);
+  // Optional supporting-docs link (Google Drive etc). Only accept a real http(s) URL.
+  const rawDocs = (b.docsUrl || '').toString().trim().slice(0, 500);
+  const docsUrl = /^https?:\/\/\S+\.\S+/.test(rawDocs) ? rawDocs : null;
 
   const f = await getFounder();
   const priceChf = kind === 'text' ? f.textPriceChf : f.consultPriceChf;
@@ -38,7 +41,7 @@ export const POST: APIRoute = async ({ request }) => {
 
   // Free path
   if (!gated || priceChf <= 0 || !isConfigured()) {
-    const id = await createServicePending({ kind, name, email, phone, preferred, durationMin, note, amountPaise: 0, currency: f.currency, paid: !isConfigured() ? false : true });
+    const id = await createServicePending({ kind, name, email, phone, preferred, durationMin, note, docsUrl, amountPaise: 0, currency: f.currency, paid: !isConfigured() ? false : true });
     if (kind === 'text') return json({ ok: true, free: true, revealHref: directConnectHref(f.connectNumber, f.connectMessage) });
     return json({ ok: true, free: true, confirmed: true, bookingId: id });
   }
@@ -48,7 +51,7 @@ export const POST: APIRoute = async ({ request }) => {
     const fx = await convertToInrPaise(f.currency, Math.round(priceChf * 100));
     const order = await createOrder({ amountPaise: fx.paise, currency: 'INR', receipt: ('fdr_' + kind + '_' + Date.now()).slice(0, 40), notes: { kind, email, service: 'founder' } });
     if (!order.ok) return json({ ok: false, error: order.error }, 502);
-    const bookingId = await createServicePending({ kind, name, email, phone, preferred, durationMin, note, orderId: order.order.id, amountPaise: fx.paise, currency: 'INR', paid: false });
+    const bookingId = await createServicePending({ kind, name, email, phone, preferred, durationMin, note, docsUrl, orderId: order.order.id, amountPaise: fx.paise, currency: 'INR', paid: false });
     await db.execute(sql`
       INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, email, notes)
       VALUES (${order.order.id}, ${fx.paise}, 'INR', 'created', ${'founder_' + kind}, 'founder', ${bookingId}, ${email},
