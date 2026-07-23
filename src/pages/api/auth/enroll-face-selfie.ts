@@ -47,6 +47,13 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
     const selfie = typeof body?.selfie === 'string' ? body.selfie : '';
     if (/^data:image\/(jpeg|png);base64,/.test(selfie) && selfie.length < 900_000) {
       try {
+        // ORDERING: face-2FA enrolment is forced by middleware on the FIRST protected page load,
+        // which for a new hire happens BEFORE their hr_employees row exists. So always retain the
+        // enrolment selfie against the enrolment itself; it is promoted to a profile photo either
+        // now (already an employee) or at employee-record creation (see promoteEnrolmentPhoto).
+        await db.execute(sql`ALTER TABLE user_face_enrollments ADD COLUMN IF NOT EXISTS selfie_url TEXT`).catch(() => {});
+        await db.execute(sql`UPDATE user_face_enrollments SET selfie_url = ${selfie} WHERE user_id = ${user.id}`).catch(() => {});
+
         const emp = await db.execute(sql`SELECT id FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
         const isEmployee = (Array.isArray(emp) ? emp : (emp as any)?.rows || []).length > 0;
         if (isEmployee) {

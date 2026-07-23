@@ -117,6 +117,23 @@ export async function pendingForReview(limit = 100): Promise<any[]> {
     LEFT JOIN users u ON u.id::text = d.user_id
     ORDER BY (d.status = 'submitted') DESC, d.id DESC LIMIT ${limit}`));
 }
+/** Promote a retained face-2FA enrolment selfie to the employee's profile photo.
+ *  Called when the employee record is created, because enrolment happens BEFORE that row exists
+ *  (middleware forces face-2FA on the first protected page load). Safe to call repeatedly. */
+export async function promoteEnrolmentPhoto(userId: string): Promise<boolean> {
+  const { db, sql } = await ctx();
+  try {
+    await db.execute(sql`ALTER TABLE user_face_enrollments ADD COLUMN IF NOT EXISTS selfie_url TEXT`).catch(() => {});
+    await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
+    const r = rows(await db.execute(sql`SELECT selfie_url FROM user_face_enrollments WHERE user_id = ${userId} AND selfie_url IS NOT NULL LIMIT 1`));
+    const photo = r[0]?.selfie_url;
+    if (!photo) return false;
+    await db.execute(sql`UPDATE users SET photo_url = COALESCE(photo_url, ${photo}) WHERE id = ${userId}::uuid`).catch(() => {});
+    await db.execute(sql`UPDATE hr_employees SET photo_url = COALESCE(photo_url, ${photo}) WHERE user_id = ${userId}`).catch(() => {});
+    return true;
+  } catch { return false; }
+}
+
 /** Progress for a hire: how far through the credential step they are. */
 export function progress(docs: OnboardingDoc[]): { submitted: number; verified: number; rejected: number; complete: boolean } {
   const verified = docs.filter((d) => d.status === 'verified').length;

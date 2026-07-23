@@ -25,8 +25,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
       return json({ ok: true, docs: await listDocs(uid) });
     }
     if (b.action === 'review') {
-      // HR only — an applicant/hire can never review their own credentials.
-      if (!user.role || user.role === 'applicant') return json({ ok: false, error: 'Not allowed.' }, 403);
+      // HR ONLY. Must be the same 'employees' section permission that gates /admin/hr — a bare
+      // `role !== 'applicant'` check was a privilege escalation: roles the middleware bans from
+      // /admin entirely (partner, teacher, technical_moderator) could still verify or reject any
+      // hire's credential by POSTing here, and ids are sequential so enumeration was trivial.
+      const { userCanAccess } = await import('@/lib/auth/permissions');
+      const allowed = await userCanAccess(String(user.id), 'employees', 'edit').catch(() => false);
+      if (!allowed) return json({ ok: false, error: 'Not allowed.' }, 403);
       const status = b.status === 'verified' ? 'verified' : b.status === 'rejected' ? 'rejected' : 'submitted';
       await reviewDoc(Number(b.id), status as any, uid, b.note ? String(b.note).slice(0, 300) : undefined);
       return json({ ok: true });
