@@ -12,6 +12,16 @@ if (!['super_admin', 'hr'].includes(user.role)) return Astro.redirect('/admin?de
 let errorMsg = '';
 let successMsg = '';
 
+// Payroll decisions and salary changes are money decisions: they must leave a trail. Nothing
+// under /admin/hr wrote to audit_log, so a salary could be changed and there was no record of
+// who changed it, when, or from what.
+async function audit(userId: string, action: string, entityId: string, diff: Record<string, unknown>) {
+  try {
+    const { logAudit } = await import('@/lib/audit');
+    await logAudit({ userId, action, entity: 'hr_payroll', entityId, diff });
+  } catch (_) {}
+}
+
 const currentMonth = new Date().getMonth() + 1;
 const currentYear = new Date().getFullYear();
 
@@ -24,6 +34,11 @@ if (Astro.request.method === 'POST') {
       const month = parseInt(fd.get('month') as string);
       const year = parseInt(fd.get('year') as string);
       const notes = (fd.get('notes') as string || '').trim();
+
+      // Loss-of-pay columns. Additive and idempotent, matching how the rest of the HR schema
+      // provisions itself; see db/hr-schema.sql for the full canonical definition.
+      await db.execute(sqlExpr`ALTER TABLE hr_payslips ADD COLUMN IF NOT EXISTS lop_days NUMERIC(6,2) NOT NULL DEFAULT 0`).catch(() => {});
+      await db.execute(sqlExpr`ALTER TABLE hr_payslips ADD COLUMN IF NOT EXISTS lop_deduction NUMERIC(14,2) NOT NULL DEFAULT 0`).catch(() => {});
 
       // Check if run already exists
       const existing = await db.execute(sqlExpr`SELECT id FROM hr_payroll_runs WHERE month = ${month} AND year = ${year} LIMIT 1`);
@@ -80,8 +95,6 @@ if (Astro.request.method === 'POST') {
           else if (gross > 10000) professionalTax = 150;
           const tds = parseFloat(emp.tds || 0);
           const otherDeductions = parseFloat(emp.other_deductions || 0);
-          const totalDed = pfEmployee + esicEmployee + professionalTax + tds + otherDeductions;
-          const net = gross - totalDed;
 
           // Count attendance for this month
           const attResult = await db.execute(sqlExpr`
@@ -97,17 +110,46 @@ if (Astro.request.method === 'POST') {
           const _attRows = Array.isArray(attResult) ? attResult : (attResult?.rows || []);
           const att = (_attRows[0] || {}) as any;
 
+          // LOSS OF PAY. Unpaid leave and absence used to cost nothing: an employee on a month of
+          // unpaid leave was still paid in full, because the run read the salary structure and
+          // never looked at what the attendance and leave modules recorded.
+          //   LOP days = approved UNPAID leave days falling in this month + days marked absent.
+          //   Paid leave (casual / sick / earned) is not deducted — that is what the allowance is.
+          const daysInMonth = new Date(year, month, 0).getDate();
+          let unpaidDays = 0;
+          try {
+            const up = await db.execute(sqlExpr`
+              SELECT COALESCE(SUM(
+                (LEAST(end_date, make_date(${year}, ${month}, ${daysInMonth}))
+                 - GREATEST(start_date, make_date(${year}, ${month}, 1))) + 1
+              ), 0)::int AS d
+              FROM hr_leave_request
+              WHERE employee_id = ${emp.id} AND status = 'approved' AND leave_type = 'unpaid'
+                AND start_date <= make_date(${year}, ${month}, ${daysInMonth})
+                AND end_date   >= make_date(${year}, ${month}, 1)`);
+            const _u = Array.isArray(up) ? up : (up as any)?.rows || [];
+            unpaidDays = Number((_u[0] as any)?.d || 0);
+          } catch (_) { /* leave module not provisioned yet -> no unpaid days */ }
+
+          const daysAbsent = parseFloat(att.days_absent || 0);
+          const lopDays = Math.min(daysInMonth, Math.max(0, unpaidDays) + Math.max(0, daysAbsent));
+          const perDay = daysInMonth > 0 ? gross / daysInMonth : 0;
+          const lopDeduction = Math.round(perDay * lopDays * 100) / 100;
+
+          const totalDed = pfEmployee + esicEmployee + professionalTax + tds + otherDeductions + lopDeduction;
+          const net = Math.max(0, gross - totalDed);
+
           await db.execute(sqlExpr`
             INSERT INTO hr_payslips (
               payroll_run_id, employee_id, month, year,
-              days_worked, days_leave, days_absent,
+              days_worked, days_leave, days_absent, lop_days, lop_deduction,
               basic, hra, da, special_allowance, transport_allowance, medical_allowance,
               other_allowances, gross_salary,
               pf_employee, esic_employee, professional_tax, tds, other_deductions,
               total_deductions, net_salary, currency, status
             ) VALUES (
               ${runId}, ${emp.id}, ${month}, ${year},
-              ${parseFloat(att.days_worked || 0)}, ${parseFloat(att.days_leave || 0)}, ${parseFloat(att.days_absent || 0)},
+              ${parseFloat(att.days_worked || 0)}, ${parseFloat(att.days_leave || 0)}, ${daysAbsent}, ${lopDays}, ${lopDeduction},
               ${basic}, ${hra}, ${da}, ${specialAllowance}, ${transportAllowance}, ${medicalAllowance},
               ${otherAllowances}, ${gross},
               ${pfEmployee}, ${esicEmployee}, ${professionalTax}, ${tds}, ${otherDeductions},
@@ -141,6 +183,7 @@ if (Astro.request.method === 'POST') {
         WHERE id = ${runId}
       `);
       await db.execute(sqlExpr`UPDATE hr_payslips SET status = 'approved' WHERE payroll_run_id = ${runId}`);
+      await audit(user.id, 'hr.payroll.approved', runId, {});
       successMsg = 'Payroll run approved.';
     } else if (action === 'mark_paid') {
       const runId = fd.get('runId') as string;
@@ -148,7 +191,23 @@ if (Astro.request.method === 'POST') {
         UPDATE hr_payroll_runs SET status = 'paid', paid_at = NOW() WHERE id = ${runId}
       `);
       await db.execute(sqlExpr`UPDATE hr_payslips SET status = 'paid', paid_at = NOW() WHERE payroll_run_id = ${runId}`);
-      successMsg = 'Payroll marked as paid.';
+
+      // Money must actually land somewhere. Marking a run paid used to change two status columns
+      // and stop, so wallet balances stayed at zero no matter how many months had been paid and
+      // employees had nothing to withdraw. Credit the ledger here; the call is idempotent by
+      // payslip ref, so re-clicking Mark Paid cannot pay anyone twice.
+      let payoutMsg = '';
+      try {
+        const { creditPayrollRun } = await import('@/lib/hr-wallet');
+        const res = await creditPayrollRun(runId, user.id);
+        payoutMsg = res.credited > 0
+          ? ` ${res.credited} wallet${res.credited === 1 ? '' : 's'} credited (₹${Math.round(res.total).toLocaleString('en-IN')}).`
+          : ' Wallets were already credited for this run.';
+        await audit(user.id, 'hr.payroll.paid', runId, { credited: res.credited, total: res.total });
+      } catch (e: any) {
+        payoutMsg = ' Wallet credit could not be completed — open Payouts and check before telling anyone they have been paid.';
+      }
+      successMsg = 'Payroll marked as paid.' + payoutMsg;
     } else if (action === 'update_salary') {
       const empId = fd.get('empId') as string;
       const basic = parseFloat(fd.get('basic') as string || '0');
@@ -167,6 +226,14 @@ if (Astro.request.method === 'POST') {
       const professionalTax = gross > 15000 ? 200 : gross > 10000 ? 150 : 0;
       const totalDed = pfEmployee + esicEmployee + professionalTax + tds;
       const net = gross - totalDed;
+
+      // Capture what the salary WAS, so the audit entry records the change and not just the result.
+      let prev: any = null;
+      try {
+        const p = await db.execute(sqlExpr`SELECT gross_salary, net_salary, currency FROM hr_salary_structures
+          WHERE employee_id = ${empId} AND effective_to IS NULL ORDER BY effective_from DESC LIMIT 1`);
+        prev = (Array.isArray(p) ? p : (p as any)?.rows || [])[0] || null;
+      } catch (_) {}
 
       // Close existing structure
       await db.execute(sqlExpr`
@@ -191,6 +258,10 @@ if (Astro.request.method === 'POST') {
 
       // Update base salary on employee
       await db.execute(sqlExpr`UPDATE hr_employees SET base_salary = ${gross}, currency = ${currency} WHERE id = ${empId}`);
+      await audit(user.id, 'hr.salary.updated', empId, {
+        from: prev ? { gross: Number(prev.gross_salary || 0), net: Number(prev.net_salary || 0), currency: prev.currency } : null,
+        to: { gross, net, currency },
+      });
       successMsg = `Salary structure updated. Gross: ${currency} ${gross.toLocaleString('en-IN')}, Net: ${currency} ${net.toLocaleString('en-IN')}`;
     }
   } catch (err: any) {

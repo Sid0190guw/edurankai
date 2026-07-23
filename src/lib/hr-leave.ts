@@ -93,5 +93,53 @@ export async function decideLeave(id: string, user: any, decision: 'approved' | 
   const role = await approverRole(user, l.employee_id);
   if (!role) return { ok: false, error: 'You are not permitted to decide this request.' };
   await db.execute(sql`UPDATE hr_leave_request SET status = ${decision}, decided_by = ${user.id}, decided_by_role = ${role}, decided_at = NOW(), decision_note = ${note || null} WHERE id = ${id}`);
+
+  // Approving leave has to reach attendance, or the two modules disagree about the same day:
+  // payroll counts attendance, so an approved leave day with no attendance row was counted as
+  // nothing at all, and a day the employee had been told to take off could be read as absence.
+  if (decision === 'approved') await markLeaveAttendance(l);
+
+  try {
+    const { logAudit } = await import('@/lib/audit');
+    await logAudit({
+      userId: String(user.id), action: 'hr.leave.' + decision, entity: 'hr_leave_request', entityId: String(id),
+      diff: { employeeId: l.employee_id, leaveType: l.leave_type, days: l.days, from: l.start_date, to: l.end_date, byRole: role, note: note || null },
+    });
+  } catch (_) {}
+
   return { ok: true };
+}
+
+/**
+ * Write one attendance row per day of an approved leave, status 'on_leave'.
+ *
+ * Marks every calendar day in the range, which is deliberately consistent with how `days` is
+ * counted when the leave is applied for (daysBetween is calendar days, not working days).
+ * A day the employee actually worked is left alone — present/wfh wins over on_leave, so a
+ * back-dated approval can never erase real attendance.
+ */
+export async function markLeaveAttendance(l: any): Promise<number> {
+  const start = new Date(String(l.start_date).slice(0, 10) + 'T00:00:00');
+  const end = new Date(String(l.end_date).slice(0, 10) + 'T00:00:00');
+  if (isNaN(start.getTime()) || isNaN(end.getTime()) || end < start) return 0;
+  // Guard against an absurd range creating thousands of rows.
+  const span = Math.round((end.getTime() - start.getTime()) / 86400000) + 1;
+  if (span > 400) return 0;
+
+  const note = 'Approved ' + String(l.leave_type || 'leave') + ' leave';
+  let written = 0;
+  for (let i = 0; i < span; i++) {
+    const d = new Date(start.getTime() + i * 86400000);
+    const iso = d.toISOString().slice(0, 10);
+    try {
+      await db.execute(sql`
+        INSERT INTO hr_attendance (employee_id, date, status, work_mode, notes)
+        VALUES (${l.employee_id}, ${iso}, 'on_leave', 'leave', ${note})
+        ON CONFLICT (employee_id, date) DO UPDATE
+          SET status = 'on_leave', notes = ${note}
+          WHERE hr_attendance.status NOT IN ('present', 'wfh')`);
+      written++;
+    } catch (_) { /* one bad day must not abort the approval */ }
+  }
+  return written;
 }

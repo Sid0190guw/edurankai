@@ -303,15 +303,20 @@ const _empRows = Array.isArray(result) ? result : (result?.rows || []);
 if (_empRows.length === 0) return Astro.redirect('/admin/hr/employees');
 const emp = _empRows[0] as any;
 
-// Fetch leave balances
-const leaveBalances = await db.execute(sqlExpr`
-  SELECT lb.*, lt.name, lt.code, lt.is_paid
-  FROM hr_leave_balances lb
-  JOIN hr_leave_types lt ON lb.leave_type_id = lt.id
-  WHERE lb.employee_id = ${id} AND lb.year = EXTRACT(YEAR FROM NOW())
-  ORDER BY lt.name
-`);
-const leaveBalanceRows = (Array.isArray(leaveBalances) ? leaveBalances : leaveBalanceRows) as any[];
+// Leave balances, read from the table the leave workflow actually writes.
+//
+// Two leave schemas existed side by side: hr_leave_request (singular), which /admin/hr/leave and
+// the employee portal read and write through src/lib/hr-leave.ts, and hr_leave_types /
+// hr_leave_balances / hr_leave_requests (plural), which only ever had readers. This tab queried
+// the plural set, so an employee's Leave tab was empty no matter how much leave they had taken.
+const { getBalances, LEAVE_TYPES } = await import('@/lib/hr-leave');
+const _balances = await getBalances(id).catch(() => [] as any[]);
+const leaveBalanceRows = _balances.map((b: any) => ({
+  name: b.name, code: b.id, is_paid: b.id !== 'unpaid',
+  allocated: b.allowance, used: b.used, pending: b.pending, carried_forward: 0,
+  unlimited: !(b.allowance > 0),
+})) as any[];
+const LEAVE_NAME: Record<string, string> = Object.fromEntries(LEAVE_TYPES.map((t: any) => [t.id, t.name]));
 
 // Load conduct flags per Recruitment & Work Policy v2.0
 const { listFlags, BREACH_TYPES } = await import('@/lib/hr-flags');
@@ -335,17 +340,20 @@ const attendance = await db.execute(sqlExpr`
   SELECT * FROM hr_attendance WHERE employee_id = ${id}
   ORDER BY date DESC LIMIT 10
 `);
-const attendanceRows = (Array.isArray(attendance) ? attendance : attendanceRows) as any[];
+// `: attendanceRows` here referenced the variable inside its own initialiser — on any driver
+// result that is not a plain array that throws a ReferenceError and takes the whole page down.
+const attendanceRows = (Array.isArray(attendance) ? attendance : ((attendance as any)?.rows || [])) as any[];
 
-// Fetch recent leave requests
-const leaveRequests = await db.execute(sqlExpr`
-  SELECT lr.*, lt.name as leave_name, lt.code
-  FROM hr_leave_requests lr
-  JOIN hr_leave_types lt ON lr.leave_type_id = lt.id
-  WHERE lr.employee_id = ${id}
-  ORDER BY lr.applied_at DESC LIMIT 5
-`);
-const leaveRequestRows = (Array.isArray(leaveRequests) ? leaveRequests : leaveRequestRows) as any[];
+// Recent leave requests — same singular table the leave workflow writes (see note above).
+let leaveRequestRows: any[] = [];
+try {
+  const leaveRequests = await db.execute(sqlExpr`
+    SELECT * FROM hr_leave_request WHERE employee_id = ${id}
+    ORDER BY start_date DESC LIMIT 5
+  `);
+  leaveRequestRows = ((Array.isArray(leaveRequests) ? leaveRequests : (leaveRequests as any)?.rows || []) as any[])
+    .map((lr: any) => ({ ...lr, leave_name: LEAVE_NAME[lr.leave_type] || lr.leave_type, code: lr.leave_type }));
+} catch (e) { leaveRequestRows = []; }
 
 // Fetch recent daily work reports
 let dailyReportRows: any[] = [];
@@ -883,8 +891,10 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
             <p style="font-size:12px;margin-top:4px;">Use Leave Management to allocate leave.</p>
           </div>
         ) : leaveBalanceRows.map((lb: any) => {
-          const remaining = parseFloat(lb.allocated) + parseFloat(lb.carried_forward || 0) - parseFloat(lb.used || 0);
-          const pct = lb.allocated > 0 ? Math.min(100, (parseFloat(lb.used || 0) / parseFloat(lb.allocated)) * 100) : 0;
+          const remaining = lb.unlimited
+            ? null
+            : parseFloat(lb.allocated) + parseFloat(lb.carried_forward || 0) - parseFloat(lb.used || 0) - parseFloat(lb.pending || 0);
+          const pct = lb.allocated > 0 ? Math.min(100, ((parseFloat(lb.used || 0) + parseFloat(lb.pending || 0)) / parseFloat(lb.allocated)) * 100) : 0;
           return (
             <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px;">
               <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
@@ -893,8 +903,8 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
                   <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;font-family:'Geist Mono',monospace;">{lb.code} · {lb.is_paid ? 'Paid' : 'Unpaid'}</p>
                 </div>
                 <div style="text-align:right;">
-                  <p style="font-size:18px;font-weight:700;color:#fff;margin:0;">{remaining}</p>
-                  <p style="font-size:10px;color:#6e6e78;margin:0;">of {lb.allocated} left</p>
+                  <p style="font-size:18px;font-weight:700;color:#fff;margin:0;">{lb.unlimited ? '—' : remaining}</p>
+                  <p style="font-size:10px;color:#6e6e78;margin:0;">{lb.unlimited ? 'no annual allowance' : 'of ' + lb.allocated + ' left'}</p>
                 </div>
               </div>
               <div style="background:#15151a;border-radius:100px;height:4px;overflow:hidden;">
@@ -902,7 +912,7 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
               </div>
               <div style="display:flex;justify-content:space-between;margin-top:6px;">
                 <span style="font-size:10px;color:#6e6e78;">Used: {lb.used || 0}</span>
-                <span style="font-size:10px;color:#6e6e78;">Carried: {lb.carried_forward || 0}</span>
+                <span style="font-size:10px;color:#6e6e78;">Awaiting approval: {lb.pending || 0}</span>
               </div>
             </div>
           );

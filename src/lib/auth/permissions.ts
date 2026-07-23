@@ -196,6 +196,47 @@ export async function getViewableSectionKeys(user: { id: string; role: string } 
   return new Set<string>(defaults);
 }
 
+/**
+ * Authorise ONE action on ONE admin section — the check to use in API routes and page POST
+ * handlers, so a URL cannot do what the sidebar would not offer.
+ *
+ * Use this rather than `userCanAccess`, which consults ONLY custom role assignments and so
+ * returns false for a super_admin (who typically has none) — that silently locks out the very
+ * people a feature is built for. And never use `user.role !== 'applicant'` as an authorisation
+ * test: every internal role passes it, including the `editor` that offer letters auto-assign to
+ * candidates who have not yet accepted.
+ *
+ *   super_admin           -> allowed
+ *   >=1 custom role       -> exactly what those roles grant for this page key + action
+ *   else built-in role    -> that role's ROLE_SECTIONS defaults (a granted section implies
+ *                            view/edit/export on it; delete stays super_admin-only)
+ *   unknown role          -> DENIED (deny by default; the sidebar filter's "don't restrict"
+ *                            fallback is not a safe answer for a write or a bulk export)
+ */
+export async function canAccessSection(
+  user: { id: string; role: string } | null | undefined,
+  sectionKey: string,
+  action: PermissionAction = 'view',
+): Promise<boolean> {
+  if (!user) return false;
+  if (user.role === 'super_admin') return true;
+  if (user.role === 'applicant') return false;
+
+  try {
+    const assigns = await db.select({ roleId: userRoleAssignments.roleId })
+      .from(userRoleAssignments)
+      .where(eq(userRoleAssignments.userId, user.id));
+    if (assigns.length > 0) {
+      return await userCanAccess(user.id, sectionKey, action);
+    }
+  } catch { return false; }
+
+  const defaults = ROLE_SECTIONS[user.role];
+  if (!defaults) return false;
+  if (!defaults.includes(sectionKey)) return false;
+  return action !== 'delete';
+}
+
 /** Standard page-key constants. Use these instead of hardcoding strings. */
 export const PAGE_KEYS = {
   DASHBOARD: 'dashboard',

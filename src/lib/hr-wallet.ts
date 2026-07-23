@@ -69,6 +69,45 @@ export async function credit(employeeId: string, amount: number, kind: string, n
 
 // ---- bank accounts ----
 function mask(acc: string): string { const a = (acc || '').replace(/\s/g, ''); return a.length > 4 ? '••••' + a.slice(-4) : a; }
+/**
+ * Credit a payroll run into employee wallets — the step that was missing entirely.
+ *
+ * Payroll marked a run "paid" and set every payslip to paid, but nothing ever reached the wallet
+ * ledger, so an employee's balance stayed at zero however many months they had been paid for and
+ * there was nothing to withdraw. This closes payroll -> wallet -> withdrawal into one chain.
+ *
+ * IDEMPOTENT: each credit carries ref 'payslip:<id>', and an existing txn with that ref is
+ * skipped. Marking a run paid twice (double submit, retry, an HR user re-clicking) must not pay
+ * anyone twice.
+ */
+export async function creditPayrollRun(runId: string, byUserId: string | null): Promise<{ credited: number; skipped: number; total: number }> {
+  await ensureWalletSchema();
+  const slips = await safe(sql`
+    SELECT ps.id, ps.employee_id, ps.net_salary, ps.currency, pr.month, pr.year
+    FROM hr_payslips ps JOIN hr_payroll_runs pr ON ps.payroll_run_id = pr.id
+    WHERE ps.payroll_run_id = ${runId}`);
+
+  const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+  let credited = 0, skipped = 0, total = 0;
+
+  for (const s of slips) {
+    const amount = Number(s.net_salary || 0);
+    if (!(amount > 0) || !s.employee_id) { skipped++; continue; }
+    const ref = 'payslip:' + s.id;
+    const dupe = await safe(sql`SELECT id FROM hr_wallet_txn WHERE ref = ${ref} LIMIT 1`);
+    if (dupe.length) { skipped++; continue; }
+    const period = (MONTHS[(Number(s.month) || 1) - 1] || '') + ' ' + (s.year || '');
+    try {
+      await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, currency, kind, note, ref, created_by)
+        VALUES (${s.employee_id}, 'credit', ${amount}, ${s.currency || 'INR'}, 'salary',
+                ${'Salary for ' + period.trim()}, ${ref}, ${byUserId})`);
+      credited++; total += amount;
+    } catch { skipped++; }
+  }
+  return { credited, skipped, total };
+}
+
 export async function listBankAccounts(employeeId: string): Promise<any[]> {
   await ensureWalletSchema();
   return (await safe(sql`SELECT id, holder, account_number, ifsc, bank_name, upi_id, is_primary, verified FROM hr_bank_account WHERE employee_id = ${employeeId} ORDER BY is_primary DESC, created_at DESC`))
@@ -126,7 +165,17 @@ export async function decideWithdrawal(id: string, user: any, decision: 'approve
   const role = await approverRole(user, w.employee_id);
   if (!role) return { ok: false, error: 'You are not permitted to approve this withdrawal.' };
   await db.execute(sql`UPDATE hr_withdrawal SET status = ${decision}, decided_by = ${user.id}, decided_by_role = ${role}, decided_at = NOW(), decision_note = ${note || null} WHERE id = ${id}`);
+  await hrAudit(user.id, 'hr.withdrawal.' + decision, String(id),
+    { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, byRole: role, note: note || null });
   return { ok: true };
+}
+
+/** Money decisions leave a trail. Nothing under /admin/hr wrote to audit_log before this. */
+export async function hrAudit(userId: string, action: string, entityId: string, diff: Record<string, unknown>): Promise<void> {
+  try {
+    const { logAudit } = await import('@/lib/audit');
+    await logAudit({ userId: String(userId), action, entity: 'hr_wallet', entityId, diff });
+  } catch (_) { /* auditing must never block the decision it records */ }
 }
 
 // Pay out an approved withdrawal via Razorpay (RazorpayX Payouts) if configured;
@@ -158,5 +207,7 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
   await db.execute(sql`UPDATE hr_withdrawal SET status = 'paid', payout_ref = ${ref}, paid_at = NOW() WHERE id = ${id}`);
   await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, kind, note, ref, created_by)
     VALUES (${w.employee_id}, 'debit', ${w.amount}, 'withdrawal', ${'Withdrawal via ' + paidVia}, ${ref}, ${user.id})`);
+  await hrAudit(user.id, 'hr.withdrawal.paid', String(id),
+    { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, paidVia, payoutRef: ref });
   return { ok: true, ref: ref || undefined };
 }

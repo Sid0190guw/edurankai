@@ -107,6 +107,12 @@ export async function removeDoc(userId: string, id: number): Promise<boolean> {
 export async function reviewDoc(id: number, status: DocStatus, by: string, note?: string): Promise<void> {
   const { db, sql } = await ctx();
   await db.execute(sql`UPDATE hr_onboarding_documents SET status = ${status}, review_note = ${note || null}, reviewed_by = ${by}, reviewed_at = now() WHERE id = ${id}`);
+  // Verifying a credential is a hiring decision — it needs a record of who decided and why.
+  try {
+    const { logAudit } = await import('@/lib/audit');
+    await logAudit({ userId: by, action: 'hr.onboarding_doc.' + status, entity: 'hr_onboarding_document',
+      entityId: String(id), diff: { status, note: note || null } });
+  } catch (_) {}
 }
 /** Everything awaiting HR, newest first, with who submitted it. */
 export async function pendingForReview(limit = 100): Promise<any[]> {

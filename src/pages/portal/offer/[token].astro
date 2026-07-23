@@ -28,13 +28,27 @@ const appList = await db.select().from(applications)
   .where(and(eq(applications.id, offer.applicationId), eq(applications.applicantUserId, user.id)))
   .limit(1);
 
-// Allow admins to view too
-const isAdmin = user.role !== 'applicant';
-if (appList.length === 0 && !isAdmin) return Astro.redirect('/portal');
+// WHO IS LOOKING? Two distinct answers, and the old `user.role !== 'applicant'` conflated them.
+//
+//  - The RECIPIENT signs or declines. Ownership is the application being theirs, or the offer
+//    having created their account. Role is NOT a proxy for this: an offer letter auto-creates a
+//    candidate account with role 'editor', so a recipient without a prior application counted as
+//    "admin", which made the whole page read-only and left them unable to sign their own offer.
+//  - STAFF may read it, and only read it. That must be the same permission that gates the
+//    /admin/offers section — under the old test any internal role (editor, marketing, partner,
+//    teacher) could open any candidate's offer, salary included, from the token alone.
+const isOwner = appList.length > 0
+  || (offer.createdUserId && String(offer.createdUserId) === String(user.id));
+let isAdmin = false;   // "viewing as staff" — never allowed to sign
+if (!isOwner) {
+  const { canAccessSection } = await import('@/lib/auth/permissions');
+  isAdmin = await canAccessSection(user as any, 'offers', 'view').catch(() => false);
+  if (!isAdmin) return Astro.redirect('/portal');
+}
 const app: any = appList.length > 0 ? appList[0] : null;
 
-// Handle signing
-if (Astro.request.method === 'POST' && !isAdmin) {
+// Handle signing — recipient only.
+if (Astro.request.method === 'POST' && isOwner) {
   const _fdPeek = await Astro.request.clone().formData();
   const _action = (_fdPeek.get('action') as string || 'sign').trim();
 
@@ -93,7 +107,14 @@ if (Astro.request.method === 'POST' && !isAdmin) {
     const fd = await Astro.request.formData();
     const signatureDataUrl = (fd.get('signatureDataUrl') as string || '').trim();
 
-    if (!signatureDataUrl || !signatureDataUrl.startsWith('data:image/')) {
+    // Consent is checked HERE, not only in the browser. The acceptance checkbox previously had no
+    // `name`, so it was never submitted and the server had no record that the terms were ever
+    // agreed to — for a binding electronic acceptance the only evidence was a client-side alert().
+    const consented = (fd.get('consent') as string || '') === 'yes';
+
+    if (!consented) {
+      errorMsg = 'Please tick the box confirming you have read and accept the terms before signing.';
+    } else if (!signatureDataUrl || !signatureDataUrl.startsWith('data:image/')) {
       errorMsg = 'Please draw your signature before submitting.';
     } else if (signatureDataUrl.length > 500000) {
       errorMsg = 'Signature image too large.';
@@ -133,6 +154,26 @@ if (Astro.request.method === 'POST' && !isAdmin) {
         try {
           const { transferApplicantToEmployee } = await import('@/lib/hire-transfer');
           await transferApplicantToEmployee(offer);
+        } catch (_) {}
+
+        // NOW they are staff. Internal access is granted on acceptance, not on offer send.
+        // Never demote an existing admin/HR account that happens to accept an offer.
+        try {
+          const { sql: sqlRaw } = await import('drizzle-orm');
+          await db.execute(sqlRaw`UPDATE users SET role = 'editor', updated_at = NOW()
+            WHERE id = ${user.id}::uuid AND role = 'applicant'`);
+        } catch (_) {}
+
+        // Durable evidence of acceptance: who, when, from where, and that consent was given.
+        try {
+          const { logAudit } = await import('@/lib/audit');
+          await logAudit({
+            userId: String(user.id), action: 'offer.signed', entity: 'offer_letter',
+            entityId: String(offer.id), ipAddress: ipHeader.substring(0, 64),
+            diff: { refNumber: offer.refNumber, roleTitle: offer.roleTitle,
+              consent: true, consentText: 'read the offer, accepts all terms, typed name is legal e-signature',
+              userAgent: ua.slice(0, 300) },
+          });
         } catch (_) {}
 
         // The face-2FA selfie was captured before this employee record existed (middleware forces
@@ -515,7 +556,7 @@ const offerPdfData = {
           </div>
 
           <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;background:#fff;border:1.5px solid rgba(0,0,0,0.1);border-radius:8px;cursor:pointer;font-size:13.5px;color:#0a0a0c;line-height:1.5;">
-            <input type="checkbox" id="acceptCheck" required style="margin-top:3px;accent-color:#FF4F00;flex-shrink:0;width:18px;height:18px;" />
+            <input type="checkbox" id="acceptCheck" name="consent" value="yes" required style="margin-top:3px;accent-color:#FF4F00;flex-shrink:0;width:18px;height:18px;" />
             <span>I have read this offer, accept all the terms, and confirm that the typed name above is my legal electronic signature. My signature, IP address, and timestamp will be permanently recorded as evidence of acceptance.</span>
           </label>
 

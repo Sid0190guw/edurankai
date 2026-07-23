@@ -76,22 +76,11 @@ async function syncHiredToEmployee(applicationId: string, actorUserId: string) {
       )
     `);
 
-    // Allocate default leave balances for current year
-    const year = new Date().getFullYear();
-    const empResult = await db.execute(sql`SELECT id FROM hr_employees WHERE application_id = ${applicationId} LIMIT 1`);
-    const _empResultRows = Array.isArray(empResult) ? empResult : (empResult?.rows || []);
-    if (_empResultRows.length > 0) {
-      const empId = (_empResultRows[0] as any).id;
-      const leaveTypes = await db.execute(sql`SELECT id, days_per_year FROM hr_leave_types WHERE is_active = true`);
-      const _ltRows = (Array.isArray(leaveTypes) ? leaveTypes : (leaveTypes?.rows || [])) as any[];
-      for (const lt of _ltRows) {
-        await db.execute(sql`
-          INSERT INTO hr_leave_balances (employee_id, leave_type_id, year, allocated, used)
-          VALUES (${empId}, ${lt.id}, ${year}, ${lt.days_per_year || 0}, 0)
-          ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING
-        `);
-      }
-    }
+    // Leave allocation used to be seeded into hr_leave_types / hr_leave_balances here. Those
+    // tables have no writer in the live leave workflow and no reader any more: entitlement comes
+    // from LEAVE_TYPES in src/lib/hr-leave.ts and consumption is derived from hr_leave_request,
+    // so every new employee starts with the correct allowance without a per-employee seed row.
+    // Seeding them again would only recreate the split that left the Leave tab blank.
 
     console.log(`[HR Sync] Created employee ${empCode} from application ${applicationId}`);
   } catch (err: any) {

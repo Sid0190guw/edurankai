@@ -13,8 +13,15 @@ function escapeCSV(val: any): string {
 
 export const GET: APIRoute = async ({ locals }) => {
   const user = locals.user;
-  if (!user || user.role === 'applicant') {
-    return new Response('Forbidden', { status: 403 });
+  // A bulk CSV of the employee roster (includes salary) must require the SAME permission that gates the
+  // matching admin section. `role !== 'applicant'` was not that check: every internal role —
+  // including editor, which offer letters auto-assign to candidates before they even accept —
+  // passed it, so the whole file was one authenticated GET away for anyone who was not an applicant.
+  if (!user) return new Response('Forbidden', { status: 403 });
+  {
+    const { canAccessSection } = await import('@/lib/auth/permissions');
+    const allowed = await canAccessSection(user as any, 'employees', 'export').catch(() => false);
+    if (!allowed) return new Response('Forbidden', { status: 403 });
   }
   try {
     const r = await db.execute(sql`
