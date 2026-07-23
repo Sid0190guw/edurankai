@@ -40,7 +40,33 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
         is_active = true,
         enrolled_at = NOW()
     `);
-    return json({ ok: true, message: 'Face 2FA is now active for your account.' });
+
+    // EMPLOYEES ONLY: the photo taken at face verification becomes their profile picture, so the
+    // picture on record is the verified one. Other roles enrol for 2FA without a photo being kept.
+    let photoSaved = false;
+    const selfie = typeof body?.selfie === 'string' ? body.selfie : '';
+    if (/^data:image\/(jpeg|png);base64,/.test(selfie) && selfie.length < 900_000) {
+      try {
+        const emp = await db.execute(sql`SELECT id FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
+        const isEmployee = (Array.isArray(emp) ? emp : (emp as any)?.rows || []).length > 0;
+        if (isEmployee) {
+          let photoUrl = selfie;   // fall back to the inline image when no blob store is configured
+          try {
+            if (process.env.BLOB_READ_WRITE_TOKEN) {
+              const { put } = await import('@vercel/blob');
+              const bin = Buffer.from(selfie.split(',')[1], 'base64');
+              const res = await put('employee-photos/' + user.id + '-' + Date.now() + '.jpg', bin, { access: 'public', contentType: 'image/jpeg', addRandomSuffix: false });
+              if ((res as any)?.url) photoUrl = (res as any).url;
+            }
+          } catch (_) { /* keep the inline image */ }
+          await db.execute(sql`UPDATE users SET photo_url = ${photoUrl} WHERE id = ${user.id}`);
+          await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS photo_url TEXT`).catch(() => {});
+          await db.execute(sql`UPDATE hr_employees SET photo_url = ${photoUrl} WHERE user_id = ${user.id}`).catch(() => {});
+          photoSaved = true;
+        }
+      } catch (_) { /* never block 2FA enrolment because a photo failed to save */ }
+    }
+    return json({ ok: true, photoSaved, message: 'Face 2FA is now active for your account.' });
   } catch (e: any) {
     return json({ ok: false, error: e?.message || 'server error' }, 500);
   }
