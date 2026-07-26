@@ -116,7 +116,10 @@ if (dryRun) {
   process.exit(0);
 }
 
-const sql = postgres(process.env.DATABASE_URL, { max: 1, onnotice: () => {} });
+// prepare:false — Supabase's transaction pooler (pgbouncer, :6543) does not support prepared
+// statements; without this a migration over the pooled URL can fail mid-file. Harmless on a
+// direct/session connection too.
+const sql = postgres(process.env.DATABASE_URL, { max: 1, prepare: false, onnotice: () => {} });
 
 let ok = 0, failed = 0;
 const failures = [];
