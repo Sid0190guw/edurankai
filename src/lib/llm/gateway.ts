@@ -201,6 +201,43 @@ export async function chatStream(system: string, messages: ChatMessage[], c: Llm
   } finally { clearTimeout(to); }
 }
 
+/** Resolve a READY config for a caller. Prefers the DB-configured provider (self-hosted 'own' or
+ *  claude). If the gateway is not enabled but ANTHROPIC_API_KEY is present in env, fall back to
+ *  Anthropic as an OPTIONAL connector so features keep working today — set provider='own' +
+ *  baseUrl in the super-admin panel to switch to a self-hosted open-weight model with ZERO code
+ *  change. This is the sovereignty seam: proprietary AI is a connector, never a hard dependency. */
+export async function effectiveConfig(overrides: Partial<LlmConfig> = {}): Promise<LlmConfig> {
+  const c = { ...(await getConfig()), ...overrides };
+  if (isReady(c)) return c;
+  const envKey = process.env.ANTHROPIC_API_KEY || '';
+  if (envKey) return { ...c, enabled: true, provider: 'claude', claudeApiKey: envKey };
+  return c;
+}
+
+export interface CompleteResult { ok: boolean; text: string; provider: Provider | 'none'; configured: boolean; error?: string; }
+
+/** THE single entry point every non-streaming LLM feature should use — do not call api.anthropic.com
+ *  directly. Resolves the provider (self-hosted → env-Anthropic fallback), calls it, logs usage and
+ *  captures a training example, and returns a graceful `fallback` when nothing is configured. So a
+ *  caller NEVER crashes and NEVER credits a user against a stub: check `.ok` (success) and
+ *  `.configured` (a provider exists) before awarding XP or treating the reply as real. */
+export async function complete(opts: {
+  feature: string; system: string; messages: ChatMessage[]; userId?: string | null;
+  maxTokens?: number; temperature?: number; fallback?: string;
+}): Promise<CompleteResult> {
+  const c = await effectiveConfig({
+    ...(opts.maxTokens != null ? { maxTokens: opts.maxTokens } : {}),
+    ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
+  });
+  if (!isReady(c)) return { ok: false, text: opts.fallback ?? '', provider: 'none', configured: false, error: 'LLM not configured' };
+  const t0 = Date.now();
+  const r = await chat(opts.system, opts.messages, c);
+  const promptChars = opts.system.length + opts.messages.reduce((n, m) => n + (m.content || '').length, 0);
+  await logUsage(opts.userId ?? null, opts.feature, c, promptChars, (r.text || '').length, Date.now() - t0, r.ok ? 'ok' : 'error', r.promptTokens, r.completionTokens);
+  if (r.ok && r.text) await logTrainingExample(opts.userId ?? null, opts.feature, c, opts.system, opts.messages, r.text);
+  return { ok: r.ok, text: r.ok ? r.text : (opts.fallback ?? ''), provider: c.provider, configured: true, error: r.error };
+}
+
 // Non-streaming (health check / test connection).
 export async function chat(system: string, messages: ChatMessage[], c: LlmConfig): Promise<ChatResult> {
   if (!isReady(c)) return { ok: false, text: '', error: 'LLM not configured' };

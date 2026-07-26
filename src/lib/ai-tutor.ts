@@ -1,11 +1,10 @@
-// AI Conversation tutor — chat with an AI in your target language. Uses
-// Anthropic Claude. Awards XP per turn. Falls back to a stub message if
-// ANTHROPIC_API_KEY is missing.
+// AI Conversation tutor — chat with an AI in your target language. Routes through the first-party
+// LLM gateway (self-hosted 'own' model → env-Anthropic fallback), so switching to a self-hosted
+// open-weight model is a config change. Awards XP ONLY for a real model reply — never against the
+// "being set up" stub (that was a bug: XP was credited even with no provider configured).
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-
-const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
-const MODEL = 'claude-sonnet-4-6';
+import { complete, type ChatMessage } from '@/lib/llm/gateway';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
@@ -66,7 +65,6 @@ export async function continueConversation(opts: {
   userMessage: string;
 }): Promise<AiReply & { conversationId: string; xpDelta: number; turnCount: number }> {
   await ensureSchema();
-  const apiKey = process.env.ANTHROPIC_API_KEY;
   const language = opts.language || 'en';
   const topic = opts.topic || '';
   const level = opts.level || 'beginner';
@@ -87,34 +85,29 @@ export async function continueConversation(opts: {
   const messages: any[] = Array.isArray(conv.messages) ? conv.messages : (typeof conv.messages === 'string' ? JSON.parse(conv.messages) : []);
   messages.push({ role: 'user', content: opts.userMessage });
 
+  const history: ChatMessage[] = messages.slice(-12).map((m: any) => ({
+    role: m.role === 'user' ? 'user' : 'assistant', content: String(m.content || ''),
+  }));
+  const r = await complete({
+    feature: 'ai_tutor_conversation', system: systemPrompt(language, topic, level),
+    messages: history, userId: opts.userId, maxTokens: 400,
+  });
+
   let reply: string;
-  if (!apiKey) {
-    reply = `The live conversational tutor for ${LANGS[language] || language} is being set up and will be available soon. Until then, keep practising with the lessons and assessments.`;
+  let real = false;   // was this a genuine model reply (i.e. XP-worthy)?
+  if (r.ok && r.text) {
+    reply = r.text.trim() || '(no reply)';
+    real = true;
+  } else if (r.configured) {
+    // A provider IS configured but the call failed — surface the error, award nothing.
+    return { ok: false, error: 'AI temporarily unavailable: ' + (r.error || 'request failed').slice(0, 200), conversationId: conv.id, xpDelta: 0, turnCount: conv.turn_count };
   } else {
-    try {
-      const resp = await fetch(CLAUDE_API, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({
-          model: MODEL,
-          max_tokens: 400,
-          system: systemPrompt(language, topic, level),
-          messages: messages.slice(-12).map(m => ({ role: m.role, content: m.content })),
-        }),
-      });
-      if (!resp.ok) {
-        const err = await resp.text();
-        return { ok: false, error: 'AI temporarily unavailable: ' + err.slice(0, 200), conversationId: conv.id, xpDelta: 0, turnCount: conv.turn_count };
-      }
-      const data = await resp.json() as any;
-      reply = (data?.content?.[0]?.text || '').trim() || '(no reply)';
-    } catch (e: any) {
-      return { ok: false, error: e?.message || 'network error', conversationId: conv.id, xpDelta: 0, turnCount: conv.turn_count };
-    }
+    // No provider configured — graceful stub, and crucially NO XP for it.
+    reply = `The live conversational tutor for ${LANGS[language] || language} is being set up and will be available soon. Until then, keep practising with the lessons and assessments.`;
   }
 
   messages.push({ role: 'assistant', content: reply });
-  const xpDelta = 4; // 4 XP per learner turn
+  const xpDelta = real ? 4 : 0; // 4 XP per learner turn — but never for the stub reply
   await db.execute(sql`
     UPDATE ai_conversations SET
       messages = ${JSON.stringify(messages)}::jsonb,
@@ -122,10 +115,12 @@ export async function continueConversation(opts: {
       xp_awarded = xp_awarded + ${xpDelta}
     WHERE id = ${conv.id}
   `);
-  try {
-    const { awardXp } = await import('@/lib/xp');
-    await awardXp({ userId: opts.userId, source: 'ai_conversation', refId: conv.id, delta: xpDelta, reason: 'AI conversation turn (' + (LANGS[language] || language) + ')' });
-  } catch (_) {}
+  if (real) {
+    try {
+      const { awardXp } = await import('@/lib/xp');
+      await awardXp({ userId: opts.userId, source: 'ai_conversation', refId: conv.id, delta: xpDelta, reason: 'AI conversation turn (' + (LANGS[language] || language) + ')' });
+    } catch (_) {}
+  }
 
   return { ok: true, reply, conversationId: conv.id, xpDelta, turnCount: conv.turn_count + 1 };
 }

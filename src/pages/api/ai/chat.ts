@@ -1,9 +1,8 @@
 // src/pages/api/ai/chat.ts - FAQ Assistant only
-// No DB access, no user data exposure
+// No DB access, no user data exposure. Routes through the first-party LLM gateway
+// (self-hosted 'own' model → env-Anthropic fallback), never api.anthropic.com directly.
 import type { APIRoute } from 'astro';
-
-const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
-const MODEL = 'claude-sonnet-4-20250514';
+import { complete } from '@/lib/llm/gateway';
 
 const FAQ_SYSTEM = `You are the EduRankAI Help Assistant - a friendly FAQ and support bot for edurankai.in.
 
@@ -51,20 +50,11 @@ WHAT YOU KNOW (the only things you should answer about):
    - You can request deletion at any time via hr@edurankai.in
    - Location tracking only happens with your consent (for SOS safety feature)
 
-7. WHY EDURANKAI CHARGES A FEE (very common question):
-   - There is a small per-application processing fee. The amount depends on the role's level — Intern roles are the lowest, C-Level the highest.
-   - There is NO separate "account creation" or "portal access" fee anymore — accounts are created free when you sign up. The application fee is the single paid step.
-   - The fee exists because EduRankAI takes NO government subsidies, NO advertiser money, NO investor pressure on hiring outcomes, and NO donations with strings attached. The platform costs real money to run.
-   - Where the money goes:
-     a) People — real humans review every application; interview panels; talent ops; verification team
-     b) Infrastructure — hosting, databases, in-app mailbox, AI interview platform, proctoring stack, payment gateway
-     c) Verification — identity checks, credential cross-checks, reference calls, document validation
-     d) Tooling — the test runner, AI interview platform, mail server, CI/CD, security
-     e) Independence — paying our own bills means no advertiser, donor, or investor influences who gets hired
-   - The fee does NOT improve your chances. The rubric is published and decisions are made on merit.
-   - Non-refundable once verification begins, refundable in days if there's a payment glitch on our side.
-   - Fee waiver: available to anyone with genuine financial need. Waiver applications are reviewed manually and approved waivers are silent (no flag on file, no different treatment). Link: /apply/waiver
-   - Full breakdown: /policy/fees
+7. COST TO APPLY (common question):
+   - Applying is FREE. There is no application fee at any level, and no payment step anywhere in the application journey. Accounts are created free when you sign up.
+   - EduRankAI takes NO government subsidies, NO advertiser money, NO investor pressure on hiring outcomes, and NO donations with strings attached — but applying costs you nothing.
+   - Every application is reviewed by real humans (recruitment, technical, academic and leadership teams). Applying does not require or involve any payment.
+   - Internships and apprenticeships are unpaid engagements — you apply for the work, mentorship and experience, not a stipend.
 
 CONTACT:
 - General: hr@edurankai.in
@@ -85,14 +75,6 @@ YOUR RULES:
 CRITICAL: You have NO access to user accounts, applications, or any database. You only know the general info above.`;
 
 export const POST: APIRoute = async ({ request }) => {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return new Response(JSON.stringify({
-      ok: false,
-      error: 'AI assistant not configured yet.'
-    }), { headers: { 'Content-Type': 'application/json' } });
-  }
-
   try {
     const body = await request.json();
     const { messages } = body;
@@ -100,34 +82,20 @@ export const POST: APIRoute = async ({ request }) => {
       return new Response(JSON.stringify({ ok: false, error: 'No messages' }), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    // Limit conversation length to prevent runaway costs
-    const recentMessages = messages.slice(-10);
+    // Limit conversation length to prevent runaway cost/latency.
+    const recentMessages = messages.slice(-10).map((m: any) => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || ''),
+    }));
 
-    const resp = await fetch(CLAUDE_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 600,
-        system: FAQ_SYSTEM,
-        messages: recentMessages,
-      }),
-    });
-
-    if (!resp.ok) {
-      const err = await resp.text();
-      console.error('Claude API error:', resp.status, err);
+    const r = await complete({ feature: 'faq_bot', system: FAQ_SYSTEM, messages: recentMessages, maxTokens: 600 });
+    if (!r.configured) {
+      return new Response(JSON.stringify({ ok: false, error: 'AI assistant not configured yet.' }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (!r.ok) {
+      console.error('faq_bot gateway error:', r.error);
       return new Response(JSON.stringify({ ok: false, error: 'AI temporarily unavailable. Please try again.' }), { headers: { 'Content-Type': 'application/json' } });
     }
-
-    const data = await resp.json() as any;
-    const reply = data.content?.[0]?.text || 'Sorry, I could not generate a response.';
-
-    return new Response(JSON.stringify({ ok: true, reply }), { headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true, reply: r.text || 'Sorry, I could not generate a response.' }), { headers: { 'Content-Type': 'application/json' } });
   } catch (e: any) {
     return new Response(JSON.stringify({ ok: false, error: e.message }), { headers: { 'Content-Type': 'application/json' } });
   }

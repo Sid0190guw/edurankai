@@ -1,9 +1,12 @@
-// Thin wrapper around the Anthropic API for short, one-shot LLM calls.
-// Returns an empty string if ANTHROPIC_API_KEY is missing so callers can
-// silently fall back to deterministic behaviour.
+// Short, one-shot LLM calls for the interview/test tooling. Text goes through the first-party
+// gateway (self-hosted 'own' model → env-Anthropic fallback), so it runs against a self-hosted
+// open-weight model with zero code change. The document/image (multimodal) path still uses the
+// vision-capable claude provider — but with creds+model resolved from the gateway CONFIG, not a
+// raw env key — because a self-hosted vision model would need the OpenAI multimodal content
+// format (a follow-up). Returns [] / '' when nothing is configured so callers degrade silently.
+import { complete, effectiveConfig } from '@/lib/llm/gateway';
 
-const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
-const MODEL = 'claude-sonnet-4-6'; // current best general-purpose Sonnet
+const CLAUDE_API = 'https://api.anthropic.com/v1/messages';   // multimodal-only path
 
 const LANGUAGE_NAMES: Record<string, string> = {
   'en': 'English', 'en-IN': 'English (India)', 'en-US': 'English (US)', 'en-GB': 'English (UK)',
@@ -23,7 +26,22 @@ function languageName(bcp47: string): string {
 }
 
 export function isLlmConfigured(): boolean {
+  // Heuristic used to gate UI: an env Anthropic key means the fallback connector is available.
+  // (A DB-configured self-hosted 'own' provider also works at call time even when this is false.)
   return !!process.env.ANTHROPIC_API_KEY;
+}
+
+function parseQuestions(text: string): GeneratedQuestion[] {
+  try {
+    const t = (text || '').trim();
+    const m = t.match(/\[[\s\S]*\]/);
+    const arr = JSON.parse(m ? m[0] : t);
+    if (!Array.isArray(arr)) return [];
+    return arr.map((q: any) => ({
+      prompt: String(q?.prompt || q?.question || '').trim().slice(0, 1000),
+      topics: Array.isArray(q?.topics) ? q.topics.map((t: any) => String(t).trim()).filter(Boolean).slice(0, 8) : [],
+    })).filter((q: GeneratedQuestion) => q.prompt);
+  } catch { return []; }
 }
 
 export interface GeneratedQuestion { prompt: string; topics: string[]; }
@@ -35,44 +53,37 @@ export async function generateInterviewQuestions(opts: {
   sourceText?: string; pdfBase64?: string; imageBase64?: string; imageMime?: string;
   count?: number; lang?: string; role?: string;
 }): Promise<GeneratedQuestion[]> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return [];
   const lang = languageName(opts.lang || 'en-IN');
   const n = Math.max(1, Math.min(30, opts.count || 8));
   const roleLine = opts.role ? ` The interview is for the role: ${opts.role}.` : '';
   const system = `You are an expert interviewer and examiner.${roleLine} From the provided source material, write ${n} clear, standalone interview/test questions in ${lang}. Mix recall, conceptual-understanding and applied/scenario questions appropriate to the material's level. Each question must be answerable from the material or reasonable domain knowledge. Return ONLY a JSON array; each element is an object {"prompt": "<the question>", "topics": ["topic1","topic2"]}. No prose, no markdown fences.`;
 
-  let content: any;
-  if (opts.pdfBase64) {
-    content = [
-      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: opts.pdfBase64 } },
-      { type: 'text', text: `Generate ${n} interview/test questions in ${lang} from this document. Return ONLY the JSON array.` },
-    ];
-  } else if (opts.imageBase64) {
-    content = [
-      { type: 'image', source: { type: 'base64', media_type: opts.imageMime || 'image/png', data: opts.imageBase64 } },
-      { type: 'text', text: `Generate ${n} interview/test questions in ${lang} from this image. Return ONLY the JSON array.` },
-    ];
-  } else {
-    content = `Source material:\n\n${(opts.sourceText || '').slice(0, 80000)}\n\nGenerate ${n} interview/test questions in ${lang}. Return ONLY the JSON array.`;
+  // TEXT path → first-party gateway (portable to a self-hosted open-weight model).
+  if (!opts.pdfBase64 && !opts.imageBase64) {
+    const userContent = `Source material:\n\n${(opts.sourceText || '').slice(0, 80000)}\n\nGenerate ${n} interview/test questions in ${lang}. Return ONLY the JSON array.`;
+    const r = await complete({ feature: 'interview_qgen', system, messages: [{ role: 'user', content: userContent }], maxTokens: 3000 });
+    return r.ok ? parseQuestions(r.text) : [];
   }
 
+  // MULTIMODAL path (PDF/image) — needs a vision model. Creds+model come from the gateway config
+  // (DB claude creds → env), so this stays config-driven, not a raw hard-wired key.
+  const cfg = await effectiveConfig();
+  const apiKey = cfg.claudeApiKey;
+  if (!apiKey) return [];
+  const content = opts.pdfBase64
+    ? [ { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: opts.pdfBase64 } },
+        { type: 'text', text: `Generate ${n} interview/test questions in ${lang} from this document. Return ONLY the JSON array.` } ]
+    : [ { type: 'image', source: { type: 'base64', media_type: opts.imageMime || 'image/png', data: opts.imageBase64 } },
+        { type: 'text', text: `Generate ${n} interview/test questions in ${lang} from this image. Return ONLY the JSON array.` } ];
   try {
     const resp = await fetch(CLAUDE_API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: MODEL, max_tokens: 3000, system, messages: [{ role: 'user', content }] }),
+      body: JSON.stringify({ model: cfg.claudeModel, max_tokens: 3000, system, messages: [{ role: 'user', content }] }),
     });
     if (!resp.ok) { console.error('generateInterviewQuestions: api error', resp.status, await resp.text().catch(() => '')); return []; }
     const data = await resp.json() as any;
-    let text = (data.content?.[0]?.text || '').trim();
-    const m = text.match(/\[[\s\S]*\]/);
-    const arr = JSON.parse(m ? m[0] : text);
-    if (!Array.isArray(arr)) return [];
-    return arr.map((q: any) => ({
-      prompt: String(q?.prompt || q?.question || '').trim().slice(0, 1000),
-      topics: Array.isArray(q?.topics) ? q.topics.map((t: any) => String(t).trim()).filter(Boolean).slice(0, 8) : [],
-    })).filter((q: GeneratedQuestion) => q.prompt);
+    return parseQuestions(data.content?.[0]?.text || '');
   } catch (e: any) { console.error('generateInterviewQuestions:', e?.message || e); return []; }
 }
 
@@ -85,9 +96,6 @@ interface FollowUpInput {
 
 /** Ask one short follow-up question in the candidate's language. */
 export async function askFollowUp(input: FollowUpInput): Promise<string> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return '';
-
   const lang = languageName(input.lang || 'en-IN');
   const ctx = (input.contextTurns || []).slice(-6)
     .map(t => `${t.role === 'ai' ? 'Interviewer' : 'Candidate'}: ${t.text}`)
@@ -113,30 +121,7 @@ ${ctx ? `Conversation so far:\n${ctx}\n` : ''}
 
 Write ONE follow-up question in ${lang}.`;
 
-  try {
-    const resp = await fetch(CLAUDE_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 120,
-        system,
-        messages: [{ role: 'user', content: userMsg }],
-      }),
-    });
-    if (!resp.ok) {
-      console.error('askFollowUp: claude api error', resp.status, await resp.text().catch(() => ''));
-      return '';
-    }
-    const data = await resp.json() as any;
-    const text = (data.content?.[0]?.text || '').trim().replace(/^["“'']+|["”'']+$/g, '');
-    return text;
-  } catch (e: any) {
-    console.error('askFollowUp:', e?.message || e);
-    return '';
-  }
+  const r = await complete({ feature: 'interview_followup', system, messages: [{ role: 'user', content: userMsg }], maxTokens: 120 });
+  if (!r.ok || !r.text) return '';
+  return r.text.trim().replace(/^["“'']+|["”'']+$/g, '');
 }

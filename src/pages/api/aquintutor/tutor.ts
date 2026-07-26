@@ -6,20 +6,13 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-
-const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
-const MODEL = 'claude-sonnet-4-5';
+import { complete, type ChatMessage } from '@/lib/llm/gateway';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
 export const POST: APIRoute = async ({ request, locals }) => {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return json({ ok: false, error: 'The course tutor is being set up and will be available soon.' }, 503);
-  }
-
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
   const courseSlug = (body?.courseSlug || '').toString();
@@ -76,33 +69,18 @@ Your role:
 Tone: warm, precise, never condescending. Address the student as if you were a faculty member who is glad they came to office hours.`;
 
     // Trim message history to last 16 turns
-    const trimmed = messages.slice(-16).map((m: any) => ({
+    const trimmed: ChatMessage[] = messages.slice(-16).map((m: any) => ({
       role: m.role === 'user' ? 'user' : 'assistant',
       content: (m.content || '').toString().slice(0, 8000),
     }));
 
-    const resp = await fetch(CLAUDE_API, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 800,
-        system,
-        messages: trimmed,
-      }),
-    });
-    if (!resp.ok) {
-      const err = await resp.text().catch(() => '');
-      console.error('tutor: claude api error', resp.status, err);
+    const r = await complete({ feature: 'course_tutor', system, messages: trimmed, userId: user?.id, maxTokens: 800 });
+    if (!r.configured) return json({ ok: false, error: 'The course tutor is being set up and will be available soon.' }, 503);
+    if (!r.ok) {
+      console.error('course_tutor gateway error:', r.error);
       return json({ ok: false, error: 'AI tutor temporarily unavailable.' }, 502);
     }
-    const data = await resp.json() as any;
-    const reply = (data?.content?.[0]?.text || '').trim() || 'Sorry, no response generated.';
-    return json({ ok: true, reply });
+    return json({ ok: true, reply: (r.text || '').trim() || 'Sorry, no response generated.' });
   } catch (e: any) {
     return json({ ok: false, error: e?.message || 'server error' }, 500);
   }
