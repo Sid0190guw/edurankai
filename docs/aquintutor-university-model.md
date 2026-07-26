@@ -145,26 +145,35 @@ alongside learning. Layers:
 - **Student safety:** cyberbullying/harassment detection, well-being monitoring (privacy-safeguarded),
   emergency response. *(SOS/well-being features already present.)*
 
-## 8. Implementation roadmap
+## 8. Implementation roadmap — status
 
-**Phase 0 — Programs catalog (STARTED).** A first-class Programs/Degrees model classified by the
-delivery-model taxonomy (§1), with virtual% and partner-type, surfaced on a public catalog page.
-This is the concrete anchor everything else hangs off.
+All five phases now have shipped software surfaces (2026-07-26). Remaining work is
+partner-onboarding, faculty content authoring, and the infrastructure/hardware items called out below.
 
-**Phase 1 — Delivery-model surfaces.** Per-program "how it's delivered" pages: which parts are digital,
-which virtual-lab, which partner-practical; link programs → existing virtual labs and courses.
+**Phase 0 — Programs catalog. ✅ SHIPPED.** `aquin_programs` + `/aquintutor/programs` — the degree
+portfolio classified by delivery model, with virtual% and partner type; regulated programs separated.
 
-**Phase 2 — Partner registry.** A partners model (type, accreditation, capacity, MoU status) so
-practical placements and joint competency assessment can be tracked.
+**Phase 1 — Delivery-model surfaces. ✅ SHIPPED.** `/aquintutor/programs/[slug]` — per-program "how
+it's delivered" (digital %, practical partner, selective immersive, assessment), links to
+courses/labs/partners/competencies.
 
-**Phase 3 — Competency framework.** Competency definitions per program + progression tracking across
-theory / practical / projects / community / wellness / research.
+**Phase 2 — Partner registry. ✅ SHIPPED.** `aquin_partners` (9 ecosystem categories, MoU status,
+accreditation, capacity) + public `/aquintutor/partners` + `/aquintutor/admin/partners`. *Remaining:
+onboarding real partner organizations.*
 
-**Phase 4 — Immersive & clinical-campus.** Selective AR/VR sessions; 360°/multi-angle capture pipeline
-for demonstrations; AI overlays (labels, translation, Q&A, auto-quiz) on recorded sessions.
+**Phase 3 — Competency framework. ✅ SHIPPED.** `aquin_competencies` + `aquin_competency_progress`
+(6 dimensions, 3 assessment modes, per-learner progression) + `/aquintutor/competencies`. *Remaining:
+faculty define competencies per program.*
 
-**Phase 5 — Security hardening.** Close the infrastructure-security gaps (WAF/DDoS/SOC/scanning) and
-research-security workspaces; extend the credential/employer-verification portal.
+**Phase 4 — Immersive & clinical-campus. ✅ SHIPPED (software seam).** `aquin_immersive_sessions` +
+`/aquintutor/clinical-campus` — session registry, playback, AI-overlay config, honest contribution
+table. *Remaining (hardware/ops): the physical 360°/multi-angle capture rigs and VR headsets at partner
+sites, and the AI-overlay inference pipeline.*
+
+**Phase 5 — Security & digital trust. ✅ SHIPPED (posture + verification).** `/aquintutor/security`
+posture page (honest Active/Planned/Infrastructure status) + links the existing `/verify` credential
+portal. *Remaining (ops, not code): WAF/DDoS/SOC/continuous scanning; and the Planned items —
+zero-trust, browser lockdown, plagiarism, secure research workspaces, verifiable transcripts.*
 
 Regulatory compliance (§3) gates any regulated program (MBBS/BDS/etc.) — those remain hybrid,
 partner-delivered for clinical competencies, and are offered only within statutory requirements.
