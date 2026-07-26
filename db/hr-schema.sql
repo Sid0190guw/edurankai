@@ -14,6 +14,10 @@
 --
 -- HOW TO APPLY
 --   psql "$DATABASE_URL" -f db/hr-schema.sql
+-- or, if psql is not installed (uses the app's own postgres driver):
+--   node scripts/apply-sql.mjs db/hr-schema.sql --env-file .env.production --dry-run   # preview
+--   node scripts/apply-sql.mjs db/hr-schema.sql --env-file .env.production             # apply
+-- The runner prints the target host first — confirm it is the Supabase database, not Neon.
 --
 -- SCOPE NOTE. Column types here are reconstructed from how the application reads and writes
 -- them, not dumped from production, so on the live database the existing column types win (the
@@ -83,6 +87,30 @@ CREATE TABLE IF NOT EXISTS hr_employees (
 ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS photo_url TEXT;
 ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS work_email TEXT;
 ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS onboarding_status TEXT NOT NULL DEFAULT 'pending';
+-- Columns added as the HR module grew: fuller personal details + emergency contact
+-- (admin/hr/employees/[id] and portal/profile), worker classification (admin/hr/classification),
+-- and offboarding (admin/hr/employees/[id], lib/hr/sync.ts). ADD COLUMN IF NOT EXISTS, so these
+-- are a no-op on the existing production table and only complete a fresh environment — where
+-- their absence otherwise 500s the edit-employee, classification and offboarding screens.
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS nationality                TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS emergency_contact_name     TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS emergency_contact_phone    TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS emergency_contact_relation TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS city                       TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS state                      TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS country                    TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS pf_number                  TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS classification             TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS country_of_work            TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS engaged_via                TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS classification_reviewed_at TIMESTAMPTZ;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS classification_reviewed_by UUID;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS exit_type                  TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS exit_reason                TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS notice_served_at           TIMESTAMPTZ;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS offboarding_state          JSONB;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS relieving_letter_url       TEXT;
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS notes                      TEXT;
 CREATE INDEX IF NOT EXISTS hr_employees_user_idx   ON hr_employees (user_id);
 CREATE INDEX IF NOT EXISTS hr_employees_active_idx ON hr_employees (is_active, created_at DESC);
 CREATE INDEX IF NOT EXISTS hr_employees_app_idx    ON hr_employees (application_id);
@@ -97,7 +125,8 @@ CREATE TABLE IF NOT EXISTS hr_attendance (
   date        DATE NOT NULL,
   clock_in    TIMESTAMPTZ,
   clock_out   TIMESTAMPTZ,
-  work_hours  NUMERIC(6,2) NOT NULL DEFAULT 0,
+  work_hours     NUMERIC(6,2) NOT NULL DEFAULT 0,
+  overtime_hours NUMERIC(6,2) NOT NULL DEFAULT 0,
   status      TEXT NOT NULL DEFAULT 'present',   -- present | wfh | on_leave | absent | holiday
   work_mode   TEXT NOT NULL DEFAULT 'remote',
   notes       TEXT,
@@ -105,6 +134,9 @@ CREATE TABLE IF NOT EXISTS hr_attendance (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CONSTRAINT hr_attendance_emp_date_key UNIQUE (employee_id, date)
 );
+-- overtime_hours is summed on /admin/hr/attendance; ADD COLUMN so it exists on the pre-existing
+-- production table too (the CREATE TABLE above only fills a brand-new one).
+ALTER TABLE hr_attendance ADD COLUMN IF NOT EXISTS overtime_hours NUMERIC(6,2) NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS hr_attendance_emp_idx ON hr_attendance (employee_id, date DESC);
 
 -- ---------------------------------------------------------------------------
@@ -304,6 +336,74 @@ CREATE TABLE IF NOT EXISTS hr_withdrawal (
   payout_ref      TEXT, paid_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS hr_withdrawal_status ON hr_withdrawal (status, requested_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Time logs — per-period work entries an employee books against a day. Read on
+-- /admin/hr/attendance (UNGUARDED — a fresh DB without this table 500s that page) and written
+-- from /portal/employee. start_time / end_time are "HH:MM" strings parsed client-side.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hr_time_logs (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id UUID NOT NULL,
+  log_date    DATE NOT NULL,
+  start_time  TEXT,
+  end_time    TEXT,
+  hours       NUMERIC(6,2) NOT NULL DEFAULT 0,
+  task        TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS hr_time_logs_emp_date_idx ON hr_time_logs (employee_id, log_date);
+
+-- ---------------------------------------------------------------------------
+-- Task log — end-of-day task summary captured at clock-out. Self-bootstrapped by
+-- portal/employee.astro; defined here so the schema is complete.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hr_task_log (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id UUID NOT NULL,
+  log_date    DATE NOT NULL,
+  task        TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'done',
+  percent     INT NOT NULL DEFAULT 100,
+  details     TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS hr_task_log_emp_date_idx ON hr_task_log (employee_id, log_date);
+
+-- ---------------------------------------------------------------------------
+-- Performance reviews — cycles + one review row per (cycle, employee). The auto-seed inserts a
+-- row per active employee with ON CONFLICT (cycle_id, employee_id), so that pair MUST be unique.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hr_review_cycles (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title        TEXT NOT NULL,
+  period_start DATE,
+  period_end   DATE,
+  review_type  TEXT,
+  status       TEXT NOT NULL DEFAULT 'draft',    -- draft | active | closed
+  created_by   UUID,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS hr_performance_reviews (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  cycle_id          UUID NOT NULL,
+  employee_id       UUID NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'pending',  -- pending | in_progress | submitted
+  overall_rating    NUMERIC(5,2),
+  goals_score       NUMERIC(5,2),
+  skills_score      NUMERIC(5,2),
+  attitude_score    NUMERIC(5,2),
+  strengths         TEXT,
+  improvements      TEXT,
+  goals_next        TEXT,
+  reviewer_comments TEXT,
+  submitted_at      TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT hr_performance_reviews_cycle_emp_key UNIQUE (cycle_id, employee_id)
+);
+CREATE INDEX IF NOT EXISTS hr_performance_reviews_cycle_idx ON hr_performance_reviews (cycle_id);
 
 -- ---------------------------------------------------------------------------
 -- New-hire joining documents (Google Drive links, capped per hire)
