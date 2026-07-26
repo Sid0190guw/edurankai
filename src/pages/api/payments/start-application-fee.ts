@@ -45,6 +45,19 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const intentRow = (Array.isArray(intentRows) ? intentRows : (intentRows?.rows || []))[0] as any;
       if (!intentRow) return json({ ok: false, error: 'Application intent not found' }, 404);
 
+      // FEE-FREE SHORT-CIRCUIT. Applications carry no fee (see application-fee.ts), so never try
+      // to open a ₹0 gateway order — Razorpay rejects amounts under ₹1, which would strand the
+      // applicant. Materialise the application as free and send them to confirmation. This also
+      // covers any stale/cached pay page that still POSTs here after the fee was removed.
+      if (resolveApplicationFeeChf({ roleFee: intentRow.role_fee, level: intentRow.level, engagementType: intentRow.role_engagement }) <= 0) {
+        try {
+          const { materialiseFromIntent } = await import('@/lib/fee-waiver');
+          const newId = await materialiseFromIntent(intentRow.id, { paid: false, waiverGranted: true, waiverReason: 'No application fee (applications are free).' });
+          if (newId) return json({ ok: true, alreadyPaid: true, free: true, redirect: '/apply/confirmation?id=' + newId });
+        } catch (_) {}
+        return json({ ok: true, alreadyPaid: true, free: true, redirect: '/portal' });
+      }
+
       // IDEMPOTENCY (prevents the double-charge): if this intent already has a
       // captured payment, do NOT create a new order. Re-run the materialisation
       // (in case it failed the first time) and send the applicant to their
@@ -165,6 +178,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const confirmUrl = '/apply/confirmation?id=' + app.id;
     if (app.fee_paid) {
       return json({ ok: true, alreadyPaid: true, redirect: confirmUrl });
+    }
+
+    // FEE-FREE SHORT-CIRCUIT (see the intent branch above and application-fee.ts): applications
+    // are free, so mark this one settled and confirm it rather than opening a ₹0 gateway order.
+    if (resolveApplicationFeeChf({ roleFee: app.role_fee, level: app.level, engagementType: app.role_engagement }) <= 0) {
+      await db.execute(sql`UPDATE applications SET fee_paid = true, updated_at = NOW() WHERE id = ${app.id}`).catch(() => {});
+      return json({ ok: true, alreadyPaid: true, free: true, redirect: confirmUrl });
     }
 
     // Webhook-independent double-charge guard for the direct app-fee path: settle
