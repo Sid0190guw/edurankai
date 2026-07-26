@@ -152,6 +152,34 @@ export async function listPrograms(): Promise<Program[]> {
   return rows(await db.execute(sql`SELECT * FROM aquin_programs WHERE is_published = true ORDER BY regulated ASC, delivery_model ASC, sort_order ASC`)).map(toProgram);
 }
 
+export async function getProgram(slug: string): Promise<Program | null> {
+  await ensureProgramsSchema();
+  const r = rows(await db.execute(sql`SELECT * FROM aquin_programs WHERE slug = ${slug} AND is_published = true LIMIT 1`))[0];
+  return r ? toProgram(r) : null;
+}
+
+/** All published program slugs — for static path generation on the detail route. */
+export async function allProgramSlugs(): Promise<string[]> {
+  try { await seedPrograms(); return rows(await db.execute(sql`SELECT slug FROM aquin_programs WHERE is_published = true`)).map((r) => String(r.slug)); }
+  catch { return []; }
+}
+
+/** The delivery breakdown for one program — what is digital, what is virtual-lab, what is partner
+ *  practical, and how it is assessed. Derived from the delivery model; honest per §1 of the spec. */
+export function deliveryBreakdown(p: Program): { digital: string; practical: string; assessment: string; immersive: string } {
+  const m = modelByN(p.deliveryModel);
+  return {
+    digital: `${p.virtualPct}% delivered online — live and recorded classes, AI tutoring, real-time visualization and simulations, on a laptop, tablet or phone.`,
+    practical: p.deliveryModel === 1
+      ? 'No external practical component — this program is fully online.'
+      : `Practical training through ${m.partnerType.toLowerCase()}, with competencies assessed on-site.`,
+    assessment: p.deliveryModel === 1
+      ? 'Continuous online assessment, proctored examinations and verifiable credentials.'
+      : 'Joint, competency-based assessment by AquinTutor and the partner institution.',
+    immersive: 'AR/VR/XR is used selectively — for laboratory work, anatomy, simulations and design visualization — not as the everyday teaching medium.',
+  };
+}
+
 /** Programs grouped by delivery model (virtual first), plus a separate regulated/hybrid bucket. */
 export async function programsByModel(): Promise<{ virtual: { model: DeliveryModel; programs: Program[] }[]; regulated: Program[] }> {
   const all = await listPrograms();
