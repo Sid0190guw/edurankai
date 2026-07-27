@@ -128,9 +128,15 @@ for (let i = 0; i < statements.length; i++) {
   const stmt = statements[i];
   const n = String(i + 1).padStart(3);
   try {
-    await sql.unsafe(stmt);
+    const result = await sql.unsafe(stmt);
     ok++;
     console.log(`${n}  ok    ${label(stmt)}`);
+    // Show rows for diagnostic SELECTs (e.g. a "find duplicates" step in a migration).
+    if (Array.isArray(result) && result.length > 0) {
+      console.log(`       ${result.length} row(s):`);
+      for (const row of result.slice(0, 100)) console.log('         ' + JSON.stringify(row));
+      if (result.length > 100) console.log(`         … and ${result.length - 100} more`);
+    }
   } catch (e) {
     failed++;
     // The real Postgres reason, not just the failed SQL.
