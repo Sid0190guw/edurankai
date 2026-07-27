@@ -1,0 +1,100 @@
+---
+// One-click duplicate-applications tool. Uses the app's own DB connection (no password needed),
+// so an admin can (1) see any same-person-same-role live duplicates, and (2) turn on the DB-level
+// backstop that blocks them at the source. Mirrors db/reapply-and-dedup.sql, but runnable from a
+// screen instead of the terminal.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+const { canAccessSection } = await import('@/lib/auth/permissions');
+const allowed = await canAccessSection(user as any, 'applications', 'edit').catch(() => false);
+if (!allowed) return Astro.redirect('/admin?denied=applications');
+
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+let msg = '', err = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  if (fd.get('action') === 'create_index') {
+    try {
+      await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS applications_one_live_per_user_role
+        ON applications (applicant_user_id, role_id)
+        WHERE applicant_user_id IS NOT NULL AND role_id IS NOT NULL
+          AND status NOT IN ('withdrawn', 'rejected', 'declined')`);
+      msg = 'Backstop is ON. The database now blocks a second live application for the same person + role (closes the concurrent-submit race). Re-applying is still allowed once the prior one is withdrawn/rejected.';
+    } catch (e: any) {
+      err = 'Could not create the index: ' + (e?.cause?.message || e?.message || 'unknown') + '. Resolve the duplicates listed below first (Trash the extra of each pair), then try again.';
+    }
+  }
+}
+
+let dupes: any[] = [];
+try {
+  dupes = rows(await db.execute(sql`
+    SELECT applicant_user_id, role_id, COUNT(*)::int AS live_apps,
+           array_agg(id::text ORDER BY created_at) AS ids,
+           array_agg(status::text ORDER BY created_at) AS statuses,
+           MIN(first_name) AS first_name, MIN(last_name) AS last_name, MIN(role_title_snapshot) AS role_title
+    FROM applications
+    WHERE applicant_user_id IS NOT NULL AND role_id IS NOT NULL
+      AND status NOT IN ('withdrawn', 'rejected', 'declined')
+    GROUP BY applicant_user_id, role_id HAVING COUNT(*) > 1
+    ORDER BY COUNT(*) DESC`));
+} catch (e) {}
+
+let indexExists = false;
+try {
+  indexExists = rows(await db.execute(sql`SELECT 1 FROM pg_indexes WHERE indexname = 'applications_one_live_per_user_role' LIMIT 1`)).length > 0;
+} catch (e) {}
+
+const clean = dupes.length === 0;
+---
+<AdminLayout title="Duplicate applications" activeNav="applications">
+<div style="padding:16px;max-width:900px;margin:0 auto;">
+  <a href="/admin/applications" style="font-size:12px;color:#8a8a94;text-decoration:none;font-family:'Geist Mono',monospace;">&larr; Applications</a>
+  <h1 style="font-size:20px;font-weight:800;color:#fff;margin:10px 0 4px;">Duplicate-application backstop</h1>
+  <p style="font-size:13px;color:#8a8a94;margin:0 0 18px;line-height:1.6;">At most one live application per person + role. The app already enforces this; this adds the database-level guarantee that also closes the rare case of two submissions landing at the exact same moment.</p>
+
+  {msg && <div style="background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.35);color:#6ee7b7;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:14px;">{msg}</div>}
+  {err && <div style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:14px;">{err}</div>}
+
+  <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;">
+    <div>
+      <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 3px;">Backstop status</p>
+      <p style="font-size:12.5px;margin:0;color:{indexExists ? '#6ee7b7' : '#fbbf24'};">{indexExists ? 'ON — the database blocks duplicate live applications.' : 'OFF — not yet enabled.'}</p>
+    </div>
+    {!indexExists && (
+      <form method="POST">
+        <input type="hidden" name="action" value="create_index" />
+        <button type="submit" disabled={!clean} title={clean ? '' : 'Resolve the duplicates below first'}
+          style={`border:none;font-size:13px;font-weight:700;padding:10px 18px;border-radius:9px;cursor:${clean ? 'pointer' : 'not-allowed'};${clean ? 'background:#FF4F00;color:#fff;' : 'background:#2a2a30;color:#6e6e78;'}`}>
+          Turn on backstop
+        </button>
+      </form>
+    )}
+  </div>
+
+  <h2 style="font-size:14px;font-weight:700;color:#fff;margin:0 0 10px;">Existing duplicates ({dupes.length})</h2>
+  {clean ? (
+    <p style="font-size:13px;color:#6ee7b7;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:14px;">No duplicate live applications. {indexExists ? 'The backstop is on — you are fully covered.' : 'Click "Turn on backstop" above to enable the database guarantee.'}</p>
+  ) : (
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <p style="font-size:12.5px;color:#fbbf24;margin:0 0 4px;">Trash the extra of each pair (keep the furthest-along one), then the backstop can be turned on.</p>
+      {dupes.map((d) => (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;">
+          <p style="font-size:13.5px;font-weight:600;color:#fff;margin:0 0 6px;">{(d.first_name || '') + ' ' + (d.last_name || '')} &middot; <span style="color:#8a8a94;font-weight:400;">{d.role_title || 'role'}</span> &middot; <span style="color:#fca5a5;">{d.live_apps} live</span></p>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">
+            {(d.ids || []).map((id: string, i: number) => (
+              <a href={`/admin/applications/${id}`} style="font-size:11px;text-decoration:none;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;padding:4px 9px;border-radius:6px;">{(d.statuses || [])[i] || 'app'} &middot; open &rarr;</a>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+</AdminLayout>
