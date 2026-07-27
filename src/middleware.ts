@@ -199,7 +199,15 @@ export const onRequest = defineMiddleware(async (context, next) => {
     // Anonymous + public page -> let the CDN cache it so repeat hits never touch Neon.
     if (context.request.method === 'GET' && isPublicCacheable(path)) {
       const res = await next();
-      res.headers.set('Cache-Control', 'public, max-age=0, s-maxage=300, stale-while-revalidate=900');
+      // Never CDN-cache a DEGRADED render (a DB hiccup that emptied the page): otherwise that broken
+      // response gets pinned at the edge for up to 15 min even after the DB recovers. A page signals
+      // degradation by setting the 'x-era-degraded' header when a data query failed.
+      if (res.headers.get('x-era-degraded')) {
+        res.headers.set('Cache-Control', 'no-store');
+        res.headers.delete('x-era-degraded');
+      } else {
+        res.headers.set('Cache-Control', 'public, max-age=0, s-maxage=300, stale-while-revalidate=900');
+      }
       res.headers.set('Vary', 'Cookie');
       return res;
     }
