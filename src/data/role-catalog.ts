@@ -6,6 +6,11 @@
 // This exists to end per-day sponsored-listing bills on external job boards:
 // the careers portal + JobPosting structured data (free Google indexing) is
 // the primary channel; external boards become optional.
+//
+// The large AICTE-format internship catalog (170+ roles across 20 domains) lives in a
+// separate file, src/data/intern-catalog.ts, and is appended to ROLE_CATALOG at the bottom
+// of this file — kept apart so this file stays about hand-curated permanent/senior roles.
+import { INTERN_CATALOG } from './intern-catalog';
 
 export interface CatalogDepartment {
   id: string;
@@ -32,6 +37,21 @@ export interface CatalogRole {
   openings?: number;
   /** Substring matched against product slugs at import time (e.g. 'karate'). */
   productMatch?: string;
+
+  // ---- AICTE-portal-format internship fields (all optional; see src/lib/role-aicte.ts) ----
+  keywords?: string[];
+  learningOutcomes?: string[];
+  qualificationType?: string;              // e.g. "UG / PG"
+  qualifications?: string[];               // e.g. "Any Bachelor's Degree"
+  specialisations?: string[];              // disciplines encouraged to apply
+  noOfInterns?: number;                    // "No. of Interns Required"
+  perks?: string[];
+  internshipMode?: 'Full-Time' | 'Part-Time';
+  workingDaysPerWeek?: number;
+  hoursPerWeek?: number;
+  projectHoursPerDay?: number;
+  wellbeingHoursPerDay?: number;
+  engagementNotes?: string[];              // freeform "Terms of Engagement" bullets
 }
 
 export const CATALOG_DEPARTMENTS: CatalogDepartment[] = [
@@ -46,12 +66,23 @@ export const CATALOG_DEPARTMENTS: CatalogDepartment[] = [
   { id: 'operations', name: 'Operations & Support', icon: 'briefcase', description: 'Customer success, product support, documentation, and knowledge management.' },
   { id: 'martial-arts', name: 'Martial Arts & Sports', icon: 'activity', description: 'The global karate and martial-arts platform: instruction, community, and development.' },
   { id: 'innovation-grants', name: 'Innovation & Grants', icon: 'lightbulb', description: 'Non-dilutive funding: government grants, innovation schemes, and R&D incentives that keep EduRankAI independent.' },
+  { id: 'cybersecurity', name: 'Cybersecurity', icon: 'shield', description: 'Application, network, and cloud security; SOC operations, penetration testing, digital forensics, and governance/risk/compliance.' },
+  { id: 'engineering-disciplines', name: 'Core Engineering Disciplines', icon: 'cog', description: 'Mechanical, civil, electrical, aerospace, and allied engineering disciplines behind our physical and hybrid programmes.' },
+  { id: 'research', name: 'Research', icon: 'flask', description: 'Scientific, policy, market, education, and healthcare research that grounds our products in evidence.' },
+  { id: 'executive-office', name: "Founder's & Executive Office", icon: 'compass', description: "Direct support to the founder's and executive office: coordination, intelligence, planning, and communication." },
+  { id: 'sales-bd', name: 'Sales & Business Development', icon: 'handshake', description: 'Enterprise sales, partnerships, pre-sales, and client relationships that grow the ecosystem responsibly.' },
+  { id: 'education-learning', name: 'Education & Learning Design', icon: 'book', description: 'Curriculum, instructional design, and learning-experience design behind AquinTutor and our academic content.' },
+  { id: 'media-communications', name: 'Media & Communications', icon: 'mic', description: 'Writing, public relations, corporate communications, journalism, podcasts, photography, and video.' },
+  { id: 'healthcare-biotech', name: 'Healthcare & BioTech', icon: 'heart', description: 'Bioinformatics, medical AI, healthcare analytics, and clinical/biomedical research.' },
+  { id: 'administration', name: 'Administration', icon: 'folder', description: 'Office administration, facilities, and corporate administrative operations.' },
+  { id: 'governance-affairs', name: 'Governance & Corporate Affairs', icon: 'landmark', description: 'Corporate affairs, governance and compliance, ESG, public policy, and stakeholder/government/board relations.' },
+  { id: 'entrepreneurship', name: 'Entrepreneurship & Innovation', icon: 'rocket', description: 'Venture development, incubation, and strategic initiatives across the EduRankAI ecosystem.' },
 ];
 
 const REMOTE_IN = 'Remote / Hybrid (India)';
 const PERM = 'Permanent';
 
-export const ROLE_CATALOG: CatalogRole[] = [
+const HAND_CURATED_ROLES: CatalogRole[] = [
   // ─── AI & RESEARCH ────────────────────────────────────────────────
   {
     slug: 'senior-ai-engineer-computer-vision',
@@ -919,3 +950,5 @@ export const ROLE_CATALOG: CatalogRole[] = [
     ],
   },
 ];
+
+export const ROLE_CATALOG: CatalogRole[] = [...HAND_CURATED_ROLES, ...INTERN_CATALOG];
