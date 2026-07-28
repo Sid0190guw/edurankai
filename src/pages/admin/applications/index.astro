@@ -134,8 +134,17 @@ if (isTrash) {
   conditions.push(sql`deleted_at IS NOT NULL`);
 } else {
   conditions.push(sql`deleted_at IS NULL`);
-  if (archivedFilter === 'archived') conditions.push(eq(applications.isArchived, true));
-  else if (archivedFilter === 'active') conditions.push(eq(applications.isArchived, false));
+  if (archivedFilter === 'archived') {
+    conditions.push(eq(applications.isArchived, true));
+  } else {
+    // Not archived / not trashed — segment by lifecycle stage so "Active" holds only in-progress
+    // applications; finished candidates live in their own section.
+    conditions.push(eq(applications.isArchived, false));
+    if (archivedFilter === 'hired') conditions.push(sql`status = 'hired'`);
+    else if (archivedFilter === 'rejected') conditions.push(sql`status = 'rejected'`);
+    else if (archivedFilter === 'withdrawn') conditions.push(sql`status IN ('withdrawn', 'declined')`);
+    else conditions.push(sql`status NOT IN ('hired', 'rejected', 'withdrawn', 'declined')`); // 'active'
+  }
 }
 if (search.trim()) {
   const term = '%' + search.trim() + '%';
@@ -157,10 +166,26 @@ const apps = await db.select({
 }).from(applications).where(whereClause).orderBy(desc(applications.createdAt))
   .limit(perPage).offset((page - 1) * perPage);
 
-// Status counts
+// Lifecycle segment counts for the top tabs.
+const vcRes = await db.execute(sql`
+  SELECT
+    COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_archived = false AND status NOT IN ('hired','rejected','withdrawn','declined','pending_payment'))::int AS active,
+    COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_archived = false AND status = 'hired')::int AS hired,
+    COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_archived = false AND status = 'rejected')::int AS rejected,
+    COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_archived = false AND status IN ('withdrawn','declined'))::int AS withdrawn,
+    COUNT(*) FILTER (WHERE deleted_at IS NULL AND is_archived = true)::int AS archived,
+    COUNT(*) FILTER (WHERE deleted_at IS NOT NULL)::int AS trash
+  FROM applications`);
+const vcRow = ((Array.isArray(vcRes) ? vcRes : (vcRes as any)?.rows || []) as any[])[0] || {};
+const viewCounts: Record<string, number> = {
+  active: Number(vcRow.active || 0), hired: Number(vcRow.hired || 0), rejected: Number(vcRow.rejected || 0),
+  withdrawn: Number(vcRow.withdrawn || 0), archived: Number(vcRow.archived || 0), trash: Number(vcRow.trash || 0),
+};
+
+// Status pills (Active view only) — counts of the in-progress stages.
 const counts = await db.execute(sql`
   SELECT status, COUNT(*)::int as n FROM applications
-  WHERE ${isTrash ? sql`deleted_at IS NOT NULL` : sql`deleted_at IS NULL AND is_archived = ${archivedFilter === 'archived'}`}
+  WHERE deleted_at IS NULL AND is_archived = false AND status NOT IN ('hired','rejected','withdrawn','declined','pending_payment')
   GROUP BY status
 `);
 const countMap: Record<string, number> = {};
@@ -200,16 +225,17 @@ const ALL_STATUSES = ['pending_payment','submitted','reviewing','shortlisted','i
       <button type="submit" style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 14px;color:#fff;font-size:12px;cursor:pointer;">Go</button>
     </form>
 
-    <!-- Active / Archived / Trash -->
-    <div style="display:flex;gap:6px;margin-bottom:8px;">
-      {[['active','Active'],['archived','Archived'],['trash','Trash']].map(([key, label]) => (
-        <a href={`?status=${statusFilter}&archived=${key}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:5px 12px;border-radius:8px;white-space:nowrap;${archivedFilter === key ? (key === 'trash' ? 'background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;' : 'background:#FF4F00;color:#fff;') : 'background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;'}`}>
-          {label}
+    <!-- Lifecycle sections: Active holds only in-progress; finished candidates get their own tab -->
+    <div style="display:flex;gap:6px;margin-bottom:8px;overflow-x:auto;padding-bottom:2px;">
+      {[['active','Active'],['hired','Hired'],['rejected','Rejected'],['withdrawn','Withdrawn'],['archived','Archived'],['trash','Trash']].map(([key, label]) => (
+        <a href={`?status=all&archived=${key}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:5px 12px;border-radius:8px;white-space:nowrap;flex-shrink:0;${archivedFilter === key ? (key === 'trash' ? 'background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;' : key === 'hired' ? 'background:#10b981;color:#fff;' : key === 'rejected' ? 'background:#ef4444;color:#fff;' : 'background:#FF4F00;color:#fff;') : 'background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;'}`}>
+          {label} ({viewCounts[key]})
         </a>
       ))}
     </div>
 
-    <!-- Status pills -->
+    <!-- Status pills — refine the in-progress stages (Active section only) -->
+    {archivedFilter === 'active' && (
     <div style="display:flex;gap:6px;overflow-x:auto;padding-bottom:2px;">
       <a href={`?status=all&archived=${archivedFilter}`} style={`text-decoration:none;font-size:11px;font-weight:600;padding:4px 10px;border-radius:100px;white-space:nowrap;flex-shrink:0;${statusFilter === 'all' ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;'}`}>
         All ({totalActive})
@@ -220,6 +246,7 @@ const ALL_STATUSES = ['pending_payment','submitted','reviewing','shortlisted','i
         </a>
       ))}
     </div>
+    )}
   </div>
 
   <!-- Messages -->
