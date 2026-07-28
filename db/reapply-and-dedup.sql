@@ -18,13 +18,13 @@ SELECT applicant_user_id, role_id, COUNT(*) AS live_apps,
 FROM applications
 WHERE applicant_user_id IS NOT NULL
   AND role_id IS NOT NULL
-  AND status NOT IN ('withdrawn', 'rejected', 'declined')
+  AND status NOT IN ('withdrawn', 'rejected')
 GROUP BY applicant_user_id, role_id
 HAVING COUNT(*) > 1;
 
 -- ---------------------------------------------------------------------------
 -- STEP 2 — the backstop. At most ONE live application per (user, role). Re-application is still
--- allowed once the prior one is withdrawn/rejected/declined (the 6-month cooling is enforced in
+-- allowed once the prior one is withdrawn/rejected (the 6-month cooling is enforced in
 -- app code, since a time-window rule cannot be a plain unique index). Idempotent.
 -- If this errors with "could not create unique index ... duplicate key", STEP 1 still returns rows —
 -- resolve them and re-run. It is safe to re-run the whole file.
@@ -33,4 +33,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS applications_one_live_per_user_role
   ON applications (applicant_user_id, role_id)
   WHERE applicant_user_id IS NOT NULL
     AND role_id IS NOT NULL
-    AND status NOT IN ('withdrawn', 'rejected', 'declined');
+    AND status NOT IN ('withdrawn', 'rejected');

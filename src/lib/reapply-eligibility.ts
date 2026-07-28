@@ -4,7 +4,9 @@
 //   1. NO ACTIVE DUPLICATE — a person may hold at most one live application per role. (This is the
 //      "Prajna Saha applied twice / SUBMITTED + INTERVIEW" bug: there was no such rule, only a
 //      racy app-level look-then-insert.)
-//   2. 6-MONTH COOLING — after an application to a role ends (withdrawn / rejected / declined),
+//   2. 6-MONTH COOLING — after an application to a role ends (withdrawn / rejected — a declined
+//      offer sets the linked application to 'rejected', not a separate 'declined' status; that
+//      value only exists on offer_letters.status, never on applications.status),
 //      the person cannot re-apply to the SAME role for 6 months.
 //
 // Matching is deliberately broad — by (user id OR email) AND (role id OR role title snapshot) — so
@@ -16,7 +18,11 @@ const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 export const COOLING_DAYS = 180; // 6 months
 
 // An application is "finished" (eligible to start the cooling clock) in these states.
-const ENDED = ['withdrawn', 'rejected', 'declined'];
+// NOTE: applications.status is a Postgres ENUM that does NOT include 'declined' — a declined offer
+// sets the linked application's status to 'rejected' instead (see offer/[token].astro). Never add
+// 'declined' here or to any raw-SQL comparison against applications.status; it doesn't exist as a
+// value and Postgres will reject it outright ("invalid input value for enum application_status").
+const ENDED = ['withdrawn', 'rejected'];
 
 export interface Eligibility {
   allowed: boolean;
