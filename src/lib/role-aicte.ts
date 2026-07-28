@@ -78,13 +78,16 @@ export async function getRoleAicte(roleId: string): Promise<RoleAicte> {
 export async function setRoleAicte(roleId: string, a: Partial<RoleAicte>): Promise<void> {
   await ensureRoleAicteColumns();
   const v: RoleAicte = { ...EMPTY, ...a };
+  // Every TEXT[] column needs an explicit ::text[] cast — without it postgres-js/drizzle sends a
+  // JS array as an ambiguous "record" literal, which Postgres rejects ("expression is of type
+  // record"). Mirrors the working pattern in role-products.ts's setRoleProducts().
   await db.execute(sql`
     UPDATE roles SET
-      keywords = ${v.keywords}, learning_outcomes = ${v.learningOutcomes}, qualification_type = ${v.qualificationType || null},
-      qualifications = ${v.qualifications}, specialisations = ${v.specialisations},
-      no_of_interns = ${v.noOfInterns}, perks = ${v.perks}, internship_mode = ${v.internshipMode || 'Full-Time'},
+      keywords = ${v.keywords}::text[], learning_outcomes = ${v.learningOutcomes}::text[], qualification_type = ${v.qualificationType || null},
+      qualifications = ${v.qualifications}::text[], specialisations = ${v.specialisations}::text[],
+      no_of_interns = ${v.noOfInterns}, perks = ${v.perks}::text[], internship_mode = ${v.internshipMode || 'Full-Time'},
       working_days_per_week = ${v.workingDaysPerWeek}, hours_per_week = ${v.hoursPerWeek},
       project_hours_per_day = ${v.projectHoursPerDay}, wellbeing_hours_per_day = ${v.wellbeingHoursPerDay},
-      engagement_notes = ${v.engagementNotes}
+      engagement_notes = ${v.engagementNotes}::text[]
     WHERE id = ${roleId}`);
 }

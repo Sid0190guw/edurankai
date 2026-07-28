@@ -6,7 +6,7 @@ import { can } from '@/lib/auth/permissions';
 import { desc, eq, asc, ilike, and, or, SQL } from 'drizzle-orm';
 import { CATALOG_DEPARTMENTS, ROLE_CATALOG } from '@/data/role-catalog';
 import { getProductOptions, setRoleProducts, setRoleOpenings } from '@/lib/role-products';
-import { setRoleAicte } from '@/lib/role-aicte';
+import { setRoleAicte, getRoleAicte } from '@/lib/role-aicte';
 import { logAudit } from '@/lib/audit';
 
 const user = Astro.locals.user!;
@@ -27,54 +27,92 @@ if (Astro.request.method === 'POST' && canEdit) {
       for (const d of CATALOG_DEPARTMENTS) {
         await db.insert(departments).values({ id: d.id, name: d.name, icon: d.icon, description: d.description, sortOrder: 50 }).onConflictDoNothing();
       }
-      const existing = await db.select({ slug: roles.slug, title: roles.title }).from(roles);
+      // slug -> id for roles ALREADY present, so a catalog entry that matches by exact slug (i.e.
+      // one of OUR OWN prior imports — never a hand-written role, since those use different slugs)
+      // can have its AICTE fields backfilled if an earlier partial/failed import left them empty.
+      const existing = await db.select({ id: roles.id, slug: roles.slug, title: roles.title }).from(roles);
+      const idBySlug = new Map(existing.map((r) => [r.slug, r.id]));
       const haveSlugs = new Set(existing.map((r) => r.slug));
       const haveTitles = new Set(existing.map((r) => normTitle(r.title)));
       const productOptions = await getProductOptions();
       const added: string[] = [];
+      const repaired: string[] = [];
+      const failed: { title: string; reason: string }[] = [];
       let skipped = 0;
-      for (const c of ROLE_CATALOG) {
-        if (haveSlugs.has(c.slug) || haveTitles.has(normTitle(c.title))) { skipped++; continue; }
-        const inserted = await db.insert(roles).values({
-          slug: c.slug,
-          departmentId: c.departmentId,
-          title: c.title,
-          level: c.level,
-          function: c.function,
-          engagementType: c.engagementType,
-          location: c.location,
-          duration: c.duration,
-          salary: c.salary,
-          about: c.about,
-          responsibilities: c.responsibilities as string[],
-          skills: c.skills as string[],
-          eligibility: c.eligibility as string[],
-          isOpen: true,
-          isFeatured: !!c.isFeatured,
-          sortOrder: 50,
-        }).returning({ id: roles.id });
-        if (c.productMatch) {
-          const tags = productOptions.filter((p) => p.slug.includes(c.productMatch!) || p.name.toLowerCase().includes(c.productMatch!)).map((p) => p.slug);
-          if (tags.length) await setRoleProducts(inserted[0].id, tags);
-        }
-        if (c.openings) await setRoleOpenings(inserted[0].id, c.openings);
-        if (c.keywords || c.learningOutcomes || c.qualificationType || c.qualifications || c.specialisations
-            || c.noOfInterns || c.perks || c.internshipMode || c.workingDaysPerWeek || c.hoursPerWeek
-            || c.projectHoursPerDay || c.wellbeingHoursPerDay || c.engagementNotes) {
-          await setRoleAicte(inserted[0].id, {
-            keywords: c.keywords, learningOutcomes: c.learningOutcomes, qualificationType: c.qualificationType,
-            qualifications: c.qualifications, specialisations: c.specialisations, noOfInterns: c.noOfInterns,
-            perks: c.perks, internshipMode: c.internshipMode, workingDaysPerWeek: c.workingDaysPerWeek,
-            hoursPerWeek: c.hoursPerWeek, projectHoursPerDay: c.projectHoursPerDay,
-            wellbeingHoursPerDay: c.wellbeingHoursPerDay, engagementNotes: c.engagementNotes,
-          });
-        }
-        added.push(c.title);
+
+      function aicteOf(c: (typeof ROLE_CATALOG)[number]) {
+        return {
+          keywords: c.keywords, learningOutcomes: c.learningOutcomes, qualificationType: c.qualificationType,
+          qualifications: c.qualifications, specialisations: c.specialisations, noOfInterns: c.noOfInterns,
+          perks: c.perks, internshipMode: c.internshipMode, workingDaysPerWeek: c.workingDaysPerWeek,
+          hoursPerWeek: c.hoursPerWeek, projectHoursPerDay: c.projectHoursPerDay,
+          wellbeingHoursPerDay: c.wellbeingHoursPerDay, engagementNotes: c.engagementNotes,
+        };
       }
-      await logAudit({ userId: user.id, action: 'role.import_catalog', entity: 'role', entityId: 'catalog', diff: { added, skipped }, ipAddress: Astro.clientAddress });
-      importMsg = added.length
-        ? 'Imported ' + added.length + ' new role' + (added.length === 1 ? '' : 's') + ' (' + skipped + ' already present, untouched): ' + added.join(' · ')
-        : 'Nothing to import — all ' + skipped + ' catalog roles already exist. Your roles were not touched.';
+      const hasAicteData = (c: (typeof ROLE_CATALOG)[number]) =>
+        !!(c.keywords || c.learningOutcomes || c.qualificationType || c.qualifications || c.specialisations
+          || c.noOfInterns || c.perks || c.internshipMode || c.workingDaysPerWeek || c.hoursPerWeek
+          || c.projectHoursPerDay || c.wellbeingHoursPerDay || c.engagementNotes);
+
+      for (const c of ROLE_CATALOG) {
+        // Exact-slug match to an existing row = one of our own catalog roles from a prior import.
+        // Repair it if it's missing AICTE data (the earlier type-cast bug could leave the base row
+        // inserted but its AICTE columns never set, since that UPDATE failed and stopped the loop).
+        const existingId = idBySlug.get(c.slug);
+        if (existingId && hasAicteData(c)) {
+          try {
+            const cur = await getRoleAicte(existingId);
+            const empty = cur.keywords.length === 0 && cur.learningOutcomes.length === 0 && cur.perks.length === 0;
+            if (empty) { await setRoleAicte(existingId, aicteOf(c)); repaired.push(c.title); }
+          } catch (_) {}
+        }
+        if (haveSlugs.has(c.slug) || haveTitles.has(normTitle(c.title))) { skipped++; continue; }
+
+        // Per-role isolation: one bad row must never abort the whole import. The base row is
+        // inserted first; product tags / openings / AICTE fields are best-effort afterwards.
+        try {
+          const inserted = await db.insert(roles).values({
+            slug: c.slug,
+            departmentId: c.departmentId,
+            title: c.title,
+            level: c.level,
+            function: c.function,
+            engagementType: c.engagementType,
+            location: c.location,
+            duration: c.duration,
+            salary: c.salary,
+            about: c.about,
+            responsibilities: c.responsibilities as string[],
+            skills: c.skills as string[],
+            eligibility: c.eligibility as string[],
+            isOpen: true,
+            isFeatured: !!c.isFeatured,
+            sortOrder: 50,
+          }).returning({ id: roles.id });
+          haveSlugs.add(c.slug); // guard against any accidental repeat later in the same run
+          try {
+            if (c.productMatch) {
+              const tags = productOptions.filter((p) => p.slug.includes(c.productMatch!) || p.name.toLowerCase().includes(c.productMatch!)).map((p) => p.slug);
+              if (tags.length) await setRoleProducts(inserted[0].id, tags);
+            }
+            if (c.openings) await setRoleOpenings(inserted[0].id, c.openings);
+            if (hasAicteData(c)) await setRoleAicte(inserted[0].id, aicteOf(c));
+          } catch (e: any) {
+            failed.push({ title: c.title, reason: 'created, but extra fields failed: ' + (e?.cause?.message || e?.message || 'unknown') });
+          }
+          added.push(c.title);
+        } catch (e: any) {
+          failed.push({ title: c.title, reason: e?.cause?.message || e?.message || 'unknown error' });
+        }
+      }
+      await logAudit({ userId: user.id, action: 'role.import_catalog', entity: 'role', entityId: 'catalog', diff: { added, skipped, repaired, failed }, ipAddress: Astro.clientAddress });
+      const parts: string[] = [];
+      parts.push(added.length
+        ? 'Imported ' + added.length + ' new role' + (added.length === 1 ? '' : 's') + ' (' + skipped + ' already present, untouched).'
+        : 'No new roles to import — all ' + skipped + ' catalog roles already exist. Your roles were not touched.');
+      if (repaired.length) parts.push('Repaired AICTE fields on ' + repaired.length + ' previously-imported role' + (repaired.length === 1 ? '' : 's') + ' that were missing them.');
+      if (failed.length) parts.push(failed.length + ' role' + (failed.length === 1 ? '' : 's') + ' had a problem: ' + failed.map((f) => f.title + ' (' + f.reason + ')').join(' · '));
+      importMsg = parts.join(' ');
     } catch (e: any) {
       importMsg = 'Import failed: ' + (e?.cause?.message || e?.message || 'unknown error');
     }
