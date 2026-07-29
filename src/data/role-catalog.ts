@@ -22,6 +22,7 @@ import {
   INTERN_CATALOG_PHASE4_C, INTERN_CATALOG_PHASE4_D,
   PHASE4_DEPARTMENTS,
 } from './intern-catalog-phase4';
+import { INTERN_CATALOG_PHASE5, PHASE5_DEPARTMENTS } from './intern-catalog-phase5';
 
 export interface CatalogDepartment {
   id: string;
@@ -95,6 +96,7 @@ export const CATALOG_DEPARTMENTS: CatalogDepartment[] = [
   ...PHASE3_DEPARTMENTS_BATCH3,
   // Phase 4 enterprise/corporate functions — see src/data/intern-catalog-phase4.ts
   ...PHASE4_DEPARTMENTS,
+  ...PHASE5_DEPARTMENTS,
 ];
 
 const REMOTE_IN = 'Remote / Hybrid (India)';
@@ -1014,4 +1016,5 @@ export const ROLE_CATALOG: CatalogRole[] = [
   ...INTERN_CATALOG_PHASE4_B,
   ...INTERN_CATALOG_PHASE4_C,
   ...INTERN_CATALOG_PHASE4_D,
+  ...INTERN_CATALOG_PHASE5,
 ];
