@@ -6,7 +6,7 @@ import { can } from '@/lib/auth/permissions';
 import { desc, eq, asc, ilike, and, or, SQL } from 'drizzle-orm';
 import { CATALOG_DEPARTMENTS, ROLE_CATALOG } from '@/data/role-catalog';
 import { getProductOptions, setRoleProducts, setRoleOpenings } from '@/lib/role-products';
-import { setRoleAicte, getRoleAicte } from '@/lib/role-aicte';
+import { setRoleAicte, ensureRoleAicteColumns } from '@/lib/role-aicte';
 import { logAudit } from '@/lib/audit';
 
 const user = Astro.locals.user!;
@@ -24,14 +24,30 @@ if (Astro.request.method === 'POST' && canEdit) {
   const fd = await Astro.request.formData();
   if (fd.get('_action') === 'import_catalog') {
     try {
+      // Hard cap on rows touched per request. This runs in a serverless function with a fixed
+      // time limit; at 583 catalog roles an unbounded run returns 504 FUNCTION_INVOCATION_TIMEOUT
+      // and commits only a partial import. Bounded + idempotent means the button can simply be
+      // clicked again until it reports nothing remaining. For a full bulk load prefer the
+      // terminal importer, .dev-scripts/import-roles.mjs, which has no time limit.
+      const BATCH = 60;
+      await ensureRoleAicteColumns();
       for (const d of CATALOG_DEPARTMENTS) {
         await db.insert(departments).values({ id: d.id, name: d.name, icon: d.icon, description: d.description, sortOrder: 50 }).onConflictDoNothing();
       }
-      // slug -> id for roles ALREADY present, so a catalog entry that matches by exact slug (i.e.
-      // one of OUR OWN prior imports — never a hand-written role, since those use different slugs)
-      // can have its AICTE fields backfilled if an earlier partial/failed import left them empty.
-      const existing = await db.select({ id: roles.id, slug: roles.slug, title: roles.title }).from(roles);
+      // One query for everything we need about existing rows, including whether their AICTE
+      // columns are empty. Previously this page called getRoleAicte() once PER catalog role —
+      // 583 sequential round-trips, which by itself exhausted the function's time budget even
+      // when there was nothing left to import.
+      const existingRows = (await db.execute(sql`
+        SELECT id, slug, title,
+          (COALESCE(array_length(keywords, 1), 0) = 0
+           AND COALESCE(array_length(learning_outcomes, 1), 0) = 0
+           AND COALESCE(array_length(perks, 1), 0) = 0) AS aicte_empty
+        FROM roles`)) as any;
+      const existing: { id: string; slug: string; title: string; aicte_empty: boolean }[] =
+        Array.isArray(existingRows) ? existingRows : (existingRows?.rows || []);
       const idBySlug = new Map(existing.map((r) => [r.slug, r.id]));
+      const aicteEmptyBySlug = new Map(existing.map((r) => [r.slug, !!r.aicte_empty]));
       const haveSlugs = new Set(existing.map((r) => r.slug));
       const haveTitles = new Set(existing.map((r) => normTitle(r.title)));
       const productOptions = await getProductOptions();
@@ -39,6 +55,8 @@ if (Astro.request.method === 'POST' && canEdit) {
       const repaired: string[] = [];
       const failed: { title: string; reason: string }[] = [];
       let skipped = 0;
+      let budget = BATCH;      // rows we may still touch this request
+      let remaining = 0;       // rows we deliberately deferred to the next click
 
       function aicteOf(c: (typeof ROLE_CATALOG)[number]) {
         return {
@@ -56,17 +74,19 @@ if (Astro.request.method === 'POST' && canEdit) {
 
       for (const c of ROLE_CATALOG) {
         // Exact-slug match to an existing row = one of our own catalog roles from a prior import.
-        // Repair it if it's missing AICTE data (the earlier type-cast bug could leave the base row
-        // inserted but its AICTE columns never set, since that UPDATE failed and stopped the loop).
+        // Repair it if it's missing AICTE data (an earlier timed-out import could leave the base
+        // row inserted but its AICTE columns never set).
         const existingId = idBySlug.get(c.slug);
-        if (existingId && hasAicteData(c)) {
-          try {
-            const cur = await getRoleAicte(existingId);
-            const empty = cur.keywords.length === 0 && cur.learningOutcomes.length === 0 && cur.perks.length === 0;
-            if (empty) { await setRoleAicte(existingId, aicteOf(c)); repaired.push(c.title); }
-          } catch (_) {}
+        if (existingId && hasAicteData(c) && aicteEmptyBySlug.get(c.slug)) {
+          if (budget > 0) {
+            try { await setRoleAicte(existingId, aicteOf(c)); repaired.push(c.title); budget--; } catch (_) {}
+          } else {
+            remaining++;
+          }
         }
         if (haveSlugs.has(c.slug) || haveTitles.has(normTitle(c.title))) { skipped++; continue; }
+        if (budget <= 0) { remaining++; continue; }
+        budget--;
 
         // Per-role isolation: one bad row must never abort the whole import. The base row is
         // inserted first; product tags / openings / AICTE fields are best-effort afterwards.
@@ -111,6 +131,7 @@ if (Astro.request.method === 'POST' && canEdit) {
         ? 'Imported ' + added.length + ' new role' + (added.length === 1 ? '' : 's') + ' (' + skipped + ' already present, untouched).'
         : 'No new roles to import — all ' + skipped + ' catalog roles already exist. Your roles were not touched.');
       if (repaired.length) parts.push('Repaired AICTE fields on ' + repaired.length + ' previously-imported role' + (repaired.length === 1 ? '' : 's') + ' that were missing them.');
+      if (remaining) parts.push(remaining + ' more still to process — click Import catalog again to continue. (Bulk loads are faster from the terminal: npx tsx .dev-scripts/import-roles.mjs)');
       if (failed.length) parts.push(failed.length + ' role' + (failed.length === 1 ? '' : 's') + ' had a problem: ' + failed.map((f) => f.title + ' (' + f.reason + ')').join(' · '));
       importMsg = parts.join(' ');
     } catch (e: any) {
