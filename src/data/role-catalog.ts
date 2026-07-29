@@ -11,6 +11,7 @@
 // separate file, src/data/intern-catalog.ts, and is appended to ROLE_CATALOG at the bottom
 // of this file — kept apart so this file stays about hand-curated permanent/senior roles.
 import { INTERN_CATALOG } from './intern-catalog';
+import { INTERN_CATALOG_PHASE2, PHASE2_DEPARTMENTS } from './intern-catalog-phase2';
 
 export interface CatalogDepartment {
   id: string;
@@ -77,6 +78,8 @@ export const CATALOG_DEPARTMENTS: CatalogDepartment[] = [
   { id: 'administration', name: 'Administration', icon: 'folder', description: 'Office administration, facilities, and corporate administrative operations.' },
   { id: 'governance-affairs', name: 'Governance & Corporate Affairs', icon: 'landmark', description: 'Corporate affairs, governance and compliance, ESG, public policy, and stakeholder/government/board relations.' },
   { id: 'entrepreneurship', name: 'Entrepreneurship & Innovation', icon: 'rocket', description: 'Venture development, incubation, and strategic initiatives across the EduRankAI ecosystem.' },
+  // Phase 2 domain-specific verticals — see src/data/intern-catalog-phase2.ts
+  ...PHASE2_DEPARTMENTS,
 ];
 
 const REMOTE_IN = 'Remote / Hybrid (India)';
@@ -472,6 +475,39 @@ const HAND_CURATED_ROLES: CatalogRole[] = [
   },
 
   // ─── PRODUCT & PROGRAMS ───────────────────────────────────────────
+  {
+    slug: 'director-of-product',
+    departmentId: 'product-programs',
+    title: 'Director of Product',
+    level: 'Lead',
+    function: 'Lead product strategy, execution, and growth across our AI-powered product ecosystem — multiple product lines, one coherent thesis.',
+    engagementType: 'Full-Time',
+    location: REMOTE_IN,
+    duration: PERM,
+    salary: 'INR 45,00,000 - 80,00,000 per annum',
+    isFeatured: true,
+    about: 'With a growing portfolio of products spanning Artificial Intelligence, Education Technology, Enterprise SaaS, research platforms, and emerging ventures, we need a senior product leader to define long-term vision, build and mentor high-performing product teams, and turn research into products people actually use. You will work closely with Engineering, Design, Research, Sales, Marketing, and the founder\'s office, owning the complete product lifecycle from ideation to launch and continuous improvement across multiple product lines simultaneously.',
+    responsibilities: [
+      'Define and execute product vision and long-term roadmap across multiple product lines.',
+      'Lead and mentor Product Managers and cross-functional product teams as the portfolio grows.',
+      'Set product strategy aligned with company-wide objectives; prioritise by customer value, business impact, and technical feasibility.',
+      'Drive product discovery through customer research, market analysis, and competitive intelligence.',
+      'Partner closely with AI/Research, Engineering, Design, Marketing, Sales, and Operations on every launch.',
+      'Define product KPIs and hold teams accountable to measurable outcomes.',
+      'Own the complete product lifecycle: ideation, discovery, delivery, launch, and continuous improvement.',
+      'Build scalable product-management processes and documentation as the team and portfolio scale.',
+      'Present product strategy and business cases to the founder and executive leadership.',
+      'Foster a culture of innovation, experimentation, and customer-centric product development.',
+    ],
+    skills: ['Product strategy', 'Product discovery & user research', 'Roadmap planning & prioritisation', 'Agile / Lean product development', 'AI & LLM-powered products', 'Enterprise SaaS', 'Product analytics', 'Go-to-market strategy', 'Cross-functional leadership', 'Stakeholder communication', 'API products', 'Data-driven decision making'],
+    eligibility: [
+      "Bachelor's degree in Engineering, Computer Science, Information Technology, Business, or a related field; MBA or equivalent preferred.",
+      'Significant experience in product management, preferably across SaaS, AI, EdTech, or enterprise software.',
+      'Demonstrated experience leading product teams and shipping complex technology products end to end.',
+      'Comfortable owning multiple product lines at once and switching context without losing depth.',
+      'Strong written communication — you will represent product thinking to the founder and to every function.',
+    ],
+  },
   {
     slug: 'program-manager',
     departmentId: 'product-programs',
@@ -951,4 +987,4 @@ const HAND_CURATED_ROLES: CatalogRole[] = [
   },
 ];
 
-export const ROLE_CATALOG: CatalogRole[] = [...HAND_CURATED_ROLES, ...INTERN_CATALOG];
+export const ROLE_CATALOG: CatalogRole[] = [...HAND_CURATED_ROLES, ...INTERN_CATALOG, ...INTERN_CATALOG_PHASE2];
