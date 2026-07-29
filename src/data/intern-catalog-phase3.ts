@@ -76,16 +76,6 @@ const CS_QUALIFICATIONS = ['B.Tech/B.E.', "Master's Degree", 'Any Relevant Degre
 // =====================================================================================
 const ARTIFICIAL_INTELLIGENCE: CatalogRole[] = [
   role({
-    slug: 'generative-ai-intern', departmentId: 'ai-research', title: 'Generative AI Intern', noOfInterns: 4,
-    about: 'Generative AI sits at the centre of our tutoring, content, and simulation research — where models generate explanations, practice problems, and adaptive feedback rather than just classify or retrieve.',
-    responsibilities: ['Support fine-tuning and prompt-engineering experiments for generative models.', 'Assist in building evaluation harnesses for generated educational content.', 'Research generative-AI architectures (diffusion, autoregressive, retrieval-augmented).', 'Document experiment results and failure modes honestly.', 'Support integration of generative outputs into AquinTutor prototypes.'],
-    skills: ['Python', 'Prompt engineering', 'Fine-tuning (LoRA/PEFT basics)', 'Evaluation design', 'Generative model architectures', 'Documentation'],
-    learningOutcomes: ['Generative Model Experimentation', 'Prompt Engineering', 'Evaluation Harness Design', 'Applied Generative AI in Education'],
-    qualificationType: UGPG, qualifications: CS_QUALIFICATIONS,
-    specialisations: ['Computer Science', 'Artificial Intelligence', 'Data Science', 'Any Relevant Discipline'],
-    keywords: ['Generative AI', 'LLMs', 'Diffusion Models', 'Fine-Tuning', 'Prompt Engineering'],
-  }),
-  role({
     slug: 'agentic-ai-intern', departmentId: 'ai-research', title: 'Agentic AI Intern', noOfInterns: 3,
     about: 'Agentic systems — models that plan, call tools, and take multi-step actions — underlie our roadmap for autonomous tutoring workflows and internal automation.',
     responsibilities: ['Research agentic-AI frameworks (tool use, planning, multi-step reasoning).', 'Support building and testing simple agent prototypes.', 'Assist in evaluating agent reliability and failure modes.', 'Document safety and reliability findings.', 'Collaborate with the AI research team on agent-architecture decisions.'],
@@ -192,16 +182,6 @@ const CYBER_INTELLIGENCE: CatalogRole[] = [
     keywords: ['Threat Intelligence', 'MITRE ATT&CK', 'OSINT', 'Cybersecurity'],
   }),
   role({
-    slug: 'digital-forensics-intern', departmentId: 'cybersecurity', title: 'Digital Forensics Intern', noOfInterns: 2,
-    about: 'Digital forensics — reconstructing what happened after a security incident — is a precise, evidence-driven discipline students can practise on real (sanitised) case studies.',
-    responsibilities: ['Support forensic analysis of security incidents (log analysis, timeline reconstruction).', 'Assist in maintaining chain-of-custody documentation practices.', 'Research forensic tools and methodologies.', 'Document findings clearly for both technical and non-technical audiences.', 'Support tabletop incident-response exercises.'],
-    skills: ['Digital forensics fundamentals', 'Log analysis', 'Linux command line', 'Documentation', 'Attention to detail'],
-    learningOutcomes: ['Forensic Analysis Methodology', 'Log Analysis & Timeline Reconstruction', 'Chain-of-Custody Documentation', 'Incident Reporting'],
-    qualificationType: UGPG, qualifications: STD_QUALIFICATIONS,
-    specialisations: ['Cybersecurity', 'Computer Science', 'Any Relevant Discipline'],
-    keywords: ['Digital Forensics', 'Incident Response', 'Log Analysis', 'Cybersecurity'],
-  }),
-  role({
     slug: 'malware-analysis-intern', departmentId: 'cybersecurity', title: 'Malware Analysis Intern', noOfInterns: 2,
     about: 'Understanding how malware works — statically and dynamically — in a safe, sandboxed environment, building the analytical skill that underlies effective defence.',
     responsibilities: ['Support static and dynamic analysis of malware samples in sandboxed environments.', 'Assist in documenting malware behaviour and indicators.', 'Research malware families and evasion techniques.', 'Maintain strict lab-safety and containment practices.', 'Document analysis reports for the security team.'],
@@ -212,27 +192,6 @@ const CYBER_INTELLIGENCE: CatalogRole[] = [
     keywords: ['Malware Analysis', 'Reverse Engineering', 'Sandboxing', 'Cybersecurity'],
   }),
   role({
-    slug: 'soc-analyst-intern', departmentId: 'cybersecurity', title: 'SOC Analyst Intern', noOfInterns: 3,
-    about: 'Security Operations Centre work — monitoring, triaging, and escalating alerts — is the frontline discipline of practical cybersecurity, applied to our own live systems.',
-    responsibilities: ['Monitor security alerts and logs for anomalies.', 'Support triage and escalation of security events.', 'Assist in tuning alert rules to reduce false positives.', 'Document incident-response runbooks.', 'Support shift handover reporting practices.'],
-    skills: ['SIEM tools basics', 'Log monitoring', 'Alert triage', 'Security fundamentals', 'Documentation'],
-    learningOutcomes: ['SOC Monitoring & Triage', 'Alert Rule Tuning', 'Incident Runbook Documentation', 'Security Operations Practice'],
-    qualificationType: UGPG, qualifications: STD_QUALIFICATIONS,
-    specialisations: ['Cybersecurity', 'Computer Science', 'Any Relevant Discipline'],
-    keywords: ['SOC Analyst', 'SIEM', 'Security Monitoring', 'Cybersecurity'],
-  }),
-  role({
-    slug: 'penetration-testing-intern', departmentId: 'cybersecurity', title: 'Penetration Testing Intern', noOfInterns: 3,
-    about: 'Authorised, scoped penetration testing of our own systems — finding weaknesses before an attacker does, under strict rules of engagement.',
-    responsibilities: ['Support scoped, authorised penetration tests of internal systems.', 'Assist in vulnerability identification and exploitation (within approved scope).', 'Document findings with clear reproduction steps and severity ratings.', 'Support remediation verification after fixes are applied.', 'Follow strict rules-of-engagement and authorisation protocols at all times.'],
-    skills: ['Penetration testing fundamentals', 'Common vulnerability classes (OWASP Top 10)', 'Security tools (Burp Suite/nmap or equivalent)', 'Report writing', 'Ethical discipline'],
-    learningOutcomes: ['Authorised Penetration Testing Methodology', 'Vulnerability Identification & Reporting', 'Remediation Verification', 'Ethical Security Practice'],
-    qualificationType: UGPG, qualifications: STD_QUALIFICATIONS,
-    specialisations: ['Cybersecurity', 'Computer Science', 'Any Relevant Discipline'],
-    keywords: ['Penetration Testing', 'Ethical Hacking', 'OWASP', 'Vulnerability Assessment'],
-    eligibilityExtra: ['All testing is strictly scoped and authorised in writing; interns work only within approved boundaries.'],
-  }),
-  role({
     slug: 'incident-response-intern', departmentId: 'cybersecurity', title: 'Incident Response Intern', noOfInterns: 2,
     about: 'When something does go wrong, structured incident response — containment, eradication, recovery, and honest post-mortems — is what limits real-world damage.',
     responsibilities: ['Support incident-response process documentation and drills.', 'Assist in post-incident review and root-cause analysis.', 'Research incident-response frameworks and best practices.', 'Document lessons learned and remediation action items.', 'Support communication templates for incident stakeholders.'],
@@ -241,16 +200,6 @@ const CYBER_INTELLIGENCE: CatalogRole[] = [
     qualificationType: UGPG, qualifications: STD_QUALIFICATIONS,
     specialisations: ['Cybersecurity', 'Computer Science', 'Any Relevant Discipline'],
     keywords: ['Incident Response', 'Security Operations', 'Root Cause Analysis', 'Cybersecurity'],
-  }),
-  role({
-    slug: 'cloud-security-intern', departmentId: 'cybersecurity', title: 'Cloud Security Intern', noOfInterns: 3,
-    about: 'Our infrastructure runs on cloud platforms — securing that surface (access controls, misconfigurations, secrets management) is where most real-world breaches actually happen.',
-    responsibilities: ['Support cloud-configuration security reviews (access controls, network rules).', 'Assist in identifying and remediating cloud misconfigurations.', 'Research cloud-security best practices (CIS benchmarks or equivalent).', 'Support secrets-management and least-privilege access reviews.', 'Document findings and remediation guidance.'],
-    skills: ['Cloud platforms (AWS/GCP/Azure basics)', 'IAM/access-control concepts', 'Cloud security benchmarks', 'Documentation', 'Analytical thinking'],
-    learningOutcomes: ['Cloud Configuration Security Review', 'Misconfiguration Remediation', 'IAM & Least-Privilege Practices', 'Cloud Security Benchmarking'],
-    qualificationType: UGPG, qualifications: STD_QUALIFICATIONS,
-    specialisations: ['Cybersecurity', 'Cloud Computing', 'Computer Science', 'Any Relevant Discipline'],
-    keywords: ['Cloud Security', 'AWS Security', 'IAM', 'Cybersecurity'],
   }),
   role({
     slug: 'identity-access-management-intern', departmentId: 'cybersecurity', title: 'Identity & Access Management Intern', noOfInterns: 2,
@@ -354,36 +303,6 @@ const DATA_PLATFORM: CatalogRole[] = [
 // CLOUD & INFRASTRUCTURE (fits the existing engineering department)
 // =====================================================================================
 const CLOUD_INFRASTRUCTURE: CatalogRole[] = [
-  role({
-    slug: 'platform-engineering-intern', departmentId: 'engineering', title: 'Platform Engineering Intern', noOfInterns: 3,
-    about: 'Platform engineering builds the internal tools and paved paths that let our product teams ship faster and more safely — a distinct discipline from application feature work.',
-    responsibilities: ['Support building internal developer tools and platform capabilities.', 'Assist in improving CI/CD pipelines for product teams.', 'Research platform-engineering patterns (self-service infrastructure, golden paths).', 'Document platform tooling and onboarding guides.', 'Support developer-experience feedback loops.'],
-    skills: ['CI/CD tools', 'Infrastructure as code basics', 'Scripting (Python/Bash)', 'Developer-tooling design', 'Documentation'],
-    learningOutcomes: ['Platform Engineering Patterns', 'CI/CD Pipeline Improvement', 'Internal Developer Tooling', 'Developer Experience Design'],
-    qualificationType: UGPG, qualifications: CS_QUALIFICATIONS,
-    specialisations: ['Computer Science', 'Software Engineering', 'Any Relevant Discipline'],
-    keywords: ['Platform Engineering', 'CI/CD', 'Developer Experience', 'Infrastructure'],
-  }),
-  role({
-    slug: 'site-reliability-engineering-intern', departmentId: 'engineering', title: 'Site Reliability Engineering (SRE) Intern', noOfInterns: 3,
-    about: 'Keeping the platform actually up — monitoring, incident response, and reliability engineering for real production systems serving real applicants and students.',
-    responsibilities: ['Support uptime/reliability monitoring for production systems.', 'Assist in defining and tracking SLOs/SLIs.', 'Support incident-response and post-mortem documentation.', 'Research reliability-engineering best practices.', 'Support capacity-planning and load-testing exercises.'],
-    skills: ['Monitoring/observability tools', 'Linux fundamentals', 'Incident-response practices', 'SLO/SLI concepts', 'Scripting'],
-    learningOutcomes: ['SRE Practices & SLO Design', 'Production Monitoring', 'Incident Response & Post-Mortems', 'Capacity Planning'],
-    qualificationType: UGPG, qualifications: CS_QUALIFICATIONS,
-    specialisations: ['Computer Science', 'Software Engineering', 'Any Relevant Discipline'],
-    keywords: ['Site Reliability Engineering', 'SRE', 'Observability', 'Incident Response'],
-  }),
-  role({
-    slug: 'infrastructure-engineering-intern', departmentId: 'engineering', title: 'Infrastructure Engineering Intern', noOfInterns: 3,
-    about: 'The foundational infrastructure — servers, networking, deployment pipelines — that everything else at EduRankAI runs on top of.',
-    responsibilities: ['Support infrastructure provisioning and configuration management.', 'Assist in maintaining deployment pipelines.', 'Research infrastructure-as-code tools and practices.', 'Document infrastructure architecture and runbooks.', 'Support infrastructure cost and performance monitoring.'],
-    skills: ['Infrastructure as code (Terraform or equivalent)', 'Linux fundamentals', 'Networking basics', 'Cloud platforms', 'Documentation'],
-    learningOutcomes: ['Infrastructure as Code', 'Deployment Pipeline Management', 'Infrastructure Architecture', 'Cost/Performance Monitoring'],
-    qualificationType: UGPG, qualifications: CS_QUALIFICATIONS,
-    specialisations: ['Computer Science', 'Software Engineering', 'Any Relevant Discipline'],
-    keywords: ['Infrastructure Engineering', 'Terraform', 'Cloud Infrastructure', 'DevOps'],
-  }),
   role({
     slug: 'kubernetes-intern', departmentId: 'engineering', title: 'Kubernetes Intern', noOfInterns: 2,
     about: 'Hands-on container-orchestration internship — deploying, scaling, and debugging services on Kubernetes, a genuinely deep and marketable skill.',
@@ -720,16 +639,6 @@ const RESEARCH_SPECIALISED: CatalogRole[] = [
 ];
 
 const EDUCATION_TECHNOLOGY: CatalogRole[] = [
-  role({
-    slug: 'learning-experience-design-intern', departmentId: 'education-learning', title: 'Learning Experience Design Intern', noOfInterns: 3,
-    about: 'Learning Experience (LX) Design — designing the end-to-end learner journey, not just individual lessons — directly shapes how AquinTutor is actually experienced.',
-    responsibilities: ['Support design of end-to-end learner journeys within AquinTutor.', 'Assist in prototyping and testing learning-experience flows.', 'Research LX design patterns from leading learning platforms.', 'Document learner-journey maps and design rationale.', 'Coordinate with instructional design and product teams.'],
-    skills: ['LX/UX design principles', 'Journey mapping', 'Prototyping tools', 'Research synthesis', 'Documentation'],
-    learningOutcomes: ['Learner-Journey Design', 'LX Prototyping & Testing', 'Learning-Platform Pattern Research', 'Cross-Team LX Coordination'],
-    qualificationType: UGPG, qualifications: STD_QUALIFICATIONS,
-    specialisations: ['Education', 'Design', 'Instructional Design', 'Any Relevant Discipline'],
-    keywords: ['Learning Experience Design', 'LX Design', 'EdTech', 'Learner Journey'],
-  }),
   role({
     slug: 'curriculum-innovation-intern', departmentId: 'education-learning', title: 'Curriculum Innovation Intern', noOfInterns: 2,
     about: 'Rethinking how curriculum itself should work in an AI-tutored context — not just digitising a syllabus, but redesigning it for adaptive, verified learning.',
