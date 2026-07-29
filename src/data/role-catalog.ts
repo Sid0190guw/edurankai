@@ -12,7 +12,7 @@
 // of this file — kept apart so this file stays about hand-curated permanent/senior roles.
 import { INTERN_CATALOG } from './intern-catalog';
 import { INTERN_CATALOG_PHASE2, PHASE2_DEPARTMENTS } from './intern-catalog-phase2';
-import { INTERN_CATALOG_PHASE3_BATCH1, PHASE3_DEPARTMENTS_BATCH1 } from './intern-catalog-phase3';
+import { INTERN_CATALOG_PHASE3_BATCH1, PHASE3_DEPARTMENTS_BATCH1, INTERN_CATALOG_PHASE3_BATCH2 } from './intern-catalog-phase3';
 
 export interface CatalogDepartment {
   id: string;
@@ -990,4 +990,4 @@ const HAND_CURATED_ROLES: CatalogRole[] = [
   },
 ];
 
-export const ROLE_CATALOG: CatalogRole[] = [...HAND_CURATED_ROLES, ...INTERN_CATALOG, ...INTERN_CATALOG_PHASE2, ...INTERN_CATALOG_PHASE3_BATCH1];
+export const ROLE_CATALOG: CatalogRole[] = [...HAND_CURATED_ROLES, ...INTERN_CATALOG, ...INTERN_CATALOG_PHASE2, ...INTERN_CATALOG_PHASE3_BATCH1, ...INTERN_CATALOG_PHASE3_BATCH2];
