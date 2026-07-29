@@ -12,7 +12,11 @@
 // of this file — kept apart so this file stays about hand-curated permanent/senior roles.
 import { INTERN_CATALOG } from './intern-catalog';
 import { INTERN_CATALOG_PHASE2, PHASE2_DEPARTMENTS } from './intern-catalog-phase2';
-import { INTERN_CATALOG_PHASE3_BATCH1, PHASE3_DEPARTMENTS_BATCH1, INTERN_CATALOG_PHASE3_BATCH2 } from './intern-catalog-phase3';
+import {
+  INTERN_CATALOG_PHASE3_BATCH1, PHASE3_DEPARTMENTS_BATCH1,
+  INTERN_CATALOG_PHASE3_BATCH2,
+  INTERN_CATALOG_PHASE3_BATCH3A, INTERN_CATALOG_PHASE3_BATCH3B, PHASE3_DEPARTMENTS_BATCH3,
+} from './intern-catalog-phase3';
 
 export interface CatalogDepartment {
   id: string;
@@ -83,6 +87,7 @@ export const CATALOG_DEPARTMENTS: CatalogDepartment[] = [
   ...PHASE2_DEPARTMENTS,
   // Phase 3 — see src/data/intern-catalog-phase3.ts
   ...PHASE3_DEPARTMENTS_BATCH1,
+  ...PHASE3_DEPARTMENTS_BATCH3,
 ];
 
 const REMOTE_IN = 'Remote / Hybrid (India)';
@@ -990,4 +995,12 @@ const HAND_CURATED_ROLES: CatalogRole[] = [
   },
 ];
 
-export const ROLE_CATALOG: CatalogRole[] = [...HAND_CURATED_ROLES, ...INTERN_CATALOG, ...INTERN_CATALOG_PHASE2, ...INTERN_CATALOG_PHASE3_BATCH1, ...INTERN_CATALOG_PHASE3_BATCH2];
+export const ROLE_CATALOG: CatalogRole[] = [
+  ...HAND_CURATED_ROLES,
+  ...INTERN_CATALOG,
+  ...INTERN_CATALOG_PHASE2,
+  ...INTERN_CATALOG_PHASE3_BATCH1,
+  ...INTERN_CATALOG_PHASE3_BATCH2,
+  ...INTERN_CATALOG_PHASE3_BATCH3A,
+  ...INTERN_CATALOG_PHASE3_BATCH3B,
+];
