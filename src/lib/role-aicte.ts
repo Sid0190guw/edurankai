@@ -10,6 +10,7 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
+import { textArray } from '@/lib/pg-array';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
@@ -75,28 +76,10 @@ export async function getRoleAicte(roleId: string): Promise<RoleAicte> {
   } catch { return { ...EMPTY }; }
 }
 
-/**
- * Build a text[] value from a JS string array, safely.
- *
- * The previous approach — `${jsArray}::text[]` — DID NOT WORK. postgres-js/drizzle sends a JS array
- * as a row/record literal, so Postgres rejected every one of these writes with
- * "cannot cast type record to text[]". Because the only caller wrapped setRoleAicte in a
- * try/catch, that error was swallowed on every single import: base role rows were inserted while
- * keywords, learning_outcomes, qualifications, specialisations, perks and engagement_notes stayed
- * NULL for all 988 live roles. Confirmed on production via /admin/roles/diagnose, which reported
- * "0 open roles have a keyword containing 'a'" while the search clause itself ran fine.
- *
- * Going via jsonb is the fix: the value crosses as ONE ordinary text parameter (so it is
- * injection-safe and needs no manual escaping of commas, quotes, braces or backslashes — all of
- * which appear in this catalog's text), and jsonb_array_elements_text unpacks it unambiguously.
- * Hand-building a '{a,b,c}' array literal would also work but requires getting that escaping
- * exactly right, which is not worth the risk here.
- */
-function textArray(xs: string[] | null | undefined) {
-  const arr = (xs || []).filter((x) => typeof x === 'string');
-  return sql`COALESCE((SELECT array_agg(t.x) FROM jsonb_array_elements_text(${JSON.stringify(arr)}::jsonb) AS t(x)), ARRAY[]::text[])`;
-}
-
+// Arrays go through textArray() from src/lib/pg-array.ts. The previous `${jsArray}::text[]` form
+// threw "cannot cast type record to text[]" on every call and, being wrapped in a try/catch by the
+// caller, left all six of these columns NULL across all 988 live roles. That module documents the
+// mechanism and the other three places the same pattern had broken.
 export async function setRoleAicte(roleId: string, a: Partial<RoleAicte>): Promise<void> {
   await ensureRoleAicteColumns();
   const v: RoleAicte = { ...EMPTY, ...a };

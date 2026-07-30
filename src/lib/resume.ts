@@ -5,6 +5,7 @@
 // is fully editable and managed ONLY by a super admin via /admin/resumes.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { textIn } from '@/lib/pg-array';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
@@ -129,7 +130,11 @@ export async function getSharedResume(slug: string): Promise<any | null> {
 export async function deleteResumes(ids: string[]): Promise<number> {
   if (!ids.length) return 0;
   await ensureResumeSchema();
-  const r = await db.execute(sql`DELETE FROM resume_submissions WHERE id::text = ANY(${ids}::text[]) RETURNING id`);
+  // `ANY(${ids}::text[])` threw "cannot cast type record to text[]", so "Delete selected" in
+  // /admin/resumes silently deleted nothing — which matters more than usual here, because these rows
+  // hold personal data captured from the public /resume builder and a targeted erasure request made
+  // through the UI would appear to succeed while retaining the data. See src/lib/pg-array.ts.
+  const r = await db.execute(sql`DELETE FROM resume_submissions WHERE id::text IN ${textIn(ids)} RETURNING id`);
   return rows(r).length;
 }
 

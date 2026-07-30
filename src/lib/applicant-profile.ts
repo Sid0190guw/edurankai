@@ -8,6 +8,7 @@
 // profile (headline / bio / skills / links + a share toggle + slug) — those
 // columns exist now so Phase 2 (the profile page) needs no migration.
 import { db } from '@/lib/db';
+import { textArray } from '@/lib/pg-array';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 
@@ -89,6 +90,12 @@ export interface ProfilePatch {
 }
 
 /** Full update of editable profile fields (portal self-edit or admin edit). */
+// The skills column previously used the broken JS-array-plus-::text[] cast, which threw
+// "cannot cast type record to text[]". Because every field below is written in ONE statement, an
+// applicant who typed even a single skill could not save ANY of their profile — headline, bio,
+// links, experience, education, name, city, phone and photo were all discarded together. The
+// `as any` on that line was masking the type error. See src/lib/pg-array.ts for the mechanism.
+// textArray's nullWhenEmpty keeps this column's original NULL-vs-empty-list semantics.
 export async function updateProfile(userId: string, patch: ProfilePatch): Promise<void> {
   await ensureApplicantProfileSchema();
   await ensureRow(userId);
@@ -96,7 +103,7 @@ export async function updateProfile(userId: string, patch: ProfilePatch): Promis
     UPDATE applicant_profiles SET
       headline = ${patch.headline ?? null},
       bio = ${patch.bio ?? null},
-      skills = ${(patch.skills && patch.skills.length ? patch.skills : null) as any}::text[],
+      skills = ${textArray(patch.skills, true)},
       links = ${patch.links ? JSON.stringify(patch.links) : null}::jsonb,
       experience = ${patch.experience ? JSON.stringify(patch.experience) : null}::jsonb,
       education = ${patch.education ? JSON.stringify(patch.education) : null}::jsonb,

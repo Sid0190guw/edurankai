@@ -10,6 +10,7 @@
 // ensureOnce so it costs one DDL round-trip per server process — important for
 // keeping Neon compute idle.
 import { db } from '@/lib/db';
+import { textArray } from '@/lib/pg-array';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 
@@ -73,8 +74,11 @@ export async function getOpenRoleCountsByProduct(): Promise<Record<string, numbe
 export async function setRoleProducts(roleId: string, slugs: string[]): Promise<void> {
   await ensureRoleProductColumn();
   const list = clean(slugs);
+  // `${list}::text[]` threw "cannot cast type record to text[]" on EVERY call — see
+  // src/lib/pg-array.ts. Product tags therefore never saved, which also meant every save in
+  // /admin/roles/new and /admin/roles/[id] 500'd after writing the role itself.
   await db.execute(sql`
-    UPDATE roles SET products = ${list}::text[], product = ${list[0] || null}
+    UPDATE roles SET products = ${textArray(list)}, product = ${list[0] || null}
     WHERE id = ${roleId}
   `);
 }
