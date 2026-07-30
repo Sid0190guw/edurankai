@@ -88,7 +88,11 @@ function role(r: {
 // =====================================================================================
 // 1. FLAGSHIP — LLM Engineering Internship
 // =====================================================================================
-export const FLAGSHIP_AI: CatalogRole[] = [
+// Base definition. The exported FLAGSHIP_AI is assembled at the bottom of this file, where it
+// inherits the union of every quantum track's competencies on top of what is written here — the
+// programme spans the whole deep-technology stack, quantum AI included, so its criteria are the
+// superset. Derived rather than copied so the two can never drift apart.
+const LLM_FLAGSHIP_BASE: CatalogRole[] = [
   {
     slug: 'llm-engineering-intern',
     departmentId: 'ai-research',
@@ -144,11 +148,15 @@ export const FLAGSHIP_AI: CatalogRole[] = [
       'This programme is fully in person for its full 8 months — it is not remote or hybrid.',
       'Selected interns must be resident within EduRankAI’s highest-protocol zone for the duration of the programme and comply with its access-control, information-security and conduct requirements.',
       'Open to candidates worldwide. Overseas interns are supported on a separate stipend band (up to CHF 25,000 per month) and are subject to the same in-person and protocol-zone requirements.',
-      // Written as a clearance/authorisation condition rather than a nationality blacklist. This is
-      // the mechanism that actually governs restricted-zone access, it is enforceable, and it does
-      // not put an unlawful exclusion into a publicly indexed JobPosting. See the note to the
-      // founder before changing this wording.
-      'Because the programme is performed in person inside a restricted-protocol zone and involves proprietary and controlled research, every offer is conditional on obtaining the security clearance, background verification and work authorisation required for that access. Where an applicant’s nationality places them in a category requiring prior government clearance for such access or for an Indian employment visa, EduRankAI cannot guarantee that clearance will be granted, and an offer may not be possible. Applicants are asked to confirm they can satisfy these requirements before applying.',
+      // Citizenship restriction written verbatim as directed by the founder, on the stated basis
+      // that this is a high-protocol, secure programme. A concern was raised that a named
+      // nationality exclusion in a publicly indexed JobPosting carries legal exposure in the
+      // jurisdictions this posting is intended to reach, and the instruction was reaffirmed with
+      // that known. Do not soften or reword this without the founder's explicit sign-off.
+      'CITIZENSHIP RESTRICTION: this is a high-protocol, secure programme. Citizens of Pakistan, Turkey (Türkiye) or China, and citizens of any country hostile to Bharat (India), are not eligible for this programme.',
+      'Because the programme is performed in person inside a restricted-protocol zone and involves proprietary and controlled research, every offer is additionally conditional on obtaining the security clearance, background verification and work authorisation required for that access. EduRankAI cannot guarantee that a government clearance or employment visa will be granted, and an offer may not be possible where it is not. Applicants are asked to confirm they can satisfy these requirements before applying.',
+      'MANDATORY VERIFICATION: candidates must provide complete citizenship and identity documentation. EduRankAI may additionally require a full verified bonafide history covering birth to the present — including residence, education, employment and travel history — and may verify any of it with the issuing authorities. Documents are shared as Google Drive links with "Anyone with the link" access enabled; they are never uploaded to this site.',
+      'EduRankAI reserves the absolute and sole right to reject any application, at any stage and without obligation to give reasons, and to withdraw an offer where verification is incomplete, refused, or found to be inaccurate.',
     ],
     learningOutcomes: [
       'Large Language Models & Foundation Models',
@@ -290,5 +298,30 @@ export const QUANTUM_AI: CatalogRole[] = [
     keywords: ['Quantum Finance', 'Portfolio Optimization', 'Quantum Risk Analytics', 'Quantitative Finance'],
   }),
 ];
+
+// =====================================================================================
+// 3. Assemble the flagship: its own criteria PLUS the union of all 7 quantum tracks.
+// =====================================================================================
+const uniq = (xs: (string | undefined)[]) => [...new Set(xs.filter((x): x is string => !!x))];
+const fromQuantum = (pick: (r: CatalogRole) => string[] | undefined) => QUANTUM_AI.flatMap((r) => pick(r) || []);
+
+// Responsibilities are curated rather than unioned: concatenating all seven task lists would add
+// ~35 near-identical bullets ("Present findings to the research team" seven times) and bury the
+// engineering work. Skills, outcomes, specialisations and keywords ARE unioned in full — breadth
+// there is useful to candidates and is what makes the posting findable on those search terms.
+const QUANTUM_RESPONSIBILITIES = [
+  'Extend the same first-principles approach to quantum AI: implement parameterised quantum circuits and quantum neural networks in simulation.',
+  'Study where quantum methods genuinely beat a classical baseline — and report honestly where they do not.',
+  'Work across the quantum stack as projects require: quantum NLP, optimisation (QAOA/QUBO), error correction and mitigation on noisy hardware, electronic-structure simulation (VQE), and hybrid classical-quantum execution pipelines.',
+];
+
+export const FLAGSHIP_AI: CatalogRole[] = LLM_FLAGSHIP_BASE.map((r) => ({
+  ...r,
+  responsibilities: uniq([...(r.responsibilities || []), ...QUANTUM_RESPONSIBILITIES]),
+  skills: uniq([...(r.skills || []), ...fromQuantum((q) => q.skills)]),
+  learningOutcomes: uniq([...(r.learningOutcomes || []), ...fromQuantum((q) => q.learningOutcomes)]),
+  specialisations: uniq([...(r.specialisations || []), ...fromQuantum((q) => q.specialisations)]),
+  keywords: uniq([...(r.keywords || []), ...fromQuantum((q) => q.keywords)]),
+}));
 
 export const CATALOG_FLAGSHIP_AI: CatalogRole[] = [...FLAGSHIP_AI, ...QUANTUM_AI];
