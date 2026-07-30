@@ -15,10 +15,12 @@
 import type { CatalogRole } from './role-catalog';
 
 const REMOTE_IN = 'Remote / Hybrid (India)';
-// The flagship programme is fully in person. NOTE: for a non-remote role the JobPosting JSON-LD
-// puts this string into address.addressLocality, and Google Jobs needs a real city there - so the
-// actual campus city must replace "India" below for the posting to index properly.
-const ONSITE_IN = 'On-site (India)';
+// Fully in person, in India, at a location deliberately not published — this is a high-protocol
+// secure programme. careers/[slug].astro detects that no city is named here and emits only
+// addressCountry in the JobPosting JSON-LD rather than pushing this whole string into
+// addressLocality. Trade-off accepted: without a city the posting cannot match city-level job
+// searches, which costs some reach in exchange for not disclosing the site.
+const ONSITE_IN = 'On-site, India (exact location disclosed on selection)';
 
 const ABOUT_INTRO = 'EduRankAI is developing next-generation technologies in Artificial Intelligence, Education Technology, Research, Product Engineering, and Digital Innovation.';
 
