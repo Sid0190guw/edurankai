@@ -36,11 +36,12 @@ export const GET: APIRoute = async () => {
   const today = new Date().toISOString().split('T')[0];
 
   // Dynamic: every open role gets a sitemap entry so Google for Jobs crawls them
-  let openRoles: Array<{ slug: string; updatedAt: Date | null }> = [];
+  let openRoles: Array<{ slug: string; updatedAt: Date | null; isFeatured: boolean | null }> = [];
   try {
     openRoles = await db.select({
       slug: roles.slug,
       updatedAt: roles.updatedAt,
+      isFeatured: roles.isFeatured,
     }).from(roles).where(eq(roles.isOpen, true)).orderBy(desc(roles.updatedAt));
   } catch (_) {
     // DB unreachable - degrade to static sitemap
@@ -93,11 +94,13 @@ export const GET: APIRoute = async () => {
     const lastmod = r.updatedAt
       ? new Date(r.updatedAt).toISOString().split('T')[0]
       : today;
+    // Flagship (featured) roles are the ones we most want crawled and surfaced, so they get the
+    // highest role priority and a daily changefreq rather than sitting level with every other post.
     return '  <url>'
       + '<loc>' + SITE.url + '/careers/' + r.slug + '</loc>'
       + '<lastmod>' + lastmod + '</lastmod>'
-      + '<changefreq>weekly</changefreq>'
-      + '<priority>0.85</priority>'
+      + '<changefreq>' + (r.isFeatured ? 'daily' : 'weekly') + '</changefreq>'
+      + '<priority>' + (r.isFeatured ? '0.95' : '0.85') + '</priority>'
       + '</url>';
   });
 
