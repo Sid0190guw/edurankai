@@ -52,16 +52,46 @@ export const POST: APIRoute = async ({ request, locals }) => {
     // Find candidate's user account
     const candResult = await db.execute(sql`SELECT id FROM users WHERE email = ${app.email} LIMIT 1`);
     const candRows = Array.isArray(candResult) ? candResult : (candResult?.rows || []);
+    const candidateName = ((app.first_name || app.firstName || '') + ' ' + (app.last_name || app.lastName || '')).trim() || app.email || 'Candidate';
+    const whenText = (() => {
+      try { return new Date(scheduledAt).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }); }
+      catch { return String(scheduledAt); }
+    })();
+
     if (candRows.length > 0) {
       const candidateId = (candRows[0] as any).id;
       await db.execute(sql`UPDATE interview_rounds SET candidate_id = ${candidateId} WHERE id = ${interviewId}`);
 
-      // Notify candidate
-      await db.execute(sql`
-        INSERT INTO notifications (user_id, title, body, type)
-        VALUES (${candidateId}, 'Interview Scheduled', ${'Your ' + (roundType||'interview') + ' is scheduled. Title: ' + title}, 'system')
-      `).catch(()=>{});
+      // Notify the candidate. This previously wrote straight into the notifications table with
+      // type 'system', which meant: no web push was ever delivered (only a silent in-app row),
+      // no category/priority was stored so it rendered as system/medium instead of
+      // interviews/critical, and the 2-minute de-dupe in persistNotification was bypassed.
+      // sendPushToUser does all of that correctly. Guarded so a push failure can never make a
+      // successfully-scheduled interview report ok:false to the caller.
+      try {
+        const { sendPushToUser } = await import('@/lib/push');
+        await sendPushToUser(candidateId, {
+          type: 'interview_scheduled',
+          title: 'Interview scheduled',
+          body: 'Your ' + (roundType || 'interview') + ' is on ' + whenText + '. ' + title,
+          url: '/portal/applications/' + applicationId,
+          tag: 'interview-' + interviewId,
+        });
+      } catch (_) {}
     }
+
+    // Tell the rest of the recruiting team, excluding the admin who just scheduled it — they
+    // already know. sendPushToAdmins honours per-admin preference toggles.
+    try {
+      const { sendPushToAdmins } = await import('@/lib/push');
+      await sendPushToAdmins({
+        type: 'interview_scheduled',
+        title: 'Interview scheduled',
+        body: candidateName + ' - round ' + roundNumber + ' (' + (roundType || 'screening') + ') on ' + whenText,
+        url: '/admin/applications/' + applicationId,
+        tag: 'interview-admin-' + interviewId,
+      }, user.id);
+    } catch (_) {}
 
     // Log activity
     await db.execute(sql`
