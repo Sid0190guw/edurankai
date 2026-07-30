@@ -4,6 +4,7 @@ import { db } from '@/lib/db';
 import { roles, departments } from '@/lib/db/schema';
 import { eq, asc, desc, and, or, ilike, sql } from 'drizzle-orm';
 import { ensureRoleProductColumn } from '@/lib/role-products';
+import { ensureRoleAicteColumns } from '@/lib/role-aicte';
 
 const url = new URL(Astro.request.url);
 const q = url.searchParams.get('q') || '';
@@ -15,27 +16,43 @@ const productFilter = url.searchParams.get('product') || '';
 // `product` is a runtime column (not in the Drizzle schema) — ensure it exists
 // so the raw filter below is safe even on a fresh DB.
 await ensureRoleProductColumn().catch(() => {});
+// `keywords` is also a runtime column (src/lib/role-aicte.ts) and is searched below.
+await ensureRoleAicteColumns().catch(() => {});
 
-const conditions = [eq(roles.isOpen, true)];
-if (q) {
-  // Search matches title, function, OR any individual skill tag (roles.skills is a JSONB string
-  // array — jsonb_array_elements_text unpacks it so each tag is matched independently, not just
-  // a substring of the whole array). GUARDED with jsonb_typeof: jsonb_array_elements_text throws
-  // a hard Postgres error on any row whose skills column isn't actually a JSON array (NULL, a
-  // stray object, legacy data) — and since this runs per-row across the whole table, ONE bad row
-  // silently killed EVERY search (caught by the try/catch below, surfacing as "0 results" for
-  // every term, including ones that should obviously match — e.g. "Engineer"). The CASE falls
-  // back to an empty array for any non-array value instead of erroring the whole query.
-  conditions.push(sql`(
-    ${roles.title} ILIKE ${'%' + q + '%'}
-    OR ${roles.function} ILIKE ${'%' + q + '%'}
-    OR EXISTS (
+// Search predicate, built as a factory so the query below can retry with a narrower version.
+// A search that silently returns nothing for EVERY term is far worse than one matching fewer
+// fields, and that is exactly what happened once before (see the jsonb_typeof note below).
+const searchClause = (includeKeywords: boolean) => {
+  const like = '%' + q + '%';
+  const parts = [
+    sql`${roles.title} ILIKE ${like}`,
+    sql`${roles.function} ILIKE ${like}`,
+    // The long-form description: many terms appear only here.
+    sql`${roles.about} ILIKE ${like}`,
+    // roles.skills is a JSONB string array — jsonb_array_elements_text unpacks it so each tag is
+    // matched independently, not just as a substring of the whole array. GUARDED with
+    // jsonb_typeof: jsonb_array_elements_text throws a hard Postgres error on any row whose
+    // skills column isn't actually a JSON array (NULL, a stray object, legacy data) — and since
+    // this runs per-row across the whole table, ONE bad row silently killed EVERY search,
+    // surfacing as "0 results" even for terms that obviously match (e.g. "Engineer"). The CASE
+    // falls back to an empty array for any non-array value instead of erroring the whole query.
+    sql`EXISTS (
       SELECT 1 FROM jsonb_array_elements_text(
         CASE WHEN jsonb_typeof(${roles.skills}) = 'array' THEN ${roles.skills} ELSE '[]'::jsonb END
-      ) AS skill WHERE skill ILIKE ${'%' + q + '%'}
-    )
-  )`);
-}
+      ) AS skill WHERE skill ILIKE ${like}
+    )`,
+    // Let people search by department name ("Cybersecurity", "FinTech") and not just role text.
+    sql`EXISTS (SELECT 1 FROM departments d WHERE d.id = ${roles.departmentId} AND d.name ILIKE ${like})`,
+  ];
+  if (includeKeywords) {
+    // Every catalogue role carries keyword tags ("GovTech", "LegalTech", "Space Systems") that
+    // appear in NO other column, so without this those searches return nothing at all.
+    parts.push(sql`EXISTS (SELECT 1 FROM unnest(COALESCE(keywords, '{}'::text[])) AS kw WHERE kw ILIKE ${like})`);
+  }
+  return sql`(${sql.join(parts, sql` OR `)})`;
+};
+
+const conditions = [eq(roles.isOpen, true)];
 if (deptFilter) conditions.push(eq(roles.departmentId, deptFilter));
 if (levelFilter) conditions.push(eq(roles.level, levelFilter as any));
 if (productFilter) conditions.push(sql`(${productFilter} = ANY(products) OR product = ${productFilter})`);
@@ -53,21 +70,40 @@ const hasFilters = !!(q || deptFilter || levelFilter || productFilter);
 
 // Guarded so a DB hiccup degrades to an empty state instead of a 500 on a public marketing page.
 let openRoles: any[] = [];
+const runRolesQuery = (where: any) => db.select({
+  id: roles.id,
+  title: roles.title,
+  slug: roles.slug,
+  level: roles.level,
+  departmentId: roles.departmentId,
+  function: roles.function,
+  engagementType: roles.engagementType,
+  location: roles.location,
+  salary: roles.salary,
+  skills: roles.skills,
+  isFeatured: roles.isFeatured
+}).from(roles).where(where).orderBy(desc(roles.isFeatured), asc(roles.sortOrder), asc(roles.title));
+
 try {
-  openRoles = await db.select({
-    id: roles.id,
-    title: roles.title,
-    slug: roles.slug,
-    level: roles.level,
-    departmentId: roles.departmentId,
-    function: roles.function,
-    engagementType: roles.engagementType,
-    location: roles.location,
-    salary: roles.salary,
-    skills: roles.skills,
-    isFeatured: roles.isFeatured
-  }).from(roles).where(and(...conditions)).orderBy(desc(roles.isFeatured), asc(roles.sortOrder), asc(roles.title));
-} catch (e: any) { console.error('[careers] roles query failed:', e?.cause?.message || e?.message); Astro.response.headers.set('x-era-degraded', '1'); }
+  openRoles = await runRolesQuery(and(...conditions, ...(q ? [searchClause(true)] : [])));
+} catch (e: any) {
+  const reason = e?.cause?.message || e?.message;
+  console.error('[careers] roles query failed:', reason);
+  if (q) {
+    // The widest predicate failed — most likely the runtime `keywords` column is absent on this
+    // database. Retry without it rather than reporting "no roles match", which is what a bare
+    // catch here would do and is indistinguishable from a genuinely empty result.
+    try {
+      openRoles = await runRolesQuery(and(...conditions, searchClause(false)));
+      console.error('[careers] retried search without keywords and succeeded');
+    } catch (e2: any) {
+      console.error('[careers] narrowed search also failed:', e2?.cause?.message || e2?.message);
+      Astro.response.headers.set('x-era-degraded', '1');
+    }
+  } else {
+    Astro.response.headers.set('x-era-degraded', '1');
+  }
+}
 
 let allDepts: any[] = [];
 try { allDepts = await db.select().from(departments).orderBy(asc(departments.sortOrder)); }
