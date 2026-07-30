@@ -109,6 +109,11 @@ const LLM_FLAGSHIP_BASE: CatalogRole[] = [
     salary: 'Performance-based stipend of up to INR 2,50,000 per month (India) or CHF 25,000 per month (overseas interns), awarded on demonstrated merit',
     isFeatured: true,
     openings: 4,
+    // National-security classification. Precise location is a CONDITION of applying to this
+    // programme, enforced server-side at submission — see src/lib/role-security.ts. It is disclosed
+    // on the form up front so nobody reaches the end and is only then told they cannot be accepted.
+    requiresPreciseLocation: true,
+    securityNote: 'This programme involves controlled research inside a restricted-protocol zone. Sharing your precise location is a condition of applying and your application cannot be submitted without it. Every other open role at EduRankAI can be applied to without this.',
     about: ABOUT_INTRO + ' Most internships teach you to use AI; this one asks you to help build it. '
       + 'The Large Language Model (LLM) Engineering Internship is one of our flagship research and engineering programmes. '
       + 'It is deliberately not a prompt-engineering, chatbot-integration or API-consumption internship — it is a deep-technology '

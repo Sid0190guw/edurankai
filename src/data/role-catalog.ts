@@ -51,6 +51,16 @@ export interface CatalogRole {
   /** Substring matched against product slugs at import time (e.g. 'karate'). */
   productMatch?: string;
 
+  /**
+   * Security-classified role: sharing a PRECISE location is a condition of applying, enforced
+   * server-side at submission (src/lib/role-security.ts). Set this only for roles involving
+   * controlled research or restricted-zone access — it makes the application refusable, so using it
+   * casually would block legitimate candidates from ordinary jobs.
+   */
+  requiresPreciseLocation?: boolean;
+  /** Shown to the applicant to explain the requirement above, in their own interest. */
+  securityNote?: string;
+
   // ---- AICTE-portal-format internship fields (all optional; see src/lib/role-aicte.ts) ----
   keywords?: string[];
   learningOutcomes?: string[];

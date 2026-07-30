@@ -81,8 +81,14 @@
 
   // 2. Precise location, once per browser, and only after the notice has been shown.
   var ASKED = 'era_geo_asked_v1';
-  function askPrecise() {
-    try { if (sessionStorage.getItem(ASKED)) return; sessionStorage.setItem(ASKED, '1'); } catch (_) {}
+  /* force=true bypasses the once-per-session guard. The mandatory gate on security-classified roles
+     needs that: the guard exists so an honest applicant is not nagged, but when location is a
+     CONDITION of applying the grant must actually be recorded, even if the optional ask already ran
+     earlier in the session. */
+  function askPrecise(force) {
+    if (!force) {
+      try { if (sessionStorage.getItem(ASKED)) return; sessionStorage.setItem(ASKED, '1'); } catch (_) {}
+    }
     if (!navigator.geolocation) { var u = base(); u.status = 'unavailable'; send(u); return; }
     navigator.geolocation.getCurrentPosition(
       function (pos) {

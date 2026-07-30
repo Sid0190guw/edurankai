@@ -7,6 +7,7 @@ import { eq } from 'drizzle-orm';
 import { getActiveDraft, saveDraft } from '@/lib/apply/draft';
 import { safeDraft } from '@/lib/apply/data';
 import { getProfileCommon, saveCommonFromStep1 } from '@/lib/applicant-profile';
+import { getRoleSecurity } from '@/lib/role-security';
 
 const user = Astro.locals.user;
 if (!user) {
@@ -175,6 +176,11 @@ const COUNTRY_CODES = [
 ];
 
 const todayDate = new Date().toISOString().split('T')[0];
+
+// Security-classified roles require a precise location as a CONDITION of applying. Read it here so
+// the requirement is disclosed on the FIRST screen — the server refuses the submission at step 6, and
+// finding that out only at the end would waste the applicant's time.
+const roleSecurity = await getRoleSecurity(preselectedRole?.id);
 ---
 <ApplyLayout step={1} totalSteps={6} stepTitle="Personal Info" stepSubtitle="Quick basics — just enough to reach you." roleTitle={preselectedRole?.title}>
 
@@ -443,24 +449,90 @@ const todayDate = new Date().toISOString().split('T')[0];
     India's DPDP Act, and simply the honest way to ask. Device signals (timezone, locale) are sent
     without a prompt because they need no permission; precise location always asks, and a refusal is
     recorded as a refusal rather than retried. */}
-<div
-  data-era-apply
-  data-step="step-1"
-  data-era-geo-consent
-  class="mt-8 rounded-xl border border-white/10 bg-white/[0.03] p-4"
->
-  <p class="text-[0.7rem] font-mono uppercase tracking-[0.15em] text-white/40 mb-2">Verification notice</p>
-  <p class="text-[0.82rem] text-white/70 leading-relaxed">
-    We record where this application is submitted from &mdash; your approximate location from your
-    internet connection, and your device's timezone and language settings. Your browser will also ask
-    once whether to share your precise location; you can decline and still apply. This is used only to
-    verify applications and prevent fraud, is visible only to our senior review team, and is never sold
-    or shared. Write to <a href="mailto:hr@edurankai.in" class="text-burn underline">hr@edurankai.in</a>
-    to ask what we hold about you or to have it deleted.
-  </p>
-</div>
+{/* Only the consent trigger lives here — ApplyLayout supplies the step identity and loads the
+    script for all six steps, so this must NOT repeat data-era-apply. */}
+{roleSecurity.requiresPreciseLocation ? (
+  <div
+    data-era-geo-required
+    class="mt-8 rounded-xl border border-burn/40 bg-burn/[0.07] p-4"
+  >
+    <p class="text-[0.7rem] font-mono uppercase tracking-[0.15em] text-burn mb-2 font-bold">
+      Precise location required for this role
+    </p>
+    <p class="text-[0.82rem] text-white/80 leading-relaxed mb-3">
+      {roleSecurity.securityNote
+        || 'This role involves controlled research inside a restricted-protocol zone. Sharing your precise location is a condition of applying.'}
+    </p>
+    <label class="flex items-start gap-2.5 cursor-pointer">
+      <input type="checkbox" name="preciseLocationConsent" data-era-geo-gate required
+        class="mt-0.5 w-4 h-4 accent-burn shrink-0" />
+      <span class="text-[0.82rem] text-white/80 leading-relaxed">
+        I consent to sharing my precise location for security verification, and I understand this
+        application cannot be submitted without it.
+      </span>
+    </label>
+    {/* Live status, so the applicant is never guessing whether the browser actually granted it. */}
+    <p data-era-geo-status class="text-[0.76rem] mt-3 text-white/50">
+      Tick the box above and your browser will ask for location access.
+    </p>
+    <p class="text-[0.74rem] text-white/40 leading-relaxed mt-3">
+      Visible only to our senior review team. Never sold or shared. Write to
+      <a href="mailto:hr@edurankai.in" class="text-burn underline">hr@edurankai.in</a> to ask what we
+      hold about you or to have it deleted. Every other open role can be applied to without this.
+    </p>
+  </div>
+) : (
+  <div
+    data-era-geo-consent
+    class="mt-8 rounded-xl border border-white/10 bg-white/[0.03] p-4"
+  >
+    <p class="text-[0.7rem] font-mono uppercase tracking-[0.15em] text-white/40 mb-2">Verification notice</p>
+    <p class="text-[0.82rem] text-white/70 leading-relaxed">
+      We record where this application is submitted from &mdash; your approximate location from your
+      internet connection, and your device's timezone and language settings. Your browser will also ask
+      once whether to share your precise location; you can decline and still apply. This is used only to
+      verify applications and prevent fraud, is visible only to our senior review team, and is never sold
+      or shared. Write to <a href="mailto:hr@edurankai.in" class="text-burn underline">hr@edurankai.in</a>
+      to ask what we hold about you or to have it deleted.
+    </p>
+  </div>
+)}
 
-<script src="/apply-location.js" is:inline defer></script>
+<script is:inline>
+  /* Mandatory-location gate for security-classified roles. Ticking the box triggers the browser
+     prompt immediately and reports the real outcome, so an applicant is never left believing they
+     have granted access when the browser refused. This is a courtesy layer only — the binding check
+     runs on the server at submission, because a browser-only gate can be bypassed. */
+  (function () {
+    var box = document.querySelector('[data-era-geo-gate]');
+    var status = document.querySelector('[data-era-geo-status]');
+    if (!box || !status) return;
+    var granted = false;
+    function say(msg, cls) { status.textContent = msg; status.className = 'text-[0.76rem] mt-3 ' + cls; }
+
+    box.addEventListener('change', function () {
+      if (!box.checked || granted) return;
+      if (!navigator.geolocation) { say('Your browser does not support location sharing, so this role cannot be applied to from this device.', 'text-red-400'); return; }
+      say('Waiting for your browser to confirm location access...', 'text-white/60');
+      navigator.geolocation.getCurrentPosition(
+        function () {
+          granted = true;
+          say('Location access granted. You can continue.', 'text-green-400');
+          // force=true: the once-per-session guard must not stop this being RECORDED, since the
+          // server requires a stored grant before it will accept the application.
+          if (window.AquinApplyLocation) window.AquinApplyLocation.askPrecise(true);
+        },
+        function (err) {
+          box.checked = false;
+          say(err && err.code === 1
+            ? 'Location access was blocked. Allow location for this site in your browser settings, then tick the box again.'
+            : 'We could not read your location. Check that location services are on, then tick the box again.', 'text-red-400');
+        },
+        { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+      );
+    });
+  })();
+</script>
 
 </ApplyLayout>
 
