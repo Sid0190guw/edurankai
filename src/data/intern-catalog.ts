@@ -758,17 +758,11 @@ const PRODUCT_DESIGN: CatalogRole[] = [
     specialisations: ['Design', 'Visual Communication', 'Any Relevant Discipline'],
     keywords: ['Product Design', 'Figma', 'UI Design', 'Design Systems'],
   }),
-  role({
-    slug: 'ui-ux-design-intern-v2',
-    departmentId: 'design', title: 'UI/UX Design Intern', noOfInterns: 12,
-    about: 'Design real screens for real products, with mentorship and a portfolio to show for it — user flows, wireframes, and polished interfaces.',
-    responsibilities: ['Create wireframes, prototypes, and high-fidelity UI designs.', 'Conduct usability research and incorporate feedback.', 'Collaborate with product and engineering on feasible designs.', 'Maintain consistency with the design system.', 'Present design rationale to stakeholders.'],
-    skills: ['Figma', 'Wireframing & prototyping', 'User research basics', 'Visual design principles'],
-    learningOutcomes: ['UX Research & Wireframing', 'High-Fidelity UI Design', 'Prototyping', 'Design Rationale Communication', 'Usability Testing'],
-    qualificationType: UGPG, qualifications: STD_QUALIFICATIONS,
-    specialisations: ['Design', 'Visual Communication', 'Any Relevant Discipline'],
-    keywords: ['UI Design', 'UX Design', 'Figma', 'Wireframing', 'Prototyping'],
-  }),
+  // REMOVED 'ui-ux-design-intern-v2'. It carried the SAME title ("UI/UX Design Intern") and even
+  // the same opening line as the hand-curated paid role in role-catalog.ts (slug
+  // ui-ux-design-intern, stipend INR 10,000-20,000). The -v2 suffix worked around the slug clash
+  // but not the title clash, so the importer's normalised-title dedup skipped it on every run and
+  // it never reached the database. The paid hand-curated entry is the one to keep.
   role({
     slug: 'graphic-design-intern',
     departmentId: 'design', title: 'Graphic Design Intern', noOfInterns: 15,

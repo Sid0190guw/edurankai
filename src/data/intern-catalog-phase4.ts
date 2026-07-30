@@ -883,16 +883,10 @@ const GOVT_INSTITUTIONAL: CatalogRole[] = [
 // (the full-time role).
 // =====================================================================================
 const EXECUTIVE_OFFICE_TOPUP: CatalogRole[] = [
-  role({
-    slug: 'founder-office-intern', departmentId: 'executive-office', title: 'Founder Office Intern', noOfInterns: 2,
-    about: 'The founder office specifically — earlier-stage, wider-aperture work spanning new ventures, research directions, and external relationships.',
-    responsibilities: ['Support research on new venture and product directions.', 'Assist in preparing founder-level briefing material.', 'Track founder-office commitments and follow-ups.', 'Document research findings and options analysis.', 'Support coordination across ventures in the ecosystem.'],
-    skills: ['Research and synthesis', 'Briefing preparation', 'Commitment tracking', 'Discretion and confidentiality', 'Adaptability'],
-    learningOutcomes: ['Founder-Level Research & Synthesis', 'Executive Briefing Preparation', 'Commitment & Follow-Up Tracking', 'Cross-Venture Coordination'],
-    qualificationType: UGPG, qualifications: MGMT_QUALIFICATIONS,
-    specialisations: ['Business Administration', 'Any Relevant Discipline'],
-    keywords: ['Founder Office', 'Executive Office', 'Venture Development', 'Strategy'],
-  }),
+  // REMOVED 'Founder Office Intern'. It duplicated the existing "Founder's Office Intern"
+  // (intern-catalog.ts, slug founders-office-intern) — the two normalise to the same string under
+  // the importer's dedup rule, so this one was silently skipped on every import and never reached
+  // the database. The original has 4 openings to this one's 2 and is already live, so it stays.
   role({
     slug: 'chief-of-staff-intern', departmentId: 'executive-office', title: 'Chief of Staff Intern', noOfInterns: 2,
     about: 'The chief-of-staff craft at internship level — making an executive\'s time and attention go further through preparation and follow-through.',
