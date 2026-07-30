@@ -1,0 +1,148 @@
+---
+// Read-only diagnostic for the AICTE columns and the careers keyword-search clause.
+//
+// Exists because keyword-only searches ("Telemetry Analysis", "Multilingual AI") return zero on
+// the live site and there are two very different possible causes that cannot be told apart from
+// outside the database: either the runtime `keywords` column is empty/absent, or the search clause
+// itself errors and the resilience fallback in careers.astro silently covers for it. This page
+// runs the exact same SQL the careers page runs and reports which it is.
+//
+// Strictly SELECT-only. Nothing here writes, alters, or deletes.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { can } from '@/lib/auth/permissions';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user!;
+if (!can(user, 'roles.edit')) return Astro.redirect('/admin');
+
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+type Check = { label: string; ok: boolean | null; detail: string };
+const checks: Check[] = [];
+const add = (label: string, ok: boolean | null, detail: string) => checks.push({ label, ok, detail });
+
+const AICTE_COLS = ['keywords', 'learning_outcomes', 'qualification_type', 'qualifications', 'specialisations',
+  'no_of_interns', 'perks', 'internship_mode', 'working_days_per_week', 'hours_per_week',
+  'project_hours_per_day', 'wellbeing_hours_per_day', 'engagement_notes'];
+
+// 1. Do the AICTE columns actually exist on the roles table?
+let presentCols: string[] = [];
+try {
+  presentCols = rows(await db.execute(sql`
+    SELECT column_name FROM information_schema.columns
+    WHERE table_name = 'roles' AND column_name = ANY(${AICTE_COLS}::text[])`)).map((r: any) => r.column_name);
+  const missing = AICTE_COLS.filter((c) => !presentCols.includes(c));
+  add('AICTE columns exist on roles', missing.length === 0,
+    missing.length === 0 ? `all ${AICTE_COLS.length} present` : `MISSING: ${missing.join(', ')}`);
+} catch (e: any) {
+  add('AICTE columns exist on roles', false, 'check failed: ' + (e?.cause?.message || e?.message));
+}
+
+const hasKeywords = presentCols.includes('keywords');
+
+// 2. How many rows actually have data in them?
+if (hasKeywords) {
+  try {
+    const r = rows(await db.execute(sql`
+      SELECT COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE COALESCE(array_length(keywords, 1), 0) > 0)::int AS with_keywords,
+        COUNT(*) FILTER (WHERE COALESCE(array_length(learning_outcomes, 1), 0) > 0)::int AS with_outcomes,
+        COUNT(*) FILTER (WHERE COALESCE(array_length(perks, 1), 0) > 0)::int AS with_perks,
+        COUNT(*) FILTER (WHERE COALESCE(array_length(engagement_notes, 1), 0) > 0)::int AS with_terms
+      FROM roles`))[0];
+    add('Rows with keywords populated', r.with_keywords > 0,
+      `${r.with_keywords} of ${r.total} roles. learning_outcomes: ${r.with_outcomes}, perks: ${r.with_perks}, engagement_notes (Terms of Engagement): ${r.with_terms}`);
+  } catch (e: any) {
+    add('Rows with keywords populated', false, 'query failed: ' + (e?.cause?.message || e?.message));
+  }
+}
+
+// 3. Run the EXACT keyword clause careers.astro uses. If this throws, the clause is the bug.
+let clauseWorks = false;
+try {
+  const r = rows(await db.execute(sql`
+    SELECT COUNT(*)::int AS n FROM roles
+    WHERE is_open = true
+      AND EXISTS (SELECT 1 FROM unnest(COALESCE(keywords, '{}'::text[])) AS kw WHERE kw ILIKE ${'%a%'})`))[0];
+  clauseWorks = true;
+  add('Keyword search clause executes', true, `ran without error; ${r.n} open roles have a keyword containing "a"`);
+} catch (e: any) {
+  add('Keyword search clause executes', false, 'THE CLAUSE IS THE BUG -> ' + (e?.cause?.message || e?.message));
+}
+
+// 4. The specific failing searches, isolated to the keywords column only.
+for (const term of ['Telemetry Analysis', 'Multilingual AI', 'Drone Systems', 'OCR']) {
+  if (!clauseWorks) break;
+  try {
+    const r = rows(await db.execute(sql`
+      SELECT title FROM roles
+      WHERE is_open = true
+        AND EXISTS (SELECT 1 FROM unnest(COALESCE(keywords, '{}'::text[])) AS kw WHERE kw ILIKE ${'%' + term + '%'})
+      LIMIT 5`));
+    add(`keywords match: "${term}"`, r.length > 0, r.length ? r.map((x: any) => x.title).join(' | ') : 'no role has this keyword stored');
+  } catch (e: any) {
+    add(`keywords match: "${term}"`, false, 'failed: ' + (e?.cause?.message || e?.message));
+  }
+}
+
+// 5. Confirm the whole composite predicate careers.astro builds is valid SQL.
+try {
+  const like = '%Telemetry Analysis%';
+  const r = rows(await db.execute(sql`
+    SELECT COUNT(*)::int AS n FROM roles
+    WHERE is_open = true AND (
+      title ILIKE ${like}
+      OR function ILIKE ${like}
+      OR about ILIKE ${like}
+      OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+           CASE WHEN jsonb_typeof(skills) = 'array' THEN skills ELSE '[]'::jsonb END) AS skill WHERE skill ILIKE ${like})
+      OR EXISTS (SELECT 1 FROM departments d WHERE d.id = roles.department_id AND d.name ILIKE ${like})
+      OR EXISTS (SELECT 1 FROM unnest(COALESCE(keywords, '{}'::text[])) AS kw WHERE kw ILIKE ${like})
+    )`))[0];
+  add('Full careers.astro search predicate', true, `valid SQL; returns ${r.n} for "Telemetry Analysis"`);
+} catch (e: any) {
+  add('Full careers.astro search predicate', false, 'INVALID -> ' + (e?.cause?.message || e?.message));
+}
+
+// 6. Are the newest roles present at all?
+try {
+  const r = rows(await db.execute(sql`
+    SELECT slug FROM roles WHERE slug = ANY(${['llm-engineering-intern', 'quantum-nlp-intern', 'quantum-finance-intern']}::text[])`));
+  add('Newest 8 roles imported', r.length === 3, r.length ? 'found: ' + r.map((x: any) => x.slug).join(', ') : 'none of the new roles are in the database yet — click Import catalog');
+} catch (e: any) {
+  add('Newest 8 roles imported', false, 'check failed: ' + (e?.cause?.message || e?.message));
+}
+
+const failed = checks.filter((c) => c.ok === false).length;
+---
+<AdminLayout title="Role data diagnostic">
+  <div style="max-width:900px;">
+    <h1 style="font-family:'Fraunces',serif;font-size:26px;margin:0 0 6px;">Role data diagnostic</h1>
+    <p style="font-size:13px;color:#8a8a94;margin:0 0 20px;">
+      Read-only. Runs the exact SQL the careers page uses, to show whether the AICTE columns hold data
+      and whether the keyword-search clause is valid. Nothing on this page writes to the database.
+    </p>
+
+    <div style={`padding:12px 14px;border-radius:10px;margin-bottom:18px;border:1px solid ${failed ? '#7f1d1d' : '#14532d'};background:${failed ? 'rgba(127,29,29,0.18)' : 'rgba(20,83,45,0.18)'};`}>
+      <strong style="font-size:14px;">{failed === 0 ? 'All checks passed.' : failed + ' check(s) failed — see below.'}</strong>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      {checks.map((c) => (
+        <div style={`border:1px solid ${c.ok === false ? '#7f1d1d' : '#2a2a30'};border-radius:10px;padding:12px 14px;background:#0f0f14;`}>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+            <span style={`font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:${c.ok === false ? '#f87171' : '#4ade80'};`}>
+              {c.ok === false ? 'FAIL' : 'OK'}
+            </span>
+            <span style="font-size:13px;font-weight:600;color:#e8e8ee;">{c.label}</span>
+          </div>
+          <p style="font-size:12px;color:#a0a0a8;margin:0;line-height:1.5;word-break:break-word;">{c.detail}</p>
+        </div>
+      ))}
+    </div>
+
+    <p style="font-size:12px;color:#8a8a94;margin:20px 0 0;">
+      <a href="/admin/roles" style="color:#FF4F00;">Back to roles</a>
+    </p>
+  </div>
+</AdminLayout>
