@@ -59,15 +59,22 @@ function enrichPayload(p: PushPayload) {
 export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; group: string }[] = [
   // Recruitment
   { type: 'new_application',    label: 'New applications',          desc: 'When someone submits an application',          group: 'Recruitment' },
+  { type: 'application_started',label: 'Applications awaiting fee', desc: 'When someone completes the form but the fee has not cleared yet', group: 'Recruitment' },
+  { type: 'application_recovered', label: 'Recovered applications', desc: 'When a stuck or abandoned application is automatically recovered', group: 'Recruitment' },
   { type: 'applicant_message',  label: 'Applicant messages',        desc: 'When an applicant replies on their application', group: 'Recruitment' },
   { type: 'application_status', label: 'Application status changes', desc: 'When an application moves to a new stage',      group: 'Recruitment' },
   { type: 'offer_extended',     label: 'Offer extended',            desc: 'When an offer is extended to a candidate',     group: 'Recruitment' },
   { type: 'offer_signed',       label: 'Offer accepted',            desc: 'When a candidate signs their offer letter',    group: 'Recruitment' },
   { type: 'offer_declined',     label: 'Offer declined',            desc: 'When a candidate declines their offer',        group: 'Recruitment' },
+  { type: 'fee_waiver_request', label: 'Fee waiver requests',       desc: 'When an applicant asks for the application fee to be waived', group: 'Recruitment' },
   { type: 'fee_waiver_applicant_reply', label: 'Fee waiver replies',        desc: 'When an applicant replies on a fee waiver thread', group: 'Recruitment' },
+  { type: 'duplicate_application_fee', label: 'Duplicate fee charged',     desc: 'When an applicant is charged twice for the same application', group: 'Recruitment' },
+  { type: 'paid_application_stuck',    label: 'Paid but not created',      desc: 'When a fee was captured but the application was never created - needs manual repair', group: 'Recruitment' },
   { type: 'fee_waiver_coupon_redeemed', label: 'Fee waiver coupon redeemed', desc: 'When an applicant redeems a fee-waiver coupon to bypass payment', group: 'Recruitment' },
   { type: 'study_abroad_request',       label: 'Study-abroad requests',       desc: 'When an applicant submits a study-abroad support request',       group: 'Recruitment' },
   { type: 'intl_payment_request',       label: 'International payment requests', desc: 'When an applicant requests an international payment path (Stripe / PayPal / wire / Wise)', group: 'Recruitment' },
+  { type: 'partnership_starter_paid',   label: 'Partnership starter paid',  desc: 'When a partner pays their starter fee',        group: 'People & HR' },
+  { type: 'partner_payout_request',     label: 'Partner payout requests',   desc: 'When a partner requests a payout',             group: 'People & HR' },
   { type: 'visvambhara_applicant_reply',label: 'Visvambhara access replies', desc: 'When an applicant replies on a Visvambhara access request', group: 'Recruitment' },
   // Communication
   { type: 'chat_message',       label: 'Discussion messages',       desc: 'When someone posts in any discussion channel', group: 'Communication' },
@@ -80,8 +87,10 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
   { type: 'payroll_run',        label: 'Payroll',                   desc: 'When a payroll run completes or needs review',  group: 'People & HR' },
   // Academic / LMS
   { type: 'interview_scheduled',label: 'Interviews',                desc: 'When an interview is scheduled or updated',    group: 'Academic' },
+  { type: 'ai_interview_completed', label: 'AI interviews completed', desc: 'When a candidate finishes an AI interview and it is awaiting review', group: 'Academic' },
   { type: 'test_submitted',     label: 'Test submissions',          desc: 'When a candidate submits a proctored test',    group: 'Academic' },
   { type: 'lms_enrolment',      label: 'AquinTutor enrolments',     desc: 'When a learner enrols in a course',            group: 'Academic' },
+  { type: 'course_completed',   label: 'Course completions',        desc: 'When a learner completes a course',            group: 'Academic' },
   // Institutional
   { type: 'new_hei_submission', label: 'HEI submissions',           desc: 'When an institution submits scores',           group: 'Institutional' },
   { type: 'hei_truth_report',   label: 'HEI truth reports',         desc: 'When an HEI truth report is generated',        group: 'Institutional' },
