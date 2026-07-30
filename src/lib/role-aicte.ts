@@ -75,19 +75,38 @@ export async function getRoleAicte(roleId: string): Promise<RoleAicte> {
   } catch { return { ...EMPTY }; }
 }
 
+/**
+ * Build a text[] value from a JS string array, safely.
+ *
+ * The previous approach — `${jsArray}::text[]` — DID NOT WORK. postgres-js/drizzle sends a JS array
+ * as a row/record literal, so Postgres rejected every one of these writes with
+ * "cannot cast type record to text[]". Because the only caller wrapped setRoleAicte in a
+ * try/catch, that error was swallowed on every single import: base role rows were inserted while
+ * keywords, learning_outcomes, qualifications, specialisations, perks and engagement_notes stayed
+ * NULL for all 988 live roles. Confirmed on production via /admin/roles/diagnose, which reported
+ * "0 open roles have a keyword containing 'a'" while the search clause itself ran fine.
+ *
+ * Going via jsonb is the fix: the value crosses as ONE ordinary text parameter (so it is
+ * injection-safe and needs no manual escaping of commas, quotes, braces or backslashes — all of
+ * which appear in this catalog's text), and jsonb_array_elements_text unpacks it unambiguously.
+ * Hand-building a '{a,b,c}' array literal would also work but requires getting that escaping
+ * exactly right, which is not worth the risk here.
+ */
+function textArray(xs: string[] | null | undefined) {
+  const arr = (xs || []).filter((x) => typeof x === 'string');
+  return sql`COALESCE((SELECT array_agg(t.x) FROM jsonb_array_elements_text(${JSON.stringify(arr)}::jsonb) AS t(x)), ARRAY[]::text[])`;
+}
+
 export async function setRoleAicte(roleId: string, a: Partial<RoleAicte>): Promise<void> {
   await ensureRoleAicteColumns();
   const v: RoleAicte = { ...EMPTY, ...a };
-  // Every TEXT[] column needs an explicit ::text[] cast — without it postgres-js/drizzle sends a
-  // JS array as an ambiguous "record" literal, which Postgres rejects ("expression is of type
-  // record"). Mirrors the working pattern in role-products.ts's setRoleProducts().
   await db.execute(sql`
     UPDATE roles SET
-      keywords = ${v.keywords}::text[], learning_outcomes = ${v.learningOutcomes}::text[], qualification_type = ${v.qualificationType || null},
-      qualifications = ${v.qualifications}::text[], specialisations = ${v.specialisations}::text[],
-      no_of_interns = ${v.noOfInterns}, perks = ${v.perks}::text[], internship_mode = ${v.internshipMode || 'Full-Time'},
+      keywords = ${textArray(v.keywords)}, learning_outcomes = ${textArray(v.learningOutcomes)}, qualification_type = ${v.qualificationType || null},
+      qualifications = ${textArray(v.qualifications)}, specialisations = ${textArray(v.specialisations)},
+      no_of_interns = ${v.noOfInterns}, perks = ${textArray(v.perks)}, internship_mode = ${v.internshipMode || 'Full-Time'},
       working_days_per_week = ${v.workingDaysPerWeek}, hours_per_week = ${v.hoursPerWeek},
       project_hours_per_day = ${v.projectHoursPerDay}, wellbeing_hours_per_day = ${v.wellbeingHoursPerDay},
-      engagement_notes = ${v.engagementNotes}::text[]
+      engagement_notes = ${textArray(v.engagementNotes)}
     WHERE id = ${roleId}`);
 }
