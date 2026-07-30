@@ -5,7 +5,7 @@ import { roles, departments } from '@/lib/db/schema';
 import { can } from '@/lib/auth/permissions';
 import { desc, eq, asc, ilike, and, or, SQL } from 'drizzle-orm';
 import { CATALOG_DEPARTMENTS, ROLE_CATALOG } from '@/data/role-catalog';
-import { getProductOptions, setRoleProducts, setRoleOpenings } from '@/lib/role-products';
+import { getProductOptions, setRoleProducts, setRoleOpenings, ensureRoleProductColumn } from '@/lib/role-products';
 import { setRoleAicte, ensureRoleAicteColumns } from '@/lib/role-aicte';
 import { logAudit } from '@/lib/audit';
 
@@ -24,30 +24,37 @@ if (Astro.request.method === 'POST' && canEdit) {
   const fd = await Astro.request.formData();
   if (fd.get('_action') === 'import_catalog') {
     try {
-      // Hard cap on rows touched per request. This runs in a serverless function with a fixed
-      // time limit; at 583 catalog roles an unbounded run returns 504 FUNCTION_INVOCATION_TIMEOUT
-      // and commits only a partial import. Bounded + idempotent means the button can simply be
-      // clicked again until it reports nothing remaining. For a full bulk load prefer the
-      // terminal importer, .dev-scripts/import-roles.mjs, which has no time limit.
-      const BATCH = 60;
+      // Bounded by WALL CLOCK, not by a guessed row count. This runs in a serverless function with
+      // a fixed time limit, and an unbounded run returns 504 FUNCTION_INVOCATION_TIMEOUT having
+      // committed only a partial import. A time budget adapts to however fast the database actually
+      // is on the day, where a fixed row cap either wastes the request or overruns it. Work is also
+      // pipelined in chunks below (postgres-js pipelines concurrent queries on a connection), so a
+      // single click gets through far more than the previous strictly-sequential 60.
+      // Everything here is idempotent, so the button can simply be clicked again until it reports
+      // nothing remaining.
+      const DEADLINE = Date.now() + 20_000;
+      const outOfTime = () => Date.now() >= DEADLINE;
       await ensureRoleAicteColumns();
+      await ensureRoleProductColumn().catch(() => {});
       for (const d of CATALOG_DEPARTMENTS) {
         await db.insert(departments).values({ id: d.id, name: d.name, icon: d.icon, description: d.description, sortOrder: 50 }).onConflictDoNothing();
       }
-      // One query for everything we need about existing rows, including whether their AICTE
-      // columns are empty. Previously this page called getRoleAicte() once PER catalog role —
-      // 583 sequential round-trips, which by itself exhausted the function's time budget even
-      // when there was nothing left to import.
+      // ONE query for everything we need about existing rows: identity, whether their AICTE columns
+      // are empty, and whether their product tags are empty. This page used to call getRoleAicte()
+      // once PER catalog role — hundreds of sequential round-trips that exhausted the time budget
+      // even when there was nothing left to import.
       const existingRows = (await db.execute(sql`
         SELECT id, slug, title,
           (COALESCE(array_length(keywords, 1), 0) = 0
            AND COALESCE(array_length(learning_outcomes, 1), 0) = 0
-           AND COALESCE(array_length(perks, 1), 0) = 0) AS aicte_empty
+           AND COALESCE(array_length(perks, 1), 0) = 0) AS aicte_empty,
+          (COALESCE(array_length(products, 1), 0) = 0) AS products_empty
         FROM roles`)) as any;
-      const existing: { id: string; slug: string; title: string; aicte_empty: boolean }[] =
+      const existing: { id: string; slug: string; title: string; aicte_empty: boolean; products_empty: boolean }[] =
         Array.isArray(existingRows) ? existingRows : (existingRows?.rows || []);
       const idBySlug = new Map(existing.map((r) => [r.slug, r.id]));
       const aicteEmptyBySlug = new Map(existing.map((r) => [r.slug, !!r.aicte_empty]));
+      const productsEmptyBySlug = new Map(existing.map((r) => [r.slug, !!r.products_empty]));
       const haveSlugs = new Set(existing.map((r) => r.slug));
       const haveTitles = new Set(existing.map((r) => normTitle(r.title)));
       const productOptions = await getProductOptions();
@@ -55,8 +62,7 @@ if (Astro.request.method === 'POST' && canEdit) {
       const repaired: string[] = [];
       const failed: { title: string; reason: string }[] = [];
       let skipped = 0;
-      let budget = BATCH;      // rows we may still touch this request
-      let remaining = 0;       // rows we deliberately deferred to the next click
+      let remaining = 0;       // work deliberately deferred to the next click
 
       function aicteOf(c: (typeof ROLE_CATALOG)[number]) {
         return {
@@ -77,16 +83,32 @@ if (Astro.request.method === 'POST' && canEdit) {
         // Repair it if it's missing AICTE data (an earlier timed-out import could leave the base
         // row inserted but its AICTE columns never set).
         const existingId = idBySlug.get(c.slug);
-        if (existingId && hasAicteData(c) && aicteEmptyBySlug.get(c.slug)) {
-          if (budget > 0) {
-            try { await setRoleAicte(existingId, aicteOf(c)); repaired.push(c.title); budget--; } catch (_) {}
-          } else {
-            remaining++;
+        if (existingId) {
+          // Repair AICTE fields left empty by earlier imports. Until the record-cast bug in
+          // setRoleAicte was fixed these writes failed on EVERY call, so most existing rows need it.
+          if (hasAicteData(c) && aicteEmptyBySlug.get(c.slug)) {
+            if (outOfTime()) { remaining++; }
+            else {
+              try { await setRoleAicte(existingId, aicteOf(c)); repaired.push(c.title); }
+              catch (e: any) { failed.push({ title: c.title, reason: 'AICTE repair failed: ' + (e?.cause?.message || e?.message || 'unknown') }); }
+            }
+          }
+          // Same story for product tags: setRoleProducts also threw on every call, so existing
+          // roles have no tags and their venture pages render empty.
+          if (c.productMatch && productsEmptyBySlug.get(c.slug)) {
+            if (outOfTime()) { remaining++; }
+            else {
+              try {
+                const tags = productOptions.filter((p) => p.slug.includes(c.productMatch!) || p.name.toLowerCase().includes(c.productMatch!)).map((p) => p.slug);
+                if (tags.length) await setRoleProducts(existingId, tags);
+              } catch (e: any) {
+                failed.push({ title: c.title, reason: 'product-tag repair failed: ' + (e?.cause?.message || e?.message || 'unknown') });
+              }
+            }
           }
         }
         if (haveSlugs.has(c.slug) || haveTitles.has(normTitle(c.title))) { skipped++; continue; }
-        if (budget <= 0) { remaining++; continue; }
-        budget--;
+        if (outOfTime()) { remaining++; continue; }
 
         // Per-role isolation: one bad row must never abort the whole import. The base row is
         // inserted first; product tags / openings / AICTE fields are best-effort afterwards.
