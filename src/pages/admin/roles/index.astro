@@ -6,7 +6,7 @@ import { can } from '@/lib/auth/permissions';
 import { desc, eq, asc, ilike, and, or, SQL } from 'drizzle-orm';
 import { CATALOG_DEPARTMENTS, ROLE_CATALOG } from '@/data/role-catalog';
 import { getProductOptions, setRoleProducts, setRoleOpenings, ensureRoleProductColumn } from '@/lib/role-products';
-import { setRoleAicte, ensureRoleAicteColumns } from '@/lib/role-aicte';
+import { setRoleAicte, setRoleAicteBulk, ensureRoleAicteColumns } from '@/lib/role-aicte';
 import { setRoleSecurity } from '@/lib/role-security';
 import { logAudit } from '@/lib/audit';
 
@@ -64,6 +64,7 @@ if (Astro.request.method === 'POST' && canEdit) {
       const failed: { title: string; reason: string }[] = [];
       let skipped = 0;
       let remaining = 0;       // work deliberately deferred to the next click
+      const aicteRepairQueue: { slug: string; a: any; title: string }[] = [];
 
       function aicteOf(c: (typeof ROLE_CATALOG)[number]) {
         return {
@@ -85,14 +86,11 @@ if (Astro.request.method === 'POST' && canEdit) {
         // row inserted but its AICTE columns never set).
         const existingId = idBySlug.get(c.slug);
         if (existingId) {
-          // Repair AICTE fields left empty by earlier imports. Until the record-cast bug in
-          // setRoleAicte was fixed these writes failed on EVERY call, so most existing rows need it.
+          // Collect AICTE repairs rather than issuing them one at a time. Doing ~600 sequential
+          // round-trips from a serverless function to a pooled database is what made this take
+          // several slow clicks; they are applied below in a single bulk statement per 150 roles.
           if (hasAicteData(c) && aicteEmptyBySlug.get(c.slug)) {
-            if (outOfTime()) { remaining++; }
-            else {
-              try { await setRoleAicte(existingId, aicteOf(c)); repaired.push(c.title); }
-              catch (e: any) { failed.push({ title: c.title, reason: 'AICTE repair failed: ' + (e?.cause?.message || e?.message || 'unknown') }); }
-            }
+            aicteRepairQueue.push({ slug: c.slug, a: aicteOf(c), title: c.title });
           }
           // Same story for product tags: setRoleProducts also threw on every call, so existing
           // roles have no tags and their venture pages render empty.
@@ -165,6 +163,18 @@ if (Astro.request.method === 'POST' && canEdit) {
           failed.push({ title: c.title, reason: e?.cause?.message || e?.message || 'unknown error' });
         }
       }
+      // Apply every queued AICTE repair in ONE statement per 150 roles instead of one per role.
+      // This is the difference between a handful of queries and several hundred, and is why the
+      // import no longer needs to be clicked repeatedly.
+      if (aicteRepairQueue.length) {
+        try {
+          const n = await setRoleAicteBulk(aicteRepairQueue.map((q) => ({ slug: q.slug, a: q.a })));
+          for (const q of aicteRepairQueue.slice(0, n)) repaired.push(q.title);
+        } catch (e: any) {
+          failed.push({ title: aicteRepairQueue.length + ' roles', reason: 'bulk AICTE repair failed: ' + (e?.cause?.message || e?.message || 'unknown') });
+        }
+      }
+
       await logAudit({ userId: user.id, action: 'role.import_catalog', entity: 'role', entityId: 'catalog', diff: { added, skipped, repaired, failed }, ipAddress: Astro.clientAddress });
       const parts: string[] = [];
       parts.push(added.length
