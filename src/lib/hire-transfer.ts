@@ -34,6 +34,18 @@ export async function transferApplicantToEmployee(offer: any): Promise<{ created
       INSERT INTO hr_employees (user_id, employee_code, full_name, email, personal_email, phone, designation, employment_type, joining_date, employment_status, application_id, is_active, onboarding_status)
       VALUES (${userId}, ${empCode}, ${name}, ${email}, ${email}, ${c.candidatePhone || null}, ${designation}, ${empType}, ${joining}::date, 'active', ${appId}, true, 'pending')
       RETURNING id`));
+
+    // Put them in their groups the moment they become an employee — the common group and their
+    // department's, which is created on first use. Guarded and awaited: a group failure must never
+    // undo a hire, but it must also not be fired and forgotten, because on a serverless platform
+    // that work is killed when the response is sent.
+    try {
+      const { autoJoinOnOnboard } = await import('@/lib/work-groups');
+      await autoJoinOnOnboard(userId, (c as any).departmentId || null, (c as any).departmentName || designation || null);
+    } catch (e: any) {
+      console.error('[hire-transfer] group auto-join failed:', e?.cause?.message || e?.message);
+    }
+
     return { created: true, employeeId: (ins[0] as any)?.id };
   } catch (e: any) {
     console.error('[hire-transfer] failed:', e?.message);
