@@ -63,6 +63,23 @@ export const POST: APIRoute = async ({ request, locals }) => {
     }
 
     const amountPaise = Math.max(100, parseInt(course.price_inr_paise || 100));
+
+    // Same absurd-price guard as the two test-checkout paths. price_inr_paise is in PAISE, so a
+    // course saved as 500 meaning "Rs 500" charges Rs 5. That units trap already took a real
+    // Rs 1.20 payment for the Quantum Science & ASI bootcamp test, and this column is populated the
+    // same way for courses. Refusing is strictly better than charging a nonsense amount: a failed
+    // checkout is a support message, whereas a wrong charge is a refund, a reconciliation problem,
+    // and a learner who believes they have paid and enrolled.
+    if (amountPaise > 0 && amountPaise < 1000) {
+      console.error('[start-enrollment] refusing absurd price', {
+        courseSlug: course.slug, amountPaise, price_inr_paise: course.price_inr_paise,
+      });
+      return json({
+        ok: false,
+        error: 'This course is not correctly priced yet, so we have not taken any payment. Please write to hr@edurankai.in and we will sort it out.',
+      }, 409);
+    }
+
     const receipt = 'aq_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 
     const result = await createOrder({
