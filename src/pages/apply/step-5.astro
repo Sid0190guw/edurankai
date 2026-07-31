@@ -5,6 +5,7 @@ import { roles } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 import { getActiveDraft, saveDraft } from '@/lib/apply/draft';
 import { safeDraft, isInternOrApprentice } from '@/lib/apply/data';
+import { listActiveSources, recordSourceUse, recordSuggestion } from '@/lib/application-sources';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -67,10 +68,16 @@ if (Astro.request.method === 'POST') {
   if (!data.engagementType) missing.push('Engagement type preference');
   if (!data.remoteComfort) missing.push('Remote comfort');
   if (!data.source) missing.push('How you heard about us');
-  if (!data.applyChannel) missing.push('How you are applying');
-  // The institutional and job-board pathways need their specifics.
-  if ((data.applyChannel === 'institutional' || data.applyChannel === 'jobboard') && !data.applyChannelDetail) {
-    missing.push(data.applyChannel === 'institutional' ? 'Your portal / placement or training cell' : 'Which job platform');
+  // Mandatory: an application cannot be submitted without saying where it came from.
+  if (!data.applyChannel) missing.push('Where you are applying from');
+  // Whichever options the admin marked as needing specifics — referral employee ID, which platform,
+  // which university, and so on. Driven by the same data the options come from, so a new option
+  // with a follow-up question is enforced without touching this file.
+  {
+    const picked = CHANNEL_OPTIONS.find((o) => o.value === data.applyChannel);
+    if (picked && picked.detailRequired && !data.applyChannelDetail) {
+      missing.push(picked.detailLabel || 'Details for how you are applying');
+    }
   }
 
   if (missing.length > 0) {
@@ -78,6 +85,12 @@ if (Astro.request.method === 'POST') {
   } else {
     const newDraft = { ...draft, step5: data };
     await saveDraft(user.id, user.email, newDraft, 6);
+    // Count real usage so the admin list shows which sources actually bring people in, and capture
+    // free-text answers for review. Both are best-effort — neither may block an application.
+    await recordSourceUse(data.applyChannel).catch(() => {});
+    if (data.applyChannelDetail && /other/i.test(data.applyChannel)) {
+      await recordSuggestion(data.applyChannelDetail).catch(() => {});
+    }
     return Astro.redirect('/apply/step-6' + (roleSlug ? '?role=' + roleSlug : ''));
   }
 }
@@ -107,12 +120,20 @@ const REMOTE_OPTIONS = [
   'Either works'
 ];
 
-// The application pathway — three channels, each with its own follow-up detail.
-const CHANNEL_OPTIONS = [
-  { value: 'direct', title: 'Directly on the EduRankAI career portal', hint: 'You found and applied here on edurankai.in.', detailLabel: '' },
-  { value: 'institutional', title: 'Through my college / an internship portal', hint: 'e.g. AICTE Internship, your placement or training cell.', detailLabel: 'Which portal, and your placement / training cell' },
-  { value: 'jobboard', title: 'Through a job platform', hint: 'Our own Vrittih.online, or LinkedIn, Indeed, Internshala and similar.', detailLabel: 'Which platform' },
-];
+// The application pathway. This list used to be hardcoded here, so adding a job board meant a code
+// change and a deploy; it is now admin-managed data (/admin/application-sources). The hardcoded set
+// remains only as a fallback for the case where the table cannot be read, so the application form
+// can never become unusable because of it.
+const dbSources = await listActiveSources();
+const CHANNEL_OPTIONS = dbSources.length
+  ? dbSources.map((s) => ({ value: s.slug, title: s.label, hint: '', detailLabel: s.detailLabel || '', detailRequired: s.detailRequired }))
+  : [
+      { value: 'direct', title: 'Directly on the EduRankAI career portal', hint: 'You found and applied here on edurankai.in.', detailLabel: '', detailRequired: false },
+      { value: 'institutional', title: 'Through my college / an internship portal', hint: 'e.g. AICTE Internship, your placement or training cell.', detailLabel: 'Which portal, and your placement / training cell', detailRequired: true },
+      { value: 'jobboard', title: 'Through a job platform', hint: 'Our own Vrittih.online, or LinkedIn, Indeed, Internshala and similar.', detailLabel: 'Which platform', detailRequired: true },
+    ];
+// Slugs whose follow-up answer is compulsory — used by both the server check and the client script.
+const DETAIL_REQUIRED = CHANNEL_OPTIONS.filter((o) => o.detailRequired).map((o) => o.value);
 
 const SOURCE_OPTIONS = [
   'LinkedIn',
@@ -263,8 +284,8 @@ const SOURCE_OPTIONS = [
               );
             })}
           </div>
-          <div id="channelDetailWrap" class={s5.applyChannel === 'institutional' || s5.applyChannel === 'jobboard' ? 'mt-2.5' : 'mt-2.5 hidden'}>
-            <label id="channelDetailLabel" class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">{s5.applyChannel === 'jobboard' ? 'Which platform' : 'Which portal, and your placement / training cell'} <span class="text-burn">*</span></label>
+          <div id="channelDetailWrap" data-required-slugs={JSON.stringify(DETAIL_REQUIRED)} class={DETAIL_REQUIRED.includes(s5.applyChannel) ? 'mt-2.5' : 'mt-2.5 hidden'}>
+            <label id="channelDetailLabel" class="block text-[0.68rem] font-bold uppercase tracking-wider text-ink-soft mb-1.5">{CHANNEL_OPTIONS.find((o) => o.value === s5.applyChannel)?.detailLabel || 'Details'} <span class="text-burn">*</span></label>
             <input type="text" name="applyChannelDetail" value={s5.applyChannelDetail || ''} placeholder="e.g. Vrittih.online / AICTE Internship - JD College Placement Cell / Internshala" maxlength="200" class="w-full px-3 py-2.5 border border-ink/15 rounded-lg text-[0.9rem] outline-none focus:border-burn bg-white" list="platformSuggest" />
             <datalist id="platformSuggest"><option value="Vrittih.online"></option><option value="LinkedIn"></option><option value="Indeed"></option><option value="Internshala"></option><option value="Naukri"></option></datalist>
           </div>
@@ -301,18 +322,24 @@ const SOURCE_OPTIONS = [
   </form>
 
   <script is:inline>
-    // Show the follow-up detail only for the institutional / job-board pathways,
-    // and label it for the chosen one. "Direct" needs no extra detail.
+    // Show the follow-up field only for options the admin marked as needing one, and take its
+    // wording from that option. Both the list of options and which need a follow-up are now data
+    // (/admin/application-sources), so nothing here is hardcoded to particular channels — adding a
+    // new source with its own question works without touching this script.
     (function () {
       var wrap = document.getElementById('channelDetailWrap');
       var label = document.getElementById('channelDetailLabel');
       var input = wrap ? wrap.querySelector('input[name="applyChannelDetail"]') : null;
+      var needs = [];
+      try { needs = JSON.parse(wrap.getAttribute('data-required-slugs') || '[]'); } catch (_) {}
       function sync() {
         var picked = document.querySelector('input[name="applyChannel"]:checked');
         var v = picked ? picked.value : '';
-        if (v === 'institutional' || v === 'jobboard') {
+        var opt = picked ? picked.closest('.channel-opt') : null;
+        if (v && needs.indexOf(v) !== -1) {
           wrap.classList.remove('hidden');
-          if (label) label.firstChild.textContent = (v === 'jobboard' ? 'Which platform ' : 'Which portal, and your placement / training cell ');
+          var text = (opt && opt.getAttribute('data-detail-label')) || 'Details';
+          if (label && label.firstChild) label.firstChild.textContent = text + ' ';
           if (input) input.setAttribute('required', 'required');
         } else {
           wrap.classList.add('hidden');
