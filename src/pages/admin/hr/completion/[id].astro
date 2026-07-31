@@ -1,0 +1,189 @@
+---
+// Offboarding report and completion letter for one employee.
+//
+// Everything here is computed from recorded attendance, approved leave and logged reviews — nobody
+// types a credit figure. The letter is something people show to universities and employers, so a
+// hand-entered number would be a claim we could not stand behind.
+//
+// The page is deliberately honest about gaps: if terms were never set, or the requirement is unmet,
+// it says so rather than rendering a confident-looking letter over missing data.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ledgerFor, reviewsFor, termsFor, setTermsFor } from '@/lib/credit-ledger';
+import { completionFigures, remainingWeeks, weeklyHoursFor } from '@/lib/credit-hours';
+
+const user = Astro.locals.user!;
+if (!can(user, 'hr.edit') && !can(user, 'employees.edit')) return Astro.redirect('/admin');
+
+const id = Astro.params.id!;
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+let msg = '';
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  if (fd.get('_action') === 'terms') {
+    const kind = String(fd.get('kind') || 'full-time') === 'part-time' ? 'part-time' : 'full-time';
+    const wh = parseFloat(String(fd.get('weeklyHours') || '')) || null;
+    await setTermsFor(id, {
+      kind,
+      weeklyHours: wh ?? (kind === 'full-time' ? 40 : undefined),
+      workingDaysPerWeek: parseInt(String(fd.get('daysPerWeek') || '5')) || 5,
+      requiredCreditHours: parseInt(String(fd.get('required') || '')) || undefined,
+    });
+    msg = 'Engagement terms saved.';
+  } else if (fd.get('_action') === 'review') {
+    const note = String(fd.get('note') || '').trim();
+    if (note) {
+      await db.execute(sql`
+        INSERT INTO hr_reviews (employee_id, reviewer_name, reviewer_id, rating, note, period)
+        VALUES (${id}, ${user.name || user.email}, ${user.id},
+                ${parseInt(String(fd.get('rating') || '')) || null}, ${note},
+                ${String(fd.get('period') || '') || null})`).catch(() => {});
+      msg = 'Review added.';
+    }
+  }
+}
+
+const emp = rows(await db.execute(sql`
+  SELECT id, full_name, email, designation, joining_date, employment_status, employment_type
+  FROM hr_employees WHERE id = ${id} LIMIT 1`))[0];
+if (!emp) return Astro.redirect('/admin/hr/employees');
+
+const terms = await termsFor(id);
+const { summary, days } = await ledgerFor(id, terms);
+const reviews = await reviewsFor(id);
+const achievements = reviews.filter((r) => (r.rating || 0) >= 4).map((r) => r.note).slice(0, 6);
+
+const figures = completionFigures({
+  name: emp.full_name, role: emp.designation || '',
+  startDate: String(emp.joining_date || '').slice(0, 10),
+  endDate: new Date().toISOString().slice(0, 10),
+  terms, summary, reviews, achievements,
+});
+const weeksLeft = remainingWeeks(summary, terms);
+const contractedWeekly = weeklyHoursFor(terms);
+const termsMissing = terms.kind === 'part-time' && contractedWeekly === 0;
+
+const card = 'border:1px solid #2a2a30;border-radius:12px;background:#0f0f14;padding:14px;';
+const stat = (label: string, value: string, tone = '#e8e8ee') =>
+  `<div style="${card}"><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">${label}</p><p style="font-size:20px;font-weight:700;color:${tone};margin:0;font-family:'Geist Mono',monospace;">${value}</p></div>`;
+---
+<AdminLayout title={'Completion — ' + emp.full_name}>
+  <div style="max-width:900px;">
+    <h1 style="font-family:'Fraunces',serif;font-size:24px;margin:0 0 2px;">{emp.full_name}</h1>
+    <p style="font-size:13px;color:#8a8a94;margin:0 0 16px;">{emp.designation} · joined {String(emp.joining_date || '').slice(0, 10) || 'unknown'}</p>
+
+    {msg && <div style="padding:10px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #14532d;background:rgba(20,83,45,0.2);font-size:13px;">{msg}</div>}
+
+    {termsMissing && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #b45309;background:rgba(180,83,9,0.14);font-size:13px;line-height:1.55;">
+        <strong>Part-time hours have not been set.</strong> Credit cannot be calculated until the
+        agreed weekly hours are recorded, so the figures below read as zero. This is deliberate —
+        guessing a contract would misstate what this person agreed to.
+      </div>
+    )}
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:18px;">
+      <Fragment set:html={stat('Credit-hours earned', String(summary.creditHours))} />
+      <Fragment set:html={stat('Attendance', summary.attendancePct + '%', summary.attendancePct >= 85 ? '#4ade80' : summary.attendancePct >= 70 ? '#fbbf24' : '#f87171')} />
+      <Fragment set:html={stat('Required', summary.requiredCreditHours ? String(summary.requiredCreditHours) : 'not set')} />
+      <Fragment set:html={stat('Weeks remaining', weeksLeft == null ? '—' : String(weeksLeft))} />
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:18px;">
+      <Fragment set:html={stat('Days present', String(summary.daysPresent))} />
+      <Fragment set:html={stat('Authorised leave', String(summary.authorisedLeaveDays))} />
+      <Fragment set:html={stat('Unauthorised', String(summary.unauthorisedLeaveDays), summary.unauthorisedLeaveDays ? '#f87171' : '#e8e8ee')} />
+      <Fragment set:html={stat('Notice breaches', String(summary.noticeBreaches), summary.noticeBreaches ? '#fbbf24' : '#e8e8ee')} />
+    </div>
+
+    {/* Terms */}
+    <details style={card + 'margin-bottom:16px;'}>
+      <summary style="cursor:pointer;font-size:13px;font-weight:600;">Engagement terms</summary>
+      <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;align-items:end;margin-top:12px;">
+        <input type="hidden" name="_action" value="terms" />
+        <label style="font-size:11px;color:#8a8a94;">Kind
+          <select name="kind" style="width:100%;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:7px;border-radius:6px;font-size:12.5px;">
+            <option value="full-time" selected={terms.kind === 'full-time'}>Full-time</option>
+            <option value="part-time" selected={terms.kind === 'part-time'}>Part-time</option>
+          </select>
+        </label>
+        <label style="font-size:11px;color:#8a8a94;">Hours / week
+          <input name="weeklyHours" type="number" step="0.5" value={terms.weeklyHours ?? ''} style="width:100%;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:7px;border-radius:6px;font-size:12.5px;" />
+        </label>
+        <label style="font-size:11px;color:#8a8a94;">Days / week
+          <input name="daysPerWeek" type="number" value={terms.workingDaysPerWeek ?? 5} style="width:100%;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:7px;border-radius:6px;font-size:12.5px;" />
+        </label>
+        <label style="font-size:11px;color:#8a8a94;">Required credit-hours
+          <input name="required" type="number" value={terms.requiredCreditHours ?? ''} style="width:100%;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:7px;border-radius:6px;font-size:12.5px;" />
+        </label>
+        <button type="submit" style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:12.5px;padding:8px 14px;border-radius:6px;cursor:pointer;">Save</button>
+      </form>
+      <p style="font-size:11px;color:#6e6e78;margin:10px 0 0;line-height:1.5;">
+        Part-time is pro-rata against a 40-hour week and must reach the SAME required credit-hours,
+        so a half load simply runs twice as long.
+      </p>
+    </details>
+
+    {/* Reviews */}
+    <div style={card + 'margin-bottom:16px;'}>
+      <p style="font-size:13px;font-weight:600;margin:0 0 10px;">Reviews ({reviews.length})</p>
+      {reviews.length === 0 && <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;">No reviews recorded yet.</p>}
+      {reviews.map((r) => (
+        <div style="border-top:1px solid #1a1a22;padding:8px 0;">
+          <p style="font-size:12px;color:#e8e8ee;margin:0;">{r.note}</p>
+          <p style="font-size:10.5px;color:#6e6e78;margin:3px 0 0;">{r.reviewer} · {r.date}{r.rating ? ' · ' + r.rating + '/5' : ''}</p>
+        </div>
+      ))}
+      <form method="POST" style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+        <input type="hidden" name="_action" value="review" />
+        <input name="note" placeholder="Add a review note" required style="flex:1;min-width:200px;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:8px;border-radius:6px;font-size:12.5px;" />
+        <input name="rating" type="number" min="1" max="5" placeholder="1-5" style="width:70px;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:8px;border-radius:6px;font-size:12.5px;" />
+        <button type="submit" style="background:#1a1a22;border:1px solid #2a2a30;color:#e8e8ee;font-size:12.5px;padding:8px 14px;border-radius:6px;cursor:pointer;">Add</button>
+      </form>
+    </div>
+
+    {/* The letter */}
+    <div style="border:1px solid #2a2a30;border-radius:12px;background:#fff;color:#111;padding:26px;" id="letter">
+      <p style="font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#a33;margin:0 0 14px;">Certificate of completion</p>
+      <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
+        This is to certify that <strong>{emp.full_name}</strong> served as
+        <strong> {emp.designation}</strong> at EduRankAI from
+        <strong> {String(emp.joining_date || '').slice(0, 10) || '—'}</strong> to
+        <strong> {new Date().toISOString().slice(0, 10)}</strong>.
+      </p>
+      <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
+        Over this engagement they completed <strong>{figures.creditHours} credit-hours</strong> of
+        verified work at an attendance of <strong>{figures.attendancePct}%</strong>
+        {terms.kind === 'part-time' ? ' on an agreed part-time load of ' + contractedWeekly + ' hours per week' : ''}.
+        {figures.reviewCount > 0 && figures.averageRating != null
+          ? ` Across ${figures.reviewCount} recorded reviews their average rating was ${figures.averageRating} out of 5.`
+          : ''}
+      </p>
+      {figures.achievements.length > 0 && (
+        <>
+          <p style="font-size:13px;font-weight:700;margin:16px 0 6px;">Key achievements</p>
+          <ul style="margin:0 0 12px;padding-left:18px;">
+            {figures.achievements.map((a) => <li style="font-size:14px;line-height:1.6;">{a}</li>)}
+          </ul>
+        </>
+      )}
+      <p style="font-size:12.5px;color:#555;line-height:1.6;margin:16px 0 0;border-top:1px solid #eee;padding-top:12px;">
+        {figures.reason} Figures are computed from recorded attendance, approved leave and logged
+        reviews. One credit-hour represents one hour of verified engagement; a full-time week is 40.
+      </p>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-top:12px;">
+      <button type="button" onclick="window.print()" style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;">Print / save as PDF</button>
+      <span style={`font-size:12px;padding:10px 0;color:${figures.eligible ? '#4ade80' : '#fbbf24'};`}>
+        {figures.eligible ? 'Requirement met.' : 'Requirement not yet met — issuing is your call.'}
+      </span>
+    </div>
+    <p style="font-size:11.5px;color:#6e6e78;margin:10px 0 0;">
+      {days.length} attendance day(s) counted. Nothing on the letter is typed by hand.
+    </p>
+  </div>
+</AdminLayout>

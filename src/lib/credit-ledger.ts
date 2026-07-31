@@ -118,6 +118,54 @@ export async function ledgerFor(employeeId: string, terms: EngagementTerms): Pro
   }
 }
 
+/**
+ * The engagement terms agreed with one employee.
+ *
+ * Stored per-employee rather than inferred from their role, because two interns on the same role
+ * can be on different loads, and the completion letter must state what THIS person agreed to.
+ * Columns are added at runtime, matching the pattern used elsewhere in this codebase.
+ */
+export async function termsFor(employeeId: string): Promise<EngagementTerms> {
+  // A sane default only for the shape; the real numbers come from the row when set.
+  const fallback: EngagementTerms = { kind: 'full-time', workingDaysPerWeek: 5 };
+  if (!employeeId) return fallback;
+  try {
+    for (const [col, type] of [
+      ['engagement_kind', "TEXT NOT NULL DEFAULT 'full-time'"],
+      ['weekly_hours', 'NUMERIC(5,2)'],
+      ['working_days_per_week', 'INT'],
+      ['required_credit_hours', 'INT'],
+    ] as [string, string][]) {
+      await db.execute(sql.raw(`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS ${col} ${type}`)).catch(() => {});
+    }
+    const r = rows(await db.execute(sql`
+      SELECT engagement_kind, weekly_hours, working_days_per_week, required_credit_hours
+      FROM hr_employees WHERE id = ${employeeId} LIMIT 1`))[0];
+    if (!r) return fallback;
+    const kind = r.engagement_kind === 'part-time' ? 'part-time' : 'full-time';
+    return {
+      kind,
+      // Left undefined rather than defaulted for part-time: weeklyHoursFor() resolves an unstated
+      // part-time load to 0 on purpose, so a missing contract shows as missing instead of being
+      // quietly invented.
+      weeklyHours: r.weekly_hours == null ? (kind === 'full-time' ? 40 : undefined) : Number(r.weekly_hours),
+      workingDaysPerWeek: r.working_days_per_week == null ? 5 : Number(r.working_days_per_week),
+      requiredCreditHours: r.required_credit_hours == null ? undefined : Number(r.required_credit_hours),
+    };
+  } catch { return fallback; }
+}
+
+export async function setTermsFor(employeeId: string, t: EngagementTerms): Promise<void> {
+  await termsFor(employeeId);   // ensures the columns exist
+  await db.execute(sql`
+    UPDATE hr_employees SET
+      engagement_kind = ${t.kind},
+      weekly_hours = ${t.weeklyHours ?? null},
+      working_days_per_week = ${t.workingDaysPerWeek ?? 5},
+      required_credit_hours = ${t.requiredCreditHours ?? null}
+    WHERE id = ${employeeId}`);
+}
+
 /** Reviews recorded against an employee, newest first, for the offboarding report. */
 export async function reviewsFor(employeeId: string): Promise<ReviewEntry[]> {
   if (!employeeId) return [];
