@@ -65,6 +65,7 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
   { type: 'application_status', label: 'Application status changes', desc: 'When an application moves to a new stage',      group: 'Recruitment' },
   { type: 'offer_extended',     label: 'Offer extended',            desc: 'When an offer is extended to a candidate',     group: 'Recruitment' },
   { type: 'offer_signed',       label: 'Offer accepted',            desc: 'When a candidate signs their offer letter',    group: 'Recruitment' },
+  { type: 'offer_verification_request', label: 'Offer verification requests', desc: 'When an employer, institution or individual asks us to verify an offer letter', group: 'Recruitment' },
   { type: 'offer_declined',     label: 'Offer declined',            desc: 'When a candidate declines their offer',        group: 'Recruitment' },
   { type: 'fee_waiver_request', label: 'Fee waiver requests',       desc: 'When an applicant asks for the application fee to be waived', group: 'Recruitment' },
   { type: 'fee_waiver_applicant_reply', label: 'Fee waiver replies',        desc: 'When an applicant replies on a fee waiver thread', group: 'Recruitment' },

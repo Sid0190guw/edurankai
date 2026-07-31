@@ -79,6 +79,10 @@ const NOTIF_META: Record<string, NotifMeta> = {
   visvambhara_reply:      { category: 'messages', priority: 'high' },    // (user-facing counterpart)
   fee_waiver_reply:       { category: 'messages', priority: 'high' },    // (user-facing counterpart)
   applicant_thread_message: { category: 'messages', priority: 'high' },
+  // Someone outside the organisation asking whether an offer letter is genuine. High rather than
+  // medium: a firm has usually paid and is waiting, and a candidate's job offer elsewhere can hinge
+  // on the answer.
+  offer_verification_request: { category: 'jobs', priority: 'high' },
   // Interviews
   interview_scheduled:    { category: 'interviews', priority: 'critical' },
   ai_interview_completed: { category: 'interviews', priority: 'high' },  // finished; awaiting review
