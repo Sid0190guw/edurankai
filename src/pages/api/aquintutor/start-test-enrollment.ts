@@ -90,6 +90,23 @@ export const POST: APIRoute = async ({ request, locals }) => {
       amountPaise = Math.max(1, parseInt(test.price_inr_paise || 100));
       displayAmountMinor = amountPaise;
     }
+
+    // FAIL LOUDLY ON AN ABSURD PRICE. price_inr_paise is in PAISE, and a test configured with 120
+    // meaning "Rs 120" charges Rs 1.20 — which is exactly what happened to the Quantum Science & ASI
+    // bootcamp. The old floor was Math.max(1, ...), i.e. one paise, so any unit mistake sailed
+    // through and took real money at ~1% of the intended price. Refusing is strictly better than
+    // charging a nonsense amount: a failed checkout is a support message, whereas a wrong charge is
+    // a refund, a reconciliation problem, and a candidate who believes they have paid.
+    const MIN_SANE_PAISE = 1000;   // Rs 10 — below this a paid test is misconfigured, not cheap
+    if (amountPaise > 0 && amountPaise < MIN_SANE_PAISE) {
+      console.error('[start-test-enrollment] refusing absurd price', {
+        testId: test.id, slug: test.slug, amountPaise, priceChf, price_inr_paise: test.price_inr_paise,
+      });
+      return json({
+        ok: false,
+        error: 'This test is not correctly priced yet, so we have not taken any payment. Please write to hr@edurankai.in and we will sort it out.',
+      }, 409);
+    }
     const receipt = 'qt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 
     // Universal account credit: pay the test fee from the wallet if it covers it.

@@ -60,6 +60,14 @@ export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
     } else {
       fx = await convertToInrPaise('INR', Math.max(1, parseInt(test.price_inr_paise || 100)));
     }
+    // Same absurd-price guard as the logged-in path (start-test-enrollment.ts). price_inr_paise is
+    // in PAISE, so a test configured with 120 meaning "Rs 120" charges Rs 1.20. Refuse rather than
+    // take a nonsense payment — a failed checkout is a support message, a wrong charge is a refund.
+    if (fx.paise > 0 && fx.paise < 1000) {
+      console.error('[guest-start] refusing absurd price', { slug: test.slug, paise: fx.paise, priceChf, price_inr_paise: test.price_inr_paise });
+      return json({ ok: false, error: 'This test is not correctly priced yet, so we have not taken any payment. Please write to hr@edurankai.in and we will sort it out.' }, 409);
+    }
+
     const receipt = 'gqt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
     const result = await createOrder({
       amountPaise: fx.paise, currency: 'INR', receipt,
