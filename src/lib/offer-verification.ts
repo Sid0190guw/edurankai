@@ -74,8 +74,11 @@ export function ensureVerificationSchema(): Promise<void> {
       response_note TEXT,
       answered_by UUID,
       answered_at TIMESTAMPTZ,
+      answer_delivered_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
+    // Added after the table shipped, so existing deployments need the column too.
+    await db.execute(sql`ALTER TABLE offer_verification_requests ADD COLUMN IF NOT EXISTS answer_delivered_at TIMESTAMPTZ`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS offer_verif_token_idx ON offer_verification_requests (token, created_at DESC)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS offer_verif_status_idx ON offer_verification_requests (status, created_at DESC)`);
   });
@@ -187,6 +190,52 @@ export async function markPaid(id: string, orderId?: string): Promise<void> {
   } catch { /* the webhook may retry; never throw back at the gateway */ }
 }
 
+/**
+ * Email the answer to whoever asked.
+ *
+ * Deliberately conservative about what it discloses: it confirms the letter and repeats the note
+ * the reviewer wrote, and nothing else. A verification entitles someone to confirm what they were
+ * told — not to receive salary, contact details or the application file. The same rule the module
+ * header states, enforced at the point the data actually leaves the building.
+ */
+export async function deliverAnswer(id: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    await ensureVerificationSchema();
+    const r = rows(await db.execute(sql`
+      SELECT requester_name, requester_email, organisation, kind, response_note, token
+        FROM offer_verification_requests WHERE id = ${id} LIMIT 1`))[0];
+    if (!r) return { ok: false, error: 'No such request.' };
+    if (!r.requester_email) return { ok: false, error: 'No email on the request.' };
+
+    const { sendExternal } = await import('@/lib/mail-transport');
+    const note = String(r.response_note || '').trim();
+    const safe = (s: string) => String(s || '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' } as any)[c]);
+
+    const html = `
+      <p>Dear ${safe(r.requester_name)},</p>
+      <p>We have completed the offer-letter verification you requested${r.organisation ? ' on behalf of ' + safe(r.organisation) : ''}.</p>
+      <blockquote style="margin:16px 0;padding:12px 16px;background:#faf6ef;border-left:3px solid #c2410c;">${safe(note).replace(/\n/g, '<br>')}</blockquote>
+      <p style="color:#5c5349;font-size:13px;">This response confirms the authenticity of the letter presented to you and its stated role and dates. It does not include compensation, personal contact details or any part of the candidate's application.</p>
+      <p style="color:#5c5349;font-size:13px;">Reference ${safe(String(r.token).slice(0, 10))}.</p>
+      <p>EduRankAI</p>`;
+
+    const res = await sendExternal({
+      from: 'EduRankAI Verification <hr@edurankai.in>',
+      to: r.requester_email,
+      subject: 'Offer letter verification — reference ' + String(r.token).slice(0, 10),
+      html,
+      text: `Dear ${r.requester_name},\n\nWe have completed the offer-letter verification you requested.\n\n${note}\n\nThis response confirms the authenticity of the letter and its stated role and dates only.\n\nReference ${String(r.token).slice(0, 10)}.\n\nEduRankAI`,
+    });
+
+    if (!(res as any)?.ok) return { ok: false, error: (res as any)?.error || 'Mail transport refused the message.' };
+    await db.execute(sql`UPDATE offer_verification_requests SET answer_delivered_at = NOW() WHERE id = ${id}`).catch(() => {});
+    return { ok: true };
+  } catch (e: any) {
+    console.error('[offer-verification/deliverAnswer]', e?.cause?.message || e?.message);
+    return { ok: false, error: e?.cause?.message || e?.message || 'Could not send the answer.' };
+  }
+}
+
 export async function listRequests(status?: RequestStatus): Promise<VerificationRequest[]> {
   try {
     await ensureVerificationSchema();
@@ -210,6 +259,12 @@ export async function answerRequest(id: string, byUserId: string, note: string):
       UPDATE offer_verification_requests
       SET status = 'answered', response_note = ${note.slice(0, 2000)}, answered_by = ${byUserId}, answered_at = NOW()
       WHERE id = ${id}`);
+
+    // Tell the requester. Answering used to write the note to the database and stop there, so the
+    // firm that had just paid 5 CHF for a verification received nothing at all and had no way to
+    // know it had been answered. A paid request that produces silence is worse than no service.
+    await deliverAnswer(id).catch(() => { /* the answer is recorded; delivery is reported separately */ });
+
     return { ok: true };
   } catch (e: any) {
     return { ok: false, error: e?.cause?.message || e?.message || 'Could not save.' };
