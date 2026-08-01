@@ -24,7 +24,9 @@ const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const BASE_TILES = ['home', 'profile'];
 
 // Learning surfaces. Open to any portal account — interns, learners and staff alike.
-const LEARNER_TILES = ['learn', 'community', 'wellbeing'];
+// 'records' is everyone's own access history. It is never withheld: the whole point of showing a
+// person who read their communications is that they do not have to be granted permission to look.
+const LEARNER_TILES = ['learn', 'community', 'wellbeing', 'records'];
 
 // Employment surfaces. These only mean anything for someone with an active HR record, and for
 // anyone else they are an invitation to a screen that will refuse them.

@@ -208,6 +208,113 @@ export async function logAccess(input: {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Retrieval.
+//
+// WHAT CAN AND CANNOT BE PRODUCED. Portal direct messages are end-to-end encrypted: chat_messages
+// stores `ciphertext` and `iv`, and there is no key escrow, so the server has never held the keys
+// and CANNOT decrypt them. No amount of authority changes that — it is a property of how the
+// messages were stored, not a permission setting.
+//
+// So what these functions return is the ENVELOPE: who spoke to whom, when, how often, whether an
+// attachment was involved, whether a message was later deleted. That is real evidence and it is
+// honestly labelled. What must never happen is a screen that shows a thread, shows no messages,
+// and lets a reader conclude the conversation was reviewed and found innocuous when in fact it was
+// never readable. Every caller surfaces `contentRecoverable: false` alongside the rows.
+// ---------------------------------------------------------------------------------------------
+
+export interface HeldThread {
+  id: string;
+  kind: string;
+  title: string | null;
+  participants: string[];
+  messageCount: number;
+  firstAt: string | null;
+  lastAt: string | null;
+  contentRecoverable: boolean;
+}
+
+/** Conversation threads that exist, with participants and volume. Content is NOT included. */
+export async function listHeldThreads(opts: { subjectUserId?: string | null; limit?: number } = {}): Promise<HeldThread[]> {
+  const limit = Math.min(Math.max(opts.limit || 100, 1), 300);
+  try {
+    const r = await db.execute(sql`
+      SELECT t.id, t.kind, t.title,
+             COUNT(m.id)::int AS message_count,
+             MIN(m.created_at) AS first_at,
+             MAX(m.created_at) AS last_at,
+             COALESCE(
+               (SELECT array_agg(DISTINCT COALESCE(u.full_name, u.email))
+                  FROM chat_thread_members cm JOIN users u ON u.id = cm.user_id
+                 WHERE cm.thread_id = t.id), '{}') AS participants
+        FROM chat_threads t
+        LEFT JOIN chat_messages m ON m.thread_id = t.id
+       WHERE ${opts.subjectUserId
+          ? sql`EXISTS (SELECT 1 FROM chat_thread_members x WHERE x.thread_id = t.id AND x.user_id = ${opts.subjectUserId})`
+          : sql`TRUE`}
+       GROUP BY t.id, t.kind, t.title
+       ORDER BY MAX(m.created_at) DESC NULLS LAST
+       LIMIT ${limit}`);
+    return rows(r).map((x: any) => ({
+      id: x.id, kind: x.kind, title: x.title,
+      participants: Array.isArray(x.participants) ? x.participants.filter(Boolean) : [],
+      messageCount: Number(x.message_count) || 0,
+      firstAt: x.first_at ? String(x.first_at) : null,
+      lastAt: x.last_at ? String(x.last_at) : null,
+      // Always false for portal DMs. Stated per-thread rather than as a footnote so it travels
+      // with the data if these rows are ever exported.
+      contentRecoverable: false,
+    }));
+  } catch (e: any) {
+    console.error('[legal-hold] listHeldThreads', e?.cause?.message || e?.message);
+    return [];
+  }
+}
+
+export interface HeldMessage {
+  id: string;
+  senderName: string | null;
+  createdAt: string;
+  deletedAt: string | null;
+  hasAttachment: boolean;
+  sizeBytes: number;
+  contentRecoverable: boolean;
+}
+
+/**
+ * The message envelopes in one thread.
+ *
+ * Returns no plaintext, because none exists server-side. `sizeBytes` is the length of the stored
+ * ciphertext — useful for establishing that a substantive exchange took place, and useless for
+ * inferring what was said.
+ */
+export async function heldThreadMessages(threadId: string, limit = 500): Promise<HeldMessage[]> {
+  if (!threadId) return [];
+  try {
+    const r = await db.execute(sql`
+      SELECT m.id, m.created_at, m.deleted_at, m.attachment_url,
+             LENGTH(m.ciphertext) AS size_bytes,
+             COALESCE(u.full_name, u.email) AS sender_name
+        FROM chat_messages m
+        LEFT JOIN users u ON u.id = m.sender_user_id
+       WHERE m.thread_id = ${threadId}
+       ORDER BY m.created_at ASC
+       LIMIT ${Math.min(Math.max(limit, 1), 1000)}`);
+    return rows(r).map((x: any) => ({
+      id: x.id,
+      senderName: x.sender_name || null,
+      createdAt: String(x.created_at),
+      deletedAt: x.deleted_at ? String(x.deleted_at) : null,
+      hasAttachment: !!x.attachment_url,
+      sizeBytes: Number(x.size_bytes) || 0,
+      contentRecoverable: false,
+    }));
+  } catch (e: any) {
+    console.error('[legal-hold] heldThreadMessages', e?.cause?.message || e?.message);
+    return [];
+  }
+}
+
 export interface AccessRecord {
   id: string; matterReference: string | null; matterTitle: string | null;
   accessedBy: string; accessedByName: string | null;

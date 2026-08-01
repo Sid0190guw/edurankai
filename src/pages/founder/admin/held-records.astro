@@ -1,0 +1,198 @@
+---
+// Founder console — reading retained communications under a numbered matter.
+//
+// This is the read half of the legal-hold module. The write half (opening and closing matters)
+// lives on /founder/admin/legal-hold; the module had no read surface at all, so logAccess() had
+// never been called by anything and the promise that "every access is logged" was unenforced.
+//
+// THE ORDER MATTERS. Nothing is fetched until logAccess() has returned ok. If the log write fails,
+// or the matter is closed, or no reason was given, this page renders the form and NOT the records.
+// A log written after the fact is a log that can be skipped by whatever failed in between — the
+// only version that holds anyone to account is the one written first.
+//
+// WHAT THIS CANNOT PRODUCE. Portal direct messages are end-to-end encrypted with no key escrow, so
+// message CONTENT is unrecoverable — permanently, for everyone, including the founder. This page
+// says so on the record rather than showing an empty thread and letting a reader conclude the
+// conversation was reviewed and found innocuous.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import {
+  canAccessHeldRecords, listMatters, logAccess,
+  listHeldThreads, heldThreadMessages,
+} from '@/lib/legal-hold';
+import { logAudit } from '@/lib/audit';
+
+const user = Astro.locals.user!;
+// Founder only — the same gate as the matters page. Not admins, not super admins generally.
+if (!canAccessHeldRecords(user as any)) return Astro.redirect('/admin');
+
+const MIN_REASON = 20;
+
+let err = '';
+let granted = false;
+let threads: any[] = [];
+let messages: any[] = [];
+let openedThreadId = '';
+let usedMatter = '';
+let usedReason = '';
+
+const matters = await listMatters('open');
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const matterId = String(fd.get('matter_id') || '').trim();
+  const justification = String(fd.get('justification') || '').trim();
+  openedThreadId = String(fd.get('thread_id') || '').trim();
+
+  if (!matterId) {
+    err = 'Choose the matter this access is for.';
+  } else if (justification.length < MIN_REASON) {
+    // Not a formality. The reason is what a later reviewer reads to judge whether this access was
+    // proportionate, and "checking" tells them nothing.
+    err = `Give a specific reason of at least ${MIN_REASON} characters. It is recorded permanently against this access.`;
+  } else {
+    // Count what is about to be disclosed BEFORE disclosing it, so the log records the real extent.
+    const scope = openedThreadId
+      ? await heldThreadMessages(openedThreadId)
+      : await listHeldThreads({ limit: 100 });
+
+    const res = await logAccess({
+      matterId,
+      accessedBy: user.id,
+      sourceKind: openedThreadId ? 'dm' : 'group',
+      sourceId: openedThreadId || null,
+      itemCount: scope.length,
+      justification,
+      ip: (Astro.clientAddress || '').toString().slice(0, 64) || null,
+    });
+
+    if (!res.ok) {
+      // Fail closed. The records are not shown if the access could not be recorded.
+      err = res.error || 'That access could not be recorded, so it was not permitted.';
+    } else {
+      granted = true;
+      usedMatter = matterId;
+      usedReason = justification;
+      if (openedThreadId) messages = scope as any[];
+      else threads = scope as any[];
+      await logAudit({
+        userId: user.id, action: 'legal_hold.read',
+        detail: `matter=${matterId} thread=${openedThreadId || 'index'} items=${scope.length}`,
+      } as any).catch(() => {});
+    }
+  }
+}
+
+const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' }) : '—');
+---
+
+<AdminLayout title="Held records">
+  <div style="max-width:1000px;">
+    <div style="margin-bottom:18px;">
+      <p style="font-size:10px;color:#8a8a94;text-transform:uppercase;letter-spacing:0.08em;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 4px;">Founder console</p>
+      <h1 style="font-size:22px;color:#fff;margin:0 0 6px;font-weight:700;">Held records</h1>
+      <p style="font-size:12.5px;color:#8a8a94;margin:0;line-height:1.6;">
+        Reading anything here is recorded against an open matter, with your reason, and is visible to
+        the person whose communications were read. There is no way to look without leaving a trace —
+        that is the point.
+      </p>
+    </div>
+
+    {err && (
+      <div style="background:#2a1215;border:1px solid #5b1d24;color:#fca5a5;padding:11px 14px;border-radius:10px;font-size:12.5px;margin-bottom:16px;">{err}</div>
+    )}
+
+    {matters.length === 0 && (
+      <div style="background:#15151a;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
+        <p style="font-size:13px;color:#e5e5ea;margin:0 0 8px;">There is no open matter.</p>
+        <p style="font-size:12.5px;color:#8a8a94;margin:0;line-height:1.6;">
+          Records cannot be read outside a numbered matter. Open one on
+          <a href="/founder/admin/legal-hold" style="color:#7dd3fc;">the matters page</a> first, with the
+          reason it exists.
+        </p>
+      </div>
+    )}
+
+    {matters.length > 0 && (
+      <form method="POST" style="background:#15151a;border:1px solid #1a1a1f;border-radius:12px;padding:16px;margin-bottom:20px;">
+        <input type="hidden" name="thread_id" value={openedThreadId} />
+        <label style="display:block;font-size:11px;color:#8a8a94;text-transform:uppercase;letter-spacing:0.08em;font-family:'Geist Mono',monospace;font-weight:700;margin-bottom:6px;">Matter</label>
+        <select name="matter_id" required style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:7px;font-size:13px;margin-bottom:14px;">
+          <option value="">Select the matter this access is for…</option>
+          {matters.map((m: any) => (
+            <option value={m.id} selected={m.id === usedMatter}>{m.reference} — {m.title}</option>
+          ))}
+        </select>
+
+        <label style="display:block;font-size:11px;color:#8a8a94;text-transform:uppercase;letter-spacing:0.08em;font-family:'Geist Mono',monospace;font-weight:700;margin-bottom:6px;">Reason for this access</label>
+        <textarea name="justification" required rows="3" minlength={MIN_REASON}
+          placeholder="What are you looking for, and why does this matter require it?"
+          style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:7px;font-size:13px;line-height:1.5;resize:vertical;">{usedReason}</textarea>
+        <p style="font-size:11.5px;color:#6b6b76;margin:6px 0 14px;">Recorded permanently, and shown to the subject in their own access history.</p>
+
+        <button type="submit" style="background:#1045BB;color:#fff;border:none;padding:9px 16px;border-radius:7px;font-size:12.5px;font-weight:700;cursor:pointer;">
+          {openedThreadId ? 'Open this thread' : 'List conversations'}
+        </button>
+      </form>
+    )}
+
+    {granted && (
+      <div style="background:#1a1508;border:1px solid #46370f;color:#fbbf24;padding:11px 14px;border-radius:10px;font-size:12.5px;margin-bottom:16px;line-height:1.6;">
+        <b>Message content is not recoverable.</b> Portal direct messages are end-to-end encrypted and
+        the server has never held the keys, so what follows is who spoke to whom and when — not what
+        was said. Nobody can produce the text of these messages, including you.
+      </div>
+    )}
+
+    {granted && !openedThreadId && (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+          <div style="min-width:680px;">
+            <div style="background:#15151a;border-bottom:1px solid #1a1a1f;padding:10px 14px;display:grid;grid-template-columns:1.6fr 1fr 90px 1.1fr 110px;gap:10px;font-size:10px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.08em;font-weight:700;">
+              <div>Participants</div><div>Kind</div><div>Messages</div><div>Last activity</div><div></div>
+            </div>
+            {threads.length === 0 && (
+              <p style="padding:14px;font-size:12.5px;color:#8a8a94;margin:0;">No conversations recorded.</p>
+            )}
+            {threads.map((t: any) => (
+              <form method="POST" style="display:grid;grid-template-columns:1.6fr 1fr 90px 1.1fr 110px;gap:10px;padding:10px 14px;border-bottom:1px solid #15151a;align-items:center;">
+                <input type="hidden" name="matter_id" value={usedMatter} />
+                <input type="hidden" name="justification" value={usedReason} />
+                <input type="hidden" name="thread_id" value={t.id} />
+                <div style="font-size:12.5px;color:#fff;">{t.participants.length ? t.participants.join(', ') : 'Unknown'}</div>
+                <div style="font-size:11.5px;color:#9aa6b6;">{t.title || t.kind}</div>
+                <div style="font-size:11.5px;color:#9aa6b6;font-family:'Geist Mono',monospace;">{t.messageCount}</div>
+                <div style="font-size:11px;color:#8a8a94;font-family:'Geist Mono',monospace;">{fmt(t.lastAt)}</div>
+                <button type="submit" style="background:#1f1f26;color:#e5e5ea;border:1px solid #2a2a2f;padding:6px 10px;border-radius:5px;font-size:10.5px;font-weight:700;cursor:pointer;">Open</button>
+              </form>
+            ))}
+          </div>
+        </div>
+      </div>
+    )}
+
+    {granted && openedThreadId && (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+          <div style="min-width:620px;">
+            <div style="background:#15151a;border-bottom:1px solid #1a1a1f;padding:10px 14px;display:grid;grid-template-columns:1.2fr 1.3fr 110px 1fr;gap:10px;font-size:10px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.08em;font-weight:700;">
+              <div>Sender</div><div>Sent</div><div>Size</div><div>State</div>
+            </div>
+            {messages.length === 0 && (
+              <p style="padding:14px;font-size:12.5px;color:#8a8a94;margin:0;">No messages in this thread.</p>
+            )}
+            {messages.map((m: any) => (
+              <div style="display:grid;grid-template-columns:1.2fr 1.3fr 110px 1fr;gap:10px;padding:9px 14px;border-bottom:1px solid #15151a;align-items:center;">
+                <div style="font-size:12.5px;color:#fff;">{m.senderName || 'Unknown'}</div>
+                <div style="font-size:11px;color:#8a8a94;font-family:'Geist Mono',monospace;">{fmt(m.createdAt)}</div>
+                <div style="font-size:11px;color:#9aa6b6;font-family:'Geist Mono',monospace;">{m.sizeBytes} B</div>
+                <div style="font-size:11.5px;color:#9aa6b6;">
+                  {m.deletedAt ? 'Deleted ' + fmt(m.deletedAt) : 'Present'}{m.hasAttachment ? ' · attachment' : ''}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    )}
+  </div>
+</AdminLayout>
