@@ -1,0 +1,153 @@
+---
+// Console for answering offer-letter verification requests.
+//
+// Completes the loop opened by the QR: someone scans, picks a path, gives their details, and this
+// is where a human confirms or declines. Without it the requests pile up unseen, which is worse
+// than the manual email route it replaced.
+//
+// Gated on offers permission, so recruiters and HR can answer without needing super-admin rights —
+// a verification is routine work, not a privileged one. What it will NOT do is answer a firm's
+// request while the fee is outstanding; answerRequest() enforces that server-side rather than
+// relying on this page hiding a button.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { listRequests, answerRequest, markPaid, isFreePath, FIRM_VERIFICATION_FEE_CHF } from '@/lib/offer-verification';
+import { logAudit } from '@/lib/audit';
+
+const user = Astro.locals.user!;
+if (!can(user, 'offers.edit') && !can(user, 'offers.view')) return Astro.redirect('/admin');
+const canAnswer = can(user, 'offers.edit');
+
+let msg = '';
+let err = '';
+
+if (Astro.request.method === 'POST' && canAnswer) {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const id = String(fd.get('id') || '');
+  try {
+    if (action === 'answer') {
+      const r = await answerRequest(id, user.id, String(fd.get('note') || ''));
+      if (r.ok) { msg = 'Response recorded.'; }
+      else err = r.error || 'Could not save.';
+    } else if (action === 'mark_paid') {
+      // Manual capture, for a fee settled by invoice or transfer rather than the card flow. Recorded
+      // as an audit event because it is someone asserting money arrived.
+      await markPaid(id);
+      msg = 'Marked as paid. The request can now be answered.';
+    }
+    if (msg) await logAudit({ userId: user.id, action: 'offer_verification.' + action, entity: 'offer_verification', entityId: id, ipAddress: Astro.clientAddress });
+  } catch (e: any) {
+    err = e?.cause?.message || e?.message || 'Something went wrong.';
+  }
+}
+
+const all = await listRequests();
+const awaitingPayment = all.filter((r) => r.status === 'pending_payment');
+const open = all.filter((r) => r.status === 'open');
+const answered = all.filter((r) => r.status === 'answered');
+
+const KIND_LABEL: Record<string, string> = {
+  individual: 'Individual', institution: 'Educational institution', firm: 'Firm / employer',
+};
+const card = 'border:1px solid #2a2a30;border-radius:12px;background:#0f0f14;padding:14px;margin-bottom:10px;';
+const when = (s: string) => { try { return new Date(s).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }); } catch { return s; } };
+---
+<AdminLayout title="Offer verifications">
+  <div style="max-width:920px;">
+    <h1 style="font-family:'Fraunces',serif;font-size:26px;margin:0 0 4px;">Offer verifications</h1>
+    <p style="font-size:13px;color:#8a8a94;margin:0 0 18px;">
+      Requests from employers, institutions and individuals asking us to confirm an offer letter is
+      genuine. Individuals and educational institutions are not charged; firms pay {FIRM_VERIFICATION_FEE_CHF} CHF.
+    </p>
+
+    {msg && <div style="padding:10px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #14532d;background:rgba(20,83,45,0.2);font-size:13px;">{msg}</div>}
+    {err && <div style="padding:10px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #7f1d1d;background:rgba(127,29,29,0.2);font-size:13px;">{err}</div>}
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:20px;">
+      <div style={card}><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">To answer</p><p style="font-size:20px;font-weight:700;margin:0;color:#fbbf24;font-family:'Geist Mono',monospace;">{open.length}</p></div>
+      <div style={card}><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Awaiting payment</p><p style="font-size:20px;font-weight:700;margin:0;color:#8a8a94;font-family:'Geist Mono',monospace;">{awaitingPayment.length}</p></div>
+      <div style={card}><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Answered</p><p style="font-size:20px;font-weight:700;margin:0;color:#4ade80;font-family:'Geist Mono',monospace;">{answered.length}</p></div>
+    </div>
+
+    {open.length === 0 && awaitingPayment.length === 0 && (
+      <div style={card + 'text-align:center;'}><p style="font-size:13px;color:#8a8a94;margin:0;">Nothing waiting.</p></div>
+    )}
+
+    {[...open, ...awaitingPayment].map((r) => (
+      <div style={card}>
+        <div style="display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;">
+          <div style="flex:1;min-width:220px;">
+            <p style="font-size:14px;font-weight:700;color:#e8e8ee;margin:0;">
+              {r.requesterName}{r.organisation ? ' · ' + r.organisation : ''}
+            </p>
+            <p style="font-size:11.5px;color:#8a8a94;margin:3px 0 0;">
+              {KIND_LABEL[r.kind] || r.kind}{r.designation ? ' · ' + r.designation : ''} · {when(r.createdAt)}
+            </p>
+            <p style="font-size:11.5px;color:#a0a0a8;margin:4px 0 0;">
+              <a href={'mailto:' + r.requesterEmail} style="color:#FF4F00;">{r.requesterEmail}</a>
+              {r.requesterPhone ? ' · ' + r.requesterPhone : ''}
+              {r.orgWebsite ? ' · ' : ''}
+              {r.orgWebsite && <a href={r.orgWebsite} target="_blank" rel="noopener noreferrer" style="color:#7f9cf5;">{r.orgWebsite}</a>}
+            </p>
+          </div>
+          <span style={`font-size:9.5px;font-weight:700;letter-spacing:0.06em;padding:3px 9px;border-radius:100px;white-space:nowrap;color:${r.paid || isFreePath(r.kind) ? '#4ade80' : '#fbbf24'};background:${r.paid || isFreePath(r.kind) ? 'rgba(74,222,128,0.14)' : 'rgba(251,191,36,0.14)'};`}>
+            {isFreePath(r.kind) ? 'NO CHARGE' : (r.paid ? 'PAID' : FIRM_VERIFICATION_FEE_CHF + ' CHF DUE')}
+          </span>
+        </div>
+
+        {r.purpose && (
+          <p style="font-size:12.5px;color:#a0a0a8;margin:10px 0 0;line-height:1.55;background:#12121a;border-radius:8px;padding:9px 11px;">
+            <span style="color:#6e6e78;">Why: </span>{r.purpose}
+          </p>
+        )}
+
+        <p style="font-size:11px;color:#6e6e78;margin:8px 0 0;font-family:monospace;">
+          Offer ref {r.token.slice(0, 14)} · <a href={'/offer/verify/' + r.token} target="_blank" rel="noopener noreferrer" style="color:#7f9cf5;">open the letter check</a>
+        </p>
+
+        {canAnswer && (
+          r.status === 'pending_payment' ? (
+            <form method="POST" style="margin-top:10px;">
+              <input type="hidden" name="_action" value="mark_paid" />
+              <input type="hidden" name="id" value={r.id} />
+              <p style="font-size:11.5px;color:#8a8a94;margin:0 0 8px;line-height:1.5;">
+                Not answerable until the fee is captured. Use this only when payment has genuinely
+                arrived by invoice or transfer &mdash; it is recorded against your account.
+              </p>
+              <button type="submit" style="background:#1a1a22;border:1px solid #2a2a30;color:#e8e8ee;font-size:12px;padding:7px 12px;border-radius:6px;cursor:pointer;">Mark as paid</button>
+            </form>
+          ) : (
+            <form method="POST" style="margin-top:10px;">
+              <input type="hidden" name="_action" value="answer" />
+              <input type="hidden" name="id" value={r.id} />
+              <textarea name="note" rows="2" required maxlength="2000"
+                placeholder="What you confirmed to them. Role and dates only — no salary or personal details."
+                style="width:100%;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:9px;border-radius:6px;font-size:12.5px;font-family:inherit;"></textarea>
+              <button type="submit" style="margin-top:8px;background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:12.5px;padding:8px 16px;border-radius:6px;cursor:pointer;">Record response</button>
+            </form>
+          )
+        )}
+      </div>
+    ))}
+
+    {answered.length > 0 && (
+      <>
+        <h2 style="font-family:'Fraunces',serif;font-size:17px;margin:22px 0 8px;">Answered</h2>
+        {answered.slice(0, 40).map((r) => (
+          <div style={card}>
+            <p style="font-size:13px;color:#e8e8ee;margin:0;">{r.requesterName}{r.organisation ? ' · ' + r.organisation : ''}</p>
+            <p style="font-size:11px;color:#6e6e78;margin:3px 0 0;">{KIND_LABEL[r.kind] || r.kind} · answered {r.answeredAt ? when(r.answeredAt) : ''}</p>
+            {r.responseNote && <p style="font-size:12px;color:#a0a0a8;margin:6px 0 0;line-height:1.55;">{r.responseNote}</p>}
+          </div>
+        ))}
+      </>
+    )}
+
+    <p style="font-size:11.5px;color:#6e6e78;margin:18px 0 0;line-height:1.6;">
+      A verification confirms the letter is genuine and states the role and dates. It does not
+      disclose salary, contact details or the candidate's application &mdash; a verifier is entitled
+      to confirm what they were told, not to acquire a dossier.
+    </p>
+  </div>
+</AdminLayout>
