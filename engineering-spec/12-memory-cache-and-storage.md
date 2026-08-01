@@ -15,7 +15,7 @@ The Virtual Storage Manager (VSM) is a stateless read-through cache and storage-
 **Already exists (reuse, do not duplicate):**
 - `src/lib/kernel/*` — the object store. `kernel_objects.version` (integer, bumped in `repository.ts` `updateObject` via `o.version += 1` inside the `'updated'` transition) is the invalidation primitive. `security_labels text[]`, `owner`, and `lifecycle_state` are the fields the Zero-Trust access gate reads (`permissions jsonb` and `synchronization_state` stay available on the envelope for future policy but are not consulted by the current gate).
 - `src/lib/storage.ts` — the blob tier. `BlobStore` interface, `getStore()`, `vercelBlobStore()` (needs `BLOB_READ_WRITE_TOKEN`), `memoryStore()` dev fallback, `storageKey()`. VSM does **not** re-implement blob storage; it references this as tier `blob`.
-- `src/lib/db/index.ts` — the `postgres-js`/Drizzle client (`db`, `execute` typed `any`). Postgres/Neon is tier `db` (persistent memory analog).
+- `src/lib/db/index.ts` — the `postgres-js`/Drizzle client (`db`, `execute` typed `any`). Postgres/Supabase is tier `db` (persistent memory analog).
 - `settings` table (`key varchar pk`, `value jsonb`) — stores the tunable TTL policy under key `vsm.ttl` (optional; falls back to code defaults).
 - `auditLog` table — records cache purges (`action='cache.purge'`), so no new audit table is needed.
 - Existing `Cache-Control` usage (`src/pages/api/labs/catalog.json.ts`: `public, max-age=600, s-maxage=3600`; `src/pages/api/fx/rates.ts`) — VSM centralizes and standardizes this pattern into `http.ts`.
@@ -345,11 +345,11 @@ GET handler:
 - **Resident kernel managing RAM/cache tiers** → there is no long-lived process. Every request is a fresh (or warm) stateless Vercel function. Replaced by: stateless request handlers + Postgres state + edge/CDN + optional external KV + per-request memo.
 - **L1/L2/L3 CPU cache & HBM / "unified memory across CPU/GPU/accelerators"** → no shared process RAM. Mapped to: `request` memo (per-invocation, not shared) → optional `kv` (shared, TTL'd) → `edge`/CDN (HTTP `Cache-Control`). Cross-invocation in-instance module memory is only safe because keys are **content-addressed by `version`**; it is never a source of truth.
 - **Memory coherency protocols (MESI-style)** → replaced by content-addressed keys (`objectCacheKey` embeds `kernel_objects.version`) plus a short-TTL head pointer busted on write. A `version` bump is the coherency event.
-- **Persistent memory / NVDIMM** → Postgres/Neon (system of record) for objects; `@vercel/blob`+CDN for large immutable assets (existing `src/lib/storage.ts`). No byte-addressable persistent memory exists or is needed.
+- **Persistent memory / NVDIMM** → Postgres/Supabase (system of record) for objects; `@vercel/blob`+CDN for large immutable assets (existing `src/lib/storage.ts`). No byte-addressable persistent memory exists or is needed.
 - **Memory virtualization / protection rings** → the Zero-Trust read gate (`canReadObject`) over `security_labels` + RBAC principal. This is authorization, not hardware isolation.
 
 **Out of scope (spec asks for it; not buildable on this stack — do not attempt):**
-- **Confidential computing / TEEs / secure enclaves / encrypted memory (Ch. 19 §10)** → not available on Vercel functions. We rely on the providers' encryption-at-rest (Neon/Vercel Blob) and TLS in transit. Do not claim enclave-grade confidentiality.
+- **Confidential computing / TEEs / secure enclaves / encrypted memory (Ch. 19 §10)** → not available on Vercel functions. We rely on the providers' encryption-at-rest (Supabase/Vercel Blob) and TLS in transit. Do not claim enclave-grade confidentiality.
 - **Hardware Security Modules / key management / secret rotation with HSM (Ch. 19 §11)** → secrets are plain environment variables (`DATABASE_URL`, `BLOB_READ_WRITE_TOKEN`, `KV_REST_API_*`) managed by Vercel. HSM-backed rotation is out of scope.
 - **Post-quantum cryptography** → not implemented; session tokens/hashing use the existing `@oslojs/crypto`. Out of scope.
 - **Autonomous cyber defense / self-defending platforms / threat-detection Digital Twins (Ch. 19 §14, §16)** → replaced by pragmatic controls only: the default-deny read gate, `auditLog` records, and standard rate limiting. No autonomous/AI threat response.

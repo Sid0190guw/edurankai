@@ -9,7 +9,7 @@
 | Parent org | EduRankAI (hosts AquinTutor as a self-contained sub-platform) |
 | Status | Living document — authoritative for all implementation |
 | Audience | Senior engineers, and Claude Code operating in VS Code |
-| Runtime today | Astro 5 SSR on Vercel · Drizzle ORM (postgres-js) · Neon Postgres · @vercel/blob |
+| Runtime today | Astro 5 SSR on Vercel · Drizzle ORM (postgres-js) · Supabase Postgres · @vercel/blob |
 | Live | edurankai.in (AquinTutor at `/aquintutor/*`) |
 
 > **How to read this document.** It describes the *entire finished product*, not just its structure. Where the current codebase already implements a behaviour, the spec states it as **[Built]** and describes the real implementation so it is not regressed. Where a behaviour is specified but not yet built, it is marked **[Planned]**. Where the source prompt was silent and a decision was inferred, it is marked **[Assumption]** with the rationale. An implementer must never need to guess; if a genuine ambiguity remains, it is listed in the open-questions register (§0.6) rather than silently resolved.
@@ -107,7 +107,7 @@ AquinTutor exists to make **mastery verifiable and lifelong**. The market is sat
 2. **Every tier has a signature experience** tuned to its real job-to-be-done, not a re-skin of the same course player.
 3. **Verification is unfakeable.** "Completed but unverified" is a first-class, visible state.
 4. **Hands-on by default.** Elite virtual labs, embeddable into any institution's infrastructure (iframe / SDK / LTI), at a market-ready standard.
-5. **Offline-first and fast.** Core learning works without connectivity; interactions hold 60fps; compute cost stays low (Neon suspend-friendly).
+5. **Offline-first and fast.** Core learning works without connectivity; interactions hold 60fps; compute cost stays low (Supabase suspend-friendly).
 6. **Institution-grade.** Sellable to schools and universities as seats and as embeddable labs.
 
 ### 1.4 Problems being solved
@@ -144,7 +144,7 @@ AquinTutor exists to make **mastery verifiable and lifelong**. The market is sat
 - A learner can point to a **verified skill map** rather than a certificate of attendance.
 - A parent sees **"3 of 9 mastered, verified"** — never a hollow "100% complete."
 - An institution embeds a **lab as an API** into its own portal in under a day.
-- The platform runs within **Vercel Hobby + Neon free-tier** constraints until scale justifies upgrade.
+- The platform runs within **Vercel Hobby + Supabase free-tier** constraints until scale justifies upgrade.
 
 ### 1.7 Success metrics (KPIs)
 
@@ -592,7 +592,7 @@ Hero → **stage picker band** ("Who's learning?") with 8 tier cards (each → `
 
 - Client fetches to `/api/aquintutor/learn` are fire-and-forget with local optimism; failures are queued offline and retried on reconnect.
 - Server wraps DB ops in try/catch; returns `e.cause?.message` (real Postgres reason) not the SQL string.
-- Neon compute exhaustion (all routes 500, sessions query fails) is a *capacity* signal, not an attack → reduce polling; upgrade plan.
+- Supabase compute exhaustion (all routes 500, sessions query fails) is a *capacity* signal, not an attack → reduce polling; upgrade plan.
 
 ---
 
@@ -600,7 +600,7 @@ Hero → **stage picker band** ("Who's learning?") with 8 tier cards (each → `
 
 ### 5.1 Conventions
 
-- Engine: **Neon Postgres**; access via **Drizzle ORM over postgres-js**.
+- Engine: **Supabase Postgres**; access via **Drizzle ORM over postgres-js**.
 - **postgres-js returns plain arrays** — always normalize: `const rows = (r) => Array.isArray(r) ? r : (r?.rows || [])`. Never `r.rows[0]` blindly.
 - **Errors:** the real reason is in `e.cause?.message` (Drizzle's `e.message` is only the failed SQL).
 - **Self-bootstrapping schema:** app tables are created/altered at runtime via `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, memoized once per process (`ensure*` promise). No migration files for app tables.
@@ -747,8 +747,8 @@ All self-bootstrapping (create themselves at runtime on first request; no manual
 - **File storage:** `@vercel/blob` (photos, resume PDFs, uploads).
 - **Search:** in-catalogue filtering client-side + server queries; full-text **[Planned]**.
 - **Logging:** structured server logs (`e.cause?.message`); Vercel logs.
-- **Monitoring:** Vercel analytics; Neon compute usage watch (capacity guard).
-- **Backup/recovery:** Neon PITR (plan-dependent); logs append-only; §14.8.
+- **Monitoring:** Vercel analytics; Supabase compute usage watch (capacity guard).
+- **Backup/recovery:** Supabase PITR (plan-dependent); logs append-only; §14.8.
 
 ---
 
@@ -921,7 +921,7 @@ LTI 1.1 provider. `launch` verifies OAuth 1.0 HMAC-SHA1 signatures against `lti_
 ### 10.2 Caching / DB / query optimization
 
 - SSR + CDN for static; service-worker offline cache. Queries are point-lookups on PK where possible; add planned indexes (§5.4). Avoid N+1 by batching mastery reads (`getMastery` returns a map).
-- **Neon capacity guard:** minimize background polling/reconcile so the compute can auto-suspend; if every route 500s and the sessions query fails, that is compute exhaustion → reduce polling and upgrade plan (not an attack).
+- **Supabase capacity guard:** minimize background polling/reconcile so the compute can auto-suspend; if every route 500s and the sessions query fails, that is compute exhaustion → reduce polling and upgrade plan (not an attack).
 
 ### 10.3 Image optimization / CDN / lazy loading / streaming
 
@@ -929,7 +929,7 @@ LTI 1.1 provider. `launch` verifies OAuth 1.0 HMAC-SHA1 signatures against `lti_
 
 ### 10.4 Scalability / load balancing / HA
 
-- Stateless SSR scales horizontally on Vercel; DB is the shared state (Neon). HA via managed platform; scale-out path in §17.3.
+- Stateless SSR scales horizontally on Vercel; DB is the shared state (Supabase). HA via managed platform; scale-out path in §17.3.
 - **Deploy ceiling:** Vercel Hobby = 100 deploys/day; on "Resource is limited," stop and notify (don't retry).
 
 ---
@@ -959,7 +959,7 @@ LTI 1.1 provider. `launch` verifies OAuth 1.0 HMAC-SHA1 signatures against `lti_
 
 - **Learner dashboard:** mastered/verified counts, current path, streaks.
 - **Parent/Teacher dashboard:** verified vs done per child/classroom; "completed but unverified" surfaced.
-- **Ops dashboard:** KPIs from §1.7; p95 latency; Neon compute.
+- **Ops dashboard:** KPIs from §1.7; p95 latency; Supabase compute.
 
 ### 12.3 Funnels
 
@@ -991,7 +991,7 @@ LTI 1.1 provider. `launch` verifies OAuth 1.0 HMAC-SHA1 signatures against `lti_
 
 ### 14.1 Infrastructure & environments
 
-- **Host:** Vercel (Astro SSR adapter). **DB:** Neon Postgres. **Storage:** @vercel/blob. **Domain:** edurankai.in (AquinTutor at `/aquintutor/*`; own domain is Q1/§17.4).
+- **Host:** Vercel (Astro SSR adapter). **DB:** Supabase Postgres. **Storage:** @vercel/blob. **Domain:** edurankai.in (AquinTutor at `/aquintutor/*`; own domain is Q1/§17.4).
 - Environments: **production** (live), **preview** (per-branch Vercel), **local** (dev).
 
 ### 14.2 CI/CD
@@ -1009,11 +1009,11 @@ LTI 1.1 provider. `launch` verifies OAuth 1.0 HMAC-SHA1 signatures against `lti_
 
 ### 14.5 Monitoring & logging
 
-- Vercel logs + analytics; Neon compute usage; structured error logs (`e.cause?.message`).
+- Vercel logs + analytics; Supabase compute usage; structured error logs (`e.cause?.message`).
 
 ### 14.6 Backup, disaster recovery, rollback
 
-- Neon PITR (plan-dependent). Rollback = redeploy previous Vercel build; DB additive-only migrations reduce rollback risk. Append-only logs are never destructively migrated.
+- Supabase PITR (plan-dependent). Rollback = redeploy previous Vercel build; DB additive-only migrations reduce rollback risk. Append-only logs are never destructively migrated.
 
 ### 14.7 Deploy guardrails
 
@@ -1079,7 +1079,7 @@ LTI 1.1 provider. `launch` verifies OAuth 1.0 HMAC-SHA1 signatures against `lti_
 | End users (learners/guardians) | In-app help + onboarding | how verification works; how to use each signature feature. |
 | API consumers [B2B] | Labs/LTI integration guide | catalog schema, embed snippet, SDK usage, LTI setup, grade passback. |
 | Deployment | Runbook | env vars, cron limits, deploy ceiling, stale-deploy check, prod-migration procedure. |
-| Maintenance | Ops guide | Neon capacity guard, backup/rollback, incident response. |
+| Maintenance | Ops guide | Supabase capacity guard, backup/rollback, incident response. |
 
 ---
 
@@ -1095,7 +1095,7 @@ LTI 1.1 provider. `launch` verifies OAuth 1.0 HMAC-SHA1 signatures against `lti_
 
 ### 17.3 Microservice migration
 
-- Extract high-load domains (assessment scoring, LTI, analytics rollups) into separate services behind the same API surface if Vercel/Neon limits are exceeded. Keep the learn API stable as the contract.
+- Extract high-load domains (assessment scoring, LTI, analytics rollups) into separate services behind the same API surface if Vercel/Supabase limits are exceeded. Keep the learn API stable as the contract.
 
 ### 17.4 Multi-tenancy & domain (Q1)
 
@@ -1159,7 +1159,7 @@ This section narrates the finished product from open to close, per scenario, so 
 
 - Wrong answers never lock the learner out; hints ladder; retries are free.
 - Network loss → banner; progress queued; nothing lost; sync on reconnect.
-- Neon at capacity → operator upgrades; app reduces polling to let compute suspend.
+- Supabase at capacity → operator upgrades; app reduces polling to let compute suspend.
 
 ### 18.8 Payments (paid add-ons)
 

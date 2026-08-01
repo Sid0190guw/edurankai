@@ -240,7 +240,7 @@ Runs **only** when explicitly requested (`action:'offline'` or `opts.offline`), 
 - *Web-search "authenticate with bona fide sources while teaching."* → Source-grounding is an **authoring/research-time** concern (`aquintutor-research.ts`, authoring flow), not a lesson-execution step. The runtime serves already-published, source-checked content.
 
 **External services required**
-- Postgres (Neon/postgres-js) — the only hard dependency for state.
+- Postgres (Supabase/postgres-js) — the only hard dependency for state.
 - `@vercel/blob` — for offline manifest assets / prerendered media (Block 05/06).
 - (Optional, future) external cache for hot published KOs; background queue for large offline compiles.
 

@@ -82,7 +82,7 @@ These are the items where the platform **cannot run — or a core, high-sensitiv
 - **Self-host admin fonts:** download the 3 OFL woff2 families to `public/fonts`, add `@font-face`, remove the Google Fonts `<link>` in `AdminLayout.astro:253-255`.
 - **Drop Google Analytics:** remove the gtag block in `BaseLayout.astro:117-127` / leave `PUBLIC_GA_ID` unset; `public/analytics.js → /api/track` already covers it.
 - **Delete dead Resend config:** `resend_api_key` column read + `RESEND_API_KEY` env in `src/lib/mail.ts`, the `'resend'` union member in `mail-transport.ts`, and the "SMTP/Resend" UI copy — prevents a future "just paste a Resend key" regression.
-- **Prune dormant DB deps:** remove `@neondatabase/serverless` (package.json:19) and the dead `src/lib/db/index.ts.bak`; remove unused `pg`; relabel `admin/infra.astro:36,55,73` off "Neon (Postgres)" / `NEON_FREE_BYTES` (it currently misreports the provider to operators).
+- **Prune dormant DB deps:** remove `the Postgres driver` (package.json:19) and the dead `src/lib/db/index.ts.bak`; remove unused `pg`; relabel `admin/infra.astro:36,55,73` off "Supabase (Postgres)" / `DB_FREE_BYTES` (it currently misreports the provider to operators).
 - **Vendor face-api + OCR assets** into `public/models/` and `public/` (Tesseract engine, WASM, pdf.js, per-language `.traineddata`); repoint CDN URLs. Closes 3.2 and the OCR CDN lock-in in one pass; enables true offline for the rural goal.
 
 ### P1 — Near-term (small, the half-done interfaces)
