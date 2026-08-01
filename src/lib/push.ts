@@ -154,6 +154,26 @@ async function persistNotification(userId: string, p: PushPayload) {
 // ALSO writes a row to the in-app notifications feed for each eligible admin
 // so the bell + /admin/notifications populate even if browser push fails.
 export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: string): Promise<void> {
+  // Mirror every admin notification into the activity feed.
+  //
+  // Nineteen files call this function directly, and none of them recorded anything, so
+  // /admin/activity was reading an empty table while notifications flew past it. Instrumenting the
+  // sink they ALL already call turns every one of them into a producer without editing any of
+  // them — and without a new call site to forget next time.
+  //
+  // Recorded as 'log-only' because the notification is going out on this very call; letting it
+  // default to 'digest' would announce the same event a second time in the nightly summary.
+  //
+  // activity_alert / activity_digest are skipped deliberately: those are emitted BY the feed
+  // itself (record() sends an alert when an event routes to 'push'), so recording them here would
+  // call record -> sendPushToAdmins -> record and never terminate.
+  if (payload.type !== 'activity_alert' && payload.type !== 'activity_digest') {
+    import('@/lib/activity-feed')
+      .then((m) => m.record('notify.' + payload.type, { title: payload.title, body: payload.body, url: payload.url }, { reach: 'log-only' }))
+      // Never let bookkeeping stop a notification the user is waiting on.
+      .catch(() => {});
+  }
+
   const vapidConfigured = !!(VAPID_PUBLIC && VAPID_PRIVATE);
   if (!vapidConfigured) {
     console.warn('[push] VAPID keys not configured. Browser push skipped — in-app bell still works.');

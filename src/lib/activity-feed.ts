@@ -36,6 +36,11 @@ const ROUTING: Record<string, Reach> = {
   'security.admin_created': 'push',
   'data.export': 'push',
   'data.purge': 'push',
+  // Joining and leaving. Someone is waiting on the other side of each of these — a hire blocked
+  // until their document is reviewed, or an account that should stop working today — so they are
+  // summarised rather than left purely to whoever thinks to open the screen.
+  'hr.onboarding_document_submitted': 'digest',
+  'hr.separation_started': 'push',
   // Routine but time-sensitive.
   [EVENTS.OFFER_EXTENDED]: 'digest',
   [EVENTS.INTERVIEW_SCHEDULED]: 'digest',
@@ -82,10 +87,18 @@ function summarise(event: string, payload: any): string {
  * Record one event. Never throws: observability must not be able to break the action it observes,
  * and the event bus already isolates handlers so a failure here cannot affect siblings either.
  */
-export async function record(event: string, payload: any, meta: Partial<EventMeta> = {}): Promise<void> {
+export async function record(
+  event: string,
+  payload: any,
+  // `reach` overrides the routing table for this one call. It exists for events that have ALREADY
+  // been delivered by another path — an admin push that we are mirroring into the feed for the
+  // record. Without it those rows would default to 'digest' and the same thing would be announced
+  // twice: once as it happened, once again in the nightly summary.
+  meta: Partial<EventMeta> & { reach?: Reach } = {},
+): Promise<void> {
   try {
     await ensureActivitySchema();
-    const reach: Reach = ROUTING[event] || 'digest';
+    const reach: Reach = meta.reach || ROUTING[event] || 'digest';
     await db.execute(sql`
       INSERT INTO activity_log (event, actor_id, correlation_id, summary, payload, reach, digested)
       VALUES (${event}, ${meta.actorId || null}, ${meta.correlationId || null},

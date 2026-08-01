@@ -93,6 +93,19 @@ export async function openSeparation(opts: any) {
       ${opts.pipId || null}, ${opts.relatedFlagId || null})
     RETURNING id
   `));
+
+  // Someone is leaving. This one interrupts rather than waiting for the digest: a separation
+  // starts clocks that other people have to act on inside a fixed window — final attendance and
+  // credit, access revocation, the completion letter — and finding out the next morning has
+  // already cost a day of that window.
+  try {
+    const { record } = await import('@/lib/activity-feed');
+    await record('hr.separation_started', {
+      id: r[0]?.id, employeeId: opts.employeeId, kind: opts.kind,
+      initiatedBy: opts.initiatedBy || 'employee', lastWorkingDay: opts.lastWorkingDay || null,
+    }, { actorId: opts.actorId || null });
+  } catch (_) { /* the separation is committed; the notification is secondary */ }
+
   return { ok: true, id: r[0]?.id };
 }
 

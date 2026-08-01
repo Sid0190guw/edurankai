@@ -95,6 +95,19 @@ export async function addDoc(userId: string, o: { docType: string; title: string
     INSERT INTO hr_onboarding_documents (user_id, employee_id, doc_type, title, drive_url)
     VALUES (${userId}, ${o.employeeId || null}, ${type}, ${String(o.title || '').slice(0, 200)}, ${o.driveUrl.trim()})
     RETURNING id`));
+
+  // Tell the people who have to act on it. A hire submitting a joining document produced no
+  // notification at all, so the document sat waiting for a review nobody knew was owed — the hire
+  // has done their part and is then blocked by silence. Best-effort: the document is already
+  // committed by this point, so a notification failure must not report the submission as failed.
+  try {
+    const { record } = await import('@/lib/activity-feed');
+    await record('hr.onboarding_document_submitted', {
+      id: Number(r[0]?.id || 0), userId, employeeId: o.employeeId || null,
+      docType: type, title: String(o.title || '').slice(0, 200),
+    }, { actorId: userId });
+  } catch (_) { /* recorded activity is secondary to the submission itself */ }
+
   return { ok: true, id: Number(r[0]?.id || 0) };
 }
 /** A hire may withdraw their own document while it is still under review. */
