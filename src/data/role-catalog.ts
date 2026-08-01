@@ -24,6 +24,16 @@ import {
   PHASE4_DEPARTMENTS,
 } from './intern-catalog-phase4';
 import { INTERN_CATALOG_PHASE5, PHASE5_DEPARTMENTS } from './intern-catalog-phase5';
+// Business research, commercial intelligence, lead generation, data operations and outreach.
+// Cross-checked against the 554 intern titles already in the catalog before writing: exact
+// duplicates were dropped rather than re-listed under a different name, and titles that sit next to
+// an existing role say in their own text how they differ from it. These use existing departments
+// only — no new department is introduced.
+import { INTERN_CATALOG_BIZ1 } from './intern-catalog-biz1';
+import { INTERN_CATALOG_BIZ2 } from './intern-catalog-biz2';
+import { INTERN_CATALOG_BIZ3 } from './intern-catalog-biz3';
+import { INTERN_CATALOG_BIZ4 } from './intern-catalog-biz4';
+import { INTERN_CATALOG_BIZ5 } from './intern-catalog-biz5';
 
 export interface CatalogDepartment {
   id: string;
@@ -1029,4 +1039,9 @@ export const ROLE_CATALOG: CatalogRole[] = [
   ...INTERN_CATALOG_PHASE4_C,
   ...INTERN_CATALOG_PHASE4_D,
   ...INTERN_CATALOG_PHASE5,
+  ...INTERN_CATALOG_BIZ1,
+  ...INTERN_CATALOG_BIZ2,
+  ...INTERN_CATALOG_BIZ3,
+  ...INTERN_CATALOG_BIZ4,
+  ...INTERN_CATALOG_BIZ5,
 ];
