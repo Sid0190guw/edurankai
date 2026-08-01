@@ -133,6 +133,16 @@ export async function setRoleAicteBulk(items: { slug: string; a: Partial<RoleAic
       };
     });
 
+    // jsonb_to_recordset REQUIRES a JSON array. If the payload ever serialises to anything else the
+    // database answers "cannot call jsonb_to_recordset on a non-array", which names the SQL function
+    // rather than the data and sends you looking in the wrong place. Assert it here, where the
+    // message can say what was actually wrong and the whole import does not fail on the last step.
+    if (!Array.isArray(payload)) {
+      console.error('[role-aicte] payload is not an array; skipping chunk', typeof payload);
+      continue;
+    }
+    if (payload.length === 0) continue;
+
     // jsonb_to_recordset turns the payload into a typed relation we can join on. The text[] columns
     // arrive as jsonb arrays and are unpacked per row — same mechanism as textArray(), just applied
     // set-wise instead of one value at a time.
