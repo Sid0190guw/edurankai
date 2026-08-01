@@ -7,9 +7,38 @@
   var sessionId = sessionStorage.getItem(SESSION_KEY);
   var lastLat = null, lastLon = null;
 
-  // ── 1. Location tracking (update every 60s if user shared GPS) ─────────
-  function updateLocation(lat, lon, acc) {
-    lastLat = lat; lastLon = lon;
+  // ── 1. Location tracking (at most one update per 60s if the user shared GPS) ─────────
+  //
+  // THIS USED TO TAKE THE WHOLE SITE DOWN. The old code called watchPosition() inside a
+  // setInterval(..., 60000). watchPosition registers a PERSISTENT watcher, so a new watcher was
+  // added every minute and none were ever cleared: after an hour a single open tab held sixty
+  // watchers, each firing on every GPS tick and each POSTing to /api/location/update. The request
+  // volume compounded until the database connection pool was exhausted, at which point the session
+  // lookup itself started failing and EVERY authenticated page returned 500 — the apply flow
+  // included. The symptom looked nothing like its cause, which is what made it expensive.
+  //
+  // Now: exactly one watcher for the life of the page, and the POST is throttled by time AND by
+  // distance, because a phone sitting still still emits position events.
+  var MIN_MS_BETWEEN_SENDS = 60000;
+  var MIN_METRES_MOVED = 25;
+  var lastSentAt = 0;
+  var watchId = null;
+
+  // Rough metres between two coordinates. Good enough to decide "has this person actually moved",
+  // which is all it is used for.
+  function metresBetween(aLat, aLon, bLat, bLon) {
+    var dLat = (bLat - aLat) * 111320;
+    var dLon = (bLon - aLon) * 111320 * Math.cos(aLat * Math.PI / 180);
+    return Math.sqrt(dLat * dLat + dLon * dLon);
+  }
+
+  function updateLocation(lat, lon, acc, force) {
+    var now = Date.now();
+    if (!force) {
+      if (now - lastSentAt < MIN_MS_BETWEEN_SENDS) return;
+      if (lastLat !== null && metresBetween(lastLat, lastLon, lat, lon) < MIN_METRES_MOVED) return;
+    }
+    lastLat = lat; lastLon = lon; lastSentAt = now;
     fetch('/api/location/update', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -20,18 +49,29 @@
 
   function startTracking() {
     if (!navigator.geolocation) return;
-    navigator.geolocation.watchPosition(
-      function(pos) { updateLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy); },
+    if (watchId !== null) return;               // one watcher, ever
+    watchId = navigator.geolocation.watchPosition(
+      function(pos) { updateLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy, false); },
       function() {},
       { enableHighAccuracy: true, maximumAge: 30000 }
     );
   }
 
-  // Only track if user previously allowed GPS (check via analytics session)
+  // Stop watching when the tab is hidden and resume when it comes back, so a forgotten background
+  // tab is not reporting a position nobody is looking at.
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    } else if (!document.hidden) {
+      startTracking();
+    }
+  });
+
   navigator.geolocation?.getCurrentPosition(
     function(pos) {
-      updateLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
-      setInterval(startTracking, 60000);
+      updateLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy, true);
+      startTracking();
     },
     function() {},
     { timeout: 3000, maximumAge: 60000 }
