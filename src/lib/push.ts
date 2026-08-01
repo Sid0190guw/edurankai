@@ -94,6 +94,8 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
   { type: 'course_completed',   label: 'Course completions',        desc: 'When a learner completes a course',            group: 'Academic' },
   // Institutional
   { type: 'new_hei_submission', label: 'HEI submissions',           desc: 'When an institution submits scores',           group: 'Institutional' },
+  { type: 'activity_alert',     label: 'Platform alerts',           desc: 'Money moved, a permission changed, or data was exported - things needing attention immediately', group: 'People & HR' },
+  { type: 'activity_digest',    label: 'Activity digest',           desc: 'A periodic roll-up of routine platform activity', group: 'People & HR' },
   { type: 'hei_truth_report',   label: 'HEI truth reports',         desc: 'When an HEI truth report is generated',        group: 'Institutional' },
 ];
 

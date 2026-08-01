@@ -101,6 +101,11 @@ const NOTIF_META: Record<string, NotifMeta> = {
   // Institutional
   new_hei_submission:     { category: 'institutional', priority: 'medium' },
   hei_truth_report:       { category: 'institutional', priority: 'medium' },
+  // Platform activity. An alert is something that needed a person right then — money moved, a
+  // permission changed, data left the building. The digest is the periodic roll-up of everything
+  // routine, deliberately low so it never competes with the alert.
+  activity_alert:         { category: 'system', priority: 'critical' },
+  activity_digest:        { category: 'system', priority: 'low' },
   // System / test
   test:                   { category: 'system', priority: 'low' },
 };
