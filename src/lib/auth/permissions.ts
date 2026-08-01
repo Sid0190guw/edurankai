@@ -9,6 +9,11 @@ export type Permission =
   | 'content.view' | 'content.edit'
   | 'users.view' | 'users.edit'
   | 'settings.view' | 'settings.edit'
+  // Offer-letter verification requests (the QR two-path flow). These were referenced by
+  // /admin/offer-verifications before they existed here, so can() returned false for EVERY role
+  // including super_admin and the console redirected everyone away — firms could be charged for a
+  // verification that no human could then open and answer.
+  | 'offers.view' | 'offers.edit'
   | 'audit.view';
 
 const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
@@ -21,6 +26,7 @@ const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'content.view', 'content.edit',
     'users.view', 'users.edit',
     'settings.view', 'settings.edit',
+    'offers.view', 'offers.edit',
     'audit.view'
   ],
   hr: [
@@ -28,12 +34,17 @@ const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'roles.view', 'roles.edit',
     'applications.view', 'applications.edit', 'applications.score',
     'events.view', 'events.edit',
+    // HR issues the offer letters, so HR answers the verifications that come back against them.
+    'offers.view', 'offers.edit',
     'content.view'
   ],
   recruiter: [
     'admin.access',
     'roles.view',
-    'applications.view', 'applications.edit', 'applications.score'
+    'applications.view', 'applications.edit', 'applications.score',
+    // A recruiter can see who is checking a candidate's letter, but answering on the record is
+    // HR's call — read-only here.
+    'offers.view'
   ],
   reviewer: [
     'admin.access',
