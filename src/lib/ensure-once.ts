@@ -1,6 +1,6 @@
 // Run a schema-ensure (CREATE TABLE IF NOT EXISTS / ALTER ...) at most ONCE per
 // server process. Many libs call ensureX() at the top of every function; those
-// DDL round-trips add up and keep the Neon compute busy (and cost CU-hours).
+// DDL round-trips add up and keep the database compute busy.
 // Caching the "already ensured" state per process removes that chatter while
 // staying correct (the tables only need creating once).
 //

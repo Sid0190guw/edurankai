@@ -490,7 +490,7 @@
     } catch (_) {}
 
     // Poll adaptively and PAUSE when the tab is hidden, so an idle background tab
-    // never keeps the database awake (lets Neon scale to zero). Faster only while
+    // never keeps the database awake (lets it idle). Faster only while
     // the chat is actually open; slow when closed; effectively off when hidden.
     function nextPollDelay() {
       if (document.hidden) return 300000;

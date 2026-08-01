@@ -131,7 +131,7 @@ async function hasFaceEnrolled(userId: string): Promise<boolean> {
 }
 
 // Public pages safe to edge-cache for ANONYMOUS visitors so repeat hits are served
-// from the CDN and never touch Neon. Excludes auth, forms (contact/apply/waiver),
+// from the CDN and never touch the database. Excludes auth, forms (contact/apply/waiver),
 // portal, and admin — those stay dynamic/private. Signed-in users never hit this
 // path (they carry a session token), and Vary:Cookie keeps the two apart.
 const PUBLIC_CACHEABLE_EXACT = new Set([
@@ -217,7 +217,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
     context.locals.user = null;
     context.locals.session = null;
     if (isGatedLab(path) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
-    // Anonymous + public page -> let the CDN cache it so repeat hits never touch Neon.
+    // Anonymous + public page -> let the CDN cache it so repeat hits never touch the database.
     if (context.request.method === 'GET' && isPublicCacheable(path)) {
       const res = await next();
       // Never CDN-cache a DEGRADED render (a DB hiccup that emptied the page): otherwise that broken
@@ -253,7 +253,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // hand-click Approve on applicant accounts ever again.
   // Run the promote at most ONCE per user per browser (cookie guard) instead of a
   // write on every request. Already-approved applicants then make zero writes on
-  // navigation, so Neon can stay suspended. The WHERE clause still no-ops safely.
+  // navigation, so the database stays idle. The WHERE clause still no-ops safely.
   if (result.user.role === 'applicant' && context.cookies.get('era_appr')?.value !== result.user.id) {
     try {
       await db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE id = ${result.user.id} AND access_status = 'pending'`);

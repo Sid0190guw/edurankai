@@ -5,7 +5,7 @@
 //   node scripts/apply-sql.mjs db/hr-schema.sql --env-file .env.production
 //
 // CHECK THE TARGET BEFORE YOU APPLY. The banner prints the host it is connected to (credentials
-// masked). The repo's .env may point at an OLD database — this project moved from Neon to
+// masked). The repo's .env may point at an OLD, RETIRED database. Confirm the host is
 // Supabase, and a stale .env means you would migrate the wrong database and see no effect in
 // production. To target production, pull its environment and pass it explicitly:
 //

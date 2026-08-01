@@ -17,7 +17,7 @@
 -- or, if psql is not installed (uses the app's own postgres driver):
 --   node scripts/apply-sql.mjs db/hr-schema.sql --env-file .env.production --dry-run   # preview
 --   node scripts/apply-sql.mjs db/hr-schema.sql --env-file .env.production             # apply
--- The runner prints the target host first — confirm it is the Supabase database, not Neon.
+-- The runner prints the target host first — confirm it is the Supabase database.
 --
 -- SCOPE NOTE. Column types here are reconstructed from how the application reads and writes
 -- them, not dumped from production, so on the live database the existing column types win (the

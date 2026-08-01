@@ -8,7 +8,7 @@
 //
 // Columns are added at runtime (ALTER ... IF NOT EXISTS), memoised via
 // ensureOnce so it costs one DDL round-trip per server process — important for
-// keeping Neon compute idle.
+// keeping database compute idle.
 import { db } from '@/lib/db';
 import { textArray } from '@/lib/pg-array';
 import { sql } from 'drizzle-orm';

@@ -13,7 +13,7 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 // Memoise the DDL so we don't fire CREATE TABLE IF NOT EXISTS on every poll
-// (every admin hits this endpoint every 15s — that DDL chatter keeps Neon awake
+// (every admin hits this endpoint every 15s — that DDL chatter keeps the database awake
 // and burns compute for nothing). One ensure per server process is enough.
 let tableReady: Promise<void> | null = null;
 function ensureTable(): Promise<void> {
