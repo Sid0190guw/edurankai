@@ -28,6 +28,8 @@ try {
 
 let done = false;
 let err = '';
+// Set for the firm path so the page can open checkout immediately after the request is recorded.
+let payRequestId = '';
 
 if (Astro.request.method === 'POST' && validToken) {
   const fd = await Astro.request.formData();
@@ -46,11 +48,19 @@ if (Astro.request.method === 'POST' && validToken) {
   });
   if (res.ok) {
     done = true;
-    await notifyNewRequest({
-      id: res.id || '', kind, token,
-      requesterName: String(fd.get('name') || ''),
-      organisation: String(fd.get('organisation') || ''),
-    });
+    if (free) {
+      // Free paths are actionable immediately, so tell the team now.
+      await notifyNewRequest({
+        id: res.id || '', kind, token,
+        requesterName: String(fd.get('name') || ''),
+        organisation: String(fd.get('organisation') || ''),
+      });
+    } else {
+      // Paid path: the team is notified by the confirm endpoint once the fee clears. Notifying at
+      // submission would queue work nobody could act on, since a firm request cannot be answered
+      // while the fee is outstanding.
+      payRequestId = res.id || '';
+    }
   } else {
     err = res.error || 'Could not submit that.';
   }
@@ -71,15 +81,144 @@ const field = 'w-full px-3 py-3 border border-ink/15 rounded-lg text-[0.9rem] ou
         </p>
       </div>
     ) : done ? (
-      <div class="border border-green-200 bg-green-50 rounded-xl p-6">
-        <h1 class="font-display text-[1.3rem] font-semibold text-green-900 mb-2">Request received</h1>
-        <p class="text-[0.88rem] text-green-900 leading-relaxed">
+      <div class="border border-green-200 bg-green-50 rounded-xl p-6" id="doneBox" data-request-id={payRequestId}>
+        <h1 class="font-display text-[1.3rem] font-semibold text-green-900 mb-2">
+          {free ? 'Request received' : 'One step left'}
+        </h1>
+        <p class="text-[0.88rem] text-green-900 leading-relaxed" id="doneMsg">
           {free
             ? 'Our team will send the signed certification to the email you gave, usually within two working days.'
-            : `We will email you a payment link for the ${FIRM_VERIFICATION_FEE_CHF} CHF certification fee, charged in INR at the live rate. The certification is issued once payment clears.`}
+            : `Pay the ${FIRM_VERIFICATION_FEE_CHF} CHF certification fee to complete your request. It is charged in INR at the live exchange rate.`}
         </p>
+        {!free && (
+          <>
+            <button type="button" id="payBtn"
+              class="mt-4 w-full bg-burn text-white font-semibold py-3.5 rounded-lg text-[0.95rem]">
+              Pay and submit
+            </button>
+            <p class="text-[0.76rem] text-green-900/80 mt-2.5 leading-relaxed" id="payNote">
+              Your request is saved. If you close this page, write to
+              <a href="mailto:hr@edurankai.in" class="underline">hr@edurankai.in</a> with the reference
+              below and we will invoice you instead.
+            </p>
+          </>
+        )}
         <p class="text-[0.8rem] text-green-900/80 mt-3">Reference: <span class="font-mono">{token.slice(0, 12)}</span></p>
       </div>
+
+      <script is:inline>
+            /* Opens Razorpay for the certification fee. The AMOUNT IS NOT SENT FROM HERE - the
+               server computes it from the configured CHF fee at the live rate, because anything
+               posted from a browser can be edited before it is sent.
+
+               Deliberately at the top level of the template, NOT inside a JSX conditional: Astro
+               parses a conditional's children as JSX, so every `{` of JavaScript inside one is read
+               as the start of an expression and the build fails. It guards itself instead, and
+               no-ops when there is nothing to pay for.
+
+               The request id comes from the DOM rather than define:vars, which Astro does not allow
+               alongside is:inline. */
+            (function () {
+              var box = document.getElementById('doneBox');
+              var payRequestId = box ? box.getAttribute('data-request-id') : '';
+              var btn = document.getElementById('payBtn');
+              var note = document.getElementById('payNote');
+              var msg = document.getElementById('doneMsg');
+              if (!btn || !payRequestId) return;
+              var busy = false;
+
+              /* Loaded on demand, so someone on the free path never downloads a payment SDK. */
+              function withRazorpay(cb, onErr) {
+                if (typeof Razorpay !== 'undefined') return cb();
+                var s = document.createElement('script');
+                s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+                s.onload = function () {
+                  if (typeof Razorpay === 'undefined') onErr(new Error('The payment window could not load.'));
+                  else cb();
+                };
+                s.onerror = function () { onErr(new Error('The payment window could not load. Please check your connection and try again.')); };
+                document.head.appendChild(s);
+              }
+
+              function say(t, cls) { if (note) { note.textContent = t; note.className = 'text-[0.8rem] mt-2.5 leading-relaxed ' + cls; } }
+
+              btn.addEventListener('click', function () {
+                if (busy) return;
+                busy = true;
+                btn.disabled = true;
+                btn.textContent = 'Starting...';
+
+                fetch('/api/offer-verification/pay', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ requestId: payRequestId }),
+                })
+                  .then(function (r) { return r.json(); })
+                  .then(function (d) {
+                    if (!d || !d.ok) throw new Error((d && d.error) || 'Could not start the payment.');
+                    withRazorpay(function () { openCheckout(d); }, function (e) {
+                      busy = false; btn.disabled = false; btn.textContent = 'Pay and submit';
+                      say(e.message, 'text-red-700');
+                    });
+                  })
+                  .catch(function (e) {
+                    busy = false;
+                    btn.disabled = false;
+                    btn.textContent = 'Pay and submit';
+                    say(e.message || 'Could not start the payment.', 'text-red-700');
+                  });
+              });
+
+              function openCheckout(d) {
+                    var rzp = new Razorpay({
+                      key: d.keyId,
+                      order_id: d.orderId,
+                      amount: d.amountPaise,
+                      currency: d.currency,
+                      name: 'EduRankAI',
+                      description: 'Offer letter certification (' + d.feeChf + ' CHF)',
+                      prefill: { name: d.name || '', email: d.email || '' },
+                      handler: function (resp) {
+                        btn.textContent = 'Confirming...';
+                        fetch('/api/offer-verification/confirm', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            orderId: resp.razorpay_order_id,
+                            paymentId: resp.razorpay_payment_id,
+                            signature: resp.razorpay_signature,
+                          }),
+                        })
+                          .then(function (r) { return r.json(); })
+                          .then(function (c) {
+                            if (c && c.ok) {
+                              btn.style.display = 'none';
+                              if (msg) msg.textContent = 'Payment received. Our team will send the signed certification to the email you gave, usually within two working days.';
+                              say('Thank you. Nothing further is needed.', 'text-green-900/80');
+                            } else {
+                              // Money has left their account, so never imply it has not.
+                              btn.style.display = 'none';
+                              say((c && c.error) || 'Payment went through but we could not record it. Please write to hr@edurankai.in with your payment id.', 'text-red-700 font-semibold');
+                            }
+                          })
+                          .catch(function () {
+                            btn.style.display = 'none';
+                            say('Payment went through but we could not reach our server to record it. Please write to hr@edurankai.in with your payment id — do not pay again.', 'text-red-700 font-semibold');
+                          });
+                      },
+                      modal: {
+                        ondismiss: function () {
+                          busy = false;
+                          btn.disabled = false;
+                          btn.textContent = 'Pay and submit';
+                          say('Payment cancelled. Your request is still saved — you can pay now or ask us to invoice you.', 'text-green-900/80');
+                        },
+                      },
+                    });
+                    rzp.open();
+              }
+            })();
+      </script>
     ) : (
       <>
         <p class="text-[0.7rem] font-mono uppercase tracking-[0.15em] text-burn font-bold mb-2">{label}</p>

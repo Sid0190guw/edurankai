@@ -145,6 +145,37 @@ export async function createRequest(input: CreateInput): Promise<{ ok: boolean; 
   }
 }
 
+/**
+ * Attach the gateway order to the request before checkout opens.
+ *
+ * Recorded up front so confirmation can be matched back to the request that was actually paid for.
+ * Without it, a confirmation would have to trust a request id supplied by the browser, and anyone
+ * could point a real payment at someone else's request — or at a request they never paid for.
+ */
+export async function setOrderId(id: string, orderId: string): Promise<void> {
+  await ensureVerificationSchema();
+  await db.execute(sql`UPDATE offer_verification_requests SET razorpay_order_id = ${orderId} WHERE id = ${id}`);
+}
+
+/** The request a gateway order belongs to. The authority on what a payment was for. */
+export async function findByOrderId(orderId: string): Promise<VerificationRequest | null> {
+  try {
+    await ensureVerificationSchema();
+    const r = rows(await db.execute(sql`
+      SELECT * FROM offer_verification_requests WHERE razorpay_order_id = ${orderId} LIMIT 1`))[0];
+    return r ? map(r) : null;
+  } catch { return null; }
+}
+
+/** One request by id, for the checkout page. */
+export async function getRequest(id: string): Promise<VerificationRequest | null> {
+  try {
+    await ensureVerificationSchema();
+    const r = rows(await db.execute(sql`SELECT * FROM offer_verification_requests WHERE id = ${id} LIMIT 1`))[0];
+    return r ? map(r) : null;
+  } catch { return null; }
+}
+
 /** Mark a firm request paid once the gateway confirms. Idempotent. */
 export async function markPaid(id: string, orderId?: string): Promise<void> {
   try {
