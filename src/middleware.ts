@@ -153,6 +153,27 @@ function isPublicCacheable(path: string): boolean {
 export const onRequest = defineMiddleware(async (context, next) => {
   const path = new URL(context.request.url).pathname;
 
+  // CIRCUIT BREAKER — answered before any database work, deliberately.
+  //
+  // sos.js v5 registered a new geolocation watcher every 60 seconds and never cleared any of them,
+  // so a single tab left open accumulated watchers and POSTed here on every GPS tick from each one.
+  // Each POST paid a session lookup in this middleware, which exhausted the connection pool, which
+  // made the session query itself fail — and once THAT fails every authenticated page returns 500.
+  // The apply flow and the admin application view both went down from a location beacon.
+  //
+  // v6 fixes the leak, but a browser tab opened before the fix keeps running v5 and cannot be
+  // reached by deploying. So the endpoint is retired at the edge of the request: 410 costs no
+  // connection, which lets the pool recover while old tabs drain. sos.js v6+ sends at most one
+  // update per minute and stops on 410.
+  //
+  // Remove this block only when v5 traffic has stopped appearing in the logs.
+  if (path === '/api/location/update') {
+    return new Response(JSON.stringify({ ok: false, retired: true }), {
+      status: 410,
+      headers: { 'Content-Type': 'application/json', 'cache-control': 'no-store' },
+    });
+  }
+
   // Viśvambhara deep modules ALWAYS require sign-in + admin approval. Handled
   // first so unauthenticated visitors are bounced to the access page instead
   // of seeing raw HTML.

@@ -44,6 +44,15 @@
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
       body: JSON.stringify({ lat: lat, lon: lon, accuracy: acc })
+    }).then(function (r) {
+      // 410 means the server has retired this beacon. Stop watching entirely rather than continuing
+      // to fire at a door that is closed — a client that ignores the server's answer is how the
+      // original incident kept going after it was fixed.
+      if (r && r.status === 410 && watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+        lastSentAt = Number.MAX_SAFE_INTEGER;
+      }
     }).catch(function() {});
   }
 
