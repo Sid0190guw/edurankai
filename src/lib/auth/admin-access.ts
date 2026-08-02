@@ -179,9 +179,16 @@ export async function canOpenAdmin(user: AdminAccessUser | null | undefined): Pr
   // slip past it. Compared case-insensitively, because an address is the same address however it was
   // typed into the HR form. The email arm is omitted entirely when there is no address, so an empty
   // string can never match a row with an empty column.
+  // work_email is DECLARED in db/hr-schema.sql but does NOT EXIST on the production table. Naming it
+  // here made this query throw, and because this guard fails closed, the throw denied /admin to
+  // EVERY administrator including the founder — who then bounced to /portal and landed on the
+  // onboarding page. A guard that cannot read its own input is a guard that locks out the building.
+  //
+  // Matching on user_id, personal_email and email is what AdminLayout has always used and is what
+  // the live schema actually supports. The column is created below if a deployment ever lacks it, so
+  // the two schemas converge instead of quietly disagreeing.
   const byEmail = email
-    ? sql` OR lower(coalesce(work_email, '')) = ${email}
-           OR lower(coalesce(personal_email, '')) = ${email}
+    ? sql` OR lower(coalesce(personal_email, '')) = ${email}
            OR lower(coalesce(email, '')) = ${email}`
     : sql``;
 
