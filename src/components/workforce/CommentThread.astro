@@ -1,0 +1,465 @@
+---
+/**
+ * Workforce / CommentThread — the conversation on a task.
+ *
+ * WHAT THIS IS FOR. listComments() in src/lib/employee-tasks.ts returns
+ * TaskComment rows for anyone who may see the task, watchers included, and
+ * addComment() writes one back. This renders that list and the form that
+ * appends to it. Plain text and line breaks in this pass: no rich text, no
+ * uploads.
+ *
+ * ------------------------------------------------------------------------
+ * REPLIES ARE OFF UNTIL THE COLUMN EXISTS, AND THAT IS THE POINT.
+ *
+ * employee_task_comments, as created in ensureTaskTables(), has five columns:
+ * id, task_id, author_user_id, body, created_at. THERE IS NO parent_id.
+ * addComment(taskId, authorUserId, body) has nowhere to put one and would
+ * discard it. So `parentField` defaults to null, and when it is null this
+ * component renders NO per-comment reply form at all — one form at the foot of
+ * the thread, which posts the comment the engine can actually store.
+ *
+ * A "Reply" button that silently posts a top-level comment is the exact failure
+ * this repo keeps paying for: naming hr_employees.work_email, which was in
+ * db/hr-schema.sql and not on the live table, took the site down three times in
+ * one day. A control is a promise about what the server will do. When the
+ * column lands, a page passes parentField="parent_id" and every reply form in
+ * here switches on at once — opt IN to a capability, never assume it.
+ * ------------------------------------------------------------------------
+ *
+ * DESIGN DECISION — the thread is a FLAT ordered list with a "Replying to
+ * <name>" line, not nested <ol>s. Two reasons and both are about the reader.
+ * At 360px, three levels of nesting leaves a reply about 200px of text width,
+ * which is roughly five words a line. And a screen reader in a nested list
+ * announces "list, four items, list, two items, list, one item" and expects the
+ * listener to hold the tree in their head; a sentence naming who is being
+ * replied to says the same thing in three words, at any depth, without the
+ * listener counting anything. Indentation is kept as a small visual echo,
+ * capped at three levels, and the sentence is what actually carries it.
+ *
+ * DESIGN DECISION — the body is rendered as a TEXT NODE inside a pre-wrap
+ * block. Never set:html, and never a <br> pass. Astro escapes text nodes, so
+ * `white-space: pre-wrap` is what turns the newlines a person typed into the
+ * lines they meant, with literally no path by which anything they type can
+ * become markup. "Safe line breaks" and "no injection surface" are the same
+ * CSS declaration, which is the cheapest safety in the whole set.
+ */
+import '../../styles/workforce.css';
+
+export interface Props {
+  /** From listComments(). `parentId` is read only if parentField is set. */
+  comments: Array<{
+    id: string;
+    authorName?: string | null;
+    authorRole?: string | null;
+    body: string;
+    createdAt?: string | null;
+    parentId?: string | null;
+  }>;
+  taskId: string;
+  /** May this viewer write? Presentation only; the server must still refuse. */
+  canComment?: boolean;
+  /** Omit so the form posts to the page it is on. */
+  action?: string;
+  /** Hidden field names, so the page owns its own POST contract. */
+  actionField?: string;
+  actionValue?: string;
+  taskField?: string;
+  bodyField?: string;
+  /** Set ONLY when employee_task_comments really has this column. See above. */
+  parentField?: string | null;
+  headingLevel?: 2 | 3 | 4;
+  heading?: string;
+  /** Shown in place of the form when canComment is false. */
+  cannotCommentText?: string;
+  class?: string;
+}
+
+const {
+  comments = [],
+  taskId,
+  canComment = true,
+  action,
+  actionField = 'action',
+  actionValue = 'comment',
+  taskField = 'task_id',
+  bodyField = 'body',
+  parentField = null,
+  headingLevel = 3,
+  heading = 'Comments',
+  cannotCommentText = 'You can read this conversation but not add to it.',
+  class: cls = '',
+} = Astro.props;
+
+// `: any` is required, not lazy — see the note in TaskCard.astro. Astro resolves
+// a capitalised JSX name to a value, a string-typed value is not a component
+// type, and the element then rejects `class` at check time while rendering
+// perfectly at runtime.
+const Heading: any = `h${headingLevel}`;
+const allowReplies = Boolean(parentField);
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Elapsed interval, for the same reason Timeline.astro uses one: the server
+// does not know the reader's timezone, and an interval is the same number
+// everywhere. The exact instant stays in the datetime attribute.
+const sinceText = (iso: string) => {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '';
+  const secs = Math.floor((Date.now() - t) / 1000);
+  if (secs < 60) return 'just now';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return mins === 1 ? '1 minute ago' : mins + ' minutes ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs === 1 ? '1 hour ago' : hrs + ' hours ago';
+  const days = Math.floor(hrs / 24);
+  if (days === 1) return 'yesterday';
+  if (days < 31) return days + ' days ago';
+  const d = new Date(t);
+  const y = d.getUTCFullYear();
+  const now = new Date().getUTCFullYear();
+  return d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()] + (y === now ? '' : ' ' + y);
+};
+
+const list = (comments || []).filter((c) => c && c.id);
+
+// Depth and parent name, computed iteratively. A parentId naming a comment that
+// is not in this list is treated as a root — an orphaned reply must still be
+// readable, not swallowed. The walk is bounded by the list length, so a cycle
+// in the data cannot spin here.
+const byId = new Map<string, any>();
+for (const c of list) byId.set(String(c.id), c);
+
+const MAX_DEPTH = 3;
+const rows = list.map((c) => {
+  let depth = 0;
+  let parentName = '';
+  if (allowReplies) {
+    let cursor = c;
+    let guard = 0;
+    while (guard < list.length) {
+      const pid = String(cursor.parentId || '');
+      if (!pid || !byId.has(pid)) break;
+      const parent = byId.get(pid);
+      if (depth === 0) parentName = String(parent.authorName || '').trim() || 'someone';
+      depth += 1;
+      cursor = parent;
+      guard += 1;
+    }
+  }
+  return {
+    c,
+    depth: Math.min(depth, MAX_DEPTH),
+    parentName,
+    when: c.createdAt ? sinceText(String(c.createdAt)) : '',
+    author: String(c.authorName || '').trim() || 'Name not on record',
+    role: String(c.authorRole || '').trim(),
+  };
+});
+
+const formId = 'wf-comment-' + String(taskId || 'task').replace(/[^a-zA-Z0-9_-]/g, '');
+---
+
+<section class:list={['wf-thread-wrap', cls]}>
+  <Heading class="wf-thread__heading">
+    {heading}
+    {rows.length > 0 && <span class="wf-thread__count">{rows.length}</span>}
+  </Heading>
+
+  {rows.length === 0 && (
+    <p class="wf-thread__none">
+      No comments yet. If this task is waiting on something, saying so here is
+      how the next person finds out.
+    </p>
+  )}
+
+  {rows.length > 0 && (
+    <ol class="wf-thread">
+      {rows.map((r) => (
+        <li class="wf-thread__item" data-depth={String(r.depth)}>
+          <article class="wf-comment">
+            <p class="wf-comment__head">
+              <span class="wf-comment__author">{r.author}</span>
+              {r.role && <span class="wf-comment__role">{r.role}</span>}
+              {r.c.createdAt
+                ? <time class="wf-comment__when" datetime={String(r.c.createdAt)} data-ts={String(r.c.createdAt)}>{r.when}</time>
+                : <span class="wf-comment__when">Time not recorded</span>}
+            </p>
+
+            {r.depth > 0 && r.parentName && (
+              <p class="wf-comment__replyingto">{'Replying to ' + r.parentName}</p>
+            )}
+
+            {/* A text node in a pre-wrap block. Nothing typed here can ever
+                become an element; see the note at the top of this file. */}
+            <p class="wf-comment__body">{r.c.body}</p>
+
+            {allowReplies && canComment && (
+              <details class="wf-comment__replybox">
+                <summary class="wf-comment__replybtn wf-focusable">Reply</summary>
+                <form class="wf-form" method="POST" action={action}>
+                  <input type="hidden" name={actionField} value={actionValue} />
+                  <input type="hidden" name={taskField} value={taskId} />
+                  <input type="hidden" name={parentField as string} value={r.c.id} />
+                  <label class="wf-sr-only" for={formId + '-r-' + r.c.id}>
+                    {'Reply to ' + r.author}
+                  </label>
+                  <textarea
+                    class="wf-form__input"
+                    id={formId + '-r-' + r.c.id}
+                    name={bodyField}
+                    rows="3"
+                    required
+                    maxlength="4000"
+                    placeholder="Write a reply"
+                  ></textarea>
+                  <div class="wf-form__actions">
+                    <button class="wf-btn wf-focusable" type="submit">Post reply</button>
+                  </div>
+                </form>
+              </details>
+            )}
+          </article>
+        </li>
+      ))}
+    </ol>
+  )}
+
+  {canComment ? (
+    <form class="wf-form wf-form--main" method="POST" action={action}>
+      <input type="hidden" name={actionField} value={actionValue} />
+      <input type="hidden" name={taskField} value={taskId} />
+      <label class="wf-form__label" for={formId}>Add a comment</label>
+      <textarea
+        class="wf-form__input"
+        id={formId}
+        name={bodyField}
+        rows="3"
+        required
+        maxlength="4000"
+        placeholder="Plain text. Line breaks are kept."
+      ></textarea>
+      <div class="wf-form__actions">
+        <button class="wf-btn wf-btn--primary wf-focusable" type="submit">Post comment</button>
+        <span class="wf-form__hint">Everyone who can see this task can read it.</span>
+      </div>
+    </form>
+  ) : (
+    <p class="wf-thread__none">{cannotCommentText}</p>
+  )}
+</section>
+
+<style>
+  .wf-thread-wrap {
+    font-family: var(--wf-font);
+    color: var(--wf-ink);
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .wf-thread__heading {
+    display: flex;
+    align-items: center;
+    gap: var(--wf-s-2);
+    margin: 0 0 var(--wf-s-3);
+    font-size: var(--wf-t-title);
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+
+  .wf-thread__count {
+    padding: 1px 8px;
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-veil);
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-micro);
+    font-weight: 700;
+  }
+
+  .wf-thread__none {
+    margin: 0 0 var(--wf-s-4);
+    font-size: var(--wf-t-meta);
+    line-height: 1.6;
+    color: var(--wf-ink-3);
+    max-width: 56ch;
+  }
+
+  .wf-thread__item {
+    margin: 0 0 var(--wf-s-3);
+  }
+
+  /* The visual echo of the thread, capped at three. The sentence inside each
+     reply is what actually carries the relationship; see the note at the top. */
+  .wf-thread__item[data-depth='1'] { padding-left: 14px; border-left: 2px solid var(--wf-line); }
+  .wf-thread__item[data-depth='2'] { padding-left: 28px; border-left: 2px solid var(--wf-line); }
+  .wf-thread__item[data-depth='3'] { padding-left: 42px; border-left: 2px solid var(--wf-line); }
+
+  .wf-comment {
+    min-width: 0;
+  }
+
+  .wf-comment__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--wf-s-1) var(--wf-s-2);
+    margin: 0;
+    font-size: var(--wf-t-meta);
+  }
+
+  .wf-comment__author {
+    font-weight: 650;
+    color: var(--wf-ink);
+    overflow-wrap: anywhere;
+  }
+
+  .wf-comment__role {
+    padding: 1px 7px;
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-veil);
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-micro);
+    font-weight: 600;
+  }
+
+  .wf-comment__when {
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-micro);
+  }
+
+  .wf-comment__replyingto {
+    margin: 2px 0 0;
+    font-size: var(--wf-t-micro);
+    color: var(--wf-ink-3);
+  }
+
+  .wf-comment__body {
+    margin: var(--wf-s-1) 0 0;
+    font-size: var(--wf-t-body);
+    line-height: 1.6;
+    color: var(--wf-ink-2);
+    /* The whole of "plain text plus safe line breaks". */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .wf-comment__replybox {
+    margin-top: var(--wf-s-2);
+  }
+
+  .wf-comment__replybtn {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--wf-touch);
+    padding: var(--wf-s-2) 0;
+    color: var(--wf-info-text);
+    font-size: var(--wf-t-meta);
+    font-weight: 650;
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .wf-comment__replybtn::-webkit-details-marker {
+    display: none;
+  }
+
+  .wf-comment__replybtn:active {
+    opacity: 0.65;
+  }
+
+  /* ------------------------------- the form ------------------------------ */
+
+  .wf-form {
+    margin: var(--wf-s-2) 0 0;
+    min-width: 0;
+  }
+
+  .wf-form--main {
+    margin-top: var(--wf-s-4);
+    padding-top: var(--wf-s-4);
+    border-top: 1px solid var(--wf-line);
+  }
+
+  .wf-form__label {
+    display: block;
+    margin-bottom: var(--wf-s-2);
+    font-size: var(--wf-t-meta);
+    font-weight: 650;
+    color: var(--wf-ink);
+  }
+
+  .wf-form__input {
+    display: block;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    /* min-width:0 on a textarea is what stops a long unbroken word from
+       widening the form past the viewport and giving the PAGE a sideways
+       scrollbar at 360px. */
+    min-width: 0;
+    padding: var(--wf-s-2) var(--wf-s-3);
+    border: 1px solid var(--wf-line-strong);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-raised);
+    color: var(--wf-ink);
+    font-family: inherit;
+    /* 16px. Anything smaller and iOS Safari zooms the page when the field takes
+       focus, which on a phone throws the reader out of their place in the
+       thread every single time they go to type. */
+    font-size: 1rem;
+    line-height: 1.55;
+    resize: vertical;
+  }
+
+  .wf-form__input:focus-visible {
+    outline: 2px solid var(--wf-focus);
+    outline-offset: 1px;
+    border-color: var(--wf-focus);
+  }
+
+  .wf-form__actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--wf-s-2) var(--wf-s-3);
+    margin-top: var(--wf-s-2);
+  }
+
+  .wf-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: var(--wf-touch);
+    padding: var(--wf-s-2) var(--wf-s-4);
+    border: 1px solid var(--wf-line-strong);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-raised);
+    color: var(--wf-ink);
+    font-family: inherit;
+    font-size: var(--wf-t-body);
+    font-weight: 650;
+    cursor: pointer;
+  }
+
+  .wf-btn--primary {
+    border-color: var(--wf-ink);
+    background: var(--wf-ink);
+    color: var(--wf-surface);
+  }
+
+  .wf-btn:active {
+    opacity: 0.75;
+  }
+
+  .wf-form__hint {
+    font-size: var(--wf-t-micro);
+    color: var(--wf-ink-3);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .wf-btn:active,
+    .wf-comment__replybtn:active {
+      opacity: 1;
+    }
+  }
+</style>

@@ -1,0 +1,735 @@
+---
+/**
+ * Workforce / TaskCard — one task, as it appears in a list or a board column.
+ *
+ * THE FACE CARRIES FOUR SIGNALS, OR FIVE WHEN SOMETHING IS WRONG. Title,
+ * priority, due, assignee — and a risk chip only when there is a risk. That is
+ * the whole face. Effort, logged time, attachments, comments, checklist,
+ * labels, project, parent, subtask count, description, who assigned it and
+ * when it last moved all live inside a <details> that is shut by default.
+ *
+ * WHY, STATED PLAINLY, BECAUSE THIS IS THE DECISION THE REST OF THE COMPONENT
+ * SERVES. A card carrying nineteen signals communicates none of them: the eye
+ * gets no ranking, so every card costs the same amount of attention as every
+ * other, and by the thirtieth card in a column the reader has stopped reading
+ * and started scrolling. Four signals give the eye a shape it can match against
+ * the next card without focusing. That is why Linear is still scannable at hour
+ * nine and why a certain kind of board is exhausting at hour one. The person
+ * looking at this screen has been in it since morning.
+ *
+ * DESIGN DECISION — the constraint is structural, not editorial. There is no
+ * slot on the face. A caller cannot add a sixth chip to it without editing this
+ * file, and the moment they open this file they meet this comment. Everything
+ * extensible about this component is inside the expansion, where an extra field
+ * costs a reader nothing because they asked to see it. A guideline in a wiki
+ * about how many chips a card should have would be gone in a quarter; a
+ * component with nowhere to put the sixth chip is still enforcing it next year.
+ *
+ * THE EXPANSION IS A NATIVE <details> AND NEEDS NO JAVASCRIPT. It opens with a
+ * click, with Enter, with Space, and it is announced as expanded or collapsed
+ * without a single aria attribute from us. Find-in-page opens it in Chrome. It
+ * works with the network down and the bundle blocked. An accordion built from a
+ * button and a hidden div would need script, state, aria-expanded, aria-controls
+ * and a keyboard handler to be worse than this.
+ *
+ * MOTION: none on open. A <details> that animates makes the reader wait to find
+ * out something they already asked for, and the height of the panel is unknown
+ * until it is open, so animating it correctly costs script. The press feedback
+ * on the summary is opacity, and that is the only thing that moves.
+ *
+ * OVERDUE IS THE ENGINE'S ANSWER, NOT OURS. `isOverdue` comes from
+ * employee-tasks.ts, where it is computed by Postgres against CURRENT_DATE in
+ * the same query that returned the row. The date arithmetic here only chooses
+ * the WORDING ("2 days late" rather than "Due 30 Jul"); it never overrules the
+ * flag. Two clocks, one of which is the browser's, must not be allowed to
+ * disagree about whether somebody is late.
+ */
+import type { TaskStatus, TaskPriority } from '@/lib/employee-tasks';
+import StatusBadge from './StatusBadge.astro';
+import PriorityFlag from './PriorityFlag.astro';
+import AvatarStack from './AvatarStack.astro';
+import '../../styles/workforce.css';
+
+export interface Props {
+  title: string;
+  href?: string;
+  /** 2 to 5. The card title is a heading; pick the level that fits the page. */
+  headingLevel?: 2 | 3 | 4 | 5;
+
+  // --- the face ---
+  priority?: TaskPriority | string;
+  dueOn?: string | null;
+  /** From the engine. The authority on lateness; see the note above. */
+  isOverdue?: boolean;
+  status?: TaskStatus | string;
+  statusLabel?: string;
+  assignee?: { name?: string | null; role?: string | null } | null;
+  /** Overrides the computed risk chip. One chip only, whatever is passed. */
+  risk?: { tone?: string; text: string } | null;
+
+  // --- the expansion ---
+  description?: string | null;
+  blockedReason?: string | null;
+  cancelReason?: string | null;
+  project?: string | null;
+  parentTitle?: string | null;
+  parentHref?: string | null;
+  subtaskCount?: number | null;
+  subtasksDone?: number | null;
+  checklist?: Array<{ label: string; done?: boolean }>;
+  labels?: string[];
+  estimateHours?: number | null;
+  loggedHours?: number | null;
+  attachmentCount?: number | null;
+  commentCount?: number | null;
+  collaborators?: Array<{ name?: string | null; role?: string | null }>;
+  assignedByName?: string | null;
+  createdAt?: string | null;
+  statusChangedAt?: string | null;
+  completedAt?: string | null;
+
+  /** Start expanded. For a detail page rendering the same card. */
+  open?: boolean;
+  /** Hides the expansion entirely when there is nothing behind it. */
+  detailsLabel?: string;
+  class?: string;
+}
+
+const {
+  title,
+  href,
+  headingLevel = 3,
+  priority = 'normal',
+  dueOn = null,
+  isOverdue = false,
+  status = '',
+  statusLabel,
+  assignee = null,
+  risk = null,
+  description = null,
+  blockedReason = null,
+  cancelReason = null,
+  project = null,
+  parentTitle = null,
+  parentHref = null,
+  subtaskCount = null,
+  subtasksDone = null,
+  checklist = [],
+  labels = [],
+  estimateHours = null,
+  loggedHours = null,
+  attachmentCount = null,
+  commentCount = null,
+  collaborators = [],
+  assignedByName = null,
+  createdAt = null,
+  statusChangedAt = null,
+  completedAt = null,
+  open = false,
+  detailsLabel = 'Details',
+  class: cls = '',
+} = Astro.props;
+
+// A dynamic heading tag, so the card sits at whatever depth the page's outline
+// puts it. The `: any` is load-bearing and is not laziness: Astro's checker
+// resolves a capitalised JSX name to a VALUE, and a value of string type is not
+// a component type, so it falls back to IntrinsicAttributes and rejects `class`
+// on the element. Astro renders a string-valued component as that HTML tag at
+// runtime regardless. src/components/wellness/EmptyState.astro ships this same
+// pattern without the annotation and carries the error to this day; the
+// annotation is how this file does not add a fifth copy of it.
+const Heading: any = `h${headingLevel}`;
+
+// CLOSED_STATUSES in employee-tasks.ts. Restated because this is a
+// presentational judgement — a finished task is drawn calmly — and the engine
+// is still the only thing that decides what closed MEANS.
+const CLOSED = ['completed', 'cancelled', 'archived'];
+const statusKey = String(status || '').trim().toLowerCase();
+const normalisedStatus = statusKey === 'open' ? 'assigned' : (statusKey === 'done' ? 'completed' : statusKey);
+const isClosed = CLOSED.indexOf(normalisedStatus) >= 0;
+
+// --- dates -----------------------------------------------------------------
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const DAY_MS = 86400000;
+
+const parseDay = (v: string | null | undefined) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v || ''));
+  if (!m) return null;
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+};
+
+const todayUTC = (() => {
+  const n = new Date();
+  return Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate());
+})();
+
+const dueMs = parseDay(dueOn);
+const daysLeft = dueMs === null ? null : Math.round((dueMs - todayUTC) / DAY_MS);
+
+const shortDate = (v: string | null | undefined) => {
+  const ms = parseDay(v);
+  if (ms === null) return '';
+  const d = new Date(ms);
+  const thisYear = new Date().getUTCFullYear();
+  const y = d.getUTCFullYear();
+  return d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()] + (y === thisYear ? '' : ' ' + y);
+};
+
+const plural = (n: number, one: string, many: string) => (n === 1 ? '1 ' + one : n + ' ' + many);
+
+// --- the due chip and the risk chip, and the rule that keeps them to one ----
+//
+// If a task is late, "2 days late" replaces the due date rather than sitting
+// next to it: two chips about the same fact is the nineteen-signal card
+// starting again. Blocked keeps its due chip, because a blocked task is still
+// owed on the day it was owed.
+let dueChip: { tone: string; text: string; muted: boolean } | null = null;
+let riskChip: { tone: string; text: string } | null = null;
+
+const late = !isClosed && (isOverdue || (daysLeft !== null && daysLeft < 0));
+
+if (risk && risk.text) {
+  riskChip = { tone: risk.tone || 'danger', text: risk.text };
+} else if (late) {
+  const by = daysLeft === null ? null : Math.abs(daysLeft);
+  riskChip = { tone: 'overdue', text: by === null ? 'Overdue' : plural(by, 'day late', 'days late') };
+} else if (normalisedStatus === 'blocked') {
+  riskChip = { tone: 'blocked', text: 'Blocked' };
+}
+
+if (dueMs !== null && !late) {
+  let text = 'Due ' + shortDate(dueOn);
+  let tone = 'draft';
+  if (daysLeft === 0) { text = 'Due today'; tone = 'due_soon'; }
+  else if (daysLeft === 1) { text = 'Due tomorrow'; tone = 'due_soon'; }
+  else if (daysLeft !== null && daysLeft > 1 && daysLeft <= 6) { text = 'Due in ' + daysLeft + ' days'; }
+  dueChip = { tone, text, muted: isClosed };
+}
+
+const assigneeName = String(assignee?.name || '').trim();
+
+// --- the expansion ---------------------------------------------------------
+const hasEffort = typeof estimateHours === 'number' || typeof loggedHours === 'number';
+const hasSubtasks = typeof subtaskCount === 'number' && subtaskCount > 0;
+const hasChecklist = Array.isArray(checklist) && checklist.length > 0;
+const checklistDone = hasChecklist ? checklist.filter((c) => c && c.done).length : 0;
+const hasLabels = Array.isArray(labels) && labels.length > 0;
+const hasCounts =
+  (typeof commentCount === 'number' && commentCount > 0) ||
+  (typeof attachmentCount === 'number' && attachmentCount > 0);
+const reason = blockedReason || cancelReason || null;
+
+const hasExpansion = Boolean(
+  description || reason || project || parentTitle || hasSubtasks || hasChecklist ||
+  hasLabels || hasEffort || hasCounts || (collaborators && collaborators.length) ||
+  assignedByName || createdAt || statusChangedAt || completedAt,
+);
+
+const hours = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1)) + 'h';
+
+const CLOCK =
+  '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.6V12l3 1.8"/>';
+---
+
+<article class:list={['wf-card', { 'is-closed': isClosed }, cls]}>
+
+  <!-- ============================ THE FACE ============================ -->
+  <Heading class="wf-card__title">
+    {href
+      ? <a class="wf-card__link wf-focusable" href={href}>{title}</a>
+      : <span>{title}</span>}
+  </Heading>
+
+  <div class="wf-card__signals">
+    <PriorityFlag priority={priority} hideNormal={true} />
+
+    {dueChip && (
+      <span class:list={['wf-chip', { 'is-muted': dueChip.muted }]} data-wf-tone={dueChip.tone}>
+        {dueChip.text}
+      </span>
+    )}
+
+    {riskChip && (
+      <span class="wf-chip wf-chip--risk" data-wf-tone={riskChip.tone}>
+        <svg
+          class="wf-chip__glyph"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.9"
+          stroke-linecap="round"
+          aria-hidden="true"
+          set:html={CLOCK}
+        />
+        {riskChip.text}
+      </span>
+    )}
+  </div>
+
+  {assigneeName && (
+    <p class="wf-card__who">
+      <AvatarStack people={[assignee || {}]} label="Assigned to" />
+      <span class="wf-card__whoname">{assigneeName}</span>
+    </p>
+  )}
+
+  <!-- ========================== THE EXPANSION ========================== -->
+  {hasExpansion && (
+    <details class="wf-card__more" open={open}>
+      <summary class="wf-card__summary wf-focusable">
+        <span class="wf-card__summarytext">{detailsLabel}</span>
+        <svg
+          class="wf-card__caret"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="m7 10 5 5 5-5" />
+        </svg>
+      </summary>
+
+      <div class="wf-card__panel">
+        {status && (
+          <p class="wf-card__row">
+            <StatusBadge status={status} label={statusLabel} />
+          </p>
+        )}
+
+        {/* Plain text in a pre-wrap block: line breaks survive and there is no
+            markup path in, so nothing a person types can become an element. */}
+        {description && <p class="wf-card__text">{description}</p>}
+
+        {reason && (
+          <p class="wf-card__note" data-wf-tone={blockedReason ? 'blocked' : 'cancelled'}>
+            <span class="wf-card__notelabel">{blockedReason ? 'Blocked because' : 'Cancelled because'}</span>
+            <span class="wf-card__notebody">{reason}</span>
+          </p>
+        )}
+
+        {hasChecklist && (
+          <div class="wf-card__block">
+            <p class="wf-card__blocklabel">{'Checklist, ' + checklistDone + ' of ' + checklist.length}</p>
+            <ul class="wf-card__checks">
+              {checklist.map((c) => (
+                <li class:list={['wf-card__check', { 'is-done': c.done }]}>
+                  <svg class="wf-card__checkbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="4" y="4" width="16" height="16" rx="4" />
+                    {c.done && <path d="m8.6 12.3 2.3 2.3 4.5-4.9" />}
+                  </svg>
+                  <span>{c.label}</span>
+                  <span class="wf-sr-only">{c.done ? ' (done)' : ' (not done)'}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {hasLabels && (
+          <ul class="wf-card__labels">
+            {labels.map((l) => <li class="wf-card__label">{l}</li>)}
+          </ul>
+        )}
+
+        <dl class="wf-card__facts">
+          {project && (
+            <div class="wf-card__fact"><dt>Project</dt><dd>{project}</dd></div>
+          )}
+          {parentTitle && (
+            <div class="wf-card__fact">
+              <dt>Part of</dt>
+              <dd>{parentHref ? <a class="wf-focusable" href={parentHref}>{parentTitle}</a> : parentTitle}</dd>
+            </div>
+          )}
+          {hasSubtasks && (
+            <div class="wf-card__fact">
+              <dt>Subtasks</dt>
+              <dd>{typeof subtasksDone === 'number' ? subtasksDone + ' of ' + subtaskCount + ' done' : String(subtaskCount)}</dd>
+            </div>
+          )}
+          {typeof estimateHours === 'number' && (
+            <div class="wf-card__fact"><dt>Estimate</dt><dd>{hours(estimateHours)}</dd></div>
+          )}
+          {typeof loggedHours === 'number' && (
+            <div class="wf-card__fact"><dt>Logged</dt><dd>{hours(loggedHours)}</dd></div>
+          )}
+          {typeof commentCount === 'number' && commentCount > 0 && (
+            <div class="wf-card__fact"><dt>Comments</dt><dd>{String(commentCount)}</dd></div>
+          )}
+          {typeof attachmentCount === 'number' && attachmentCount > 0 && (
+            <div class="wf-card__fact"><dt>Links</dt><dd>{String(attachmentCount)}</dd></div>
+          )}
+          {assignedByName && (
+            <div class="wf-card__fact"><dt>Assigned by</dt><dd>{assignedByName}</dd></div>
+          )}
+          {createdAt && (
+            <div class="wf-card__fact"><dt>Created</dt><dd>{shortDate(createdAt) || createdAt.slice(0, 10)}</dd></div>
+          )}
+          {statusChangedAt && (
+            <div class="wf-card__fact"><dt>Last moved</dt><dd>{shortDate(statusChangedAt) || statusChangedAt.slice(0, 10)}</dd></div>
+          )}
+          {completedAt && (
+            <div class="wf-card__fact"><dt>Completed</dt><dd>{shortDate(completedAt) || completedAt.slice(0, 10)}</dd></div>
+          )}
+        </dl>
+
+        {collaborators && collaborators.length > 0 && (
+          <div class="wf-card__block">
+            <p class="wf-card__blocklabel">On this task</p>
+            <AvatarStack people={collaborators} max={4} label="On this task" />
+          </div>
+        )}
+
+        <slot />
+      </div>
+    </details>
+  )}
+
+  <slot name="actions" />
+</article>
+
+<style>
+  .wf-card {
+    box-sizing: border-box;
+    max-width: 100%;
+    min-width: 0;
+    padding: var(--wf-s-3);
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-md);
+    background: var(--wf-surface);
+    font-family: var(--wf-font);
+    color: var(--wf-ink);
+  }
+
+  /* A finished task is not a dimmed task: dimming it drops the contrast of a
+     record people still have to read. It loses its emphasis, not its legibility. */
+  .wf-card.is-closed .wf-card__title {
+    font-weight: 500;
+    color: var(--wf-ink-2);
+  }
+
+  .wf-card__title {
+    margin: 0;
+    font-size: var(--wf-t-body);
+    font-weight: 600;
+    line-height: 1.4;
+    letter-spacing: -0.005em;
+    overflow-wrap: anywhere;
+  }
+
+  /* THE TARGET IS THE TOP BAND OF THE CARD, NOT THE WORDS.
+     The link is display:block with 12px of padding and exactly 12px of negative
+     margin, so its box bleeds out to the card's own edges while the text stays
+     visually where it was. A one-line title becomes a full-width target 44px
+     tall, and the negative bottom margin means the chips below do not move.
+
+     Deliberately NOT the usual `::after { position:absolute; inset:0 }` trick
+     that stretches the link over the whole card. That overlay would sit on top
+     of the <details> summary and on top of anything a page puts in the actions
+     slot — a move form, a status select — and in Astro a scoped rule in this
+     file cannot lift slotted children back above it, because slotted markup
+     carries the PARENT's scope hash and this component's selectors never match
+     it. A card whose "Move" button silently stops working on a phone is a worse
+     outcome than a slightly smaller target, so the target stops at the title. */
+  .wf-card__link {
+    display: block;
+    margin: calc(var(--wf-s-3) * -1);
+    padding: var(--wf-s-3);
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .wf-card__link:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .wf-card__link:focus-visible {
+    outline: 2px solid var(--wf-focus);
+    outline-offset: -3px;
+    border-radius: var(--wf-r-sm);
+  }
+
+  .wf-card__signals {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--wf-s-1) var(--wf-s-2);
+    margin-top: var(--wf-s-2);
+    /* Nothing here is empty-but-spaced: an empty flex row with a margin is a
+       gap the reader reads as a missing thing. */
+    min-height: 0;
+  }
+
+  .wf-card__signals:empty {
+    display: none;
+    margin-top: 0;
+  }
+
+  .wf-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-tone-wash);
+    border: 1px solid var(--wf-tone-border);
+    color: var(--wf-tone-text);
+    font-size: var(--wf-t-micro);
+    font-weight: 600;
+    line-height: 1.45;
+    white-space: nowrap;
+  }
+
+  /* A due date that is comfortably in the future is a fact, not an alert: no
+     fill, no border, just a quiet line of text. */
+  .wf-chip[data-wf-tone='draft'] {
+    padding-left: 0;
+    padding-right: 0;
+    background: none;
+    border-color: transparent;
+    color: var(--wf-ink-3);
+    font-weight: 500;
+  }
+
+  .wf-chip.is-muted {
+    color: var(--wf-ink-4);
+  }
+
+  .wf-chip__glyph {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+  }
+
+  .wf-card__who {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--wf-s-2);
+    margin: var(--wf-s-2) 0 0;
+    font-size: var(--wf-t-meta);
+    color: var(--wf-ink-3);
+    min-width: 0;
+  }
+
+  .wf-card__whoname {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ------------------------------ expansion ------------------------------ */
+
+  .wf-card__more {
+    position: relative;
+    margin-top: var(--wf-s-2);
+  }
+
+  .wf-card__summary {
+    display: flex;
+    align-items: center;
+    gap: var(--wf-s-1);
+    /* A full 44px, and full-bleed to the card edges by the same negative-margin
+       trick the title uses. The platform's disclosure triangle is removed
+       because it cannot be sized, coloured or positioned; the caret below is
+       the replacement and it rotates to report the state. */
+    min-height: var(--wf-touch);
+    margin: 0 calc(var(--wf-s-3) * -1);
+    padding: var(--wf-s-2) var(--wf-s-3);
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-meta);
+    font-weight: 600;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+
+  .wf-card__summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .wf-card__summary:active {
+    opacity: 0.65;
+  }
+
+  .wf-card__caret {
+    width: 15px;
+    height: 15px;
+    flex: 0 0 auto;
+  }
+
+  /* The caret rotating IS the state change: it says "this is now open" at the
+     exact spot the finger landed. Transform only, and it is the one animation
+     in this component. */
+  @media (prefers-reduced-motion: no-preference) {
+    .wf-card__caret {
+      transition: transform var(--wf-dur-state) var(--wf-ease);
+    }
+  }
+
+  .wf-card__more[open] > .wf-card__summary .wf-card__caret {
+    transform: rotate(180deg);
+  }
+
+  .wf-card__panel {
+    position: relative;
+    padding-top: var(--wf-s-1);
+    border-top: 1px solid var(--wf-line);
+    margin-top: 0;
+  }
+
+  .wf-card__row {
+    margin: var(--wf-s-3) 0 0;
+  }
+
+  .wf-card__text {
+    margin: var(--wf-s-3) 0 0;
+    font-size: var(--wf-t-meta);
+    line-height: 1.6;
+    color: var(--wf-ink-2);
+    /* Line breaks a person typed survive. No markup is ever parsed. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .wf-card__note {
+    display: block;
+    margin: var(--wf-s-3) 0 0;
+    padding: var(--wf-s-2) var(--wf-s-3);
+    border: 1px solid var(--wf-tone-border);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-tone-wash);
+    color: var(--wf-tone-text);
+    font-size: var(--wf-t-meta);
+    line-height: 1.55;
+  }
+
+  .wf-card__notelabel {
+    display: block;
+    font-weight: 700;
+    margin-bottom: 2px;
+  }
+
+  .wf-card__notebody {
+    display: block;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .wf-card__block {
+    margin-top: var(--wf-s-3);
+  }
+
+  .wf-card__blocklabel {
+    margin: 0 0 var(--wf-s-2);
+    font-size: var(--wf-t-micro);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--wf-ink-3);
+  }
+
+  .wf-card__checks {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .wf-card__check {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--wf-s-2);
+    padding: 3px 0;
+    font-size: var(--wf-t-meta);
+    line-height: 1.5;
+    color: var(--wf-ink-2);
+    overflow-wrap: anywhere;
+  }
+
+  .wf-card__check.is-done {
+    color: var(--wf-ink-3);
+  }
+
+  .wf-card__checkbox {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    margin-top: 1px;
+    color: var(--wf-ink-4);
+  }
+
+  .wf-card__check.is-done .wf-card__checkbox {
+    color: var(--wf-approved-accent);
+  }
+
+  .wf-card__labels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--wf-s-1);
+    margin: var(--wf-s-3) 0 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .wf-card__label {
+    padding: 2px 8px;
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-veil);
+    color: var(--wf-ink-2);
+    font-size: var(--wf-t-micro);
+    font-weight: 500;
+  }
+
+  .wf-card__facts {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--wf-s-2);
+    margin: var(--wf-s-3) 0 0;
+  }
+
+  .wf-card__fact {
+    display: flex;
+    align-items: baseline;
+    gap: var(--wf-s-2);
+    min-width: 0;
+    font-size: var(--wf-t-meta);
+  }
+
+  .wf-card__fact dt {
+    flex: 0 0 auto;
+    min-width: 84px;
+    color: var(--wf-ink-3);
+  }
+
+  .wf-card__fact dd {
+    margin: 0;
+    min-width: 0;
+    color: var(--wf-ink);
+    overflow-wrap: anywhere;
+  }
+
+  .wf-card__fact a {
+    color: inherit;
+  }
+
+  /* Two columns of facts only when there is genuinely room. At 360px this stays
+     one column, which is the width that matters most here. */
+  @media (min-width: 560px) {
+    .wf-card__facts {
+      grid-template-columns: 1fr 1fr;
+      gap: var(--wf-s-2) var(--wf-s-4);
+    }
+  }
+
+  @media (forced-colors: active) {
+    .wf-chip {
+      border-color: CanvasText;
+    }
+  }
+</style>
