@@ -141,7 +141,32 @@ export async function canOpenAdmin(user: AdminAccessUser | null | undefined): Pr
   // A deactivated account keeps its role, so this is checked separately and first — can() folds the
   // two together and would report the wrong reason in the log.
   if (user.isActive === false) return deny('account-disabled', role || null);
-  if (!role || !ADMIN_CAPABLE_ROLES.has(role)) return deny('role-not-admin-capable', role || null);
+  // Two ways in, and only two.
+  //
+  //   1. A BUILT-IN role that holds admin.access in the compiled matrix.
+  //   2. A CUSTOM role, created in the admin panel, explicitly granted admin.access in the registry.
+  //
+  // The second is what makes a new role work without a deploy — the whole point of the registry.
+  // Without it, admin.access could be granted, recorded and audited while quietly doing nothing,
+  // which is its own kind of lie: the console would say someone had access that they did not.
+  //
+  // It stays DENY BY DEFAULT. The registry is asked only after the built-in test fails, it resolves
+  // to an empty set on any error, and the internship check below still runs afterwards — so a
+  // custom grant cannot be used to hand the console to an intern. admin.access is also unreachable
+  // through the section matrix (registry.ts filters it out in SQL), so it can only ever be granted
+  // deliberately, by name, with an audit row naming who did it.
+  if (!role || !ADMIN_CAPABLE_ROLES.has(role)) {
+    let viaRegistry = false;
+    try {
+      const { hasPermission, PERM_ADMIN_ACCESS } = await import('@/lib/auth/registry');
+      viaRegistry = await hasPermission(user.id, PERM_ADMIN_ACCESS);
+    } catch (e: any) {
+      // Fail closed: an unreadable registry denies, exactly as an unreadable HR record does.
+      console.error('[admin-access] registry lookup failed', e?.cause?.message || e?.message);
+      viaRegistry = false;
+    }
+    if (!viaRegistry) return deny('role-not-admin-capable', role || null);
+  }
 
   // Session-derived, never request-derived. Used as the fallback scope when the person has no
   // employee record, so a department_head still resolves the department the admin console set.
