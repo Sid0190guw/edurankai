@@ -22,6 +22,41 @@ const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 export interface InternCheck { isIntern: boolean; demoted: boolean }
 
 /**
+ * Demote EVERY intern still holding the editor role, in one statement.
+ *
+ * checkInternAccess() below only repairs a person at the moment they try to open /admin, which
+ * leaves everyone who has not visited since the fix still sitting in the users list as an editor —
+ * still carrying admin.access everywhere else that reads users.role, and still counted as staff by
+ * anything that fans out notifications by role. Waiting for each of them to click is not a fix.
+ *
+ * Narrow in exactly the same way as the per-request guard: a row is touched only if it is 'editor'
+ * AND joins to an hr_employees record marked as an internship. A real editor, HR, an admin or the
+ * founder is never matched. Returns how many rows changed so the caller can report it honestly.
+ */
+export async function demoteAllInternEditors(): Promise<number> {
+  try {
+    const r = await db.execute(sql`
+      UPDATE users u
+         SET role = 'applicant', updated_at = NOW()
+       WHERE u.role = 'editor'
+         AND EXISTS (
+           SELECT 1 FROM hr_employees e
+            WHERE (e.user_id = u.id OR e.email = u.email
+                   OR e.work_email = u.email OR e.personal_email = u.email)
+              AND (COALESCE(e.employment_type, '') ILIKE '%intern%'
+                   OR COALESCE(e.designation, '') ILIKE '%intern%')
+         )
+       RETURNING u.id`);
+    const n = rows(r).length;
+    if (n > 0) console.warn('[intern-guard] bulk demoted intern editors', { count: n });
+    return n;
+  } catch (e: any) {
+    console.error('[intern-guard] bulk demote failed', e?.cause?.message || e?.message);
+    return 0;
+  }
+}
+
+/**
  * Is this person an intern who should not be in the admin panel?
  *
  * FAILS OPEN on error, and that is the right direction here: this guard's job is to remove access
