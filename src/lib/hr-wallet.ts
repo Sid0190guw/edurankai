@@ -143,6 +143,49 @@ export async function listWithdrawals(opts: { employeeId?: string; status?: stri
 
 // Approval permission: super-admin / admin / HR always; the employee's reporting
 // manager (if the schema links one) also may approve. Returns the role label used.
+/**
+ * Withdrawal requests THIS person can actually decide.
+ *
+ * The counterpart to pendingLeaveForApprover(). listWithdrawals() answers "one employee's" or "all
+ * with this status"; neither tells an approver what is waiting on them, so requests sit unanswered
+ * while everyone assumes someone else is looking.
+ *
+ * Same authority as approverRole(), expressed in SQL: super_admin and admin and the exact role 'hr'
+ * see every pending request; everyone else sees only employees whose reporting_manager_id is their
+ * own USERS id. decideWithdrawal() still re-checks through approverRole() — this decides what to
+ * show, never what may be done.
+ */
+export async function pendingWithdrawalsForApprover(user: any): Promise<any[]> {
+  if (!user?.id) return [];
+  await ensureWalletSchema();
+
+  const role = String(user.role || '').toLowerCase();
+  const seesAll = role === 'super_admin' || role === 'admin' || role === 'hr';
+
+  try {
+    if (seesAll) {
+      return await safe(sql`
+        SELECT w.*, e.full_name, e.employee_code
+          FROM hr_withdrawal w
+          LEFT JOIN hr_employees e ON e.id = w.employee_id
+         WHERE w.status = 'pending'
+         ORDER BY w.requested_at ASC
+         LIMIT 120`);
+    }
+    return await safe(sql`
+      SELECT w.*, e.full_name, e.employee_code
+        FROM hr_withdrawal w
+        JOIN hr_employees e ON e.id = w.employee_id
+       WHERE w.status = 'pending'
+         AND e.reporting_manager_id::text = ${String(user.id)}
+       ORDER BY w.requested_at ASC
+       LIMIT 120`);
+  } catch (e: any) {
+    console.error('[hr-wallet] pendingWithdrawalsForApprover', e?.cause?.message || e?.message);
+    return [];
+  }
+}
+
 export async function approverRole(user: any, employeeId: string): Promise<string | null> {
   if (!user) return null;
   const role = (user.role || '').toLowerCase();

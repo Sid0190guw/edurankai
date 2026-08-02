@@ -80,6 +80,60 @@ export async function listLeave(opts: { employeeId?: string; status?: string } =
     ORDER BY (l.status='pending') DESC, l.start_date DESC LIMIT 120`);
 }
 
+/**
+ * Leave requests THIS person can actually decide.
+ *
+ * listLeave() answers "one employee's requests" or "every request with this status" — neither of
+ * which tells an approver what is waiting on THEM. Without this, a reporting manager has to read a
+ * list of everyone's pending leave and work out by hand which rows they are allowed to act on, so
+ * cover never gets arranged because nobody knows they are the blocker.
+ *
+ * The authority test is the same one decideLeave() enforces, expressed in SQL rather than repeated
+ * in prose: super_admin and admin see every pending request; the exact role 'hr' sees every pending
+ * request; everyone else sees only the requests of employees whose reporting_manager_id is their own
+ * USERS id. Anyone else sees nothing.
+ *
+ * Deciding is still re-checked by decideLeave() through approverRole(). This function decides what
+ * to SHOW; it is never the permission itself. A list is not an authorisation.
+ */
+export async function pendingLeaveForApprover(user: any): Promise<any[]> {
+  if (!user?.id) return [];
+  await ensureLeaveSchema();
+
+  const role = String(user.role || '').toLowerCase();
+  // Exact match, never a substring. `role.indexOf('hr') >= 0` used to let any role merely containing
+  // those two letters approve leave, which at 1100+ admin-created roles is a matter of spelling.
+  const seesAll = role === 'super_admin' || role === 'admin' || role === 'hr';
+
+  try {
+    if (seesAll) {
+      return rows(await db.execute(sql`
+        SELECT l.*, e.full_name, e.employee_code, e.designation
+          FROM hr_leave_request l
+          LEFT JOIN hr_employees e ON e.id = l.employee_id
+         WHERE l.status = 'pending'
+         ORDER BY l.start_date ASC
+         LIMIT 120`));
+    }
+    // reporting_manager_id holds a USERS id, not an hr_employees id — the same column and the same
+    // comparison approverRole() makes. Compared as text because the column is UUID here and a slug
+    // elsewhere in this schema; ::uuid would throw on the latter.
+    return rows(await db.execute(sql`
+      SELECT l.*, e.full_name, e.employee_code, e.designation
+        FROM hr_leave_request l
+        JOIN hr_employees e ON e.id = l.employee_id
+       WHERE l.status = 'pending'
+         AND e.reporting_manager_id::text = ${String(user.id)}
+       ORDER BY l.start_date ASC
+       LIMIT 120`));
+  } catch (e: any) {
+    // Fail closed: an approver seeing nothing is a missed notification; an approver seeing everyone
+    // else's leave is a data leak.
+    console.error('[hr-leave] pendingLeaveForApprover', e?.cause?.message || e?.message);
+    return [];
+  }
+}
+
 export async function cancelLeave(id: string, employeeId: string): Promise<void> {
   await ensureLeaveSchema();
   await db.execute(sql`UPDATE hr_leave_request SET status='cancelled' WHERE id = ${id} AND employee_id = ${employeeId} AND status='pending'`).catch(() => {});
