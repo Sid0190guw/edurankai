@@ -29,6 +29,38 @@
 // caller passes — the set of people who can put work on someone else's list is exactly the set the
 // HR record already says has authority over them. If HR or the founder ever need to assign, that
 // belongs behind an explicit capability check in src/lib/auth/registry.ts, not a parameter.
+//
+// =================================================================================================
+// SECOND PASS — the workflow, the collaborators and the board.
+// =================================================================================================
+//
+// A STATUS FIELD THAT ACCEPTS ANYTHING IS A SHARED TEXT BOX, NOT A WORKFLOW. The first version of
+// this module stored one of four free strings and let either of two people write any of them at any
+// time. That is enough for a personal to-do list and not enough for work that is handed over,
+// reviewed and signed off: there is no way to say "this was approved", no way to tell "not started"
+// from "cancelled", and nothing refuses a move that makes no sense. TASK_STATUSES + TRANSITIONS
+// below replace it with an explicit graph — every edge names the statuses it joins AND the roles
+// allowed to walk it, and canTransition() refuses everything else IN WORDS.
+//
+// TWO VOCABULARIES, ONE COLUMN, AND WHY NOTHING IS REWRITTEN. Rows already in production carry the
+// old values 'open' and 'done'. This module does NOT run a bulk UPDATE over a live table on a render
+// path to tidy that up: reads normalise instead (see CANON), so a legacy row is understood exactly
+// like a canonical one, and it is rewritten in the canonical vocabulary the first time somebody
+// moves it. A migration that is not needed is a migration that cannot fail at 9am.
+//
+// THE OLD SHAPE IS STILL THE OLD SHAPE. src/pages/portal/employee.astro renders a four-value select
+// ('open' / 'in_progress' / 'blocked' / 'done') and filters its list on `status !== 'done'`. That
+// page is live and is not edited by this change, so `EmployeeTask.status` — the type it reads —
+// still speaks the four legacy values, projected from the canonical one (legacyStatusOf). The
+// canonical status is carried alongside it as `EmployeeTask.state`. New surfaces use BoardTask,
+// whose `status` is canonical and needs no translation. One entity, two views, neither lying.
+//
+// NEW SCHEMA CANNOT TAKE DOWN OLD SURFACES. employee_task_collaborators and the columns added with
+// it are asserted in their OWN try/catch inside ensureTaskTables(), and no query that the existing
+// portal calls names any of them. If that DDL fails, the board and the detail view fail closed and
+// say so; "my tasks" on somebody's phone keeps working. A column that is declared is not a column
+// that exists — that mistake (hr_employees.work_email) cost three outages in one day, and the answer
+// is to keep the blast radius of new schema inside the new surfaces.
 import { db } from '@/lib/db';
 import { sql, type SQL } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
@@ -43,12 +75,6 @@ const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 // catch {} — that is what hid both of today's outages for hours.
 const logFail = (tag: string, e: any) => console.error('[employee-tasks] ' + tag, e?.cause?.message || e?.message);
 
-export type TaskStatus = 'open' | 'in_progress' | 'blocked' | 'done';
-export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
-
-const STATUSES: TaskStatus[] = ['open', 'in_progress', 'blocked', 'done'];
-const PRIORITIES: TaskPriority[] = ['low', 'normal', 'high', 'urgent'];
-
 /** One message for every refusal, so probing ids cannot distinguish "no such task" from "not yours". */
 const NOT_AVAILABLE = 'That task is not available.';
 
@@ -62,9 +88,342 @@ const NOT_AVAILABLE = 'That task is not available.';
  */
 const WRITE_FAILED = 'Something went wrong saving that. Nothing was changed. Try again in a moment.';
 
-/** Declared before the readers that return it. `const` is not hoisted. */
-const EMPTY_COUNTS: TaskCounts = { open: 0, inProgress: 0, blocked: 0, done: 0, overdue: 0, total: 0 };
+/** A value going into a ::uuid cast must look like one, or the cast throws on the render path. */
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
+// ---------------------------------------------------------------------------------------------
+// THE STATUS MODEL. Declared at the very top of the file, above every function and every SQL
+// fragment that reads it — `const` is not hoisted, and a fragment built from a constant declared
+// further down throws at module load with a message that names neither.
+// ---------------------------------------------------------------------------------------------
+
+export type TaskStatus =
+  | 'draft'
+  | 'assigned'
+  | 'accepted'
+  | 'in_progress'
+  | 'blocked'
+  | 'under_review'
+  | 'approved'
+  | 'completed'
+  | 'cancelled'
+  | 'archived';
+
+/** The four values written before this file grew a workflow. Still accepted, still projected. */
+export type LegacyTaskStatus = 'open' | 'in_progress' | 'blocked' | 'done';
+
+/** Anything a caller may hand to a write: canonical, or one of the two legacy names. */
+export type AnyTaskStatus = TaskStatus | LegacyTaskStatus;
+
+/** Board column order, and the order every list of statuses is rendered in. */
+export const TASK_STATUSES: TaskStatus[] = [
+  'draft', 'assigned', 'accepted', 'in_progress', 'blocked',
+  'under_review', 'approved', 'completed', 'cancelled', 'archived',
+];
+
+/** Plain words for a screen. No emoji anywhere in this codebase — SVG only, and never from a lib. */
+export const STATUS_LABELS: Record<TaskStatus, string> = {
+  draft: 'Draft',
+  assigned: 'Assigned',
+  accepted: 'Accepted',
+  in_progress: 'In progress',
+  blocked: 'Blocked',
+  under_review: 'Under review',
+  approved: 'Approved',
+  completed: 'Completed',
+  cancelled: 'Cancelled',
+  archived: 'Archived',
+};
+
+/** Nothing is owed on these, so they are never overdue and never counted as outstanding work. */
+export const CLOSED_STATUSES: TaskStatus[] = ['completed', 'cancelled', 'archived'];
+
+/**
+ * The old names, mapped once. 'open' meant "given out, not started" — that is `assigned`. 'done'
+ * meant "finished" — that is `completed`. Any other string in the column (there should be none) is
+ * read as `assigned`, which is the safe direction: it keeps the task visible and outstanding rather
+ * than quietly filing it as finished.
+ */
+const STATUS_ALIASES: Record<string, TaskStatus> = {
+  open: 'assigned',
+  done: 'completed',
+};
+
+const STATUS_SET = new Set<string>(TASK_STATUSES);
+
+export function isTaskStatus(v: unknown): v is TaskStatus {
+  return typeof v === 'string' && STATUS_SET.has(v);
+}
+
+/** Canonical form of any status string, or null if it is not one we know at all. */
+export function canonicalStatus(v: unknown): TaskStatus | null {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (!s) return null;
+  if (STATUS_SET.has(s)) return s as TaskStatus;
+  return STATUS_ALIASES[s] ?? null;
+}
+
+/**
+ * The canonical status seen through the four-value window the live portal renders.
+ *
+ * `under_review` and `approved` project to 'in_progress' because from the assignee's phone they are
+ * both "still open, not finished". `cancelled` and `archived` project to 'done' so they drop off a
+ * list of outstanding work — they are not achievements, and nothing on that page calls them one.
+ */
+export function legacyStatusOf(status: TaskStatus): LegacyTaskStatus {
+  if (status === 'draft' || status === 'assigned' || status === 'accepted') return 'open';
+  if (status === 'blocked') return 'blocked';
+  if (status === 'completed' || status === 'cancelled' || status === 'archived') return 'done';
+  return 'in_progress';
+}
+
+// ---------------------------------------------------------------------------------------------
+// WHO MAY WALK WHICH EDGE.
+// ---------------------------------------------------------------------------------------------
+
+/** A row in employee_task_collaborators. Each of these means something different below. */
+export type TaskCollaboratorRole = 'assignee' | 'co_assignee' | 'reviewer' | 'approver' | 'watcher';
+
+export const TASK_COLLABORATOR_ROLES: TaskCollaboratorRole[] =
+  ['assignee', 'co_assignee', 'reviewer', 'approver', 'watcher'];
+
+export const COLLABORATOR_ROLE_LABELS: Record<TaskCollaboratorRole, string> = {
+  assignee: 'Assignee',
+  co_assignee: 'Working on it',
+  reviewer: 'Reviewer',
+  approver: 'Approver',
+  watcher: 'Watching',
+};
+
+/**
+ * The roles an ACTOR can hold on a task. Two of them are not collaborator rows at all:
+ *   'assigner' — they created the task (employee_tasks.assigned_by_user_id).
+ *   'lead'     — they are the department head over the assignee's department. This is the only
+ *                team-lead signal that exists in this database (users.role = 'department_head' plus
+ *                users.assigned_department_id); see the long note in workspace-access.ts.
+ * A person can hold several at once, and every check below tests the whole set, not a "primary" one.
+ */
+export type TaskActorRole = TaskCollaboratorRole | 'assigner' | 'lead';
+
+export const ACTOR_ROLE_LABELS: Record<TaskActorRole, string> = {
+  assignee: 'the assignee',
+  co_assignee: 'someone working on it',
+  reviewer: 'a reviewer',
+  approver: 'an approver',
+  watcher: 'a watcher',
+  assigner: 'the person who assigned it',
+  lead: 'the department lead',
+};
+
+// The four rights, named once. WORK moves the task along, MANAGE governs its existence, APPROVE
+// signs it off, REVISE sends it back. `watcher` appears in NONE of them, which is the entire
+// definition of a watcher: they can read the task and comment on it, and that is all.
+const WORK: TaskActorRole[] = ['assignee', 'co_assignee', 'assigner', 'lead'];
+const MANAGE: TaskActorRole[] = ['assigner', 'lead'];
+const APPROVE: TaskActorRole[] = ['approver', 'lead'];
+const REVISE: TaskActorRole[] = ['reviewer', 'approver', 'lead'];
+const REOPEN: TaskActorRole[] = ['assignee', 'co_assignee', 'assigner', 'lead', 'approver'];
+const BACK_TO_WORK: TaskActorRole[] = ['assignee', 'co_assignee', 'assigner', 'lead', 'reviewer', 'approver'];
+
+/**
+ * THE GRAPH. from -> to -> the roles allowed to make that move.
+ *
+ * The spine is draft -> assigned -> accepted -> in_progress -> (blocked | under_review) ->
+ * approved -> completed, with cancelled and archived reachable from almost anywhere. The extra
+ * edges are deliberate and each is a real thing a person does:
+ *
+ *   - assigned/accepted/blocked -> completed. The chain is the expected path, not a maze. Somebody
+ *     who did a ten-minute job without first clicking "In progress" may still say it is done, and a
+ *     workflow that refuses that trains people to lie to it.
+ *   - under_review -> completed is APPROVE only. Once work is under review, closing it is the
+ *     reviewer's call, not the author's — that is the whole point of putting it under review.
+ *   - under_review -> in_progress is the revision path. A reviewer holds it (that is what "may
+ *     request revision" means), and so does the assignee, who is allowed to pull their own work back
+ *     before somebody reads it.
+ *   - approved -> completed is WORK: the sign-off has happened, closing it is bookkeeping.
+ *   - completed -> in_progress reopens. Audited, like every other move.
+ *
+ * An edge that is absent is absent on purpose. `draft -> completed` is not here because a task
+ * nobody was ever given cannot have been finished.
+ */
+const TRANSITIONS: Record<TaskStatus, Partial<Record<TaskStatus, TaskActorRole[]>>> = {
+  draft: {
+    assigned: MANAGE,
+    cancelled: MANAGE,
+    archived: MANAGE,
+  },
+  assigned: {
+    accepted: WORK,
+    in_progress: WORK,
+    blocked: WORK,
+    completed: WORK,
+    draft: MANAGE,
+    cancelled: MANAGE,
+    archived: MANAGE,
+  },
+  accepted: {
+    in_progress: WORK,
+    blocked: WORK,
+    under_review: WORK,
+    completed: WORK,
+    assigned: WORK,
+    cancelled: MANAGE,
+    archived: MANAGE,
+  },
+  in_progress: {
+    blocked: WORK,
+    under_review: WORK,
+    completed: WORK,
+    accepted: WORK,
+    assigned: WORK,
+    cancelled: MANAGE,
+    archived: MANAGE,
+  },
+  blocked: {
+    in_progress: WORK,
+    accepted: WORK,
+    assigned: WORK,
+    under_review: WORK,
+    completed: WORK,
+    cancelled: MANAGE,
+    archived: MANAGE,
+  },
+  under_review: {
+    approved: APPROVE,
+    completed: APPROVE,
+    in_progress: BACK_TO_WORK,
+    blocked: WORK,
+    cancelled: MANAGE,
+    archived: MANAGE,
+  },
+  approved: {
+    completed: WORK,
+    in_progress: REVISE,
+    cancelled: MANAGE,
+    archived: MANAGE,
+  },
+  completed: {
+    in_progress: REOPEN,
+    under_review: REOPEN,
+    cancelled: MANAGE,
+    archived: MANAGE,
+  },
+  cancelled: {
+    assigned: MANAGE,
+    archived: MANAGE,
+  },
+  archived: {
+    assigned: MANAGE,
+  },
+};
+
+/** Statuses that mean nothing unless somebody says why. Enforced in moveTask, before the write. */
+const REASON_REQUIRED: TaskStatus[] = ['blocked', 'cancelled'];
+const REASON_MIN = 5;
+
+export function statusNeedsReason(status: TaskStatus): boolean {
+  return REASON_REQUIRED.indexOf(status) >= 0;
+}
+
+/**
+ * The answer to "may this person make this move", and WHY NOT when the answer is no.
+ *
+ * READ THIS BEFORE CALLING IT: this returns an OBJECT, not a boolean. `if (canTransition(a, b, r))`
+ * is always true and would wave every move through. Test `.ok`, or use isAllowedTransition() when a
+ * plain predicate is what you want.
+ *
+ * @param role one role or several — a person is often the assignee AND the assigner, and holding any
+ *             one qualifying role is enough.
+ */
+export interface TransitionCheck {
+  ok: boolean;
+  /** Null when ok. A sentence for a person, never a database message. */
+  reason: string | null;
+  /** The roles that WOULD have been allowed, so a screen can say who to ask. */
+  allowedRoles: TaskActorRole[];
+}
+
+export function canTransition(
+  from: AnyTaskStatus | string,
+  to: AnyTaskStatus | string,
+  role: TaskActorRole | TaskActorRole[] | null | undefined,
+): TransitionCheck {
+  const a = canonicalStatus(from);
+  const b = canonicalStatus(to);
+
+  if (!a) return { ok: false, reason: 'That task is in a state this workflow does not recognise.', allowedRoles: [] };
+  if (!b) return { ok: false, reason: 'That is not a status we track.', allowedRoles: [] };
+  if (a === b) {
+    return { ok: false, reason: 'It is already ' + STATUS_LABELS[b].toLowerCase() + '.', allowedRoles: [] };
+  }
+
+  const held: TaskActorRole[] = Array.isArray(role) ? role.filter(Boolean) : (role ? [role] : []);
+  const allowed = TRANSITIONS[a]?.[b];
+
+  if (!allowed || allowed.length === 0) {
+    const onward = Object.keys(TRANSITIONS[a] || {}) as TaskStatus[];
+    const names = onward.map((s) => STATUS_LABELS[s]).join(', ');
+    return {
+      ok: false,
+      allowedRoles: [],
+      reason: names
+        ? STATUS_LABELS[a] + ' does not move to ' + STATUS_LABELS[b] + '. From here it can go to: ' + names + '.'
+        : STATUS_LABELS[a] + ' is where this task ends; it does not move to ' + STATUS_LABELS[b] + '.',
+    };
+  }
+
+  if (held.length === 0) {
+    return { ok: false, allowedRoles: allowed, reason: 'You are not on this task, so you cannot move it.' };
+  }
+  if (!held.some((r) => allowed.indexOf(r) >= 0)) {
+    const who = allowed.map((r) => ACTOR_ROLE_LABELS[r]).join(' or ');
+    return {
+      ok: false,
+      allowedRoles: allowed,
+      reason: 'Moving this to ' + STATUS_LABELS[b] + ' is for ' + who + '. Ask them, or add a comment saying it is ready.',
+    };
+  }
+
+  return { ok: true, reason: null, allowedRoles: allowed };
+}
+
+/** The same question as a plain predicate, for the places that only need a yes or no. */
+export function isAllowedTransition(
+  from: AnyTaskStatus | string,
+  to: AnyTaskStatus | string,
+  role: TaskActorRole | TaskActorRole[] | null | undefined,
+): boolean {
+  return canTransition(from, to, role).ok;
+}
+
+/**
+ * Every move this person may make from here, in board order.
+ *
+ * Render the buttons from THIS, not from TASK_STATUSES: a control that exists only to be refused is
+ * a control that teaches people the system is broken.
+ */
+export function allowedTransitionsFor(
+  from: AnyTaskStatus | string,
+  role: TaskActorRole | TaskActorRole[] | null | undefined,
+): TaskStatus[] {
+  const a = canonicalStatus(from);
+  if (!a) return [];
+  return TASK_STATUSES.filter((s) => s !== a && canTransition(a, s, role).ok);
+}
+
+export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
+export const TASK_PRIORITIES: TaskPriority[] = ['low', 'normal', 'high', 'urgent'];
+const PRIORITIES = TASK_PRIORITIES;
+
+// ---------------------------------------------------------------------------------------------
+// Types.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * THE COMPATIBILITY SHAPE. `status` here is one of the four legacy values because
+ * src/pages/portal/employee.astro reads exactly that and is not edited by this change. The canonical
+ * status is `state`. New code should read BoardTask instead, whose `status` is canonical.
+ */
 export interface EmployeeTask {
   id: string;
   employeeId: string;
@@ -75,13 +434,48 @@ export interface EmployeeTask {
   title: string;
   description: string | null;
   priority: TaskPriority;
-  status: TaskStatus;
+  /** Legacy four-value projection of `state`. See legacyStatusOf. */
+  status: LegacyTaskStatus;
+  /** The real status. */
+  state: TaskStatus;
+  stateLabel: string;
   dueOn: string | null;
   isOverdue: boolean;
   blockedReason: string | null;
   commentCount: number;
   createdAt: string;
   completedAt: string | null;
+}
+
+/** What the board and the detail view render. `status` is canonical here — no translation. */
+export interface BoardTask {
+  id: string;
+  employeeId: string;
+  employeeName: string | null;
+  assignedByUserId: string | null;
+  assignedByName: string | null;
+  selfAssigned: boolean;
+  title: string;
+  description: string | null;
+  priority: TaskPriority;
+  status: TaskStatus;
+  statusLabel: string;
+  /** For a surface that still speaks the old four values. */
+  legacyStatus: LegacyTaskStatus;
+  dueOn: string | null;
+  isOverdue: boolean;
+  blockedReason: string | null;
+  cancelReason: string | null;
+  commentCount: number;
+  collaboratorCount: number;
+  createdAt: string;
+  updatedAt: string | null;
+  completedAt: string | null;
+  statusChangedAt: string | null;
+  /** Every role the VIEWER holds on this task. Resolved in SQL, never claimed by the caller. */
+  viewerRoles: TaskActorRole[];
+  /** Exactly the moves this viewer may make. Render controls from this and nothing else. */
+  allowedTransitions: TaskStatus[];
 }
 
 export interface TaskComment {
@@ -93,6 +487,17 @@ export interface TaskComment {
   createdAt: string;
 }
 
+export interface TaskCollaborator {
+  id: string;
+  taskId: string;
+  userId: string;
+  name: string | null;
+  role: TaskCollaboratorRole;
+  roleLabel: string;
+  addedByUserId: string | null;
+  addedAt: string | null;
+}
+
 export interface TaskCounts {
   open: number;
   inProgress: number;
@@ -100,6 +505,80 @@ export interface TaskCounts {
   done: number;
   overdue: number;
   total: number;
+}
+
+/** Declared before the readers that return it. `const` is not hoisted. */
+const EMPTY_COUNTS: TaskCounts = { open: 0, inProgress: 0, blocked: 0, done: 0, overdue: 0, total: 0 };
+
+export interface MyTasksView {
+  ok: boolean;
+  tasks: EmployeeTask[];
+  counts: TaskCounts;
+}
+
+export interface BoardColumn {
+  status: TaskStatus;
+  label: string;
+  count: number;
+  tasks: BoardTask[];
+}
+
+export interface BoardFilters {
+  assigneeEmployeeId: string | null;
+  priority: TaskPriority | null;
+  overdueOnly: boolean;
+  includeArchived: boolean;
+}
+
+export interface BoardView {
+  /** False means the read did not happen. An empty board with ok:true means there is genuinely
+   *  nothing — the same distinction MyTasksView makes, for the same reason. */
+  ok: boolean;
+  reason: 'ok' | 'no-viewer' | 'lookup-failed';
+  columns: BoardColumn[];
+  /** The same task objects, flat, for a list rendering or a count. */
+  tasks: BoardTask[];
+  total: number;
+  overdue: number;
+  /** The filters ACTUALLY applied. An unusable value is dropped and reported, never applied silently. */
+  filters: BoardFilters;
+  notice: string | null;
+}
+
+/**
+ * The assignee's department, for the detail page's properties column.
+ *
+ * `name` is null when the id points at no departments row, and — separately — when the name could
+ * not be read at all. A missing label is not a missing department, so the id is kept either way and
+ * the screen can still say "recorded, but we could not name it" rather than "none".
+ */
+export interface TaskDepartment {
+  id: string;
+  name: string | null;
+}
+
+export interface TaskDetail {
+  task: BoardTask;
+  comments: TaskComment[];
+  collaborators: TaskCollaborator[];
+  viewerRoles: TaskActorRole[];
+  /** Whether the viewer may write a comment. True for everyone who can see the task, watchers too. */
+  viewerMayComment: boolean;
+  /**
+   * The department the work sits in, off the ASSIGNEE's hr_employees row.
+   *
+   * Null is the ordinary case, not an error: hr_employees.department_id is written by exactly one
+   * code path (src/lib/hr/sync.ts, when an application turns 'hired'), so anyone HR added by hand
+   * has none. See DEPARTMENT_COVERAGE_NOTICE in workspace-access.ts. A screen must say "not
+   * recorded", never imply the person has no team.
+   */
+  department: TaskDepartment | null;
+}
+
+export interface TaskDetailView {
+  ok: boolean;
+  reason: 'ok' | 'no-viewer' | 'not-visible' | 'lookup-failed';
+  detail: TaskDetail | null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -130,7 +609,11 @@ export function ensureTaskSchema(): Promise<void> {
   // anywhere, and the only symptom is an empty task list. Log the real reason, then RE-THROW — the
   // rethrow is what makes ensureOnce drop the cache entry and retry on the next request instead of
   // remembering a failure for the life of the process.
-  return ensureOnce('employee_tasks_v1', async () => {
+  //
+  // The key is v2 because the second pass adds tables and columns. A running process that already
+  // ensured v1 is a process running the old code, so there is no version of this that skips the new
+  // DDL and then queries it.
+  return ensureOnce('employee_tasks_v2', async () => {
     try {
       await ensureTaskTables();
     } catch (e: any) {
@@ -184,10 +667,64 @@ async function ensureTaskTables(): Promise<void> {
     } catch (e: any) {
       logFail('ensureTaskSchema reporting_manager_id', e);
     }
+
+    // -------------------------------------------------------------------------------------------
+    // SECOND PASS SCHEMA — deliberately non-fatal, and here is exactly what that buys.
+    //
+    // Everything above this line is what "my tasks" on somebody's phone depends on. Everything below
+    // is what the board, the detail view and every WRITE need. It is wrapped so a failure here cannot
+    // blank a page that has worked for months.
+    //
+    // WHAT STILL WORKS IF THIS BLOCK LOGS: reading. listMyTasks / myTasksView / listTasksForTeam /
+    // taskCounts name no column and no table created below (see the note on TASK_COLUMNS), so the
+    // portal card keeps rendering somebody's real work.
+    // WHAT STOPS: the board, the task detail, and moveTask / updateTaskStatus, which read the
+    // collaborator roles and write status_changed_at. They refuse in words and the log line names the
+    // real Postgres reason. A person who can see their tasks but cannot tick one off is a bad day;
+    // a person whose task list renders empty is told a lie about their own work. This block chooses
+    // the first.
+    // -------------------------------------------------------------------------------------------
+    try {
+      await db.execute(sql`ALTER TABLE employee_tasks ADD COLUMN IF NOT EXISTS status_changed_at TIMESTAMPTZ`);
+      // "Cancelled" with no stated cause is as useless as "blocked" with none: nobody reading the
+      // board later can tell whether the work stopped mattering or somebody clicked the wrong thing.
+      await db.execute(sql`ALTER TABLE employee_tasks ADD COLUMN IF NOT EXISTS cancel_reason TEXT`);
+      // Catalogue-only change, no table rewrite. New rows land in the canonical vocabulary even if
+      // something inserts without naming a status; createTask names one regardless.
+      await db.execute(sql`ALTER TABLE employee_tasks ALTER COLUMN status SET DEFAULT 'assigned'`);
+
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS employee_task_collaborators (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        task_id UUID NOT NULL REFERENCES employee_tasks(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL,
+        role TEXT NOT NULL DEFAULT 'watcher',
+        added_by_user_id UUID,
+        added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+      await db.execute(sql`ALTER TABLE employee_task_collaborators ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'watcher'`);
+      await db.execute(sql`ALTER TABLE employee_task_collaborators ADD COLUMN IF NOT EXISTS added_by_user_id UUID`);
+      await db.execute(sql`ALTER TABLE employee_task_collaborators ADD COLUMN IF NOT EXISTS added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS employee_task_collab_task_idx ON employee_task_collaborators (task_id)`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS employee_task_collab_user_idx ON employee_task_collaborators (user_id, role)`);
+    } catch (e: any) {
+      logFail('ensureTaskSchema collaborators', e);
+    }
+
+    // Its own try/catch, one level deeper. A UNIQUE index is the one piece of DDL here that can fail
+    // on data rather than on syntax, and addCollaborator does NOT depend on it: the insert is an
+    // INSERT ... SELECT ... WHERE NOT EXISTS, which is correct with or without the constraint. This
+    // is insurance against a concurrent double-click, not the mechanism.
+    try {
+      await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS employee_task_collab_uidx
+        ON employee_task_collaborators (task_id, user_id, role)`);
+    } catch (e: any) {
+      logFail('ensureTaskSchema collaborators unique index', e);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
-// Shared fragments.
+// Shared fragments. Every one of them is built from constants declared above, and every one takes
+// its ids as bound parameters — nothing in this file interpolates request input into SQL text.
 // ---------------------------------------------------------------------------------------------
 
 /**
@@ -203,20 +740,100 @@ const eq = (column: SQL, value: string | null | undefined): SQL => {
   return sql`${column}::text = ${v}`;
 };
 
+const statusList = (list: TaskStatus[]): SQL => sql.join(list.map((s) => sql`${s}`), sql`, `);
+
 /**
- * The actor is the assignee or the assigner, re-derived from the row rather than taken on trust.
+ * THE NORMALISER. Reads the stored status in the canonical vocabulary whatever was written.
  *
- * The assignee side is an IN over hr_employees rather than a single id because one person can hold
- * more than one hr_employees row — a closed internship plus a current contract. A task sitting on
- * the older row is still theirs to update.
+ * Built from TASK_STATUSES rather than restated, so adding a status cannot leave this fragment
+ * behind — a hand-written list here that drifted from the union would silently file real tasks as
+ * 'assigned' and nobody would see it happen.
  */
-const actorOwnsTask = (actorUserId: string | null | undefined): SQL => {
-  const actor = String(actorUserId || '').trim();
-  if (!actor) return sql`false`;
-  return sql`(
-    t.assigned_by_user_id::text = ${actor}
-    OR t.employee_id IN (SELECT e.id FROM hr_employees e WHERE e.user_id::text = ${actor})
-  )`;
+const CANON: SQL = sql`(CASE
+    WHEN t.status IN (${statusList(TASK_STATUSES)}) THEN t.status
+    WHEN t.status = 'open' THEN 'assigned'
+    WHEN t.status = 'done' THEN 'completed'
+    ELSE 'assigned' END)`;
+
+/** Late, and still owed. Closed statuses are never late — there is nothing left to be late for. */
+const IS_OVERDUE: SQL = sql`(t.due_on IS NOT NULL AND t.due_on < CURRENT_DATE
+    AND ${CANON} NOT IN (${statusList(CLOSED_STATUSES)}))`;
+
+/**
+ * The assignee, re-derived from the row rather than taken on trust.
+ *
+ * An IN over hr_employees rather than a single id because one person can hold more than one
+ * hr_employees row — a closed internship plus a current contract. A task sitting on the older row is
+ * still theirs to update.
+ *
+ * (This replaces the first pass's actorOwnsTask(), which was "assignee OR assigner" and was the
+ * whole access model when neither collaborators nor leads existed. It is not kept alongside
+ * visibleToSql(): two fragments that both mean "may touch this task" is how one of them ends up
+ * being the one nobody remembered to update.)
+ */
+const isAssigneeSql = (viewer: string): SQL =>
+  sql`(t.employee_id IN (SELECT ae.id FROM hr_employees ae WHERE ae.user_id::text = ${viewer}))`;
+
+const isAssignerSql = (viewer: string): SQL =>
+  sql`(t.assigned_by_user_id IS NOT NULL AND t.assigned_by_user_id::text = ${viewer})`;
+
+/**
+ * A department head over the assignee's department.
+ *
+ * users.role is a Postgres enum, so it is cast to text before lower() — `lower(anyenum)` has no
+ * function match and the statement would fail outright. Both department keys are compared as text:
+ * departments.id is a varchar(50) slug in src/lib/db/schema.ts and a UUID in db/hr-schema.sql, and a
+ * ::uuid cast would throw on half the estate. NULL on either side matches nothing, which is the
+ * correct answer for a lead whose department was never set.
+ */
+const isLeadSql = (viewer: string): SQL => sql`EXISTS (
+    SELECT 1 FROM users lu, hr_employees le
+     WHERE le.id = t.employee_id
+       AND lu.id::text = ${viewer}
+       AND lower(lu.role::text) = 'department_head'
+       AND lu.assigned_department_id IS NOT NULL
+       AND le.department_id IS NOT NULL
+       AND lu.assigned_department_id::text = le.department_id::text)`;
+
+const hasCollabRoleSql = (viewer: string, role: TaskCollaboratorRole): SQL => sql`EXISTS (
+    SELECT 1 FROM employee_task_collaborators c
+     WHERE c.task_id = t.id AND c.user_id::text = ${viewer} AND c.role = ${role})`;
+
+const isCollaboratorSql = (viewer: string): SQL => sql`EXISTS (
+    SELECT 1 FROM employee_task_collaborators c
+     WHERE c.task_id = t.id AND c.user_id::text = ${viewer})`;
+
+/**
+ * MAY THIS PERSON SEE THIS TASK AT ALL. The assignee, the assigner, anyone listed as a collaborator,
+ * or the lead of the assignee's department — decided here, in the WHERE clause, so a row the viewer
+ * may not see is never read in the first place. Filtering afterwards is not access control; by then
+ * the row has already been fetched into a page's memory.
+ *
+ * An empty viewer compiles to `false`: an unresolvable viewer sees nothing, never everything.
+ */
+const visibleToSql = (viewerUserId: string | null | undefined): SQL => {
+  const v = String(viewerUserId || '').trim();
+  if (!v) return sql`false`;
+  return sql`(${isAssigneeSql(v)} OR ${isAssignerSql(v)} OR ${isCollaboratorSql(v)} OR ${isLeadSql(v)})`;
+};
+
+/**
+ * Does the actor hold ANY of these roles on this task? Used inside the UPDATE that moves a task, so
+ * the role that authorised the move is re-derived by the database in the same statement that writes.
+ * A role revoked a moment ago cannot be spent on a move a moment later.
+ */
+const actorHasAnyRoleSql = (viewerUserId: string | null | undefined, roles: TaskActorRole[]): SQL => {
+  const v = String(viewerUserId || '').trim();
+  if (!v || !roles || roles.length === 0) return sql`false`;
+  const parts: SQL[] = [];
+  for (const role of roles) {
+    if (role === 'assigner') parts.push(isAssignerSql(v));
+    else if (role === 'lead') parts.push(isLeadSql(v));
+    else if (role === 'assignee') parts.push(sql`(${isAssigneeSql(v)} OR ${hasCollabRoleSql(v, 'assignee')})`);
+    else parts.push(hasCollabRoleSql(v, role));
+  }
+  if (parts.length === 0) return sql`false`;
+  return sql`(${sql.join(parts, sql` OR `)})`;
 };
 
 /**
@@ -235,32 +852,94 @@ const nameOfUser = (column: SQL): SQL => sql`(
    LIMIT 1
 )`;
 
+/**
+ * The legacy read list. It names ONLY columns that existed before this pass — status_changed_at,
+ * cancel_reason and the collaborators table are absent on purpose. myTasksView() runs on somebody's
+ * phone through src/pages/portal/employee.astro, and if the second-pass DDL ever fails this query
+ * must still work. A query that names a column it is not certain of is how three outages started.
+ */
 const TASK_COLUMNS = sql`
-  t.id, t.employee_id, t.assigned_by_user_id, t.title, t.description, t.priority, t.status,
+  t.id, t.employee_id, t.assigned_by_user_id, t.title, t.description, t.priority,
   t.due_on, t.created_at, t.completed_at, t.blocked_reason,
-  (t.due_on IS NOT NULL AND t.due_on < CURRENT_DATE AND t.status <> 'done') AS is_overdue,
+  ${CANON} AS canonical_status,
+  ${IS_OVERDUE} AS is_overdue,
   ${nameOfUser(sql`t.assigned_by_user_id`)} AS assigned_by_name,
   (SELECT COUNT(*)::int FROM employee_task_comments c WHERE c.task_id = t.id) AS comment_count
 `;
 
-const mapTask = (r: any): EmployeeTask => ({
-  id: r.id,
-  employeeId: r.employee_id,
-  employeeName: r.employee_name ?? null,
-  assignedByUserId: r.assigned_by_user_id ?? null,
-  assignedByName: r.assigned_by_name ?? null,
-  selfAssigned: !!r.self_assigned,
-  title: r.title,
-  description: r.description ?? null,
-  priority: (PRIORITIES.includes(r.priority) ? r.priority : 'normal') as TaskPriority,
-  status: (STATUSES.includes(r.status) ? r.status : 'open') as TaskStatus,
-  dueOn: r.due_on ? String(r.due_on).slice(0, 10) : null,
-  isOverdue: !!r.is_overdue,
-  blockedReason: r.blocked_reason ?? null,
-  commentCount: Number(r.comment_count) || 0,
-  createdAt: String(r.created_at),
-  completedAt: r.completed_at ? String(r.completed_at) : null,
-});
+const asPriority = (v: any): TaskPriority =>
+  (PRIORITIES.indexOf(String(v) as TaskPriority) >= 0 ? String(v) : 'normal') as TaskPriority;
+
+const mapTask = (r: any): EmployeeTask => {
+  const state = canonicalStatus(r.canonical_status) || 'assigned';
+  return {
+    id: r.id,
+    employeeId: r.employee_id,
+    employeeName: r.employee_name ?? null,
+    assignedByUserId: r.assigned_by_user_id ?? null,
+    assignedByName: r.assigned_by_name ?? null,
+    selfAssigned: !!r.self_assigned,
+    title: r.title,
+    description: r.description ?? null,
+    priority: asPriority(r.priority),
+    status: legacyStatusOf(state),
+    state,
+    stateLabel: STATUS_LABELS[state],
+    dueOn: r.due_on ? String(r.due_on).slice(0, 10) : null,
+    isOverdue: !!r.is_overdue,
+    blockedReason: r.blocked_reason ?? null,
+    commentCount: Number(r.comment_count) || 0,
+    createdAt: String(r.created_at),
+    completedAt: r.completed_at ? String(r.completed_at) : null,
+  };
+};
+
+/** The roles a row's boolean flags and role list say the viewer holds. Order is stable for display. */
+const rolesFromRow = (r: any): TaskActorRole[] => {
+  const out: TaskActorRole[] = [];
+  if (r.is_assignee === true) out.push('assignee');
+  if (r.is_assigner === true) out.push('assigner');
+  if (r.is_lead === true) out.push('lead');
+  for (const raw of String(r.collab_roles || '').split(',')) {
+    const role = raw.trim();
+    if (!role) continue;
+    if (TASK_COLLABORATOR_ROLES.indexOf(role as TaskCollaboratorRole) < 0) continue;
+    if (out.indexOf(role as TaskActorRole) >= 0) continue;
+    out.push(role as TaskActorRole);
+  }
+  return out;
+};
+
+const mapBoardTask = (r: any): BoardTask => {
+  const status = canonicalStatus(r.canonical_status) || 'assigned';
+  const viewerRoles = rolesFromRow(r);
+  return {
+    id: String(r.id),
+    employeeId: String(r.employee_id),
+    employeeName: r.employee_name ?? null,
+    assignedByUserId: r.assigned_by_user_id ?? null,
+    assignedByName: r.assigned_by_name ?? null,
+    selfAssigned: !!r.self_assigned,
+    title: String(r.title || ''),
+    description: r.description ?? null,
+    priority: asPriority(r.priority),
+    status,
+    statusLabel: STATUS_LABELS[status],
+    legacyStatus: legacyStatusOf(status),
+    dueOn: r.due_on ? String(r.due_on).slice(0, 10) : null,
+    isOverdue: !!r.is_overdue,
+    blockedReason: r.blocked_reason ?? null,
+    cancelReason: r.cancel_reason ?? null,
+    commentCount: Number(r.comment_count) || 0,
+    collaboratorCount: Number(r.collaborator_count) || 0,
+    createdAt: String(r.created_at),
+    updatedAt: r.updated_at ? String(r.updated_at) : null,
+    completedAt: r.completed_at ? String(r.completed_at) : null,
+    statusChangedAt: r.status_changed_at ? String(r.status_changed_at) : null,
+    viewerRoles,
+    allowedTransitions: allowedTransitionsFor(status, viewerRoles),
+  };
+};
 
 // ---------------------------------------------------------------------------------------------
 // Reads.
@@ -281,7 +960,7 @@ async function readMyTasks(employeeId: string, limit: number): Promise<EmployeeT
              AS self_assigned
       FROM employee_tasks t
      WHERE ${employeeFilter({ employeeId }, sql`t.employee_id`)}
-     ORDER BY (t.status = 'done'),
+     ORDER BY (${CANON} IN (${statusList(CLOSED_STATUSES)})),
               (t.due_on IS NULL), t.due_on ASC,
               CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
               t.created_at DESC
@@ -310,12 +989,6 @@ export async function listMyTasks(employeeId: string, limit = 100): Promise<Empl
  * ensureTaskSchema() cannot throw — ensureOnce() swallows — so a database with no employee_tasks
  * table surfaces here as ok:false from the SELECT, which is exactly the intended signal.
  */
-export interface MyTasksView {
-  ok: boolean;
-  tasks: EmployeeTask[];
-  counts: TaskCounts;
-}
-
 export async function myTasksView(employeeId: string, limit = 100): Promise<MyTasksView> {
   try {
     await ensureTaskSchema();
@@ -351,7 +1024,7 @@ export async function listTasksForTeam(departmentId: string | null | undefined, 
         JOIN hr_employees e ON e.id = t.employee_id
        WHERE ${departmentFilter({ scopeDepartmentId: departmentId ?? null }, sql`e.department_id`)}
          AND e.is_active = true
-       ORDER BY (t.status = 'done'),
+       ORDER BY (${CANON} IN (${statusList(CLOSED_STATUSES)})),
                 (t.due_on IS NULL), t.due_on ASC,
                 e.full_name ASC,
                 t.created_at DESC
@@ -362,13 +1035,21 @@ export async function listTasksForTeam(departmentId: string | null | undefined, 
   }
 }
 
+/**
+ * The counts, in the four buckets the portal card renders.
+ *
+ * `open` is everything given out but not started (draft, assigned, accepted); `inProgress` covers
+ * work in flight including review and sign-off; `done` is `completed` ONLY. Cancelled and archived
+ * tasks are in `total` and in no bucket — calling a cancelled task "finished" would inflate somebody's
+ * completion count with work that never happened.
+ */
 async function readTaskCounts(employeeId: string): Promise<TaskCounts> {
   const r = rows(await db.execute(sql`
-    SELECT COUNT(*) FILTER (WHERE t.status = 'open')::int        AS open_count,
-           COUNT(*) FILTER (WHERE t.status = 'in_progress')::int AS in_progress_count,
-           COUNT(*) FILTER (WHERE t.status = 'blocked')::int     AS blocked_count,
-           COUNT(*) FILTER (WHERE t.status = 'done')::int        AS done_count,
-           COUNT(*) FILTER (WHERE t.due_on IS NOT NULL AND t.due_on < CURRENT_DATE AND t.status <> 'done')::int AS overdue_count,
+    SELECT COUNT(*) FILTER (WHERE ${CANON} IN ('draft', 'assigned', 'accepted'))::int        AS open_count,
+           COUNT(*) FILTER (WHERE ${CANON} IN ('in_progress', 'under_review', 'approved'))::int AS in_progress_count,
+           COUNT(*) FILTER (WHERE ${CANON} = 'blocked')::int                                 AS blocked_count,
+           COUNT(*) FILTER (WHERE ${CANON} = 'completed')::int                               AS done_count,
+           COUNT(*) FILTER (WHERE ${IS_OVERDUE})::int                                        AS overdue_count,
            COUNT(*)::int AS total_count
       FROM employee_tasks t
      WHERE ${employeeFilter({ employeeId }, sql`t.employee_id`)}`))[0];
@@ -394,7 +1075,15 @@ export async function taskCounts(employeeId: string): Promise<TaskCounts> {
   }
 }
 
-/** Comments on one task, for the assignee or the assigner only. Anyone else gets an empty list. */
+/**
+ * Comments on one task, for anyone who may see the task: the assignee, the assigner, a collaborator
+ * of any role, or the department lead. Anyone else gets an empty list.
+ *
+ * WIDENED IN THE SECOND PASS. It used to be the assignee and the assigner only, which predates
+ * collaborators existing at all — a reviewer who could not read the conversation could not review
+ * anything. The clause is the same visibleToSql() the detail view uses, so there is one definition of
+ * "may see this task" and not two that drift.
+ */
 export async function listComments(taskId: string, viewerUserId: string): Promise<TaskComment[]> {
   try {
     await ensureTaskSchema();
@@ -403,7 +1092,7 @@ export async function listComments(taskId: string, viewerUserId: string): Promis
              ${nameOfUser(sql`c.author_user_id`)} AS author_name
         FROM employee_task_comments c
         JOIN employee_tasks t ON t.id = c.task_id
-       WHERE ${eq(sql`c.task_id`, taskId)} AND ${actorOwnsTask(viewerUserId)}
+       WHERE ${eq(sql`c.task_id`, taskId)} AND ${visibleToSql(viewerUserId)}
        ORDER BY c.created_at ASC
        LIMIT 200`)).map((r: any) => ({
         id: r.id,
@@ -416,6 +1105,445 @@ export async function listComments(taskId: string, viewerUserId: string): Promis
   } catch (e: any) {
     logFail('listComments', e);
     return [];
+  }
+}
+
+/** Who is on a task, for anyone who may see the task. Same clause, same reason. */
+export async function listCollaborators(taskId: string, viewerUserId: string): Promise<TaskCollaborator[]> {
+  try {
+    await ensureTaskSchema();
+    return rows(await db.execute(sql`
+      SELECT col.id, col.task_id, col.user_id, col.role, col.added_by_user_id, col.added_at,
+             ${nameOfUser(sql`col.user_id`)} AS person_name
+        FROM employee_task_collaborators col
+        JOIN employee_tasks t ON t.id = col.task_id
+       WHERE ${eq(sql`col.task_id`, taskId)} AND ${visibleToSql(viewerUserId)}
+       ORDER BY col.added_at ASC
+       LIMIT 200`)).map((r: any) => {
+        const role = (TASK_COLLABORATOR_ROLES.indexOf(String(r.role) as TaskCollaboratorRole) >= 0
+          ? String(r.role) : 'watcher') as TaskCollaboratorRole;
+        return {
+          id: String(r.id),
+          taskId: String(r.task_id),
+          userId: String(r.user_id),
+          name: r.person_name ?? null,
+          role,
+          roleLabel: COLLABORATOR_ROLE_LABELS[role],
+          addedByUserId: r.added_by_user_id ?? null,
+          addedAt: r.added_at ? String(r.added_at) : null,
+        };
+      });
+  } catch (e: any) {
+    logFail('listCollaborators', e);
+    return [];
+  }
+}
+
+/**
+ * The full board row list for one viewer: the task, and the roles that viewer holds on it, resolved
+ * by the database in the same statement. Nothing downstream may claim a role this did not return.
+ */
+const VIEWER_ROLE_COLUMNS = (viewer: string): SQL => sql`
+  ${isAssigneeSql(viewer)} AS is_assignee,
+  ${isAssignerSql(viewer)} AS is_assigner,
+  ${isLeadSql(viewer)} AS is_lead,
+  COALESCE((SELECT string_agg(DISTINCT c.role, ',')
+              FROM employee_task_collaborators c
+             WHERE c.task_id = t.id AND c.user_id::text = ${viewer}), '') AS collab_roles`;
+
+/** The board/detail column list. Names the second-pass columns, so it is used only by new surfaces. */
+const BOARD_TASK_COLUMNS = sql`
+  t.id, t.employee_id, t.assigned_by_user_id, t.title, t.description, t.priority,
+  t.due_on, t.created_at, t.updated_at, t.completed_at, t.blocked_reason, t.cancel_reason,
+  t.status_changed_at,
+  ${CANON} AS canonical_status,
+  ${IS_OVERDUE} AS is_overdue,
+  ${nameOfUser(sql`t.assigned_by_user_id`)} AS assigned_by_name,
+  (SELECT COUNT(*)::int FROM employee_task_comments c WHERE c.task_id = t.id) AS comment_count,
+  (SELECT COUNT(*)::int FROM employee_task_collaborators c WHERE c.task_id = t.id) AS collaborator_count,
+  (SELECT e.full_name FROM hr_employees e WHERE e.id = t.employee_id
+    ORDER BY e.is_active DESC, e.created_at DESC LIMIT 1) AS employee_name,
+  (t.assigned_by_user_id IS NOT NULL
+   AND t.assigned_by_user_id = (SELECT e.user_id FROM hr_employees e WHERE e.id = t.employee_id))
+    AS self_assigned`;
+
+/**
+ * The detail view's columns: the board's, plus the assignee's department KEY.
+ *
+ * A separate fragment rather than an extra line in BOARD_TASK_COLUMNS, because that one runs once
+ * per row for a whole department on /portal/tasks and this is wanted once, on one task. The board
+ * does not render a department and must not pay a correlated subquery per card for it.
+ *
+ * Only the key is read here. The NAME is looked up afterwards, in its own try/catch — the same split
+ * workspace-access.ts makes, and for the same reason: a department name is a label, not a
+ * permission, and losing the whole task detail because `departments` could not be read would be the
+ * wrong failure. `department_id` is a UUID in db/hr-schema.sql and a varchar(50) slug in
+ * src/lib/db/schema.ts, so it is carried as text and never cast.
+ */
+const DETAIL_TASK_COLUMNS = sql`${BOARD_TASK_COLUMNS},
+  (SELECT e.department_id FROM hr_employees e WHERE e.id = t.employee_id
+    ORDER BY e.is_active DESC, e.created_at DESC LIMIT 1) AS employee_department_id`;
+
+/**
+ * ONE task, with its comments and the people on it — or nothing, if this viewer may not see it.
+ *
+ * The visibility decision is a WHERE clause (visibleToSql), not a filter applied to a row that has
+ * already been read. src/pages/admin/users/[id].astro is the shape being avoided: it SELECTs the
+ * target first and redirects afterwards, which means the data was in memory before the check ran.
+ *
+ * Returns `ok:false` with a reason rather than a bare null, because "you may not see this" and "the
+ * database did not answer" must not render the same sentence at somebody.
+ */
+export async function getTaskView(taskId: string, viewerUserId: string): Promise<TaskDetailView> {
+  const viewer = String(viewerUserId || '').trim();
+  // ok:false, not ok:true with nothing in it. No read happened, so "there is no such task" is not a
+  // fact this function is in a position to state.
+  if (!viewer || !String(taskId || '').trim()) {
+    return { ok: false, reason: 'no-viewer', detail: null };
+  }
+
+  try {
+    await ensureTaskSchema();
+
+    const row = rows(await db.execute(sql`
+      SELECT ${DETAIL_TASK_COLUMNS}, ${VIEWER_ROLE_COLUMNS(viewer)}
+        FROM employee_tasks t
+       WHERE ${eq(sql`t.id`, taskId)}
+         AND ${visibleToSql(viewer)}
+       LIMIT 1`))[0];
+
+    if (!row) return { ok: true, reason: 'not-visible', detail: null };
+
+    const task = mapBoardTask(row);
+    const [comments, collaborators] = await Promise.all([
+      listComments(taskId, viewer),
+      listCollaborators(taskId, viewer),
+    ]);
+
+    // The label, allowed to fail on its own. See the note on DETAIL_TASK_COLUMNS.
+    const deptId = row.employee_department_id === null || row.employee_department_id === undefined
+      ? null
+      : String(row.employee_department_id).trim() || null;
+    let department: TaskDepartment | null = deptId ? { id: deptId, name: null } : null;
+    if (department) {
+      try {
+        const d = rows(await db.execute(sql`
+          SELECT name FROM departments WHERE id::text = ${department.id} LIMIT 1`))[0];
+        if (d?.name) department.name = String(d.name);
+      } catch (e: any) {
+        logFail('getTaskView department', e);
+      }
+    }
+
+    return {
+      ok: true,
+      reason: 'ok',
+      detail: {
+        task,
+        comments,
+        collaborators,
+        viewerRoles: task.viewerRoles,
+        // Everyone who can see it can say something about it. That IS the watcher's whole right.
+        viewerMayComment: task.viewerRoles.length > 0,
+        department,
+      },
+    };
+  } catch (e: any) {
+    logFail('getTaskView', e);
+    return { ok: false, reason: 'lookup-failed', detail: null };
+  }
+}
+
+/**
+ * One task with its comments, or null if the viewer may not see it.
+ *
+ * Thin wrapper over getTaskView. Note that a database failure also lands as null here, which is why
+ * getTaskView exists: a page that must distinguish "no such task" from "we could not read" should
+ * call that one and render two different sentences.
+ */
+export async function getTask(taskId: string, viewerUserId: string): Promise<TaskDetail | null> {
+  return (await getTaskView(taskId, viewerUserId)).detail;
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE ACTIVITY TRAIL. What was done to this task, by whom, in what capacity, and when.
+//
+// WHY IT IS READ FROM audit_log AND NOT FROM THE TASK ROW. employee_tasks carries the CURRENT
+// status and status_changed_at, which answers "where is it now" and nothing else. Who moved it out
+// of `under_review` three weeks ago, whether the approver or the lead signed it off, and what reason
+// was given when it was blocked are only in the audit records the writes above already emit. That is
+// the difference between a status field and a defensible record.
+//
+// THE VISIBILITY CLAUSE IS THE SAME ONE. The read joins employee_tasks and carries visibleToSql(),
+// so history is readable exactly by the people who may read the task — decided in the WHERE clause,
+// not filtered afterwards. Calling this without being able to see the task returns nothing.
+//
+// WHAT IT IS NOT: A COMPLETE LOG, AND NOTHING HERE MAY CLAIM OTHERWISE.
+//   1. logAudit() swallows its own failures (src/lib/audit.ts:21) — by design, so a task write is
+//      never lost because the audit insert failed. The consequence is that a move CAN have happened
+//      with no record of it here.
+//   2. addComment() is not audited at all. Comments are their own list; the trail does not repeat
+//      them, and a screen must not describe this as "everything that happened".
+//   3. Nothing before the audit call existed is in here, and old rows are never backfilled.
+// Word the heading accordingly: it records status changes and changes to who is on the task.
+// ---------------------------------------------------------------------------------------------
+
+/** One row of the trail, already turned into the words a screen renders. */
+export interface TaskActivityEntry {
+  actorName: string;
+  /** The capacity they acted in AS RECORDED AT THE TIME, not as it stands today. */
+  actorRole: string | null;
+  /** A verb phrase: 'created this task', 'moved this task'. */
+  action: string;
+  /** Previous and new value. Raw status keys when kind is 'status' — a badge derives its own word. */
+  from: string | null;
+  to: string | null;
+  kind: 'status' | 'text';
+  note: string | null;
+  at: string;
+}
+
+export interface TaskActivityView {
+  /** False means the trail was not read. An empty trail with ok:true means there is genuinely
+   *  nothing recorded — never render "nothing has happened" on a failed read. */
+  ok: boolean;
+  reason: 'ok' | 'no-viewer' | 'lookup-failed';
+  entries: TaskActivityEntry[];
+}
+
+/**
+ * The actor's own roles, as a phrase. Reads ACTOR_ROLE_LABELS so the trail says "the department
+ * lead" in the same words canTransition() uses when it refuses somebody.
+ *
+ * WHICH KEY HOLDS THEM DEPENDS ON THE ACTION, and getting it wrong would put a false capacity next
+ * to a person's name. moveTask writes the actor's roles as `roles`; addCollaborator and
+ * removeCollaborator write them as `byRoles`, and removeCollaborator's `roles` is something else
+ * entirely — the roles that were REMOVED from the target. Each branch below names its own key.
+ */
+const roleLabelsOf = (v: any): string | null => {
+  const list = Array.isArray(v) ? v : (v ? [v] : []);
+  const names: string[] = [];
+  for (const raw of list) {
+    const label = ACTOR_ROLE_LABELS[String(raw) as TaskActorRole];
+    if (label && names.indexOf(label) < 0) names.push(label);
+  }
+  return names.length > 0 ? names.join(' and ') : null;
+};
+
+const collabRoleLabel = (v: any): string => {
+  const key = String(v || '').trim().toLowerCase() as TaskCollaboratorRole;
+  return COLLABORATOR_ROLE_LABELS[key] || String(v || '').trim() || 'a role we no longer use';
+};
+
+const mapActivity = (r: any): TaskActivityEntry => {
+  // jsonb comes back as an object; a null column and a legacy string both fall back to {}.
+  const diff: any = (r.diff && typeof r.diff === 'object' && !Array.isArray(r.diff)) ? r.diff : {};
+  const action = String(r.action || '').trim();
+  const at = String(r.created_at);
+  // A name is not a permission and its absence is not an error — hr_employees may simply carry no
+  // row for that account. Never render a bare UUID at somebody.
+  const actorName = String(r.actor_name || '').trim() || 'Someone whose name is not on record';
+  const targetName = String(r.target_name || '').trim();
+  const base = { actorName, at, from: null as string | null, to: null as string | null };
+
+  if (action === 'task.assign') {
+    const to = canonicalStatus(diff.status);
+    const bits: string[] = [];
+    if (diff.priority && String(diff.priority) !== 'normal') bits.push('Priority ' + String(diff.priority) + '.');
+    if (diff.dueOn) bits.push('Due ' + String(diff.dueOn).slice(0, 10) + '.');
+    return {
+      ...base,
+      actorRole: ACTOR_ROLE_LABELS.assigner,
+      action: 'created this task',
+      to,
+      kind: 'status',
+      note: bits.length > 0 ? bits.join(' ') : null,
+    };
+  }
+
+  if (action === 'task.status' || action === 'task.complete') {
+    return {
+      ...base,
+      actorRole: roleLabelsOf(diff.roles),
+      action: 'moved this task',
+      from: canonicalStatus(diff.from),
+      to: canonicalStatus(diff.to),
+      kind: 'status',
+      // moveTask only stores a reason for the statuses that demand one; null everywhere else.
+      note: diff.reason ? String(diff.reason) : null,
+    };
+  }
+
+  if (action === 'task.collaborator.add') {
+    return {
+      ...base,
+      actorRole: roleLabelsOf(diff.byRoles),
+      action: targetName ? 'added ' + targetName : 'added someone whose name is not on record',
+      to: collabRoleLabel(diff.role),
+      kind: 'text',
+      note: null,
+    };
+  }
+
+  if (action === 'task.collaborator.remove') {
+    const removed = (Array.isArray(diff.roles) ? diff.roles : []).map(collabRoleLabel).join(', ');
+    return {
+      ...base,
+      actorRole: roleLabelsOf(diff.byRoles),
+      action: diff.selfRemoval === true
+        ? 'took themselves off this task'
+        : 'took ' + (targetName || 'someone whose name is not on record') + ' off this task',
+      from: removed || null,
+      kind: 'text',
+      note: null,
+    };
+  }
+
+  // An action this function has not been taught. Shown as itself rather than dropped: a trail that
+  // silently omits what it does not recognise is worse than one that shows a bare verb, because the
+  // reader cannot tell the difference between "nothing happened" and "we hid it".
+  return { ...base, actorRole: null, action: action || 'did something we no longer have a name for', kind: 'text', note: null };
+};
+
+/**
+ * The trail for one task, oldest first.
+ *
+ * Chronological rather than newest-first on purpose: this is read months later to reconstruct what
+ * happened in order, and a history that runs backwards has to be read backwards.
+ *
+ * Both name lookups compare as TEXT and cast nothing. `diff->>'userId'` is whatever was written into
+ * a jsonb blob; `(...)::uuid` on it would throw on the render path the first time anything put a
+ * non-uuid there, and a page that cannot render is a worse outcome than a name that resolves to null.
+ */
+export async function listTaskActivity(
+  taskId: string,
+  viewerUserId: string,
+  limit = 200,
+): Promise<TaskActivityView> {
+  const viewer = String(viewerUserId || '').trim();
+  if (!viewer || !String(taskId || '').trim()) return { ok: false, reason: 'no-viewer', entries: [] };
+
+  try {
+    await ensureTaskSchema();
+
+    const list = rows(await db.execute(sql`
+      SELECT a.action, a.diff, a.created_at,
+             ${nameOfUser(sql`a.user_id`)} AS actor_name,
+             (SELECT n.full_name FROM hr_employees n
+               WHERE n.user_id::text = a.diff->>'userId'
+               ORDER BY n.is_active DESC, n.created_at DESC
+               LIMIT 1) AS target_name
+        FROM audit_log a
+        JOIN employee_tasks t ON t.id::text = a.entity_id
+       WHERE a.entity = 'employee_task'
+         AND ${eq(sql`a.entity_id`, taskId)}
+         AND ${visibleToSql(viewer)}
+       ORDER BY a.created_at ASC
+       LIMIT ${Math.min(Math.max(limit, 1), 500)}`)).map(mapActivity);
+
+    return { ok: true, reason: 'ok', entries: list };
+  } catch (e: any) {
+    logFail('listTaskActivity', e);
+    // ok:false, never an empty trail presented as fact. "Nothing has been done to this task" is a
+    // claim about a record, and a failed read is not in a position to make it.
+    return { ok: false, reason: 'lookup-failed', entries: [] };
+  }
+}
+
+/**
+ * EVERYTHING THIS VIEWER MAY SEE, GROUPED FOR THE BOARD, IN ONE QUERY.
+ *
+ * One query, not one per column. Ten SELECTs — one per status — would be ten round trips that can
+ * disagree with each other: a task moved between the third and the seventh appears twice or not at
+ * all, and the board shows a state that never existed. One statement, grouped in memory afterwards,
+ * cannot do that.
+ *
+ * The scope is the same four routes as getTask, decided in the WHERE clause. An unresolvable viewer
+ * gets an empty board, never everyone's.
+ */
+export async function listBoard(
+  viewerUserId: string,
+  opts: {
+    assigneeEmployeeId?: string | null;
+    priority?: string | null;
+    overdueOnly?: boolean;
+    includeArchived?: boolean;
+    limit?: number;
+  } = {},
+): Promise<BoardView> {
+  const viewer = String(viewerUserId || '').trim();
+
+  const wantedPriority = String(opts.priority || '').trim().toLowerCase();
+  const priority: TaskPriority | null =
+    PRIORITIES.indexOf(wantedPriority as TaskPriority) >= 0 ? (wantedPriority as TaskPriority) : null;
+  // An unusable filter is DROPPED and SAID OUT LOUD. Applying nothing while the chip still reads
+  // "Urgent" would show a full board under a label claiming it is filtered.
+  const notice = wantedPriority && !priority
+    ? 'That priority is not one we track, so the board is not filtered by priority.'
+    : null;
+
+  const assignee = String(opts.assigneeEmployeeId || '').trim() || null;
+  const overdueOnly = opts.overdueOnly === true;
+  const includeArchived = opts.includeArchived === true;
+
+  const filters: BoardFilters = {
+    assigneeEmployeeId: assignee,
+    priority,
+    overdueOnly,
+    includeArchived,
+  };
+
+  const columnsFor = (list: BoardTask[]): BoardColumn[] => {
+    const shown = TASK_STATUSES.filter((s) => includeArchived || s !== 'archived');
+    return shown.map((status) => {
+      const tasks = list.filter((t) => t.status === status);
+      return { status, label: STATUS_LABELS[status], count: tasks.length, tasks };
+    });
+  };
+
+  // An unresolvable viewer sees nothing — and the board is told the read did not happen, so it
+  // renders "we could not load this" rather than an empty board that reads as "no work exists".
+  if (!viewer) {
+    return { ok: false, reason: 'no-viewer', columns: columnsFor([]), tasks: [], total: 0, overdue: 0, filters, notice };
+  }
+
+  try {
+    await ensureTaskSchema();
+
+    const assigneeClause = assignee ? sql`AND ${eq(sql`t.employee_id`, assignee)}` : sql``;
+    const priorityClause = priority ? sql`AND t.priority = ${priority}` : sql``;
+    const overdueClause = overdueOnly ? sql`AND ${IS_OVERDUE}` : sql``;
+    const archivedClause = includeArchived ? sql`` : sql`AND ${CANON} <> 'archived'`;
+    const limit = Math.min(Math.max(Number(opts.limit) || 400, 1), 1000);
+
+    const list = rows(await db.execute(sql`
+      SELECT ${BOARD_TASK_COLUMNS}, ${VIEWER_ROLE_COLUMNS(viewer)}
+        FROM employee_tasks t
+       WHERE ${visibleToSql(viewer)}
+         ${assigneeClause}
+         ${priorityClause}
+         ${overdueClause}
+         ${archivedClause}
+       ORDER BY (t.due_on IS NULL), t.due_on ASC,
+                CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+                t.created_at DESC
+       LIMIT ${limit}`)).map(mapBoardTask);
+
+    return {
+      ok: true,
+      reason: 'ok',
+      columns: columnsFor(list),
+      tasks: list,
+      total: list.length,
+      overdue: list.filter((t) => t.isOverdue).length,
+      filters,
+      notice,
+    };
+  } catch (e: any) {
+    logFail('listBoard', e);
+    // Fail closed AND say so. An empty board rendered as fact would tell a lead their department has
+    // no work in flight.
+    return { ok: false, reason: 'lookup-failed', columns: columnsFor([]), tasks: [], total: 0, overdue: 0, filters, notice };
   }
 }
 
@@ -443,6 +1571,8 @@ export async function createTask(input: {
   priority?: TaskPriority;
   dueOn?: string | null;
   scopeDepartmentId?: string | null;
+  /** 'draft' keeps it off the assignee's list until it is deliberately assigned. Defaults to assigned. */
+  status?: 'draft' | 'assigned';
   ipAddress?: string | null;
 }): Promise<{ ok: boolean; id?: string; error?: string }> {
   const title = (input.title || '').trim();
@@ -451,9 +1581,13 @@ export async function createTask(input: {
 
   if (title.length < 3) return { ok: false, error: 'Give the task a title.' };
   if (!employeeId || !assigner) return { ok: false, error: NOT_AVAILABLE };
+  // The value goes into a ::uuid cast below, where a malformed string throws rather than refuses.
+  if (!UUID_RE.test(assigner)) return { ok: false, error: NOT_AVAILABLE };
 
-  const priority: TaskPriority = PRIORITIES.includes(input.priority as TaskPriority)
+  const priority: TaskPriority = PRIORITIES.indexOf(input.priority as TaskPriority) >= 0
     ? (input.priority as TaskPriority) : 'normal';
+
+  const status: TaskStatus = input.status === 'draft' ? 'draft' : 'assigned';
 
   // A malformed date reaching a DATE column throws. Validate the shape here and refuse in words.
   const dueRaw = String(input.dueOn || '').trim();
@@ -468,10 +1602,10 @@ export async function createTask(input: {
   try {
     await ensureTaskSchema();
     const r = rows(await db.execute(sql`
-      INSERT INTO employee_tasks (employee_id, assigned_by_user_id, title, description, priority, due_on)
+      INSERT INTO employee_tasks (employee_id, assigned_by_user_id, title, description, priority, status, due_on)
       SELECT e.id, ${assigner}::uuid, ${title.slice(0, 300)},
              ${(input.description || '').trim().slice(0, 4000) || null},
-             ${priority}, ${dueOn}::date
+             ${priority}, ${status}, ${dueOn}::date
         FROM hr_employees e
        WHERE e.id::text = ${employeeId}
          AND e.is_active = true
@@ -489,9 +1623,18 @@ export async function createTask(input: {
       action: 'task.assign',
       entity: 'employee_task',
       entityId: String(r.id),
-      diff: { employeeId: r.employee_id, title: title.slice(0, 300), priority, dueOn },
+      diff: { employeeId: r.employee_id, title: title.slice(0, 300), priority, dueOn, status },
       ipAddress: input.ipAddress || undefined,
     });
+
+    // SEED THE TWO OBVIOUS COLLABORATORS, and never at the cost of the task itself.
+    //
+    // The person who handed the work out is its approver by default — otherwise every task would
+    // reach `under_review` with nobody entitled to sign it off, and only a department lead could
+    // unstick it. Best-effort on purpose: base visibility (assignee, assigner, lead) does NOT come
+    // from these rows, so a task with no collaborator rows is still readable and workable by exactly
+    // the people it was before. A failure here is logged and the task still exists.
+    await seedCollaborators(String(r.id), String(r.employee_id), assigner);
 
     return { ok: true, id: String(r.id) };
   } catch (e: any) {
@@ -502,67 +1645,196 @@ export async function createTask(input: {
 }
 
 /**
- * Move a task's status.
- *
- * The authorisation is the UPDATE's own WHERE clause. Checking first and updating afterwards would
- * leave a window between the two, and — more to the point — it would put the rule in a place a
- * future edit can step around. Here, a statement that is not entitled updates zero rows and returns
- * nothing, and there is no version of this function that writes without the check.
- *
- * `blocked` requires a reason, for the same purpose a legal matter does: "blocked" with no stated
- * cause is a task nobody can unblock. Reaching `done` stamps completed_at; leaving `done` clears it,
- * so a reopened task does not keep claiming a completion date that no longer happened.
+ * Assignee -> 'assignee', assigner -> 'approver'. Never throws; the caller has already committed the
+ * task and must not fail after the fact because a convenience row could not be written.
  */
-export async function updateTaskStatus(
+async function seedCollaborators(taskId: string, employeeId: string, assignerUserId: string): Promise<void> {
+  try {
+    await db.execute(sql`
+      INSERT INTO employee_task_collaborators (task_id, user_id, role, added_by_user_id)
+      SELECT ${taskId}::uuid, e.user_id, 'assignee', ${assignerUserId}::uuid
+        FROM hr_employees e
+       WHERE e.id::text = ${employeeId}
+         AND e.user_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM employee_task_collaborators c
+                          WHERE c.task_id = ${taskId}::uuid AND c.user_id = e.user_id AND c.role = 'assignee')`);
+
+    await db.execute(sql`
+      INSERT INTO employee_task_collaborators (task_id, user_id, role, added_by_user_id)
+      SELECT ${taskId}::uuid, ${assignerUserId}::uuid, 'approver', ${assignerUserId}::uuid
+       WHERE NOT EXISTS (SELECT 1 FROM employee_task_collaborators c
+                          WHERE c.task_id = ${taskId}::uuid AND c.user_id = ${assignerUserId}::uuid
+                            AND c.role = 'approver')`);
+  } catch (e: any) {
+    logFail('createTask seedCollaborators', e);
+  }
+}
+
+/** The status and the viewer's roles, read once, for a write that is about to be validated. */
+interface TaskAccessSnapshot {
+  id: string;
+  employeeId: string;
+  title: string;
+  status: TaskStatus;
+  roles: TaskActorRole[];
+}
+
+async function readTaskAccess(taskId: string, viewerUserId: string): Promise<TaskAccessSnapshot | null> {
+  const viewer = String(viewerUserId || '').trim();
+  if (!viewer) return null;
+
+  const r = rows(await db.execute(sql`
+    SELECT t.id, t.employee_id, t.title, ${CANON} AS canonical_status, ${VIEWER_ROLE_COLUMNS(viewer)}
+      FROM employee_tasks t
+     WHERE ${eq(sql`t.id`, taskId)}
+       AND ${visibleToSql(viewer)}
+     LIMIT 1`))[0];
+
+  if (!r) return null;
+  return {
+    id: String(r.id),
+    employeeId: String(r.employee_id),
+    title: String(r.title || ''),
+    status: canonicalStatus(r.canonical_status) || 'assigned',
+    roles: rolesFromRow(r),
+  };
+}
+
+/**
+ * MOVE A TASK. The one write both the drag island and the no-JS form call.
+ *
+ * Three things have to be true and all three are checked before anything is written: the transition
+ * exists in the graph, this actor holds a role allowed to walk it, and any status that demands a
+ * reason has one. A refusal comes back as a sentence — an invalid move is REFUSED, never quietly
+ * written and never silently ignored, because a status field that accepts anything is a shared text
+ * box and not a workflow.
+ *
+ * THE READ AND THE WRITE CANNOT DISAGREE. The UPDATE carries three guards of its own: the id, the
+ * status it was validated against (`${CANON} = from`, so a concurrent move makes this one write zero
+ * rows rather than overwrite it), and actorHasAnyRoleSql() for exactly the roles this edge allows. A
+ * role removed between the read and the write cannot be spent, and a task somebody else moved in the
+ * meantime is reported as moved rather than clobbered.
+ */
+export async function moveTask(
   taskId: string,
   actorUserId: string,
-  status: TaskStatus,
-  opts: { blockedReason?: string | null; ipAddress?: string | null } = {},
-): Promise<{ ok: boolean; error?: string }> {
-  if (!STATUSES.includes(status)) return { ok: false, error: 'That is not a valid status.' };
+  toStatus: AnyTaskStatus | string,
+  opts: { reason?: string | null; ipAddress?: string | null } = {},
+): Promise<{ ok: boolean; status?: TaskStatus; changed?: boolean; error?: string }> {
+  const actor = String(actorUserId || '').trim();
+  const to = canonicalStatus(toStatus);
 
-  const reason = (opts.blockedReason || '').trim();
-  if (status === 'blocked' && reason.length < 5) {
-    return { ok: false, error: 'Say what is blocking it, so someone can unblock it.' };
-  }
+  if (!to) return { ok: false, error: 'That is not a status we track.' };
+  if (!actor || !String(taskId || '').trim()) return { ok: false, error: NOT_AVAILABLE };
 
-  const completedAt = status === 'done' ? sql`NOW()` : sql`NULL`;
-  const blockedReason = status === 'blocked' ? sql`${reason.slice(0, 2000)}` : sql`NULL`;
+  const reason = String(opts.reason || '').trim();
 
   try {
     await ensureTaskSchema();
+
+    const snap = await readTaskAccess(taskId, actor);
+    if (!snap) return { ok: false, error: NOT_AVAILABLE };
+
+    // Dropping a card back in the column it came from is not an error and must not be reported as
+    // one. Nothing is written and nothing is audited, because nothing happened.
+    if (snap.status === to) return { ok: true, status: to, changed: false };
+
+    const check = canTransition(snap.status, to, snap.roles);
+    if (!check.ok) return { ok: false, error: check.reason || NOT_AVAILABLE };
+
+    if (statusNeedsReason(to) && reason.length < REASON_MIN) {
+      return {
+        ok: false,
+        error: to === 'blocked'
+          ? 'Say what is blocking it, so someone can unblock it.'
+          : 'Say why it is being cancelled, so the record explains itself later.',
+      };
+    }
+
+    const allowedRoles = TRANSITIONS[snap.status]?.[to] || [];
+    if (allowedRoles.length === 0) return { ok: false, error: NOT_AVAILABLE };
+
+    // Reaching `completed` stamps completed_at; leaving it clears it, so a reopened task does not
+    // keep claiming a completion date that no longer happened. The two reason columns work the same
+    // way: a task that is no longer blocked must not still show why it once was.
+    const completedAt = to === 'completed' ? sql`NOW()` : sql`NULL`;
+    const blockedReason = to === 'blocked' ? sql`${reason.slice(0, 2000)}` : sql`NULL`;
+    const cancelReason = to === 'cancelled' ? sql`${reason.slice(0, 2000)}` : sql`NULL`;
+
     const r = rows(await db.execute(sql`
       UPDATE employee_tasks AS t
-         SET status = ${status},
+         SET status = ${to},
              blocked_reason = ${blockedReason},
+             cancel_reason = ${cancelReason},
              completed_at = ${completedAt},
+             status_changed_at = NOW(),
              updated_at = NOW()
        WHERE ${eq(sql`t.id`, taskId)}
-         AND ${actorOwnsTask(actorUserId)}
+         AND ${CANON} = ${snap.status}
+         AND ${actorHasAnyRoleSql(actor, allowedRoles)}
       RETURNING t.id, t.employee_id, t.title`))[0];
 
-    if (!r?.id) return { ok: false, error: NOT_AVAILABLE };
+    if (!r?.id) {
+      // Zero rows after the checks passed means the row changed underneath us — a colleague moved
+      // the same card. Say that, rather than "not available", which would read as a permission
+      // problem and send somebody to ask for access they already have.
+      return { ok: false, error: 'That task changed while this page was open. Reload it and try again.' };
+    }
 
     await logAudit({
-      userId: String(actorUserId || '') || null,
-      action: status === 'done' ? 'task.complete' : 'task.status',
+      userId: actor,
+      action: to === 'completed' ? 'task.complete' : 'task.status',
       entity: 'employee_task',
       entityId: String(r.id),
-      diff: { employeeId: r.employee_id, title: r.title, status, blockedReason: status === 'blocked' ? reason.slice(0, 2000) : null },
+      diff: {
+        employeeId: r.employee_id,
+        title: r.title,
+        from: snap.status,
+        to,
+        roles: snap.roles,
+        reason: statusNeedsReason(to) ? reason.slice(0, 2000) : null,
+      },
       ipAddress: opts.ipAddress || undefined,
     });
 
-    return { ok: true };
+    return { ok: true, status: to, changed: true };
   } catch (e: any) {
-    logFail('updateTaskStatus', e);
-    // logFail above already recorded e.cause.message. See WRITE_FAILED for why it is not echoed back.
+    logFail('moveTask', e);
     return { ok: false, error: WRITE_FAILED };
   }
 }
 
 /**
- * Comment on a task. Same two people as updateTaskStatus, enforced the same way: INSERT ... SELECT,
- * so the entitlement is part of the write rather than a check in front of it.
+ * Move a task's status — the original signature, still exactly what src/pages/portal/employee.astro
+ * posts to.
+ *
+ * It speaks the four legacy values ('open', 'in_progress', 'blocked', 'done'), which
+ * canonicalStatus() maps onto the real ones before moveTask validates the transition. Behaviour that
+ * page relies on is unchanged: the assignee and the assigner can still start, block and finish work
+ * from their phone, and `blocked` still demands a stated cause. What is new is that a move the
+ * workflow does not allow now comes back as a sentence explaining who may make it, instead of being
+ * written because nobody was checking.
+ */
+export async function updateTaskStatus(
+  taskId: string,
+  actorUserId: string,
+  status: AnyTaskStatus,
+  opts: { blockedReason?: string | null; ipAddress?: string | null } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await moveTask(taskId, actorUserId, status, {
+    reason: opts.blockedReason || '',
+    ipAddress: opts.ipAddress || null,
+  });
+  return res.ok ? { ok: true } : { ok: false, error: res.error };
+}
+
+/**
+ * Comment on a task. Anyone who may SEE the task may comment on it, watchers included — that is the
+ * whole of a watcher's rights, and a person who can read the work but not say "this is blocked on
+ * me" is a person the board silences for no reason.
+ *
+ * Enforced the same way as every other write here: INSERT ... SELECT, so the entitlement is part of
+ * the statement rather than a check standing in front of it.
  */
 export async function addComment(
   taskId: string,
@@ -575,6 +1847,7 @@ export async function addComment(
 
   const author = String(authorUserId || '').trim();
   if (!author) return { ok: false, error: NOT_AVAILABLE };
+  if (!UUID_RE.test(author)) return { ok: false, error: NOT_AVAILABLE };
 
   try {
     await ensureTaskSchema();
@@ -583,7 +1856,7 @@ export async function addComment(
       SELECT t.id, ${author}::uuid, ${text.slice(0, 4000)}
         FROM employee_tasks t
        WHERE ${eq(sql`t.id`, taskId)}
-         AND ${actorOwnsTask(author)}
+         AND ${visibleToSql(author)}
       RETURNING id`))[0];
 
     if (!r?.id) return { ok: false, error: NOT_AVAILABLE };
@@ -591,6 +1864,214 @@ export async function addComment(
   } catch (e: any) {
     logFail('addComment', e);
     // logFail above already recorded e.cause.message. See WRITE_FAILED for why it is not echoed back.
+    return { ok: false, error: WRITE_FAILED };
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Collaborators.
+//
+// WHO MAY ADD WHOM, and why it is not simply "anyone on the task". Roles are not labels here: an
+// approver is the only person who can sign work off. If the assignee could add themselves as an
+// approver, every review gate in this file would be one form POST away from meaningless — the person
+// doing the work would approve the work. So:
+//
+//   - the assigner or the department lead may add ANY role, including reviewer and approver;
+//   - the assignee or a co-assignee may pull in help — 'watcher' and 'co_assignee' only;
+//   - a reviewer, an approver or a watcher may add nobody.
+//
+// Removal is narrower still: the assigner, the lead, or a person taking themselves off. Both are
+// audited, because a change to who may approve work is a change to who holds authority.
+// ---------------------------------------------------------------------------------------------
+
+const CAN_ADD_ANY_ROLE: TaskActorRole[] = ['assigner', 'lead'];
+const CAN_ADD_HELPERS: TaskActorRole[] = ['assignee', 'co_assignee', 'assigner', 'lead'];
+const HELPER_ROLES: TaskCollaboratorRole[] = ['watcher', 'co_assignee'];
+
+const holdsAny = (held: TaskActorRole[], allowed: TaskActorRole[]): boolean =>
+  held.some((r) => allowed.indexOf(r) >= 0);
+
+/**
+ * WHICH COLLABORATOR ROLES THIS ACTOR MAY HAND OUT — the question a screen has to answer before it
+ * draws a dropdown, answered from the SAME constants addCollaborator() enforces with.
+ *
+ * Read allowedTransitionsFor() for the precedent: a control that exists only to be refused teaches
+ * people the system is broken, so a page builds its options from what the engine will accept. The
+ * alternative — a page listing the roles it believes an assignee may add — is a second copy of the
+ * rights model, and the second copy is the one nobody remembers to update. There is no version of
+ * this that can drift from the write, because there is nothing here to keep in step.
+ *
+ * An empty array means "draw no control": a reviewer, an approver and a watcher may add nobody.
+ * This is presentation only. addCollaborator() re-derives the same authority inside the INSERT.
+ */
+export function collaboratorRolesAddableBy(held: TaskActorRole[] | null | undefined): TaskCollaboratorRole[] {
+  const roles = Array.isArray(held) ? held : [];
+  if (holdsAny(roles, CAN_ADD_ANY_ROLE)) return TASK_COLLABORATOR_ROLES.slice();
+  if (holdsAny(roles, CAN_ADD_HELPERS)) return HELPER_ROLES.slice();
+  return [];
+}
+
+/**
+ * May this actor take OTHER people off the task? Anyone on it may always take themselves off, which
+ * is why that case is not a parameter here — see removeCollaborator's `isSelf` branch.
+ */
+export function mayRemoveOtherCollaborators(held: TaskActorRole[] | null | undefined): boolean {
+  return holdsAny(Array.isArray(held) ? held : [], CAN_ADD_ANY_ROLE);
+}
+
+export async function addCollaborator(
+  taskId: string,
+  actorUserId: string,
+  targetUserId: string,
+  role: TaskCollaboratorRole | string,
+  opts: { ipAddress?: string | null } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const actor = String(actorUserId || '').trim();
+  const target = String(targetUserId || '').trim();
+  const wanted = String(role || '').trim().toLowerCase() as TaskCollaboratorRole;
+
+  if (!actor || !target || !String(taskId || '').trim()) return { ok: false, error: NOT_AVAILABLE };
+  if (TASK_COLLABORATOR_ROLES.indexOf(wanted) < 0) {
+    return { ok: false, error: 'Pick one of: ' + TASK_COLLABORATOR_ROLES.join(', ') + '.' };
+  }
+  // Both go into ::uuid casts below. A malformed id must refuse in words, not throw on the render
+  // path with "invalid input syntax for type uuid".
+  if (!UUID_RE.test(actor) || !UUID_RE.test(target)) return { ok: false, error: NOT_AVAILABLE };
+
+  try {
+    await ensureTaskSchema();
+
+    const snap = await readTaskAccess(taskId, actor);
+    if (!snap) return { ok: false, error: NOT_AVAILABLE };
+
+    const isHelperRole = HELPER_ROLES.indexOf(wanted) >= 0;
+    const mayAdd = holdsAny(snap.roles, CAN_ADD_ANY_ROLE)
+      || (isHelperRole && holdsAny(snap.roles, CAN_ADD_HELPERS));
+
+    if (!mayAdd) {
+      return {
+        ok: false,
+        error: isHelperRole
+          ? 'Only the people working on this task, the person who assigned it or the department lead can add someone to it.'
+          : 'Only the person who assigned this task or the department lead can name a reviewer or an approver. That is what stops work being signed off by whoever did it.',
+      };
+    }
+
+    // The authority is re-derived by the database in the same statement that writes, against exactly
+    // the roles the check above allowed. WHERE NOT EXISTS rather than ON CONFLICT: the unique index
+    // is created in its own try/catch and correctness must not depend on it having succeeded.
+    const authority = actorHasAnyRoleSql(actor, isHelperRole ? CAN_ADD_HELPERS : CAN_ADD_ANY_ROLE);
+
+    const r = rows(await db.execute(sql`
+      INSERT INTO employee_task_collaborators (task_id, user_id, role, added_by_user_id)
+      SELECT t.id, ${target}::uuid, ${wanted}, ${actor}::uuid
+        FROM employee_tasks t
+       WHERE ${eq(sql`t.id`, taskId)}
+         AND ${authority}
+         AND NOT EXISTS (SELECT 1 FROM employee_task_collaborators c
+                          WHERE c.task_id = t.id AND c.user_id::text = ${target} AND c.role = ${wanted})
+      RETURNING id`))[0];
+
+    if (!r?.id) {
+      // Zero rows is either "already on the task with that role" or "not allowed". They are
+      // different facts and only one of them is a problem, so ask rather than guess.
+      const already = rows(await db.execute(sql`
+        SELECT 1 FROM employee_task_collaborators
+         WHERE task_id::text = ${String(taskId).trim()} AND user_id::text = ${target} AND role = ${wanted}
+         LIMIT 1`));
+      if (already.length > 0) return { ok: true };
+      return { ok: false, error: NOT_AVAILABLE };
+    }
+
+    await logAudit({
+      userId: actor,
+      action: 'task.collaborator.add',
+      entity: 'employee_task',
+      entityId: snap.id,
+      diff: { taskTitle: snap.title, employeeId: snap.employeeId, userId: target, role: wanted, byRoles: snap.roles },
+      ipAddress: opts.ipAddress || undefined,
+    });
+
+    return { ok: true };
+  } catch (e: any) {
+    logFail('addCollaborator', e);
+    return { ok: false, error: WRITE_FAILED };
+  }
+}
+
+/**
+ * Take somebody off a task.
+ *
+ * @param role omit to remove every role that person holds on the task. Passing one removes only that
+ *             row, so a reviewer who is also a watcher can stop reviewing without losing sight of it.
+ */
+export async function removeCollaborator(
+  taskId: string,
+  actorUserId: string,
+  targetUserId: string,
+  role?: TaskCollaboratorRole | string | null,
+  opts: { ipAddress?: string | null } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const actor = String(actorUserId || '').trim();
+  const target = String(targetUserId || '').trim();
+
+  if (!actor || !target || !String(taskId || '').trim()) return { ok: false, error: NOT_AVAILABLE };
+
+  const wanted = String(role || '').trim().toLowerCase();
+  if (wanted && TASK_COLLABORATOR_ROLES.indexOf(wanted as TaskCollaboratorRole) < 0) {
+    return { ok: false, error: 'Pick one of: ' + TASK_COLLABORATOR_ROLES.join(', ') + '.' };
+  }
+
+  try {
+    await ensureTaskSchema();
+
+    const snap = await readTaskAccess(taskId, actor);
+    if (!snap) return { ok: false, error: NOT_AVAILABLE };
+
+    const isSelf = actor === target;
+    if (!isSelf && !holdsAny(snap.roles, CAN_ADD_ANY_ROLE)) {
+      return {
+        ok: false,
+        error: 'Only the person who assigned this task or the department lead can take someone off it. You can always take yourself off.',
+      };
+    }
+
+    // Self-removal needs no role at all beyond being on the task, which readTaskAccess already
+    // established; otherwise the assigner/lead check is re-derived by the database here.
+    const authority = isSelf ? sql`true` : actorHasAnyRoleSql(actor, CAN_ADD_ANY_ROLE);
+    const roleClause = wanted ? sql`AND col.role = ${wanted}` : sql``;
+
+    const removed = rows(await db.execute(sql`
+      DELETE FROM employee_task_collaborators AS col
+       USING employee_tasks AS t
+       WHERE t.id = col.task_id
+         AND ${eq(sql`col.task_id`, taskId)}
+         AND col.user_id::text = ${target}
+         ${roleClause}
+         AND ${authority}
+      RETURNING col.id, col.role`));
+
+    if (removed.length === 0) return { ok: true };   // nothing to remove; nothing happened, nothing to log
+
+    await logAudit({
+      userId: actor,
+      action: 'task.collaborator.remove',
+      entity: 'employee_task',
+      entityId: snap.id,
+      diff: {
+        taskTitle: snap.title,
+        employeeId: snap.employeeId,
+        userId: target,
+        roles: removed.map((x: any) => String(x.role)),
+        selfRemoval: isSelf,
+        byRoles: snap.roles,
+      },
+      ipAddress: opts.ipAddress || undefined,
+    });
+
+    return { ok: true };
+  } catch (e: any) {
+    logFail('removeCollaborator', e);
     return { ok: false, error: WRITE_FAILED };
   }
 }

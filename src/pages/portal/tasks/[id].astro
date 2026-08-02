@@ -1,0 +1,1270 @@
+---
+// src/pages/portal/tasks/[id].astro — ONE TASK. /portal/tasks/<id>
+//
+// WHAT THIS PAGE IS. The board (/portal/tasks) answers "where is everything"; this answers "what
+// happened to this one, and what may I do about it". It owns no rules. src/lib/employee-tasks.ts
+// holds the status graph, the roles, the visibility clause and every write; this file resolves who
+// is asking, renders what the engine returned, and posts back through it. Every refusal a person
+// reads here is a sentence the engine wrote — two places deciding who may approve work is how one of
+// them ends up being the one nobody remembered to update.
+//
+// INVISIBLE MEANS NOT FOUND. getTaskView() decides visibility in the WHERE clause, so a task this
+// viewer may not see is never read. When that happens this page says the task could not be found and
+// returns 404 — never "this is not yours", which would confirm the task exists and who it belongs
+// to. The only distinction it draws is between "no such task for you" and "we could not read the
+// database", because those need different sentences: one is final, the other is "try again".
+//
+// GATE FIRST, THEN READ. requireEmployee() runs above every read and above the POST handler. It is
+// not what scopes the data — listBoard/getTaskView do that against the users id — but a write must
+// never be attempted from a page state that was refused.
+//
+// SUBTASKS AND DEPENDENCIES ARE NOT RENDERED BECAUSE THE ENGINE HAS NEITHER.
+// employee_tasks has no parent_task_id and no blocked_by, ensureTaskTables() creates no link table,
+// and there is no reader or writer for either idea anywhere in src/lib/employee-tasks.ts. So this
+// page shows nothing about them — not an empty "Subtasks" panel, not a disabled "Add subtask"
+// button. A control is a promise about what the server will do, and the standing lesson here is
+// hr_employees.work_email: a name that was in db/hr-schema.sql, absent from the live table, and cost
+// three outages in one day. When the engine grows subtasks, this comment is the place to start.
+//
+// REPLIES ON COMMENTS ARE OFF FOR THE SAME REASON. employee_task_comments has five columns and none
+// of them is parent_id; addComment() would discard one. CommentThread is therefore rendered WITHOUT
+// `parentField`, which is its documented opt-in — see the note at the top of that component.
+import '@/styles/workforce.css';
+import StatusBadge from '@/components/workforce/StatusBadge.astro';
+import PriorityFlag from '@/components/workforce/PriorityFlag.astro';
+import AvatarStack from '@/components/workforce/AvatarStack.astro';
+import Timeline from '@/components/workforce/Timeline.astro';
+import CommentThread from '@/components/workforce/CommentThread.astro';
+import Dialog from '@/components/workforce/Dialog.astro';
+import PermissionGate from '@/components/workforce/PermissionGate.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { requireEmployee, requireTeamLead, departmentFilter } from '@/lib/auth/workspace-access';
+import {
+  STATUS_LABELS,
+  COLLABORATOR_ROLE_LABELS,
+  canonicalStatus,
+  canTransition,
+  statusNeedsReason,
+  getTaskView,
+  listTaskActivity,
+  moveTask,
+  addComment,
+  addCollaborator,
+  removeCollaborator,
+  collaboratorRolesAddableBy,
+  mayRemoveOtherCollaborators,
+  type TaskStatus,
+  type TaskCollaboratorRole,
+  type TaskDetail,
+  type TaskActivityEntry,
+} from '@/lib/employee-tasks';
+
+const user = Astro.locals.user as any;
+
+// postgres-js resolves to a plain array, never a { rows } object.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+// ---------------------------------------------------------------------------------------------
+// GATE. Identical to the board's, deliberately: a department head whose own hr_employees row HR has
+// not created yet is a real person with real work, and requireTeamLead() exists for exactly that
+// case. 'ambiguous-record' must NOT fall through — that denial is the considered refusal to guess
+// between two people — and neither must 'inactive' or 'lookup-failed'.
+// ---------------------------------------------------------------------------------------------
+const gate = await requireEmployee(user, '/portal/tasks');
+const leadGate = (!gate.ok && gate.code === 'no-employee-record')
+  ? await requireTeamLead(user, '/portal/tasks')
+  : null;
+
+const denial = gate.ok ? null : (leadGate && leadGate.ok ? null : gate);
+if (denial && denial.redirect) return Astro.redirect(denial.redirect);
+
+const mayUse = !denial;
+const viewerUserId = String(user?.id || '').trim();
+const viewerName = String(user?.name || user?.email || '').trim();
+const myEmployeeId = gate.ok
+  ? gate.workspace.employeeId
+  : (leadGate && leadGate.ok && leadGate.workspace ? leadGate.workspace.employeeId : null);
+
+// The department a lead may draw a roster from, from the SESSION and nowhere else. Null for
+// everyone who is not a department head, and departmentFilter() turns a null into `false`, so the
+// worst a mistake below can produce is an empty list rather than the whole organisation.
+const scopeDepartmentId = gate.ok
+  ? gate.scopeDepartmentId
+  : (leadGate && leadGate.ok ? leadGate.scopeDepartmentId : null);
+
+// ---------------------------------------------------------------------------------------------
+// EVERY const THE POST HANDLER TOUCHES IS DECLARED ABOVE IT. `const` is not hoisted; a handler that
+// reaches a declaration further down throws on its own first line while the page still reports
+// success. That has taken this site down twice.
+// ---------------------------------------------------------------------------------------------
+
+const taskId = String(Astro.params.id || '').trim();
+const params = Astro.url.searchParams;
+
+/** The canonical path for this task. Never built from anything but the route parameter. */
+const basePath = '/portal/tasks/' + encodeURIComponent(taskId);
+
+const detailUrl = (over: any = {}): string => {
+  const p = new URLSearchParams();
+  if (over.add) p.set('add', '1');
+  if (over.msg) p.set('msg', String(over.msg).slice(0, 300));
+  if (over.bad) p.set('bad', '1');
+  const s = p.toString();
+  return s ? basePath + '?' + s : basePath;
+};
+
+/** Where every form on this page posts. Declared before the handler and before the JSX. */
+const selfUrl = basePath;
+
+// ---------------------------------------------------------------------------------------------
+// THE WRITES. Six actions, every one of them a plain form POST, every one of them re-authorised by
+// the engine inside the statement that performs it. An action the viewer cannot take is not
+// rendered — and would be refused here anyway, which is the half that actually matters.
+// ---------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  if (!mayUse) {
+    return Astro.redirect(detailUrl({ msg: 'Please sign in again to change this task.', bad: 1 }));
+  }
+
+  let msg = '';
+  let bad = 1;
+
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '').trim();
+    const formTaskId = String(fd.get('task_id') || '').trim();
+    const ip = Astro.clientAddress;
+
+    // THE ID IN THE URL IS THE ONLY ONE THAT COUNTS. Every write below uses `taskId` from the route.
+    // A form body naming a different task is refused rather than followed: the engine would still
+    // check the actor's rights on whichever task it was handed, so this is not a permission fix, it
+    // is a refusal to act on a page that is not the page the person is looking at.
+    if (formTaskId && formTaskId !== taskId) {
+      msg = 'That form was for a different task, so nothing was changed. Reload this page and try again.';
+    } else if (action === 'move') {
+      const rawTo = String(fd.get('to') || '').trim();
+      const reason = String(fd.get('reason') || '').trim();
+      // canonicalStatus() rather than a list restated here: one vocabulary, owned by the engine.
+      const to = canonicalStatus(rawTo);
+      if (!rawTo) {
+        // Distinct from an unknown status. Somebody who pressed Move without choosing needs telling
+        // what to do, not telling that they typed something invalid.
+        msg = 'Pick where to move it, then press Move.';
+      } else if (!to) {
+        msg = 'That is not a status we track.';
+      } else {
+        const res = await moveTask(taskId, viewerUserId, to, { reason, ipAddress: ip });
+        if (res.ok) {
+          bad = 0;
+          msg = res.changed === false
+            ? 'It was already there, so nothing changed.'
+            : 'Moved to ' + (STATUS_LABELS[to] || to) + '.';
+        } else {
+          msg = res.error || 'Could not move that task.';
+        }
+      }
+    } else if (action === 'comment') {
+      const body = String(fd.get('body') || '').trim();
+      const res = await addComment(taskId, viewerUserId, body, { ipAddress: ip });
+      if (res.ok) { bad = 0; msg = 'Comment posted.'; }
+      else { msg = res.error || 'Could not post that comment.'; }
+    } else if (action === 'revise') {
+      // REQUESTING A REVISION IS A COMMENT PLUS A MOVE, AND THE COMMENT IS WHY.
+      //
+      // moveTask() stores a reason ONLY for the two statuses that demand one (blocked, cancelled)
+      // and writes NULL for every other move — so a "why does this need changing" box wired to the
+      // move's `reason` field would be a text box that silently discards what a reviewer typed. The
+      // note is posted as a real comment first; only if that succeeds is the task moved. If the
+      // comment fails the task stays where it is, because sending work back with no statement of
+      // what is wrong is worse than not sending it back at all.
+      const note = String(fd.get('note') || '').trim();
+      if (note.length < 3) {
+        msg = 'Say what needs changing. That note is the only thing the person picking this up again will have to go on.';
+      } else {
+        const said = await addComment(taskId, viewerUserId, note, { ipAddress: ip });
+        if (!said.ok) {
+          msg = said.error || 'Could not save that note, so the task has been left where it is.';
+        } else {
+          const res = await moveTask(taskId, viewerUserId, 'in_progress', { ipAddress: ip });
+          if (res.ok) {
+            bad = 0;
+            msg = 'Sent back for changes. Your note is in the discussion.';
+          } else {
+            // Partial outcome, stated plainly. The note is now public and the task did not move;
+            // pretending either half did not happen would leave somebody guessing.
+            msg = 'Your note was posted, but the task was not moved. ' + (res.error || '');
+          }
+        }
+      }
+    } else if (action === 'approve') {
+      const note = String(fd.get('note') || '').trim();
+      let noteOk = true;
+      if (note) {
+        const said = await addComment(taskId, viewerUserId, note, { ipAddress: ip });
+        noteOk = said.ok;
+        if (!said.ok) {
+          msg = 'Your note could not be saved, so nothing was approved. Try again in a moment.';
+        }
+      }
+      if (noteOk) {
+        const res = await moveTask(taskId, viewerUserId, 'approved', { ipAddress: ip });
+        if (res.ok) { bad = 0; msg = 'Approved.'; }
+        else { msg = res.error || 'Could not approve this task.'; }
+      }
+    } else if (action === 'collab_add') {
+      const targetUserId = String(fd.get('user_id') || '').trim();
+      const role = String(fd.get('role') || '').trim();
+      if (!targetUserId) {
+        msg = 'Pick who to add.';
+      } else {
+        const res = await addCollaborator(taskId, viewerUserId, targetUserId, role, { ipAddress: ip });
+        // addCollaborator returns ok when the person already held that role, so the wording is true
+        // either way rather than claiming a change that may not have happened.
+        if (res.ok) { bad = 0; msg = 'They are on this task.'; }
+        else { msg = res.error || 'Could not add them to this task.'; }
+      }
+    } else if (action === 'collab_remove') {
+      const targetUserId = String(fd.get('user_id') || '').trim();
+      const role = String(fd.get('role') || '').trim();
+      if (!targetUserId) {
+        msg = 'Pick who to take off.';
+      } else {
+        const res = await removeCollaborator(taskId, viewerUserId, targetUserId, role || null, { ipAddress: ip });
+        // Same shape: removing nobody is reported as success by the engine, so this says what is
+        // true afterwards rather than what was done.
+        if (res.ok) { bad = 0; msg = 'They are no longer on this task in that role.'; }
+        else { msg = res.error || 'Could not change who is on this task.'; }
+      }
+    } else {
+      // An action this page does not have. Nothing was changed, so nothing is said.
+      return Astro.redirect(selfUrl);
+    }
+  } catch (e: any) {
+    // Never a bare catch. The real Postgres reason is on e.cause; e.message is only the SQL that
+    // failed. A swallowed exception in a write path hid two of this project's outages for hours.
+    console.error('[portal/tasks/id] post', e?.cause?.message || e?.message);
+    msg = 'Something went wrong saving that. Nothing was changed. Try again in a moment.';
+  }
+
+  return Astro.redirect(detailUrl({ msg, bad: bad ? 1 : 0 }));
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE READ.
+// ---------------------------------------------------------------------------------------------
+
+let detail: TaskDetail | null = null;
+let readReason = 'no-viewer';
+let readOk = false;
+
+if (mayUse) {
+  try {
+    const view = await getTaskView(taskId, viewerUserId);
+    readOk = view.ok;
+    readReason = view.reason;
+    detail = view.detail;
+  } catch (e: any) {
+    // getTaskView catches its own failures and reports lookup-failed, so this only fires on
+    // something it could not. It still logs: a page that renders "not found" on a swallowed error
+    // tells somebody their work does not exist.
+    console.error('[portal/tasks/id] getTaskView', e?.cause?.message || e?.message);
+    readOk = false;
+    readReason = 'lookup-failed';
+  }
+}
+
+// The three outcomes, kept apart because they are three different sentences.
+const notFound = mayUse && readOk && !detail;          // reason 'not-visible' — say NOT FOUND
+const loadFailed = mayUse && !readOk;                  // the database did not answer
+if (notFound) Astro.response.status = 404;
+
+const task = detail ? detail.task : null;
+const viewerRoles = detail ? detail.viewerRoles : [];
+
+// ACTIVITY. Read only once the task itself resolved — there is nothing to show a trail for
+// otherwise, and asking would be a second query nobody reads.
+let activity: TaskActivityEntry[] = [];
+let activityOk = false;
+if (detail) {
+  const act = await listTaskActivity(taskId, viewerUserId);
+  activityOk = act.ok;
+  activity = act.entries;
+}
+
+// ---------------------------------------------------------------------------------------------
+// WHAT THIS VIEWER MAY DO. Every one of these comes from the engine — from the transitions it
+// computed against roles the DATABASE resolved, or from the same constants its writes enforce with.
+// Nothing on this page decides a right for itself.
+// ---------------------------------------------------------------------------------------------
+
+const allowedTransitions: TaskStatus[] = task ? task.allowedTransitions : [];
+const moveNeedsReason = allowedTransitions.some((s) => statusNeedsReason(s));
+
+// Approve is only ever reachable from `under_review`, and only by an approver or the department
+// lead — so the presence of 'approved' in allowedTransitions IS the entitlement, already checked
+// against the database. The reason line is shown only where an absent Approve button would be
+// puzzling: the task is sitting in review and this person is not the one who signs it off.
+const approveCheck = task ? canTransition(task.status, 'approved', viewerRoles) : null;
+const mayApprove = !!approveCheck && approveCheck.ok;
+const showApproveReason = !!task && !mayApprove && task.status === 'under_review';
+
+// "Request revision" and "pull my own work back" are the SAME move (to in_progress) made by
+// different people, and only the wording differs. This test picks the wording; it is not an
+// authorisation check — the engine authorises the move either way, and the generic status control
+// below offers it regardless. Holding a reviewing capacity is what makes "request revision" the
+// honest label rather than "pull it back".
+const reviewCapacity = viewerRoles.indexOf('reviewer') >= 0
+  || viewerRoles.indexOf('approver') >= 0
+  || viewerRoles.indexOf('lead') >= 0;
+const mayRequestRevision = !!task
+  && (task.status === 'under_review' || task.status === 'approved')
+  && allowedTransitions.indexOf('in_progress') >= 0
+  && reviewCapacity;
+
+// Which collaborator roles this viewer may hand out, derived from the very constants
+// addCollaborator() enforces with. Empty means draw no control at all.
+const addableRoles: TaskCollaboratorRole[] = detail ? collaboratorRolesAddableBy(viewerRoles) : [];
+const mayRemoveOthers = detail ? mayRemoveOtherCollaborators(viewerRoles) : false;
+
+// THE CANDIDATE LIST, AND WHY IT IS THIS SHORT.
+//
+// addCollaborator() takes a users id, so a picker needs names against ids — and the only roster this
+// page is entitled to show is one the session already grants. departmentFilter() carries
+// gate.scopeDepartmentId, which workspace-access.ts populates ONLY for a department head, and
+// compiles an absent scope to `false`. So a lead sees their own department and nobody else sees a
+// roster at all; there is no ?department= to try and no wider list assembled in JavaScript.
+//
+// People already on the task are added to the list so a role can be changed — promoting a watcher to
+// reviewer needs no new visibility, since the viewer can already see them here.
+const candidates: any[] = [];
+const seenCandidate: any = {};
+if (detail && addableRoles.length > 0) {
+  if (scopeDepartmentId) {
+    try {
+      // Only the two columns a picker needs. The portal's older lookups do SELECT *, which drags
+      // gender, Aadhaar, PAN and bank details into the render context of a page that shows none of
+      // them; `gender` is the exact column read in the 2026-08-02 breach.
+      for (const r of rowsOf(await db.execute(sql`
+        SELECT e.user_id::text AS user_id, e.full_name
+          FROM hr_employees e
+         WHERE ${departmentFilter({ scopeDepartmentId })}
+           AND e.is_active = true
+           AND e.user_id IS NOT NULL
+         ORDER BY e.full_name ASC
+         LIMIT 200`))) {
+        const id = String(r.user_id || '').trim();
+        if (!id || seenCandidate[id]) continue;
+        seenCandidate[id] = 1;
+        candidates.push({ id, name: String(r.full_name || '').trim() || 'Name not recorded' });
+      }
+    } catch (e: any) {
+      // The picker is a convenience; losing it must not lose the page.
+      console.error('[portal/tasks/id] candidates', e?.cause?.message || e?.message);
+    }
+  }
+  for (const c of detail.collaborators) {
+    const id = String(c.userId || '').trim();
+    if (!id || seenCandidate[id]) continue;
+    seenCandidate[id] = 1;
+    candidates.push({ id, name: String(c.name || '').trim() || 'Name not recorded' });
+  }
+  candidates.sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Display helpers. Functions rather than typed maps read inside JSX — a Record<string,string>
+// indexed from a template is a known parser trap in .astro files here.
+// ---------------------------------------------------------------------------------------------
+
+const labelOf = (s: string): string => STATUS_LABELS[s as TaskStatus] || s;
+const collabLabelOf = (s: string): string =>
+  COLLABORATOR_ROLE_LABELS[s as TaskCollaboratorRole] || s;
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const todayIso = new Date().toISOString().slice(0, 10);
+
+const dayLabel = (iso: string): string => {
+  const d = new Date(String(iso) + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return String(iso);
+  const y = d.getUTCFullYear();
+  const now = new Date().getUTCFullYear();
+  return d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()] + (y === now ? '' : ' ' + y);
+};
+
+/**
+ * A date that has passed is INFORMATION, stated plainly in the same amber every other "worth
+ * knowing" line on the portal uses — never red, never an alarm. Somebody looking at their own late
+ * work already knows it is late. `isOverdue` comes from Postgres (CURRENT_DATE, inside the query),
+ * so there is one definition of late; "Due today" is compared against the server's own date and is
+ * only ever a nicety.
+ */
+const dueText = (): string => {
+  if (!task || !task.dueOn) return 'No date set';
+  if (task.isOverdue) return 'Was due ' + dayLabel(task.dueOn);
+  if (task.dueOn === todayIso) return 'Due today';
+  return 'Due ' + dayLabel(task.dueOn);
+};
+
+const collabPeople = (detail ? detail.collaborators : []).map((c) => ({
+  id: c.userId,
+  name: c.name || 'Name not on record',
+  role: c.roleLabel,
+}));
+
+const assigneeName = task ? (task.employeeName || 'Name not recorded') : '';
+const assigneeIsMe = !!(task && myEmployeeId && String(task.employeeId) === String(myEmployeeId));
+const assignerName = task ? (task.assignedByName || 'Name not recorded') : '';
+
+// The words for what this viewer is on this task, from the engine's own labels.
+const myRoleWords = viewerRoles.map((r) => collabLabelOf(r)).join(', ');
+
+const addPanel = params.get('add') === '1';
+const flash = String(params.get('msg') || '').slice(0, 300);
+const flashBad = params.get('bad') === '1';
+
+const pageTitle = task
+  ? (task.title || 'Untitled task') + ' - EduRankAI'
+  : (notFound ? 'Task not found - EduRankAI' : 'Task - EduRankAI');
+---
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>{pageTitle}</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <meta name="robots" content="noindex"/>
+</head>
+<body>
+
+<nav class="topbar">
+  <a class="topbar__back wf-focusable" href="/portal/tasks" aria-label="Back to the task board">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <polyline points="15 18 9 12 15 6"/>
+    </svg>
+    <span>Board</span>
+  </a>
+  <span class="topbar__who">{viewerName}</span>
+</nav>
+
+<div class="wrap">
+
+  {flash && (
+    <p class={flashBad ? 'note note--warn' : 'note note--ok'} role="status">{flash}</p>
+  )}
+
+  {denial && (
+    <section class="panel">
+      <h1 class="panel__title">{denial.title}</h1>
+      <p class="panel__body">{denial.reason}</p>
+      <p class="panel__body"><a class="link wf-focusable" href="/portal/employee">Go to My HR</a></p>
+    </section>
+  )}
+
+  {notFound && (
+    <section class="panel">
+      {/* NOT "this task is not yours". That phrasing confirms the task exists and that somebody
+          else has it, which is exactly what a person probing ids is looking for. One sentence for
+          both cases, the same one getTaskView() is built to make possible. */}
+      <h1 class="panel__title">We could not find that task</h1>
+      <p class="panel__body">
+        It may have been removed, or the link may be wrong. Your board has everything currently on
+        your list.
+      </p>
+      <p class="panel__body"><a class="link wf-focusable" href="/portal/tasks">Back to the board</a></p>
+    </section>
+  )}
+
+  {loadFailed && (
+    <section class="panel">
+      <h1 class="panel__title">We could not load that task just now</h1>
+      <p class="panel__body">
+        {readReason === 'no-viewer'
+          ? 'We could not work out who is asking. Sign in again and reload this page.'
+          : 'Something went wrong reading it. Nothing has been lost or changed. Try again in a moment, and tell HR if it keeps happening.'}
+      </p>
+      <p class="panel__body"><a class="link wf-focusable" href="/portal/tasks">Back to the board</a></p>
+    </section>
+  )}
+
+  {task && detail && (
+    <article>
+      <header class="head">
+        <h1 class="head__title">{task.title || 'Untitled task'}</h1>
+
+        <div class="head__marks">
+          <StatusBadge status={task.status} label={task.statusLabel} size="md" />
+          <PriorityFlag priority={task.priority} size="md" />
+          {task.dueOn && (
+            <span class={task.isOverdue ? 'due due--late' : (task.dueOn === todayIso ? 'due due--soon' : 'due')}>
+              {dueText()}
+            </span>
+          )}
+        </div>
+
+        {task.status === 'blocked' && task.blockedReason && (
+          <p class="reasonbox">
+            <span class="reasonbox__label">Blocked</span>
+            {task.blockedReason}
+          </p>
+        )}
+        {task.status === 'cancelled' && task.cancelReason && (
+          <p class="reasonbox">
+            <span class="reasonbox__label">Cancelled</span>
+            {task.cancelReason}
+          </p>
+        )}
+
+        {task.description
+          ? <p class="head__desc">{task.description}</p>
+          : <p class="head__none">No description was written for this task.</p>}
+      </header>
+
+      <div class="cols">
+
+        {/* PROPERTIES. First in the document so that at 360px it stacks above the discussion, and
+            placed into the right-hand column on a wide screen by grid-column, not by DOM order. */}
+        <aside class="props" aria-label="Task properties and actions">
+
+          {/* ------------------------------ status ------------------------------ */}
+          <section class="block">
+            <h2 class="block__h">Status</h2>
+
+            {allowedTransitions.length > 0 ? (
+              <form method="POST" action={selfUrl} class="form">
+                <input type="hidden" name="action" value="move"/>
+                <input type="hidden" name="task_id" value={task.id}/>
+                <label class="form__label" for="to">Move this task</label>
+                {/* Options come from t.allowedTransitions and nothing else. A control that exists
+                    only to be refused teaches people the system is broken. */}
+                <select class="form__field" id="to" name="to" required>
+                  <option value="">Choose a status</option>
+                  {(allowedTransitions as string[]).map((s: string) => (
+                    <option value={s}>{labelOf(s)}</option>
+                  ))}
+                </select>
+                {moveNeedsReason && (
+                  <div class="form__row">
+                    <label class="form__label" for="reason">
+                      Why, if you are blocking or cancelling it
+                    </label>
+                    <input class="form__field" type="text" id="reason" name="reason" maxlength="2000"
+                      placeholder="Blocked and Cancelled both need a reason"/>
+                  </div>
+                )}
+                <button class="btn btn--primary wf-focusable" type="submit">Move</button>
+              </form>
+            ) : (
+              <p class="quiet">
+                There is nothing you can move this to from here. You can still add a comment.
+              </p>
+            )}
+
+            {/* APPROVE. Its own control because signing work off is not the same act as changing a
+                field, and because it is the one move an approver looks for by name. */}
+            {(mayApprove || showApproveReason) && (
+              <PermissionGate allowed={mayApprove} reason={approveCheck ? approveCheck.reason : null}>
+                <form method="POST" action={selfUrl} class="form form--sep">
+                  <input type="hidden" name="action" value="approve"/>
+                  <input type="hidden" name="task_id" value={task.id}/>
+                  <label class="form__label" for="approve-note">Approve this work</label>
+                  <textarea class="form__field" id="approve-note" name="note" rows="2" maxlength="4000"
+                    placeholder="Optional note, posted to the discussion"></textarea>
+                  <button class="btn btn--primary wf-focusable" type="submit">Approve</button>
+                </form>
+              </PermissionGate>
+            )}
+
+            {/* REQUEST REVISION. The note is REQUIRED and is posted as a comment, because moveTask
+                keeps a reason only for Blocked and Cancelled — see the POST handler. */}
+            {mayRequestRevision && (
+              <form method="POST" action={selfUrl} class="form form--sep">
+                <input type="hidden" name="action" value="revise"/>
+                <input type="hidden" name="task_id" value={task.id}/>
+                <label class="form__label" for="revise-note">Send it back for changes</label>
+                <textarea class="form__field" id="revise-note" name="note" rows="3" required maxlength="4000"
+                  placeholder="What needs changing?"></textarea>
+                <p class="form__hint">This goes into the discussion, where the person picking it up will read it.</p>
+                <button class="btn wf-focusable" type="submit">Request revision</button>
+              </form>
+            )}
+          </section>
+
+          {/* ---------------------------- properties ---------------------------- */}
+          <section class="block">
+            <h2 class="block__h">Details</h2>
+            <dl class="dl">
+              <dt class="dl__k">Priority</dt>
+              <dd class="dl__v"><PriorityFlag priority={task.priority} /></dd>
+
+              <dt class="dl__k">Due</dt>
+              <dd class="dl__v">{dueText()}</dd>
+
+              <dt class="dl__k">Department</dt>
+              <dd class="dl__v">
+                {detail.department
+                  ? (detail.department.name || 'Recorded, but we could not read its name')
+                  : 'Not recorded'}
+              </dd>
+
+              <dt class="dl__k">Assigned to</dt>
+              <dd class="dl__v">{assigneeIsMe ? assigneeName + ' (you)' : assigneeName}</dd>
+
+              <dt class="dl__k">Assigned by</dt>
+              <dd class="dl__v">
+                {task.selfAssigned ? assigneeName + ' (their own task)' : assignerName}
+              </dd>
+
+              <dt class="dl__k">You are</dt>
+              <dd class="dl__v">{myRoleWords || 'Not on this task'}</dd>
+            </dl>
+            {!detail.department && (
+              <p class="quiet">
+                A department is only recorded when someone is hired through the pipeline. Records
+                created by hand do not have one, so this being empty says nothing about the person.
+              </p>
+            )}
+          </section>
+
+          {/* --------------------------- collaborators -------------------------- */}
+          <section class="block" id="people">
+            <h2 class="block__h">On this task</h2>
+
+            {collabPeople.length > 0 ? (
+              <div class="stack">
+                <AvatarStack people={collabPeople} max={4} size="md" label="People on this task" />
+              </div>
+            ) : (
+              <p class="quiet">Nobody has been named on this task beyond the person it was given to.</p>
+            )}
+
+            {detail.collaborators.length > 0 && (
+              <ul class="people">
+                {detail.collaborators.map((c) => (
+                  <li class="people__row">
+                    <span class="people__name">
+                      {c.name || 'Name not on record'}
+                      {String(c.userId) === viewerUserId && <span class="people__you">you</span>}
+                    </span>
+                    <span class="people__role">{c.roleLabel}</span>
+                    {(mayRemoveOthers || String(c.userId) === viewerUserId) && (
+                      <form method="POST" action={selfUrl} class="people__form">
+                        <input type="hidden" name="action" value="collab_remove"/>
+                        <input type="hidden" name="task_id" value={task.id}/>
+                        <input type="hidden" name="user_id" value={c.userId}/>
+                        <input type="hidden" name="role" value={c.role}/>
+                        <button class="btn btn--small wf-focusable" type="submit">
+                          {String(c.userId) === viewerUserId ? 'Leave' : 'Remove'}
+                          <span class="wf-sr-only">
+                            {' ' + (c.name || 'this person') + ' as ' + c.roleLabel}
+                          </span>
+                        </button>
+                      </form>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {/* ADDING SOMEONE. The dialog and the ?add=1 section below are the same form, and only
+                ONE of them is ever in the DOM: without script the trigger is an anchor that
+                navigates to ?add=1 and gets the plain section; with script it opens the dialog.
+                Mutually exclusive branches, so there is no hidden duplicate to submit by accident
+                and no id used twice. */}
+            <PermissionGate
+              allowed={addableRoles.length > 0}
+              reason={'Adding a reviewer or an approver is for the person who assigned this task or the department lead. That is what stops work being signed off by whoever did it.'}
+            >
+              {candidates.length === 0 ? (
+                <p class="quiet">
+                  There is nobody here to choose from. This page can only offer people from a
+                  department you lead, plus anyone already named on this task.
+                </p>
+              ) : (
+                <div class="addwrap">
+                  {!addPanel && (
+                    <Dialog
+                      id="add-person"
+                      title="Add someone to this task"
+                      description="They will be able to read this task and its discussion."
+                      fallbackHref={detailUrl({ add: 1 }) + '#add-person-section'}
+                      triggerLabel="Add someone"
+                      triggerVariant="quiet"
+                      headingLevel={2}
+                    >
+                      <form method="POST" action={selfUrl} class="form">
+                        <input type="hidden" name="action" value="collab_add"/>
+                        <input type="hidden" name="task_id" value={task.id}/>
+                        <label class="form__label" for="add-who">Who</label>
+                        <select class="form__field" id="add-who" name="user_id" required>
+                          <option value="">Choose a person</option>
+                          {candidates.map((p: any) => (
+                            <option value={p.id}>{p.id === viewerUserId ? p.name + ' (you)' : p.name}</option>
+                          ))}
+                        </select>
+                        <div class="form__row">
+                          <label class="form__label" for="add-role">As</label>
+                          <select class="form__field" id="add-role" name="role" required>
+                            {(addableRoles as string[]).map((r: string) => (
+                              <option value={r}>{collabLabelOf(r)}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <button class="btn btn--primary wf-focusable" type="submit">Add to task</button>
+                      </form>
+                    </Dialog>
+                  )}
+
+                  {addPanel && (
+                    <section id="add-person-section" class="form form--sep">
+                      <h3 class="block__h">Add someone to this task</h3>
+                      <form method="POST" action={selfUrl}>
+                        <input type="hidden" name="action" value="collab_add"/>
+                        <input type="hidden" name="task_id" value={task.id}/>
+                        <label class="form__label" for="add-who">Who</label>
+                        <select class="form__field" id="add-who" name="user_id" required>
+                          <option value="">Choose a person</option>
+                          {candidates.map((p: any) => (
+                            <option value={p.id}>{p.id === viewerUserId ? p.name + ' (you)' : p.name}</option>
+                          ))}
+                        </select>
+                        <div class="form__row">
+                          <label class="form__label" for="add-role">As</label>
+                          <select class="form__field" id="add-role" name="role" required>
+                            {(addableRoles as string[]).map((r: string) => (
+                              <option value={r}>{collabLabelOf(r)}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <button class="btn btn--primary wf-focusable" type="submit">Add to task</button>
+                      </form>
+                      <p class="form__hint"><a class="link wf-focusable" href={selfUrl}>Cancel</a></p>
+                    </section>
+                  )}
+                </div>
+              )}
+            </PermissionGate>
+          </section>
+        </aside>
+
+        {/* ------------------------------ main column ------------------------------ */}
+        <main class="main">
+
+          <section class="block block--wide">
+            <h2 class="block__h">Activity</h2>
+            <p class="quiet">
+              Status changes, and changes to who is on this task. Comments are in the discussion
+              below.
+            </p>
+
+            {!activityOk && (
+              <p class="note note--warn" role="status">
+                The history could not be read just now, so this is not a record of what has happened.
+                Nothing has been lost. Try again in a moment.
+              </p>
+            )}
+
+            {activityOk && activity.length === 0 && (
+              <p class="quiet">
+                Nothing has been recorded against this task yet. Records begin when a task is created
+                or moved.
+              </p>
+            )}
+
+            {activityOk && activity.length > 0 && (
+              <ol class="wf-timeline">
+                {activity.map((e: TaskActivityEntry) => (
+                  <Timeline
+                    actor={e.actorName}
+                    actorRole={e.actorRole}
+                    action={e.action}
+                    from={e.from}
+                    to={e.to}
+                    kind={e.kind}
+                    note={e.note}
+                    at={e.at}
+                  />
+                ))}
+              </ol>
+            )}
+          </section>
+
+          <section class="block block--wide">
+            {/* No parentField: employee_task_comments has no parent_id column and addComment()
+                would discard one. See the note at the top of CommentThread.astro. */}
+            <CommentThread
+              comments={detail.comments.map((c) => ({
+                id: c.id,
+                authorName: c.authorName,
+                body: c.body,
+                createdAt: c.createdAt,
+              }))}
+              taskId={task.id}
+              canComment={detail.viewerMayComment}
+              action={selfUrl}
+              actionField="action"
+              actionValue="comment"
+              taskField="task_id"
+              bodyField="body"
+              heading="Discussion"
+              headingLevel={2}
+              cannotCommentText="You can read this conversation but not add to it."
+            />
+          </section>
+        </main>
+      </div>
+    </article>
+  )}
+</div>
+
+<style>
+  /* The page is built on the tokens in src/styles/workforce.css so it matches the components it
+     renders. Motion is opacity and transform only, and there is none on this page that does not
+     report a state change. */
+  :global(html) {
+    background: var(--wf-ground);
+  }
+
+  :global(body) {
+    margin: 0;
+    background: var(--wf-ground);
+    color: var(--wf-ink);
+    font-family: var(--wf-font);
+    font-size: var(--wf-t-body);
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  /* -------------------------------- the bar -------------------------------- */
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--wf-s-3);
+    height: 52px;
+    padding: 0 var(--wf-s-4);
+    background: var(--wf-nav-surface);
+    border-bottom: 1px solid var(--wf-nav-line);
+  }
+
+  .topbar__back {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--wf-s-2);
+    /* 44px of target inside a 52px bar, without pushing the bar taller. */
+    min-height: var(--wf-touch);
+    padding-right: var(--wf-s-2);
+    color: var(--wf-nav-ink);
+    font-size: var(--wf-t-meta);
+    font-weight: 650;
+    text-decoration: none;
+  }
+
+  .topbar__back svg {
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+  }
+
+  .topbar__who {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--wf-nav-ink);
+    font-size: var(--wf-t-micro);
+  }
+
+  /* ------------------------------- the shell ------------------------------- */
+
+  .wrap {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: var(--wf-s-4) var(--wf-s-4) var(--wf-s-6);
+  }
+
+  .note {
+    margin: 0 0 var(--wf-s-4);
+    padding: var(--wf-s-3);
+    border-radius: var(--wf-r-md);
+    border: 1px solid var(--wf-line);
+    font-size: var(--wf-t-meta);
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+  }
+
+  .note--ok {
+    border-color: var(--wf-approved-border);
+    background: var(--wf-approved-wash);
+    color: var(--wf-approved-text);
+  }
+
+  .note--warn {
+    border-color: var(--wf-overdue-border);
+    background: var(--wf-overdue-wash);
+    color: var(--wf-overdue-text);
+  }
+
+  .panel {
+    padding: var(--wf-s-5) var(--wf-s-4);
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-lg);
+    background: var(--wf-surface);
+  }
+
+  .panel__title {
+    margin: 0 0 var(--wf-s-2);
+    font-size: var(--wf-t-lg);
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  .panel__body {
+    margin: 0 0 var(--wf-s-2);
+    max-width: 60ch;
+    color: var(--wf-ink-2);
+  }
+
+  .link {
+    color: var(--wf-info-text);
+    font-weight: 650;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  /* -------------------------------- the head ------------------------------- */
+
+  .head {
+    margin-bottom: var(--wf-s-5);
+  }
+
+  .head__title {
+    margin: 0;
+    font-size: 1.375rem;
+    font-weight: 700;
+    line-height: 1.25;
+    letter-spacing: -0.015em;
+    text-wrap: balance;
+    /* A pasted URL in a title must not widen the page at 360px. */
+    overflow-wrap: anywhere;
+  }
+
+  .head__marks {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--wf-s-2);
+    margin-top: var(--wf-s-3);
+  }
+
+  .due {
+    font-size: var(--wf-t-meta);
+    font-weight: 650;
+    color: var(--wf-ink-3);
+  }
+
+  /* Amber, never red. A late task is information, not an emergency. */
+  .due--late { color: var(--wf-overdue-text); }
+  .due--soon { color: var(--wf-due_soon-text); }
+
+  .head__desc {
+    margin: var(--wf-s-4) 0 0;
+    max-width: 68ch;
+    color: var(--wf-ink-2);
+    /* The description is stored as typed. pre-wrap keeps the line breaks a person meant, and
+       because it is a text node Astro escapes it, so nothing typed can become markup. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .head__none {
+    margin: var(--wf-s-4) 0 0;
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-meta);
+  }
+
+  .reasonbox {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--wf-s-2);
+    margin: var(--wf-s-3) 0 0;
+    padding: var(--wf-s-3);
+    border: 1px solid var(--wf-blocked-border);
+    border-radius: var(--wf-r-md);
+    background: var(--wf-blocked-wash);
+    color: var(--wf-blocked-text);
+    font-size: var(--wf-t-meta);
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+  }
+
+  .reasonbox__label {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: var(--wf-t-micro);
+  }
+
+  /* ------------------------------- the columns ----------------------------- */
+
+  .cols {
+    display: grid;
+    gap: var(--wf-s-5);
+    /* One column at 360px. min-width:0 is what stops a long word inside a child from widening the
+       track and giving the PAGE a sideways scrollbar. */
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .props,
+  .main {
+    min-width: 0;
+  }
+
+  @media (min-width: 900px) {
+    .cols {
+      grid-template-columns: minmax(0, 1fr) 21rem;
+      align-items: start;
+    }
+
+    /* Placed by grid, not by document order: the properties column is FIRST in the DOM so that at
+       360px it stacks above the discussion, which is where the actions belong on a phone. */
+    .main { grid-column: 1; grid-row: 1; }
+
+    .props {
+      grid-column: 2;
+      grid-row: 1;
+      position: sticky;
+      top: var(--wf-s-4);
+      /* A sticky column taller than the viewport would hide its own last control. */
+      max-height: calc(100vh - var(--wf-s-6));
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+  }
+
+  .block {
+    padding: var(--wf-s-4);
+    margin-bottom: var(--wf-s-4);
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-lg);
+    background: var(--wf-surface);
+    min-width: 0;
+  }
+
+  .block:last-child { margin-bottom: 0; }
+
+  .block__h {
+    margin: 0 0 var(--wf-s-3);
+    font-size: var(--wf-t-title);
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+
+  .quiet {
+    margin: 0 0 var(--wf-s-2);
+    max-width: 60ch;
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-meta);
+    line-height: 1.55;
+  }
+
+  .quiet:last-child { margin-bottom: 0; }
+
+  /* --------------------------------- forms --------------------------------- */
+
+  .form {
+    margin: 0;
+    min-width: 0;
+  }
+
+  .form--sep {
+    margin-top: var(--wf-s-4);
+    padding-top: var(--wf-s-4);
+    border-top: 1px solid var(--wf-line);
+  }
+
+  .form__row {
+    margin-top: var(--wf-s-3);
+  }
+
+  .form__label {
+    display: block;
+    margin-bottom: var(--wf-s-2);
+    font-size: var(--wf-t-meta);
+    font-weight: 650;
+    color: var(--wf-ink);
+  }
+
+  .form__field {
+    display: block;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    min-height: var(--wf-touch);
+    padding: var(--wf-s-2) var(--wf-s-3);
+    border: 1px solid var(--wf-line-strong);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-raised);
+    color: var(--wf-ink);
+    font-family: inherit;
+    /* 16px. Anything smaller and iOS Safari zooms the page the moment the field takes focus. */
+    font-size: 1rem;
+    line-height: 1.5;
+  }
+
+  textarea.form__field {
+    resize: vertical;
+  }
+
+  .form__field:focus-visible {
+    outline: 2px solid var(--wf-focus);
+    outline-offset: 1px;
+    border-color: var(--wf-focus);
+  }
+
+  .form__hint {
+    margin: var(--wf-s-2) 0 0;
+    font-size: var(--wf-t-micro);
+    line-height: 1.5;
+    color: var(--wf-ink-3);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: var(--wf-touch);
+    margin-top: var(--wf-s-3);
+    padding: var(--wf-s-2) var(--wf-s-4);
+    border: 1px solid var(--wf-line-strong);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-raised);
+    color: var(--wf-ink);
+    font-family: inherit;
+    font-size: var(--wf-t-body);
+    font-weight: 650;
+    cursor: pointer;
+  }
+
+  .btn--primary {
+    border-color: var(--wf-ink);
+    background: var(--wf-ink);
+    color: var(--wf-surface);
+  }
+
+  .btn--small {
+    min-height: 32px;
+    margin-top: 0;
+    padding: var(--wf-s-1) var(--wf-s-3);
+    font-size: var(--wf-t-micro);
+  }
+
+  .btn:active { opacity: 0.8; }
+
+  /* -------------------------------- details -------------------------------- */
+
+  .dl {
+    display: grid;
+    grid-template-columns: 8.5rem minmax(0, 1fr);
+    gap: var(--wf-s-2) var(--wf-s-3);
+    margin: 0;
+  }
+
+  .dl__k {
+    margin: 0;
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-meta);
+  }
+
+  .dl__v {
+    margin: 0;
+    min-width: 0;
+    color: var(--wf-ink);
+    font-size: var(--wf-t-meta);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+
+  /* ------------------------------- the people ------------------------------ */
+
+  .stack {
+    margin-bottom: var(--wf-s-3);
+  }
+
+  .people {
+    list-style: none;
+    margin: 0 0 var(--wf-s-3);
+    padding: 0;
+  }
+
+  .people__row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--wf-s-2);
+    padding: var(--wf-s-2) 0;
+    border-bottom: 1px solid var(--wf-line);
+  }
+
+  .people__row:last-child { border-bottom: none; }
+
+  .people__name {
+    flex: 1 1 8rem;
+    min-width: 0;
+    font-size: var(--wf-t-meta);
+    font-weight: 650;
+    overflow-wrap: anywhere;
+  }
+
+  .people__you {
+    margin-left: var(--wf-s-1);
+    padding: 1px 6px;
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-veil);
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-micro);
+    font-weight: 700;
+  }
+
+  .people__role {
+    padding: 1px 7px;
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-veil);
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-micro);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .people__form {
+    margin: 0;
+    flex: 0 0 auto;
+  }
+
+  .addwrap {
+    margin-top: var(--wf-s-2);
+  }
+
+  .block--wide {
+    margin-bottom: var(--wf-s-5);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .btn:active { opacity: 1; }
+  }
+
+  @media (forced-colors: active) {
+    .block,
+    .panel {
+      border-color: CanvasText;
+    }
+  }
+</style>
+</body>
+</html>

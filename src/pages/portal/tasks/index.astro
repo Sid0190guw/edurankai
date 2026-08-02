@@ -1,0 +1,1142 @@
+---
+// src/pages/portal/tasks/index.astro — THE BOARD. /portal/tasks
+//
+// WHAT THIS PAGE OWNS, WHICH IS ALMOST NOTHING. src/lib/employee-tasks.ts already holds the whole
+// workflow: the status graph, who may walk which edge, the collaborator roles, the visibility
+// clause. src/styles/workforce.css and src/components/workforce/* already hold the whole visual
+// language. This page resolves who is asking, hands their users id to listBoard(), groups what comes
+// back by TASK_STATUSES, and posts moves back through moveTask(). Every refusal a person reads here
+// is a sentence the ENGINE wrote; every colour, every size and every duration is a TOKEN. Two places
+// deciding who may finish a task is how one of them becomes the one nobody remembered to update, and
+// two places deciding what "overdue" looks like is how a board ends up with three different ambers.
+//
+// MOVING A CARD WORKS WITHOUT JAVASCRIPT, AND THAT IS THE MECHANISM, NOT THE FALLBACK. Every card
+// carries a real <form method="POST"> with a status <select> and a Move button. The drag-and-drop at
+// the bottom of this file is one small inline script that does exactly one thing: set that same
+// select and submit that same form. If it never runs — old Android WebView, script blocked, a touch
+// screen with no HTML5 drag — nothing is lost and nothing is hidden. The script also adds the drag
+// affordance itself (`draggable`, the grab cursor), so a browser that cannot drag never shows a
+// handle it will not honour. The select is in tab order and is the keyboard path; accessible drag is
+// only accessible because the form exists underneath it.
+//
+// THE SELECT ON EACH CARD IS BUILT FROM t.allowedTransitions AND NOTHING ELSE. That list is computed
+// per task, per viewer, from roles the DATABASE resolved in the same query that returned the row. A
+// control that exists only to be refused teaches people the system is broken, so a task this person
+// cannot move shows no control at all and says so in words instead.
+//
+// WHY THE ASSIGNEE FILTER IS APPLIED HERE AND THE OTHERS ARE APPLIED IN SQL. listBoard() can filter
+// by assignee and is deliberately not asked to. The people in the assignee dropdown are derived from
+// the board's own rows — the only list of names this page is entitled to show, since anyone else
+// would be a person the viewer cannot see. If the assignee filter ran in SQL, the dropdown would be
+// rebuilt from a result set containing exactly one person, and switching from one colleague to
+// another would be impossible without first clearing the filter. Priority, overdue and archived stay
+// in SQL where they belong. Still ONE query. The cost is that its LIMIT applies before the narrowing,
+// so when the board comes back full the page says so rather than presenting a truncation as the whole.
+//
+// NO CARD LINKS ANYWHERE. /portal/tasks/[id] does not exist yet — this directory holds this file and
+// nothing else. TaskCard takes an optional `href` and it is deliberately not passed: a board where
+// every title is a 404 is worse than a board with no titles linked. Everything a detail page would
+// have shown (description, the blocked or cancelled reason, who assigned it, when it last moved, the
+// comment count) is inside the card's own <details>, which is native, needs no script and is shut by
+// default. When the detail route ships, `href={'/portal/tasks/' + t.id}` is the one-line change.
+import '@/styles/workforce.css';
+import {
+  requireEmployee,
+  requireTeamLead,
+} from '@/lib/auth/workspace-access';
+import {
+  TASK_STATUSES,
+  STATUS_LABELS,
+  TASK_PRIORITIES,
+  canonicalStatus,
+  isTaskStatus,
+  listBoard,
+  moveTask,
+  type TaskStatus,
+  type TaskPriority,
+  type BoardTask,
+} from '@/lib/employee-tasks';
+import BottomNav from '@/components/workforce/BottomNav.astro';
+import FilterBar from '@/components/workforce/FilterBar.astro';
+import TaskCard from '@/components/workforce/TaskCard.astro';
+import EmptyState from '@/components/workforce/EmptyState.astro';
+
+const user = Astro.locals.user as any;
+
+// ---------------------------------------------------------------------------------------------
+// GATE FIRST. Nobody unresolvable sees a board.
+//
+// requireEmployee() is the base gate for a personal work surface and is the right one here: the
+// board is somebody's own work. It does insist on an active hr_employees row, and there is exactly
+// one person that wrongly excludes — a department head whose own HR record HR has not created yet.
+// requireTeamLead() exists precisely for that case (its doc comment: authority is
+// users.role + users.assigned_department_id, and demanding an employee row would lock a real lead out
+// without narrowing what they may see by a single row), so a 'no-employee-record' denial gets a
+// second look through that gate and nothing else does. 'ambiguous-record' must NOT fall through —
+// that denial is the deliberate refusal to guess between two people — and neither must 'inactive'
+// (a closed record stays closed) nor 'lookup-failed' (the database blinked; guessing again is not an
+// answer). Either way the CONTENTS of the board are scoped by listBoard()'s own WHERE clause against
+// this users id, so the gate decides whether a person is resolvable, never what they may read.
+const gate = await requireEmployee(user, '/portal/tasks');
+const leadGate = (!gate.ok && gate.code === 'no-employee-record')
+  ? await requireTeamLead(user, '/portal/tasks')
+  : null;
+
+const denial = gate.ok ? null : (leadGate && leadGate.ok ? null : gate);
+if (denial && denial.redirect) return Astro.redirect(denial.redirect);
+
+const mayUse = !denial;
+const viewerUserId = String(user?.id || '').trim();
+const myEmployeeId = gate.ok
+  ? gate.workspace.employeeId
+  : (leadGate && leadGate.ok && leadGate.workspace ? leadGate.workspace.employeeId : null);
+const viewerName = String(user?.name || user?.email || '').trim();
+
+// ---------------------------------------------------------------------------------------------
+// EVERY const BELOW IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted; a handler that
+// reaches a declaration further down throws on its first line while the page still reports success.
+// That has taken this site down twice. Nothing in the POST block reads anything declared after it.
+// ---------------------------------------------------------------------------------------------
+
+const params = Astro.url.searchParams;
+
+/** Assignee narrowing. Validated against the board's own people list after the read, not here. */
+const who = String(params.get('who') || '').trim().slice(0, 64);
+
+const rawPriority = String(params.get('prio') || '').trim().toLowerCase();
+const priority: TaskPriority | null =
+  (TASK_PRIORITIES as string[]).indexOf(rawPriority) >= 0 ? (rawPriority as TaskPriority) : null;
+// An unusable filter is dropped AND said out loud. A full board under a chip still reading "Urgent"
+// is the page lying about what it is showing.
+const priorityNotice = rawPriority && !priority
+  ? 'That priority is not one we track, so the board is not filtered by priority.'
+  : '';
+
+const overdueOnly = params.get('late') === '1';
+const includeArchived = params.get('arch') === '1';
+
+const rawColumn = String(params.get('col') || '').trim().toLowerCase();
+const oneColumn: TaskStatus | null = isTaskStatus(rawColumn) ? rawColumn : null;
+const columnNotice = rawColumn && !oneColumn
+  ? 'That is not a column we have, so the whole board is shown.'
+  : '';
+
+// ---------------------------------------------------------------------------------------------
+// DENSITY AND FOCUS MODE. A cookie, a data attribute on <html>, and not one line of JavaScript.
+//
+// Both are read here and WRITTEN by the POST handler below, because a display preference that lives
+// in the URL is a preference somebody accidentally shares in a link, and a preference that lives in
+// localStorage is one that arrives after first paint and reflows the board underneath the reader.
+// A cookie is on the request, so the very first byte of HTML is already in the right density.
+//
+// The values are validated against these lists before they reach an attribute. Neither is ever
+// interpolated raw: 'compact' is a value this file recognises or it is 'cozy'.
+const DENSITIES = ['comfortable', 'cozy', 'compact'];
+const DENSITY_LABELS = ['Comfortable', 'Cozy', 'Compact'];
+const rawDensity = String(Astro.cookies.get('wf_density')?.value || '').trim().toLowerCase();
+const density = DENSITIES.indexOf(rawDensity) >= 0 ? rawDensity : 'cozy';
+const focusOn = String(Astro.cookies.get('wf_focus')?.value || '').trim().toLowerCase() === 'on';
+
+// A year, path-wide, and httpOnly because nothing on the client ever reads it — the server stamps
+// the attribute. `secure` is conditional so the cookie is not silently dropped on a local http run.
+const COOKIE_OPTS = {
+  path: '/',
+  maxAge: 60 * 60 * 24 * 365,
+  sameSite: 'lax' as const,
+  httpOnly: true,
+  secure: Astro.url.protocol === 'https:',
+};
+
+/**
+ * Build a URL for this page carrying the CURRENT filters, with named overrides.
+ *
+ * Every link and both forms go through this, so a move, a column jump or a filter change never
+ * silently drops the other filters — coming back to a board that has quietly reset itself is how
+ * somebody loses the view they were working in. Density and focus are NOT in here: they are cookies,
+ * so they survive every one of these navigations without occupying a query parameter.
+ */
+const boardUrl = (over: any = {}): string => {
+  const has = (k: string) => Object.prototype.hasOwnProperty.call(over, k);
+  const p = new URLSearchParams();
+
+  const nextWho = has('who') ? over.who : who;
+  if (nextWho) p.set('who', String(nextWho).slice(0, 64));
+
+  const nextPrio = has('prio') ? over.prio : priority;
+  if (nextPrio) p.set('prio', String(nextPrio));
+
+  const nextLate = has('late') ? over.late : overdueOnly;
+  if (nextLate) p.set('late', '1');
+
+  const nextArch = has('arch') ? over.arch : includeArchived;
+  if (nextArch) p.set('arch', '1');
+
+  const nextCol = has('col') ? over.col : oneColumn;
+  if (nextCol) p.set('col', String(nextCol));
+
+  if (over.msg) p.set('msg', String(over.msg).slice(0, 300));
+  if (over.bad) p.set('bad', '1');
+
+  const s = p.toString();
+  return s ? '/portal/tasks?' + s : '/portal/tasks';
+};
+
+/** Declared before the handler that uses it, and before the JSX that uses it. */
+const selfUrl = boardUrl({});
+
+// ---------------------------------------------------------------------------------------------
+// THE WRITES. Two actions: move a task, or change a display preference. Both POST, both redirect.
+// ---------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  // The gate runs above this block, so an unresolvable person cannot post a move even by hand.
+  // moveTask() would refuse them anyway — it re-derives the role inside the UPDATE — but a write
+  // must never be attempted from a page state that was refused.
+  if (!mayUse) {
+    return Astro.redirect(boardUrl({ msg: 'Please sign in again to move tasks.', bad: 1 }));
+  }
+
+  let msg = '';
+  let bad = 1;
+
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '').trim();
+
+    // ---- display preference -------------------------------------------------------------
+    // A POST rather than a link, because it changes stored state; a redirect afterwards, so a
+    // reload does not re-submit it. Only values on the allow-lists are ever written.
+    if (action === 'prefs') {
+      const wantedDensity = String(fd.get('density') || '').trim().toLowerCase();
+      const wantedFocus = String(fd.get('focus') || '').trim().toLowerCase();
+      if (DENSITIES.indexOf(wantedDensity) >= 0) {
+        Astro.cookies.set('wf_density', wantedDensity, COOKIE_OPTS);
+      }
+      if (wantedFocus === 'on' || wantedFocus === 'off') {
+        Astro.cookies.set('wf_focus', wantedFocus, COOKIE_OPTS);
+      }
+      return Astro.redirect(selfUrl);
+    }
+
+    if (action !== 'move') {
+      return Astro.redirect(selfUrl);
+    }
+
+    // ---- move ---------------------------------------------------------------------------
+    const taskId = String(fd.get('task_id') || '').trim();
+    const rawTo = String(fd.get('to') || '').trim();
+    const reason = String(fd.get('reason') || '').trim();
+    // canonicalStatus() rather than a list restated here: one vocabulary, owned by the engine.
+    const to = canonicalStatus(rawTo);
+
+    if (!taskId) {
+      msg = 'That task is not available.';
+    } else if (!rawTo) {
+      // Distinct from an unknown status. Somebody who pressed Move without choosing needs telling
+      // what to do, not telling that they typed something invalid.
+      msg = 'Pick where to move it, then press Move.';
+    } else if (!to) {
+      msg = 'That is not a status we track.';
+    } else {
+      // The engine validates the edge, the role and the required reason, and re-derives the
+      // authorising role inside the UPDATE. This page adds no checks of its own and overrides none.
+      const res = await moveTask(taskId, viewerUserId, to, {
+        reason,
+        ipAddress: Astro.clientAddress,
+      });
+      if (res.ok) {
+        bad = 0;
+        msg = res.changed === false
+          ? 'That task was already there, so nothing changed.'
+          : 'Moved to ' + (STATUS_LABELS[to] || to) + '.';
+      } else {
+        msg = res.error || 'Could not move that task.';
+      }
+    }
+  } catch (e: any) {
+    // Never a bare catch. The real Postgres reason lives on e.cause; e.message is only the SQL.
+    console.error('[portal/tasks] post', e?.cause?.message || e?.message);
+    msg = 'Could not do that just now. Nothing was changed. Try again in a moment.';
+  }
+
+  return Astro.redirect(boardUrl({ msg, bad: bad ? 1 : 0 }));
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE READ. One query.
+// ---------------------------------------------------------------------------------------------
+
+// 600 rather than the engine's default 400, because this board is shared by a lead's whole
+// department and the assignee narrowing happens after the LIMIT (see the header note). Truncation is
+// detected below and stated rather than hidden.
+const BOARD_LIMIT = 600;
+
+let boardOk = false;
+let boardReason = 'no-viewer';
+let allTasks: BoardTask[] = [];
+let engineNotice = '';
+
+if (mayUse) {
+  try {
+    const view = await listBoard(viewerUserId, {
+      priority,
+      overdueOnly,
+      includeArchived,
+      limit: BOARD_LIMIT,
+    });
+    boardOk = view.ok;
+    boardReason = view.reason;
+    allTasks = Array.isArray(view.tasks) ? view.tasks : [];
+    engineNotice = view.notice || '';
+  } catch (e: any) {
+    // listBoard catches its own failures and reports ok:false, so this only fires on something it
+    // could not. It still logs, because a page that renders an empty board on a swallowed error is
+    // telling a lead their department has no work in flight.
+    console.error('[portal/tasks] listBoard', e?.cause?.message || e?.message);
+    boardOk = false;
+    boardReason = 'lookup-failed';
+  }
+}
+
+const truncated = boardOk && allTasks.length >= BOARD_LIMIT;
+
+// The people on this board — derived from its own rows, so this dropdown can never name somebody the
+// viewer is not already entitled to see.
+const people: any[] = [];
+const seenPerson: any = {};
+for (const t of allTasks) {
+  const id = String(t.employeeId || '');
+  if (!id || seenPerson[id]) continue;
+  seenPerson[id] = 1;
+  people.push({
+    id,
+    name: String(t.employeeName || '').trim() || 'Name not recorded',
+    isMe: !!myEmployeeId && id === myEmployeeId,
+  });
+}
+people.sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
+
+const whoValid = who && people.some((p: any) => p.id === who) ? who : null;
+const whoNotice = who && !whoValid
+  ? 'Nobody with work on this board matches that person, so the board is not filtered by assignee.'
+  : '';
+const whoName = whoValid ? (people.find((p: any) => p.id === whoValid)?.name || '') : '';
+
+const shown: BoardTask[] = whoValid ? allTasks.filter((t) => String(t.employeeId) === whoValid) : allTasks;
+
+// Columns from TASK_STATUSES, in its order. `archived` is only a column when it was asked for —
+// otherwise it is an empty box on every board forever.
+const statusesShown: TaskStatus[] = TASK_STATUSES.filter((s) => includeArchived || s !== 'archived');
+const columns = statusesShown.map((status) => ({
+  status,
+  label: STATUS_LABELS[status] || status,
+  tasks: shown.filter((t) => t.status === status),
+}));
+const visibleColumns = oneColumn ? columns.filter((c) => c.status === oneColumn) : columns;
+
+const totalShown = shown.length;
+const overdueShown = shown.filter((t) => t.isOverdue).length;
+
+const filtersOn = !!(whoValid || priority || overdueOnly || includeArchived || oneColumn);
+
+// ---------------------------------------------------------------------------------------------
+// Display helpers. Functions rather than typed maps indexed inside JSX — a Record<string,string>
+// read from a template is a known parser trap in .astro files here.
+// ---------------------------------------------------------------------------------------------
+
+const labelOf = (s: string): string => STATUS_LABELS[s as TaskStatus] || s;
+
+/** A real sentence per column, so an empty column says what belongs in it. */
+const emptyTitle = (s: string): string => {
+  if (s === 'draft') return 'Nothing in draft';
+  if (s === 'assigned') return 'Nothing waiting to be picked up';
+  if (s === 'accepted') return 'Nothing accepted and not started';
+  if (s === 'in_progress') return 'Nothing in flight';
+  if (s === 'blocked') return 'Nothing is blocked';
+  if (s === 'under_review') return 'Nothing waiting to be read';
+  if (s === 'approved') return 'Nothing signed off and open';
+  if (s === 'completed') return 'Nothing finished yet';
+  if (s === 'cancelled') return 'Nothing cancelled';
+  if (s === 'archived') return 'Nothing archived';
+  return 'Nothing here';
+};
+
+// An empty Blocked column is the best news on the board and is drawn as such: the tick, on the
+// approved ramp. Everything else gets the calm empty tray.
+const emptyArt = (s: string): 'check' | 'tray' => (s === 'blocked' ? 'check' : 'tray');
+const emptyTone = (s: string): string => (s === 'blocked' ? 'approved' : 'draft');
+
+/** Only worth a text box when one of the two statuses that demand a stated cause is reachable. */
+const needsReasonBox = (t: BoardTask): boolean =>
+  t.allowedTransitions.indexOf('blocked') >= 0 || t.allowedTransitions.indexOf('cancelled') >= 0;
+
+// Options for the filter bar. Built as plain {value,label} pairs — no literal-type narrowing to go
+// wrong — and passed into a component that renders a GET form and no JavaScript at all.
+const whoOptions = [{ value: '', label: 'Everyone' }].concat(
+  people.map((p: any) => ({ value: String(p.id), label: p.isMe ? p.name + ' (you)' : p.name })),
+);
+const prioOptions = [{ value: '', label: 'Any priority' }].concat(
+  (TASK_PRIORITIES as string[]).map((p) => ({ value: p, label: p.charAt(0).toUpperCase() + p.slice(1) })),
+);
+
+const flash = String(params.get('msg') || '').slice(0, 300);
+const flashBad = params.get('bad') === '1';
+
+const filterSummary = totalShown + (totalShown === 1 ? ' task' : ' tasks')
+  + (overdueShown > 0 ? ', ' + overdueShown + ' past their date' : '');
+---
+<!doctype html>
+<html lang="en" data-density={density} data-focus-mode={focusOn ? 'on' : 'off'}>
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Task board - EduRankAI</title>
+  <meta name="robots" content="noindex"/>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+</head>
+<body>
+
+<a class="skip wf-focusable" href="#board">Skip to the board</a>
+
+<header class="bar">
+  <a class="bar__back wf-focusable" href="/portal/employee" aria-label="Back to My HR">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+  </a>
+  <h1 class="bar__title">Task board</h1>
+  {viewerName && <span class="bar__who">{viewerName}</span>}
+</header>
+
+<main class="page">
+
+  {flash && (
+    <p class="note" role="status" data-wf-tone={flashBad ? 'danger' : 'approved'}>{flash}</p>
+  )}
+
+  {denial && (
+    <section class="panel">
+      <h2 class="panel__title">{denial.title}</h2>
+      <p class="panel__body">{denial.reason}</p>
+      <p class="panel__body"><a class="link wf-focusable" href="/portal/employee">Go to My HR</a></p>
+    </section>
+  )}
+
+  {mayUse && !boardOk && (
+    <p class="note" role="status" data-wf-tone="danger">
+      {boardReason === 'no-viewer'
+        ? 'We could not work out who is asking, so no board is shown. Sign in again and reload this page.'
+        : 'The board could not be loaded just now, so this is not a list of your work. Nothing has been lost. Reload in a moment, and tell HR if it keeps happening.'}
+    </p>
+  )}
+
+  {mayUse && boardOk && (
+    <div>
+      <p class="tally">
+        <b class="wf-num">{totalShown}</b>
+        <span>{totalShown === 1 ? 'task' : 'tasks'} you can see{whoName ? ' for ' + whoName : ''}</span>
+        {overdueShown > 0 && (
+          <span class="tally__late" data-wf-tone="overdue">{overdueShown} past their date</span>
+        )}
+      </p>
+
+      {priorityNotice && <p class="note" data-wf-tone="info">{priorityNotice}</p>}
+      {whoNotice && <p class="note" data-wf-tone="info">{whoNotice}</p>}
+      {columnNotice && <p class="note" data-wf-tone="info">{columnNotice}</p>}
+      {engineNotice && <p class="note" data-wf-tone="info">{engineNotice}</p>}
+      {truncated && (
+        <p class="note" data-wf-tone="info">Showing the first {BOARD_LIMIT} tasks. There are more than this, so narrow the board with the filters below to be sure you are seeing everything.</p>
+      )}
+
+      {/* FILTERS. A GET form and no script: the result is a URL somebody can bookmark or send to a
+          colleague, Back is the undo stack, and the filters survive the POST that moves a card
+          because the move redirects through boardUrl(). `col` is carried so changing a filter does
+          not knock you out of the single column you were reading. */}
+      <FilterBar
+        class="filters"
+        action="/portal/tasks"
+        label="Filter the board"
+        submitLabel="Apply"
+        clearHref={filtersOn ? '/portal/tasks' : undefined}
+        clearLabel="Clear filters"
+        summary={filterSummary}
+        carry={oneColumn ? [{ name: 'col', value: oneColumn }] : []}
+        fields={[
+          { name: 'who', label: 'Person', type: 'select', value: whoValid || '', options: whoOptions },
+          { name: 'prio', label: 'Priority', type: 'select', value: priority || '', options: prioOptions },
+          { name: 'late', label: 'Only tasks past their date', type: 'checkbox', checked: overdueOnly },
+          { name: 'arch', label: 'Include archived', type: 'checkbox', checked: includeArchived },
+        ]}
+      />
+
+      {/* DENSITY AND FOCUS. Two POSTs, a cookie each, zero bytes of JavaScript. Density is the
+          reason this board can be a reading surface at 09:00 and a triage queue at 17:00 without
+          being two screens; focus mode drops the chrome to the quiet ink so the cards carry the
+          contrast. Both are colour and spacing tokens only — nothing here re-queries anything. */}
+      <form class="prefs" method="POST" action={selfUrl}>
+        <input type="hidden" name="action" value="prefs"/>
+
+        <fieldset class="prefs__set">
+          <legend class="prefs__legend">Density</legend>
+          <div class="prefs__row">
+            {DENSITIES.map((d: string, i: number) => (
+              <button
+                class:list={['prefs__btn', 'wf-focusable', { 'is-on': d === density }]}
+                type="submit"
+                name="density"
+                value={d}
+                aria-pressed={d === density ? 'true' : 'false'}
+              >{DENSITY_LABELS[i]}</button>
+            ))}
+          </div>
+        </fieldset>
+
+        <fieldset class="prefs__set">
+          <legend class="prefs__legend">Reading</legend>
+          <div class="prefs__row">
+            <button
+              class:list={['prefs__btn', 'wf-focusable', { 'is-on': focusOn }]}
+              type="submit"
+              name="focus"
+              value={focusOn ? 'off' : 'on'}
+              aria-pressed={focusOn ? 'true' : 'false'}
+            >Focus mode</button>
+          </div>
+        </fieldset>
+      </form>
+
+      {/* THE COLUMN CHIPS, AND THE MOBILE DECISION.
+          At 360px a board of nine columns is roughly 2,400px of sideways swiping, and somebody
+          hunting for their one blocked task would swipe past six columns to reach it. So the columns
+          scroll horizontally INSIDE their own container — the PAGE never scrolls sideways — and
+          these chips give a one-tap route to a single full-width column via ?col=. It is a real
+          filter rather than a responsive trick, which is why it stays on a wide screen too: "show me
+          only what is under review" is a reasonable thing to want on a laptop. The chips carry the
+          counts, so the shape of the whole board is readable without scrolling at all. */}
+      <nav class="chips" aria-label="Jump to one column">
+        <a
+          class:list={['chip', 'wf-focusable', { 'is-on': !oneColumn }]}
+          href={boardUrl({ col: null })}
+          aria-current={!oneColumn ? 'true' : undefined}
+        >All columns <span class="chip__n wf-num">{totalShown}</span></a>
+        {columns.map((c: any) => (
+          <a
+            class:list={['chip', 'wf-focusable', { 'is-on': oneColumn === c.status }]}
+            href={boardUrl({ col: c.status })}
+            aria-current={oneColumn === c.status ? 'true' : undefined}
+          >{c.label} <span class="chip__n wf-num">{c.tasks.length}</span></a>
+        ))}
+      </nav>
+
+      {totalShown === 0 ? (
+        <EmptyState
+          class="boardempty"
+          headingLevel={2}
+          illustration={filtersOn ? 'search' : 'tray'}
+          tone={filtersOn ? 'draft' : 'approved'}
+          title={filtersOn ? 'Nothing matches these filters' : 'No work is on your board'}
+          body={filtersOn
+            ? 'The filters are narrower than the board. Clear them to see everything you can see.'
+            : 'Tasks appear here once somebody assigns work to you, or once you are added to a task as a reviewer, an approver or a watcher.'}
+          actionLabel={filtersOn ? 'Clear filters' : 'Go to My HR'}
+          actionHref={filtersOn ? '/portal/tasks' : '/portal/employee'}
+        />
+      ) : (
+        <div id="board" class:list={['board', { 'is-single': !!oneColumn }]} tabindex="-1">
+          {visibleColumns.map((c: any) => (
+            <section class="col" data-status={c.status} aria-labelledby={'colh-' + c.status}>
+
+              {/* THE STICKY HEADER, AND WHERE IT IS GENUINELY STICKY.
+                  Multi-column: .col is capped in height and .col__body is the scroller, so the
+                  header is a non-scrolling flex sibling — always visible, no sticky needed, and the
+                  cap means a three-card column stays three cards tall. Single column: there is no
+                  cap and no inner scroller, so position:sticky pins the header to the VIEWPORT as
+                  the page scrolls. Both are real. What is NOT attempted is a viewport-sticky header
+                  inside the horizontal scroller: an overflow-x:auto element is a scroll container in
+                  both axes, so sticky there resolves against a box that never scrolls vertically and
+                  silently does nothing.
+                  z-index is 2, not --wf-z-sticky (100): the bottom tab bar is at 40, and a column
+                  header at 100 would paint straight over it. */}
+              <div class="colhead">
+                <h2 class="colhead__name" id={'colh-' + c.status}>{c.label}</h2>
+                <span class="colhead__n wf-num">{c.tasks.length}</span>
+              </div>
+
+              <div class="col__body">
+                {c.tasks.length === 0 && (
+                  <EmptyState
+                    compact={true}
+                    headingLevel={3}
+                    illustration={emptyArt(c.status)}
+                    tone={emptyTone(c.status)}
+                    title={emptyTitle(c.status)}
+                  />
+                )}
+
+                {(c.tasks as BoardTask[]).map((t: BoardTask) => (
+                  <div class="tw" data-form={'mv-' + t.id}>
+                    <TaskCard
+                      headingLevel={3}
+                      title={t.title || 'Untitled task'}
+                      status={t.status}
+                      statusLabel={t.statusLabel}
+                      priority={t.priority}
+                      dueOn={t.dueOn}
+                      isOverdue={t.isOverdue}
+                      assignee={{ name: t.employeeName, role: t.selfAssigned ? 'Self-assigned' : null }}
+                      description={t.description}
+                      blockedReason={t.blockedReason}
+                      cancelReason={t.cancelReason}
+                      commentCount={t.commentCount}
+                      assignedByName={t.assignedByName}
+                      createdAt={t.createdAt}
+                      statusChangedAt={t.statusChangedAt}
+                      completedAt={t.completedAt}
+                      detailsLabel="Details"
+                    >
+                      {/* THE REAL MECHANISM. Options come from t.allowedTransitions, which the
+                          engine computed from roles the database resolved — never from
+                          TASK_STATUSES, which would offer moves this person cannot make. */}
+                      <form slot="actions" class="mv" method="POST" action={selfUrl} id={'mv-' + t.id}>
+                        <input type="hidden" name="action" value="move"/>
+                        <input type="hidden" name="task_id" value={t.id}/>
+                        {t.allowedTransitions.length > 0 ? (
+                          <div class="mv__row">
+                            <select
+                              class="mv__select"
+                              name="to"
+                              required
+                              aria-label={'Move ' + (t.title || 'this task') + ' to'}
+                            >
+                              <option value="">Move to</option>
+                              {(t.allowedTransitions as string[]).map((s: string) => (
+                                <option value={s}>{labelOf(s)}</option>
+                              ))}
+                            </select>
+                            <button class="mv__go wf-focusable" type="submit">Move</button>
+                          </div>
+                        ) : (
+                          <p class="mv__none">Nothing you can move this to from here.</p>
+                        )}
+                        {t.allowedTransitions.length > 0 && needsReasonBox(t) && (
+                          <input
+                            class="mv__reason"
+                            type="text"
+                            name="reason"
+                            maxlength="2000"
+                            aria-label="Why, if you are blocking or cancelling it"
+                            placeholder="If blocking or cancelling, say why"
+                          />
+                        )}
+                      </form>
+                    </TaskCard>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
+
+      <p class="hint">Drag a card onto a column to move it, or use the Move button on the card. Both do the same thing, and the Move button is the one that works everywhere.</p>
+    </div>
+  )}
+</main>
+
+<BottomNav variant="tasks" active="tasks" />
+
+<style is:global>
+  /* This page is self-contained — its own doctype, like /portal/employee — so the shell styles are
+     global by intent. Every value below is a token from src/styles/workforce.css. There is not one
+     hex code, one pixel size or one duration invented here. */
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html { background: var(--wf-ground); }
+
+  body {
+    margin: 0;
+    background: var(--wf-ground);
+    color: var(--wf-ink);
+    font-family: var(--wf-font);
+    font-size: var(--wf-t-body);
+    line-height: 1.5;
+    min-height: 100vh;
+    /* The tab bar is position:fixed, so the page reserves its height plus the home-indicator inset.
+       Without this the last card sits underneath the bar and cannot be reached. */
+    padding-bottom: calc(76px + env(safe-area-inset-bottom));
+    /* The one line that guarantees Ruling: no horizontal PAGE scroll at 360px. The board scrolls
+       inside itself; nothing is allowed to push the document wider than the phone. */
+    overflow-x: hidden;
+  }
+
+  .skip {
+    position: absolute;
+    left: var(--wf-s-2);
+    top: calc(var(--wf-s-2) * -8);
+    z-index: var(--wf-z-toast);
+    padding: var(--wf-s-2) var(--wf-s-4);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-ink);
+    color: var(--wf-surface);
+    font-weight: 650;
+    text-decoration: none;
+  }
+  .skip:focus { top: var(--wf-s-2); }
+
+  /* ---------------------------------------------------------------- top bar */
+
+  .bar {
+    display: flex;
+    align-items: center;
+    gap: var(--wf-s-3);
+    min-height: 52px;
+    padding: 0 var(--wf-s-4);
+    background: var(--wf-nav-surface);
+    border-bottom: 1px solid var(--wf-nav-line);
+  }
+
+  .bar__back {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    /* 44px of target on a 18px glyph, pulled back with negative margin so it does not shove the
+       title off-centre. */
+    width: var(--wf-touch);
+    height: var(--wf-touch);
+    margin-left: calc(var(--wf-s-3) * -1);
+    color: var(--wf-nav-ink);
+    border-radius: var(--wf-r-sm);
+  }
+
+  .bar__title {
+    margin: 0;
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: var(--wf-t-title);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--wf-on-solid);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .bar__who {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 45%;
+    font-size: var(--wf-t-micro);
+    color: var(--wf-nav-ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ------------------------------------------------------------------- page */
+
+  .page { padding: 0 0 var(--wf-s-5); }
+
+  .note {
+    margin: var(--wf-s-3) var(--wf-s-4) 0;
+    padding: var(--wf-s-2) var(--wf-s-3);
+    border: 1px solid var(--wf-tone-border);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-tone-wash);
+    color: var(--wf-tone-text);
+    font-size: var(--wf-t-meta);
+    line-height: 1.55;
+  }
+
+  .panel {
+    margin: var(--wf-s-4);
+    padding: var(--wf-s-5) var(--wf-s-4);
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-md);
+    background: var(--wf-surface);
+  }
+  .panel__title { margin: 0 0 var(--wf-s-2); font-size: var(--wf-t-title); font-weight: 700; }
+  .panel__body { margin: 0 0 var(--wf-s-2); font-size: var(--wf-t-meta); color: var(--wf-ink-2); line-height: 1.6; }
+  .link { color: var(--wf-info-text); }
+
+  .tally {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--wf-s-2);
+    margin: var(--wf-s-4) var(--wf-s-4) 0;
+    font-size: var(--wf-t-meta);
+    color: var(--wf-ink-3);
+  }
+  .tally b { font-size: 22px; font-weight: 800; line-height: 1; color: var(--wf-ink); }
+  .tally__late { font-weight: 650; color: var(--wf-tone-text); }
+
+  .filters { margin: var(--wf-s-3) var(--wf-s-4) 0; }
+
+  /* --------------------------------------------------------------- prefs bar */
+
+  .prefs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--wf-s-4);
+    margin: var(--wf-s-3) var(--wf-s-4) 0;
+  }
+  .prefs__set { min-width: 0; margin: 0; padding: 0; border: 0; }
+  .prefs__legend {
+    padding: 0;
+    margin-bottom: var(--wf-s-1);
+    font-size: var(--wf-t-micro);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--wf-chrome-ink);
+  }
+  .prefs__row { display: flex; flex-wrap: wrap; gap: var(--wf-s-1); }
+
+  .prefs__btn {
+    min-height: var(--wf-control-h);
+    padding: 0 var(--wf-s-3);
+    border: 1px solid var(--wf-line-strong);
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-surface);
+    color: var(--wf-ink-2);
+    font-family: inherit;
+    font-size: var(--wf-t-meta);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  /* The pressed state is a fill AND a weight change, never colour alone. */
+  .prefs__btn.is-on {
+    background: var(--wf-ink);
+    border-color: var(--wf-ink);
+    color: var(--wf-on-solid);
+    font-weight: 700;
+  }
+  .prefs__btn:active { opacity: 0.8; }
+
+  /* ------------------------------------------------------------------ chips */
+
+  .chips {
+    display: flex;
+    gap: var(--wf-s-1);
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    padding: var(--wf-s-4) var(--wf-s-4) var(--wf-s-1);
+  }
+
+  .chip {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--wf-s-1);
+    min-height: var(--wf-control-h);
+    padding: 0 var(--wf-s-3);
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-surface);
+    color: var(--wf-ink-2);
+    font-size: var(--wf-t-meta);
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .chip__n { font-size: var(--wf-t-micro); font-weight: 700; color: var(--wf-ink-3); }
+  .chip.is-on { background: var(--wf-ink); border-color: var(--wf-ink); color: var(--wf-on-solid); }
+  .chip.is-on .chip__n { color: var(--wf-on-solid); opacity: 0.75; }
+
+  /* ------------------------------------------------------------------ board */
+
+  .board {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--wf-gap);
+    /* The columns scroll here. The PAGE never scrolls sideways.
+       overscroll-behavior-x stops a swipe past the last column from triggering the browser's
+       back gesture, which on a board is a lost place in a list. */
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x proximity;
+    padding: var(--wf-s-3) var(--wf-s-4) var(--wf-s-4);
+  }
+  .board:focus { outline: none; }
+
+  .col {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    width: min(82vw, 300px);
+    min-width: 0;
+    /* A capped column with an inner scroller is what keeps the header visible. vh first so an
+       Android WebView with no dvh support still gets a cap rather than an uncapped column. */
+    max-height: calc(100vh - 210px);
+    max-height: calc(100dvh - 210px);
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-lg);
+    background: var(--wf-sunk);
+    scroll-snap-align: start;
+  }
+
+  .colhead {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--wf-s-2);
+    flex: 0 0 auto;
+    padding: var(--wf-pad) var(--wf-pad) var(--wf-pad-tight);
+    /* Opaque, because cards scroll underneath it. */
+    background: var(--wf-raised);
+    border-bottom: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-lg) var(--wf-r-lg) 0 0;
+  }
+  .colhead__name {
+    margin: 0;
+    min-width: 0;
+    font-size: var(--wf-t-meta);
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    color: var(--wf-ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .colhead__n {
+    flex: 0 0 auto;
+    padding: 2px var(--wf-s-2);
+    border-radius: var(--wf-r-pill);
+    background: var(--wf-veil);
+    color: var(--wf-ink-3);
+    font-size: var(--wf-t-micro);
+    font-weight: 700;
+  }
+
+  .col__body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: var(--wf-pad-tight);
+    display: flex;
+    flex-direction: column;
+    gap: var(--wf-gap);
+  }
+
+  /* SINGLE COLUMN. No horizontal scroller, no cap, no inner scroller: the page is the scroller and
+     position:sticky on the header therefore pins to the VIEWPORT, which is the mode where a column
+     is actually long enough for that to matter. */
+  .board.is-single { display: block; overflow: visible; padding-top: var(--wf-s-3); }
+  .board.is-single .col { width: auto; max-height: none; }
+  .board.is-single .col__body { overflow: visible; }
+
+  .tw { min-width: 0; }
+
+  /* --------------------------------------------------------------- move form */
+
+  .mv { margin-top: var(--wf-s-3); }
+  .mv__row { display: flex; gap: var(--wf-s-1); align-items: stretch; }
+
+  .mv__select {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: var(--wf-control-h);
+    padding: 0 var(--wf-s-2);
+    border: 1px solid var(--wf-line-strong);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-raised);
+    color: var(--wf-ink);
+    font-family: inherit;
+    /* 16px so iOS Safari does not zoom the whole board when this takes focus. */
+    font-size: 1rem;
+  }
+  .mv__select:focus-visible { outline: 2px solid var(--wf-focus); outline-offset: 1px; }
+
+  .mv__go {
+    flex: 0 0 auto;
+    min-height: var(--wf-control-h);
+    padding: 0 var(--wf-s-3);
+    border: 1px solid var(--wf-ink);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-ink);
+    color: var(--wf-on-solid);
+    font-family: inherit;
+    font-size: var(--wf-t-meta);
+    font-weight: 650;
+    cursor: pointer;
+  }
+  .mv__go:active { opacity: 0.8; }
+
+  .mv__reason {
+    width: 100%;
+    min-height: var(--wf-control-h);
+    margin-top: var(--wf-s-1);
+    padding: 0 var(--wf-s-2);
+    border: 1px solid var(--wf-line-strong);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-raised);
+    color: var(--wf-ink);
+    font-family: inherit;
+    font-size: 1rem;
+  }
+  .mv__reason:focus-visible { outline: 2px solid var(--wf-focus); outline-offset: 1px; }
+
+  .mv__none {
+    margin: 0;
+    font-size: var(--wf-t-meta);
+    color: var(--wf-ink-3);
+    line-height: 1.5;
+  }
+
+  .boardempty { margin: var(--wf-s-4); }
+
+  .hint {
+    margin: var(--wf-s-3) var(--wf-s-4) 0;
+    font-size: var(--wf-t-meta);
+    color: var(--wf-chrome-ink);
+    line-height: 1.6;
+  }
+
+  /* ------------------------------------------------------------------- drag */
+
+  /* Added by the script, so a browser that cannot drag never shows a handle it will not honour. */
+  body.dnd .tw { cursor: grab; }
+  body.dnd .tw:active { cursor: grabbing; }
+
+  /* The card in somebody's hand. Opacity and transform only, as the ruling requires — no colour
+     animation, no shadow animation, nothing that costs a repaint. */
+  .tw.is-dragging { opacity: 0.45; }
+
+  /* The drop target says yes IN ADVANCE. This only ever appears on a column the engine would
+     actually accept, because the script checks the select's own options before allowing the drop. */
+  .col.is-over { border-color: var(--wf-in_progress-accent); background: var(--wf-in_progress-wash); }
+  .col.is-over .colhead { border-bottom-color: var(--wf-in_progress-accent); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .tw { transition: var(--wf-tr-state); }
+    .col { transition: background-color var(--wf-dur-state) var(--wf-ease), border-color var(--wf-dur-state) var(--wf-ease); }
+  }
+
+  /* ------------------------------------------------------------------ wide */
+
+  @media (min-width: 900px) {
+    .col { width: 300px; max-height: calc(100vh - 240px); max-height: calc(100dvh - 240px); }
+    .board.is-single .col { width: min(720px, 100%); max-height: none; }
+  }
+
+  @media (forced-colors: active) {
+    .chip.is-on, .prefs__btn.is-on { forced-color-adjust: none; background: Highlight; color: HighlightText; }
+    .col.is-over { border-color: Highlight; }
+  }
+</style>
+
+<script is:inline>
+/* DRAG AND DROP: an enhancement, never the mechanism.
+   Everything below submits the same form the Move button submits. It adds the `draggable` attribute
+   and the grab cursor itself, so a browser without HTML5 drag shows no affordance it cannot honour,
+   and a drop onto a column this card may not move to is refused HERE rather than sent to the server
+   to be refused there. Motion is entirely in CSS inside a prefers-reduced-motion query. No
+   framework, no library, no bundle, no npm install. */
+(function () {
+  var proto = document.createElement('div');
+  if (!('draggable' in proto)) return;
+
+  var cards = document.querySelectorAll('.tw[data-form]');
+  var cols = document.querySelectorAll('.col[data-status]');
+  if (!cards.length || cols.length < 2) return;
+
+  document.body.className += ' dnd';
+  var held = null;
+
+  function formOf(card) {
+    var id = card.getAttribute('data-form');
+    return id ? document.getElementById(id) : null;
+  }
+  function pickerOf(card) {
+    var f = formOf(card);
+    return f ? f.querySelector('select[name="to"]') : null;
+  }
+  function canDrop(card, status) {
+    var s = pickerOf(card);
+    if (!s) return false;
+    for (var i = 0; i < s.options.length; i++) {
+      if (s.options[i].value === status) return true;
+    }
+    return false;
+  }
+  function clearOver() {
+    for (var i = 0; i < cols.length; i++) {
+      cols[i].className = cols[i].className.replace(/\s*is-over\b/, '');
+    }
+  }
+  /* A drag that starts on the select, the reason box, the Move button or the Details summary would
+     take those controls away from the person using them — on Firefox a draggable ancestor stops you
+     selecting text in a child input at all. The keyboard path must never be collateral damage of
+     the mouse path, so a drag beginning inside a control is cancelled and the control just works. */
+  function fromControl(el) {
+    for (var n = el; n && n !== document.body; n = n.parentNode) {
+      var tag = (n.tagName || '').toUpperCase();
+      if (tag === 'SELECT' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON'
+        || tag === 'OPTION' || tag === 'LABEL' || tag === 'SUMMARY' || tag === 'A') return true;
+    }
+    return false;
+  }
+
+  for (var i = 0; i < cards.length; i++) {
+    (function (card) {
+      card.draggable = true;
+      card.addEventListener('dragstart', function (e) {
+        if (fromControl(e.target)) { e.preventDefault(); return; }
+        held = card;
+        card.className += ' is-dragging';
+        try {
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', card.getAttribute('data-form') || '');
+        } catch (err) { /* Safari refuses setData in some modes; the drag still works. */ }
+      });
+      card.addEventListener('dragend', function () {
+        card.className = card.className.replace(/\s*is-dragging\b/, '');
+        held = null;
+        clearOver();
+      });
+    })(cards[i]);
+  }
+
+  for (var k = 0; k < cols.length; k++) {
+    (function (col) {
+      var status = col.getAttribute('data-status');
+      col.addEventListener('dragover', function (e) {
+        if (!held || !canDrop(held, status)) return;  /* no preventDefault means no drop: an honest refusal */
+        e.preventDefault();
+        /* A null check rather than a bare catch: dataTransfer is null outside a real drag, and
+           that is the only way this line can fail. Nothing is being swallowed. */
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        if (col.className.indexOf('is-over') < 0) col.className += ' is-over';
+      });
+      col.addEventListener('dragleave', function () {
+        col.className = col.className.replace(/\s*is-over\b/, '');
+      });
+      col.addEventListener('drop', function (e) {
+        col.className = col.className.replace(/\s*is-over\b/, '');
+        if (!held || !canDrop(held, status)) return;
+        e.preventDefault();
+        var card = held;
+        var form = formOf(card);
+        var picker = pickerOf(card);
+        if (!form || !picker) return;
+        picker.value = status;
+        /* Blocked and Cancelled are refused by the engine without a stated cause. Ask for it here
+           rather than spending a round trip to be told. */
+        var reason = form.querySelector('input[name="reason"]');
+        if (reason && (status === 'blocked' || status === 'cancelled') && !reason.value.replace(/^\s+|\s+$/g, '')) {
+          card.className = card.className.replace(/\s*is-dragging\b/, '');
+          held = null;
+          reason.focus();
+          return;
+        }
+        form.submit();
+      });
+    })(cols[k]);
+  }
+})();
+</script>
+</body>
+</html>
