@@ -43,6 +43,7 @@ import { requireEmployee, requireTeamLead, departmentFilter } from '@/lib/auth/w
 import {
   STATUS_LABELS,
   COLLABORATOR_ROLE_LABELS,
+  ACTOR_ROLE_LABELS,
   canonicalStatus,
   canTransition,
   statusNeedsReason,
@@ -55,6 +56,7 @@ import {
   collaboratorRolesAddableBy,
   mayRemoveOtherCollaborators,
   type TaskStatus,
+  type TaskActorRole,
   type TaskCollaboratorRole,
   type TaskDetail,
   type TaskActivityEntry,
@@ -101,6 +103,21 @@ const scopeDepartmentId = gate.ok
 
 const taskId = String(Astro.params.id || '').trim();
 const params = Astro.url.searchParams;
+
+// DENSITY AND FOCUS MODE, READ FROM THE SAME COOKIES THE BOARD WRITES.
+//
+// /portal/tasks sets wf_density and wf_focus and stamps them on its own <html>. This page did not
+// read them, so somebody who had turned Focus mode on, opened a task, and found the chrome back at
+// full strength was looking at a preference that had silently stopped applying halfway through the
+// surface. A toggle is a promise about the whole product it appears to govern.
+//
+// READ ONLY. This page never writes either cookie — the board owns that control, and two writers for
+// one preference is how they come to disagree. Both values are validated against these lists before
+// they reach an attribute; nothing from the request is ever interpolated raw.
+const DENSITIES = ['comfortable', 'cozy', 'compact'];
+const rawDensity = String(Astro.cookies.get('wf_density')?.value || '').trim().toLowerCase();
+const density = DENSITIES.indexOf(rawDensity) >= 0 ? rawDensity : 'cozy';
+const focusOn = String(Astro.cookies.get('wf_focus')?.value || '').trim().toLowerCase() === 'on';
 
 /** The canonical path for this task. Never built from anything but the route parameter. */
 const basePath = '/portal/tasks/' + encodeURIComponent(taskId);
@@ -198,19 +215,35 @@ if (Astro.request.method === 'POST') {
         }
       }
     } else if (action === 'approve') {
+      // THE NOTE IS OPTIONAL, AND IT IS POSTED BEFORE THE APPROVAL IS ATTEMPTED — so when the
+      // approval is then REFUSED, a comment is already public and the person who wrote it has to be
+      // told. Anyone who can see this task may comment on it (watchers included), so the note lands
+      // for people whose approval the engine will decline a moment later: a watcher or a reviewer
+      // pressing Approve gets refused by TRANSITIONS, which allows that edge to an approver or the
+      // department lead only. Reporting just the refusal would leave their words on the task with no
+      // indication they were saved. Same shape as the revise branch below, for the same reason.
       const note = String(fd.get('note') || '').trim();
-      let noteOk = true;
+      let notePosted = false;
+      let noteFailed = false;
       if (note) {
         const said = await addComment(taskId, viewerUserId, note, { ipAddress: ip });
-        noteOk = said.ok;
+        notePosted = said.ok;
+        noteFailed = !said.ok;
         if (!said.ok) {
           msg = 'Your note could not be saved, so nothing was approved. Try again in a moment.';
         }
       }
-      if (noteOk) {
+      if (!noteFailed) {
         const res = await moveTask(taskId, viewerUserId, 'approved', { ipAddress: ip });
-        if (res.ok) { bad = 0; msg = 'Approved.'; }
-        else { msg = res.error || 'Could not approve this task.'; }
+        if (res.ok) {
+          bad = 0;
+          msg = notePosted ? 'Approved. Your note is in the discussion.' : 'Approved.';
+        } else {
+          const why = res.error || 'Could not approve this task.';
+          msg = notePosted
+            ? 'Your note was posted, but this was not approved. ' + why
+            : why;
+        }
       }
     } else if (action === 'collab_add') {
       const targetUserId = String(fd.get('user_id') || '').trim();
@@ -378,8 +411,23 @@ if (detail && addableRoles.length > 0) {
 // ---------------------------------------------------------------------------------------------
 
 const labelOf = (s: string): string => STATUS_LABELS[s as TaskStatus] || s;
+
+/** For a COLLABORATOR role — the five values that exist as rows. Used by the pickers. */
 const collabLabelOf = (s: string): string =>
   COLLABORATOR_ROLE_LABELS[s as TaskCollaboratorRole] || s;
+
+/**
+ * For an ACTOR role, which is a wider set: the five collaborator roles PLUS 'assigner' and 'lead',
+ * neither of which is a collaborator row and neither of which COLLABORATOR_ROLE_LABELS has a key for.
+ *
+ * This is a separate function because using the collaborator map on an actor role is exactly the bug
+ * that was here: `COLLABORATOR_ROLE_LABELS['assigner'] || 'assigner'` fell through to the raw key, so
+ * the "You are" line on this page read "assignee, assigner" — a database enum, printed at a person.
+ * ACTOR_ROLE_LABELS is the engine's own wording for the same seven values and is what canTransition()
+ * refuses people in, so the page and the refusal now use one vocabulary.
+ */
+const actorLabelOf = (s: string): string =>
+  ACTOR_ROLE_LABELS[s as TaskActorRole] || s;
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const todayIso = new Date().toISOString().slice(0, 10);
@@ -416,8 +464,9 @@ const assigneeName = task ? (task.employeeName || 'Name not recorded') : '';
 const assigneeIsMe = !!(task && myEmployeeId && String(task.employeeId) === String(myEmployeeId));
 const assignerName = task ? (task.assignedByName || 'Name not recorded') : '';
 
-// The words for what this viewer is on this task, from the engine's own labels.
-const myRoleWords = viewerRoles.map((r) => collabLabelOf(r)).join(', ');
+// The words for what this viewer is on this task, from the engine's own ACTOR labels — see
+// actorLabelOf above for why this is not the collaborator map.
+const myRoleWords = viewerRoles.map((r) => actorLabelOf(r)).join(', ');
 
 const addPanel = params.get('add') === '1';
 const flash = String(params.get('msg') || '').slice(0, 300);
@@ -428,7 +477,7 @@ const pageTitle = task
   : (notFound ? 'Task not found - EduRankAI' : 'Task - EduRankAI');
 ---
 <!doctype html>
-<html lang="en">
+<html lang="en" data-density={density} data-focus-mode={focusOn ? 'on' : 'off'}>
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
@@ -448,10 +497,30 @@ const pageTitle = task
   <span class="topbar__who">{viewerName}</span>
 </nav>
 
-<div class="wrap">
+{/* THE main LANDMARK IS HERE, AT THE TOP, AND NOT ON THE COLUMN BELOW.
+    It used to be <main class="main"> inside the <article>, which is invalid: the HTML spec forbids
+    <main> as a descendant of article, aside, header, footer or nav, and the practical cost is that
+    the one landmark a screen-reader user jumps to with a single key was nested inside a page region
+    and covered only the activity column — not the title, the status controls or the people. One
+    <main> around the page content, and the inner column is a labelled <section>. */}
+<main class="wrap">
 
+  {/* WHETHER THAT WORKED IS NOT ALLOWED TO BE A COLOUR. Green wash and amber wash are the same
+      wash in greyscale and under deuteranopia — the whole reason StatusBadge draws ten shapes
+      rather than ten hues — so the outcome carries a glyph as well, and a word for a screen
+      reader, which reads the sentence in order and never sees either wash. */}
   {flash && (
-    <p class={flashBad ? 'note note--warn' : 'note note--ok'} role="status">{flash}</p>
+    <p class={flashBad ? 'note note--flash note--warn' : 'note note--flash note--ok'} role="status">
+      <svg class="note__glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"/>
+        {flashBad
+          ? <><path d="M12 7.4v5.4"/><path d="M12 16.4h.01"/></>
+          : <path d="m8.2 12.3 2.6 2.6 5-5.4"/>}
+      </svg>
+      <span class="wf-sr-only">{flashBad ? 'Not done. ' : 'Done. '}</span>
+      <span class="note__text">{flash}</span>
+    </p>
   )}
 
   {denial && (
@@ -749,7 +818,7 @@ const pageTitle = task
         </aside>
 
         {/* ------------------------------ main column ------------------------------ */}
-        <main class="main">
+        <section class="main" aria-label="Activity and discussion">
 
           <section class="block block--wide">
             <h2 class="block__h">Activity</h2>
@@ -812,16 +881,27 @@ const pageTitle = task
               cannotCommentText="You can read this conversation but not add to it."
             />
           </section>
-        </main>
+        </section>
       </div>
     </article>
   )}
-</div>
+</main>
 
 <style>
   /* The page is built on the tokens in src/styles/workforce.css so it matches the components it
      renders. Motion is opacity and transform only, and there is none on this page that does not
      report a state change. */
+  /* This page is self-contained, with its own doctype, so it carries its own reset. workforce.css
+     deliberately ships tokens and two utilities and no reset at all, and every component in the set
+     sets box-sizing on its own root — but the markup THIS file writes (the blocks, the grid, the
+     definition list) had none, so a padded child was one added declaration away from being wider
+     than its track at 360px. One line, and the class of bug is gone. */
+  :global(*),
+  :global(*::before),
+  :global(*::after) {
+    box-sizing: border-box;
+  }
+
   :global(html) {
     background: var(--wf-ground);
   }
@@ -834,6 +914,10 @@ const pageTitle = task
     font-size: var(--wf-t-body);
     line-height: 1.6;
     min-height: 100vh;
+    /* The guarantee: no horizontal PAGE scroll at 360px, whatever a person types into a title.
+       Safe for the sticky properties column below — <html> sets no overflow, so this propagates to
+       the VIEWPORT and body's own used value stays `visible`, which is what keeps sticky working. */
+    overflow-x: hidden;
   }
 
   /* -------------------------------- the bar -------------------------------- */
@@ -880,6 +964,9 @@ const pageTitle = task
   /* ------------------------------- the shell ------------------------------- */
 
   .wrap {
+    /* Stated, not assumed: a very old Android WebView lays an element it does not know out as
+       inline, and this set is built to work on one. */
+    display: block;
     max-width: 1120px;
     margin: 0 auto;
     padding: var(--wf-s-4) var(--wf-s-4) var(--wf-s-6);
@@ -905,6 +992,25 @@ const pageTitle = task
     border-color: var(--wf-overdue-border);
     background: var(--wf-overdue-wash);
     color: var(--wf-overdue-text);
+  }
+
+  /* Only the outcome message is a flex row; the standing notices elsewhere on
+     this page are plain paragraphs and stay that way. */
+  .note--flash {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--wf-s-2);
+  }
+
+  .note__glyph {
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+    margin-top: 1px;
+  }
+
+  .note__text {
+    min-width: 0;
   }
 
   .panel {
