@@ -101,6 +101,7 @@ export interface Workspace {
 export type WorkspaceDenial =
   | 'not-signed-in'
   | 'no-employee-record'
+  | 'ambiguous-record'
   | 'inactive'
   | 'not-an-intern'
   | 'not-a-team-lead'
@@ -164,7 +165,7 @@ const EMPLOYEE_COLUMNS = sql`
  */
 type WorkspaceLookup =
   | { status: 'ok'; workspace: Workspace }
-  | { status: 'none' | 'failed'; workspace: null };
+  | { status: 'none' | 'failed' | 'ambiguous'; workspace: null };
 
 async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<WorkspaceLookup> {
   if (!user?.id) return { status: 'none', workspace: null };
@@ -206,11 +207,28 @@ async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<
     // their own record. Compared case-insensitively, because an address is the same address however
     // it was typed into the HR form.
     if (!row && email) {
-      row = rows(await db.execute(sql`
+      // LIMIT 2, not 1, and the reason is the check immediately below.
+      const matches = rows(await db.execute(sql`
         SELECT ${EMPLOYEE_COLUMNS} FROM hr_employees
          WHERE lower(work_email) = ${email} OR lower(personal_email) = ${email} OR lower(email) = ${email}
          ORDER BY is_active DESC, created_at DESC
-         LIMIT 1`))[0] || null;
+         LIMIT 2`));
+
+      // TWO PEOPLE ON FILE UNDER ONE ADDRESS: REFUSE, NEVER PICK.
+      //
+      // This fallback is the single point in the whole design where the scope key is derived from
+      // something softer than an id, so it is the one place a wrong answer is possible at all. An
+      // address is not unique here: hr_employees carries THREE email columns, no unique constraint
+      // sits on any of them, and both a shared inbox typed into `email` and a manager's address
+      // entered on a subordinate's record produce two matches. `ORDER BY ... LIMIT 1` would then
+      // quietly hand whoever signs in first the other person's hours, leave, reviews, documents and
+      // credit position — and the backfill below would stamp user_id onto that row and make the
+      // mistake permanent and invisible.
+      //
+      // Refusing costs a real employee one message to HR. Guessing costs a different employee their
+      // privacy, silently, with no way for either of them to notice.
+      if (matches.length > 1) return { status: 'ambiguous', workspace: null };
+      row = matches[0] || null;
 
       // Backfill so the next request takes the indexed path. Best-effort, and guarded on
       // user_id IS NULL so it can never re-point somebody else's record at this account.
@@ -330,6 +348,12 @@ export async function requireEmployee(
   if (found.status === 'failed') {
     return deny('lookup-failed', 'We could not load your record just now',
       'Something went wrong reading your employee record. Nothing you have logged is lost. Try again in a moment, and tell HR if it keeps happening.');
+  }
+  // Told plainly, because the fix is HR's and the person can name it in one sentence. Showing one
+  // of the two records instead would be showing somebody else's work to somebody who is not them.
+  if (found.status === 'ambiguous') {
+    return deny('ambiguous-record', 'More than one employee record uses your email address',
+      'We will not guess which one is yours, because the wrong guess would show you another person\'s record. Ask HR to leave your address on your record only, then reload this page.');
   }
   const ws = found.workspace;
   if (!ws) {

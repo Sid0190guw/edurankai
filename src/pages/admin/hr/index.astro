@@ -42,15 +42,25 @@ if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent('/adm
 // entitlement is checked with can(), and the HR desk itself is narrowed to the two roles that own
 // this work — plus anyone a custom role has explicitly granted the 'hr' section, which is the
 // mechanism the team already uses to hire HR staff without making them super admins.
+//
+// AND IT REFUSES OUT LOUD. This gate previously redirected to '/admin?notice=hr-console-restricted'.
+// Nothing in this codebase reads a `notice` parameter — not /admin/index.astro, not AdminLayout — so
+// that was a silent bounce to the dashboard: the person is refused, told nothing, and tries again.
+// Refusing without a sentence is how people conclude the product is broken and go and ask for a
+// wider role than they need, which is the exact pressure that created the promotion this whole piece
+// of work exists to undo. So a person who holds the console but not this desk is told, in place,
+// what they are looking at and who opens it. No query runs on that path.
 const roleName = String((user as any).role || '').toLowerCase();
 const isHrDesk = roleName === 'hr' || roleName === 'super_admin';
 const hasConsole = can(user as any, 'admin.access');
-const grantedHrSection = hasConsole && !isHrDesk
+// No console entitlement at all: there is nothing to explain on a screen they cannot open either.
+// /admin guards itself and sends them where they belong.
+if (!hasConsole) return Astro.redirect('/admin');
+const grantedHrSection = !isHrDesk
   ? await canAccessSection(user as any, 'hr', 'view').catch(() => false)
   : false;
-if (!hasConsole || (!isHrDesk && !grantedHrSection)) {
-  return Astro.redirect('/admin?notice=hr-console-restricted');
-}
+/** True = refused. Declared here, above every read below, and every read is skipped when it is set. */
+const denied = !isHrDesk && !grantedHrSection;
 
 // ---------------------------------------------------------------------------------------------
 // Helpers. Declared before every read below: a const referenced above its own declaration threw on
@@ -129,7 +139,13 @@ const MONTH_END = sql`(date_trunc('month', CURRENT_DATE) + interval '1 month')::
 // report. departments is joined on department_id = id with no cast in either direction: the id is a
 // slug in schema.ts and a uuid in the reconstructed SQL file, and ::uuid would throw on a slug.
 // ---------------------------------------------------------------------------------------------
-const [totalsRows, deptRows, joinerRows, leaverRows, exceptionRows, openPunchRows] = await Promise.all([
+//
+// `denied` short-circuits every one of them. A refused person must not cause a single row of
+// employee data to be read: a gate that still runs the query and then hides the result is not a
+// gate, it is a render filter.
+const [totalsRows, deptRows, joinerRows, leaverRows, exceptionRows, openPunchRows] = denied
+  ? [[], [], [], [], [], []]
+  : await Promise.all([
   q('totals', sql`
     SELECT
       CURRENT_DATE AS today,
@@ -215,7 +231,7 @@ const exceptionTotal = notMarked + absentToday + openPunches + zeroHours;
 
 // Documents awaiting verification. pendingForReview() creates its table if it is missing, which is
 // how this feature ships without a hand-run migration.
-const allDocs = await safeCall('onboarding-documents', () => pendingForReview(200));
+const allDocs = denied ? [] : await safeCall('onboarding-documents', () => pendingForReview(200));
 // Oldest submission first, for the same reason as the leave queue: a person who has done their part
 // and is waiting on us is the thing this panel is for.
 const docsWaiting = allDocs
@@ -226,22 +242,26 @@ const docsWaiting = allDocs
 // candidate's identity and criminal-check state and belongs on its own screen.
 let bgvOpen = 0;
 let bgvFlagged = 0;
-try {
-  await ensureBgvSchema();
-  const b = (rowsOf(await db.execute(sql`
-    SELECT COUNT(*) FILTER (WHERE overall_status IN ('pending', 'in_progress'))::int AS open_checks,
-           COUNT(*) FILTER (WHERE overall_status = 'flagged')::int AS flagged
-    FROM hr_bgv_records`))[0] as any) || {};
-  bgvOpen = num(b.open_checks);
-  bgvFlagged = num(b.flagged);
-} catch (e: any) {
-  console.error('[admin/hr] bgv', e?.cause?.message || e?.message);
-  unread.push('bgv');
+// Not wrapped in the try: a refusal is not a failed read, and reporting it as one would put "bgv"
+// in the "could not be read" banner on a page that never asked.
+if (!denied) {
+  try {
+    await ensureBgvSchema();
+    const b = (rowsOf(await db.execute(sql`
+      SELECT COUNT(*) FILTER (WHERE overall_status IN ('pending', 'in_progress'))::int AS open_checks,
+             COUNT(*) FILTER (WHERE overall_status = 'flagged')::int AS flagged
+      FROM hr_bgv_records`))[0] as any) || {};
+    bgvOpen = num(b.open_checks);
+    bgvFlagged = num(b.flagged);
+  } catch (e: any) {
+    console.error('[admin/hr] bgv', e?.cause?.message || e?.message);
+    unread.push('bgv');
+  }
 }
 
 // Leave awaiting a decision. listLeave({ status }) joins the employee name for the admin side; the
 // no-argument form is the one that must never be called from a portal page.
-const pendingLeave = await safeCall('leave-pending', () => listLeave({ status: 'pending' }));
+const pendingLeave = denied ? [] : await safeCall('leave-pending', () => listLeave({ status: 'pending' }));
 // Longest-waiting first. listLeave returns the newest start date first, which buries the request
 // that has been sitting the longest — the one this panel exists to surface. Ordering only; the set
 // itself is exactly what the query returned.
@@ -258,7 +278,7 @@ const leaveQueue = pendingLeave.slice().sort((a: any, b: any) =>
 // ---------------------------------------------------------------------------------------------
 const INTERN_LIMIT = 48;
 let internTermsAvailable = true;
-let internRowsRaw = await q('interns', sql`
+let internRowsRaw = denied ? [] : await q('interns', sql`
   SELECT e.id, e.full_name, e.employee_code, e.designation, e.joining_date, d.name AS dept_name,
          e.engagement_kind, e.weekly_hours, e.working_days_per_week, e.required_credit_hours
   FROM hr_employees e
@@ -266,7 +286,7 @@ let internRowsRaw = await q('interns', sql`
   WHERE e.is_active = true AND ${INTERN_MATCH}
   ORDER BY e.joining_date ASC NULLS LAST
   LIMIT ${INTERN_LIMIT}`);
-if (unread.includes('interns')) {
+if (!denied && unread.includes('interns')) {
   // The read failed. Retry without the four runtime-added engagement columns, which is the only
   // difference that can be missing on a database where termsFor() has never run. If THAT works the
   // terms genuinely are not recorded yet; if it fails too, the failure is something else and stays
@@ -412,6 +432,30 @@ const modules = [
 const monthLabel = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', month: 'long', year: 'numeric' });
 ---
 <AdminLayout title="HR" activeNav="hr">
+
+  {denied && (
+    <div class="admin-page hrhome">
+      <div class="admin-page-header">
+        <div class="admin-page-title-block">
+          <div class="admin-page-eyebrow">People operations</div>
+          <h1 class="admin-page-title">HR</h1>
+        </div>
+      </div>
+      <div class="hrnote hrnote-warn">
+        <strong>This console belongs to the people team.</strong>
+        <span> It holds employee records, joining documents and leave decisions, so it opens for
+        the HR role and for anyone a custom role has been given the HR section. Your account has
+        neither, and nothing on it has been read. If this is part of your job, ask a super admin to
+        add the HR section to your role &mdash; that is a smaller change than moving your whole
+        account, and it leaves a record of who granted it.</span>
+      </div>
+      <div class="hrlinks">
+        <a class="admin-btn" href="/admin">Back to the dashboard</a>
+      </div>
+    </div>
+  )}
+
+  {!denied && (
   <div class="admin-page hrhome">
 
     <div class="admin-page-header">
@@ -719,8 +763,10 @@ const monthLabel = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolk
         <div class="hrnote hrnote-warn">
           <strong>Engagement terms are not recorded on this database yet.</strong>
           <span> The agreed hours and the credit-hour requirement are written the first time an
-          engagement is set on a completion screen. Until then no credit position can be computed,
-          so the figures below would be meaningless and are not shown.</span>
+          engagement is set on a completion screen. The table below still lists every intern, and
+          the hours earned and attendance in it are real &mdash; but &ldquo;Required&rdquo; reads
+          &ldquo;not set&rdquo; for everyone, there is no percentage, and nobody can be called ahead
+          or behind, because there is nothing recorded to be ahead or behind of.</span>
         </div>
       )}
 
@@ -807,6 +853,7 @@ const monthLabel = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolk
     </section>
 
   </div>
+  )}
 
   <style>
     .hrhome { padding-bottom: 72px; }

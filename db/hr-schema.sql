@@ -111,6 +111,11 @@ ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS notice_served_at           TIM
 ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS offboarding_state          JSONB;
 ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS relieving_letter_url       TEXT;
 ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS notes                      TEXT;
+-- The reporting line. Holds a USERS id, not an hr_employees id: approverRole() in
+-- src/lib/hr-wallet.ts compares it to the signed-in user's id so the manager can approve leave and
+-- wallet withdrawals. Written by admin/hr/employees/[id] (Employment tab), which also runs this
+-- ALTER at page load, as does admin/hr/employees (the list reads it).
+ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id       UUID;
 CREATE INDEX IF NOT EXISTS hr_employees_user_idx   ON hr_employees (user_id);
 CREATE INDEX IF NOT EXISTS hr_employees_active_idx ON hr_employees (is_active, created_at DESC);
 CREATE INDEX IF NOT EXISTS hr_employees_app_idx    ON hr_employees (application_id);

@@ -11,8 +11,35 @@ import { logEvent } from '@/lib/logger';
 // a prefix test here would let /admin/login-anything through, and a second entry is how an unguarded
 // path gets added later "just for a moment".
 const ADMIN_GUARD_EXEMPT = '/admin/login';
+// Repeated slashes are collapsed before the test. `//admin/users` is the same resource to a router
+// but a different string to startsWith(), and "the guard did not recognise the path" is exactly how
+// a deny-by-default gate turns back into allow-by-default. Both the match AND the exemption use the
+// normalised form, so `//admin/login` is still the login page and the hardening locks nobody out.
+const normalisePath = (path: string): string => String(path || '').replace(/\/{2,}/g, '/');
 function isAdminPath(path: string): boolean {
-  return path === '/admin' || path.startsWith('/admin/');
+  const p = normalisePath(path);
+  return p === '/admin' || p.startsWith('/admin/');
+}
+/** The single exemption, matched exactly (never by prefix) on the normalised path. */
+function isAdminGuardExempt(path: string): boolean {
+  return normalisePath(path) === ADMIN_GUARD_EXEMPT;
+}
+/**
+ * An admin path asked for by somebody with NO valid session.
+ *
+ * canOpenAdmin cannot answer for a request that has no user, and the code below returns early for
+ * both "no cookie" and "cookie no longer valid" — so without this the structural gate covers only
+ * signed-in people, and the guarantee it advertises (a new admin page is protected the day it is
+ * written) does not hold for an anonymous visitor. Today every admin page but the login screen
+ * renders inside AdminLayout, which redirects a signed-out user itself; that redirect runs AFTER the
+ * page's own frontmatter, so the queries still execute, and a page written next month that renders
+ * its own shell would have served its content outright.
+ *
+ * Same destination as AdminLayout's redirect, so the two never disagree.
+ */
+function signedOutAdminRedirect(path: string): Response | null {
+  if (!isAdminPath(path) || isAdminGuardExempt(path)) return null;
+  return new Response(null, { status: 302, headers: { Location: '/admin/login', 'cache-control': 'no-store' } });
 }
 
 // Map an /admin/* path to its permission section key (longest-prefix wins).
@@ -226,6 +253,9 @@ export const onRequest = defineMiddleware(async (context, next) => {
   if (!token) {
     context.locals.user = null;
     context.locals.session = null;
+    // No cookie at all. Deny by default reaches nobody-at-all too — see signedOutAdminRedirect.
+    const anonAdmin = signedOutAdminRedirect(path);
+    if (anonAdmin) return anonAdmin;
     if (isGatedLab(path) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
     // Anonymous + public page -> let the CDN cache it so repeat hits never touch the database.
     if (context.request.method === 'GET' && isPublicCacheable(path)) {
@@ -249,6 +279,10 @@ export const onRequest = defineMiddleware(async (context, next) => {
     clearSessionCookie(context.cookies);
     context.locals.user = null;
     context.locals.session = null;
+    // Expired or revoked session. The cookie has just been cleared above; /admin/login is exempt, so
+    // the very next request renders the sign-in form normally and nobody can be stuck in a loop.
+    const staleAdmin = signedOutAdminRedirect(path);
+    if (staleAdmin) return staleAdmin;
     if (isGatedLab(path) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
     return next();
   }
@@ -316,7 +350,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // /admin/login is the single exemption — gating it would lock everyone out of signing in. Note that
   // /admin/logout is NOT exempt: a refused person is bounced with their session intact and signs out
   // at /logout or /portal/logout, which is a smaller cost than a second hole in the guard.
-  if (isAdminPath(path) && path !== ADMIN_GUARD_EXEMPT) {
+  if (isAdminPath(path) && !isAdminGuardExempt(path)) {
     const verdict = await canOpenAdmin(result.user as any);
     if (!verdict.allowed) {
       // Logged as a refused ATTEMPT, not an error: the path and the user id are what turn "someone

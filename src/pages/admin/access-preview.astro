@@ -1,0 +1,672 @@
+---
+// src/pages/admin/access-preview.astro — what each role can reach, and who currently holds it.
+//
+// WHY IT EXISTS. In 2026 an intern reached the super-admin dashboard in production and read the
+// applicant pipeline, employee records and candidate names. The cause was a role promotion on offer
+// signing (`UPDATE users SET role = 'editor'`, and editor carries admin.access). The promotion is
+// gone, intern-guard.ts blocks and repairs the accounts it created, and canOpenAdmin() now refuses by
+// default. What was still missing is the part that would have let somebody SEE it coming: one screen
+// showing what a role can reach and who is holding it. Until now that was knowable only by reading
+// four files and holding them in your head at once, and nobody does that on a Tuesday.
+//
+// WHAT IT REFUSES TO BE. There is no "view as user" and no "sign in as". Impersonation destroys the
+// audit trail and reads private data under someone else's name — the wrong answer to "what can they
+// see". This page DESCRIBES access. It never grants it, and it has no POST handler at all.
+//
+// EVERYTHING IS DERIVED, NOTHING IS TYPED OUT. The matrix comes from PERMS_BY_ROLE, the sidebar
+// answer from the layout's own source (see admin-nav-parse.ts), the admin-capable list from
+// ADMIN_CAPABLE_ROLES, the internship test from the same isInternshipRecord() the gate uses. A
+// hand-copied summary of a permission model is one edit away from lying, and a lying access page is
+// worse than none: it gets read once, believed, and never questioned again.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+// ?raw is resolved by Vite at build time, and Astro's own plugin skips ids carrying it, so this is
+// the layout's real text inlined into the bundle — not a copy anyone has to remember to update.
+import layoutSource from '../../layouts/AdminLayout.astro?raw';
+import { can, PERMS_BY_ROLE, ROLE_LABELS, defaultSectionKeysForRole } from '@/lib/auth/permissions';
+import type { Permission } from '@/lib/auth/permissions';
+import { ADMIN_CAPABLE_ROLES, isInternshipRecord } from '@/lib/auth/admin-access';
+import { ALL_ADMIN_SECTION_KEYS, adminSectionLabel } from '@/lib/admin-sections';
+import { parseAdminNav, navIdVisible } from '@/lib/admin-nav-parse';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+// Both strings already exist in the Permission union. Inventing a new one made a whole console
+// unreachable earlier in this project, because can() answers false for every role — including
+// super_admin — when the permission is not in the matrix. users.view is what makes this a super-admin
+// screen (no other role holds it); admin.access is the same door every other admin page uses.
+if (!can(user, 'users.view') || !can(user, 'admin.access')) return Astro.redirect('/admin');
+
+// Declared before anything that calls them: `const` is not hoisted, and reaching a later declaration
+// from a handler has taken pages down in this repo.
+const asRows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const logFail = (tag: string, e: any) => console.error('[access-preview] ' + tag, e?.cause?.message || e?.message);
+const labelOf = (role: string): string => (ROLE_LABELS as any)[role] || role;
+// Engagements that are not staff employment. Narrower than "anything unusual" on purpose: a list that
+// cries wolf gets ignored, and this one has to be believed the day it fires.
+const NON_STAFF_PATTERN = /\b(apprentice|trainee|volunteer)/i;
+const when = (v: any): string => {
+  if (!v) return 'never';
+  try { return new Date(v).toLocaleDateString('en-IN', { dateStyle: 'medium' }); } catch { return String(v); }
+};
+
+// ---------------------------------------------------------------- 1. the matrix, from the matrix
+type RoleKey = keyof typeof PERMS_BY_ROLE;
+const roleKeys = Object.keys(PERMS_BY_ROLE) as RoleKey[];
+
+// Every permission any role actually holds, in declaration order (super_admin holds all of them
+// today, so this is the whole union). A permission added to the union but granted to NO role cannot
+// appear here — it also cannot let anybody in, which is why the footnote says so rather than this
+// pretending to enumerate a TypeScript type at runtime.
+const permissions: Permission[] = [];
+for (const role of roleKeys) {
+  for (const perm of PERMS_BY_ROLE[role]) if (!permissions.includes(perm)) permissions.push(perm);
+}
+
+const matrix = roleKeys.map((role) => ({
+  role,
+  label: labelOf(role),
+  adminCapable: ADMIN_CAPABLE_ROLES.has(role),
+  granted: PERMS_BY_ROLE[role].length,
+  cells: permissions.map((perm) => ({ perm, on: PERMS_BY_ROLE[role].includes(perm) })),
+}));
+
+// ------------------------------------------------- 2. what the sidebar would offer, per role
+const nav = parseAdminNav(layoutSource);
+const roleViews = roleKeys.map((role) => {
+  const keys = defaultSectionKeysForRole(role);
+  const visible = nav.items.filter((item) => navIdVisible(nav, item.id, keys));
+  return {
+    role,
+    label: labelOf(role),
+    adminCapable: ADMIN_CAPABLE_ROLES.has(role),
+    sectionKeys: keys === null ? [] : [...keys].sort(),
+    // null from defaultSectionKeysForRole means "no filtering", which is correct for super_admin and
+    // an accident for anyone else. Split the two so the accident is visible.
+    unrestricted: keys === null,
+    unrestrictedByOmission: keys === null && role !== 'super_admin',
+    count: visible.length,
+    visible,
+  };
+});
+
+// --------------------------------------------------------- 5. gaps between the nav and the registry
+const seenIds = new Set<string>();
+const unmappedNav = nav.items.filter((item) => {
+  if (nav.navSection.has(item.id) || nav.universal.has(item.id)) return false;
+  if (seenIds.has(item.id)) return false;
+  seenIds.add(item.id);
+  return true;
+});
+const mappedTargets = new Set<string>([...nav.navSection.values()]);
+// A section key the permission editor offers that no nav entry points at: grantable, but granting it
+// puts no link in anybody's sidebar. The mirror image of an unmapped entry, and just as invisible.
+const unusedSectionKeys = ALL_ADMIN_SECTION_KEYS.filter((k) => !mappedTargets.has(k));
+// A mapping pointing at a key that is not in the registry — nobody could ever be granted it, so the
+// entry would be hidden from every restricted admin forever. Empty today; it should stay that way.
+const danglingTargets = [...mappedTargets].filter((k) => !ALL_ADMIN_SECTION_KEYS.includes(k));
+
+// ------------------------------------------------------------------ 3 + 4. who actually holds this
+const adminRoleList = [...ADMIN_CAPABLE_ROLES].sort();
+const roleTotals = new Map<string, { total: number; active: number }>();
+let holders: any[] = [];
+let hrRows: any[] = [];
+let countsError = '';
+let holdersError = '';
+let flagError = '';
+
+try {
+  const r = await db.execute(sql`
+    SELECT role::text AS role,
+           COUNT(*)::int AS total,
+           SUM(CASE WHEN is_active THEN 1 ELSE 0 END)::int AS active
+      FROM users
+     GROUP BY role`);
+  for (const row of asRows(r)) {
+    roleTotals.set(String(row.role), { total: Number(row.total) || 0, active: Number(row.active) || 0 });
+  }
+} catch (e: any) {
+  logFail('role counts', e);
+  countsError = 'Could not read the per-role counts. The matrix above is still accurate; these numbers are not.';
+}
+
+if (adminRoleList.length > 0) {
+  const roleValues = sql.join(adminRoleList.map((r) => sql`${r}`), sql`, `);
+  try {
+    // Named people, deliberately, and ONLY for roles that can open this console: a wrong grant is
+    // obvious when you can read the name and invisible when you can only read a count. Applicants and
+    // the AquinTutor-scoped roles are counted and never listed — a roster of every applicant is not
+    // what this page is for, and publishing one here would be its own disclosure.
+    holders = asRows(await db.execute(sql`
+      SELECT u.id::text AS id, u.name, u.email, u.role::text AS role, u.is_active, u.last_login_at
+        FROM users u
+       WHERE u.role::text IN (${roleValues})
+       ORDER BY u.role::text ASC, lower(u.name) ASC
+       LIMIT 500`));
+  } catch (e: any) {
+    logFail('holders', e);
+    holdersError = 'Could not list the people holding admin-capable roles.';
+  }
+
+  try {
+    // Five columns off hr_employees and no more. That table also holds gender, Aadhaar, PAN, bank and
+    // salary, and none of them belong on a screen about permissions. The join matches on every
+    // identity column because hr_employees.user_id is nullable and only backfilled opportunistically:
+    // matching on user_id alone would miss exactly the records this section exists to find.
+    hrRows = asRows(await db.execute(sql`
+      SELECT u.id::text AS id, u.name, u.email, u.role::text AS role,
+             e.employment_type, e.designation, e.employment_status,
+             e.is_active AS employee_active
+        FROM users u
+        JOIN hr_employees e
+          ON (e.user_id = u.id
+              OR lower(coalesce(e.work_email, '')) = lower(u.email)
+              OR lower(coalesce(e.personal_email, '')) = lower(u.email)
+              OR lower(coalesce(e.email, '')) = lower(u.email))
+       WHERE u.role::text IN (${roleValues})
+       LIMIT 1000`));
+  } catch (e: any) {
+    logFail('hr cross-check', e);
+    flagError = 'Could not cross-check admin roles against HR records, so an empty list below means unknown, not clear.';
+  }
+}
+
+const totalsFor = (role: string) => roleTotals.get(role) || { total: 0, active: 0 };
+// Every number that came out of the counts query goes through here. A failed query rendering "0
+// accounts" against each role is the same lie as a confident "0 flagged": the warning banner sits
+// above the table, and the table underneath it would quietly contradict it.
+const countCell = (n: number): string => (countsError ? 'n/a' : String(n));
+// Role values present in `users` that the permission matrix does not know about — one written
+// straight into the database, or one renamed in source and left behind in the data. Such an account
+// holds NOTHING (can() answers false for a role the matrix does not list) and canOpenAdmin() refuses
+// it at the door, so this is a data-integrity finding rather than an open door. It still belongs
+// here: this is the page whose job is to notice. Derived by comparing the two, never enumerated.
+const unknownRoles = [...roleTotals.keys()].filter((r) => !(roleKeys as string[]).includes(r));
+const holdersByRole = adminRoleList.map((role) => ({
+  role,
+  label: labelOf(role),
+  people: holders.filter((h) => String(h.role) === role),
+}));
+
+// Group the HR rows per person, then judge the CURRENT engagement the same way canOpenAdmin() does:
+// live rows if there are any, otherwise the closed ones. An intern later hired full time is therefore
+// not flagged — their internship row is closed and the live one is not — which keeps this list to
+// people whose access is genuinely questionable today.
+const peopleWithRecords = new Map<string, any>();
+for (const row of hrRows) {
+  const id = String(row.id);
+  const entry = peopleWithRecords.get(id) || { id, name: row.name, email: row.email, role: String(row.role), records: [] };
+  entry.records.push(row);
+  peopleWithRecords.set(id, entry);
+}
+
+const flagged: any[] = [];
+for (const person of peopleWithRecords.values()) {
+  const isLive = (r: any) => r.employee_active === true
+    && String(r.employment_status || 'active').trim().toLowerCase() !== 'inactive';
+  const live = person.records.filter(isLive);
+  const considered = live.length > 0 ? live : person.records;
+  const reasons: string[] = [];
+  if (considered.some((r: any) => isInternshipRecord(r.employment_type, r.designation))) {
+    reasons.push('Internship on file');
+  }
+  if (considered.some((r: any) => NON_STAFF_PATTERN.test(String(r.employment_type || ''))
+    || NON_STAFF_PATTERN.test(String(r.designation || '')))) {
+    reasons.push('Non-staff engagement');
+  }
+  if (live.length === 0) reasons.push('No current engagement');
+  if (reasons.length === 0) continue;
+  flagged.push({
+    id: person.id,
+    name: person.name,
+    email: person.email,
+    role: person.role,
+    reasonText: reasons.join(' · '),
+    records: considered.map((r: any) => ({
+      type: String(r.employment_type || '').trim() || 'type not recorded',
+      designation: String(r.designation || '').trim() || 'no designation',
+      status: String(r.employment_status || '').trim() || (r.employee_active === false ? 'inactive' : 'active'),
+    })),
+    weight: reasons.length,
+  });
+}
+flagged.sort((a, b) => (b.weight - a.weight) || String(a.name).localeCompare(String(b.name)));
+
+// The tiles read as reassurance, so a failed query must never render as a confident zero: "0 flagged"
+// on an access console is exactly the kind of wrong answer that gets believed and never re-checked.
+const adminHolderLabel = holdersError ? 'n/a' : String(holders.length);
+const totalUsersLabel = countsError ? 'an unknown number of' : String([...roleTotals.values()].reduce((n, v) => n + v.total, 0));
+const flagLabel = flagError ? 'n/a' : String(flagged.length);
+const flagNote = flagError ? 'check failed' : (flagged.length === 0 ? 'nothing to correct' : 'needs a decision');
+const flagAlarm = Boolean(flagError) || flagged.length > 0;
+---
+
+<AdminLayout title="Access preview" activeNav="access-preview">
+  <div class="ap">
+    <header class="ap-head">
+      <p class="ap-eyebrow">Access &middot; read only</p>
+      <h1>What each role can reach</h1>
+      <p class="ap-lede">
+        Every role, every permission it holds, the sidebar it would actually be handed, and the people
+        holding it right now &mdash; all read from the same files the checks read, so this page cannot
+        quietly disagree with the system it describes. It changes nothing: there is no impersonation
+        here and no form to submit. Corrections happen in <a href="/admin/users">Users</a> and in
+        <code>src/lib/auth/permissions.ts</code>.
+      </p>
+    </header>
+
+    {nav.problem && (
+      <div class="ap-note ap-bad">
+        <strong>The sidebar could not be read.</strong> {nav.problem} Sections 2 and 5 below are
+        therefore incomplete, and an empty list there means <em>unknown</em>, not <em>none</em>. The
+        fix is in <code>src/lib/admin-nav-parse.ts</code>.
+      </div>
+    )}
+
+    <div class="ap-tiles">
+      <div class="ap-tile"><p class="ap-k">Roles</p><p class="ap-v">{roleKeys.length}</p><p class="ap-s">{adminRoleList.length} can open admin</p></div>
+      <div class="ap-tile"><p class="ap-k">Permissions</p><p class="ap-v">{permissions.length}</p><p class="ap-s">in the matrix</p></div>
+      <div class="ap-tile"><p class="ap-k">Sidebar entries</p><p class="ap-v">{nav.problem ? 'n/a' : String(nav.items.length)}</p><p class="ap-s">{nav.problem ? 'sidebar unreadable' : unmappedNav.length + ' unmapped'}</p></div>
+      <div class="ap-tile"><p class="ap-k">Admin accounts</p><p class="ap-v">{adminHolderLabel}</p><p class="ap-s">of {totalUsersLabel} users</p></div>
+      <div class={flagAlarm ? 'ap-tile ap-alarm' : 'ap-tile'}>
+        <p class="ap-k">Flagged</p>
+        <p class="ap-v">{flagLabel}</p>
+        <p class="ap-s">{flagNote}</p>
+      </div>
+    </div>
+
+    <section>
+      <h2>1. Role matrix</h2>
+      <p class="ap-sub">
+        Straight from <code>PERMS_BY_ROLE</code>. Grant a permission to a role there and this table
+        grows on the next deploy. <strong>admin.access</strong> is highlighted because it alone decides
+        whether an account can open this console at all &mdash; every other column describes what
+        someone does once they are already inside.
+      </p>
+      <div class="ap-scroll">
+        <table class="ap-table">
+          <thead>
+            <tr>
+              <th scope="col" class="ap-rowhead">Role</th>
+              {permissions.map((perm) => (
+                <th scope="col" class={perm === 'admin.access' ? 'ap-perm ap-key' : 'ap-perm'}>
+                  <span class="ap-res">{perm.split('.')[0]}</span>
+                  <span class="ap-act">{perm.split('.')[1]}</span>
+                </th>
+              ))}
+              <th scope="col" class="ap-tot">Held</th>
+            </tr>
+          </thead>
+          <tbody>
+            {matrix.map((row) => (
+              <tr>
+                <th scope="row" class="ap-rowhead">
+                  <span class="ap-rl">{row.label}</span>
+                  <span class="ap-rk">{row.role}</span>
+                </th>
+                {row.cells.map((cell) => (
+                  <td
+                    class={cell.perm === 'admin.access' ? 'ap-cell ap-key' : 'ap-cell'}
+                    title={row.role + ' ' + (cell.on ? 'holds' : 'does not hold') + ' ' + cell.perm}
+                  >
+                    {cell.on ? (
+                      <svg viewBox="0 0 12 12" class="ap-tick" aria-hidden="true"><path d="M2 6.3 4.7 9 10 3.2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+                    ) : (
+                      <span class="ap-off" aria-hidden="true"></span>
+                    )}
+                    <span class="ap-sr">{cell.on ? 'granted' : 'not granted'}</span>
+                  </td>
+                ))}
+                <td class="ap-cell ap-tot">{row.granted}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="ap-foot">
+        A permission that exists in the <code>Permission</code> union but is granted to no role cannot
+        appear above &mdash; and cannot let anyone in either. Per-person overrides built in
+        <a href="/admin/team/roles">Custom Roles</a> are a separate, finer-grained system that replaces
+        these defaults for whoever is assigned one; this table is the built-in matrix.
+      </p>
+    </section>
+
+    <section>
+      <h2>2. What each role sees</h2>
+      <p class="ap-sub">
+        The sidebar this role would be handed, computed by running the layout's own
+        <code>NAV_SECTION</code> map against the section keys <code>getViewableSectionKeys</code>
+        resolves for it. An entry with no mapping fails closed and stays hidden &mdash; section 5 lists
+        which ones those are.
+      </p>
+      <div class="ap-note">
+        <strong>This is the menu, not the lock.</strong> A hidden link is still reachable by typing the
+        URL unless the page itself calls <code>canAccessSection()</code>. In the 2026 escalation the
+        promoted accounts had a modest sidebar; what they read was the dashboard, which every signed-in
+        admin keeps. Read this section as "what is offered", and treat the per-page checks as the thing
+        that actually refuses.
+      </div>
+      {roleViews.map((view) => (
+        <article class={view.adminCapable ? 'ap-role' : 'ap-role ap-muted'}>
+          <div class="ap-role-head">
+            <div>
+              <h3>{view.label} <span class="ap-rk">{view.role}</span></h3>
+              <p class="ap-role-sub">
+                {view.adminCapable
+                  ? view.count + ' sidebar entries, from ' + (view.unrestricted ? 'no section filter at all' : view.sectionKeys.length + ' section keys')
+                  : '0 entries. canOpenAdmin() refuses this role before the sidebar is built, because it does not hold admin.access.'}
+              </p>
+            </div>
+            <span class={view.adminCapable ? 'ap-pill ap-on' : 'ap-pill ap-offpill'}>{view.adminCapable ? 'admin.access' : 'no admin.access'}</span>
+          </div>
+
+          {view.unrestrictedByOmission && (
+            <p class="ap-warn">
+              No entry in <code>ROLE_SECTIONS</code>, so the sidebar filter does not restrict this role
+              at all &mdash; it would be handed all {view.count} entries. Nothing is exposed today,
+              because the role holds no <code>admin.access</code> and the gate refuses it at the door,
+              but that gate is the only thing standing there. Give the role an explicit section list
+              before it is ever allowed in.
+            </p>
+          )}
+
+          {view.adminCapable && !view.unrestricted && (
+            <ul class="ap-chips">
+              {view.visible.map((item) => (
+                <li class="ap-chip">
+                  {item.group && <span class="ap-g">{item.group}</span>}
+                  <a href={item.href}>{item.label}</a>
+                </li>
+              ))}
+            </ul>
+          )}
+          {view.adminCapable && view.unrestricted && (
+            <p class="ap-role-note">Every entry in the sidebar ({view.count}), unfiltered by design.</p>
+          )}
+          {!view.adminCapable && !view.unrestrictedByOmission && (
+            <p class="ap-role-note">
+              Section keys on file: {view.sectionKeys.length === 0 ? 'none' : view.sectionKeys.map((k) => adminSectionLabel(k)).join(', ')}.
+              Moot while the role cannot open admin at all.
+            </p>
+          )}
+        </article>
+      ))}
+    </section>
+
+    <section>
+      <h2>3. Who holds each role</h2>
+      <p class="ap-sub">
+        Counts for every role; names and addresses only for the roles that can open this console,
+        because that is where a wrong grant does damage. Applicants and the learning-platform roles are
+        counted and never listed.
+      </p>
+      {countsError && <div class="ap-note ap-bad">{countsError}</div>}
+      <div class="ap-scroll">
+        <table class="ap-table">
+          <thead>
+            <tr>
+              <th scope="col">Role</th>
+              <th scope="col">Can open admin</th>
+              <th scope="col" class="ap-tot">Accounts</th>
+              <th scope="col" class="ap-tot">Active</th>
+            </tr>
+          </thead>
+          <tbody>
+            {roleKeys.map((role) => (
+              <tr>
+                <th scope="row"><span class="ap-rl">{labelOf(role)}</span> <span class="ap-rk">{role}</span></th>
+                <td>{ADMIN_CAPABLE_ROLES.has(role) ? <span class="ap-pill ap-on">yes</span> : <span class="ap-pill ap-offpill">no</span>}</td>
+                <td class="ap-num">{countCell(totalsFor(role).total)}</td>
+                <td class="ap-num">{countCell(totalsFor(role).active)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {unknownRoles.length > 0 && (
+        <div class="ap-note ap-bad">
+          <strong>Role values the matrix does not know about:</strong> {unknownRoles.join(', ')}. Accounts
+          carrying one hold no permission at all &mdash; <code>can()</code> answers false for a role that is
+          not in <code>PERMS_BY_ROLE</code>, and <code>canOpenAdmin()</code> refuses it at the door &mdash; so
+          nothing is exposed by them. They are still wrong, and they are the shape a role written straight
+          into the database takes. Correct them in <a href="/admin/users">Users</a>.
+        </div>
+      )}
+
+      {holdersError && <div class="ap-note ap-bad">{holdersError}</div>}
+      {holdersByRole.map((group) => (
+        <div class="ap-holders">
+          <h3>{group.label} <span class="ap-rk">{group.role}</span> <span class="ap-cnt">{holdersError ? 'n/a' : String(group.people.length)}</span></h3>
+          {holdersError && <p class="ap-role-note">Not readable: the query above failed. Unknown, not none.</p>}
+          {!holdersError && group.people.length === 0 && <p class="ap-role-note">Nobody holds this role.</p>}
+          {!holdersError && group.people.length > 0 && (
+            <ul class="ap-people">
+              {group.people.map((p: any) => (
+                <li class={p.is_active ? 'ap-person' : 'ap-person ap-dim'}>
+                  <span class="ap-pn">{p.name}</span>
+                  <a class="ap-pe" href={'mailto:' + p.email}>{p.email}</a>
+                  <span class="ap-pm">{p.is_active ? 'active' : 'deactivated'} &middot; last signed in {when(p.last_login_at)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ))}
+      {holders.length >= 500 && (
+        <p class="ap-foot">Showing the first 500 admin-capable accounts. If the list is genuinely that long, that is the finding.</p>
+      )}
+    </section>
+
+    <section>
+      <h2>4. Flagged</h2>
+      <p class="ap-sub">
+        Anyone holding a role that can open admin who also has an internship, a non-staff engagement,
+        or no current engagement on file. This is the exact shape of the 2026 incident. The internship
+        test is the same <code>isInternshipRecord()</code> the gate uses, judged on the current
+        engagement &mdash; so someone who interned and was then hired is not flagged here.
+      </p>
+      {flagError && <div class="ap-note ap-bad">{flagError}</div>}
+      {!flagError && flagged.length === 0 && (
+        <div class="ap-note ap-good">
+          <strong>Nobody is flagged.</strong> Every account holding an admin-capable role has a current
+          staff record, and no internship record carries one. This is the state you want &mdash; and
+          the thing to re-read after any change to how offers are signed.
+        </div>
+      )}
+      {flagged.map((person: any) => (
+        <article class="ap-flag">
+          <div class="ap-flag-head">
+            <svg viewBox="0 0 20 20" class="ap-alert" aria-hidden="true"><path d="M10 3.2 18 17H2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" /><path d="M10 8v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /><circle cx="10" cy="14.6" r="0.9" fill="currentColor" /></svg>
+            <div>
+              <p class="ap-fn">{person.name} <span class="ap-rk">{labelOf(person.role)}</span></p>
+              <p class="ap-fe">{person.email}</p>
+            </div>
+            <a class="ap-fix" href="/admin/users">Correct in Users</a>
+          </div>
+          <p class="ap-reasons">{person.reasonText}</p>
+          <ul class="ap-recs">
+            {person.records.map((r: any) => (
+              <li>{r.designation} &middot; {r.type} &middot; {r.status}</li>
+            ))}
+          </ul>
+        </article>
+      ))}
+      {flagged.length > 0 && (
+        <p class="ap-foot">
+          A flag is a question, not a verdict: the HR record may be stale rather than the role wrong.
+          Decide it in <a href="/admin/users">Users</a> or on the person's HR record &mdash; nothing on
+          this page changes either.
+        </p>
+      )}
+    </section>
+
+    <section>
+      <h2>5. Unmapped sections</h2>
+      <p class="ap-sub">
+        Sidebar entries with no <code>NAV_SECTION</code> mapping. They fail closed, so a restricted
+        admin never sees them &mdash; the safe direction, and completely invisible to whoever added
+        them. A super admin sees all of these, so nothing listed here is being hidden from this screen.
+      </p>
+      {nav.problem && (
+        <div class="ap-note ap-bad">
+          <strong>Unknown, not none.</strong> The sidebar could not be read, so this list is empty because
+          the check could not run &mdash; not because every entry turned out to be mapped.
+        </div>
+      )}
+      {!nav.problem && unmappedNav.length === 0 && (
+        <div class="ap-note ap-good"><strong>Every sidebar entry is mapped.</strong> Nothing is hidden by omission.</div>
+      )}
+      {!nav.problem && unmappedNav.length > 0 && (
+          <div class="ap-scroll">
+            <table class="ap-table">
+              <thead><tr><th scope="col">Entry</th><th scope="col">Group</th><th scope="col">Path</th><th scope="col">Nav id</th></tr></thead>
+              <tbody>
+                {unmappedNav.map((item) => (
+                  <tr>
+                    <th scope="row">{item.label}</th>
+                    <td>{item.group || 'top level'}</td>
+                    <td><a href={item.href}>{item.href}</a></td>
+                    <td><code>{item.id}</code></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      <p class="ap-foot">
+        {unmappedNav.length} of {nav.items.length} entries are unmapped. Fixing one means adding the
+        nav id to <code>NAV_SECTION</code> in the layout, pointed at a key from the section registry
+        &mdash; the same keys the <a href="/admin/team/roles">Custom Roles</a> editor grants.
+      </p>
+
+      {danglingTargets.length > 0 && (
+        <div class="ap-note ap-bad">
+          <strong>Mappings pointing at nothing:</strong> {danglingTargets.join(', ')}. No role can be
+          granted these keys, so those entries stay hidden from every restricted admin forever.
+        </div>
+      )}
+
+      <h3 class="ap-subh">Section keys no sidebar entry uses</h3>
+      <p class="ap-sub">
+        The mirror image: grantable in the permission editor, but granting one puts no link in anyone's
+        sidebar. Harmless when the page is reached another way, a dead end when it is not.
+      </p>
+      {unusedSectionKeys.length === 0
+        ? <p class="ap-role-note">None. Every section key is used by at least one entry.</p>
+        : (
+          <ul class="ap-chips">
+            {unusedSectionKeys.map((k) => (
+              <li class="ap-chip"><span class="ap-g">{adminSectionLabel(k)}</span><code>{k}</code></li>
+            ))}
+          </ul>
+        )}
+    </section>
+
+    <p class="ap-closing">
+      Read-only by design. This console describes access; it does not grant it, and it deliberately
+      offers no way to browse as somebody else &mdash; that would put one person's reading of private
+      data under another person's name in the audit log. Change access in
+      <a href="/admin/users">Users</a>, <a href="/admin/team/roles">Custom Roles</a>, or the permission
+      matrix in source.
+    </p>
+  </div>
+</AdminLayout>
+
+<style>
+  .ap { max-width: 1180px; color: #e8e8ee; }
+  .ap-head { margin-bottom: 22px; }
+  .ap-eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: #6e6e78; margin: 0 0 6px; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  .ap h1 { font-family: 'Fraunces', serif; font-size: 27px; line-height: 1.15; margin: 0 0 8px; }
+  .ap-lede { font-size: 13px; line-height: 1.65; color: #a0a0a8; margin: 0; max-width: 72ch; }
+  .ap a { color: #FF4F00; text-decoration: none; }
+  .ap a:hover { text-decoration: underline; }
+  .ap code { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.9em; color: #b9b9c4; background: #15151c; border-radius: 4px; padding: 1px 5px; }
+
+  .ap-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 26px; }
+  .ap-tile { border: 1px solid #2a2a30; border-radius: 12px; background: #0f0f14; padding: 12px 14px; }
+  .ap-tile.ap-alarm { border-color: #7f1d1d; background: rgba(127, 29, 29, 0.16); }
+  .ap-k { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.1em; color: #6e6e78; margin: 0 0 5px; }
+  .ap-v { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 22px; font-weight: 700; margin: 0; color: #e8e8ee; }
+  .ap-tile.ap-alarm .ap-v { color: #f87171; }
+  .ap-s { font-size: 10.5px; color: #6e6e78; margin: 3px 0 0; }
+
+  .ap section { margin: 0 0 34px; }
+  .ap h2 { font-family: 'Fraunces', serif; font-size: 19px; margin: 0 0 6px; color: #f2f2f6; }
+  .ap h3 { font-size: 13.5px; margin: 0; font-weight: 700; color: #e8e8ee; }
+  .ap-subh { font-size: 14px; margin: 22px 0 4px; font-family: 'Fraunces', serif; }
+  .ap-sub { font-size: 12.5px; line-height: 1.6; color: #8a8a94; margin: 0 0 14px; max-width: 78ch; }
+  .ap-foot { font-size: 11.5px; line-height: 1.6; color: #6e6e78; margin: 12px 0 0; max-width: 78ch; }
+
+  .ap-note { border: 1px solid #2a2a30; background: #0f0f14; border-radius: 10px; padding: 11px 14px; font-size: 12.5px; line-height: 1.6; color: #a0a0a8; margin: 0 0 14px; }
+  .ap-note strong { color: #e8e8ee; }
+  .ap-note.ap-bad { border-color: #7f1d1d; background: rgba(127, 29, 29, 0.18); }
+  .ap-note.ap-good { border-color: #14532d; background: rgba(20, 83, 45, 0.2); }
+
+  .ap-scroll { overflow-x: auto; border: 1px solid #2a2a30; border-radius: 12px; background: #0f0f14; -webkit-overflow-scrolling: touch; }
+  .ap-table { border-collapse: collapse; width: 100%; font-size: 12px; display: table; }
+  .ap-table th, .ap-table td { border-bottom: 1px solid #1c1c24; padding: 7px 9px; text-align: left; vertical-align: middle; }
+  .ap-table tbody tr:last-child th, .ap-table tbody tr:last-child td { border-bottom: 0; }
+  .ap-table thead th { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.07em; color: #6e6e78; font-weight: 600; background: #12121a; }
+  .ap-perm { min-width: 62px; }
+  .ap-res { display: block; color: #55555f; }
+  .ap-act { display: block; color: #9a9aa4; }
+  .ap-perm.ap-key .ap-res, .ap-perm.ap-key .ap-act { color: #FF4F00; }
+  .ap-perm.ap-key, .ap-cell.ap-key { background: rgba(255, 79, 0, 0.07); }
+  .ap-rowhead { position: sticky; left: 0; background: #0f0f14; min-width: 128px; z-index: 2; border-right: 1px solid #1c1c24; }
+  .ap-table thead .ap-rowhead { background: #12121a; z-index: 3; }
+  .ap-rl { display: block; color: #e8e8ee; font-size: 12.5px; font-weight: 600; }
+  .ap-rk { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; color: #6e6e78; font-weight: 400; }
+  .ap-cell { text-align: center; }
+  .ap-tot { text-align: right; font-family: 'JetBrains Mono', ui-monospace, monospace; color: #8a8a94; }
+  .ap-num { font-family: 'JetBrains Mono', ui-monospace, monospace; text-align: right; color: #a0a0a8; }
+  .ap-tick { width: 13px; height: 13px; color: #4ade80; display: inline-block; }
+  .ap-cell.ap-key .ap-tick { color: #FF4F00; }
+  .ap-off { display: inline-block; width: 4px; height: 4px; border-radius: 50%; background: #2f2f38; vertical-align: middle; }
+  .ap-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+  .ap-role { border: 1px solid #2a2a30; border-radius: 12px; background: #0f0f14; padding: 13px 15px; margin-bottom: 10px; }
+  .ap-role.ap-muted { background: #0c0c11; border-color: #1f1f26; }
+  .ap-role-head { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+  .ap-role-head > div { flex: 1; min-width: 190px; }
+  .ap-role-sub { font-size: 11.5px; color: #8a8a94; margin: 4px 0 0; line-height: 1.5; }
+  .ap-role-note { font-size: 11.5px; color: #6e6e78; margin: 8px 0 0; line-height: 1.55; }
+  .ap-warn { font-size: 11.5px; line-height: 1.6; color: #fbbf24; background: rgba(251, 191, 36, 0.08); border: 1px solid rgba(251, 191, 36, 0.28); border-radius: 8px; padding: 9px 11px; margin: 10px 0 0; }
+  .ap-pill { font-size: 9.5px; font-weight: 700; letter-spacing: 0.05em; padding: 3px 9px; border-radius: 100px; white-space: nowrap; display: inline-block; }
+  .ap-pill.ap-on { color: #4ade80; background: rgba(74, 222, 128, 0.14); }
+  .ap-pill.ap-offpill { color: #8a8a94; background: #1a1a22; }
+
+  .ap-chips { list-style: none; padding: 0; margin: 11px 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .ap-chip { display: inline-flex; align-items: baseline; gap: 5px; border: 1px solid #24242c; background: #14141b; border-radius: 100px; padding: 4px 10px; font-size: 11.5px; color: #c8c8d2; }
+  .ap-g { font-size: 9.5px; color: #6e6e78; text-transform: uppercase; letter-spacing: 0.06em; }
+  .ap-chip a { color: #c8c8d2; }
+
+  .ap-holders { margin-top: 16px; }
+  .ap-cnt { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #6e6e78; }
+  .ap-people { list-style: none; padding: 0; margin: 8px 0 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 8px; }
+  .ap-person { border: 1px solid #24242c; border-radius: 10px; background: #0f0f14; padding: 9px 11px; }
+  .ap-person.ap-dim { opacity: 0.6; }
+  .ap-pn { display: block; font-size: 12.5px; font-weight: 600; color: #e8e8ee; }
+  .ap-pe { display: block; font-size: 11.5px; word-break: break-all; }
+  .ap-pm { display: block; font-size: 10.5px; color: #6e6e78; margin-top: 2px; }
+
+  .ap-flag { border: 1px solid #7f1d1d; background: rgba(127, 29, 29, 0.14); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+  .ap-flag-head { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+  .ap-flag-head > div { flex: 1; min-width: 180px; }
+  .ap-alert { width: 20px; height: 20px; color: #f87171; flex: none; }
+  .ap-fn { font-size: 13.5px; font-weight: 700; margin: 0; color: #f5f5f8; }
+  .ap-fe { font-size: 11.5px; color: #a0a0a8; margin: 2px 0 0; word-break: break-all; }
+  .ap-fix { font-size: 11.5px; font-weight: 600; border: 1px solid #7f1d1d; border-radius: 6px; padding: 5px 10px; white-space: nowrap; }
+  .ap-reasons { font-size: 11.5px; color: #fca5a5; margin: 9px 0 0; }
+  .ap-recs { list-style: none; padding: 0; margin: 6px 0 0; font-size: 11px; color: #8a8a94; }
+  .ap-recs li { padding: 2px 0; }
+
+  .ap-closing { font-size: 11.5px; line-height: 1.7; color: #6e6e78; margin: 26px 0 0; border-top: 1px solid #1c1c24; padding-top: 14px; max-width: 78ch; }
+
+  @media (max-width: 560px) {
+    .ap h1 { font-size: 22px; }
+    .ap-tiles { grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); }
+    .ap-people { grid-template-columns: 1fr; }
+  }
+</style>

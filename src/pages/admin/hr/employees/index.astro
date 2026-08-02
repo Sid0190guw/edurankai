@@ -28,6 +28,13 @@ const hrEmployees = pgTable('hr_employees', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 });
 
+// Self-bootstrap the reporting line (idempotent). Repeated from the employee detail page because
+// this list reads the column and has no other ensure step of its own — without it, a database
+// predating the column would 500 the whole list instead of showing a blank manager.
+try {
+  await db.execute(sqlExpr`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
+} catch (_) {}
+
 let errorMsg = '';
 let successMsg = '';
 
@@ -92,12 +99,17 @@ const _countRows = Array.isArray(countResult) ? countResult : (countResult?.rows
 const totalCount = parseInt((_countRows[0] as any)?.n || '0');
 const totalPages = Math.ceil(totalCount / perPage);
 
+// The reporting manager comes back as a correlated scalar subquery, not a join: reporting_manager_id
+// holds a USERS id, and a join on m.user_id would duplicate an employee card if two employee rows
+// ever shared one login. A missing manager renders as "Not set" — which is the point of showing it.
 const employees = await db.execute(sqlExpr`
-  SELECT id, employee_code, full_name, email, phone, designation, employment_type, work_mode, employment_status, joining_date, base_salary, currency, is_active
-  FROM hr_employees
-  WHERE (${statusFilter === 'all'} OR employment_status = ${statusFilter})
-  AND (${!q} OR full_name ILIKE ${'%' + q + '%'} OR email ILIKE ${'%' + q + '%'} OR employee_code ILIKE ${'%' + q + '%'} OR designation ILIKE ${'%' + q + '%'})
-  ORDER BY created_at DESC
+  SELECT e.id, e.employee_code, e.full_name, e.email, e.phone, e.designation, e.employment_type, e.work_mode, e.employment_status, e.joining_date, e.base_salary, e.currency, e.is_active,
+    e.reporting_manager_id,
+    (SELECT m.full_name FROM hr_employees m WHERE m.user_id = e.reporting_manager_id ORDER BY m.is_active DESC LIMIT 1) AS manager_name
+  FROM hr_employees e
+  WHERE (${statusFilter === 'all'} OR e.employment_status = ${statusFilter})
+  AND (${!q} OR e.full_name ILIKE ${'%' + q + '%'} OR e.email ILIKE ${'%' + q + '%'} OR e.employee_code ILIKE ${'%' + q + '%'} OR e.designation ILIKE ${'%' + q + '%'})
+  ORDER BY e.created_at DESC
   LIMIT ${perPage} OFFSET ${offset}
 `);
 
@@ -208,6 +220,18 @@ const s = (_statsRows[0] || {}) as any;
           <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
             <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Salary</p>
             <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;">{emp.base_salary ? `${emp.currency || 'INR'} ${parseFloat(emp.base_salary).toLocaleString('en-IN')}` : 'Unpaid'}</p>
+          </div>
+          {/* A missing reporting manager is not a cosmetic gap: approverRole() in src/lib/hr-wallet.ts
+              lets the reporting manager approve this person's leave and wallet withdrawals, so an
+              unset one means every request escalates to HR or an admin. Visible on the card so it
+              cannot stay unnoticed. */}
+          <div style={`border-radius:6px;padding:6px 8px;grid-column:1/-1;${emp.manager_name ? 'background:#15151a;' : 'background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.22);'}`}>
+            <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Reports To</p>
+            {emp.manager_name
+              ? <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{emp.manager_name}</p>
+              : emp.reporting_manager_id
+                ? <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Set, but that login is not on the employee register</p>
+                : <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Not set. Nobody can approve their leave or withdrawals.</p>}
           </div>
         </div>
         <!-- Actions -->

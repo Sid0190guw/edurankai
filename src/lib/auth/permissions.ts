@@ -16,7 +16,10 @@ export type Permission =
   | 'offers.view' | 'offers.edit'
   | 'audit.view';
 
-const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
+// Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
+// drifting away from the real one (/admin/access-preview). Nothing outside this file may decide
+// access from it — use can(), which is the single test every other caller already uses.
+export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
   super_admin: [
     'admin.access',
     'roles.view', 'roles.edit',
@@ -179,6 +182,23 @@ const ROLE_SECTIONS: Record<string, string[]> = {
 };
 
 /**
+ * The section keys a BUILT-IN role gets when the person has no custom role assigned — the tail of
+ * getViewableSectionKeys(), lifted out so it can be answered for a role rather than for a person.
+ * Pure: no database, no session, safe to call for every role at once (/admin/access-preview does).
+ *
+ * null means "no section filtering", which covers two different situations and the caller must not
+ * confuse them: super_admin (unrestricted on purpose) and a role with NO entry in ROLE_SECTIONS
+ * (unrestricted by omission — for partner/teacher/technical_moderator the thing actually keeping
+ * them out of the admin panel is lacking admin.access, not this filter).
+ */
+export function defaultSectionKeysForRole(role: string): Set<string> | null {
+  if (role === 'super_admin') return null;
+  const defaults = ROLE_SECTIONS[role];
+  if (!defaults) return null; // unknown role -> don't restrict
+  return new Set<string>(defaults);
+}
+
+/**
  * Returns the set of admin section keys this user may VIEW, used to filter the
  * sidebar (and enforce in middleware) so people only see pages they can open.
  *   - super_admin            -> null  (means "everything", no filtering)
@@ -202,9 +222,7 @@ export async function getViewableSectionKeys(user: { id: string; role: string } 
     for (const p of perms) if (p.canView) set.add(p.pageKey);
     return set;
   }
-  const defaults = ROLE_SECTIONS[user.role];
-  if (!defaults) return null; // unknown role -> don't restrict
-  return new Set<string>(defaults);
+  return defaultSectionKeysForRole(user.role);
 }
 
 /**

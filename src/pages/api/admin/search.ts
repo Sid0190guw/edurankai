@@ -4,6 +4,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { canOpenAdmin } from '@/lib/auth/admin-access';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -12,7 +13,20 @@ function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const GET: APIRoute = async ({ request, locals }) => {
   const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'unauthorized' }, 401);
+  // THE SAME ANSWER AS THE ADMIN PANEL ITSELF, and not a weaker one.
+  //
+  // This endpoint returns applicant names, email addresses and application numbers — the exact data
+  // the 2026 escalation exposed — and its only caller is the search box in AdminLayout, i.e. someone
+  // who has already passed the /admin gate. It previously admitted anyone who was merely NOT an
+  // applicant, which is the test src/lib/auth/permissions.ts explicitly warns against: every
+  // internal role passes it, including the `editor` that offer signing used to hand out, and
+  // including the partner / teacher / moderator scopes the middleware bounces off /admin entirely.
+  // /api/* is not matched by isAdminPath in src/middleware.ts, so the structural gate does not cover
+  // this URL and it has to ask the same question for itself.
+  const verdict = await canOpenAdmin(user);
+  if (!verdict.allowed) {
+    return json({ ok: false, error: 'unauthorized' }, verdict.reason === 'not-signed-in' ? 401 : 403);
+  }
 
   const q = (new URL(request.url).searchParams.get('q') || '').trim().toLowerCase();
   if (q.length < 2) return json({ ok: true, results: [] });

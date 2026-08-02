@@ -22,6 +22,37 @@ try {
     ADD COLUMN IF NOT EXISTS relieving_letter_url TEXT`);
 } catch (_) {}
 
+// The reporting line. Its own statement, not another clause on the block above: if any one clause
+// of a multi-clause ALTER fails the whole statement is rolled back, and this is the column the
+// approval chain depends on. UUID, holding a USERS id (see the select below).
+try {
+  await db.execute(sqlExpr`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
+} catch (_) {}
+
+// Who may be recorded as a reporting manager.
+//
+// reporting_manager_id holds a USERS id, NOT an hr_employees id — approverRole() in
+// src/lib/hr-wallet.ts compares it to the signed-in user's id, so anything else stored here can
+// never match and the manager silently cannot approve. Hence the filter on user_id IS NOT NULL:
+// an employee with no login is structurally unable to approve anything, and offering them would
+// record an approval chain that only looks connected.
+//
+// Declared BEFORE the POST handler because the handler validates the submitted value against it.
+// `const` is not hoisted here.
+let managerOptions: any[] = [];
+try {
+  const mgrRes = await db.execute(sqlExpr`
+    SELECT e.user_id, e.full_name, e.designation, e.employee_code
+      FROM hr_employees e
+     WHERE e.user_id IS NOT NULL
+       AND e.is_active = true
+       AND e.id <> ${id}
+     ORDER BY e.full_name ASC
+     LIMIT 500`);
+  managerOptions = (Array.isArray(mgrRes) ? mgrRes : ((mgrRes as any)?.rows || [])) as any[];
+} catch (_) { managerOptions = []; }
+const managerUserIds = new Set(managerOptions.map((m: any) => String(m.user_id)));
+
 let errorMsg = '';
 let successMsg = '';
 
@@ -70,23 +101,32 @@ if (Astro.request.method === 'POST') {
       const currency = (fd.get('currency') as string || 'INR').trim();
       const panNumber = (fd.get('panNumber') as string || '').trim();
       const aadhaarNumber = (fd.get('aadhaarNumber') as string || '').trim();
+      const reportingManagerId = (fd.get('reportingManagerId') as string || '').trim();
 
-      await db.execute(sqlExpr`
-        UPDATE hr_employees SET
-          designation = ${designation || null},
-          employment_type = ${employmentType || null},
-          work_mode = ${workMode || null},
-          joining_date = ${joiningDate || null},
-          confirmation_date = ${confirmationDate || null},
-          probation_end_date = ${probationEndDate || null},
-          base_salary = ${baseSalary ? parseFloat(baseSalary) : null},
-          currency = ${currency},
-          pan_number = ${panNumber || null},
-          aadhaar_number = ${aadhaarNumber || null},
-          updated_at = NOW()
-        WHERE id = ${id}
-      `);
-      successMsg = 'Employment details updated.';
+      // Approval authority is being written here, so an id that did not come from the offered list
+      // is refused outright rather than quietly dropped: a posted value could otherwise point at
+      // any user in the system and hand them approval rights over this employee.
+      if (reportingManagerId && !managerUserIds.has(reportingManagerId)) {
+        errorMsg = 'That reporting manager is not an active employee with a login. Nothing was saved — pick someone from the list.';
+      } else {
+        await db.execute(sqlExpr`
+          UPDATE hr_employees SET
+            designation = ${designation || null},
+            employment_type = ${employmentType || null},
+            work_mode = ${workMode || null},
+            joining_date = ${joiningDate || null},
+            confirmation_date = ${confirmationDate || null},
+            probation_end_date = ${probationEndDate || null},
+            base_salary = ${baseSalary ? parseFloat(baseSalary) : null},
+            currency = ${currency},
+            pan_number = ${panNumber || null},
+            aadhaar_number = ${aadhaarNumber || null},
+            reporting_manager_id = ${reportingManagerId || null},
+            updated_at = NOW()
+          WHERE id = ${id}
+        `);
+        successMsg = 'Employment details updated.';
+      }
     } else if (action === 'update_bank') {
       const bankAccountNumber = (fd.get('bankAccountNumber') as string || '').trim();
       const bankName = (fd.get('bankName') as string || '').trim();
@@ -303,6 +343,23 @@ const _empRows = Array.isArray(result) ? result : (result?.rows || []);
 if (_empRows.length === 0) return Astro.redirect('/admin/hr/employees');
 const emp = _empRows[0] as any;
 
+// The manager on file may since have left or been deactivated, in which case they are not in the
+// options list above. Show them anyway, labelled — an empty select would read as "nobody is set"
+// and HR would never know an approval chain had gone dead.
+const currentManagerId = emp.reporting_manager_id ? String(emp.reporting_manager_id) : '';
+let staleManagerLabel = '';
+if (currentManagerId && !managerUserIds.has(currentManagerId)) {
+  staleManagerLabel = 'Recorded manager is no longer an active employee';
+  try {
+    const smRes = await db.execute(sqlExpr`SELECT full_name, designation FROM hr_employees WHERE user_id = ${currentManagerId} LIMIT 1`);
+    const smRows = (Array.isArray(smRes) ? smRes : ((smRes as any)?.rows || [])) as any[];
+    const sm = smRows[0];
+    if (sm?.full_name) {
+      staleManagerLabel = sm.full_name + (sm.designation ? ' (' + sm.designation + ')' : '') + ' — no longer active';
+    }
+  } catch (_) {}
+}
+
 // Leave balances, read from the table the leave workflow actually writes.
 //
 // Two leave schemas existed side by side: hr_leave_request (singular), which /admin/hr/leave and
@@ -502,6 +559,26 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
           <div style="grid-column:1/-1;">
             <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Designation</label>
             <input type="text" name="designation" value={emp.designation || ''} placeholder="Senior Engineer" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+          </div>
+          <div style="grid-column:1/-1;">
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Reporting Manager</label>
+            <select name="reportingManagerId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+              <option value="" selected={!currentManagerId}>No reporting manager set</option>
+              {staleManagerLabel && <option value={currentManagerId} selected>{staleManagerLabel}</option>}
+              {managerOptions.map((m: any) => (
+                <option value={String(m.user_id)} selected={String(m.user_id) === currentManagerId}>
+                  {m.full_name}{m.designation ? ' — ' + m.designation : ''}
+                </option>
+              ))}
+            </select>
+            <p style="font-size:10.5px;color:#6e6e78;margin:5px 0 0;line-height:1.5;">
+              This person can approve this employee's leave and wallet withdrawals. Only active employees with a linked login can be selected, because approval is checked against the signed-in account.
+            </p>
+            {managerOptions.length === 0 && (
+              <p style="font-size:10.5px;color:#fbbf24;margin:4px 0 0;line-height:1.5;">
+                No one is selectable yet: no other active employee has a linked user account. Link the account first, then set the manager here.
+              </p>
+            )}
           </div>
           <div>
             <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Employment Type</label>
