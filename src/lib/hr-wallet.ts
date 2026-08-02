@@ -148,12 +148,30 @@ export async function approverRole(user: any, employeeId: string): Promise<strin
   const role = (user.role || '').toLowerCase();
   if (role === 'super_admin') return 'super_admin';
   if (role === 'admin') return 'admin';
-  if (role.indexOf('hr') >= 0) return 'hr_head';
-  // reporting manager link (guarded — column names vary)
-  for (const col of ['reporting_manager_user_id', 'manager_user_id']) {
-    const r = (await safe(sql.raw(`SELECT 1 FROM hr_employees WHERE id = '${employeeId.replace(/'/g, "")}' AND ${col} = '${(user.id || '').replace(/'/g, "")}' LIMIT 1`)));
-    if (r.length) return 'reporting_manager';
-  }
+
+  // EXACT match, not a substring test.
+  //
+  // This was `role.indexOf('hr') >= 0`, so ANY role whose name merely contained the letters "hr"
+  // was treated as HR head and could approve leave and wallet withdrawals. It was safe only by the
+  // accident of the current role list, and this organisation is heading for 1100+ roles created
+  // from the admin panel — "Chief HR Officer" would have passed, and so would anything else with
+  // those two letters anywhere in it. Approval authority must never depend on spelling.
+  if (role === 'hr') return 'hr_head';
+
+  // The employee's own reporting manager may approve.
+  //
+  // This previously probed `reporting_manager_user_id` and `manager_user_id` — neither column
+  // exists. The errors were swallowed by safe(), so the branch silently returned nothing every
+  // time and a reporting manager could never approve anything. It also built the query by string
+  // interpolation with a strip-the-quotes sanitiser, which is not a defence.
+  //
+  // The real column is hr_employees.reporting_manager_id, and it holds a USERS id. Parameterised.
+  const r = await safe(sql`
+    SELECT 1 FROM hr_employees
+     WHERE id = ${employeeId}::uuid AND reporting_manager_id = ${user.id}::uuid
+     LIMIT 1`);
+  if (r.length) return 'reporting_manager';
+
   return null;
 }
 
