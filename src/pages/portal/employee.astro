@@ -30,6 +30,22 @@ try {
   console.error('[portal/employee] work_email ensure', e?.cause?.message || e?.message);
 }
 
+// reporting_manager_id has the same shape of problem. It is declared in db/hr-schema.sql, but the
+// only things that ALTER it in are the two admin HR screens, at page load — so on a database where
+// neither has ever been opened the column is simply not there. The `SELECT *` below would not fail
+// on that (it returns whatever columns exist), it would just hand back an object without the field,
+// and the team-leader section would read "not assigned" for someone whose manager IS recorded.
+// Its own ensureOnce key rather than folded into the block above, so one failing cannot mask the
+// other in the logs.
+try {
+  const { ensureOnce } = await import('@/lib/ensure-once');
+  await ensureOnce('hr_employees_reporting_manager_v1', async () => {
+    await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
+  });
+} catch (e: any) {
+  console.error('[portal/employee] reporting_manager_id ensure', e?.cause?.message || e?.message);
+}
+
 // Find employee linked to this user
 try {
   const r = await db.execute(sql`SELECT * FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
@@ -49,6 +65,11 @@ if (!employee) {
     }
   } catch(e) {}
 }
+
+// Declared HERE, above the POST handler, because `const` is not hoisted: a const declared further
+// down this file throws on the handler's first line while the page still reports success. That is
+// what broke apply step 5 and the /admin/roles/diagnose Repair button.
+const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done'];
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -147,6 +168,42 @@ if (Astro.request.method === 'POST') {
     if (logId) await db.execute(sql`DELETE FROM hr_time_logs WHERE id = ${logId} AND employee_id = ${employee.id}`).catch(() => {});
     return Astro.redirect('/portal/employee');
   }
+
+  // Move a task along.
+  //
+  // The actor passed to updateTaskStatus() is `user.id`, a USERS id — NOT employee.id. The library
+  // re-derives the right to write inside the UPDATE's own WHERE clause, matching the actor against
+  // `assigned_by_user_id` or against `hr_employees.user_id` for the assignee. Handing it an
+  // hr_employees id instead would match neither: every update would update zero rows and refuse
+  // with "That task is not available." while looking, from here, exactly like a permission problem.
+  // Same class of mistake as joining reporting_manager_id to hr_employees.id.
+  //
+  // The posted task_id is not trusted on its own — nothing here checks ownership, because the
+  // statement that writes is the thing that checks it, and there is no path around that.
+  if (action === 'task_status' && employee) {
+    const taskId = (fd.get('task_id') as string || '').trim();
+    const nextStatus = (fd.get('status') as string || '').trim();
+    // "Blocked" with no stated cause is a task nobody can unblock, so the library requires a reason.
+    // The field is carried through from the form rather than dropped, otherwise choosing Blocked
+    // would be a control that always refuses.
+    const blockedReason = (fd.get('blocked_reason') as string || '').trim();
+    if (!taskId || !TASK_STATUSES.includes(nextStatus)) {
+      return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('That is not a status we track.'));
+    }
+    let taskMsg = '';
+    try {
+      const { updateTaskStatus } = await import('@/lib/employee-tasks');
+      const res = await updateTaskStatus(taskId, user.id, nextStatus as any, {
+        blockedReason,
+        ipAddress: Astro.clientAddress,
+      });
+      taskMsg = res?.ok ? 'Task updated.' : (res?.error || 'Could not update that task.');
+    } catch (e: any) {
+      console.error('[portal/employee] task_status', e?.cause?.message || e?.message);
+      taskMsg = 'Could not update that task.';
+    }
+    return Astro.redirect('/portal/employee?msg=' + encodeURIComponent(taskMsg));
+  }
 }
 
 // Today's time logs (period tracking)
@@ -225,6 +282,167 @@ if (employee) {
 
 const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+// ---------------------------------------------------------------------------------------------
+// Tasks, team leader, chat and community. Reads only — none of this writes a row.
+//
+// Every one of them is scoped to this person in the WHERE clause, and every one has its own
+// try/catch that logs `e?.cause?.message || e?.message`. That is not decoration: each touches a
+// table that may legitimately not exist yet on a given database, and a bare `catch {}` here is
+// exactly what let a missing column tell every employee they had no profile for a whole day while
+// the page rendered a cheerful green flash.
+// ---------------------------------------------------------------------------------------------
+
+const todayIso = new Date().toISOString().split('T')[0];
+// A DATE column comes back from postgres-js as a Date at UTC midnight, so read it in UTC — using
+// local getters would shift a due date by a day for anyone east or west of the server.
+const isoDay = (v: any) => {
+  if (!v) return '';
+  if (typeof v === 'string') return v.slice(0, 10);
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10);
+};
+const dayLabel = (v: any) => {
+  const iso = isoDay(v);
+  if (!iso) return '';
+  const d = new Date(iso + 'T00:00:00Z');
+  return isNaN(d.getTime()) ? iso : d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()];
+};
+
+// MY TASKS. src/lib/employee-tasks.ts owns the table, the scoping and the schema ensure; this page
+// only asks it for one person's rows and is handed employee.id — the hr_employees id, which is what
+// every hr_* table is keyed by. (The WRITE above takes user.id instead; the two are different ids
+// for different questions, and the library is explicit about which it wants.)
+//
+// listMyTasks() already catches and logs its own failures and returns [], so a missing table shows
+// an empty list rather than a 500. The try/catch here is for the import itself, and it logs: a bare
+// catch is what let a missing column tell every employee they had no profile for a day.
+let myTasks: any[] = [];
+let taskTally: any = null;
+let tasksReady = false;
+if (employee?.id) {
+  try {
+    const { listMyTasks, taskCounts } = await import('@/lib/employee-tasks');
+    const list = await listMyTasks(employee.id);
+    myTasks = Array.isArray(list) ? list : [];
+    taskTally = await taskCounts(employee.id);
+    tasksReady = true;
+  } catch (e: any) {
+    console.error('[portal/employee] tasks', e?.cause?.message || e?.message);
+  }
+}
+// listMyTasks returns everything, finished work sorted last. This page is the phone screen someone
+// checks between jobs, so it shows what is still outstanding; the finished count goes in the
+// subtitle rather than as rows nobody needs to scroll past.
+//
+// `isOverdue` is computed by Postgres against CURRENT_DATE inside the query. Preferring it to a
+// string comparison here keeps one definition of "late" instead of two that drift apart by a day
+// whenever the server clock and UTC disagree.
+const openTasks = myTasks
+  .filter((t: any) => t.id && t.status !== 'done')
+  .map((t: any) => ({
+    id: t.id,
+    title: t.title || 'Untitled task',
+    priority: String(t.priority || 'normal').toLowerCase(),
+    status: String(t.status || 'open').toLowerCase(),
+    due: isoDay(t.dueOn),
+    overdue: !!t.isOverdue,
+    detail: t.description || '',
+    blockedReason: t.blockedReason || '',
+    from: t.selfAssigned ? '' : (t.assignedByName || ''),
+  }));
+const overdueCount = Number(taskTally?.overdue ?? NaN);
+const doneCount = Number(taskTally?.done ?? NaN);
+const overdueShown = Number.isFinite(overdueCount) ? overdueCount : openTasks.filter((t: any) => t.overdue).length;
+const taskMeta = [
+  overdueShown > 0 ? overdueShown + (overdueShown === 1 ? ' past its date' : ' past their date') : '',
+  Number.isFinite(doneCount) && doneCount > 0 ? doneCount + ' finished' : '',
+].filter(Boolean).join(' · ');
+
+// MY TEAM LEADER. reporting_manager_id holds a USERS id, not an hr_employees id — hr-wallet.ts
+// compares it straight to the signed-in user.id — so the lookup is on user_id. Joining it to
+// hr_employees.id can never match, which is how the same section on /portal/workspace used to read
+// "not recorded" for people whose manager was recorded perfectly well.
+//
+// ORDER BY ... LIMIT 1 is load-bearing, not tidiness: one person can hold more than one
+// hr_employees row (a closed internship plus a current contract), so this can match several rows
+// for a single human. Their current row is the one to show.
+//
+// This is the only row belonging to somebody else that this page reads, and it is narrowed to two
+// display columns — no email, no identifier, no employment detail — reached solely through a
+// pointer stored on the viewer's own record.
+let manager: any = null;
+if (employee?.reporting_manager_id) {
+  try {
+    const r = await db.execute(sql`
+      SELECT full_name, designation
+        FROM hr_employees
+       WHERE user_id = ${employee.reporting_manager_id}
+       ORDER BY is_active DESC, created_at DESC
+       LIMIT 1`);
+    const mrows = Array.isArray(r) ? r : (r?.rows || []);
+    manager = mrows[0] || null;
+  } catch (e: any) {
+    console.error('[portal/employee] manager', e?.cause?.message || e?.message);
+  }
+}
+
+// CHAT. Two numbers, and nothing else is possible. chat_messages stores `ciphertext` and `iv`;
+// there is no plaintext column, and the private key is generated in the browser and never leaves
+// localStorage, so no server-rendered page can show what was said. chat_threads.last_message_preview
+// is not a preview either — the send handler writes the literal string '[encrypted]' into it, so
+// rendering that column would print "[encrypted]" at someone.
+//
+// No schema ensure here on purpose: /portal/messages owns these tables, and it also creates a
+// starter thread on first visit. This card must never write, so if the tables are absent it simply
+// shows the link without counts.
+let chatThreads = 0;
+let chatUnread = 0;
+let chatReady = false;
+if (user?.id) {
+  try {
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int AS threads,
+             COUNT(*) FILTER (WHERE EXISTS (
+               SELECT 1 FROM chat_messages c
+                WHERE c.thread_id = m.thread_id
+                  AND c.sender_user_id <> ${user.id}
+                  AND c.deleted_at IS NULL
+                  AND (m.last_read_at IS NULL OR c.created_at > m.last_read_at)
+             ))::int AS unread
+        FROM chat_thread_members m
+       WHERE m.user_id = ${user.id}`);
+    const crows = Array.isArray(r) ? r : (r?.rows || []);
+    chatThreads = Number(crows[0]?.threads) || 0;
+    chatUnread = Number(crows[0]?.unread) || 0;
+    chatReady = true;
+  } catch (e: any) {
+    console.error('[portal/employee] chat counts', e?.cause?.message || e?.message);
+  }
+}
+
+// COMMUNITY. visibleGroupsFor() is the only permitted way to list groups, and this page does not
+// go near the work_groups table itself. It returns the groups this person belongs to plus the
+// sub-groups of those — a group they are not entitled to is ABSENT from the result, not greyed
+// out and not "request access", because a list of team names is a map of the organisation.
+//
+// It deliberately selects `has_link`, never `join_url`: a chat invite link is a bearer credential,
+// so the URL is only ever revealed by a POST on /portal/team-groups after membership is re-derived
+// at the moment of access. Nothing below renders a link, and there is no total count of anything
+// unseen — that would be the same map by another route.
+let myGroups: any[] = [];
+if (user?.id) {
+  try {
+    const { visibleGroupsFor } = await import('@/lib/work-groups');
+    myGroups = await visibleGroupsFor(user.id);
+  } catch (e: any) {
+    console.error('[portal/employee] groups', e?.cause?.message || e?.message);
+  }
+}
+const memberGroups = myGroups.filter((g: any) => g.isMember);
+// Sub-groups of a group they are already in: visible and joinable by definition, so counting them
+// discloses nothing they could not already see on /portal/team-groups.
+const joinableGroups = myGroups.filter((g: any) => !g.isMember);
 
 // The credit position, shown to the person it is about. Interns were being measured on
 // credit-hours they could not see; the figures already existed but only on the admin side, so the
@@ -384,6 +602,37 @@ const creditPct = credit?.requiredCreditHours
       </div>
     </div>
 
+    <!-- Team leader -->
+    {/* Sits directly under the employee card because it is part of "who you are here", and because
+        this is the person whose name someone needs before they can chase anything: it is the
+        recorded approver for leave and for wallet withdrawals. When nobody is recorded this says
+        so and names the fix, rather than falling back to "HR" or to an admin — showing a plausible
+        approver who is not the recorded one would send people to the wrong desk. */}
+    <div class="card">
+      <div class="card-header">
+        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">My team leader</p>
+      </div>
+      <div class="card-body">
+        {manager ? (
+          <div>
+            <div style="display:flex;align-items:center;gap:12px;">
+              <div style="width:40px;height:40px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#6b7280;flex-shrink:0;">{String(manager.full_name || '?').charAt(0).toUpperCase()}</div>
+              <div style="min-width:0;">
+                <p style="font-size:14px;font-weight:600;color:#111;margin:0;">{manager.full_name}</p>
+                <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">{manager.designation || 'Reporting manager'}</p>
+              </div>
+            </div>
+            <p style="font-size:11.5px;color:#6b7280;margin:10px 0 0;line-height:1.5;">Your leave and wallet requests go to them for approval.</p>
+          </div>
+        ) : (
+          <div>
+            <p style="font-size:13px;font-weight:600;color:#374151;margin:0 0 4px;">Not assigned yet</p>
+            <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">Ask HR to set your reporting manager on your employee record. Until it is set there is no named approver for your leave or wallet requests.</p>
+          </div>
+        )}
+      </div>
+    </div>
+
     <!-- Wallet + Leave quick links -->
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:0 14px 12px;">
       <a href="/portal/employee/wallet" style="display:flex;flex-direction:column;gap:8px;background:linear-gradient(135deg,#1a1510,#2b241b);color:#faf6ef;text-decoration:none;border-radius:14px;padding:15px;">
@@ -516,6 +765,89 @@ const creditPct = credit?.requiredCreditHours
       </div>
     </div>
 
+    <!-- My tasks -->
+    {/* Placed after attendance because this is where the day's work already lives, and before the
+        clock-out summaries below, which are a different thing entirely: those are what this person
+        typed at the end of a session, this is what is outstanding. Rendered only when
+        src/lib/employee-tasks.ts actually loaded — an empty shell would read as "you have no
+        tasks", which is a claim, not an absence. */}
+    {tasksReady && (
+      <div class="card">
+        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+          <p style="font-size:13px;font-weight:700;color:#111;margin:0;">My tasks</p>
+          <span style="font-size:12px;font-weight:700;color:#FF4F00;">{openTasks.length} open</span>
+        </div>
+        <div class="card-body">
+          {taskMeta && <p style="font-size:11.5px;color:#6b7280;margin:0 0 10px;">{taskMeta}</p>}
+          {openTasks.length === 0 && (
+            <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">Nothing on your list right now. Anything assigned to you will appear here, with whatever date it is wanted by.</p>
+          )}
+          {openTasks.length > 0 && (
+            <div style="display:flex;flex-direction:column;gap:14px;">
+              {(openTasks as any[]).map((t: any) => {
+                // Bare object literals inside the map, matching the timeline above. Nothing here is
+                // red — not urgent, not overdue. A date that has passed is information, and
+                // colouring it like an emergency on somebody's own HR page is a way of shouting at
+                // them about work they very likely already know is late. `normal` is the default
+                // priority and gets no chip at all: a badge on every row labels nothing.
+                const prioText = { urgent:'#9a3412', high:'#b45309', low:'#9ca3af' };
+                const prioBg = { urgent:'rgba(154,49,18,0.10)', high:'rgba(180,83,9,0.10)', low:'#f9fafb' };
+                const dueToday = !!t.due && t.due === todayIso;
+                const dueColor = t.overdue ? '#b45309' : dueToday ? '#FF4F00' : '#6b7280';
+                const dueText = !t.due ? '' : t.overdue ? 'Was due ' + dayLabel(t.due) : dueToday ? 'Due today' : 'Due ' + dayLabel(t.due);
+                return (
+                  <div style="border-bottom:1px solid #f0f0f0;padding-bottom:14px;">
+                    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;">
+                      <span style="font-size:13px;font-weight:600;color:#111;flex:1;min-width:140px;line-height:1.4;">{t.title}</span>
+                      {t.priority !== 'normal' && (
+                        <span style={`font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 8px;border-radius:99px;color:${prioText[t.priority] || '#6b7280'};background:${prioBg[t.priority] || '#f3f4f6'};`}>{t.priority}</span>
+                      )}
+                    </div>
+                    {t.detail && <p style="font-size:12px;color:#6b7280;margin:3px 0 0;line-height:1.5;">{t.detail}</p>}
+                    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;margin-top:4px;">
+                      {dueText && <span style={`font-size:11.5px;font-weight:600;color:${dueColor};`}>{dueText}</span>}
+                      {t.from && <span style="font-size:11.5px;color:#9ca3af;">from {t.from}</span>}
+                    </div>
+                    {t.status === 'blocked' && t.blockedReason && (
+                      <p style="font-size:11.5px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:7px 9px;margin:6px 0 0;line-height:1.45;">Blocked: {t.blockedReason}</p>
+                    )}
+                    {/* Plain form POST to this same page, no JS involved: the select and the button
+                        are the whole control. The reason field is always present rather than
+                        revealed on change, because revealing it would need a script and, without
+                        one, choosing Blocked would be a control that refuses every time — the
+                        library requires a stated cause before it will accept that status. */}
+                    <form method="POST" style="margin-top:8px;">
+                      <input type="hidden" name="action" value="task_status"/>
+                      <input type="hidden" name="task_id" value={t.id}/>
+                      <div style="display:flex;gap:6px;align-items:center;">
+                        <select name="status" aria-label="Status of this task" style="flex:1;min-width:0;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 10px;font-size:12.5px;outline:none;">
+                          <option value="open" selected={t.status === 'open'}>Not started</option>
+                          <option value="in_progress" selected={t.status === 'in_progress'}>In progress</option>
+                          <option value="blocked" selected={t.status === 'blocked'}>Blocked</option>
+                          <option value="done" selected={t.status === 'done'}>Done</option>
+                        </select>
+                        <button type="submit" style="background:#111;color:#fff;border:none;font-size:12.5px;font-weight:600;padding:10px 14px;border-radius:8px;cursor:pointer;flex-shrink:0;">Update</button>
+                      </div>
+                      <input name="blocked_reason" aria-label="If blocked, what is blocking it" placeholder="If blocked, what is blocking it?" value={t.blockedReason} maxlength="2000" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:12px;outline:none;margin-top:6px;"/>
+                    </form>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    )}
+
+    {/* MEETINGS — deliberately absent, and this comment is the section.
+        There is no meetings table in this codebase: no `meetings`, no `hr_meetings`, no staff
+        calendar of any kind. The near misses are all something else — `interview_rounds` and
+        `manual_interviews` are CANDIDATE hiring interviews keyed to `applications`, and
+        `aq_study_plan` is a learner's own study block. Rendering an empty "No upcoming meetings"
+        card would be worse than rendering nothing: it states as fact that there are none, when in
+        truth nothing is being read, and someone would miss a meeting trusting it.
+        If this is ever built, mirror aq_study_plan (src/lib/aquintutor-calendar.ts) for the shape
+        and self-bootstrap it with ensureOnce, and the card belongs right here. */}
     {taskLogs.length > 0 && (
       <div class="card">
         <div class="card-header"><p style="font-size:13px;font-weight:700;color:#111;margin:0;">Today's session summaries</p></div>
@@ -604,6 +936,72 @@ const creditPct = credit?.requiredCreditHours
             </a>
           </div>
         ))}
+      </div>
+    </div>
+
+    <!-- Chat -->
+    {/* A link-out, near the bottom, so it cannot push attendance below the fold. Counts only: the
+        messages themselves are end-to-end encrypted and the key never leaves the browser, so there
+        is nothing here that could show content even if it wanted to. Saying that plainly matters —
+        someone who believes a server can read their messages behaves differently in them. */}
+    <div class="card">
+      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Chat</p>
+        {chatReady && chatUnread > 0 && (
+          <span style="font-size:12px;font-weight:700;color:#FF4F00;">{chatUnread} unread</span>
+        )}
+      </div>
+      <div class="card-body">
+        {chatReady && (
+          <p style="font-size:13px;font-weight:600;color:#111;margin:0 0 4px;">
+            {chatThreads === 0
+              ? 'No conversations yet'
+              : chatThreads + (chatThreads === 1 ? ' conversation' : ' conversations')}
+          </p>
+        )}
+        <p style="font-size:12px;color:#6b7280;margin:0 0 12px;line-height:1.55;">Messages are end-to-end encrypted. They can only be read on a device holding your key, so none of their content is shown here.</p>
+        <a href="/portal/messages" style="display:flex;align-items:center;justify-content:center;gap:8px;background:#111;color:#fff;text-decoration:none;font-size:13.5px;font-weight:600;padding:12px;border-radius:10px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Open chat
+        </a>
+      </div>
+    </div>
+
+    <!-- Community -->
+    {/* Only the groups this person is entitled to, straight from visibleGroupsFor(). Anything else
+        is absent rather than locked: a list of team names someone cannot join is a map of the
+        organisation. No join_url is fetched or rendered anywhere here — the link is a bearer
+        credential and is revealed only by the POST on /portal/team-groups. */}
+    <div class="card">
+      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Community</p>
+        <a href="/portal/team-groups" style="font-size:12px;font-weight:700;color:#FF4F00;text-decoration:none;">Open</a>
+      </div>
+      <div class="card-body">
+        {memberGroups.length === 0 && (
+          <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">You are not in a team group yet. Groups are added when your onboarding is completed — ask HR if that has been done and you still see this.</p>
+        )}
+        {memberGroups.length > 0 && (
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            {(memberGroups.slice(0, 5) as any[]).map((g: any) => (
+              <a href="/portal/team-groups" style="display:flex;align-items:center;gap:10px;text-decoration:none;background:#f9fafb;border:1px solid #f0f0f0;border-radius:10px;padding:10px 11px;">
+                <div style="width:28px;height:28px;border-radius:8px;background:rgba(255,79,0,0.1);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                </div>
+                <div style="min-width:0;flex:1;">
+                  <div style="font-size:13px;font-weight:600;color:#111;">{g.name}</div>
+                  <div style="font-size:11px;color:#6b7280;margin-top:1px;">{g.memberCount} member{g.memberCount === 1 ? '' : 's'}{g.hasLink ? ' · chat link inside' : ''}</div>
+                </div>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2" style="flex-shrink:0;"><polyline points="9 18 15 12 9 6"/></svg>
+              </a>
+            ))}
+          </div>
+        )}
+        {joinableGroups.length > 0 && (
+          <p style="font-size:11.5px;color:#6b7280;margin:10px 0 0;line-height:1.5;">
+            {joinableGroups.length} group{joinableGroups.length === 1 ? '' : 's'} inside these you can join.
+          </p>
+        )}
       </div>
     </div>
 
