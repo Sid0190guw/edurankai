@@ -257,8 +257,15 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'courses', label: 'Courses', href: '/admin/courses', icon: 'book', section: 'lms' },
       { id: 'paths', label: 'Learning Paths', href: '/admin/paths', icon: 'grid', section: 'lms' },
       { id: 'instructors', label: 'Faculty', href: '/admin/instructors', icon: 'users', section: 'lms' },
-      // NEWLY MAPPED. The AquinTutor console, gated with the rest of the LMS.
-      { id: 'aquintutor-command', label: 'Command Center', href: '/aquintutor/admin', icon: 'shield', section: 'lms' },
+      // NEWLY MAPPED, and NOT on 'lms' with the rest of this group, which is where it was first put.
+      // This is the only entry in the catalogue whose href leaves /admin, so middleware's
+      // PATH_SECTION never sees it and the page guards itself: src/pages/aquintutor/admin/index.astro
+      // redirects anything that is not super_admin to /aquintutor. Gating it on 'lms' therefore
+      // offered it to `editor` — the one restricted built-in role holding 'lms' — and to any custom
+      // role granted lms.view, as a link that bounces on click. 'settings' is held by no built-in role
+      // but super_admin, so the entry stays exactly as visible as it is today and the menu goes on
+      // mirroring the lock. Widen it the day that page's own guard widens, not before.
+      { id: 'aquintutor-command', label: 'Command Center', href: '/aquintutor/admin', icon: 'shield', section: 'settings' },
     ],
   },
   { id: 'custom-offer', label: 'Custom Offer', href: '/admin/offer/blank', icon: 'file-text', section: 'custom_offer' },
@@ -543,7 +550,8 @@ export interface AdminNavUser {
  * PASS `locals`. resolvePermissions memoises per request on Astro.locals, so a page that also checks
  * permissions in its own frontmatter pays for one lookup rather than two.
  *
- * FAILS CLOSED at every step: no session, a degraded resolve, or a thrown anything returns
+ * FAILS CLOSED at every step: no session, a resolve that answered anything other than 'ok' (an
+ * outage, a deactivated account, a deleted account with a live cookie), or a thrown anything returns
  * failsafeNav() — Dashboard and Notifications, never the full tree.
  */
 export async function buildAdminNav(
@@ -561,22 +569,47 @@ export async function buildAdminNav(
     // keeps every page load by the people who load the console most at zero extra queries, which is
     // what the sidebar costs today and is worth preserving on a database billed by compute time.
     // isActive is still checked: a deactivated account keeps its role, and resolvePermissions would
-    // have refused it.
-    if (role === 'super_admin' && user.isActive !== false) {
+    // have refused it. `=== true`, not `!== false`. Astro.locals.user is the full users row and validateSession()
+    // already deletes the session of a deactivated account, so the fast path still costs zero
+    // queries for the real caller. A caller passing a PARTIAL user ({ id, role }) has no isActive to
+    // check, and reading "absent" as "active" is how a fast path hands the whole console to an
+    // account somebody deactivated an hour ago. Absent now falls through to resolvePermissions,
+    // which reads is_active from the database and answers correctly either way.
+    if (role === 'super_admin' && user.isActive === true) {
       return navForPermissions(sections, navPermissionsForRole('super_admin'));
     }
 
     const resolved = await resolvePermissions(String(user.id), { locals: opts.locals });
-    if (resolved.degraded) {
-      // Degraded means the answer could not be computed, not that the person holds nothing. Say so in
-      // the log — an empty sidebar with no explanation reads as a permissions problem and sends
-      // somebody looking in the wrong place for hours.
-      logEvent('warn', 'admin.nav.degraded', { userId: String(user.id), role: role || null, reason: resolved.reason });
+
+    // ANY answer that is not 'ok' means the resolver DECLINED to say what this person holds, and its
+    // permission set is empty in every one of those cases. Trusting `degraded` alone was a fail-OPEN
+    // hole: denied() marks 'not-found' and 'account-disabled' as degraded=false — they are honest
+    // answers, not outages — so both fell through to the branch below, which throws the resolver's
+    // answer away and recomputes the menu from `user.role` on the session object. A deactivated HR
+    // account got the full 34-entry HR sidebar; an account deleted mid-session got the sidebar of
+    // whatever role its stale cookie still claimed. Neither could open the pages behind those links,
+    // but the link list itself is the disclosure this module exists to withhold.
+    if (resolved.reason !== 'ok') {
+      // Said out loud, with the reason: an empty sidebar and no explanation reads as a permissions
+      // problem and sends somebody looking in the wrong place for hours. 'lookup-failed' is an
+      // outage; 'account-disabled' and 'not-found' are a stale session and want a different fix.
+      logEvent('warn', 'admin.nav.not-resolved', {
+        userId: String(user.id),
+        role: role || null,
+        reason: resolved.reason,
+        degraded: resolved.degraded,
+      });
       return failsafeNav(sections);
     }
 
     if (resolved.customRoles.length === 0) {
-      return navForPermissions(sections, navPermissionsForRole(resolved.role || role));
+      // resolved.role, NOT `resolved.role || role`. Past this point the resolver answered 'ok', so
+      // it read users.role from the database — that is the authoritative value, and the one the door
+      // enforces against. Falling back to the role on the session object would let a stale or
+      // tampered cookie name a wider role than the account actually has and get a wider menu for it.
+      // A null here means the stored role is blank, and navPermissionsForRole() answers that with an
+      // empty set: nothing but the universal entries, which is the correct answer to "no role".
+      return navForPermissions(sections, navPermissionsForRole(resolved.role));
     }
 
     // 'dashboard' unconditionally, exactly as getViewableSectionKeys does for anyone holding a custom

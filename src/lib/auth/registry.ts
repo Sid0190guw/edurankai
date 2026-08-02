@@ -982,6 +982,33 @@ export async function deleteRole(roleId: string, actor: Actor): Promise<Registry
 }
 
 /**
+ * The people who hold a role right now, as a list of identifiers that survives account deletion.
+ *
+ * Used ONLY to enrich the admin.access audit diff, and written so it can never throw. It runs
+ * between the grant INSERT and the strict audit write, and an exception there would escape to
+ * assignPermission's outer catch — which returns fail() WITHOUT the rollback that the audit-failure
+ * path performs, leaving a live, unaudited grant of console access behind a message saying it was
+ * not granted. A degraded answer here costs a line of detail in the log; a thrown one would cost the
+ * exact guarantee this module exists to make.
+ *
+ * Declared above its caller: `const` is not hoisted and a handler reaching a later declaration has
+ * taken pages down on this project.
+ */
+const holdersOfRole = async (roleId: string): Promise<string[] | { unavailable: string }> => {
+  try {
+    const r = await db.execute(sql`
+      SELECT DISTINCT COALESCE(u.email, u.name, u.id::text) AS who
+        FROM user_role_assignments ura
+        JOIN users u ON u.id = ura.user_id
+       WHERE ura.role_id = ${roleId}::uuid
+       LIMIT 500`);
+    return rows(r).map((x: any) => String(x.who)).filter(Boolean);
+  } catch (e: any) {
+    return { unavailable: reason(e) };
+  }
+};
+
+/**
  * Grant one permission to one role.
  *
  * A SENSITIVE permission (admin.access, users.edit, settings.edit, audit.view, any `.delete`) is
@@ -1033,6 +1060,25 @@ export async function assignPermission(
       // know what the key means to understand what happened.
       diff.notice = (actor.email || actor.name || actor.id)
         + ' granted admin console access to the role "' + role.name + '".';
+
+      // AND WHO GAINED IT. The grant is recorded against a ROLE, but the question after an incident
+      // is always about PEOPLE — and everybody already in this role gains console access the instant
+      // this row lands, with no assignment event of their own to find in the log. assignRoleToUser()
+      // records the reverse case (person added to a role that already holds it) strictly; without
+      // this, going the other way round left the same escalation with no named beneficiary anywhere.
+      const holders = await holdersOfRole(roleId);
+      if (Array.isArray(holders)) {
+        diff.gainedConsoleAccess = holders;
+        if (holders.length > 0) {
+          diff.notice = String(diff.notice) + ' ' + holders.length
+            + (holders.length === 1 ? ' person already in that role gains it: ' : ' people already in that role gain it: ')
+            + holders.join(', ') + '.';
+        }
+      } else {
+        // Never silently omitted: "no holders listed" and "the holder list could not be read" are
+        // different facts and an audit log that conflates them is not evidence of anything.
+        diff.gainedConsoleAccess = 'could not be read: ' + holders.unavailable;
+      }
     }
 
     if (!sensitive) {
