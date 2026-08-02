@@ -1,5 +1,15 @@
 ﻿---
 import BottomNav from '@/components/workforce/BottomNav.astro';
+// The command centre at the top of this page is built from the workforce set and its tokens, not
+// from a second visual language invented here. StatusBadge and PriorityFlag each carry a distinct
+// SHAPE and a text label, so the triage list still reads with every colour deleted — which is the
+// point on a screen someone scans in five seconds on a phone in daylight.
+import EmptyState from '@/components/workforce/EmptyState.astro';
+import PriorityFlag from '@/components/workforce/PriorityFlag.astro';
+import StatusBadge from '@/components/workforce/StatusBadge.astro';
+// Imported explicitly rather than relying on the three components above dragging it in: two of them
+// render only conditionally, and the tokens the new CSS below uses must be present on every render.
+import '@/styles/workforce.css';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 
@@ -12,6 +22,12 @@ let payslips: any[] = [];
 let todayEvents: any[] = [];
 let currentStatus: 'clocked_out' | 'clocked_in' | 'on_break' = 'clocked_out';
 let todayHours = 0;
+// Whether the PUNCH READ happened. currentStatus and todayHours both default to "clocked out, zero
+// hours", which is indistinguishable from a failed read — and the new strip at the top of the page
+// states today's clock position as a fact. Declared here, with the values it describes, and above
+// the POST handler: `const`/`let` is not hoisted and a handler reaching a later declaration has
+// taken pages down in this repo before.
+let clockReadFailed = false;
 
 // work_email is declared in db/hr-schema.sql but does NOT exist on the production table. The
 // email-fallback lookup below names it, so that query threw, was swallowed by its bare catch, and
@@ -343,6 +359,11 @@ if (employee) {
     // silence looks like: if the punch READ fails, currentStatus stays 'clocked_out' and the page
     // offers "Clock In" to somebody who is already clocked in. The clock-in/out WRITE path above is
     // untouched.
+    //
+    // The flag is new and does exactly one thing: it lets the strip at the top say "we could not
+    // read your punches" instead of printing "Not clocked in · 0h" as a statement about somebody's
+    // day. Nothing below branches on it, so the clock buttons behave exactly as they did.
+    clockReadFailed = true;
     console.error('[portal/employee] clock events', e?.cause?.message || e?.message);
   }
 }
@@ -546,9 +567,318 @@ if (employee?.id) {
 const creditPct = credit?.requiredCreditHours
   ? Math.min(100, Math.round((credit.creditHours / credit.requiredCreditHours) * 100))
   : null;
+
+// =================================================================================================
+// THE COMMAND CENTRE. Everything below feeds the two sections at the TOP of the page: what needs
+// this person today, and where their day currently stands.
+//
+// THE RULE THIS SECTION IS BUILT ON: every number here is an arithmetic partition of rows that
+// already exist, read by code that already writes them. Nothing is claimed that the schema cannot
+// answer, and nothing that cannot be answered is rendered as an empty card, a zero, or a
+// "coming soon" — the four things deliberately ABSENT are listed in the comment above the markup.
+//
+// AND THE SECOND RULE: an empty bucket and a failed read are different sentences. Every source
+// below reports whether it RAN, and the section refuses to print "nothing is waiting on you" over
+// a read that did not happen. That is the same failure shape as a green flash over a write that
+// never landed, and this page has already been punished for it twice.
+// =================================================================================================
+
+// TODAY, AS THE DATABASE COUNTS IT.
+//
+// `todayIso` above is `new Date()` in the SERVER's timezone; `due_on` is compared against
+// CURRENT_DATE inside Postgres, in the DATABASE's timezone. The two disagree by a day whenever the
+// process and the session are set differently, and "Due today" is exactly the claim that must not
+// be off by one. `isOverdue` already comes from SQL for this reason; this is the same discipline
+// applied to the other side of the partition. If this one-column read fails, the due-today bucket
+// is not rendered AT ALL rather than guessed at from the clock in this process.
+let dbToday = '';
+try {
+  const r = await db.execute(sql`SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d`);
+  const drows = Array.isArray(r) ? r : (r?.rows || []);
+  dbToday = String(drows[0]?.d || '');
+} catch (e: any) {
+  console.error('[portal/employee] current date', e?.cause?.message || e?.message);
+}
+
+// TASKS: LATE, AND DUE TODAY. Both partitioned out of the list myTasksView already returned, so
+// this costs no extra query and cannot disagree with the "My tasks" card further down the page.
+// `overdue` is Postgres' own IS_OVERDUE flag; `openTasks` has already dropped everything whose
+// legacy status is 'done', which covers completed, cancelled and archived.
+const attentionTasksOk = tasksReady && !tasksFailed;
+const overdueTasks = attentionTasksOk ? openTasks.filter((t: any) => t.overdue) : [];
+const dueTodayTasks = (attentionTasksOk && dbToday)
+  ? openTasks.filter((t: any) => !t.overdue && t.due === dbToday)
+  : [];
+
+// WAITING ON MY SIGN-OFF, AND WAITING ON MY REVIEW.
+//
+// listBoard() resolves the viewer's roles per row IN SQL (VIEWER_ROLE_COLUMNS), so nothing here can
+// claim a role the database did not grant. Its argument is the USERS id — collaborators are keyed
+// by users.id, not by hr_employees.id, and handing it the wrong one returns an empty board forever
+// rather than an error.
+//
+// A task where the viewer is approver OR lead is counted as sign-off and NOT again as a review, so
+// somebody holding both roles on one task sees it once. Reviewers are only ever added by hand
+// (seedCollaborators creates 'assignee' and 'approver' and nothing else), so an empty review bucket
+// is the ordinary, correct state and is simply absent rather than rendered as a zero.
+let boardOk = false;
+let signOffTasks: any[] = [];
+let reviewTasks: any[] = [];
+if (user?.id) {
+  try {
+    const { listBoard } = await import('@/lib/employee-tasks');
+    const board = await listBoard(user.id, { limit: 400 });
+    boardOk = board?.ok === true;
+    if (boardOk) {
+      const waiting = (board.tasks as any[]).filter((t: any) => t.status === 'under_review');
+      signOffTasks = waiting.filter((t: any) =>
+        t.viewerRoles.indexOf('approver') >= 0 || t.viewerRoles.indexOf('lead') >= 0);
+      const signOffIds = new Set(signOffTasks.map((t: any) => t.id));
+      reviewTasks = waiting.filter((t: any) =>
+        !signOffIds.has(t.id) && t.viewerRoles.indexOf('reviewer') >= 0);
+    }
+  } catch (e: any) {
+    console.error('[portal/employee] board', e?.cause?.message || e?.message);
+  }
+}
+
+// LEAVE AND WITHDRAWAL REQUESTS WAITING ON A DECISION — AND ONLY FOR SOMEONE WHO CAN ACTUALLY
+// DECIDE ONE.
+//
+// approverRole() (src/lib/hr-wallet.ts:146) grants approval to super_admin, admin, role === 'hr',
+// and to the employee's recorded reporting manager. The manager branch is REAL and is deliberately
+// not surfaced here, because the only two screens in this codebase that call decideLeave() and
+// decideWithdrawal() are /admin/hr/leave and /admin/hr/wallet, and both refuse anyone who is not
+// super_admin / admin / hr — before that, src/middleware.ts refuses /admin entirely to a role
+// without admin.access. So a reporting manager who is not also HR has nowhere to go: putting
+// "2 requests need you" in front of them with no reachable screen is a count that cannot be acted
+// on, which is the thing this section exists to avoid. That gap is a missing portal-side approval
+// surface, and it is reported as such rather than papered over with a link that bounces.
+//
+// The role test is EXACT. /admin/hr/leave uses `role.indexOf('hr') >= 0`, which any role merely
+// containing those two letters passes; matching exactly can only ever show this row to fewer
+// people than the screen admits, never to more.
+//
+// Own rows are excluded: your own pending request is not an approval waiting on YOU, it is on
+// /portal/employee/leave. Counts only — no names, no amounts, no reasons.
+const viewerRole = String(user.role || '').trim().toLowerCase();
+const canDecideHrRequests = viewerRole === 'super_admin' || viewerRole === 'admin' || viewerRole === 'hr';
+let pendingLeave = 0;
+let pendingWithdrawals = 0;
+let hrQueueFailed = false;
+if (canDecideHrRequests && employee?.id) {
+  // Separate try/catch per table, so one missing table cannot mask the other in the logs — and
+  // neither uses the bare `safe()` wrapper in hr-leave.ts / hr-wallet.ts, which swallows without
+  // logging and would render a failed read as "0 waiting".
+  try {
+    const { ensureLeaveSchema } = await import('@/lib/hr-leave');
+    await ensureLeaveSchema();
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM hr_leave_request
+       WHERE status = 'pending' AND employee_id::text <> ${employee.id}`);
+    const lrows = Array.isArray(r) ? r : (r?.rows || []);
+    pendingLeave = Number(lrows[0]?.n) || 0;
+  } catch (e: any) {
+    hrQueueFailed = true;
+    console.error('[portal/employee] pending leave', e?.cause?.message || e?.message);
+  }
+  try {
+    const { ensureWalletSchema } = await import('@/lib/hr-wallet');
+    await ensureWalletSchema();
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM hr_withdrawal
+       WHERE status = 'pending' AND employee_id::text <> ${employee.id}`);
+    const wrows = Array.isArray(r) ? r : (r?.rows || []);
+    pendingWithdrawals = Number(wrows[0]?.n) || 0;
+  } catch (e: any) {
+    hrQueueFailed = true;
+    console.error('[portal/employee] pending withdrawals', e?.cause?.message || e?.message);
+  }
+}
+
+// THE ROWS. Built here rather than as five near-identical blocks of JSX, so the ordering — late
+// first, then today, then other people waiting on you — is one readable list and not a layout
+// accident. Plain object literals with no type annotation: a typed map in .astro JSX does not
+// compile.
+//
+// Each glyph is a distinct SHAPE, not a colour: a clock, a calendar, two ticks, an eye, a card.
+// The row still triages correctly in greyscale, and no emoji appears anywhere.
+const GLYPH_LATE = '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.2V12l3.1 1.9"/>';
+const GLYPH_TODAY = '<rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10.2h17M8.5 3v4M15.5 3v4"/>';
+const GLYPH_SIGNOFF = '<path d="m2.8 12.6 3.2 3.2 6.6-7"/><path d="m10.6 15.2 1.4 1.4 6.8-7.2"/>';
+const GLYPH_REVIEW = '<path d="M2.6 12S6.2 6.2 12 6.2 21.4 12 21.4 12 17.8 17.8 12 17.8 2.6 12 2.6 12Z"/><circle cx="12" cy="12" r="2.4"/>';
+const GLYPH_MONEY = '<rect x="2.5" y="5.5" width="19" height="13" rx="2.5"/><path d="M2.5 10.4h19"/>';
+
+const ROW_CAP = 3;
+const attentionRows: any[] = [];
+
+overdueTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
+  key: 'late-' + t.id,
+  href: '/portal/tasks/' + t.id,
+  title: t.title,
+  // Deliberately not the word "overdue" shouted in red. The row below it says what to do; this
+  // says what happened. The existing task list on this page made the same call and it holds here.
+  note: t.due ? 'Late · was due ' + dayLabel(t.due) : 'Late',
+  tone: 'overdue',
+  glyph: GLYPH_LATE,
+  priority: t.priority,
+}));
+
+dueTodayTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
+  key: 'today-' + t.id,
+  href: '/portal/tasks/' + t.id,
+  title: t.title,
+  note: 'Due today',
+  // 'due_soon', not 'due': the tone name has to be a ramp that exists in workforce.css, or the
+  // [data-wf-tone] binding misses and the row silently falls back to the neutral ink — legible, but
+  // no longer distinguishable from an informational row, which is the whole job of this bucket.
+  tone: 'due_soon',
+  glyph: GLYPH_TODAY,
+  priority: t.priority,
+}));
+
+signOffTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
+  key: 'sign-' + t.id,
+  href: '/portal/tasks/' + t.id,
+  title: t.title,
+  note: t.employeeName ? 'Waiting for your sign-off · ' + t.employeeName : 'Waiting for your sign-off',
+  tone: 'info',
+  glyph: GLYPH_SIGNOFF,
+  priority: t.priority,
+}));
+
+reviewTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
+  key: 'rev-' + t.id,
+  href: '/portal/tasks/' + t.id,
+  title: t.title,
+  note: t.employeeName ? 'Waiting for your review · ' + t.employeeName : 'Waiting for your review',
+  tone: 'info',
+  glyph: GLYPH_REVIEW,
+  priority: t.priority,
+}));
+
+if (pendingLeave > 0) attentionRows.push({
+  key: 'leave-queue',
+  href: '/admin/hr/leave',
+  title: pendingLeave === 1 ? 'One leave request needs a decision' : pendingLeave + ' leave requests need a decision',
+  note: 'Nobody knows if they can take the days until you answer',
+  tone: 'info',
+  glyph: GLYPH_TODAY,
+  priority: '',
+});
+
+if (pendingWithdrawals > 0) attentionRows.push({
+  key: 'withdrawal-queue',
+  href: '/admin/hr/wallet',
+  title: pendingWithdrawals === 1 ? 'One withdrawal needs a decision' : pendingWithdrawals + ' withdrawals need a decision',
+  note: 'Money already earned, waiting to be released',
+  tone: 'info',
+  glyph: GLYPH_MONEY,
+  priority: '',
+});
+
+// The headline counts THINGS, not rows: four late tasks are four things even though three are
+// shown. The overflow link is computed over tasks only, because the two queue rows are already a
+// count of everything in them.
+const attentionTaskTotal =
+  overdueTasks.length + dueTodayTasks.length + signOffTasks.length + reviewTasks.length;
+const attentionTaskShown =
+  Math.min(ROW_CAP, overdueTasks.length) + Math.min(ROW_CAP, dueTodayTasks.length)
+  + Math.min(ROW_CAP, signOffTasks.length) + Math.min(ROW_CAP, reviewTasks.length);
+const attentionMore = attentionTaskTotal - attentionTaskShown;
+const attentionCount = attentionTaskTotal + pendingLeave + pendingWithdrawals;
+
+// WHAT THE SECTION IS NOT ALLOWED TO SAY. If any source did not run, "nothing is waiting on you" is
+// not a fact this page is in a position to state, so the all-clear is withheld and the gap is named
+// instead. Each clause is separate so the sentence can say WHICH part is missing.
+const attentionGaps: string[] = [];
+if (!attentionTasksOk) attentionGaps.push('your own task list');
+else if (!dbToday) attentionGaps.push('what is due today');
+if (!boardOk) attentionGaps.push('anything waiting on your sign-off or review');
+if (hrQueueFailed) attentionGaps.push('the leave and withdrawal queues');
+const attentionIncomplete = attentionGaps.length > 0;
+
+// TODAY'S STATE. The task currently in flight, off the list already read — `state` is the canonical
+// status, so this is genuinely in_progress and not the legacy bucket that also holds under_review.
+const currentTask = (myTasks as any[]).find((t: any) => t.state === 'in_progress') || null;
+
+// The sentence that replaces the all-clear when a source did not answer. Built here rather than in
+// the markup because joining a list with "and" inside JSX is three nested ternaries nobody can read.
+const attentionGapText = attentionGaps.length === 0
+  ? ''
+  : attentionGaps.length === 1
+    ? attentionGaps[0]
+    : attentionGaps.slice(0, -1).join(', ') + ' and ' + attentionGaps[attentionGaps.length - 1];
+
+// Show the headline count only when the section is entitled to make a total. If a source did not
+// answer, "3" is a number this page cannot stand behind, and a wrong total at the top of a triage
+// screen is worse than none.
+const attentionCountShown = !attentionIncomplete && attentionCount > 0;
+
+// TODAY'S CLOCK POSITION, IN WORDS.
+//
+// currentStatus is derived from the LAST punch of the day and defaults to 'clocked_out' — which is
+// also exactly what a FAILED read looks like. clockReadFailed is the only thing that separates the
+// two, so it is tested FIRST here: this strip states somebody's clock position as a fact directly
+// under a heading that says what needs them today, and "Not clocked in yet" printed over a query
+// that threw is the same lie as a green flash over a write that never landed.
+//
+// The label on the link is the label on the CONTROL it scrolls to, so the jump does not surprise:
+// the attendance card renders "Clock In" for exactly the state where this says 'Clock in'.
+const clockLabel = clockReadFailed
+  ? "Today's punches could not be read"
+  : currentStatus === 'clocked_in'
+    ? 'Clocked in'
+    : currentStatus === 'on_break'
+      ? 'On a break'
+      : todayEvents.length > 0
+        ? 'Clocked out for today'
+        : 'Not clocked in yet';
+const clockTone = clockReadFailed
+  ? 'danger'
+  : currentStatus === 'clocked_in'
+    ? 'approved'
+    : currentStatus === 'on_break'
+      ? 'in_progress'
+      : todayEvents.length > 0
+        ? 'completed'
+        : 'draft';
+const clockCta = clockReadFailed
+  ? 'Open attendance'
+  : currentStatus === 'on_break'
+    ? 'Resume work'
+    : currentStatus === 'clocked_in'
+      ? 'Clock out or take a break'
+      : 'Clock in';
+// Hours are withheld, not zeroed, when the punch read failed: 0h is a statement about someone's day.
+// The label says "on the clock" and not "worked" on purpose — break_start/break_end are recorded in
+// hr_clock_events but do NOT adjust this span, so it is wall-clock from the first punch and includes
+// every break taken.
+const showTodayHours = !clockReadFailed && todayHours > 0;
+
+// THE FOUR THINGS THIS SECTION DELIBERATELY DOES NOT SHOW, each because the database cannot answer
+// it and a placeholder would be a lie rather than a gap:
+//   MEETINGS TODAY — meet_rooms.scheduled_at is written by nothing in this repo (the only INSERT is
+//     the ad-hoc huddle at portal/meet/[id].astro:98), and its declared host_user_id INTEGER
+//     contradicts the ::uuid casts in the code that reads it. A card here would query a column no
+//     code has ever populated.
+//   ANNOUNCEMENTS — there is no announcements table anywhere in src, db or scripts. `discussions`
+//     is a peer board, and its is_pinned column is declared and written by nothing.
+//   PERFORMANCE REVIEWS WAITING ON ME — hr_performance_reviews has no reviewer column at all.
+//     Nothing records who reviews whom, so "waiting on me" is unanswerable.
+//   UNREAD COMMENTS / "X IS WAITING FOR YOUR ANSWER" — employee_task_comments has five columns
+//     (id, task_id, author_user_id, body, created_at). No read state, no mentions, no receipts.
+//     The only honest comment number is a total, which is not "waiting on you".
+// Their absence IS the answer. Do not add an empty card for any of them.
 ---
 <!doctype html>
-<html lang="en" style="background:#f8f6f1;">
+<!-- data-theme="light" PINS the workforce tokens. workforce.css flips its whole ramp inside
+     `@media (prefers-color-scheme: dark) { :root:not([data-theme='light']) }`, and every card on
+     this page is a hardcoded white on a hardcoded #f8f6f1 body. Without the pin, a phone set to
+     dark would render --wf-ink (#F7F5F3) as the text colour on those white cards — invisible.
+     It also fixes a latent split that predates this change: BottomNav already uses these tokens,
+     so the bar alone was going dark under a light page. -->
+<html lang="en" data-theme="light" style="background:#f8f6f1;">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
@@ -568,6 +898,88 @@ const creditPct = credit?.requiredCreditHours
        own styles. body's padding-bottom below stays: the bar is position:fixed and takes no space
        in flow, so that padding is the only thing keeping the last card clear of it. */
     .event-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+
+    /* =========================================================================
+       THE COMMAND CENTRE — the two sections at the top of the page.
+
+       NOT A SECOND DESIGN SYSTEM. Every value below is a token from
+       src/styles/workforce.css, which is imported in the frontmatter: colour,
+       line, radius, spacing, type, touch floor and motion all come from there,
+       so this section inherits the contrast work (AAA ink on every surface) and
+       the reduced-motion handling without restating either. The only literals
+       are layout numbers that carry no meaning.
+
+       The row's left edge is its tone accent and its mark is its tone wash, but
+       neither is the SIGNAL: each row states in words what it is and why, and
+       each glyph is a distinct shape. Delete every colour here and the triage
+       list still reads in order, which is the rule the token file was built on.
+       ========================================================================= */
+    .cc{margin:0 14px 12px;}
+    .cc-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin:0 2px 8px;}
+    .cc-title{font-family:var(--wf-font);font-size:var(--wf-t-title);font-weight:700;letter-spacing:-0.01em;color:var(--wf-ink);margin:0;}
+    .cc-count{font-family:var(--wf-font);font-size:var(--wf-t-meta);font-weight:700;color:var(--wf-ink-3);white-space:nowrap;}
+    .cc-list{display:flex;flex-direction:column;gap:var(--wf-s-2);}
+
+    /* A whole row is the target, not a link buried inside it: this is opened
+       with a thumb, and 44px is the floor the token file sets. */
+    .cc-row{display:flex;align-items:flex-start;gap:10px;min-height:var(--wf-touch);padding:11px 12px;
+      background:var(--wf-surface);border:1px solid var(--wf-line);border-left:3px solid var(--wf-tone-accent);
+      border-radius:var(--wf-r-md);box-shadow:var(--wf-shadow-1);text-decoration:none;
+      transition:var(--wf-tr-feedback);}
+    .cc-row:active{transform:scale(var(--wf-press));}
+    .cc-row__mark{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:30px;height:30px;
+      border-radius:var(--wf-r-sm);background:var(--wf-tone-wash);border:1px solid var(--wf-tone-border);
+      color:var(--wf-tone-text);}
+    .cc-row__mark svg{width:16px;height:16px;display:block;}
+    .cc-row__body{flex:1 1 auto;min-width:0;}
+    .cc-row__title{display:block;font-family:var(--wf-font);font-size:var(--wf-t-body);font-weight:650;
+      line-height:1.35;color:var(--wf-ink);overflow-wrap:anywhere;}
+    .cc-row__note{display:block;margin-top:2px;font-family:var(--wf-font);font-size:var(--wf-t-meta);
+      line-height:1.45;color:var(--wf-tone-text);overflow-wrap:anywhere;}
+    .cc-row__side{flex:0 0 auto;display:flex;align-items:center;gap:6px;padding-top:2px;}
+    .cc-row__chev{flex:0 0 auto;width:16px;height:16px;color:var(--wf-ink-4);}
+
+    .cc-panel{background:var(--wf-surface);border:1px solid var(--wf-line);border-radius:var(--wf-r-md);
+      box-shadow:var(--wf-shadow-1);overflow:hidden;}
+    /* The "a source did not answer" notice. due_soon rather than danger: nothing
+       is broken for the person reading it, but the list below is incomplete and
+       they must not read it as an all-clear. */
+    .cc-gap{margin:8px 0 0;padding:10px 12px;background:var(--wf-due_soon-wash);
+      border:1px solid var(--wf-due_soon-border);border-radius:var(--wf-r-sm);color:var(--wf-due_soon-text);
+      font-family:var(--wf-font);font-size:var(--wf-t-meta);line-height:1.55;}
+    .cc-more{display:inline-flex;align-items:center;min-height:var(--wf-touch);margin-top:2px;padding:0 2px;
+      font-family:var(--wf-font);font-size:var(--wf-t-meta);font-weight:650;color:var(--wf-info-text);
+      text-decoration:none;}
+
+    /* ---- where the day currently stands ---------------------------------- */
+    .cc-today{margin:0 14px 14px;padding:12px;display:flex;flex-direction:column;gap:10px;
+      background:var(--wf-surface);border:1px solid var(--wf-line);border-radius:var(--wf-r-md);
+      box-shadow:var(--wf-shadow-1);}
+    .cc-now{display:flex;align-items:center;flex-wrap:wrap;gap:8px 10px;}
+    .cc-now__dot{flex:0 0 auto;width:10px;height:10px;border-radius:50%;background:var(--wf-tone-accent);}
+    .cc-now__label{margin:0;font-family:var(--wf-font);font-size:var(--wf-t-body);font-weight:650;color:var(--wf-ink);}
+    .cc-now__hours{margin-left:auto;font-family:var(--wf-font);font-size:var(--wf-t-body);font-weight:700;color:var(--wf-ink);white-space:nowrap;}
+    .cc-now__sub{flex-basis:100%;margin:0;font-family:var(--wf-font);font-size:var(--wf-t-micro);line-height:1.5;color:var(--wf-ink-3);}
+    .cc-task{display:flex;align-items:center;gap:9px;min-height:var(--wf-touch);padding:9px 10px;
+      background:var(--wf-veil);border:1px solid var(--wf-line);border-radius:var(--wf-r-sm);text-decoration:none;}
+    .cc-task__body{flex:1 1 auto;min-width:0;}
+    .cc-task__eyebrow{display:block;font-family:var(--wf-font);font-size:var(--wf-t-micro);font-weight:700;
+      letter-spacing:0.06em;text-transform:uppercase;color:var(--wf-ink-3);}
+    .cc-task__title{display:block;margin-top:1px;font-family:var(--wf-font);font-size:var(--wf-t-meta);
+      font-weight:650;line-height:1.4;color:var(--wf-ink);overflow-wrap:anywhere;}
+    .cc-cta{align-self:flex-start;display:inline-flex;align-items:center;gap:7px;min-height:var(--wf-touch);
+      padding:9px 14px;background:var(--wf-ink);border:1px solid var(--wf-ink);border-radius:var(--wf-r-sm);
+      color:var(--wf-on-solid);font-family:var(--wf-font);font-size:var(--wf-t-meta);font-weight:650;
+      text-decoration:none;transition:var(--wf-tr-feedback);}
+    .cc-cta:active{transform:scale(var(--wf-press));}
+
+    /* The topbar is sticky at 52px, so an in-page jump would land the target
+       underneath it. */
+    #attendance{scroll-margin-top:64px;}
+
+    @media (forced-colors: active){
+      .cc-row,.cc-panel,.cc-today,.cc-task{border-color:CanvasText;}
+    }
   </style>
 </head>
 <body>
@@ -594,10 +1006,122 @@ const creditPct = credit?.requiredCreditHours
 {employee && (
   <div style="padding-top:14px;">
 
-    {/* Credit position. Shown first because it is the thing an intern most wants to know, and
-        because it was previously visible only to admins - they were being measured on a number
-        they had to ask for. Every figure is computed from recorded attendance and approved leave
-        by the same engine that produces the completion letter, so this and the letter agree. */}
+    {/* =====================================================================
+        WHAT NEEDS YOU TODAY. The first thing on the page, because the question
+        someone opens this at 9am to answer is not "how am I doing" — it is
+        "what happens if I do nothing". Everything in it is an item they can act
+        on, and every row is a direct link to the one screen where they act.
+
+        FOUR THINGS ARE ABSENT AND THAT IS THE ANSWER, not an omission: meetings
+        today, announcements, performance reviews waiting on me, and unread
+        comments. The reasons are recorded in the frontmatter at the end of the
+        script block. None of them gets a placeholder card, a zero or a "coming
+        soon", because a card that cannot be filled is a card people learn to
+        trust and then miss something behind.
+        ===================================================================== */}
+    <section class="cc" aria-labelledby="cc-heading">
+      <div class="cc-head">
+        <h2 class="cc-title" id="cc-heading">Needs you today</h2>
+        {attentionCountShown && (
+          <span class="cc-count wf-num">{attentionCount} {attentionCount === 1 ? 'item' : 'items'}</span>
+        )}
+      </div>
+
+      {attentionRows.length > 0 && (
+        <div class="cc-list">
+          {(attentionRows as any[]).map((r: any) => (
+            <a class="cc-row wf-focusable" href={r.href} data-wf-tone={r.tone}>
+              <span class="cc-row__mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" set:html={r.glyph} />
+              </span>
+              <span class="cc-row__body">
+                <span class="cc-row__title">{r.title}</span>
+                <span class="cc-row__note">{r.note}</span>
+              </span>
+              <span class="cc-row__side">
+                {/* Renders nothing at all for a normal-priority task: a flag on
+                    three quarters of the rows is a flag on none of them. */}
+                <PriorityFlag priority={r.priority} hideNormal={true} />
+                <svg class="cc-row__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+              </span>
+            </a>
+          ))}
+        </div>
+      )}
+
+      {/* THE ALL-CLEAR. Shown only when every source actually answered — an
+          empty attention list is good news and reads like it, but it is a claim
+          about somebody's day and this page states it only when it is in a
+          position to know. */}
+      {attentionRows.length === 0 && !attentionIncomplete && (
+        <div class="cc-panel">
+          <EmptyState
+            title="Nothing is waiting on you"
+            body="No task of yours is late or due today, and nobody is waiting on your sign-off. Anything that arrives will show up here first."
+            illustration="check"
+            tone="approved"
+            headingLevel={3}
+            compact
+          />
+        </div>
+      )}
+
+      {/* The other half of that sentence. Named per source, so it says WHICH
+          part is missing rather than a generic apology. */}
+      {attentionIncomplete && (
+        <p class="cc-gap">
+          {attentionRows.length > 0
+            ? 'This list is incomplete: we could not read ' + attentionGapText + ' just now, so there may be more than is shown here.'
+            : 'We could not read ' + attentionGapText + ' just now, so this is not an all-clear. Nothing has been lost. Reload in a moment, and tell HR if it keeps happening.'}
+        </p>
+      )}
+
+      {attentionMore > 0 && (
+        <a class="cc-more wf-num wf-focusable" href="/portal/tasks">{attentionMore} more on your task board</a>
+      )}
+    </section>
+
+    {/* WHERE THE DAY STANDS. Read-only by design: the clock forms live in the
+        attendance card below and are not duplicated here, because they are
+        driven by ids (submitClock('clockForm')) and a second copy would give
+        two elements the same id and break the punch that already works. This
+        strip states the position and jumps to the control. */}
+    <section class="cc-today" aria-label="Where your day stands">
+      <div class="cc-now" data-wf-tone={clockTone}>
+        <span class="cc-now__dot" aria-hidden="true"></span>
+        <p class="cc-now__label">{clockLabel}</p>
+        {showTodayHours && <span class="cc-now__hours wf-num">{todayHours}h</span>}
+        {showTodayHours && (
+          <p class="cc-now__sub">On the clock since your first punch today. Breaks are recorded, but they are not deducted from this figure.</p>
+        )}
+        {clockReadFailed && (
+          <p class="cc-now__sub">This is not a statement that you are clocked out — the read itself failed. Open attendance to see where you actually stand.</p>
+        )}
+      </div>
+
+      {currentTask && (
+        <a class="cc-task wf-focusable" href={'/portal/tasks/' + currentTask.id}>
+          <StatusBadge status="in_progress" size="sm" glyphOnly />
+          <span class="cc-task__body">
+            <span class="cc-task__eyebrow">In progress right now</span>
+            <span class="cc-task__title">{currentTask.title}</span>
+          </span>
+          <svg class="cc-row__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        </a>
+      )}
+
+      <a class="cc-cta wf-focusable" href="#attendance">
+        {clockCta}
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+      </a>
+    </section>
+
+    {/* Credit position. Now the first thing BELOW the command centre rather than the first thing on
+        the page: it is what an intern most wants to know, but it is a standing figure, not something
+        that needs them this morning, and the two sections above are the ones that do. It stays high
+        because it was previously visible only to admins - they were being measured on a number they
+        had to ask for. Every figure is computed from recorded attendance and approved leave by the
+        same engine that produces the completion letter, so this and the letter agree. */}
     {credit && (
       <div class="card">
         <div class="card-body">
@@ -728,7 +1252,9 @@ const creditPct = credit?.requiredCreditHours
     </div>
 
     <!-- Clock in/out -->
-    <div class="card">
+    {/* id is the target of the jump link in the strip at the top of the page. Nothing else about
+        this card changed: the forms, their ids and submitClock() are untouched. */}
+    <div class="card" id="attendance">
       <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
         <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Attendance Today</p>
         <div style="display:flex;align-items:center;gap:6px;">
