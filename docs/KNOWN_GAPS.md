@@ -14,6 +14,20 @@ database did not have. Verify against **writers**, never against `db/hr-schema.s
 | `meet_rooms.scheduled_at`, `duration_min`, `invitees`, `recurrence` | Declared in `src/pages/portal/meet/index.astro`. Sole INSERT (`meet/[id].astro:98`) writes only `id, host_user_id, title, kind`. | **Open.** No meetings capability may be built until a writer exists. |
 | `meet_rooms.host_user_id` | Declared `INTEGER`; `users.id` is UUID. | **Open.** Schema contradicts its own reader. |
 
+## RESOLVED 2026-08-02 — `users.full_name` does not exist
+
+`users` has `name` (`src/lib/db/schema.ts:50`). Four files queried `u.full_name`, which throws.
+`/portal/messages` returned HTTP 500 for every signed-in user with a thread. Fixed by aliasing at
+the query boundary (`u.name AS full_name`) so callers are unchanged.
+
+Files corrected: `src/pages/portal/messages.astro` (3 sites), `src/lib/gamification.ts`,
+`src/lib/legal-hold.ts` (2 sites). **`legal-hold.ts` was mine** — the participant and sender-name
+lookups in the founder held-records surface would have failed the same way.
+
+Fifth instance of declared-vs-existing this week. The pattern is now unmistakable: this codebase
+routinely queries columns that exist only in someone's mental model. Verify against
+`src/lib/db/schema.ts` and the writers, never against intuition or `db/hr-schema.sql`.
+
 ## Missing capabilities (migration required, do not fake)
 
 - **Projects** — no table. Tasks have no project relation.

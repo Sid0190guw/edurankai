@@ -157,7 +157,7 @@ export async function getLeaderboard(limit: number = 20) {
         ls.level,
         ls.current_streak_days,
         ls.longest_streak_days,
-        COALESCE(u.full_name, u.email, 'Learner') AS display_name,
+        COALESCE(u.name, u.email, 'Learner') AS display_name,
         u.email,
         ROW_NUMBER() OVER (ORDER BY ls.total_xp DESC, ls.user_id ASC) AS rank
       FROM learner_streaks ls

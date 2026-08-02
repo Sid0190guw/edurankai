@@ -244,7 +244,7 @@ export async function listHeldThreads(opts: { subjectUserId?: string | null; lim
              MIN(m.created_at) AS first_at,
              MAX(m.created_at) AS last_at,
              COALESCE(
-               (SELECT array_agg(DISTINCT COALESCE(u.full_name, u.email))
+               (SELECT array_agg(DISTINCT COALESCE(u.name, u.email))
                   FROM chat_thread_members cm JOIN users u ON u.id = cm.user_id
                  WHERE cm.thread_id = t.id), '{}') AS participants
         FROM chat_threads t
@@ -294,7 +294,7 @@ export async function heldThreadMessages(threadId: string, limit = 500): Promise
     const r = await db.execute(sql`
       SELECT m.id, m.created_at, m.deleted_at, m.attachment_url,
              LENGTH(m.ciphertext) AS size_bytes,
-             COALESCE(u.full_name, u.email) AS sender_name
+             COALESCE(u.name, u.email) AS sender_name
         FROM chat_messages m
         LEFT JOIN users u ON u.id = m.sender_user_id
        WHERE m.thread_id = ${threadId}
