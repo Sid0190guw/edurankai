@@ -21,10 +21,21 @@ let todayHours = 0;
 // better than deleting the reference from the four places that use it: the schema declares it, so
 // the next person to write a query will reach for it again. Idempotent, and the two schemas
 // converge instead of quietly disagreeing.
+//
+// The try/catch has to be INSIDE the ensureOnce callback, not around it. ensureOnce() returns
+// `p.catch(() => {})` (src/lib/ensure-once.ts:24) — it swallows, so an outer catch never fires and a
+// failed ALTER leaves no trace at all. That is precisely the silence this page has already been
+// punished for. Log the real reason, then re-throw: the re-throw is what makes ensureOnce drop its
+// cache entry and try again on the next request rather than remembering the failure forever.
 try {
   const { ensureOnce } = await import('@/lib/ensure-once');
   await ensureOnce('hr_employees_work_email_v1', async () => {
-    await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS work_email TEXT`);
+    try {
+      await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS work_email TEXT`);
+    } catch (e: any) {
+      console.error('[portal/employee] work_email ALTER', e?.cause?.message || e?.message);
+      throw e;
+    }
   });
 } catch (e: any) {
   console.error('[portal/employee] work_email ensure', e?.cause?.message || e?.message);
@@ -40,18 +51,31 @@ try {
 try {
   const { ensureOnce } = await import('@/lib/ensure-once');
   await ensureOnce('hr_employees_reporting_manager_v1', async () => {
-    await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
+    try {
+      await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
+    } catch (e: any) {
+      console.error('[portal/employee] reporting_manager_id ALTER', e?.cause?.message || e?.message);
+      throw e;
+    }
   });
 } catch (e: any) {
   console.error('[portal/employee] reporting_manager_id ensure', e?.cause?.message || e?.message);
 }
 
-// Find employee linked to this user
+// Find employee linked to this user.
+//
+// These two catches were BARE (`catch(e) {}`). That is not a detail: the missing work_email column
+// threw inside the fallback below, the empty catch ate it, and every person whose record is linked by
+// email alone was told for a day that they had no employee profile — with nothing in the logs to say
+// why. The lookups still fail closed (no record found means the "no employee profile" card, which is
+// correct), but the reason is now on the record.
 try {
   const r = await db.execute(sql`SELECT * FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   employee = rows[0] || null;
-} catch(e) {}
+} catch (e: any) {
+  console.error('[portal/employee] employee lookup by user_id', e?.cause?.message || e?.message);
+}
 
 // If no direct link, try matching by any email on file (work, personal, or login).
 if (!employee) {
@@ -59,11 +83,22 @@ if (!employee) {
     const r = await db.execute(sql`SELECT * FROM hr_employees WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email}) AND is_active = true LIMIT 1`);
     const rows = Array.isArray(r) ? r : (r?.rows || []);
     employee = rows[0] || null;
-    // Link user_id
+    // Link user_id, ONLY onto a record that is not already claimed.
+    //
+    // Without `AND user_id IS NULL` this stamps the signed-in account onto whatever row the email
+    // matched — including a row that already belongs to somebody else. hr_employees has three email
+    // columns and a unique constraint on none of them, so a shared inbox typed into `email`, or a
+    // manager's address entered on a subordinate's record, is enough to make one person's account
+    // permanently point at another person's employee row: their attendance, leave, payslips, credit
+    // hours and now their tasks. The guard is the same one src/lib/auth/workspace-access.ts:238
+    // already uses, and it costs nothing — an unlinked row is the only case this fallback exists for.
     if (employee) {
-      await db.execute(sql`UPDATE hr_employees SET user_id = ${user.id} WHERE id = ${employee.id}`).catch(() => {});
+      await db.execute(sql`UPDATE hr_employees SET user_id = ${user.id} WHERE id = ${employee.id} AND user_id IS NULL`)
+        .catch((e: any) => console.error('[portal/employee] user_id backfill', e?.cause?.message || e?.message));
     }
-  } catch(e) {}
+  } catch (e: any) {
+    console.error('[portal/employee] employee lookup by email', e?.cause?.message || e?.message);
+  }
 }
 
 // Declared HERE, above the POST handler, because `const` is not hoisted: a const declared further
@@ -215,7 +250,9 @@ if (employee) {
     const r = await db.execute(sql`SELECT * FROM hr_time_logs WHERE employee_id = ${employee.id} AND log_date = ${today} ORDER BY start_time ASC`);
     timeLogs = Array.isArray(r) ? r : (r?.rows || []);
     loggedHours = Math.round(timeLogs.reduce((a: number, l: any) => a + Number(l.hours || 0), 0) * 100) / 100;
-  } catch (e) {}
+  } catch (e: any) {
+    console.error('[portal/employee] time logs', e?.cause?.message || e?.message);
+  }
 }
 
 // Today's clock-out task summaries
@@ -224,7 +261,9 @@ if (employee) {
   try {
     const r = await db.execute(sql`SELECT task, status, percent, details, created_at FROM hr_task_log WHERE employee_id = ${employee.id} AND log_date = CURRENT_DATE ORDER BY created_at DESC`);
     taskLogs = Array.isArray(r) ? r : (r?.rows || []);
-  } catch (e) {}
+  } catch (e: any) {
+    console.error('[portal/employee] session summaries', e?.cause?.message || e?.message);
+  }
 }
 
 // Today's daily report (if already submitted)
@@ -235,7 +274,9 @@ if (employee) {
     const r = await db.execute(sql`SELECT * FROM hr_daily_reports WHERE employee_id = ${employee.id} AND report_date = ${today} LIMIT 1`);
     const rows = Array.isArray(r) ? r : (r?.rows || []);
     todayReport = rows[0] || null;
-  } catch (e) {}
+  } catch (e: any) {
+    console.error('[portal/employee] daily report', e?.cause?.message || e?.message);
+  }
 }
 
 // Get payslips
@@ -250,7 +291,9 @@ if (employee) {
       LIMIT 12
     `);
     payslips = Array.isArray(r) ? r : (r?.rows || []);
-  } catch(e) {}
+  } catch (e: any) {
+    console.error('[portal/employee] payslips', e?.cause?.message || e?.message);
+  }
 
   // Get today's clock events
   try {
@@ -277,7 +320,13 @@ if (employee) {
       const end = clockOut ? new Date(clockOut.event_time) : new Date();
       todayHours = Math.round(((end.getTime() - new Date(clockIn.event_time).getTime()) / 3600000) * 10) / 10;
     }
-  } catch(e) {}
+  } catch (e: any) {
+    // Logging only — no control flow changed here. This catch is worth a line because of what its
+    // silence looks like: if the punch READ fails, currentStatus stays 'clocked_out' and the page
+    // offers "Clock In" to somebody who is already clocked in. The clock-in/out WRITE path above is
+    // untouched.
+    console.error('[portal/employee] clock events', e?.cause?.message || e?.message);
+  }
 }
 
 const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
@@ -314,19 +363,25 @@ const dayLabel = (v: any) => {
 // every hr_* table is keyed by. (The WRITE above takes user.id instead; the two are different ids
 // for different questions, and the library is explicit about which it wants.)
 //
-// listMyTasks() already catches and logs its own failures and returns [], so a missing table shows
-// an empty list rather than a 500. The try/catch here is for the import itself, and it logs: a bare
-// catch is what let a missing column tell every employee they had no profile for a day.
+// myTasksView() is used rather than listMyTasks()+taskCounts() for one reason: it reports whether the
+// read HAPPENED. Both of those return [] and zeroes on failure, so "you have no tasks" and "the query
+// threw" arrive identically — and the card would then print "Nothing on your list right now" at
+// somebody whose task table could not be read. That is a claim, not an absence, and it is the same
+// failure shape as a green flash over a write that did not happen. With `ok` the card can say the
+// honest thing instead. It never throws, so no page state depends on the try/catch here; the catch is
+// for the dynamic import itself, and it logs.
 let myTasks: any[] = [];
 let taskTally: any = null;
 let tasksReady = false;
+let tasksFailed = false;
 if (employee?.id) {
   try {
-    const { listMyTasks, taskCounts } = await import('@/lib/employee-tasks');
-    const list = await listMyTasks(employee.id);
-    myTasks = Array.isArray(list) ? list : [];
-    taskTally = await taskCounts(employee.id);
+    const { myTasksView } = await import('@/lib/employee-tasks');
+    const view = await myTasksView(employee.id);
+    myTasks = Array.isArray(view?.tasks) ? view.tasks : [];
+    taskTally = view?.counts ?? null;
     tasksReady = true;
+    tasksFailed = !view?.ok;
   } catch (e: any) {
     console.error('[portal/employee] tasks', e?.cause?.message || e?.message);
   }
@@ -442,7 +497,12 @@ if (user?.id) {
 const memberGroups = myGroups.filter((g: any) => g.isMember);
 // Sub-groups of a group they are already in: visible and joinable by definition, so counting them
 // discloses nothing they could not already see on /portal/team-groups.
-const joinableGroups = myGroups.filter((g: any) => !g.isMember);
+//
+// `kind === 'sub'` is not belt-and-braces. joinGroup() in src/lib/work-groups.ts:241 REFUSES anything
+// that is not a sub-group — department and global membership follows onboarding, it is not chosen —
+// so a non-member row of any other kind would be counted under the words "you can join" and then be
+// refused when they tried. Counting only what the join actually accepts keeps the sentence true.
+const joinableGroups = myGroups.filter((g: any) => !g.isMember && g.kind === 'sub' && g.parentId);
 
 // The credit position, shown to the person it is about. Interns were being measured on
 // credit-hours they could not see; the figures already existed but only on the admin side, so the
@@ -459,7 +519,11 @@ if (employee?.id) {
     const led = await ledgerFor(employee.id, creditTerms);
     credit = led.summary;
     weeksLeft = remainingWeeks(credit, creditTerms);
-  } catch (_) { /* never block the HR page over a summary */ }
+  } catch (e: any) {
+    // Still never blocks the page over a summary — but no longer silently. A credit figure that
+    // quietly stops appearing is exactly the kind of absence nobody reports and nobody notices.
+    console.error('[portal/employee] credit', e?.cause?.message || e?.message);
+  }
 }
 const creditPct = credit?.requiredCreditHours
   ? Math.min(100, Math.round((credit.creditHours / credit.requiredCreditHours) * 100))
@@ -775,11 +839,19 @@ const creditPct = credit?.requiredCreditHours
       <div class="card">
         <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
           <p style="font-size:13px;font-weight:700;color:#111;margin:0;">My tasks</p>
-          <span style="font-size:12px;font-weight:700;color:#FF4F00;">{openTasks.length} open</span>
+          {/* No count when the read failed: "0 open" is the same false claim as the empty state,
+              just smaller and easier to believe. */}
+          {!tasksFailed && <span style="font-size:12px;font-weight:700;color:#FF4F00;">{openTasks.length} open</span>}
         </div>
         <div class="card-body">
           {taskMeta && <p style="font-size:11.5px;color:#6b7280;margin:0 0 10px;">{taskMeta}</p>}
-          {openTasks.length === 0 && (
+          {/* Two different empty states, because they are two different facts. "Nothing on your list"
+              is a statement about your work; it must never be printed when the truth is that the read
+              failed and this page does not know. */}
+          {tasksFailed && (
+            <p style="font-size:12.5px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:9px 11px;margin:0;line-height:1.5;">Your task list could not be loaded just now, so this is not a list of your work. Nothing has been lost. Reload in a moment, and tell HR if it keeps happening.</p>
+          )}
+          {!tasksFailed && openTasks.length === 0 && (
             <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">Nothing on your list right now. Anything assigned to you will appear here, with whatever date it is wanted by.</p>
           )}
           {openTasks.length > 0 && (

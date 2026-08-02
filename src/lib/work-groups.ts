@@ -72,6 +72,24 @@ export function ensureWorkGroupSchema(): Promise<void> {
       joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       CONSTRAINT work_group_member_unique UNIQUE (group_id, user_id)
     )`);
+    // CREATE TABLE IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE, INCLUDING ONE MISSING COLUMNS.
+    // Every column above past the primary key is therefore asserted again here. This is not
+    // belt-and-braces: it is the exact failure that put hr_employees.work_email in db/hr-schema.sql
+    // and not on the live table, and visibleGroupsFor() NAMES join_url, parent_id, department_id,
+    // is_main and created_by — a query that names a missing column throws, and the only symptom on
+    // /portal/employee is a Community card that says "you are not in a team group yet". On a fresh
+    // database these are no-ops.
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS description TEXT`);
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'custom'`);
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS parent_id UUID REFERENCES work_groups(id) ON DELETE CASCADE`);
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS department_id VARCHAR(50)`);
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS is_main BOOLEAN NOT NULL DEFAULT false`);
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true`);
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS join_url TEXT`);
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS join_label TEXT`);
+    await db.execute(sql`ALTER TABLE work_groups ADD COLUMN IF NOT EXISTS created_by UUID`);
+    await db.execute(sql`ALTER TABLE work_group_members ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member'`);
+    await db.execute(sql`ALTER TABLE work_group_members ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'auto'`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS work_group_members_user_idx ON work_group_members (user_id)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS work_groups_parent_idx ON work_groups (parent_id)`);
     // The one common group. is_main protects it from deletion or reparenting.
@@ -121,7 +139,14 @@ export async function visibleGroupsFor(userId: string): Promise<WorkGroup[]> {
           OR (g.parent_id IS NOT NULL AND g.parent_id IN (SELECT group_id FROM mine))
         )
       ORDER BY g.is_main DESC, g.kind, g.name`)).map(map);
-  } catch { return []; }
+  } catch (e: any) {
+    // Was a bare `catch { return [] }`. Still fails closed — showing no groups is always the safe
+    // answer — but the failure now leaves a trace. Silently returning [] here makes every caller
+    // print "you are not in a team group yet", which is a claim about someone's membership made by
+    // code that has just failed to find out.
+    console.error('[work-groups] visibleGroupsFor', e?.cause?.message || e?.message);
+    return [];
+  }
 }
 
 /** Membership check. Every privileged read goes through this rather than trusting a caller. */

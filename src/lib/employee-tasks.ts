@@ -52,6 +52,19 @@ const PRIORITIES: TaskPriority[] = ['low', 'normal', 'high', 'urgent'];
 /** One message for every refusal, so probing ids cannot distinguish "no such task" from "not yours". */
 const NOT_AVAILABLE = 'That task is not available.';
 
+/**
+ * What a person is shown when a write fails. Deliberately NOT the database's own words.
+ *
+ * `e.cause.message` is the real Postgres reason and it belongs in the log, every time — that is the
+ * house rule and nothing here weakens it. It does not belong in a redirect query string on somebody's
+ * HR page: 'column "blocked_reason" of relation "employee_tasks" does not exist' names the schema to
+ * whoever asks, and tells the person reading it nothing they can act on.
+ */
+const WRITE_FAILED = 'Something went wrong saving that. Nothing was changed. Try again in a moment.';
+
+/** Declared before the readers that return it. `const` is not hoisted. */
+const EMPTY_COUNTS: TaskCounts = { open: 0, inProgress: 0, blocked: 0, done: 0, overdue: 0, total: 0 };
+
 export interface EmployeeTask {
   id: string;
   employeeId: string;
@@ -111,8 +124,24 @@ export interface TaskCounts {
  * which is the correct direction to fail.
  */
 export function ensureTaskSchema(): Promise<void> {
+  // ensureOnce() SWALLOWS whatever this callback throws (src/lib/ensure-once.ts:24) so callers keep
+  // their tolerate-missing-schema behaviour. That is the right contract for callers and the wrong
+  // one for the logs: without the try/catch below, a CREATE TABLE that fails leaves no trace
+  // anywhere, and the only symptom is an empty task list. Log the real reason, then RE-THROW — the
+  // rethrow is what makes ensureOnce drop the cache entry and retry on the next request instead of
+  // remembering a failure for the life of the process.
   return ensureOnce('employee_tasks_v1', async () => {
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS employee_tasks (
+    try {
+      await ensureTaskTables();
+    } catch (e: any) {
+      logFail('ensureTaskSchema', e);
+      throw e;
+    }
+  });
+}
+
+async function ensureTaskTables(): Promise<void> {
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS employee_tasks (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       employee_id UUID NOT NULL,
       assigned_by_user_id UUID,
@@ -155,7 +184,6 @@ export function ensureTaskSchema(): Promise<void> {
     } catch (e: any) {
       logFail('ensureTaskSchema reporting_manager_id', e);
     }
-  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -245,24 +273,58 @@ const mapTask = (r: any): EmployeeTask => ({
  * string, a route parameter or a hidden field. employeeFilter() compiles an empty value to `false`,
  * so a caller that skipped its gate gets nothing instead of everyone.
  */
+async function readMyTasks(employeeId: string, limit: number): Promise<EmployeeTask[]> {
+  return rows(await db.execute(sql`
+    SELECT ${TASK_COLUMNS},
+           (t.assigned_by_user_id IS NOT NULL
+            AND t.assigned_by_user_id = (SELECT e.user_id FROM hr_employees e WHERE e.id = t.employee_id))
+             AS self_assigned
+      FROM employee_tasks t
+     WHERE ${employeeFilter({ employeeId }, sql`t.employee_id`)}
+     ORDER BY (t.status = 'done'),
+              (t.due_on IS NULL), t.due_on ASC,
+              CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+              t.created_at DESC
+     LIMIT ${Math.min(Math.max(limit, 1), 300)}`)).map(mapTask);
+}
+
 export async function listMyTasks(employeeId: string, limit = 100): Promise<EmployeeTask[]> {
   try {
     await ensureTaskSchema();
-    return rows(await db.execute(sql`
-      SELECT ${TASK_COLUMNS},
-             (t.assigned_by_user_id IS NOT NULL
-              AND t.assigned_by_user_id = (SELECT e.user_id FROM hr_employees e WHERE e.id = t.employee_id))
-               AS self_assigned
-        FROM employee_tasks t
-       WHERE ${employeeFilter({ employeeId }, sql`t.employee_id`)}
-       ORDER BY (t.status = 'done'),
-                (t.due_on IS NULL), t.due_on ASC,
-                CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
-                t.created_at DESC
-       LIMIT ${Math.min(Math.max(limit, 1), 300)}`)).map(mapTask);
+    return await readMyTasks(employeeId, limit);
   } catch (e: any) {
     logFail('listMyTasks', e);
     return [];
+  }
+}
+
+/**
+ * The same rows, plus WHETHER THE READ ACTUALLY HAPPENED.
+ *
+ * listMyTasks() returns [] both when a person has no tasks and when the query threw, and a caller
+ * cannot tell those apart. On a screen that is the difference between an absence and a claim: "Nothing
+ * on your list right now" printed because employee_tasks could not be read is the page telling
+ * somebody they owe no work when it does not know. That is the same shape as the green flash over a
+ * failed clock-in, and it is worth an extra return field to avoid.
+ *
+ * ensureTaskSchema() cannot throw — ensureOnce() swallows — so a database with no employee_tasks
+ * table surfaces here as ok:false from the SELECT, which is exactly the intended signal.
+ */
+export interface MyTasksView {
+  ok: boolean;
+  tasks: EmployeeTask[];
+  counts: TaskCounts;
+}
+
+export async function myTasksView(employeeId: string, limit = 100): Promise<MyTasksView> {
+  try {
+    await ensureTaskSchema();
+    const tasks = await readMyTasks(employeeId, limit);
+    const counts = await readTaskCounts(employeeId);
+    return { ok: true, tasks, counts };
+  } catch (e: any) {
+    logFail('myTasksView', e);
+    return { ok: false, tasks: [], counts: { ...EMPTY_COUNTS } };
   }
 }
 
@@ -300,32 +362,35 @@ export async function listTasksForTeam(departmentId: string | null | undefined, 
   }
 }
 
+async function readTaskCounts(employeeId: string): Promise<TaskCounts> {
+  const r = rows(await db.execute(sql`
+    SELECT COUNT(*) FILTER (WHERE t.status = 'open')::int        AS open_count,
+           COUNT(*) FILTER (WHERE t.status = 'in_progress')::int AS in_progress_count,
+           COUNT(*) FILTER (WHERE t.status = 'blocked')::int     AS blocked_count,
+           COUNT(*) FILTER (WHERE t.status = 'done')::int        AS done_count,
+           COUNT(*) FILTER (WHERE t.due_on IS NOT NULL AND t.due_on < CURRENT_DATE AND t.status <> 'done')::int AS overdue_count,
+           COUNT(*)::int AS total_count
+      FROM employee_tasks t
+     WHERE ${employeeFilter({ employeeId }, sql`t.employee_id`)}`))[0];
+  if (!r) return { ...EMPTY_COUNTS };
+  return {
+    open: Number(r.open_count) || 0,
+    inProgress: Number(r.in_progress_count) || 0,
+    blocked: Number(r.blocked_count) || 0,
+    done: Number(r.done_count) || 0,
+    overdue: Number(r.overdue_count) || 0,
+    total: Number(r.total_count) || 0,
+  };
+}
+
 /** Headline numbers for one person. Same scoping rule as listMyTasks: employeeId from the session. */
 export async function taskCounts(employeeId: string): Promise<TaskCounts> {
-  const empty: TaskCounts = { open: 0, inProgress: 0, blocked: 0, done: 0, overdue: 0, total: 0 };
   try {
     await ensureTaskSchema();
-    const r = rows(await db.execute(sql`
-      SELECT COUNT(*) FILTER (WHERE t.status = 'open')::int        AS open_count,
-             COUNT(*) FILTER (WHERE t.status = 'in_progress')::int AS in_progress_count,
-             COUNT(*) FILTER (WHERE t.status = 'blocked')::int     AS blocked_count,
-             COUNT(*) FILTER (WHERE t.status = 'done')::int        AS done_count,
-             COUNT(*) FILTER (WHERE t.due_on IS NOT NULL AND t.due_on < CURRENT_DATE AND t.status <> 'done')::int AS overdue_count,
-             COUNT(*)::int AS total_count
-        FROM employee_tasks t
-       WHERE ${employeeFilter({ employeeId }, sql`t.employee_id`)}`))[0];
-    if (!r) return empty;
-    return {
-      open: Number(r.open_count) || 0,
-      inProgress: Number(r.in_progress_count) || 0,
-      blocked: Number(r.blocked_count) || 0,
-      done: Number(r.done_count) || 0,
-      overdue: Number(r.overdue_count) || 0,
-      total: Number(r.total_count) || 0,
-    };
+    return await readTaskCounts(employeeId);
   } catch (e: any) {
     logFail('taskCounts', e);
-    return empty;
+    return { ...EMPTY_COUNTS };
   }
 }
 
@@ -431,7 +496,8 @@ export async function createTask(input: {
     return { ok: true, id: String(r.id) };
   } catch (e: any) {
     logFail('createTask', e);
-    return { ok: false, error: e?.cause?.message || e?.message || 'Could not create the task.' };
+    // logFail above already recorded e.cause.message. See WRITE_FAILED for why it is not echoed back.
+    return { ok: false, error: WRITE_FAILED };
   }
 }
 
@@ -489,7 +555,8 @@ export async function updateTaskStatus(
     return { ok: true };
   } catch (e: any) {
     logFail('updateTaskStatus', e);
-    return { ok: false, error: e?.cause?.message || e?.message || 'Could not update the task.' };
+    // logFail above already recorded e.cause.message. See WRITE_FAILED for why it is not echoed back.
+    return { ok: false, error: WRITE_FAILED };
   }
 }
 
@@ -523,6 +590,7 @@ export async function addComment(
     return { ok: true, id: String(r.id) };
   } catch (e: any) {
     logFail('addComment', e);
-    return { ok: false, error: e?.cause?.message || e?.message || 'Could not add the comment.' };
+    // logFail above already recorded e.cause.message. See WRITE_FAILED for why it is not echoed back.
+    return { ok: false, error: WRITE_FAILED };
   }
 }
