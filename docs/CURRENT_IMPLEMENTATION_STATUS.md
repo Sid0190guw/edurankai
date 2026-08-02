@@ -15,6 +15,7 @@ Project memory. Update at the end of every session. Do not restate history in ch
 | Design system | `src/styles/workforce.css`, `src/components/workforce/*` | 11 components. Status carries shape as well as hue. Density/focus modes are CSS-only. |
 | BottomNav | all three portal pages | One component, variant-based. Migration complete. |
 | Command Center | `/portal/employee` | Built from six verified data sources only. |
+| Approvals | `/portal/approvals` | Leave and withdrawals waiting on this person. Reporting managers included, not only HR. Page shows; `decideLeave`/`decideWithdrawal` re-check authority at the write. |
 | Wellness (phase 1) | `/portal/wellness`, `/admin/wellness`, `/founder/admin/wellness` | Women-only gate server-side; oversight aggregate-only, groups under `MIN_GROUP` suppressed. |
 | Legal hold | `/founder/admin/held-records`, `/portal/my-record-access` | `logAccess()` before render; subject can see their own access history. |
 

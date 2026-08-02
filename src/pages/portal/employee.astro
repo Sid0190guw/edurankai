@@ -666,33 +666,81 @@ const canDecideHrRequests = viewerRole === 'super_admin' || viewerRole === 'admi
 let pendingLeave = 0;
 let pendingWithdrawals = 0;
 let hrQueueFailed = false;
-if (canDecideHrRequests && employee?.id) {
-  // Separate try/catch per table, so one missing table cannot mask the other in the logs — and
-  // neither uses the bare `safe()` wrapper in hr-leave.ts / hr-wallet.ts, which swallows without
-  // logging and would render a failed read as "0 waiting".
+// Counts now come from the SAME readers /portal/approvals renders, rather than a second pair of
+// COUNT queries that could disagree with it. The previous version also gated on role alone, so a
+// reporting manager — the person the request is actually assigned to — saw no count at all and had
+// no way to learn something was waiting on them.
+if (employee?.id) {
   try {
-    const { ensureLeaveSchema } = await import('@/lib/hr-leave');
-    await ensureLeaveSchema();
-    const r = await db.execute(sql`
-      SELECT COUNT(*)::int AS n FROM hr_leave_request
-       WHERE status = 'pending' AND employee_id::text <> ${employee.id}`);
-    const lrows = Array.isArray(r) ? r : (r?.rows || []);
-    pendingLeave = Number(lrows[0]?.n) || 0;
+    const [{ pendingLeaveForApprover }, { pendingWithdrawalsForApprover }] = await Promise.all([
+      import('@/lib/hr-leave'),
+      import('@/lib/hr-wallet'),
+    ]);
+    const [lv, wd] = await Promise.all([
+      pendingLeaveForApprover(user),
+      pendingWithdrawalsForApprover(user),
+    ]);
+    // Own rows excluded: your own pending request is not an approval waiting on YOU.
+    pendingLeave = lv.filter((r: any) => String(r.employee_id) !== String(employee.id)).length;
+    pendingWithdrawals = wd.filter((r: any) => String(r.employee_id) !== String(employee.id)).length;
   } catch (e: any) {
     hrQueueFailed = true;
-    console.error('[portal/employee] pending leave', e?.cause?.message || e?.message);
+    console.error('[portal/employee] approver queue', e?.cause?.message || e?.message);
   }
+}
+
+// JOINING DOCUMENTS, MINE — the ones a reviewer sent back.
+//
+// hr_onboarding_documents.status is written by real code on BOTH sides, which is the only reason
+// this row exists: addDoc() inserts 'submitted' from /portal/onboarding, and reviewDoc() writes
+// 'rejected' together with a note from the "Send back" button on /admin/hr/onboarding. A rejected
+// row is therefore a state a real person put there, not a column a schema file merely declares.
+//
+// listDocs() rather than a COUNT, for two reasons. It is the function that OWNS the table's DDL —
+// its ctx() runs the CREATE TABLE IF NOT EXISTS — so this cannot be the query that discovers the
+// table is missing. And the cap is MAX_DOCS = 5 rows per person, so reading them costs less than
+// the round trip a count would save. It is scoped to user_id inside its own WHERE clause, it reads
+// only this person's rows, and it THROWS rather than returning [] on failure — which is exactly
+// what this section needs, because an empty list and a failed read must not become the same
+// sentence.
+let rejectedDocs = 0;
+let docsFailed = false;
+if (user?.id) {
   try {
-    const { ensureWalletSchema } = await import('@/lib/hr-wallet');
-    await ensureWalletSchema();
-    const r = await db.execute(sql`
-      SELECT COUNT(*)::int AS n FROM hr_withdrawal
-       WHERE status = 'pending' AND employee_id::text <> ${employee.id}`);
-    const wrows = Array.isArray(r) ? r : (r?.rows || []);
-    pendingWithdrawals = Number(wrows[0]?.n) || 0;
+    const { listDocs } = await import('@/lib/hr-onboarding');
+    const docs = await listDocs(String(user.id));
+    rejectedDocs = docs.filter((d: any) => d.status === 'rejected').length;
   } catch (e: any) {
-    hrQueueFailed = true;
-    console.error('[portal/employee] pending withdrawals', e?.cause?.message || e?.message);
+    docsFailed = true;
+    console.error('[portal/employee] joining documents', e?.cause?.message || e?.message);
+  }
+}
+
+// JOINING DOCUMENTS WAITING FOR A REVIEW — and, again, only for somebody who can reach the screen.
+//
+// Gated on the SAME exact role test as the leave and withdrawal queues above, and deliberately NOT
+// on canAccessSection(user, 'employees', 'edit'), which is what /api/portal/onboarding/documents
+// itself uses to authorise the review. That test can return true for a custom role that does not
+// hold admin.access, and src/middleware.ts bounces precisely that role off /admin — so the wider
+// test would put a count in front of somebody whose only route to act on it is a redirect. Same
+// reasoning and the same three roles as the block above: narrower than the screen admits, never
+// wider.
+//
+// A COUNT, not pendingForReview(): that helper joins `users` and returns names and email addresses
+// for up to 150 people, and none of that belongs in the render context of a page that needs one
+// integer. Own rows are excluded — a document YOU submitted is not a review waiting on YOU.
+let docsToReview = 0;
+let docReviewFailed = false;
+if (canDecideHrRequests && user?.id) {
+  try {
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM hr_onboarding_documents
+       WHERE status = 'submitted' AND user_id <> ${String(user.id)}`);
+    const orows = Array.isArray(r) ? r : (r?.rows || []);
+    docsToReview = Number(orows[0]?.n) || 0;
+  } catch (e: any) {
+    docReviewFailed = true;
+    console.error('[portal/employee] joining document reviews', e?.cause?.message || e?.message);
   }
 }
 
@@ -701,13 +749,18 @@ if (canDecideHrRequests && employee?.id) {
 // accident. Plain object literals with no type annotation: a typed map in .astro JSX does not
 // compile.
 //
-// Each glyph is a distinct SHAPE, not a colour: a clock, a calendar, two ticks, an eye, a card.
+// Each glyph is a distinct SHAPE, not a colour: a clock, a calendar, two ticks, an eye, a card,
+// a folded page, a tray.
 // The row still triages correctly in greyscale, and no emoji appears anywhere.
 const GLYPH_LATE = '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.2V12l3.1 1.9"/>';
 const GLYPH_TODAY = '<rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10.2h17M8.5 3v4M15.5 3v4"/>';
 const GLYPH_SIGNOFF = '<path d="m2.8 12.6 3.2 3.2 6.6-7"/><path d="m10.6 15.2 1.4 1.4 6.8-7.2"/>';
 const GLYPH_REVIEW = '<path d="M2.6 12S6.2 6.2 12 6.2 21.4 12 21.4 12 17.8 17.8 12 17.8 2.6 12 2.6 12Z"/><circle cx="12" cy="12" r="2.4"/>';
 const GLYPH_MONEY = '<rect x="2.5" y="5.5" width="19" height="13" rx="2.5"/><path d="M2.5 10.4h19"/>';
+// A page with a folded corner, and a tray. Both distinct in outline from the clock, the calendar,
+// the two ticks, the eye and the card above — the list still triages with every colour deleted.
+const GLYPH_DOC = '<path d="M14 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5Z"/><path d="M14 3.5v5h5"/><path d="M8.8 14.2h6.4"/>';
+const GLYPH_INBOX = '<path d="M3.5 13.6 6.4 5.3A2 2 0 0 1 8.3 4h7.4a2 2 0 0 1 1.9 1.3l2.9 8.3v4a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2Z"/><path d="M3.5 13.6h4l1.4 2.6h6.2l1.4-2.6h4"/>';
 
 const ROW_CAP = 3;
 const attentionRows: any[] = [];
@@ -737,6 +790,20 @@ dueTodayTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
   priority: t.priority,
 }));
 
+// One summarising row for the whole bucket rather than one row per document, so no cap arithmetic
+// applies to it and the number shown IS the number there is. The wording is the same guidance
+// /portal/workspace already gives, because a person who reads both should not have to work out
+// whether they are being told two different things.
+if (rejectedDocs > 0) attentionRows.push({
+  key: 'docs-back',
+  href: '/portal/onboarding',
+  title: rejectedDocs === 1 ? 'One joining document was sent back' : rejectedDocs + ' joining documents were sent back',
+  note: 'Usually the sharing permission rather than the document. Re-share it so anyone with the link can view, then submit it again',
+  tone: 'due_soon',
+  glyph: GLYPH_DOC,
+  priority: '',
+});
+
 signOffTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
   key: 'sign-' + t.id,
   href: '/portal/tasks/' + t.id,
@@ -757,9 +824,19 @@ reviewTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
   priority: t.priority,
 }));
 
+if (docsToReview > 0) attentionRows.push({
+  key: 'docs-review',
+  href: '/admin/hr/onboarding',
+  title: docsToReview === 1 ? 'One joining document needs a review' : docsToReview + ' joining documents need a review',
+  note: 'A new hire has done their part and cannot be cleared to join until someone looks',
+  tone: 'info',
+  glyph: GLYPH_INBOX,
+  priority: '',
+});
+
 if (pendingLeave > 0) attentionRows.push({
   key: 'leave-queue',
-  href: '/admin/hr/leave',
+  href: '/portal/approvals',
   title: pendingLeave === 1 ? 'One leave request needs a decision' : pendingLeave + ' leave requests need a decision',
   note: 'Nobody knows if they can take the days until you answer',
   tone: 'info',
@@ -769,7 +846,7 @@ if (pendingLeave > 0) attentionRows.push({
 
 if (pendingWithdrawals > 0) attentionRows.push({
   key: 'withdrawal-queue',
-  href: '/admin/hr/wallet',
+  href: '/portal/approvals',
   title: pendingWithdrawals === 1 ? 'One withdrawal needs a decision' : pendingWithdrawals + ' withdrawals need a decision',
   note: 'Money already earned, waiting to be released',
   tone: 'info',
@@ -786,7 +863,10 @@ const attentionTaskShown =
   Math.min(ROW_CAP, overdueTasks.length) + Math.min(ROW_CAP, dueTodayTasks.length)
   + Math.min(ROW_CAP, signOffTasks.length) + Math.min(ROW_CAP, reviewTasks.length);
 const attentionMore = attentionTaskTotal - attentionTaskShown;
-const attentionCount = attentionTaskTotal + pendingLeave + pendingWithdrawals;
+// The document buckets are counted here but NOT in attentionMore: like the two queue rows, each is
+// a single row that already states its own whole count, so none of it is hidden behind the cap.
+const attentionCount =
+  attentionTaskTotal + pendingLeave + pendingWithdrawals + rejectedDocs + docsToReview;
 
 // WHAT THE SECTION IS NOT ALLOWED TO SAY. If any source did not run, "nothing is waiting on you" is
 // not a fact this page is in a position to state, so the all-clear is withheld and the gap is named
@@ -796,6 +876,8 @@ if (!attentionTasksOk) attentionGaps.push('your own task list');
 else if (!dbToday) attentionGaps.push('what is due today');
 if (!boardOk) attentionGaps.push('anything waiting on your sign-off or review');
 if (hrQueueFailed) attentionGaps.push('the leave and withdrawal queues');
+if (docsFailed) attentionGaps.push('your joining documents');
+if (docReviewFailed) attentionGaps.push('the joining-document review queue');
 const attentionIncomplete = attentionGaps.length > 0;
 
 // TODAY'S STATE. The task currently in flight, off the list already read — `state` is the canonical
@@ -856,8 +938,8 @@ const clockCta = clockReadFailed
 // every break taken.
 const showTodayHours = !clockReadFailed && todayHours > 0;
 
-// THE FOUR THINGS THIS SECTION DELIBERATELY DOES NOT SHOW, each because the database cannot answer
-// it and a placeholder would be a lie rather than a gap:
+// THE THINGS THIS SECTION DELIBERATELY DOES NOT SHOW, each because the database cannot answer it
+// and a placeholder would be a lie rather than a gap:
 //   MEETINGS TODAY — meet_rooms.scheduled_at is written by nothing in this repo (the only INSERT is
 //     the ad-hoc huddle at portal/meet/[id].astro:98), and its declared host_user_id INTEGER
 //     contradicts the ::uuid casts in the code that reads it. A card here would query a column no
@@ -869,6 +951,15 @@ const showTodayHours = !clockReadFailed && todayHours > 0;
 //   UNREAD COMMENTS / "X IS WAITING FOR YOUR ANSWER" — employee_task_comments has five columns
 //     (id, task_id, author_user_id, body, created_at). No read state, no mentions, no receipts.
 //     The only honest comment number is a total, which is not "waiting on you".
+//   OFFER LETTERS AWAITING MY SIGNATURE — and this one is the reason the joining-documents rows
+//     above are worded as narrowly as they are. Signing is reached by an unguessable token sent to
+//     one person, so there is no per-user inbox to query: "documents needing you" here means the
+//     onboarding credentials and NOTHING else. Widening that sentence would quietly promise an
+//     offer-letter reminder this page cannot deliver.
+//   WHAT LEARNING IS ASSIGNED TO ME — training_enrollments has exactly one writer, and it is the
+//     learner's own first open of a course (portal/courses/[slug].astro). There is no assigner, no
+//     due date and no "required" flag, so "what I have started" is answerable and "what is assigned
+//     to me" is not. This card only ever claims the second, so it is absent.
 // Their absence IS the answer. Do not add an empty card for any of them.
 ---
 <!doctype html>
@@ -1012,12 +1103,13 @@ const showTodayHours = !clockReadFailed && todayHours > 0;
         "what happens if I do nothing". Everything in it is an item they can act
         on, and every row is a direct link to the one screen where they act.
 
-        FOUR THINGS ARE ABSENT AND THAT IS THE ANSWER, not an omission: meetings
-        today, announcements, performance reviews waiting on me, and unread
-        comments. The reasons are recorded in the frontmatter at the end of the
-        script block. None of them gets a placeholder card, a zero or a "coming
-        soon", because a card that cannot be filled is a card people learn to
-        trust and then miss something behind.
+        SEVERAL THINGS ARE ABSENT AND THAT IS THE ANSWER, not an omission:
+        meetings today, announcements, performance reviews waiting on me, unread
+        comments, offer letters awaiting a signature, and assigned learning. The
+        reasons are recorded in the frontmatter at the end of the script block.
+        None of them gets a placeholder card, a zero or a "coming soon", because
+        a card that cannot be filled is a card people learn to trust and then
+        miss something behind.
         ===================================================================== */}
     <section class="cc" aria-labelledby="cc-heading">
       <div class="cc-head">
@@ -1035,8 +1127,13 @@ const showTodayHours = !clockReadFailed && todayHours > 0;
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" set:html={r.glyph} />
               </span>
               <span class="cc-row__body">
-                <span class="cc-row__title">{r.title}</span>
-                <span class="cc-row__note">{r.note}</span>
+                {/* wf-num on the title, not only on the headline: four of these rows state a
+                    COUNT inside the sentence ("3 joining documents were sent back"), and a
+                    proportional 1 next to a proportional 3 is the one place a triage list can be
+                    misread at a glance. It is inert on the titles that carry no digits. */}
+                <span class="cc-row__title wf-num">{r.title}</span>
+                {/* Same reason: the late rows carry a date here ("was due 4 Aug"). */}
+                <span class="cc-row__note wf-num">{r.note}</span>
               </span>
               <span class="cc-row__side">
                 {/* Renders nothing at all for a normal-priority task: a flag on

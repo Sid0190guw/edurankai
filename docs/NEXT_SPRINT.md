@@ -2,7 +2,10 @@
 
 Dependency order. Build top-down; each item is buildable only after those above it.
 
-1. **Approver inbox query** — `listLeave()` and the withdrawal reader have no by-approver filter, so
+1. ~~**Approver inbox query**~~ DONE (8edc64a) and surfaced at `/portal/approvals` (this commit).
+   Remaining in this capability: task sign-off (`status='under_review'` where viewer holds `approver`)
+   is a third decision path with its own transition rules — belongs with the task engine.
+1. ~~superseded~~ **Approver inbox query** — `listLeave()` and the withdrawal reader have no by-approver filter, so
    "waiting on me" needs a query joining `hr_leave_request` / `hr_withdrawal` to
    `hr_employees.reporting_manager_id`. Existing tables; no migration. Unblocks a real approvals surface.
 2. **Projects table** — migration, then a `project_id` on `employee_tasks`. Unblocks project grouping,
