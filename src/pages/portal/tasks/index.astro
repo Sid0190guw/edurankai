@@ -40,10 +40,54 @@
 // The card's <details> still carries the summary (description, the blocked or cancelled reason, who
 // assigned it, when it last moved), so the common questions are answered without leaving the board
 // at all — the link is for the conversation and the collaborators, which only the detail page has.
+//
+// =================================================================================================
+// ASSIGNING WORK. The disclosure above the board is createTask()'s first and only caller.
+// =================================================================================================
+//
+// WHY IT IS HERE AND NOT ON A PAGE OF ITS OWN. Until this form existed, employee_tasks had no
+// reachable INSERT anywhere in the repository: the engine, the ten-state graph, the collaborator
+// roles and eleven components were all correct and the table could only ever be empty, so every task
+// widget rendered a truthful empty state forever and an intern opening Tasks saw nothing. The board
+// is where somebody already is when they think "and X needs to do Y", so the form is a <details>
+// shut by default at the top of it rather than a second screen to navigate to. Shut, it costs one
+// 44px row; the columns are not pushed down by a form nobody is filling in right now.
+//
+// WHO MAY BE ASSIGNED TO, AND WHY THE LIST IS THIS SHORT. createTask() authorises three routes and
+// re-derives every one of them inside its own INSERT ... SELECT, against the TARGET's row:
+//
+//     e.user_id = the assigner            -- themselves; self-assigned work is ordinary
+//  OR e.reporting_manager_id = the assigner  -- their own reports (this column holds a USERS id)
+//  OR e.department_id = scopeDepartmentId    -- present ONLY when the caller passes that scope
+//
+// and its own doc says `scopeDepartmentId` is the department-head route and must come from
+// gate.scopeDepartmentId — which workspace-access.ts populates for role === 'department_head' and
+// leaves null for everyone else. So "their own department" here means THE DEPARTMENT THEY LEAD, and
+// this page builds its dropdown from exactly those three routes and passes exactly that scope.
+//
+// The wider reading was considered and rejected: passing the actor's OWN hr_employees.department_id
+// as scopeDepartmentId would let any employee put work on any colleague's list, which is a rights
+// model this page would be inventing on top of the engine's — and the second copy is always the one
+// nobody remembers to update. If assigning across a department without leading it is wanted, it
+// belongs in employee-tasks.ts next to the other three routes, not in a dropdown here.
+//
+// Somebody with no reports and no department to lead therefore sees exactly one option: themselves.
+// That is honest — self-assigned work is real work and it puts real rows on their board — and it is
+// what the engine will actually accept from them.
+//
+// THE OPTIONS ARE NOT THE CHECK. The dropdown is drawn from a query, and a query result is a
+// suggestion; the POST handler re-asks the database whether this actor may assign to the id that
+// arrived, over the same scope fragment, BEFORE createTask() is called — and createTask() then
+// re-derives it a third time inside the INSERT itself. A posted assignee outside the scope is
+// refused in words and the refusal is audited. That is the same rule as every other write here.
 import '@/styles/workforce.css';
+import { db } from '@/lib/db';
+import { sql, type SQL } from 'drizzle-orm';
+import { logAudit } from '@/lib/audit';
 import {
   requireEmployee,
   requireTeamLead,
+  DEPARTMENT_COVERAGE_NOTICE,
 } from '@/lib/auth/workspace-access';
 import {
   TASK_STATUSES,
@@ -53,6 +97,8 @@ import {
   isTaskStatus,
   listBoard,
   moveTask,
+  createTask,
+  ensureTaskSchema,
   type TaskStatus,
   type TaskPriority,
   type BoardTask,
@@ -63,6 +109,11 @@ import TaskCard from '@/components/workforce/TaskCard.astro';
 import EmptyState from '@/components/workforce/EmptyState.astro';
 
 const user = Astro.locals.user as any;
+
+// postgres-js resolves to a plain array, never a { rows } object. Declared before everything that
+// uses it: `const` is not hoisted, and a handler reaching a later declaration has taken pages down
+// in this repo before.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
 // ---------------------------------------------------------------------------------------------
 // GATE FIRST. Nobody unresolvable sees a board.
@@ -92,6 +143,14 @@ const myEmployeeId = gate.ok
   ? gate.workspace.employeeId
   : (leadGate && leadGate.ok && leadGate.workspace ? leadGate.workspace.employeeId : null);
 const viewerName = String(user?.name || user?.email || '').trim();
+
+// The department a lead may assign into, FROM THE SESSION and nowhere else. workspace-access.ts
+// populates it for role === 'department_head' only and leaves it null for everyone else, so the
+// department route below simply is not in the statement for anybody else — there is no ?department=
+// to try and no wider scope a form field can ask for.
+const scopeDepartmentId = gate.ok
+  ? gate.scopeDepartmentId
+  : (leadGate && leadGate.ok ? leadGate.scopeDepartmentId : null);
 
 // ---------------------------------------------------------------------------------------------
 // EVERY const BELOW IS DECLARED ABOVE THE POST HANDLER. `const` is not hoisted; a handler that
@@ -177,6 +236,9 @@ const boardUrl = (over: any = {}): string => {
 
   if (over.msg) p.set('msg', String(over.msg).slice(0, 300));
   if (over.bad) p.set('bad', '1');
+  // The task that was just created, so the confirmation can offer to open it. Only ever set by the
+  // assign redirect and never carried onward by a filter change — it describes one moment.
+  if (over.made) p.set('made', String(over.made).slice(0, 64));
 
   const s = p.toString();
   return s ? '/portal/tasks?' + s : '/portal/tasks';
@@ -184,6 +246,83 @@ const boardUrl = (over: any = {}): string => {
 
 /** Declared before the handler that uses it, and before the JSX that uses it. */
 const selfUrl = boardUrl({});
+
+// ---------------------------------------------------------------------------------------------
+// WHO THIS PERSON MAY PUT WORK ON. One fragment, used by the dropdown AND by the handler.
+//
+// It is a single definition on purpose. A page that lists people with one query and then checks a
+// submission with a differently-worded second one has two rights models, and the day they drift the
+// narrower one is the dropdown — which is the half nobody tests, because the wrong option is simply
+// never clicked. Here the SELECT that draws the options and the SELECT that authorises the POST are
+// the same text with a different projection.
+//
+// It mirrors createTask()'s own WHERE clause, and deliberately cannot be wider than it: the lead
+// route appears only when the SESSION carries a department scope, which is exactly the value passed
+// to createTask() as `scopeDepartmentId`. Every comparison is ::text — reporting_manager_id holds a
+// USERS id, department_id is a varchar(50) slug in src/lib/db/schema.ts and a UUID in
+// db/hr-schema.sql, and a ::uuid cast would throw on half the estate rather than return no rows.
+//
+// An unresolvable viewer compiles to `false`: nobody, never everybody.
+const assignLeadClause: SQL = scopeDepartmentId
+  ? sql`OR e.department_id::text = ${scopeDepartmentId}`
+  : sql``;
+
+const assignableScope: SQL = viewerUserId
+  ? sql`(e.user_id::text = ${viewerUserId}
+      OR e.reporting_manager_id::text = ${viewerUserId}
+      ${assignLeadClause})`
+  : sql`false`;
+
+/**
+ * May this actor put work on this employee, and what is that person called?
+ *
+ * Returns null when the QUESTION COULD NOT BE ASKED — the column is missing, the database blinked —
+ * which is a different fact from "no", and the handler says a different sentence for it. Treating a
+ * failed check as a refusal would be tolerable; treating it as permission would not, and returning
+ * a bare boolean is how the second one eventually happens.
+ *
+ * ensureTaskSchema() first because this query NAMES reporting_manager_id, which is ALTERed in by
+ * that ensure block and by two admin pages, and a query that names an absent column throws where a
+ * SELECT * would not. That is the work_email failure exactly.
+ */
+const checkAssignable = async (employeeId: string): Promise<{ ok: boolean; name: string } | null> => {
+  const id = String(employeeId || '').trim();
+  if (!id || !viewerUserId) return { ok: false, name: '' };
+  try {
+    await ensureTaskSchema();
+    const r = rowsOf(await db.execute(sql`
+      SELECT e.full_name
+        FROM hr_employees e
+       WHERE e.id::text = ${id}
+         AND e.is_active = true
+         AND ${assignableScope}
+       LIMIT 1`))[0];
+    if (!r) return { ok: false, name: '' };
+    return { ok: true, name: String(r.full_name || '').trim() };
+  } catch (e: any) {
+    // Never a bare catch. The real Postgres reason is on e.cause; e.message is only the SQL.
+    console.error('[portal/tasks] assignable check', e?.cause?.message || e?.message);
+    return null;
+  }
+};
+
+// ---------------------------------------------------------------------------------------------
+// WHAT THE ASSIGN FORM IS HOLDING. Declared above the handler that writes them and above the JSX
+// that reads them.
+//
+// A REFUSED ASSIGNMENT RE-RENDERS; IT DOES NOT REDIRECT. Every other write on this page is
+// POST-redirect-GET, which is right for a move (two fields, both re-choosable in a second) and
+// wrong for a form somebody has just typed four thousand characters of brief into: the query string
+// cannot carry it, so a redirect would throw their words away to protect them from a double-submit
+// that a refused create cannot cause — nothing was written. SUCCESS still redirects, which is what
+// makes a refresh unable to create the task twice.
+let assignError = '';
+let assignOpen = false;
+let assignTitle = '';
+let assignDescription = '';
+let assignWho = '';
+let assignPriority = 'normal';
+let assignDue = '';
 
 // ---------------------------------------------------------------------------------------------
 // THE WRITES. Two actions: move a task, or change a display preference. Both POST, both redirect.
@@ -198,6 +337,9 @@ if (Astro.request.method === 'POST') {
 
   let msg = '';
   let bad = 1;
+  // Set only by the assign branch, and only when nothing was written. It suppresses the redirect at
+  // the end of this block so the page renders with the form still filled in and the reason showing.
+  let renderInstead = false;
 
   try {
     const fd = await Astro.request.formData();
@@ -218,48 +360,147 @@ if (Astro.request.method === 'POST') {
       return Astro.redirect(selfUrl);
     }
 
-    if (action !== 'move') {
-      return Astro.redirect(selfUrl);
+    // ---- assign ---------------------------------------------------------------------------
+    // The one caller createTask() has. Everything typed is echoed back into the form on a refusal,
+    // so nothing here throws somebody's brief away to report a missing title.
+    if (action === 'assign') {
+      assignTitle = String(fd.get('title') || '').trim().slice(0, 300);
+      assignDescription = String(fd.get('description') || '').trim().slice(0, 4000);
+      assignWho = String(fd.get('assignee') || '').trim().slice(0, 64);
+      assignDue = String(fd.get('due') || '').trim().slice(0, 20);
+      const wantedPrio = String(fd.get('priority') || '').trim().toLowerCase();
+      assignPriority = (TASK_PRIORITIES as string[]).indexOf(wantedPrio) >= 0 ? wantedPrio : 'normal';
+      assignOpen = true;
+
+      if (assignTitle.length < 3) {
+        // The engine refuses this too. It is checked here as well so the person is told before a
+        // round trip, not instead of one.
+        assignError = 'Give the task a title of at least three characters. It is the only thing the person picking this up will see first.';
+        renderInstead = true;
+      } else if (!assignWho) {
+        assignError = 'Choose who the task is for.';
+        renderInstead = true;
+      } else if (assignDue && !/^\d{4}-\d{2}-\d{2}$/.test(assignDue)) {
+        assignError = 'Give the due date as YYYY-MM-DD, or leave it empty.';
+        renderInstead = true;
+      } else if (wantedPrio && (TASK_PRIORITIES as string[]).indexOf(wantedPrio) < 0) {
+        assignError = 'That is not a priority we track. Pick one of the four.';
+        renderInstead = true;
+      } else {
+        // SERVER-SIDE AUTHORITY. The options this form drew are not the check: they were drawn from
+        // a query whose result is now several seconds old, on a page that may have been open since
+        // this morning, and the id in the body is whatever the browser sent. Ask the database again,
+        // over the same scope fragment, before anything is written.
+        const target = await checkAssignable(assignWho);
+
+        if (target === null) {
+          // The check did not run. Refuse and say so — an unanswered authority question is not a yes.
+          assignError = 'We could not confirm who you may assign work to just now, so nothing was created. Nothing has been lost. Try again in a moment.';
+          renderInstead = true;
+        } else if (!target.ok) {
+          // One sentence whether the record does not exist, is closed, or is simply not theirs to
+          // assign to. Probing ids must not be able to tell those apart.
+          assignError = 'You cannot assign work to that person. You can assign to yourself, to anyone HR has recorded as reporting to you, and to your department if you lead one.';
+          renderInstead = true;
+          // A posted assignee outside the scope is worth a record. It is not proof of anything on
+          // its own — a stale page reaches here honestly — but a change to who somebody can put
+          // work on is an authority question, and the refusals are the half that is never visible
+          // otherwise. No entityId: nothing was created, so there is no task to hang it on.
+          await logAudit({
+            userId: viewerUserId,
+            action: 'task.assign.refused',
+            entity: 'employee_task',
+            diff: { employeeId: assignWho, reason: 'out-of-scope' },
+            ipAddress: Astro.clientAddress,
+          });
+        } else {
+          // The engine re-derives this authority a THIRD time, inside its own INSERT ... SELECT, and
+          // audits the assignment itself through src/lib/audit.ts (action 'task.assign', with this
+          // ip). It is not logged again here: two audit rows for one assignment would be a lie about
+          // what happened.
+          const res = await createTask({
+            employeeId: assignWho,
+            assignedByUserId: viewerUserId,
+            title: assignTitle,
+            description: assignDescription || null,
+            priority: assignPriority as TaskPriority,
+            dueOn: assignDue || null,
+            // The department-head route, from the session. Null for everyone else, and then the
+            // clause is not in createTask's statement at all.
+            scopeDepartmentId,
+            status: 'assigned',
+            ipAddress: Astro.clientAddress,
+          });
+
+          if (res.ok) {
+            // REDIRECT ON SUCCESS, so a refresh re-loads the board instead of creating the task a
+            // second time. `made` carries the new id for the confirmation link and is dropped by the
+            // next navigation.
+            const named = target.name || 'them';
+            return Astro.redirect(boardUrl({
+              msg: 'Assigned to ' + named + '.',
+              bad: 0,
+              made: res.id || '',
+            }));
+          }
+
+          assignError = res.error || 'Could not create that task.';
+          renderInstead = true;
+        }
+      }
     }
 
     // ---- move ---------------------------------------------------------------------------
-    const taskId = String(fd.get('task_id') || '').trim();
-    const rawTo = String(fd.get('to') || '').trim();
-    const reason = String(fd.get('reason') || '').trim();
-    // canonicalStatus() rather than a list restated here: one vocabulary, owned by the engine.
-    const to = canonicalStatus(rawTo);
+    // An `else if`, not a fall-through: a refused assignment must not then be read as a move with no
+    // task_id and reported as "that task is not available", which is a sentence about a task nobody
+    // touched. Anything that is neither is an action this page does not have, and nothing was
+    // changed, so nothing is said.
+    if (action === 'move') {
+      const taskId = String(fd.get('task_id') || '').trim();
+      const rawTo = String(fd.get('to') || '').trim();
+      const reason = String(fd.get('reason') || '').trim();
+      // canonicalStatus() rather than a list restated here: one vocabulary, owned by the engine.
+      const to = canonicalStatus(rawTo);
 
-    if (!taskId) {
-      msg = 'That task is not available.';
-    } else if (!rawTo) {
-      // Distinct from an unknown status. Somebody who pressed Move without choosing needs telling
-      // what to do, not telling that they typed something invalid.
-      msg = 'Pick where to move it, then press Move.';
-    } else if (!to) {
-      msg = 'That is not a status we track.';
-    } else {
-      // The engine validates the edge, the role and the required reason, and re-derives the
-      // authorising role inside the UPDATE. This page adds no checks of its own and overrides none.
-      const res = await moveTask(taskId, viewerUserId, to, {
-        reason,
-        ipAddress: Astro.clientAddress,
-      });
-      if (res.ok) {
-        bad = 0;
-        msg = res.changed === false
-          ? 'That task was already there, so nothing changed.'
-          : 'Moved to ' + (STATUS_LABELS[to] || to) + '.';
+      if (!taskId) {
+        msg = 'That task is not available.';
+      } else if (!rawTo) {
+        // Distinct from an unknown status. Somebody who pressed Move without choosing needs telling
+        // what to do, not telling that they typed something invalid.
+        msg = 'Pick where to move it, then press Move.';
+      } else if (!to) {
+        msg = 'That is not a status we track.';
       } else {
-        msg = res.error || 'Could not move that task.';
+        // The engine validates the edge, the role and the required reason, and re-derives the
+        // authorising role inside the UPDATE. This page adds no checks of its own and overrides none.
+        const res = await moveTask(taskId, viewerUserId, to, {
+          reason,
+          ipAddress: Astro.clientAddress,
+        });
+        if (res.ok) {
+          bad = 0;
+          msg = res.changed === false
+            ? 'That task was already there, so nothing changed.'
+            : 'Moved to ' + (STATUS_LABELS[to] || to) + '.';
+        } else {
+          msg = res.error || 'Could not move that task.';
+        }
       }
+    } else if (!renderInstead) {
+      return Astro.redirect(selfUrl);
     }
   } catch (e: any) {
     // Never a bare catch. The real Postgres reason lives on e.cause; e.message is only the SQL.
     console.error('[portal/tasks] post', e?.cause?.message || e?.message);
     msg = 'Could not do that just now. Nothing was changed. Try again in a moment.';
+    // An exception is not a refusal the form can explain, so it is reported the ordinary way rather
+    // than left sitting under the assign disclosure.
+    renderInstead = false;
   }
 
-  return Astro.redirect(boardUrl({ msg, bad: bad ? 1 : 0 }));
+  // The assign branch renders instead of redirecting so nothing typed is thrown away. Everything
+  // else on this page is POST-redirect-GET.
+  if (!renderInstead) return Astro.redirect(boardUrl({ msg, bad: bad ? 1 : 0 }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -299,6 +540,80 @@ if (mayUse) {
 }
 
 const truncated = boardOk && allTasks.length >= BOARD_LIMIT;
+
+// ---------------------------------------------------------------------------------------------
+// THE ASSIGN ROSTER. The same scope fragment the handler authorises with, projected for a dropdown.
+//
+// It is read whether or not the board read succeeded: being unable to see the board is no reason to
+// be unable to give somebody a job, and the two failures are independent.
+//
+// Three columns, and not one more. The portal's older employee lookups do SELECT *, which drags
+// gender, Aadhaar, PAN and bank details into the render context of a page that shows none of them —
+// `gender` is the exact column read in the 2026-08-02 breach. A picker needs an id, a name, and
+// enough to tell two people with the same name apart.
+const ASSIGN_ROSTER_LIMIT = 200;
+
+let assignRosterOk = false;
+let assignRosterTruncated = false;
+const assignPeople: any[] = [];
+
+if (mayUse) {
+  try {
+    // NAMES reporting_manager_id, so the ensure block that ALTERs it in runs first. See
+    // checkAssignable() for why a query that names an absent column is a different animal from one
+    // that does not.
+    await ensureTaskSchema();
+    const roster = rowsOf(await db.execute(sql`
+      SELECT e.id::text AS id,
+             e.full_name,
+             e.designation,
+             (e.user_id::text = ${viewerUserId}) AS is_me,
+             (e.reporting_manager_id::text = ${viewerUserId}) AS is_report
+        FROM hr_employees e
+       WHERE e.is_active = true
+         AND ${assignableScope}
+       ORDER BY e.full_name ASC
+       LIMIT ${ASSIGN_ROSTER_LIMIT}`));
+
+    assignRosterOk = true;
+    assignRosterTruncated = roster.length >= ASSIGN_ROSTER_LIMIT;
+
+    for (const r of roster) {
+      const id = String(r.id || '').trim();
+      if (!id) continue;
+      assignPeople.push({
+        id,
+        // A name is not a permission and its absence is not an error. Never render a bare UUID.
+        name: String(r.full_name || '').trim() || 'Name not recorded',
+        designation: String(r.designation || '').trim(),
+        // is_me and is_report come back NULL when the underlying column is NULL, so both are tested
+        // for an explicit true. The order matters: somebody can be both your report and in the
+        // department you lead, and they are listed once, under the closer relationship.
+        relation: r.is_me === true ? 'me' : (r.is_report === true ? 'report' : 'dept'),
+      });
+    }
+  } catch (e: any) {
+    // The form is a convenience; losing it must not lose the board. It fails CLOSED and says so
+    // rather than drawing an empty dropdown that reads as "there is nobody you can assign to".
+    console.error('[portal/tasks] assign roster', e?.cause?.message || e?.message);
+    assignRosterOk = false;
+  }
+}
+
+// Grouped for the dropdown's optgroups, so the list says WHY each person is on it. Plain arrays
+// filtered here rather than a map indexed inside the template — a Record<string,string> read from
+// JSX is a known parser trap in .astro files here.
+const assignMine = assignPeople.filter((p: any) => p.relation === 'me');
+const assignReports = assignPeople.filter((p: any) => p.relation === 'report');
+const assignDept = assignPeople.filter((p: any) => p.relation === 'dept');
+
+/** Name, plus the designation when there is one — two colleagues can share a name. */
+const personLabel = (p: any): string => (p.designation ? p.name + ', ' + p.designation : p.name);
+
+const assignPrioOptions = (TASK_PRIORITIES as string[]).map((p) => ({
+  value: p,
+  label: p.charAt(0).toUpperCase() + p.slice(1),
+}));
 
 // The people on this board — derived from its own rows, so this dropdown can never name somebody the
 // viewer is not already entitled to see.
@@ -382,6 +697,13 @@ const prioOptions = [{ value: '', label: 'Any priority' }].concat(
 const flash = String(params.get('msg') || '').slice(0, 300);
 const flashBad = params.get('bad') === '1';
 
+// The task the assign form just created, if this render followed that redirect. Validated as a UUID
+// before it is allowed anywhere near an href: it arrives in a query string, and a link built from
+// unvalidated request text is a link somebody else can choose the destination of.
+const rawMade = String(params.get('made') || '').trim();
+const madeId = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(rawMade)
+  ? rawMade : '';
+
 const filterSummary = totalShown + (totalShown === 1 ? ' task' : ' tasks')
   + (overdueShown > 0 ? ', ' + overdueShown + ' past their date' : '');
 ---
@@ -422,7 +744,10 @@ const filterSummary = totalShown + (totalShown === 1 ? ' task' : ' tasks')
           : <path d="m8.2 12.3 2.6 2.6 5-5.4"/>}
       </svg>
       <span class="wf-sr-only">{flashBad ? 'Not done. ' : 'Done. '}</span>
-      <span class="note__text">{flash}</span>
+      <span class="note__text">
+        {flash}
+        {madeId && <a class="link wf-focusable note__link" href={'/portal/tasks/' + madeId}>Open the task</a>}
+      </span>
     </p>
   )}
 
@@ -440,6 +765,168 @@ const filterSummary = totalShown + (totalShown === 1 ? ' task' : ' tasks')
         ? 'We could not work out who is asking, so no board is shown. Sign in again and reload this page.'
         : 'The board could not be loaded just now, so this is not a list of your work. Nothing has been lost. Reload in a moment, and tell HR if it keeps happening.'}
     </p>
+  )}
+
+  {/* ASSIGNING WORK. Shut by default, so it costs one row of the board rather than a column of it,
+      and OUTSIDE the boardOk branch on purpose: a board that could not be read is no reason to stop
+      somebody handing out a job. It re-opens by itself when a submission was refused, with what they
+      typed still in the fields — see the note on renderInstead above. No script anywhere in it: a
+      <details>, a <form method="POST">, and the page it posts to is this one. */}
+  {mayUse && (
+    <details class="asn" open={assignOpen}>
+      <summary class="asn__summary wf-focusable">
+        <svg class="asn__plus" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14"/><path d="M5 12h14"/>
+        </svg>
+        <span class="asn__summarytext">Assign a task</span>
+        <svg class="asn__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="m7 10 5 5 5-5"/>
+        </svg>
+      </summary>
+
+      <div class="asn__panel">
+        {assignError && (
+          <p class="note asn__err" role="alert" data-wf-tone="danger">
+            <span class="wf-sr-only">Not done. </span>{assignError}
+          </p>
+        )}
+
+        {!assignRosterOk && (
+          <p class="note" data-wf-tone="danger">
+            We could not work out who you can give work to just now, so this form is not shown and
+            nothing has been lost. Reload in a moment, and tell HR if it keeps happening.
+          </p>
+        )}
+
+        {assignRosterOk && assignPeople.length === 0 && (
+          <p class="note" data-wf-tone="info">
+            There is nobody here to choose from. This form offers the people your own record reaches:
+            yourself, anyone HR has recorded as reporting to you, and the department you lead. Ask HR
+            to link your employee record to this sign-in, or to record your reporting line, then
+            reload this page.
+          </p>
+        )}
+
+        {assignRosterOk && assignPeople.length > 0 && (
+          <form class="asn__form" method="POST" action={selfUrl}>
+            <input type="hidden" name="action" value="assign"/>
+
+            <div class="asn__field">
+              <label class="asn__label" for="asn-title">What needs doing</label>
+              <input
+                class="asn__input"
+                id="asn-title"
+                type="text"
+                name="title"
+                value={assignTitle}
+                required
+                minlength="3"
+                maxlength="300"
+                autocomplete="off"
+                placeholder="Write the outcome, not the activity"
+              />
+            </div>
+
+            <div class="asn__field">
+              <label class="asn__label" for="asn-who">Who it is for</label>
+              {/* Built from the roster query and nothing else, and grouped so the list says why each
+                  person is on it. A control that exists only to be refused teaches people the system
+                  is broken — and the handler re-asks the database anyway. */}
+              <select class="asn__input" id="asn-who" name="assignee" required>
+                <option value="">Choose a person</option>
+                {assignMine.length > 0 && (
+                  <optgroup label="You">
+                    {assignMine.map((p: any) => (
+                      <option value={p.id} selected={assignWho === p.id}>{p.name + ' (you)'}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {assignReports.length > 0 && (
+                  <optgroup label="Reports to you">
+                    {assignReports.map((p: any) => (
+                      <option value={p.id} selected={assignWho === p.id}>{personLabel(p)}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {assignDept.length > 0 && (
+                  <optgroup label="The department you lead">
+                    {assignDept.map((p: any) => (
+                      <option value={p.id} selected={assignWho === p.id}>{personLabel(p)}</option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+            </div>
+
+            <div class="asn__pair">
+              <div class="asn__field">
+                <label class="asn__label" for="asn-prio">Priority</label>
+                <select class="asn__input" id="asn-prio" name="priority">
+                  {assignPrioOptions.map((o: any) => (
+                    <option value={o.value} selected={assignPriority === o.value}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div class="asn__field">
+                <label class="asn__label" for="asn-due">Due date</label>
+                {/* type="date" on a phone, a plain text box on anything that does not know it — the
+                    pattern is there for exactly that fallback, and the handler validates the shape
+                    again regardless. Optional: a date nobody agreed is worse than no date. */}
+                <input
+                  class="asn__input"
+                  id="asn-due"
+                  type="date"
+                  name="due"
+                  value={assignDue}
+                  pattern="[0-9]{4}-[0-9]{2}-[0-9]{2}"
+                  placeholder="YYYY-MM-DD"
+                />
+              </div>
+            </div>
+
+            <div class="asn__field">
+              <label class="asn__label" for="asn-desc">Detail (optional)</label>
+              <textarea
+                class="asn__input asn__area"
+                id="asn-desc"
+                name="description"
+                rows="3"
+                maxlength="4000"
+                placeholder="What done looks like, and anything they will need"
+              >{assignDescription}</textarea>
+            </div>
+
+            <div class="asn__actions">
+              <button class="asn__go wf-focusable" type="submit">Assign it</button>
+              <p class="asn__hint">
+                It lands in Assigned on their board straight away, and you become its approver.
+              </p>
+            </div>
+          </form>
+        )}
+
+        <p class="asn__scope">
+          {scopeDepartmentId
+            ? 'You can give work to yourself, to anyone HR has recorded as reporting to you, and to the department you lead.'
+            : 'You can give work to yourself and to anyone HR has recorded as reporting to you.'}
+          {' '}
+          If somebody who reports to you is missing, ask HR to set you as their reporting manager on
+          their employee record.
+        </p>
+
+        {scopeDepartmentId && <p class="asn__scope">{DEPARTMENT_COVERAGE_NOTICE}</p>}
+
+        {assignRosterTruncated && (
+          <p class="note" data-wf-tone="info">
+            Showing the first {ASSIGN_ROSTER_LIMIT} people. There are more than this, so somebody you
+            are looking for may not be in the list.
+          </p>
+        )}
+      </div>
+    </details>
   )}
 
   {mayUse && boardOk && (
@@ -805,6 +1292,133 @@ const filterSummary = totalShown + (totalShown === 1 ? ' task' : ' tasks')
   .tally__late { font-weight: 650; color: var(--wf-tone-text); }
 
   .filters { margin: var(--wf-s-3) var(--wf-s-4) 0; }
+
+  /* ------------------------------------------------------------ assign form */
+
+  /* Every value here is a token. The disclosure is one 44px row shut, so the columns start where
+     they started before this form existed. */
+  .asn {
+    display: block;
+    margin: var(--wf-s-3) var(--wf-s-4) 0;
+    border: 1px solid var(--wf-line);
+    border-radius: var(--wf-r-md);
+    background: var(--wf-surface);
+  }
+
+  .asn__summary {
+    display: flex;
+    align-items: center;
+    gap: var(--wf-s-2);
+    min-height: var(--wf-touch);
+    padding: var(--wf-s-2) var(--wf-s-3);
+    color: var(--wf-ink);
+    font-size: var(--wf-t-body);
+    font-weight: 650;
+    cursor: pointer;
+    /* The platform triangle cannot be sized, coloured or positioned; the caret is the replacement
+       and it rotates to report the state. */
+    list-style: none;
+    user-select: none;
+  }
+  .asn__summary::-webkit-details-marker { display: none; }
+  .asn__summary:active { opacity: 0.7; }
+  .asn__summarytext { flex: 1 1 auto; min-width: 0; }
+  .asn__plus, .asn__caret { width: 16px; height: 16px; flex: 0 0 auto; color: var(--wf-ink-3); }
+  .asn[open] > .asn__summary .asn__caret { transform: rotate(180deg); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .asn__caret { transition: transform var(--wf-dur-state) var(--wf-ease); }
+  }
+
+  .asn__panel { padding: var(--wf-s-3); border-top: 1px solid var(--wf-line); }
+  /* .note is written for the page margin; inside the panel it is already inset. */
+  .asn__panel .note { margin: 0 0 var(--wf-s-3); }
+
+  .asn__form { display: block; }
+  .asn__field { min-width: 0; margin-bottom: var(--wf-s-3); }
+
+  .asn__label {
+    display: block;
+    margin-bottom: var(--wf-s-1);
+    font-size: var(--wf-t-micro);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--wf-ink-3);
+  }
+
+  .asn__input {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    min-height: var(--wf-touch);
+    padding: var(--wf-s-2) var(--wf-s-3);
+    border: 1px solid var(--wf-line-strong);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-raised);
+    color: var(--wf-ink);
+    font-family: inherit;
+    /* 16px, so iOS Safari does not zoom the whole board when a field takes focus. */
+    font-size: 1rem;
+    line-height: 1.4;
+  }
+  .asn__input:focus-visible {
+    outline: 2px solid var(--wf-focus);
+    outline-offset: 1px;
+    border-color: var(--wf-focus);
+  }
+
+  .asn__area { min-height: calc(var(--wf-touch) * 1.8); line-height: 1.5; resize: vertical; }
+
+  /* One column at 360px, where two would put a date picker in 150px. Two only when there is room
+     for both to stay tappable. */
+  .asn__pair { display: grid; grid-template-columns: 1fr; gap: 0 var(--wf-s-3); }
+
+  .asn__actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--wf-s-3);
+  }
+
+  .asn__go {
+    flex: 0 0 auto;
+    min-height: var(--wf-touch);
+    padding: 0 var(--wf-s-5);
+    border: 1px solid var(--wf-ink);
+    border-radius: var(--wf-r-sm);
+    background: var(--wf-ink);
+    color: var(--wf-on-solid);
+    font-family: inherit;
+    font-size: var(--wf-t-body);
+    font-weight: 650;
+    cursor: pointer;
+  }
+  .asn__go:active { opacity: 0.8; }
+
+  .asn__hint {
+    flex: 1 1 180px;
+    min-width: 0;
+    margin: 0;
+    font-size: var(--wf-t-meta);
+    color: var(--wf-ink-3);
+    line-height: 1.5;
+  }
+
+  .asn__scope {
+    margin: var(--wf-s-3) 0 0;
+    font-size: var(--wf-t-meta);
+    color: var(--wf-chrome-ink);
+    line-height: 1.6;
+  }
+
+  .note__link { margin-left: var(--wf-s-2); white-space: nowrap; }
+
+  @media (min-width: 420px) {
+    .asn__pair { grid-template-columns: 1fr 1fr; }
+  }
 
   /* --------------------------------------------------------------- prefs bar */
 
