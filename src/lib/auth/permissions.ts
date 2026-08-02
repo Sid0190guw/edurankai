@@ -179,6 +179,19 @@ const ROLE_SECTIONS: Record<string, string[]> = {
     'dashboard', 'content', 'products', 'events', 'lms', 'custom_offer',
   ],
   applicant: [],
+  // These three were ABSENT from this map, and absence means "no section filtering" — so if any of
+  // them ever reached the admin sidebar they would have seen all 108 entries, the widest view in the
+  // product, purely because nobody had written a line for them. They are confined to
+  // /aquintutor/admin by canOpenAdmin() and the middleware, so this was latent rather than live,
+  // but a gap that depends on a separate guard never being changed is not a gap worth keeping.
+  //
+  // /admin/access-preview surfaced it. That is what the page is for: an unrestricted role reads as
+  // "108 entries" on screen instead of hiding in an omission nobody would grep for.
+  //
+  // Empty means empty. Their abilities live in their own panels, never the main admin.
+  partner: [],
+  teacher: [],
+  technical_moderator: [],
 };
 
 /**
