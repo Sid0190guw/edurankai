@@ -1,0 +1,1489 @@
+---
+// The main wellness surface.
+//
+// One screen that answers three questions in order: where am I today, what usually helps in this
+// part of the month, and what have I actually logged. Everything below it is a form.
+//
+// Four decisions worth writing down.
+//
+// 1. THE GATE RUNS FIRST, BEFORE ANY QUERY. Nothing about her cycle is read until the engine has
+//    said yes. requireWellnessAccess() is exactly `(await canAccessWellness(user)).allowed`, so
+//    canAccessWellness is called here instead: it is the same single lookup, and it also returns
+//    the reason accessMessage() needs to choose its words. No gender check is written on this page.
+//    A "no" renders one calm card and nothing else - no forms, no history, no counts.
+//
+// 2. IT IS A FORM AND NOTHING ELSE. No JavaScript is shipped from this file. All three forms POST
+//    to this page, and a success redirects to a query string so a refresh cannot log the same day
+//    twice. Progressive disclosure is a native <details> through Reveal, so the depth is available
+//    with JS off, on a struggling phone, and in print.
+//
+// 3. THE PREDICTION SAYS HOW SURE IT IS, IN WORDS, NEXT TO THE DATE. The engine's own confidence
+//    and its plain-language basis are printed with the number, never a bare date. A date presented
+//    as fact when it is arithmetic on two data points is how a tool like this gets someone caught
+//    out.
+//
+// 4. MOTION IS RATIONED BY SECTION, NOT BY TASTE. Cards here are static. The symptom form, the
+//    confirmation that follows it, and every red-flag line are Tier C: they declare `animation:
+//    none; transition: none` explicitly so the stillness survives a later tidy-up. The only things
+//    that move on this page are the Reveal chevrons, which are chrome.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import '@/styles/wellness.css';
+import Card from '@/components/wellness/Card.astro';
+import Metric from '@/components/wellness/Metric.astro';
+import Ring from '@/components/wellness/Ring.astro';
+import Reveal from '@/components/wellness/Reveal.astro';
+import Notice from '@/components/wellness/Notice.astro';
+import EmptyState from '@/components/wellness/EmptyState.astro';
+import Icon from '@/components/wellness/Icon.astro';
+import type { RedFlag, CycleOverview, SymptomRow } from '@/lib/wellness';
+import {
+  canAccessWellness,
+  accessMessage,
+  cycleOverview,
+  listSymptoms,
+  logCycleStart,
+  setCycleEnd,
+  logSymptom,
+  matchRedFlags,
+  cycleGaps,
+  parseDay,
+  daysBetween,
+  today,
+  ymd,
+  DEFAULT_CYCLE_DAYS,
+  MIN_PLAUSIBLE_CYCLE_DAYS,
+  MAX_PLAUSIBLE_CYCLE_DAYS,
+  FLOW_OPTIONS,
+  SYMPTOM_OPTIONS,
+  SEVERITY_LABELS,
+  RED_FLAGS,
+  RED_FLAG_INTRO,
+  RED_FLAG_FOOTER,
+  NOT_MEDICAL_ADVICE,
+} from '@/lib/wellness';
+
+// --- constants and helpers. Every one of them is declared before the POST handler below. -------
+
+const PAGE_PATH = '/portal/wellness';
+const CONSULT_PATH = '/portal/wellness/consult';
+const MAX_NOTE = 2000;
+const TODAY_YMD = ymd(today());
+
+// Chart geometry. Plain numbers, because they are geometry rather than design values.
+const CHART_W = 320;
+const CHART_H = 92;
+const CHART_BASE = 74;
+const CHART_TOP = 12;
+const CHART_GAPS_SHOWN = 8;
+
+function fmtDay(day: string): string {
+  if (!day) return '';
+  try {
+    // UTC on purpose: the engine hands back date-only strings, and rendering them in the server's
+    // local zone would slide a date backwards by a day west of Greenwich.
+    return new Date(day + 'T00:00:00Z').toLocaleDateString('en-GB', {
+      timeZone: 'UTC',
+      day: 'numeric',
+      month: 'long',
+      year: 'numeric',
+    });
+  } catch {
+    return day;
+  }
+}
+
+function fmtDayShort(day: string): string {
+  if (!day) return '';
+  try {
+    return new Date(day + 'T00:00:00Z').toLocaleDateString('en-GB', {
+      timeZone: 'UTC',
+      day: 'numeric',
+      month: 'short',
+    });
+  } catch {
+    return day;
+  }
+}
+
+function dayWord(n: number): string {
+  return Math.abs(n) === 1 ? 'day' : 'days';
+}
+
+function flowLabel(v: string | null): string {
+  if (v === 'spotting') return 'Spotting';
+  if (v === 'light') return 'Light';
+  if (v === 'medium') return 'Medium';
+  if (v === 'heavy') return 'Heavy';
+  return '';
+}
+
+function severityLabel(n: number): string {
+  const i = Math.max(1, Math.min(3, Math.round(n)));
+  return SEVERITY_LABELS[i] || 'Mild';
+}
+
+function severityHint(n: number): string {
+  if (n === 3) return 'Hard to work around';
+  if (n === 2) return 'In the way, still manageable';
+  return 'There, not in the way';
+}
+
+function confidenceWord(c: string): string {
+  if (c === 'high') return 'High';
+  if (c === 'medium') return 'Moderate';
+  return 'Low';
+}
+
+function confidenceSentence(c: string): string {
+  if (c === 'high') {
+    return 'Confidence in this date is high. Your recent cycles have been close enough to each other that it usually lands within a day or two.';
+  }
+  if (c === 'medium') {
+    return 'Confidence in this date is moderate. Take it as a few days either side rather than as a fixed day.';
+  }
+  return 'Confidence in this date is low. It is a rough guide, not something to plan around.';
+}
+
+function phaseWord(p: string): string {
+  if (p === 'menstrual') return 'Bleeding';
+  if (p === 'follicular') return 'Building up';
+  if (p === 'ovulatory') return 'Around ovulation';
+  if (p === 'luteal') return 'Before your period';
+  return 'Not enough logged yet';
+}
+
+function urgencyWord(u: string): string {
+  return u === 'same_day' ? 'Today' : 'This week';
+}
+
+/** Inclusive length of a closed period, or null while it is still open. */
+function periodLength(startedOn: string, endedOn: string | null): number | null {
+  if (!endedOn) return null;
+  const s = parseDay(startedOn);
+  const e = parseDay(endedOn);
+  if (!s || !e) return null;
+  return daysBetween(s, e) + 1;
+}
+
+// --- who is asking ------------------------------------------------------------------------------
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PAGE_PATH));
+
+// THE GATE. Server-side, from the employee record, before a single row of her cycle is read.
+const access = await canAccessWellness(user);
+const denied = access.allowed ? null : accessMessage(access.reason);
+
+// --- POST ---------------------------------------------------------------------------------------
+
+let errMsg = '';
+let errForm = '';
+let postFlags: RedFlag[] = [];
+let keptStart = TODAY_YMD;
+let keptFlow = '';
+let keptStartNotes = '';
+let keptSymptom = '';
+let keptSeverity = 1;
+let keptNote = '';
+let keptOn = TODAY_YMD;
+
+if (access.allowed && Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const intent = String(fd.get('intent') || '');
+
+    if (intent === 'start') {
+      errForm = 'start';
+      keptStart = String(fd.get('started_on') || '').trim() || TODAY_YMD;
+      keptFlow = String(fd.get('flow') || '').trim();
+      keptStartNotes = String(fd.get('notes') || '').slice(0, MAX_NOTE);
+      const result = await logCycleStart(user.id, {
+        startedOn: keptStart,
+        flow: keptFlow || null,
+        notes: keptStartNotes.trim() || null,
+      });
+      if (result.ok) return Astro.redirect(PAGE_PATH + '?logged=start#today');
+      errMsg = result.error || 'That did not save. Please try once more.';
+    } else if (intent === 'end') {
+      errForm = 'end';
+      const cycleId = String(fd.get('cycle_id') || '').trim();
+      const endedOn = String(fd.get('ended_on') || '').trim();
+      if (!cycleId) {
+        errMsg = 'There is no open period to close off just now.';
+      } else {
+        const result = await setCycleEnd(user.id, cycleId, endedOn || null);
+        if (result.ok) return Astro.redirect(PAGE_PATH + '?logged=end#history');
+        errMsg = result.error || 'That did not save. Please try once more.';
+      }
+    } else if (intent === 'symptom') {
+      errForm = 'symptom';
+      keptSymptom = String(fd.get('symptom') || '').trim();
+      keptSeverity = Math.max(1, Math.min(3, Math.round(Number(fd.get('severity')) || 1)));
+      keptNote = String(fd.get('note') || '').slice(0, MAX_NOTE);
+      keptOn = String(fd.get('logged_on') || '').trim() || TODAY_YMD;
+      const result = await logSymptom(user.id, {
+        loggedOn: keptOn,
+        symptom: keptSymptom,
+        severity: keptSeverity,
+        note: keptNote || null,
+      });
+      if (result.ok && result.id) {
+        return Astro.redirect(PAGE_PATH + '?noted=' + encodeURIComponent(result.id) + '#symptom');
+      }
+      // It did not save. Keep what she typed, and still show the doctor lines if any matched.
+      errMsg = result.error || 'That did not save. Please try once more.';
+      postFlags = result.redFlags || [];
+    }
+  } catch (e: any) {
+    console.error('[wellness] main page:', e?.cause?.message || e?.message);
+    errMsg = 'That did not save. Please try once more.';
+  }
+}
+
+// --- GET ------------------------------------------------------------------------------------------
+
+let overview: CycleOverview | null = null;
+let symptoms: SymptomRow[] = [];
+
+if (access.allowed) {
+  const [ov, sy] = await Promise.all([
+    cycleOverview(user.id),
+    listSymptoms(user.id, 120, 60),
+  ]);
+  overview = ov;
+  symptoms = sy;
+}
+
+const loggedParam = (Astro.url.searchParams.get('logged') || '').trim();
+const notedParam = (Astro.url.searchParams.get('noted') || '').trim();
+
+// The confirmation re-reads the row through the owner-scoped list, so an id edited into the URL
+// finds nothing rather than finding somebody else's note.
+const notedRow = notedParam ? symptoms.find((s) => s.id === notedParam) || null : null;
+const notedFlags = notedRow ? matchRedFlags(notedRow.symptom + ' ' + (notedRow.note || '')) : [];
+const careFlags = notedFlags.length ? notedFlags : postFlags;
+
+// Consts, not lets, so the narrowing survives into the .map() callbacks below.
+const cycles = overview ? overview.cycles : [];
+const guidance = overview ? overview.guidance : null;
+const prediction = overview ? overview.prediction : null;
+const avgCycle = overview ? overview.averageCycleDays : null;
+const avgPeriod = overview ? overview.averagePeriodDays : null;
+const dayOfCycle = overview ? overview.dayOfCycle : null;
+const cyclesLogged = overview ? overview.cyclesLogged : 0;
+const phase = overview ? overview.phase : 'unknown';
+
+const openCycle = cycles.find((c) => !c.endedOn) || null;
+const ringMax = avgCycle || DEFAULT_CYCLE_DAYS;
+
+const nextDate = prediction && prediction.nextStart ? parseDay(prediction.nextStart) : null;
+const daysToNext = nextDate ? daysBetween(today(), nextDate) : null;
+
+// The chart: recent start-to-start gaps, implausible ones already removed by the engine.
+const gaps = cycleGaps(cycles);
+const shownGaps = gaps.slice(-CHART_GAPS_SHOWN);
+const gapScale = shownGaps.length ? Math.max(35, Math.max(...shownGaps)) : 35;
+const slot = shownGaps.length ? CHART_W / shownGaps.length : CHART_W;
+const barW = Math.min(26, slot * 0.55);
+const barR = Math.min(4, barW / 2);
+const bars = shownGaps.map((g, i) => {
+  const h = Math.max(4, (g / gapScale) * (CHART_BASE - CHART_TOP));
+  return {
+    i,
+    days: g,
+    x: Number((i * slot + (slot - barW) / 2).toFixed(2)),
+    y: Number((CHART_BASE - h).toFixed(2)),
+    h: Number(h.toFixed(2)),
+  };
+});
+
+const severityChoices = [1, 2, 3].map((n) => ({
+  value: n,
+  label: severityLabel(n),
+  hint: severityHint(n),
+}));
+
+const formSymptom = (SYMPTOM_OPTIONS as readonly string[]).includes(keptSymptom) ? keptSymptom : '';
+const formFlow = (FLOW_OPTIONS as readonly string[]).includes(keptFlow) ? keptFlow : '';
+---
+
+<BaseLayout
+  title="Wellness"
+  description="Your own cycle log: where you are today, what usually helps in this part of the month, and everything you have noted."
+  noindex={true}
+>
+  <div class="wl">
+    <div class="wl-inner">
+
+      <header class="wl-head">
+        <p class="wl-eyebrow">Wellness</p>
+        <h1 class="wl-title">Where you are today</h1>
+        <p class="wl-lede">
+          What your cycle looks like from the dates you have logged, what usually helps in this part
+          of the month, and somewhere to note anything you want to remember. Everything on this page
+          is yours alone.
+        </p>
+      </header>
+
+      {denied ? (
+        <Card module="cycle" padding="lg">
+          <h2 class="wl-h2">{denied.title}</h2>
+          <p class="wl-p">{denied.body}</p>
+          <p class="wl-p wl-p--muted">{denied.help}</p>
+        </Card>
+      ) : (
+        <div class="wl-stack">
+
+          {loggedParam === 'start' && (
+            <Notice kind="info" title="Day one is logged">
+              <p>That date is in now, and everything on this page has been worked out again from it.</p>
+            </Notice>
+          )}
+
+          {loggedParam === 'end' && (
+            <Notice kind="info" title="That period is closed off">
+              <p>Knowing how long it ran is what makes the average period length below worth reading.</p>
+            </Notice>
+          )}
+
+          {notedRow && careFlags.length === 0 && (
+            <div class="wl-still">
+              <Notice kind="info" title="That is noted">
+                <p>
+                  {notedRow.symptom}, {severityLabel(notedRow.severity).toLowerCase()}, on {fmtDay(notedRow.loggedOn)}.
+                  It sits with the rest of your notes further down this page.
+                </p>
+              </Notice>
+            </div>
+          )}
+
+          {careFlags.length > 0 && (
+            <div class="wl-still">
+              <Notice kind="urgent" title="One of these is worth a doctor looking at">
+                <p>
+                  Nothing here is a diagnosis and nothing has been decided about you. This is only the
+                  line that matches what you noted, so that it is not left sitting in a log.
+                </p>
+                {careFlags.map((f) => (
+                  <p>
+                    <span class="wl-flag-sign">{f.sign}</span>{' '}
+                    <span class="wl-flag-action">{f.action}</span>
+                  </p>
+                ))}
+              </Notice>
+            </div>
+          )}
+
+          {/* ---------------- today ---------------- */}
+          <section class="wl-section" id="today" aria-labelledby="today-h">
+            <h2 class="wl-section-h" id="today-h">Today</h2>
+
+            {cyclesLogged === 0 ? (
+              <Card module="cycle" padding="md">
+                <EmptyState
+                  module="cycle"
+                  headingLevel={3}
+                  title="Nothing logged yet"
+                  body="Log the first day of your most recent period and this page starts working from your own dates. One date is enough to begin with."
+                  actionLabel="Log a period start"
+                  actionHref="#log"
+                />
+              </Card>
+            ) : (
+              <Card module="cycle" padding="lg">
+                <div class="wl-today">
+                  {dayOfCycle !== null && (
+                    <div class="wl-today-ring">
+                      <Ring
+                        value={dayOfCycle}
+                        max={ringMax}
+                        module="cycle"
+                        size={132}
+                        display={String(dayOfCycle)}
+                        unit="day"
+                        label={'Day ' + dayOfCycle + ' of a cycle that usually runs about ' + ringMax + ' days'}
+                      />
+                    </div>
+                  )}
+
+                  <div class="wl-today-text">
+                    <p class="wl-chip">{phaseWord(phase)}</p>
+                    {guidance && <h3 class="wl-h3">{guidance.title}</h3>}
+                    {guidance && <p class="wl-p">{guidance.summary}</p>}
+                    {overview && overview.lastStart && (
+                      <p class="wl-meta">Last period started {fmtDay(overview.lastStart)}.</p>
+                    )}
+                  </div>
+                </div>
+
+                {guidance && (
+                  <div class="wl-reveal">
+                    <Reveal
+                      module="cycle"
+                      flush
+                      summary="What is happening, and what usually helps"
+                      meta="Food, water, movement, sleep"
+                    >
+                      <div class="wl-guide">
+
+                        <h3 class="wl-guide-h">What your body is doing</h3>
+                        <ul class="wl-list">
+                          {guidance.detail.whatIsHappening.map((line) => (
+                            <li>{line}</li>
+                          ))}
+                        </ul>
+
+                        <h3 class="wl-guide-h">Eating</h3>
+                        <p class="wl-guide-lead">{guidance.detail.eating.headline}</p>
+                        <ul class="wl-foods">
+                          {guidance.detail.eating.foods.map((f) => (
+                            <li class="wl-food">
+                              <p class="wl-food-name">{f.food}</p>
+                              <p class="wl-food-why"><span class="wl-food-key">Why it helps.</span> {f.why}</p>
+                              <p class="wl-food-when"><span class="wl-food-key">When.</span> {f.when}</p>
+                            </li>
+                          ))}
+                        </ul>
+                        <p class="wl-guide-sub">Worth easing off</p>
+                        <ul class="wl-list">
+                          {guidance.detail.eating.easeOff.map((line) => (
+                            <li>{line}</li>
+                          ))}
+                        </ul>
+
+                        <h3 class="wl-guide-h">Hydration</h3>
+                        <p class="wl-guide-lead">{guidance.detail.hydration.headline}</p>
+                        <ul class="wl-list">
+                          {guidance.detail.hydration.points.map((line) => (
+                            <li>{line}</li>
+                          ))}
+                        </ul>
+
+                        <h3 class="wl-guide-h">Movement</h3>
+                        <p class="wl-guide-lead">{guidance.detail.movement.headline}</p>
+                        <ul class="wl-list">
+                          {guidance.detail.movement.points.map((line) => (
+                            <li>{line}</li>
+                          ))}
+                        </ul>
+
+                        <h3 class="wl-guide-h">Sleep</h3>
+                        <p class="wl-guide-lead">{guidance.detail.sleep.headline}</p>
+                        <ul class="wl-list">
+                          {guidance.detail.sleep.points.map((line) => (
+                            <li>{line}</li>
+                          ))}
+                        </ul>
+
+                        <h3 class="wl-guide-h">Small things</h3>
+                        <ul class="wl-list">
+                          {guidance.detail.smallThings.map((line) => (
+                            <li>{line}</li>
+                          ))}
+                        </ul>
+
+                        <p class="wl-guide-foot">{guidance.notMedicalAdvice}</p>
+                      </div>
+                    </Reveal>
+                  </div>
+                )}
+              </Card>
+            )}
+
+            {prediction && (
+              <Card module="cycle" padding="lg">
+                <h3 class="wl-h3">Your next period</h3>
+
+                {daysToNext === null ? (
+                  <p class="wl-p">
+                    There is nothing to estimate from yet. {prediction.basis}
+                  </p>
+                ) : (
+                  <div class="wl-predict">
+                    {daysToNext > 0 && (
+                      <Metric
+                        module="cycle"
+                        size="lg"
+                        value={daysToNext}
+                        unit={dayWord(daysToNext)}
+                        label="Until it is expected"
+                        hint={'Around ' + fmtDay(prediction.nextStart || '') + '. Confidence: ' + confidenceWord(prediction.confidence).toLowerCase() + '.'}
+                      />
+                    )}
+
+                    {daysToNext === 0 && (
+                      <Metric
+                        module="cycle"
+                        size="lg"
+                        value="Today"
+                        label="When it is expected"
+                        hint={'Around ' + fmtDay(prediction.nextStart || '') + '. Confidence: ' + confidenceWord(prediction.confidence).toLowerCase() + '.'}
+                      />
+                    )}
+
+                    {daysToNext < 0 && (
+                      <Metric
+                        module="cycle"
+                        size="lg"
+                        value={Math.abs(daysToNext)}
+                        unit={dayWord(daysToNext) + ' ago'}
+                        label="The expected date has passed"
+                        hint={'It was around ' + fmtDay(prediction.nextStart || '') + '. Logging the start date, whenever it comes, resets this.'}
+                      />
+                    )}
+
+                    <p class="wl-p">{confidenceSentence(prediction.confidence)}</p>
+                    <p class="wl-p wl-p--muted">{prediction.basis}</p>
+
+                    <ul class="wl-facts">
+                      <li>
+                        <span class="wl-fact-k">Cycles logged</span>
+                        <span class="wl-fact-v">{prediction.cyclesLogged}</span>
+                      </li>
+                      <li>
+                        <span class="wl-fact-k">Used in the average</span>
+                        <span class="wl-fact-v">{prediction.usableGaps}</span>
+                      </li>
+                      {prediction.spreadDays !== null && (
+                        <li>
+                          <span class="wl-fact-k">Spread, shortest to longest</span>
+                          <span class="wl-fact-v">{prediction.spreadDays} {dayWord(prediction.spreadDays)}</span>
+                        </li>
+                      )}
+                    </ul>
+                  </div>
+                )}
+              </Card>
+            )}
+          </section>
+
+          {/* ---------------- logging a period ---------------- */}
+          <section class="wl-section" id="log" aria-labelledby="log-h">
+            <h2 class="wl-section-h" id="log-h">Log a period</h2>
+
+            <Card module="cycle" padding="lg">
+              <h3 class="wl-h3">Start</h3>
+              <p class="wl-p wl-p--muted">
+                Day one is the first day of bleeding. Logging the same day twice updates it rather
+                than adding a second cycle, so there is nothing to undo if you tap it again.
+              </p>
+
+              {errForm === 'start' && errMsg && <p class="wl-error">{errMsg}</p>}
+
+              <form method="POST" class="wl-form">
+                <input type="hidden" name="intent" value="start" />
+
+                <div class="wl-field">
+                  <label class="wl-label" for="started_on">First day</label>
+                  <input
+                    class="wl-input"
+                    type="date"
+                    id="started_on"
+                    name="started_on"
+                    value={keptStart}
+                    max={TODAY_YMD}
+                    required
+                  />
+                </div>
+
+                <div class="wl-field">
+                  <label class="wl-label" for="flow">How heavy, roughly</label>
+                  <select class="wl-input" id="flow" name="flow">
+                    <option value="">I would rather not say</option>
+                    {FLOW_OPTIONS.map((f) => (
+                      <option value={f} selected={formFlow === f}>{flowLabel(f)}</option>
+                    ))}
+                  </select>
+                  <p class="wl-hint">Optional. A rough answer is more useful than a blank one, and it is easy to change.</p>
+                </div>
+
+                <div class="wl-field">
+                  <label class="wl-label" for="notes">Anything you want to remember</label>
+                  <textarea class="wl-input wl-textarea" id="notes" name="notes" rows="3" maxlength={MAX_NOTE}>{keptStartNotes}</textarea>
+                  <p class="wl-hint">Optional, and read by nobody but you.</p>
+                </div>
+
+                <button class="wl-submit" type="submit">Log this start</button>
+              </form>
+            </Card>
+
+            <Card module="cycle" padding="lg">
+              <h3 class="wl-h3">End</h3>
+
+              {openCycle ? (
+                <>
+                  <p class="wl-p wl-p--muted">
+                    The period that started {fmtDay(openCycle.startedOn)} has no end date yet.
+                    Closing it off is what makes the average period length below mean anything.
+                  </p>
+
+                  {errForm === 'end' && errMsg && <p class="wl-error">{errMsg}</p>}
+
+                  <form method="POST" class="wl-form">
+                    <input type="hidden" name="intent" value="end" />
+                    <input type="hidden" name="cycle_id" value={openCycle.id} />
+
+                    <div class="wl-field">
+                      <label class="wl-label" for="ended_on">Last day of bleeding</label>
+                      <input
+                        class="wl-input"
+                        type="date"
+                        id="ended_on"
+                        name="ended_on"
+                        value={TODAY_YMD}
+                        min={openCycle.startedOn}
+                        max={TODAY_YMD}
+                        required
+                      />
+                      <p class="wl-hint">On or after the day it started. Nothing else changes.</p>
+                    </div>
+
+                    <button class="wl-submit" type="submit">Close this one off</button>
+                  </form>
+                </>
+              ) : (
+                <p class="wl-p wl-p--muted">
+                  {cyclesLogged === 0
+                    ? 'Once a period start is logged, closing it off will appear here.'
+                    : 'Everything you have logged already has an end date. There is nothing waiting to be closed off.'}
+                </p>
+              )}
+            </Card>
+          </section>
+
+          {/* ---------------- symptoms. Tier C throughout: nothing here moves. ---------------- */}
+          <section class="wl-section wl-still" id="symptom" aria-labelledby="symptom-h">
+            <h2 class="wl-section-h" id="symptom-h">Note how you are feeling</h2>
+
+            <Card module="cycle" padding="lg">
+              <p class="wl-p wl-p--muted">
+                One thing at a time, with a rough sense of how much of the day it took. Three months of
+                this is what turns a bad week into a pattern you can see.
+              </p>
+
+              {errForm === 'symptom' && errMsg && <p class="wl-error">{errMsg}</p>}
+
+              <form method="POST" class="wl-form">
+                <input type="hidden" name="intent" value="symptom" />
+
+                <div class="wl-field">
+                  <label class="wl-label" for="symptom-choice">What you noticed</label>
+                  <select class="wl-input" id="symptom-choice" name="symptom" required>
+                    <option value="">Choose one</option>
+                    {SYMPTOM_OPTIONS.map((s) => (
+                      <option value={s} selected={formSymptom === s}>{s}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <fieldset class="wl-fieldset">
+                  <legend class="wl-label">How much of the day it took</legend>
+                  <div class="wl-choices">
+                    {severityChoices.map((c) => (
+                      <label class="wl-choice">
+                        <input type="radio" name="severity" value={c.value} checked={keptSeverity === c.value} />
+                        <span class="wl-choice-text">
+                          <span class="wl-choice-label">{c.label}</span>
+                          <span class="wl-choice-hint">{c.hint}</span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+
+                <div class="wl-field">
+                  <label class="wl-label" for="logged_on">Which day</label>
+                  <input
+                    class="wl-input"
+                    type="date"
+                    id="logged_on"
+                    name="logged_on"
+                    value={keptOn}
+                    max={TODAY_YMD}
+                    required
+                  />
+                </div>
+
+                <div class="wl-field">
+                  <label class="wl-label" for="note">In your own words</label>
+                  <textarea class="wl-input wl-textarea" id="note" name="note" rows="3" maxlength={MAX_NOTE}>{keptNote}</textarea>
+                  <p class="wl-hint">
+                    Optional. If what you write matches something on the doctor list further down, that
+                    line is shown back to you. Nothing is blocked and nothing is decided.
+                  </p>
+                </div>
+
+                <button class="wl-submit" type="submit">Note this</button>
+              </form>
+            </Card>
+          </section>
+
+          {/* ---------------- history ---------------- */}
+          <section class="wl-section" id="history" aria-labelledby="history-h">
+            <h2 class="wl-section-h" id="history-h">Your history</h2>
+
+            <Card module="cycle" padding="lg">
+              <div class="wl-metrics">
+                <Metric
+                  module="cycle"
+                  size="sm"
+                  value={avgCycle === null ? 'Not yet' : avgCycle}
+                  unit={avgCycle === null ? undefined : dayWord(avgCycle)}
+                  label="Average cycle"
+                  hint="The start of one period to the start of the next."
+                />
+                <Metric
+                  module="cycle"
+                  size="sm"
+                  value={avgPeriod === null ? 'Not yet' : avgPeriod}
+                  unit={avgPeriod === null ? undefined : dayWord(avgPeriod)}
+                  label="Average period"
+                  hint="Counted inclusively, from the cycles that have an end date."
+                />
+                <Metric
+                  module="cycle"
+                  size="sm"
+                  value={cyclesLogged}
+                  label="Cycles logged"
+                  hint={'Kept for as long as you want them.'}
+                />
+              </div>
+
+              {shownGaps.length > 0 && (
+                <div class="wl-chart">
+                  <p class="wl-chart-h">Your last {shownGaps.length} {shownGaps.length === 1 ? 'cycle' : 'cycles'}, start to start</p>
+                  <svg
+                    class="wl-chart-svg"
+                    viewBox={'0 0 ' + CHART_W + ' ' + CHART_H}
+                    role="img"
+                    aria-label={'Cycle lengths, oldest first: ' + shownGaps.join(', ') + ' days.'}
+                  >
+                    <line
+                      class="wl-chart-base"
+                      x1="0"
+                      y1={CHART_BASE + 0.5}
+                      x2={CHART_W}
+                      y2={CHART_BASE + 0.5}
+                    />
+                    {bars.map((b) => (
+                      <g>
+                        <rect class="wl-chart-bar" x={b.x} y={b.y} width={barW} height={b.h} rx={barR} />
+                        <text class="wl-chart-num" x={b.x + barW / 2} y={CHART_H - 4} text-anchor="middle">{b.days}</text>
+                      </g>
+                    ))}
+                  </svg>
+                  <p class="wl-hint">
+                    Oldest on the left. Gaps under {MIN_PLAUSIBLE_CYCLE_DAYS} days or over {MAX_PLAUSIBLE_CYCLE_DAYS}
+                    {' '}are left out of both the chart and the average, because they are almost always a
+                    doubled entry or a month that went unlogged rather than a cycle that length.
+                  </p>
+                </div>
+              )}
+
+              {cycles.length === 0 ? (
+                <EmptyState
+                  module="cycle"
+                  headingLevel={3}
+                  title="No cycles here yet"
+                  body="What you log appears here, newest first, with nothing else attached to it."
+                />
+              ) : (
+                <ul class="wl-cycles">
+                  {cycles.map((c) => (
+                    <li class="wl-cycle">
+                      <span class="wl-cycle-date">{fmtDay(c.startedOn)}</span>
+                      <span class="wl-cycle-meta">
+                        {c.endedOn
+                          ? 'Ran ' + periodLength(c.startedOn, c.endedOn) + ' ' + dayWord(periodLength(c.startedOn, c.endedOn) || 1) + ', to ' + fmtDayShort(c.endedOn)
+                          : 'Not closed off yet'}
+                        {c.flow ? ' - ' + flowLabel(c.flow).toLowerCase() : ''}
+                      </span>
+                      {c.notes && <span class="wl-cycle-note">{c.notes}</span>}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+
+            <Card module="cycle" padding="lg">
+              <h3 class="wl-h3">What you have noted</h3>
+              {symptoms.length === 0 ? (
+                <p class="wl-p wl-p--muted">
+                  Nothing noted in the last four months. Anything you add appears here, and you can
+                  read it back whenever you want to.
+                </p>
+              ) : (
+                <ul class="wl-symptoms">
+                  {symptoms.map((s) => (
+                    <li class="wl-symptom">
+                      <span class="wl-symptom-day">{fmtDayShort(s.loggedOn)}</span>
+                      <span class="wl-symptom-body">
+                        <span class="wl-symptom-name">{s.symptom}</span>
+                        <span class="wl-symptom-sev">{severityLabel(s.severity)}</span>
+                        {s.note && <span class="wl-symptom-note">{s.note}</span>}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+          </section>
+
+          {/* ---------------- the doctor list. Tier C: nothing here moves. ---------------- */}
+          <section class="wl-section wl-still" id="doctor" aria-labelledby="doctor-h">
+            <h2 class="wl-section-h" id="doctor-h">When to speak to a doctor</h2>
+
+            <Notice kind="urgent" title="Worth having a doctor look at">
+              <p>{RED_FLAG_INTRO}</p>
+              <ul class="wl-flags">
+                {RED_FLAGS.map((f) => (
+                  <li class="wl-flag">
+                    <p class="wl-flag-sign">{f.sign}</p>
+                    <p class="wl-flag-context">{f.context}</p>
+                    <p class="wl-flag-action">
+                      <span class="wl-flag-when">{urgencyWord(f.urgency)}</span>
+                      {' '}{f.action}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+              <p>{RED_FLAG_FOOTER}</p>
+            </Notice>
+
+            <Notice kind="info" title="This is general information">
+              <p>{NOT_MEDICAL_ADVICE}</p>
+            </Notice>
+
+            <Card module="therapy" href={CONSULT_PATH} label="Talk to a wellness consultant">
+              <div class="wl-consult">
+                <span class="wl-consult-icon">
+                  <Icon name="chat-heart" size={22} stroke={1.8} />
+                </span>
+                <span class="wl-consult-text">
+                  <span class="wl-consult-title">Talk to someone</span>
+                  <span class="wl-consult-body">
+                    Send a private note to a wellness consultant. It is read by the person it goes to
+                    and by nobody else.
+                  </span>
+                </span>
+                <span class="wl-consult-chev">
+                  <Icon name="chevron-right" size={18} stroke={1.8} />
+                </span>
+              </div>
+            </Card>
+          </section>
+
+        </div>
+      )}
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  /* Every colour, radius, space and duration here is a token. The only literal
+     numbers are geometry and the 44px touch floor. */
+  .wl {
+    background-color: var(--w-canvas);
+    color: var(--w-ink);
+    font-family: var(--w-font-body);
+    font-size: var(--w-t-body);
+    line-height: 1.6;
+    /* The cycle hue governs this page. */
+    --w-accent: var(--w-m-cycle-accent);
+    --w-tint: var(--w-m-cycle-tint);
+  }
+
+  .wl-inner {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 40rem;
+    margin: 0 auto;
+    padding: var(--w-s-5) var(--w-s-4) var(--w-s-6);
+  }
+
+  @media (min-width: 640px) {
+    .wl-inner { padding: var(--w-s-6) var(--w-s-5); }
+  }
+
+  .wl-head { margin: 0 0 var(--w-s-5); }
+
+  .wl-eyebrow {
+    margin: 0 0 var(--w-s-2);
+    font-size: var(--w-t-meta);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--w-ink-3);
+  }
+
+  .wl-title {
+    margin: 0 0 var(--w-s-3);
+    font-family: var(--w-font-display);
+    font-size: clamp(1.75rem, 7vw, 2.25rem);
+    font-weight: 400;
+    line-height: 1.15;
+    color: var(--w-ink);
+    text-wrap: balance;
+  }
+
+  .wl-lede {
+    margin: 0;
+    max-width: 42ch;
+    color: var(--w-ink-2);
+    text-wrap: pretty;
+  }
+
+  .wl-stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-s-6);
+  }
+
+  .wl-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-s-3);
+  }
+
+  .wl-section-h {
+    margin: 0;
+    font-family: var(--w-font-display);
+    font-size: 1.375rem;
+    font-weight: 400;
+    line-height: 1.25;
+    color: var(--w-ink);
+  }
+
+  .wl-h2 {
+    margin: 0 0 var(--w-s-2);
+    font-family: var(--w-font-display);
+    font-size: 1.25rem;
+    font-weight: 400;
+    line-height: 1.25;
+    color: var(--w-ink);
+  }
+
+  .wl-h3 {
+    margin: 0 0 var(--w-s-2);
+    font-size: var(--w-t-title);
+    font-weight: 600;
+    line-height: 1.35;
+    color: var(--w-ink);
+  }
+
+  .wl-p {
+    margin: 0 0 var(--w-s-3);
+    color: var(--w-ink-2);
+    overflow-wrap: anywhere;
+  }
+  .wl-p:last-child { margin-bottom: 0; }
+  .wl-p--muted { color: var(--w-ink-3); }
+
+  .wl-meta {
+    margin: var(--w-s-2) 0 0;
+    font-size: var(--w-t-meta);
+    color: var(--w-ink-3);
+  }
+
+  .wl-hint {
+    margin: var(--w-s-2) 0 0;
+    font-size: var(--w-t-meta);
+    line-height: 1.5;
+    color: var(--w-ink-3);
+  }
+
+  .wl-error {
+    margin: 0 0 var(--w-s-3);
+    color: var(--w-caution);
+  }
+
+  /* Tier C, stated rather than assumed: symptom logging, its confirmation, and
+     every red-flag line hold still in every preference state. */
+  .wl-still,
+  .wl-still * {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* ---- today ---------------------------------------------------------- */
+  .wl-today {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--w-s-4);
+  }
+
+  @media (min-width: 480px) {
+    .wl-today {
+      flex-direction: row;
+      align-items: center;
+    }
+  }
+
+  .wl-today-ring { flex: 0 0 auto; }
+  .wl-today-text { flex: 1 1 auto; min-width: 0; }
+
+  .wl-chip {
+    display: inline-block;
+    margin: 0 0 var(--w-s-2);
+    padding: 2px var(--w-s-2);
+    background-color: var(--w-tint);
+    border-radius: var(--w-r-pill);
+    font-size: var(--w-t-meta);
+    line-height: 1.6;
+    color: var(--w-ink);
+  }
+
+  .wl-reveal {
+    margin-top: var(--w-s-4);
+    border-top: 1px solid var(--w-hairline);
+  }
+
+  /* ---- the guidance body ---------------------------------------------- */
+  .wl-guide { min-width: 0; }
+
+  .wl-guide-h {
+    margin: var(--w-s-4) 0 var(--w-s-2);
+    font-size: var(--w-t-body);
+    font-weight: 600;
+    line-height: 1.4;
+    color: var(--w-ink);
+  }
+  .wl-guide-h:first-child { margin-top: 0; }
+
+  .wl-guide-sub {
+    margin: var(--w-s-4) 0 var(--w-s-2);
+    font-size: var(--w-t-meta);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--w-ink-3);
+  }
+
+  .wl-guide-lead {
+    margin: 0 0 var(--w-s-2);
+    color: var(--w-ink);
+  }
+
+  .wl-guide-foot {
+    margin: var(--w-s-5) 0 0;
+    padding-top: var(--w-s-3);
+    border-top: 1px solid var(--w-hairline);
+    font-size: var(--w-t-meta);
+    line-height: 1.6;
+    color: var(--w-ink-3);
+  }
+
+  .wl-list {
+    margin: 0;
+    padding-inline-start: 1.1em;
+    color: var(--w-ink-2);
+  }
+  .wl-list li { margin-bottom: var(--w-s-2); }
+  .wl-list li:last-child { margin-bottom: 0; }
+
+  .wl-foods {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-s-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .wl-food {
+    min-width: 0;
+    padding: var(--w-s-3);
+    background-color: var(--w-surface-sunk);
+    border-radius: var(--w-r-sm);
+  }
+
+  .wl-food-name {
+    margin: 0 0 var(--w-s-2);
+    font-weight: 600;
+    color: var(--w-ink);
+    overflow-wrap: anywhere;
+  }
+
+  .wl-food-why,
+  .wl-food-when {
+    margin: 0 0 var(--w-s-1);
+    font-size: var(--w-t-meta);
+    line-height: 1.6;
+    color: var(--w-ink-2);
+  }
+  .wl-food-when { margin-bottom: 0; }
+
+  .wl-food-key {
+    font-weight: 600;
+    color: var(--w-ink);
+  }
+
+  /* ---- prediction ------------------------------------------------------ */
+  .wl-predict { min-width: 0; }
+  .wl-predict .wl-p { margin-top: var(--w-s-4); }
+
+  .wl-facts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-s-1);
+    margin: var(--w-s-4) 0 0;
+    padding: var(--w-s-3);
+    background-color: var(--w-surface-sunk);
+    border-radius: var(--w-r-sm);
+    list-style: none;
+  }
+
+  .wl-facts li {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: var(--w-s-2);
+    font-size: var(--w-t-meta);
+  }
+
+  .wl-fact-k { color: var(--w-ink-3); }
+  .wl-fact-v {
+    font-variant-numeric: tabular-nums lining-nums;
+    color: var(--w-ink);
+  }
+
+  /* ---- forms ----------------------------------------------------------- */
+  .wl-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-s-5);
+    margin-top: var(--w-s-4);
+  }
+
+  .wl-field { display: block; min-width: 0; }
+
+  .wl-fieldset {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-width: 0;
+  }
+
+  .wl-label {
+    display: block;
+    margin: 0 0 var(--w-s-2);
+    padding: 0;
+    font-size: var(--w-t-body);
+    font-weight: 500;
+    color: var(--w-ink);
+  }
+
+  .wl-input {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-height: 44px;
+    padding: var(--w-s-3);
+    background-color: var(--w-surface-sunk);
+    color: var(--w-ink);
+    border: 1px solid var(--w-hairline-strong);
+    border-radius: var(--w-r-sm);
+    font-family: var(--w-font-body);
+    /* 16px so a phone does not zoom the page when the field takes focus. */
+    font-size: 1rem;
+    line-height: 1.5;
+  }
+
+  .wl-textarea {
+    resize: vertical;
+    min-height: 5.5rem;
+    overflow-wrap: anywhere;
+  }
+
+  .wl-input:focus-visible {
+    outline: 2px solid var(--w-focus);
+    outline-offset: 1px;
+  }
+
+  .wl-choices {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-s-2);
+  }
+
+  .wl-choice {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--w-s-3);
+    min-height: 44px;
+    padding: var(--w-s-3);
+    background-color: var(--w-surface-sunk);
+    border: 1px solid var(--w-hairline);
+    border-radius: var(--w-r-sm);
+    cursor: pointer;
+  }
+
+  .wl-choice input {
+    flex: 0 0 auto;
+    margin: 2px 0 0;
+    width: 18px;
+    height: 18px;
+    accent-color: var(--w-accent);
+  }
+
+  .wl-choice input:focus-visible {
+    outline: 2px solid var(--w-focus);
+    outline-offset: 2px;
+  }
+
+  .wl-choice:has(input:checked) { border-color: var(--w-hairline-strong); }
+
+  .wl-choice-text { display: block; min-width: 0; }
+  .wl-choice-label { display: block; color: var(--w-ink); }
+  .wl-choice-hint {
+    display: block;
+    margin-top: 2px;
+    font-size: var(--w-t-meta);
+    line-height: 1.5;
+    color: var(--w-ink-3);
+  }
+
+  .wl-submit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    align-self: flex-start;
+    min-height: 44px;
+    padding: var(--w-s-2) var(--w-s-5);
+    background-color: var(--w-accent);
+    color: var(--w-on-accent);
+    border: 0;
+    border-radius: var(--w-r-pill);
+    font-family: var(--w-font-body);
+    font-size: var(--w-t-body);
+    font-weight: 500;
+    line-height: 1.2;
+    cursor: pointer;
+  }
+  .wl-submit:focus-visible {
+    outline: 2px solid var(--w-focus);
+    outline-offset: 3px;
+  }
+
+  /* ---- history --------------------------------------------------------- */
+  .wl-metrics {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--w-s-4);
+  }
+
+  @media (min-width: 480px) {
+    .wl-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+
+  .wl-chart {
+    margin-top: var(--w-s-5);
+    padding-top: var(--w-s-4);
+    border-top: 1px solid var(--w-hairline);
+  }
+
+  .wl-chart-h {
+    margin: 0 0 var(--w-s-3);
+    font-size: var(--w-t-meta);
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--w-ink-3);
+  }
+
+  .wl-chart-svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-width: 100%;
+  }
+
+  .wl-chart-base {
+    stroke: var(--w-hairline-strong);
+    stroke-width: 1;
+  }
+
+  .wl-chart-bar { fill: var(--w-accent); }
+
+  .wl-chart-num {
+    fill: var(--w-ink-3);
+    font-family: var(--w-font-num);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .wl-cycles,
+  .wl-symptoms {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-s-2);
+    margin: var(--w-s-5) 0 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .wl-cycle {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: var(--w-s-3);
+    background-color: var(--w-surface-sunk);
+    border-radius: var(--w-r-sm);
+  }
+
+  .wl-cycle-date {
+    font-weight: 500;
+    color: var(--w-ink);
+  }
+
+  .wl-cycle-meta {
+    font-size: var(--w-t-meta);
+    color: var(--w-ink-3);
+  }
+
+  .wl-cycle-note {
+    margin-top: var(--w-s-1);
+    font-size: var(--w-t-meta);
+    color: var(--w-ink-2);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .wl-symptoms { margin-top: var(--w-s-4); }
+
+  .wl-symptom {
+    display: flex;
+    align-items: baseline;
+    gap: var(--w-s-3);
+    min-width: 0;
+    padding-bottom: var(--w-s-2);
+    border-bottom: 1px solid var(--w-hairline);
+  }
+  .wl-symptom:last-child { border-bottom: 0; padding-bottom: 0; }
+
+  .wl-symptom-day {
+    flex: 0 0 4.5rem;
+    font-size: var(--w-t-meta);
+    font-variant-numeric: tabular-nums lining-nums;
+    color: var(--w-ink-3);
+  }
+
+  .wl-symptom-body {
+    display: block;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .wl-symptom-name {
+    color: var(--w-ink);
+    overflow-wrap: anywhere;
+  }
+
+  .wl-symptom-sev {
+    display: inline-block;
+    margin-inline-start: var(--w-s-2);
+    padding: 1px var(--w-s-2);
+    background-color: var(--w-tint);
+    border-radius: var(--w-r-pill);
+    font-size: var(--w-t-meta);
+    color: var(--w-ink);
+  }
+
+  .wl-symptom-note {
+    display: block;
+    margin-top: 2px;
+    font-size: var(--w-t-meta);
+    color: var(--w-ink-2);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  /* ---- the doctor list -------------------------------------------------- */
+  .wl-flags {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-s-4);
+    margin: var(--w-s-4) 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .wl-flag { min-width: 0; }
+
+  .wl-flag-sign {
+    margin: 0 0 var(--w-s-1);
+    font-weight: 500;
+    color: var(--w-ink);
+  }
+
+  .wl-flag-context {
+    margin: 0 0 var(--w-s-1);
+    font-size: var(--w-t-meta);
+    line-height: 1.6;
+    color: var(--w-ink-2);
+  }
+
+  .wl-flag-action {
+    margin: 0;
+    font-size: var(--w-t-meta);
+    line-height: 1.6;
+    color: var(--w-ink);
+  }
+
+  .wl-flag-when {
+    display: inline-block;
+    margin-inline-end: var(--w-s-1);
+    padding: 1px var(--w-s-2);
+    background-color: var(--w-surface);
+    border-radius: var(--w-r-pill);
+    font-size: var(--w-t-meta);
+    color: var(--w-ink-2);
+  }
+
+  /* ---- the one link out ------------------------------------------------- */
+  .wl-consult {
+    display: flex;
+    align-items: center;
+    gap: var(--w-s-3);
+    min-width: 0;
+  }
+
+  .wl-consult-icon {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    background-color: var(--w-tint);
+    border-radius: var(--w-r-pill);
+    color: var(--w-accent);
+  }
+
+  .wl-consult-text {
+    display: block;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .wl-consult-title {
+    display: block;
+    font-weight: 600;
+    color: var(--w-ink);
+  }
+
+  .wl-consult-body {
+    display: block;
+    margin-top: 2px;
+    font-size: var(--w-t-meta);
+    line-height: 1.5;
+    color: var(--w-ink-2);
+  }
+
+  .wl-consult-chev {
+    flex: 0 0 auto;
+    color: var(--w-ink-3);
+  }
+</style>

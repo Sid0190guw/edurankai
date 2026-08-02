@@ -1,0 +1,871 @@
+---
+/**
+ * /founder/admin/wellness — founder oversight of the women's wellness programme.
+ *
+ * AGGREGATE ONLY. THAT IS THE WHOLE DESIGN, NOT A SETTING.
+ * There is no query on this page that returns a row per person. No name, no user id, no cycle, no
+ * symptom, no request body, no reply, no drill-down, no "view as". Everything rendered here comes
+ * from programmeHealth() in src/lib/wellness.ts, which is the only oversight entry point in that
+ * engine and which already enforces the k-anonymity floor of MIN_GROUP distinct people before it
+ * publishes anything. The engine deliberately contains no "read any user's log" helper, so there is
+ * no function this page could have called even if somebody wanted the screen to exist.
+ *
+ * WHY THE FOUNDER GETS THE NARROWEST GATE AND NOT THE WIDEST.
+ * canAccessHeldRecords() is founder-only by design (see src/lib/legal-hold.ts). It is used here not
+ * because the founder may see more than an administrator, but because this is the console where the
+ * decision to STAFF the programme is taken, and the narrower the set of people who can reach it the
+ * more meaningful "who could possibly have looked" becomes. The founder sees exactly the same
+ * counts an administrator sees on /admin/wellness. Seniority buys nothing extra here, and the page
+ * says so out loud rather than leaving it as a silent omission somebody could mistake for an
+ * oversight and "fix".
+ *
+ * SUPPRESSION IS HONOURED EXACTLY AS THE ENGINE PRINTS IT. Where a figure is suppressed this page
+ * prints TOO_FEW_LABEL and never a small count. Where the engine reports that some categories were
+ * held back, the remaining categories are dropped too: publishing the survivors beside a total lets
+ * anybody subtract their way back to the held-back ones, which is the standard differencing attack
+ * and defeats the floor entirely.
+ *
+ * MOTION. Nothing on this page animates except a 150ms tap on the one form control, which is
+ * navigation. Every figure is still. House rules: postgres-js returns plain arrays (no DB call is
+ * made from this file at all), and a real Postgres reason lives on e.cause.message.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import '@/styles/wellness.css';
+
+import Card from '@/components/wellness/Card.astro';
+import Metric from '@/components/wellness/Metric.astro';
+import Notice from '@/components/wellness/Notice.astro';
+import Reveal from '@/components/wellness/Reveal.astro';
+import EmptyState from '@/components/wellness/EmptyState.astro';
+
+import { canAccessHeldRecords } from '@/lib/legal-hold';
+import {
+  programmeHealth,
+  MIN_GROUP,
+  TOO_FEW_LABEL,
+  CONSULT_PRIVACY_NOTE,
+  type ProgrammeHealth,
+} from '@/lib/wellness';
+
+// ---------------------------------------------------------------------------
+// ACCESS. Signed in first, then the founder gate from the legal-hold module.
+// canAccessHeldRecords fails closed on a null user, so the second check would be enough on its
+// own; the first exists so somebody arriving signed-out lands on a login page rather than being
+// bounced through the admin dashboard for no reason.
+// ---------------------------------------------------------------------------
+const currentUser = Astro.locals.user;
+if (!currentUser) return Astro.redirect('/admin/login');
+if (!canAccessHeldRecords(currentUser as any)) return Astro.redirect('/admin');
+
+// ---------------------------------------------------------------------------
+// EVERY CONSTANT THIS FILE NEEDS IS DECLARED BEFORE THE POST HANDLER BELOW.
+// ---------------------------------------------------------------------------
+interface WindowOption {
+  days: number;
+  label: string;
+}
+
+const WINDOW_OPTIONS: WindowOption[] = [
+  { days: 30, label: 'Last 30 days' },
+  { days: 90, label: 'Last 90 days' },
+  { days: 180, label: 'Last 6 months' },
+  { days: 365, label: 'Last 12 months' },
+];
+
+const DEFAULT_DAYS = 90;
+
+/** Only a window we offer is ever accepted. Anything else quietly becomes the default. */
+function normaliseDays(v: unknown): number {
+  const n = Number.parseInt(String(v ?? ''), 10);
+  return WINDOW_OPTIONS.some((o) => o.days === n) ? n : DEFAULT_DAYS;
+}
+
+/** Hours into something a person reads without converting in their head. */
+function hoursFigure(n: number | null | undefined): { value: string; unit: string } {
+  if (n === null || n === undefined || !Number.isFinite(Number(n))) return { value: TOO_FEW_LABEL, unit: '' };
+  const v = Number(n);
+  if (v < 1) return { value: 'Under 1', unit: 'hour' };
+  if (v < 48) {
+    const r = Math.round(v * 10) / 10;
+    return { value: String(r), unit: r === 1 ? 'hour' : 'hours' };
+  }
+  const d = Math.round(v / 24);
+  return { value: String(d), unit: d === 1 ? 'day' : 'days' };
+}
+
+/** The sentence this page exists to make unmissable. Stated as a property, not as a policy. */
+const COMMITMENT =
+  "You cannot read one woman's log from here. Not her cycle, not her symptoms, not the message she wrote to a consultant, and not the reply she was sent. No screen in this console shows it, no export contains it, and no permission unlocks it, because the function that would return it was never written. Being the founder does not change that.";
+
+// ---------------------------------------------------------------------------
+// The reporting window. The form posts to this page; the query string is read too, so a bookmarked
+// window still works. Neither path needs JavaScript.
+// ---------------------------------------------------------------------------
+let days = normaliseDays(Astro.url.searchParams.get('days'));
+let formError = '';
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    days = normaliseDays(fd.get('days'));
+  } catch (e: any) {
+    console.error('[founder/wellness] form read:', e?.cause?.message || e?.message);
+    formError = 'That did not come through. The period has been left where it was.';
+  }
+}
+
+let health: ProgrammeHealth | null = null;
+let readFailed = false;
+try {
+  health = await programmeHealth(days);
+} catch (e: any) {
+  readFailed = true;
+  console.error('[founder/wellness] programmeHealth:', e?.cause?.message || e?.message);
+}
+
+const active = health?.active ?? null;
+const load = health?.load ?? null;
+const timings = health?.responseTimes ?? null;
+const topics = health?.topics ?? null;
+
+const windowLabel =
+  days === 365 ? 'the last twelve months' : days === 180 ? 'the last six months' : `the last ${days} days`;
+
+// A partial breakdown beside a published total is a subtraction away from the very categories the
+// floor protects, so the breakdown appears only when the engine held nothing back at all.
+const showBreakdown = !!load && !load.suppressed && !load.someCategoriesSuppressed;
+const totalRequests = load && !load.suppressed && load.total.count !== null ? load.total.count : null;
+
+const medianFig = hoursFigure(timings && !timings.suppressed ? timings.medianHours : null);
+const averageFig = hoursFigure(timings && !timings.suppressed ? timings.averageHours : null);
+const longestFig = hoursFigure(load && !load.suppressed ? load.longestWaitHours : null);
+
+const queueIsEmpty = !!load && !load.suppressed && load.longestWaitHours === null;
+
+// The headline strip. Built here so the markup stays a loop rather than four near-identical blocks,
+// and so a suppressed reading renders as words instead of as a small number.
+interface Signal {
+  key: string;
+  label: string;
+  suppressed: boolean;
+  value: string;
+  unit: string;
+  hint: string;
+  held: string;
+}
+
+const signals: Signal[] = [
+  {
+    key: 'people',
+    label: 'People using it',
+    suppressed: !active || active.suppressed || active.people === null,
+    value: active && active.people !== null ? String(active.people) : '',
+    unit: '',
+    hint: 'Anyone who logged, tracked or asked something. Counted once each, whatever they used.',
+    held: `Fewer than ${MIN_GROUP} people used it in this period, so no number is published. That is the floor working, not a gap in the data.`,
+  },
+  {
+    key: 'requests',
+    label: 'Requests raised',
+    suppressed: totalRequests === null,
+    value: totalRequests !== null ? String(totalRequests) : '',
+    unit: '',
+    hint: 'How many people asked to speak to a consultant. What they asked is not readable from here.',
+    held: load?.note || `Fewer than ${MIN_GROUP} people have used this in the period, so nothing is reported.`,
+  },
+  {
+    key: 'typical',
+    label: 'Typical wait for a reply',
+    suppressed: !timings || timings.suppressed,
+    value: medianFig.value,
+    unit: medianFig.unit,
+    hint: 'The middle of the range. Half the replies were faster than this, half slower.',
+    held: timings?.note || `Fewer than ${MIN_GROUP} people have had a reply in this period, so no timing is reported.`,
+  },
+  {
+    key: 'longest',
+    label: 'Longest wait in the queue now',
+    suppressed: !load || load.suppressed,
+    value: queueIsEmpty ? 'None' : longestFig.value,
+    unit: queueIsEmpty ? 'waiting' : longestFig.unit,
+    hint: 'The oldest request still without an answer. Who it is and what it says is not shown here or anywhere else.',
+    held: 'Too few requests in the period for a queue figure to mean anything but a description of somebody.',
+  },
+];
+
+const topicMax = topics && topics.topics.length ? Math.max(...topics.topics.map((t) => t.people)) : 0;
+
+// Short enough to be read standing up. The depth sits behind the Reveal underneath.
+const SLIP_STEPS = [
+  {
+    title: 'Ask the consultants, not the queue',
+    body: 'They already know whether this is more requests arriving or fewer hours available to answer them. The queue cannot tell you which, and opening a request to find out is not an option that exists.',
+  },
+  {
+    title: 'Add hours before you add process',
+    body: 'One more active consultant moves the typical wait further than any change to how requests are sorted. Sorting a backlog does not shrink it.',
+  },
+  {
+    title: 'Say the wait out loud, early',
+    body: 'A stated wait of five days is survivable. An unexplained silence is what makes somebody stop asking, and the person who stops asking is the one this programme was built for.',
+  },
+];
+---
+
+<AdminLayout title="Wellness programme" activeNav="">
+  <div class="wf">
+    <header class="wf-head">
+      <p class="w-label">Founder oversight</p>
+      <h1 class="wf-title">Wellness programme health</h1>
+      <p class="wf-lead w-prose">
+        Counts and durations for {windowLabel}, so the programme can be staffed, budgeted and held to
+        its promises. Nothing on this page describes a person.
+      </p>
+    </header>
+
+    {/* The commitment. First thing on the page, before a single number, because it is the reason
+        the numbers are trustworthy at all. */}
+    <section class="wf-commit" aria-label="What this console cannot do">
+      <Notice kind="info" title="What this console cannot do">
+        <p class="wf-p">{COMMITMENT}</p>
+        <p class="wf-p">
+          Everything below is a count or a duration. Any group smaller than {MIN_GROUP} people is
+          reported as "{TOO_FEW_LABEL}" rather than as a number.
+        </p>
+
+        <Reveal summary="Why a small number is never printed here" flush class="wf-reveal">
+          <p class="wf-p">
+            Below {MIN_GROUP} people a count stops being a statistic and starts being a description
+            of somebody. In an organisation this size, a line like "two people asked about pregnancy
+            this month" plus ordinary office knowledge names them. So the figure is withheld rather
+            than rounded, because rounding still leaks the shape of it.
+          </p>
+          <p class="wf-p">
+            The leftovers go with it. A total published beside a partly suppressed breakdown can be
+            subtracted back down to the suppressed part, so when any category is held back the whole
+            breakdown is dropped and only the total remains, which on its own reveals nothing.
+          </p>
+          <p class="wf-p">
+            The floor is always counted in distinct people, never in requests. Forty requests from
+            three people is still a picture of three people.
+          </p>
+        </Reveal>
+      </Notice>
+    </section>
+
+    {/* Reporting period. A form that posts to this page: no JavaScript, no client state. */}
+    <form method="POST" class="wf-win" aria-labelledby="wf-win-label">
+      <label class="w-label wf-win__label" id="wf-win-label" for="wf-days">Reporting period</label>
+      <select id="wf-days" name="days" class="wf-win__select">
+        {WINDOW_OPTIONS.map((o) => (
+          <option value={o.days} selected={o.days === days}>{o.label}</option>
+        ))}
+      </select>
+      <button type="submit" class="wf-win__go">Show</button>
+    </form>
+
+    {formError && (
+      <p class="wf-note wf-note--standalone">{formError}</p>
+    )}
+
+    {readFailed && (
+      <section class="wf-commit" aria-label="The figures could not be read just now">
+        <Notice kind="guidance" title="The figures could not be read just now">
+          <p class="wf-p">
+            The programme counts are temporarily unavailable. Nothing has been lost and nothing else
+            is affected. Reloading in a few minutes is usually enough.
+          </p>
+        </Notice>
+      </section>
+    )}
+
+    {/* The strip an oversight reader actually scans. */}
+    <section class="wf-signals" aria-label={`Programme signals for ${windowLabel}`}>
+      {signals.map((s) => (
+        <Card module="neutral" padding="md" as="article" class="wf-sig">
+          {s.suppressed ? (
+            <div class="wf-held">
+              <p class="w-label">{s.label}</p>
+              <p class="wf-held__value">{TOO_FEW_LABEL}</p>
+              <p class="wf-held__hint">{s.held}</p>
+            </div>
+          ) : (
+            <Metric
+              size="md"
+              module="neutral"
+              value={s.value}
+              unit={s.unit}
+              label={s.label}
+              hint={s.hint}
+            />
+          )}
+        </Card>
+      ))}
+    </section>
+
+    <div class="wf-grid">
+      {/* Demand ---------------------------------------------------------- */}
+      <Card module="therapy" padding="lg" as="section" label="Demand for a consultant" class="wf-card">
+        <h2 class="wf-card__title">Demand</h2>
+        <p class="wf-sub">
+          How much is being asked for, and whether it is being picked up. The category and the count
+          are all that is read to produce this.
+        </p>
+
+        {showBreakdown && load ? (
+          <ul class="wf-split">
+            <li class="wf-split__row">
+              <span class="wf-split__name">Waiting to be picked up</span>
+              <span class="wf-split__val w-num">{load.waiting.label}</span>
+            </li>
+            <li class="wf-split__row">
+              <span class="wf-split__name">With a consultant</span>
+              <span class="wf-split__val w-num">{load.withConsultant.label}</span>
+            </li>
+            <li class="wf-split__row">
+              <span class="wf-split__name">Answered</span>
+              <span class="wf-split__val w-num">{load.answered.label}</span>
+            </li>
+            <li class="wf-split__row">
+              <span class="wf-split__name">Different people who asked</span>
+              <span class="wf-split__val w-num">{load.people}</span>
+            </li>
+          </ul>
+        ) : (
+          <p class="wf-note">
+            {load && !load.suppressed
+              ? `The breakdown is not shown. Some of its categories held fewer than ${MIN_GROUP} people, and showing the rest beside the total would give those categories away by subtraction.`
+              : load?.note || `Fewer than ${MIN_GROUP} people have used this in the period, so nothing is broken down.`}
+          </p>
+        )}
+
+        {load && !load.suppressed && (
+          <p class="wf-note">
+            {queueIsEmpty
+              ? 'Nothing is currently waiting for a reply.'
+              : `Somebody has been waiting ${longestFig.value} ${longestFig.unit} for an answer. Who she is and what she asked is not shown here, and there is nowhere else in this console it could be looked up.`}
+          </p>
+        )}
+      </Card>
+
+      {/* Reply times ----------------------------------------------------- */}
+      <Card module="fitness" padding="lg" as="section" label="How long a reply takes" class="wf-card">
+        <h2 class="wf-card__title">Reply times</h2>
+        <p class="wf-sub">
+          The number that says whether this works. A woman who waits a week for an answer has not
+          been helped, however good the answer was when it arrived.
+        </p>
+
+        {timings && !timings.suppressed ? (
+          <ul class="wf-split">
+            <li class="wf-split__row">
+              <span class="wf-split__name">Typical wait (median)</span>
+              <span class="wf-split__val w-num">{medianFig.value} {medianFig.unit}</span>
+            </li>
+            <li class="wf-split__row">
+              <span class="wf-split__name">Average wait</span>
+              <span class="wf-split__val w-num">{averageFig.value} {averageFig.unit}</span>
+            </li>
+            <li class="wf-split__row">
+              <span class="wf-split__name">Replies measured</span>
+              <span class="wf-split__val w-num">{timings.answeredCount}</span>
+            </li>
+          </ul>
+        ) : (
+          <p class="wf-note">
+            {timings?.note || `Fewer than ${MIN_GROUP} people have had a reply in this period, so no timing is reported.`}
+          </p>
+        )}
+
+        <p class="wf-note">
+          The average and the median are kept side by side on purpose. When they pull apart, a small
+          number of very long waits is being hidden inside a comfortable average.
+        </p>
+      </Card>
+    </div>
+
+    {/* Subjects ---------------------------------------------------------- */}
+    <section class="wf-topics" data-module="cycle" aria-labelledby="wf-topics-title">
+      <Card module="cycle" padding="lg" as="div" class="wf-card">
+        <h2 class="wf-card__title" id="wf-topics-title">Subjects being raised</h2>
+        <p class="wf-sub">
+          Which kind of consultant to arrange, by category and by how many different people chose it.
+          The category is the only thing counted; no question and no answer is opened to produce this.
+        </p>
+
+        {topics && topics.topics.length > 0 ? (
+          <div>
+            <ul class="wf-bars">
+              {topics.topics.map((t) => (
+                <li class="wf-bar">
+                  <div class="wf-bar__head">
+                    <span class="wf-bar__name">{t.topic}</span>
+                    <span class="wf-bar__val w-num">{t.people}</span>
+                  </div>
+                  <div class="wf-bar__track" aria-hidden="true">
+                    <div
+                      class="wf-bar__fill"
+                      style={`width:${topicMax > 0 ? Math.max(6, Math.round((t.people / topicMax) * 100)) : 0}%`}
+                    >
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            {topics.someCategoriesSuppressed && <p class="wf-note">{topics.note}</p>}
+          </div>
+        ) : (
+          <EmptyState
+            module="cycle"
+            illustration="note"
+            headingLevel={3}
+            title="Nothing is broken down here yet"
+            body={topics?.note || `No single subject has been raised by ${MIN_GROUP} or more people, so nothing is listed.`}
+          />
+        )}
+      </Card>
+    </section>
+
+    {/* What to do if response times slip --------------------------------- */}
+    <section class="wf-slip" aria-labelledby="wf-slip-title">
+      <h2 class="wf-card__title" id="wf-slip-title">If reply times start slipping</h2>
+      <p class="wf-sub w-prose">
+        Watch the typical wait and the longest wait in the queue together. One tells you the ordinary
+        experience, the other tells you the worst one. Both are on this page, and neither of them
+        tells you who is waiting.
+      </p>
+
+      <ol class="wf-steps">
+        {SLIP_STEPS.map((s, i) => (
+          <li class="wf-step">
+            <span class="wf-step__n w-num">{i + 1}</span>
+            <div class="wf-step__text">
+              <p class="wf-step__title">{s.title}</p>
+              <p class="wf-p">{s.body}</p>
+            </div>
+          </li>
+        ))}
+      </ol>
+
+      <Reveal summary="The three things not to do, and why" class="wf-reveal">
+        <p class="wf-p">
+          <strong class="wf-strong">Do not ask to see a particular request to check it is being
+          handled.</strong> There is no screen that would show it and none that could be built without
+          removing the promise every woman was given when she wrote it. If a specific case needs
+          chasing, the consultant is the person to ask, and they answer about their own workload
+          rather than about her.
+        </p>
+        <p class="wf-p">
+          <strong class="wf-strong">Do not shorten the reporting period to make a small group
+          visible.</strong> The floor applies at every window. A shorter period holds back more, not
+          less, and a window chosen to expose a handful of people is the thing the floor exists to
+          prevent.
+        </p>
+        <p class="wf-p">
+          <strong class="wf-strong">Do not read a slipping average as somebody failing.</strong>
+          Consultants answer this alongside their own work. A wait that grows is usually a staffing
+          fact, and treating it as a performance fact is how the honest reporting stops.
+        </p>
+        <p class="wf-p">
+          If the typical wait passes a working week, the programme is not delivering what it says it
+          delivers, whatever the other figures look like. That is the point to add a consultant or to
+          narrow what the programme promises, not the point to look harder at the queue.
+        </p>
+      </Reveal>
+    </section>
+
+    <footer class="wf-foot">
+      <p class="wf-p w-prose">{COMMITMENT}</p>
+      {health && <p class="wf-note w-prose">{health.disclaimer}</p>}
+      <p class="wf-note w-prose">
+        This is the sentence every woman is shown before she writes anything: {CONSULT_PRIVACY_NOTE}
+      </p>
+      <p class="wf-note w-prose">
+        The same figures are available to the oversight role at{' '}
+        <a class="wf-link w-focusable" href="/admin/wellness">/admin/wellness</a>. Seniority does not
+        widen what either page can show.
+      </p>
+    </footer>
+  </div>
+</AdminLayout>
+
+<style>
+  /* Every colour here reads from src/styles/wellness.css. No hex is written in this file, which is
+     also what makes the page follow the console's own light and dark toggle: AdminLayout sets
+     data-theme on <html> and defaults it to dark, and the wellness tokens already answer to it. */
+  .wf {
+    box-sizing: border-box;
+    max-width: var(--w-container);
+    margin: 0 auto;
+    padding: var(--w-space-5) var(--w-gutter) var(--w-space-10);
+    background-color: var(--w-ground);
+    color: var(--w-ink);
+    font-family: var(--w-font-text);
+    overflow-x: hidden;
+  }
+
+  .wf :global(*) {
+    box-sizing: border-box;
+  }
+
+  /* ---- header ---------------------------------------------------------- */
+  .wf-head {
+    max-width: var(--w-container-readable);
+  }
+
+  .wf-title {
+    margin: var(--w-space-2) 0 0;
+    font-family: 'Fraunces', var(--w-font-display);
+    font-size: var(--w-text-h1);
+    font-weight: var(--w-weight-regular);
+    line-height: var(--w-leading-tight);
+    letter-spacing: var(--w-tracking-tight);
+    color: var(--w-ink);
+    text-wrap: balance;
+  }
+
+  .wf-lead {
+    margin: var(--w-space-3) 0 0;
+    font-size: var(--w-text-base);
+    line-height: var(--w-leading-relaxed);
+    color: var(--w-ink-2);
+  }
+
+  /* ---- the commitment -------------------------------------------------- */
+  .wf-commit {
+    margin-top: var(--w-space-6);
+  }
+
+  .wf-p {
+    margin: 0 0 var(--w-space-3);
+    font-size: var(--w-text-sm);
+    line-height: var(--w-leading-relaxed);
+    color: var(--w-ink);
+  }
+
+  .wf-p:last-child {
+    margin-bottom: 0;
+  }
+
+  .wf-strong {
+    font-weight: var(--w-weight-semibold);
+    color: var(--w-ink);
+  }
+
+  .wf-reveal {
+    margin-top: var(--w-space-3);
+  }
+
+  /* ---- reporting period ------------------------------------------------ */
+  .wf-win {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--w-space-2);
+    margin-top: var(--w-space-6);
+    padding: var(--w-space-3) var(--w-space-4);
+    border: var(--w-border-width) solid var(--w-hairline);
+    border-radius: var(--w-radius-md);
+    background-color: var(--w-surface-sunk);
+  }
+
+  .wf-win__label {
+    flex: 1 1 100%;
+  }
+
+  .wf-win__select {
+    flex: 1 1 12rem;
+    min-width: 0;
+    min-height: var(--w-tap-min);
+    padding: 0 var(--w-space-3);
+    border: var(--w-border-width) solid var(--w-hairline-strong);
+    border-radius: var(--w-radius-sm);
+    background-color: var(--w-surface);
+    color: var(--w-ink);
+    font-family: inherit;
+    font-size: var(--w-text-base);
+  }
+
+  .wf-win__go {
+    min-height: var(--w-tap-min);
+    padding: 0 var(--w-space-5);
+    border: var(--w-border-width) solid var(--w-hairline-heavy);
+    border-radius: var(--w-radius-sm);
+    background-color: var(--w-surface);
+    color: var(--w-ink);
+    font-family: inherit;
+    font-size: var(--w-text-sm);
+    font-weight: var(--w-weight-semibold);
+    cursor: pointer;
+    /* Tier B, and only here: this is a control, everything else on the page is a figure. */
+    transition: opacity var(--w-b-dur-tap) var(--w-b-ease);
+  }
+
+  .wf-win__go:hover {
+    opacity: 0.82;
+  }
+
+  .wf-win__select:focus-visible,
+  .wf-win__go:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: 2px;
+  }
+
+  /* ---- signal strip ---------------------------------------------------- */
+  .wf-signals {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--w-space-3);
+    margin-top: var(--w-space-5);
+  }
+
+  @media (min-width: 600px) {
+    .wf-signals {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (min-width: 1000px) {
+    .wf-signals {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+  }
+
+  .wf-sig {
+    min-width: 0;
+  }
+
+  /* A withheld reading is words, never a greyed-out number. */
+  .wf-held__value {
+    margin: 0;
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-lg);
+    font-weight: var(--w-weight-medium);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink-2);
+  }
+
+  .wf-held__hint {
+    margin: var(--w-space-2) 0 0;
+    font-size: var(--w-text-caption);
+    line-height: var(--w-leading-normal);
+    color: var(--w-ink-3);
+  }
+
+  /* ---- two-column body ------------------------------------------------- */
+  .wf-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--w-space-4);
+    margin-top: var(--w-space-4);
+  }
+
+  @media (min-width: 860px) {
+    .wf-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  .wf-card {
+    min-width: 0;
+  }
+
+  .wf-card__title {
+    margin: 0;
+    font-family: 'Fraunces', var(--w-font-display);
+    font-size: var(--w-text-h3);
+    font-weight: var(--w-weight-regular);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+  }
+
+  .wf-sub {
+    margin: var(--w-space-2) 0 var(--w-space-4);
+    font-size: var(--w-text-sm);
+    line-height: var(--w-leading-relaxed);
+    color: var(--w-ink-2);
+  }
+
+  .wf-note {
+    margin: var(--w-space-4) 0 0;
+    font-size: var(--w-text-caption);
+    line-height: var(--w-leading-normal);
+    color: var(--w-ink-3);
+  }
+
+  .wf-note--standalone {
+    margin-top: var(--w-space-3);
+  }
+
+  /* ---- figure rows ----------------------------------------------------- */
+  .wf-split {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .wf-split__row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--w-space-4);
+    padding: var(--w-space-3) 0;
+    border-top: var(--w-border-width) solid var(--w-hairline);
+  }
+
+  .wf-split__row:first-child {
+    border-top: 0;
+    padding-top: 0;
+  }
+
+  .wf-split__name {
+    font-size: var(--w-text-sm);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink-2);
+    min-width: 0;
+  }
+
+  .wf-split__val {
+    font-size: var(--w-text-lg);
+    font-weight: var(--w-weight-medium);
+    color: var(--w-ink);
+    white-space: nowrap;
+  }
+
+  /* ---- subject bars ---------------------------------------------------- */
+  .wf-topics {
+    margin-top: var(--w-space-4);
+  }
+
+  .wf-bars {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: var(--w-space-4);
+  }
+
+  .wf-bar__head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--w-space-3);
+    margin-bottom: var(--w-space-2);
+  }
+
+  .wf-bar__name {
+    font-size: var(--w-text-sm);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+    min-width: 0;
+  }
+
+  .wf-bar__val {
+    font-size: var(--w-text-sm);
+    font-weight: var(--w-weight-medium);
+    color: var(--w-ink-2);
+    white-space: nowrap;
+  }
+
+  .wf-bar__track {
+    height: 8px;
+    border-radius: var(--w-radius-pill);
+    background-color: var(--w-surface-sunk);
+    overflow: hidden;
+  }
+
+  /* Accent is non-text by the token rules, which is exactly what a bar is. The number beside it
+     carries the value, so nothing depends on colour. Painted once, never transitioned. */
+  .wf-bar__fill {
+    height: 100%;
+    border-radius: var(--w-radius-pill);
+    background-color: var(--w-module-accent, var(--w-ink-4));
+  }
+
+  /* ---- what to do if it slips ------------------------------------------ */
+  .wf-slip {
+    margin-top: var(--w-space-7);
+    padding: var(--w-space-5) var(--w-space-4);
+    border: var(--w-border-width) solid var(--w-hairline);
+    border-radius: var(--w-radius-lg);
+    background-color: var(--w-surface-veil);
+  }
+
+  @media (min-width: 600px) {
+    .wf-slip {
+      padding: var(--w-space-6);
+    }
+  }
+
+  .wf-steps {
+    margin: var(--w-space-5) 0 var(--w-space-5);
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: var(--w-space-4);
+  }
+
+  .wf-step {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--w-space-3);
+    min-width: 0;
+  }
+
+  .wf-step__n {
+    flex: 0 0 auto;
+    width: 1.75rem;
+    height: 1.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: var(--w-border-width) solid var(--w-hairline-strong);
+    border-radius: var(--w-radius-circle);
+    font-size: var(--w-text-caption);
+    font-weight: var(--w-weight-semibold);
+    color: var(--w-ink-2);
+  }
+
+  .wf-step__text {
+    min-width: 0;
+  }
+
+  .wf-step__title {
+    margin: 0 0 var(--w-space-1);
+    font-size: var(--w-text-base);
+    font-weight: var(--w-weight-semibold);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+  }
+
+  /* ---- footer ---------------------------------------------------------- */
+  .wf-foot {
+    margin-top: var(--w-space-7);
+    padding-top: var(--w-space-5);
+    border-top: var(--w-border-width) solid var(--w-hairline);
+  }
+
+  .wf-foot .wf-note {
+    margin-top: var(--w-space-3);
+  }
+
+  .wf-link {
+    color: var(--w-ink);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  /* ---- 360px ----------------------------------------------------------- */
+  @media (max-width: 380px) {
+    .wf {
+      padding-left: var(--w-space-3);
+      padding-right: var(--w-space-3);
+    }
+
+    .wf-split__row {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: var(--w-space-1);
+    }
+  }
+</style>

@@ -1,0 +1,814 @@
+---
+// Talking to a human.
+//
+// One screen with two halves: the note she sends, and every note she has already sent with whatever
+// came back. Both halves are server-rendered and there is no JavaScript on this page at all.
+//
+// FOUR DECISIONS WORTH WRITING DOWN.
+//
+// 1. THE GATE IS THE ENGINE'S GATE, CALLED HERE FOR ITSELF.
+//    canAccessWellness() reads the employee record on the server and matches on user_id or any of
+//    the three email columns, because the users-to-employees link is not always filled in and a
+//    woman whose record was never linked must not be locked out of something she is entitled to.
+//    No employee row at all and a row with a blank or unrecognised gender return the same reason,
+//    so they get the same calm message. Nothing here re-implements that check or second-guesses it,
+//    and nothing the browser sends can change the answer.
+//
+// 2. ESCALATION NEVER BLOCKS.
+//    If she asks for the soonest answer, or the words she used match one of the engine's red-flag
+//    lines, a calm note appears above the form asking her to arrange care today rather than waiting
+//    on a reply here. It changes nothing else: the form still submits, the button still works. A
+//    system that refuses to take the message from the woman who most needs to send one is not safer,
+//    it is only quieter.
+//
+// 3. IT IS A FORM AND NOTHING ELSE.
+//    It posts to its own URL. A successful send redirects to ?sent=<id> so a refresh cannot send it
+//    twice, and the confirmation re-reads that one request through the owner-scoped query, so the id
+//    in the URL cannot be edited into somebody else's message.
+//
+// 4. STILLNESS WHERE IT MATTERS.
+//    The only thing on this page that moves is a confirmation arriving, and only when no red flag
+//    matched. At the moment she is being told to see a doctor, nothing on the screen moves.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import '@/styles/wellness.css';
+import Card from '@/components/wellness/Card.astro';
+import Notice from '@/components/wellness/Notice.astro';
+import Reveal from '@/components/wellness/Reveal.astro';
+import EmptyState from '@/components/wellness/EmptyState.astro';
+import {
+  canAccessWellness,
+  accessMessage,
+  createConsultRequest,
+  listMyConsultRequests,
+  getMyConsultRequest,
+  cancelConsultRequest,
+  listConsultants,
+  matchRedFlags,
+  CONSULT_TOPICS,
+  CONSULT_URGENCIES,
+  URGENCY_LABELS,
+  CONSULT_NOT_URGENT_CARE,
+  CONSULT_PRIVACY_NOTE,
+  type RedFlag,
+} from '@/lib/wellness';
+
+// --- constants and helpers ---------------------------------------------------------------------
+// All of them declared here, above the POST handler that uses them.
+
+const PAGE_PATH = '/portal/wellness/consult';
+/** The engine caps the stored message at the same figure; this is the browser telling her first. */
+const MAX_MESSAGE = 4000;
+const DEFAULT_URGENCY = 'routine';
+/** The top of the engine's three urgencies. This is the one that pulls the care note. */
+const URGENT_VALUE = 'priority';
+
+function urgencyMeta(value: string): { value: string; label: string; hint: string } {
+  const found = URGENCY_LABELS.find((u) => u.value === value);
+  if (found) return { value: found.value, label: found.label, hint: found.hint };
+  return { value: value, label: 'Whenever there is time', hint: '' };
+}
+
+function fmtDay(iso: string): string {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+  } catch {
+    return '';
+  }
+}
+
+/** Plain words for a status. No colour carries any of this; the sentence does. */
+function statusLine(status: string, consultantName: string | null): string {
+  if (status === 'answered') return consultantName ? 'Answered by ' + consultantName : 'Answered';
+  if (status === 'assigned') return consultantName ? 'With ' + consultantName : 'With a consultant';
+  if (status === 'open') return 'Waiting to be picked up';
+  if (status === 'closed') return 'Closed';
+  if (status === 'cancelled') return 'Withdrawn';
+  return 'In progress';
+}
+
+function canWithdraw(status: string): boolean {
+  return status === 'open' || status === 'assigned';
+}
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PAGE_PATH));
+
+// The gate. Read from the employee record on the server, by the engine, fail-closed.
+const access = await canAccessWellness(user);
+const denied = access.allowed ? null : accessMessage(access.reason);
+
+// --- POST --------------------------------------------------------------------------------------
+let errMsg = '';
+let postFlags: RedFlag[] = [];
+let keptTopic = '';
+let keptUrgency: string = DEFAULT_URGENCY;
+let keptMessage = '';
+let keptConsultant = '';
+
+if (access.allowed && Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const intent = String(fd.get('intent') || 'create');
+
+    if (intent === 'cancel') {
+      const target = String(fd.get('request_id') || '').trim();
+      // Owner-scoped inside the engine: an id that is not hers updates nothing.
+      if (target) await cancelConsultRequest(user.id, target);
+      return Astro.redirect(PAGE_PATH + '?withdrawn=1');
+    }
+
+    keptTopic = String(fd.get('topic') || '').trim();
+    keptUrgency = String(fd.get('urgency') || DEFAULT_URGENCY).trim();
+    keptMessage = String(fd.get('message') || '').slice(0, MAX_MESSAGE);
+    keptConsultant = String(fd.get('consultant') || '').trim();
+
+    const result = await createConsultRequest(user.id, {
+      topic: keptTopic || null,
+      urgency: keptUrgency || DEFAULT_URGENCY,
+      message: keptMessage,
+      consultantUserId: keptConsultant || null,
+    });
+
+    if (result.ok && result.id) {
+      return Astro.redirect(PAGE_PATH + '?sent=' + encodeURIComponent(result.id));
+    }
+
+    // It did not send. Keep every word she wrote, and still show the care note if one matched:
+    // a failed save is the worst possible moment to swallow "please see a doctor today".
+    errMsg = result.error || 'That did not send. Please try once more.';
+    postFlags = result.redFlags || [];
+  } catch (e: any) {
+    console.error('[wellness] consult page:', e?.cause?.message || e?.message);
+    errMsg = 'That did not send. Please try once more.';
+  }
+}
+
+// --- GET ---------------------------------------------------------------------------------------
+const sentParam = (Astro.url.searchParams.get('sent') || '').trim();
+const withdrawn = Astro.url.searchParams.get('withdrawn') === '1';
+
+// Owner-scoped read. Somebody else's id here returns null rather than anything at all.
+const sent = access.allowed && sentParam ? await getMyConsultRequest(user.id, sentParam) : null;
+const sentFlags: RedFlag[] = sent && sent.message ? matchRedFlags(sent.message) : [];
+
+const requests = access.allowed ? await listMyConsultRequests(user.id, 20) : [];
+const consultants = access.allowed ? await listConsultants(true) : [];
+
+// The care note. Shown when the engine matched a red flag in what she wrote, or when she asked for
+// the soonest answer. It sits above the form and it never gates the button.
+const shownFlags: RedFlag[] = sentFlags.length ? sentFlags : postFlags;
+const urgentPick = (sent ? sent.urgency === URGENT_VALUE : false) || keptUrgency === URGENT_VALUE;
+const careNow = shownFlags.length > 0 || urgentPick;
+
+const chosenConsultant = keptConsultant
+  ? consultants.find((c) => c.userId === keptConsultant)
+  : undefined;
+const urgencyOptions = CONSULT_URGENCIES.map((v) => urgencyMeta(v));
+const formUrgency = (CONSULT_URGENCIES as readonly string[]).includes(keptUrgency)
+  ? keptUrgency
+  : DEFAULT_URGENCY;
+const sentUrgencyHint = sent ? urgencyMeta(sent.urgency).hint : '';
+---
+
+<BaseLayout
+  title="Talk to someone"
+  description="Send a private note to a wellness consultant, and read the replies to the ones you have already sent."
+  noindex={true}
+>
+  <main class="wc" data-module="therapy">
+    <div class="wc-inner">
+
+      <a class="wc-back" href="/portal">Back to the portal</a>
+
+      <header class="wc-head">
+        <p class="wc-eyebrow">Consultation</p>
+        <h1 class="wc-title">Talk to someone</h1>
+        <p class="wc-lede">
+          Write as much or as little as you like. It goes to one wellness consultant, who reads it and
+          writes back on this page. There is no form to fill in properly and nothing to justify.
+        </p>
+      </header>
+
+      {denied ? (
+        <Card module="therapy" padding="lg" class="wc-card">
+          <h2 class="wc-h2">{denied.title}</h2>
+          <p class="wc-p">{denied.body}</p>
+          <p class="wc-p wc-p--muted">{denied.help}</p>
+        </Card>
+      ) : (
+        <div class="wc-stack">
+
+          {withdrawn && (
+            <Notice kind="info" title="That request has been withdrawn">
+              <p>
+                The message you wrote with it has been removed. Nothing needs to be explained, and you
+                can send a new one whenever you would like.
+              </p>
+            </Notice>
+          )}
+
+          {careNow && (
+            <div class="wc-still">
+              <Notice kind="urgent" title="Please arrange care today rather than waiting for a reply here">
+                <p>
+                  This goes to a person, and a reply takes time. If you are able to, please speak to a
+                  doctor, a clinic or urgent care today. Sending this changes nothing about that, and
+                  your request is safe here either way.
+                </p>
+                {shownFlags.map((f) => (
+                  <p><span class="wc-flag-sign">{f.sign}</span> {f.action}</p>
+                ))}
+              </Notice>
+            </div>
+          )}
+
+          {sent && (
+            <div class={careNow ? 'wc-still' : 'wc-arrive'}>
+              <Card module="therapy" tone={careNow ? 'calm' : 'celebratory'} padding="lg" class="wc-card">
+                <h2 class="wc-h2">That has been sent</h2>
+                <p class="wc-p">
+                  {sent.consultantName
+                    ? 'It is with ' + sent.consultantName + ' now.'
+                    : 'It is waiting for a consultant to pick it up.'}
+                  {sentUrgencyHint ? ' ' + sentUrgencyHint : ''}
+                </p>
+                <p class="wc-p wc-p--muted">
+                  The reply will appear further down this page, and you will not need to go looking
+                  for it.
+                </p>
+                <p class="wc-p">
+                  <a class="wc-link" href="#your-requests">Everything you have sent</a>
+                </p>
+              </Card>
+            </div>
+          )}
+
+          <section class="wc-section" aria-labelledby="ask-h">
+            <h2 class="wc-section-h" id="ask-h">Send a note</h2>
+
+            <Notice kind="info" title="This is not urgent care">
+              <p>{CONSULT_NOT_URGENT_CARE}</p>
+            </Notice>
+
+            {errMsg && (
+              <div class="wc-still">
+                <Notice kind="info" title="That did not send">
+                  <p>{errMsg}</p>
+                  <p>Everything you wrote is still in the box below, exactly as you left it.</p>
+                </Notice>
+              </div>
+            )}
+
+            <Card module="therapy" padding="lg" class="wc-card">
+              <form method="POST" class="wc-form">
+                <input type="hidden" name="intent" value="create" />
+
+                <div class="wc-field">
+                  <label class="wc-label" for="topic">What it is about</label>
+                  <select class="wc-select" id="topic" name="topic">
+                    <option value="">I would rather not label it</option>
+                    {CONSULT_TOPICS.map((t) => (
+                      <option value={t} selected={keptTopic === t}>{t}</option>
+                    ))}
+                  </select>
+                  <p class="wc-hint">
+                    Only used to send it to the right person. You can leave it as it is.
+                  </p>
+                </div>
+
+                <fieldset class="wc-fieldset">
+                  <legend class="wc-label">How soon would you like an answer</legend>
+                  <div class="wc-choices">
+                    {urgencyOptions.map((u) => (
+                      <label class="wc-choice">
+                        <input
+                          type="radio"
+                          name="urgency"
+                          value={u.value}
+                          checked={formUrgency === u.value}
+                        />
+                        <span class="wc-choice-text">
+                          <span class="wc-choice-label">{u.label}</span>
+                          {u.hint && <span class="wc-choice-hint">{u.hint}</span>}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+
+                <div class="wc-field">
+                  <label class="wc-label" for="message">What you would like to talk through</label>
+                  <textarea
+                    class="wc-textarea"
+                    id="message"
+                    name="message"
+                    rows="8"
+                    required
+                    maxlength={MAX_MESSAGE}
+                    aria-describedby="message-hint"
+                    placeholder="In your own words. There is no right way to write this."
+                  >{keptMessage}</textarea>
+                  <p class="wc-hint" id="message-hint">
+                    Up to {MAX_MESSAGE} characters. Read by the consultant it goes to, and by nobody
+                    else.
+                  </p>
+                </div>
+
+                {consultants.length > 0 && (
+                  <div class="wc-field">
+                    <label class="wc-label" for="consultant">Who should read it</label>
+                    <select class="wc-select" id="consultant" name="consultant">
+                      <option value="">Whoever is free</option>
+                      {consultants.map((c) => (
+                        <option value={c.userId} selected={keptConsultant === c.userId}>
+                          {c.credentials ? c.displayName + ', ' + c.credentials : c.displayName}
+                        </option>
+                      ))}
+                    </select>
+                    <p class="wc-hint">
+                      {chosenConsultant
+                        ? 'It goes to ' + chosenConsultant.displayName + ' and to nobody else.'
+                        : 'Left as it is, it goes to one consultant from the wellness team.'}
+                    </p>
+                  </div>
+                )}
+
+                <button class="wc-submit" type="submit">Send it</button>
+              </form>
+            </Card>
+
+            <Notice kind="info" title="Who can read this">
+              <p>{CONSULT_PRIVACY_NOTE}</p>
+            </Notice>
+
+            <Reveal module="therapy" summary="What happens to it after you send it" meta="Optional reading">
+              <p class="wc-p">
+                It sits in a queue with the topic and the date on it. A consultant picks it up, opens
+                it, and writes back here. The reply appears under your request further down this page.
+              </p>
+              <p class="wc-p">
+                If you withdraw a request before it is answered, the message you wrote is deleted at
+                the same moment. What stays behind is the fact that a request existed and when, which
+                is what keeps the queue honest about how long people are waiting.
+              </p>
+              <p class="wc-p wc-p--muted">
+                Nobody has to explain anything to us to use this, and nothing you write here changes
+                anything on your employee record.
+              </p>
+            </Reveal>
+          </section>
+
+          <section class="wc-section" id="your-requests" aria-labelledby="mine-h">
+            <h2 class="wc-section-h" id="mine-h">What you have sent</h2>
+
+            {requests.length === 0 ? (
+              <Card module="therapy" padding="md" class="wc-card">
+                <EmptyState
+                  module="therapy"
+                  illustration="note"
+                  headingLevel={3}
+                  title="Nothing sent yet"
+                  body="When you send a note it will sit here with its reply, for as long as you want to keep it."
+                />
+              </Card>
+            ) : (
+              <ul class="wc-list">
+                {requests.map((r) => (
+                  <li class="wc-item">
+                    <Card module="therapy" padding="md" class="wc-card">
+                      <div class="wc-item-head">
+                        <h3 class="wc-item-title">{r.topic || 'A general question'}</h3>
+                        <span class="wc-status">{statusLine(r.status, r.consultantName)}</span>
+                      </div>
+
+                      <p class="wc-meta">Sent {fmtDay(r.createdAt)}</p>
+
+                      {r.response ? (
+                        <div class="wc-reply">
+                          <p class="wc-reply-from">
+                            {r.consultantName || 'Your consultant'}
+                            {r.answeredAt ? ', ' + fmtDay(r.answeredAt) : ''}
+                          </p>
+                          <p class="wc-reply-body">{r.response}</p>
+                        </div>
+                      ) : r.status === 'cancelled' ? (
+                        <p class="wc-p wc-p--muted">
+                          You withdrew this, and the message you wrote was removed with it.
+                        </p>
+                      ) : (
+                        <p class="wc-p wc-p--muted">
+                          No reply yet. {urgencyMeta(r.urgency).hint}
+                        </p>
+                      )}
+
+                      {r.message && (
+                        <div class="wc-reveal">
+                          <Reveal module="therapy" flush summary="What you wrote">
+                            <p class="wc-own-words">{r.message}</p>
+                          </Reveal>
+                        </div>
+                      )}
+
+                      {canWithdraw(r.status) && (
+                        <form method="POST" class="wc-withdraw">
+                          <input type="hidden" name="intent" value="cancel" />
+                          <input type="hidden" name="request_id" value={r.id} />
+                          <button class="wc-quiet" type="submit">Withdraw this request</button>
+                          <span class="wc-hint">This deletes the message you wrote.</span>
+                        </form>
+                      )}
+                    </Card>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+        </div>
+      )}
+    </div>
+  </main>
+</BaseLayout>
+
+<style>
+  /* Every value below is a token from src/styles/wellness.css. The only literal
+     numbers are geometry that has no token: line thicknesses and one measure. */
+
+  .wc {
+    background-color: var(--w-ground);
+    color: var(--w-ink);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-base);
+    line-height: var(--w-leading-relaxed);
+  }
+
+  /* Phone first: one column, 16px gutters, nothing with an intrinsic width that
+     can push a 360px screen sideways. */
+  .wc-inner {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: var(--w-container-readable);
+    margin: 0 auto;
+    padding: var(--w-space-5) var(--w-space-4) var(--w-space-10);
+  }
+
+  @media (min-width: 640px) {
+    .wc-inner {
+      padding-top: var(--w-space-7);
+      padding-inline: var(--w-space-5);
+    }
+  }
+
+  .wc-back {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--w-tap-min);
+    color: var(--w-ink-3);
+    font-size: var(--w-text-caption);
+    text-decoration: none;
+  }
+  .wc-back:hover { color: var(--w-ink); }
+  .wc-back:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: var(--w-focus-offset);
+    border-radius: var(--w-radius-xs);
+  }
+
+  .wc-head { margin: var(--w-space-2) 0 var(--w-space-6); }
+
+  .wc-eyebrow {
+    margin: 0 0 var(--w-space-2);
+    font-size: var(--w-text-label);
+    font-weight: var(--w-weight-semibold);
+    letter-spacing: var(--w-tracking-wide);
+    text-transform: uppercase;
+    color: var(--w-ink-3);
+  }
+
+  .wc-title {
+    margin: 0 0 var(--w-space-3);
+    font-family: var(--w-font-display);
+    font-size: var(--w-text-h1);
+    font-weight: var(--w-weight-regular);
+    line-height: var(--w-leading-tight);
+    letter-spacing: var(--w-tracking-tight);
+    color: var(--w-ink);
+    text-wrap: balance;
+  }
+
+  .wc-lede {
+    margin: 0;
+    color: var(--w-ink-2);
+    text-wrap: pretty;
+  }
+
+  .wc-stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-6);
+  }
+
+  .wc-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-4);
+    scroll-margin-top: var(--w-space-6);
+  }
+
+  .wc-section-h,
+  .wc-h2 {
+    margin: 0 0 var(--w-space-2);
+    font-family: var(--w-font-display);
+    font-size: var(--w-text-h2);
+    font-weight: var(--w-weight-regular);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+  }
+  .wc-section-h { margin-bottom: 0; }
+
+  .wc-p {
+    margin: 0 0 var(--w-space-3);
+    color: var(--w-ink-2);
+    overflow-wrap: anywhere;
+  }
+  .wc-p:last-child { margin-bottom: 0; }
+  .wc-p--muted { color: var(--w-ink-3); }
+
+  .wc-link {
+    color: var(--w-ink);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .wc-link:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: var(--w-focus-offset);
+    border-radius: var(--w-radius-xs);
+  }
+
+  /* Red-flag copy and anything shown after a failure. No motion, in any
+     preference state, declared here so it cannot be tidied away later. */
+  .wc-still {
+    animation: none;
+    transition: none;
+  }
+  .wc-flag-sign { color: var(--w-ink); }
+
+  /* --- the form ------------------------------------------------------------ */
+
+  .wc-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-6);
+  }
+
+  .wc-field { display: block; }
+
+  .wc-fieldset {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-width: 0;
+  }
+
+  .wc-label {
+    display: block;
+    margin: 0 0 var(--w-space-2);
+    padding: 0;
+    font-size: var(--w-text-base);
+    font-weight: var(--w-weight-medium);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+  }
+
+  .wc-hint {
+    margin: var(--w-space-2) 0 0;
+    font-size: var(--w-text-caption);
+    line-height: var(--w-leading-normal);
+    color: var(--w-ink-3);
+  }
+
+  .wc-select,
+  .wc-textarea {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-height: var(--w-tap-min);
+    padding: var(--w-space-3);
+    background-color: var(--w-surface-sunk);
+    color: var(--w-ink);
+    border: var(--w-border-width) solid var(--w-hairline-strong);
+    border-radius: var(--w-radius-sm);
+    font-family: var(--w-font-text);
+    /* The body floor, so a phone never zooms the page when a field takes focus. */
+    font-size: var(--w-text-base);
+    line-height: var(--w-leading-normal);
+  }
+
+  .wc-textarea {
+    min-height: 10rem;
+    resize: vertical;
+    overflow-wrap: anywhere;
+  }
+
+  .wc-select:focus-visible,
+  .wc-textarea:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: 1px;
+  }
+
+  .wc-choices {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-2);
+  }
+
+  .wc-choice {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--w-space-3);
+    min-height: var(--w-tap-min);
+    padding: var(--w-space-3);
+    background-color: var(--w-surface-sunk);
+    border: var(--w-border-width) solid var(--w-hairline);
+    border-radius: var(--w-radius-sm);
+    cursor: pointer;
+  }
+
+  .wc-choice input {
+    flex: 0 0 auto;
+    width: 18px;
+    height: 18px;
+    margin: 2px 0 0;
+    accent-color: var(--w-module-text);
+  }
+
+  .wc-choice input:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: var(--w-focus-offset);
+  }
+
+  /* The selected row firms its edge. Never colour on its own. */
+  .wc-choice:has(input:checked) { border-color: var(--w-hairline-heavy); }
+
+  .wc-choice-text {
+    display: block;
+    min-width: 0;
+  }
+  .wc-choice-label {
+    display: block;
+    color: var(--w-ink);
+  }
+  .wc-choice-hint {
+    display: block;
+    margin-top: var(--w-space-1);
+    font-size: var(--w-text-caption);
+    line-height: var(--w-leading-normal);
+    color: var(--w-ink-3);
+  }
+
+  /* The one filled control on the page, and the one pairing the token file
+     sanctions for it: module text as the fill, ink-on-fill as the label. */
+  .wc-submit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    align-self: flex-start;
+    min-height: var(--w-tap-min);
+    padding: var(--w-space-3) var(--w-space-6);
+    background-color: var(--w-module-text);
+    color: var(--w-ink-on-fill);
+    border: 0;
+    border-radius: var(--w-radius-pill);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-base);
+    font-weight: var(--w-weight-medium);
+    line-height: var(--w-leading-snug);
+    cursor: pointer;
+  }
+  .wc-submit:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: 3px;
+  }
+
+  /* --- her own requests ----------------------------------------------------- */
+
+  .wc-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .wc-item { min-width: 0; }
+
+  .wc-item-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--w-space-2);
+  }
+
+  .wc-item-title {
+    margin: 0;
+    font-size: var(--w-text-h3);
+    font-weight: var(--w-weight-medium);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+    overflow-wrap: anywhere;
+  }
+
+  .wc-status {
+    flex: 0 0 auto;
+    padding: var(--w-space-1) var(--w-space-3);
+    background-color: var(--w-surface-sunk);
+    border-radius: var(--w-radius-pill);
+    font-size: var(--w-text-caption);
+    line-height: var(--w-leading-normal);
+    color: var(--w-ink-2);
+  }
+
+  .wc-meta {
+    margin: var(--w-space-1) 0 var(--w-space-4);
+    font-size: var(--w-text-caption);
+    color: var(--w-ink-3);
+  }
+
+  .wc-reply {
+    margin: 0 0 var(--w-space-3);
+    padding: var(--w-space-4);
+    background-color: var(--w-module-surface);
+    border: var(--w-border-width) solid var(--w-module-border);
+    border-radius: var(--w-radius-md);
+  }
+  .wc-reply-from {
+    margin: 0 0 var(--w-space-2);
+    font-size: var(--w-text-caption);
+    color: var(--w-ink-3);
+  }
+  .wc-reply-body {
+    margin: 0;
+    color: var(--w-ink);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .wc-reveal {
+    margin-top: var(--w-space-2);
+    border-top: var(--w-border-width) solid var(--w-hairline);
+  }
+  .wc-own-words {
+    margin: 0;
+    color: var(--w-ink-2);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .wc-withdraw {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--w-space-3);
+    margin-top: var(--w-space-3);
+  }
+  .wc-withdraw .wc-hint { margin: 0; }
+
+  .wc-quiet {
+    min-height: var(--w-tap-min);
+    padding: 0;
+    background: none;
+    border: 0;
+    color: var(--w-ink-2);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-caption);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+  .wc-quiet:hover { color: var(--w-ink); }
+  .wc-quiet:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: var(--w-focus-offset);
+    border-radius: var(--w-radius-xs);
+  }
+
+  /* --- the only thing on this page that moves --------------------------------
+     A note has just reached a person. That is a quiet completion, so the
+     confirmation is allowed to arrive rather than appear: one shot, opacity and
+     transform only, Tier B duration and curve. The class is never applied when a
+     red flag matched, and the rule lives inside no-preference so the reduced
+     motion build is the default rather than an undo. */
+  @media (prefers-reduced-motion: no-preference) {
+    .wc-arrive {
+      animation: wc-arrive var(--w-b-dur-move) var(--w-b-ease) both;
+    }
+  }
+
+  @keyframes wc-arrive {
+    from { opacity: 0; transform: translateY(var(--w-rise)); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+</style>
