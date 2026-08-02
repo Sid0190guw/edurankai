@@ -4,6 +4,16 @@ import { readSessionCookie, setSessionCookie, clearSessionCookie } from '@/lib/a
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { getViewableSectionKeys, can } from '@/lib/auth/permissions';
+import { canOpenAdmin } from '@/lib/auth/admin-access';
+import { logEvent } from '@/lib/logger';
+
+// Every /admin path except this one must pass canOpenAdmin. Exactly one exemption, matched exactly:
+// a prefix test here would let /admin/login-anything through, and a second entry is how an unguarded
+// path gets added later "just for a moment".
+const ADMIN_GUARD_EXEMPT = '/admin/login';
+function isAdminPath(path: string): boolean {
+  return path === '/admin' || path.startsWith('/admin/');
+}
 
 // Map an /admin/* path to its permission section key (longest-prefix wins).
 // Universal/auth paths (dashboard, mail, notifications, login, logout) are not
@@ -286,6 +296,42 @@ export const onRequest = defineMiddleware(async (context, next) => {
       : r === 'technical_moderator' ? '/aquintutor/admin/moderator'
       : '/aquintutor/admin/partner';
     return new Response(null, { status: 302, headers: { Location: dest } });
+  }
+
+  // DENY BY DEFAULT — the structural gate, and the only one that a NEW admin page cannot forget.
+  //
+  // Everything above this line is a rule about a role someone thought of: applicants go to /portal,
+  // AquinTutor scopes go to their own panel. This one is the opposite shape. It asks canOpenAdmin
+  // (src/lib/auth/admin-access.ts) whether this person may open an admin surface AT ALL, and the
+  // default answer there is no. That matters because the escalation it exists to stop was not an
+  // unhandled role: 'editor' was handled, held admin.access legitimately, and was handed to every
+  // intern who signed an offer letter.
+  //
+  // Being here rather than in a page or a layout is the whole point. AdminLayout's intern check runs
+  // only for pages that use AdminLayout; a page written next month that renders its own shell, or an
+  // endpoint under /admin/api/*, is covered by this the day it is written rather than the day someone
+  // notices. It also refuses BEFORE the page's frontmatter runs, so nothing sensitive is queried, let
+  // alone rendered.
+  //
+  // /admin/login is the single exemption — gating it would lock everyone out of signing in. Note that
+  // /admin/logout is NOT exempt: a refused person is bounced with their session intact and signs out
+  // at /logout or /portal/logout, which is a smaller cost than a second hole in the guard.
+  if (isAdminPath(path) && path !== ADMIN_GUARD_EXEMPT) {
+    const verdict = await canOpenAdmin(result.user as any);
+    if (!verdict.allowed) {
+      // Logged as a refused ATTEMPT, not an error: the path and the user id are what turn "someone
+      // reported they can see the pipeline" into a specific account on a specific screen.
+      logEvent('warn', 'admin.access.refused', {
+        path,
+        userId: result.user.id,
+        role: verdict.role,
+        reason: verdict.reason,
+      });
+      // Same destination as AdminLayout's existing intern refusal, so the two guards never disagree
+      // about where a refused person lands.
+      const dest = verdict.reason === 'internship' ? '/portal?notice=admin-access-removed' : '/portal';
+      return new Response(null, { status: 302, headers: { Location: dest, 'cache-control': 'no-store' } });
+    }
   }
 
   // Permission gate: a user assigned a custom role only reaches sections that

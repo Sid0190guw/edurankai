@@ -1,0 +1,507 @@
+---
+// /portal/team — the team lead's own interface.
+//
+// WHY IT EXISTS. /admin was one console for the super admin, and an automatic role promotion handed
+// it to everyone who signed an offer. That promotion is gone and interns are blocked
+// (src/lib/auth/intern-guard.ts), but blocking only removes what people should never have had. This
+// is the other half: the screen a lead actually needs, holding only what a lead actually needs.
+//
+// WHAT A LEAD NEEDS, AND NOTHING MORE. Capacity and progress: who is working today, who is on leave,
+// what is coming up so cover can be arranged, and whose hours are drifting so it can be talked about
+// early rather than discovered in a completion report. That is the whole brief.
+//
+// WHAT IS DELIBERATELY ABSENT, each for a reason:
+//   - Salary, bank details, PAN/Aadhaar/UAN, address, date of birth, gender. A lead plans work; none
+//     of that helps them plan work. `gender` is the exact column read in the 2026-08-02 breach, so it
+//     is not selected here, not joined, and not used to colour anything. (The gate's EMPLOYEE_COLUMNS
+//     list refuses them at the source too.)
+//   - Anything from wellness_* (src/lib/wellness.ts). That system is women-only, gated, and
+//     aggregate-only by design, with no "read any user's log" helper anywhere in it. A team screen
+//     must not be the place that quietly grows one.
+//   - hr_clock_events. It stores latitude, longitude, accuracy, IP, device string and a base64 selfie
+//     for every punch. A person may see their own trail; a lead seeing their reports' is
+//     surveillance, not management. Attendance here comes from hr_attendance — status and hours.
+//   - The free-text `reason` on a leave request. It is where people write "hospital", "my father",
+//     "the results came back". The lead gets the type, the dates and the days, which is everything
+//     cover planning needs. HR, who decides the request, still sees the reason.
+//   - Profile photos. They are the frame captured at face-2FA enrolment. Repurposing a security
+//     capture into a manager's roster is not what anyone consented to, so initials are used.
+//
+// HOW SCOPING WORKS HERE. requireTeamLead() resolves ONE department id from the session
+// (users.role = 'department_head' + users.assigned_department_id — see the long note in
+// src/lib/auth/workspace-access.ts for why that pair is the only working signal in this database,
+// and what has to be populated before a real per-manager team can exist). Every query below carries
+// departmentFilter(gate) IN ITS OWN WHERE CLAUSE, joining to hr_employees where the table has no
+// department column of its own, so another department's rows are never read in the first place.
+// Nothing in the URL or a form body changes what comes back; there is no ?department= to try.
+// Post-fetch filtering is not scoping and is not used — src/pages/admin/users/[id].astro:14-21 is
+// the shape being avoided. departmentFilter() returns `false` rather than `true` when no scope
+// resolved, so the worst a mistake here can produce is an empty page, never someone else's team.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { requireTeamLead, departmentFilter, DEPARTMENT_COVERAGE_NOTICE } from '@/lib/auth/workspace-access';
+import { ensureLeaveSchema } from '@/lib/hr-leave';
+import { ensureTermColumns, termsFromRow, ledgerForMany } from '@/lib/credit-ledger';
+
+const user = Astro.locals.user;
+
+// Every helper is declared before the first await that could reach it. `const` is not hoisted, and a
+// declaration used above its own line has taken pages down in this repo before.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const dayStr = (v: any): string => {
+  if (!v) return '';
+  const s = v instanceof Date ? v.toISOString() : String(v);
+  return s.slice(0, 10);
+};
+const fmtDay = (v: any): string => {
+  const s = dayStr(v);
+  if (s.length < 10) return '';
+  const parts = s.split('-');
+  return String(Number(parts[2])) + ' ' + (MONTHS[Number(parts[1]) - 1] || '');
+};
+const fmtRange = (a: any, b: any): string => {
+  const from = fmtDay(a), to = fmtDay(b);
+  return !to || to === from ? from : from + ' to ' + to;
+};
+const initialsOf = (name: any): string => String(name || '')
+  .trim().split(/\s+/).slice(0, 2).map((p: string) => p.charAt(0).toUpperCase()).join('') || '?';
+const num = (v: any): number => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+
+// Today's state, in words a lead can act on. Nobody is called "absent" for the mere absence of a
+// row: not having clocked in is a missing record, not a finding.
+const chipFor = (status: string): { label: string; fg: string; bg: string } => {
+  if (status === 'present') return { label: 'Working', fg: '#1c7a45', bg: '#eaf5ed' };
+  if (status === 'wfh') return { label: 'Working remotely', fg: '#1c7a45', bg: '#eaf5ed' };
+  if (status === 'on_leave') return { label: 'On leave', fg: '#8a5a12', bg: '#fdf3e3' };
+  if (status === 'holiday') return { label: 'Holiday', fg: '#5c5349', bg: '#f2ede4' };
+  if (status === 'absent') return { label: 'Marked absent', fg: '#a5342a', bg: '#fbeceb' };
+  return { label: 'Not recorded yet', fg: '#8a7f70', bg: '#f6f2ea' };
+};
+const attendanceColour = (pct: number): string => (pct >= 85 ? '#1c7a45' : pct >= 70 ? '#8a5a12' : '#a5342a');
+const leaveLabel = (t: any): string => {
+  const s = String(t || '').toLowerCase();
+  if (s === 'casual') return 'Casual';
+  if (s === 'sick') return 'Sick';
+  if (s === 'earned') return 'Earned';
+  if (s === 'unpaid') return 'Unpaid';
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : 'Leave';
+};
+
+const MEMBER_LIMIT = 60;
+
+// THE GATE. First await on the page, before any data query.
+const gate = await requireTeamLead(user, '/portal/team');
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+
+const scoped = gate.ok ? gate : null;
+const denial = gate.ok ? null : gate;
+// The lead's own employee id, used only to mark their own row in the roster. May be null: the gate
+// deliberately does not require a lead to have an employee record of their own.
+const selfEmployeeId = scoped?.workspace?.employeeId ? String(scoped.workspace.employeeId) : '';
+
+let deptName = '';
+let members: any[] = [];
+let truncated = false;
+let loadError = '';
+let leaveError = '';
+let creditError = '';
+const todayBy: any = {};
+const weekBy: any = {};
+const ledgerBy: any = {};
+let pendingLeave: any[] = [];
+let upcomingLeave: any[] = [];
+
+if (scoped) {
+  // A label, never a permission: if the name cannot be read the page still scopes correctly and
+  // simply shows the key. Reuses the name already resolved by the gate when it is the same
+  // department, so the common case costs no query at all.
+  const own = scoped.workspace?.department;
+  if (own && String(own.id) === String(scoped.scopeDepartmentId) && own.name) {
+    deptName = String(own.name);
+  } else {
+    try {
+      const d = rowsOf(await db.execute(sql`
+        SELECT name FROM departments WHERE id::text = ${String(scoped.scopeDepartmentId)} LIMIT 1`))[0];
+      if (d?.name) deptName = String(d.name);
+    } catch (e: any) {
+      console.error('[portal/team] department name', e?.cause?.message || e?.message);
+    }
+  }
+
+  try {
+    // Once for the whole page, not four DDL statements per person: the four engagement columns are
+    // added at runtime by credit-ledger, and reading them for everyone in the members query is what
+    // keeps this to a handful of round trips.
+    await ensureTermColumns();
+    members = rowsOf(await db.execute(sql`
+      SELECT e.id::text AS id, e.full_name, e.employee_code, e.designation, e.employment_type,
+             e.work_mode, e.joining_date,
+             e.engagement_kind, e.weekly_hours, e.working_days_per_week, e.required_credit_hours
+        FROM hr_employees e
+       WHERE ${departmentFilter(scoped)}
+         AND e.is_active = true
+       ORDER BY e.full_name ASC
+       LIMIT 61`));
+    if (members.length > MEMBER_LIMIT) { truncated = true; members = members.slice(0, MEMBER_LIMIT); }
+  } catch (e: any) {
+    console.error('[portal/team] members', e?.cause?.message || e?.message);
+    loadError = 'The team list could not be read just now.';
+  }
+
+  // Today. Scoped by the same department predicate rather than by an id list assembled in
+  // JavaScript, so the boundary is enforced by the query itself.
+  try {
+    for (const t of rowsOf(await db.execute(sql`
+      SELECT a.employee_id::text AS employee_id, a.status, a.work_hours
+        FROM hr_attendance a
+        JOIN hr_employees e ON e.id = a.employee_id
+       WHERE ${departmentFilter(scoped)}
+         AND e.is_active = true
+         AND a.date = CURRENT_DATE`))) {
+      todayBy[String(t.employee_id)] = t;
+    }
+  } catch (e: any) {
+    console.error('[portal/team] today', e?.cause?.message || e?.message);
+  }
+
+  // The last seven days, as one grouped read. Enough to see a drift starting without turning the
+  // page into a timesheet audit.
+  try {
+    for (const w of rowsOf(await db.execute(sql`
+      SELECT a.employee_id::text AS employee_id,
+             COALESCE(SUM(a.work_hours), 0)::float8 AS hours,
+             (COUNT(*) FILTER (WHERE a.status IN ('present', 'wfh')))::int AS days_in
+        FROM hr_attendance a
+        JOIN hr_employees e ON e.id = a.employee_id
+       WHERE ${departmentFilter(scoped)}
+         AND e.is_active = true
+         AND a.date >= CURRENT_DATE - INTERVAL '6 days'
+         AND a.date <= CURRENT_DATE
+       GROUP BY a.employee_id`))) {
+      weekBy[String(w.employee_id)] = w;
+    }
+  } catch (e: any) {
+    console.error('[portal/team] week', e?.cause?.message || e?.message);
+  }
+
+  // Leave. hr_leave_request (SINGULAR) is the live table; the plural hr_leave_requests /
+  // hr_leave_types / hr_leave_balances are an orphaned second schema with no writer.
+  try {
+    await ensureLeaveSchema();
+    pendingLeave = rowsOf(await db.execute(sql`
+      SELECT l.id::text AS id, l.employee_id::text AS employee_id, l.leave_type,
+             l.start_date, l.end_date, l.days, l.requested_at,
+             e.full_name, e.employee_code
+        FROM hr_leave_request l
+        JOIN hr_employees e ON e.id = l.employee_id
+       WHERE l.status = 'pending'
+         AND ${departmentFilter(scoped)}
+         AND e.is_active = true
+       ORDER BY l.start_date ASC
+       LIMIT 40`));
+    upcomingLeave = rowsOf(await db.execute(sql`
+      SELECT l.id::text AS id, l.employee_id::text AS employee_id, l.leave_type,
+             l.start_date, l.end_date, l.days, e.full_name
+        FROM hr_leave_request l
+        JOIN hr_employees e ON e.id = l.employee_id
+       WHERE l.status = 'approved'
+         AND ${departmentFilter(scoped)}
+         AND e.is_active = true
+         AND l.end_date >= CURRENT_DATE
+         AND l.start_date <= CURRENT_DATE + INTERVAL '30 days'
+       ORDER BY l.start_date ASC
+       LIMIT 40`));
+  } catch (e: any) {
+    console.error('[portal/team] leave', e?.cause?.message || e?.message);
+    leaveError = 'Leave could not be read just now.';
+  }
+
+  // Credit. The SAME engine that writes the completion letter, in two queries for the whole team, so
+  // what a lead reads about someone is exactly what that person reads on their own page and exactly
+  // what their letter will say. Three readings that disagree would be worse than one.
+  if (members.length) {
+    try {
+      const led = await ledgerForMany(members.map((m: any) => ({
+        employeeId: String(m.id),
+        terms: termsFromRow(m),
+      })));
+      for (const m of members) {
+        const r = led.get(String(m.id));
+        if (r) ledgerBy[String(m.id)] = r.summary;
+      }
+    } catch (e: any) {
+      console.error('[portal/team] credit', e?.cause?.message || e?.message);
+      creditError = 'Hours and credit could not be read just now.';
+    }
+  }
+}
+
+// Counts for the day strip, derived from what was already read — never a second query.
+const workingNow = members.filter((m: any) => {
+  const s = String(todayBy[String(m.id)]?.status || '');
+  return s === 'present' || s === 'wfh';
+}).length;
+const onLeaveNow = members.filter((m: any) => String(todayBy[String(m.id)]?.status || '') === 'on_leave').length;
+const unrecordedNow = members.length - workingNow - onLeaveNow;
+const deptLabel = scoped ? (deptName || String(scoped.scopeDepartmentId)) : '';
+---
+
+<BaseLayout title="My team" description="Capacity and progress for the department you lead." noindex={true}>
+  <section style="max-width:840px;margin:0 auto;padding:26px 16px 72px;">
+
+    <p style="font-size:10.5px;letter-spacing:0.14em;text-transform:uppercase;color:#c2410c;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 6px;">Team lead</p>
+    <h1 style="font-family:Fraunces,Georgia,serif;font-size:clamp(24px,5.5vw,32px);color:#1a1510;margin:0 0 10px;font-weight:600;">My team</h1>
+
+    {denial && (
+      <div style="background:#faf6ef;border:1px solid #ece4d6;border-radius:14px;padding:18px 18px 20px;margin-top:14px;">
+        <p style="font-size:15px;color:#1a1510;margin:0 0 8px;font-weight:600;">{denial.title}</p>
+        <p style="font-size:13.5px;color:#5c5349;line-height:1.7;margin:0;">{denial.reason}</p>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:16px;">
+          <a href="/portal/employee" style="display:inline-block;background:#1a1510;color:#faf6ef;text-decoration:none;font-size:13px;font-weight:600;padding:10px 16px;border-radius:10px;">Go to my HR page</a>
+          <a href="/portal" style="display:inline-block;background:transparent;border:1px solid #ece4d6;color:#5c5349;text-decoration:none;font-size:13px;font-weight:600;padding:10px 16px;border-radius:10px;">Back to the portal</a>
+        </div>
+      </div>
+    )}
+
+    {scoped && (
+      <div>
+        <p style="font-size:14px;color:#5c5349;line-height:1.7;margin:0 0 18px;">
+          Capacity and progress for <b style="color:#1a1510;">{deptLabel}</b>. This page can show one
+          department, and only ever this one.
+        </p>
+
+        {/* The scope, stated rather than assumed. A lead who does not know where the boundary is
+            drawn cannot tell a quiet gap from an empty team, and the department stamp has exactly one
+            automatic writer, so gaps are common and have to be named. */}
+        <div style="background:#faf6ef;border:1px solid #ece4d6;border-radius:14px;padding:14px 16px;margin-bottom:18px;">
+          <p style="font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 8px;">What you are looking at</p>
+          <p style="font-size:12.5px;color:#5c5349;line-height:1.7;margin:0;">
+            The department recorded against your account by HR. {DEPARTMENT_COVERAGE_NOTICE}
+          </p>
+        </div>
+
+        {loadError && (
+          <div style="background:#fbeceb;border:1px solid #f0cfcb;border-radius:14px;padding:14px 16px;margin-bottom:18px;">
+            <p style="font-size:13px;color:#a5342a;margin:0;line-height:1.6;">{loadError} Nothing is lost; try again in a moment.</p>
+          </div>
+        )}
+
+        {members.length > 0 && (
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px;">
+            <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:14px 16px;">
+              <p style="font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 4px;">Working today</p>
+              <p style="font-size:24px;font-weight:700;color:#1c7a45;margin:0;font-family:'Geist Mono',monospace;">{workingNow}</p>
+            </div>
+            <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:14px 16px;">
+              <p style="font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 4px;">On leave</p>
+              <p style="font-size:24px;font-weight:700;color:#8a5a12;margin:0;font-family:'Geist Mono',monospace;">{onLeaveNow}</p>
+            </div>
+            <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:14px 16px;">
+              <p style="font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 4px;">Nothing recorded</p>
+              <p style="font-size:24px;font-weight:700;color:#5c5349;margin:0;font-family:'Geist Mono',monospace;">{unrecordedNow}</p>
+            </div>
+          </div>
+        )}
+
+        {/* PEOPLE */}
+        <h2 style="font-family:Fraunces,Georgia,serif;font-size:19px;color:#1a1510;margin:0 0 4px;font-weight:600;">
+          {deptLabel}{members.length > 0 ? ' — ' + members.length + (members.length === 1 ? ' person' : ' people') : ''}
+        </h2>
+        <p style="font-size:12.5px;color:#8a7f70;line-height:1.65;margin:0 0 14px;">
+          Hours and credit are the same figures each person sees on their own HR page, produced by the
+          same engine that writes their completion report.
+        </p>
+
+        {creditError && (
+          <p style="font-size:12.5px;color:#a5342a;line-height:1.6;margin:0 0 12px;">{creditError} Names and today's status below are still accurate.</p>
+        )}
+
+        {members.length === 0 && !loadError && (
+          <div style="background:#faf6ef;border:1px solid #ece4d6;border-radius:14px;padding:18px;">
+            <p style="font-size:14px;color:#1a1510;margin:0 0 8px;font-weight:600;">Nobody in this department has a department stamp on their record</p>
+            <p style="font-size:13px;color:#5c5349;line-height:1.7;margin:0;">
+              This is far more likely a gap in the records than an empty team. A department is written
+              onto an employee record automatically in one situation only: when an application is
+              marked hired. Anyone HR added by hand has no department on file, and there is no field on
+              the employee form to set it, so they cannot appear here yet. Ask HR to record the
+              department against each person and this list fills in by itself.
+            </p>
+          </div>
+        )}
+
+        {members.length > 0 && (
+          <div style="display:flex;flex-direction:column;gap:10px;">
+            {members.map((m: any) => {
+              const id = String(m.id);
+              const t = todayBy[id];
+              const chip = chipFor(String(t?.status || ''));
+              const hoursToday = round1(num(t?.work_hours));
+              const week = weekBy[id];
+              const weekHours = round1(num(week?.hours));
+              const weekDays = num(week?.days_in);
+              const s = ledgerBy[id];
+              const req = s?.requiredCreditHours || 0;
+              const pct = req > 0 ? Math.min(100, Math.round((num(s?.creditHours) / req) * 100)) : null;
+              const partTimeUnset = String(m.engagement_kind || '') === 'part-time' && m.weekly_hours == null;
+              const isSelf = selfEmployeeId !== '' && id === selfEmployeeId;
+              return (
+                <article style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:14px 15px;">
+                  <div style="display:flex;gap:11px;align-items:flex-start;">
+                    {/* Initials, not the face-2FA capture. A security photo is not a roster photo. */}
+                    <div style="width:38px;height:38px;border-radius:50%;background:#f2ede4;color:#8a5a12;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0;font-family:'Geist Mono',monospace;">{initialsOf(m.full_name)}</div>
+                    <div style="flex:1;min-width:0;">
+                      <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:baseline;">
+                        <p style="font-size:14.5px;color:#1a1510;margin:0;font-weight:600;">{m.full_name}</p>
+                        {isSelf && <span style="font-size:10.5px;color:#8a7f70;font-family:'Geist Mono',monospace;">you</span>}
+                      </div>
+                      <p style="font-size:12px;color:#8a7f70;margin:2px 0 0;line-height:1.5;">
+                        {m.designation || 'Role not recorded'}{m.employment_type ? ' · ' + m.employment_type : ''}
+                      </p>
+                    </div>
+                    <span style={`font-size:10.5px;font-weight:700;letter-spacing:0.04em;padding:4px 9px;border-radius:99px;white-space:nowrap;color:${chip.fg};background:${chip.bg};`}>{chip.label}</span>
+                  </div>
+
+                  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:10px;margin-top:12px;">
+                    <div>
+                      <p style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0;">Today</p>
+                      <p style="font-size:15px;font-weight:700;color:#1a1510;margin:2px 0 0;font-family:'Geist Mono',monospace;">{hoursToday > 0 ? hoursToday + 'h' : '--'}</p>
+                    </div>
+                    <div>
+                      <p style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0;">Last 7 days</p>
+                      <p style="font-size:15px;font-weight:700;color:#1a1510;margin:2px 0 0;font-family:'Geist Mono',monospace;">{weekHours > 0 ? weekHours + 'h' : '--'}</p>
+                      <p style="font-size:10.5px;color:#8a7f70;margin:1px 0 0;">{weekDays} day{weekDays === 1 ? '' : 's'} in</p>
+                    </div>
+                    <div>
+                      <p style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0;">Attendance</p>
+                      <p style={`font-size:15px;font-weight:700;margin:2px 0 0;font-family:'Geist Mono',monospace;color:${s ? attendanceColour(num(s.attendancePct)) : '#8a7f70'};`}>{s ? num(s.attendancePct) + '%' : '--'}</p>
+                    </div>
+                    <div>
+                      <p style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0;">Credit</p>
+                      <p style="font-size:15px;font-weight:700;color:#1a1510;margin:2px 0 0;font-family:'Geist Mono',monospace;">{s ? num(s.creditHours) : '--'}{req > 0 ? ' / ' + req : ''}</p>
+                    </div>
+                  </div>
+
+                  {pct !== null && (
+                    <div style="margin-top:10px;">
+                      <div style="height:6px;background:#f2ede4;border-radius:99px;overflow:hidden;">
+                        <div style={`height:100%;width:${pct}%;background:${pct >= 100 ? '#1c7a45' : '#c2410c'};border-radius:99px;`}></div>
+                      </div>
+                    </div>
+                  )}
+
+                  {s && (num(s.unauthorisedLeaveDays) > 0 || num(s.noticeBreaches) > 0) && (
+                    <p style="font-size:12px;color:#8a5a12;line-height:1.6;margin:10px 0 0;background:#fdf3e3;border:1px solid #f2e0c0;border-radius:10px;padding:8px 10px;">
+                      {num(s.unauthorisedLeaveDays) > 0 ? num(s.unauthorisedLeaveDays) + ' day(s) recorded without approved leave. ' : ''}
+                      {num(s.noticeBreaches) > 0 ? num(s.noticeBreaches) + ' leave(s) taken without notice beforehand. ' : ''}
+                      This appears on their completion report, so it is worth a conversation now.
+                    </p>
+                  )}
+
+                  {partTimeUnset && (
+                    <p style="font-size:12px;color:#8a5a12;line-height:1.6;margin:10px 0 0;">
+                      Agreed part-time hours are not recorded, so credit cannot be calculated for this
+                      person. HR can set them.
+                    </p>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        )}
+
+        {truncated && (
+          <p style="font-size:12px;color:#8a7f70;line-height:1.6;margin:12px 0 0;">
+            Showing the first {MEMBER_LIMIT} people alphabetically. This department has more.
+          </p>
+        )}
+
+        {/* LEAVE AWAITING A DECISION */}
+        <h2 style="font-family:Fraunces,Georgia,serif;font-size:19px;color:#1a1510;margin:30px 0 4px;font-weight:600;">Leave awaiting a decision</h2>
+        <p style="font-size:12.5px;color:#8a7f70;line-height:1.65;margin:0 0 14px;">
+          Requests from your department that nobody has answered yet.
+        </p>
+
+        {leaveError && <p style="font-size:12.5px;color:#a5342a;line-height:1.6;margin:0 0 12px;">{leaveError}</p>}
+
+        {/* HONEST ABOUT THE BUTTON THAT IS NOT HERE. A lead cannot approve leave in this system today:
+            every decision runs through approverRole() in src/lib/hr-wallet.ts:146-158, which
+            recognises super_admin, admin and HR only — its reporting-manager branch probes two columns
+            that do not exist on hr_employees and has never returned true. Rendering Approve and Reject
+            buttons that always answer "you are not permitted to decide this request" would be worse
+            than not rendering them. Widening that function is a real decision, because it is SHARED
+            with withdrawals, which move money. */}
+        {pendingLeave.length === 0 && !leaveError && (
+          <div style="background:#f4f9f4;border:1px solid #cfe5d3;border-radius:14px;padding:16px 18px;">
+            <p style="font-size:13.5px;color:#1c7a45;margin:0;font-weight:600;">Nothing is waiting.</p>
+          </div>
+        )}
+
+        {pendingLeave.length > 0 && (
+          <div style="display:flex;flex-direction:column;gap:10px;">
+            {pendingLeave.map((l: any) => (
+              <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:13px 15px;">
+                <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:baseline;">
+                  <p style="font-size:14px;color:#1a1510;margin:0;font-weight:600;">{l.full_name}</p>
+                  <span style="font-size:10.5px;font-weight:700;color:#8a5a12;background:#fdf3e3;padding:4px 9px;border-radius:99px;">Awaiting HR</span>
+                </div>
+                <p style="font-size:12.5px;color:#5c5349;margin:6px 0 0;line-height:1.6;">
+                  {leaveLabel(l.leave_type)} leave · {fmtRange(l.start_date, l.end_date)} · {num(l.days)} day{num(l.days) === 1 ? '' : 's'}
+                </p>
+              </div>
+            ))}
+            <p style="font-size:12px;color:#8a7f70;line-height:1.65;margin:2px 0 0;">
+              Leave is decided by HR, not from this page, so these are here to be planned around rather
+              than actioned. The reason someone gave is deliberately not shown: it is where health and
+              family details get written, and cover planning does not need them.
+            </p>
+          </div>
+        )}
+
+        {/* UPCOMING APPROVED LEAVE */}
+        <h2 style="font-family:Fraunces,Georgia,serif;font-size:19px;color:#1a1510;margin:30px 0 4px;font-weight:600;">Approved leave, next 30 days</h2>
+        <p style="font-size:12.5px;color:#8a7f70;line-height:1.65;margin:0 0 14px;">
+          Who will be away, so cover can be arranged before it is urgent.
+        </p>
+
+        {upcomingLeave.length === 0 && !leaveError && (
+          <div style="background:#faf6ef;border:1px solid #ece4d6;border-radius:14px;padding:16px 18px;">
+            <p style="font-size:13.5px;color:#5c5349;margin:0;">No approved leave in the next 30 days.</p>
+          </div>
+        )}
+
+        {upcomingLeave.length > 0 && (
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            {upcomingLeave.map((l: any) => (
+              <div style="background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 14px;display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;justify-content:space-between;">
+                <p style="font-size:13.5px;color:#1a1510;margin:0;font-weight:600;">{l.full_name}</p>
+                <p style="font-size:12.5px;color:#5c5349;margin:0;font-family:'Geist Mono',monospace;">
+                  {fmtRange(l.start_date, l.end_date)} · {num(l.days)}d · {leaveLabel(l.leave_type)}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* WHAT THIS PAGE WILL NOT SHOW. Written down where the people it protects can read it. */}
+        <div style="margin-top:30px;background:#faf6ef;border:1px solid #ece4d6;border-radius:14px;padding:16px 18px;">
+          <p style="font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 10px;">What a lead is not shown</p>
+          <p style="font-size:12.5px;color:#5c5349;line-height:1.75;margin:0;">
+            Pay, bank details, government identifiers, home address and date of birth are not on this
+            page and are not read to build it. Neither is anything from the wellbeing system, which is
+            private to the person it belongs to and reported only in aggregate. Location, device and
+            the check-in photo captured at each clock-in are visible to that person alone and never to
+            a lead. What is here is capacity and progress, which is what leading a team needs.
+          </p>
+        </div>
+
+        <p style="font-size:12px;color:#8a7f70;line-height:1.7;margin:18px 0 0;">
+          Your own hours, leave and credit live on <a href="/portal/employee" style="color:#c2410c;">your HR page</a>.
+        </p>
+      </div>
+    )}
+
+  </section>
+</BaseLayout>

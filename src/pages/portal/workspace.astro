@@ -1,453 +1,1089 @@
 ---
+// /portal/workspace — the working person's own interface.
+//
+// WHAT THIS REPLACES, TWICE OVER.
+//
+// First: /admin was built as one console for the super admin and then handed out by an automatic
+// role promotion, so every intern who signed an offer could open the applicant pipeline, employee
+// records and candidate names. That promotion is gone and interns are blocked (intern-guard.ts).
+// This is the screen they should have had instead — their own record, and nobody else's.
+//
+// Second: this URL previously served a marketing shell that INSERTED eight invented inbox rows
+// ("Study partner", "Mentor", "Fee receipt") into a workspace_recent_items table on first visit,
+// alongside hardcoded "Last used 2h ago" strings and links to /portal/tasks and /portal/calendar.
+// It showed a person fictional messages from fictional people inside their own portal. Everything
+// below is read from the tables that actually record this person's work, and nothing on this page
+// is written unless they type it.
+//
+// THE SCOPING RULE. `ws.employeeId` is resolved from the session by requireEmployee() and from
+// nowhere else, and every statement narrows on it IN THE WHERE CLAUSE via employeeFilter(ws). No
+// query string, form field or header can change whose rows come back: the only request values
+// honoured are a flash message and a time-log id, and that id is deleted with the employee filter
+// beside it, so an id belonging to somebody else simply matches nothing.
+//
+// WHY requireEmployee AND NOT requireIntern. The scope is identical either way — one person, their
+// own employee_id. requireIntern would additionally refuse every non-intern their own hours, leave,
+// documents and reviews, which costs them a useful screen and protects nobody. The intern framing
+// appears in the copy where it is true (ws.isIntern), not in the gate.
+//
+// NOT READ FROM HERE, deliberately: hr_clock_events (a GPS fix, an IP, a device string and a selfie
+// per punch — this person's own attendance comes from hr_attendance's status and hours instead) and
+// every wellness_* table.
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import { requireEmployee, employeeFilter } from '@/lib/auth/workspace-access';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ledgerFor, termsFor, reviewsFor } from '@/lib/credit-ledger';
+import { remainingWeeks } from '@/lib/credit-hours';
+import { getBalances, listLeave } from '@/lib/hr-leave';
+import { listDocs, progress as docProgress, docTypeLabel, MAX_DOCS } from '@/lib/hr-onboarding';
 
-const user = Astro.locals.user;
-if (!user) return Astro.redirect('/portal/login?next=/portal/workspace');
+const PAGE = '/portal/workspace';
 
-function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+// THE GATE, FIRST — before any query and before the POST handler, so a write can never run
+// unscoped and nothing is read that the caller has not been authorised for.
+const gate = await requireEmployee(Astro.locals.user, PAGE);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
 
-// --- Bootstrap unified inbox aggregation table ---
-try {
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS workspace_recent_items (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID NOT NULL,
-      source VARCHAR(40) NOT NULL,
-      kind VARCHAR(40) NOT NULL,
-      title TEXT,
-      preview TEXT,
-      sender_name TEXT,
-      ref_url TEXT,
-      unread BOOLEAN DEFAULT TRUE,
-      occurred_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS workspace_recent_items_user_time ON workspace_recent_items (user_id, occurred_at DESC)`);
-} catch (e) {}
+const ws = gate.ok ? gate.workspace : null;
+const denial = gate.ok ? null : gate;
+const viewerId = String(Astro.locals.user?.id || '');
 
-// --- Handle POST: mark an item read, or seed demo items for first-time users ---
-let flashMsg = '';
+// ---------------------------------------------------------------------------
+// Helpers. Every const is declared ABOVE the POST handler that uses it: `const` is not hoisted,
+// and a handler reaching a later declaration has taken two pages down in this repo.
+// ---------------------------------------------------------------------------
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const q = async (query: any): Promise<any[]> => {
+  try {
+    return rowsOf(await db.execute(query));
+  } catch (e: any) {
+    // The real Postgres reason is on the cause; e.message is only the failed SQL.
+    console.error('[portal/workspace]', e?.cause?.message || e?.message);
+    return [];
+  }
+};
+const todayIso = new Date().toISOString().slice(0, 10);
+const toMinutes = (t: string): number => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || '').trim());
+  if (!m) return -1;
+  const h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
+  return h >= 0 && h <= 23 && mi >= 0 && mi <= 59 ? h * 60 + mi : -1;
+};
+/** Whole days between an ISO date and today. Negative means the future. */
+const daysAgo = (iso: string): number => {
+  const then = Date.parse(String(iso) + 'T00:00:00Z');
+  if (Number.isNaN(then)) return NaN;
+  return Math.round((Date.parse(todayIso + 'T00:00:00Z') - then) / 86400000);
+};
+const BACKFILL_DAYS = 7;   // how far back a missed hour block may be entered here
+const round1 = (n: any): number => Math.round((Number(n) || 0) * 10) / 10;
+const isoOf = (d: any): string => {
+  if (!d) return '';
+  const s = d instanceof Date ? d.toISOString() : String(d);
+  return s.slice(0, 10);
+};
+const prettyDate = (d: any): string => {
+  const s = isoOf(d);
+  if (!s) return '';
+  const dt = new Date(s + 'T00:00:00Z');
+  if (isNaN(dt.getTime())) return s;
+  return dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+};
+const shortDate = (d: any): string => {
+  const s = isoOf(d);
+  if (!s) return '';
+  const dt = new Date(s + 'T00:00:00Z');
+  if (isNaN(dt.getTime())) return s;
+  return dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+};
+// Plain functions rather than typed lookup maps: a Record<string,string> used inside JSX breaks
+// parsing in this codebase's .astro files.
+function dayTone(status: string): string {
+  if (status === 'present') return '#15803d';
+  if (status === 'half-day') return '#65a30d';
+  if (status === 'authorised-leave') return '#0284c7';
+  if (status === 'unauthorised-leave') return '#b91c1c';
+  if (status === 'holiday') return '#c9c0b2';
+  return '#e4dccd';
+}
+function dayWord(status: string): string {
+  if (status === 'present') return 'Worked';
+  if (status === 'half-day') return 'Half day';
+  if (status === 'authorised-leave') return 'Approved leave';
+  if (status === 'unauthorised-leave') return 'Absent, no approved leave';
+  if (status === 'holiday') return 'Holiday';
+  return 'Not started';
+}
+function leaveTone(status: string): string {
+  if (status === 'approved') return '#15803d';
+  if (status === 'rejected') return '#b91c1c';
+  if (status === 'cancelled') return '#6b6255';
+  return '#b45309';
+}
+function taskTone(status: string): string {
+  if (status === 'done') return '#15803d';
+  if (status === 'blocked') return '#b91c1c';
+  return '#b45309';
+}
+function docTone(status: string): string {
+  if (status === 'verified') return '#15803d';
+  if (status === 'rejected') return '#b91c1c';
+  return '#b45309';
+}
+
+// ---------------------------------------------------------------------------
+// POST. Two actions, both on this person's own hour log, both narrowed by employeeFilter(ws).
+// Ordinary form posts back to this same URL — no JavaScript involved, and none on the page.
+// ---------------------------------------------------------------------------
 if (Astro.request.method === 'POST') {
+  // No resolved workspace, no write. A denial cannot be talked around by posting to the page.
+  if (!ws) return Astro.redirect(PAGE);
+
   const fd = await Astro.request.formData();
   const action = String(fd.get('action') || '');
-  try {
-    if (action === 'mark_read') {
-      const id = String(fd.get('id') || '');
-      if (id) {
-        await db.execute(sql`UPDATE workspace_recent_items SET unread = FALSE WHERE id::text = ${id} AND user_id = ${user.id}`);
-        flashMsg = 'Marked as read.';
-      }
-    } else if (action === 'mark_all_read') {
-      await db.execute(sql`UPDATE workspace_recent_items SET unread = FALSE WHERE user_id = ${user.id}`);
-      flashMsg = 'All caught up.';
+  let flash = '';
+
+  if (action === 'add_time_log') {
+    const logDate = String(fd.get('log_date') || '').trim();
+    const start = String(fd.get('start_time') || '').trim();
+    const end = String(fd.get('end_time') || '').trim();
+    const task = String(fd.get('task') || '').trim();
+    const gap = daysAgo(logDate);
+    const s = toMinutes(start), e = toMinutes(end);
+
+    if (Number.isNaN(gap) || gap < 0) {
+      flash = 'Pick a day that has already happened. Hours cannot be logged ahead of time.';
+    } else if (gap > BACKFILL_DAYS - 1) {
+      // Bounded on purpose: catching up on a day you worked is fair, rewriting last month is a
+      // change to a record other people rely on and should go through HR, who leave a trail.
+      flash = 'You can fill in the last ' + BACKFILL_DAYS + ' days here. For anything older, ask HR to add it so there is a record of who changed what.';
+    } else if (s < 0 || e < 0 || e <= s) {
+      flash = 'Enter a start and an end time, with the end after the start.';
+    } else if (task.length < 3) {
+      flash = 'Say briefly what you worked on in that block.';
+    } else {
+      const hours = Math.round(((e - s) / 60) * 100) / 100;
+      const ins = await q(sql`
+        INSERT INTO hr_time_logs (employee_id, log_date, start_time, end_time, hours, task)
+        VALUES (${ws.employeeId}, ${logDate}, ${start}, ${end}, ${hours}, ${task.slice(0, 500)})
+        RETURNING id`);
+      flash = ins.length
+        ? 'Logged ' + hours + 'h on ' + prettyDate(logDate) + '.'
+        : 'That did not save. Nothing else was lost - try again in a moment.';
     }
-  } catch (e) {}
+  } else if (action === 'delete_time_log') {
+    const logId = String(fd.get('log_id') || '').trim();
+    if (logId) {
+      // The employee filter beside the id is what makes this safe: somebody else's id matches
+      // nothing rather than deleting their row.
+      const del = await q(sql`
+        DELETE FROM hr_time_logs
+         WHERE id::text = ${logId} AND ${employeeFilter(ws)}
+        RETURNING id`);
+      flash = del.length ? 'Entry removed.' : 'That entry is no longer there.';
+    }
+  }
+
+  return Astro.redirect(PAGE + (flash ? '?msg=' + encodeURIComponent(flash) : ''));
 }
 
-// --- Seed a few items for new users so the inbox is never empty on first load ---
-let countRow: any = [];
-try {
-  countRow = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM workspace_recent_items WHERE user_id = ${user.id}`));
-} catch {}
-const totalItems = Number(countRow?.[0]?.c || 0);
+// ---------------------------------------------------------------------------
+// Reads. All of them narrowed to this one employee, none of them by anything the browser sent.
+// ---------------------------------------------------------------------------
 
-if (totalItems === 0) {
+// Who they report to, from THEIR OWN row's pointer.
+//
+// Honest about what this shows today: hr_employees.reporting_manager_id is declared at
+// db/hr-schema.sql:55 and written by no code path in this repo, so it is NULL for everyone and this
+// currently renders as "not recorded". It is here rather than omitted because the moment HR can set
+// it a person should see it, and because the alternative — inventing a second mentor field on this
+// page — creates two places for one fact to disagree.
+//
+// This is the ONLY row belonging to another person that this page reads, and it is narrowed hard:
+// two display columns, no email, no identifier, no employment detail. It is reached solely through
+// a pointer stored on the viewer's own record — the WHERE clause is on the VIEWER, so the join can
+// only ever arrive at whoever HR recorded as their manager, and nothing the browser sends
+// participates. There is also no ALTER adding this column to a pre-existing hr_employees, so on a
+// database older than the schema file the statement throws, q() logs the cause and returns nothing,
+// and the section reads as not recorded — the correct outcome in both cases.
+const manager = ws ? (await q(sql`
+  SELECT m.full_name AS manager_name, m.designation AS manager_role
+    FROM hr_employees e
+    JOIN hr_employees m ON m.id = e.reporting_manager_id
+   WHERE ${employeeFilter(ws, sql`e.id`)}
+   LIMIT 1`))[0] : null;
+
+// How far in they are. Elapsed time is not progress on its own — the requirement is a number of
+// credit-hours, not a duration (credit-hours.ts) — so this is shown as elapsed time NEXT TO the
+// credit figure, never as a substitute for it.
+const daysSinceJoining = ws?.joiningDate ? daysAgo(ws.joiningDate) : NaN;
+const weeksSinceJoining = Number.isNaN(daysSinceJoining) || daysSinceJoining < 0
+  ? null
+  : Math.floor(daysSinceJoining / 7);
+
+let credit: any = null;
+let terms: any = null;
+let weeksLeft: number | null = null;
+let ledgerDays: any[] = [];
+if (ws) {
   try {
-    await db.execute(sql`
-      INSERT INTO workspace_recent_items (user_id, source, kind, title, preview, sender_name, ref_url, unread, occurred_at) VALUES
-      (${user.id}, 'mail', 'message', 'Welcome to the Workspace', 'Your single inbox is now live across mail, chat, and notifications.', 'Workspace team', '/portal/mail', TRUE, NOW() - INTERVAL '4 minutes'),
-      (${user.id}, 'chat', 'dm', 'Direct message', 'Hey — quick question about the lab assignment when you get a sec.', 'Study partner', '/portal/messages', TRUE, NOW() - INTERVAL '32 minutes'),
-      (${user.id}, 'notification', 'system', 'New lesson published', 'Module 4 lesson 2 is ready — you can resume where you left off.', 'AquinTutor', '/aquintutor/dashboard', TRUE, NOW() - INTERVAL '2 hours'),
-      (${user.id}, 'mail', 'message', 'Fee receipt', 'Your latest application fee has been receipted. Reference attached.', 'Finance desk', '/portal/mail', FALSE, NOW() - INTERVAL '5 hours'),
-      (${user.id}, 'chat', 'group', 'Project cohort', 'Reminder: stand-up moved to 18:30 IST this evening.', 'Cohort channel', '/portal/messages', FALSE, NOW() - INTERVAL '1 day'),
-      (${user.id}, 'notification', 'task', 'Task due soon', 'Submit reflective essay before midnight tomorrow.', 'Tasks', '/portal/tasks', TRUE, NOW() - INTERVAL '1 day 3 hours'),
-      (${user.id}, 'mail', 'message', 'Mentor catch-up', 'Available Friday at 15:00 for the quarterly review — please confirm.', 'Mentor', '/portal/mail', FALSE, NOW() - INTERVAL '2 days'),
-      (${user.id}, 'notification', 'system', 'New certificate issued', 'Your Sanskrit-awareness certificate is available for download.', 'Certificates', '/portal/achievements', FALSE, NOW() - INTERVAL '3 days')
-    `);
-  } catch (e) {}
+    // The same engine that produces the completion letter, so what is read here is what the letter
+    // will say. Not recomputed locally: two implementations of the same figure eventually disagree,
+    // and this one goes to a university.
+    terms = await termsFor(ws.employeeId);
+    const led = await ledgerFor(ws.employeeId, terms);
+    credit = led.summary;
+    ledgerDays = led.days || [];
+    weeksLeft = remainingWeeks(credit, terms);
+  } catch (e: any) {
+    console.error('[portal/workspace] ledger', e?.cause?.message || e?.message);
+  }
 }
+const creditPct = credit && credit.requiredCreditHours
+  ? Math.min(100, Math.round((credit.creditHours / credit.requiredCreditHours) * 100))
+  : null;
+const recentDays = ledgerDays.slice(-35);
+// The last stretch in words and hours, newest first. The colour strip above it reads a whole
+// engagement at a glance; this is the part someone actually checks on a phone when they want to
+// know what a specific day was recorded as.
+const recentDetail = ledgerDays.slice(-10).reverse();
 
-// --- Pull the most recent 8 items for the unified inbox ---
-let inboxRows: any[] = [];
-try {
-  inboxRows = rows(await db.execute(sql`
-    SELECT id::text AS id, source, kind, title, preview, sender_name, ref_url, unread, occurred_at
-      FROM workspace_recent_items
-     WHERE user_id = ${user.id}
-     ORDER BY occurred_at DESC
-     LIMIT 8
-  `));
-} catch {}
+// Attendance totals, from hr_attendance's status and hours.
+const attRow = ws ? (await q(sql`
+  SELECT
+    COALESCE(SUM(work_hours) FILTER (WHERE date >= date_trunc('week', CURRENT_DATE)::date), 0)::float  AS week_hours,
+    COALESCE(SUM(work_hours) FILTER (WHERE date >= date_trunc('month', CURRENT_DATE)::date), 0)::float AS month_hours,
+    COUNT(*) FILTER (WHERE date >= date_trunc('week', CURRENT_DATE)::date  AND status IN ('present','wfh'))::int AS week_days,
+    COUNT(*) FILTER (WHERE date >= date_trunc('month', CURRENT_DATE)::date AND status IN ('present','wfh'))::int AS month_days
+  FROM hr_attendance WHERE ${employeeFilter(ws)}`))[0] : null;
 
-const unreadCount = inboxRows.filter((i: any) => i.unread).length;
-
-// Format relative time for the inbox
-function relTime(d: any): string {
-  if (!d) return '';
-  const t = new Date(d).getTime();
-  if (Number.isNaN(t)) return '';
-  const diff = Math.floor((Date.now() - t) / 1000);
-  if (diff < 60) return diff + 's';
-  if (diff < 3600) return Math.floor(diff / 60) + 'm';
-  if (diff < 86400) return Math.floor(diff / 3600) + 'h';
-  return Math.floor(diff / 86400) + 'd';
+const timeLogs = ws ? await q(sql`
+  SELECT id, log_date, start_time, end_time, hours, task
+    FROM hr_time_logs
+   WHERE ${employeeFilter(ws)} AND log_date >= CURRENT_DATE - INTERVAL '13 days'
+   ORDER BY log_date DESC, start_time ASC
+   LIMIT 200`) : [];
+// Grouped by day so a fortnight reads as a diary rather than a list of rows.
+const logDays: any[] = [];
+for (const l of timeLogs) {
+  const key = isoOf(l.log_date);
+  let bucket = logDays.find((b: any) => b.date === key);
+  if (!bucket) { bucket = { date: key, hours: 0, entries: [] as any[] }; logDays.push(bucket); }
+  bucket.hours = Math.round((bucket.hours + (Number(l.hours) || 0)) * 100) / 100;
+  bucket.entries.push(l);
 }
+const loggedFortnight = round1(logDays.reduce((a: number, b: any) => a + b.hours, 0));
 
-// --- Tool catalogue grouped by purpose ---
-type Tool = { name: string; href: string; desc: string; icon: string; lastUsed: string };
+const taskLogs = ws ? await q(sql`
+  SELECT id, log_date, task, status, percent, details
+    FROM hr_task_log
+   WHERE ${employeeFilter(ws)}
+   ORDER BY log_date DESC, created_at DESC
+   LIMIT 20`) : [];
 
-const communicate: Tool[] = [
-  { name: 'Mail',       href: '/portal/mail',                          desc: 'Encrypted-at-rest mail with threading, attachments, and filters.', icon: 'mail',     lastUsed: '2h ago' },
-  { name: 'Chat',       href: '/portal/messages',                      desc: 'Real-time direct + group messaging with on-device encryption.',   icon: 'chat',     lastUsed: '32m ago' },
-  { name: 'Live class', href: '/portal/liveclass',                     desc: 'Browser-native video rooms with shared whiteboard and chat.',     icon: 'live',     lastUsed: 'yesterday' },
-  { name: 'Network',    href: '/aquintutor/careerflow/network',        desc: 'Professional graph of peers, mentors, faculty, and recruiters.',  icon: 'network',  lastUsed: '3d ago' },
-];
+const reports = ws ? await q(sql`
+  SELECT report_date, work_done, progress, blockers
+    FROM hr_daily_reports
+   WHERE ${employeeFilter(ws)}
+   ORDER BY report_date DESC
+   LIMIT 7`) : [];
 
-const create: Tool[] = [
-  { name: 'Notes',            href: '/portal/notes',                  desc: 'Markdown notebooks with sharing, collaborators, and revision history.', icon: 'note',    lastUsed: '15m ago' },
-  { name: 'Resume',           href: '/portal/resume-builder',         desc: 'Structured resume builder with auto-formatted print export.',            icon: 'resume',  lastUsed: '1w ago' },
-  { name: 'Notebook',         href: '/portal/tools/notebook',         desc: 'Code + markdown cells, sandboxed runtime, charts, tables, exports.',     icon: 'book',    lastUsed: '4h ago' },
-  { name: 'Code IDE',         href: '/portal/tools/ide',              desc: 'Multi-tab editor with palette, terminal, and syntax highlighting.',      icon: 'code',    lastUsed: '6h ago' },
-  { name: 'Canvas Pro',       href: '/portal/tools/canvas-pro',       desc: 'Layered raster editor with blend modes, filters, and PNG export.',       icon: 'canvas',  lastUsed: '2d ago' },
-  { name: 'Animation Studio', href: '/aquintutor/labs/animator',      desc: 'Keyframe-driven 2D motion authoring with onion skin and export.',        icon: 'film',    lastUsed: 'never' },
-  { name: 'Flashcards',       href: '/portal/flashcards',             desc: 'Spaced-repetition decks with leitner buckets and daily review.',         icon: 'card',    lastUsed: 'today' },
-];
-
-const manage: Tool[] = [
-  { name: 'CRM',      href: '/portal/crm',      desc: 'Contact, opportunity, and activity ledger with audit log.',     icon: 'crm',  lastUsed: '1h ago' },
-  { name: 'Tasks',    href: '/portal/tasks',    desc: 'Personal task queue with priorities, due dates, and tags.',     icon: 'task', lastUsed: '8m ago' },
-  { name: 'Calendar', href: '/portal/calendar', desc: 'Month and week views with classes, deadlines, and bookings.',   icon: 'cal',  lastUsed: '20m ago' },
-];
-
-// Map source -> chip label and chip class (computed in frontmatter to avoid JSX `<` parsing issues)
-function chipFor(source: string): { label: string; cls: string } {
-  if (source === 'mail') return { label: 'Mail', cls: 'chip chip-mail' };
-  if (source === 'chat') return { label: 'Chat', cls: 'chip chip-chat' };
-  return { label: 'Alert', cls: 'chip chip-note' };
+let balances: any[] = [];
+let leaveHistory: any[] = [];
+if (ws) {
+  try { balances = await getBalances(ws.employeeId); }
+  catch (e: any) { console.error('[portal/workspace] balances', e?.cause?.message || e?.message); }
+  // listLeave WITH an employeeId returns only that person's rows. The no-argument form returns
+  // everybody joined to their names and must never be called from a portal page.
+  try { leaveHistory = await listLeave({ employeeId: ws.employeeId }); }
+  catch (e: any) { console.error('[portal/workspace] leave', e?.cause?.message || e?.message); }
 }
+// Unpaid leave has an allowance of 0, and getBalances() reports its remaining as Infinity
+// (hr-leave.ts:56). Rendering that would put the word "Infinity" where a number belongs, so only
+// types with a real allowance are shown as balances.
+const countedBalances = balances.filter((b: any) => Number(b.allowance) > 0);
+
+// Split rather than merely counted. "3 requests" tells someone nothing they can act on; what they
+// came to check is whether the days they booked are safe, and whether anything is still waiting.
+// Approved leave that has not finished yet is the answer to the first, sorted soonest first.
+const upcomingLeave = leaveHistory
+  .filter((l: any) => l.status === 'approved' && isoOf(l.end_date) >= todayIso)
+  .sort((a: any, b: any) => isoOf(a.start_date).localeCompare(isoOf(b.start_date)));
+const pendingRequests = leaveHistory.filter((l: any) => l.status === 'pending');
+const pendingLeave = pendingRequests.length;
+// Already decided or already over — the history, kept separate so the two live blocks above are not
+// buried under a year of past requests.
+const settledLeave = leaveHistory.filter(
+  (l: any) => !upcomingLeave.includes(l) && !pendingRequests.includes(l));
+
+let docs: any[] = [];
+if (ws && viewerId) {
+  // hr_onboarding_documents is keyed by user_id, not employee_id: a hire submits before their
+  // employee row necessarily exists.
+  try { docs = await listDocs(viewerId); }
+  catch (e: any) { console.error('[portal/workspace] docs', e?.cause?.message || e?.message); }
+}
+const docStats = docProgress(docs as any);
+
+let reviews: any[] = [];
+if (ws) {
+  try { reviews = await reviewsFor(ws.employeeId); }
+  catch (e: any) { console.error('[portal/workspace] reviews', e?.cause?.message || e?.message); }
+}
+// Formal review cycles, but only once SUBMITTED, and only the parts written to be given to the
+// person: the score, what went well, what to improve, what is next. reviewer_comments is left out
+// on purpose — it is the reviewer's own working note, and a half-finished draft is not feedback.
+const perfReviews = ws ? await q(sql`
+  SELECT pr.overall_rating, pr.strengths, pr.improvements, pr.goals_next, pr.submitted_at,
+         c.title AS cycle_title, c.period_start, c.period_end
+    FROM hr_performance_reviews pr
+    LEFT JOIN hr_review_cycles c ON c.id = pr.cycle_id
+   WHERE ${employeeFilter(ws, sql`pr.employee_id`)} AND pr.status = 'submitted'
+   ORDER BY pr.submitted_at DESC NULLS LAST
+   LIMIT 10`) : [];
+
+const msg = Astro.url.searchParams.get('msg') || '';
+// Days offered for a backfilled hour block: today and the six before it.
+const backfillDates: string[] = [];
+for (let i = 0; i < BACKFILL_DAYS; i++) {
+  backfillDates.push(new Date(Date.parse(todayIso + 'T00:00:00Z') - i * 86400000).toISOString().slice(0, 10));
+}
+const onboardingDone = !!ws && (ws.onboardingStatus === 'submitted' || ws.onboardingStatus === 'verified');
 ---
-<BaseLayout title="Workspace · EduRankAI" description="One sign-on, one inbox, fourteen in-house tools for students and staff.">
-<style>
-  :root { --cream:#FAF8F5; --ink:#0E0B08; --burn:#FF4F00; --muted:#6b6258; --line:rgba(14,11,8,0.10); --paper:#FFFDF8; }
-  body { background: var(--cream); color: var(--ink); font-family:'Cormorant Garamond', Georgia, serif; }
-  .wrap { max-width: 1240px; margin: 0 auto; padding: 64px 24px 120px; }
-  .eyebrow { font-family:'Geist Mono', ui-monospace, monospace; font-size:11px; letter-spacing:.16em; text-transform:uppercase; color: var(--burn); }
-  h1.hero { font-size: clamp(44px, 6vw, 72px); line-height: 1.02; margin: 12px 0 18px; letter-spacing:-.01em; }
-  h1.hero em { font-style: italic; color: var(--burn); }
-  .hero-sub { font-size: 19px; max-width: 720px; color: #2a2520; }
-  .flash { margin: 20px 0; padding: 10px 14px; background:#fff; border:1px solid var(--line); border-left:3px solid var(--burn); font-family:'Geist Mono',monospace; font-size:12px; }
-  .stats { display:grid; grid-template-columns: repeat(5, 1fr); gap: 0; margin: 36px 0 18px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
-  .stat { padding: 18px 16px; border-right: 1px solid var(--line); }
-  .stat:last-child { border-right: none; }
-  .stat .num { font-size: 28px; line-height:1; font-weight: 500; }
-  .stat .lbl { font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:.14em; text-transform:uppercase; color: var(--muted); margin-top: 6px; }
-  @media (max-width: 800px) { .stats { grid-template-columns: repeat(2, 1fr); } .stat { border-bottom:1px solid var(--line); } }
-  .grid-2 { display: grid; grid-template-columns: 1.35fr .75fr; gap: 28px; margin-top: 44px; }
-  @media (max-width: 1000px) { .grid-2 { grid-template-columns: 1fr; } }
-  .panel { background: var(--paper); border:1px solid var(--line); padding: 22px; }
-  .panel h2 { font-size: 22px; margin: 0 0 4px; letter-spacing:-.01em; }
-  .panel .sub { font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:.14em; text-transform:uppercase; color: var(--muted); margin-bottom: 16px; }
-  .quick { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-  .quick a, .quick button { display:inline-flex; align-items:center; gap:6px; padding: 8px 12px; background:#fff; border:1px solid var(--line); color: var(--ink); font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:.05em; text-transform:uppercase; text-decoration:none; cursor:pointer; }
-  .quick a:hover, .quick button:hover { border-color: var(--ink); background: var(--ink); color:#fff; }
-  .inbox-list { display:flex; flex-direction:column; }
-  .inbox-row { display:grid; grid-template-columns: 60px 1fr auto; gap: 10px; padding: 12px 0; border-top: 1px solid var(--line); align-items: flex-start; }
-  .inbox-row:first-child { border-top: none; }
-  .inbox-row .when { font-family:'Geist Mono',monospace; font-size:10px; color: var(--muted); padding-top: 4px; }
-  .inbox-row .body { min-width: 0; }
-  .inbox-row .body a { color: var(--ink); text-decoration: none; }
-  .inbox-row .body a:hover { color: var(--burn); }
-  .inbox-row .body .row-title { font-size: 17px; font-weight: 500; display:flex; gap:8px; align-items:center; }
-  .inbox-row .body .row-preview { font-size: 14px; color: #4a4239; margin-top: 2px; line-height:1.4; }
-  .inbox-row .body .row-meta { font-family:'Geist Mono',monospace; font-size:10px; color: var(--muted); margin-top: 4px; letter-spacing:.05em; }
-  .chip { display:inline-block; padding: 2px 8px; font-family:'Geist Mono',monospace; font-size:9px; letter-spacing:.1em; text-transform:uppercase; border-radius: 99px; }
-  .chip-mail { background: rgba(255,79,0,0.12); color: var(--burn); }
-  .chip-chat { background: rgba(14,11,8,0.08); color: var(--ink); }
-  .chip-note { background: rgba(120, 100, 70, 0.14); color: #604f30; }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--burn); display: inline-block; }
-  .inbox-row form button.read { background: transparent; border: none; cursor: pointer; font-family:'Geist Mono',monospace; font-size: 10px; letter-spacing:.1em; text-transform: uppercase; color: var(--muted); padding: 4px 6px; }
-  .inbox-row form button.read:hover { color: var(--burn); }
-  .empty { padding: 18px; text-align:center; color: var(--muted); font-style: italic; }
-  .group-head { display:flex; align-items: baseline; gap: 14px; margin: 50px 0 14px; }
-  .group-head h3 { margin: 0; font-size: 26px; letter-spacing:-.01em; }
-  .group-head .meta { font-family:'Geist Mono',monospace; font-size: 10px; letter-spacing:.14em; text-transform:uppercase; color: var(--muted); }
-  .tool-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
-  @media (max-width: 1100px) { .tool-grid { grid-template-columns: repeat(3, 1fr); } }
-  @media (max-width: 760px)  { .tool-grid { grid-template-columns: repeat(2, 1fr); } }
-  @media (max-width: 480px)  { .tool-grid { grid-template-columns: 1fr; } }
-  .tool { background: var(--paper); border: 1px solid var(--line); padding: 18px; display: flex; flex-direction: column; gap: 8px; transition: border-color .15s, transform .15s; position: relative; min-height: 180px; }
-  .tool:hover { border-color: var(--ink); }
-  .tool .ic { width: 36px; height: 36px; display:flex; align-items:center; justify-content:center; background: rgba(255,79,0,0.10); color: var(--burn); border-radius: 6px; }
-  .tool .nm { font-size: 22px; line-height: 1.1; letter-spacing:-.01em; }
-  .tool .ds { font-size: 14px; color: #4a4239; line-height: 1.4; flex: 1; }
-  .tool .bot { display:flex; align-items:center; justify-content: space-between; margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
-  .tool .last { font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:.06em; color: var(--muted); text-transform: uppercase; }
-  .tool .open { font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color: var(--ink); text-decoration: none; padding: 4px 10px; border: 1px solid var(--ink); }
-  .tool .open:hover { background: var(--ink); color: #fff; }
-  .stretched { position: absolute; inset: 0; }
-  .privacy { margin-top: 60px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
-  @media (max-width: 900px) { .privacy { grid-template-columns: repeat(2, 1fr); } }
-  .priv { padding: 18px; background: var(--paper); border: 1px solid var(--line); }
-  .priv .hd { display:flex; align-items:center; gap: 10px; margin-bottom: 10px; }
-  .priv .hd .ic { width: 28px; height: 28px; display:flex; align-items:center; justify-content:center; color: var(--burn); }
-  .priv h4 { margin: 0; font-size: 18px; }
-  .priv p { font-size: 13px; color: #4a4239; line-height: 1.5; margin: 0; }
-  .closing { margin-top: 60px; padding: 30px; background: var(--ink); color: #fff; display:flex; justify-content: space-between; align-items: center; gap: 24px; flex-wrap: wrap; }
-  .closing .lt { max-width: 620px; }
-  .closing h3 { margin: 0 0 8px; font-size: 28px; letter-spacing:-.01em; }
-  .closing p { margin: 0; font-size: 14px; color: #c5c0b8; }
-  .closing a { font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:.1em; text-transform:uppercase; color: var(--ink); background: var(--burn); padding: 12px 18px; text-decoration: none; }
-</style>
 
-<main class="wrap">
+<BaseLayout
+  title="My workspace"
+  description="Your own record: hours, credit, leave, tasks, documents and reviews."
+  noindex={true}
+>
+  <section class="ws">
 
-  <div class="eyebrow">Portal · Workspace</div>
-  <h1 class="hero">Everything a student or staff <em>needs to work</em>.</h1>
-  <p class="hero-sub">Fourteen in-house tools. No external dependencies. One sign-on, one inbox, one ledger of activity across everything you do.</p>
-
-  {flashMsg && <div class="flash">{flashMsg}</div>}
-
-  <div class="stats">
-    <div class="stat"><div class="num">14</div><div class="lbl">In-house tools</div></div>
-    <div class="stat"><div class="num">1</div><div class="lbl">Sign-on</div></div>
-    <div class="stat"><div class="num">1</div><div class="lbl">Inbox</div></div>
-    <div class="stat"><div class="num">100%</div><div class="lbl">Browser-native</div></div>
-    <div class="stat"><div class="num">AES-GCM</div><div class="lbl">Encrypted at rest</div></div>
-  </div>
-
-  <!-- Unified inbox + quick actions -->
-  <div class="grid-2">
-    <section class="panel" aria-label="Unified inbox">
-      <div style="display:flex; justify-content: space-between; align-items: baseline;">
-        <div>
-          <h2>Unified inbox</h2>
-          <div class="sub">Mail · Chat · Notifications · last 8</div>
-        </div>
-        <div style="display:flex; gap: 10px; align-items:center;">
-          <span style="font-family:'Geist Mono',monospace; font-size:11px; color: var(--muted);">{unreadCount} unread</span>
-          {unreadCount > 0 && (
-            <form method="POST" style="margin:0;">
-              <input type="hidden" name="action" value="mark_all_read" />
-              <button class="read" type="submit" style="border:1px solid var(--line); padding:6px 10px;">Mark all read</button>
-            </form>
-          )}
+    {denial && (
+      <div class="ws-empty">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+        </svg>
+        <h1>{denial.title}</h1>
+        <p>{denial.reason}</p>
+        <div class="ws-empty-actions">
+          <a class="ws-btn" href="/portal">Back to the portal</a>
+          <a class="ws-btn ghost" href="mailto:hr@edurankai.in">Email HR</a>
         </div>
       </div>
+    )}
 
-      <div class="inbox-list">
-        {inboxRows.length === 0 && <div class="empty">Your inbox is clear.</div>}
-        {inboxRows.map((it: any) => {
-          const chip = chipFor(it.source);
-          return (
-            <div class="inbox-row">
-              <div class="when">{relTime(it.occurred_at)}</div>
-              <div class="body">
-                <a href={it.ref_url || '#'}>
-                  <div class="row-title">
-                    {it.unread && <span class="dot" aria-hidden="true"></span>}
-                    <span>{it.title}</span>
-                    <span class={chip.cls}>{chip.label}</span>
-                  </div>
-                </a>
-                <div class="row-preview">{it.preview}</div>
-                <div class="row-meta">From {it.sender_name || 'unknown'} · {it.kind}</div>
+    {ws && (
+      <div>
+
+        {msg && <p class="ws-flash">{msg}</p>}
+
+        {/* ---------------------------------------------------------------- Who you are */}
+        <header class="ws-head">
+          {ws.photoUrl
+            ? <img class="ws-avatar" src={ws.photoUrl} alt="" width="56" height="56" />
+            : <div class="ws-avatar ws-avatar-fallback">{(ws.fullName || '?').charAt(0).toUpperCase()}</div>}
+          <div class="ws-head-text">
+            <p class="ws-eyebrow">Your workspace</p>
+            <h1>{ws.fullName}</h1>
+            <p class="ws-sub">
+              {ws.designation || 'Role not recorded'}
+              {ws.employeeCode ? ' · ' + ws.employeeCode : ''}
+            </p>
+            <div class="ws-chips">
+              {ws.department && ws.department.name && <span class="ws-chip">{ws.department.name}</span>}
+              {ws.employmentType && <span class="ws-chip">{ws.employmentType}</span>}
+              {ws.workMode && <span class="ws-chip">{ws.workMode}</span>}
+              {ws.joiningDate && <span class="ws-chip">Joined {shortDate(ws.joiningDate)}</span>}
+            </div>
+          </div>
+        </header>
+
+        {!ws.department && (
+          <p class="ws-note">
+            Your department is not recorded on your employee record, so anything organised by
+            department will look empty for you. That is a gap in the record, not in your work. Ask HR
+            to set it.
+          </p>
+        )}
+        {ws.department && !ws.department.name && (
+          <p class="ws-note">
+            Your record points at a department we cannot find a name for. Nothing here depends on it,
+            but it is worth telling HR.
+          </p>
+        )}
+
+        {/* The four facts a person is asked for and cannot always remember. Each one says
+            "Not recorded" rather than going blank: an empty row looks like a page that failed,
+            and a gap in the record is something they can get fixed. */}
+        <div class="ws-card ws-facts">
+          <div class="ws-fact">
+            <span class="ws-stat-label">Reporting to</span>
+            <span>{manager && manager.manager_name
+              ? manager.manager_name + (manager.manager_role ? ' · ' + manager.manager_role : '')
+              : 'Not recorded'}</span>
+          </div>
+          <div class="ws-fact">
+            <span class="ws-stat-label">Joined</span>
+            <span>{ws.joiningDate ? prettyDate(ws.joiningDate) : 'Not recorded'}</span>
+          </div>
+          <div class="ws-fact">
+            <span class="ws-stat-label">{ws.isIntern ? 'Into your internship' : 'Time here'}</span>
+            <span>
+              {weeksSinceJoining === null
+                ? 'Not recorded'
+                : weeksSinceJoining < 1
+                  ? daysSinceJoining + ' day' + (daysSinceJoining === 1 ? '' : 's')
+                  : 'Week ' + (weeksSinceJoining + 1)}
+            </span>
+          </div>
+          <div class="ws-fact">
+            <span class="ws-stat-label">Engagement</span>
+            <span class="ws-cap">{ws.employmentStatus || 'active'}</span>
+          </div>
+        </div>
+
+        <p class="ws-scope-note">
+          This page is your own record and only ever your own. It is built from the same data as your
+          completion report, so nothing here is a number somebody else has to read out to you.
+        </p>
+
+        {/* ---------------------------------------------------------------- Credit position */}
+        <section class="ws-card">
+          <div class="ws-card-head">
+            <h2>Your credit position</h2>
+            {weeksLeft !== null && weeksLeft > 0 && (
+              <span class="ws-meta">about {weeksLeft} week{weeksLeft === 1 ? '' : 's'} to go</span>
+            )}
+          </div>
+
+          {!credit && (
+            <p class="ws-muted">
+              We could not read your credit position just now. Nothing you have logged is affected.
+              Reload in a moment, and tell HR if it keeps happening.
+            </p>
+          )}
+
+          {credit && (
+            <div>
+              <p class="ws-big">
+                <strong>{credit.creditHours}</strong>
+                <span>{credit.requiredCreditHours ? 'of ' + credit.requiredCreditHours + ' credit-hours' : 'credit-hours earned'}</span>
+              </p>
+
+              {creditPct !== null && (
+                <div class="ws-bar-wrap">
+                  <div class="ws-bar"><div class="ws-bar-fill" style={`width:${creditPct}%;background:${creditPct >= 100 ? '#15803d' : '#c2410c'};`}></div></div>
+                  <p class="ws-muted small">{creditPct >= 100 ? 'Requirement met.' : creditPct + '% of the requirement'}</p>
+                </div>
+              )}
+
+              {!credit.requiredCreditHours && (
+                <p class="ws-muted small">
+                  No credit-hour requirement is set on your engagement, so there is no target to
+                  measure against - only the hours you have actually earned.
+                </p>
+              )}
+
+              {/* Time served is not the measure and saying so prevents a nasty surprise at the end.
+                  Only shown when both figures are real, and only as a comparison. */}
+              {weeksSinceJoining !== null && weeksLeft !== null && weeksLeft > 0 && creditPct !== null && (
+                <p class="ws-muted small spaced-top">
+                  You are {weeksSinceJoining < 1 ? 'in your first week' : 'in week ' + (weeksSinceJoining + 1)} and
+                  {' '}{creditPct}% of the way to the requirement. What counts is the credit-hours, not the
+                  weeks - at your current agreed load that is about {weeksLeft} more week{weeksLeft === 1 ? '' : 's'} of
+                  full engagement.
+                </p>
+              )}
+
+              <div class="ws-stats">
+                <div>
+                  <span class="ws-stat-label">Attendance</span>
+                  <span class="ws-stat" style={`color:${credit.attendancePct >= 85 ? '#15803d' : credit.attendancePct >= 70 ? '#b45309' : '#b91c1c'};`}>{credit.attendancePct}%</span>
+                </div>
+                <div>
+                  <span class="ws-stat-label">Days worked</span>
+                  <span class="ws-stat">{credit.daysPresent}</span>
+                </div>
+                <div>
+                  <span class="ws-stat-label">Approved leave</span>
+                  <span class="ws-stat">{credit.authorisedLeaveDays}</span>
+                </div>
+                <div>
+                  <span class="ws-stat-label">Still to earn</span>
+                  <span class="ws-stat">{credit.shortfallHours === null ? 'n/a' : credit.shortfallHours + 'h'}</span>
+                </div>
               </div>
-              {it.unread ? (
-                <form method="POST" style="margin:0;">
-                  <input type="hidden" name="action" value="mark_read" />
-                  <input type="hidden" name="id" value={it.id} />
-                  <button class="read" type="submit">Mark read</button>
-                </form>
-              ) : (
-                <span style="font-family:'Geist Mono',monospace; font-size:10px; color: var(--muted); padding-top:4px;">read</span>
+
+              {(credit.unauthorisedLeaveDays > 0 || credit.noticeBreaches > 0) && (
+                <div class="ws-warn">
+                  {credit.unauthorisedLeaveDays > 0 && (
+                    <p><strong>{credit.unauthorisedLeaveDays} day{credit.unauthorisedLeaveDays === 1 ? '' : 's'}</strong> are recorded as absent with no approved leave covering them.</p>
+                  )}
+                  {credit.noticeBreaches > 0 && (
+                    <p><strong>{credit.noticeBreaches}</strong> leave day{credit.noticeBreaches === 1 ? '' : 's'} had no notice given before the day itself.</p>
+                  )}
+                  <p class="small">Both appear on your completion report. Applying before you take leave is what keeps a day authorised - shown here now, while there is still time to act on it.</p>
+                </div>
+              )}
+
+              {terms && terms.kind === 'part-time' && !terms.weeklyHours && (
+                <p class="ws-note">
+                  Your agreed part-time hours are not recorded, so credit cannot be worked out yet.
+                  Ask HR to set them - we would rather show nothing than guess at what you agreed to.
+                </p>
               )}
             </div>
-          );
-        })}
+          )}
+        </section>
+
+        {/* ---------------------------------------------------------------- Hours and attendance */}
+        <section class="ws-card">
+          <div class="ws-card-head">
+            <h2>Hours and attendance</h2>
+            <a class="ws-link" href="/portal/employee">Clock in or out</a>
+          </div>
+
+          <div class="ws-stats">
+            <div>
+              <span class="ws-stat-label">This week</span>
+              <span class="ws-stat">{round1(attRow?.week_hours)}h</span>
+            </div>
+            <div>
+              <span class="ws-stat-label">Days in, this week</span>
+              <span class="ws-stat">{Number(attRow?.week_days || 0)}</span>
+            </div>
+            <div>
+              <span class="ws-stat-label">This month</span>
+              <span class="ws-stat">{round1(attRow?.month_hours)}h</span>
+            </div>
+            <div>
+              <span class="ws-stat-label">Days in, this month</span>
+              <span class="ws-stat">{Number(attRow?.month_days || 0)}</span>
+            </div>
+          </div>
+
+          {recentDays.length > 0 ? (
+            <div>
+              <p class="ws-stat-label spaced">Your last {recentDays.length} recorded days</p>
+              <div class="ws-scroll">
+                <div class="ws-strip">
+                  {recentDays.map((d: any) => (
+                    <span class="ws-day" style={`background:${dayTone(d.status)};`} title={shortDate(d.date) + ' - ' + dayWord(d.status)}></span>
+                  ))}
+                </div>
+              </div>
+              <ul class="ws-legend">
+                <li><i style="background:#15803d;"></i>Worked</li>
+                <li><i style="background:#0284c7;"></i>Approved leave</li>
+                <li><i style="background:#b91c1c;"></i>Absent</li>
+                <li><i style="background:#c9c0b2;"></i>Holiday</li>
+              </ul>
+
+              {/* The same days in words. A colour block cannot be read on a phone and cannot be
+                  read at all by a screen reader, and "what was the 14th recorded as" is the
+                  question people actually open this page with. */}
+              <div class="ws-daygroup">
+                <p class="ws-daygroup-head">
+                  <span>Day by day</span>
+                  <span class="ws-meta">most recent first</span>
+                </p>
+                {recentDetail.map((d: any) => (
+                  <div class="ws-row">
+                    <span class="ws-mono">{shortDate(d.date)}</span>
+                    <span class="ws-row-main" style={`color:${d.status === 'unauthorised-leave' ? '#b91c1c' : 'inherit'};`}>
+                      {dayWord(d.status)}
+                    </span>
+                    {/* Only 'present' ever carries hours: credit-ledger.ts drops a stored 0 so a
+                        leave day cannot read as "worked zero hours", and a half day is credited by
+                        rule rather than from the clock. Asking the other statuses for hours would
+                        print "not recorded" against every one of them, which is not true. */}
+                    <span class="ws-meta">
+                      {d.status !== 'present'
+                        ? ''
+                        : (d.hours === undefined || d.hours === null ? 'hours not recorded' : round1(d.hours) + 'h')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              {credit && credit.unauthorisedLeaveDays > 0 && (
+                <p class="ws-note">
+                  A day marked absent becomes approved leave the moment an approved request covers
+                  it. If one of these was agreed with someone and never went through the leave form,
+                  that is worth sorting out now rather than at the end - it is counted against your
+                  completion report either way.
+                </p>
+              )}
+            </div>
+          ) : (
+            <p class="ws-muted">No attendance has been recorded against you yet. Your first clock-in starts it.</p>
+          )}
+        </section>
+
+        {/* ---------------------------------------------------------------- Hour log */}
+        <section class="ws-card">
+          <div class="ws-card-head">
+            <h2>Your hour log</h2>
+            <span class="ws-meta">{loggedFortnight}h in the last fortnight</span>
+          </div>
+          <p class="ws-muted small">
+            The blocks you booked against a day. The attendance page only shows today, so this is
+            where you check a week you have already worked, and fill in a block you forgot.
+          </p>
+
+          {logDays.length === 0 && <p class="ws-muted">Nothing logged in the last fortnight.</p>}
+
+          {logDays.map((bucket: any) => (
+            <div class="ws-daygroup">
+              <p class="ws-daygroup-head">
+                <span>{prettyDate(bucket.date)}</span>
+                <span class="ws-meta">{round1(bucket.hours)}h</span>
+              </p>
+              {bucket.entries.map((l: any) => (
+                <div class="ws-row">
+                  <span class="ws-mono">{l.start_time} to {l.end_time}</span>
+                  <span class="ws-row-main">{l.task}</span>
+                  <span class="ws-meta">{round1(l.hours)}h</span>
+                  <form method="POST">
+                    <input type="hidden" name="action" value="delete_time_log" />
+                    <input type="hidden" name="log_id" value={l.id} />
+                    <button type="submit" class="ws-del">Remove</button>
+                  </form>
+                </div>
+              ))}
+            </div>
+          ))}
+
+          <form method="POST" class="ws-form">
+            <input type="hidden" name="action" value="add_time_log" />
+            <div class="ws-field">
+              <label for="ws-date">Day</label>
+              <select id="ws-date" name="log_date">
+                {backfillDates.map((d: string) => (
+                  <option value={d}>{d === todayIso ? 'Today' : prettyDate(d)}</option>
+                ))}
+              </select>
+            </div>
+            <div class="ws-field">
+              <label for="ws-from">From</label>
+              <input id="ws-from" type="time" name="start_time" required />
+            </div>
+            <div class="ws-field">
+              <label for="ws-to">To</label>
+              <input id="ws-to" type="time" name="end_time" required />
+            </div>
+            <div class="ws-field grow">
+              <label for="ws-task">What you worked on</label>
+              <input id="ws-task" name="task" required maxlength="500" placeholder="e.g. Rewrote the intake form validation" />
+            </div>
+            <button type="submit" class="ws-btn">Add block</button>
+          </form>
+          <p class="ws-muted small">
+            You can fill in the last {BACKFILL_DAYS} days. Anything older goes through HR, so a
+            change to your record always has a name against it.
+          </p>
+        </section>
+
+        {/* ---------------------------------------------------------------- Leave */}
+        <section class="ws-card">
+          <div class="ws-card-head">
+            <h2>Your leave</h2>
+            <a class="ws-link" href="/portal/employee/leave">Apply for leave</a>
+          </div>
+
+          {countedBalances.length > 0 ? (
+            <div class="ws-stats">
+              {countedBalances.map((b: any) => (
+                <div>
+                  <span class="ws-stat-label">{b.name}</span>
+                  <span class="ws-stat">{b.remaining}</span>
+                  <span class="ws-meta">of {b.allowance} left{b.pending ? ', ' + b.pending + ' pending' : ''}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p class="ws-muted">No leave allowance is set up for you yet.</p>
+          )}
+
+          {leaveHistory.length === 0 && <p class="ws-muted">You have not requested any leave.</p>}
+
+          {/* Booked and safe. */}
+          {upcomingLeave.length > 0 && (
+            <div class="ws-daygroup">
+              <p class="ws-daygroup-head"><span>Approved and still to come</span></p>
+              {upcomingLeave.map((l: any) => (
+                <div class="ws-row">
+                  <span class="ws-row-main">
+                    <strong class="ws-cap">{l.leave_type}</strong>
+                    <span class="ws-meta"> {shortDate(l.start_date)} to {shortDate(l.end_date)} · {l.days}d</span>
+                  </span>
+                  <span class="ws-pill" style={`color:${leaveTone('approved')};border-color:${leaveTone('approved')}40;`}>approved</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Not yet safe, and the difference matters: an unapproved day taken is an unauthorised
+              absence on the completion report, which is the thing that costs people a certificate. */}
+          {pendingLeave > 0 && (
+            <div class="ws-daygroup">
+              <p class="ws-daygroup-head"><span>Waiting on a decision</span></p>
+              {pendingRequests.map((l: any) => (
+                <div class="ws-row">
+                  <span class="ws-row-main">
+                    <strong class="ws-cap">{l.leave_type}</strong>
+                    <span class="ws-meta"> {shortDate(l.start_date)} to {shortDate(l.end_date)} · {l.days}d</span>
+                  </span>
+                  <span class="ws-pill" style={`color:${leaveTone('pending')};border-color:${leaveTone('pending')}40;`}>pending</span>
+                </div>
+              ))}
+              <p class="ws-note">
+                {pendingLeave === 1 ? 'This request has' : 'These requests have'} not been decided
+                yet. Until a request is approved, the days it covers are not authorised leave - if
+                you take them and the decision does not come, they are recorded as absence.
+              </p>
+            </div>
+          )}
+
+          {settledLeave.length > 0 && (
+            <div class="ws-daygroup">
+              <p class="ws-daygroup-head"><span>Earlier requests</span></p>
+              {settledLeave.slice(0, 10).map((l: any) => (
+                <div class="ws-row">
+                  <span class="ws-row-main">
+                    <strong class="ws-cap">{l.leave_type}</strong>
+                    <span class="ws-meta"> {shortDate(l.start_date)} to {shortDate(l.end_date)} · {l.days}d</span>
+                  </span>
+                  <span class="ws-pill" style={`color:${leaveTone(l.status)};border-color:${leaveTone(l.status)}40;`}>{l.status}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <p class="ws-muted small">
+            Leave is decided by HR or an administrator. Notice given before the first day is what
+            makes those days authorised on your credit record.
+          </p>
+        </section>
+
+        {/* ---------------------------------------------------------------- Tasks */}
+        <section class="ws-card">
+          <div class="ws-card-head"><h2>What you have been working on</h2></div>
+          <p class="ws-muted small">
+            There is no separate assignments table in this system, so nobody is quietly holding a
+            task list for you. This is what you recorded yourself at clock-out and in your daily
+            report - which is also what a reviewer reads.
+          </p>
+
+          {taskLogs.length === 0 && reports.length === 0 && (
+            <p class="ws-muted">Nothing recorded yet. Your clock-out wrap-up and your daily report both land here.</p>
+          )}
+
+          {taskLogs.length > 0 && (
+            <div class="ws-daygroup">
+              <p class="ws-daygroup-head"><span>Session wrap-ups</span></p>
+              {taskLogs.map((t: any) => (
+                <div class="ws-row">
+                  <span class="ws-meta ws-mono">{shortDate(t.log_date)}</span>
+                  <span class="ws-row-main">
+                    {t.task}
+                    {t.details && <span class="ws-meta block">{t.details}</span>}
+                  </span>
+                  <span class="ws-pill" style={`color:${taskTone(t.status)};border-color:${taskTone(t.status)}40;`}>{t.status}</span>
+                  <span class="ws-meta ws-mono">{t.percent}%</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {reports.length > 0 && (
+            <div class="ws-daygroup">
+              <p class="ws-daygroup-head"><span>Daily reports</span></p>
+              {reports.map((r: any) => (
+                <div class="ws-report">
+                  <p class="ws-meta ws-mono">{prettyDate(r.report_date)}</p>
+                  <p>{r.work_done}</p>
+                  {r.progress && <p class="ws-muted small">Next: {r.progress}</p>}
+                  {r.blockers && <p class="ws-blocked small">Blocked on: {r.blockers}</p>}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* ---------------------------------------------------------------- Joining documents */}
+        <section class="ws-card">
+          <div class="ws-card-head">
+            <h2>Your joining documents</h2>
+            <a class="ws-link" href="/portal/employee/onboarding">Onboarding form</a>
+          </div>
+
+          <div class="ws-stats">
+            <div>
+              <span class="ws-stat-label">Onboarding</span>
+              <span class="ws-stat" style={`color:${onboardingDone ? '#15803d' : '#b45309'};`}>
+                {ws.onboardingStatus || 'pending'}
+              </span>
+            </div>
+            <div>
+              <span class="ws-stat-label">Submitted</span>
+              <span class="ws-stat">{docStats.submitted} of {MAX_DOCS}</span>
+            </div>
+            <div>
+              <span class="ws-stat-label">Verified</span>
+              <span class="ws-stat" style={`color:${docStats.verified > 0 ? '#15803d' : '#6b6255'};`}>{docStats.verified}</span>
+            </div>
+            <div>
+              <span class="ws-stat-label">Needs redoing</span>
+              <span class="ws-stat" style={`color:${docStats.rejected > 0 ? '#b91c1c' : '#6b6255'};`}>{docStats.rejected}</span>
+            </div>
+          </div>
+
+          {docs.length === 0 && (
+            <p class="ws-muted">
+              No documents submitted yet. They are shared as view-only links to your own cloud
+              storage, so the file itself never leaves your account.
+            </p>
+          )}
+          {/* The link is the document. Nothing was uploaded here and there is no copy on our side to
+              open, so "view" means opening the share link in their own storage - which is also the
+              fastest way for them to check the sharing permission a reviewer could not get past. */}
+          {docs.map((d: any) => (
+            <div class="ws-row">
+              <span class="ws-row-main">
+                <strong>{docTypeLabel(d.docType)}</strong>
+                {d.title && <span class="ws-meta"> {d.title}</span>}
+                {d.reviewNote && <span class="ws-meta block">Reviewer: {d.reviewNote}</span>}
+              </span>
+              {d.driveUrl && (
+                <a class="ws-link" href={d.driveUrl} target="_blank" rel="noopener noreferrer">Open</a>
+              )}
+              <span class="ws-pill" style={`color:${docTone(d.status)};border-color:${docTone(d.status)}40;`}>{d.status}</span>
+            </div>
+          ))}
+          {docStats.rejected > 0 && (
+            <p class="ws-note">
+              A document sent back is usually a sharing-permission problem rather than anything wrong
+              with the document itself. Re-share it so that anyone holding the link can view it, then
+              submit it again.
+            </p>
+          )}
+        </section>
+
+        {/* ---------------------------------------------------------------- Reviews */}
+        <section class="ws-card">
+          <div class="ws-card-head"><h2>Your reviews</h2></div>
+
+          {reviews.length === 0 && perfReviews.length === 0 && (
+            <p class="ws-muted">
+              No review has been written about you yet. When one is, it appears here for you to read
+              - the same words that go into your completion report.
+            </p>
+          )}
+
+          {perfReviews.map((p: any) => (
+            <div class="ws-review">
+              <p class="ws-review-head">
+                <strong>{p.cycle_title || 'Review'}</strong>
+                {p.overall_rating !== null && p.overall_rating !== undefined && (
+                  <span class="ws-pill">{Number(p.overall_rating)} out of 5</span>
+                )}
+              </p>
+              {(p.period_start || p.period_end) && (
+                <p class="ws-meta ws-mono">{shortDate(p.period_start)} to {shortDate(p.period_end)}</p>
+              )}
+              {p.strengths && <p><span class="ws-stat-label">Went well</span> {p.strengths}</p>}
+              {p.improvements && <p><span class="ws-stat-label">To improve</span> {p.improvements}</p>}
+              {p.goals_next && <p><span class="ws-stat-label">Next</span> {p.goals_next}</p>}
+            </div>
+          ))}
+
+          {reviews.map((r: any) => (
+            <div class="ws-review">
+              <p class="ws-review-head">
+                <strong>{r.reviewer}</strong>
+                {r.rating ? <span class="ws-pill">{r.rating} out of 5</span> : null}
+                <span class="ws-meta ws-mono">{prettyDate(r.date)}</span>
+              </p>
+              {r.note && <p>{r.note}</p>}
+            </div>
+          ))}
+        </section>
+
+        {/* ---------------------------------------------------------------- Elsewhere */}
+        <nav class="ws-tiles" aria-label="Other pages">
+          <a href="/portal/employee">
+            <strong>Attendance</strong>
+            <span>Clock in, clock out, today's log</span>
+          </a>
+          <a href="/portal/employee/leave">
+            <strong>Leave</strong>
+            <span>Apply and track requests</span>
+          </a>
+          <a href="/portal/employee/wallet">
+            <strong>Wallet</strong>
+            <span>Payments and withdrawals</span>
+          </a>
+          <a href="/portal/my-record-access">
+            <strong>My record</strong>
+            <span>Who has read your communications</span>
+          </a>
+        </nav>
+
+        <p class="ws-foot">
+          Something here wrong? It is your record, so it should be corrected rather than worked
+          around. Write to <a href="mailto:hr@edurankai.in">hr@edurankai.in</a> and say what does not
+          match.
+        </p>
+
       </div>
-    </section>
+    )}
+  </section>
 
-    <aside class="panel" aria-label="Quick actions">
-      <h2>Quick actions</h2>
-      <div class="sub">Jump straight into a task</div>
-      <div class="quick" style="flex-direction: column; align-items: stretch;">
-        <a href="/portal/mail?compose=1">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16v12H4z"/><path d="M4 6l8 7 8-7"/></svg>
-          Compose mail
-        </a>
-        <a href="/portal/notes?new=1">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>
-          New note
-        </a>
-        <a href="/portal/messages?new=1">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          Start a chat
-        </a>
-        <a href="/portal/crm?new=contact">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>
-          Add to CRM
-        </a>
-        <a href="/portal/workspace?new=1">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-          Create task
-        </a>
-        <a href="/portal/workspace?new=1">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
-          Schedule event
-        </a>
-        <a href="/portal/liveclass?new=1">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-          Start a live room
-        </a>
-      </div>
-    </aside>
-  </div>
+  <style>
+    .ws { max-width: 760px; margin: 0 auto; padding: 22px 16px 64px; color: #1a1510;
+          font-family: 'Inter Tight', system-ui, sans-serif; }
+    .ws h1 { font-family: Fraunces, Georgia, serif; font-size: clamp(1.45rem, 5vw, 1.9rem);
+             font-weight: 600; line-height: 1.15; margin: 0; }
+    .ws h2 { font-family: Fraunces, Georgia, serif; font-size: 1.05rem; font-weight: 600; margin: 0; }
+    .ws p { margin: 0 0 8px; line-height: 1.55; font-size: 0.92rem; }
+    .ws p:last-child { margin-bottom: 0; }
 
-  <!-- COMMUNICATE -->
-  <div class="group-head">
-    <h3>Communicate</h3>
-    <span class="meta">four tools · one identity</span>
-  </div>
-  <div class="tool-grid">
-    {communicate.map((t: Tool) => (
-      <article class="tool">
-        <div class="ic" aria-hidden="true">
-          {t.icon === 'mail'    && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16v12H4z"/><path d="M4 6l8 7 8-7"/></svg>}
-          {t.icon === 'chat'    && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>}
-          {t.icon === 'live'    && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>}
-          {t.icon === 'network' && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M6 9v3a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3V9"/></svg>}
-        </div>
-        <div class="nm">{t.name}</div>
-        <div class="ds">{t.desc}</div>
-        <div class="bot">
-          <span class="last">Last used · {t.lastUsed}</span>
-          <a class="open" href={t.href}>Open</a>
-        </div>
-        <a class="stretched" href={t.href} aria-label={t.name}></a>
-      </article>
-    ))}
-  </div>
+    .ws-flash { background: rgba(21,128,61,.09); border: 1px solid rgba(21,128,61,.28);
+                color: #14532d; border-radius: 10px; padding: 10px 14px; font-size: 0.86rem;
+                margin-bottom: 14px; }
 
-  <!-- CREATE -->
-  <div class="group-head">
-    <h3>Create</h3>
-    <span class="meta">seven authoring surfaces · all sandboxed</span>
-  </div>
-  <div class="tool-grid">
-    {create.map((t: Tool) => (
-      <article class="tool">
-        <div class="ic" aria-hidden="true">
-          {t.icon === 'note'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 17h6"/></svg>}
-          {t.icon === 'resume' && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>}
-          {t.icon === 'book'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>}
-          {t.icon === 'code'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>}
-          {t.icon === 'canvas' && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>}
-          {t.icon === 'film'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M2 8h20M2 16h20M7 3v18M17 3v18"/></svg>}
-          {t.icon === 'card'   && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="14" rx="2"/><path d="M7 3h10v3H7z"/></svg>}
-        </div>
-        <div class="nm">{t.name}</div>
-        <div class="ds">{t.desc}</div>
-        <div class="bot">
-          <span class="last">Last used · {t.lastUsed}</span>
-          <a class="open" href={t.href}>Open</a>
-        </div>
-        <a class="stretched" href={t.href} aria-label={t.name}></a>
-      </article>
-    ))}
-  </div>
+    .ws-head { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 12px; }
+    .ws-avatar { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; flex: 0 0 auto;
+                 border: 2px solid rgba(194,65,12,.25); }
+    .ws-avatar-fallback { display: flex; align-items: center; justify-content: center;
+                          background: rgba(194,65,12,.1); color: #c2410c; font-size: 1.3rem;
+                          font-weight: 700; }
+    .ws-head-text { min-width: 0; }
+    .ws-eyebrow { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.62rem;
+                  letter-spacing: .16em; text-transform: uppercase; color: #c2410c;
+                  font-weight: 700; margin: 0 0 4px; }
+    .ws-sub { color: #6b6255; font-size: 0.88rem; margin: 4px 0 0; }
+    .ws-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .ws-chip { font-size: 0.72rem; background: #f3ece0; border: 1px solid #ece4d6; color: #6b6255;
+               border-radius: 99px; padding: 3px 10px; text-transform: capitalize; }
 
-  <!-- MANAGE -->
-  <div class="group-head">
-    <h3>Manage</h3>
-    <span class="meta">three ledgers · audit trails</span>
-  </div>
-  <div class="tool-grid">
-    {manage.map((t: Tool) => (
-      <article class="tool">
-        <div class="ic" aria-hidden="true">
-          {t.icon === 'crm'  && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>}
-          {t.icon === 'task' && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>}
-          {t.icon === 'cal'  && <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>}
-        </div>
-        <div class="nm">{t.name}</div>
-        <div class="ds">{t.desc}</div>
-        <div class="bot">
-          <span class="last">Last used · {t.lastUsed}</span>
-          <a class="open" href={t.href}>Open</a>
-        </div>
-        <a class="stretched" href={t.href} aria-label={t.name}></a>
-      </article>
-    ))}
-  </div>
+    .ws-scope-note { color: #6b6255; font-size: 0.86rem; margin-bottom: 16px; }
+    .ws-note { background: #fdf6ec; border: 1px solid #f0dcc0; color: #7c4a12;
+               border-radius: 10px; padding: 10px 13px; font-size: 0.85rem; margin: 12px 0 0; }
+    .ws-warn { background: #fdf1ef; border: 1px solid #f2cfc7; color: #8a2c1a;
+               border-radius: 10px; padding: 10px 13px; margin-top: 12px; }
+    .ws-warn p { font-size: 0.85rem; }
 
-  <!-- PRIVACY + SECURITY -->
-  <div class="group-head" style="margin-top: 68px;">
-    <h3>Privacy &amp; security</h3>
-    <span class="meta">how we keep your work yours</span>
-  </div>
-  <div class="privacy">
-    <div class="priv">
-      <div class="hd">
-        <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6"/></svg></span>
-        <h4>Single sign-on</h4>
-      </div>
-      <p>One identity opens every tool. Session cookies are HttpOnly and SameSite=Lax. Step-up authentication kicks in for sensitive actions (export, delete, billing).</p>
-    </div>
-    <div class="priv">
-      <div class="hd">
-        <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>
-        <h4>On-device chat encryption</h4>
-      </div>
-      <p>Chat messages are encrypted in the browser with AES-GCM, keyed material derived from your passphrase via PBKDF2 inside the Web Crypto API. The server stores ciphertext only.</p>
-    </div>
-    <div class="priv">
-      <div class="hd">
-        <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l9 4v6c0 5-3.5 9.5-9 10-5.5-.5-9-5-9-10V6z"/></svg></span>
-        <h4>Mail encrypted at rest</h4>
-      </div>
-      <p>Mail bodies and attachments are encrypted at rest with per-tenant data keys. Search indices use deterministic envelope encryption so we can match without exposing plaintext.</p>
-    </div>
-    <div class="priv">
-      <div class="hd">
-        <span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 14l2 2 4-4"/></svg></span>
-        <h4>CRM audit log</h4>
-      </div>
-      <p>Every contact view, edit, export, and merge in the CRM is logged with actor, IP, and timestamp. Logs are append-only and reviewable from the workspace admin surface.</p>
-    </div>
-  </div>
+    .ws-card { background: #fff; border: 1px solid #ece4d6; border-radius: 16px;
+               padding: 16px; margin-bottom: 14px; box-shadow: 0 8px 26px rgba(26,21,16,.04); }
+    .ws-card-head { display: flex; align-items: baseline; justify-content: space-between;
+                    gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .ws-link { font-size: 0.8rem; font-weight: 600; color: #c2410c; text-decoration: none;
+               white-space: nowrap; }
+    .ws-link:hover { text-decoration: underline; }
 
-  <div class="closing">
-    <div class="lt">
-      <h3>One workspace, no third parties.</h3>
-      <p>Mail, chat, video, notebooks, CRM, code, canvas, calendar — all built and run by us, so a single audit covers your whole workday.</p>
-    </div>
-    <a href="/portal">Back to portal home</a>
-  </div>
+    .ws-big { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 0 0 4px; }
+    .ws-big strong { font-family: Fraunces, Georgia, serif; font-size: 2.4rem; line-height: 1;
+                     font-weight: 600; }
+    .ws-big span { color: #6b6255; font-size: 0.88rem; }
 
-</main>
+    .ws-bar-wrap { margin: 10px 0 4px; }
+    .ws-bar { height: 8px; background: #f0e9db; border-radius: 99px; overflow: hidden; }
+    .ws-bar-fill { height: 100%; border-radius: 99px; }
 
-<script is:inline>
-  (function(){
-    // Light client polish: keep the inbox dot visually pulsing on first paint.
-    var dots = document.querySelectorAll('.dot');
-    dots.forEach(function(d){
-      d.animate(
-        [ { transform: 'scale(1)', opacity: 1 }, { transform: 'scale(1.6)', opacity: 0.2 }, { transform: 'scale(1)', opacity: 1 } ],
-        { duration: 1800, iterations: Infinity }
-      );
-    });
+    .ws-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
+                margin: 14px 0 0; }
+    @media (min-width: 520px) { .ws-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    .ws-stat-label { display: block; font-family: 'JetBrains Mono', ui-monospace, monospace;
+                     font-size: 0.6rem; letter-spacing: .1em; text-transform: uppercase;
+                     color: #9a8f7d; font-weight: 700; }
+    .ws-stat-label.spaced { margin: 16px 0 8px; }
+    .spaced-top { margin-top: 10px; }
 
-    // Provide a confirm prompt before marking all-read, to avoid mistakes.
-    var markAllForms = document.querySelectorAll('form input[name="action"][value="mark_all_read"]');
-    markAllForms.forEach(function(input){
-      var form = input.closest('form');
-      if (!form) return;
-      form.addEventListener('submit', function(e){
-        if (!window.confirm('Mark every inbox item as read?')) e.preventDefault();
-      });
-    });
-  })();
-</script>
+    /* Engagement facts. One column at 360px so a long manager name never forces the page sideways;
+       two once there is room for it. */
+    .ws-facts { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 460px) { .ws-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .ws-fact { min-width: 0; }
+    .ws-fact span:last-child { display: block; font-size: 0.92rem; margin-top: 3px;
+                               overflow-wrap: anywhere; }
+    .ws-stat { display: block; font-size: 1.15rem; font-weight: 700; margin-top: 2px;
+               text-transform: capitalize; }
+
+    .ws-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 4px; }
+    .ws-strip { display: flex; gap: 3px; min-width: min-content; }
+    .ws-day { width: 12px; height: 26px; border-radius: 3px; flex: 0 0 auto; }
+    .ws-legend { list-style: none; display: flex; flex-wrap: wrap; gap: 12px; padding: 0;
+                 margin: 10px 0 0; font-size: 0.74rem; color: #6b6255; }
+    .ws-legend li { display: flex; align-items: center; gap: 5px; }
+    .ws-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+
+    .ws-daygroup { margin-top: 14px; }
+    .ws-daygroup-head { display: flex; justify-content: space-between; align-items: baseline;
+                        gap: 8px; font-family: 'JetBrains Mono', ui-monospace, monospace;
+                        font-size: 0.66rem; letter-spacing: .09em; text-transform: uppercase;
+                        color: #9a8f7d; font-weight: 700; border-bottom: 1px solid #f2ece0;
+                        padding-bottom: 5px; margin-bottom: 2px; }
+    .ws-row { display: flex; align-items: flex-start; gap: 9px; flex-wrap: wrap;
+              padding: 9px 0; border-bottom: 1px solid #f6f1e8; font-size: 0.87rem; }
+    .ws-row:last-child { border-bottom: none; }
+    .ws-row-main { flex: 1 1 150px; min-width: 0; overflow-wrap: anywhere; }
+    .ws-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.72rem;
+               color: #6b6255; white-space: nowrap; }
+    .ws-meta { color: #9a8f7d; font-size: 0.76rem; }
+    .ws-meta.block { display: block; margin-top: 2px; }
+    .ws-muted { color: #6b6255; }
+    .ws-muted.small, .small { font-size: 0.8rem; }
+    .ws-cap { text-transform: capitalize; }
+    .ws-blocked { color: #8a2c1a; }
+    .ws-pill { border: 1px solid #ece4d6; border-radius: 99px; padding: 2px 9px;
+               font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.64rem;
+               font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+               white-space: nowrap; }
+    .ws-del { background: none; border: none; color: #b91c1c; font-size: 0.74rem; cursor: pointer;
+              padding: 0; font-family: inherit; text-decoration: underline; }
+
+    .ws-report { padding: 10px 0; border-bottom: 1px solid #f6f1e8; }
+    .ws-report:last-child { border-bottom: none; }
+    .ws-review { padding: 12px 0; border-bottom: 1px solid #f6f1e8; }
+    .ws-review:last-child { border-bottom: none; }
+    .ws-review-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+    .ws-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+               margin-top: 16px; padding-top: 14px; border-top: 1px solid #f2ece0; }
+    .ws-field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 120px; min-width: 0; }
+    .ws-field.grow { flex: 4 1 200px; }
+    .ws-field label { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.6rem;
+                      letter-spacing: .1em; text-transform: uppercase; color: #9a8f7d;
+                      font-weight: 700; }
+    .ws-field input, .ws-field select { width: 100%; background: #faf7f1; border: 1px solid #e6ddcd;
+                      border-radius: 9px; padding: 9px 11px; font-size: 0.88rem;
+                      font-family: inherit; color: #1a1510; outline: none; }
+    .ws-field input:focus, .ws-field select:focus { border-color: #c2410c; }
+
+    .ws-btn { background: #c2410c; color: #fff; border: none; border-radius: 10px;
+              padding: 10px 18px; font-size: 0.88rem; font-weight: 600; cursor: pointer;
+              font-family: inherit; text-decoration: none; display: inline-block; }
+    .ws-btn.ghost { background: none; color: #c2410c; border: 1px solid #e6ddcd; }
+
+    .ws-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;
+                margin-top: 18px; }
+    .ws-tiles a { background: #fff; border: 1px solid #ece4d6; border-radius: 14px; padding: 13px;
+                  text-decoration: none; color: #1a1510; display: block; }
+    .ws-tiles a:hover { border-color: #c2410c; }
+    .ws-tiles strong { display: block; font-size: 0.9rem; }
+    .ws-tiles span { display: block; color: #9a8f7d; font-size: 0.75rem; margin-top: 3px; }
+
+    .ws-foot { margin-top: 20px; color: #6b6255; font-size: 0.82rem; }
+    .ws-foot a { color: #c2410c; }
+
+    .ws-empty { background: #fff; border: 1px solid #ece4d6; border-radius: 16px;
+                padding: 34px 20px; text-align: center; color: #6b6255; }
+    .ws-empty svg { color: #9a8f7d; margin-bottom: 10px; }
+    .ws-empty h1 { font-size: 1.2rem; margin-bottom: 8px; }
+    .ws-empty p { max-width: 42ch; margin: 0 auto; }
+    .ws-empty-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;
+                        margin-top: 18px; }
+  </style>
 </BaseLayout>

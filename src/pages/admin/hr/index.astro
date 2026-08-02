@@ -1,159 +1,998 @@
 ---
+// /admin/hr — HR's own console.
+//
+// WHY THIS IS SEPARATE. /admin was built as one screen for the super admin and then handed out by an
+// automatic role promotion, so people who only needed their own record ended up reading the whole
+// company's. This page is the opposite move: one console scoped to the work HR actually does —
+// who is here, who arrived, who left, what is waiting on a decision, and which interns are at risk
+// of missing the credit-hours they will be certified against.
+//
+// WHAT IS DELIBERATELY ABSENT. No health or wellness data of any kind. src/lib/wellness.ts is
+// women-only and aggregate-only, and HR is not an exception to that — no wellness_* table is read,
+// joined or counted here. No gender (the column a survey read out of production on 2026-08-02).
+// No salary, bank, PAN, Aadhaar, date of birth or address. And no hr_clock_events: that table holds
+// a GPS fix, an IP address and a selfie per punch, and an overview screen is not a reason to open
+// someone's movements. Attendance here is read from hr_attendance — status and hours, nothing else.
+// Leave reasons are free text where people describe why they are unwell, so the reason column is
+// not rendered; the decision screen is where a request is read in full.
+//
+// EVERY FIGURE IS READ, NOT ASSUMED. Where a panel cannot be read it says so, because a dashboard
+// that renders 0 for "could not query" is worse than one that admits the gap.
 import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can, canAccessSection } from '@/lib/auth/permissions';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { pendingForReview, docTypeLabel } from '@/lib/hr-onboarding';
+import { listLeave } from '@/lib/hr-leave';
+import { ensureBgvSchema } from '@/lib/hr-bgv';
+import { ledgerForMany } from '@/lib/credit-ledger';
+import { weeklyHoursFor, FULL_TIME_WEEKLY_HOURS } from '@/lib/credit-hours';
+import type { EngagementTerms } from '@/lib/credit-hours';
 
 const user = Astro.locals.user;
-if (!user) return Astro.redirect('/admin/login');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent('/admin/hr'));
 
-let empCount = 0, leaveCount = 0, attendanceToday = 0, payrollPending = 0;
+// THE GATE. 'admin.access' is an existing permission in src/lib/auth/permissions.ts — inventing a
+// new one is how /admin/offer-verifications ended up unreachable for every role including the
+// founder, and /admin/hr/completion/[id] still checks 'hr.edit' and 'employees.edit', neither of
+// which exists, so can() returns false there for everyone. Only real permission names are used here.
+//
+// admin.access alone is not enough: editor, marketing, recruiter and reviewer all carry it, and the
+// editor role is exactly what the faulty offer-signing promotion handed to interns. So the console
+// entitlement is checked with can(), and the HR desk itself is narrowed to the two roles that own
+// this work — plus anyone a custom role has explicitly granted the 'hr' section, which is the
+// mechanism the team already uses to hire HR staff without making them super admins.
+const roleName = String((user as any).role || '').toLowerCase();
+const isHrDesk = roleName === 'hr' || roleName === 'super_admin';
+const hasConsole = can(user as any, 'admin.access');
+const grantedHrSection = hasConsole && !isHrDesk
+  ? await canAccessSection(user as any, 'hr', 'view').catch(() => false)
+  : false;
+if (!hasConsole || (!isHrDesk && !grantedHrSection)) {
+  return Astro.redirect('/admin?notice=hr-console-restricted');
+}
 
-try {
-  const r = await db.execute(sql`
-    SELECT
-      (SELECT COUNT(*)::int FROM hr_employees WHERE is_active = true) as emps,
-      (SELECT COUNT(*)::int FROM hr_leave_request WHERE status = 'pending') as leaves,
-      (SELECT COUNT(*)::int FROM hr_attendance WHERE date = CURRENT_DATE) as att,
-      (SELECT COUNT(*)::int FROM hr_payroll_runs WHERE status = 'draft') as payroll
-  `);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  const d = rows[0] as any;
-  if (d) {
-    empCount = Number(d.emps) || 0;
-    leaveCount = Number(d.leaves) || 0;
-    attendanceToday = Number(d.att) || 0;
-    payrollPending = Number(d.payroll) || 0;
+// ---------------------------------------------------------------------------------------------
+// Helpers. Declared before every read below: a const referenced above its own declaration threw on
+// the first line of apply step 5 and of the /admin/roles diagnose Repair button in this codebase.
+// ---------------------------------------------------------------------------------------------
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const unread: string[] = [];
+const q = async (tag: string, query: any): Promise<any[]> => {
+  try {
+    return rowsOf(await db.execute(query));
+  } catch (e: any) {
+    // The real Postgres reason lives on e.cause; e.message is only the SQL that failed.
+    console.error('[admin/hr] ' + tag, e?.cause?.message || e?.message);
+    unread.push(tag);
+    return [];
   }
-} catch(e) {}
+};
+const safeCall = async (tag: string, fn: () => Promise<any[]>): Promise<any[]> => {
+  try {
+    return await fn();
+  } catch (e: any) {
+    console.error('[admin/hr] ' + tag, e?.cause?.message || e?.message);
+    unread.push(tag);
+    return [];
+  }
+};
+
+const num = (v: any): number => (Number.isFinite(Number(v)) ? Number(v) : 0);
+// postgres-js hands a DATE column back as a JS Date, so String(d).slice(0, 10) yields "Mon Aug 04"
+// rather than "2026-08-04" and every date comparison built on it silently stops matching. Same
+// shape as iso() in credit-ledger.ts, for the same reason.
+const isoDate = (d: any): string => {
+  if (!d) return '';
+  return (d instanceof Date ? d.toISOString() : String(d)).slice(0, 10);
+};
+const startedAlready = (d: any): boolean => {
+  const s = isoDate(d);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const t = new Date(s + 'T00:00:00Z').getTime();
+  return Number.isFinite(t) && t <= Date.now();
+};
+const fmtDay = (d: any): string => {
+  if (!d) return 'not recorded';
+  try { return new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' }); }
+  catch { return String(d).slice(0, 10); }
+};
+const fmtFull = (d: any): string => {
+  if (!d) return 'not recorded';
+  try { return new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' }); }
+  catch { return String(d).slice(0, 10); }
+};
+const daysSince = (d: any): number | null => {
+  if (!d) return null;
+  const t = new Date(d).getTime();
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((Date.now() - t) / 86400000));
+};
+const waitLabel = (d: any): string => {
+  const n = daysSince(d);
+  if (n == null) return '';
+  if (n === 0) return 'today';
+  return n === 1 ? '1 day' : n + ' days';
+};
+
+// employment_type is free text and inconsistently written ('Internship' from the HR form,
+// 'full_time' from the auto-hire path), so an intern is matched the same way src/lib/auth/
+// intern-guard.ts matches one: lowercase, substring, and check the designation too.
+const INTERN_MATCH = sql`(lower(coalesce(e.employment_type, '')) LIKE '%intern%'
+                       OR lower(coalesce(e.designation, '')) LIKE '%intern%')`;
+// Both sides of the month window, so a joining_date on the 1st and one on the 31st both land in it.
+const MONTH_START = sql`date_trunc('month', CURRENT_DATE)::date`;
+const MONTH_END = sql`(date_trunc('month', CURRENT_DATE) + interval '1 month')::date`;
+
+// ---------------------------------------------------------------------------------------------
+// Reads. Independent queries run together — this is a landing screen and it should not feel like a
+// report. departments is joined on department_id = id with no cast in either direction: the id is a
+// slug in schema.ts and a uuid in the reconstructed SQL file, and ::uuid would throw on a slug.
+// ---------------------------------------------------------------------------------------------
+const [totalsRows, deptRows, joinerRows, leaverRows, exceptionRows, openPunchRows] = await Promise.all([
+  q('totals', sql`
+    SELECT
+      CURRENT_DATE AS today,
+      COUNT(*) FILTER (WHERE e.is_active = true)::int AS active_total,
+      COUNT(*) FILTER (WHERE e.is_active = true AND e.department_id IS NULL)::int AS no_department,
+      COUNT(*) FILTER (WHERE e.is_active = true AND ${INTERN_MATCH})::int AS active_interns,
+      COUNT(*) FILTER (WHERE e.joining_date >= ${MONTH_START} AND e.joining_date < ${MONTH_END})::int AS joiners_month,
+      COUNT(*) FILTER (WHERE COALESCE(e.last_working_day, e.exit_date) >= ${MONTH_START}
+                         AND COALESCE(e.last_working_day, e.exit_date) < ${MONTH_END})::int AS leavers_month
+    FROM hr_employees e`),
+
+  q('headcount-by-department', sql`
+    SELECT e.department_id AS dept_id,
+           d.name AS dept_name,
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE ${INTERN_MATCH})::int AS interns
+    FROM hr_employees e
+    LEFT JOIN departments d ON e.department_id = d.id
+    WHERE e.is_active = true
+    GROUP BY e.department_id, d.name
+    ORDER BY COUNT(*) DESC, d.name ASC`),
+
+  q('joiners', sql`
+    SELECT e.id, e.full_name, e.employee_code, e.designation, e.joining_date,
+           e.employment_type, e.is_active, d.name AS dept_name
+    FROM hr_employees e
+    LEFT JOIN departments d ON e.department_id = d.id
+    WHERE e.joining_date >= ${MONTH_START} AND e.joining_date < ${MONTH_END}
+    ORDER BY e.joining_date ASC
+    LIMIT 30`),
+
+  q('leavers', sql`
+    SELECT e.id, e.full_name, e.employee_code, e.designation, e.is_active,
+           COALESCE(e.last_working_day, e.exit_date) AS leave_date,
+           d.name AS dept_name
+    FROM hr_employees e
+    LEFT JOIN departments d ON e.department_id = d.id
+    WHERE COALESCE(e.last_working_day, e.exit_date) >= ${MONTH_START}
+      AND COALESCE(e.last_working_day, e.exit_date) < ${MONTH_END}
+    ORDER BY COALESCE(e.last_working_day, e.exit_date) ASC
+    LIMIT 30`),
+
+  // Attendance exceptions, all four from hr_attendance only.
+  q('attendance-exceptions', sql`
+    SELECT
+      (SELECT COUNT(*)::int FROM hr_employees e
+        WHERE e.is_active = true
+          AND NOT EXISTS (SELECT 1 FROM hr_attendance a WHERE a.employee_id = e.id AND a.date = CURRENT_DATE)) AS not_marked,
+      (SELECT COUNT(*)::int FROM hr_attendance a JOIN hr_employees e ON e.id = a.employee_id
+        WHERE e.is_active = true AND a.date = CURRENT_DATE AND a.status = 'absent') AS absent_today,
+      (SELECT COUNT(*)::int FROM hr_attendance a JOIN hr_employees e ON e.id = a.employee_id
+        WHERE e.is_active = true AND a.clock_in IS NOT NULL AND a.clock_out IS NULL AND a.date < CURRENT_DATE) AS open_punches,
+      (SELECT COUNT(*)::int FROM hr_attendance a JOIN hr_employees e ON e.id = a.employee_id
+        WHERE e.is_active = true AND a.clock_in IS NOT NULL AND a.clock_out IS NOT NULL
+          AND COALESCE(a.work_hours, 0) <= 0 AND a.date >= (CURRENT_DATE - 30)) AS zero_hours`),
+
+  q('open-punches', sql`
+    SELECT a.date, a.clock_in, e.full_name, e.employee_code, e.designation
+    FROM hr_attendance a
+    JOIN hr_employees e ON e.id = a.employee_id
+    WHERE e.is_active = true AND a.clock_in IS NOT NULL AND a.clock_out IS NULL AND a.date < CURRENT_DATE
+    ORDER BY a.date DESC
+    LIMIT 12`),
+]);
+
+const totals = (totalsRows[0] as any) || {};
+const activeTotal = num(totals.active_total);
+const noDepartment = num(totals.no_department);
+const activeInterns = num(totals.active_interns);
+const joinersMonth = num(totals.joiners_month);
+const leaversMonth = num(totals.leavers_month);
+// The date the database is working from. Attendance is written against CURRENT_DATE by the portal
+// clock, so "today" here has to be the server's day or the exception counts would disagree with the
+// rows they are counting.
+const serverToday = totals.today ? fmtFull(totals.today) : '';
+
+const exceptions = (exceptionRows[0] as any) || {};
+const notMarked = num(exceptions.not_marked);
+const absentToday = num(exceptions.absent_today);
+const openPunches = num(exceptions.open_punches);
+const zeroHours = num(exceptions.zero_hours);
+const exceptionTotal = notMarked + absentToday + openPunches + zeroHours;
+
+// Documents awaiting verification. pendingForReview() creates its table if it is missing, which is
+// how this feature ships without a hand-run migration.
+const allDocs = await safeCall('onboarding-documents', () => pendingForReview(200));
+// Oldest submission first, for the same reason as the leave queue: a person who has done their part
+// and is waiting on us is the thing this panel is for.
+const docsWaiting = allDocs
+  .filter((d: any) => d.status === 'submitted')
+  .sort((a: any, b: any) => new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime());
+
+// Background verification, the other thing HR verifies. Counted, never listed: a BGV row carries a
+// candidate's identity and criminal-check state and belongs on its own screen.
+let bgvOpen = 0;
+let bgvFlagged = 0;
+try {
+  await ensureBgvSchema();
+  const b = (rowsOf(await db.execute(sql`
+    SELECT COUNT(*) FILTER (WHERE overall_status IN ('pending', 'in_progress'))::int AS open_checks,
+           COUNT(*) FILTER (WHERE overall_status = 'flagged')::int AS flagged
+    FROM hr_bgv_records`))[0] as any) || {};
+  bgvOpen = num(b.open_checks);
+  bgvFlagged = num(b.flagged);
+} catch (e: any) {
+  console.error('[admin/hr] bgv', e?.cause?.message || e?.message);
+  unread.push('bgv');
+}
+
+// Leave awaiting a decision. listLeave({ status }) joins the employee name for the admin side; the
+// no-argument form is the one that must never be called from a portal page.
+const pendingLeave = await safeCall('leave-pending', () => listLeave({ status: 'pending' }));
+// Longest-waiting first. listLeave returns the newest start date first, which buries the request
+// that has been sitting the longest — the one this panel exists to surface. Ordering only; the set
+// itself is exactly what the query returned.
+const leaveQueue = pendingLeave.slice().sort((a: any, b: any) =>
+  new Date(a.requested_at || 0).getTime() - new Date(b.requested_at || 0).getTime());
+
+// ---------------------------------------------------------------------------------------------
+// Interns and their credit position.
+//
+// The four engagement columns are added at runtime by credit-ledger.termsFor(), so on a database
+// where no one has opened their portal yet they may not exist. The read is attempted with them and
+// falls back to the same query without them, in which case terms are unset and the page says so
+// rather than inventing a 40-hour week for someone who never agreed to one.
+// ---------------------------------------------------------------------------------------------
+const INTERN_LIMIT = 48;
+let internTermsAvailable = true;
+let internRowsRaw = await q('interns', sql`
+  SELECT e.id, e.full_name, e.employee_code, e.designation, e.joining_date, d.name AS dept_name,
+         e.engagement_kind, e.weekly_hours, e.working_days_per_week, e.required_credit_hours
+  FROM hr_employees e
+  LEFT JOIN departments d ON e.department_id = d.id
+  WHERE e.is_active = true AND ${INTERN_MATCH}
+  ORDER BY e.joining_date ASC NULLS LAST
+  LIMIT ${INTERN_LIMIT}`);
+if (unread.includes('interns')) {
+  // The read failed. Retry without the four runtime-added engagement columns, which is the only
+  // difference that can be missing on a database where termsFor() has never run. If THAT works the
+  // terms genuinely are not recorded yet; if it fails too, the failure is something else and stays
+  // on the unread list so the banner names it rather than the page blaming missing terms.
+  unread.splice(unread.indexOf('interns'), 1);
+  internRowsRaw = await q('interns', sql`
+    SELECT e.id, e.full_name, e.employee_code, e.designation, e.joining_date, d.name AS dept_name
+    FROM hr_employees e
+    LEFT JOIN departments d ON e.department_id = d.id
+    WHERE e.is_active = true AND ${INTERN_MATCH}
+    ORDER BY e.joining_date ASC NULLS LAST
+    LIMIT ${INTERN_LIMIT}`);
+  // Both reads failed: leave termsAvailable true so the page does not blame a cause it has not
+  // established, and let the unread banner name the panel instead.
+  internTermsAvailable = unread.includes('interns');
+}
+
+const termsById = new Map<string, EngagementTerms>();
+for (const r of internRowsRaw) {
+  const kind = (r as any).engagement_kind === 'part-time' ? 'part-time' : 'full-time';
+  termsById.set(String((r as any).id), {
+    kind,
+    // Part-time with no agreed hours stays undefined on purpose: weeklyHoursFor() resolves it to 0
+    // so a missing contract reads as missing instead of being quietly filled in.
+    weeklyHours: (r as any).weekly_hours == null
+      ? (kind === 'full-time' ? FULL_TIME_WEEKLY_HOURS : undefined)
+      : Number((r as any).weekly_hours),
+    workingDaysPerWeek: (r as any).working_days_per_week == null ? 5 : Number((r as any).working_days_per_week),
+    requiredCreditHours: (r as any).required_credit_hours == null ? undefined : Number((r as any).required_credit_hours),
+  });
+}
+
+const ledgers = await ledgerForMany(
+  internRowsRaw.map((r: any) => ({ employeeId: String(r.id), terms: termsById.get(String(r.id))! })),
+);
+
+// Presentation helper, declared above the list that uses it. Returns a plain object rather than a
+// typed lookup map, because a Record<string,string> declared for use inside JSX breaks .astro
+// parsing in this project.
+const stateChip = (s: string) => {
+  if (s === 'behind') return { label: 'Behind pace', bg: 'rgba(220,38,38,0.14)', fg: '#fca5a5', border: 'rgba(220,38,38,0.3)' };
+  if (s === 'approaching') return { label: 'Approaching', bg: 'rgba(251,191,36,0.14)', fg: '#fcd34d', border: 'rgba(251,191,36,0.3)' };
+  if (s === 'met') return { label: 'Requirement met', bg: 'rgba(16,185,129,0.14)', fg: '#6ee7b7', border: 'rgba(16,185,129,0.3)' };
+  if (s === 'terms-missing') return { label: 'Hours not set', bg: 'rgba(168,85,247,0.14)', fg: '#d8b4fe', border: 'rgba(168,85,247,0.3)' };
+  if (s === 'no-requirement') return { label: 'No requirement set', bg: 'rgba(120,120,132,0.16)', fg: '#b4b4be', border: 'rgba(120,120,132,0.32)' };
+  return { label: 'On track', bg: 'rgba(96,165,250,0.14)', fg: '#93c5fd', border: 'rgba(96,165,250,0.3)' };
+};
+
+const MS_WEEK = 7 * 24 * 3600 * 1000;
+const internList = internRowsRaw.map((r: any) => {
+  const id = String(r.id);
+  const terms: EngagementTerms = termsById.get(id) || { kind: 'full-time', workingDaysPerWeek: 5 };
+  const ledger = ledgers.get(id);
+  const summary = ledger ? ledger.summary : null;
+  const weekly = weeklyHoursFor(terms);
+  const required = summary ? summary.requiredCreditHours : null;
+  const earned = summary ? summary.creditHours : 0;
+  const pct = summary ? summary.completionPct : null;
+
+  // Pace, stated plainly: at the load this person agreed to, this is what the elapsed weeks since
+  // their joining date should have produced. It is capped at the requirement so finishing early
+  // never reads as "behind", and it is null when the joining date was never recorded — a figure
+  // computed from a missing start date would be a guess dressed up as a measurement.
+  let elapsedWeeks: number | null = null;
+  const joinedIso = isoDate(r.joining_date);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(joinedIso)) {
+    const started = new Date(joinedIso + 'T00:00:00Z').getTime();
+    if (Number.isFinite(started)) elapsedWeeks = Math.max(0, Math.floor((Date.now() - started) / MS_WEEK));
+  }
+  const paceTarget = required && weekly > 0 && elapsedWeeks != null
+    ? Math.min(required, elapsedWeeks * weekly)
+    : null;
+  const behindBy = paceTarget != null ? Math.round((paceTarget - earned) * 10) / 10 : null;
+
+  let state = 'on-track';
+  if (weekly <= 0) state = 'terms-missing';
+  else if (required == null) state = 'no-requirement';
+  else if (pct != null && pct >= 100) state = 'met';
+  else if (pct != null && pct >= 80) state = 'approaching';
+  else if (paceTarget != null && paceTarget > 0 && earned < paceTarget * 0.8) state = 'behind';
+
+  return {
+    id,
+    name: r.full_name || 'Unnamed record',
+    code: r.employee_code || '',
+    designation: r.designation || '',
+    dept: r.dept_name || '',
+    joined: r.joining_date,
+    kind: terms.kind,
+    weekly,
+    earned,
+    required,
+    pct,
+    behindBy: behindBy != null && behindBy > 0 ? behindBy : null,
+    weeksRemaining: ledger ? ledger.weeksRemaining : null,
+    unauthorised: summary ? summary.unauthorisedLeaveDays : 0,
+    noticeBreaches: summary ? summary.noticeBreaches : 0,
+    attendancePct: summary ? summary.attendancePct : 0,
+    state,
+    chip: stateChip(state),
+  };
+});
+
+const stateRank = (s: string): number => {
+  if (s === 'behind') return 0;
+  if (s === 'approaching') return 1;
+  if (s === 'terms-missing') return 2;
+  if (s === 'no-requirement') return 3;
+  if (s === 'on-track') return 4;
+  return 5;
+};
+internList.sort((a, b) => stateRank(a.state) - stateRank(b.state) || b.earned - a.earned);
+
+const internsBehind = internList.filter((i) => i.state === 'behind').length;
+const internsApproaching = internList.filter((i) => i.state === 'approaching').length;
+const internsUnset = internList.filter((i) => i.state === 'terms-missing' || i.state === 'no-requirement').length;
+
+const tiles = [
+  { label: 'Active people', value: activeTotal, tone: '#e8e8ee', href: '/admin/hr/employees', note: activeInterns + ' on an internship' },
+  { label: 'Joined this month', value: joinersMonth, tone: '#6ee7b7', href: '/admin/hr/employees', note: 'by joining date' },
+  { label: 'Left this month', value: leaversMonth, tone: '#fca5a5', href: '/admin/hr/separations', note: 'by last working day' },
+  { label: 'Documents to verify', value: docsWaiting.length, tone: '#fcd34d', href: '/admin/hr/onboarding', note: bgvOpen + ' BGV checks open' },
+  { label: 'Leave to decide', value: pendingLeave.length, tone: '#fcd34d', href: '/admin/hr/leave', note: 'awaiting a decision' },
+  { label: 'Attendance exceptions', value: exceptionTotal, tone: exceptionTotal > 0 ? '#fcd34d' : '#e8e8ee', href: '/admin/hr/attendance', note: 'on ' + serverToday },
+];
 
 const modules = [
-  {
-    label: 'Employees',
-    desc: 'Add, view, and manage employee profiles',
-    href: '/admin/hr/employees',
-    status: 'live',
-    stat: empCount + ' active',
-    color: '#10b981',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>'
-  },
-  {
-    label: 'Leave Management',
-    desc: 'Approve/reject requests, allocate balances',
-    href: '/admin/hr/leave',
-    status: 'live',
-    stat: leaveCount + ' pending',
-    color: '#fbbf24',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>'
-  },
-  {
-    label: 'Attendance',
-    desc: 'Daily tracking, monthly summary, bulk mark',
-    href: '/admin/hr/attendance',
-    status: 'live',
-    stat: attendanceToday + ' marked today',
-    color: '#60a5fa',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>'
-  },
-  {
-    label: 'Payroll',
-    desc: 'Run payroll, payslips, salary structures',
-    href: '/admin/hr/payroll',
-    status: 'live',
-    stat: payrollPending + ' pending runs',
-    color: '#a78bfa',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>'
-  },
-  {
-    label: 'Recommendation Letter',
-    desc: 'Generate LOR / TWMIC / completion certificates',
-    href: '/admin/hr/recommendation',
-    status: 'live',
-    stat: null,
-    color: '#34d399',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>'
-  },
-  {
-    label: 'Offboarding Docs',
-    desc: 'Relieving / experience / NOC letters',
-    href: '/admin/hr/offboarding',
-    status: 'live',
-    stat: null,
-    color: '#f97316',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>'
-  },
-  {
-    label: 'Performance Reviews',
-    desc: 'Rubric-based evaluation cycles, ratings',
-    href: '/admin/hr/performance',
-    status: 'live',
-    stat: null,
-    color: '#e879f9',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>'
-  },
-  {
-    label: 'Training & Certifications',
-    desc: 'Learning paths, certification tracking',
-    href: '/admin/hr/training',
-    status: 'live',
-    stat: null,
-    color: '#6e6e78',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>'
-  },
-  {
-    label: 'Asset Management',
-    desc: 'Laptops, accounts, equipment allocation',
-    href: '/admin/hr/assets',
-    status: 'planned',
-    stat: null,
-    color: '#6e6e78',
-    svg: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>'
-  },
+  { label: 'Employees', href: '/admin/hr/employees', note: activeTotal + ' active' },
+  { label: 'Joining documents', href: '/admin/hr/onboarding', note: docsWaiting.length + ' to verify' },
+  { label: 'BGV', href: '/admin/hr/bgv', note: bgvOpen + ' open' },
+  { label: 'Leave', href: '/admin/hr/leave', note: pendingLeave.length + ' pending' },
+  { label: 'Attendance', href: '/admin/hr/attendance', note: exceptionTotal + ' exceptions' },
+  { label: 'Payroll', href: '/admin/hr/payroll', note: '' },
+  { label: 'Requisitions', href: '/admin/hr/requisitions', note: '' },
+  { label: 'Classification register', href: '/admin/hr/classification', note: '' },
+  { label: 'Separations', href: '/admin/hr/separations', note: leaversMonth + ' this month' },
+  { label: 'Performance reviews', href: '/admin/hr/performance', note: '' },
+  { label: 'Training', href: '/admin/hr/training', note: '' },
+  { label: 'Recommendation letters', href: '/admin/hr/recommendation', note: '' },
+  { label: 'Offboarding documents', href: '/admin/hr/offboarding', note: '' },
 ];
+
+const monthLabel = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', month: 'long', year: 'numeric' });
 ---
-<AdminLayout title="HR Management" activeNav="hr">
-<div style="padding-bottom:80px;">
+<AdminLayout title="HR" activeNav="hr">
+  <div class="admin-page hrhome">
 
-  <!-- Header -->
-  <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;">
-    <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0;">People Operations</p>
-    <h1 style="font-size:20px;font-weight:700;color:#fff;margin:4px 0 0;">HR Management</h1>
-  </div>
+    <div class="admin-page-header">
+      <div class="admin-page-title-block">
+        <div class="admin-page-eyebrow">People operations</div>
+        <h1 class="admin-page-title">HR</h1>
+        <p class="admin-page-sub">
+          What is waiting on you, and who it concerns. Health and wellness records are not shown on
+          this console and are not available to HR &mdash; that system is aggregate-only by design.
+          Salary, bank and identity-document fields live on the individual employee record, not here.
+        </p>
+      </div>
+    </div>
 
-  <!-- Live stats -->
-  <div style="padding:14px 16px 0;display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
-    {[
-      { label: 'Active Employees', value: empCount, color: '#10b981', href: '/admin/hr/employees' },
-      { label: 'Pending Leave', value: leaveCount, color: '#fbbf24', href: '/admin/hr/leave' },
-      { label: 'Marked Today', value: attendanceToday, color: '#60a5fa', href: '/admin/hr/attendance' },
-      { label: 'Payroll Drafts', value: payrollPending, color: '#a78bfa', href: '/admin/hr/payroll' },
-    ].map(s => (
-      <a href={s.href} style="text-decoration:none;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:10px;text-align:center;">
-        <p style={`font-size:22px;font-weight:800;color:${s.color};margin:0;line-height:1;font-family:'Geist Mono',monospace;`}>{s.value}</p>
-        <p style="font-size:9px;color:#6e6e78;margin:3px 0 0;line-height:1.3;">{s.label}</p>
-      </a>
-    ))}
-  </div>
+    {unread.length > 0 && (
+      <div class="hrnote hrnote-warn">
+        <strong>Some panels could not be read.</strong>
+        <span> {unread.join(', ')}. Those sections are blank rather than zero &mdash; a figure that
+        failed to load is not the same as nothing to do. The reason is in the server log.</span>
+      </div>
+    )}
 
-  <!-- Modules grid -->
-  <div style="padding:14px 16px;display:flex;flex-direction:column;gap:6px;">
-    {modules.map(m => (
-      <a href={m.status === 'planned' ? '#' : m.href} style={`text-decoration:none;background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;display:flex;align-items:center;gap:14px;${m.status==='planned'?'opacity:0.5;cursor:not-allowed;':''}`}>
-        <div style={`width:44px;height:44px;border-radius:10px;background:${m.color}18;border:1px solid ${m.color}33;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:${m.color};`} set:html={m.svg}></div>
-        <div style="flex:1;min-width:0;">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;">
-            <p style="font-size:14px;font-weight:600;color:#fff;margin:0;">{m.label}</p>
-            <span style={`font-size:9px;font-weight:700;padding:1px 7px;border-radius:100px;${m.status==='live'?'background:rgba(16,185,129,0.15);color:#6ee7b7;':'background:#15151a;color:#6e6e78;'}`}>{m.status.toUpperCase()}</span>
-          </div>
-          <p style="font-size:11px;color:#6e6e78;margin:0;">{m.desc}</p>
-          {m.stat && <p style={`font-size:10px;color:${m.color};margin:4px 0 0;font-family:'Geist Mono',monospace;`}>{m.stat}</p>}
+    {/* ---------------------------------------------------------------- Overview */}
+    <div class="hrtiles">
+      {tiles.map((t) => (
+        <a class="hrtile" href={t.href}>
+          <p class="hrtile-v" style={'color:' + t.tone + ';'}>{t.value}</p>
+          <p class="hrtile-l">{t.label}</p>
+          <p class="hrtile-n">{t.note}</p>
+        </a>
+      ))}
+    </div>
+
+    {/* ---------------------------------------------------------------- Headcount */}
+    <section class="hrsec">
+      <div class="hrsec-head">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <h2>Headcount by department</h2>
+        <span class="hrsec-meta">{activeTotal} active</span>
+      </div>
+
+      {noDepartment > 0 && (
+        <div class="hrnote">
+          <strong>{noDepartment} active {noDepartment === 1 ? 'person has' : 'people have'} no department recorded.</strong>
+          <span> A department is only written automatically when someone is hired through an
+          application; records added by hand on the employee screen have no department field at all,
+          so this is a gap in the form rather than a gap in the team. They are listed below as
+          &ldquo;not recorded&rdquo; and are counted in the total.</span>
         </div>
-        {m.status === 'live' && (
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-        )}
-      </a>
-    ))}
+      )}
+
+      <div class="hrscroll">
+        <table class="admin-table hrtable">
+          <thead>
+            <tr><th>Department</th><th class="hrnum">People</th><th class="hrnum">On internship</th><th class="hrbar-h">Share</th></tr>
+          </thead>
+          <tbody>
+            {deptRows.length === 0 && (
+              <tr><td colspan="4" class="admin-table-empty">No active employee records to group.</td></tr>
+            )}
+            {deptRows.map((d: any) => (
+              <tr>
+                <td>
+                  <span class="hrname">{d.dept_name || (d.dept_id ? 'Unrecognised department' : 'Not recorded')}</span>
+                  {!d.dept_name && d.dept_id && <span class="hrsub">key {String(d.dept_id)} is not in the department list</span>}
+                </td>
+                <td class="hrnum hrmono">{num(d.total)}</td>
+                <td class="hrnum hrmono">{num(d.interns)}</td>
+                <td class="hrbar-h">
+                  <span class="hrbar"><i style={'width:' + (activeTotal > 0 ? Math.round((num(d.total) / activeTotal) * 100) : 0) + '%;'}></i></span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    {/* ---------------------------------------------------------------- Movement */}
+    <section class="hrsec">
+      <div class="hrsec-head">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+        <h2>Joiners and leavers</h2>
+        <span class="hrsec-meta">{monthLabel}</span>
+      </div>
+
+      <div class="hrsplit">
+        <div class="hrpanel">
+          <p class="hrpanel-title">Joined this month <span class="hrcount">{joinersMonth}</span></p>
+          {joinerRows.length === 0 ? (
+            <p class="hrempty">Nobody has a joining date in this month.</p>
+          ) : (
+            <div class="hrscroll">
+              <table class="admin-table hrtable">
+                <thead><tr><th>Name</th><th>Role</th><th>Joined</th></tr></thead>
+                <tbody>
+                  {joinerRows.map((r: any) => (
+                    <tr>
+                      <td>
+                        <span class="hrname">{r.full_name || 'Unnamed record'}</span>
+                        <span class="hrsub">{r.employee_code || 'no code'}{r.dept_name ? ' · ' + r.dept_name : ''}</span>
+                      </td>
+                      <td>{r.designation || 'not recorded'}</td>
+                      <td class="hrmono">{fmtDay(r.joining_date)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {joinersMonth > joinerRows.length && (
+            <p class="hrempty">Showing the first {joinerRows.length} of {joinersMonth}. The full list is on the employees screen.</p>
+          )}
+        </div>
+
+        <div class="hrpanel">
+          <p class="hrpanel-title">Left this month <span class="hrcount">{leaversMonth}</span></p>
+          {leaverRows.length === 0 ? (
+            <p class="hrempty">No last working day falls in this month.</p>
+          ) : (
+            <div class="hrscroll">
+              <table class="admin-table hrtable">
+                <thead><tr><th>Name</th><th>Role</th><th>Last day</th></tr></thead>
+                <tbody>
+                  {leaverRows.map((r: any) => (
+                    <tr>
+                      <td>
+                        <span class="hrname">{r.full_name || 'Unnamed record'}</span>
+                        <span class="hrsub">{r.employee_code || 'no code'}{r.is_active ? ' · record still active' : ''}</span>
+                      </td>
+                      <td>{r.designation || 'not recorded'}</td>
+                      <td class="hrmono">{fmtDay(r.leave_date)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {leaversMonth > leaverRows.length && (
+            <p class="hrempty">Showing the first {leaverRows.length} of {leaversMonth}.</p>
+          )}
+        </div>
+      </div>
+    </section>
+
+    {/* ---------------------------------------------------------------- Waiting on HR */}
+    <section class="hrsec">
+      <div class="hrsec-head">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <h2>Waiting on a decision</h2>
+        <span class="hrsec-meta">{docsWaiting.length + pendingLeave.length} items</span>
+      </div>
+
+      <div class="hrsplit">
+        <div class="hrpanel">
+          <p class="hrpanel-title">Documents to verify <span class="hrcount">{docsWaiting.length}</span></p>
+          <p class="hrempty">
+            Credentials are Google Drive links shared by the person &mdash; nothing is stored on our
+            servers. Open and verify them on the joining documents screen.
+          </p>
+          {docsWaiting.length > 0 && (
+            <div class="hrscroll">
+              <table class="admin-table hrtable">
+                <thead><tr><th>Person</th><th>Document</th><th>Waiting</th></tr></thead>
+                <tbody>
+                  {docsWaiting.slice(0, 10).map((d: any) => (
+                    <tr>
+                      <td><span class="hrname">{d.user_name || 'Unknown'}</span></td>
+                      <td>{d.title || docTypeLabel(d.doc_type)}</td>
+                      <td class="hrmono">{waitLabel(d.created_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {docsWaiting.length > 10 && (
+            <p class="hrempty">Showing the 10 that have been waiting longest, of {docsWaiting.length}.</p>
+          )}
+          <div class="hrlinks">
+            <a class="admin-btn" href="/admin/hr/onboarding">Joining documents</a>
+            <a class="admin-btn" href="/admin/hr/bgv">BGV {bgvOpen > 0 ? '(' + bgvOpen + ' open)' : ''}</a>
+          </div>
+          {bgvFlagged > 0 && (
+            <p class="hrempty">{bgvFlagged} background {bgvFlagged === 1 ? 'check is' : 'checks are'} flagged for a human to read. A flag is advisory; a person decides.</p>
+          )}
+        </div>
+
+        <div class="hrpanel">
+          <p class="hrpanel-title">Leave to decide <span class="hrcount">{pendingLeave.length}</span></p>
+          <p class="hrempty">
+            The written reason is not shown here &mdash; people describe why they are unwell in it.
+            Open the request to read it before deciding.
+          </p>
+          {pendingLeave.length === 0 ? (
+            <p class="hrempty">Nothing waiting.</p>
+          ) : (
+            <div class="hrscroll">
+              <table class="admin-table hrtable">
+                <thead><tr><th>Person</th><th>Type</th><th>Dates</th><th class="hrnum">Days</th><th>Waiting</th></tr></thead>
+                <tbody>
+                  {leaveQueue.slice(0, 12).map((l: any) => (
+                    <tr>
+                      <td>
+                        <span class="hrname">{l.full_name || 'Unknown employee'}</span>
+                        <span class="hrsub">{l.employee_code || ''}</span>
+                      </td>
+                      <td class="hrcap">{l.leave_type || ''}</td>
+                      <td class="hrmono">
+                        {fmtDay(l.start_date)}{isoDate(l.start_date) !== isoDate(l.end_date) ? ' to ' + fmtDay(l.end_date) : ''}
+                      </td>
+                      <td class="hrnum hrmono">{num(l.days)}</td>
+                      <td class="hrmono">
+                        {waitLabel(l.requested_at)}
+                        {startedAlready(l.start_date) && <span class="hrflag">already started</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {pendingLeave.length > 12 && (
+            <p class="hrempty">Showing the 12 that have been waiting longest, of {pendingLeave.length}.</p>
+          )}
+          <div class="hrlinks"><a class="admin-btn" href="/admin/hr/leave">Decide leave</a></div>
+        </div>
+      </div>
+    </section>
+
+    {/* ---------------------------------------------------------------- Attendance exceptions */}
+    <section class="hrsec">
+      <div class="hrsec-head">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <h2>Attendance exceptions</h2>
+        <span class="hrsec-meta">{serverToday}</span>
+      </div>
+
+      <div class="hrtiles hrtiles-4">
+        <div class="hrtile hrtile-flat">
+          <p class="hrtile-v" style={'color:' + (notMarked > 0 ? '#fcd34d' : '#e8e8ee') + ';'}>{notMarked}</p>
+          <p class="hrtile-l">Not marked today</p>
+          <p class="hrtile-n">active people with no row for today</p>
+        </div>
+        <div class="hrtile hrtile-flat">
+          <p class="hrtile-v" style={'color:' + (absentToday > 0 ? '#fca5a5' : '#e8e8ee') + ';'}>{absentToday}</p>
+          <p class="hrtile-l">Recorded absent</p>
+          <p class="hrtile-n">marked absent for today</p>
+        </div>
+        <div class="hrtile hrtile-flat">
+          <p class="hrtile-v" style={'color:' + (openPunches > 0 ? '#fcd34d' : '#e8e8ee') + ';'}>{openPunches}</p>
+          <p class="hrtile-l">Never clocked out</p>
+          <p class="hrtile-n">clocked in on an earlier day</p>
+        </div>
+        <div class="hrtile hrtile-flat">
+          <p class="hrtile-v" style={'color:' + (zeroHours > 0 ? '#fcd34d' : '#e8e8ee') + ';'}>{zeroHours}</p>
+          <p class="hrtile-l">Zero hours recorded</p>
+          <p class="hrtile-n">both punches, no hours, last 30 days</p>
+        </div>
+      </div>
+
+      <p class="hrempty">
+        Read from the attendance record only &mdash; status and hours. The punch log holds a location
+        fix, an IP address and a photograph for every clock-in, and none of that is opened here.
+      </p>
+
+      {openPunchRows.length > 0 && (
+        <div class="hrscroll">
+          <table class="admin-table hrtable">
+            <thead><tr><th>Person</th><th>Role</th><th>Day left open</th></tr></thead>
+            <tbody>
+              {openPunchRows.map((r: any) => (
+                <tr>
+                  <td>
+                    <span class="hrname">{r.full_name || 'Unnamed record'}</span>
+                    <span class="hrsub">{r.employee_code || ''}</span>
+                  </td>
+                  <td>{r.designation || 'not recorded'}</td>
+                  <td class="hrmono">{fmtFull(r.date)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div class="hrlinks"><a class="admin-btn" href="/admin/hr/attendance">Open attendance</a></div>
+    </section>
+
+    {/* ---------------------------------------------------------------- Interns and credit */}
+    <section class="hrsec">
+      <div class="hrsec-head">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c3 3 9 3 12 0v-5"/></svg>
+        <h2>Interns and credit-hours</h2>
+        <span class="hrsec-meta">{internsBehind} behind &middot; {internsApproaching} approaching</span>
+      </div>
+
+      <p class="hrempty">
+        One credit-hour is one hour of verified engagement; a full-time week is {FULL_TIME_WEEKLY_HOURS}.
+        &ldquo;Behind pace&rdquo; compares what has been earned against what the weeks since the
+        joining date should have produced at the load that was agreed &mdash; it is a prompt to talk
+        to someone, not a judgement. Part-time runs longer to reach the same total, never a smaller one.
+      </p>
+
+      {!internTermsAvailable && (
+        <div class="hrnote hrnote-warn">
+          <strong>Engagement terms are not recorded on this database yet.</strong>
+          <span> The agreed hours and the credit-hour requirement are written the first time an
+          engagement is set on a completion screen. Until then no credit position can be computed,
+          so the figures below would be meaningless and are not shown.</span>
+        </div>
+      )}
+
+      {internsUnset > 0 && internTermsAvailable && (
+        <div class="hrnote">
+          <strong>{internsUnset} {internsUnset === 1 ? 'intern has' : 'interns have'} no requirement or no agreed hours on file.</strong>
+          <span> Their credit cannot be measured against anything until that is set, so they are
+          shown without a percentage rather than with a flattering one. Set it from the intern&rsquo;s
+          completion screen.</span>
+        </div>
+      )}
+
+      {internList.length === 0 ? (
+        <p class="hrempty">No active internship records. Employment type and job title are both checked, because the two are written inconsistently.</p>
+      ) : (
+        <div class="hrscroll">
+          <table class="admin-table hrtable hrtable-wide">
+            <thead>
+              <tr>
+                <th>Intern</th>
+                <th>Status</th>
+                <th class="hrnum">Earned</th>
+                <th class="hrnum">Required</th>
+                <th class="hrnum">Attendance</th>
+                <th>Flags</th>
+                <th>Joined</th>
+              </tr>
+            </thead>
+            <tbody>
+              {internList.map((i) => (
+                <tr>
+                  <td>
+                    <a class="hrname hrlink" href={'/admin/hr/completion/' + i.id}>{i.name}</a>
+                    <span class="hrsub">
+                      {i.code ? i.code + ' · ' : ''}{i.designation || 'role not recorded'}{i.dept ? ' · ' + i.dept : ''}
+                      {i.kind === 'part-time' ? ' · part-time ' + (i.weekly > 0 ? i.weekly + 'h/week' : 'hours not set') : ''}
+                    </span>
+                  </td>
+                  <td>
+                    <span class="hrchip" style={'background:' + i.chip.bg + ';color:' + i.chip.fg + ';border-color:' + i.chip.border + ';'}>
+                      {i.chip.label}
+                    </span>
+                    {i.behindBy != null && i.state === 'behind' && <span class="hrsub">{i.behindBy}h behind pace</span>}
+                    {i.weeksRemaining != null && i.weeksRemaining > 0 && i.state !== 'behind' && <span class="hrsub">about {i.weeksRemaining} {i.weeksRemaining === 1 ? 'week' : 'weeks'} to go</span>}
+                  </td>
+                  <td class="hrnum hrmono">{i.earned}</td>
+                  <td class="hrnum hrmono">
+                    {i.required == null ? 'not set' : i.required}
+                    {i.pct != null && <span class="hrsub hrsub-num">{i.pct}%</span>}
+                  </td>
+                  <td class="hrnum hrmono">{i.attendancePct}%</td>
+                  <td>
+                    {i.unauthorised > 0 && <span class="hrflag hrflag-bad">{i.unauthorised} unauthorised</span>}
+                    {i.noticeBreaches > 0 && <span class="hrflag">{i.noticeBreaches} without notice</span>}
+                    {i.unauthorised === 0 && i.noticeBreaches === 0 && <span class="hrsub">none</span>}
+                  </td>
+                  <td class="hrmono">{fmtFull(i.joined)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {internList.length >= INTERN_LIMIT && (
+        <p class="hrempty">Showing the first {INTERN_LIMIT} internship records, oldest joining date first.</p>
+      )}
+    </section>
+
+    {/* ---------------------------------------------------------------- Modules */}
+    <section class="hrsec">
+      <div class="hrsec-head">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+        <h2>All HR screens</h2>
+      </div>
+      <div class="hrmods">
+        {modules.map((m) => (
+          <a class="hrmod" href={m.href}>
+            <span class="hrmod-l">{m.label}</span>
+            {m.note && <span class="hrmod-n">{m.note}</span>}
+          </a>
+        ))}
+      </div>
+    </section>
+
   </div>
 
-</div>
+  <style>
+    .hrhome { padding-bottom: 72px; }
+
+    .hrnote {
+      border: 1px solid #26262e;
+      background: #0e0e12;
+      border-left: 2px solid #3a3a44;
+      border-radius: 8px;
+      padding: 11px 14px;
+      margin: 0 0 14px;
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: #a8a8b2;
+    }
+    .hrnote strong { color: #e8e8ee; font-weight: 600; }
+    .hrnote-warn { border-left-color: #b45309; background: rgba(180, 83, 9, 0.08); }
+
+    .hrtiles {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-bottom: 26px;
+    }
+    .hrtiles-4 { margin-bottom: 14px; }
+    .hrtile {
+      display: block;
+      background: #0e0e12;
+      border: 1px solid #1a1a20;
+      border-radius: 10px;
+      padding: 13px 14px;
+      text-decoration: none;
+      transition: border-color 0.12s ease, background 0.12s ease;
+      min-width: 0;
+    }
+    a.hrtile:hover { border-color: #2a2a32; background: #101016; }
+    .hrtile-flat { cursor: default; }
+    .hrtile-v {
+      font-size: 26px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      margin: 0;
+      line-height: 1.05;
+    }
+    .hrtile-l { font-size: 11.5px; color: #d8d8de; margin: 6px 0 0; font-weight: 500; }
+    .hrtile-n { font-size: 10.5px; color: #6e6e78; margin: 3px 0 0; line-height: 1.4; }
+
+    .hrsec { margin-bottom: 30px; }
+    .hrsec-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding-bottom: 9px;
+      border-bottom: 1px solid #15151a;
+      color: #6e6e78;
+      flex-wrap: wrap;
+    }
+    .hrsec-head h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #fff;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }
+    .hrsec-meta {
+      margin-left: auto;
+      font-size: 10.5px;
+      color: #6e6e78;
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      white-space: nowrap;
+    }
+
+    .hrsplit { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+    .hrpanel {
+      background: #0b0b0f;
+      border: 1px solid #1a1a20;
+      border-radius: 10px;
+      padding: 14px;
+      min-width: 0;
+    }
+    .hrpanel-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #8a8a94;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin: 0 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .hrcount {
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      font-size: 12px;
+      color: #fff;
+      background: #16161c;
+      border: 1px solid #23232b;
+      border-radius: 5px;
+      padding: 1px 7px;
+      letter-spacing: 0;
+    }
+    .hrempty { font-size: 11.5px; color: #6e6e78; line-height: 1.6; margin: 0 0 10px; }
+
+    /* Wide tables scroll inside their own box. The page itself must never scroll sideways on a
+       phone, which is what happens when a long name or an employee code widens a cell. */
+    .hrscroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      border: 1px solid #1a1a20;
+      border-radius: 9px;
+      background: #0b0b0f;
+      margin-bottom: 10px;
+    }
+    .hrtable { min-width: 460px; }
+    .hrtable-wide { min-width: 760px; }
+    .hrtable th { white-space: nowrap; }
+    .hrtable td { vertical-align: top; }
+    .hrtable tr:last-child td { border-bottom: 0; }
+    .hrnum { text-align: right; }
+    .hrbar-h { width: 96px; }
+    .hrmono { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11.5px; white-space: nowrap; }
+    .hrcap { text-transform: capitalize; }
+
+    .hrname { display: block; color: #fff; font-weight: 500; overflow-wrap: anywhere; }
+    a.hrlink { text-decoration: none; }
+    a.hrlink:hover { color: #FF7040; }
+    .hrsub { display: block; font-size: 10.5px; color: #6e6e78; margin-top: 2px; overflow-wrap: anywhere; }
+    .hrsub-num { font-family: 'Geist Mono', ui-monospace, monospace; }
+
+    .hrbar { display: block; height: 5px; border-radius: 3px; background: #16161c; overflow: hidden; }
+    .hrbar i { display: block; height: 100%; background: #FF4F00; }
+
+    .hrchip {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 100px;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }
+    .hrflag {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 500;
+      padding: 1px 7px;
+      border-radius: 4px;
+      background: rgba(251, 191, 36, 0.12);
+      color: #fcd34d;
+      border: 1px solid rgba(251, 191, 36, 0.24);
+      margin: 1px 4px 1px 0;
+      white-space: nowrap;
+    }
+    .hrflag-bad { background: rgba(220, 38, 38, 0.12); color: #fca5a5; border-color: rgba(220, 38, 38, 0.26); }
+
+    .hrlinks { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+
+    .hrmods { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; }
+    .hrmod {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: #0e0e12;
+      border: 1px solid #1a1a20;
+      border-radius: 8px;
+      padding: 11px 13px;
+      text-decoration: none;
+      min-width: 0;
+    }
+    .hrmod:hover { border-color: #2a2a32; background: #101016; }
+    .hrmod-l { font-size: 12.5px; color: #d8d8de; font-weight: 500; overflow-wrap: anywhere; }
+    .hrmod-n {
+      font-size: 10px;
+      color: #6e6e78;
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    @media (max-width: 560px) {
+      .hrtiles { grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 8px; }
+      .hrtile-v { font-size: 22px; }
+      .hrsec-meta { margin-left: 0; width: 100%; }
+    }
+  </style>
 </AdminLayout>
