@@ -1,331 +1,1000 @@
 ---
+// src/pages/admin/team/roles.astro — the role console. Everything an organisation needs to decide
+// who can do what, without a developer.
+//
+// WHY IT LOOKS LIKE THIS. The previous version of this page could create a role and tick a
+// four-column page matrix. What it could not do was answer the questions that actually get asked
+// after an access incident: which permissions exist, which of them open the admin console, who is
+// holding one right now, and what will this person SEE when they sign in. Those answers lived in
+// four source files, so in practice roles were handed out by whoever could read TypeScript.
+//
+// Every list here is DERIVED, never typed out:
+//   - the permission picker comes from permission_catalogue (listPermissionGroups), so a permission
+//     invented next week appears here with no edit to this file;
+//   - the sidebar preview calls navForPermissions() from src/lib/admin-nav.ts — the same function
+//     that builds the real sidebar, on the same catalogue, with the permissions this role actually
+//     holds. It is not a description of the menu; it is the menu;
+//   - the holders are the real assignments.
+// A hand-copied summary of a permission model is one edit away from lying, and a lying access page
+// is worse than none: it gets read once, believed, and never questioned again.
+//
+// ONE SAVE WRITES BOTH RECORDS, and that is the point of applyRolePermissions(). Ticking
+// `applications.view` writes a row in role_permission_grants (which hasPermission() and the sidebar
+// read) AND the matching page-key row in role_permissions (which getViewableSectionKeys() and
+// middleware read). Writing only the first would produce a link that redirects on click — the exact
+// gap registry.ts and admin-nav.ts both document. The "What they will see" panel compares the two
+// answers and says so if they ever diverge, rather than assuming they cannot.
+//
+// NO JAVASCRIPT. Every form posts to this page and every control is a link or a submit button, so
+// the console works with scripting off and adds nothing to the page weight. The delete confirmation
+// is a panel rather than a confirm() dialog for the same reason.
+//
+// THE GATE is can(user, 'users.edit') plus can(user, 'admin.access') — both already in the
+// Permission union. Inventing a new string here would make can() answer false for EVERY role,
+// including super_admin, and the whole console would redirect everyone away; that has happened on
+// this project before. users.edit is what makes this a super-admin screen: no other built-in role
+// holds it, which is correct for the page that hands out admin console access.
 import AdminLayout from '@/layouts/AdminLayout.astro';
-import { db } from '@/lib/db';
-import { teamRoles, rolePermissions, userRoleAssignments, users } from '@/lib/db/schema';
-import { ADMIN_SECTION_GROUPS, ALL_ADMIN_SECTION_KEYS } from '@/lib/admin-sections';
-import { eq, asc, sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
+import {
+  ensureRegistrySchema,
+  listRoles,
+  listPermissionGroups,
+  permissionsForRole,
+  sectionMatrixForRole,
+  sectionMatrixKeys,
+  listRoleMembers,
+  listAssignableUsers,
+  createRole,
+  updateRole,
+  deleteRole,
+  applyRolePermissions,
+  assignRoleToUser,
+  unassignRoleFromUser,
+  registerPermission,
+  isSensitiveKey,
+  slugifyRoleKey,
+  PERM_ADMIN_ACCESS,
+  type Actor,
+  type RoleRecord,
+  type RoleGrantRecord,
+  type RoleMember,
+  type SectionGrant,
+} from '@/lib/auth/registry';
+import {
+  ADMIN_NAV,
+  navForPermissions,
+  flattenNav,
+  isNavGroup,
+  NAV_SECTION_PROBLEMS,
+  type AdminNavEntry,
+} from '@/lib/admin-nav';
+import { adminSectionLabel } from '@/lib/admin-sections';
 
-const user = Astro.locals.user!;
-if (!user || user.role === 'applicant') return Astro.redirect('/portal');
-if (user.role !== 'super_admin' && user.role !== 'hr') return Astro.redirect('/admin');
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user, 'users.edit') || !can(user, 'admin.access')) return Astro.redirect('/admin');
 
-let errorMsg = '';
-let okMsg = '';
-
-// Auto-discovered from the central registry: adding a section there makes it
-// appear in this permission matrix automatically.
-const PAGE_GROUPS = ADMIN_SECTION_GROUPS.map((g) => ({ label: g.label, pages: g.sections }));
+// ---------------------------------------------------------------------------------------- helpers
+// Declared BEFORE the POST handler that uses them. `const` is not hoisted, and a handler reaching a
+// later declaration has thrown on its first line while the page reported success on this project.
+const actor: Actor = {
+  id: String(user.id),
+  email: (user as any).email ?? null,
+  name: (user as any).name ?? null,
+  ip: (Astro.request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || null,
+};
 
 const COLORS = ['orange', 'blue', 'green', 'purple', 'red', 'gold', 'pink'];
 
+function colorStyle(c: string): string {
+  if (c === 'blue') return 'background:rgba(59,130,246,0.15);color:#60a5fa;';
+  if (c === 'green') return 'background:rgba(16,185,129,0.15);color:#10b981;';
+  if (c === 'purple') return 'background:rgba(139,92,246,0.15);color:#a78bfa;';
+  if (c === 'red') return 'background:rgba(220,38,38,0.15);color:#fca5a5;';
+  if (c === 'gold') return 'background:rgba(251,191,36,0.15);color:#fbbf24;';
+  if (c === 'pink') return 'background:rgba(236,72,153,0.15);color:#f9a8d4;';
+  return 'background:rgba(255,79,0,0.15);color:#FF7040;';
+}
+
+function when(value: any): string {
+  if (!value) return 'date not recorded';
+  try { return new Date(value).toLocaleDateString('en-IN', { dateStyle: 'medium' }); } catch { return String(value); }
+}
+
+function personLabel(p: { name: string | null; email: string | null }): string {
+  return String(p.name || '').trim() || String(p.email || '').trim() || 'unnamed account';
+}
+
+// ------------------------------------------------------------------------------------ page state
+let errorMsg = '';
+let okMsg = '';
+const problems: string[] = [];
+let adminAccessNotice = '';
+// Set by the POST handler so the panel the admin was working in stays open afterwards.
+let focusRoleId = '';
+let focusTab = '';
+let openCreate = false;
+// What the admin typed into the create form, kept so a rejected name does not cost them the rest.
+let draftName = '';
+let draftKey = '';
+let draftDescription = '';
+let draftColor = 'orange';
+
+// ---------------------------------------------------------------------------------- POST handler
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
-  const action = fd.get('_action') as string;
+  const action = String(fd.get('_action') || '');
+  const roleId = String(fd.get('role_id') || '').trim();
+  focusRoleId = roleId;
 
   try {
-    if (action === 'create_role' || action === 'update_role') {
-      const id = (fd.get('id') as string || '').trim();
-      const name = (fd.get('name') as string || '').trim();
-      const description = (fd.get('description') as string || '').trim() || null;
-      const color = (fd.get('color') as string || 'orange').trim();
-
-      if (!name || name.length < 2) {
-        errorMsg = 'Role name required (min 2 chars).';
-      } else if (action === 'create_role') {
-        const exists = await db.select({ id: teamRoles.id }).from(teamRoles).where(eq(teamRoles.name, name)).limit(1);
-        if (exists.length > 0) {
-          errorMsg = 'Role name already exists.';
-        } else {
-          await db.insert(teamRoles).values({ name, description, color, createdByUserId: user.id });
-          okMsg = 'Role "' + name + '" created.';
-        }
-      } else {
-        await db.update(teamRoles).set({ name, description, color, updatedAt: new Date() }).where(eq(teamRoles.id, id));
-        okMsg = 'Role updated.';
+    if (action === 'create_role') {
+      focusTab = 'permissions';
+      draftName = String(fd.get('name') || '');
+      draftKey = String(fd.get('key') || '');
+      draftDescription = String(fd.get('description') || '');
+      draftColor = String(fd.get('color') || 'orange');
+      const result = await createRole({
+        name: draftName, key: draftKey, description: draftDescription, color: draftColor,
+      }, actor);
+      if (result.ok && result.data) {
+        focusRoleId = result.data.id;
+        okMsg = 'Role created with the key "' + result.data.key + '". It holds no permissions yet: tick what it may do below, then add people to it.';
+      } else if (!result.ok) {
+        errorMsg = result.error;
+        openCreate = true;
       }
+    } else if (action === 'update_role') {
+      focusTab = 'settings';
+      const result = await updateRole(roleId, {
+        name: String(fd.get('name') || ''),
+        key: String(fd.get('key') || ''),
+        description: String(fd.get('description') || ''),
+        color: String(fd.get('color') || 'orange'),
+      }, actor);
+      if (result.ok) okMsg = 'Role details saved.';
+      else errorMsg = result.error;
     } else if (action === 'delete_role') {
-      const id = (fd.get('id') as string || '').trim();
-      if (id) {
-        await db.delete(teamRoles).where(eq(teamRoles.id, id));
-        okMsg = 'Role deleted (assignments + permissions cascade).';
+      focusTab = 'delete';
+      const result = await deleteRole(roleId, actor);
+      if (result.ok) {
+        okMsg = 'Role deleted. What it granted is recorded in the audit log.';
+        focusRoleId = '';
+        focusTab = '';
+      } else {
+        errorMsg = result.error;
       }
     } else if (action === 'save_permissions') {
-      const roleId = (fd.get('role_id') as string || '').trim();
-      if (!roleId) {
-        errorMsg = 'No role selected.';
+      focusTab = 'permissions';
+      const wanted = fd.getAll('perm').map((v) => String(v));
+      const held = await permissionsForRole(roleId);
+      if (wanted.length === 0 && held.length > 0 && String(fd.get('confirm_empty') || '') !== 'yes') {
+        // A save with nothing ticked strips the role bare. That is a legitimate thing to want and a
+        // terrible thing to do by accident — a mis-scrolled page or a half-loaded form looks exactly
+        // the same to the server as a deliberate one.
+        errorMsg = 'Nothing was ticked, and this role currently holds ' + held.length + ' permission'
+          + (held.length === 1 ? '' : 's') + '. Nothing was changed. To genuinely strip it bare, tick'
+          + ' "Remove every permission from this role" and save again.';
       } else {
-        // Wipe existing perms for this role
-        await db.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
-
-        // Insert checked permissions (iterate every registered section).
-        const allPageKeys = ALL_ADMIN_SECTION_KEYS;
-        for (const pk of allPageKeys) {
-          const canView = fd.get('perm_' + pk + '_view') === 'on';
-          const canEdit = fd.get('perm_' + pk + '_edit') === 'on';
-          const canDelete = fd.get('perm_' + pk + '_delete') === 'on';
-          const canExport = fd.get('perm_' + pk + '_export') === 'on';
-          if (canView || canEdit || canDelete || canExport) {
-            await db.insert(rolePermissions).values({
-              roleId, pageKey: pk, canView, canEdit, canDelete, canExport
-            });
+        const result = await applyRolePermissions(roleId, wanted, actor);
+        if (!result.ok) {
+          errorMsg = result.error;
+        } else if (result.data) {
+          const { granted, revoked } = result.data;
+          for (const p of result.data.problems) problems.push(p);
+          if (granted.length === 0 && revoked.length === 0) {
+            okMsg = 'No change — this role already held exactly that.';
+          } else {
+            const parts: string[] = [];
+            if (granted.length > 0) parts.push('granted ' + granted.length);
+            if (revoked.length > 0) parts.push('revoked ' + revoked.length);
+            okMsg = 'Permissions saved: ' + parts.join(', ') + '. Every one is in the audit log under your name.';
+          }
+          if (granted.includes(PERM_ADMIN_ACCESS)) {
+            adminAccessNotice = 'Recorded in the audit log: ' + (actor.email || actor.name || actor.id)
+              + ' granted admin console access to this role.';
           }
         }
-        okMsg = 'Permissions saved.';
       }
     } else if (action === 'assign_user') {
-      const userId = (fd.get('user_id') as string || '').trim();
-      const roleId = (fd.get('role_id') as string || '').trim();
-      if (userId && roleId) {
-        const exists = await db.select().from(userRoleAssignments)
-          .where(sql`${userRoleAssignments.userId} = ${userId} AND ${userRoleAssignments.roleId} = ${roleId}`).limit(1);
-        if (exists.length === 0) {
-          await db.insert(userRoleAssignments).values({ userId, roleId, assignedByUserId: user.id });
-          okMsg = 'User assigned to role.';
-        } else {
-          errorMsg = 'User already has this role.';
-        }
-      }
+      focusTab = 'people';
+      const result = await assignRoleToUser(String(fd.get('user_id') || '').trim(), roleId, actor);
+      if (result.ok) okMsg = 'Added to the role. The assignment is in the audit log under your name.';
+      else errorMsg = result.error;
     } else if (action === 'unassign_user') {
-      const userId = (fd.get('user_id') as string || '').trim();
-      const roleId = (fd.get('role_id') as string || '').trim();
-      if (userId && roleId) {
-        await db.delete(userRoleAssignments)
-          .where(sql`${userRoleAssignments.userId} = ${userId} AND ${userRoleAssignments.roleId} = ${roleId}`);
-        okMsg = 'Removed from role.';
+      // Removing a holder from the delete confirmation should leave you on the delete confirmation,
+      // watching the blocking list shrink, not bounce you to another tab mid-decision.
+      focusTab = String(fd.get('return_tab') || 'people');
+      const result = await unassignRoleFromUser(String(fd.get('user_id') || '').trim(), roleId, actor);
+      if (result.ok) okMsg = 'Removed from the role.';
+      else errorMsg = result.error;
+    } else if (action === 'register_permission') {
+      focusTab = 'permissions';
+      const key = String(fd.get('new_key') || '');
+      const result = await registerPermission({
+        key,
+        label: String(fd.get('new_label') || ''),
+        group: String(fd.get('new_group') || 'Other'),
+        description: String(fd.get('new_description') || ''),
+        isSensitive: String(fd.get('new_sensitive') || '') === 'on',
+      }, actor);
+      if (result.ok) {
+        okMsg = 'Added "' + key.trim().toLowerCase() + '" to the catalogue. It is now grantable — but'
+          + ' nothing checks it until a page or an API route asks hasPermission() for it.';
+      } else {
+        errorMsg = result.error;
       }
+    } else {
+      errorMsg = 'Unknown action. Nothing was changed.';
     }
   } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+    // The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+    errorMsg = 'Nothing was saved: ' + (err?.cause?.message || err?.message || 'unknown error');
   }
 }
 
+// ----------------------------------------------------------------------------------------- reads
 const url = new URL(Astro.request.url);
-const editingRoleId = url.searchParams.get('edit') || '';
-const showPermsForId = url.searchParams.get('perms') || '';
-const showAssignForId = url.searchParams.get('assign') || '';
+const paramRole = url.searchParams.get('role') || '';
+const paramTab = url.searchParams.get('tab') || '';
+const searchQuery = (url.searchParams.get('q') || '').trim();
+const wantCreate = openCreate || url.searchParams.get('new') === '1';
 
-const allRoles = await db.select().from(teamRoles).orderBy(asc(teamRoles.name));
-const editingRole = editingRoleId && editingRoleId !== 'new' ? allRoles.find(r => r.id === editingRoleId) : null;
-const permsRole = showPermsForId ? allRoles.find(r => r.id === showPermsForId) : null;
-const assignRole = showAssignForId ? allRoles.find(r => r.id === showAssignForId) : null;
+await ensureRegistrySchema();
+const roles: RoleRecord[] = await listRoles();
 
-// Existing perms for the role being edited
-const currentPerms = permsRole
-  ? await db.select().from(rolePermissions).where(eq(rolePermissions.roleId, permsRole.id))
-  : [];
-const permMap: Record<string, any> = {};
-for (const p of currentPerms) permMap[p.pageKey] = p;
+const selectedId = focusRoleId || paramRole;
+const role: RoleRecord | null = roles.find((r) => r.id === selectedId) || null;
+const TABS = ['permissions', 'people', 'sidebar', 'settings', 'delete'];
+const rawTab = focusTab || paramTab || 'permissions';
+const tab = role ? (TABS.includes(rawTab) ? rawTab : 'permissions') : '';
 
-// Member counts per role
-const memberCounts = await db.select({
-  roleId: userRoleAssignments.roleId,
-  count: sql<number>`count(*)::int`
-}).from(userRoleAssignments).groupBy(userRoleAssignments.roleId);
-const memberCountMap: Record<string, number> = {};
-for (const m of memberCounts) memberCountMap[m.roleId] = m.count as number;
+let grants: RoleGrantRecord[] = [];
+let matrix: SectionGrant[] = [];
+let members: RoleMember[] = [];
+let candidates: { id: string; name: string | null; email: string | null; builtinRole: string; isActive: boolean }[] = [];
+let permissionGroups: { label: string; permissions: any[] }[] = [];
 
-// For assign UI: members of this role + all eligible users
-let currentMembers: any[] = [];
-let eligibleUsers: any[] = [];
-if (assignRole) {
-  const mids = await db.select({ uid: userRoleAssignments.userId }).from(userRoleAssignments).where(eq(userRoleAssignments.roleId, assignRole.id));
-  const memberIds = mids.map(m => m.uid);
-  if (memberIds.length > 0) {
-    currentMembers = await db.select({ id: users.id, name: users.name, email: users.email, role: users.role })
-      .from(users).where(sql`${users.id} = ANY(ARRAY[${sql.raw(memberIds.map(id => "'" + id + "'").join(','))}]::uuid[])`);
+if (role) {
+  grants = await permissionsForRole(role.id);
+  matrix = await sectionMatrixForRole(role.id);
+  if (tab === 'people' || tab === 'delete') {
+    members = await listRoleMembers(role.id);
+    if (tab === 'people') candidates = await listAssignableUsers(searchQuery, 40);
   }
-  eligibleUsers = await db.select({ id: users.id, name: users.name, email: users.email, role: users.role })
-    .from(users)
-    .where(sql`${users.role} <> 'applicant' AND ${users.role} <> 'institution_admin' AND ${users.isActive} = true`)
-    .orderBy(asc(users.name));
+  if (tab === 'permissions') permissionGroups = await listPermissionGroups();
 }
 
-function colorStyle(c: string): string {
-  const map: Record<string, string> = {
-    orange: 'background:rgba(255,79,0,0.15);color:#FF7040;',
-    blue: 'background:rgba(59,130,246,0.15);color:#60a5fa;',
-    green: 'background:rgba(16,185,129,0.15);color:#10b981;',
-    purple: 'background:rgba(139,92,246,0.15);color:#a78bfa;',
-    red: 'background:rgba(220,38,38,0.15);color:#fca5a5;',
-    gold: 'background:rgba(251,191,36,0.15);color:#fbbf24;',
-    pink: 'background:rgba(236,72,153,0.15);color:#f9a8d4;'
-  };
-  return map[c] || map.orange;
+// --------------------------------------------------------------------------------------- derived
+const heldKeys = new Set(grants.map((g) => g.key));
+const explicitKeys = new Set(grants.filter((g) => g.source === 'grant').map((g) => g.key));
+const grantsAdminAccess = heldKeys.has(PERM_ADMIN_ACCESS);
+// A page_key stored on this role that the section registry does not contain. Nothing can grant it,
+// nothing checks it, and the next save drops it. Said out loud rather than silently cleaned up.
+const strayPageKeys = matrix.filter((m) => !m.known).map((m) => m.pageKey);
+
+// The sidebar this role produces, from the SAME function the sidebar itself is built with
+// (navForPermissions in src/lib/admin-nav.ts) and the same permission keys a holder resolves to —
+// explicit grants unioned with the section matrix, which is exactly what permissionsForRole returns.
+// Nothing here is a second copy of the menu, so this panel cannot disagree with what people get.
+const navTree: AdminNavEntry[] = role ? navForPermissions(ADMIN_NAV, heldKeys) : [];
+const navCount = flattenNav(navTree).length;
+const navTotal = flattenNav(ADMIN_NAV).length;
+
+// The same question asked of the record the DOOR reads. Middleware resolves a path to a section key
+// and checks getViewableSectionKeys(), which consults role_permissions and nothing else — so an
+// entry that appears in navTree but not here is a link this console promised and the middleware
+// would refuse. Saving permissions through this console keeps the two in step; this comparison is
+// what proves it rather than assuming it. 'dashboard' is added because the door adds it for anyone
+// holding a custom role.
+const navEnforced = role ? navForPermissions(ADMIN_NAV, ['dashboard.view', ...sectionMatrixKeys(matrix)]) : [];
+const enforcedIds = new Set(flattenNav(navEnforced).map((i) => i.id));
+// Deduplicated by id: one nav id legitimately appears twice in the catalogue, and naming the same
+// entry twice in a warning makes the warning look wrong.
+const seenPromised = new Set<string>();
+const promisedNotEnforced = flattenNav(navTree).filter((i) => {
+  if (enforcedIds.has(i.id) || seenPromised.has(i.id)) return false;
+  seenPromised.add(i.id);
+  return true;
+});
+
+// The sections that actually produce links, read off role_permissions for the same reason.
+const viewableSections = matrix.filter((m) => m.view && m.known).map((m) => m.pageKey);
+
+const memberCount = role ? role.memberCount : 0;
+const totalRoles = roles.length;
+const totalHolders = roles.reduce((n, r) => n + r.memberCount, 0);
+const adminGrantingRoles = roles.filter((r) => r.grantsAdminAccess);
+
+function tabHref(roleId: string, name: string): string {
+  return '/admin/team/roles?role=' + encodeURIComponent(roleId) + '&tab=' + name;
 }
 ---
-<AdminLayout title="Custom Roles" activeNav="team-roles">
-  <div class="admin-page" style="max-width:1400px;">
 
-    <div class="admin-page-header" style="margin-bottom:18px;display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;">
-      <div class="admin-page-title-block">
-        <div class="admin-page-eyebrow">Team Management</div>
-        <h1 class="admin-page-title">Custom Roles</h1>
-        <p class="admin-page-sub">Define custom roles (e.g. "HEI Editor", "Assam Region Lead") and grant per-page permissions. <em>Additive — does not replace existing role enum.</em></p>
-      </div>
-      <a href="?edit=new" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11.5px;text-decoration:none;">+ New role</a>
+<AdminLayout title="Role console" activeNav="team-roles">
+  <div class="rc">
+
+    <header class="rc-head">
+      <p class="rc-eyebrow">Access &middot; roles and permissions</p>
+      <h1>Role console</h1>
+      <p class="rc-lede">
+        Create a role, decide exactly what it may do, put people in it, and see the console those
+        people will actually be handed. Every permission below is read from the live catalogue, so
+        the list is complete by construction rather than by somebody remembering to update it. Every
+        change here is written to the <a href="/admin/audit">audit log</a> under your name.
+      </p>
+    </header>
+
+    <div class="rc-tiles">
+      <div class="rc-tile"><p class="rc-k">Roles</p><p class="rc-v">{totalRoles}</p><p class="rc-s">{adminGrantingRoles.length} grant console access</p></div>
+      <div class="rc-tile"><p class="rc-k">Assignments</p><p class="rc-v">{totalHolders}</p><p class="rc-s">people holding a custom role</p></div>
+      <div class="rc-tile"><p class="rc-k">Sidebar entries</p><p class="rc-v">{navTotal}</p><p class="rc-s">available to grant</p></div>
     </div>
 
-    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{errorMsg}</div>}
-    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12px;padding:10px 13px;border-radius:6px;margin-bottom:14px;">{okMsg}</div>}
-
-    {/* CREATE/EDIT ROLE FORM */}
-    {(editingRoleId === 'new' || editingRole) && (
-      <form method="POST" class="admin-card" style="padding:16px;margin-bottom:14px;display:flex;flex-direction:column;gap:10px;">
-        <input type="hidden" name="_action" value={editingRole ? 'update_role' : 'create_role'} />
-        {editingRole && <input type="hidden" name="id" value={editingRole.id} />}
-        <h3 style="font-size:13px;font-weight:600;color:#fff;margin-bottom:2px;">{editingRole ? 'Edit role' : '+ New role'}</h3>
-
-        <div><label class="rfl">Name *</label><input name="name" required class="rfi" placeholder="e.g. HEI Editor" value={editingRole ? editingRole.name : ''} /></div>
-        <div><label class="rfl">Description</label><textarea name="description" rows="2" class="rfi" placeholder="What this role is for...">{editingRole && editingRole.description ? editingRole.description : ''}</textarea></div>
-        <div>
-          <label class="rfl">Color</label>
-          <select name="color" class="rfi">
-            {COLORS.map((c) => <option value={c} selected={editingRole ? editingRole.color === c : c === 'orange'}>{c}</option>)}
-          </select>
-        </div>
-        <div style="display:flex;gap:8px;">
-          <button type="submit" class="admin-btn admin-btn-primary" style="flex:1;">{editingRole ? 'Save' : 'Create'}</button>
-          <a href="/admin/team/roles" class="admin-btn" style="padding:7px 14px;text-decoration:none;display:flex;align-items:center;">Cancel</a>
-        </div>
-      </form>
+    {errorMsg && <div class="rc-note rc-bad"><strong>Not done.</strong> {errorMsg}</div>}
+    {okMsg && <div class="rc-note rc-good">{okMsg}</div>}
+    {adminAccessNotice && <div class="rc-note rc-warn"><strong>Console access granted.</strong> {adminAccessNotice}</div>}
+    {problems.length > 0 && (
+      <div class="rc-note rc-bad">
+        <strong>Read these before assuming the save was complete:</strong>
+        <ul class="rc-problems">{problems.map((p) => <li>{p}</li>)}</ul>
+      </div>
     )}
 
-    {/* PERMISSIONS MATRIX */}
-    {permsRole && (
-      <form method="POST" class="admin-card" style="padding:18px;margin-bottom:14px;">
-        <input type="hidden" name="_action" value="save_permissions" />
-        <input type="hidden" name="role_id" value={permsRole.id} />
+    <div class="rc-note">
+      <strong>What a grant of <code>admin.access</code> does today.</strong> It is recorded, resolvable
+      and honoured by <code>hasPermission()</code>, and it is the permission an intern once held
+      through the built-in <code>editor</code> role. It does <em>not</em>, by itself, open
+      <code>/admin</code>: the door is <code>canOpenAdmin()</code>, which reads the built-in role on
+      the account, so the person also needs an admin-capable role in
+      <a href="/admin/users">Users</a>. That is a deliberate limit, not an oversight &mdash; this
+      console cannot widen the blast radius of the incident it was built after. See
+      <a href="/admin/access-preview">Access preview</a> for which built-in roles qualify.
+    </div>
 
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px;flex-wrap:wrap;">
-          <div>
-            <h3 style="font-size:15px;font-weight:600;color:#fff;">Permissions for <span style={'padding:2px 10px;border-radius:100px;font-size:13px;' + colorStyle(permsRole.color)}>{permsRole.name}</span></h3>
-            <p style="font-size:11.5px;color:#a0a0ab;margin-top:4px;">Check the actions this role can perform on each page. Unchecked = no access.</p>
-          </div>
-          <a href="/admin/team/roles" class="admin-btn" style="padding:6px 12px;font-size:11px;text-decoration:none;">Close</a>
-        </div>
-
-        {PAGE_GROUPS.map((group) => (
-          <div style="margin-bottom:18px;">
-            <h4 style="font-size:11px;color:#FF7040;text-transform:uppercase;letter-spacing:0.12em;font-weight:700;margin-bottom:8px;">{group.label}</h4>
-            <table class="admin-table">
-              <thead>
-                <tr>
-                  <th>Page</th>
-                  <th style="text-align:center;width:70px;">View</th>
-                  <th style="text-align:center;width:70px;">Edit</th>
-                  <th style="text-align:center;width:70px;">Delete</th>
-                  <th style="text-align:center;width:70px;">Export</th>
-                </tr>
-              </thead>
-              <tbody>
-                {group.pages.map((p) => {
-                  const cur = permMap[p.key];
-                  return (
-                    <tr>
-                      <td style="font-size:12px;color:#d8d8de;">{p.label}</td>
-                      <td style="text-align:center;"><input type="checkbox" name={'perm_' + p.key + '_view'} checked={cur && cur.canView} style="accent-color:#FF4F00;" /></td>
-                      <td style="text-align:center;"><input type="checkbox" name={'perm_' + p.key + '_edit'} checked={cur && cur.canEdit} style="accent-color:#FF4F00;" /></td>
-                      <td style="text-align:center;"><input type="checkbox" name={'perm_' + p.key + '_delete'} checked={cur && cur.canDelete} style="accent-color:#FF4F00;" /></td>
-                      <td style="text-align:center;"><input type="checkbox" name={'perm_' + p.key + '_export'} checked={cur && cur.canExport} style="accent-color:#FF4F00;" /></td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        ))}
-
-        <button type="submit" class="admin-btn admin-btn-primary" style="margin-top:6px;">Save permissions</button>
-      </form>
+    {NAV_SECTION_PROBLEMS.length > 0 && (
+      <div class="rc-note rc-bad">
+        <strong>Sidebar entries gated on a section that does not exist:</strong>
+        {NAV_SECTION_PROBLEMS.map((p) => p.id + ' to ' + p.section).join(', ')}. No role can be granted
+        those keys, so those entries stay hidden from every restricted admin however this console is
+        used. The fix is in <code>src/lib/admin-sections.ts</code> or <code>src/lib/admin-nav.ts</code>.
+      </div>
     )}
 
-    {/* ASSIGN MEMBERS */}
-    {assignRole && (
-      <div class="admin-card" style="padding:18px;margin-bottom:14px;">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px;flex-wrap:wrap;">
-          <div>
-            <h3 style="font-size:15px;font-weight:600;color:#fff;">Members of <span style={'padding:2px 10px;border-radius:100px;font-size:13px;' + colorStyle(assignRole.color)}>{assignRole.name}</span></h3>
-            <p style="font-size:11.5px;color:#a0a0ab;margin-top:4px;">{currentMembers.length} assigned</p>
-          </div>
-          <a href="/admin/team/roles" class="admin-btn" style="padding:6px 12px;font-size:11px;text-decoration:none;">Close</a>
+    <div class="rc-body">
+
+      {/* ------------------------------------------------------------------ left: the roles */}
+      <aside class="rc-list">
+        <div class="rc-list-head">
+          <h2>Roles</h2>
+          <a class="rc-btn rc-primary" href="/admin/team/roles?new=1">New role</a>
         </div>
 
-        {/* Current members */}
-        {currentMembers.length > 0 && (
-          <div style="margin-bottom:14px;">
-            <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.1em;font-weight:600;margin-bottom:6px;">Currently assigned</p>
-            <div style="display:flex;flex-direction:column;gap:5px;">
-              {currentMembers.map((m) => (
-                <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;">
-                  <div>
-                    <span style="color:#fff;font-size:12.5px;font-weight:500;">{m.name}</span>
-                    <span style="color:#6e6e78;font-size:11px;margin-left:8px;">{m.email}</span>
-                    <span style="color:#a0a0ab;font-size:10.5px;margin-left:8px;">({m.role})</span>
-                  </div>
-                  <form method="POST" style="display:inline;">
-                    <input type="hidden" name="_action" value="unassign_user" />
-                    <input type="hidden" name="role_id" value={assignRole.id} />
-                    <input type="hidden" name="user_id" value={m.id} />
-                    <button type="submit" class="admin-btn" style="padding:3px 9px;font-size:10.5px;color:#fca5a5;">Remove</button>
-                  </form>
-                </div>
-              ))}
+        {roles.length === 0 && (
+          <p class="rc-empty">No custom roles yet. A custom role replaces the built-in section
+          defaults for whoever holds it, so start with what the job actually needs.</p>
+        )}
+
+        <ul class="rc-roles">
+          {roles.map((r) => (
+            <li class={role && r.id === role.id ? 'rc-role rc-current' : 'rc-role'}>
+              <a class="rc-role-link" href={tabHref(r.id, 'permissions')}>
+                <span class="rc-pill" style={colorStyle(r.color)}>{r.name}</span>
+                <span class="rc-role-meta">
+                  {r.memberCount} {r.memberCount === 1 ? 'person' : 'people'} &middot; {r.permissionCount} granted
+                </span>
+                {r.key && <span class="rc-key">{r.key}</span>}
+              </a>
+              {r.grantsAdminAccess && (
+                <span class="rc-flag" title="This role grants admin.access">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3.2 18 17H2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" /><path d="M10 8v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /><circle cx="10" cy="14.6" r="0.9" fill="currentColor" /></svg>
+                  console access
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      </aside>
+
+      {/* ----------------------------------------------------------------- right: the panels */}
+      <section class="rc-panel">
+
+        {wantCreate && (
+          <form method="POST" class="rc-card">
+            <input type="hidden" name="_action" value="create_role" />
+            <h2>New role</h2>
+            <p class="rc-sub">
+              A new role can do nothing until you grant it something. That is the correct starting
+              point: a role that inherits "roughly what the last one had" is how somebody ends up
+              holding a permission nobody chose to give them.
+            </p>
+
+            <label class="rc-field">
+              <span class="rc-label">Name</span>
+              <input class="rc-input" name="name" required minlength="2" maxlength="80" placeholder="HEI Editor" value={draftName} />
+              <span class="rc-hint">What people will call it. You can change this later.</span>
+            </label>
+
+            <label class="rc-field">
+              <span class="rc-label">Key</span>
+              <input class="rc-input" name="key" maxlength="80" placeholder="hei-editor" value={draftKey} />
+              <span class="rc-hint">
+                The permanent identifier, for anything that needs to name this role without depending
+                on its label. Lowercase letters, digits, dashes and underscores. Leave it blank to
+                derive one from the name. It cannot be changed afterwards, because a key that can be
+                edited is just a second name.
+              </span>
+            </label>
+
+            <label class="rc-field">
+              <span class="rc-label">Description</span>
+              <textarea class="rc-input" name="description" rows="2" maxlength="500" placeholder="Who this is for and what it is meant to cover.">{draftDescription}</textarea>
+            </label>
+
+            <label class="rc-field">
+              <span class="rc-label">Colour</span>
+              <select class="rc-input" name="color">
+                {COLORS.map((c) => <option value={c} selected={c === draftColor}>{c}</option>)}
+              </select>
+            </label>
+
+            <div class="rc-actions">
+              <button class="rc-btn rc-primary" type="submit">Create role</button>
+              <a class="rc-btn" href="/admin/team/roles">Cancel</a>
             </div>
+          </form>
+        )}
+
+        {!role && !wantCreate && (
+          <div class="rc-card rc-placeholder">
+            <h2>Pick a role</h2>
+            <p class="rc-sub">
+              Choose a role on the left to edit what it may do, see who holds it, and preview the
+              admin console its holders are handed. To see what the <em>built-in</em> roles grant
+              instead, read <a href="/admin/access-preview">Access preview</a> &mdash; those are set
+              in source and are not editable here.
+            </p>
           </div>
         )}
 
-        {/* Add member form */}
-        <form method="POST" style="padding-top:14px;border-top:1px solid #1f1f26;display:flex;gap:8px;align-items:end;">
-          <input type="hidden" name="_action" value="assign_user" />
-          <input type="hidden" name="role_id" value={assignRole.id} />
-          <div style="flex:1;">
-            <label class="rfl">Add user</label>
-            <select name="user_id" required class="rfi">
-              <option value="">Pick user...</option>
-              {eligibleUsers.filter(u => !currentMembers.some(m => m.id === u.id)).map((u) => (
-                <option value={u.id}>{u.name} ({u.email}) — {u.role}</option>
-              ))}
-            </select>
-          </div>
-          <button type="submit" class="admin-btn admin-btn-primary" style="padding:7px 14px;font-size:11px;">Assign</button>
-        </form>
-      </div>
-    )}
-
-    {/* LIST ALL ROLES */}
-    {allRoles.length === 0 && !editingRoleId && (
-      <div class="admin-card" style="padding:30px;text-align:center;color:#6e6e78;font-size:13px;">No custom roles yet. Click <strong>+ New role</strong> above.</div>
-    )}
-
-    <div style="display:flex;flex-direction:column;gap:8px;">
-      {allRoles.map((r) => (
-        <div class="admin-card" style="padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
-          <div style="flex:1;min-width:180px;">
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-              <span style={'padding:3px 10px;border-radius:100px;font-size:12.5px;font-weight:600;' + colorStyle(r.color)}>{r.name}</span>
-              <span style="font-size:11px;color:#6e6e78;">{memberCountMap[r.id] || 0} member{(memberCountMap[r.id] || 0) === 1 ? '' : 's'}</span>
+        {role && (
+          <div class="rc-card">
+            <div class="rc-role-head">
+              <div>
+                <h2><span class="rc-pill rc-pill-lg" style={colorStyle(role.color)}>{role.name}</span></h2>
+                <p class="rc-role-facts">
+                  {role.key ? role.key : 'no key set'} &middot; {memberCount} {memberCount === 1 ? 'person holds it' : 'people hold it'} &middot; created {when(role.createdAt)}
+                </p>
+                {role.description && <p class="rc-sub">{role.description}</p>}
+              </div>
+              {grantsAdminAccess && (
+                <span class="rc-badge rc-badge-alarm">grants admin.access</span>
+              )}
             </div>
-            {r.description && <p style="font-size:11.5px;color:#a0a0ab;margin-top:4px;line-height:1.5;">{r.description}</p>}
+
+            <nav class="rc-tabs">
+              <a class={tab === 'permissions' ? 'rc-tab rc-tab-on' : 'rc-tab'} href={tabHref(role.id, 'permissions')}>What it may do</a>
+              <a class={tab === 'people' ? 'rc-tab rc-tab-on' : 'rc-tab'} href={tabHref(role.id, 'people')}>Who holds it ({memberCount})</a>
+              <a class={tab === 'sidebar' ? 'rc-tab rc-tab-on' : 'rc-tab'} href={tabHref(role.id, 'sidebar')}>What they will see</a>
+              <a class={tab === 'settings' ? 'rc-tab rc-tab-on' : 'rc-tab'} href={tabHref(role.id, 'settings')}>Details</a>
+              <a class={tab === 'delete' ? 'rc-tab rc-tab-on rc-tab-danger' : 'rc-tab'} href={tabHref(role.id, 'delete')}>Delete</a>
+            </nav>
+
+            {strayPageKeys.length > 0 && (
+              <div class="rc-note rc-bad">
+                <strong>Stored page keys that no longer exist:</strong> {strayPageKeys.join(', ')}.
+                Nothing checks them and no checkbox below can control them. The next save of this
+                role's permissions removes them.
+              </div>
+            )}
+
+            {/* ------------------------------------------------------------- permissions */}
+            {tab === 'permissions' && (
+              <form method="POST" class="rc-perms">
+                <input type="hidden" name="_action" value="save_permissions" />
+                <input type="hidden" name="role_id" value={role.id} />
+
+                <p class="rc-sub">
+                  Every permission that exists, straight from the catalogue &mdash; {grants.length} of
+                  them are held by this role today. Ticking a section permission such as
+                  <code>applications.view</code> also puts that section in the holder's sidebar and
+                  lets the URL open, because this console writes both records from one list.
+                </p>
+
+                <div class="rc-note rc-warn">
+                  <strong>One permission is not like the others.</strong> <code>admin.access</code> is
+                  the entrance to this console. Turning it on writes an audit entry naming you, and
+                  the grant is refused outright if that entry cannot be written &mdash; a sensitive
+                  permission is not granted off the record. Read the note at the top of this page for
+                  what it does and does not open today.
+                </div>
+
+                {permissionGroups.map((group) => {
+                  const heldHere = group.permissions.filter((p: any) => heldKeys.has(p.key)).length;
+                  return (
+                    <details class="rc-group" open={heldHere > 0}>
+                      <summary>
+                        <span class="rc-group-name">{group.label}</span>
+                        <span class="rc-group-count">{heldHere} of {group.permissions.length}</span>
+                      </summary>
+                      <ul class="rc-perm-list">
+                        {group.permissions.map((p: any) => {
+                          const held = heldKeys.has(p.key);
+                          const viaMatrixOnly = held && !explicitKeys.has(p.key);
+                          const sensitive = isSensitiveKey(p.key, p.isSensitive);
+                          const isDoor = p.key === PERM_ADMIN_ACCESS;
+                          return (
+                            <li class={isDoor ? 'rc-perm rc-perm-door' : 'rc-perm'}>
+                              <label class="rc-perm-label">
+                                <input type="checkbox" name="perm" value={p.key} checked={held} />
+                                <span class="rc-perm-body">
+                                  <span class="rc-perm-title">
+                                    {p.label}
+                                    <code class="rc-perm-key">{p.key}</code>
+                                    {sensitive && <span class="rc-badge rc-badge-warn">sensitive</span>}
+                                    {viaMatrixOnly && <span class="rc-badge">held via the older page matrix</span>}
+                                  </span>
+                                  {p.description && <span class="rc-perm-desc">{p.description}</span>}
+                                </span>
+                              </label>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </details>
+                  );
+                })}
+
+                {permissionGroups.length === 0 && (
+                  <div class="rc-note rc-bad">
+                    <strong>The permission catalogue could not be read.</strong> That is a database
+                    problem, not an empty catalogue &mdash; do not save this form while it says this,
+                    or you will be telling the system this role holds nothing.
+                  </div>
+                )}
+
+                <div class="rc-save">
+                  <button class="rc-btn rc-primary" type="submit">Save permissions</button>
+                  <label class="rc-confirm">
+                    <input type="checkbox" name="confirm_empty" value="yes" />
+                    <span>Remove every permission from this role</span>
+                  </label>
+                </div>
+                <p class="rc-hint">
+                  Saving replaces this role's permissions with exactly what is ticked. Unticking
+                  something removes it. Each grant and each revoke is logged separately under your
+                  name, so the record shows what changed rather than only that something did.
+                </p>
+              </form>
+            )}
+
+            {/* ------------------------- the catalogue itself: a separate form, never nested */}
+            {tab === 'permissions' && (
+              <details class="rc-group">
+                <summary>
+                  <span class="rc-group-name">Add a permission to the catalogue</span>
+                  <span class="rc-group-count">rarely needed</span>
+                </summary>
+                <div class="rc-newperm">
+                  <p class="rc-sub">
+                    A key here is a promise that something checks it. Registering
+                    <code>reports.export</code> does not create a check: a page or an API route
+                    still has to ask <code>hasPermission()</code> for it. Write in the description
+                    what it is meant to control, so whoever grants it later knows what they are
+                    handing over. Section permissions appear on their own and never need adding here.
+                  </p>
+                  <form method="POST">
+                    <input type="hidden" name="_action" value="register_permission" />
+                    <input type="hidden" name="role_id" value={role.id} />
+                    <div class="rc-grid2">
+                      <label class="rc-field">
+                        <span class="rc-label">Key</span>
+                        <input class="rc-input" name="new_key" placeholder="reports.export" />
+                      </label>
+                      <label class="rc-field">
+                        <span class="rc-label">Label</span>
+                        <input class="rc-input" name="new_label" placeholder="Export reports" />
+                      </label>
+                      <label class="rc-field">
+                        <span class="rc-label">Group</span>
+                        <input class="rc-input" name="new_group" placeholder="System" />
+                      </label>
+                      <label class="rc-field rc-field-check">
+                        <input type="checkbox" name="new_sensitive" />
+                        <span class="rc-hint">Sensitive: granting it must be provably on the record</span>
+                      </label>
+                    </div>
+                    <label class="rc-field">
+                      <span class="rc-label">What it controls</span>
+                      <textarea class="rc-input" name="new_description" rows="2" placeholder="Which screen or action asks for this, in plain words."></textarea>
+                    </label>
+                    <button class="rc-btn" type="submit">Add to catalogue</button>
+                  </form>
+                </div>
+              </details>
+            )}
+
+            {/* ------------------------------------------------------------------ people */}
+            {tab === 'people' && (
+              <div class="rc-people">
+                <p class="rc-sub">
+                  Anyone here holds everything this role grants. A custom role <em>replaces</em> the
+                  built-in section defaults for whoever holds it, so someone who could previously
+                  reach a section by virtue of their built-in role may lose it by gaining this one
+                  &mdash; check the sidebar preview before you add people.
+                </p>
+
+                {members.length === 0 && <p class="rc-empty">Nobody holds this role.</p>}
+
+                {members.length > 0 && (
+                  <ul class="rc-members">
+                    {members.map((m) => (
+                      <li class={m.isActive ? 'rc-member' : 'rc-member rc-dim'}>
+                        <div class="rc-member-who">
+                          <span class="rc-member-name">{personLabel(m)}</span>
+                          <span class="rc-member-mail">{m.email}</span>
+                          <span class="rc-member-meta">
+                            {m.builtinRole} &middot; {m.isActive ? 'active' : 'deactivated'} &middot; added {when(m.assignedAt)}
+                          </span>
+                        </div>
+                        <form method="POST">
+                          <input type="hidden" name="_action" value="unassign_user" />
+                          <input type="hidden" name="role_id" value={role.id} />
+                          <input type="hidden" name="user_id" value={m.userId} />
+                          <button class="rc-btn rc-danger" type="submit">Remove</button>
+                        </form>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                <h3 class="rc-subh">Add someone</h3>
+                <form method="GET" class="rc-search">
+                  <input type="hidden" name="role" value={role.id} />
+                  <input type="hidden" name="tab" value="people" />
+                  <input class="rc-input" type="search" name="q" value={searchQuery} placeholder="Search by name or email" />
+                  <button class="rc-btn" type="submit">Search</button>
+                </form>
+
+                {candidates.length === 0 && (
+                  <p class="rc-empty">
+                    {searchQuery
+                      ? 'No active staff account matches that. Applicant accounts cannot hold a staff role.'
+                      : 'Search for the person by name or email.'}
+                  </p>
+                )}
+
+                {candidates.length > 0 && (
+                  <ul class="rc-candidates">
+                    {candidates.filter((c) => !members.some((m) => m.userId === c.id)).map((c) => (
+                      <li class="rc-candidate">
+                        <div class="rc-member-who">
+                          <span class="rc-member-name">{personLabel(c)}</span>
+                          <span class="rc-member-mail">{c.email}</span>
+                          <span class="rc-member-meta">{c.builtinRole}</span>
+                        </div>
+                        <form method="POST">
+                          <input type="hidden" name="_action" value="assign_user" />
+                          <input type="hidden" name="role_id" value={role.id} />
+                          <input type="hidden" name="user_id" value={c.id} />
+                          <button class="rc-btn rc-primary" type="submit">Add to role</button>
+                        </form>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {candidates.length >= 40 && (
+                  <p class="rc-hint">Showing the first 40 matches. Narrow the search to find someone further down.</p>
+                )}
+              </div>
+            )}
+
+            {/* ----------------------------------------------------------------- sidebar */}
+            {tab === 'sidebar' && (
+              <div class="rc-nav">
+                <p class="rc-sub">
+                  The admin console a holder of this role is handed. This is not a description of the
+                  menu: it is the menu, built by the same function the sidebar itself calls, from the
+                  permissions this role actually holds. If the list is smaller than you expected,
+                  the permissions tab is what to change.
+                </p>
+
+                <div class="rc-note">
+                  <strong>Two things this preview cannot know.</strong> Someone assigned several
+                  custom roles gets the union of them, not only this one. And a visible link is not
+                  permission to open the page: middleware re-checks the section on every request, and
+                  a super admin is never filtered at all, so a super admin holding this role still
+                  sees everything.
+                </div>
+
+                {promisedNotEnforced.length > 0 && (
+                  <div class="rc-note rc-bad">
+                    <strong>Promised here, refused at the door:</strong>
+                    {promisedNotEnforced.map((i) => i.label).join(', ')}. These are held as registry
+                    grants but are not in this role's page-permission rows, which is the record the
+                    middleware reads &mdash; so the link would appear and then redirect. Open the
+                    permissions tab and save once: this console writes both records together and the
+                    disagreement goes away.
+                  </div>
+                )}
+
+                <p class="rc-count">
+                  {navCount} {navCount === 1 ? 'entry' : 'entries'} out of {navTotal},
+                  from {viewableSections.length} viewable {viewableSections.length === 1 ? 'section' : 'sections'}.
+                </p>
+
+                {viewableSections.length > 0 && (
+                  <ul class="rc-chips">
+                    {viewableSections.map((k) => <li class="rc-chip">{adminSectionLabel(k)}</li>)}
+                  </ul>
+                )}
+
+                <div class="rc-navtree">
+                  {navTree.map((entry) => (
+                    isNavGroup(entry)
+                      ? (
+                        <div class="rc-navgroup">
+                          <h3 class="rc-subh">{entry.label}</h3>
+                          <ul class="rc-chips">
+                            {entry.children.map((c) => <li class="rc-chip"><a href={c.href}>{c.label}</a></li>)}
+                          </ul>
+                        </div>
+                      )
+                      : <span class="rc-chip rc-chip-solo"><a href={entry.href}>{entry.label}</a></span>
+                  ))}
+                </div>
+
+                {navCount === 0 && (
+                  <p class="rc-empty">
+                    This role opens nothing. Someone holding only this role would see an admin
+                    console with no navigation at all.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* ---------------------------------------------------------------- settings */}
+            {tab === 'settings' && (
+              <form method="POST" class="rc-settings">
+                <input type="hidden" name="_action" value="update_role" />
+                <input type="hidden" name="role_id" value={role.id} />
+
+                <label class="rc-field">
+                  <span class="rc-label">Name</span>
+                  <input class="rc-input" name="name" required minlength="2" maxlength="80" value={role.name} />
+                </label>
+
+                <label class="rc-field">
+                  <span class="rc-label">Key</span>
+                  {role.key
+                    ? <input class="rc-input" value={role.key} readonly disabled />
+                    : <input class="rc-input" name="key" maxlength="80" placeholder={slugifyRoleKey(role.name)} />}
+                  <span class="rc-hint">
+                    {role.key
+                      ? 'Permanent. Anything referencing this role uses it, and changing it would break those references without saying so.'
+                      : 'This role predates keys. Set one now and it becomes permanent; leave it blank and the role keeps working without one.'}
+                  </span>
+                </label>
+
+                <label class="rc-field">
+                  <span class="rc-label">Description</span>
+                  <textarea class="rc-input" name="description" rows="3" maxlength="500">{role.description || ''}</textarea>
+                </label>
+
+                <label class="rc-field">
+                  <span class="rc-label">Colour</span>
+                  <select class="rc-input" name="color">
+                    {COLORS.map((c) => <option value={c} selected={role.color === c}>{c}</option>)}
+                  </select>
+                </label>
+
+                <div class="rc-actions">
+                  <button class="rc-btn rc-primary" type="submit">Save details</button>
+                </div>
+              </form>
+            )}
+
+            {/* ------------------------------------------------------------------ delete */}
+            {tab === 'delete' && (
+              <div class="rc-delete">
+                {members.length > 0 && (
+                  <div class="rc-note rc-bad">
+                    <strong>
+                      {members.length} {members.length === 1 ? 'person still holds' : 'people still hold'} this role,
+                      so it cannot be deleted.
+                    </strong>
+                    Deleting it now would take away whatever it grants without telling any of them,
+                    and the first symptom would be somebody unable to do their job with no
+                    explanation. Move them first.
+                  </div>
+                )}
+
+                {members.length > 0 && (
+                  <ul class="rc-members">
+                    {members.map((m) => (
+                      <li class="rc-member">
+                        <div class="rc-member-who">
+                          <span class="rc-member-name">{personLabel(m)}</span>
+                          <span class="rc-member-mail">{m.email}</span>
+                          <span class="rc-member-meta">{m.builtinRole} &middot; added {when(m.assignedAt)}</span>
+                        </div>
+                        <form method="POST">
+                          <input type="hidden" name="_action" value="unassign_user" />
+                          <input type="hidden" name="role_id" value={role.id} />
+                          <input type="hidden" name="user_id" value={m.userId} />
+                          <input type="hidden" name="return_tab" value="delete" />
+                          <button class="rc-btn rc-danger" type="submit">Remove from role</button>
+                        </form>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {members.length === 0 && (
+                  <div class="rc-note">
+                    <strong>Nobody holds this role.</strong> Deleting it removes the role and the
+                    <span>{grants.length}</span>
+                    permission{grants.length === 1 ? '' : 's'} it holds. What it granted is written
+                    to the audit log first, so the record survives the role.
+                  </div>
+                )}
+
+                <form method="POST" class="rc-actions">
+                  <input type="hidden" name="_action" value="delete_role" />
+                  <input type="hidden" name="role_id" value={role.id} />
+                  <button class="rc-btn rc-danger" type="submit" disabled={members.length > 0}>
+                    Delete "{role.name}"
+                  </button>
+                  <a class="rc-btn" href={tabHref(role.id, 'permissions')}>Cancel</a>
+                </form>
+              </div>
+            )}
           </div>
-          <div style="display:flex;gap:4px;flex-wrap:wrap;">
-            <a href={'?perms=' + r.id} class="admin-btn" style="padding:5px 10px;font-size:10.5px;text-decoration:none;">Permissions</a>
-            <a href={'?assign=' + r.id} class="admin-btn" style="padding:5px 10px;font-size:10.5px;text-decoration:none;">Members</a>
-            <a href={'?edit=' + r.id} class="admin-btn" style="padding:5px 10px;font-size:10.5px;text-decoration:none;">Edit</a>
-            <form method="POST" style="display:inline;" onsubmit="return confirm('Delete role and unassign all members?');">
-              <input type="hidden" name="_action" value="delete_role" />
-              <input type="hidden" name="id" value={r.id} />
-              <button type="submit" class="admin-btn" style="padding:5px 10px;font-size:10.5px;color:#fca5a5;">Del</button>
-            </form>
-          </div>
-        </div>
-      ))}
+        )}
+      </section>
     </div>
 
+    <p class="rc-closing">
+      Custom roles are additive to the built-in matrix and never subtract from it: to take an ability
+      away from someone, change their role in <a href="/admin/users">Users</a>. What the built-in
+      roles grant, and who holds them, is in <a href="/admin/access-preview">Access preview</a>.
+    </p>
   </div>
-  <style>
-    .rfl { display:block;font-size:10px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px; }
-    .rfi { width:100%;padding:7px 10px;background:#08080a;border:1px solid #1f1f26;border-radius:5px;color:#fff;font-size:12px;font-family:inherit;outline:none; }
-    .rfi:focus { border-color:#FF4F00; }
-    textarea.rfi { resize:vertical; }
-  </style>
 </AdminLayout>
+
+<style>
+  .rc { max-width: 1240px; color: #e8e8ee; }
+  .rc a { color: #FF4F00; text-decoration: none; }
+  .rc a:hover { text-decoration: underline; }
+  .rc code { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.9em; color: #b9b9c4; background: #15151c; border-radius: 4px; padding: 1px 5px; }
+
+  .rc-head { margin-bottom: 18px; }
+  .rc-eyebrow { font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: #6e6e78; margin: 0 0 6px; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  .rc h1 { font-family: 'Fraunces', serif; font-size: 27px; line-height: 1.15; margin: 0 0 8px; }
+  .rc-lede { font-size: 13px; line-height: 1.65; color: #a0a0a8; margin: 0; max-width: 76ch; }
+
+  .rc-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 18px 0; }
+  .rc-tile { border: 1px solid #2a2a30; border-radius: 12px; background: #0f0f14; padding: 12px 14px; }
+  .rc-k { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.1em; color: #6e6e78; margin: 0 0 5px; }
+  .rc-v { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 22px; font-weight: 700; margin: 0; }
+  .rc-s { font-size: 10.5px; color: #6e6e78; margin: 3px 0 0; }
+
+  .rc-note { border: 1px solid #2a2a30; background: #0f0f14; border-radius: 10px; padding: 11px 14px; font-size: 12.5px; line-height: 1.65; color: #a0a0a8; margin: 0 0 14px; }
+  .rc-note strong { color: #e8e8ee; }
+  .rc-note.rc-bad { border-color: #7f1d1d; background: rgba(127, 29, 29, 0.18); }
+  .rc-note.rc-good { border-color: #14532d; background: rgba(20, 83, 45, 0.2); color: #b7e4c7; }
+  .rc-note.rc-warn { border-color: rgba(251, 191, 36, 0.35); background: rgba(251, 191, 36, 0.08); color: #f6d491; }
+  .rc-note.rc-warn strong { color: #fbbf24; }
+  .rc-problems { margin: 6px 0 0; padding-left: 18px; }
+  .rc-problems li { margin: 3px 0; }
+
+  .rc-body { display: grid; grid-template-columns: minmax(0, 280px) minmax(0, 1fr); gap: 14px; align-items: start; }
+
+  .rc-list { border: 1px solid #2a2a30; border-radius: 12px; background: #0f0f14; padding: 12px; }
+  .rc-list-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .rc-list h2 { font-family: 'Fraunces', serif; font-size: 16px; margin: 0; }
+  .rc-roles { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .rc-role { border: 1px solid #1f1f26; border-radius: 10px; background: #0c0c11; padding: 9px 10px; }
+  .rc-role.rc-current { border-color: #FF4F00; background: rgba(255, 79, 0, 0.06); }
+  .rc-role-link { display: block; color: inherit; }
+  .rc-role-link:hover { text-decoration: none; }
+  .rc-role-meta { display: block; font-size: 10.5px; color: #6e6e78; margin-top: 5px; }
+  .rc-key { display: inline-block; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; color: #55555f; margin-top: 3px; }
+  .rc-flag { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: #f87171; margin-top: 6px; }
+  .rc-flag svg { width: 12px; height: 12px; }
+
+  .rc-pill { display: inline-block; padding: 3px 10px; border-radius: 100px; font-size: 12.5px; font-weight: 600; }
+  .rc-pill-lg { font-size: 15px; padding: 4px 13px; }
+
+  .rc-panel { min-width: 0; }
+  .rc-card { border: 1px solid #2a2a30; border-radius: 12px; background: #0f0f14; padding: 16px; }
+  .rc-card h2 { font-family: 'Fraunces', serif; font-size: 19px; margin: 0 0 6px; }
+  .rc-sub { font-size: 12.5px; line-height: 1.65; color: #8a8a94; margin: 0 0 12px; max-width: 78ch; }
+  .rc-subh { font-size: 13.5px; margin: 18px 0 6px; font-family: 'Fraunces', serif; color: #e8e8ee; }
+  .rc-hint { display: block; font-size: 11px; line-height: 1.55; color: #6e6e78; margin-top: 4px; }
+  .rc-empty { font-size: 12.5px; color: #6e6e78; line-height: 1.6; margin: 8px 0; }
+  .rc-count { font-size: 12px; color: #a0a0a8; margin: 0 0 10px; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+  .rc-role-head { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; justify-content: space-between; }
+  .rc-role-head > div { flex: 1; min-width: 200px; }
+  .rc-role-facts { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10.5px; color: #6e6e78; margin: 6px 0 8px; }
+
+  .rc-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 14px 0; border-bottom: 1px solid #1f1f26; padding-bottom: 10px; }
+  .rc-tab { font-size: 11.5px; padding: 6px 11px; border-radius: 100px; border: 1px solid #24242c; color: #a0a0a8; background: #0c0c11; }
+  .rc-tab:hover { text-decoration: none; border-color: #3a3a44; }
+  .rc-tab.rc-tab-on { border-color: #FF4F00; color: #FF7040; background: rgba(255, 79, 0, 0.08); }
+  .rc-tab.rc-tab-danger { border-color: #7f1d1d; color: #fca5a5; background: rgba(127, 29, 29, 0.16); }
+
+  .rc-group { border: 1px solid #1f1f26; border-radius: 10px; background: #0c0c11; margin-bottom: 8px; }
+  .rc-group > summary { cursor: pointer; padding: 10px 12px; display: flex; justify-content: space-between; gap: 10px; align-items: center; font-size: 12.5px; }
+  .rc-group-name { font-weight: 600; color: #e8e8ee; }
+  .rc-group-count { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10.5px; color: #6e6e78; }
+  .rc-perm-list { list-style: none; margin: 0; padding: 0 10px 10px; display: flex; flex-direction: column; gap: 4px; }
+  .rc-perm { border: 1px solid transparent; border-radius: 8px; }
+  .rc-perm.rc-perm-door { border-color: rgba(251, 191, 36, 0.35); background: rgba(251, 191, 36, 0.06); }
+  .rc-perm-label { display: flex; gap: 9px; align-items: flex-start; padding: 8px 9px; cursor: pointer; }
+  .rc-perm-label input { margin-top: 3px; accent-color: #FF4F00; flex: none; width: 15px; height: 15px; }
+  .rc-perm-body { min-width: 0; }
+  .rc-perm-title { display: block; font-size: 12.5px; color: #e8e8ee; line-height: 1.5; }
+  .rc-perm-key { margin-left: 6px; }
+  .rc-perm-desc { display: block; font-size: 11.5px; color: #8a8a94; line-height: 1.55; margin-top: 3px; }
+
+  .rc-badge { display: inline-block; font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em; padding: 2px 7px; border-radius: 100px; background: #1a1a22; color: #8a8a94; margin-left: 6px; vertical-align: middle; }
+  .rc-badge.rc-badge-warn { background: rgba(251, 191, 36, 0.14); color: #fbbf24; }
+  .rc-badge.rc-badge-alarm { background: rgba(220, 38, 38, 0.16); color: #fca5a5; margin-left: 0; }
+
+  .rc-save { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 14px; }
+  .rc-confirm { display: inline-flex; gap: 7px; align-items: center; font-size: 11.5px; color: #fca5a5; }
+  .rc-confirm input { accent-color: #dc2626; width: 15px; height: 15px; }
+
+  .rc-field { display: block; margin-bottom: 12px; }
+  .rc-field-check { display: flex; gap: 8px; align-items: center; }
+  .rc-label { display: block; font-size: 10px; font-weight: 600; color: #8a8a94; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 5px; }
+  .rc-input { width: 100%; padding: 8px 10px; background: #08080a; border: 1px solid #1f1f26; border-radius: 6px; color: #fff; font-size: 12.5px; font-family: inherit; outline: none; }
+  .rc-input:focus { border-color: #FF4F00; }
+  .rc-input:disabled { color: #8a8a94; background: #101016; }
+  textarea.rc-input { resize: vertical; }
+
+  .rc-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0 12px; }
+  .rc-newperm-form { border: 1px solid #1f1f26; border-radius: 10px; background: #0c0c11; padding: 12px; margin-top: 10px; }
+  .rc-newperm { padding: 0 12px 10px; }
+
+  .rc-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+  .rc-btn { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 7px 13px; border-radius: 7px; border: 1px solid #2a2a30; background: #14141b; color: #d8d8de; cursor: pointer; font-family: inherit; }
+  .rc-btn:hover { text-decoration: none; border-color: #3a3a44; }
+  .rc-btn.rc-primary { background: #FF4F00; border-color: #FF4F00; color: #0b0b0f; }
+  .rc-btn.rc-danger { color: #fca5a5; border-color: #7f1d1d; background: rgba(127, 29, 29, 0.16); }
+  .rc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .rc-members, .rc-candidates { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .rc-member, .rc-candidate { display: flex; gap: 10px; justify-content: space-between; align-items: center; flex-wrap: wrap; border: 1px solid #1f1f26; border-radius: 10px; background: #0c0c11; padding: 9px 11px; }
+  .rc-member.rc-dim { opacity: 0.6; }
+  .rc-member-who { min-width: 0; flex: 1; }
+  .rc-member-name { display: block; font-size: 12.5px; font-weight: 600; color: #e8e8ee; }
+  .rc-member-mail { display: block; font-size: 11.5px; color: #a0a0a8; word-break: break-all; }
+  .rc-member-meta { display: block; font-size: 10.5px; color: #6e6e78; margin-top: 2px; }
+
+  .rc-search { display: flex; gap: 8px; align-items: center; margin: 8px 0 10px; }
+  .rc-search .rc-input { flex: 1; }
+
+  .rc-chips { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .rc-chip { border: 1px solid #24242c; background: #14141b; border-radius: 100px; padding: 4px 10px; font-size: 11.5px; color: #c8c8d2; }
+  .rc-chip a { color: #c8c8d2; }
+  .rc-navgroup { margin-top: 12px; }
+  .rc-navtree { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
+  .rc-chip-solo { align-self: flex-start; margin-top: 6px; }
+
+  .rc-placeholder { color: #8a8a94; }
+  .rc-closing { font-size: 11.5px; line-height: 1.7; color: #6e6e78; margin: 22px 0 0; border-top: 1px solid #1c1c24; padding-top: 14px; max-width: 78ch; }
+
+  @media (max-width: 900px) {
+    .rc-body { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .rc h1 { font-size: 22px; }
+    .rc-tiles { grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); }
+    .rc-member, .rc-candidate { align-items: flex-start; }
+    .rc-perm-label { padding: 8px 6px; }
+  }
+</style>

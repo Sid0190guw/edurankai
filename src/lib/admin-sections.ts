@@ -102,3 +102,49 @@ export function adminSectionLabel(key: string): string {
   }
   return key;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Permission key <-> section mapping.
+//
+// A permission key like `applications.view` and a row in role_permissions (page_key
+// 'applications', can_view true) are THE SAME STATEMENT written twice. This function is the one
+// place that says so, so the permission registry (src/lib/auth/registry.ts) can translate between
+// the two without a second, drifting copy of the rule. It lives here, next to the section registry,
+// because it is pure — no database, no session — and any module can import it without dragging a
+// database client along.
+//
+// It is the same `<section>.<action>` shape seedCatalogueRows() writes into permission_catalogue and
+// the same one src/lib/admin-nav.ts gates each sidebar entry on, so the catalogue, the section
+// matrix and the menu all name one ability the same way.
+// ---------------------------------------------------------------------------------------------
+
+/** The four columns role_permissions stores, in the order the role editor shows them. */
+export const ADMIN_SECTION_ACTIONS = ['view', 'edit', 'delete', 'export'] as const;
+export type AdminSectionAction = typeof ADMIN_SECTION_ACTIONS[number];
+
+const SECTION_KEY_SET = new Set<string>(ALL_ADMIN_SECTION_KEYS);
+
+/**
+ * The admin section a permission key controls, or null when it controls none.
+ *
+ * Split on the LAST dot, because section keys contain underscores rather than dots today but a key
+ * like `hei.claims.view` must still resolve if one ever does. Returns null unless BOTH halves are
+ * real: the action must be one of the four columns, and the section must be in the registry above.
+ * That is what stops a typo, or a page_key somebody typed into a form years ago, from being
+ * treated as a live grant.
+ *
+ * `admin.access` is excluded by name and not by accident: there is no `admin` section, but this is
+ * the permission that opens the console and it must never be derivable from a page-key checkbox.
+ * See the same rule enforced in registry.ts's customRoleKeys().
+ */
+export function sectionTargetFor(permissionKey: string): { section: string; action: AdminSectionAction } | null {
+  const key = String(permissionKey || '').trim();
+  if (!key || key === 'admin.access') return null;
+  const dot = key.lastIndexOf('.');
+  if (dot <= 0 || dot === key.length - 1) return null;
+  const section = key.slice(0, dot);
+  const action = key.slice(dot + 1) as AdminSectionAction;
+  if (!(ADMIN_SECTION_ACTIONS as readonly string[]).includes(action)) return null;
+  if (!SECTION_KEY_SET.has(section)) return null;
+  return { section, action };
+}

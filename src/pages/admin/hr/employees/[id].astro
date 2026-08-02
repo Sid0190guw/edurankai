@@ -39,6 +39,13 @@ try {
 //
 // Declared BEFORE the POST handler because the handler validates the submitted value against it.
 // `const` is not hoisted here.
+//
+// Excluded by USER id, not only by employee row id. `e.id <> id` alone is not enough: one person
+// can hold more than one hr_employees row (a closed internship and a current contract — admin-
+// access.ts reads up to five per person for exactly that reason), so their own login would still be
+// offered through the second row. Set that and approverRole() in src/lib/hr-wallet.ts returns
+// 'reporting_manager' for them on their own record — they approve their own leave and their own
+// wallet withdrawals. Nobody is their own approver.
 let managerOptions: any[] = [];
 try {
   const mgrRes = await db.execute(sqlExpr`
@@ -47,9 +54,19 @@ try {
      WHERE e.user_id IS NOT NULL
        AND e.is_active = true
        AND e.id <> ${id}
+       AND e.user_id IS DISTINCT FROM (SELECT t.user_id FROM hr_employees t WHERE t.id = ${id})
      ORDER BY e.full_name ASC
      LIMIT 500`);
-  managerOptions = (Array.isArray(mgrRes) ? mgrRes : ((mgrRes as any)?.rows || [])) as any[];
+  const mgrRows = (Array.isArray(mgrRes) ? mgrRes : ((mgrRes as any)?.rows || [])) as any[];
+  // One option per LOGIN, not per employee row, for the same reason: the same name twice in a
+  // select is a choice nobody can make correctly, and both entries write the same value anyway.
+  const seenManagerUser = new Set<string>();
+  managerOptions = mgrRows.filter((m: any) => {
+    const uid = String(m.user_id || '');
+    if (!uid || seenManagerUser.has(uid)) return false;
+    seenManagerUser.add(uid);
+    return true;
+  });
 } catch (_) { managerOptions = []; }
 const managerUserIds = new Set(managerOptions.map((m: any) => String(m.user_id)));
 
@@ -106,7 +123,23 @@ if (Astro.request.method === 'POST') {
       // Approval authority is being written here, so an id that did not come from the offered list
       // is refused outright rather than quietly dropped: a posted value could otherwise point at
       // any user in the system and hand them approval rights over this employee.
-      if (reportingManagerId && !managerUserIds.has(reportingManagerId)) {
+      //
+      // With ONE exception, and it matters. The select deliberately still offers the manager already
+      // on file when that person has since left or been deactivated — labelled, so the record never
+      // reads as "nobody is set" — and that option is PRE-SELECTED. Refusing it would block every
+      // other employment edit on this page (designation, salary, PAN, joining date) behind an error
+      // about a manager the person editing never touched, and the only way out would be to change
+      // the reporting line to make an unrelated correction. Re-posting the value already stored
+      // grants nothing that is not already granted, so it is accepted; anything else is not.
+      let managerAccepted = !reportingManagerId || managerUserIds.has(reportingManagerId);
+      if (!managerAccepted) {
+        const curRes = await db.execute(sqlExpr`SELECT reporting_manager_id FROM hr_employees WHERE id = ${id} LIMIT 1`);
+        const curRows = (Array.isArray(curRes) ? curRes : ((curRes as any)?.rows || [])) as any[];
+        managerAccepted = curRows.length > 0
+          && String(curRows[0]?.reporting_manager_id || '') === reportingManagerId;
+      }
+
+      if (!managerAccepted) {
         errorMsg = 'That reporting manager is not an active employee with a login. Nothing was saved — pick someone from the list.';
       } else {
         await db.execute(sqlExpr`

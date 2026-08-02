@@ -46,7 +46,7 @@ import { ensureOnce } from '@/lib/ensure-once';
 import { logAudit } from '@/lib/audit';
 import { logEvent } from '@/lib/logger';
 import { PERMS_BY_ROLE, type Permission } from '@/lib/auth/permissions';
-import { ADMIN_SECTION_GROUPS } from '@/lib/admin-sections';
+import { ADMIN_SECTION_GROUPS, ADMIN_SECTION_ACTIONS, sectionTargetFor, type AdminSectionAction } from '@/lib/admin-sections';
 import type { User } from '@/lib/db/schema';
 
 // postgres-js resolves to a plain array, never a { rows } object. Declared at the very top because
@@ -72,14 +72,30 @@ export const PERM_ADMIN_ACCESS = 'admin.access';
  */
 export const WILDCARD = '*';
 
-/** Actions the section matrix (/admin/team/roles) can grant, in the order the editor shows them. */
-export const SECTION_ACTIONS = ['view', 'edit', 'delete', 'export'] as const;
-export type SectionAction = typeof SECTION_ACTIONS[number];
+/**
+ * Actions the section matrix (/admin/team/roles) can grant, in the order the editor shows them.
+ * Re-exported from admin-sections.ts rather than restated, so this module and the sidebar preview
+ * cannot end up disagreeing about what the four columns of role_permissions are called.
+ */
+export const SECTION_ACTIONS = ADMIN_SECTION_ACTIONS;
+export type SectionAction = AdminSectionAction;
 
 const ROLE_NAME_MIN = 2;
 const ROLE_NAME_MAX = 80;
 /** `group.action` or `group.sub.action`; lowercase, dots and underscores only. */
 const PERMISSION_KEY_RE = /^[a-z0-9_]+(\.[a-z0-9_]+)+$/;
+/** A role key: lowercase, starts with a letter or digit, then letters, digits, dashes, underscores. */
+const ROLE_KEY_RE = /^[a-z0-9][a-z0-9_-]{1,79}$/;
+
+/** Turn a role name into a usable key, so nobody has to invent one to create a role. */
+export function slugifyRoleKey(input: string): string {
+  return String(input || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+}
 
 // ---------------------------------------------------------------------------------------------
 // The built-in catalogue.
@@ -148,6 +164,21 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
 /** Every built-in permission key, at runtime. Derived — it cannot drift from the union. */
 export const BUILTIN_PERMISSION_KEYS: string[] = Object.keys(BUILTIN_PERMISSIONS);
 
+/**
+ * Must this grant be provably on the record?
+ *
+ * Decided in CODE, and only ever ADDED to what the catalogue row says. The row is writable from the
+ * admin panel, and a row claiming is_sensitive=false would otherwise route a grant of admin.access
+ * down the ordinary audit path — whose write failure logAudit() swallows by design. Reading
+ * sensitivity from data alone would mean the thing being protected could turn its own protection
+ * off. admin.access is pinned true whatever any row or any future edit to the map above says.
+ */
+export function isSensitiveKey(key: string, catalogueSaysSensitive: boolean): boolean {
+  if (key === PERM_ADMIN_ACCESS) return true;
+  if (catalogueSaysSensitive) return true;
+  return BUILTIN_PERMISSIONS[key as Permission]?.sensitive === true;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------------------------
@@ -166,6 +197,8 @@ export interface PermissionRecord {
 export interface RoleRecord {
   id: string;
   name: string;
+  /** The stable key set at creation. Null for roles created before the column existed. */
+  key: string | null;
   description: string | null;
   color: string;
   isSystem: boolean;
@@ -245,6 +278,17 @@ const DDL: string[] = [
   `ALTER TABLE team_roles ADD COLUMN IF NOT EXISTS color VARCHAR(20) NOT NULL DEFAULT 'orange'`,
   `ALTER TABLE team_roles ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT false`,
   `ALTER TABLE team_roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+  // The stable identifier. `name` is the label an admin edits — "Assam Region Lead" becomes "North
+  // East Lead" and anything that referenced it by name is now referencing nothing. role_key is set
+  // once, at creation, and never changed, so a script or a config file can name a role and still
+  // mean the same role a year later.
+  //
+  // Nullable, and every existing row starts NULL — which is why the UNIQUE index below is safe to
+  // add to a live table. The general warning at the top of this list (a unique index fails outright
+  // if the data already conflicts) does not apply to a column that has no values yet, and NULLs do
+  // not conflict with each other in a Postgres unique index.
+  `ALTER TABLE team_roles ADD COLUMN IF NOT EXISTS role_key VARCHAR(80)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS team_roles_role_key_uidx ON team_roles (role_key) WHERE role_key IS NOT NULL`,
 
   `CREATE TABLE IF NOT EXISTS role_permissions (
      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -499,7 +543,7 @@ export async function listRoles(): Promise<RoleRecord[]> {
   try {
     await ensureRegistrySchema();
     const r = await db.execute(sql`
-      SELECT tr.id, tr.name, tr.description, tr.color, tr.is_system, tr.created_at,
+      SELECT tr.id, tr.name, tr.role_key, tr.description, tr.color, tr.is_system, tr.created_at,
              (SELECT COUNT(*)::int FROM user_role_assignments ura WHERE ura.role_id = tr.id) AS member_count,
              (SELECT COUNT(*)::int FROM role_permission_grants g WHERE g.role_id = tr.id) AS permission_count,
              EXISTS (SELECT 1 FROM role_permission_grants g
@@ -509,6 +553,7 @@ export async function listRoles(): Promise<RoleRecord[]> {
     return rows(r).map((x: any) => ({
       id: String(x.id),
       name: String(x.name),
+      key: x.role_key ? String(x.role_key) : null,
       description: x.description ?? null,
       color: String(x.color || 'orange'),
       isSystem: x.is_system === true,
@@ -586,8 +631,17 @@ export async function permissionsForRole(roleId: string): Promise<RoleGrantRecor
  */
 function memoOf(locals: any): Map<string, Promise<ResolvedPermissions>> | null {
   if (!locals || typeof locals !== 'object') return null;
-  if (!locals.__permRegistryMemo) locals.__permRegistryMemo = new Map<string, Promise<ResolvedPermissions>>();
-  return locals.__permRegistryMemo as Map<string, Promise<ResolvedPermissions>>;
+  // Wrapped because this is the ONE statement in resolvePermissions that sits outside its try, and
+  // it WRITES to an object it did not create. A frozen or proxied `locals` throws on assignment,
+  // and an exception escaping an authorisation function is not a denial — it is a 500 whose meaning
+  // the caller has to guess. A memo is an optimisation; losing it costs a query, not a decision.
+  try {
+    if (!locals.__permRegistryMemo) locals.__permRegistryMemo = new Map<string, Promise<ResolvedPermissions>>();
+    const memo = locals.__permRegistryMemo;
+    return memo instanceof Map ? memo : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Drop a memoised answer — call after granting or revoking inside the same request. */
@@ -764,43 +818,56 @@ async function permissionRow(key: string): Promise<{ key: string; label: string;
  * the last one had" is how an intern gets admin.access.
  */
 export async function createRole(
-  input: { name: string; description?: string | null; color?: string | null },
+  input: { name: string; key?: string | null; description?: string | null; color?: string | null },
   actor: Actor,
-): Promise<RegistryResult<{ id: string }>> {
+): Promise<RegistryResult<{ id: string; key: string }>> {
   const name = String(input.name || '').trim();
   const description = String(input.description || '').trim() || null;
   const color = String(input.color || 'orange').trim().slice(0, 20) || 'orange';
+  // Blank is the normal case: derive the key from the name rather than making somebody invent one.
+  const key = slugifyRoleKey(String(input.key || '').trim() || name);
 
   if (name.length < ROLE_NAME_MIN) return fail('Give the role a name of at least ' + ROLE_NAME_MIN + ' characters.');
   if (name.length > ROLE_NAME_MAX) return fail('Role names are limited to ' + ROLE_NAME_MAX + ' characters.');
+  if (!ROLE_KEY_RE.test(key)) {
+    return fail('A role key looks like "hei-editor": lowercase letters, digits, dashes or underscores, at least two characters.');
+  }
   if (!actor?.id) return fail('A signed-in person must be recorded as creating the role.');
 
   try {
     await ensureRegistrySchema();
     const clash = rows(await db.execute(sql`SELECT id FROM team_roles WHERE lower(name) = ${name.toLowerCase()} LIMIT 1`));
     if (clash.length > 0) return fail('A role called "' + name + '" already exists.');
+    const keyClash = rows(await db.execute(sql`SELECT name FROM team_roles WHERE role_key = ${key} LIMIT 1`));
+    if (keyClash.length > 0) return fail('The key "' + key + '" is already used by "' + String(keyClash[0].name) + '". Keys are permanent, so pick another.');
 
     const created = rows(await db.execute(sql`
-      INSERT INTO team_roles (name, description, color, created_by_user_id)
-      VALUES (${name}, ${description}, ${color}, ${actor.id}::uuid)
+      INSERT INTO team_roles (name, role_key, description, color, created_by_user_id)
+      VALUES (${name}, ${key}, ${description}, ${color}, ${actor.id}::uuid)
       RETURNING id`))[0];
     const id = String(created.id);
 
     await record({
       actor, action: 'role.create', entity: 'team_role', entityId: id,
-      diff: { name, description, color, ...actorFacts(actor) },
+      diff: { name, key, description, color, ...actorFacts(actor) },
     });
-    return { ok: true, data: { id } };
+    return { ok: true, data: { id, key } };
   } catch (e: any) {
     logFail('auth.registry.createRole', e);
     return fail(reason(e));
   }
 }
 
-/** Rename or re-describe a role. Its permissions are changed with assign/revokePermission, not here. */
+/**
+ * Rename or re-describe a role. Its permissions are changed with applyRolePermissions(), not here.
+ *
+ * The KEY is deliberately one-way. It can be filled in when it is missing — every role created
+ * before the column existed has none — and once it holds a value it cannot be changed, because a
+ * key that can be edited is just a second name and is worth nothing to whatever referenced it.
+ */
 export async function updateRole(
   roleId: string,
-  patch: { name?: string; description?: string | null; color?: string | null },
+  patch: { name?: string; key?: string | null; description?: string | null; color?: string | null },
   actor: Actor,
 ): Promise<RegistryResult> {
   if (!roleId) return fail('No role given.');
@@ -809,7 +876,7 @@ export async function updateRole(
   try {
     await ensureRegistrySchema();
     const before = rows(await db.execute(sql`
-      SELECT id, name, description, color, is_system FROM team_roles WHERE id = ${roleId}::uuid LIMIT 1`))[0];
+      SELECT id, name, role_key, description, color, is_system FROM team_roles WHERE id = ${roleId}::uuid LIMIT 1`))[0];
     if (!before) return fail('No such role.');
 
     const name = patch.name === undefined ? String(before.name) : String(patch.name || '').trim();
@@ -831,15 +898,29 @@ export async function updateRole(
       ? String(before.color || 'orange')
       : (String(patch.color || 'orange').trim().slice(0, 20) || 'orange');
 
+    const existingKey = before.role_key ? String(before.role_key) : null;
+    let key = existingKey;
+    const wantedKey = patch.key === undefined ? null : slugifyRoleKey(String(patch.key || '').trim());
+    if (wantedKey && wantedKey !== existingKey) {
+      if (existingKey) return fail('The key "' + existingKey + '" is permanent. Anything referencing this role uses it, and changing it would break those references silently.');
+      if (!ROLE_KEY_RE.test(wantedKey)) {
+        return fail('A role key looks like "hei-editor": lowercase letters, digits, dashes or underscores, at least two characters.');
+      }
+      const keyClash = rows(await db.execute(sql`
+        SELECT name FROM team_roles WHERE role_key = ${wantedKey} AND id <> ${roleId}::uuid LIMIT 1`));
+      if (keyClash.length > 0) return fail('The key "' + wantedKey + '" is already used by "' + String(keyClash[0].name) + '".');
+      key = wantedKey;
+    }
+
     await db.execute(sql`
-      UPDATE team_roles SET name = ${name}, description = ${description}, color = ${color}, updated_at = NOW()
+      UPDATE team_roles SET name = ${name}, role_key = ${key}, description = ${description}, color = ${color}, updated_at = NOW()
        WHERE id = ${roleId}::uuid`);
 
     await record({
       actor, action: 'role.update', entity: 'team_role', entityId: roleId,
       diff: {
-        before: { name: before.name, description: before.description ?? null, color: before.color },
-        after: { name, description, color },
+        before: { name: before.name, key: existingKey, description: before.description ?? null, color: before.color },
+        after: { name, key, description, color },
         ...actorFacts(actor),
       },
     });
@@ -930,6 +1011,10 @@ export async function assignPermission(
     // nothing will ever check, which reads as "granted" on a screen and grants nothing.
     if (!perm) return fail('"' + key + '" is not a known permission. Add it to the catalogue first.');
 
+    // NOT `perm.isSensitive` on its own — see isSensitiveKey(). The catalogue row is admin-writable
+    // and must not be able to demote admin.access into the swallow-on-failure audit path.
+    const sensitive = isSensitiveKey(key, perm.isSensitive);
+
     const why = String(opts.reason || '').trim().slice(0, 2000) || null;
 
     const inserted = rows(await db.execute(sql`
@@ -941,7 +1026,7 @@ export async function assignPermission(
 
     const diff: Record<string, unknown> = {
       roleId, roleName: role.name, permissionKey: key, permissionLabel: perm.label,
-      sensitive: perm.isSensitive, reason: why, ...actorFacts(actor),
+      sensitive, reason: why, ...actorFacts(actor),
     };
     if (key === PERM_ADMIN_ACCESS) {
       // Written in words, in the record itself. Whoever reads this log later should not have to
@@ -950,7 +1035,7 @@ export async function assignPermission(
         + ' granted admin console access to the role "' + role.name + '".';
     }
 
-    if (!perm.isSensitive) {
+    if (!sensitive) {
       await record({ actor, action: 'permission.grant', entity: 'role_permission', entityId: roleId + ':' + key, diff });
       return { ok: true };
     }
@@ -1069,6 +1154,17 @@ export async function registerPermission(
   if (!PERMISSION_KEY_RE.test(key)) {
     return fail('A permission key looks like "reports.export": lowercase words separated by dots.');
   }
+  // Refused BY NAME, from the code catalogue, before any row is looked up.
+  //
+  // The lookup below can only refuse a built-in that is already SEEDED. ensureRegistrySchema() runs
+  // through ensureOnce(), which swallows its own failure, so a boot where the seed did not land
+  // leaves `admin.access` absent from permission_catalogue — and this function would then happily
+  // create it as a non-builtin row with is_sensitive=false. Granting it afterwards would take the
+  // ordinary audit path, whose failures are swallowed, producing exactly the thing this module
+  // exists to make impossible: console access granted with no record of who granted it.
+  if (BUILTIN_PERMISSION_KEYS.includes(key)) {
+    return fail('"' + key + '" is a built-in permission and is described in code, not here.');
+  }
   if (label.length < 3) return fail('Give the permission a label somebody will understand on a checkbox.');
   if (!actor?.id) return fail('A signed-in person must be recorded as adding the permission.');
 
@@ -1140,5 +1236,413 @@ export async function whoHolds(permissionKey: string): Promise<{
   } catch (e: any) {
     logFail('auth.registry.whoHolds', e);
     return [];
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Membership — who holds a role, and the two writes that change it.
+//
+// These live here rather than in the page because user_role_assignments is this module's table (its
+// DDL is above) and because an assignment is a grant: putting somebody in a role hands them every
+// permission it holds, and that has to be on the record with the same discipline as granting the
+// permission itself.
+// ---------------------------------------------------------------------------------------------
+
+export interface RoleMember {
+  userId: string;
+  name: string | null;
+  email: string | null;
+  /** The role on users.role. It is what canOpenAdmin() actually reads, so the console shows it. */
+  builtinRole: string | null;
+  isActive: boolean;
+  assignedAt: string | null;
+}
+
+/**
+ * The people holding one role, named.
+ *
+ * The console needs the names and not a count: "3 people still hold this" is not enough to act on
+ * when the next thing an admin has to do is move those three somewhere else. GROUP BY collapses the
+ * duplicate assignment rows the schema deliberately tolerates (see the DDL note above).
+ */
+export async function listRoleMembers(roleId: string): Promise<RoleMember[]> {
+  if (!roleId) return [];
+  try {
+    await ensureRegistrySchema();
+    const r = await db.execute(sql`
+      SELECT u.id::text AS user_id, u.name, u.email, u.role::text AS builtin_role, u.is_active,
+             MIN(ura.assigned_at) AS assigned_at
+        FROM user_role_assignments ura
+        JOIN users u ON u.id = ura.user_id
+       WHERE ura.role_id = ${roleId}::uuid
+       GROUP BY u.id, u.name, u.email, u.role, u.is_active
+       ORDER BY lower(coalesce(u.name, '')) ASC
+       LIMIT 500`);
+    return rows(r).map((x: any) => ({
+      userId: String(x.user_id),
+      name: x.name ?? null,
+      email: x.email ?? null,
+      builtinRole: x.builtin_role ? String(x.builtin_role) : null,
+      isActive: x.is_active !== false,
+      assignedAt: x.assigned_at ? String(x.assigned_at) : null,
+    }));
+  } catch (e: any) {
+    logFail('auth.registry.listRoleMembers', e);
+    return [];
+  }
+}
+
+/**
+ * Accounts that can be put into a custom role, filtered by a search term.
+ *
+ * SEARCHED RATHER THAN LISTED, on purpose. The previous editor rendered every active non-applicant
+ * account into a <select>; on a database with thousands of accounts that is a slow page and an
+ * unreadable dropdown at 360px. Applicants are excluded because a custom role is a staff construct
+ * and an applicant list on an access screen is its own disclosure.
+ */
+export async function listAssignableUsers(
+  query: string = '',
+  limit: number = 40,
+): Promise<{ id: string; name: string | null; email: string | null; builtinRole: string; isActive: boolean }[]> {
+  try {
+    await ensureRegistrySchema();
+    const q = String(query || '').trim();
+    const like = '%' + q.replace(/[%_\\]/g, (m) => '\\' + m) + '%';
+    // Backslash is LIKE's default escape character, so the JS-side escaping above is enough and no
+    // ESCAPE clause is needed. A search for "50%" must find "50%", not every row in the table.
+    const filter = q ? sql` AND (u.name ILIKE ${like} OR u.email ILIKE ${like})` : sql``;
+    const r = await db.execute(sql`
+      SELECT u.id::text AS id, u.name, u.email, u.role::text AS builtin_role, u.is_active
+        FROM users u
+       WHERE u.role::text <> 'applicant'
+         AND u.is_active = true
+         ${filter}
+       ORDER BY lower(coalesce(u.name, '')) ASC
+       LIMIT ${Math.max(1, Math.min(200, Math.floor(limit)))}`);
+    return rows(r).map((x: any) => ({
+      id: String(x.id),
+      name: x.name ?? null,
+      email: x.email ?? null,
+      builtinRole: String(x.builtin_role || ''),
+      isActive: x.is_active !== false,
+    }));
+  } catch (e: any) {
+    logFail('auth.registry.listAssignableUsers', e);
+    return [];
+  }
+}
+
+/** The sensitive permissions a role hands whoever is assigned to it. Empty is the common case. */
+async function sensitiveGrantsOf(roleId: string): Promise<string[]> {
+  const r = await db.execute(sql`
+    SELECT g.permission_key AS key, COALESCE(c.is_sensitive, false) AS is_sensitive
+      FROM role_permission_grants g
+      LEFT JOIN permission_catalogue c ON c.key = g.permission_key
+     WHERE g.role_id = ${roleId}::uuid`);
+  return rows(r)
+    .filter((x: any) => isSensitiveKey(String(x.key), x.is_sensitive === true))
+    .map((x: any) => String(x.key));
+}
+
+/**
+ * Put somebody in a role.
+ *
+ * When the role carries a sensitive permission the audit row is written STRICTLY and the assignment
+ * is undone if it cannot be: handing a person admin.access by dropping them into a role is the same
+ * act as granting it, and assignPermission() already refuses to let that happen off the record.
+ * Recording it only when the logging happens to be up would make the whole discipline decorative.
+ */
+export async function assignRoleToUser(
+  userId: string,
+  roleId: string,
+  actor: Actor,
+): Promise<RegistryResult> {
+  if (!userId) return fail('Pick somebody to add.');
+  if (!roleId) return fail('No role given.');
+  if (!actor?.id) return fail('A signed-in person must be recorded as making the assignment.');
+
+  try {
+    await ensureRegistrySchema();
+    const role = await roleRow(roleId);
+    if (!role) return fail('No such role.');
+
+    const person = rows(await db.execute(sql`
+      SELECT id::text AS id, name, email, role::text AS builtin_role, is_active
+        FROM users WHERE id = ${userId}::uuid LIMIT 1`))[0];
+    if (!person) return fail('No such account.');
+    if (String(person.builtin_role) === 'applicant') {
+      return fail('Applicant accounts cannot hold a staff role. Change the account role in Users first.');
+    }
+
+    const already = rows(await db.execute(sql`
+      SELECT id FROM user_role_assignments
+       WHERE user_id = ${userId}::uuid AND role_id = ${roleId}::uuid LIMIT 1`));
+    if (already.length > 0) return fail(String(person.name || person.email || 'That person') + ' already holds "' + role.name + '".');
+
+    await db.execute(sql`
+      INSERT INTO user_role_assignments (user_id, role_id, assigned_by_user_id)
+      VALUES (${userId}::uuid, ${roleId}::uuid, ${actor.id}::uuid)`);
+
+    const sensitive = await sensitiveGrantsOf(roleId);
+    const diff: Record<string, unknown> = {
+      roleId, roleName: role.name,
+      userId, userEmail: person.email ?? null, userName: person.name ?? null,
+      builtinRole: person.builtin_role ?? null,
+      sensitivePermissions: sensitive,
+      ...actorFacts(actor),
+    };
+    if (sensitive.includes(PERM_ADMIN_ACCESS)) {
+      diff.notice = (actor.email || actor.name || actor.id)
+        + ' put ' + (person.email || person.name || userId)
+        + ' into "' + role.name + '", a role that holds admin console access.';
+    }
+
+    if (sensitive.length === 0) {
+      await record({ actor, action: 'role.assign', entity: 'user_role_assignment', entityId: roleId + ':' + userId, diff });
+      return { ok: true };
+    }
+
+    try {
+      await recordStrict({ actor, action: 'role.assign.sensitive', entity: 'user_role_assignment', entityId: roleId + ':' + userId, diff });
+    } catch (auditErr: any) {
+      try {
+        await db.execute(sql`
+          DELETE FROM user_role_assignments
+           WHERE user_id = ${userId}::uuid AND role_id = ${roleId}::uuid`);
+      } catch (rollbackErr: any) {
+        logEvent('error', 'auth.registry.unaudited-assignment', {
+          roleId, roleName: role.name, userId,
+          byUserId: actor.id, byEmail: actor.email || null,
+          auditError: reason(auditErr), rollbackError: reason(rollbackErr),
+        });
+        return fail('They were added to "' + role.name + '" but it could NOT be recorded, and the assignment could not be undone. Remove them by hand and tell whoever runs this system.');
+      }
+      logFail('auth.registry.assignRoleToUser.audit', auditErr);
+      return fail('"' + role.name + '" holds sensitive permissions and the audit log could not record who assigned it, so nobody was added. Try again.');
+    }
+
+    return { ok: true };
+  } catch (e: any) {
+    logFail('auth.registry.assignRoleToUser', e);
+    return fail(reason(e));
+  }
+}
+
+/**
+ * Take somebody out of a role.
+ *
+ * The same asymmetry revokePermission() documents: a removal that cannot be logged still happens.
+ * Refusing to withdraw access because the logging is down is failing open.
+ */
+export async function unassignRoleFromUser(
+  userId: string,
+  roleId: string,
+  actor: Actor,
+): Promise<RegistryResult> {
+  if (!userId || !roleId) return fail('Pick a person and a role.');
+  if (!actor?.id) return fail('A signed-in person must be recorded as making the change.');
+
+  try {
+    await ensureRegistrySchema();
+    const role = await roleRow(roleId);
+    if (!role) return fail('No such role.');
+
+    const removed = rows(await db.execute(sql`
+      DELETE FROM user_role_assignments
+       WHERE user_id = ${userId}::uuid AND role_id = ${roleId}::uuid
+       RETURNING id`));
+    if (removed.length === 0) return fail('They were not in that role.');
+
+    await record({
+      actor, action: 'role.unassign', entity: 'user_role_assignment', entityId: roleId + ':' + userId,
+      diff: { roleId, roleName: role.name, userId, removedRows: removed.length, ...actorFacts(actor) },
+    });
+    return { ok: true };
+  } catch (e: any) {
+    logFail('auth.registry.unassignRoleFromUser', e);
+    return fail(reason(e));
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The section matrix, and the one write that keeps it in step with the grants.
+//
+// role_permissions is not a legacy table to be tolerated: it is what getViewableSectionKeys() and
+// canAccessSection() actually read, which makes it the thing that decides what appears in somebody's
+// sidebar and whether a URL opens. A grant of `applications.view` that did not reach it would be a
+// permission the console says the role has and the product does not honour. applyRolePermissions()
+// therefore writes BOTH, from one list of checkboxes, so the two cannot drift.
+// ---------------------------------------------------------------------------------------------
+
+export interface SectionGrant {
+  pageKey: string;
+  view: boolean;
+  edit: boolean;
+  remove: boolean;
+  export: boolean;
+  /** False when page_key is not in src/lib/admin-sections.ts — a row nothing can grant or check. */
+  known: boolean;
+}
+
+/** The page-key rows a role holds, as stored. Read it to show the truth, not the intention. */
+export async function sectionMatrixForRole(roleId: string): Promise<SectionGrant[]> {
+  if (!roleId) return [];
+  try {
+    await ensureRegistrySchema();
+    const r = await db.execute(sql`
+      SELECT page_key, can_view, can_edit, can_delete, can_export
+        FROM role_permissions WHERE role_id = ${roleId}::uuid
+       ORDER BY page_key ASC`);
+    return rows(r).map((x: any) => ({
+      pageKey: String(x.page_key),
+      view: x.can_view === true,
+      edit: x.can_edit === true,
+      remove: x.can_delete === true,
+      export: x.can_export === true,
+      known: sectionTargetFor(String(x.page_key) + '.view') !== null,
+    }));
+  } catch (e: any) {
+    logFail('auth.registry.sectionMatrixForRole', e);
+    return [];
+  }
+}
+
+/** The permission keys a stored section matrix is equivalent to. Pure; used for the nav preview. */
+export function sectionMatrixKeys(matrix: SectionGrant[]): string[] {
+  const out: string[] = [];
+  for (const row of matrix) {
+    if (row.view) out.push(row.pageKey + '.view');
+    if (row.edit) out.push(row.pageKey + '.edit');
+    if (row.remove) out.push(row.pageKey + '.delete');
+    if (row.export) out.push(row.pageKey + '.export');
+  }
+  return out;
+}
+
+/** Rewrite role_permissions so it says exactly what `keys` says, and nothing else. */
+async function writeSectionMatrix(roleId: string, keys: Iterable<string>): Promise<void> {
+  const byPage = new Map<string, { view: boolean; edit: boolean; remove: boolean; exportable: boolean }>();
+  for (const key of keys) {
+    const target = sectionTargetFor(key);
+    if (!target) continue;
+    const row = byPage.get(target.section) || { view: false, edit: false, remove: false, exportable: false };
+    if (target.action === 'view') row.view = true;
+    else if (target.action === 'edit') row.edit = true;
+    else if (target.action === 'delete') row.remove = true;
+    else row.exportable = true;
+    byPage.set(target.section, row);
+  }
+
+  await db.execute(sql`DELETE FROM role_permissions WHERE role_id = ${roleId}::uuid`);
+  const entries = [...byPage.entries()];
+  if (entries.length === 0) return;
+  const values = sql.join(
+    entries.map(([page, v]) => sql`(${roleId}::uuid, ${page}, ${v.view}, ${v.edit}, ${v.remove}, ${v.exportable})`),
+    sql`, `,
+  );
+  await db.execute(sql`
+    INSERT INTO role_permissions (role_id, page_key, can_view, can_edit, can_delete, can_export)
+    VALUES ${values}`);
+}
+
+export interface ApplyResult {
+  granted: string[];
+  revoked: string[];
+  /** Things the admin must read: a refused grant, an unknown key, a partially applied save. */
+  problems: string[];
+}
+
+/**
+ * Make a role hold EXACTLY these permissions.
+ *
+ * One save from one list of checkboxes. The order is deliberate:
+ *
+ *   1. Unknown keys are dropped and reported. A key that is not catalogued cannot be checked by
+ *      anything, so granting it would put a tick on a screen and change nothing in the product.
+ *   2. The section matrix is rewritten FIRST, from the desired set. Doing it before the revokes is
+ *      what lets revokePermission() tell the truth: its "the role still has this through the page
+ *      matrix" warning is correct only if the matrix has already been brought into line.
+ *   3. Grants and revokes go one at a time through assignPermission()/revokePermission(), so every
+ *      single one is audited by the code that already knows how — including the strict, rollback-on-
+ *      failure path for admin.access and the other sensitive keys.
+ *   4. If any grant was REFUSED (a sensitive one whose audit row would not write), the matrix is
+ *      rebuilt from what actually ended up on the record. Otherwise step 2 would have quietly left
+ *      the role holding, through role_permissions, the very ability the grant was refused.
+ *
+ * Returns ok with a list of problems rather than throwing: a save where nineteen permissions applied
+ * and one was refused is not a failure to report as "save failed", and it is not a success either.
+ */
+export async function applyRolePermissions(
+  roleId: string,
+  desiredKeys: string[],
+  actor: Actor,
+): Promise<RegistryResult<ApplyResult>> {
+  if (!roleId) return fail('No role given.');
+  if (!actor?.id) return fail('A signed-in person must be recorded as making the change.');
+
+  try {
+    await ensureRegistrySchema();
+    const role = await roleRow(roleId);
+    if (!role) return fail('No such role.');
+
+    const catalogued = new Set(
+      rows(await db.execute(sql`SELECT key FROM permission_catalogue`)).map((x: any) => String(x.key)),
+    );
+    if (catalogued.size === 0) {
+      // Applying an empty catalogue would read every checkbox as unknown and revoke the lot.
+      return fail('The permission catalogue could not be read, so nothing was changed. Reload and try again.');
+    }
+
+    const problems: string[] = [];
+    const desired = new Set<string>();
+    for (const raw of desiredKeys) {
+      const key = String(raw || '').trim();
+      if (!key) continue;
+      if (!catalogued.has(key)) { problems.push('"' + key + '" is not a known permission and was ignored.'); continue; }
+      desired.add(key);
+    }
+
+    const current = new Set(
+      rows(await db.execute(sql`SELECT permission_key FROM role_permission_grants WHERE role_id = ${roleId}::uuid`))
+        .map((x: any) => String(x.permission_key)),
+    );
+
+    await writeSectionMatrix(roleId, desired);
+
+    const granted: string[] = [];
+    const revoked: string[] = [];
+    let refusedGrant = false;
+
+    for (const key of desired) {
+      if (current.has(key)) continue;
+      const result = await assignPermission(roleId, key, actor, { reason: 'Set in the role console.' });
+      if (result.ok) granted.push(key);
+      else { problems.push(result.error); refusedGrant = true; }
+    }
+    for (const key of current) {
+      if (desired.has(key)) continue;
+      const result = await revokePermission(roleId, key, actor);
+      if (result.ok) revoked.push(key);
+      else problems.push(result.error);
+    }
+
+    if (refusedGrant) {
+      const effective = rows(await db.execute(sql`
+        SELECT permission_key FROM role_permission_grants WHERE role_id = ${roleId}::uuid`))
+        .map((x: any) => String(x.permission_key));
+      await writeSectionMatrix(roleId, effective);
+    }
+
+    if (granted.length > 0 || revoked.length > 0) {
+      await record({
+        actor, action: 'role.permissions.apply', entity: 'team_role', entityId: roleId,
+        diff: { roleName: role.name, granted, revoked, holds: [...desired].length, ...actorFacts(actor) },
+      });
+    }
+
+    return { ok: true, data: { granted, revoked, problems } };
+  } catch (e: any) {
+    logFail('auth.registry.applyRolePermissions', e);
+    return fail(reason(e));
   }
 }
