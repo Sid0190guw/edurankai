@@ -16,12 +16,32 @@
 //   idCardBlobUrl?: string  // optional - if client uploaded to @vercel/blob first
 // }
 
+//
+// SECURITY NOTE — READ BEFORE CHANGING THE FLAG BELOW.
+// This route has NO SESSION CHECK (compare enroll-face.ts, which requires locals.user), and
+// src/middleware.ts exempts every /api/ path from the session and face gates. It was therefore fully
+// unauthenticated, and its auto-pass branch set users.password_hash TO A PASSWORD CHOSEN IN THE
+// REQUEST BODY. The three things standing between a stranger and that branch were: a STRUCTURAL check
+// of the ID number (a format test in src/lib/id-verify.ts, not an issuer check), a name match that
+// returns true on ONE shared token of three or more characters ("prasad" matches "Siddharth Prasad"),
+// and `matchPassed`, which was derived entirely from a number in the request body. Worse than
+// enroll-face.ts's version of that defect, because this route receives only ONE descriptor — the
+// selfie — so there is no ID descriptor to compare it against and the match CANNOT be verified
+// server-side at all. One POST took over any not-yet-verified account, including a super_admin, and
+// enrolled the caller's own face as its second factor at the same time.
+//
+// It cannot be made safe by tightening the fuzzy matcher, so the auto-pass branch is now behind
+// IDENTITY_SETUP_AUTO_PASS and DEFAULTS TO OFF. With it off, every submission takes the branch that
+// already existed for a failed match: documents are stored and a human reviews them at
+// /admin/identity-verifications. Nothing auto-sets a password. Turning it back on needs a deliberate
+// environment change and the sign-off of whoever owns this flow.
 import type { APIRoute } from 'astro';
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { verifyIdNumber, isIdType } from '@/lib/id-verify';
+import { checkRateLimit, clientIpOf, isPrivilegedAccount, recordAttempt } from '@/lib/auth/recovery';
 
 const scrypt = promisify(crypto.scrypt) as (pw: string, salt: Buffer, len: number) => Promise<Buffer>;
 const KEY_LEN = 64;
@@ -29,6 +49,25 @@ const KEY_LEN = 64;
 // Pass threshold: face-api euclidean distance under this is considered a match.
 // 0.45 is strict but reduces false-positives for ID verification.
 const FACE_MATCH_THRESHOLD = 0.50;
+
+// The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+
+const ROUTE = 'identity_setup' as const;
+
+/**
+ * THE FLAG. Off unless the environment says the exact string 'true'.
+ *
+ * OFF  (default) - no submission ever sets a password. Everything routes to manual review, which is
+ *                  the branch that already exists and which the client page already handles
+ *                  (identity-setup.astro checks `d.ok && d.reviewPending`).
+ * ON             - restores the previous self-serve behaviour, WHICH IS STILL CLIENT-ATTESTED. Only
+ *                  turn it on if somebody has decided that risk is acceptable.
+ *
+ * Declared here, above the handler, because `const` is not hoisted and a handler reaching a later
+ * declaration has taken pages down on this project.
+ */
+const AUTO_PASS_ENABLED = String(process.env.IDENTITY_SETUP_AUTO_PASS || '').trim().toLowerCase() === 'true';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -66,6 +105,22 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
+  const ipEarly = clientIpOf(request, clientAddress);
+  const identifierEarly = (body?.email || '').toString().trim().toLowerCase();
+  // Shared-state ceiling. Unauthenticated document submission with no cap is how a fuzzy name matcher
+  // gets ground down; the per-identifier budget is the tight one, the per-IP budget is loose enough
+  // for a shared office address.
+  if (identifierEarly) {
+    const limit = await checkRateLimit(ROUTE, identifierEarly, ipEarly);
+    if (!limit.allowed) {
+      await recordAttempt({ route: ROUTE, identifier: identifierEarly, ip: ipEarly, outcome: 'rate_limited', detail: limit.scope });
+      return json({
+        ok: false,
+        error: 'Too many identity-setup attempts. Wait ' + Math.ceil(limit.retryAfterSeconds / 60) + ' minutes and try again, or email hr@edurankai.in.',
+      }, 429);
+    }
+  }
+
   const email = (body?.email || '').toString().trim().toLowerCase();
   const claimedName = (body?.name || '').toString().trim();
   const claimedDob = (body?.dob || '').toString().trim();
@@ -90,9 +145,19 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   if (!newPassword || newPassword.length < 8) return json({ ok: false, error: 'Password must be 8+ characters' }, 400);
   if (newPassword.length > 200) return json({ ok: false, error: 'Password too long' }, 400);
   if (!Array.isArray(descriptor) || descriptor.length !== 128) return json({ ok: false, error: 'Invalid face descriptor (need 128 floats)' }, 400);
+  if (descriptor.some((n: any) => !Number.isFinite(Number(n)))) return json({ ok: false, error: 'Face descriptor contains non-numeric values' }, 400);
+  // An all-zero vector is a "no face detected" result, not a face. Rejected the same way
+  // enroll-face-selfie.ts already rejects it, so a blank enrolment cannot be stored.
+  if (!descriptor.some((n: any) => Number.isFinite(Number(n)) && Math.abs(Number(n)) > 1e-6)) {
+    return json({ ok: false, error: 'No face detected in the selfie. Retake it with better lighting.' }, 400);
+  }
   // Auto-match is advisory: it may be absent (no face detectable on the ID, or the
   // models did not load). A present, in-range distance under threshold is an instant
   // self-serve pass; anything else routes to manual review rather than dead-ending.
+  //
+  // IT IS ALSO CLIENT-ATTESTED AND UNVERIFIABLE HERE. Only the selfie descriptor is posted, so there
+  // is no ID descriptor to measure against; this number is whatever the caller said. That is why the
+  // branch it controls is behind AUTO_PASS_ENABLED and off by default.
   const hasMatch = Number.isFinite(matchDistanceRaw) && matchDistanceRaw >= 0 && matchDistanceRaw <= 2;
 
   // ID type + number must be present and the number must structurally match
@@ -104,12 +169,13 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   // ID image storage is best-effort (the face match + ID number are the actual
   // verification). If blob storage is unavailable the image URL may be empty.
 
-  // Instant self-serve verify only when the auto-match is present AND passes.
+  // The client's own verdict, recorded in the audit rows below exactly as before. It is NOT the gate:
+  // see autoPass, which is resolved after the account is known.
   const matchPassed = hasMatch && matchDistanceRaw <= FACE_MATCH_THRESHOLD;
 
   try {
     // Find user
-    const u = await db.execute(sql`SELECT id, email, name, role, identity_verified FROM users WHERE LOWER(email) = ${email} LIMIT 1`);
+    const u = await db.execute(sql`SELECT id, email, name, role, is_active, assigned_department_id, identity_verified FROM users WHERE LOWER(email) = ${email} LIMIT 1`);
     const uRows = Array.isArray(u) ? u : (u?.rows || []);
     if (uRows.length === 0) {
       // Log attempt + reject
@@ -117,14 +183,29 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         INSERT INTO identity_verifications (email, claimed_name, claimed_dob, id_card_type, face_match_distance, face_match_passed, verdict, reject_reason, ip_address, user_agent)
         VALUES (${email}, ${claimedName}, ${claimedDob}, ${idCardType || null}, ${matchDistanceRaw}, ${matchPassed}, 'rejected', 'no user with that email', ${ip || null}, ${ua})
       `).catch(() => {});
+      await recordAttempt({ route: ROUTE, identifier: email, ip, outcome: 'no_account' });
       return json({ ok: false, error: 'No account with that email. If you are new, sign up first.' }, 404);
     }
     const user = uRows[0] as any;
 
     // Already verified? Don't allow overwrite via this flow.
     if (user.identity_verified) {
+      await recordAttempt({ route: ROUTE, identifier: email, ip, userId: user.id, outcome: 'already_verified' });
       return json({ ok: false, error: 'Account already identity-verified. Use the regular password reset, or contact hr@edurankai.in.' }, 409);
     }
+
+    // WHO MAY NEVER TAKE THE AUTO-PASS BRANCH, whatever the flag says.
+    //
+    // A privileged account is the one whose takeover costs the most, and the only thing standing in
+    // front of this branch is a name-token match on a name that is public for staff. A deactivated
+    // account must not be revived by an unauthenticated request either. Both still submit their
+    // documents and both still reach a human — they are refused the SHORTCUT, not the flow.
+    const privileged = await isPrivilegedAccount({
+      id: user.id, email: user.email, name: user.name, role: user.role,
+      isActive: user.is_active, assignedDepartmentId: user.assigned_department_id,
+    });
+    const inactive = user.is_active === false;
+    const autoPass = AUTO_PASS_ENABLED && matchPassed && !privileged && !inactive;
 
     // Name match
     if (!nameMatches(claimedName, user.name || '')) {
@@ -132,18 +213,35 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         INSERT INTO identity_verifications (user_id, email, claimed_name, claimed_dob, id_card_type, face_match_distance, face_match_passed, verdict, reject_reason, ip_address, user_agent)
         VALUES (${user.id}, ${email}, ${claimedName}, ${claimedDob}, ${idCardType || null}, ${matchDistanceRaw}, ${matchPassed}, 'rejected', 'name does not match account', ${ip || null}, ${ua})
       `).catch(() => {});
+      await recordAttempt({ route: ROUTE, identifier: email, ip, userId: user.id, outcome: 'name_mismatch' });
       return json({ ok: false, error: 'Name does not match the account on file.' }, 400);
     }
 
-    // Face match — when it doesn't auto-pass we DON'T dead-end. We securely save
-    // the documents (ID image + selfie) and route to manual review, so a human
-    // evaluator can compare the ID face to the selfie. Nothing is auto-penalised.
-    if (!matchPassed) {
-      const meta = JSON.stringify({ selfie: selfieDataUrl || null, matchDistance: hasMatch ? matchDistanceRaw : null, autoMatch: hasMatch ? 'below_threshold' : 'unavailable' });
+    // Manual review — the branch that now runs for EVERYTHING unless AUTO_PASS_ENABLED is on and the
+    // account is an ordinary, active, unverified one. We don't dead-end: the documents (ID image +
+    // selfie) are stored securely and a human evaluator compares the ID face to the selfie at
+    // /admin/identity-verifications. Nothing is auto-penalised, and no password is written here.
+    if (!autoPass) {
+      const reviewReason = privileged
+        ? 'privileged account - manual review required'
+        : inactive
+          ? 'deactivated account - manual review required'
+          : !AUTO_PASS_ENABLED
+            ? 'self-serve auto-pass disabled - manual review'
+            : hasMatch ? 'auto-match below threshold - manual review' : 'no auto-match - manual review';
+      const meta = JSON.stringify({
+        selfie: selfieDataUrl || null,
+        matchDistance: hasMatch ? matchDistanceRaw : null,
+        autoMatch: hasMatch ? (matchPassed ? 'client_claimed_pass' : 'below_threshold') : 'unavailable',
+        matchSource: 'client',
+        autoPassEnabled: AUTO_PASS_ENABLED,
+        privileged,
+        inactive,
+      });
       await db.execute(sql`
         INSERT INTO identity_verifications (user_id, email, claimed_name, claimed_dob, id_card_type, id_card_blob_url, face_match_distance, face_match_passed, verdict, reject_reason, metadata, ip_address, user_agent)
-        VALUES (${user.id}, ${email}, ${claimedName}, ${claimedDob}, ${idCardType || null}, ${idCardBlobUrl}, ${hasMatch ? matchDistanceRaw : null}, false, 'pending', ${hasMatch ? 'auto-match below threshold - manual review' : 'no auto-match - manual review'}, ${meta}::jsonb, ${ip || null}, ${ua})
-      `).catch(() => {});
+        VALUES (${user.id}, ${email}, ${claimedName}, ${claimedDob}, ${idCardType || null}, ${idCardBlobUrl}, ${hasMatch ? matchDistanceRaw : null}, false, 'pending', ${reviewReason}, ${meta}::jsonb, ${ip || null}, ${ua})
+      `).catch((e: any) => { console.error('[identity-setup] review audit insert failed:', causeOf(e)); });
       // Stash the documents on the user record too, so the reviewer always has them.
       await db.execute(sql`
         UPDATE users SET
@@ -153,14 +251,20 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
           id_number = COALESCE(${idNumber}, id_number),
           updated_at = NOW()
         WHERE id = ${user.id}
-      `).catch(() => {});
-      const why = hasMatch
-        ? 'We could not automatically match your face to the ID (distance ' + matchDistanceRaw.toFixed(3) + ').'
-        : 'We could not run the automatic face match.';
-      return json({ ok: true, reviewPending: true, message: why + ' Your documents have been securely submitted for manual review - our team will verify and email you. You can also retry with brighter, even lighting and no glasses or mask.' });
+      `).catch((e: any) => { console.error('[identity-setup] document stash failed:', causeOf(e)); });
+      await recordAttempt({ route: ROUTE, identifier: email, ip, userId: user.id, outcome: 'review_pending', detail: reviewReason });
+      // Honest about which of these actually happened, because "we could not match your face" would
+      // be a lie when the truth is that self-serve setup is switched off.
+      const why = (!AUTO_PASS_ENABLED || privileged || inactive)
+        ? 'Identity setup on this account is completed by a person, not automatically.'
+        : hasMatch
+          ? 'We could not automatically match your face to the ID (distance ' + matchDistanceRaw.toFixed(3) + ').'
+          : 'We could not run the automatic face match.';
+      return json({ ok: true, reviewPending: true, message: why + ' Your documents have been securely submitted for review - our team will verify and email you. Your password has not been changed.' });
     }
 
     // ===== PASS - commit identity =====
+    // Only reachable with IDENTITY_SETUP_AUTO_PASS=true on an ordinary, active, unverified account.
     const passwordHash = await hashPassword(newPassword);
 
     await db.execute(sql`
@@ -174,10 +278,12 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
         id_doc_url = ${idCardBlobUrl},
         photo_url = COALESCE(${selfieDataUrl || null}, photo_url),
         photo_verified = ${selfieDataUrl ? true : false},
-        is_active = true,
         updated_at = NOW()
       WHERE id = ${user.id}
     `);
+    // `is_active = true` USED TO BE IN THAT LIST. It is gone: reviving a deliberately deactivated
+    // account is an administrator's decision, not a side effect of an unauthenticated form post. A
+    // deactivated account never reaches this branch anyway (see `inactive` above).
 
     // Save face descriptor for future face-login
     await db.execute(sql`
@@ -194,7 +300,8 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     await db.execute(sql`
       INSERT INTO identity_verifications (user_id, email, claimed_name, claimed_dob, id_card_type, id_card_blob_url, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
       VALUES (${user.id}, ${email}, ${claimedName}, ${claimedDob}, ${idCardType || null}, ${idCardBlobUrl}, ${matchDistanceRaw}, true, 'verified', ${ip || null}, ${ua})
-    `).catch(() => {});
+    `).catch((e: any) => { console.error('[identity-setup] verified audit insert failed:', causeOf(e)); });
+    await recordAttempt({ route: ROUTE, identifier: email, ip, userId: user.id, outcome: 'auto_pass_committed', detail: 'client distance ' + matchDistanceRaw });
 
     return json({
       ok: true,
@@ -205,6 +312,9 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
       message: 'Identity verified. Your password and face login are set. Sign in below.',
     });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'server error' }, 500);
+    // Never swallowed: the real Postgres reason is on e.cause, and e.message is only the failed SQL.
+    console.error('[identity-setup] failed:', causeOf(e));
+    await recordAttempt({ route: ROUTE, identifier: email, ip, outcome: 'error', detail: causeOf(e) }).catch(() => {});
+    return json({ ok: false, error: 'We could not process that submission. Try again, or email hr@edurankai.in.' }, 500);
   }
 };
