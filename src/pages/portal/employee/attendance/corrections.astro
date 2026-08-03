@@ -1,0 +1,481 @@
+---
+// /portal/employee/attendance/corrections — ASK FOR A DAY TO BE PUT RIGHT, AND DECIDE THE ONES
+// ROUTED TO YOU.
+//
+// =================================================================================================
+// TWO PANELS, ONE SCREEN, AND THE SECOND ONE IS THE POINT
+// =================================================================================================
+//
+// A correction is a small factual claim about one day, and it needs a person to agree with it. This
+// page carries both halves: what you have asked for, and what has been routed to you. Splitting them
+// across two surfaces would mean an approver has to know a second URL exists, which is exactly how a
+// queue goes unread for eleven days.
+//
+// =================================================================================================
+// THE APPROVAL IS NOT DECIDED HERE
+// =================================================================================================
+//
+// Every decision goes through src/lib/workflow.ts decideInstance(), which asks mayAct() on the
+// posted instance and admits exactly three kinds of person: THE APPROVER THE ORGANIZATION GRAPH
+// ROUTED IT TO, somebody standing in for them under an in-force delegation edge, or a holder of the
+// domain's standing capability — and the `attendance` domain deliberately defines none, so for this
+// domain it is the routed person or their delegate and nobody else. Not a role name. Not "HR can do
+// anything". Not this page.
+//
+// WHAT THIS PAGE MAY NOT DO, AND STRUCTURALLY CANNOT: approve anything itself. There is no branch
+// below that writes an approved state, and src/lib/attendance.ts applyCorrection() refuses unless
+// the workflow instance already says 'approved'. If the graph cannot name an approver the request
+// HALTS and this page prints the engine's own sentence saying which relationship is missing. It
+// never falls back to a role name and never auto-approves, because either one would silently undo
+// the authorization migration and would look exactly like the feature working.
+//
+// THE GRAPH IS EMPTY until the founder runs db/org-graph-backfill.sql, so the ordinary first render
+// here is a halted request explaining that. That is honest, not broken.
+//
+// =================================================================================================
+// APPROVED IS NOT THE SAME AS APPLIED
+// =================================================================================================
+//
+// The decision and the write to hr_attendance are two facts. An approver decides on their phone; the
+// person whose day it is opens this page a minute later. applyApprovedCorrections() reconciles that
+// gap on load — bounded, idempotent — so a timesheet never shows the old numbers under an "Approved"
+// chip, which would read as the product having lost the decision.
+//
+// const BEFORE THE HANDLER: every const the POST handler reads is declared above it.
+// MOBILE FIRST: 360px, 44px targets, nothing scrolls the page sideways.
+import BottomNav from '@/components/workforce/BottomNav.astro';
+import EmptyState from '@/components/workforce/EmptyState.astro';
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  requestCorrection,
+  withdrawCorrection,
+  correctionsFor,
+  correctionById,
+  applyApprovedCorrections,
+  applyCorrection,
+  today as attendanceToday,
+  CORRECTION_WINDOW_DAYS,
+  ATTENDANCE_STATUSES,
+  STATUS_LABELS,
+} from '@/lib/attendance';
+import {
+  pendingForApprover,
+  decideInstance,
+  cancelWorkflow,
+  STATE_LABELS,
+  VIA_LABELS,
+} from '@/lib/workflow';
+
+const PATH = '/portal/employee/attendance/corrections';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ------------------------------------------------------------------------------------------------
+// CONSTANTS AND HELPERS — ALL ABOVE THE POST HANDLER. `const` is not hoisted.
+// ------------------------------------------------------------------------------------------------
+
+/** Plain words, from a function: a Record<string,string> read inside JSX is an .astro parse hazard. */
+function stateLabel(state: string | null): string {
+  const key = String(state || '');
+  if (key === 'draft') return STATE_LABELS.draft;
+  if (key === 'pending') return STATE_LABELS.pending;
+  if (key === 'approved') return STATE_LABELS.approved;
+  if (key === 'rejected') return STATE_LABELS.rejected;
+  if (key === 'cancelled') return STATE_LABELS.cancelled;
+  if (key === 'halted') return STATE_LABELS.halted;
+  return 'Not sent for approval';
+}
+
+function viaLabel(via: string | null): string {
+  const key = String(via || '');
+  if (key === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (key === 'department_head') return VIA_LABELS.department_head;
+  if (key === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (key === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+function statusLabel(status: string | null): string {
+  if (status === 'present') return STATUS_LABELS.present;
+  if (status === 'wfh') return STATUS_LABELS.wfh;
+  if (status === 'on_leave') return STATUS_LABELS.on_leave;
+  if (status === 'absent') return STATUS_LABELS.absent;
+  if (status === 'holiday') return STATUS_LABELS.holiday;
+  return '';
+}
+
+const clockTime = (iso: string | null) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+};
+
+const dayLabel = (iso: string) => {
+  if (!iso) return '';
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+};
+
+/** The statuses somebody may ask a day to be recorded as. `holiday` is not one of them: a holiday is
+ *  a fact about the organization's calendar, not a claim one person makes about their own day. */
+const REQUESTABLE = ATTENDANCE_STATUSES.filter((s) => s !== 'holiday');
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+let flash = '';
+let flashError = '';
+let halted = '';
+
+// ------------------------------------------------------------------------------------------------
+// WRITES. Three actions, and not one of them can approve anything by itself.
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+
+    if (action === 'request' && employeeId) {
+      const res = await requestCorrection({
+        employeeId,
+        workDate: String(form.get('work_date') || ''),
+        requestedStatus: String(form.get('status') || '') || null,
+        clockInHm: String(form.get('in') || '') || null,
+        clockOutHm: String(form.get('out') || '') || null,
+        reason: String(form.get('reason') || ''),
+        requestedByUserId: String(user.id),
+      });
+      if (res.ok) {
+        flash = 'Your correction has been sent for approval.';
+        // The engine halted it because routing could not name anybody. Its sentence is shown as it
+        // is, rather than being softened into "pending" — which would be a lie about who is looking.
+        if (res.state === 'halted') halted = res.haltReason || 'Routing could not name an approver.';
+      } else {
+        flashError = res.error || 'That could not be sent.';
+      }
+    } else if (action === 'withdraw' && employeeId) {
+      const correctionId = String(form.get('correction_id') || '');
+      const res = await withdrawCorrection(correctionId, employeeId);
+      if (res.ok) {
+        // Withdrawing the request also cancels the approval, so nobody is left holding a decision
+        // about something that no longer wants deciding. cancelWorkflow re-checks who may do it.
+        const record = await correctionById(correctionId);
+        if (record?.workflow?.id) {
+          await cancelWorkflow(record.workflow.id, user as any, 'Withdrawn by the person who asked');
+        }
+        flash = res.changed ? 'Your request has been withdrawn.' : 'That request was already settled.';
+      } else {
+        flashError = res.error || 'That could not be withdrawn.';
+      }
+    } else if (action === 'decide') {
+      const instanceId = String(form.get('instance_id') || '');
+      const decision = String(form.get('decision') || '');
+      if (decision !== 'approved' && decision !== 'rejected') {
+        flashError = 'That is not a decision we record.';
+      } else {
+        // THE AUTHORITY CHECK LIVES INSIDE decideInstance -> mayAct(). It is asked on the posted
+        // instance id, never on the rendered one, so a stale page cannot decide somebody else's.
+        const res = await decideInstance(
+          instanceId,
+          user as any,
+          decision,
+          String(form.get('note') || ''),
+        );
+        if (res.ok) {
+          flash = decision === 'approved' ? 'Approved.' : 'Rejected, with your note.';
+          // Approved and applied are two facts. Write the day now rather than leaving the person
+          // looking at old numbers under an Approved chip.
+          if (res.state === 'approved') {
+            const correctionRecordId = String(form.get('correction_id') || '');
+            if (correctionRecordId) {
+              const applied = await applyCorrection(correctionRecordId);
+              if (!applied.ok) flashError = applied.error || 'The decision was recorded but the day was not updated.';
+            }
+          }
+        } else {
+          flashError = res.error || 'That decision could not be recorded.';
+        }
+      }
+    } else {
+      flashError = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    flashError = 'We could not do that: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/attendance/corrections] post', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+
+// Reconcile before reading, so an approval decided elsewhere a moment ago is already in the day.
+if (employeeId) await applyApprovedCorrections(employeeId);
+
+const now = await attendanceToday();
+const mine = employeeId ? await correctionsFor(employeeId) : [];
+
+// WHAT IS WAITING ON THIS PERSON. pendingForApprover returns ROUTED AND DELEGATED steps only — a
+// standing capability does not put every request in the company on somebody's personal list, and
+// widening it here would recreate on a queue screen exactly the per-user reach that per-row routing
+// exists to avoid.
+let inbox: any[] = [];
+try {
+  const pending = await pendingForApprover(String(user.id));
+  const attendanceOnly = pending.filter((p) => p.instance.domain === 'attendance');
+  for (const p of attendanceOnly) {
+    const record = await correctionById(String(p.instance.recordId));
+    inbox.push({ pending: p, record });
+  }
+} catch (e: any) {
+  console.error('[portal/attendance/corrections] inbox', e?.cause?.message || e?.message);
+}
+
+const maxDate = now || '';
+const minDate = now ? new Date(new Date(now + 'T00:00:00Z').getTime() - CORRECTION_WINDOW_DAYS * 86400000).toISOString().slice(0, 10) : '';
+---
+
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Attendance corrections - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    html,body{overflow-x:hidden;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;
+      padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
+      padding:10px 16px 2px;margin:0;scrollbar-width:thin;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;
+      border:1px solid #DFDCD8;border-radius:999px;background:#FDFDFC;color:#564E43;
+      font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .tab:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;
+      background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;
+      background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;
+      background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .lab{display:block;margin:10px 0 4px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;
+      background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    textarea.field{min-height:88px;resize:vertical;}
+    .pair{display:flex;flex-wrap:wrap;gap:8px;}
+    .pair > div{flex:1 1 140px;min-width:0;}
+    .go{width:100%;min-height:48px;margin-top:12px;padding:12px 16px;border:1px solid #1B1813;
+      border-radius:10px;background:#1B1813;color:#FFFFFF;font:inherit;font-size:0.9375rem;
+      font-weight:650;cursor:pointer;}
+    .go:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .rows{list-style:none;margin:10px 0 0;padding:0;}
+    .row{padding:11px 13px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;margin-bottom:8px;}
+    .row p{margin:0;font-size:0.875rem;line-height:1.5;overflow-wrap:anywhere;}
+    .row small{display:block;margin-top:4px;font-size:0.75rem;line-height:1.55;color:#70685C;
+      overflow-wrap:anywhere;}
+    .chip{display:inline-block;margin-top:6px;padding:3px 9px;border-radius:999px;font-size:0.6875rem;
+      font-weight:700;letter-spacing:0.03em;border:1px solid #DFDCD8;color:#564E43;background:#F8F8F6;}
+    .chip-ok{border-color:#CBE3D2;background:#F1F8F3;color:#1F5132;}
+    .chip-no{border-color:#EFCFCB;background:#FDF3F2;color:#8A2C21;}
+    .chip-wait{border-color:#CDD8EA;background:#F1F5FB;color:#224E91;}
+    .chip-halt{border-color:#EADECD;background:#FBF7F1;color:#6D470D;}
+    .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;}
+    .act{flex:1 1 120px;min-height:44px;padding:10px 12px;border:1px solid #1B1813;border-radius:8px;
+      background:#1B1813;color:#FFFFFF;font:inherit;font-size:0.8125rem;font-weight:650;cursor:pointer;}
+    .act--soft{border-color:#DFDCD8;background:#FDFDFC;color:#564E43;}
+    .act:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;
+      line-height:1.6;color:#70685C;}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Attendance corrections</h1>
+    <p>Ask for a day to be put right, and decide the ones routed to you.</p>
+  </header>
+
+  <nav class="tabs" aria-label="Attendance">
+    <a class="tab" href="/portal/employee/attendance">Today and this week</a>
+    <a class="tab" href={PATH} aria-current="page">Corrections</a>
+    <a class="tab" href="/portal/employee/attendance/roster">Shifts and roster</a>
+    <a class="tab" href="/portal/employee/calendar">Calendar</a>
+  </nav>
+
+  <main class="wrap">
+    {!gate.ok && (
+      <EmptyState
+        title={gate.title || 'This screen is not available'}
+        body={gate.reason || 'Corrections are recorded against your employee record.'}
+        illustration="note"
+        actionLabel="Back to your workspace"
+        actionHref="/portal/employee"
+      />
+    )}
+
+    {flash && <p class="ok">{flash}</p>}
+    {halted && (
+      <p class="notice">
+        Your request was saved and it is not waiting on anybody yet: {halted} Once that relationship
+        is recorded on the organization graph, the request carries on from where it stopped. Nothing
+        was approved and nothing was guessed.
+      </p>
+    )}
+    {flashError && <p class="bad">{flashError}</p>}
+
+    {inbox.length > 0 && (
+      <section class="card">
+        <h2>Waiting on you</h2>
+        <p>
+          These were routed to you by the organization graph, because it records you as the reporting
+          manager of the person who asked, or because you are standing in for them.
+        </p>
+        <ul class="rows">
+          {inbox.map((item) => (
+            <li class="row">
+              <p>
+                {item.record ? (item.record.employeeName || 'A colleague') : 'A colleague'}
+                {item.record ? ', ' + dayLabel(item.record.workDate) : ''}
+              </p>
+              <small>
+                {item.record ? item.record.reason : 'The correction record could not be read.'}
+              </small>
+              <small>
+                {item.record && item.record.requestedStatus ? 'Asked to be recorded as ' + statusLabel(item.record.requestedStatus) + '. ' : ''}
+                {item.record && item.record.requestedClockIn ? 'Check in ' + clockTime(item.record.requestedClockIn) + '. ' : ''}
+                {item.record && item.record.requestedClockOut ? 'Check out ' + clockTime(item.record.requestedClockOut) + '.' : ''}
+              </small>
+              <span class="chip chip-wait">Routed to you as {viaLabel(item.pending.step.via)}</span>
+              <form method="POST" action={PATH}>
+                <input type="hidden" name="action" value="decide" />
+                <input type="hidden" name="instance_id" value={item.pending.instance.id} />
+                <input type="hidden" name="correction_id" value={item.record ? item.record.id : ''} />
+                <label class="lab" for={'note-' + item.pending.step.id}>A note, if you want to leave one</label>
+                <input class="field" id={'note-' + item.pending.step.id} name="note" type="text"
+                  maxlength="300" autocomplete="off" placeholder="Optional" />
+                <div class="acts">
+                  <button class="act" type="submit" name="decision" value="approved">Approve</button>
+                  <button class="act act--soft" type="submit" name="decision" value="rejected">Reject</button>
+                </div>
+              </form>
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    {gate.ok && (
+      <section class="card">
+        <h2>Ask for a correction</h2>
+        <p>
+          It goes to your reporting manager, resolved from the organization graph. You can ask about
+          a day in the last {CORRECTION_WINDOW_DAYS} days.
+        </p>
+        <form method="POST" action={PATH}>
+          <input type="hidden" name="action" value="request" />
+
+          <label class="lab" for="work_date">Which day</label>
+          <input class="field" id="work_date" name="work_date" type="date" required
+            max={maxDate} min={minDate} />
+
+          <label class="lab" for="status">What it should be recorded as</label>
+          <select class="field" id="status" name="status">
+            <option value="">Leave the status as it is</option>
+            {REQUESTABLE.map((s) => (<option value={s}>{statusLabel(s)}</option>))}
+          </select>
+
+          <div class="pair">
+            <div>
+              <label class="lab" for="in">Check in</label>
+              <input class="field" id="in" name="in" type="time" />
+            </div>
+            <div>
+              <label class="lab" for="out">Check out</label>
+              <input class="field" id="out" name="out" type="time" />
+            </div>
+          </div>
+
+          <label class="lab" for="reason">What happened</label>
+          <textarea class="field" id="reason" name="reason" maxlength="1000" required
+            placeholder="One line is enough. Your manager reads this."></textarea>
+
+          <button class="go" type="submit">Send for approval</button>
+        </form>
+      </section>
+    )}
+
+    {gate.ok && (
+      <section class="card">
+        <h2>Your requests</h2>
+        {mine.length === 0 && (
+          <p>You have not asked for any day to be corrected. That is the ordinary state of things.</p>
+        )}
+        <ul class="rows">
+          {mine.map((c) => (
+            <li class="row">
+              <p>{dayLabel(c.workDate)}</p>
+              <small>{c.reason}</small>
+              <small>
+                {c.requestedStatus ? 'Asked to be recorded as ' + statusLabel(c.requestedStatus) + '. ' : ''}
+                {c.requestedClockIn ? 'Check in ' + clockTime(c.requestedClockIn) + '. ' : ''}
+                {c.requestedClockOut ? 'Check out ' + clockTime(c.requestedClockOut) + '.' : ''}
+              </small>
+              <span class={
+                c.withdrawnAt ? 'chip'
+                : c.workflow && c.workflow.state === 'approved' ? 'chip chip-ok'
+                : c.workflow && c.workflow.state === 'rejected' ? 'chip chip-no'
+                : c.workflow && c.workflow.state === 'halted' ? 'chip chip-halt'
+                : 'chip chip-wait'
+              }>
+                {c.withdrawnAt ? 'Withdrawn' : stateLabel(c.workflow ? c.workflow.state : null)}
+              </span>
+              {c.workflow && c.workflow.state === 'halted' && c.workflow.haltReason && (
+                <small>{c.workflow.haltReason}</small>
+              )}
+              {c.workflow && c.workflow.state === 'approved' && !c.appliedAt && (
+                <small>Approved. The day is being updated; reload in a moment if it still shows the old numbers.</small>
+              )}
+              {c.appliedAt && <small>The day has been updated.</small>}
+              {!c.withdrawnAt && !c.appliedAt && c.workflow && c.workflow.state === 'pending' && (
+                <form method="POST" action={PATH}>
+                  <input type="hidden" name="action" value="withdraw" />
+                  <input type="hidden" name="correction_id" value={c.id} />
+                  <div class="acts">
+                    <button class="act act--soft" type="submit">Withdraw this request</button>
+                  </div>
+                </form>
+              )}
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    <p class="foot">
+      A correction is decided by the person the organization graph routes it to, and by nobody else.
+      Holding a senior job title does not put a request on your list, and no page in this product can
+      approve one on its own. When the graph cannot name an approver the request stops and says which
+      relationship is missing, rather than being approved by default or quietly assigned to whoever
+      happens to be available.
+    </p>
+  </main>
+
+  <BottomNav variant="hr" active="" label="Primary" />
+</body>
+</html>

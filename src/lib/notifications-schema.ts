@@ -27,7 +27,16 @@ export function ensureNotificationsSchema(): Promise<void> {
       await db.execute(sql`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS clicked_at TIMESTAMPTZ`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS notifications_user_id_idx ON notifications(user_id, created_at DESC)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS notifications_unread_idx ON notifications(user_id, is_read) WHERE is_read = false`);
-    } catch (_) { ready = null; }
+    } catch (e: any) {
+      // Dropped from the cache so the next call retries — and LOGGED with the real Postgres reason
+      // (e.message is only the failed SQL). This is now the ONE CREATE of `notifications` in the
+      // repository: four narrower copies used to sit in push.ts, both notifications-recent endpoints
+      // and /aquintutor/notifications, and any of them could win the race on a fresh database and
+      // leave the table without category/priority. If this ensure fails, the bell, the portal poll
+      // and every reader go quiet together, so it may not fail silently.
+      ready = null;
+      console.error('[notifications-schema] ensure failed', e?.cause?.message || e?.message);
+    }
   })();
   return ready;
 }

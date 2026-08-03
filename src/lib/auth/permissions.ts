@@ -166,7 +166,33 @@ export type Permission =
 
   // The salary screen: base_salary, payslips, payroll runs. super_admin + hr, matching the literal
   // role list on /admin/hr/payroll today.
+  // ALSO GATES the salary-component catalogue (/admin/hr/payroll/components), which is where the
+  // rates for provident fund, state insurance, professional tax and withholding are now SET BY AN
+  // ADMINISTRATOR instead of being hardcoded inside the payroll run. That is the same authority this
+  // key already describes — "set salaries, generate payslips" — expressed on a screen rather than in
+  // a constant, so no second key is invented for it.
   | 'payroll.manage'
+  // READING EVERY EXPENSE, TRAVEL AND ADVANCE CLAIM IN THE COMPANY (/admin/hr/payroll/claims),
+  // together with the approval chain each one is walking and the wallet withdrawals routed alongside
+  // them.
+  //
+  // A NEW POWER, WHICH IS WHY IT IS A NEW KEY, and there is no population to preserve: before
+  // src/lib/expenses.ts there was no claim table anywhere in this codebase and no surface that could
+  // list one. So the rule that applies is the one requisitions.approve and community.moderate were
+  // settled by — GRANT TO THE NARROWEST DEFENSIBLE HOLDER and write down why. That is super_admin +
+  // hr, the two roles that already hold payroll.manage and payouts.approve, i.e. the people who
+  // already see what every employee is paid. Nobody else holds it and nothing is widened.
+  //
+  // IT CONFERS NO APPROVAL, AND MUST NOT BE READ AS ONE. Deciding a claim happens in
+  // src/lib/workflow.ts, where the `expenses` and `travel` domains deliberately declare
+  // `capability: null` — only the person the Organization Graph ROUTED to, or their in-force
+  // delegate, may decide. Holding this key means watching the queue, not acting on it. Mapping those
+  // domains onto a standing capability would hand every holder authority over every claim in the
+  // company, which is exactly the per-user reach that per-row routing exists to remove.
+  //
+  // SENSITIVE in registry.ts: a claim names what a colleague spent money on, medical claims included,
+  // so a grant of it is written strictly and rolled back if the audit row cannot be written.
+  | 'expenses.review'
   // A restricted exam's question bank. Named to match the `tests_restricted` SECTION KEY that
   // already exists in src/lib/admin-sections.ts ("Restricted Exams — Designated-authority only")
   // rather than inventing a second spelling for the same authority. See the dedupe note below.
@@ -177,7 +203,217 @@ export type Permission =
   // Approving a hiring requisition (src/lib/hr-requisition.ts decideRequisition).
   | 'requisitions.approve'
   // Acting on the live-classroom moderation queue (src/lib/moderation.ts).
-  | 'community.moderate';
+  | 'community.moderate'
+  // =============================================================================================
+  // PROCUREMENT — the purchasing console and the vendor list.
+  //
+  // NEITHER OF THESE APPROVES ANYTHING, and that is the load-bearing part. A purchase request is
+  // approved by the people the ORGANIZATION GRAPH names for that requester — their reporting
+  // manager, their department head, and an executive sponsor at or above the amount declared on the
+  // chain — resolved per ROW by src/lib/workflow.ts. That engine's `procurement` domain carries
+  // `capability: null` on purpose, so NO key in this union confers standing authority over somebody
+  // else's purchase request, and neither of these two is a way to acquire one. Only the person the
+  // graph routed to, or their in-force delegate, may decide.
+  //
+  //   procurement.view    open /admin/procurement: every request in the company, the approval chain
+  //                       each is in, and the orders raised against them.
+  //   procurement.manage  raise a purchase order against an ALREADY-APPROVED request, confirm a
+  //                       receipt (including the asset tag), and add or retire a vendor.
+  //
+  // SPLIT ON THE EXACT PRECEDENT OF payouts.approve / payouts.pay: the same two roles hold both
+  // today, and they are still two keys, so that a future grant can separate reading the purchasing
+  // record from committing the company to a supplier without a code change.
+  //
+  // GRANTED TO super_admin AND hr, which is who holds the equivalent authority over company money
+  // today: `hr` is the only built-in role below super_admin carrying `finance` and `payouts` in
+  // ROLE_SECTIONS, and /admin/finance has been super_admin + hr since it was written. This records
+  // the population the product already has; it does not invent a wider one.
+  //
+  // THE CONSOLE ALSO ACCEPTS canAccessSection(user, 'finance', 'edit'), for the same reason
+  // /admin/hr/leave/workflow accepts the `leave` section: a CUSTOM role holding the finance section
+  // resolves through the registry as `finance.edit` and NEVER as `procurement.view`, so gating on
+  // the capability alone would remove access from every custom role that has it today. Accepting
+  // either is the documented way to convert without narrowing.
+  //
+  // WHAT THESE KEYS DELIBERATELY DO NOT GATE: an employee raising a purchase request for themselves
+  // and watching it move. That is a self-scoped fact about the signed-in person, narrowed in the
+  // WHERE clause by their own user id, and gating it would lock out exactly the people it is for —
+  // an employee's account frequently carries the `applicant` role, which holds nothing at all.
+  | 'procurement.view' | 'procurement.manage'
+  // =============================================================================================
+  // WORKPLACE SERVICES - helpdesk, asset register, document library.
+  //
+  // THERE IS NO EQUIVALENT AUTHORITY TO PRESERVE, and that is a fact about the codebase rather than
+  // an assumption: before these three modules there was no ticket table anywhere, no asset register
+  // (only hr_separation.assets_returned - one boolean, with nothing behind it), and no company
+  // document library at all. src/lib/workforce/navigation.ts NAV_BACKLOG stated the last of those
+  // in as many words. So there is no population to reproduce, and the rule that applies is the one
+  // requisitions.approve and community.moderate were settled by: GRANT TO THE NARROWEST DEFENSIBLE
+  // HOLDER and write down why, rather than reproduce an accident or invent a wide grant.
+  //
+  // NARROWEST DEFENSIBLE = super_admin + hr, matching the two new admin sections ('helpdesk',
+  // 'assets') added to ROLE_SECTIONS below, so the sidebar, the page gate and the capability all
+  // admit the same people. UNLIKE requisitions.approve and community.moderate, every key here is
+  // ENFORCED at its call sites from the day it ships: the admin surfaces refuse without it, and
+  // every write re-checks it against the posted id rather than the rendered one.
+  //
+  // WHAT THESE KEYS DELIBERATELY DO NOT GATE: an employee raising a ticket, seeing the assets
+  // issued to them, or reading a document shared with them. Those are self-scoped facts about the
+  // signed-in person, resolved from their own hr_employees row and narrowed in the WHERE clause.
+  // Gating them on a capability would lock out exactly the people they exist for - an employee's
+  // account frequently carries the `applicant` role, which holds nothing at all.
+  // =============================================================================================
+
+  // Every ticket on every desk: read it, assign it, move it through its states, resolve and close
+  // it. An IT ticket carries device and account detail and an HR ticket carries whatever somebody
+  // felt unable to say to their own manager, so this is not a read to hand out widely.
+  | 'helpdesk.manage'
+  // The asset register: record an asset, issue it to somebody, take it back, log damage, retire it.
+  // It is also a claim about a person ("Priya holds laptop LAP-014"), which is why it is one named
+  // authority rather than an open hardware list.
+  | 'assets.manage'
+  // The company document library: folders, categories, retention, and sharing a document beyond the
+  // people it was shared with. NOT the power to APPROVE a document - that is routed per document
+  // through the Organization Graph by src/lib/workflow.ts, and holding this key confers no approval
+  // over anybody. Publishing what an approval already settled is this key; deciding it is not.
+  | 'documents.manage'
+  // =============================================================================================
+  // WORKING TIME AND AGGREGATE REPORTING (src/lib/attendance.ts, src/lib/analytics-workforce.ts).
+  //
+  // NEITHER OF THESE APPROVES ANYTHING. An attendance correction is routed per ROW through
+  // src/lib/workflow.ts in the `attendance` domain, whose definition carries `capability: null` — so
+  // no key in this union confers standing authority over one, and holding either of these puts
+  // nobody on an approval route. The reporting manager the ORGANIZATION GRAPH names decides it, and
+  // their in-force delegate may stand in.
+  // =============================================================================================
+  //
+  // DEFINING WORKING TIME: shifts, who is rostered on which one, the holiday list, and the QR
+  // stations a punch may be scanned at (/portal/employee/attendance/roster).
+  //
+  // POPULATION, DERIVED FROM THE AUTHORITY IT SITS BESIDE. None of these objects existed before, so
+  // there is no rule to preserve exactly, and the settled approach for that case — the one
+  // requisitions.approve, community.moderate and the workplace-services keys above were decided by —
+  // is GRANT TO THE NARROWEST DEFENSIBLE HOLDER AND WRITE DOWN WHY. That is whoever already
+  // administers attendance: the `attendance` section in ROLE_SECTIONS below, held by `hr` alone among
+  // the built-in roles, plus super_admin who is unrestricted there. Those two, and nobody else.
+  //
+  // WHY NOT AN EXISTING KEY. `employee.manage` means "administer people records", and a shift pattern
+  // is not a people record; reusing it would hand rostering to a population chosen for a different
+  // power and make a future narrowing of either impossible without moving the other.
+  // `department.lead` is a SCOPING signal about one department, not authority over the organization's
+  // working-time definitions.
+  //
+  // EVERY EMPLOYEE STILL READS THEIR OWN SHIFT AND THE HOLIDAY LIST without holding this. Those are
+  // facts about their own working life, and the read half of that screen is gated on their employee
+  // record rather than on this key.
+  | 'attendance.roster.manage'
+  // OPENING THE WORKFORCE ANALYTICS CONSOLE (/admin/analytics): headcount, department, attendance,
+  // leave, recruitment and performance — AGGREGATE ONLY, suppressed below the platform minimum group
+  // size, with no row-per-person query behind any of it and no drill-down to one.
+  //
+  // POPULATION: super_admin + hr, the same two who hold `employee.manage` and can therefore already
+  // read every individual employee record one at a time on /admin/hr/employees. So this grants
+  // sight of nothing new — it offers the aggregate instead of the row, which is the NARROWER
+  // artefact.
+  //
+  // ITS OWN KEY RATHER THAN employee.manage, BECAUSE THE AUDIT LINE MATTERS. "Opened the analytics
+  // console" and "administered an employee record" are different acts, and a log that describes one
+  // as the other misdescribes what happened. It also means a future grant of read-only aggregate
+  // reporting to, say, a department head need not come bundled with the power to edit people's
+  // records.
+  //
+  // THE PAGE MUST ASK FOR IT, AND DOES. src/middleware.ts has no section key for /admin/analytics,
+  // so the only structural gate on that URL is canOpenAdmin() — which admits every admin-capable
+  // role, including the `editor` that offer letters once handed to interns. can(user,
+  // 'analytics.view') on the page is therefore the real gate rather than a second belt.
+  //
+  // WHAT NO GRANT OF THIS EVER BUYS: individual health or wellness data. Nothing behind this
+  // capability queries wellness_* at all — that is enforced by the absence of the query in
+  // src/lib/analytics-workforce.ts, not by a permission check somebody could widen later.
+  | 'analytics.view'
+  // =============================================================================================
+  // THE EMPLOYEE REFERRAL PROGRAMME (src/lib/referrals.ts).
+  //
+  // TWO KEYS, AND NEITHER OF THEM APPROVES A PAYMENT. A referral reward is decided by the people the
+  // ORGANIZATION GRAPH names for the referrer, routed per ROW through src/lib/workflow.ts in the
+  // `recruitment` domain — whose definition carries `capability: null`, so no key in this union
+  // confers standing authority over somebody else's reward. `referrals.reward` is the power to
+  // RECORD an amount and to SEND it for approval; the decision belongs to the routed approver or
+  // their in-force delegate, and releasing the money is still `payouts.pay` in the payouts console.
+  //
+  //   referrals.view    open /admin/recruitment/referrals: every referral, who referred whom, the
+  //                     candidate's name, email and CV link, and where the reward has got to.
+  //   referrals.reward  record that a referral earns an amount, and send that amount into approval.
+  //
+  // HOW THE GRANTS WERE DERIVED, given that no referral programme existed to preserve a population
+  // from. Each key is matched to the EXISTING key whose holders already hold the same class of
+  // information or authority, so nobody gains a power they did not already have in another form:
+  //
+  //   referrals.view   -> the holders of `applications.view` (super_admin, hr, recruiter, reviewer,
+  //                       department_head). A referral record is a candidate's name, email address
+  //                       and CV link — exactly the class of data those five already read on
+  //                       /admin/applications, and the referral console is a view of the same
+  //                       pipeline from a different end. Granting it more narrowly would hide from a
+  //                       reviewer a candidate whose full application they can already open.
+  //   referrals.reward -> the holders of `payouts.approve` (super_admin, hr). Putting a number on a
+  //                       payment that will later leave the company is money-adjacent, and those two
+  //                       are who the product already trusts with that class of act. `recruiter`
+  //                       deliberately does NOT hold it: a recruiter may see the programme and may
+  //                       not price it.
+  //
+  // AN EMPLOYEE SUBMITTING A REFERRAL HOLDS NEITHER, AND MUST NOT NEED TO. That surface
+  // (/portal/employee/referrals) is self-scoped to the signed-in person's own referrals and is gated
+  // on HAVING AN EMPLOYEE RECORD, which is a fact about a row rather than a capability. Gating it on
+  // a key would lock out exactly the people the programme is for — an employee's account frequently
+  // carries the `applicant` role, which holds nothing at all.
+  //
+  // ASK FOR THESE WITH can(), NEVER hasPermission(). `referrals` is not a section key in
+  // src/lib/admin-sections.ts, so seedCatalogueRows() derives nothing — but page_key is free text, so
+  // a hand-typed row could spell `referrals.view`, and a registry-based check would then admit a
+  // custom role nobody deliberately granted candidate contact details to.
+  | 'referrals.view' | 'referrals.reward'
+
+  // =============================================================================================
+  // PERFORMANCE, SKILLS AND LEARNING. Three keys, and each one is deliberately NARROW because the
+  // authority they do NOT carry is the whole point of the design.
+  //
+  // WHAT THESE KEYS ARE NOT. None of them makes anybody a manager. "Sees this person's goals",
+  // "writes their appraisal", "assesses their skills", "assigns them a course" are per-ROW facts
+  // resolved from the Organization Graph (src/lib/org-graph.ts isReportingManager /
+  // getDirectReports / getReviewers / isResponsibleFor), exactly as the note above this matrix says
+  // a reporting-manager authority must be. Granting one of these in order to "cover managers" would
+  // hand every holder authority over every employee — the widest change available in this file, and
+  // the precise regression Phase 1 removed.
+  //
+  // So each key means "across the whole organization, without a relationship" — the HR desk's job.
+  //
+  // NEITHER APPROVES AN APPRAISAL. src/lib/workflow.ts declares the `appraisal` domain with
+  // `capability: null`, so only the person the graph ROUTED to (the department head), or their
+  // in-force delegate, may sign one off. `performance.manage` gates RUNNING a cycle and calibrating
+  // it; making it standing authority on that chain would let the calibration desk approve its own
+  // calibration, which is not a second look.
+  //
+  // POPULATION, DERIVED NOT INVENTED. All three are granted to super_admin + hr, which is exactly
+  // who can reach the surfaces they gate today: /admin/hr/performance and /admin/hr/training fall
+  // under the `hr` and `training` sections in PATH_SECTION (src/middleware.ts), and ROLE_SECTIONS
+  // below gives both sections to `hr` alone (super_admin is unrestricted). Nobody gains anything.
+  //
+  // ASK FOR THESE WITH can(), NEVER hasPermission(). There is no `performance`, `skills` or
+  // `learning` section in src/lib/admin-sections.ts, so seedCatalogueRows() derives nothing — but
+  // page_key is free text, so a hand-typed row could spell one of them and a registry-based check
+  // would admit a custom role nobody deliberately granted appraisal ratings to.
+  // =============================================================================================
+
+  // Run appraisal cycles for the whole organization: open a cycle, move it between self-assessment,
+  // manager review and calibration, adjust a rating for somebody who does not report to you, and
+  // record an outcome. A reporting manager writes their OWN reports' reviews through the graph.
+  | 'performance.manage'
+  // Maintain the skill catalogue, and record a skill level for somebody who is not your report. An
+  // employee always records their own; a manager records their reports'. Neither needs this.
+  | 'skills.manage'
+  // Assign a course to anybody in the organization, and schedule the training calendar. A manager
+  // assigns to their own reports through the graph; this is the org-wide version.
+  | 'learning.assign';
 
 // Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
 // drifting away from the real one (/admin/access-preview). Nothing outside this file may decide
@@ -390,6 +626,9 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'reports.export',
     // /admin/hr/payroll lists ['super_admin','hr'] literally.
     'payroll.manage',
+    // EXPENSE, TRAVEL AND ADVANCE CLAIMS — a read of the whole queue, and no authority to decide one.
+    // No prior population to preserve: there was no claim table before src/lib/expenses.ts.
+    'expenses.review',
     // /admin/tests/[id] admits super_admin || hr, but hr never reaches the line (no 'tests' section).
     'tests_restricted.view',
     // NOT population-preserving, and granted narrowly on purpose — see the note on `hr` below.
@@ -397,7 +636,31 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // NO RULE EXISTS TO PRESERVE at either call site. Granted to the narrowest defensible holder and
     // reported: enforcing them is a policy decision, and neither call site may be converted until a
     // human has made it.
-    'requisitions.approve', 'community.moderate'
+    'requisitions.approve', 'community.moderate',
+    // PROCUREMENT. A read of the purchasing record, and the authority to commit an ALREADY-APPROVED
+    // request to a supplier. Neither decides an approval — routing does that, per request, from the
+    // Organization Graph. No prior population to preserve: there was no purchasing module.
+    'procurement.view', 'procurement.manage',
+    // WORKPLACE SERVICES. No prior authority to preserve - there was no helpdesk, no asset
+    // register and no document library anywhere in this codebase. Granted to the narrowest
+    // defensible holder, and enforced at every call site from day one.
+    'helpdesk.manage', 'assets.manage', 'documents.manage',
+    // WORKING TIME AND AGGREGATE REPORTING. Narrowest defensible holders, matching whoever already
+    // administers attendance and whoever already reads every employee record one at a time. Neither
+    // key approves anything: an attendance correction routes per row from the Organization Graph.
+    'attendance.roster.manage', 'analytics.view',
+    // REFERRALS. Matched to the holders of applications.view and payouts.approve respectively — see
+    // the derivation above the union. Neither key approves a payment.
+    'referrals.view', 'referrals.reward',
+    // PERFORMANCE, SKILLS AND LEARNING. These three were DOCUMENTED as "granted to super_admin + hr"
+    // in four places — the union comment above, and the gate headers of /admin/hr/performance/cycles,
+    // /skills and /learning — but were listed under `hr` alone. can() reads PERMS_BY_ROLE and has no
+    // wildcard branch for super_admin, so the founder was refused every write on all three consoles:
+    // the page opened (admin.access passes) and then every save redirected back with the "you do not
+    // hold this desk" panel. Adding them here makes the code match the population every one of those
+    // comments already claims. Nobody but super_admin gains anything, and super_admin is unrestricted
+    // in the section filter these pages also sit behind.
+    'performance.manage', 'skills.manage', 'learning.assign'
   ],
   hr: [
     'admin.access',
@@ -422,6 +685,10 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // role holding the 'payroll' section in ROLE_SECTIONS, so it reaches the page and passes the
     // line. Exact population, named instead of spelled.
     'payroll.manage',
+    // The claims queue. Same reasoning as the super_admin grant above: HR already sees every salary
+    // and already decides every withdrawal on /admin/hr/wallet, so a read of the claim queue adds no
+    // reach they do not have. It still confers no approval — routing decides that, per claim.
+    'expenses.review',
     // NOT POPULATION-PRESERVING, AND THE ONLY GRANT IN THIS FILE THAT ISN'T. /admin/sos.astro has no
     // role check at all (its only test is `if (!user)`) and no PATH_SECTION entry, so TODAY every
     // admin-capable role reaches it: super_admin, hr, recruiter, reviewer, department_head,
@@ -436,7 +703,32 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // remove recruiter, reviewer, department_head, marketing, editor and every custom admin.access
     // role from an emergency screen. Get that approved first; the grant is ready and inert until
     // then.
-    'safety.respond'
+    'safety.respond',
+    // `hr` is the only built-in role holding the 'hr' and 'training' sections in ROLE_SECTIONS, so it
+    // is the only non-super_admin role that reaches /admin/hr/performance and /admin/hr/training
+    // today. Exact population, named instead of spelled — nobody gains and nobody loses.
+    'performance.manage', 'skills.manage', 'learning.assign',
+    // PROCUREMENT. `hr` is the only built-in role below super_admin holding the `finance` and
+    // `payouts` sections in ROLE_SECTIONS, and /admin/finance has been super_admin + hr since it was
+    // written — so the people who already handle company money handle the purchasing record too.
+    // The console accepts EITHER this key or the `finance` section, so no custom role that can open
+    // /admin/finance today is shut out of the purchasing console tomorrow.
+    'procurement.view', 'procurement.manage',
+    // WORKPLACE SERVICES. The people desk already answers, informally, the questions these
+    // three modules formalise - who is holding which laptop, what the joining paperwork says,
+    // and whatever an employee could not raise with their own manager. `hr` is also the only
+    // built-in role holding the matching 'helpdesk' and 'assets' sections in ROLE_SECTIONS
+    // below, so the sidebar, the page gate and the capability admit exactly the same accounts.
+    'helpdesk.manage', 'assets.manage', 'documents.manage',
+    // WORKING TIME AND AGGREGATE REPORTING. `hr` is the only built-in role holding the `attendance`
+    // section in ROLE_SECTIONS below, so it is already the role that administers attendance; and it
+    // holds employee.manage, so it can already read every employee record one at a time. Both keys
+    // record authority this role has in substance today. Neither puts anybody on an approval route.
+    'attendance.roster.manage', 'analytics.view',
+    // REFERRALS. `hr` holds payouts.approve, so it holds referrals.reward: putting a number on a
+    // referral bonus is the same class of act as approving a withdrawal, and the same two accounts
+    // already do it. It still approves nothing — the reward routes through the workflow engine.
+    'referrals.view', 'referrals.reward'
   ],
   recruiter: [
     'admin.access',
@@ -445,12 +737,20 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // A recruiter can see who is checking a candidate's letter, but answering on the record is
     // HR's call — read-only here.
     'offers.view',
+    // The referral programme is a view of the hiring pipeline from the employee end, holding the
+    // same class of candidate detail this role already reads on /admin/applications. NOT
+    // 'referrals.reward': a recruiter may see the programme and may not price it.
+    'referrals.view',
     ...INTERNAL_ROLE_KEYS
   ],
   reviewer: [
     'admin.access',
     'roles.view',
     'applications.view', 'applications.score',
+    // Same reasoning as recruiter, one step narrower: a reviewer already opens the full application
+    // of anybody in this list, so hiding the referral that produced it would be a distinction
+    // without a difference. No reward authority.
+    'referrals.view',
     ...INTERNAL_ROLE_KEYS
   ],
   department_head: [
@@ -466,6 +766,9 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // and requireTeamLead() refuses an intern record outright; both conditions are per-PERSON, they
     // survive this grant, and a conversion must keep them.
     'department.lead',
+    // Holds applications.view, so it holds this: a department head reads the applications for their
+    // own hiring and the referral console is the same pipeline seen from the employee end.
+    'referrals.view',
     ...INTERNAL_ROLE_KEYS
   ],
   marketing: [
@@ -578,6 +881,7 @@ const ROLE_SECTIONS: Record<string, string[]> = {
   hr: [
     'dashboard', 'applications', 'offers', 'messages', 'dms', 'discussion',
     'hr', 'employees', 'leave', 'attendance', 'payroll', 'payouts', 'training', 'finance',
+    'helpdesk', 'assets',
     'roles', 'departments', 'interviews', 'interviews_manual', 'interviews_ai',
     'events', 'content', 'custom_offer',
   ],

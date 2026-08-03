@@ -544,6 +544,77 @@ export async function getMentor(
 }
 
 /**
+ * Who reviews this employee's work? The `reviewer` edge, read in the ordinary direction.
+ *
+ * ADDED FOR 360 FEEDBACK, and added HERE rather than in the module that needed it. The vocabulary
+ * already carried 'reviewer' ("subject reviews object's work for a cycle in scope_id") and
+ * RESPONSIBILITY_TYPES already counted it, but no resolver existed — so the alternative was a second
+ * query against org_relationships written from outside this file, which is exactly the drift the
+ * header forbids. Two modules resolving one relationship is how they start disagreeing about it.
+ *
+ * `scopeId` narrows to one review cycle when the edge was recorded with one. Omit it for every
+ * reviewer regardless of cycle. An edge recorded with NO scope answers on both paths, because a
+ * standing reviewer is a reviewer for whatever cycle is running.
+ */
+export async function getReviewers(
+  employeeId: string,
+  opts?: AsOfOptions & { scopeId?: string | null },
+): Promise<OrgPerson[]> {
+  if (!isUuid(employeeId)) return [];
+  const at = asOfIso(opts);
+  if (!at) return [];
+  const scope = opts?.scopeId ? String(opts.scopeId).trim() : null;
+  try {
+    await ensureOrgGraphSchema();
+    const r = await db.execute(sql`
+      SELECT ${PERSON_COLS}
+        FROM org_relationships r
+        JOIN hr_employees e ON e.id = r.subject_employee_id
+       WHERE r.type = 'reviewer'
+         AND r.object_employee_id = ${employeeId}::uuid
+         AND (${scope}::text IS NULL OR r.scope_id IS NULL OR r.scope_id = ${scope}::text)
+         AND ${inForce('r', at)}
+       ORDER BY e.full_name ASC`);
+    return rows(r).map(mapPerson);
+  } catch (e: any) {
+    logFail('getReviewers', e);
+    return [];
+  }
+}
+
+/**
+ * Whose work does this employee review? The INVERSE of getReviewers, and it needs to exist for the
+ * same reason getDirectReports exists alongside getManager: a reviewer opening their own screen asks
+ * "what do I owe", which is the other end of the same edge.
+ */
+export async function getReviewSubjects(
+  reviewerEmployeeId: string,
+  opts?: AsOfOptions & { scopeId?: string | null },
+): Promise<OrgPerson[]> {
+  if (!isUuid(reviewerEmployeeId)) return [];
+  const at = asOfIso(opts);
+  if (!at) return [];
+  const scope = opts?.scopeId ? String(opts.scopeId).trim() : null;
+  try {
+    await ensureOrgGraphSchema();
+    const r = await db.execute(sql`
+      SELECT ${PERSON_COLS}
+        FROM org_relationships r
+        JOIN hr_employees e ON e.id = r.object_employee_id
+       WHERE r.type = 'reviewer'
+         AND r.subject_employee_id = ${reviewerEmployeeId}::uuid
+         AND r.object_employee_id IS NOT NULL
+         AND (${scope}::text IS NULL OR r.scope_id IS NULL OR r.scope_id = ${scope}::text)
+         AND ${inForce('r', at)}
+       ORDER BY e.full_name ASC`);
+    return rows(r).map(mapPerson);
+  } catch (e: any) {
+    logFail('getReviewSubjects', e);
+    return [];
+  }
+}
+
+/**
  * Who owns approvals for a domain — optionally for one named employee?
  *
  * `domain` is a free string held in scope_id ('leave', 'payouts', ...). A row with

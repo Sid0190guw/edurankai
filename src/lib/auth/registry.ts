@@ -328,7 +328,22 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
   'payroll.manage': {
     label: 'Run payroll',
     group: 'Finance',
-    description: 'Open the payroll screen and set salaries, generate payslips and mark a month paid. It reads and writes base salary, which is the most sensitive number on an employee\'s record after their health data.',
+    description: 'Open the payroll screen and set salaries, generate payslips and mark a month paid. It also sets the salary components every payslip is built from, including the rates used for provident fund, state insurance, professional tax and withholding — the product computes those from the rates you enter and makes no claim that they are correct for your jurisdiction. It reads and writes base salary, which is the most sensitive number on an employee\'s record after their health data.',
+    sensitive: true,
+  },
+  // MONEY, AND SOMEBODY ELSE\'S SPENDING. Sensitive for two separate reasons: a claim queue is a
+  // running record of what colleagues buy, where they travel and when they are ill (a medical
+  // reimbursement names the category on its face), and it is the screen a finance team works the
+  // company\'s outgoings from.
+  //
+  // WHAT IT IS NOT: permission to approve anything. The `expenses` and `travel` workflow domains
+  // declare no standing capability at all, on purpose, so a claim can only be decided by the person
+  // the Organization Graph routed it to or their in-force delegate. Granting this to a role does not
+  // place that role in a single approval chain.
+  'expenses.review': {
+    label: 'Review expense and travel claims',
+    group: 'Finance',
+    description: 'Open the claims console and read every expense, travel and advance request raised by anyone in the company: the amount, the category, the receipt link, and who each one is currently waiting on. That includes medical reimbursements, which name a colleague and a health-related spend on the same row. It does NOT let you approve, reject or pay anything — every claim is decided by the approver the Organization Graph routes it to, and holding this key does not put you in that chain.',
     sensitive: true,
   },
   // Same key the `tests_restricted` SECTION already spells (src/lib/admin-sections.ts:57,
@@ -358,6 +373,51 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     description: 'Read the moderation queue and act on what is in it: remove a message, allow it, mute or remove somebody from a room. Some of the people involved are minors. NOT ENFORCED ANYWHERE YET: the moderation library records who acted but checks nobody, so granting this changes nothing until the check is added.',
     sensitive: true,
   },
+  // ---------------------------------------------------------------------------------------------
+  // PROCUREMENT. Two keys, and neither of them approves anything.
+  //
+  // A purchase request is approved by the people the Organization Graph names for THAT requester,
+  // per row, by src/lib/workflow.ts — whose `procurement` domain carries no standing capability at
+  // all. So an admin reading these descriptions should read them as what they say: seeing what the
+  // company is buying, and committing an already-approved request to a supplier. Neither is a way to
+  // sign off somebody else's request, and granting both to a role does not make its holders
+  // approvers of anything.
+  // ---------------------------------------------------------------------------------------------
+  'procurement.view': {
+    label: 'See what the company is buying',
+    group: 'Finance',
+    description: 'Open the purchasing console: every purchase request anybody has raised, what it costs, the justification behind it, the approval chain it is in and who it is currently waiting on, plus every purchase order and receipt. It shows spending across the whole organization, not one team. It does NOT let the holder approve a request — approval is routed to the requester\'s own manager and department head.',
+  },
+  'procurement.manage': {
+    label: 'Raise purchase orders and manage vendors',
+    group: 'Finance',
+    description: 'Turn an ALREADY-APPROVED purchase request into a purchase order against a supplier, confirm that the item arrived and record its asset tag, and add or retire a vendor. This commits the company to a supplier, so it is separate from merely reading the purchasing record — the same split as approving a withdrawal versus releasing the money. It still confers no approval over anybody\'s request.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // PERFORMANCE, SKILLS AND LEARNING. Read the description of each one as what it SAYS: "across the
+  // whole organization, without a relationship". None of them makes the holder anybody's manager —
+  // seeing one person's goals, writing their appraisal or assigning them a course is resolved from
+  // the Organization Graph per ROW, and a capability cannot express "this person and not that one".
+  // Granting one of these to cover managers hands every holder authority over every employee.
+  // ---------------------------------------------------------------------------------------------
+  'performance.manage': {
+    label: 'Run appraisal cycles for everyone',
+    group: 'People',
+    description: 'Open and close appraisal cycles, move a cycle between self-assessment, manager review and calibration, adjust a rating for somebody who does not report to you, and record an outcome. A reporting manager writes their own reports\' reviews through the reporting line and needs none of this.',
+    sensitive: true,
+  },
+  'skills.manage': {
+    label: 'Maintain the skill catalogue',
+    group: 'People',
+    description: 'Add, describe and retire skills, and record a skill level for anybody in the organization. Employees always record their own; a manager records their reports\'. This is the org-wide version, and it is what the department skill matrix is read with.',
+  },
+  'learning.assign': {
+    label: 'Assign learning to anyone',
+    group: 'People',
+    description: 'Assign a course to any employee with a due date, and schedule or cancel anything on the training calendar. A manager assigns to their own reports through the reporting line; this is the version that reaches the whole organization. EduRankAI is the technology platform — accredited partners award the credentials.',
+  },
   'settings.view': { label: 'View settings', group: 'System', description: 'See platform configuration.' },
   'settings.edit': {
     label: 'Edit settings',
@@ -369,6 +429,65 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     label: 'Read the audit log',
     group: 'System',
     description: 'Read the record of who did what. Granting it is itself worth recording.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // WORKPLACE SERVICES. Three keys, three admin surfaces, and each description says what the holder
+  // will actually be looking at - because "manage the helpdesk" reads like a chore and the thing
+  // behind it is other people's problems in their own words.
+  // ---------------------------------------------------------------------------------------------
+  'helpdesk.manage': {
+    label: 'Run the helpdesk',
+    group: 'People',
+    description: 'Open every ticket on every desk - IT, HR, Finance, Admin and asset requests - and act on it: assign it, move it through its states, resolve it and close it. An IT ticket carries device, account and access detail; an HR ticket often carries something the person did not feel able to raise with their own manager. Grant it to the people who actually answer tickets.',
+    sensitive: true,
+  },
+  'assets.manage': {
+    label: 'Keep the asset register',
+    group: 'People',
+    description: 'Record company equipment and licences, issue them to named employees, take them back, log damage and retire them. As well as a hardware list this is a claim about people - who is holding what, and since when - and it is what a separation checklist is settled against.',
+  },
+  'documents.manage': {
+    label: 'Curate the document library',
+    group: 'Content',
+    description: 'Create folders and categories, set retention, publish an approved document and share one beyond the people it was shared with. Documents here are links, never uploads. This key does NOT confer approval of a document: that is routed per document through the Organization Graph, so a curator with no relationship to the owner approves nothing.',
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // WORKING TIME AND AGGREGATE REPORTING. Neither key approves anything: an attendance correction is
+  // routed per row through src/lib/workflow.ts in the `attendance` domain, which carries no standing
+  // capability at all, so the reporting manager the Organization Graph names decides it and their
+  // in-force delegate may stand in. The derivation of both grant sets is written above PERMS_BY_ROLE
+  // in src/lib/auth/permissions.ts.
+  // ---------------------------------------------------------------------------------------------
+  'attendance.roster.manage': {
+    label: 'Define shifts, rosters and holidays',
+    group: 'People',
+    description: 'Define working-time patterns, put people on them from a date, record the holiday calendar, and register the QR stations a check-in can be scanned at. It sets what is EXPECTED of a working day; it decides no request and puts nobody on an approval route. Every employee reads their own shift and the holiday list without this. A scan or a location recorded beside a punch is evidence for a person to read, never a rule: nothing in the attendance module can refuse a punch, mark one as suspicious or reduce anybody\'s hours from a signal.',
+  },
+  'analytics.view': {
+    label: 'Open workforce analytics',
+    group: 'People',
+    description: 'Open the aggregate reporting console: headcount, departments, attendance, leave, recruitment and performance. AGGREGATE ONLY — every query behind it is a count, an average or a breakdown, none of them returns a row per person, and there is no drill-down to one. Anything covering fewer than the platform minimum group size is withheld, and its breakdown total is withheld with it so the missing number cannot be subtracted back out. No individual health or wellness data is read behind this key by anybody, including the founder; that is enforced by the absence of the query rather than by this permission.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // THE EMPLOYEE REFERRAL PROGRAMME. Two keys, neither of which approves a payment — the reward is
+  // routed per referrer through the Organization Graph by src/lib/workflow.ts, whose `recruitment`
+  // domain carries no standing capability at all. The full derivation of both grant sets is written
+  // above PERMS_BY_ROLE in src/lib/auth/permissions.ts.
+  // ---------------------------------------------------------------------------------------------
+  'referrals.view': {
+    label: 'View employee referrals',
+    group: 'Hiring',
+    description: 'Open the referral programme: who referred whom, the candidate\'s name, email address and CV link, and where each referral has got to in the pipeline. The same class of candidate detail as the applicant pipeline itself, reached from the employee end.',
+  },
+  'referrals.reward': {
+    label: 'Price and submit a referral reward',
+    group: 'Hiring',
+    description: 'Record that a referral earns an amount, and send that amount into approval. It does NOT approve the reward and it does NOT pay it: the decision belongs to whoever the Organization Graph routes the request to, and releasing the money is a separate permission in the payouts console. Whoever holds this decides what a referral is worth, so grant it where pricing a payment is genuinely part of the job.',
     sensitive: true,
   },
 };

@@ -159,6 +159,53 @@ export const WORKFLOW_DOMAINS = [
   'procurement',
   'recruitment',
   'travel',
+  // ---------------------------------------------------------------------------------------------
+  // THE EMPLOYEE LIFECYCLE. Added, not forked.
+  //
+  // Every one of these four changes WHO REPORTS TO WHOM or WHAT SOMEONE IS, which is exactly the
+  // class of change that must never be a bare UPDATE. They are declared HERE, in the one approval
+  // engine, rather than in a second engine inside the HR modules: a lifecycle change routed by its
+  // own private chain would be a parallel workflow system, and the two would disagree about who
+  // approves a transfer within a month.
+  //
+  // Adding a member to this array is an ADDITIVE edit — DOMAINS below is
+  // `Record<WorkflowDomain, DomainDefinition>`, so TypeScript refuses to compile until each new
+  // domain has a real chain. There is no way to add a domain here and forget to route it.
+  // ---------------------------------------------------------------------------------------------
+  'contract',
+  'transfer',
+  'promotion',
+  'separation',
+  // ---------------------------------------------------------------------------------------------
+  // PERFORMANCE. One domain, and deliberately only one.
+  //
+  // `appraisal` is the SIGN-OFF on a completed appraisal review — the moment a rating stops being a
+  // draft in a manager's head and becomes something the employee is told and the record carries.
+  //
+  // THERE IS NO SECOND PROMOTION DOMAIN, and that absence is the design. A promotion recommendation
+  // coming out of an appraisal routes through the `promotion` chain declared above — the lifecycle
+  // console's chain, unchanged — because "who signs off a promotion" must have exactly one answer in
+  // this product. The performance module namespaces its record id so the two cannot collide on
+  // (domain, record_id); it does not fork the chain.
+  // ---------------------------------------------------------------------------------------------
+  'appraisal',
+  // ---------------------------------------------------------------------------------------------
+  // WORKPLACE SERVICES. Two domains, added with the helpdesk and the document library - and added
+  // HERE rather than given an approval path of their own inside those modules.
+  //
+  // The two questions an asset request and a document sign-off ask are the two questions this file
+  // already answers: "who approves this, for this person, right now" (routing, per row, from the
+  // Organization Graph) and "may this signed-in user approve at all" (authorization, per user, from
+  // capabilities). A second chain living in src/lib/helpdesk.ts would be a parallel workflow engine,
+  // and the two would disagree about who signs off a laptop within a month.
+  //
+  // BOTH CARRY capability: null, DELIBERATELY. Only the person the graph routed to, or their
+  // in-force delegate, may decide. helpdesk.manage, assets.manage and documents.manage are about
+  // running those desks; none of them confers approval authority over another person's request, and
+  // mapping one onto a domain here would hand every holder a standing sign-off nobody granted them.
+  // ---------------------------------------------------------------------------------------------
+  'helpdesk',
+  'documents',
 ] as const;
 
 export type WorkflowDomain = (typeof WORKFLOW_DOMAINS)[number];
@@ -460,6 +507,158 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     escalateAfterHours: 48,
     approvalUrl: '/admin/hr/leave/workflow',
   },
+
+  // ===============================================================================================
+  // THE EMPLOYEE LIFECYCLE CHAINS.
+  //
+  // `capability: null` ON ALL FOUR, and it is the same narrow reading the five domains above use.
+  // There is no existing capability in permissions.ts whose holders mean "may approve a promotion",
+  // and mapping these onto `employee.manage` would hand every holder of the people console standing
+  // authority to approve a transfer or an exit for anyone in the company — turning a per-ROW
+  // relationship back into a per-USER grant, which is the precise defect the three-layer split
+  // exists to remove. So ONLY the person the org graph actually routed to, or their in-force
+  // delegate, may decide one of these. `employee.manage` still gates OPENING the consoles and
+  // RECORDING a request; it does not decide one.
+  //
+  // WHY THE RUNGS ARE WHAT THEY ARE. A required rung that resolves nobody HALTS, and for these four
+  // that is the correct outcome rather than an inconvenience: an exit or a reporting-line change
+  // approved by nobody is the auto-approval this engine exists to make impossible.
+  // ===============================================================================================
+
+  // Renewing or amending an employment contract. The manager owns the working relationship; whoever
+  // the organisation has named as the contract approval owner confirms the terms. The second rung is
+  // optional because naming a contracts owner is a policy choice an organisation may not have made;
+  // the first is not, because everybody has a manager or the graph is wrong.
+  contract: {
+    key: 'contract',
+    label: 'Contract change',
+    capability: null,
+    route: [
+      { step: 1, via: 'reporting_manager' },
+      { step: 2, via: 'approval_owner', optional: true },
+    ],
+    escalateAfterHours: 72,
+    approvalUrl: '/admin/hr/contracts',
+  },
+
+  // Moving somebody between departments or under a new manager. BOTH rungs are required and neither
+  // is optional: a transfer is the one change that rewrites the reporting edge itself, so the
+  // manager releasing the person and the head of the department carrying them must each say yes. If
+  // no department head is recorded, halting is the honest answer — the alternative is moving a
+  // person into a department nobody has agreed to receive them into.
+  transfer: {
+    key: 'transfer',
+    label: 'Transfer',
+    capability: null,
+    route: [
+      { step: 1, via: 'reporting_manager' },
+      { step: 2, via: 'department_head' },
+      { step: 3, via: 'approval_owner', optional: true },
+    ],
+    escalateAfterHours: 96,
+    approvalUrl: '/admin/hr/transfers',
+  },
+
+  // Designation and grade. The manager proposes and the department head confirms — the head is
+  // REQUIRED here because a promotion changes what somebody is on the record and, in most
+  // organisations, what they cost; a manager alone deciding that is how grade inflation happens
+  // quietly. The approval owner rung is optional for the usual reason.
+  promotion: {
+    key: 'promotion',
+    label: 'Promotion',
+    capability: null,
+    route: [
+      { step: 1, via: 'reporting_manager' },
+      { step: 2, via: 'department_head' },
+      { step: 3, via: 'approval_owner', optional: true },
+    ],
+    escalateAfterHours: 96,
+    approvalUrl: '/admin/hr/promotions',
+  },
+
+  // Somebody leaving. The reporting manager is the required rung; the separation approval owner is
+  // optional. Approving a separation does NOT end it — it authorises the exit to proceed. The exit
+  // itself only completes when clearance is signed off and the org-graph edges are closed, which is
+  // a separate, explicit act on the separation console.
+  separation: {
+    key: 'separation',
+    label: 'Separation',
+    capability: null,
+    route: [
+      { step: 1, via: 'reporting_manager' },
+      { step: 2, via: 'approval_owner', optional: true },
+    ],
+    escalateAfterHours: 48,
+    approvalUrl: '/admin/hr/separation',
+  },
+
+  // ===============================================================================================
+  // APPRAISAL SIGN-OFF.
+  //
+  // WHY THE FIRST RUNG IS THE DEPARTMENT HEAD AND NOT THE REPORTING MANAGER — read this before
+  // changing it. The manager is the person who WROTE the review and pressed the button. Routing the
+  // sign-off back to them would be a rubber stamp with an audit trail: the engine would record an
+  // approval, a screen would show a green state, and no second human would ever have looked at the
+  // rating. That is the same class of failure as auto-approval, just slower. `recruitment` above is
+  // the existing precedent for exactly this reasoning — its comment says the head is the first rung
+  // because "the requester is often the manager".
+  //
+  // The head is REQUIRED, so a department with no recorded head HALTS with a readable sentence
+  // rather than settling. The approval-owner rung is the calibration desk when an organisation has
+  // named one (an `approval_owner` edge scoped to the domain 'appraisal'), and it is optional for
+  // the same reason every other approval-owner rung is: naming one is a policy choice.
+  //
+  // `capability: null` — there is no capability in permissions.ts whose holders mean "may sign off
+  // any appraisal". `performance.manage` gates RUNNING cycles and calibrating; making it standing
+  // authority here would let the HR desk approve its own calibration, which is not a second look.
+  // ===============================================================================================
+  appraisal: {
+    key: 'appraisal',
+    label: 'Appraisal sign-off',
+    capability: null,
+    route: [
+      { step: 1, via: 'department_head' },
+      { step: 2, via: 'approval_owner', optional: true },
+    ],
+    escalateAfterHours: 120,
+    approvalUrl: '/portal/approvals',
+  },
+  // An asset request raised on the helpdesk: somebody is asking the company to buy or issue them
+  // equipment. The person who knows whether they need it is their own manager, so that is rung one;
+  // rung two is whoever the organisation has named to own helpdesk approvals, and it is OPTIONAL
+  // because naming one is a policy choice a small company may not have made. If neither resolves,
+  // the request HALTS with the sentence - it is never issued because routing failed.
+  //
+  // Only the asset-request category starts one of these. An IT password reset is a job, not an
+  // approval, and wrapping it in a chain would mean nobody could get their password reset until
+  // their manager came back from leave.
+  helpdesk: {
+    key: 'helpdesk',
+    label: 'Asset request',
+    capability: null,
+    route: [
+      { step: 1, via: 'reporting_manager' },
+      { step: 2, via: 'approval_owner', optional: true },
+    ],
+    escalateAfterHours: 48,
+    approvalUrl: '/admin/helpdesk',
+  },
+  // A document being signed off before it is published to the company. Same shape and the same
+  // reasoning: the owner's manager first, then the documents approval owner if the organisation has
+  // named one. A document CANNOT be published until this settles approved - src/lib/documents.ts
+  // re-reads the instance at the write and refuses otherwise, so an unapproved policy cannot reach
+  // the library by way of a second button.
+  documents: {
+    key: 'documents',
+    label: 'Document approval',
+    capability: null,
+    route: [
+      { step: 1, via: 'reporting_manager' },
+      { step: 2, via: 'approval_owner', optional: true },
+    ],
+    escalateAfterHours: 72,
+    approvalUrl: '/portal/employee/documents',
+  }
 };
 
 /** The chain a domain uses, for a screen that wants to explain the process before anything starts. */

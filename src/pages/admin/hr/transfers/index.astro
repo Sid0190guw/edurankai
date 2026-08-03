@@ -1,0 +1,384 @@
+---
+// /admin/hr/transfers — MOVING SOMEBODY. The one screen that rewrites a reporting line.
+//
+// THIS IS AN ORGANIZATION GRAPH WRITE, AND IT IS THE REASON THE GRAPH EXISTS. An approved transfer
+// calls supersedeReportingManager(), which CLOSES the open reporting edge with an effective_to and
+// OPENS the new one at the same instant, in one statement. The old edge stays on the graph, so "who
+// was this person's manager last March" keeps answering correctly after the move. Nothing on this
+// page performs an in-place UPDATE of hr_employees.reporting_manager_id as the record of the change
+// — that column is written afterwards, only to keep the compatibility layer in step, and it holds a
+// USERS id rather than an employee id.
+//
+// NOTHING MOVES WITHOUT AN APPROVAL. Raising a transfer writes a request and routes it through
+// src/lib/workflow.ts: the reporting manager, then the department head, then whoever owns transfer
+// approvals if one has been named. If any required rung resolves nobody the request HALTS carrying
+// the engine's sentence, and NOTHING is applied. There is no path here that approves by default.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { isInitialized } from '@/lib/org-graph';
+import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import {
+  ensureMoveSchema,
+  requestTransfer,
+  cancelMove,
+  syncMoves,
+  listTransfers,
+} from '@/lib/hr-lifecycle';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+// The same section middleware.ts maps '/admin/hr/*' to. Opening the screen is not moving anybody;
+// every write below asks for `employee.manage` as well.
+if (!(await canAccessSection(user, 'hr', 'edit'))) return Astro.redirect('/admin');
+
+// CONSTANTS FIRST. `const` is not hoisted.
+const PAGE = '/admin/hr/transfers';
+const mayWrite = can(user as any, 'employee.manage');
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function stateLabel(s: string): string {
+  const k = String(s || '');
+  if (k === 'pending') return 'Waiting for approval';
+  if (k === 'approved') return 'Approved';
+  if (k === 'applied') return 'Applied';
+  if (k === 'rejected') return 'Rejected';
+  if (k === 'cancelled') return 'Withdrawn';
+  if (k === 'halted') return 'Halted';
+  return k;
+}
+
+function stateTone(s: string): string {
+  const k = String(s || '');
+  if (k === 'applied') return '#86efac';
+  if (k === 'approved') return '#6ee7b7';
+  if (k === 'rejected') return '#fca5a5';
+  if (k === 'halted') return '#fbbf24';
+  if (k === 'cancelled') return '#9aa6b6';
+  return '#67e8f9';
+}
+
+function viaLabel(v: string): string {
+  const k = String(v || '');
+  if (k === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (k === 'department_head') return VIA_LABELS.department_head;
+  if (k === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (k === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+await ensureMoveSchema();
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (action === 'decide') {
+      // Re-checked where it binds: mayAct() answers on the POSTED instance id, from the graph.
+      const r = await decideInstance(
+        String(fd.get('instance_id') || ''),
+        user as any,
+        String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected',
+        String(fd.get('note') || ''),
+      );
+      flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
+      if (r.ok) {
+        const sync = await syncMoves(user.id);
+        if (sync.applied) flash += ' ' + sync.applied + ' approved move applied to the Organization Graph.';
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else if (!mayWrite) {
+      flash = 'You can read transfers, but raising one needs the employee-records permission.';
+    } else if (action === 'request') {
+      const r = await requestTransfer({
+        employeeId: String(fd.get('employee_id') || ''),
+        toDepartmentId: String(fd.get('to_department_id') || '') || null,
+        toManagerEmployeeId: String(fd.get('to_manager_employee_id') || '') || null,
+        effectiveDate: String(fd.get('effective_date') || ''),
+        reason: String(fd.get('reason') || ''),
+        requestedByUserId: user.id,
+      });
+      if (r.ok && r.haltReason) flash = 'Recorded, but it is halted: ' + r.haltReason;
+      else if (r.ok) flash = 'Sent for approval. Nobody has moved yet.';
+      else flash = r.error || 'The transfer was not saved.';
+    } else if (action === 'cancel') {
+      const r = await cancelMove('transfer', String(fd.get('transfer_id') || ''), user.id);
+      flash = r.ok ? 'Request withdrawn.' : (r.error || 'The request was not withdrawn.');
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    console.error('[admin/hr/transfers] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+// Mirror any decision made elsewhere, and apply the approved ones. Approves nothing itself.
+const synced = await syncMoves(user.id);
+
+const graphReady = await isInitialized();
+const transfers = await listTransfers({ limit: 150 });
+
+let employees: any[] = [];
+let departments: any[] = [];
+try {
+  employees = rowsOf(await db.execute(sql`
+    SELECT id, full_name, employee_code, designation, department_id::text AS department_id
+      FROM hr_employees WHERE is_active = true ORDER BY full_name ASC LIMIT 400`));
+} catch (e: any) {
+  console.error('[admin/hr/transfers] employees', e?.cause?.message || e?.message);
+}
+try {
+  // ::text on the id. departments.id is a varchar(50) slug in one schema file and a UUID in the
+  // other; a ::uuid cast throws the first time a slug arrives.
+  departments = rowsOf(await db.execute(sql`
+    SELECT id::text AS id, name FROM departments ORDER BY name ASC LIMIT 300`));
+} catch (e: any) {
+  console.error('[admin/hr/transfers] departments', e?.cause?.message || e?.message);
+}
+
+const open = transfers.filter((t) => t.state === 'pending' || t.state === 'halted').slice(0, 12);
+const detail: any[] = [];
+for (const t of open) {
+  let instance: any = null;
+  try {
+    if (t.workflowInstanceId) instance = await getInstance(t.workflowInstanceId);
+  } catch (e: any) {
+    console.error('[admin/hr/transfers] instance', e?.cause?.message || e?.message);
+  }
+  // The steps already NAME who each rung is waiting on, resolved from the graph when the instance was
+  // created and then frozen. Re-resolving it live per row would be several graph queries each and
+  // could disagree with the step the person is actually waiting on after a reorganisation.
+  const waiting = instance
+    ? (instance.steps || []).filter((s: any) => s.stepNo === instance.currentStep && s.decision === 'pending')
+    : [];
+  detail.push({ t, instance, waiting });
+}
+
+const settled = transfers.filter((t) => t.state !== 'pending' && t.state !== 'halted');
+const appliedCount = transfers.filter((t) => t.state === 'applied').length;
+const haltedCount = transfers.filter((t) => t.state === 'halted').length;
+const today = new Date().toISOString().slice(0, 10);
+---
+<AdminLayout title="Transfers" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Lifecycle · Transfers</p>
+  <h1>Transfers</h1>
+  <p class="lede">
+    Moving somebody to a new department, a new manager, or both. An approved transfer closes the old
+    reporting relationship with the date it ended and opens the new one — it does not overwrite the
+    old one, so the reporting line as it stood on any past date is still readable.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {synced.errors.length > 0 && <div class="flash warn">{synced.errors[0]}</div>}
+  {!mayWrite && (
+    <div class="flash warn">You can read transfers. Raising one needs the employee-records permission.</div>
+  )}
+  {!graphReady && (
+    <div class="flash warn">
+      The Organization Graph is not yet initialized. No approver can be resolved, so a transfer raised now
+      is recorded and halted rather than approved — and a manager change could not be superseded even if it
+      were approved, because there is no history to supersede. Run the graph backfill first.
+    </div>
+  )}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{open.length}</span><span class="tl">In progress</span></div>
+    <div class="tile"><span class="tv">{appliedCount}</span><span class="tl">Applied</span></div>
+    <div class="tile"><span class="tv">{haltedCount}</span><span class="tl">Halted</span></div>
+  </div>
+
+  {mayWrite && (
+    <details class="panel">
+      <summary>Raise a transfer</summary>
+      <form method="POST" class="form">
+        <input type="hidden" name="action" value="request" />
+        <label>Who is moving
+          <select name="employee_id" required>
+            <option value="">Choose a person</option>
+            {employees.map((e: any) => (
+              <option value={e.id}>{e.full_name}{e.designation ? ' — ' + e.designation : ''}</option>
+            ))}
+          </select>
+        </label>
+        <label>New department
+          <select name="to_department_id">
+            <option value="">Unchanged</option>
+            {departments.map((d: any) => <option value={d.id}>{d.name}</option>)}
+          </select>
+          <span class="hint">Only departments on the register can be chosen. A department that matches nothing would put this person in no list at all.</span>
+        </label>
+        <label>New reporting manager
+          <select name="to_manager_employee_id">
+            <option value="">Unchanged</option>
+            {employees.map((e: any) => (
+              <option value={e.id}>{e.full_name}{e.designation ? ' — ' + e.designation : ''}</option>
+            ))}
+          </select>
+          <span class="hint">Changing this supersedes the reporting edge on the Organization Graph. The previous one is kept, closed with the date it ended.</span>
+        </label>
+        <label>Effective date<input type="date" name="effective_date" required value={today} /></label>
+        <label>Reason<textarea name="reason" rows="2" required placeholder="An approver reads this before deciding."></textarea></label>
+        <button type="submit" class="btn">Send for approval</button>
+        <p class="hint">A transfer has to change something. It is approved by the reporting manager and then the department head; if either cannot be resolved from the graph, it halts and says so rather than going through.</p>
+      </form>
+    </details>
+  )}
+
+  <h2>In progress</h2>
+  {detail.length === 0 ? (
+    <div class="empty">No transfer is waiting on anybody.</div>
+  ) : (
+    <div class="stack">
+      {detail.map((d: any) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{d.t.employeeName || 'Employee'}</p>
+              <p class="sub">Effective {fmtDate(d.t.effectiveDate)} · raised {fmtDate(d.t.createdAt)}</p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(d.t.state) + ';border-color:' + stateTone(d.t.state) + '55;'}>
+              {stateLabel(d.t.state)}
+            </span>
+          </div>
+
+          <dl class="terms">
+            {d.t.toDepartmentId && (
+              <div><dt>Department</dt><dd>{d.t.fromDepartmentName || d.t.fromDepartmentId || 'None'} to {d.t.toDepartmentName || d.t.toDepartmentId}</dd></div>
+            )}
+            {d.t.toManagerEmployeeId && (
+              <div><dt>Reports to</dt><dd>{d.t.fromManagerName || 'Nobody on record'} to {d.t.toManagerName || 'a person'}</dd></div>
+            )}
+          </dl>
+
+          <p class="reason">{d.t.reason}</p>
+
+          {d.t.state === 'halted' && (
+            <div class="halt">
+              <strong>Halted.</strong> {d.t.haltReason || 'No approver could be resolved.'}
+              <span class="hint">Nobody has moved and nothing has been written to the Organization Graph. Record the missing relationship, then resume it from the approvals workflow.</span>
+            </div>
+          )}
+
+          {d.instance && d.instance.state === 'pending' && d.waiting.length > 0 && (
+            <div class="waiting">
+              <p class="wl">Waiting on</p>
+              {d.waiting.map((s: any) => (
+                <p class="wn">{viaLabel(s.via)} — {s.approverName || 'a person with no employee record'}</p>
+              ))}
+            </div>
+          )}
+
+          {d.instance && d.instance.state === 'pending' && (
+            <form method="POST" class="decide">
+              <input type="hidden" name="action" value="decide" />
+              <input type="hidden" name="instance_id" value={d.instance.id} />
+              <input type="text" name="note" placeholder="Note for the record (optional)" />
+              <div class="btnrow">
+                <button type="submit" name="decision" value="approved" class="btn ok">Approve</button>
+                <button type="submit" name="decision" value="rejected" class="btn no">Reject</button>
+              </div>
+              <p class="hint">Approving the final step moves them: the reporting edge is superseded on the graph and the compatibility column is brought into step behind it.</p>
+            </form>
+          )}
+
+          {mayWrite && (d.t.state === 'pending' || d.t.state === 'halted') && (
+            <form method="POST" class="inline">
+              <input type="hidden" name="action" value="cancel" />
+              <input type="hidden" name="transfer_id" value={d.t.id} />
+              <button type="submit" class="btn ghost">Withdraw this request</button>
+            </form>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>Settled</h2>
+  {settled.length === 0 ? (
+    <div class="empty">Nothing has been settled yet.</div>
+  ) : (
+    <div class="stack">
+      {settled.map((t) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{t.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {t.toDepartmentName ? 'To ' + t.toDepartmentName + '. ' : ''}
+                {t.toManagerName ? 'Reporting to ' + t.toManagerName + '. ' : ''}
+                Effective {fmtDate(t.effectiveDate)}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(t.state) + ';border-color:' + stateTone(t.state) + '55;'}>
+              {stateLabel(t.state)}
+            </span>
+          </div>
+          {t.state === 'applied' && (
+            <p class="hint">Applied {fmtDate(t.appliedAt)}. The previous reporting relationship is closed on the graph, not deleted.</p>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 22px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin-bottom: 16px; }
+  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; }
+  .form { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 60px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; display: block; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.ok { background: #15803d; }
+  .btn.no { background: #b91c1c; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; white-space: pre-wrap; }
+  .terms { display: grid; gap: 6px; margin: 12px 0 0; }
+  .terms div { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; border-bottom: 1px dashed #1a1a1f; padding-bottom: 5px; }
+  .terms dt { color: #9aa6b6; margin: 0; }
+  .terms dd { color: #e8e8ee; margin: 0; text-align: right; }
+  .halt { margin: 12px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #fde68a; line-height: 1.55; }
+  .waiting { margin: 12px 0 0; padding: 10px 12px; background: rgba(103,232,249,0.06); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .wl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .wn { font-size: 12.5px; color: #e8e8ee; margin: 0; }
+  .decide { display: grid; gap: 8px; margin-top: 12px; }
+  .inline { margin-top: 10px; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+</style>
+</AdminLayout>

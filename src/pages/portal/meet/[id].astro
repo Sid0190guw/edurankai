@@ -4,6 +4,9 @@ import SceneGL from '@/components/SceneGL.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { SCENE_EXAMPLE_IDS } from '@/lib/scene-examples';
+import {
+  ensureMeetSchema, meetBlockReason, roomLookupSql, normaliseRoomCode,
+} from '@/lib/meet-schema';
 
 // Scene list only — the chosen scene is fetched on demand (the library is ~196 KB).
 
@@ -13,101 +16,80 @@ const { id } = Astro.params as { id: string };
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/meet/' + id));
 
 /* ============================================================
-   SELF-BOOTSTRAP MEETING TABLES
+   SCHEMA — NOT CREATED HERE.
+   ============================================================
+   This page used to CREATE meet_rooms and meet_participants with UUID ids while
+   /portal/meet/index.astro CREATEd the same two tables with id TEXT and host_user_id INTEGER, in the
+   same commit. CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so whichever page was
+   opened first on a given database won and the other has been failing ever since — silently on the
+   scheduler, which swallowed the error, and with a 500 here, which did not.
+
+   src/lib/meet-schema.ts is now the ONE module that creates these tables. It reconciles the two
+   shapes additively (ALTER TABLE ... ADD COLUMN IF NOT EXISTS): nothing is dropped, no column type is
+   altered and no row is rewritten. Do not add a CREATE TABLE back to this file.
    ============================================================ */
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const logFail = (tag: string, e: any) => console.error('[portal/meet/room] ' + tag, e?.cause?.message || e?.message);
 
-try {
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS meet_rooms (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      host_user_id UUID,
-      title TEXT,
-      kind VARCHAR(20) DEFAULT 'huddle',
-      scheduled_at TIMESTAMPTZ,
-      duration_minutes INT DEFAULT 60,
-      passcode VARCHAR(40),
-      is_locked BOOLEAN DEFAULT false,
-      recording_enabled BOOLEAN DEFAULT false,
-      recording_url TEXT,
-      max_participants INT DEFAULT 250,
-      status VARCHAR(20) DEFAULT 'open',
-      features JSONB DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS meet_participants (
-      room_id UUID REFERENCES meet_rooms(id) ON DELETE CASCADE,
-      user_id UUID,
-      display_name VARCHAR(200),
-      role VARCHAR(20) DEFAULT 'attendee',
-      joined_at TIMESTAMPTZ DEFAULT NOW(),
-      left_at TIMESTAMPTZ,
-      in_lobby BOOLEAN DEFAULT false,
-      PRIMARY KEY (room_id, user_id)
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS meet_chat (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      room_id UUID,
-      user_id UUID,
-      body TEXT,
-      is_private_to UUID,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS meet_polls (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      room_id UUID,
-      question TEXT,
-      options JSONB DEFAULT '[]'::jsonb,
-      votes JSONB DEFAULT '{}'::jsonb,
-      status VARCHAR(20) DEFAULT 'live',
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS meet_breakouts (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      room_id UUID,
-      label VARCHAR(120),
-      participants JSONB DEFAULT '[]'::jsonb,
-      ends_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-} catch (e) {
-  console.error('meet schema bootstrap failed', e);
-}
+// NOT wrapped in try/catch, deliberately: ensureOnce() swallows the rejection it returns
+// (src/lib/ensure-once.ts:24), so a catch here could never fire. The failure comes back through
+// meetBlockReason() instead, which also distinguishes "the ensure did not run" from "this database
+// carries the legacy shape".
+await ensureMeetSchema();
 
 /* ============================================================
    LOAD-OR-CREATE ROOM
-   ============================================================ */
-const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+   ============================================================
+   `id` is the segment in the URL, and it is a room CODE for anything the scheduler made — the
+   client generates a 10-character code and navigates straight here. This page only recognised a
+   UUID, so a code fell through to the create branch with a FRESH gen_random_uuid(): two people
+   typing the SAME code each got their own empty room and never met each other. roomLookupSql()
+   resolves a code OR a uuid, and a room created from a code now STORES that code, so the next
+   person to open the link joins the room that exists. */
+const blockReason = meetBlockReason();
+const roomCode = normaliseRoomCode(id);
 
 let room: any = null;
-if (isUuid) {
-  const r = rowsOf(await db.execute(sql`SELECT * FROM meet_rooms WHERE id = ${id}::uuid LIMIT 1`));
-  room = r[0] || null;
-}
-if (!room) {
-  const r = rowsOf(await db.execute(sql`
-    INSERT INTO meet_rooms (id, host_user_id, title, kind)
-    VALUES (${isUuid ? id : sql`gen_random_uuid()`}, ${user.id}, ${'Untitled huddle'}, 'huddle')
-    ON CONFLICT (id) DO NOTHING
-    RETURNING *
-  `));
-  room = r[0] || null;
-  if (!room) {
-    const r2 = rowsOf(await db.execute(sql`SELECT * FROM meet_rooms WHERE id = ${id}::uuid LIMIT 1`));
-    room = r2[0] || null;
+let roomError = blockReason || '';
+if (!blockReason && roomCode) {
+  try {
+    room = rowsOf(await db.execute(sql`
+      SELECT * FROM meet_rooms WHERE ${roomLookupSql(roomCode)} LIMIT 1`))[0] || null;
+
+    if (!room) {
+      // Opening an unknown code opens a room and records the code as its handle. ON CONFLICT on the
+      // room_code index rather than on the primary key: the code is what two people share, so the
+      // code is what a race is about.
+      room = rowsOf(await db.execute(sql`
+        INSERT INTO meet_rooms (room_code, host_user_id, host_name, host_email, title, kind, status)
+        VALUES (${roomCode}, ${user.id}::uuid, ${user.name || null}, ${user.email || null},
+                ${'Untitled huddle'}, 'huddle', 'live')
+        ON CONFLICT (room_code) WHERE room_code IS NOT NULL DO NOTHING
+        RETURNING *`))[0] || null;
+
+      if (!room) {
+        // Lost the race, or the insert matched nothing. Read back rather than assume.
+        room = rowsOf(await db.execute(sql`
+          SELECT * FROM meet_rooms WHERE ${roomLookupSql(roomCode)} LIMIT 1`))[0] || null;
+      }
+    }
+  } catch (e: any) {
+    // NOT swallowed. A room that cannot be opened must say so; an empty room page that looks like a
+    // working room is how the shape mismatch stayed invisible.
+    logFail('loadOrCreateRoom', e);
+    room = null;
+    roomError = 'This room could not be opened just now. Nothing has been lost — try again in a moment.';
   }
+} else if (!blockReason) {
+  // No usable code in the URL at all.
+  roomError = 'That room link does not contain a room code.';
 }
 
-const isHost = room && room.host_user_id === user.id;
+// Compared ::text on both sides. host_user_id may be uuid or (on a database still carrying the
+// legacy shape) another type entirely, and `uuid === string` is false in JavaScript the moment the
+// driver hands back anything but a plain string — which would silently demote the host to attendee.
+const isHost = !!room && String(room.host_user_id || '') === String(user.id);
 
 /* ============================================================
    POST HANDLERS — join / chat / poll / vote / breakout / end
@@ -830,7 +812,31 @@ const myDisplayName = user.email?.split('@')[0] || 'Guest';
   /* Misc */
   .hidden { display: none !important; }
   .mt-empty { padding: 20px; text-align: center; color: #6e6e78; font-size: 12.5px; }
+
+  /* The room could not be opened. Said on screen, over the shell, instead of rendering an empty
+     room that looks like a working one. Mobile first: 360px-safe, nothing fixed-width. */
+  .mt-blocked {
+    position: fixed; inset: 0; z-index: 90; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px; text-align: center;
+    padding: 24px max(16px, env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+    background: #0a0a0c; color: #b9b9c4;
+  }
+  .mt-blocked h1 { margin: 0; font-size: 1.1rem; line-height: 1.35; font-weight: 700; color: #e8e8ee; }
+  .mt-blocked p { margin: 0; max-width: 34rem; font-size: 0.9rem; line-height: 1.65; }
+  .mt-blocked a {
+    display: inline-flex; align-items: center; min-height: 44px; padding: 0 20px; border-radius: 10px;
+    background: #f2731c; color: #fff; text-decoration: none; font-weight: 700; font-size: 0.88rem;
+  }
 </style>
+
+{roomError && (
+  <section class="mt-blocked">
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/><line x1="2" y1="2" x2="22" y2="22"/></svg>
+    <h1>This room is not open</h1>
+    <p>{roomError}</p>
+    <a href="/portal/meet">Back to meetings</a>
+  </section>
+)}
 
 <main class="mt-shell">
 
@@ -2179,7 +2185,16 @@ async function sendChat() {
   fd.append('action', 'chat');
   fd.append('body', body);
   if (privTo) fd.append('is_private_to', privTo);
-  try { await fetch(location.pathname, { method: 'POST', body: fd }); } catch {}
+  // NOT swallowed. The message has already gone to the peers over the mesh, so the sender sees it
+  // on screen either way — which is exactly why a failed PERSIST has to say something. Silence here
+  // means the transcript quietly loses messages that everyone in the room remembers sending.
+  try {
+    const r = await fetch(location.pathname, { method: 'POST', body: fd });
+    if (!r.ok) toast('That message was sent to the room but not saved to the transcript.');
+  } catch (e) {
+    console.error('[meet] persist chat', e);
+    toast('That message was sent to the room but not saved to the transcript.');
+  }
 }
 
 /* ==========================================================================
@@ -2702,7 +2717,14 @@ async function init() {
   // Auto-join
   const fd = new FormData();
   fd.append('action', 'join'); fd.append('display_name', myDisplayName);
-  fetch(location.pathname, { method: 'POST', body: fd }).catch(()=>{});
+  // NOT swallowed. If the join is not recorded the participant list is wrong for everyone else in
+  // the room, and the person who is missing from it is the only one who cannot tell.
+  fetch(location.pathname, { method: 'POST', body: fd })
+    .then(function (r) { if (!r.ok) toast('You are in the room, but the attendance list did not record you.'); })
+    .catch(function (e) {
+      console.error('[meet] join', e);
+      toast('You are in the room, but the attendance list did not record you.');
+    });
 
   // Initial pane state
   switchTab('chat');

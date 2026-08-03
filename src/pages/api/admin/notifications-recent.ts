@@ -7,32 +7,24 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { denyAdminApi } from '@/lib/auth/api-guard';
+import { ensureNotificationsSchema } from '@/lib/notifications-schema';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
-// Memoise the DDL so we don't fire CREATE TABLE IF NOT EXISTS on every poll
-// (every admin hits this endpoint every 15s — that DDL chatter keeps the database awake
-// and burns compute for nothing). One ensure per server process is enough.
-let tableReady: Promise<void> | null = null;
-function ensureTable(): Promise<void> {
-  if (tableReady) return tableReady;
-  tableReady = (async () => {
-    try {
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        title TEXT NOT NULL, body TEXT,
-        type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
-        entity_type TEXT, entity_id TEXT,
-        is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW())`);
-    } catch (_) { tableReady = null; }
-  })();
-  return tableReady;
-}
+// THE TABLE IS NOT CREATED HERE. A private ensureTable() used to sit on this spot with its own
+// CREATE TABLE IF NOT EXISTS notifications, listing FEWER columns than src/lib/push.ts writes — no
+// category, no priority, no is_archived, no seen_at/clicked_at. CREATE TABLE IF NOT EXISTS is a
+// NO-OP on an existing table, so on a database where this 15-second poll got there first, every
+// later `INSERT ... (category, priority)` in persistNotification() would have thrown forever while
+// the bell simply stayed empty and nothing anywhere said why. One table, one CREATE:
+// src/lib/notifications-schema.ts, which is additive and therefore safe on a live table.
+//
+// Still memoised — that is what ensureNotificationsSchema() does internally — so the poll does not
+// fire DDL on every request and keep the database awake for nothing.
+const ensureTable = ensureNotificationsSchema;
 
 export const GET: APIRoute = async ({ locals }) => {
   // The admin bell feed, polled by AdminLayout on every admin page. Rows are already scoped to

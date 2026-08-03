@@ -1,0 +1,648 @@
+---
+// /admin/hr/separation — SEPARATION AND EXIT, end to end.
+//
+// THIS IS THE ONE SEPARATION CONSOLE. /admin/hr/separations (plural) redirects here; there is one
+// screen and one hr_separations table behind it, because two consoles over one table is how two
+// people end up disagreeing about whether somebody has left.
+//
+// WHAT IT DOES, IN THE ORDER THE WORK HAPPENS:
+//   1. Open a separation — resignation or termination, notice period, last working day.
+//   2. Send it for approval. Routed by src/lib/workflow.ts from the Organization Graph. Approving it
+//      authorises the exit to proceed; it does not end it.
+//   3. Clearance across IT, Finance, HR and Assets. Each has to say the person is released.
+//   4. The exit interview, and the final settlement handoff.
+//   5. CLOSE THE EXIT. This is the org-graph act: the leaver's direct reports are moved onto a named
+//      manager, then every one of the leaver's open edges is CLOSED with an effective_to — never
+//      deleted. History survives the exit, which is the entire point.
+//
+// THE REFUSAL THAT MATTERS MOST. If somebody reports to the person leaving and no replacement
+// manager has been chosen, closing is REFUSED. The alternative is a set of people reporting to
+// somebody who has gone, whose leave routes to nobody and whose approvals halt with no trace back
+// to this exit.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { isInitialized } from '@/lib/org-graph';
+import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import {
+  ensureExitSchema,
+  openSeparation,
+  updateSeparation,
+  recordExitInterview,
+  listSeparations,
+  requestSeparationApproval,
+  syncSeparationApprovals,
+  setClearance,
+  clearanceFor,
+  recordSettlementHandoff,
+  exitReadiness,
+  completeSeparation,
+  SEP_KINDS,
+  EXIT_INTERVIEW_QUESTIONS,
+  CLEARANCE_AREAS,
+} from '@/lib/hr-separation';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'hr', 'edit'))) return Astro.redirect('/admin');
+
+// CONSTANTS FIRST. `const` is not hoisted; a const under the POST handler throws on its first line.
+const PAGE = '/admin/hr/separation';
+const mayWrite = can(user as any, 'employee.manage');
+
+/** How many separations get their readiness computed. Each one is several graph queries, and a long
+ *  history must not turn one page load on a phone into hundreds of round trips. */
+const DETAIL_LIMIT = 12;
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function kindLabel(k: string): string {
+  const key = String(k || '');
+  const entry = Object.entries(SEP_KINDS).find(([kk]) => kk === key);
+  return entry ? (entry[1] as any).label : key;
+}
+
+function statusLabel(s: string): string {
+  const k = String(s || '');
+  if (k === 'notice') return 'On notice';
+  if (k === 'knowledge_transfer') return 'Knowledge transfer';
+  if (k === 'exit_interview') return 'Exit interview';
+  if (k === 'settlement') return 'Settlement';
+  if (k === 'closed') return 'Closed';
+  return k;
+}
+
+function approvalLabel(s: string): string {
+  const k = String(s || 'not_requested');
+  if (k === 'not_requested') return 'Not sent for approval';
+  if (k === 'pending') return 'Waiting for approval';
+  if (k === 'approved') return 'Approved';
+  if (k === 'rejected') return 'Rejected';
+  if (k === 'cancelled') return 'Withdrawn';
+  if (k === 'halted') return 'Halted';
+  return k;
+}
+
+function approvalTone(s: string): string {
+  const k = String(s || 'not_requested');
+  if (k === 'approved') return '#86efac';
+  if (k === 'rejected') return '#fca5a5';
+  if (k === 'halted') return '#fbbf24';
+  if (k === 'pending') return '#67e8f9';
+  return '#9aa6b6';
+}
+
+function clearanceTone(s: string): string {
+  const k = String(s || 'pending');
+  if (k === 'cleared') return '#86efac';
+  if (k === 'blocked') return '#fca5a5';
+  return '#9aa6b6';
+}
+
+function viaLabel(v: string): string {
+  const k = String(v || '');
+  if (k === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (k === 'department_head') return VIA_LABELS.department_head;
+  if (k === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (k === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+await ensureExitSchema();
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (action === 'decide') {
+      const r = await decideInstance(
+        String(fd.get('instance_id') || ''),
+        user as any,
+        String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected',
+        String(fd.get('note') || ''),
+      );
+      flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
+      if (r.ok) await syncSeparationApprovals();
+    } else if (!mayWrite) {
+      flash = 'You can read separations, but changing one needs the employee-records permission.';
+    } else if (action === 'open') {
+      const noticeRaw = String(fd.get('notice_days') || '').trim();
+      await openSeparation({
+        employeeId: String(fd.get('employee_id') || ''),
+        kind: String(fd.get('kind') || 'resignation'),
+        initiatedBy: String(fd.get('initiated_by') || 'employee'),
+        noticeDays: noticeRaw ? parseInt(noticeRaw, 10) : 30,
+        lastWorkingDay: String(fd.get('last_working_day') || '') || undefined,
+        reason: String(fd.get('reason') || '') || undefined,
+        actorId: user.id,
+      });
+      flash = 'Separation opened. Send it for approval when the details are right.';
+    } else if (action === 'send_approval') {
+      const r = await requestSeparationApproval(String(fd.get('id') || ''), user.id);
+      if (r.ok && r.haltReason) flash = 'Sent, but it is halted: ' + r.haltReason;
+      else if (r.ok) flash = 'Sent for approval.';
+      else flash = r.error || 'The approval was not started.';
+    } else if (action === 'update') {
+      const id = String(fd.get('id') || '');
+      const patch: any = {};
+      const status = String(fd.get('status') || '');
+      if (status) patch.status = status;
+      const lwd = String(fd.get('last_working_day') || '');
+      if (lwd) patch.last_working_day = lwd;
+      patch.kt_complete = fd.get('kt_complete') === 'on';
+      patch.alumni_invited = fd.get('alumni_invited') === 'on';
+      const rehire = String(fd.get('eligibility_for_rehire') || '');
+      if (rehire) patch.eligibility_for_rehire = rehire;
+      const relieving = String(fd.get('relieving_letter_url') || '');
+      if (relieving) patch.relieving_letter_url = relieving;
+      const experience = String(fd.get('experience_letter_url') || '');
+      if (experience) patch.experience_letter_url = experience;
+      await updateSeparation(id, patch);
+      flash = 'Updated.';
+    } else if (action === 'clearance') {
+      const r = await setClearance({
+        separationId: String(fd.get('id') || ''),
+        area: String(fd.get('area') || ''),
+        status: String(fd.get('status') || 'pending') as any,
+        note: String(fd.get('note') || '') || null,
+        decidedByUserId: user.id,
+      });
+      flash = r.ok ? 'Clearance recorded.' : (r.error || 'The clearance was not recorded.');
+    } else if (action === 'settlement') {
+      const amountRaw = String(fd.get('ff_amount') || '').trim();
+      const r = await recordSettlementHandoff({
+        separationId: String(fd.get('id') || ''),
+        amount: amountRaw ? parseFloat(amountRaw) : null,
+        reference: String(fd.get('settlement_reference') || ''),
+        actorUserId: user.id,
+      });
+      flash = r.ok ? 'Settlement handoff recorded.' : (r.error || 'The handoff was not recorded.');
+    } else if (action === 'exit_interview') {
+      const id = String(fd.get('id') || '');
+      const resp: Record<string, string> = {};
+      for (const q of EXIT_INTERVIEW_QUESTIONS) {
+        const v = fd.get('q_' + q.key);
+        if (v) resp[q.key] = String(v);
+      }
+      await recordExitInterview(id, resp);
+      flash = 'Exit interview recorded.';
+    } else if (action === 'complete') {
+      const r = await completeSeparation({
+        separationId: String(fd.get('id') || ''),
+        actorUserId: user.id,
+        reassignReportsToEmployeeId: String(fd.get('reassign_to') || '') || null,
+      });
+      if (r.ok) {
+        flash = 'Exit closed. Their place in the Organization Graph is closed with the last working day, not deleted.';
+      } else {
+        flash = (r.error || 'The exit was not closed.')
+          + (r.blockers && r.blockers.length ? ' Outstanding: ' + r.blockers.join(' ') : '');
+      }
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. e.cause carries the real Postgres reason; e.message is only the failed SQL.
+    console.error('[admin/hr/separation] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 400)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+// Mirror any approval decided elsewhere. Decides nothing.
+const syncedApprovals = await syncSeparationApprovals();
+
+const graphReady = await isInitialized();
+const separations = await listSeparations();
+
+let employees: any[] = [];
+try {
+  employees = rowsOf(await db.execute(sql`
+    SELECT id, full_name, employee_code, designation FROM hr_employees
+     WHERE is_active = true ORDER BY full_name ASC LIMIT 400`));
+} catch (e: any) {
+  console.error('[admin/hr/separation] employees', e?.cause?.message || e?.message);
+}
+
+const openList = separations.filter((s: any) => s.status !== 'closed').slice(0, DETAIL_LIMIT);
+const closedList = separations.filter((s: any) => s.status === 'closed');
+
+const detail: any[] = [];
+for (const s of openList) {
+  let instance: any = null;
+  try {
+    if (s.workflow_instance_id) instance = await getInstance(String(s.workflow_instance_id));
+  } catch (e: any) {
+    console.error('[admin/hr/separation] instance', e?.cause?.message || e?.message);
+  }
+  const waiting = instance
+    ? (instance.steps || []).filter((st: any) => st.stepNo === instance.currentStep && st.decision === 'pending')
+    : [];
+  const clearance = await clearanceFor(String(s.id));
+  const readiness = await exitReadiness(String(s.id));
+  detail.push({ s, instance, waiting, clearance, readiness });
+}
+
+const today = new Date().toISOString().slice(0, 10);
+const inProgress = separations.filter((s: any) => s.status !== 'closed').length;
+const awaitingApproval = separations.filter((s: any) => String(s.approval_state || '') === 'pending').length;
+const haltedCount = separations.filter((s: any) => String(s.approval_state || '') === 'halted').length;
+---
+<AdminLayout title="Separation and exit" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Lifecycle · Exit</p>
+  <h1>Separation and exit</h1>
+  <p class="lede">
+    Notice, approval, clearance across every function, the exit interview, and the final settlement.
+    Closing an exit reassigns anyone who reported to the person leaving and then closes their place in
+    the Organization Graph with the date they left — their record of who they managed and who approved
+    what survives, which it would not if the edges were deleted.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {syncedApprovals.errors.length > 0 && <div class="flash warn">{syncedApprovals.errors[0]}</div>}
+  {!mayWrite && (
+    <div class="flash warn">You can read separations. Opening or closing one needs the employee-records permission.</div>
+  )}
+  {!graphReady && (
+    <div class="flash warn">
+      The Organization Graph is not yet initialized. No approver can be resolved, and there are no edges to
+      close on an exit. An employee record can still be closed, but the graph cannot be tidied until the
+      backfill has run — so this page will say so rather than claim it was.
+    </div>
+  )}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{inProgress}</span><span class="tl">In progress</span></div>
+    <div class="tile"><span class="tv">{awaitingApproval}</span><span class="tl">Waiting for approval</span></div>
+    <div class="tile"><span class="tv">{haltedCount}</span><span class="tl">Halted</span></div>
+    <div class="tile"><span class="tv">{closedList.length}</span><span class="tl">Closed</span></div>
+  </div>
+
+  {mayWrite && (
+    <details class="panel">
+      <summary>Open a separation</summary>
+      <form method="POST" class="form">
+        <input type="hidden" name="action" value="open" />
+        <label>Who is leaving
+          <select name="employee_id" required>
+            <option value="">Choose a person</option>
+            {employees.map((e: any) => (
+              <option value={e.id}>{e.full_name}{e.employee_code ? ' (' + e.employee_code + ')' : ''}</option>
+            ))}
+          </select>
+        </label>
+        <label>Kind
+          <select name="kind" required>
+            {Object.entries(SEP_KINDS).map(([k, v]) => <option value={k}>{(v as any).label}</option>)}
+          </select>
+        </label>
+        <div class="row2">
+          <label>Initiated by
+            <select name="initiated_by">
+              <option value="employee">The employee</option>
+              <option value="employer">The company</option>
+            </select>
+          </label>
+          <label>Notice days<input type="number" name="notice_days" min="0" max="365" value="30" /></label>
+        </div>
+        <label>Last working day
+          <input type="date" name="last_working_day" />
+          <span class="hint">The exit cannot be closed without this — it is the date the graph is closed as of.</span>
+        </label>
+        <label>Reason on record<textarea name="reason" rows="2"></textarea></label>
+        <button type="submit" class="btn">Open separation</button>
+      </form>
+    </details>
+  )}
+
+  <h2>In progress</h2>
+  {detail.length === 0 ? (
+    <div class="empty">Nobody is on notice.</div>
+  ) : (
+    <div class="stack">
+      {detail.map((d: any) => (
+        <details class="card">
+          <summary class="rowsum">
+            <div>
+              <p class="name">{d.s.employee_name || 'Employee'}</p>
+              <p class="sub">
+                {kindLabel(d.s.kind)} · last day {fmtDate(d.s.last_working_day) || 'not set'}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + approvalTone(d.s.approval_state) + ';border-color:' + approvalTone(d.s.approval_state) + '55;'}>
+              {approvalLabel(d.s.approval_state)}
+            </span>
+          </summary>
+
+          <div class="cardbody">
+            <p class="stage">Stage: {statusLabel(d.s.status)}</p>
+            {d.s.reason && <p class="reason">{d.s.reason}</p>}
+
+            {/* ---------------------------------------------------------------- approval */}
+            <h3>Approval</h3>
+            {String(d.s.approval_state || 'not_requested') === 'not_requested' && mayWrite && (
+              <form method="POST" class="inline">
+                <input type="hidden" name="action" value="send_approval" />
+                <input type="hidden" name="id" value={d.s.id} />
+                <button type="submit" class="btn">Send for approval</button>
+                <p class="hint">Routed to the reporting manager, then to whoever owns separation approvals if one is named. Nobody is auto-approved: if no approver resolves, it halts and says why.</p>
+              </form>
+            )}
+            {String(d.s.approval_state || '') === 'halted' && (
+              <div class="halt">
+                <strong>Halted.</strong> {d.s.halt_reason || 'No approver could be resolved.'}
+                <span class="hint">Nothing has been approved. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+              </div>
+            )}
+            {d.instance && d.instance.state === 'pending' && d.waiting.length > 0 && (
+              <div class="waiting">
+                <p class="wl">Waiting on</p>
+                {d.waiting.map((st: any) => (
+                  <p class="wn">{viaLabel(st.via)} — {st.approverName || 'a person with no employee record'}</p>
+                ))}
+              </div>
+            )}
+            {d.instance && d.instance.state === 'pending' && (
+              <form method="POST" class="decide">
+                <input type="hidden" name="action" value="decide" />
+                <input type="hidden" name="instance_id" value={d.instance.id} />
+                <input type="text" name="note" placeholder="Note for the record (optional)" />
+                <div class="btnrow">
+                  <button type="submit" name="decision" value="approved" class="btn ok">Approve</button>
+                  <button type="submit" name="decision" value="rejected" class="btn no">Reject</button>
+                </div>
+              </form>
+            )}
+
+            {/* ---------------------------------------------------------------- clearance */}
+            <h3>Clearance</h3>
+            <div class="clear">
+              {CLEARANCE_AREAS.map((area) => {
+                const row = d.clearance.find((c: any) => c.area === area.key);
+                const st = row ? row.status : 'pending';
+                return (
+                  <div class="clearrow">
+                    <div>
+                      <p class="cname">{area.label}</p>
+                      <p class="hint">{area.note}</p>
+                      {row && row.note && <p class="cnote">{row.note}</p>}
+                    </div>
+                    <span class="chip" style={'color:' + clearanceTone(st) + ';border-color:' + clearanceTone(st) + '55;'}>
+                      {st === 'cleared' ? 'Cleared' : st === 'blocked' ? 'Blocked' : 'Pending'}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            {mayWrite && (
+              <form method="POST" class="form flat">
+                <input type="hidden" name="action" value="clearance" />
+                <input type="hidden" name="id" value={d.s.id} />
+                <div class="row2">
+                  <label>Area
+                    <select name="area" required>
+                      {CLEARANCE_AREAS.map((a) => <option value={a.key}>{a.label}</option>)}
+                    </select>
+                  </label>
+                  <label>Outcome
+                    <select name="status" required>
+                      <option value="cleared">Cleared</option>
+                      <option value="blocked">Blocked</option>
+                      <option value="pending">Back to pending</option>
+                    </select>
+                  </label>
+                </div>
+                <label>Note<input type="text" name="note" placeholder="Required when blocking — the person leaving has to be told something." /></label>
+                <button type="submit" class="btn">Record clearance</button>
+              </form>
+            )}
+
+            {/* ---------------------------------------------------------------- settlement */}
+            <h3>Final settlement</h3>
+            {d.s.settlement_handoff_at ? (
+              <p class="ok-line">
+                Handed off {fmtDate(d.s.settlement_handoff_at)}
+                {d.s.settlement_reference ? ' — ' + d.s.settlement_reference : ''}
+                {d.s.ff_amount ? ' (' + (d.s.ff_currency || 'INR') + ' ' + d.s.ff_amount + ')' : ''}
+              </p>
+            ) : (
+              mayWrite && (
+                <form method="POST" class="form flat">
+                  <input type="hidden" name="action" value="settlement" />
+                  <input type="hidden" name="id" value={d.s.id} />
+                  <div class="row2">
+                    <label>Amount<input type="number" name="ff_amount" step="0.01" min="0" /></label>
+                    <label>Handoff reference<input type="text" name="settlement_reference" required placeholder="Where somebody can follow this up" /></label>
+                  </div>
+                  <button type="submit" class="btn">Record handoff</button>
+                  <p class="hint">This records that settlement was handed to whoever pays it. It does not pay anybody.</p>
+                </form>
+              )
+            )}
+
+            {/* ---------------------------------------------------------------- exit interview */}
+            <h3>Exit interview</h3>
+            {d.s.exit_interview_at ? (
+              <p class="ok-line">Recorded {fmtDate(d.s.exit_interview_at)}</p>
+            ) : String(d.s.kind) === 'death' ? (
+              <p class="hint">Not applicable for a death in service, and not required before closing.</p>
+            ) : (
+              mayWrite && (
+                <details class="panel inner">
+                  <summary>Conduct the exit interview</summary>
+                  <form method="POST" class="form">
+                    <input type="hidden" name="action" value="exit_interview" />
+                    <input type="hidden" name="id" value={d.s.id} />
+                    {EXIT_INTERVIEW_QUESTIONS.map((q) => (
+                      <label>{q.label}<textarea name={'q_' + q.key} rows="2"></textarea></label>
+                    ))}
+                    <button type="submit" class="btn">Record exit interview</button>
+                  </form>
+                </details>
+              )
+            )}
+
+            {/* ---------------------------------------------------------------- details */}
+            {mayWrite && (
+              <details class="panel inner">
+                <summary>Notice, letters and knowledge transfer</summary>
+                <form method="POST" class="form">
+                  <input type="hidden" name="action" value="update" />
+                  <input type="hidden" name="id" value={d.s.id} />
+                  <div class="row2">
+                    <label>Last working day<input type="date" name="last_working_day" value={d.s.last_working_day ? String(d.s.last_working_day).slice(0, 10) : ''} /></label>
+                    <label>Stage
+                      <select name="status">
+                        <option value="notice" selected={d.s.status === 'notice'}>On notice</option>
+                        <option value="knowledge_transfer" selected={d.s.status === 'knowledge_transfer'}>Knowledge transfer</option>
+                        <option value="exit_interview" selected={d.s.status === 'exit_interview'}>Exit interview</option>
+                        <option value="settlement" selected={d.s.status === 'settlement'}>Settlement</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label class="check"><input type="checkbox" name="kt_complete" checked={d.s.kt_complete} /> Knowledge transfer complete</label>
+                  <label class="check"><input type="checkbox" name="alumni_invited" checked={d.s.alumni_invited} /> Invited to the alumni programme</label>
+                  <label>Eligible for rehire
+                    <select name="eligibility_for_rehire">
+                      <option value="">Not decided</option>
+                      <option value="yes" selected={d.s.eligibility_for_rehire === 'yes'}>Yes</option>
+                      <option value="no" selected={d.s.eligibility_for_rehire === 'no'}>No</option>
+                      <option value="with_caveats" selected={d.s.eligibility_for_rehire === 'with_caveats'}>With caveats</option>
+                    </select>
+                  </label>
+                  <label>Relieving letter link<input type="url" name="relieving_letter_url" placeholder="https://" value={d.s.relieving_letter_url || ''} /></label>
+                  <label>Experience letter link<input type="url" name="experience_letter_url" placeholder="https://" value={d.s.experience_letter_url || ''} /></label>
+                  <button type="submit" class="btn">Save</button>
+                  <p class="hint">Letters are links to shared documents. Nothing is uploaded here.</p>
+                </form>
+              </details>
+            )}
+
+            {/* ---------------------------------------------------------------- closing */}
+            <h3>Close the exit</h3>
+            {d.readiness.directReports.length > 0 && (
+              <div class="warnbox">
+                <strong>
+                  {d.readiness.directReports.length === 1
+                    ? 'One person reports to them.'
+                    : d.readiness.directReports.length + ' people report to them.'}
+                </strong>
+                <p class="hint">
+                  {d.readiness.directReports.map((p: any) => p.fullName || 'someone').join(', ')}.
+                  Choose who picks them up. Their reporting edges are superseded on the graph, not overwritten.
+                </p>
+              </div>
+            )}
+            {d.readiness.blockers.length > 0 ? (
+              <div class="blockers">
+                <p class="wl">Outstanding before this can be closed</p>
+                {d.readiness.blockers.map((b: string) => <p class="wn">{b}</p>)}
+              </div>
+            ) : (
+              <p class="ok-line">Everything is done. This exit can be closed.</p>
+            )}
+            {mayWrite && (
+              <form method="POST" class="form flat">
+                <input type="hidden" name="action" value="complete" />
+                <input type="hidden" name="id" value={d.s.id} />
+                {d.readiness.directReports.length > 0 && (
+                  <label>Their reports move to
+                    <select name="reassign_to" required>
+                      <option value="">Choose a manager</option>
+                      {employees.map((e: any) => (
+                        <option value={e.id} selected={d.readiness.suggestedNewManager && d.readiness.suggestedNewManager.employeeId === e.id}>
+                          {e.full_name}{e.designation ? ' — ' + e.designation : ''}
+                        </option>
+                      ))}
+                    </select>
+                    {d.readiness.suggestedNewManager && d.readiness.suggestedNewManager.fullName && (
+                      <span class="hint">Their own manager, {d.readiness.suggestedNewManager.fullName}, is pre-selected as the obvious choice. Change it if somebody else should carry them.</span>
+                    )}
+                  </label>
+                )}
+                <button type="submit" class="btn no">Close this exit</button>
+                <p class="hint">This closes their employee record and closes every open edge of theirs on the Organization Graph as of the last working day. Nothing is deleted — reads as of any earlier date keep answering exactly as they do now.</p>
+              </form>
+            )}
+          </div>
+        </details>
+      ))}
+    </div>
+  )}
+
+  <h2>Closed</h2>
+  {closedList.length === 0 ? (
+    <div class="empty">No exit has been closed yet.</div>
+  ) : (
+    <div class="stack">
+      {closedList.map((s: any) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{s.employee_name || 'Employee'}</p>
+              <p class="sub">{kindLabel(s.kind)} · last day {fmtDate(s.last_working_day) || 'not recorded'}</p>
+            </div>
+            <span class="chip" style="color:#9aa6b6;">Closed</span>
+          </div>
+          <p class="hint">
+            {s.graph_closed_at
+              ? 'Organization Graph closed ' + fmtDate(s.graph_closed_at)
+                + (s.graph_edges_closed !== null && s.graph_edges_closed !== undefined ? ' — ' + s.graph_edges_closed + ' relationship(s) closed with an end date, none deleted.' : '.')
+              : 'The Organization Graph was not initialized when this exit was closed, so no edges were closed.'}
+            {s.reports_reassigned_count ? ' ' + s.reports_reassigned_count + ' direct report(s) were reassigned.' : ''}
+          </p>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  h3 { font-size: 10.5px; color: #FF7040; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 20px 0 8px; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 22px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin-bottom: 16px; }
+  .panel.inner { margin: 10px 0 0; background: #08080a; }
+  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; }
+  .form { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .form.flat { padding: 10px 0 0; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  .form label.check { display: flex; align-items: center; gap: 10px; text-transform: none; letter-spacing: normal; font-size: 13px; color: #d8d8de; font-weight: 400; min-height: 44px; }
+  .form label.check input { width: 20px; height: 20px; min-height: 20px; }
+  .row2 { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 60px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; display: block; margin: 4px 0 0; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.ok { background: #15803d; }
+  .btn.no { background: #b91c1c; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .cardhead, .rowsum { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .rowsum { cursor: pointer; list-style: none; min-height: 44px; align-items: center; }
+  .cardbody { border-top: 1px solid #1a1a1f; margin-top: 12px; padding-top: 4px; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .stage { font-size: 11.5px; color: #9aa6b6; margin: 10px 0 0; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 8px 0 0; line-height: 1.6; white-space: pre-wrap; }
+  .clear { display: grid; gap: 8px; }
+  .clearrow { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; background: #08080a; border: 1px solid #1a1a1f; border-radius: 9px; padding: 10px 12px; }
+  .cname { font-size: 13px; color: #fff; font-weight: 700; margin: 0; }
+  .cnote { font-size: 12px; color: #fca5a5; margin: 5px 0 0; line-height: 1.5; }
+  .halt { margin: 6px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #fde68a; line-height: 1.55; }
+  .warnbox { margin: 6px 0 10px; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #fde68a; line-height: 1.55; }
+  .waiting { margin: 6px 0 0; padding: 10px 12px; background: rgba(103,232,249,0.06); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .blockers { margin: 6px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.06); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; }
+  .wl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .blockers .wl { color: #fbbf24; }
+  .wn { font-size: 12.5px; color: #e8e8ee; margin: 0 0 3px; line-height: 1.5; }
+  .ok-line { font-size: 12.5px; color: #86efac; margin: 6px 0 0; }
+  .decide { display: grid; gap: 8px; margin-top: 10px; }
+  .inline { margin-top: 6px; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+  @media (min-width: 640px) { .row2 { grid-template-columns: 1fr 1fr; } }
+</style>
+</AdminLayout>

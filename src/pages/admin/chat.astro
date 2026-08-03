@@ -1,532 +1,224 @@
 ---
+// /admin/chat — the Discussion channels, now a READ-ONLY ARCHIVE.
+//
+// WHY. `chat_messages` was CREATEd by two modules with two incompatible shapes (channel + body here,
+// thread + ciphertext at /portal/messages). CREATE TABLE IF NOT EXISTS is a no-op on an existing
+// table, so one of the two systems has been throwing on every INSERT since 2026-06-09 while looking
+// completely implemented. The repair keeps ONE messenger. It is /portal/messages, decided from the
+// code and not from taste:
+//
+//   * REACH. src/lib/workforce/navigation.ts:204 offers Messages to every composed workspace member.
+//     This page is reachable only by an account that passes canOpenAdmin AND holds the `discussion`
+//     section (src/middleware.ts:57) — a strict subset of staff. An employee without admin.access is
+//     redirected off /admin entirely, so for most of the company /portal/messages is the only
+//     messaging surface that exists.
+//   * DEPENDENTS. src/lib/legal-hold.ts and src/pages/portal/employee.astro both read chat_messages
+//     through thread_id. Only this page and its endpoints read channel_id.
+//   * GUARANTEE. legal-hold.ts:214-223 states that direct-message content is not recoverable
+//     server-side. That is a property of the thread messenger's storage (ciphertext + iv, keys never
+//     leave the browser). It is false of a plaintext `body` column. Keeping the channel system as
+//     the survivor would have turned a privacy guarantee into a false statement.
+//
+// WHAT HAPPENS TO WHAT IS HERE. Nothing is deleted. Every channel and every message stays in place
+// and stays readable on this page; src/lib/chat-schema.ts adds columns and drops no data. The
+// composer, the attach button, "create channel" and "start DM" are gone, and their endpoints refuse
+// with 410 after the authorization check. Live rows must never be silently orphaned — this page is
+// how they remain reachable.
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
-import { chatChannels } from '@/lib/db/schema';
-import { asc } from 'drizzle-orm';
+import { chatChannels, chatMemberships, chatMessages } from '@/lib/db/schema';
+import { asc, eq, and, isNull } from 'drizzle-orm';
+import { ensureChatSchema, CHAT_CANONICAL_HREF } from '@/lib/chat-schema';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
 
-import { chatMemberships } from '@/lib/db/schema';
-import { or, eq as eqOp } from 'drizzle-orm';
+// Function declarations, hoisted, so they are safe wherever they are used below. `const` is not
+// hoisted and has taken pages down on this project.
+function shortTime(v: any): string {
+  if (!v) return '';
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+}
+function dayLabel(v: any): string {
+  if (!v) return '';
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' });
+}
 
-// Get user's memberships for private channels
+await ensureChatSchema();
+
+// Private channels are visible only to their members — unchanged.
 const myMemberships = await db.select({ channelId: chatMemberships.channelId })
-  .from(chatMemberships).where(eqOp(chatMemberships.userId, user.id));
-const myMemberChannelIds = myMemberships.map(m => m.channelId);
+  .from(chatMemberships).where(eq(chatMemberships.userId, user.id));
+const myMemberChannelIds = myMemberships.map((m) => m.channelId);
 
 const allChannels = await db.select().from(chatChannels).orderBy(asc(chatChannels.sortOrder), asc(chatChannels.name));
-
-// Show: public channels + private channels where user is a member
-const channels = allChannels.filter(c => !c.isPrivate || myMemberChannelIds.includes(c.id));
+const channels = allChannels.filter((c) => !c.isPrivate || myMemberChannelIds.includes(c.id));
 
 const url = new URL(Astro.request.url);
 const activeChannel = url.searchParams.get('c') || (channels[0]?.slug || 'general');
-const currentChannel = channels.find(c => c.slug === activeChannel) || channels[0];
+const currentChannel = channels.find((c) => c.slug === activeChannel) || channels[0] || null;
 
-const currentUserPayload = JSON.stringify({
-  id: user.id,
-  name: user.name || user.email,
-  email: user.email
-});
+// Server-rendered, not polled. An archive does not change, so a 1.5-second poll was paying database
+// compute for a screen that cannot receive anything — and it also means this page reads with
+// JavaScript off. currentChannel comes from the membership-filtered list above, so a private channel
+// this reader is not in can never be the one loaded.
+let archive: any[] = [];
+let archiveError = '';
+if (currentChannel) {
+  try {
+    archive = await db.select({
+      id: chatMessages.id,
+      body: chatMessages.body,
+      senderUserId: chatMessages.senderUserId,
+      senderName: chatMessages.senderName,
+      createdAt: chatMessages.createdAt,
+      editedAt: chatMessages.editedAt,
+    }).from(chatMessages)
+      .where(and(eq(chatMessages.channelId, currentChannel.id), isNull(chatMessages.deletedAt)))
+      .orderBy(asc(chatMessages.createdAt))
+      .limit(500);
+  } catch (e: any) {
+    // Never swallowed: an archive that renders empty because the query failed is indistinguishable
+    // from an archive that is genuinely empty, and this page exists to prove what was said.
+    archiveError = String(e?.cause?.message || e?.message || 'unknown error');
+    console.error('[admin/chat] archive read', archiveError);
+  }
+}
 ---
-<AdminLayout title="Discussion" description="Internal team chat">
+<AdminLayout title="Discussion archive" description="The team channels, read-only. New messages are written in the portal messenger.">
   <style>
-    /* Hide the global era-fab on this page - it overlaps the composer */
     #eraFab, #eraFabMenu { display: none !important; }
     body.era-has-fab { padding-bottom: 0 !important; }
 
-    /* MOBILE: stack channel list as a drawer, full-width chat */
+    .arc-shell { display: grid; grid-template-columns: 240px 1fr; height: calc(100vh - 70px); background: #0a0a0c; overflow: hidden; border-top: 1px solid #1f1f26; }
+    .arc-side { background: #08080a; border-right: 1px solid #1f1f26; overflow-y: auto; }
+    .arc-main { display: flex; flex-direction: column; background: #0a0a0c; min-width: 0; }
+    .arc-scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 199; display: none; }
+    .arc-scrim.open { display: block; }
+    .arc-toggle { display: none; background: #15151a; border: 1px solid #1f1f26; color: #fff; width: 44px; height: 44px; border-radius: 8px; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; }
+
+    .arc-chan { display: block; padding: 12px 14px; text-decoration: none; font-size: 13px; border-left: 3px solid transparent; color: #a0a0ab; min-height: 44px; }
+    .arc-chan.on { border-left-color: #FF4F00; background: rgba(255,79,0,0.08); color: #fff; }
+
+    .arc-stream { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+    .arc-day { text-align: center; font-family: 'Geist Mono', monospace; font-size: 10px; color: #6e6e78; letter-spacing: 0.1em; text-transform: uppercase; }
+    .arc-row { display: flex; flex-direction: column; align-items: flex-start; }
+    .arc-row.me { align-items: flex-end; }
+    .arc-meta { font-size: 10.5px; color: #6e6e78; margin-bottom: 3px; font-family: 'Geist Mono', monospace; }
+    .arc-body { max-width: 75%; padding: 9px 13px; border-radius: 14px; font-size: 13.5px; line-height: 1.5; color: #d8d8de; background: #15151a; border: 1px solid #1f1f26; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .arc-row.me .arc-body { color: #fff; background: #FF4F00; border-color: #FF4F00; }
+
+    .arc-note { border-top: 1px solid #1f1f26; background: #0a0a0c; padding: 14px 18px; display: flex; gap: 12px; align-items: flex-start; }
+    .arc-note svg { width: 18px; height: 18px; flex-shrink: 0; color: #FF7040; margin-top: 1px; }
+    .arc-note p { font-size: 12.5px; color: #a0a0ab; line-height: 1.6; margin: 0; }
+    .arc-cta { display: inline-flex; align-items: center; min-height: 44px; padding: 10px 18px; margin-top: 10px; background: #FF4F00; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 13px; }
+    .arc-pill { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #3a2a20; background: rgba(255,79,0,0.10); color: #FF7040; border-radius: 999px; padding: 3px 10px; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+    .arc-fail { margin: 18px; padding: 12px 14px; border: 1px solid #4a1f1f; background: rgba(239,68,68,0.10); color: #fca5a5; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 11.5px; line-height: 1.6; overflow-wrap: anywhere; }
+
     @media (max-width: 768px) {
-      #chatRoot {
-        grid-template-columns: 1fr !important;
-        height: calc(100vh - 110px) !important;
-      }
-      #chatChannels {
-        position: fixed !important;
-        top: 0; left: -100%; bottom: 0;
-        width: 78vw !important; max-width: 320px;
-        z-index: 200;
-        transition: left 0.22s ease;
-        box-shadow: 4px 0 22px rgba(0,0,0,0.55);
-      }
-      #chatChannels.open { left: 0 !important; }
-      #chatChannelsScrim {
-        position: fixed; inset: 0;
-        background: rgba(0,0,0,0.6);
-        z-index: 199;
-        display: none;
-      }
-      #chatChannelsScrim.open { display: block; }
-      #chatMobileToggle { display: inline-flex !important; }
-
-      /* Composer becomes stacked: full-width textarea, button row below */
-      #sendForm {
-        flex-direction: column !important;
-        align-items: stretch !important;
-        gap: 8px !important;
-      }
-      #sendForm textarea {
-        min-height: 60px !important;
-        font-size: 16px !important; /* iOS no-zoom */
-      }
-      #sendFormBtnRow {
-        display: flex !important;
-        gap: 8px !important;
-        justify-content: flex-end !important;
-      }
-      #attachBtn, #sendBtn {
-        min-height: 44px !important;
-        font-size: 14px !important;
-        padding: 10px 18px !important;
-      }
-      #sendHint { font-size: 10.5px !important; line-height: 1.5; }
+      .arc-shell { grid-template-columns: 1fr; height: calc(100vh - 110px); }
+      .arc-side { position: fixed; top: 0; left: -100%; bottom: 0; width: 78vw; max-width: 320px; z-index: 200; transition: left 0.22s ease; box-shadow: 4px 0 22px rgba(0,0,0,0.55); }
+      .arc-side.open { left: 0; }
+      .arc-toggle { display: inline-flex; }
+      .arc-body { max-width: 88%; }
+      .arc-stream { padding: 14px 12px; }
+      .arc-note { flex-direction: column; gap: 8px; }
     }
-
-    /* Desktop hide the mobile toggle */
-    #chatMobileToggle { display: none; }
   </style>
 
   <div class="admin-page" style="max-width:100%;padding:0;">
-    <div id="chatRoot" style="display:grid;grid-template-columns:240px 1fr;gap:0;height:calc(100vh - 70px);background:#0a0a0c;border-radius:0;overflow:hidden;border-top:1px solid #1f1f26;">
+    <div class="arc-shell">
+      <div class="arc-scrim" id="arcScrim"></div>
 
-      <div id="chatChannelsScrim" onclick="document.getElementById('chatChannels').classList.remove('open');this.classList.remove('open');"></div>
-
-      <!-- CHANNELS SIDEBAR -->
-      <aside id="chatChannels" style="background:#08080a;border-right:1px solid #1f1f26;overflow-y:auto;">
-        <div style="padding:14px 14px 8px;border-bottom:1px solid #1f1f26;display:flex;justify-content:space-between;align-items:center;">
-          <div>
-            <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;font-weight:700;text-transform:uppercase;">Discussion</p>
-            <p style="font-size:11px;color:#6e6e78;margin-top:2px;">{channels.length} channels</p>
-          </div>
-          <div style="display:flex;gap:6px;">
-            <button type="button" id="newDmBtn" title="Start direct message" style="background:#15151a;border:1px solid #1f1f26;color:#fff;width:28px;height:28px;border-radius:6px;font-size:13px;line-height:1;cursor:pointer;">-</button>
-            <button type="button" id="newChannelBtn" title="Create channel" style="background:#FF4F00;border:none;color:#fff;width:28px;height:28px;border-radius:6px;font-size:18px;line-height:1;cursor:pointer;font-weight:600;">+</button>
-          </div>
+      <aside class="arc-side" id="arcSide">
+        <div style="padding:14px 14px 10px;border-bottom:1px solid #1f1f26;">
+          <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;font-weight:700;text-transform:uppercase;">Discussion archive</p>
+          <p style="font-size:11px;color:#6e6e78;margin-top:2px;">{channels.length} channels, read-only</p>
         </div>
         <div style="padding:8px 0;">
           {channels.map((c) => (
-            <a href={'/admin/chat?c=' + c.slug} style={'display:block;padding:8px 14px;text-decoration:none;font-size:13px;border-left:3px solid ' + (c.slug === activeChannel ? '#FF4F00;background:rgba(255,79,0,0.08);color:#fff' : 'transparent;color:#a0a0ab') + ';transition:all 0.12s;'}>
-              <span style={'color:' + (c.isPrivate ? '#fbbf24' : '#6e6e78') + ';'}>{c.isPrivate ? '-' : '#'}</span> {c.name}
+            <a href={'/admin/chat?c=' + c.slug} class={'arc-chan' + (c.slug === activeChannel ? ' on' : '')}>
+              <span style={'color:' + (c.isPrivate ? '#fbbf24' : '#6e6e78') + ';'}>{c.isPrivate ? '*' : '#'}</span> {c.name}
             </a>
           ))}
         </div>
       </aside>
 
-      <!-- MESSAGE THREAD + COMPOSER -->
-      <section style="display:flex;flex-direction:column;background:#0a0a0c;min-width:0;">
-        <header style="padding:14px 18px;border-bottom:1px solid #1f1f26;background:#0a0a0c;">
+      <section class="arc-main">
+        <header style="padding:14px 18px;border-bottom:1px solid #1f1f26;">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
             <div style="display:flex;align-items:center;gap:10px;">
-              <button type="button" id="chatMobileToggle" onclick="var c=document.getElementById('chatChannels');var s=document.getElementById('chatChannelsScrim');c.classList.toggle('open');s.classList.toggle('open');" aria-label="Open channels" style="background:#15151a;border:1px solid #1f1f26;color:#fff;width:36px;height:36px;border-radius:8px;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+              <button type="button" class="arc-toggle" id="arcToggle" aria-label="Open channels">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
               </button>
               <div>
                 <h1 style="font-size:16px;font-weight:600;color:#fff;margin:0;"><span style="color:#6e6e78;">#</span> {currentChannel?.name || activeChannel}</h1>
                 {currentChannel?.description && <p style="font-size:11.5px;color:#6e6e78;margin-top:2px;">{currentChannel.description}</p>}
               </div>
             </div>
-            <p style="font-size:10.5px;color:#6e6e78;font-family:'Geist Mono',monospace;"><span id="connectionStatus">Live</span></p>
+            <span class="arc-pill">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              read-only
+            </span>
           </div>
         </header>
 
-        <div id="messageStream" style="flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:14px;">
-          <p style="text-align:center;color:#6e6e78;font-size:12px;padding:20px 0;" id="emptyState">Loading messages...</p>
+        {archiveError && (
+          <div class="arc-fail">
+            This channel could not be read, so what you see below is not the whole record: {archiveError}
+          </div>
+        )}
+
+        <div class="arc-stream">
+          {archive.length === 0 && !archiveError && (
+            <p style="text-align:center;color:#6e6e78;font-size:12px;padding:20px 0;">No messages were ever posted in this channel.</p>
+          )}
+          {archive.map((m, i) => (
+            <>
+              {(i === 0 || dayLabel(archive[i - 1].createdAt) !== dayLabel(m.createdAt)) && (
+                <p class="arc-day">{dayLabel(m.createdAt)}</p>
+              )}
+              <div class={'arc-row' + (m.senderUserId === user.id ? ' me' : '')}>
+                <p class="arc-meta">{m.senderUserId === user.id ? 'You' : (m.senderName || 'Unknown')} at {shortTime(m.createdAt)}{m.editedAt ? ' (edited)' : ''}</p>
+                <div class="arc-body">{m.body || ''}</div>
+              </div>
+            </>
+          ))}
         </div>
 
-        <footer style="padding:12px 18px;border-top:1px solid #1f1f26;background:#0a0a0c;">
-          <form id="sendForm" style="display:flex;gap:8px;align-items:flex-end;">
-            <textarea id="composerInput" rows="1" placeholder={'Message #' + (currentChannel?.name || activeChannel)} style="flex:1;background:#15151a;border:1px solid #1f1f26;border-radius:8px;padding:9px 12px;color:#fff;font-size:13.5px;font-family:inherit;outline:none;resize:none;max-height:140px;min-height:38px;line-height:1.4;width:100%;"></textarea>
-            <input type="file" id="fileInput" style="display:none;" />
-            <div id="sendFormBtnRow" style="display:contents;">
-              <button type="button" id="attachBtn" title="Attach file (max 10MB)" aria-label="Attach file" style="background:#15151a;border:1px solid #1f1f26;border-radius:8px;padding:9px 12px;color:#fff;font-size:13px;cursor:pointer;">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-              </button>
-              <button type="submit" id="sendBtn" style="background:#FF4F00;border:none;border-radius:8px;padding:9px 18px;color:#fff;font-weight:600;font-size:13px;cursor:pointer;">Send</button>
-            </div>
-          </form>
-          <p id="sendHint" style="font-size:10px;color:#6e6e78;margin-top:6px;line-height:1.6;">Press <kbd style="background:#15151a;border:1px solid #1f1f26;padding:1px 5px;border-radius:3px;font-size:9.5px;">Enter</kbd> to send . <kbd style="background:#15151a;border:1px solid #1f1f26;padding:1px 5px;border-radius:3px;font-size:9.5px;">Shift+Enter</kbd> for new line . Polls every 3s</p>
+        <footer class="arc-note">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+          <div>
+            <p>
+              These channels are kept for their history and no longer accept new messages. Every
+              conversation now happens in one place, where messages are encrypted in your browser and
+              cannot be read off the server.
+            </p>
+            <a class="arc-cta" href={CHAT_CANONICAL_HREF}>Open Messages</a>
+          </div>
         </footer>
       </section>
     </div>
   </div>
 
-  <script is:inline define:vars={{ channel: activeChannel, me: currentUserPayload }}>
-    (function() {
-      var currentUser = JSON.parse(me);
-      var stream = document.getElementById('messageStream');
-      var emptyState = document.getElementById('emptyState');
-      var input = document.getElementById('composerInput');
-      var form = document.getElementById('sendForm');
-      var sendBtn = document.getElementById('sendBtn');
-      var statusEl = document.getElementById('connectionStatus');
-
-      var seenIds = {};
-      var lastTs = null;
-      var pollTimer = null;
-
-      function formatTime(iso) {
-        try {
-          var d = new Date(iso);
-          return d.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
-        } catch (e) { return ''; }
-      }
-      function formatDate(iso) {
-        try {
-          var d = new Date(iso);
-          var today = new Date();
-          var sameDay = d.toDateString() === today.toDateString();
-          if (sameDay) return 'Today';
-          return d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short' });
-        } catch (e) { return ''; }
-      }
-      function escapeHtml(s) {
-        return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br/>');
-      }
-
-      function renderMessage(m) {
-        if (seenIds[m.id]) return;
-        seenIds[m.id] = true;
-        if (emptyState) { emptyState.style.display = 'none'; }
-
-        var isMe = m.senderUserId === currentUser.id;
-        var bubble = document.createElement('div');
-        bubble.style.cssText = 'display:flex;flex-direction:column;align-items:' + (isMe ? 'flex-end' : 'flex-start') + ';';
-
-        var meta = document.createElement('div');
-        meta.style.cssText = 'font-size:10.5px;color:#6e6e78;margin-bottom:3px;font-family:Geist Mono,monospace;';
-        meta.textContent = (isMe ? 'You' : (m.senderName || '?')) + ' . ' + formatTime(m.createdAt);
-        bubble.appendChild(meta);
-
-        var body = document.createElement('div');
-        body.style.cssText = 'max-width:75%;padding:9px 13px;border-radius:14px;font-size:13.5px;line-height:1.5;color:' + (isMe ? '#fff' : '#d8d8de') + ';background:' + (isMe ? '#FF4F00' : '#15151a') + ';border:1px solid ' + (isMe ? '#FF4F00' : '#1f1f26') + ';word-wrap:break-word;white-space:pre-wrap;';
-        body.innerHTML = escapeHtml(m.body);
-        bubble.appendChild(body);
-
-        stream.appendChild(bubble);
-        lastTs = m.createdAt;
-      }
-
-      function scrollToBottom() {
-        stream.scrollTop = stream.scrollHeight;
-      }
-
-      function fetchMessages() {
-        var url = '/admin/api/chat/messages?channel=' + encodeURIComponent(channel);
-        if (lastTs) url += '&since=' + encodeURIComponent(lastTs);
-        fetch(url, { credentials: 'same-origin' })
-          .then(function(r) { return r.json(); })
-          .then(function(data) {
-            statusEl.textContent = 'Live';
-            statusEl.style.color = '#10b981';
-            if (data && data.messages) {
-              var nearBottom = (stream.scrollHeight - stream.scrollTop - stream.clientHeight) < 100;
-              for (var i = 0; i < data.messages.length; i++) {
-                renderMessage(data.messages[i]);
-              }
-              if (data.messages.length > 0) {
-                if (Object.keys(seenIds).length === data.messages.length || nearBottom) {
-                  scrollToBottom();
-                }
-              } else if (Object.keys(seenIds).length === 0 && emptyState) {
-                emptyState.textContent = 'No messages yet. Say hello.';
-              }
-            }
-          })
-          .catch(function(err) {
-            statusEl.textContent = 'Reconnecting...';
-            statusEl.style.color = '#fbbf24';
-          });
-      }
-
-      function sendMessage() {
-        var text = input.value.trim();
-        if (!text) return;
-        sendBtn.disabled = true;
-        sendBtn.textContent = 'Sending...';
-        fetch('/admin/api/chat/send', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ channel: channel, body: text })
-        })
-          .then(function(r) { return r.json(); })
-          .then(function(data) {
-            if (data.ok) {
-              input.value = '';
-              input.style.height = 'auto';
-              // Fetch immediately for confirmation, then resume normal polling
-              fetchMessages();
-              if (pollTimer) clearInterval(pollTimer);
-              pollTimer = setInterval(function () { if (!document.hidden) fetchMessages(); }, 5000);
-            } else {
-              alert('Send failed: ' + (data.error || 'unknown'));
-            }
-          })
-          .catch(function(err) {
-            alert('Network error: ' + err.message);
-          })
-          .finally(function() {
-            sendBtn.disabled = false;
-            sendBtn.textContent = 'Send';
-            input.focus();
-          });
-      }
-
-      // Auto-grow textarea
-      input.addEventListener('input', function() {
-        input.style.height = 'auto';
-        input.style.height = Math.min(140, input.scrollHeight) + 'px';
-      });
-
-      // Enter to send, Shift+Enter for newline
-      input.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault();
-          sendMessage();
-        }
-      });
-
-      form.addEventListener('submit', function(e) {
-        e.preventDefault();
-        sendMessage();
-      });
-
-      // === Attach file handling ===
-      var attachBtn = document.getElementById("attachBtn");
-      var fileInput = document.getElementById("fileInput");
-      if (attachBtn && fileInput) {
-        attachBtn.addEventListener("click", function() { fileInput.click(); });
-        fileInput.addEventListener("change", function() {
-          var file = fileInput.files && fileInput.files[0];
-          if (!file) return;
-          if (file.size > 10 * 1024 * 1024) {
-            alert("File too large (max 10MB)");
-            fileInput.value = "";
-            return;
-          }
-          attachBtn.disabled = true;
-          attachBtn.textContent = "-";
-          var fd = new FormData();
-          fd.append("file", file);
-          fd.append("channel", channel);
-          fetch("/admin/api/chat/upload", { method: "POST", credentials: "same-origin", body: fd })
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-              if (data.ok) { fetchMessages(); }
-              else { alert("Upload failed: " + (data.error || "unknown")); }
-            })
-            .catch(function(err) { alert("Network error: " + err.message); })
-            .finally(function() {
-              attachBtn.disabled = false;
-              attachBtn.textContent = "-";
-              fileInput.value = "";
-            });
-        });
-      }
-
-      // === Start DM handling ===
-      var newDmBtn = document.getElementById("newDmBtn");
-      if (newDmBtn) {
-        newDmBtn.addEventListener("click", function() {
-          newDmBtn.disabled = true;
-          fetch("/admin/api/chat/users", { credentials: "same-origin" })
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-              if (!data.users || data.users.length === 0) {
-                alert("No other team members found.");
-                return;
-              }
-              var others = data.users.filter(function(u) { return u.id !== currentUser.id; });
-              if (others.length === 0) {
-                alert("You are the only team member. Invite someone first.");
-                return;
-              }
-              var list = others.map(function(u, i) { return (i+1) + ". " + (u.name || u.email) + " (" + u.email + ")"; }).join("\n");
-              var pick = prompt("Start DM with which team member?\n\n" + list + "\n\nEnter the number:");
-              if (!pick) return;
-              var idx = parseInt(pick, 10) - 1;
-              if (isNaN(idx) || idx < 0 || idx >= others.length) {
-                alert("Invalid selection.");
-                return;
-              }
-              var target = others[idx];
-              return fetch("/admin/api/chat/start-dm", {
-                method: "POST",
-                credentials: "same-origin",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ userId: target.id })
-              }).then(function(r) { return r.json(); }).then(function(d) {
-                if (d.ok && d.channel && d.channel.slug) {
-                  window.location.href = "/admin/chat?c=" + d.channel.slug;
-                } else {
-                  alert("Could not start DM: " + (d.error || "unknown"));
-                }
-              });
-            })
-            .catch(function(err) { alert("Error: " + err.message); })
-            .finally(function() { newDmBtn.disabled = false; });
-        });
-      }
-
-      // Initial load + polling
-      fetchMessages();
-      pollTimer = setInterval(fetchMessages, 1500);
-
-      // Pause polling when tab hidden, resume when visible (saves server resources)
-      document.addEventListener('visibilitychange', function() {
-        if (document.hidden) {
-          if (pollTimer) clearInterval(pollTimer);
-          pollTimer = null;
-        } else {
-          fetchMessages();
-          pollTimer = setInterval(fetchMessages, 1500);
-        }
-      });
-
-      // Clean up on page hide
-      window.addEventListener('beforeunload', function() {
-        if (pollTimer) clearInterval(pollTimer);
-      });
-    })();
-  </script>
-
-  <!-- CREATE CHANNEL MODAL -->
-  <div id="createChannelModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:200;align-items:center;justify-content:center;padding:18px;">
-    <div style="background:#0a0a0c;border:1px solid #1f1f26;border-radius:14px;width:100%;max-width:480px;max-height:90vh;overflow-y:auto;padding:22px;">
-      <h3 style="font-family:'Fraunces',serif;font-size:18px;color:#fff;margin:0 0 16px;">Create channel</h3>
-      <div style="display:flex;flex-direction:column;gap:12px;">
-        <div><label style="display:block;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.55);margin-bottom:5px;">Name *</label>
-          <input type="text" id="nc_name" placeholder="e.g. Marketing" style="width:100%;padding:9px 12px;background:#15151a;border:1px solid #1f1f26;border-radius:8px;color:#fff;font-size:13px;outline:none;" />
-        </div>
-        <div><label style="display:block;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.55);margin-bottom:5px;">Description</label>
-          <input type="text" id="nc_description" placeholder="What's this channel about?" style="width:100%;padding:9px 12px;background:#15151a;border:1px solid #1f1f26;border-radius:8px;color:#fff;font-size:13px;outline:none;" />
-        </div>
-        <label style="display:flex;align-items:center;gap:8px;padding:10px;background:rgba(255,255,255,0.04);border:1px solid #1f1f26;border-radius:8px;cursor:pointer;">
-          <input type="checkbox" id="nc_isPrivate" style="accent-color:#FF4F00;" />
-          <div>
-            <p style="font-size:13px;color:#fff;font-weight:500;margin:0;">Private channel</p>
-            <p style="font-size:11px;color:#a0a0ab;margin:2px 0 0;">Only selected members can see this channel</p>
-          </div>
-        </label>
-        <div id="nc_membersWrap" style="display:none;">
-          <label style="display:block;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.55);margin-bottom:5px;">Members</label>
-          <div id="nc_memberList" style="max-height:220px;overflow-y:auto;background:#15151a;border:1px solid #1f1f26;border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:3px;"></div>
-          <p style="font-size:10.5px;color:#6e6e78;margin-top:5px;">You'll automatically be added as creator.</p>
-        </div>
-      </div>
-      <div style="display:flex;gap:8px;margin-top:18px;">
-        <button type="button" id="nc_cancel" style="flex:1;background:rgba(255,255,255,0.08);border:1px solid #1f1f26;color:#fff;padding:9px;border-radius:8px;font-weight:600;font-size:13px;cursor:pointer;">Cancel</button>
-        <button type="button" id="nc_submit" style="flex:1;background:#FF4F00;border:none;color:#fff;padding:9px;border-radius:8px;font-weight:600;font-size:13px;cursor:pointer;">Create</button>
-      </div>
-    </div>
-  </div>
-
   <script is:inline>
-    (function() {
-      var modal = document.getElementById('createChannelModal');
-      var btn = document.getElementById('newChannelBtn');
-      var cancelBtn = document.getElementById('nc_cancel');
-      var submitBtn = document.getElementById('nc_submit');
-      var privateCheck = document.getElementById('nc_isPrivate');
-      var membersWrap = document.getElementById('nc_membersWrap');
-      var memberList = document.getElementById('nc_memberList');
-      if (!btn) return;
-
-      var allUsers = [];
-      var selectedUserIds = {};
-
-      function openModal() {
-        modal.style.display = 'flex';
-        document.getElementById('nc_name').value = '';
-        document.getElementById('nc_description').value = '';
-        privateCheck.checked = false;
-        membersWrap.style.display = 'none';
-        selectedUserIds = {};
-        if (allUsers.length === 0) {
-          fetch('/admin/api/chat/users', { credentials: 'same-origin' })
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-              if (data.users) { allUsers = data.users; renderMembers(); }
-            });
-        } else {
-          renderMembers();
-        }
-      }
-
-      function closeModal() { modal.style.display = 'none'; }
-
-      function renderMembers() {
-        if (!memberList) return;
-        memberList.innerHTML = '';
-        for (var i = 0; i < allUsers.length; i++) {
-          var u = allUsers[i];
-          var label = document.createElement('label');
-          label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:5px;cursor:pointer;font-size:12.5px;color:#d8d8de;';
-          label.onmouseover = function() { this.style.background = 'rgba(255,255,255,0.05)'; };
-          label.onmouseout = function() { this.style.background = ''; };
-          var cb = document.createElement('input');
-          cb.type = 'checkbox';
-          cb.style.accentColor = '#FF4F00';
-          cb.dataset.uid = u.id;
-          cb.onchange = function() {
-            if (this.checked) selectedUserIds[this.dataset.uid] = true;
-            else delete selectedUserIds[this.dataset.uid];
-          };
-          label.appendChild(cb);
-          var span = document.createElement('span');
-          span.innerHTML = u.name + ' <span style="color:#6e6e78;font-size:11px;">' + (u.internalHandle || u.email) + '</span>';
-          label.appendChild(span);
-          memberList.appendChild(label);
-        }
-      }
-
-      btn.addEventListener('click', openModal);
-      cancelBtn.addEventListener('click', closeModal);
-      modal.addEventListener('click', function(e) { if (e.target === modal) closeModal(); });
-
-      privateCheck.addEventListener('change', function() {
-        membersWrap.style.display = this.checked ? '' : 'none';
+    (function () {
+      var side = document.getElementById('arcSide');
+      var scrim = document.getElementById('arcScrim');
+      var toggle = document.getElementById('arcToggle');
+      if (!side || !scrim || !toggle) return;
+      function close() { side.classList.remove('open'); scrim.classList.remove('open'); }
+      toggle.addEventListener('click', function () {
+        side.classList.toggle('open');
+        scrim.classList.toggle('open');
       });
-
-      submitBtn.addEventListener('click', function() {
-        var name = document.getElementById('nc_name').value.trim();
-        var description = document.getElementById('nc_description').value.trim();
-        var isPrivate = privateCheck.checked;
-        if (!name || name.length < 2) {
-          alert('Name required (min 2 chars)');
-          return;
-        }
-        submitBtn.disabled = true;
-        submitBtn.textContent = 'Creating...';
-        fetch('/admin/api/chat/create-channel', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name,
-            description: description,
-            isPrivate: isPrivate,
-            memberIds: Object.keys(selectedUserIds)
-          })
-        })
-          .then(function(r) { return r.json(); })
-          .then(function(data) {
-            if (data.ok) {
-              window.location.href = '/admin/chat?c=' + data.channel.slug;
-            } else {
-              alert('Failed: ' + (data.error || 'unknown'));
-              submitBtn.disabled = false;
-              submitBtn.textContent = 'Create';
-            }
-          })
-          .catch(function(err) {
-            alert('Network error: ' + err.message);
-            submitBtn.disabled = false;
-            submitBtn.textContent = 'Create';
-          });
-      });
+      scrim.addEventListener('click', close);
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
     })();
   </script>
 </AdminLayout>

@@ -1,0 +1,623 @@
+---
+// /admin/procurement — THE PURCHASING CONSOLE.
+//
+// WHAT IT SHOWS: every purchase request anybody has raised, the approval chain each one is in, who
+// it is waiting on, the purchase orders raised against approved requests, and the receipts.
+//
+// WHAT IT IS NOT: a way to approve anything you were not routed. Every decision on this page goes
+// through decideInstance(), which re-checks mayAct() against the POSTED instance id — so opening
+// this console gives nobody authority over anybody's request. A finance administrator who is not the
+// requester's manager, department head or executive sponsor sees the chain and cannot decide it,
+// which is the correct and deliberate outcome of keeping routing (Layer 1) and authorization
+// (Layer 2) apart.
+//
+// THE THREE LAYERS ARE VISIBLE ON SCREEN, and that is why `via` and `acted_via` are rendered:
+//   "Waiting on: Department head - Priya"   is LAYER 1: a relationship, resolved per row.
+//   "Approved (Standing in)"                is LAYER 2 saying HOW that person was entitled.
+//   the state chip                          is LAYER 3.
+//
+// THE GATE, STATED EXACTLY. `procurement.view` OR the `finance` section at edit level. Both, because
+// a CUSTOM role holding the finance section resolves through the registry as `finance.edit` and
+// NEVER as `procurement.view` — gating on the capability alone would shut out every custom role that
+// can open /admin/finance today, which is a narrowing dressed up as a mechanism change. The same
+// reasoning is written out on /admin/hr/leave/workflow for the `leave` section.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import { isInitialized } from '@/lib/org-graph';
+import {
+  decideInstance,
+  resumeWorkflow,
+  escalateStep,
+  getInstance,
+  STATE_LABELS,
+  VIA_LABELS,
+  ACTED_VIA_LABELS,
+  type WorkflowInstanceView,
+} from '@/lib/workflow';
+import {
+  listRequests,
+  viewRequests,
+  listOrders,
+  raiseOrder,
+  confirmReceipt,
+  cancelOrder,
+  procurementSummary,
+  ORDER_STATE_LABELS,
+  procurementChain,
+  financeThreshold,
+  escalateAfterHours,
+  assetRegisterStatus,
+  formatAmount,
+  categoryLabel,
+  DEFAULT_CURRENCY,
+  type RequestView,
+} from '@/lib/procurement';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+// -------------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted, and a const declared under the POST handler that reads it
+// throws on that handler's first line while the page still reports success.
+// -------------------------------------------------------------------------------------------------
+const PAGE = '/admin/procurement';
+
+/** How many chains get their steps loaded. A backlog of two hundred must not be six hundred round
+ *  trips on one page load. */
+const DETAIL_LIMIT = 15;
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Plain words from a function, not a typed map — a `Record<string,string>` read inside JSX is one of
+ *  this project's known .astro parse hazards. */
+function stateLabel(state: string): string {
+  const key = String(state || '');
+  if (key === 'draft') return STATE_LABELS.draft;
+  if (key === 'pending') return STATE_LABELS.pending;
+  if (key === 'approved') return STATE_LABELS.approved;
+  if (key === 'rejected') return STATE_LABELS.rejected;
+  if (key === 'cancelled') return STATE_LABELS.cancelled;
+  if (key === 'halted') return STATE_LABELS.halted;
+  return key;
+}
+
+function viaLabel(via: string | null): string {
+  const key = String(via || '');
+  if (key === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (key === 'department_head') return VIA_LABELS.department_head;
+  if (key === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (key === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return key || 'Approver';
+}
+
+function actedViaLabel(v: string | null): string {
+  const key = String(v || '');
+  if (key === 'routed') return ACTED_VIA_LABELS.routed;
+  if (key === 'delegate') return ACTED_VIA_LABELS.delegate;
+  if (key === 'capability') return ACTED_VIA_LABELS.capability;
+  return '';
+}
+
+/** The order vocabulary, read from the module rather than retyped in three places on this page. */
+function orderLabel(state: string): string {
+  const key = String(state || '');
+  if (key === 'open') return ORDER_STATE_LABELS.open;
+  if (key === 'received') return ORDER_STATE_LABELS.received;
+  if (key === 'cancelled') return ORDER_STATE_LABELS.cancelled;
+  return key;
+}
+
+function stateClass(state: string): string {
+  const key = String(state || '');
+  if (key === 'approved') return 'chip chip-ok';
+  if (key === 'rejected') return 'chip chip-no';
+  if (key === 'halted') return 'chip chip-halt';
+  if (key === 'pending') return 'chip chip-wait';
+  return 'chip';
+}
+
+// THE GATE. Read the note at the top of this file before narrowing either arm.
+const financeDesk = await canAccessSection(user, 'finance', 'edit');
+const mayView = can(user as any, 'procurement.view') || financeDesk;
+if (!mayView) return Astro.redirect('/admin');
+
+/**
+ * MAY THIS PERSON COMMIT THE COMPANY TO A SUPPLIER?
+ *
+ * Raising an order, confirming a receipt, cancelling an order, resuming a halted chain and escalating
+ * a stalled rung all sit behind this. Deciding an approval does NOT — that is mayAct() inside the
+ * engine, on the posted id, and no page gate can stand in for it.
+ *
+ * Resume and escalate are here rather than left open because neither function checks entitlement
+ * itself: resumeWorkflow() re-routes from the graph (and stays halted when the graph still names
+ * nobody) and escalateStep() only ADDS the person the graph already places above the stalled one, so
+ * the blast radius of both is small — but "small" is not "nobody", and a caller must bring its own
+ * gate. This is that gate, stated where it binds.
+ */
+const mayManage = can(user as any, 'procurement.manage') || financeDesk;
+
+// -------------------------------------------------------------------------------------------------
+// WRITES
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+
+  if (action === 'decide') {
+    // NOT gated by mayManage. The engine decides this one, per row, against the posted id: being
+    // able to open this console is not being able to approve, and a page-level gate here would be
+    // exactly the per-user reach that per-row routing exists to remove.
+    const decision = String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected';
+    const r = await decideInstance(String(fd.get('instanceId') || ''), user, decision, String(fd.get('note') || ''));
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not record that decision.');
+    else if (r.changed === false) flash = 'That was already recorded. Nothing changed.';
+    else flash = 'Decision recorded. The request is now ' + stateLabel(String(r.state || '')).toLowerCase() + '.';
+  } else if (!mayManage) {
+    flash = 'You can see the purchasing record, but raising orders and receipts is a separate permission.';
+  } else if (action === 'order') {
+    const r = await raiseOrder({
+      requestId: String(fd.get('requestId') || ''),
+      vendorName: String(fd.get('vendor_name') || ''),
+      amount: String(fd.get('amount') || ''),
+      expectedDate: String(fd.get('expected_date') || ''),
+      notes: String(fd.get('notes') || ''),
+    }, String(user.id));
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not raise that order.');
+    else if (r.changed === false) flash = 'An order already exists for that request. Nothing changed.';
+    else flash = 'Purchase order raised.';
+  } else if (action === 'receipt') {
+    const r = await confirmReceipt({
+      orderId: String(fd.get('orderId') || ''),
+      note: String(fd.get('receipt_note') || ''),
+      receiptUrl: String(fd.get('receipt_url') || ''),
+      assetTag: String(fd.get('asset_tag') || ''),
+    }, String(user.id));
+    flash = r.ok ? 'Receipt confirmed.' : 'Error: ' + (r.error || 'Could not confirm that receipt.');
+  } else if (action === 'order-cancel') {
+    const r = await cancelOrder(String(fd.get('orderId') || ''), String(user.id), String(fd.get('reason') || ''));
+    flash = r.ok ? 'Order cancelled.' : 'Error: ' + (r.error || 'Could not cancel that order.');
+  } else if (action === 'resume') {
+    const r = await resumeWorkflow(String(fd.get('instanceId') || ''), user);
+    flash = r.ok ? 'Re-routed. It is waiting for approval again.' : 'Still halted: ' + (r.error || '');
+  } else if (action === 'escalate') {
+    const r = await escalateStep(String(fd.get('stepId') || ''), user);
+    flash = r.ok
+      ? 'Escalated. The next person up can now approve it as well.'
+      : 'Not escalated: ' + (r.error || '');
+  }
+
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash));
+}
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+// Asked ONCE for the whole page: "the graph has no rows" and "this person has no manager" are
+// different facts that render differently, and asking per row would be a query per row for an answer
+// that cannot change mid-render.
+const graphReady = await isInitialized();
+
+const summary = await procurementSummary();
+const requests = await listRequests({ limit: 80 });
+const views: RequestView[] = await viewRequests(requests);
+const orders = await listOrders({ limit: 60 });
+const register = await assetRegisterStatus();
+const chain = procurementChain();
+const threshold = financeThreshold();
+const escalateHours = escalateAfterHours();
+
+// The chains, with their steps, open ones first — a settled approval is history and history can wait
+// for a scroll.
+const chains: WorkflowInstanceView[] = [];
+const ordered = views
+  .filter((v) => v.instance !== null)
+  .sort((a, b) => {
+    const rank = (s: string) => (s === 'pending' ? 0 : s === 'halted' ? 1 : 2);
+    return rank(a.instance!.state) - rank(b.instance!.state);
+  });
+for (const v of ordered.slice(0, DETAIL_LIMIT)) {
+  const full = await getInstance(v.instance!.id);
+  if (full) chains.push(full);
+}
+
+const approvedAwaitingOrder = views.filter(
+  (v) => v.instance !== null && v.instance.state === 'approved' && v.order === null,
+);
+const openOrders = orders.filter((o) => o.status === 'open');
+const settledOrders = orders.filter((o) => o.status !== 'open');
+const haltedCount = views.filter((v) => v.instance !== null && v.instance.state === 'halted').length;
+---
+<AdminLayout title="Procurement" activeNav="">
+  <div class="admin-page proc-page">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Finance · Purchasing</div>
+      <h1 class="admin-page-title">Procurement</h1>
+      <p class="admin-page-sub">
+        What people have asked to buy, who each request is waiting on, and what has actually been
+        ordered and received. Approvals are routed from the Organization Graph for each requester -
+        opening this console does not make anybody an approver.
+      </p>
+    </div></div>
+
+    {msg && <div class="flash">{msg}</div>}
+
+    {!graphReady && (
+      <div class="banner banner-warn">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+        <div>
+          <strong>Organization Graph not yet initialized.</strong>
+          <p>
+            No relationships have been recorded, so no purchase request can be routed to anybody and
+            every submission will halt with that reason. This is not a fault and there is deliberately
+            no fallback: guessing an approver from a job title would hand somebody authority over
+            another team's spending. Run <code>db/org-graph-backfill.sql</code>, then reload.
+          </p>
+        </div>
+      </div>
+    )}
+
+    {!mayManage && (
+      <div class="banner banner-note">
+        <div>
+          <strong>Read access.</strong>
+          <p>
+            You can see every request, chain and order. Raising a purchase order, confirming a
+            receipt and managing vendors need the separate purchasing permission.
+          </p>
+        </div>
+      </div>
+    )}
+
+    <div class="stats">
+      <div class="stat"><span class="stat-n">{summary.submitted}</span><span class="stat-l">In approval</span></div>
+      <div class="stat"><span class="stat-n">{haltedCount}</span><span class="stat-l">Halted</span></div>
+      <div class="stat"><span class="stat-n">{summary.openOrders}</span><span class="stat-l">Orders open</span></div>
+      <div class="stat"><span class="stat-n">{summary.receivedOrders}</span><span class="stat-l">Received</span></div>
+      <div class="stat"><span class="stat-n">{summary.vendors}</span><span class="stat-l">Vendors</span></div>
+    </div>
+
+    {summary.degraded && (
+      <p class="crossref">
+        Those counts could not be read just now, so they are shown as zero rather than as a fact.
+        Reload before treating them as the answer.
+      </p>
+    )}
+
+    <p class="crossref">
+      Vendors are at <a href="/admin/procurement/vendors">Vendors</a>. An employee raises a request at
+      <a href="/portal/employee/procurement"> their own purchases screen</a>, and approves the ones
+      routed to them there without needing this console.
+    </p>
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Approved, waiting for a purchase order · {approvedAwaitingOrder.length}</h2>
+    <p class="sec-note">
+      Every approval in this list is already complete. Raising an order commits the company to a
+      supplier, which is why it is a person's decision here and not something the approval does by
+      itself.
+    </p>
+    {approvedAwaitingOrder.length === 0 && <p class="empty">Nothing is approved and unordered.</p>}
+    {approvedAwaitingOrder.map((v) => (
+      <div class="card card-block">
+        <div class="card-main">
+          <div class="card-title">
+            {v.request.item}{v.request.quantity > 1 ? ' x' + v.request.quantity : ''}
+            <span class="chip chip-ok">Approved</span>
+          </div>
+          <div class="card-sub">
+            {v.request.requesterName || 'Employee'}
+            {v.request.category ? ' · ' + categoryLabel(v.request.category) : ''}
+            {v.request.estimatedCost !== null ? ' · estimated ' + formatAmount(v.request.estimatedCost, v.request.currency) : ''}
+            {v.request.neededBy ? ' · needed by ' + fmtDate(v.request.neededBy) : ''}
+          </div>
+          {v.request.justification && <div class="card-sub">{v.request.justification}</div>}
+          {v.request.quoteUrl && (
+            <div class="card-sub"><a class="ext" href={v.request.quoteUrl} target="_blank" rel="noopener noreferrer">Quote</a></div>
+          )}
+        </div>
+        {mayManage && (
+          <form method="POST" class="grid-form">
+            <input type="hidden" name="action" value="order"/>
+            <input type="hidden" name="requestId" value={v.request.id}/>
+            <label class="fl">Supplier<input class="fi" name="vendor_name" value={v.request.vendorName || v.request.vendorSuggestion || ''} placeholder="Who we are buying from"/></label>
+            <label class="fl">Amount ({v.request.currency || DEFAULT_CURRENCY})<input class="fi" name="amount" type="number" min="0" step="1" value={v.request.estimatedCost !== null ? String(v.request.estimatedCost) : ''}/></label>
+            <label class="fl">Expected<input class="fi" name="expected_date" type="date"/></label>
+            <label class="fl">Note<input class="fi" name="notes" placeholder="Optional"/></label>
+            <button class="btn btn-go" type="submit">Raise purchase order</button>
+          </form>
+        )}
+      </div>
+    ))}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Open orders · {openOrders.length}</h2>
+    <p class="sec-note">
+      Confirming a receipt records that the thing arrived, and the asset tag is what matches this
+      purchase to the asset register.
+      {register.available
+        ? ' The register exists in this environment; record the tag it issued.'
+        : ' No asset register exists in this environment yet, so the tag is recorded here and will match one when it does.'}
+    </p>
+    {openOrders.length === 0 && <p class="empty">No orders are open.</p>}
+    {openOrders.map((o) => (
+      <div class="card card-block">
+        <div class="card-main">
+          <div class="card-title">{o.poNumber}<span class="chip chip-wait">{orderLabel(o.status)}</span></div>
+          <div class="card-sub">
+            {o.vendorName || 'No supplier recorded'}
+            {o.amount !== null ? ' · ' + formatAmount(o.amount, o.currency) : ''}
+            {o.orderDate ? ' · ordered ' + fmtDate(o.orderDate) : ''}
+            {o.expectedDate ? ' · expected ' + fmtDate(o.expectedDate) : ''}
+          </div>
+          {o.notes && <div class="card-sub">{o.notes}</div>}
+        </div>
+        {mayManage && (
+          <form method="POST" class="grid-form">
+            <input type="hidden" name="action" value="receipt"/>
+            <input type="hidden" name="orderId" value={o.id}/>
+            <label class="fl">Asset tag<input class="fi" name="asset_tag" placeholder="If it became an asset"/></label>
+            <label class="fl">Receipt link<input class="fi" name="receipt_url" type="url" placeholder="https://"/></label>
+            <label class="fl">Note<input class="fi" name="receipt_note" placeholder="Condition, quantity, anything odd"/></label>
+            <button class="btn btn-ok" type="submit">Confirm received</button>
+          </form>
+        )}
+        {mayManage && (
+          <form method="POST" class="inline-form">
+            <input type="hidden" name="action" value="order-cancel"/>
+            <input type="hidden" name="orderId" value={o.id}/>
+            <input class="fi" name="reason" placeholder="Why it is being cancelled"/>
+            <button class="btn btn-thin" type="submit">Cancel order</button>
+          </form>
+        )}
+      </div>
+    ))}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Approval chains · {chains.length} of {ordered.length}</h2>
+    {chains.length === 0 && <p class="empty">No purchase request has been sent for approval yet.</p>}
+    {chains.map((inst) => (
+      <div class="card card-block">
+        <div class="card-main">
+          <div class="card-title">
+            {inst.subjectName || 'Employee'} · {inst.summary || 'Purchase request'}
+            <span class={stateClass(inst.state)}>{stateLabel(inst.state)}</span>
+          </div>
+          <div class="card-sub">
+            Raised {fmtDate(inst.createdAt)}
+            {inst.amount !== null ? ' · ' + formatAmount(inst.amount, inst.currency) : ''}
+            {inst.settledAt ? ' · settled ' + fmtDate(inst.settledAt) : ''}
+          </div>
+
+          {inst.haltReason && inst.state === 'halted' && (
+            <div class="halt">
+              <strong>Halted.</strong> {inst.haltReason}
+              <span class="halt-note">
+                Nothing was approved and nothing was ordered. Record the missing relationship, then
+                resume - the request carries on from where it stopped.
+              </span>
+            </div>
+          )}
+
+          <ol class="steps">
+            {inst.steps.map((s) => (
+              <li class={'step step-' + s.decision}>
+                <span class="step-n">{s.stepNo}</span>
+                <span class="step-body">
+                  <span class="step-who">{viaLabel(s.via)} · {s.approverName || 'Unnamed'}</span>
+                  <span class="step-meta">
+                    {s.decision === 'pending' ? 'Waiting' : stateLabel(s.decision) || s.decision}
+                    {s.decidedAt ? ' · ' + fmtDate(s.decidedAt) : ''}
+                    {s.actedVia ? ' · ' + actedViaLabel(s.actedVia) : ''}
+                    {s.escalatedFromStepId ? ' · added by escalation' : ''}
+                    {s.mode === 'parallel' ? ' · parallel' : ''}
+                    {s.mode === 'executive' ? ' · executive' : ''}
+                  </span>
+                  {s.note && <span class="step-note">{s.note}</span>}
+                </span>
+                {mayManage && s.decision === 'pending' && inst.state === 'pending' && s.stepNo === inst.currentStep && (
+                  <form method="POST" class="step-form">
+                    <input type="hidden" name="action" value="escalate"/>
+                    <input type="hidden" name="stepId" value={s.id}/>
+                    <button class="btn btn-thin" type="submit">Escalate</button>
+                  </form>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+
+        {inst.state === 'pending' && (
+          <form method="POST" class="inline-form">
+            <input type="hidden" name="action" value="decide"/>
+            <input type="hidden" name="instanceId" value={inst.id}/>
+            <input class="fi" name="note" placeholder="note (optional)"/>
+            <button class="btn btn-ok" name="decision" value="approved" type="submit">Approve</button>
+            <button class="btn btn-no" name="decision" value="rejected" type="submit">Reject</button>
+            <span class="tiny">Only works if this request was routed to you, or you are standing in for whoever it was.</span>
+          </form>
+        )}
+
+        {mayManage && inst.state === 'halted' && (
+          <form method="POST" class="inline-form">
+            <input type="hidden" name="action" value="resume"/>
+            <input type="hidden" name="instanceId" value={inst.id}/>
+            <button class="btn btn-go" type="submit">Resume routing</button>
+          </form>
+        )}
+      </div>
+    ))}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Received and closed orders · {settledOrders.length}</h2>
+    {settledOrders.length === 0 && <p class="empty">Nothing has been received or closed yet.</p>}
+    {settledOrders.map((o) => (
+      <div class="card">
+        <div class="card-main">
+          <div class="card-title">
+            {o.poNumber}
+            <span class={o.status === 'received' ? 'chip chip-ok' : 'chip'}>{orderLabel(o.status)}</span>
+          </div>
+          <div class="card-sub">
+            {o.vendorName || 'No supplier recorded'}
+            {o.amount !== null ? ' · ' + formatAmount(o.amount, o.currency) : ''}
+            {o.receivedAt ? ' · received ' + fmtDate(o.receivedAt) : ''}
+            {o.assetTag ? ' · asset tag ' + o.assetTag : ''}
+          </div>
+          {o.receiptUrl && (
+            <div class="card-sub"><a class="ext" href={o.receiptUrl} target="_blank" rel="noopener noreferrer">Receipt</a></div>
+          )}
+          {o.assetTag && register.available && register.href && (
+            <div class="card-sub"><a class="ext" href={register.href}>Open the asset register</a></div>
+          )}
+          {o.assetTag && !register.available && (
+            <div class="card-sub tiny">
+              The asset register is not available in this environment yet. The tag is recorded here
+              and is what will match this purchase to it.
+            </div>
+          )}
+          {o.receiptNote && <div class="card-sub">{o.receiptNote}</div>}
+        </div>
+      </div>
+    ))}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">How a purchase request is routed</h2>
+    <p class="sec-note">
+      The chain below is the SHAPE of the approval, not a claim about who fills it. Every rung is
+      resolved per request, per requester, from the Organization Graph at the moment the chain starts,
+      and it is declared as data in the approval engine rather than written into this page.
+    </p>
+    <ol class="chainlist">
+      {chain.map((r) => (
+        <li>
+          <span class="hop-n">{r.step}</span>
+          <span>
+            {viaLabel(r.via)}
+            {r.parallel ? ' - shares this step with the other approver; both must approve' : ''}
+            {r.optional ? ' - optional, skipped when the organisation has not named one' : ''}
+            {r.minAmount !== null ? ' - only at or above ' + formatAmount(r.minAmount, DEFAULT_CURRENCY) : ''}
+          </span>
+        </li>
+      ))}
+    </ol>
+    <p class="sec-note">
+      {threshold !== null
+        ? 'Requests at or above ' + formatAmount(threshold, DEFAULT_CURRENCY) + ' add the executive and finance rung. That figure is part of the chain declaration, so this page reads it rather than restating it - what is on screen is what will be applied.'
+        : 'This chain has no amount threshold on it today.'}
+      A pending rung becomes escalatable after {escalateHours} hours; escalation ADDS the next person
+      up the reporting line and never takes the decision away from whoever owes it.
+    </p>
+    <p class="sec-note">
+      When a required rung resolves nobody, the request HALTS with the reason and is never approved by
+      default. That is the whole reason the halted state exists.
+    </p>
+  </div>
+
+  <style>
+    /* MOBILE FIRST — the base rules are the 360px rules; wider layouts are the exception. Nothing may
+       make the PAGE scroll sideways: every flex child carries min-width:0, because a flex item
+       defaults to min-width:auto and one long unbroken word (a pasted link, a PO number) would
+       otherwise push a card wider than the phone. */
+    .proc-page{ max-width:1040px; }
+    .flash{ margin:0 0 16px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3);
+      color:#6ee7b7; border-radius:8px; padding:10px 14px; font-size:13px; overflow-wrap:anywhere; }
+
+    .banner{ display:flex; gap:12px; align-items:flex-start; border-radius:10px; padding:14px;
+      margin:0 0 18px; font-size:13px; line-height:1.5; }
+    .banner-warn{ background:rgba(234,179,8,0.08); border:1px solid rgba(234,179,8,0.35); color:#fde68a; }
+    .banner-note{ background:rgba(148,163,184,0.08); border:1px solid rgba(148,163,184,0.28); color:#cbd5e1; }
+    .banner svg{ flex:0 0 auto; margin-top:2px; }
+    .banner p{ margin:6px 0 0; color:#d8d2bd; }
+    .banner code{ font-family:'Geist Mono',monospace; font-size:12px; background:#111; padding:1px 5px;
+      border-radius:4px; overflow-wrap:anywhere; }
+
+    .stats{ display:flex; flex-wrap:wrap; gap:8px; margin:0 0 16px; }
+    .stat{ flex:1 1 130px; min-width:0; background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px;
+      padding:12px 14px; display:flex; flex-direction:column; gap:2px; }
+    .stat-n{ font-family:'Geist Mono',monospace; font-size:22px; font-weight:700; color:#fff; }
+    .stat-l{ font-size:11px; color:#8a8a94; text-transform:uppercase; letter-spacing:0.08em; }
+
+    .crossref{ font-size:13px; color:#8a8a94; margin:0 0 22px; line-height:1.6; }
+    .crossref a, .ext{ color:#f97316; overflow-wrap:anywhere; }
+
+    .sec{ font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:0.16em; text-transform:uppercase;
+      color:#c2410c; font-weight:700; margin:26px 0 6px; }
+    .sec-note{ font-size:12.5px; color:#8a8a94; margin:0 0 12px; line-height:1.6; overflow-wrap:anywhere; }
+    .empty{ color:#8a8a94; font-size:13px; margin:0 0 18px; }
+    .tiny{ font-size:11.5px; color:#8a8a94; line-height:1.5; }
+
+    .card{ display:flex; gap:12px; background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px;
+      padding:12px 14px; margin-bottom:8px; flex-wrap:wrap; align-items:flex-start; }
+    .card-block{ flex-direction:column; }
+    .card-main{ flex:1 1 220px; min-width:0; overflow-wrap:anywhere; }
+    .card-title{ color:#fff; font-weight:700; font-size:14px; display:flex; flex-wrap:wrap; gap:8px;
+      align-items:center; }
+    .card-sub{ color:#8a8a94; font-size:12px; margin-top:3px; line-height:1.5; }
+
+    /* One column at 360px; two when there is room. Never a fixed table: a 150px field plus a nowrap
+       button is wider than a phone allows. */
+    .grid-form{ display:grid; grid-template-columns:1fr; gap:8px; width:100%; margin-top:10px; }
+    .inline-form{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; width:100%; margin-top:10px; }
+    .fl{ display:flex; flex-direction:column; gap:4px; font-size:11px; color:#8a8a94;
+      text-transform:uppercase; letter-spacing:0.06em; min-width:0; }
+    .fi{ background:#08080b; border:1px solid #262630; border-radius:7px; padding:11px 10px; color:#fff;
+      font-size:13px; outline:none; font-family:inherit; flex:1 1 150px; min-width:0; width:100%;
+      text-transform:none; letter-spacing:0; }
+    /* 44px minimum touch target. A control that needs a second attempt on a phone is a control that
+       gets pressed twice, and this page is full of things that must not happen twice. */
+    .btn{ border:none; border-radius:7px; padding:0 16px; min-height:44px; color:#fff; font-size:12px;
+      font-weight:700; cursor:pointer; font-family:'Geist Mono',monospace; white-space:nowrap;
+      flex:1 1 auto; }
+    .btn-ok{ background:#22c07e; }
+    .btn-no{ background:transparent; border:1px solid #444; color:#fca5a5; }
+    .btn-go{ background:#c2410c; }
+    .btn-thin{ background:transparent; border:1px solid #333; color:#cfd6da; font-size:11px; }
+
+    .chip{ font-family:'Geist Mono',monospace; font-size:10px; font-weight:700; text-transform:uppercase;
+      letter-spacing:0.08em; border-radius:999px; padding:3px 9px; background:#1a1a1f; color:#8a8a94; }
+    .chip-ok{ background:rgba(34,192,126,0.15); color:#86efac; }
+    .chip-no{ background:rgba(248,113,113,0.12); color:#fca5a5; }
+    .chip-wait{ background:rgba(249,115,22,0.14); color:#fdba74; }
+    .chip-halt{ background:rgba(234,179,8,0.14); color:#fde68a; }
+
+    .halt{ margin-top:10px; background:rgba(234,179,8,0.07); border:1px solid rgba(234,179,8,0.28);
+      border-radius:8px; padding:10px 12px; font-size:12.5px; color:#fde68a; line-height:1.55;
+      overflow-wrap:anywhere; }
+    .halt-note{ display:block; color:#a9a496; margin-top:5px; }
+
+    .steps{ list-style:none; margin:12px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+    .step{ display:flex; gap:10px; align-items:flex-start; background:#0b0b0f; border:1px solid #17171c;
+      border-radius:8px; padding:9px 11px; flex-wrap:wrap; }
+    .step-approved{ border-color:rgba(34,192,126,0.25); }
+    .step-rejected{ border-color:rgba(248,113,113,0.25); }
+    .step-n{ font-family:'Geist Mono',monospace; font-size:10px; color:#8a8a94; border:1px solid #2a2a33;
+      border-radius:4px; padding:1px 6px; flex:0 0 auto; margin-top:2px; }
+    .step-body{ flex:1 1 180px; min-width:0; display:flex; flex-direction:column; gap:2px;
+      overflow-wrap:anywhere; }
+    .step-who{ color:#e8e8ea; font-size:13px; font-weight:600; }
+    .step-meta{ color:#8a8a94; font-size:11.5px; }
+    .step-note{ color:#a8a8b0; font-size:12px; font-style:italic; }
+    .step-form{ flex:0 0 auto; }
+
+    .chainlist{ list-style:none; margin:0 0 12px; padding:0; display:flex; flex-direction:column; gap:7px; }
+    .chainlist li{ display:flex; gap:8px; align-items:baseline; font-size:13px; color:#cfd6da;
+      overflow-wrap:anywhere; line-height:1.55; }
+    .hop-n{ font-family:'Geist Mono',monospace; font-size:10px; color:#8a8a94; border:1px solid #2a2a33;
+      border-radius:4px; padding:1px 5px; flex:0 0 auto; }
+
+    @media (min-width:620px){
+      .grid-form{ grid-template-columns:repeat(2, minmax(0, 1fr)); align-items:end; }
+      .stat{ flex:1 1 150px; }
+    }
+  </style>
+</AdminLayout>

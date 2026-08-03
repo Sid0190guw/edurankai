@@ -1,0 +1,978 @@
+---
+// /portal/employee/performance — THE EMPLOYEE PERFORMANCE SURFACE.
+//
+// =================================================================================================
+// WHAT THIS PAGE IS
+// =================================================================================================
+//
+// One reachable screen for the four things a person actually has to do about their own performance:
+//
+//   Goals       set an objective with key results, move the numbers, see where they are.
+//   Appraisal   write a self-assessment, read the outcome when it is shared.
+//   Feedback    leave a note for a colleague, read what colleagues left for you.
+//   Team        for a manager: their reports' goals, the reviews they owe, and 360 feedback they
+//               have been asked for.
+//
+// THE TEAM TAB IS A RELATIONSHIP, NOT A ROLE. It appears when the Organization Graph records people
+// reporting to this person, or when they hold `performance.manage`. Nothing on this page reads
+// users.role, users.assigned_department_id, or an engagement type.
+//
+// =================================================================================================
+// THE EMPTY GRAPH IS THE ORDINARY FIRST RENDER, NOT AN EDGE CASE
+// =================================================================================================
+//
+// The Organization Graph is EMPTY until the founder runs db/org-graph-backfill.sql. So on a fresh
+// database: goals work (they need no relationship), self-assessments work, feedback works — and the
+// team tab says "the Organization Graph has not been set up yet", which is a DIFFERENT sentence from
+// "nobody reports to you". viewer.initialized is what tells them apart, and printing the second when
+// the first is true would tell every manager in the company they have no team.
+//
+// A sign-off that cannot be routed HALTS with a readable sentence from the workflow engine, printed
+// verbatim. It is never approved and never quietly skipped.
+//
+// =================================================================================================
+// POST-REDIRECT-GET, AND EVERY CONST BEFORE THE HANDLER
+// =================================================================================================
+//
+// Every write POSTs and then redirects with a message in the query string, so a refresh never
+// resubmits. Every `const` this file uses is declared ABOVE the POST handler: `const` is not hoisted,
+// and a handler reaching a later declaration throws on its first line while the page reports success
+// — that pattern took down apply step 5 and the /admin/roles/diagnose Repair button here.
+//
+// CLIENT JAVASCRIPT: NONE. Tabs are links, forms are forms, disclosure is native <details>.
+//
+// MOBILE FIRST — around nine in ten of these people are on a phone. 360px is the design width, every
+// control clears 44px, and nothing makes the page scroll sideways.
+import { composeWorkspace } from '@/lib/workforce/composer';
+import { resolvePerfViewer, employeeHeader, PERF_MANAGE } from '@/lib/performance-scope';
+import {
+  goalsInScope,
+  createObjective,
+  addKeyResult,
+  updateKeyResult,
+  removeKeyResult,
+  setGoalProgress,
+  closeGoal,
+  GOAL_STATUS_LABELS,
+  GOAL_VISIBILITY,
+  type Goal,
+} from '@/lib/goals';
+import {
+  activeCycle,
+  myReview,
+  reviewHistory,
+  reviewsIOwe,
+  saveSelfAssessment,
+  saveManagerReview,
+  submitForSignoff,
+  recommendPromotion,
+  signoffState,
+  promotionState,
+  giveFeedback,
+  feedbackFor,
+  feedbackIGave,
+  feedbackRecipients,
+  reviewPanelFor,
+  CYCLE_STAGE_LABELS,
+  FEEDBACK_THEMES,
+  FEEDBACK_THEME_LABELS,
+  REVIEW_OUTCOME_LABELS,
+  RATING_MIN,
+  RATING_MAX,
+  type PerformanceReview,
+  type FeedbackNote,
+} from '@/lib/performance';
+
+const PATH = '/portal/employee/performance';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ---- Constants and helpers, ALL declared before the POST handler below ---------------------------
+const VIEWS = [
+  { key: 'goals', label: 'Goals' },
+  { key: 'appraisal', label: 'Appraisal' },
+  { key: 'feedback', label: 'Feedback' },
+  { key: 'team', label: 'Team' },
+] as const;
+
+const RATINGS = [1, 2, 3, 4, 5];
+
+const back = (msg: string, view: string) =>
+  Astro.redirect(PATH + '?view=' + encodeURIComponent(view) + '&msg=' + encodeURIComponent(msg.slice(0, 300)));
+
+const fmtDate = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+const pct = (n: number) => Math.max(0, Math.min(100, Math.round(n)));
+
+// ---- The composition, then the scope. One of each per request. -----------------------------------
+let composed: any = null;
+try {
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: PATH });
+} catch (e: any) {
+  // A composition that cannot be built is not guessed at. holds() then answers false for everything,
+  // which lands the viewer on the narrowest scope — the safe direction.
+  console.error('[portal/employee/performance] compose', e?.cause?.message || e?.message);
+}
+
+const holds = (key: string): boolean => {
+  try {
+    return composed?.context?.holds ? composed.context.holds(key) === true : false;
+  } catch {
+    return false;
+  }
+};
+
+const viewer = await resolvePerfViewer(String(user.id), holds);
+const canManageOrg = holds(PERF_MANAGE);
+
+// =================================================================================================
+// WRITES
+// =================================================================================================
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const view = String(fd.get('view') || 'goals');
+
+  if (!viewer.employeeId) {
+    return back('This account has no employee record, so there is nothing to save against it.', view);
+  }
+
+  if (action === 'create_goal') {
+    const r = await createObjective({
+      employeeId: viewer.employeeId,
+      ownerUserId: viewer.userId,
+      setByUserId: viewer.userId,
+      title: String(fd.get('title') || ''),
+      description: String(fd.get('description') || ''),
+      successMetric: String(fd.get('success_metric') || ''),
+      periodLabel: String(fd.get('period_label') || ''),
+      periodStart: String(fd.get('period_start') || ''),
+      periodEnd: String(fd.get('period_end') || ''),
+      visibility: (String(fd.get('visibility') || 'manager') as any),
+    });
+    return back(r.ok ? 'Objective added.' : (r.error || 'Could not add that objective.'), 'goals');
+  }
+
+  if (action === 'add_kr') {
+    const r = await addKeyResult({
+      goalId: String(fd.get('goal_id') || ''),
+      title: String(fd.get('kr_title') || ''),
+      unit: String(fd.get('kr_unit') || ''),
+      startValue: Number(fd.get('kr_start') || 0),
+      targetValue: Number(fd.get('kr_target') || 100),
+      currentValue: Number(fd.get('kr_start') || 0),
+      actorUserId: viewer.userId,
+    });
+    return back(r.ok ? 'Key result added.' : (r.error || 'Could not add that key result.'), 'goals');
+  }
+
+  if (action === 'update_kr') {
+    const r = await updateKeyResult(String(fd.get('kr_id') || ''), {
+      currentValue: Number(fd.get('kr_current')),
+      status: String(fd.get('kr_status') || '') || null,
+      actorUserId: viewer.userId,
+    });
+    return back(r.ok ? 'Progress saved.' : (r.error || 'Could not save that.'), 'goals');
+  }
+
+  if (action === 'remove_kr') {
+    const r = await removeKeyResult(String(fd.get('kr_id') || ''), viewer.userId);
+    return back(r.ok ? 'Key result removed.' : (r.error || 'Could not remove that.'), 'goals');
+  }
+
+  if (action === 'set_progress') {
+    const r = await setGoalProgress(String(fd.get('goal_id') || ''), Number(fd.get('progress')), viewer.userId);
+    return back(r.ok ? 'Progress saved.' : (r.error || 'Could not save that.'), 'goals');
+  }
+
+  if (action === 'close_goal') {
+    const status = String(fd.get('goal_status') || 'met') as any;
+    try {
+      await closeGoal(String(fd.get('goal_id') || ''), status, String(fd.get('outcome_notes') || ''));
+      return back('Objective closed as ' + (GOAL_STATUS_LABELS[status] || status).toLowerCase() + '.', 'goals');
+    } catch (e: any) {
+      // NEVER SWALLOWED in a write path — the real reason is on e.cause.
+      console.error('[portal/employee/performance] close_goal', e?.cause?.message || e?.message);
+      return back('We could not close that objective. Nothing was changed.', 'goals');
+    }
+  }
+
+  if (action === 'save_self') {
+    const r = await saveSelfAssessment(String(fd.get('review_id') || ''), viewer.employeeId, {
+      text: String(fd.get('self_text') || ''),
+      rating: fd.get('self_rating') ? Number(fd.get('self_rating')) : null,
+      submit: fd.get('submit') === '1',
+      actorUserId: viewer.userId,
+    });
+    return back(
+      r.ok ? (fd.get('submit') === '1' ? 'Self-assessment submitted.' : 'Saved as a draft.') : (r.error || 'Could not save that.'),
+      'appraisal',
+    );
+  }
+
+  if (action === 'save_manager_review') {
+    const r = await saveManagerReview(String(fd.get('review_id') || ''), viewer, {
+      overallRating: fd.get('overall') ? Number(fd.get('overall')) : null,
+      goalsScore: fd.get('goals_score') ? Number(fd.get('goals_score')) : null,
+      skillsScore: fd.get('skills_score') ? Number(fd.get('skills_score')) : null,
+      attitudeScore: fd.get('attitude_score') ? Number(fd.get('attitude_score')) : null,
+      strengths: String(fd.get('strengths') || ''),
+      improvements: String(fd.get('improvements') || ''),
+      goalsNext: String(fd.get('goals_next') || ''),
+      comments: String(fd.get('comments') || ''),
+      submit: fd.get('submit') === '1',
+      actorUserId: viewer.userId,
+    });
+    return back(r.ok ? (fd.get('submit') === '1' ? 'Review submitted.' : 'Saved as a draft.') : (r.error || 'Could not save that.'), 'team');
+  }
+
+  if (action === 'send_signoff') {
+    const r = await submitForSignoff(String(fd.get('review_id') || ''), viewer.userId);
+    if (!r.ok) return back(r.error || 'Could not send that for sign-off.', 'team');
+    // A HALT IS REPORTED, NOT HIDDEN. The sentence names the missing relationship.
+    return back(r.haltReason ? 'Sent, but it has halted: ' + r.haltReason : 'Sent for sign-off.', 'team');
+  }
+
+  if (action === 'recommend_promotion') {
+    const r = await recommendPromotion(String(fd.get('review_id') || ''), viewer, {
+      proposedDesignation: String(fd.get('proposed_designation') || ''),
+      justification: String(fd.get('justification') || ''),
+    });
+    if (!r.ok) return back(r.error || 'Could not raise that recommendation.', 'team');
+    return back(
+      r.haltReason
+        ? 'Recommendation raised, but it has halted: ' + r.haltReason
+        : 'Recommendation raised and sent for approval.',
+      'team',
+    );
+  }
+
+  if (action === 'give_feedback') {
+    const r = await giveFeedback({
+      subjectEmployeeId: String(fd.get('subject') || ''),
+      authorUserId: viewer.userId,
+      authorEmployeeId: viewer.employeeId,
+      authorName: viewer.fullName || String((user as any).name || ''),
+      body: String(fd.get('body') || ''),
+      theme: String(fd.get('theme') || 'general'),
+      cycleId: String(fd.get('cycle_id') || '') || null,
+    });
+    return back(r.ok ? 'Feedback sent.' : (r.error || 'Could not send that.'), view === 'team' ? 'team' : 'feedback');
+  }
+
+  return back('That action is not one this page performs.', view);
+}
+
+// =================================================================================================
+// READS
+// =================================================================================================
+const params = Astro.url.searchParams;
+const requested = String(params.get('view') || 'goals');
+const view = (VIEWS as readonly { key: string }[]).some((v) => v.key === requested) ? requested : 'goals';
+const msg = String(params.get('msg') || '').slice(0, 300);
+
+const cycle = await activeCycle();
+
+let mine: Goal[] = [];
+let team: Goal[] = [];
+if (view === 'goals' || view === 'team') {
+  const scoped = await goalsInScope(viewer);
+  mine = scoped.mine;
+  team = scoped.team;
+}
+
+let ownReview: PerformanceReview | null = null;
+let history: PerformanceReview[] = [];
+let panel: any[] = [];
+let signoff: any = null;
+if (view === 'appraisal' && viewer.employeeId) {
+  ownReview = cycle ? await myReview(cycle.id, viewer.employeeId) : null;
+  history = await reviewHistory(viewer.employeeId);
+  panel = cycle ? await reviewPanelFor(viewer.employeeId, cycle.id) : [];
+  if (ownReview) signoff = await signoffState(ownReview);
+}
+
+let received: FeedbackNote[] = [];
+let given: FeedbackNote[] = [];
+let recipients: { id: string; name: string; designation: string | null }[] = [];
+if (view === 'feedback') {
+  received = viewer.employeeId ? await feedbackFor(viewer.employeeId) : [];
+  given = await feedbackIGave(viewer.userId);
+  recipients = await feedbackRecipients(viewer);
+}
+
+let owed: PerformanceReview[] = [];
+let reviewSubjectHeaders: { id: string; fullName: string; designation: string | null }[] = [];
+const promoStates = new Map<string, any>();
+if (view === 'team') {
+  owed = await reviewsIOwe(viewer, cycle?.id || null);
+  for (const r of owed) {
+    if (r.promotionWorkflowId) promoStates.set(r.id, await promotionState(r));
+  }
+  for (const p of viewer.reviewSubjects.slice(0, 20)) {
+    const h = p.employeeId ? await employeeHeader(String(p.employeeId)) : null;
+    if (h) reviewSubjectHeaders.push({ id: h.id, fullName: h.fullName, designation: h.designation });
+  }
+  if (!recipients.length) recipients = await feedbackRecipients(viewer);
+}
+
+const showTeamTab = viewer.reports.length > 0 || canManageOrg || viewer.reviewSubjects.length > 0;
+const hrefFor = (v: string) => PATH + '?view=' + v;
+const cycleStageLabel = cycle ? (CYCLE_STAGE_LABELS[cycle.stage] || cycle.stage) : '';
+---
+
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Performance - EduRankAI</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    html,body{overflow-x:hidden}
+    body{background:#f6f4ef;color:#1a1510;min-height:100vh;padding-bottom:48px;
+      font-family:'Inter Tight',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+      -webkit-text-size-adjust:100%}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;
+      gap:10px;padding:8px 14px;position:sticky;top:0;z-index:40}
+    .top a{color:#9a8f7d;text-decoration:none;display:inline-flex;align-items:center;gap:7px;
+      font-size:14px;min-height:44px}
+    .top strong{color:#fff;font-size:15px;font-weight:700}
+    .top span{color:#9a8f7d;font-size:11px;max-width:34vw;overflow:hidden;text-overflow:ellipsis;
+      white-space:nowrap}
+    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding:10px 14px 2px;
+      scrollbar-width:thin;background:#f6f4ef;position:sticky;top:54px;z-index:30}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:38px;padding:8px 14px;
+      border:1px solid #e6ddcd;border-radius:999px;background:#fff;color:#6b6255;font-size:13px;
+      font-weight:600;text-decoration:none;white-space:nowrap}
+    .tab[aria-current="page"]{background:#1a1510;border-color:#1a1510;color:#fff}
+    .tab:focus-visible{outline:2px solid #c2410c;outline-offset:2px}
+    .wrap{max-width:640px;margin:0 auto;padding:12px 14px}
+    .scope{font-size:12.5px;line-height:1.55;color:#6b6255;margin:2px 0 12px}
+    .flash{background:rgba(5,150,105,.09);border:1px solid rgba(5,150,105,.3);color:#065f46;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:14px;
+      overflow-wrap:anywhere}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:13px;
+      box-shadow:0 8px 26px rgba(26,21,16,.045)}
+    .card h2{font-size:15px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px;overflow-wrap:anywhere}
+    .card h3{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;letter-spacing:.13em;
+      text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 11px}
+    .muted{font-size:12.5px;line-height:1.55;color:#6b6255;overflow-wrap:anywhere}
+    .empty{background:#fbf8f2;border:1px dashed #e0d5c0;border-radius:14px;padding:18px 16px;
+      margin-bottom:13px}
+    .empty b{display:block;font-size:14px;margin-bottom:5px}
+    .notice{background:#fbf7f1;border:1px solid #eadecd;color:#6d470d;border-radius:10px;
+      padding:10px 12px;font-size:12.5px;line-height:1.55;margin-bottom:12px;overflow-wrap:anywhere}
+    label{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9.5px;letter-spacing:.1em;
+      text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;
+      padding:11px 12px;font-size:14px;font-family:inherit;color:#1a1510;outline:none;min-height:44px}
+    textarea{min-height:88px;resize:vertical}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c}
+    .row2{display:grid;grid-template-columns:1fr;gap:9px}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:12px 18px;font-size:14px;
+      font-weight:650;cursor:pointer;font-family:inherit;width:100%;min-height:44px;margin-top:12px}
+    .btn.ghost{background:#fff;color:#6b6255;border:1px solid #e6ddcd}
+    .btn.slim{width:auto;padding:9px 14px;font-size:13px;margin-top:0}
+    .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+    .btns .btn{width:auto;flex:1 1 130px;margin-top:0}
+    .goal{border:1px solid #ece4d6;border-radius:13px;padding:13px;margin-bottom:10px;background:#fff}
+    .goal__top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+    .goal__title{font-size:14.5px;font-weight:650;line-height:1.35;overflow-wrap:anywhere}
+    .pill{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9.5px;font-weight:700;
+      padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;flex:none;
+      background:#f2ece0;color:#6b6255}
+    .pill.open{background:rgba(194,65,12,.1);color:#9a3412}
+    .pill.met{background:rgba(5,150,105,.12);color:#065f46}
+    .bar{height:7px;border-radius:99px;background:#f0e9db;overflow:hidden;margin:9px 0 4px}
+    .bar i{display:block;height:100%;background:#c2410c;border-radius:99px}
+    .kr{border-top:1px solid #f2ece0;padding:9px 0 3px}
+    .kr__t{font-size:13.5px;line-height:1.4;overflow-wrap:anywhere}
+    .kr__m{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:#6b6255;
+      margin-top:2px}
+    .krform{display:flex;flex-wrap:wrap;gap:7px;align-items:flex-end;margin-top:7px}
+    .krform input,.krform select{flex:1 1 92px;min-width:0;min-height:44px;padding:9px 10px;font-size:13px}
+    .krform button{flex:0 0 auto}
+    details{border:1px solid #ece4d6;border-radius:12px;background:#fff;margin-bottom:11px;
+      overflow:hidden}
+    details>summary{list-style:none;cursor:pointer;padding:13px 15px;font-size:14px;font-weight:650;
+      min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+    details>summary::-webkit-details-marker{display:none}
+    details>summary::after{content:'+';font-family:ui-monospace,monospace;color:#9a8f7d;font-size:17px}
+    details[open]>summary::after{content:'\2212'}
+    details .inner{padding:0 15px 15px}
+    .note{border:1px solid #ece4d6;border-radius:12px;padding:12px 13px;margin-bottom:9px;background:#fff}
+    .note__h{display:flex;justify-content:space-between;gap:9px;align-items:baseline;margin-bottom:5px}
+    .note__a{font-size:13px;font-weight:650;overflow-wrap:anywhere}
+    .note__d{font-size:11px;color:#9a8f7d;flex:none}
+    .note__b{font-size:13.5px;line-height:1.55;overflow-wrap:anywhere;white-space:pre-wrap}
+    .kv{display:flex;justify-content:space-between;gap:10px;padding:8px 0;
+      border-bottom:1px solid #f2ece0;font-size:13.5px}
+    .kv:last-child{border-bottom:none}
+    .kv span{color:#6b6255;flex:none}
+    .halt{background:rgba(220,38,38,.07);border:1px solid rgba(220,38,38,.28);color:#991b1b;
+      border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.55;margin-top:10px;
+      overflow-wrap:anywhere}
+    .foot{font-size:11.5px;line-height:1.6;color:#9a8f7d;padding:14px 2px 0;border-top:1px solid #ece4d6;
+      margin-top:16px;overflow-wrap:anywhere}
+    @media (min-width:560px){ .row2{grid-template-columns:1fr 1fr} }
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee" aria-label="Back to my workspace">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>Workspace
+  </a>
+  <strong>Performance</strong>
+  <span>{viewer.fullName || (user as any).name}</span>
+</nav>
+
+<nav class="tabs" aria-label="Performance views">
+  {VIEWS.filter((v) => v.key !== 'team' || showTeamTab).map((v) => (
+    <a class="tab" href={hrefFor(v.key)} aria-current={v.key === view ? 'page' : null}>{v.label}</a>
+  ))}
+</nav>
+
+<main class="wrap">
+  {msg && <p class="flash">{msg}</p>}
+  <p class="scope">{viewer.explanation}</p>
+
+  {!viewer.employeeId && (
+    <div class="empty">
+      <b>There is no employee record on this account</b>
+      <p class="muted">Goals, appraisals and feedback are all attached to an employee record, and this
+        account does not have one. HR creates the record; nothing on this page can create it for you.</p>
+    </div>
+  )}
+
+  {/* ------------------------------------------------------------------ GOALS */}
+  {view === 'goals' && viewer.employeeId && (
+    <>
+      <div class="card">
+        <h3>Set an objective</h3>
+        <form method="post">
+          <input type="hidden" name="action" value="create_goal" />
+          <input type="hidden" name="view" value="goals" />
+          <label for="g-title">Objective</label>
+          <input id="g-title" name="title" maxlength="300" required
+            placeholder="What are you trying to achieve" />
+          <label for="g-desc">Why it matters</label>
+          <textarea id="g-desc" name="description" maxlength="4000"
+            placeholder="Optional. What changes if this lands"></textarea>
+          <label for="g-metric">How you will know it worked</label>
+          <input id="g-metric" name="success_metric" maxlength="500"
+            placeholder="Optional. The evidence you would point at" />
+          <div class="row2">
+            <div>
+              <label for="g-period">Period</label>
+              <input id="g-period" name="period_label" maxlength="40" placeholder="Q3 2026" />
+            </div>
+            <div>
+              <label for="g-vis">Who can see it</label>
+              <select id="g-vis" name="visibility">
+                {GOAL_VISIBILITY.map((v) => (
+                  <option value={v}>{v === 'private' ? 'Only me' : 'Me and my manager'}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="g-start">Starts</label>
+              <input id="g-start" type="date" name="period_start" />
+            </div>
+            <div>
+              <label for="g-end">Ends</label>
+              <input id="g-end" type="date" name="period_end" />
+            </div>
+          </div>
+          <button class="btn" type="submit">Add objective</button>
+        </form>
+      </div>
+
+      {mine.length === 0 && (
+        <div class="empty">
+          <b>No objectives yet</b>
+          <p class="muted">Add one above. An objective with key results takes its progress from them,
+            so you move the numbers rather than guessing a percentage.</p>
+        </div>
+      )}
+
+      {mine.map((g) => (
+        <div class="goal">
+          <div class="goal__top">
+            <div class="goal__title">{g.title}</div>
+            <span class={'pill ' + (g.status === 'open' ? 'open' : g.status === 'met' ? 'met' : '')}>
+              {GOAL_STATUS_LABELS[g.status] || g.status}
+            </span>
+          </div>
+          {g.periodLabel && <p class="muted" style="margin-top:3px">{g.periodLabel}</p>}
+          {g.description && <p class="muted" style="margin-top:5px">{g.description}</p>}
+          <div class="bar"><i style={'width:' + pct(g.progressPct) + '%'}></i></div>
+          <p class="muted">
+            {pct(g.progressPct)}% ·
+            {g.progressDerived ? ' from ' + g.keyResults.length + ' key result' + (g.keyResults.length === 1 ? '' : 's') : ' set by hand'}
+            {g.visibility === 'private' ? ' · only you can see this' : ''}
+          </p>
+
+          {g.keyResults.map((kr) => (
+            <div class="kr">
+              <div class="kr__t">{kr.title}</div>
+              <div class="kr__m">
+                {kr.currentValue} of {kr.targetValue}{kr.unit ? ' ' + kr.unit : ''} · {kr.progressPct}%
+              </div>
+              {g.status === 'open' && (
+                <form method="post" class="krform">
+                  <input type="hidden" name="action" value="update_kr" />
+                  <input type="hidden" name="view" value="goals" />
+                  <input type="hidden" name="kr_id" value={kr.id} />
+                  <input type="number" step="any" name="kr_current" value={kr.currentValue}
+                    aria-label={'Current value for ' + kr.title} />
+                  <select name="kr_status" aria-label={'Status for ' + kr.title}>
+                    <option value="open" selected={kr.status === 'open'}>Open</option>
+                    <option value="done" selected={kr.status === 'done'}>Done</option>
+                    <option value="dropped" selected={kr.status === 'dropped'}>Dropped</option>
+                  </select>
+                  <button class="btn slim" type="submit">Save</button>
+                </form>
+              )}
+              {g.status === 'open' && (
+                <form method="post" style="margin-top:7px">
+                  <input type="hidden" name="action" value="remove_kr" />
+                  <input type="hidden" name="view" value="goals" />
+                  <input type="hidden" name="kr_id" value={kr.id} />
+                  <button class="btn ghost slim" type="submit">Remove this key result</button>
+                </form>
+              )}
+            </div>
+          ))}
+
+          {g.status === 'open' && (
+            <details style="margin-top:11px">
+              <summary>Add a key result</summary>
+              <div class="inner">
+                <form method="post">
+                  <input type="hidden" name="action" value="add_kr" />
+                  <input type="hidden" name="view" value="goals" />
+                  <input type="hidden" name="goal_id" value={g.id} />
+                  <label for={'kr-t-' + g.id}>Key result</label>
+                  <input id={'kr-t-' + g.id} name="kr_title" maxlength="300" required
+                    placeholder="Something you can count" />
+                  <div class="row2">
+                    <div>
+                      <label for={'kr-s-' + g.id}>Starting at</label>
+                      <input id={'kr-s-' + g.id} type="number" step="any" name="kr_start" value="0" />
+                    </div>
+                    <div>
+                      <label for={'kr-g-' + g.id}>Target</label>
+                      <input id={'kr-g-' + g.id} type="number" step="any" name="kr_target" value="100" />
+                    </div>
+                  </div>
+                  <label for={'kr-u-' + g.id}>Unit</label>
+                  <input id={'kr-u-' + g.id} name="kr_unit" maxlength="24" placeholder="Optional" />
+                  <button class="btn" type="submit">Add key result</button>
+                </form>
+              </div>
+            </details>
+          )}
+
+          {g.status === 'open' && g.keyResults.length === 0 && (
+            <form method="post" class="krform" style="margin-top:9px">
+              <input type="hidden" name="action" value="set_progress" />
+              <input type="hidden" name="view" value="goals" />
+              <input type="hidden" name="goal_id" value={g.id} />
+              <input type="number" min="0" max="100" name="progress" value={pct(g.progressPct)}
+                aria-label={'Progress for ' + g.title} />
+              <button class="btn slim" type="submit">Save progress</button>
+            </form>
+          )}
+
+          {g.status === 'open' && (
+            <details style="margin-top:11px">
+              <summary>Close this objective</summary>
+              <div class="inner">
+                <form method="post">
+                  <input type="hidden" name="action" value="close_goal" />
+                  <input type="hidden" name="view" value="goals" />
+                  <input type="hidden" name="goal_id" value={g.id} />
+                  <label for={'gs-' + g.id}>Outcome</label>
+                  <select id={'gs-' + g.id} name="goal_status">
+                    <option value="met">Met</option>
+                    <option value="partial">Partly met</option>
+                    <option value="missed">Missed</option>
+                    <option value="dropped">Dropped</option>
+                  </select>
+                  <label for={'gn-' + g.id}>Notes</label>
+                  <textarea id={'gn-' + g.id} name="outcome_notes" maxlength="2000"></textarea>
+                  <button class="btn" type="submit">Close objective</button>
+                </form>
+              </div>
+            </details>
+          )}
+        </div>
+      ))}
+    </>
+  )}
+
+  {/* -------------------------------------------------------------- APPRAISAL */}
+  {view === 'appraisal' && viewer.employeeId && (
+    <>
+      {!cycle && (
+        <div class="empty">
+          <b>No appraisal cycle is open</b>
+          <p class="muted">Cycles are opened by the people team. When one is running it appears here
+            with your self-assessment.</p>
+        </div>
+      )}
+
+      {cycle && (
+        <div class="card">
+          <h3>Current cycle</h3>
+          <h2>{cycle.title}</h2>
+          <div class="kv"><span>Stage</span><b>{cycleStageLabel}</b></div>
+          {cycle.periodStart && cycle.periodEnd && (
+            <div class="kv"><span>Period</span><b>{fmtDate(cycle.periodStart)} to {fmtDate(cycle.periodEnd)}</b></div>
+          )}
+          {cycle.selfDueOn && <div class="kv"><span>Self-assessment due</span><b>{fmtDate(cycle.selfDueOn)}</b></div>}
+        </div>
+      )}
+
+      {cycle && !ownReview && (
+        <div class="empty">
+          <b>You are not in this cycle</b>
+          <p class="muted">Cycles are seeded from active employee records when they are opened. If you
+            joined after this one was created, the people team can add you.</p>
+        </div>
+      )}
+
+      {ownReview && (
+        <div class="card">
+          <h3>Your self-assessment</h3>
+          {ownReview.selfSubmittedAt ? (
+            <>
+              <p class="muted">Submitted {fmtDate(ownReview.selfSubmittedAt)}. A submitted
+                self-assessment cannot be edited, because your manager may already have read it.</p>
+              <p class="note__b" style="margin-top:10px">{ownReview.selfAssessment}</p>
+              {ownReview.selfRating !== null && (
+                <div class="kv" style="margin-top:8px"><span>Your own rating</span><b>{ownReview.selfRating} of {RATING_MAX}</b></div>
+              )}
+            </>
+          ) : (
+            <form method="post">
+              <input type="hidden" name="action" value="save_self" />
+              <input type="hidden" name="view" value="appraisal" />
+              <input type="hidden" name="review_id" value={ownReview.id} />
+              <label for="self-text">How the period went</label>
+              <textarea id="self-text" name="self_text" maxlength="8000"
+                placeholder="What you delivered, what you learned, what got in the way">{ownReview.selfAssessment}</textarea>
+              <label for="self-rating">Your own rating</label>
+              <select id="self-rating" name="self_rating">
+                <option value="">Prefer not to say</option>
+                {RATINGS.map((n) => (
+                  <option value={n} selected={ownReview && ownReview.selfRating === n}>{n} of {RATING_MAX}</option>
+                ))}
+              </select>
+              <div class="btns">
+                <button class="btn ghost" type="submit" name="submit" value="0">Save draft</button>
+                <button class="btn" type="submit" name="submit" value="1">Submit</button>
+              </div>
+            </form>
+          )}
+        </div>
+      )}
+
+      {ownReview && ownReview.sharedWithEmployeeAt && (
+        <div class="card">
+          <h3>Your outcome</h3>
+          <div class="kv"><span>Outcome</span><b>{REVIEW_OUTCOME_LABELS[String(ownReview.outcome)] || 'Recorded'}</b></div>
+          {ownReview.overallRating !== null && (
+            <div class="kv"><span>Manager rating</span><b>{ownReview.overallRating} of {RATING_MAX}</b></div>
+          )}
+          {ownReview.calibratedRating !== null && (
+            <div class="kv"><span>After calibration</span><b>{ownReview.calibratedRating} of {RATING_MAX}</b></div>
+          )}
+          {ownReview.strengths && (
+            <><label>Strengths</label><p class="note__b">{ownReview.strengths}</p></>
+          )}
+          {ownReview.improvements && (
+            <><label>To work on</label><p class="note__b">{ownReview.improvements}</p></>
+          )}
+          {ownReview.outcomeNote && (
+            <><label>Note</label><p class="note__b">{ownReview.outcomeNote}</p></>
+          )}
+          {ownReview.calibrationNote && (
+            <p class="muted" style="margin-top:9px">Calibration note: {ownReview.calibrationNote}. Your
+              manager's own rating is kept beside the calibrated one, so both are on the record.</p>
+          )}
+        </div>
+      )}
+
+      {signoff && (
+        <div class="card">
+          <h3>Sign-off</h3>
+          <div class="kv"><span>State</span><b>{signoff.state}</b></div>
+          {signoff.haltReason && <p class="halt">{signoff.haltReason}</p>}
+        </div>
+      )}
+
+      {cycle && (
+        <div class="card">
+          <h3>Who reviews you</h3>
+          {panel.length === 0 ? (
+            <p class="muted">
+              {viewer.initialized
+                ? 'No reviewers are recorded for you in the Organization Graph for this cycle. A 360 panel is recorded by the people team as a reviewer relationship.'
+                : 'The Organization Graph has not been set up yet, so no review panel can be resolved for anybody. That is not the same as you having no reviewers.'}
+            </p>
+          ) : (
+            panel.map((p: any) => (
+              <div class="kv"><span>{p.designation || 'Reviewer'}</span><b>{p.fullName || 'Unnamed record'}</b></div>
+            ))
+          )}
+        </div>
+      )}
+
+      {history.length > 0 && (
+        <div class="card">
+          <h3>Earlier cycles</h3>
+          {history.map((h) => (
+            <div class="kv">
+              <span>{h.cycleTitle || 'A cycle'}</span>
+              <b>{h.calibratedRating ?? h.overallRating ?? '—'}</b>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  )}
+
+  {/* --------------------------------------------------------------- FEEDBACK */}
+  {view === 'feedback' && viewer.employeeId && (
+    <>
+      <div class="card">
+        <h3>Leave feedback for a colleague</h3>
+        {recipients.length === 0 ? (
+          <p class="muted">
+            {viewer.initialized
+              ? 'There is nobody in reach to leave feedback for. The people you can pick are the ones the Organization Graph connects you to: your manager, your reports, and anybody you review.'
+              : 'The Organization Graph has not been set up yet, so we cannot work out who you work with. Once it is, the people you can leave feedback for appear here.'}
+          </p>
+        ) : (
+          <form method="post">
+            <input type="hidden" name="action" value="give_feedback" />
+            <input type="hidden" name="view" value="feedback" />
+            <label for="fb-who">Who it is for</label>
+            <select id="fb-who" name="subject" required>
+              <option value="">Choose a colleague</option>
+              {recipients.map((r) => (
+                <option value={r.id}>{r.name}{r.designation ? ' — ' + r.designation : ''}</option>
+              ))}
+            </select>
+            <label for="fb-theme">What kind</label>
+            <select id="fb-theme" name="theme">
+              {FEEDBACK_THEMES.map((t) => <option value={t}>{FEEDBACK_THEME_LABELS[t]}</option>)}
+            </select>
+            <label for="fb-body">The feedback</label>
+            <textarea id="fb-body" name="body" maxlength="4000" required
+              placeholder="Be specific about what happened and what it changed"></textarea>
+            <p class="muted" style="margin-top:8px">Your name is recorded and shown. Feedback here is
+              never anonymous.</p>
+            <button class="btn" type="submit">Send feedback</button>
+          </form>
+        )}
+      </div>
+
+      <div class="card">
+        <h3>Feedback for you</h3>
+        {received.length === 0
+          ? <p class="muted">Nothing yet. When a colleague leaves you a note it appears here first.</p>
+          : received.map((f) => (
+            <div class="note">
+              <div class="note__h">
+                <span class="note__a">{f.authorName}</span>
+                <span class="note__d">{fmtDate(f.createdAt)}</span>
+              </div>
+              <p class="note__b">{f.body}</p>
+              <p class="muted" style="margin-top:6px">{FEEDBACK_THEME_LABELS[f.theme] || f.theme}
+                {f.kind === '360' ? ' · review feedback' : ''}</p>
+            </div>
+          ))}
+      </div>
+
+      {given.length > 0 && (
+        <details>
+          <summary>Feedback you have given</summary>
+          <div class="inner">
+            {given.map((f) => (
+              <div class="note">
+                <div class="note__h">
+                  <span class="note__a">For {f.subjectName || 'a colleague'}</span>
+                  <span class="note__d">{fmtDate(f.createdAt)}</span>
+                </div>
+                <p class="note__b">{f.body}</p>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </>
+  )}
+
+  {/* ------------------------------------------------------------------- TEAM */}
+  {view === 'team' && showTeamTab && (
+    <>
+      {!viewer.initialized && (
+        <p class="notice">The Organization Graph has not been set up yet. Until it is, reporting lines
+          cannot be resolved for anybody — so a short team list here is not a statement about your team.</p>
+      )}
+
+      <div class="card">
+        <h3>Your reports</h3>
+        {viewer.reports.length === 0
+          ? <p class="muted">{viewer.initialized
+              ? 'Nobody is recorded as reporting to you in the Organization Graph.'
+              : 'No reporting lines exist yet, so nobody can be listed here.'}</p>
+          : viewer.reports.map((p) => (
+            <div class="kv">
+              <span>{p.designation || 'Team member'}</span>
+              <b>{p.fullName || 'Unnamed record'}</b>
+            </div>
+          ))}
+      </div>
+
+      {reviewSubjectHeaders.length > 0 && (
+        <div class="card">
+          <h3>People you review</h3>
+          <p class="muted" style="margin-bottom:9px">A reviewer relationship from the Organization
+            Graph. Leave them 360 feedback from the Feedback tab.</p>
+          {reviewSubjectHeaders.map((p) => (
+            <div class="kv"><span>{p.designation || 'Colleague'}</span><b>{p.fullName}</b></div>
+          ))}
+        </div>
+      )}
+
+      <div class="card">
+        <h3>Reviews you owe</h3>
+        {owed.length === 0
+          ? <p class="muted">{cycle
+              ? 'Nothing is waiting on you in this cycle.'
+              : 'No appraisal cycle is running, so there are no reviews to write.'}</p>
+          : <p class="muted" style="margin-bottom:9px">{owed.length} review{owed.length === 1 ? '' : 's'} in {cycle?.title || 'the open cycle'}.</p>}
+      </div>
+
+      {owed.map((r) => (
+        <details>
+          <summary>{r.employeeName || 'Unnamed record'}{r.managerSubmittedAt ? ' — submitted' : ''}</summary>
+          <div class="inner">
+            {r.selfSubmittedAt ? (
+              <>
+                <label>Their self-assessment</label>
+                <p class="note__b">{r.selfAssessment}</p>
+                {r.selfRating !== null && <p class="muted" style="margin-top:6px">They rated themselves {r.selfRating} of {RATING_MAX}.</p>}
+              </>
+            ) : (
+              <p class="muted">They have not submitted a self-assessment yet.</p>
+            )}
+
+            {!r.managerSubmittedAt ? (
+              <form method="post" style="margin-top:10px">
+                <input type="hidden" name="action" value="save_manager_review" />
+                <input type="hidden" name="view" value="team" />
+                <input type="hidden" name="review_id" value={r.id} />
+                <label for={'ov-' + r.id}>Overall rating</label>
+                <select id={'ov-' + r.id} name="overall">
+                  <option value="">Not yet</option>
+                  {RATINGS.map((n) => <option value={n} selected={r.overallRating === n}>{n} of {RATING_MAX}</option>)}
+                </select>
+                <label for={'st-' + r.id}>Strengths</label>
+                <textarea id={'st-' + r.id} name="strengths" maxlength="4000">{r.strengths}</textarea>
+                <label for={'im-' + r.id}>To work on</label>
+                <textarea id={'im-' + r.id} name="improvements" maxlength="4000">{r.improvements}</textarea>
+                <label for={'gn-' + r.id}>Goals for next period</label>
+                <textarea id={'gn-' + r.id} name="goals_next" maxlength="4000">{r.goalsNext}</textarea>
+                <div class="btns">
+                  <button class="btn ghost" type="submit" name="submit" value="0">Save draft</button>
+                  <button class="btn" type="submit" name="submit" value="1">Submit review</button>
+                </div>
+              </form>
+            ) : (
+              <>
+                <p class="muted" style="margin-top:10px">Submitted {fmtDate(r.managerSubmittedAt)}.
+                  Rating {r.overallRating ?? '—'} of {RATING_MAX}.</p>
+
+                {!r.workflowInstanceId && (
+                  <form method="post" style="margin-top:10px">
+                    <input type="hidden" name="action" value="send_signoff" />
+                    <input type="hidden" name="view" value="team" />
+                    <input type="hidden" name="review_id" value={r.id} />
+                    <p class="muted">Sign-off goes to the department head, then to whoever owns
+                      appraisal approvals. It never routes back to you — you wrote the review.</p>
+                    <button class="btn" type="submit">Send for sign-off</button>
+                  </form>
+                )}
+
+                <details style="margin-top:11px">
+                  <summary>Recommend for promotion</summary>
+                  <div class="inner">
+                    {r.promotionWorkflowId ? (
+                      <>
+                        <p class="muted">A recommendation has already been raised: {r.proposedDesignation}.</p>
+                        {promoStates.get(r.id)?.state && (
+                          <div class="kv" style="margin-top:8px"><span>State</span><b>{promoStates.get(r.id).state}</b></div>
+                        )}
+                        {promoStates.get(r.id)?.haltReason && (
+                          <p class="halt">{promoStates.get(r.id).haltReason}</p>
+                        )}
+                      </>
+                    ) : (
+                      <form method="post">
+                        <input type="hidden" name="action" value="recommend_promotion" />
+                        <input type="hidden" name="view" value="team" />
+                        <input type="hidden" name="review_id" value={r.id} />
+                        <label for={'pd-' + r.id}>Proposed designation</label>
+                        <input id={'pd-' + r.id} name="proposed_designation" maxlength="200" required />
+                        <label for={'pj-' + r.id}>Justification</label>
+                        <textarea id={'pj-' + r.id} name="justification" maxlength="4000" required
+                          placeholder="What they are already doing at the next level"></textarea>
+                        <p class="muted" style="margin-top:8px">This raises a recommendation for
+                          approval. It does not change anybody's designation, and nothing here writes
+                          to the employee record.</p>
+                        <button class="btn" type="submit">Raise recommendation</button>
+                      </form>
+                    )}
+                  </div>
+                </details>
+              </>
+            )}
+          </div>
+        </details>
+      ))}
+
+      {team.length > 0 && (
+        <div class="card">
+          <h3>Your team's objectives</h3>
+          <p class="muted" style="margin-bottom:10px">Objectives marked private are not listed here.</p>
+          {team.map((g) => (
+            <div class="kv">
+              <span>{g.employeeName || 'A colleague'}</span>
+              <b>{pct(g.progressPct)}% · {g.title}</b>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  )}
+
+  <p class="foot">
+    Who sees what on this page is resolved from the Organization Graph, one relationship at a time —
+    not from a job title or an account setting. Approvals go through the one approval engine, and when
+    it cannot work out who signs something off it stops and says so rather than approving it.
+  </p>
+</main>
+</body>
+</html>

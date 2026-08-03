@@ -1,37 +1,212 @@
 ---
+/**
+ * /portal/notifications — THE NOTIFICATION CENTRE. One notification system, finally openable.
+ *
+ * WHAT WAS BROKEN, AND IT WAS ONE LINE. The engine is complete and has been writing rows for
+ * employees all along: src/lib/push.ts persists FIRST and pushes second (persistNotification at
+ * push.ts:125), so the feed fills even with VAPID unset, and /api/portal/notifications-recent
+ * already returns a signed-in person their OWN rows. The only thing missing was the door. This page
+ * carried `if (user.role !== 'applicant') return Astro.redirect('/admin')` on line 8 — the role-name
+ * test src/lib/auth/permissions.ts explicitly warns against — so every employee asking for their own
+ * inbox was thrown at the admin console, which middleware.ts then bounces most of them off. Three
+ * modules had written that fact down and routed around it rather than fixing it:
+ * widgets.ts:377 (notifications.unread carries href:null "on purpose"), navigation.ts:407 (no nav
+ * entry) and workforce/loaders.ts:74. Those three notes can now be retired; see the build report.
+ *
+ * NO SECOND SYSTEM. Nothing here writes a notification, defines a type, or invents a table. It
+ * READS `notifications` and it POSTs to the endpoint that already exists. The schema-ensure is the
+ * shared one — src/lib/notifications-schema.ts — NOT a fourth hand-rolled CREATE TABLE.
+ *
+ * WHY THAT MATTERS MORE THAN IT LOOKS. This page used to run its OWN `CREATE TABLE IF NOT EXISTS
+ * notifications (...)` with a NARROWER column list than push.ts writes: no category, no priority,
+ * no is_archived, no seen_at/clicked_at. CREATE TABLE IF NOT EXISTS is a NO-OP on an existing
+ * table, so on a database where push.ts got there first the statement did precisely nothing and the
+ * mismatch stayed invisible — and on a database where THIS page ran first, every later
+ * `INSERT ... (category, priority)` in persistNotification would have thrown forever. Two modules
+ * creating one table in two shapes is the fault class; the repair is one shape, reached by additive
+ * ALTER ... ADD COLUMN IF NOT EXISTS, which is exactly what ensureNotificationsSchema() does.
+ *
+ * THE GATE IS "SIGNED IN", AND THAT IS THE WHOLE OF IT. Every row is keyed by user_id and every
+ * query below is narrowed to the caller's own. There is no version of this screen that shows one
+ * person another person's notifications, so there is no capability to ask for.
+ *
+ * MOBILE FIRST. Around nine in ten of these people are on a phone: single column at 360px, every
+ * control at least 44px, the filter rail scrolls inside its own overflow-x container so the page
+ * itself never scrolls sideways, and the whole thing renders server-side — the filters are the only
+ * JavaScript and the list is readable without it.
+ */
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureNotificationsSchema } from '@/lib/notifications-schema';
+import { CATEGORY_META, metaFor } from '@/lib/notification-catalog';
+
+// Declared at the very top, above everything that uses them: `const` is not hoisted, and a handler
+// reaching a later declaration has taken pages down on this project.
+// postgres-js resolves to a plain array, never a { rows } object.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const logFail = (tag: string, e: any) => console.error('[portal/notifications] ' + tag, e?.cause?.message || e?.message);
+const HERE = '/portal/notifications';
 
 const user = Astro.locals.user;
-if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/notifications'));
-if (user.role !== 'applicant') return Astro.redirect('/admin');
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(HERE));
+// NOTE FOR THE NEXT READER: there is deliberately NO role test here. The line that used to sit on
+// this spot sent every employee to /admin. Do not put one back.
 
-function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// ---------------------------------------------------------------------------------------------
+// THE LANES. A projection for FILTERING, not a second classification.
+// ---------------------------------------------------------------------------------------------
+//
+// The engine's own vocabulary is NotifCategory in src/lib/notification-catalog.ts — jobs, messages,
+// payments, interviews, people, academic, institutional, system — and it is what gets STORED in
+// notifications.category. These nine lanes are the employee-facing filter set, derived from the
+// type (and the stored category as a fallback) at render time. Nothing is written in this
+// vocabulary and no column holds it: a lane is a view over the existing classification, which is
+// why adding one costs no migration and can never disagree with what the engine recorded.
+//
+// Every row also carries its ENGINE category as a badge, so a lane can group without misdescribing:
+// a course completion filed under 'academic' shows "Academic" on the row even though it falls into
+// the System lane, because the nine lanes below have no academic home. That gap is real and is
+// reported rather than papered over — see the build report.
+const LANES: readonly { key: string; label: string }[] = [
+  { key: 'workflow', label: 'Workflow' },
+  { key: 'tasks', label: 'Tasks' },
+  { key: 'meetings', label: 'Meetings' },
+  { key: 'leave', label: 'Leave' },
+  { key: 'attendance', label: 'Attendance' },
+  { key: 'messages', label: 'Messages' },
+  { key: 'mail', label: 'Mail' },
+  { key: 'announcements', label: 'Announcements' },
+  { key: 'system', label: 'System' },
+];
 
+/**
+ * Which lane does a row belong in? Type first, stored category second, 'system' last.
+ *
+ * Matched on PREFIXES wherever the engine emits a family (workflow_approval / workflow_settled from
+ * src/lib/workflow.ts, partner_payout_* from the payouts screen), because an exact-key table is one
+ * new event away from silently dropping something into the wrong lane — which is the bug
+ * notification-catalog.ts records having found in 22 of 44 types on 2026-07-30.
+ */
+function laneOf(type: string, storedCategory: string | null): string {
+  const t = String(type || '').toLowerCase();
+
+  if (t.startsWith('workflow')) return 'workflow';
+  if (t.includes('task')) return 'tasks';
+  if (t.startsWith('leave')) return 'leave';
+  if (t.startsWith('attendance') || t.startsWith('clock')) return 'attendance';
+  if (t.startsWith('announcement')) return 'announcements';
+  if (t.includes('interview') || t.startsWith('meet') || t.startsWith('huddle')) return 'meetings';
+  if (t.includes('mail')) return 'mail';
+
+  // A request moving through a stage, decided by somebody else: offers, applications, fee waivers,
+  // payouts, payroll. This is what an employee means by "something of mine is being processed".
+  if (
+    t.startsWith('offer') || t.startsWith('applicant_offer') || t.startsWith('application')
+    || t.startsWith('new_application') || t.startsWith('fee_waiver') || t.startsWith('intl_payment')
+    || t.startsWith('partner_payout') || t.startsWith('partnership') || t === 'payroll_run'
+    || t.startsWith('requisition') || t.startsWith('approval') || t === 'applicant_status_change'
+    || t === 'duplicate_application_fee' || t === 'paid_application_stuck' || t === 'study_abroad_request'
+  ) return 'workflow';
+
+  const cat = String(storedCategory || '').toLowerCase();
+  if (cat === 'messages') return 'messages';
+  if (cat === 'interviews') return 'meetings';
+  if (cat === 'jobs' || cat === 'payments') return 'workflow';
+
+  if (t.includes('message') || t.startsWith('dm') || t.startsWith('chat') || t.startsWith('help') || t.includes('reply')) return 'messages';
+
+  return 'system';
+}
+
+/** Inline monochrome SVG only, by standing rule. One path list per lane. */
+function lanePaths(lane: string): string[] {
+  if (lane === 'workflow') return ['M9 11l3 3 8-8', 'M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9'];
+  if (lane === 'tasks') return ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M4 6h.01', 'M4 12h.01', 'M4 18h.01'];
+  if (lane === 'meetings') return ['M8 2v4', 'M16 2v4', 'M3 10h18', 'M3 6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'];
+  if (lane === 'leave') return ['M8 2v4', 'M16 2v4', 'M3 10h18', 'M3 6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z', 'M9 16l6-4'];
+  if (lane === 'attendance') return ['M12 6v6l4 2', 'M12 22a10 10 0 1 1 0-20 10 10 0 0 1 0 20z'];
+  if (lane === 'messages') return ['M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'];
+  if (lane === 'mail') return ['M2 6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z', 'm22 7-10 5L2 7'];
+  if (lane === 'announcements') return ['M3 11v3a1 1 0 0 0 1 1h2l4 4V6L6 10H4a1 1 0 0 0-1 1z', 'M15 8a5 5 0 0 1 0 8'];
+  return ['M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9', 'M13.7 21a2 2 0 0 1-3.4 0'];
+}
+
+// ---------------------------------------------------------------------------------------------
+// The read. Own rows only, and it says so when it could not run.
+// ---------------------------------------------------------------------------------------------
+//
+// ensureNotificationsSchema() is memoised and drops its own cache on failure, so a transient error
+// retries on the next request instead of being remembered forever. It is awaited BEFORE the SELECT
+// because the SELECT names category and priority, and on a database that has only ever seen the old
+// four-column CREATE those columns do not exist yet.
+let items: any[] = [];
+let degraded = false;
 try {
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title TEXT NOT NULL, body TEXT,
-    type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
-    entity_type TEXT, entity_id TEXT,
-    is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW())`);
-} catch (_) {}
+  await ensureNotificationsSchema();
+  items = rowsOf(await db.execute(sql`
+    SELECT id, title, body, type, action_url, is_read, created_at, category, priority
+      FROM notifications
+     WHERE user_id = ${user.id}
+       AND COALESCE(is_archived, false) = false
+     ORDER BY created_at DESC
+     LIMIT 200`));
+} catch (e: any) {
+  logFail('notifications read', e);
+  // NOT swallowed into an empty list that reads as "you have nothing". The narrower read is tried
+  // once, against the columns that have existed since the table was first created, and if THAT
+  // fails the page says so rather than printing a confident silence.
+  try {
+    items = rowsOf(await db.execute(sql`
+      SELECT id, title, body, type, action_url, is_read, created_at
+        FROM notifications
+       WHERE user_id = ${user.id}
+       ORDER BY created_at DESC
+       LIMIT 200`));
+    degraded = true;
+  } catch (e2: any) {
+    logFail('notifications fallback read', e2);
+    items = [];
+    degraded = true;
+  }
+}
 
-const items = rows(await db.execute(sql`
-  SELECT id, title, body, type, action_url, is_read, created_at
-  FROM notifications WHERE user_id = ${user.id}
-  ORDER BY created_at DESC LIMIT 200
-`));
-const unreadCount = items.filter((n: any) => !n.is_read).length;
+// Decorated once, server-side, so the markup and the filter agree by construction.
+const decorated = items.map((n: any) => {
+  const engine = String(n.category || '').trim() || metaFor(String(n.type || '')).category;
+  const priority = String(n.priority || '').trim() || metaFor(String(n.type || '')).priority;
+  const lane = laneOf(String(n.type || ''), engine);
+  const meta = (CATEGORY_META as any)[engine] || null;
+  return {
+    id: String(n.id),
+    title: String(n.title || 'Notification'),
+    body: n.body ? String(n.body) : '',
+    url: n.action_url ? String(n.action_url) : '',
+    isRead: n.is_read === true,
+    createdAt: n.created_at,
+    lane,
+    engineLabel: meta ? meta.label : 'System',
+    accent: meta ? meta.color : '#6b6259',
+    priority,
+  };
+});
+
+const unreadCount = decorated.filter((n) => !n.isRead).length;
+// Only lanes that actually hold something get a chip. An empty "Announcements" filter would promise
+// a kind of notification this product does not emit yet — there is no announcements table and
+// nothing writes one, which /portal/employee already says in plain words at the bottom of the page.
+const laneCounts = LANES.map((l) => ({
+  key: l.key,
+  label: l.label,
+  count: decorated.filter((n) => n.lane === l.key).length,
+})).filter((l) => l.count > 0);
 
 function fmt(d: any): string {
   try {
-    const now = Date.now();
     const t = new Date(d).getTime();
-    const diff = (now - t) / 1000;
+    if (isNaN(t)) return '';
+    const diff = (Date.now() - t) / 1000;
     if (diff < 60) return 'just now';
     if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
     if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
@@ -39,76 +214,258 @@ function fmt(d: any): string {
     return new Date(d).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' });
   } catch { return ''; }
 }
-
-function typeAccent(t: string): string {
-  if (t === 'visvambhara_reply' || t === 'fee_waiver_reply' || t === 'inbound_mail') return '#d97757';
-  if (t === 'fee_waiver_approved' || t === 'application_approved') return '#10b981';
-  if (t === 'fee_waiver_rejected' || t === 'application_rejected') return '#dc2626';
-  if (t === 'test_submitted' || t === 'interview_completed' || t === 'course_completed') return '#3b82f6';
-  if (t === 'certificate_issued' || t === 'friend_joined') return '#f59e0b';
-  return '#FF4F00';
-}
 ---
-<BaseLayout title="Notifications" description="Your activity, replies, and updates from EduRankAI.">
-  <section class="px-[5vw] py-8 md:py-12 max-w-3xl mx-auto">
-    <div class="flex items-baseline justify-between gap-3 mb-6 flex-wrap">
-      <div>
-        <p class="text-[0.62rem] font-mono uppercase tracking-[0.18em] text-burn font-bold mb-1">Activity feed</p>
-        <h1 class="font-display text-[clamp(1.6rem,4vw,2.2rem)] font-semibold text-ink leading-[1.15]">Notifications {unreadCount > 0 && <span class="ml-2 align-middle text-[0.85rem] bg-burn text-white px-2.5 py-1 rounded-full font-mono font-bold">{unreadCount}</span>}</h1>
-      </div>
-      {unreadCount > 0 && (
-        <button id="markAllBtn" class="text-[0.82rem] font-semibold text-burn hover:underline">Mark all as read</button>
-      )}
-    </div>
+<BaseLayout title="Notifications" description="Everything waiting on you, in one place." noindex={true}>
+  <section class="ntc">
+    <header class="ntc-head">
+      <p class="ntc-kicker">Your inbox</p>
+      <h1 class="ntc-title">
+        Notifications
+        {unreadCount > 0 && <span class="ntc-count">{unreadCount}</span>}
+      </h1>
+      <p class="ntc-sub">Every update addressed to you. Opening one takes you to the thing it is about.</p>
+    </header>
 
-    {items.length === 0 ? (
-      <div class="bg-cream-2 border border-ink/10 rounded-2xl p-10 text-center">
-        <p class="text-[0.95rem] text-ink-soft">No notifications yet. We'll let you know when there's activity on your application or messages.</p>
+    {degraded && (
+      <p class="ntc-warn">
+        We could not read part of this list just now, so it may be incomplete. Nothing has been
+        deleted. Reload in a moment, and tell us if it keeps happening.
+      </p>
+    )}
+
+    {decorated.length > 0 && (
+      <div class="ntc-controls">
+        <div class="ntc-lanes" role="group" aria-label="Filter by kind">
+          <button type="button" class="ntc-chip on" data-lane="all" aria-pressed="true">All <span class="ntc-chipn">{decorated.length}</span></button>
+          {laneCounts.map((l) => (
+            <button type="button" class="ntc-chip" data-lane={l.key} aria-pressed="false">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                {lanePaths(l.key).map((d) => <path d={d} />)}
+              </svg>
+              {l.label} <span class="ntc-chipn">{l.count}</span>
+            </button>
+          ))}
+        </div>
+        <div class="ntc-actions">
+          <label class="ntc-toggle">
+            <input type="checkbox" id="ntcUnreadOnly" />
+            <span>Unread only</span>
+          </label>
+          {unreadCount > 0 && <button type="button" id="ntcMarkAll" class="ntc-markall">Mark all as read</button>}
+        </div>
       </div>
-    ) : (
-      <ul id="notifList" class="space-y-2.5">
-        {items.map((n: any) => {
-          const accent = typeAccent(n.type);
-          return (
-            <li data-notif-id={n.id} data-unread={!n.is_read ? '1' : '0'} class={(n.is_read ? 'bg-white' : 'bg-burn-pale/30') + ' border border-ink/10 rounded-xl overflow-hidden transition-all'}>
-              <a href={n.action_url || '#'} class="flex items-stretch gap-3 px-4 py-3.5 no-underline text-ink hover:bg-burn-pale/40 transition-colors">
-                <span style={'flex-shrink:0;width:4px;background:' + accent + ';border-radius:2px;'}></span>
-                <div class="flex-1 min-w-0">
-                  <div class="flex items-baseline justify-between gap-3 mb-0.5">
-                    <p class={'text-[0.92rem] font-semibold ' + (n.is_read ? 'text-ink-2' : 'text-ink')} style="margin:0;line-height:1.3;">{n.title}</p>
-                    <span class="text-[0.7rem] font-mono text-ink-soft whitespace-nowrap flex-shrink-0">{fmt(n.created_at)}</span>
-                  </div>
-                  {n.body && <p class="text-[0.82rem] text-ink-soft leading-[1.5] m-0 line-clamp-2">{n.body}</p>}
-                </div>
-                {!n.is_read && <span class="self-center w-2 h-2 rounded-full flex-shrink-0" style={'background:' + accent + ';'}></span>}
+    )}
+
+    {decorated.length === 0 && !degraded && (
+      <div class="ntc-empty">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+        <p class="ntc-empty-t">Nothing is waiting on you</p>
+        <p class="ntc-empty-b">Approvals, replies, mail and anything raised against your name will appear here.</p>
+      </div>
+    )}
+
+    {decorated.length > 0 && (
+      <ul id="ntcList" class="ntc-list">
+        {decorated.map((n) => (
+          <li class={'ntc-item' + (n.isRead ? '' : ' unread')} data-id={n.id} data-lane={n.lane} data-unread={n.isRead ? '0' : '1'}>
+            {n.url ? (
+              <a class="ntc-row" href={n.url}>
+                <span class="ntc-accent" style={'background:' + n.accent + ';'} aria-hidden="true"></span>
+                <span class="ntc-main">
+                  <span class="ntc-row-top">
+                    <span class="ntc-h">{n.title}</span>
+                    <time class="ntc-time">{fmt(n.createdAt)}</time>
+                  </span>
+                  {n.body && <span class="ntc-b">{n.body}</span>}
+                  <span class="ntc-tags">
+                    <span class="ntc-tag">{n.engineLabel}</span>
+                    {(n.priority === 'critical' || n.priority === 'high') && <span class="ntc-tag pri">Needs attention</span>}
+                    {!n.isRead && <span class="ntc-tag new">Unread</span>}
+                  </span>
+                </span>
+                <span class="ntc-go" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+                </span>
               </a>
-            </li>
-          );
-        })}
+            ) : (
+              <div class="ntc-row static">
+                <span class="ntc-accent" style={'background:' + n.accent + ';'} aria-hidden="true"></span>
+                <span class="ntc-main">
+                  <span class="ntc-row-top">
+                    <span class="ntc-h">{n.title}</span>
+                    <time class="ntc-time">{fmt(n.createdAt)}</time>
+                  </span>
+                  {n.body && <span class="ntc-b">{n.body}</span>}
+                  <span class="ntc-tags">
+                    <span class="ntc-tag">{n.engineLabel}</span>
+                    {(n.priority === 'critical' || n.priority === 'high') && <span class="ntc-tag pri">Needs attention</span>}
+                    {!n.isRead && <span class="ntc-tag new">Unread</span>}
+                  </span>
+                </span>
+              </div>
+            )}
+            {!n.isRead && (
+              <button type="button" class="ntc-read1" data-id={n.id} aria-label={'Mark as read: ' + n.title}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+              </button>
+            )}
+          </li>
+        ))}
       </ul>
     )}
-  </section>
 
-  <script is:inline>
-    (function () {
-      var btn = document.getElementById('markAllBtn');
-      if (btn) {
-        btn.addEventListener('click', function () {
-          btn.textContent = 'Marking...';
-          fetch('/api/portal/notifications-recent', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'mark_all_read' }) })
-            .then(function (r) { return r.json(); }).then(function (d) { if (d.ok) location.reload(); else { btn.textContent = 'Mark all as read'; } })
-            .catch(function () { btn.textContent = 'Mark all as read'; });
-        });
-      }
-      // Mark individual notif as read when its row is clicked.
-      document.querySelectorAll('#notifList li[data-unread="1"] a').forEach(function (a) {
-        a.addEventListener('click', function () {
-          var li = a.closest('li');
-          var id = li && li.getAttribute('data-notif-id');
-          if (!id) return;
-          fetch('/api/portal/notifications-recent', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'mark_read', id: id }) }).catch(function () {});
-        });
-      });
-    })();
-  </script>
+    <p class="ntc-foot" id="ntcNone" hidden>Nothing in this filter.</p>
+  </section>
 </BaseLayout>
+
+<style>
+  .ntc { max-width: 46rem; margin: 0 auto; padding: 24px 5vw 88px; }
+  .ntc-head { margin-bottom: 18px; }
+  .ntc-kicker { margin: 0 0 4px; font-size: 0.62rem; letter-spacing: 0.18em; text-transform: uppercase; font-weight: 800; color: #FF4F00; font-family: ui-monospace, monospace; }
+  .ntc-title { margin: 0; font-size: clamp(1.5rem, 5vw, 2.1rem); line-height: 1.15; font-weight: 700; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .ntc-count { font-size: 0.8rem; font-weight: 800; background: #FF4F00; color: #fff; border-radius: 999px; padding: 3px 10px; font-family: ui-monospace, monospace; }
+  .ntc-sub { margin: 8px 0 0; font-size: 0.9rem; line-height: 1.55; opacity: 0.72; }
+  .ntc-warn { margin: 0 0 14px; padding: 10px 13px; border-radius: 10px; font-size: 0.84rem; line-height: 1.5; background: rgba(217,119,6,0.10); border: 1px solid rgba(217,119,6,0.28); }
+
+  .ntc-controls { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+  .ntc-lanes { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: thin; -webkit-overflow-scrolling: touch; }
+  .ntc-chip { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; min-height: 44px; padding: 0 14px; border-radius: 999px; border: 1px solid rgba(0,0,0,0.14); background: transparent; color: inherit; font-size: 0.82rem; font-weight: 700; cursor: pointer; }
+  .ntc-chip.on { background: #FF4F00; border-color: #FF4F00; color: #fff; }
+  .ntc-chipn { font-family: ui-monospace, monospace; font-size: 0.72rem; opacity: 0.75; }
+  .ntc-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .ntc-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; font-size: 0.84rem; font-weight: 600; cursor: pointer; }
+  .ntc-toggle input { width: 18px; height: 18px; accent-color: #FF4F00; }
+  .ntc-markall { min-height: 44px; padding: 0 14px; border: 1px solid rgba(0,0,0,0.14); border-radius: 10px; background: transparent; color: inherit; font-size: 0.84rem; font-weight: 700; cursor: pointer; }
+
+  .ntc-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .ntc-item { position: relative; border: 1px solid rgba(0,0,0,0.10); border-radius: 12px; overflow: hidden; }
+  .ntc-item.unread { background: rgba(255,79,0,0.045); border-color: rgba(255,79,0,0.24); }
+  .ntc-row { display: flex; align-items: stretch; gap: 11px; padding: 12px 46px 12px 12px; text-decoration: none; color: inherit; min-height: 44px; }
+  .ntc-accent { flex: 0 0 4px; border-radius: 2px; }
+  .ntc-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+  .ntc-row-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .ntc-h { font-size: 0.93rem; font-weight: 700; line-height: 1.3; }
+  .ntc-time { font-size: 0.7rem; font-family: ui-monospace, monospace; opacity: 0.6; white-space: nowrap; flex-shrink: 0; }
+  .ntc-b { font-size: 0.83rem; line-height: 1.5; opacity: 0.78; overflow-wrap: anywhere; }
+  .ntc-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+  .ntc-tag { font-size: 0.64rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; border: 1px solid rgba(0,0,0,0.14); opacity: 0.85; }
+  .ntc-tag.pri { border-color: rgba(220,38,38,0.4); color: #b91c1c; }
+  .ntc-tag.new { border-color: rgba(255,79,0,0.45); color: #FF4F00; }
+  .ntc-go { display: flex; align-items: center; opacity: 0.45; flex-shrink: 0; }
+  .ntc-read1 { position: absolute; top: 6px; right: 6px; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; border: none; background: transparent; color: inherit; opacity: 0.55; cursor: pointer; border-radius: 10px; }
+  .ntc-read1:hover, .ntc-read1:focus-visible { opacity: 1; background: rgba(0,0,0,0.06); }
+
+  .ntc-empty { border: 1px solid rgba(0,0,0,0.10); border-radius: 14px; padding: 44px 22px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .ntc-empty-t { margin: 4px 0 0; font-weight: 700; font-size: 1rem; }
+  .ntc-empty-b { margin: 0; font-size: 0.88rem; line-height: 1.55; opacity: 0.72; max-width: 30rem; }
+  .ntc-foot { margin: 16px 0 0; text-align: center; font-size: 0.86rem; opacity: 0.7; }
+
+  @media (min-width: 640px) {
+    .ntc-controls { flex-direction: row; align-items: center; justify-content: space-between; }
+    .ntc-lanes { flex: 1; }
+  }
+</style>
+
+<script is:inline>
+  (function () {
+    var list = document.getElementById('ntcList');
+    if (!list) return;
+    var API = '/api/portal/notifications-recent';
+    var lane = 'all';
+    var unreadOnly = false;
+    var none = document.getElementById('ntcNone');
+
+    function post(payload) {
+      // The EXISTING endpoint, which already narrows every UPDATE to the caller's own rows.
+      return fetch(API, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).then(function (r) { return r.json(); });
+    }
+
+    function apply() {
+      var shown = 0;
+      var items = list.querySelectorAll('.ntc-item');
+      for (var i = 0; i < items.length; i++) {
+        var el = items[i];
+        var okLane = lane === 'all' || el.getAttribute('data-lane') === lane;
+        var okRead = !unreadOnly || el.getAttribute('data-unread') === '1';
+        var show = okLane && okRead;
+        el.hidden = !show;
+        if (show) shown++;
+      }
+      if (none) none.hidden = shown !== 0;
+    }
+
+    var chips = document.querySelectorAll('.ntc-chip');
+    for (var c = 0; c < chips.length; c++) {
+      chips[c].addEventListener('click', function (e) {
+        var btn = e.currentTarget;
+        for (var k = 0; k < chips.length; k++) {
+          chips[k].classList.remove('on');
+          chips[k].setAttribute('aria-pressed', 'false');
+        }
+        btn.classList.add('on');
+        btn.setAttribute('aria-pressed', 'true');
+        lane = btn.getAttribute('data-lane') || 'all';
+        apply();
+      });
+    }
+
+    var only = document.getElementById('ntcUnreadOnly');
+    if (only) only.addEventListener('change', function () { unreadOnly = !!only.checked; apply(); });
+
+    function markLocalRead(item) {
+      if (!item) return;
+      item.setAttribute('data-unread', '0');
+      item.classList.remove('unread');
+      var tag = item.querySelector('.ntc-tag.new');
+      if (tag && tag.parentNode) tag.parentNode.removeChild(tag);
+      var btn = item.querySelector('.ntc-read1');
+      if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
+    }
+
+    // Per-row tick. Failure is SHOWN, not swallowed: the control comes back enabled and says why,
+    // so nobody believes a write happened that did not.
+    list.addEventListener('click', function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest('.ntc-read1') : null;
+      if (!btn) return;
+      e.preventDefault();
+      var item = btn.closest('.ntc-item');
+      var id = btn.getAttribute('data-id');
+      if (!id) return;
+      btn.disabled = true;
+      post({ action: 'mark_read', id: id }).then(function (d) {
+        if (d && d.ok) { markLocalRead(item); apply(); }
+        else { btn.disabled = false; btn.title = 'Could not mark as read. Try again.'; }
+      }).catch(function () { btn.disabled = false; btn.title = 'Could not mark as read. Try again.'; });
+    });
+
+    // Opening a row marks it read. Navigation is not blocked on the request: the row is on its way
+    // to the thing it is about, and a mark-read that loses the race is corrected on the next load.
+    var links = list.querySelectorAll('.ntc-item[data-unread="1"] a.ntc-row');
+    for (var j = 0; j < links.length; j++) {
+      links[j].addEventListener('click', function (e) {
+        var item = e.currentTarget.closest('.ntc-item');
+        var id = item && item.getAttribute('data-id');
+        if (!id) return;
+        post({ action: 'mark_read', id: id }).catch(function () {});
+      });
+    }
+
+    var all = document.getElementById('ntcMarkAll');
+    if (all) {
+      all.addEventListener('click', function () {
+        var label = all.textContent;
+        all.disabled = true;
+        all.textContent = 'Marking...';
+        post({ action: 'mark_all_read' }).then(function (d) {
+          if (d && d.ok) { location.reload(); }
+          else { all.disabled = false; all.textContent = label; }
+        }).catch(function () { all.disabled = false; all.textContent = label; });
+      });
+    }
+  })();
+</script>

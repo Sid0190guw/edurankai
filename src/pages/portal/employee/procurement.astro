@@ -1,0 +1,571 @@
+---
+// /portal/employee/procurement — WHAT AN EMPLOYEE CAN ACTUALLY DO ABOUT BUYING SOMETHING.
+//
+// THREE THINGS, ON ONE PHONE SCREEN:
+//   1. ask for something — item, quantity, cost, why, when it is needed, who might supply it, and a
+//      link to the quote;
+//   2. send it into the approval chain and WATCH it: which rung it is on, whose decision it is
+//      waiting for, and — when the Organization Graph cannot name somebody — the exact sentence
+//      saying why it stopped;
+//   3. decide the requests routed to THEM. A reporting manager is not an administrator and must not
+//      need /admin to approve their own team's purchase; the same queue that appears in the console
+//      appears here, for the rows this person owes a decision on and no others.
+//
+// EVERY APPROVAL DECISION ON THIS PAGE GOES THROUGH decideInstance(), which re-checks mayAct() on
+// the POSTED instance id. A hand-typed id is checked exactly as a clicked one is, so what this page
+// renders is a convenience and never the authorisation.
+//
+// NOTHING HERE RESOLVES AN APPROVER. Not from a role, not from a department name, not from a guess:
+// routing is the engine's, answered from the org graph per request, and when it names nobody this
+// page says so in the engine's own words rather than approving anything by default.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import { isInitialized } from '@/lib/org-graph';
+import {
+  pendingForApprover,
+  decideInstance,
+  STATE_LABELS,
+  VIA_LABELS,
+} from '@/lib/workflow';
+import {
+  createRequest,
+  updateDraft,
+  submitRequest,
+  cancelRequest,
+  listRequests,
+  viewRequests,
+  listVendors,
+  procurementChain,
+  financeThreshold,
+  formatAmount,
+  categoryLabel,
+  PROCUREMENT_CATEGORIES,
+  DEFAULT_CURRENCY,
+  type RequestView,
+} from '@/lib/procurement';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/employee/procurement');
+
+// -------------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted, and a const declared under the POST handler that reads it
+// throws on that handler's first line while the page still reports success — the failure that took
+// down apply step 5 and the /admin/roles/diagnose Repair button on this project.
+// -------------------------------------------------------------------------------------------------
+const PAGE = '/portal/employee/procurement';
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Plain words, from a function rather than a typed map — a `Record<string,string>` read inside JSX
+ *  is one of this project's known .astro parse hazards. */
+function stateLabel(state: string): string {
+  const key = String(state || '');
+  if (key === 'draft') return STATE_LABELS.draft;
+  if (key === 'pending') return STATE_LABELS.pending;
+  if (key === 'approved') return STATE_LABELS.approved;
+  if (key === 'rejected') return STATE_LABELS.rejected;
+  if (key === 'cancelled') return STATE_LABELS.cancelled;
+  if (key === 'halted') return STATE_LABELS.halted;
+  return key;
+}
+
+function viaLabel(via: string | null): string {
+  const key = String(via || '');
+  if (key === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (key === 'department_head') return VIA_LABELS.department_head;
+  if (key === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (key === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return key || 'Approver';
+}
+
+/**
+ * What one row SAYS it is, in one phrase.
+ *
+ * The approval state (from the engine) wins over the request's own lifecycle whenever there is one,
+ * because "waiting for approval" is the fact the person is actually asking about. There is no second
+ * copy of that state stored anywhere — this reads the instance, every render.
+ */
+function rowStatus(v: RequestView): string {
+  if (v.order && v.order.status === 'received') return 'Received';
+  if (v.order && v.order.status === 'open') return 'Ordered';
+  if (v.request.status === 'cancelled') return 'Withdrawn';
+  if (v.instance) return stateLabel(v.instance.state);
+  if (v.request.status === 'draft') return 'Draft';
+  return 'Sent for approval';
+}
+
+function statusClass(label: string): string {
+  if (label === 'Approved' || label === 'Received') return 'chip chip-ok';
+  if (label === 'Rejected') return 'chip chip-no';
+  if (label === 'Halted') return 'chip chip-halt';
+  if (label === 'Waiting for approval' || label === 'Ordered') return 'chip chip-wait';
+  return 'chip';
+}
+
+// The employee's own record, resolved from the SESSION. The approval chain is routed from
+// hr_employees.id, so a person with no employee record gets an honest screen rather than a form that
+// would collect a request nobody could ever route.
+const gate = await requireEmployee(user, PAGE);
+const employeeId = gate.ok ? gate.workspace.employeeId : null;
+
+// -------------------------------------------------------------------------------------------------
+// WRITES
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+
+  if (!gate.ok) {
+    flash = gate.reason || 'Your employee record is not available, so nothing was saved.';
+  } else if (action === 'create') {
+    const r = await createRequest({
+      requesterUserId: String(user.id),
+      requesterEmployeeId: employeeId,
+      item: String(fd.get('item') || ''),
+      category: String(fd.get('category') || ''),
+      quantity: String(fd.get('quantity') || '1'),
+      unit: String(fd.get('unit') || ''),
+      estimatedCost: String(fd.get('estimated_cost') || ''),
+      currency: DEFAULT_CURRENCY,
+      justification: String(fd.get('justification') || ''),
+      neededBy: String(fd.get('needed_by') || ''),
+      vendorId: String(fd.get('vendor_id') || ''),
+      vendorSuggestion: String(fd.get('vendor_suggestion') || ''),
+      quoteUrl: String(fd.get('quote_url') || ''),
+    });
+    flash = r.ok
+      ? 'Saved as a draft. Nobody has been asked yet — send it for approval when you are ready.'
+      : (r.error || 'Could not save that request.');
+  } else if (action === 'update') {
+    // A DRAFT ONLY, and only the person who raised it — both re-stated in the UPDATE's own WHERE
+    // clause inside updateDraft(), so a request submitted in another tab a second ago makes this
+    // write touch zero rows instead of rewriting what an approver is already looking at.
+    const r = await updateDraft(String(fd.get('id') || ''), String(user.id), {
+      item: String(fd.get('item') || ''),
+      category: String(fd.get('category') || ''),
+      quantity: String(fd.get('quantity') || '1'),
+      unit: String(fd.get('unit') || ''),
+      estimatedCost: String(fd.get('estimated_cost') || ''),
+      justification: String(fd.get('justification') || ''),
+      neededBy: String(fd.get('needed_by') || ''),
+      vendorId: String(fd.get('vendor_id') || ''),
+      vendorSuggestion: String(fd.get('vendor_suggestion') || ''),
+      quoteUrl: String(fd.get('quote_url') || ''),
+    });
+    flash = r.ok ? 'Draft updated.' : (r.error || 'Could not update that draft.');
+  } else if (action === 'submit') {
+    const r = await submitRequest(String(fd.get('id') || ''), String(user.id));
+    if (!r.ok) flash = r.error || 'Could not send that for approval.';
+    else if (r.haltReason) flash = 'Stopped before anybody was asked: ' + r.haltReason;
+    else if (r.changed === false) flash = 'That was already sent for approval. Nothing changed.';
+    else flash = 'Sent for approval.';
+  } else if (action === 'withdraw') {
+    const r = await cancelRequest(String(fd.get('id') || ''), String(user.id), String(fd.get('reason') || ''));
+    flash = r.ok ? 'Withdrawn.' : (r.error || 'Could not withdraw that.');
+  } else if (action === 'decide') {
+    const decision = String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected';
+    const r = await decideInstance(
+      String(fd.get('instanceId') || ''),
+      user,
+      decision,
+      String(fd.get('note') || ''),
+    );
+    if (!r.ok) flash = r.error || 'Could not record that decision.';
+    else if (r.changed === false) flash = 'That was already recorded. Nothing changed.';
+    else flash = 'Decision recorded. The request is now ' + stateLabel(String(r.state || '')).toLowerCase() + '.';
+  }
+
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash));
+}
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+// Asked ONCE for the whole page. "The graph has no rows at all" and "this person has no manager" are
+// different facts that must produce different sentences; a screen that shows the second when the
+// first is true tells every employee they report to nobody.
+const graphReady = await isInitialized();
+
+// SELF-SCOPED IN THE WHERE CLAUSE, not filtered afterwards: a row that must not be seen is never
+// read. listRequests refuses outright rather than widening if the id is unusable.
+const mineRaw = gate.ok ? await listRequests({ requesterUserId: String(user.id), limit: 40 }) : [];
+const mine: RequestView[] = await viewRequests(mineRaw);
+
+// What is waiting on THIS person — routed to them, or delegated to them by somebody who is away.
+// Holding a capability does not put the company's queue on this list; the engine's own docblock
+// explains why widening it would undo per-row routing on a queue screen.
+const inbox = gate.ok ? (await pendingForApprover(String(user.id))).filter((p) => p.instance.domain === 'procurement') : [];
+
+const vendors = gate.ok ? await listVendors() : [];
+const chain = procurementChain();
+const threshold = financeThreshold();
+const today = new Date().toISOString().slice(0, 10);
+
+const drafts = mine.filter((v) => v.request.status === 'draft');
+const active = mine.filter((v) => v.request.status !== 'draft');
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Purchase requests</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    /* MOBILE FIRST. The base rules are the 360px rules. Nothing may make the PAGE scroll sideways:
+       every flex child carries min-width:0, because a flex item defaults to min-width:auto and one
+       long unbroken word (a pasted link, an employee code) would otherwise push the card wider than
+       the phone. */
+    .wrap{max-width:640px;margin:0 auto;padding:14px 12px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 10px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:64px;}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:0 18px;min-height:44px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;}
+    .btn-ok{background:#0f766e;}
+    .btn-no{background:transparent;border:1px solid #d6cbb8;color:#9a2c2c;}
+    .btn-thin{background:transparent;border:1px solid #e0d6c4;color:#6b6255;font-size:13px;}
+    .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .flash{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:12px;overflow-wrap:anywhere;line-height:1.5;}
+    .warn{background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.32);color:#7c4a03;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px;line-height:1.55;overflow-wrap:anywhere;}
+    .item{border-bottom:1px solid #f2ece0;padding:12px 0;}
+    .item:last-child{border-bottom:none;}
+    .item-top{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;}
+    .item-title{font-weight:700;font-size:15px;flex:1 1 160px;min-width:0;overflow-wrap:anywhere;}
+    .meta{font-size:12px;color:#9a8f7d;margin-top:3px;overflow-wrap:anywhere;line-height:1.5;}
+    .chip{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:#f1ece1;color:#6b6255;white-space:nowrap;}
+    .chip-ok{background:rgba(5,150,105,.12);color:#065f46;}
+    .chip-no{background:rgba(220,38,38,.1);color:#9a2c2c;}
+    .chip-wait{background:rgba(217,119,6,.12);color:#8a5206;}
+    .chip-halt{background:rgba(202,138,4,.14);color:#78500a;}
+    .halt{margin-top:8px;background:rgba(202,138,4,.08);border:1px solid rgba(202,138,4,.3);border-radius:9px;padding:10px 12px;font-size:12.5px;color:#78500a;line-height:1.55;overflow-wrap:anywhere;}
+    .acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
+    .acts form{flex:1 1 130px;min-width:0;margin:0;}
+    details{border-top:1px solid #f2ece0;padding-top:8px;margin-top:10px;}
+    summary{font-size:13.5px;font-weight:600;cursor:pointer;min-height:44px;display:flex;align-items:center;}
+    .chain{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px;}
+    .chain li{display:flex;gap:9px;align-items:baseline;font-size:13.5px;color:#3c352c;line-height:1.5;overflow-wrap:anywhere;}
+    .n{font-family:'JetBrains Mono',monospace;font-size:10px;color:#9a8f7d;border:1px solid #e6ddcd;border-radius:5px;padding:2px 6px;flex:0 0 auto;}
+    .empty{font-size:13.5px;color:#6b6255;line-height:1.55;}
+    .note{font-size:12px;color:#9a8f7d;line-height:1.55;margin-top:8px;overflow-wrap:anywhere;}
+    a.link{color:#c2410c;overflow-wrap:anywhere;}
+    @media (min-width:560px){ .acts form{flex:0 0 auto;} .btn{width:auto;} }
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+    My HR
+  </a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Purchases</span>
+  <a href="/portal/employee/profile" style="font-size:12px;">Profile</a>
+</nav>
+
+<div class="wrap">
+  {msg && <div class="flash">{msg}</div>}
+
+  {!gate.ok && (
+    <div class="card">
+      <h3>{gate.title || 'Not available'}</h3>
+      <p class="empty">{gate.reason || 'Your employee record is not available.'}</p>
+    </div>
+  )}
+
+  {gate.ok && !graphReady && (
+    <div class="warn">
+      <strong>Approvals cannot be routed yet.</strong>
+      <p style="margin-top:6px;">
+        No reporting relationships have been recorded, so nothing can be sent to anybody for a
+        decision. You can still write a request down and keep it as a draft. There is deliberately no
+        fallback here: guessing an approver from a job title would hand the wrong person authority
+        over somebody else's spending.
+      </p>
+    </div>
+  )}
+
+  {gate.ok && (
+    <div>
+      <!-- ================================================================== waiting on you -->
+      {inbox.length > 0 && (
+        <div class="card">
+          <h3>Waiting on your decision · {inbox.length}</h3>
+          <p class="note" style="margin:0 0 6px;">
+            Only requests routed to you, or to somebody you are currently standing in for.
+          </p>
+          {inbox.map((row) => (
+            <div class="item">
+              <div class="item-top">
+                <div class="item-title">{row.instance.subjectName || 'A colleague'} · {row.instance.summary || 'Purchase request'}</div>
+                <span class="chip chip-wait">Step {row.step.stepNo}</span>
+              </div>
+              <div class="meta">
+                {viaLabel(row.step.via)}
+                {row.instance.amount !== null ? ' · ' + formatAmount(row.instance.amount, row.instance.currency) : ''}
+                {row.step.dueAt ? ' · due ' + fmtDate(row.step.dueAt) : ''}
+              </div>
+              <form method="POST" class="acts">
+                <input type="hidden" name="action" value="decide"/>
+                <input type="hidden" name="instanceId" value={row.instance.id}/>
+                <input name="note" placeholder="Note (optional)" style="flex:1 1 100%;"/>
+                <button class="btn btn-ok" name="decision" value="approved" type="submit">Approve</button>
+                <button class="btn btn-no" name="decision" value="rejected" type="submit">Reject</button>
+              </form>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <!-- ================================================================== ask for something -->
+      <div class="card">
+        <h3>Ask for something</h3>
+        <form method="POST">
+          <input type="hidden" name="action" value="create"/>
+
+          <label for="item">What do you need</label>
+          <input id="item" name="item" required maxlength="300" placeholder="A standing desk, a licence, a replacement charger"/>
+
+          <div class="row2">
+            <div>
+              <label for="category">Category</label>
+              <select id="category" name="category">
+                {PROCUREMENT_CATEGORIES.map((c) => (<option value={c}>{categoryLabel(c)}</option>))}
+              </select>
+            </div>
+            <div>
+              <label for="quantity">How many</label>
+              <input id="quantity" name="quantity" type="number" min="1" step="1" value="1"/>
+            </div>
+          </div>
+
+          <div class="row2">
+            <div>
+              <label for="estimated_cost">Estimated cost ({DEFAULT_CURRENCY})</label>
+              <input id="estimated_cost" name="estimated_cost" type="number" min="0" step="1" inputmode="decimal" placeholder="0"/>
+            </div>
+            <div>
+              <label for="needed_by">Needed by</label>
+              <input id="needed_by" name="needed_by" type="date" min={today}/>
+            </div>
+          </div>
+
+          <label for="justification">Why it is needed</label>
+          <textarea id="justification" name="justification" maxlength="2000" placeholder="What it is for, and what happens without it."></textarea>
+
+          <label for="vendor_id">Suggested supplier</label>
+          <select id="vendor_id" name="vendor_id">
+            <option value="">Not sure / somebody else decides</option>
+            {vendors.map((v) => (<option value={v.id}>{v.name}{v.category ? ' — ' + categoryLabel(v.category) : ''}</option>))}
+          </select>
+
+          <label for="vendor_suggestion">Or name one yourself</label>
+          <input id="vendor_suggestion" name="vendor_suggestion" maxlength="300" placeholder="Optional"/>
+
+          <label for="quote_url">Link to the quote</label>
+          <input id="quote_url" name="quote_url" type="url" inputmode="url" placeholder="https://"/>
+          <p class="note">
+            Paste a link to a shared document and set it so anybody with the link can view it. Files
+            are never uploaded here — only the link is stored.
+          </p>
+
+          <button class="btn" type="submit" style="margin-top:14px;">Save as draft</button>
+          <p class="note">
+            Saving does not ask anybody for anything. You send it for approval when you are ready.
+          </p>
+        </form>
+      </div>
+
+      <!-- ================================================================== drafts -->
+      {drafts.length > 0 && (
+        <div class="card">
+          <h3>Drafts · {drafts.length}</h3>
+          {drafts.map((v) => (
+            <div class="item">
+              <div class="item-top">
+                <div class="item-title">{v.request.item}{v.request.quantity > 1 ? ' x' + v.request.quantity : ''}</div>
+                <span class="chip">Draft</span>
+              </div>
+              <div class="meta">
+                {v.request.estimatedCost !== null ? formatAmount(v.request.estimatedCost, v.request.currency) : 'No cost yet'}
+                {v.request.category ? ' · ' + categoryLabel(v.request.category) : ''}
+                {v.request.neededBy ? ' · needed by ' + fmtDate(v.request.neededBy) : ''}
+              </div>
+              {v.request.estimatedCost === null && (
+                <div class="halt">
+                  Add an estimated cost before sending this. The chain uses the amount to decide
+                  whether it needs a finance approval, so a request without one cannot be routed
+                  honestly.
+                </div>
+              )}
+              <div class="acts">
+                <form method="POST">
+                  <input type="hidden" name="action" value="submit"/>
+                  <input type="hidden" name="id" value={v.request.id}/>
+                  <button class="btn" type="submit">Send for approval</button>
+                </form>
+                <form method="POST">
+                  <input type="hidden" name="action" value="withdraw"/>
+                  <input type="hidden" name="id" value={v.request.id}/>
+                  <button class="btn btn-thin" type="submit">Discard</button>
+                </form>
+              </div>
+
+              <details>
+                <summary>Change this draft</summary>
+                <form method="POST">
+                  <input type="hidden" name="action" value="update"/>
+                  <input type="hidden" name="id" value={v.request.id}/>
+                  <label>What you need</label>
+                  <input name="item" required maxlength="300" value={v.request.item}/>
+                  <div class="row2">
+                    <div>
+                      <label>Category</label>
+                      <select name="category">
+                        {PROCUREMENT_CATEGORIES.map((c) => (
+                          <option value={c} selected={v.request.category === c}>{categoryLabel(c)}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label>How many</label>
+                      <input name="quantity" type="number" min="1" step="1" value={String(v.request.quantity)}/>
+                    </div>
+                  </div>
+                  <div class="row2">
+                    <div>
+                      <label>Estimated cost ({v.request.currency})</label>
+                      <input name="estimated_cost" type="number" min="0" step="1" inputmode="decimal" value={v.request.estimatedCost !== null ? String(v.request.estimatedCost) : ''}/>
+                    </div>
+                    <div>
+                      <label>Needed by</label>
+                      <input name="needed_by" type="date" value={v.request.neededBy || ''}/>
+                    </div>
+                  </div>
+                  <label>Why it is needed</label>
+                  <textarea name="justification" maxlength="2000">{v.request.justification || ''}</textarea>
+                  <label>Suggested supplier</label>
+                  <select name="vendor_id">
+                    <option value="">Not sure / somebody else decides</option>
+                    {vendors.map((ven) => (
+                      <option value={ven.id} selected={v.request.vendorId === ven.id}>{ven.name}</option>
+                    ))}
+                  </select>
+                  <label>Or name one yourself</label>
+                  <input name="vendor_suggestion" maxlength="300" value={v.request.vendorSuggestion || ''}/>
+                  <label>Link to the quote</label>
+                  <input name="quote_url" type="url" inputmode="url" placeholder="https://" value={v.request.quoteUrl || ''}/>
+                  <button class="btn" type="submit">Save changes</button>
+                </form>
+              </details>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <!-- ================================================================== everything else -->
+      <div class="card">
+        <h3>Your requests · {active.length}</h3>
+        {active.length === 0 && <p class="empty">Nothing sent for approval yet.</p>}
+        {active.map((v) => (
+          <div class="item">
+            <div class="item-top">
+              <div class="item-title">{v.request.item}{v.request.quantity > 1 ? ' x' + v.request.quantity : ''}</div>
+              <span class={statusClass(rowStatus(v))}>{rowStatus(v)}</span>
+            </div>
+            <div class="meta">
+              {v.request.estimatedCost !== null ? formatAmount(v.request.estimatedCost, v.request.currency) : ''}
+              {v.request.category ? ' · ' + categoryLabel(v.request.category) : ''}
+              {v.request.submittedAt ? ' · sent ' + fmtDate(v.request.submittedAt) : ''}
+            </div>
+
+            {v.instance && v.instance.state === 'halted' && v.instance.haltReason && (
+              <div class="halt">
+                <strong>Stopped, and nothing was approved.</strong> {v.instance.haltReason}
+                <span style="display:block;margin-top:5px;">
+                  Ask HR to record the missing relationship. The request then carries on from where
+                  it stopped — it is not lost and it was not approved.
+                </span>
+              </div>
+            )}
+
+            {v.instance && v.instance.state === 'pending' && (
+              <div class="meta">Waiting at step {v.instance.currentStep} of the chain.</div>
+            )}
+
+            {v.order && (
+              <div class="meta">
+                Order {v.order.poNumber}
+                {v.order.vendorName ? ' · ' + v.order.vendorName : ''}
+                {v.order.status === 'received' && v.order.receivedAt ? ' · received ' + fmtDate(v.order.receivedAt) : ''}
+                {v.order.assetTag ? ' · asset tag ' + v.order.assetTag : ''}
+              </div>
+            )}
+
+            {v.request.quoteUrl && (
+              <div class="meta"><a class="link" href={v.request.quoteUrl} target="_blank" rel="noopener noreferrer">Quote</a></div>
+            )}
+
+            {v.request.status === 'submitted' && !v.order
+              && (!v.instance || v.instance.state === 'pending' || v.instance.state === 'halted') && (
+              <div class="acts">
+                <form method="POST">
+                  <input type="hidden" name="action" value="withdraw"/>
+                  <input type="hidden" name="id" value={v.request.id}/>
+                  <button class="btn btn-thin" type="submit">Withdraw</button>
+                </form>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <!-- ================================================================== how it is routed -->
+      <div class="card">
+        <h3>How a purchase request is approved</h3>
+        <p class="note" style="margin:0 0 10px;">
+          This is the SHAPE of the chain, not a claim about who fills it. Every rung is resolved for
+          your own request, from the recorded reporting relationships, at the moment you send it.
+        </p>
+        <ol class="chain">
+          {chain.map((r) => (
+            <li>
+              <span class="n">{r.step}</span>
+              <span>
+                {viaLabel(r.via)}
+                {r.parallel ? ' — together with the other approver at this step; both must agree' : ''}
+                {r.optional ? ' — only if your organisation has named one' : ''}
+                {r.minAmount !== null ? ' — only at or above ' + formatAmount(r.minAmount, DEFAULT_CURRENCY) : ''}
+              </span>
+            </li>
+          ))}
+        </ol>
+        {threshold !== null && (
+          <p class="note">
+            Requests at or above {formatAmount(threshold, DEFAULT_CURRENCY)} need the finance and
+            executive rung as well. That figure is part of the approval chain itself, not a rule
+            typed into this page, so what you read here is what will actually be applied.
+          </p>
+        )}
+        <p class="note">
+          If nobody can be found for a required rung, the request STOPS with a sentence explaining
+          why. It is never approved by default and it is never quietly handed to whoever happens to
+          have the right job title.
+        </p>
+      </div>
+    </div>
+  )}
+</div>
+</body>
+</html>

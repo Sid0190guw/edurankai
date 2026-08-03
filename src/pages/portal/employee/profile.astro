@@ -1,0 +1,703 @@
+---
+// /portal/employee/profile — THE ONE PAGE AN EMPLOYEE OWNS ABOUT THEMSELVES.
+//
+// WHY THIS PAGE EXISTS AT ALL. src/lib/workforce/navigation.ts NAV_BACKLOG has carried an entry
+// called `profile.edit` saying, in as many words, that an employee cannot edit their own record
+// anywhere in this product: /portal/profile/edit redirects every non-applicant to /admin and
+// middleware bounces anyone without admin.access straight back — the redirect-loop shape that took
+// /portal down before. This is the surface that answers it, and it does so WITHOUT touching that
+// redirect: a new page with its own gate, rather than an edit to a loop.
+//
+// WHO CAN SEE WHAT. Everything on this page is scoped to the employee id resolved from the SIGNED-IN
+// SESSION by requireEmployee(). No id comes from a form field, so a posted id cannot address
+// somebody else's record. HR reads the same hr_employees columns it has always read on
+// /admin/hr/employees, and this page gives them nothing new to look at — no admin surface is built
+// over the profile sections here, and one does not appear by importing the library.
+//
+// THERE IS NO MEDICAL SECTION, AND THAT IS DELIBERATE. No condition, no allergy, no medication, no
+// blood group, no disability disclosure. Individual health data is never visible to any admin or to
+// the founder on this platform. What an emergency actually needs is somebody to telephone, and the
+// emergency-contact section holds exactly that — described on screen as information the employee
+// CHOOSES to share, because that is what it is.
+//
+// DOCUMENTS ARE LINKS. Identity documents, certificates and the signature are links to a shared
+// document with view access; nothing is uploaded. The profile PHOTO is the single exception on this
+// platform: captured live or chosen from the device, resized in the browser to a small JPEG, and
+// saved through the same path the face-enrolment endpoint already uses.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  getProfile,
+  savePersonal,
+  saveEmergency,
+  saveBank,
+  saveTax,
+  saveSignature,
+  savePhoto,
+  addEntry,
+  removeEntry,
+  profileCompletion,
+  assignedEquipment,
+  sectionLabel,
+  type EmployeeProfile,
+  type ProfileEntry,
+  type AssignedItem,
+} from '@/lib/profile';
+import { assetRegisterStatus } from '@/lib/procurement';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/employee/profile');
+
+// -------------------------------------------------------------------------------------------------
+// CONSTANTS FIRST — `const` is not hoisted, and a const declared below the POST handler that reads
+// it throws on that handler's first line while the page still reports success.
+// -------------------------------------------------------------------------------------------------
+const PAGE = '/portal/employee/profile';
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Placeholder text per list section, so each form asks for the thing it actually wants. */
+function entryHint(section: string): string {
+  if (section === 'education') return 'Degree or course';
+  if (section === 'experience') return 'Job title';
+  if (section === 'skills') return 'A skill';
+  if (section === 'languages') return 'A language';
+  if (section === 'certifications') return 'Certificate name';
+  if (section === 'achievements') return 'What you did';
+  if (section === 'social_links') return 'Where it points (a name for the link)';
+  if (section === 'identity_documents') return 'Which document';
+  if (section === 'emergency_contacts') return 'Their name';
+  return 'Name';
+}
+
+function detailHint(section: string): string {
+  if (section === 'education') return 'Institution';
+  if (section === 'experience') return 'Employer';
+  if (section === 'skills') return 'How you use it';
+  if (section === 'languages') return 'Read, write, speak';
+  if (section === 'certifications') return 'Who issued it';
+  if (section === 'achievements') return 'A little more';
+  if (section === 'social_links') return 'Optional note';
+  if (section === 'identity_documents') return 'Optional note — do not type the number here';
+  if (section === 'emergency_contacts') return 'Relationship and phone number';
+  return 'Detail';
+}
+
+function periodHint(section: string): string {
+  if (section === 'education') return 'Years';
+  if (section === 'experience') return 'From — to';
+  if (section === 'languages') return 'Level';
+  if (section === 'certifications') return 'Valid until';
+  return 'When';
+}
+
+/** Which sections take a link, and which would only be given a useless empty box. */
+function wantsLink(section: string): boolean {
+  return section === 'certifications' || section === 'social_links'
+    || section === 'identity_documents' || section === 'education' || section === 'achievements';
+}
+
+const gate = await requireEmployee(user, PAGE);
+const employeeId = gate.ok ? gate.workspace.employeeId : null;
+
+// -------------------------------------------------------------------------------------------------
+// WRITES. Every one is scoped to `employeeId`, which came from the session and never from the form.
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+
+  if (!gate.ok || !employeeId) {
+    flash = gate.reason || 'Your employee record is not available, so nothing was saved.';
+  } else if (action === 'personal') {
+    const r = await savePersonal(employeeId, {
+      phone: String(fd.get('phone') || ''),
+      personalEmail: String(fd.get('personal_email') || ''),
+      dateOfBirth: String(fd.get('date_of_birth') || ''),
+      nationality: String(fd.get('nationality') || ''),
+      address: String(fd.get('address') || ''),
+      city: String(fd.get('city') || ''),
+      state: String(fd.get('state') || ''),
+      country: String(fd.get('country') || ''),
+    }, String(user.id));
+    flash = r.ok ? 'Personal details saved.' : (r.error || 'Could not save that.');
+  } else if (action === 'emergency') {
+    const r = await saveEmergency(employeeId, {
+      name: String(fd.get('ec_name') || ''),
+      phone: String(fd.get('ec_phone') || ''),
+      relation: String(fd.get('ec_relation') || ''),
+    }, String(user.id));
+    flash = r.ok ? 'Emergency contact saved.' : (r.error || 'Could not save that.');
+  } else if (action === 'bank') {
+    const r = await saveBank(employeeId, {
+      bankName: String(fd.get('bank_name') || ''),
+      holder: String(fd.get('bank_holder') || ''),
+      accountNumber: String(fd.get('bank_account_number') || ''),
+      ifsc: String(fd.get('bank_ifsc') || ''),
+      branch: String(fd.get('bank_branch') || ''),
+    }, String(user.id));
+    flash = r.ok ? 'Bank details saved.' : (r.error || 'Could not save that.');
+  } else if (action === 'tax') {
+    const r = await saveTax(employeeId, {
+      pan: String(fd.get('pan') || ''),
+      uan: String(fd.get('uan') || ''),
+      pf: String(fd.get('pf') || ''),
+      esic: String(fd.get('esic') || ''),
+    }, String(user.id));
+    flash = r.ok ? 'Tax and statutory details saved.' : (r.error || 'Could not save that.');
+  } else if (action === 'signature') {
+    const r = await saveSignature(employeeId, String(fd.get('signature_url') || ''), String(user.id));
+    flash = r.ok ? 'Signature link saved.' : (r.error || 'Could not save that.');
+  } else if (action === 'photo') {
+    const r = await savePhoto(employeeId, String(user.id), String(fd.get('photo_data') || ''));
+    flash = r.ok ? 'Photo saved.' : (r.error || 'Could not save that photo.');
+  } else if (action === 'add') {
+    const r = await addEntry(employeeId, String(fd.get('section') || ''), {
+      label: String(fd.get('label') || ''),
+      detail: String(fd.get('detail') || ''),
+      period: String(fd.get('period') || ''),
+      url: String(fd.get('url') || ''),
+    }, String(user.id));
+    flash = r.ok ? 'Added.' : (r.error || 'Could not add that.');
+  } else if (action === 'remove') {
+    const r = await removeEntry(
+      employeeId,
+      String(fd.get('section') || ''),
+      Number(fd.get('index') || -1),
+      String(user.id),
+    );
+    flash = r.ok ? 'Removed.' : (r.error || 'Could not remove that.');
+  }
+
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash));
+}
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+const profile: EmployeeProfile | null = employeeId ? await getProfile(employeeId) : null;
+const completion = profile ? profileCompletion(profile) : null;
+const equipment: AssignedItem[] = employeeId ? await assignedEquipment(employeeId) : [];
+const register = await assetRegisterStatus();
+
+/** The list sections, rendered by one loop rather than nine near-identical blocks. */
+const listSections: { key: string; items: ProfileEntry[] }[] = profile ? [
+  { key: 'education', items: profile.education },
+  { key: 'experience', items: profile.experience },
+  { key: 'skills', items: profile.skills },
+  { key: 'languages', items: profile.languages },
+  { key: 'certifications', items: profile.certifications },
+  { key: 'achievements', items: profile.achievements },
+  { key: 'social_links', items: profile.socialLinks },
+  { key: 'identity_documents', items: profile.identityDocuments },
+  { key: 'emergency_contacts', items: profile.additionalEmergency },
+] : [];
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>My profile</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    /* MOBILE FIRST — the base rules are the 360px rules. min-width:0 on every flex child, because a
+       flex item defaults to min-width:auto and one long unbroken word would push a card wider than
+       the phone and make the PAGE scroll sideways. */
+    .wrap{max-width:640px;margin:0 auto;padding:14px 12px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 10px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:64px;}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:0 18px;min-height:44px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;margin-top:12px;}
+    .btn-thin{background:transparent;border:1px solid #e0d6c4;color:#6b6255;font-size:13px;margin-top:0;}
+    .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .flash{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:12px;overflow-wrap:anywhere;line-height:1.5;}
+    .note{font-size:12px;color:#9a8f7d;line-height:1.55;margin-top:8px;overflow-wrap:anywhere;}
+    .empty{font-size:13.5px;color:#6b6255;line-height:1.55;}
+    .who{display:flex;gap:14px;align-items:center;flex-wrap:wrap;}
+    .avatar{width:72px;height:72px;border-radius:50%;object-fit:cover;background:#f1ece1;border:1px solid #e6ddcd;flex:0 0 auto;}
+    .avatar-blank{width:72px;height:72px;border-radius:50%;background:#f1ece1;border:1px solid #e6ddcd;display:flex;align-items:center;justify-content:center;color:#9a8f7d;flex:0 0 auto;}
+    .who-txt{flex:1 1 150px;min-width:0;overflow-wrap:anywhere;}
+    .who-name{font-family:'Fraunces',serif;font-size:21px;font-weight:600;line-height:1.2;}
+    .bar{height:8px;background:#f1ece1;border-radius:99px;overflow:hidden;margin-top:10px;}
+    .bar span{display:block;height:100%;background:#c2410c;}
+    .badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;}
+    .badge{font-size:11px;padding:4px 9px;border-radius:99px;background:#f6f2e9;color:#6b6255;border:1px solid #ece4d6;}
+    .badge-done{background:rgba(5,150,105,.1);color:#065f46;border-color:rgba(5,150,105,.25);}
+    .badge-opt{color:#9a8f7d;}
+    .item{border-bottom:1px solid #f2ece0;padding:11px 0;display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;}
+    .item:last-of-type{border-bottom:none;}
+    .item-txt{flex:1 1 160px;min-width:0;overflow-wrap:anywhere;}
+    .item-title{font-weight:600;font-size:14.5px;}
+    .x{background:none;border:none;color:#9a2c2c;font-size:14px;cursor:pointer;min-height:44px;min-width:44px;font-family:inherit;}
+    a.link{color:#c2410c;overflow-wrap:anywhere;}
+    details{border-top:1px solid #f2ece0;padding-top:10px;margin-top:10px;}
+    summary{font-size:13.5px;font-weight:600;cursor:pointer;min-height:44px;display:flex;align-items:center;}
+    .privacy{background:rgba(15,118,110,.06);border:1px solid rgba(15,118,110,.22);border-radius:10px;padding:12px 14px;font-size:12.5px;color:#134e4a;line-height:1.6;overflow-wrap:anywhere;}
+    @media (min-width:560px){ .btn{width:auto;} }
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+    My HR
+  </a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">My profile</span>
+  <a href="/portal/employee/procurement" style="font-size:12px;">Purchases</a>
+</nav>
+
+<div class="wrap">
+  {msg && <div class="flash">{msg}</div>}
+
+  {!gate.ok && (
+    <div class="card">
+      <h3>{gate.title || 'Not available'}</h3>
+      <p class="empty">{gate.reason || 'Your employee record is not available.'}</p>
+    </div>
+  )}
+
+  {gate.ok && !profile && (
+    <div class="card">
+      <h3>We could not load your profile</h3>
+      <p class="empty">
+        Your employee record could not be read just now. Nothing you have saved is lost. Try again in
+        a moment, and tell HR if it keeps happening.
+      </p>
+    </div>
+  )}
+
+  {gate.ok && profile && (
+    <div>
+      <!-- ================================================================== who, photo, progress -->
+      <div class="card">
+        <div class="who">
+          {profile.personal.photoUrl
+            ? <img class="avatar" src={profile.personal.photoUrl} alt="Your profile photo"/>
+            : <span class="avatar-blank"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>}
+          <div class="who-txt">
+            <div class="who-name">{profile.personal.fullName || 'Your record'}</div>
+            <div class="note" style="margin-top:2px;">
+              {profile.personal.designation || 'No designation recorded'}
+              {profile.personal.employeeCode ? ' · ' + profile.personal.employeeCode : ''}
+            </div>
+          </div>
+        </div>
+
+        {completion && (
+          <div>
+            <div class="bar"><span style={'width:' + completion.percent + '%;'}></span></div>
+            <p class="note">
+              {completion.done} of {completion.total} core sections filled in. Certifications, links,
+              identity documents, the signature, bank and tax details are optional and are not
+              counted — nothing here is withheld because a section is blank.
+            </p>
+            <div class="badges">
+              {completion.items.map((i) => (
+                <span class={i.done ? 'badge badge-done' : (i.optional ? 'badge badge-opt' : 'badge')}>
+                  {i.label}{i.optional && !i.done ? ' — optional' : ''}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <!-- ================================================================== photo -->
+      <div class="card">
+        <h3>Photo</h3>
+        <p class="note" style="margin:0 0 10px;">
+          Take one now with the camera, or choose a picture from this device. It is shrunk to a small
+          square in your browser before it is sent — this is the only file this platform stores.
+        </p>
+        <form method="POST" id="photo-form">
+          <input type="hidden" name="action" value="photo"/>
+          <input type="hidden" name="photo_data" id="photo-data"/>
+          <div class="row2">
+            <button class="btn btn-thin" type="button" id="photo-camera">Use camera</button>
+            <button class="btn btn-thin" type="button" id="photo-choose">Choose a file</button>
+          </div>
+          <input type="file" id="photo-file" accept="image/*" style="display:none;"/>
+          <video id="photo-video" playsinline muted style="display:none;width:100%;border-radius:12px;margin-top:10px;background:#000;"></video>
+          <canvas id="photo-canvas" style="display:none;"></canvas>
+          <img id="photo-preview" alt="The photo you just took" style="display:none;width:120px;height:120px;object-fit:cover;border-radius:12px;margin-top:10px;"/>
+          <div class="row2" style="margin-top:10px;">
+            <button class="btn btn-thin" type="button" id="photo-shoot" style="display:none;">Take the picture</button>
+            <button class="btn" type="submit" id="photo-save" style="display:none;">Save photo</button>
+          </div>
+          <p class="note" id="photo-msg"></p>
+        </form>
+      </div>
+
+      <!-- ================================================================== personal -->
+      <div class="card">
+        <h3>Personal information</h3>
+        <form method="POST">
+          <input type="hidden" name="action" value="personal"/>
+          <div class="row2">
+            <div>
+              <label for="phone">Phone</label>
+              <input id="phone" name="phone" type="tel" inputmode="tel" maxlength="40" value={profile.personal.phone || ''}/>
+            </div>
+            <div>
+              <label for="date_of_birth">Date of birth</label>
+              <input id="date_of_birth" name="date_of_birth" type="date" value={profile.personal.dateOfBirth || ''}/>
+            </div>
+          </div>
+          <label for="personal_email">Personal email</label>
+          <input id="personal_email" name="personal_email" type="email" inputmode="email" value={profile.personal.personalEmail || ''}/>
+          <label for="nationality">Nationality</label>
+          <input id="nationality" name="nationality" maxlength="80" value={profile.personal.nationality || ''}/>
+          <label for="address">Address</label>
+          <textarea id="address" name="address" maxlength="2000">{profile.personal.address || ''}</textarea>
+          <div class="row2">
+            <div>
+              <label for="city">City</label>
+              <input id="city" name="city" maxlength="120" value={profile.personal.city || ''}/>
+            </div>
+            <div>
+              <label for="state">State</label>
+              <input id="state" name="state" maxlength="120" value={profile.personal.state || ''}/>
+            </div>
+          </div>
+          <label for="country">Country</label>
+          <input id="country" name="country" maxlength="120" value={profile.personal.country || ''}/>
+          <button class="btn" type="submit">Save personal details</button>
+          <p class="note">
+            Your name, employee code, designation, department, joining date and reporting line are
+            part of your employment record and are kept by HR — they are shown here and changed
+            there, so nobody can quietly restate their own job.
+          </p>
+        </form>
+      </div>
+
+      <!-- ================================================================== emergency -->
+      <div class="card">
+        <h3>Emergency contact</h3>
+        <div class="privacy">
+          Who to telephone, and nothing else. This platform holds NO medical information about you —
+          no condition, no medication, no allergy, no blood group — and there is no screen anywhere,
+          for any administrator, where such a thing could be read. Share only what you would want a
+          colleague to use to reach someone on your behalf.
+        </div>
+        <form method="POST">
+          <input type="hidden" name="action" value="emergency"/>
+          <label for="ec_name">Their name</label>
+          <input id="ec_name" name="ec_name" maxlength="300" value={profile.emergency.name || ''}/>
+          <div class="row2">
+            <div>
+              <label for="ec_phone">Their phone</label>
+              <input id="ec_phone" name="ec_phone" type="tel" inputmode="tel" maxlength="40" value={profile.emergency.phone || ''}/>
+            </div>
+            <div>
+              <label for="ec_relation">Relationship</label>
+              <input id="ec_relation" name="ec_relation" maxlength="80" value={profile.emergency.relation || ''}/>
+            </div>
+          </div>
+          <button class="btn" type="submit">Save emergency contact</button>
+        </form>
+      </div>
+
+      <!-- ================================================================== the list sections -->
+      {listSections.map((sec) => (
+        <div class="card">
+          <h3>{sectionLabel(sec.key)} · {sec.items.length}</h3>
+          {sec.items.length === 0 && <p class="empty">Nothing recorded yet.</p>}
+          {sec.items.map((entry, idx) => (
+            <div class="item">
+              <div class="item-txt">
+                <div class="item-title">{entry.label}</div>
+                {entry.detail && <div class="note" style="margin-top:2px;">{entry.detail}</div>}
+                {entry.period && <div class="note" style="margin-top:2px;">{entry.period}</div>}
+                {entry.url && <div class="note" style="margin-top:2px;"><a class="link" href={entry.url} target="_blank" rel="noopener noreferrer">Open the link</a></div>}
+              </div>
+              <form method="POST" style="margin:0;flex:0 0 auto;">
+                <input type="hidden" name="action" value="remove"/>
+                <input type="hidden" name="section" value={sec.key}/>
+                <input type="hidden" name="index" value={String(idx)}/>
+                <button class="x" type="submit" aria-label={'Remove ' + entry.label}>Remove</button>
+              </form>
+            </div>
+          ))}
+
+          <details>
+            <summary>Add to {sectionLabel(sec.key).toLowerCase()}</summary>
+            <form method="POST">
+              <input type="hidden" name="action" value="add"/>
+              <input type="hidden" name="section" value={sec.key}/>
+              <label>{entryHint(sec.key)}</label>
+              <input name="label" required maxlength="300" placeholder={entryHint(sec.key)}/>
+              <label>{detailHint(sec.key)}</label>
+              <input name="detail" maxlength="2000" placeholder={detailHint(sec.key)}/>
+              <label>{periodHint(sec.key)}</label>
+              <input name="period" maxlength="80" placeholder={periodHint(sec.key)}/>
+              {wantsLink(sec.key) && (
+                <div>
+                  <label>Link</label>
+                  <input name="url" type="url" inputmode="url" placeholder="https://"/>
+                </div>
+              )}
+              <button class="btn" type="submit">Add</button>
+            </form>
+          </details>
+
+          {sec.key === 'identity_documents' && (
+            <p class="note">
+              A LINK to each document, never the document itself and never the number. Set the share
+              setting so anybody holding the link can view it, and share it only with people who need
+              to check it.
+            </p>
+          )}
+          {sec.key === 'emergency_contacts' && (
+            <p class="note">
+              A second and third person to call, if you want them recorded. Contact details only —
+              nothing about anybody's health belongs here.
+            </p>
+          )}
+        </div>
+      ))}
+
+      <!-- ================================================================== signature -->
+      <div class="card">
+        <h3>Digital signature</h3>
+        <form method="POST">
+          <input type="hidden" name="action" value="signature"/>
+          <label for="signature_url">Link to your signature</label>
+          <input id="signature_url" name="signature_url" type="url" inputmode="url" placeholder="https://" value={profile.signatureUrl || ''}/>
+          <button class="btn" type="submit">Save</button>
+          <p class="note">
+            A link to an image of your signature in your own shared drive, so you control it and can
+            withdraw it. Files are never uploaded here. Leave it empty to remove the one on record.
+          </p>
+        </form>
+        {profile.signatureUrl && (
+          <p class="note"><a class="link" href={profile.signatureUrl} target="_blank" rel="noopener noreferrer">Open the signature on record</a></p>
+        )}
+      </div>
+
+      <!-- ================================================================== equipment -->
+      <div class="card">
+        <h3>Equipment and assets</h3>
+        {equipment.length === 0 && (
+          <p class="empty">
+            Nothing has been recorded against you here yet. This list shows items bought on purchase
+            requests you raised, once somebody has confirmed they arrived.
+          </p>
+        )}
+        {equipment.map((item) => (
+          <div class="item">
+            <div class="item-txt">
+              <div class="item-title">{item.label}</div>
+              <div class="note" style="margin-top:2px;">
+                {item.reference ? 'Order ' + item.reference : ''}
+                {item.assetTag ? ' · asset tag ' + item.assetTag : ''}
+                {item.receivedAt ? ' · received ' + fmtDate(item.receivedAt) : ''}
+              </div>
+            </div>
+          </div>
+        ))}
+        <p class="note">
+          Read-only, and honest about its limits: this is what the purchasing record can prove, not
+          the whole asset register.
+          {register.available && register.href
+            ? ' The full register is kept separately and is where an item issued to you by somebody else is recorded.'
+            : ' A company-wide asset register is not available in this environment yet, so anything issued to you outside a purchase request will not appear here.'}
+        </p>
+      </div>
+
+      <!-- ================================================================== bank (optional) -->
+      <div class="card">
+        <h3>Bank details · optional</h3>
+        <p class="note" style="margin:0 0 4px;">
+          Never required. Nothing on this platform is withheld from you for leaving these blank, and
+          they are not counted towards how complete your profile is. Clear them at any time.
+        </p>
+        <form method="POST">
+          <input type="hidden" name="action" value="bank"/>
+          <label for="bank_holder">Account holder</label>
+          <input id="bank_holder" name="bank_holder" maxlength="160" value={profile.bank.holder || ''}/>
+          <label for="bank_name">Bank</label>
+          <input id="bank_name" name="bank_name" maxlength="160" value={profile.bank.bankName || ''}/>
+          <div class="row2">
+            <div>
+              <label for="bank_account_number">Account number</label>
+              <input id="bank_account_number" name="bank_account_number" maxlength="40" autocomplete="off" value={profile.bank.accountNumber || ''}/>
+            </div>
+            <div>
+              <label for="bank_ifsc">IFSC</label>
+              <input id="bank_ifsc" name="bank_ifsc" maxlength="20" autocomplete="off" value={profile.bank.ifsc || ''}/>
+            </div>
+          </div>
+          <label for="bank_branch">Branch</label>
+          <input id="bank_branch" name="bank_branch" maxlength="160" value={profile.bank.branch || ''}/>
+          <button class="btn" type="submit">Save bank details</button>
+        </form>
+      </div>
+
+      <!-- ================================================================== tax (optional) -->
+      <div class="card">
+        <h3>Tax and statutory · optional</h3>
+        <form method="POST">
+          <input type="hidden" name="action" value="tax"/>
+          <div class="row2">
+            <div>
+              <label for="pan">PAN</label>
+              <input id="pan" name="pan" maxlength="20" autocomplete="off" value={profile.tax.pan || ''}/>
+            </div>
+            <div>
+              <label for="uan">UAN</label>
+              <input id="uan" name="uan" maxlength="30" autocomplete="off" value={profile.tax.uan || ''}/>
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="pf">PF number</label>
+              <input id="pf" name="pf" maxlength="40" autocomplete="off" value={profile.tax.pf || ''}/>
+            </div>
+            <div>
+              <label for="esic">ESIC number</label>
+              <input id="esic" name="esic" maxlength="30" autocomplete="off" value={profile.tax.esic || ''}/>
+            </div>
+          </div>
+          <button class="btn" type="submit">Save tax details</button>
+          <p class="note">
+            Also optional. These are used for payroll paperwork when your organisation needs them.
+          </p>
+        </form>
+      </div>
+
+      <p class="note" style="text-align:center;">
+        {profile.updatedAt ? 'Your profile sections were last changed ' + fmtDate(profile.updatedAt) + '.' : ''}
+      </p>
+    </div>
+  )}
+</div>
+
+<script is:inline>
+  // THE PHOTO — the one stored upload on this platform, and it is resized before it leaves the phone.
+  //
+  // A camera frame is 3-12MB. Sending that would cost the person their data and the product its
+  // storage, so the picture is drawn onto a canvas at 320px on its long edge and encoded as a JPEG
+  // here. The server checks the shape and the size again, because a client-side limit is a courtesy
+  // and never a guarantee.
+  //
+  // OUTSIDE EVERY CONDITIONAL BLOCK, deliberately: a <script> inside a JSX conditional breaks .astro
+  // parsing. It guards on the elements being present instead, so it is inert on the denial screens.
+  (function () {
+    var form = document.getElementById('photo-form');
+    if (!form) return;
+    var dataField = document.getElementById('photo-data');
+    var fileInput = document.getElementById('photo-file');
+    var video = document.getElementById('photo-video');
+    var canvas = document.getElementById('photo-canvas');
+    var preview = document.getElementById('photo-preview');
+    var btnCamera = document.getElementById('photo-camera');
+    var btnChoose = document.getElementById('photo-choose');
+    var btnShoot = document.getElementById('photo-shoot');
+    var btnSave = document.getElementById('photo-save');
+    var note = document.getElementById('photo-msg');
+    var stream = null;
+    var MAX = 320;
+
+    function say(text) { if (note) note.textContent = text; }
+
+    function drawToData(source, w, h) {
+      var scale = Math.min(MAX / w, MAX / h, 1);
+      var tw = Math.max(1, Math.round(w * scale));
+      var th = Math.max(1, Math.round(h * scale));
+      canvas.width = tw;
+      canvas.height = th;
+      var ctx = canvas.getContext('2d');
+      if (!ctx) return '';
+      ctx.drawImage(source, 0, 0, tw, th);
+      return canvas.toDataURL('image/jpeg', 0.82);
+    }
+
+    function accept(dataUrl) {
+      if (!dataUrl || dataUrl.indexOf('data:image/jpeg') !== 0) {
+        say('That picture could not be prepared. Try a different one.');
+        return;
+      }
+      dataField.value = dataUrl;
+      preview.src = dataUrl;
+      preview.style.display = 'block';
+      btnSave.style.display = 'block';
+      say('Ready. Press Save photo to keep it.');
+    }
+
+    function stopCamera() {
+      if (stream) {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        stream = null;
+      }
+      video.style.display = 'none';
+      btnShoot.style.display = 'none';
+    }
+
+    if (btnChoose) btnChoose.addEventListener('click', function () { stopCamera(); fileInput.click(); });
+
+    if (fileInput) fileInput.addEventListener('change', function () {
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        var img = new Image();
+        img.onload = function () { accept(drawToData(img, img.naturalWidth, img.naturalHeight)); };
+        img.onerror = function () { say('That file is not an image we can read.'); };
+        img.src = String(reader.result || '');
+      };
+      reader.onerror = function () { say('That file could not be read.'); };
+      reader.readAsDataURL(file);
+    });
+
+    if (btnCamera) btnCamera.addEventListener('click', function () {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        say('This device will not open a camera here. Choose a file instead.');
+        return;
+      }
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+        .then(function (s) {
+          stream = s;
+          video.srcObject = s;
+          video.style.display = 'block';
+          btnShoot.style.display = 'block';
+          say('Line yourself up, then take the picture.');
+          return video.play();
+        })
+        .catch(function () { say('The camera did not open. You can choose a file instead.'); });
+    });
+
+    if (btnShoot) btnShoot.addEventListener('click', function () {
+      if (!stream) return;
+      var w = video.videoWidth || MAX;
+      var h = video.videoHeight || MAX;
+      var dataUrl = drawToData(video, w, h);
+      stopCamera();
+      accept(dataUrl);
+    });
+
+    form.addEventListener('submit', function (e) {
+      if (!dataField.value) {
+        e.preventDefault();
+        say('Take a picture or choose a file first.');
+      }
+    });
+
+    window.addEventListener('pagehide', stopCamera);
+  })();
+</script>
+</body>
+</html>

@@ -1,0 +1,441 @@
+---
+// /admin/hr/performance/learning — ASSIGNED LEARNING AND THE TRAINING CALENDAR.
+//
+// THE GATE: `learning.assign`, asked with can() — PERMS_BY_ROLE only, never the registry. Granted to
+// super_admin + hr, exactly who reaches /admin/hr/training today via the `training` section.
+//
+// THIS IS NOT A SECOND LMS. The courses come from training_courses, which is authored at
+// /admin/hr/training and played at /portal/courses. Progress comes from training_enrollments, which
+// the learner writes by opening a course. The only thing this console adds is the ASSIGNMENT — who
+// was asked to do what, by when, and whether it was required — which training_enrollments has no
+// column for. src/lib/performance-learning.ts sets out that gap in full.
+//
+// EduRankAI is the technology platform; accredited partners award credentials. Nothing here claims a
+// course completion is a degree.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  resolvePerfViewer,
+  departmentOptions,
+  rowsOf,
+  logFail,
+  LEARNING_ASSIGN,
+} from '@/lib/performance-scope';
+import {
+  allAssignments,
+  assignCourse,
+  withdrawAssignment,
+  courseOptions,
+  listTrainingEvents,
+  createTrainingEvent,
+  cancelTrainingEvent,
+  TRAINING_MODES,
+  TRAINING_MODE_LABELS,
+  type LearningItem,
+  type TrainingEvent,
+  type CourseOption,
+} from '@/lib/performance-learning';
+
+const PATH = '/admin/hr/performance/learning';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+
+const hasConsole = can(user as any, 'admin.access');
+if (!hasConsole) return Astro.redirect('/admin');
+const allowed = can(user as any, LEARNING_ASSIGN);
+
+// Every const above the handler — `const` is not hoisted, and that has taken pages down here.
+const VIEWS = [
+  { key: 'assignments', label: 'Assigned learning' },
+  { key: 'calendar', label: 'Training calendar' },
+] as const;
+
+const back = (msg: string, view: string) =>
+  Astro.redirect(PATH + '?view=' + encodeURIComponent(view) + '&msg=' + encodeURIComponent(msg.slice(0, 300)));
+
+const fmtDate = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+const fmtWhen = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleString('en-GB', {
+    day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+  }) : '';
+
+const STATE_LABELS: Record<string, string> = {
+  not_started: 'Not started',
+  in_progress: 'In progress',
+  complete: 'Complete',
+};
+
+// The viewer scope is resolved before any write, because assignCourse() needs it.
+let viewer: any = null;
+if (allowed) {
+  viewer = await resolvePerfViewer(String(user.id), (k: string) => can(user as any, k as any));
+}
+
+if (Astro.request.method === 'POST') {
+  if (!allowed || !viewer) return Astro.redirect(PATH);
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const view = String(fd.get('view') || 'assignments');
+
+  if (action === 'assign') {
+    const r = await assignCourse(viewer, {
+      employeeId: String(fd.get('employee_id') || ''),
+      courseId: String(fd.get('course_id') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      required: fd.get('required') === '1',
+      reason: String(fd.get('reason') || ''),
+      orgWide: true,
+    });
+    return back(r.ok ? 'Course assigned.' : (r.error || 'Could not assign that.'), 'assignments');
+  }
+
+  if (action === 'withdraw') {
+    const r = await withdrawAssignment(viewer, String(fd.get('assignment_id') || ''), true);
+    return back(
+      r.ok ? 'Assignment withdrawn. The row is kept, so the record still says who asked for it.' : (r.error || 'Could not withdraw that.'),
+      'assignments',
+    );
+  }
+
+  if (action === 'create_event') {
+    const r = await createTrainingEvent({
+      title: String(fd.get('title') || ''),
+      description: String(fd.get('description') || ''),
+      courseId: String(fd.get('course_id') || '') || null,
+      departmentId: String(fd.get('department_id') || '') || null,
+      startsAt: String(fd.get('starts_at') || ''),
+      endsAt: String(fd.get('ends_at') || ''),
+      location: String(fd.get('location') || ''),
+      mode: String(fd.get('mode') || 'online'),
+      capacity: fd.get('capacity') ? Number(fd.get('capacity')) : null,
+      actorUserId: String(user.id),
+    });
+    return back(r.ok ? 'Session scheduled.' : (r.error || 'Could not schedule that.'), 'calendar');
+  }
+
+  if (action === 'cancel_event') {
+    const r = await cancelTrainingEvent(String(fd.get('event_id') || ''), String(user.id));
+    return back(r.ok ? 'Session cancelled.' : (r.error || 'Could not cancel that.'), 'calendar');
+  }
+
+  return back('That action is not one this page performs.', view);
+}
+
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 300);
+const requested = String(params.get('view') || 'assignments');
+const view = (VIEWS as readonly { key: string }[]).some((v) => v.key === requested) ? requested : 'assignments';
+const overdueOnly = params.get('overdue') === '1';
+
+let assignments: LearningItem[] = [];
+let events: TrainingEvent[] = [];
+let courses: CourseOption[] = [];
+let departments: { id: string; name: string }[] = [];
+let people: { id: string; name: string }[] = [];
+let peopleUnread = false;
+
+if (allowed) {
+  courses = await courseOptions();
+  departments = await departmentOptions();
+  if (view === 'assignments') {
+    assignments = await allAssignments({ overdueOnly });
+    try {
+      const rows = rowsOf(await db.execute(sql`
+        SELECT id, full_name FROM hr_employees
+         WHERE is_active = true ORDER BY full_name ASC LIMIT 500`));
+      people = rows.map((r: any) => ({ id: String(r.id), name: r.full_name ? String(r.full_name) : 'Unnamed record' }));
+    } catch (e: any) {
+      // Say so rather than rendering an empty picker that looks like "there are no employees".
+      logFail('admin/hr/performance/learning', 'people', e);
+      peopleUnread = true;
+    }
+  } else {
+    events = await listTrainingEvents({ includePast: true });
+  }
+}
+
+const hrefFor = (v: string) => PATH + '?view=' + v;
+const overdueCount = assignments.filter((a) => a.overdue).length;
+---
+
+<AdminLayout title="Learning" activeNav="hr">
+  <style>
+    .lr{max-width:1080px}
+    .lr h1{font-size:22px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px}
+    .lr .lede{font-size:13.5px;line-height:1.6;color:#6b6255;margin:0 0 18px;max-width:70ch}
+    .lr .flash{background:rgba(5,150,105,.09);border:1px solid rgba(5,150,105,.3);color:#065f46;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:16px;
+      overflow-wrap:anywhere}
+    .lr .deny,.lr .notice{background:#fbf7f1;border:1px solid #eadecd;color:#6d470d;border-radius:12px;
+      padding:14px 16px;font-size:13px;line-height:1.6;max-width:70ch;margin-bottom:14px}
+    .lr .card{background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:16px;
+      margin-bottom:14px}
+    .lr .card h2{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;
+      letter-spacing:.13em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px}
+    .lr .muted{font-size:12.5px;line-height:1.55;color:#6b6255;overflow-wrap:anywhere}
+    .lr .tabs{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;margin-bottom:14px}
+    .lr .tab{flex:none;display:inline-flex;align-items:center;min-height:38px;padding:8px 14px;
+      border:1px solid #e6ddcd;border-radius:999px;background:#fff;color:#6b6255;font-size:13px;
+      font-weight:600;text-decoration:none;white-space:nowrap}
+    .lr .tab[aria-current="page"]{background:#1a1510;border-color:#1a1510;color:#fff}
+    .lr label{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;
+      letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;
+      margin:10px 0 4px}
+    .lr input,.lr select,.lr textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;
+      border-radius:9px;padding:10px 12px;font-size:14px;font-family:inherit;color:#1a1510;
+      outline:none;min-height:44px}
+    .lr textarea{min-height:70px;resize:vertical}
+    .lr input:focus,.lr select:focus,.lr textarea:focus{border-color:#c2410c}
+    .lr .row2{display:grid;grid-template-columns:1fr;gap:9px}
+    .lr .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;
+      font-size:14px;font-weight:650;cursor:pointer;font-family:inherit;min-height:44px;margin-top:12px}
+    .lr .btn.ghost{background:#fff;color:#6b6255;border:1px solid #e6ddcd}
+    .lr .btn.slim{padding:9px 14px;font-size:13px;margin-top:0}
+    .lr .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:10px}
+    .lr table{border-collapse:collapse;width:100%;min-width:700px;font-size:13.5px}
+    .lr th{text-align:left;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;
+      letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;padding:8px 10px;
+      border-bottom:1px solid #ece4d6;white-space:nowrap}
+    .lr td{padding:10px;border-bottom:1px solid #f4efe6;vertical-align:top}
+    .lr .pill{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;font-weight:700;
+      padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;
+      background:#f2ece0;color:#6b6255;display:inline-block;white-space:nowrap}
+    .lr .pill.done{background:rgba(5,150,105,.12);color:#065f46}
+    .lr .pill.late{background:rgba(220,38,38,.1);color:#991b1b}
+    @media (min-width:760px){ .lr .row2{grid-template-columns:1fr 1fr} }
+  </style>
+
+  <div class="lr">
+    <h1>Learning</h1>
+    <p class="lede">
+      What people were asked to do, and what they have actually done. Courses and progress come from
+      the existing course engine at <a href="/admin/hr/training">/admin/hr/training</a> — this screen
+      adds the assignment and the calendar, which that engine has no columns for.
+    </p>
+
+    {!allowed && (
+      <div class="deny">
+        <p><b>This is the learning desk.</b> You hold the admin console but not
+          <code> learning.assign</code>, which is what assigns a course to anybody in the organization
+          and schedules the training calendar.</p>
+        <p style="margin-top:9px">It is held by super admins and by HR. Assigning a course to your own
+          reports is opened by the reporting relationship instead, from
+          <a href="/portal/employee/learning">/portal/employee/learning</a>.</p>
+      </div>
+    )}
+
+    {allowed && (
+      <>
+        {msg && <p class="flash">{msg}</p>}
+
+        <div class="tabs">
+          {VIEWS.map((v) => (
+            <a class="tab" href={hrefFor(v.key)} aria-current={v.key === view ? 'page' : null}>{v.label}</a>
+          ))}
+        </div>
+
+        {courses.length === 0 && (
+          <p class="notice">
+            No published courses were found, so there is nothing to assign or to attach a session to.
+            Courses are authored and published at <a href="/admin/hr/training">/admin/hr/training</a>.
+          </p>
+        )}
+
+        {view === 'assignments' && (
+          <>
+            {peopleUnread && (
+              <p class="notice">We could not read the employee list just now, so the picker below is
+                empty. That is a failed read, not an empty organization.</p>
+            )}
+
+            <div class="card">
+              <h2>Assign a course</h2>
+              <form method="post">
+                <input type="hidden" name="action" value="assign" />
+                <input type="hidden" name="view" value="assignments" />
+                <div class="row2">
+                  <div>
+                    <label for="who">Who</label>
+                    <select id="who" name="employee_id" required>
+                      <option value="">Choose an employee</option>
+                      {people.map((p) => <option value={p.id}>{p.name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label for="course">Course</label>
+                    <select id="course" name="course_id" required>
+                      <option value="">Choose a course</option>
+                      {courses.map((c) => <option value={c.id}>{c.title}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div class="row2">
+                  <div>
+                    <label for="due">Due by</label>
+                    <input id="due" type="date" name="due_on" />
+                  </div>
+                  <div>
+                    <label for="req">Required</label>
+                    <select id="req" name="required">
+                      <option value="0">Recommended</option>
+                      <option value="1">Required</option>
+                    </select>
+                  </div>
+                </div>
+                <label for="why">Why</label>
+                <textarea id="why" name="reason" maxlength="1000"
+                  placeholder="Optional. Shown to the person it is assigned to"></textarea>
+                <button class="btn" type="submit">Assign</button>
+              </form>
+            </div>
+
+            <div class="card">
+              <h2>Assigned</h2>
+              <p class="muted">
+                {assignments.length} assignment{assignments.length === 1 ? '' : 's'}
+                {overdueCount > 0 ? ' · ' + overdueCount + ' overdue' : ''}
+                {' · '}
+                <a href={PATH + '?view=assignments' + (overdueOnly ? '' : '&overdue=1')}>
+                  {overdueOnly ? 'Show everything' : 'Show overdue only'}
+                </a>
+              </p>
+
+              {assignments.length === 0
+                ? <p class="muted" style="margin-top:12px">Nothing assigned yet. Somebody can still take
+                    any course in the catalogue on their own — an assignment is a request with a date
+                    on it, not a permission to learn.</p>
+                : (
+                  <div class="tablewrap">
+                    <table>
+                      <thead>
+                        <tr><th>Person</th><th>Course</th><th>Progress</th><th>Due</th><th>State</th><th></th></tr>
+                      </thead>
+                      <tbody>
+                        {assignments.map((a) => (
+                          <tr>
+                            <td>{a.employeeName || 'Unnamed record'}</td>
+                            <td>{a.courseTitle}{a.required ? <><br /><span class="pill">Required</span></> : null}</td>
+                            <td>{a.progressPct === null ? <span class="muted">Not opened</span> : Math.round(a.progressPct) + '%'}</td>
+                            <td>{a.dueOn ? fmtDate(a.dueOn) : <span class="muted">No date</span>}</td>
+                            <td>
+                              <span class={'pill ' + (a.state === 'complete' ? 'done' : a.overdue ? 'late' : '')}>
+                                {a.overdue && a.state !== 'complete' ? 'Overdue' : STATE_LABELS[a.state]}
+                              </span>
+                            </td>
+                            <td>
+                              <form method="post">
+                                <input type="hidden" name="action" value="withdraw" />
+                                <input type="hidden" name="view" value="assignments" />
+                                <input type="hidden" name="assignment_id" value={a.assignmentId} />
+                                <button class="btn ghost slim" type="submit">Withdraw</button>
+                              </form>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+            </div>
+          </>
+        )}
+
+        {view === 'calendar' && (
+          <>
+            <div class="card">
+              <h2>Schedule a session</h2>
+              <form method="post">
+                <input type="hidden" name="action" value="create_event" />
+                <input type="hidden" name="view" value="calendar" />
+                <label for="t">Title</label>
+                <input id="t" name="title" maxlength="200" required />
+                <label for="d">What it covers</label>
+                <textarea id="d" name="description" maxlength="2000"></textarea>
+                <div class="row2">
+                  <div>
+                    <label for="st">Starts</label>
+                    <input id="st" type="datetime-local" name="starts_at" required />
+                  </div>
+                  <div>
+                    <label for="en">Ends</label>
+                    <input id="en" type="datetime-local" name="ends_at" />
+                  </div>
+                </div>
+                <div class="row2">
+                  <div>
+                    <label for="md">How</label>
+                    <select id="md" name="mode">
+                      {TRAINING_MODES.map((m) => <option value={m}>{TRAINING_MODE_LABELS[m]}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label for="lo">Where</label>
+                    <input id="lo" name="location" maxlength="200" placeholder="Room, or a link" />
+                  </div>
+                </div>
+                <div class="row2">
+                  <div>
+                    <label for="cp">Places</label>
+                    <input id="cp" type="number" min="1" name="capacity" placeholder="Leave blank for no limit" />
+                  </div>
+                  <div>
+                    <label for="dp">Department</label>
+                    <select id="dp" name="department_id">
+                      <option value="">Everybody</option>
+                      {departments.map((d) => <option value={d.id}>{d.name}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <label for="cs">Linked course</label>
+                <select id="cs" name="course_id">
+                  <option value="">None</option>
+                  {courses.map((c) => <option value={c.id}>{c.title}</option>)}
+                </select>
+                <button class="btn" type="submit">Schedule</button>
+              </form>
+            </div>
+
+            <div class="card">
+              <h2>Scheduled</h2>
+              {events.length === 0
+                ? <p class="muted">Nothing scheduled. This is a training calendar only — there is no
+                    shift, roster or holiday data anywhere in this product, and this screen does not
+                    pretend otherwise.</p>
+                : (
+                  <div class="tablewrap">
+                    <table>
+                      <thead><tr><th>When</th><th>Session</th><th>Where</th><th>Signed up</th><th></th></tr></thead>
+                      <tbody>
+                        {events.map((ev) => (
+                          <tr>
+                            <td>{fmtWhen(ev.startsAt)}</td>
+                            <td>{ev.title}{ev.courseTitle ? <><br /><span class="muted">{ev.courseTitle}</span></> : null}</td>
+                            <td>{ev.location || TRAINING_MODE_LABELS[ev.mode] || ev.mode}
+                              {ev.departmentName ? <><br /><span class="muted">{ev.departmentName}</span></> : null}</td>
+                            <td>{ev.signups}{ev.capacity ? ' / ' + ev.capacity : ''}</td>
+                            <td>
+                              <form method="post">
+                                <input type="hidden" name="action" value="cancel_event" />
+                                <input type="hidden" name="view" value="calendar" />
+                                <input type="hidden" name="event_id" value={ev.id} />
+                                <button class="btn ghost slim" type="submit">Cancel</button>
+                              </form>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+            </div>
+          </>
+        )}
+      </>
+    )}
+  </div>
+</AdminLayout>

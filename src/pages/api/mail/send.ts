@@ -9,7 +9,7 @@ import { deliverMessage, parseAddressList, getMailboxAddress, logOutbound, getMa
 import { sendExternal } from '@/lib/mail-transport';
 import { expandGroupTokens } from '@/lib/mail-groups';
 import { getSignature, scheduleMessage, rewriteLinksForTracking } from '@/lib/mail-advanced';
-import { denyAdminApi } from '@/lib/auth/api-guard';
+import { denyMailApi } from '@/lib/auth/mail-access';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -24,11 +24,18 @@ export const POST: APIRoute = async ({ request, locals }) => {
   // EduRankAI, and could expand `@group:slug` tokens that resolve internal distribution lists.
   //
   // The one thing in the product that calls this is the composer in src/components/MailClient.astro,
-  // which is rendered by exactly one page: /admin/mail. So canOpenAdmin is the gate that surface
-  // already has — nobody who can compose today loses the ability. Mail is deliberately absent from
+  // which used to be rendered by exactly one page: /admin/mail. So canOpenAdmin (through
+  // denyAdminApi) was the gate that surface already had. Mail is deliberately absent from
   // PATH_SECTION (middleware.ts:46-47 calls it a universal path), so there is no section key to ask
   // for; that omission is what left this URL with nothing at all in front of it.
-  const denied = await denyAdminApi(locals, { label: 'mail.send' });
+  //
+  // THE GATE NOW ASKS THE MAILBOX QUESTION, NOT THE CONSOLE QUESTION. MailClient is mounted at a
+  // second surface — /portal/employee/mail — and "may you open the admin console" is the wrong
+  // question to put in front of an employee's own outbox. canUseMailbox() still contains
+  // canOpenAdmin() as one of its three arms, so nobody who could compose before loses the ability;
+  // it adds the internal roles that already send through /api/mail/test and anyone with an active
+  // employee record. See the header of src/lib/auth/mail-access.ts for exactly what moved.
+  const denied = await denyMailApi(locals, { label: 'mail.send' });
   if (denied) return denied;
   const user = (locals as any).user;
 
@@ -73,7 +80,11 @@ export const POST: APIRoute = async ({ request, locals }) => {
         bodyHtml = bodyHtml + '<br/><br/><div class="era-sig">' + sig.html + '</div>';
         bodyText = bodyText + '\n\n' + sig.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
       }
-    } catch (_) {}
+    } catch (e: any) {
+      // Still tolerated — a missing signature must not stop a message leaving — but no longer
+      // silent. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+      console.error('[api/mail/send] signature', e?.cause?.message || e?.message);
+    }
   }
 
   // Scheduled send: stash it and return; the scheduled-send cron delivers it.

@@ -10,10 +10,37 @@
 // live here, and the two routes each apply their own authorisation:
 //   /admin/hr/payslip/[id]  — HR / super admin, any employee's payslip
 //   /portal/payslip/[id]    — the signed-in employee, their OWN payslip only
+//
+// -------------------------------------------------------------------------------------------------
+// THE DOCUMENT NOW PRINTS CONFIGURED COMPONENTS, NOT HARDCODED STATUTORY RATES.
+// -------------------------------------------------------------------------------------------------
+//
+// This file used to print two labels that were compliance claims the product is not entitled to
+// make: "PF (Employee 12%)" and "ESIC (0.75%)". Those percentages came from constants in
+// /admin/hr/payroll/index.astro, they are jurisdiction-specific, they change, and they were being put
+// in front of an employee on a pay document as though they were the law.
+//
+// src/lib/payroll.ts now models every component — including those two — as something an
+// administrator configures, with the rate they entered. fetchPayslip() attaches those component lines
+// and renderPayslipHtml() prints THEM, each with its own label and the rate that was actually
+// applied.
+//
+// THE LEGACY BRANCH IS STILL HERE AND STILL CORRECT. Payslips generated before the component engine
+// have no line rows, and their fixed columns are all the record there is; they render from those
+// columns exactly as before, with the two rate claims removed from the labels. Nothing that has
+// already been issued changes its numbers.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { payslipLines, describeLine, type PayLine } from '@/lib/payroll';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+/** Escape anything that reaches the document. A component label is free text an admin typed. */
+function esc(v: any): string {
+  return String(v ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December'];
@@ -30,7 +57,14 @@ export async function fetchPayslip(id: string): Promise<any | null> {
     WHERE ps.id = ${id}
     LIMIT 1
   `);
-  return rows(r)[0] || null;
+  const ps = rows(r)[0] || null;
+  if (!ps) return null;
+  // The component breakdown, attached here rather than fetched by each route, so both doors
+  // (/portal/payslip/[id] and /admin/hr/payslip/[id]) print the same document without either of them
+  // having to know the component engine exists. An empty array is the ordinary answer for a payslip
+  // generated before components, and renderPayslipHtml falls back to the fixed columns for it.
+  ps.lines = await payslipLines(String(ps.id));
+  return ps;
 }
 
 /** The hr_employees row for a signed-in user, or null when they are not an employee. */
@@ -46,11 +80,62 @@ function fmt(n: any) {
   return parseFloat(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+/**
+ * One component row. `rate` is printed only when it EXPLAINS the amount (a percentage); a fixed
+ * component prints its amount alone, because "200 (200)" tells nobody anything.
+ */
+function lineRow(line: PayLine, currency: string, deduction: boolean): string {
+  const why = describeLine(line);
+  return `<tr><td>${esc(line.label)}${why ? ` <span style="color:#9ca3af;font-size:10px;">${esc(why)}</span>` : ''}</td>`
+    + `<td${deduction ? ' class="deduction-color"' : ''}>${deduction ? '- ' : ''}${esc(currency)} ${fmt(line.amount)}</td></tr>`;
+}
+
 /** The printable payslip. `autoPrint` opens the browser print dialog (the admin behaviour). */
 export function renderPayslipHtml(ps: any, opts: { autoPrint?: boolean } = {}): string {
   const month = MONTHS[(ps.month || 1) - 1];
   const year = ps.year;
   const autoPrint = opts.autoPrint !== false;
+  const currency = ps.currency || 'INR';
+
+  // COMPONENTS WHERE THEY EXIST, FIXED COLUMNS WHERE THEY DO NOT. Declared here, above the template
+  // literal that reads them — `const` is not hoisted, and a declaration below its first use throws on
+  // the first line of whatever reads it.
+  const lines: PayLine[] = Array.isArray(ps.lines) ? ps.lines : [];
+  const earningLines = lines.filter((l) => l.kind === 'earning');
+  const deductionLines = lines.filter((l) => l.kind === 'deduction');
+  const employerTotal = lines.reduce((s, l) => s + (Number(l.employerAmount) || 0), 0);
+  const hasComponents = lines.length > 0;
+
+  const earningsHtml = hasComponents
+    ? earningLines.map((l) => lineRow(l, currency, false)).join('')
+    : `
+          ${ps.hra > 0 ? `<tr><td>House rent allowance</td><td>${currency} ${fmt(ps.hra)}</td></tr>` : ''}
+          ${ps.da > 0 ? `<tr><td>Dearness allowance</td><td>${currency} ${fmt(ps.da)}</td></tr>` : ''}
+          ${ps.special_allowance > 0 ? `<tr><td>Special allowance</td><td>${currency} ${fmt(ps.special_allowance)}</td></tr>` : ''}
+          ${ps.transport_allowance > 0 ? `<tr><td>Transport allowance</td><td>${currency} ${fmt(ps.transport_allowance)}</td></tr>` : ''}
+          ${ps.medical_allowance > 0 ? `<tr><td>Medical allowance</td><td>${currency} ${fmt(ps.medical_allowance)}</td></tr>` : ''}
+          ${ps.other_allowances > 0 ? `<tr><td>Other allowances</td><td>${currency} ${fmt(ps.other_allowances)}</td></tr>` : ''}`;
+
+  // THE TWO RATE CLAIMS ARE GONE FROM THESE LABELS. They used to read "PF (Employee 12%)" and
+  // "ESIC (0.75%)" — percentages hardcoded in the run, printed on a pay document as though they were
+  // the law. The numbers on already-issued payslips are untouched; only the claim about WHY they are
+  // that number has been removed, because this product cannot stand behind it.
+  const deductionsHtml = hasComponents
+    ? deductionLines.map((l) => lineRow(l, currency, true)).join('')
+    : `
+          ${ps.pf_employee > 0 ? `<tr><td>Provident fund (employee)</td><td class="deduction-color">- ${currency} ${fmt(ps.pf_employee)}</td></tr>` : ''}
+          ${ps.esic_employee > 0 ? `<tr><td>State insurance (employee)</td><td class="deduction-color">- ${currency} ${fmt(ps.esic_employee)}</td></tr>` : ''}
+          ${ps.professional_tax > 0 ? `<tr><td>Professional tax</td><td class="deduction-color">- ${currency} ${fmt(ps.professional_tax)}</td></tr>` : ''}
+          ${ps.tds > 0 ? `<tr><td>Tax deducted at source</td><td class="deduction-color">- ${currency} ${fmt(ps.tds)}</td></tr>` : ''}
+          ${ps.lop_deduction > 0 ? `<tr><td>Loss of pay (${ps.lop_days || 0} day${Number(ps.lop_days) === 1 ? '' : 's'})</td><td class="deduction-color">- ${currency} ${fmt(ps.lop_deduction)}</td></tr>` : ''}
+          ${ps.other_deductions > 0 ? `<tr><td>Other deductions</td><td class="deduction-color">- ${currency} ${fmt(ps.other_deductions)}</td></tr>` : ''}`;
+
+  const employerHtml = employerTotal > 0
+    ? `<div class="total-row" style="margin-top:10px;">
+         <span style="font-weight:600;">Employer contributions (not deducted from you)</span>
+         <span style="font-weight:700;">${currency} ${fmt(employerTotal)}</span>
+       </div>`
+    : '';
 
   return `<!DOCTYPE html>
 <html>
@@ -121,43 +206,37 @@ export function renderPayslipHtml(ps: any, opts: { autoPrint?: boolean } = {}): 
       <div>
         <p class="section-title">Earnings</p>
         <table class="pay-table">
-          <tr><td>Basic Salary</td><td>${ps.currency} ${fmt(ps.basic)}</td></tr>
-          <tr><td>HRA</td><td>${ps.currency} ${fmt(ps.hra)}</td></tr>
-          ${ps.da > 0 ? `<tr><td>DA</td><td>${ps.currency} ${fmt(ps.da)}</td></tr>` : ''}
-          ${ps.special_allowance > 0 ? `<tr><td>Special Allowance</td><td>${ps.currency} ${fmt(ps.special_allowance)}</td></tr>` : ''}
-          ${ps.transport_allowance > 0 ? `<tr><td>Transport Allowance</td><td>${ps.currency} ${fmt(ps.transport_allowance)}</td></tr>` : ''}
-          ${ps.medical_allowance > 0 ? `<tr><td>Medical Allowance</td><td>${ps.currency} ${fmt(ps.medical_allowance)}</td></tr>` : ''}
-          ${ps.other_allowances > 0 ? `<tr><td>Other Allowances</td><td>${ps.currency} ${fmt(ps.other_allowances)}</td></tr>` : ''}
+          <tr><td>Basic salary</td><td>${currency} ${fmt(ps.basic)}</td></tr>
+          ${earningsHtml}
         </table>
         <div class="total-row" style="margin-top:8px;">
-          <span style="font-weight:600;">Gross Salary</span>
-          <span style="font-weight:700;">${ps.currency} ${fmt(ps.gross_salary)}</span>
+          <span style="font-weight:600;">Gross salary</span>
+          <span style="font-weight:700;">${currency} ${fmt(ps.gross_salary)}</span>
         </div>
       </div>
       <div>
         <p class="section-title">Deductions</p>
         <table class="pay-table">
-          ${ps.pf_employee > 0 ? `<tr><td>PF (Employee 12%)</td><td class="deduction-color">- ${ps.currency} ${fmt(ps.pf_employee)}</td></tr>` : ''}
-          ${ps.esic_employee > 0 ? `<tr><td>ESIC (0.75%)</td><td class="deduction-color">- ${ps.currency} ${fmt(ps.esic_employee)}</td></tr>` : ''}
-          ${ps.professional_tax > 0 ? `<tr><td>Professional Tax</td><td class="deduction-color">- ${ps.currency} ${fmt(ps.professional_tax)}</td></tr>` : ''}
-          ${ps.tds > 0 ? `<tr><td>TDS</td><td class="deduction-color">- ${ps.currency} ${fmt(ps.tds)}</td></tr>` : ''}
-          ${ps.lop_deduction > 0 ? `<tr><td>Loss of Pay (${ps.lop_days || 0} day${Number(ps.lop_days) === 1 ? '' : 's'})</td><td class="deduction-color">- ${ps.currency} ${fmt(ps.lop_deduction)}</td></tr>` : ''}
-          ${ps.other_deductions > 0 ? `<tr><td>Other Deductions</td><td class="deduction-color">- ${ps.currency} ${fmt(ps.other_deductions)}</td></tr>` : ''}
+          ${deductionsHtml || '<tr><td colspan="2" style="color:#9ca3af;">No deductions this month.</td></tr>'}
         </table>
         <div class="total-row" style="margin-top:8px;">
-          <span style="font-weight:600;">Total Deductions</span>
-          <span style="font-weight:700;color:#ef4444;">- ${ps.currency} ${fmt(ps.total_deductions)}</span>
+          <span style="font-weight:600;">Total deductions</span>
+          <span style="font-weight:700;color:#ef4444;">- ${currency} ${fmt(ps.total_deductions)}</span>
         </div>
+        ${employerHtml}
       </div>
     </div>
 
     <div class="net-pay">
-      <div><div class="label">Net Pay</div><div style="font-size:10px;opacity:0.75;">${month} ${year}</div></div>
-      <div class="amount">${ps.currency} ${fmt(ps.net_salary)}</div>
+      <div><div class="label">Net pay</div><div style="font-size:10px;opacity:0.75;">${month} ${year}</div></div>
+      <div class="amount">${currency} ${fmt(ps.net_salary)}</div>
     </div>
 
     <div class="footer">
       <p>This is a computer-generated payslip and does not require a signature.</p>
+      <p>Every component above, including any statutory deduction, is calculated from rates configured
+         by this organisation. It is a record of what was paid, not advice on what any tax or
+         contribution rule requires of you.</p>
       <p>EduRankAI &bull; hr@edurankai.in &bull; Generated on ${new Date().toLocaleDateString('en-IN')}</p>
     </div>
   </div>

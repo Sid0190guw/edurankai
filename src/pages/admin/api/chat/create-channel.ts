@@ -1,55 +1,24 @@
+// POST /admin/api/chat/create-channel — RETIRED WRITE.
+//
+// GATE: `if (!user)` plus `role !== 'applicant'`. src/lib/auth/permissions.ts warns against exactly
+// that second test — every internal role passes it, including the `editor` handed to every intern
+// by the 2026 offer-signing promotion, and including the partner/teacher scopes the middleware
+// bounces off /admin entirely. The page this serves is gated on the `discussion` section; this now
+// asks the same question through denyAdminApi().
+//
+// WRITE: a new channel is a new room in a system that no longer takes new messages. Existing
+// channels stay readable at /admin/chat; a new conversation is a thread at /portal/messages.
 import type { APIRoute } from 'astro';
-import { db } from '@/lib/db';
-import { chatChannels, chatMemberships, users } from '@/lib/db/schema';
-import { eq, inArray } from 'drizzle-orm';
+import { denyAdminApi } from '@/lib/auth/api-guard';
+import { chatArchivedResponse } from '@/lib/chat-schema';
 
-export const POST: APIRoute = async ({ request, locals }) => {
-  const user = (locals as any).user;
-  if (!user) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
-  if (user.role === 'applicant') return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 });
+export const POST: APIRoute = async ({ locals }) => {
+  const denied = await denyAdminApi(locals, {
+    section: 'discussion',
+    action: 'edit',
+    label: 'admin.api.chat.create-channel',
+  });
+  if (denied) return denied;
 
-  try {
-    const body = await request.json();
-    const name = (body.name || '').trim();
-    const description = (body.description || '').trim() || null;
-    const isPrivate = body.isPrivate === true;
-    const memberIds: string[] = Array.isArray(body.memberIds) ? body.memberIds.filter((s: any) => typeof s === 'string') : [];
-
-    if (!name || name.length < 2) {
-      return new Response(JSON.stringify({ error: 'name required (min 2 chars)' }), { status: 400 });
-    }
-
-    // Generate slug
-    const baseSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').substring(0, 50) || 'channel';
-    let slug = baseSlug;
-    let suffix = 1;
-    while (true) {
-      const existing = await db.select({ id: chatChannels.id }).from(chatChannels).where(eq(chatChannels.slug, slug)).limit(1);
-      if (existing.length === 0) break;
-      suffix++;
-      slug = baseSlug + '-' + suffix;
-    }
-
-    const inserted = await db.insert(chatChannels).values({
-      slug, name, description, isPrivate,
-      createdByUserId: user.id,
-      sortOrder: 50
-    }).returning({ id: chatChannels.id, slug: chatChannels.slug });
-
-    const channelId = inserted[0].id;
-
-    // For private channels: add creator + selected members
-    if (isPrivate) {
-      const allMemberIds = Array.from(new Set([user.id, ...memberIds]));
-      for (const uid of allMemberIds) {
-        await db.insert(chatMemberships).values({ channelId, userId: uid }).onConflictDoNothing();
-      }
-    }
-
-    return new Response(JSON.stringify({ ok: true, channel: { id: channelId, slug: inserted[0].slug } }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  } catch (err: any) {
-    return new Response(JSON.stringify({ error: err.message || 'failed' }), { status: 500 });
-  }
+  return chatArchivedResponse('Creating a Discussion channel');
 };

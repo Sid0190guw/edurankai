@@ -1,0 +1,482 @@
+---
+// /admin/hr/contracts — THE EMPLOYMENT CONTRACT REGISTER, and the approvals that change one.
+//
+// WHAT THIS PAGE IS. Every person's contract: what they were engaged as, from when, until when,
+// where the signed terms live, and what they are paid under it. Renewing or amending one is NOT an
+// edit on this screen — it is a request, routed by src/lib/workflow.ts from the Organization Graph,
+// decided by whoever that names, and applied only afterwards. There is no button here that changes
+// a contract without an approval behind it.
+//
+// APPLYING IS A MIRROR, NOT A DECISION. syncContractChanges() reads the workflow instance state back
+// and writes the approved change as a NEW contract superseding the old. It approves nothing.
+//
+// WHEN THE GRAPH IS EMPTY THIS PAGE SAYS SO AND STOPS. It does not fall back to a role name to find
+// an approver, and it does not offer a button that would do something other than what it says.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { isInitialized } from '@/lib/org-graph';
+import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import {
+  ensureContractSchema,
+  createContract,
+  requestContractChange,
+  cancelContractChange,
+  syncContractChanges,
+  listContracts,
+  listContractChanges,
+  contractsDueForRenewal,
+  contractPayLabel,
+  contractTypeLabel,
+  CONTRACT_TYPES,
+  CHANGE_KINDS,
+} from '@/lib/contracts';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+// THE SAME GATE middleware.ts applies to this path. '/admin/hr/contracts' has no entry of its own in
+// PATH_SECTION, so the longest prefix that matches is '/admin/hr' -> the `hr` section. Asking the
+// same question the door asks means the page and the middleware cannot drift apart. Every WRITE
+// below asks for more (`employee.manage`), because opening a register is not changing what somebody
+// is engaged as.
+if (!(await canAccessSection(user, 'hr', 'edit'))) return Astro.redirect('/admin');
+
+// ---------------------------------------------------------------------------------------------
+// CONSTANTS FIRST — `const` is not hoisted, and a const declared under the POST handler that reads
+// it throws on that handler's first line. That pattern took down apply step 5 on this project.
+// ---------------------------------------------------------------------------------------------
+const PAGE = '/admin/hr/contracts';
+const mayWrite = can(user as any, 'employee.manage');
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function stateLabel(s: string): string {
+  const k = String(s || '');
+  if (k === 'pending') return 'Waiting for approval';
+  if (k === 'approved') return 'Approved';
+  if (k === 'applied') return 'Applied';
+  if (k === 'rejected') return 'Rejected';
+  if (k === 'cancelled') return 'Withdrawn';
+  if (k === 'halted') return 'Halted';
+  return k;
+}
+
+function stateTone(s: string): string {
+  const k = String(s || '');
+  if (k === 'applied') return '#86efac';
+  if (k === 'approved') return '#6ee7b7';
+  if (k === 'rejected') return '#fca5a5';
+  if (k === 'halted') return '#fbbf24';
+  if (k === 'cancelled') return '#9aa6b6';
+  return '#67e8f9';
+}
+
+/** Plain words for a routing relationship. A function, not a typed map — a Record<string,string>
+ *  read inside JSX is a known .astro parse hazard on this project. */
+function viaLabel(v: string): string {
+  const k = String(v || '');
+  if (k === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (k === 'department_head') return VIA_LABELS.department_head;
+  if (k === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (k === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+await ensureContractSchema();
+
+// ---------------------------------------------------------------------------------------------
+// POST. Post-redirect-get, so a refresh never repeats a write.
+// ---------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (!mayWrite) {
+      flash = 'You can read the contract register, but changing a contract needs the employee-records permission.';
+    } else if (action === 'create') {
+      const stipendRaw = String(fd.get('stipend_amount') || '').trim();
+      const noticeRaw = String(fd.get('notice_days') || '').trim();
+      const r = await createContract({
+        employeeId: String(fd.get('employee_id') || ''),
+        contractType: String(fd.get('contract_type') || ''),
+        startDate: String(fd.get('start_date') || ''),
+        endDate: String(fd.get('end_date') || '') || null,
+        renewalDueDate: String(fd.get('renewal_due_date') || '') || null,
+        noticeDays: noticeRaw ? parseInt(noticeRaw, 10) : null,
+        termsUrl: String(fd.get('terms_url') || '') || null,
+        stipendAmount: stipendRaw ? parseFloat(stipendRaw) : null,
+        note: String(fd.get('note') || '') || null,
+        createdByUserId: user.id,
+      });
+      flash = r.ok ? 'Contract recorded.' : (r.error || 'The contract was not saved.');
+    } else if (action === 'request_change') {
+      const noticeRaw = String(fd.get('proposed_notice_days') || '').trim();
+      const stipendRaw = String(fd.get('proposed_stipend_amount') || '').trim();
+      const r = await requestContractChange({
+        contractId: String(fd.get('contract_id') || ''),
+        changeKind: String(fd.get('change_kind') || 'renewal') as any,
+        reason: String(fd.get('reason') || ''),
+        proposedContractType: String(fd.get('proposed_contract_type') || '') || null,
+        proposedEndDate: String(fd.get('proposed_end_date') || '') || null,
+        proposedRenewalDueDate: String(fd.get('proposed_renewal_due_date') || '') || null,
+        proposedNoticeDays: noticeRaw ? parseInt(noticeRaw, 10) : null,
+        proposedTermsUrl: String(fd.get('proposed_terms_url') || '') || null,
+        proposedStipendAmount: stipendRaw ? parseFloat(stipendRaw) : null,
+        requestedByUserId: user.id,
+      });
+      if (r.ok && r.haltReason) flash = 'Recorded, but it is halted: ' + r.haltReason;
+      else if (r.ok) flash = 'Sent for approval.';
+      else flash = r.error || 'The request was not saved.';
+    } else if (action === 'cancel_change') {
+      const r = await cancelContractChange(String(fd.get('change_id') || ''), user.id);
+      flash = r.ok ? 'Request withdrawn.' : (r.error || 'The request was not withdrawn.');
+    } else if (action === 'decide') {
+      // THE DECISION IS RE-CHECKED WHERE IT BINDS. decideInstance -> mayAct() answers on the POSTED
+      // instance id, from the Organization Graph, and refuses anybody the step was not routed to.
+      const r = await decideInstance(
+        String(fd.get('instance_id') || ''),
+        user as any,
+        String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected',
+        String(fd.get('note') || ''),
+      );
+      flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
+      if (r.ok) {
+        const sync = await syncContractChanges(user.id);
+        if (sync.applied) flash += ' ' + sync.applied + ' approved change applied.';
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[admin/hr/contracts] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// READS
+// ---------------------------------------------------------------------------------------------
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+// Mirror any decision made elsewhere since this page was last opened. Approves nothing.
+const synced = await syncContractChanges(user.id);
+
+const graphReady = await isInitialized();
+const contracts = await listContracts({ limit: 200 });
+const changes = await listContractChanges({ limit: 100 });
+const dueSoon = await contractsDueForRenewal(60);
+
+let employees: any[] = [];
+try {
+  employees = rowsOf(await db.execute(sql`
+    SELECT id, full_name, employee_code, designation
+      FROM hr_employees WHERE is_active = true ORDER BY full_name ASC LIMIT 400`));
+} catch (e: any) {
+  console.error('[admin/hr/contracts] employees', e?.cause?.message || e?.message);
+}
+
+/** Contracts with no open change, so the renew/amend form is only offered where it can be used. */
+const changeableIds = new Set(
+  changes.filter((c) => c.state === 'pending' || c.state === 'halted' || c.state === 'approved')
+    .map((c) => c.contractId),
+);
+
+// The live approval for each open change: who it is waiting on, or the sentence it stopped with.
+// Bounded to the open ones — each preview is a handful of graph queries and a backlog must not turn
+// one page load into hundreds of round trips.
+const openChanges = changes.filter((c) => c.state === 'pending' || c.state === 'halted').slice(0, 12);
+const changeDetail: any[] = [];
+for (const ch of openChanges) {
+  let instance: any = null;
+  try {
+    if (ch.workflowInstanceId) instance = await getInstance(ch.workflowInstanceId);
+  } catch (e: any) {
+    console.error('[admin/hr/contracts] instance', e?.cause?.message || e?.message);
+  }
+  // The steps already NAME who each rung is waiting on — they were resolved from the graph when the
+  // instance was created and then frozen, which is the record that matters. A live previewRoute()
+  // call here would re-resolve the same question a second time, several graph queries per row, and
+  // could disagree with the step the person is actually waiting on after a reorganisation.
+  const waiting = instance
+    ? (instance.steps || []).filter((s: any) => s.stepNo === instance.currentStep && s.decision === 'pending')
+    : [];
+  changeDetail.push({ change: ch, instance, waiting });
+}
+
+const activeCount = contracts.filter((c) => c.status === 'active').length;
+const pendingCount = changes.filter((c) => c.state === 'pending').length;
+const haltedCount = changes.filter((c) => c.state === 'halted').length;
+const today = new Date().toISOString().slice(0, 10);
+---
+<AdminLayout title="Contracts" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Lifecycle · Contracts</p>
+  <h1>Employment contracts</h1>
+  <p class="lede">
+    What each person is engaged as, and until when. A renewal or an amendment is sent for approval and
+    routed from the Organization Graph — it is never an edit made straight onto the record. Approving
+    one writes a new contract that supersedes the old, so the earlier terms stay readable.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {synced.errors.length > 0 && <div class="flash warn">{synced.errors[0]}</div>}
+  {!mayWrite && (
+    <div class="flash warn">
+      You can read this register. Recording or changing a contract needs the employee-records permission.
+    </div>
+  )}
+  {!graphReady && (
+    <div class="flash warn">
+      The Organization Graph is not yet initialized, so no approver can be resolved for anybody. A change
+      raised now will be recorded and halted with that reason rather than approved. Run the graph backfill
+      to start routing.
+    </div>
+  )}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{activeCount}</span><span class="tl">Contracts in force</span></div>
+    <div class="tile"><span class="tv">{dueSoon.length}</span><span class="tl">Due in 60 days</span></div>
+    <div class="tile"><span class="tv">{pendingCount}</span><span class="tl">Waiting for approval</span></div>
+    <div class="tile"><span class="tv">{haltedCount}</span><span class="tl">Halted</span></div>
+  </div>
+
+  {mayWrite && (
+    <details class="panel">
+      <summary>Record a contract</summary>
+      <form method="POST" class="form">
+        <input type="hidden" name="action" value="create" />
+        <label>Employee
+          <select name="employee_id" required>
+            <option value="">Choose a person</option>
+            {employees.map((e: any) => (
+              <option value={e.id}>{e.full_name}{e.employee_code ? ' (' + e.employee_code + ')' : ''}</option>
+            ))}
+          </select>
+        </label>
+        <label>Contract type
+          <select name="contract_type" required>
+            {CONTRACT_TYPES.map((t) => <option value={t.key}>{t.label} — {t.note}</option>)}
+          </select>
+        </label>
+        <div class="row2">
+          <label>Start date<input type="date" name="start_date" required value={today} /></label>
+          <label>End date (leave blank if open-ended)<input type="date" name="end_date" /></label>
+        </div>
+        <div class="row2">
+          <label>Renewal review date<input type="date" name="renewal_due_date" /></label>
+          <label>Notice period in days<input type="number" name="notice_days" min="0" max="365" /></label>
+        </div>
+        <label>Link to the signed terms
+          <input type="url" name="terms_url" placeholder="https://" />
+          <span class="hint">A link to the shared document. Files are never uploaded here.</span>
+        </label>
+        <label>Monthly stipend or remuneration
+          <input type="number" name="stipend_amount" min="0" step="0.01" />
+          <span class="hint">Leave blank if there is none. An internship with no amount here is recorded as unpaid.</span>
+        </label>
+        <label>Note<textarea name="note" rows="2"></textarea></label>
+        <button type="submit" class="btn">Record contract</button>
+      </form>
+    </details>
+  )}
+
+  <h2>Changes in progress</h2>
+  {changeDetail.length === 0 ? (
+    <div class="empty">No contract change is waiting on anybody.</div>
+  ) : (
+    <div class="stack">
+      {changeDetail.map((d: any) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{d.change.employeeName || 'Employee'}</p>
+              <p class="sub">{d.change.changeKind === 'renewal' ? 'Renewal' : 'Amendment'} · raised {fmtDate(d.change.createdAt)}</p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(d.change.state) + ';border-color:' + stateTone(d.change.state) + '55;'}>
+              {stateLabel(d.change.state)}
+            </span>
+          </div>
+
+          <p class="reason">{d.change.reason}</p>
+
+          <dl class="terms">
+            {d.change.proposedContractType && <div><dt>New type</dt><dd>{contractTypeLabel(d.change.proposedContractType)}</dd></div>}
+            {d.change.proposedEndDate && <div><dt>New end date</dt><dd>{fmtDate(d.change.proposedEndDate)}</dd></div>}
+            {d.change.proposedRenewalDueDate && <div><dt>New review date</dt><dd>{fmtDate(d.change.proposedRenewalDueDate)}</dd></div>}
+            {d.change.proposedNoticeDays !== null && <div><dt>Notice</dt><dd>{d.change.proposedNoticeDays} days</dd></div>}
+            {d.change.proposedStipendAmount !== null && <div><dt>Remuneration</dt><dd>{d.change.proposedStipendAmount}</dd></div>}
+            {d.change.proposedTermsUrl && <div><dt>Terms</dt><dd><a href={d.change.proposedTermsUrl} target="_blank" rel="noopener">Open the document</a></dd></div>}
+          </dl>
+
+          {d.change.state === 'halted' && (
+            <div class="halt">
+              <strong>Halted.</strong> {d.change.haltReason || 'No approver could be resolved.'}
+              <span class="hint">Nothing has been approved and nothing has been applied. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+            </div>
+          )}
+
+          {d.instance && d.instance.state === 'pending' && d.waiting.length > 0 && (
+            <div class="waiting">
+              <p class="wl">Waiting on</p>
+              {d.waiting.map((s: any) => (
+                <p class="wn">{viaLabel(s.via)} — {s.approverName || 'a person with no employee record'}</p>
+              ))}
+            </div>
+          )}
+
+          {d.instance && d.instance.state === 'pending' && (
+            <form method="POST" class="decide">
+              <input type="hidden" name="action" value="decide" />
+              <input type="hidden" name="instance_id" value={d.instance.id} />
+              <input type="text" name="note" placeholder="Note for the record (optional)" />
+              <div class="btnrow">
+                <button type="submit" name="decision" value="approved" class="btn ok">Approve</button>
+                <button type="submit" name="decision" value="rejected" class="btn no">Reject</button>
+              </div>
+              <p class="hint">Only the person this was routed to, or somebody standing in for them, can decide it. Everyone else is refused here.</p>
+            </form>
+          )}
+
+          {mayWrite && (d.change.state === 'pending' || d.change.state === 'halted') && (
+            <form method="POST" class="inline">
+              <input type="hidden" name="action" value="cancel_change" />
+              <input type="hidden" name="change_id" value={d.change.id} />
+              <button type="submit" class="btn ghost">Withdraw this request</button>
+            </form>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>The register</h2>
+  {contracts.length === 0 ? (
+    <div class="empty">No contract has been recorded yet. Record one above to start the register.</div>
+  ) : (
+    <div class="stack">
+      {contracts.map((c) => (
+        <details class="card">
+          <summary class="rowsum">
+            <div>
+              <p class="name">{c.employeeName || 'Employee'}</p>
+              <p class="sub">{contractTypeLabel(c.contractType)} · {fmtDate(c.startDate)}{c.endDate ? ' to ' + fmtDate(c.endDate) : ' — open-ended'}</p>
+            </div>
+            <span class="chip" style={'color:' + (c.status === 'active' ? '#86efac' : '#9aa6b6') + ';'}>
+              {c.status === 'active' ? 'In force' : c.status === 'superseded' ? 'Superseded' : 'Ended'}
+            </span>
+          </summary>
+          <div class="cardbody">
+            <dl class="terms">
+              <div><dt>Remuneration</dt><dd>{contractPayLabel(c)}</dd></div>
+              <div><dt>Notice</dt><dd>{c.noticeDays === null ? 'Not recorded' : c.noticeDays + ' days'}</dd></div>
+              <div><dt>Renewal review</dt><dd>{c.renewalDueDate ? fmtDate(c.renewalDueDate) : 'Not set'}</dd></div>
+              <div><dt>Signed terms</dt><dd>{c.termsUrl ? <a href={c.termsUrl} target="_blank" rel="noopener">Open the document</a> : 'No link recorded'}</dd></div>
+            </dl>
+            {c.note && <p class="reason">{c.note}</p>}
+            {c.supersedesContractId && <p class="hint">This contract supersedes an earlier one, which is kept above in this list.</p>}
+
+            {mayWrite && c.status === 'active' && !changeableIds.has(c.id) && (
+              <details class="panel inner">
+                <summary>Renew or amend</summary>
+                <form method="POST" class="form">
+                  <input type="hidden" name="action" value="request_change" />
+                  <input type="hidden" name="contract_id" value={c.id} />
+                  <label>What kind of change
+                    <select name="change_kind" required>
+                      {CHANGE_KINDS.map((k) => <option value={k.key}>{k.label} — {k.note}</option>)}
+                    </select>
+                  </label>
+                  <div class="row2">
+                    <label>New end date<input type="date" name="proposed_end_date" /></label>
+                    <label>New review date<input type="date" name="proposed_renewal_due_date" /></label>
+                  </div>
+                  <div class="row2">
+                    <label>New notice days<input type="number" name="proposed_notice_days" min="0" max="365" /></label>
+                    <label>New remuneration<input type="number" name="proposed_stipend_amount" min="0" step="0.01" /></label>
+                  </div>
+                  <label>New contract type
+                    <select name="proposed_contract_type">
+                      <option value="">Unchanged</option>
+                      {CONTRACT_TYPES.map((t) => <option value={t.key}>{t.label}</option>)}
+                    </select>
+                  </label>
+                  <label>Link to the new terms<input type="url" name="proposed_terms_url" placeholder="https://" /></label>
+                  <label>Reason<textarea name="reason" rows="2" required placeholder="An approver reads this before deciding."></textarea></label>
+                  <button type="submit" class="btn">Send for approval</button>
+                  <p class="hint">A renewal needs the new end date. An amendment needs at least one changed term. Blank fields mean unchanged.</p>
+                </form>
+              </details>
+            )}
+            {c.status === 'active' && changeableIds.has(c.id) && (
+              <p class="hint">A change to this contract is already in progress — it is listed above.</p>
+            )}
+          </div>
+        </details>
+      ))}
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; letter-spacing: 0.02em; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 22px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin-bottom: 16px; }
+  .panel.inner { margin: 12px 0 0; background: #08080a; }
+  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; }
+  .form { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  .row2 { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 60px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; display: block; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.ok { background: #15803d; }
+  .btn.no { background: #b91c1c; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .cardhead, .rowsum { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .rowsum { cursor: pointer; list-style: none; min-height: 44px; align-items: center; }
+  .cardbody { border-top: 1px solid #1a1a1f; margin-top: 12px; padding-top: 12px; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; white-space: pre-wrap; }
+  .terms { display: grid; grid-template-columns: 1fr; gap: 6px; margin: 12px 0 0; }
+  .terms div { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; border-bottom: 1px dashed #1a1a1f; padding-bottom: 5px; }
+  .terms dt { color: #9aa6b6; margin: 0; }
+  .terms dd { color: #e8e8ee; margin: 0; text-align: right; }
+  .terms a { color: #67e8f9; }
+  .halt { margin: 12px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #fde68a; line-height: 1.55; }
+  .waiting { margin: 12px 0 0; padding: 10px 12px; background: rgba(103,232,249,0.06); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .wl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .wn { font-size: 12.5px; color: #e8e8ee; margin: 0; }
+  .decide { display: grid; gap: 8px; margin-top: 12px; }
+  .inline { margin-top: 10px; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+  @media (min-width: 640px) { .row2 { grid-template-columns: 1fr 1fr; } }
+</style>
+</AdminLayout>

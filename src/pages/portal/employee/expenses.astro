@@ -1,0 +1,418 @@
+---
+// /portal/employee/expenses — raise an expense, travel or advance claim, and see what happened to it.
+//
+// EVERY CLAIM ON THIS PAGE IS APPROVED BY src/lib/workflow.ts AND BY NOTHING ELSE. This page renders;
+// src/lib/expenses.ts creates and reads; the workflow engine routes and decides. There is no approve
+// button anywhere on this surface, because an employee does not approve their own claim and this is
+// the employee's screen.
+//
+// WHEN THE ORGANIZATION GRAPH IS EMPTY, EVERY CLAIM HALTS, and this page says so in the engine's own
+// words rather than pretending the claim is moving. That is the correct behaviour until the founder
+// runs db/org-graph-backfill.sql: a claim that reported "waiting for approval" when nobody had been
+// asked would be a lie that costs somebody a month.
+//
+// THE RECEIPT FIELD IS A LINK. This platform stores no document uploads — the only file it keeps
+// anywhere is a small profile photo — so a receipt is a Google Drive link shared as "Anyone with the
+// link", exactly like joining documents. There is deliberately no file input on this page.
+//
+// NO JAVASCRIPT. The form switches shape through a query parameter rather than a script, so it works
+// on a phone with a slow connection and inside any browser that has not finished executing anything.
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  claimsForEmployee, routeWithdrawals, claimApprovalTrail, decisionsAwaiting,
+  CLAIM_KINDS, CLAIM_KIND_LABELS, CLAIM_KIND_HINTS, CLAIM_CATEGORIES,
+  type ClaimKind, type Claim,
+} from '@/lib/expenses';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/employee/expenses');
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+let employee: any = null;
+let lookupFailed = false;
+try {
+  employee = rowsOf(await db.execute(sql`
+    SELECT id, full_name, employee_code, currency FROM hr_employees
+     WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
+    || rowsOf(await db.execute(sql`
+    SELECT id, full_name, employee_code, currency FROM hr_employees
+     WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email})
+       AND is_active = true LIMIT 1`))[0]
+    || null;
+} catch (e: any) {
+  console.error('[portal/expenses] employee lookup', e?.cause?.message || e?.message);
+  lookupFailed = true;
+}
+
+const url = new URL(Astro.request.url);
+const requestedKind = String(url.searchParams.get('kind') || 'reimbursement');
+const kind: ClaimKind = (CLAIM_KINDS as readonly string[]).indexOf(requestedKind) >= 0
+  ? (requestedKind as ClaimKind)
+  : 'reimbursement';
+const msg = url.searchParams.get('msg') || '';
+const err = url.searchParams.get('err') || '';
+
+const claims: Claim[] = employee ? await claimsForEmployee(String(employee.id), 60) : [];
+
+// The wallet withdrawals this person has raised, given an approval chain by the same engine. See the
+// block at the end of src/lib/expenses.ts for why this reconciles rather than replacing the existing
+// /admin/hr/wallet decision path.
+const withdrawals = employee ? await routeWithdrawals(String(employee.id)) : [];
+
+// The approval trail per live claim, resolved once here so the list can say who each one is waiting
+// on instead of just "pending". Only for claims that are actually live — a settled claim's trail is
+// history and does not need re-reading on every page load.
+const trails = new Map<string, Awaited<ReturnType<typeof claimApprovalTrail>>>();
+for (const c of claims) {
+  if (c.status === 'submitted' || c.status === 'halted') {
+    trails.set(c.id, await claimApprovalTrail(c));
+  }
+}
+
+const today = new Date().toISOString().slice(0, 10);
+const currency = String(employee?.currency || 'INR');
+const categories = CLAIM_CATEGORIES[kind];
+
+const money = (n: any, cur: string) =>
+  (cur || 'INR') + ' ' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Plain object rather than a typed map: a Record<string,string> annotation inside .astro JSX breaks
+// the parser on this project.
+const stateColour = {
+  draft: '#6b6255',
+  submitted: '#d97706',
+  halted: '#b45309',
+  approved: '#2563eb',
+  reimbursed: '#059669',
+  rejected: '#dc2626',
+  cancelled: '#6b6255',
+};
+
+const live = claims.filter((c) => c.status === 'submitted' || c.status === 'halted');
+const settled = claims.filter((c) => c.status !== 'submitted' && c.status !== 'halted');
+
+// WHAT IS WAITING ON THIS PERSON TO DECIDE.
+//
+// Resolved from the workflow engine's own queue, which returns only steps ROUTED to this user or
+// DELEGATED to them. Most approvers here are ordinary employees who are somebody's reporting manager
+// and cannot open /admin at all, which is why the decision lives on this page rather than on an admin
+// console: the person the claim was routed TO must be able to act on it.
+//
+// The section is rendered only when it has rows. A section that is always empty teaches people to
+// stop looking at the page.
+const inbox = await decisionsAwaiting(String(user.id));
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Expenses and claims</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;overflow-x:hidden;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    .wrap{max-width:620px;margin:0 auto;padding:16px 14px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:12px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:84px;resize:vertical;}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:13px 18px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;min-height:44px;width:100%;}
+    .btn-quiet{background:#faf7f1;color:#7a2f08;border:1px solid #e6ddcd;font-size:13px;padding:10px 14px;width:auto;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:2px;margin-bottom:14px;}
+    .tabs a{flex:0 0 auto;white-space:nowrap;text-decoration:none;font-size:13px;font-weight:600;padding:0 14px;border-radius:99px;background:#fff;border:1px solid #ece4d6;color:#6b6255;display:inline-flex;align-items:center;min-height:44px;}
+    .tabs a.on{background:#12100c;border-color:#12100c;color:#fff;}
+    .row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
+    .claim{border:1px solid #f0e9dc;border-radius:12px;padding:13px;margin-bottom:10px;background:#fffdf9;}
+    .claim:last-child{margin-bottom:0;}
+    .claim .hd{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;}
+    .claim .ttl{font-size:15px;font-weight:700;overflow-wrap:anywhere;}
+    .claim .sub{font-size:11.5px;color:#8b8172;margin-top:3px;}
+    .amt{font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;white-space:nowrap;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;display:inline-block;}
+    .trail{margin-top:10px;border-top:1px dashed #ece4d6;padding-top:9px;font-size:12px;color:#6b6255;line-height:1.6;}
+    .flash-ok{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:12px 14px;font-size:13.5px;line-height:1.6;margin-bottom:14px;}
+    .flash-err{background:rgba(217,119,6,.09);border:1px solid rgba(217,119,6,.3);color:#8a4b06;border-radius:10px;padding:12px 14px;font-size:13.5px;line-height:1.6;margin-bottom:14px;}
+    .note{background:#faf7f1;border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;font-size:12px;color:#6b6255;line-height:1.6;margin-top:12px;}
+    .empty{text-align:center;padding:26px 12px;color:#6b6255;font-size:13.5px;line-height:1.6;}
+    .scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    a.inline{color:#c2410c;}
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>My HR</a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Claims</span>
+  <span style="font-size:11px;color:#9a8f7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:34vw;">{employee?.full_name || user.name}</span>
+</nav>
+
+<div class="wrap">
+  {msg && <div class="flash-ok">{msg}</div>}
+  {err && <div class="flash-err">{err}</div>}
+
+  {lookupFailed && (
+    <div class="flash-err">
+      We could not read your employee record just now, so this page cannot show your claims or accept a
+      new one. Nothing is lost. Try again in a moment, and tell HR if it keeps happening.
+    </div>
+  )}
+
+  {!lookupFailed && !employee && (
+    <div class="card">
+      <div class="empty">
+        <p style="font-weight:700;color:#1a1510;font-size:15px;">No employee record is linked to this account</p>
+        <p style="margin-top:8px;">A claim is routed for approval from your place in the organization, so
+        it needs an employee record to start from. Ask HR to link your account.</p>
+      </div>
+    </div>
+  )}
+
+  {employee && (
+    <div>
+      {inbox.length > 0 && (
+        <div class="card" style="border-color:#d9c9a8;background:#fffdf7;">
+          <h3>Waiting on you to decide</h3>
+          <p style="font-size:12.5px;color:#6b6255;line-height:1.65;margin-bottom:12px;">
+            These reached you through the reporting line and department structure your organization has
+            recorded — not through a job title. Approving is a decision on the record.
+          </p>
+          {inbox.map((d) => (
+            <div class="claim">
+              <div class="hd">
+                <div style="min-width:0;">
+                  <div class="ttl">{d.claim ? d.claim.title : (d.summary || 'Wallet withdrawal')}</div>
+                  <div class="sub">
+                    {d.subjectName || 'A colleague'} &middot; {d.domainLabel}
+                    {d.claim ? ' · ' + d.claim.categoryLabel : ''}
+                    {d.via ? ' · reached you as ' + d.via.split('_').join(' ') : ''}
+                  </div>
+                </div>
+                <div class="amt" style="flex:0 0 auto;">{money(d.amount ?? (d.claim ? d.claim.amount : 0), d.currency || currency)}</div>
+              </div>
+
+              {d.claim && d.claim.description && (
+                <div class="trail">{d.claim.description}</div>
+              )}
+              {d.claim && d.claim.receiptUrl && (
+                <div class="trail"><a class="inline" href={d.claim.receiptUrl} target="_blank" rel="noopener noreferrer">Open the receipt link before deciding</a></div>
+              )}
+              {d.withdrawalId && (
+                <div class="trail">A request to move wallet balance to a bank account. Releasing the money afterwards is a separate authority you may not hold.</div>
+              )}
+
+              <form method="POST" action="/api/portal/expenses/decide" style="margin-top:11px;">
+                <input type="hidden" name="instance_id" value={d.instanceId}/>
+                <label for={'note-' + d.instanceId}>Note (optional, kept on the record)</label>
+                <input id={'note-' + d.instanceId} name="note" maxlength="500" placeholder="Why you decided this way"/>
+                <div class="row2" style="margin-top:10px;">
+                  <button class="btn" name="decision" value="approved" type="submit" style="background:#047857;">Approve</button>
+                  <button class="btn" name="decision" value="rejected" type="submit" style="background:#b91c1c;">Reject</button>
+                </div>
+              </form>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div class="tabs">
+        {CLAIM_KINDS.map((k) => (
+          <a href={`/portal/employee/expenses?kind=${k}`} class={k === kind ? 'on' : ''}>{CLAIM_KIND_LABELS[k]}</a>
+        ))}
+      </div>
+
+      <div class="card">
+        <h3>New {CLAIM_KIND_LABELS[kind].toLowerCase()}</h3>
+        <p style="font-size:13px;color:#6b6255;line-height:1.6;">{CLAIM_KIND_HINTS[kind]}</p>
+
+        <form method="POST" action="/api/portal/expenses/submit">
+          <input type="hidden" name="kind" value={kind}/>
+          <input type="hidden" name="currency" value={currency}/>
+
+          <label for="title">What is it</label>
+          <input id="title" name="title" required maxlength="160" placeholder="A short title an approver can read at a glance"/>
+
+          <div class="row2">
+            <div>
+              <label for="amount">Amount ({currency})</label>
+              <input id="amount" name="amount" type="number" step="0.01" min="0.01" required inputmode="decimal" placeholder="0.00"/>
+            </div>
+            <div>
+              <label for="category">Category</label>
+              <select id="category" name="category">
+                {categories.map((c) => (<option value={c.value}>{c.label}</option>))}
+              </select>
+            </div>
+          </div>
+
+          {kind === 'advance' ? (
+            <div>
+              <label for="needed_by">Needed by</label>
+              <input id="needed_by" name="needed_by" type="date" required min={today}/>
+            </div>
+          ) : (
+            <div>
+              <label for="incurred_on">Date you spent it</label>
+              <input id="incurred_on" name="incurred_on" type="date" required max={today}/>
+            </div>
+          )}
+
+          {kind === 'travel' && (
+            <div>
+              <div class="row2">
+                <div>
+                  <label for="travel_from">From</label>
+                  <input id="travel_from" name="travel_from" required maxlength="120" placeholder="City you left"/>
+                </div>
+                <div>
+                  <label for="travel_to">To</label>
+                  <input id="travel_to" name="travel_to" required maxlength="120" placeholder="City you went to"/>
+                </div>
+              </div>
+              <div class="row2">
+                <div>
+                  <label for="travel_start">Departed</label>
+                  <input id="travel_start" name="travel_start" type="date"/>
+                </div>
+                <div>
+                  <label for="travel_end">Returned</label>
+                  <input id="travel_end" name="travel_end" type="date"/>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <label for="description">Details</label>
+          <textarea id="description" name="description" required maxlength="4000" placeholder="What this was for, and anything an approver would otherwise have to ask you."></textarea>
+
+          {kind !== 'advance' && (
+            <div>
+              <label for="receipt_url">Link to the receipt</label>
+              <input id="receipt_url" name="receipt_url" type="url" required inputmode="url" placeholder="https://drive.google.com/..."/>
+              <div class="note">
+                This platform stores no document uploads, so there is no file to attach. Put the receipt
+                in Google Drive, set its sharing to "Anyone with the link", and paste that link here. An
+                approver who cannot open the link cannot approve the claim.
+              </div>
+            </div>
+          )}
+
+          <button class="btn" style="margin-top:16px;" type="submit">Raise and send for approval</button>
+          <p style="font-size:11.5px;color:#9a8f7d;margin-top:9px;line-height:1.6;">
+            The claim is sent the moment you submit it. Who it goes to is worked out from your reporting
+            line and the department structure your organization has recorded, not from job titles. Larger
+            amounts pick up an additional approval on the way.
+          </p>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3>Waiting on someone</h3>
+        {live.length === 0 && (
+          <div class="empty">Nothing of yours is currently waiting for a decision.</div>
+        )}
+        {live.map((c) => (
+          <div class="claim">
+            <div class="hd">
+              <div style="min-width:0;">
+                <div class="ttl">{c.title}</div>
+                <div class="sub">{c.kindLabel} &middot; {c.categoryLabel} &middot; raised {c.createdAt ? new Date(c.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : 'recently'}</div>
+              </div>
+              <div style="text-align:right;flex:0 0 auto;">
+                <div class="amt">{money(c.amount, c.currency)}</div>
+                <span class="pill" style={`margin-top:5px;color:${stateColour[c.status]};background:${stateColour[c.status]}18;`}>{c.statusLabel}</span>
+              </div>
+            </div>
+
+            {c.status === 'halted' && (
+              <div class="trail" style="color:#8a4b06;">
+                <strong>This has not been sent to anybody yet.</strong> {c.haltReason || 'No approver could be resolved.'}
+                <br/>It will move on its own once that is recorded — you do not need to raise it again.
+              </div>
+            )}
+
+            {c.status === 'submitted' && trails.get(c.id) && (
+              <div class="trail">
+                {trails.get(c.id)!.steps.length === 0
+                  ? 'Sent for approval.'
+                  : trails.get(c.id)!.steps.map((s) => (
+                      <div>
+                        Step {s.stepNo}: {s.approverName || 'an approver'} &middot; {s.decision}
+                        {s.note ? ' — ' + s.note : ''}
+                      </div>
+                    ))}
+              </div>
+            )}
+
+            {c.receiptUrl && (
+              <div class="trail"><a class="inline" href={c.receiptUrl} target="_blank" rel="noopener noreferrer">Open the receipt link</a></div>
+            )}
+
+            <form method="POST" action="/api/portal/expenses/withdraw" style="margin-top:10px;">
+              <input type="hidden" name="claim_id" value={c.id}/>
+              <button class="btn btn-quiet" type="submit">Withdraw this claim</button>
+            </form>
+          </div>
+        ))}
+      </div>
+
+      <div class="card">
+        <h3>Settled</h3>
+        {settled.length === 0 && <div class="empty">Nothing has been settled yet.</div>}
+        {settled.map((c) => (
+          <div class="claim">
+            <div class="hd">
+              <div style="min-width:0;">
+                <div class="ttl">{c.title}</div>
+                <div class="sub">{c.kindLabel} &middot; {c.categoryLabel}</div>
+              </div>
+              <div style="text-align:right;flex:0 0 auto;">
+                <div class="amt">{money(c.amount, c.currency)}</div>
+                <span class="pill" style={`margin-top:5px;color:${stateColour[c.status]};background:${stateColour[c.status]}18;`}>{c.statusLabel}</span>
+              </div>
+            </div>
+            {c.status === 'reimbursed' && (
+              <div class="trail">Credited to your wallet. <a class="inline" href="/portal/employee/wallet">Open your wallet</a> to withdraw it to a bank account.</div>
+            )}
+            {c.status === 'approved' && (
+              <div class="trail" style="color:#8a4b06;">Approved, but the credit to your wallet has not gone through yet. Tell HR if it stays like this.</div>
+            )}
+            {c.decisionNote && <div class="trail">{c.decisionNote}</div>}
+          </div>
+        ))}
+      </div>
+
+      <div class="card">
+        <h3>Wallet withdrawals</h3>
+        <p style="font-size:13px;color:#6b6255;line-height:1.65;">
+          Requests to move your wallet balance to your bank. Raise one from
+          <a class="inline" href="/portal/employee/wallet"> your wallet</a>; it is approved through the
+          same chain as a claim.
+        </p>
+        {withdrawals.length === 0 && <div class="empty">No withdrawal requests yet.</div>}
+        {withdrawals.map((w) => (
+          <div class="claim">
+            <div class="hd">
+              <div style="min-width:0;">
+                <div class="ttl">{money(w.amount, w.currency)}</div>
+                <div class="sub">{w.requestedAt ? new Date(w.requestedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) : ''}{w.note ? ' — ' + w.note : ''}</div>
+              </div>
+              <span class="pill" style="color:#6b6255;background:#6b625518;flex:0 0 auto;">{w.status}</span>
+            </div>
+            {w.workflowState === 'halted' && w.haltReason && (
+              <div class="trail" style="color:#8a4b06;">Not sent to anybody yet: {w.haltReason}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+</div>
+</body>
+</html>
