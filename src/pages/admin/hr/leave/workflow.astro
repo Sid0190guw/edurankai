@@ -1,0 +1,523 @@
+---
+// /admin/hr/leave/workflow — THE APPROVAL WORKFLOW, made reachable.
+//
+// WHAT THIS PAGE IS FOR. src/lib/workflow.ts is a Layer 3 engine: it routes an approval from the
+// organization graph, checks authorization against capabilities, and moves a request through an
+// explicit state machine. A library nobody can open is a library nobody can check, so this page is
+// where the engine can be SEEN doing it — the route it would take, the state it is in, who it is
+// waiting on, and the exact sentence it stops with when the graph cannot name anybody.
+//
+// WHAT THIS PAGE DELIBERATELY DOES NOT DO. It does not replace /admin/hr/leave. That page still
+// approves leave through decideLeave() -> approverRole(), whose reporting-manager arm is a per-row
+// relationship and is already correct; nothing here changes it, and both pages are linked to each
+// other so neither is a dead end. Nothing on this page starts a workflow by itself: an approval
+// exists only because a person pressed "Send for approval" on a specific request.
+//
+// THE THREE LAYERS ARE VISIBLE ON SCREEN, which is the point of rendering `via` and `acted_via`:
+//   - "Waiting on: Reporting manager - Priya"  is LAYER 1. A relationship, resolved per row.
+//   - "Approved (Named approver)"              is LAYER 2 saying HOW that person was entitled.
+//   - the state chip                           is LAYER 3.
+//
+// WHEN THE GRAPH IS EMPTY, THIS PAGE SAYS SO AND STOPS. It does not fall back to role names, it does
+// not guess a manager, and it does not offer an approve button that would do something other than
+// what it says. "Organization Graph not yet initialized" is the honest render and it is the one the
+// founder will see until db/org-graph-backfill.sql has been run.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { listLeave } from '@/lib/hr-leave';
+import { isInitialized } from '@/lib/org-graph';
+import {
+  startWorkflow,
+  decideInstance,
+  resumeWorkflow,
+  escalateStep,
+  listInstances,
+  getInstance,
+  previewRoute,
+  pendingForApprover,
+  domainDefinition,
+  STATE_LABELS,
+  VIA_LABELS,
+  ACTED_VIA_LABELS,
+  type WorkflowInstanceView,
+  type RoutePlan,
+} from '@/lib/workflow';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+// The SAME gate as /admin/hr/leave, and asked the same way on purpose. `leave` is the section key
+// src/middleware.ts already maps this path to (longest-prefix on '/admin/hr/leave'), so the page and
+// the middleware ask one question rather than two that can drift apart.
+//
+// DELIBERATELY NOT `can(user, 'leave.approve')`, for the reason written out in full at the top of
+// /admin/hr/leave/index.astro: a custom role holding the `leave` section resolves as `leave.edit`
+// and never as `leave.approve`, so a bare swap would remove access from every custom role that has
+// it. Opening the page is not deciding anything — every decision below is re-checked where it binds,
+// by mayAct() inside the engine, on the posted id and not on the rendered one.
+if (!(await canAccessSection(user, 'leave', 'edit'))) return Astro.redirect('/admin');
+
+// ---------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted, and a const declared below the POST handler that reads
+// it throws on that handler's first line — the failure that took down apply step 5 and the
+// /admin/roles/diagnose Repair button on this project, both of which reported success while failing
+// every single time.
+// ---------------------------------------------------------------------------------------------
+const PAGE = '/admin/hr/leave/workflow';
+
+/** How many rows get a live route preview. Each preview is a handful of graph queries; a backlog of
+ *  two hundred pending requests must not turn one page load into six hundred round trips. */
+const PREVIEW_LIMIT = 10;
+
+/** How many instances get their steps loaded for the timeline. Same reasoning. */
+const DETAIL_LIMIT = 12;
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Plain words, from a function rather than a typed map — a `Record<string,string>` read inside JSX
+ *  is one of this project's known .astro parse hazards. */
+function stateLabel(state: string): string {
+  const key = String(state || '');
+  if (key === 'draft') return STATE_LABELS.draft;
+  if (key === 'pending') return STATE_LABELS.pending;
+  if (key === 'approved') return STATE_LABELS.approved;
+  if (key === 'rejected') return STATE_LABELS.rejected;
+  if (key === 'cancelled') return STATE_LABELS.cancelled;
+  if (key === 'halted') return STATE_LABELS.halted;
+  return key;
+}
+
+function viaLabel(via: string | null): string {
+  const key = String(via || '');
+  if (key === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (key === 'department_head') return VIA_LABELS.department_head;
+  if (key === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (key === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return key || 'Approver';
+}
+
+function actedViaLabel(v: string | null): string {
+  const key = String(v || '');
+  if (key === 'routed') return ACTED_VIA_LABELS.routed;
+  if (key === 'delegate') return ACTED_VIA_LABELS.delegate;
+  if (key === 'capability') return ACTED_VIA_LABELS.capability;
+  return '';
+}
+
+function stateClass(state: string): string {
+  const key = String(state || '');
+  if (key === 'approved') return 'chip chip-ok';
+  if (key === 'rejected') return 'chip chip-no';
+  if (key === 'halted') return 'chip chip-halt';
+  if (key === 'pending') return 'chip chip-wait';
+  return 'chip';
+}
+
+// ---------------------------------------------------------------------------------------------
+// WRITES. Every one of them goes through the engine — this page contains no SQL and no second
+// authorization check.
+//
+// WHAT BINDS WHICH ACTION, stated exactly, because the three are NOT gated the same way:
+//
+//   decide    mayAct() INSIDE decideInstance(). It runs on the id that was POSTED, so a hand-typed
+//             instance id is checked exactly as a clicked one is. This is the only action whose
+//             entitlement the engine itself enforces per request.
+//   resume    THE PAGE GATE ABOVE IS THE ONLY CHECK. resumeWorkflow() takes `user` for the audit
+//             trail and does not test entitlement. It cannot approve anything — it re-routes a
+//             halted instance to whoever the GRAPH names, and stays halted if the graph still names
+//             nobody — so the blast radius is a re-route, not a decision.
+//   escalate  SAME. escalateStep() adds the next person UP THE GRAPH as an additional approver and
+//             leaves the original pending. It cannot decide on anyone's behalf, and it refuses to
+//             fire twice on one step.
+//
+// So anyone holding the `leave` section at edit level can resume or escalate any leave instance.
+// That is the intended reading of an HR console and it is written down rather than assumed — but it
+// is a PAGE-level gate, and a future caller of these two functions from anywhere else gets no
+// entitlement check from the engine and must bring its own.
+// ---------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+
+  if (action === 'start') {
+    const r = await startWorkflow({
+      domain: 'leave',
+      recordId: String(fd.get('leaveId') || ''),
+      subjectEmployeeId: String(fd.get('employeeId') || ''),
+      summary: String(fd.get('summary') || '') || null,
+      createdByUserId: String(user.id),
+    });
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not start that approval.');
+    else if (!r.changed) flash = 'That request was already in approval.';
+    else if (r.state === 'halted') flash = 'Halted: ' + (r.haltReason || 'no approver could be resolved.');
+    else flash = 'Sent for approval.';
+  } else if (action === 'decide') {
+    const decision = String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected';
+    const r = await decideInstance(
+      String(fd.get('instanceId') || ''),
+      user,
+      decision,
+      String(fd.get('note') || ''),
+    );
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not record that decision.');
+    else if (!r.changed) flash = 'That was already recorded. Nothing changed.';
+    else flash = 'Decision recorded. The request is now ' + stateLabel(String(r.state || '')).toLowerCase() + '.';
+  } else if (action === 'resume') {
+    const r = await resumeWorkflow(String(fd.get('instanceId') || ''), user);
+    flash = r.ok ? 'Re-routed. It is waiting for approval again.' : 'Still halted: ' + (r.error || '');
+  } else if (action === 'escalate') {
+    const r = await escalateStep(String(fd.get('stepId') || ''), user);
+    flash = r.ok
+      ? 'Escalated. The next person up can now approve it as well.'
+      : 'Not escalated: ' + (r.error || '');
+  }
+
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash));
+}
+
+// ---------------------------------------------------------------------------------------------
+// READS
+// ---------------------------------------------------------------------------------------------
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+// ASKED ONCE, FOR THE WHOLE PAGE. isInitialized() is the difference between "the graph has no rows"
+// and "this person has no manager", and those two facts render completely differently. Asking it per
+// row would also be a query per row for an answer that cannot change mid-render.
+const graphReady = await isInitialized();
+
+const leaveDef = domainDefinition('leave');
+
+const allLeave = await listLeave({});
+const pendingLeave = allLeave.filter((l: any) => l.status === 'pending');
+
+const instances = await listInstances({ domain: 'leave', limit: 60 });
+const instanceByRecord = new Map<string, any>();
+for (const i of instances) instanceByRecord.set(String(i.recordId), i);
+
+// Requests that are pending and NOT yet in the engine — the ones a person can send for approval.
+const notStarted = pendingLeave.filter((l: any) => !instanceByRecord.has(String(l.id)));
+
+// The route each of those WOULD take. A read: previewRoute is resolveRoute under a name that says
+// so at the call site, and it writes nothing.
+//
+// Skipped entirely when the graph is empty, because the answer is already known and is the banner at
+// the top of the page. Running it anyway would be PREVIEW_LIMIT pointless round trips to produce the
+// same sentence ten times.
+const previews: { leaveId: string; plan: RoutePlan }[] = [];
+if (graphReady) {
+  for (const l of notStarted.slice(0, PREVIEW_LIMIT)) {
+    previews.push({ leaveId: String(l.id), plan: await previewRoute('leave', String(l.employee_id)) });
+  }
+}
+const previewFor = (id: string) => previews.find((p) => p.leaveId === id)?.plan || null;
+
+// Instances with their steps, for the timeline. Open ones first — a settled approval is history and
+// history can wait for a click.
+const ordered = [...instances].sort((a, b) => {
+  const rank = (s: string) => (s === 'pending' ? 0 : s === 'halted' ? 1 : 2);
+  return rank(a.state) - rank(b.state);
+});
+const details: WorkflowInstanceView[] = [];
+for (const i of ordered.slice(0, DETAIL_LIMIT)) {
+  const full = await getInstance(i.id);
+  if (full) details.push(full);
+}
+
+// What is waiting on the signed-in person specifically. ROUTED AND DELEGATED ONLY — a holder of
+// leave.approve does not see the whole company's queue here, and the engine's own docblock explains
+// why widening it would undo per-row routing on a queue screen.
+const mine = await pendingForApprover(String(user.id));
+
+const openCount = instances.filter((i) => i.state === 'pending').length;
+const haltedCount = instances.filter((i) => i.state === 'halted').length;
+---
+<AdminLayout title="Leave approval workflow" activeNav="">
+  <div class="admin-page wf-page">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">HR Management · Time off · Workflow</div>
+      <h1 class="admin-page-title">Leave approval workflow</h1>
+      <p class="admin-page-sub">
+        Routing comes from the Organization Graph - who approves this request, for this person, right
+        now. Whether the person it reaches may act is a separate question, answered by capabilities.
+        Both, in that order.
+      </p>
+    </div></div>
+
+    {msg && <div class="flash">{msg}</div>}
+
+    {!graphReady && (
+      <div class="banner banner-warn">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+        <div>
+          <strong>Organization Graph not yet initialized.</strong>
+          <p>
+            No relationships have been recorded yet, so nothing can be routed and no approval can be
+            started. This is not a fault and there is deliberately no fallback: guessing an approver
+            from a role name would hand every manager authority over every employee.
+            Run <code>db/org-graph-backfill.sql</code>, then reload this page.
+          </p>
+        </div>
+      </div>
+    )}
+
+    <div class="stats">
+      <div class="stat"><span class="stat-n">{pendingLeave.length}</span><span class="stat-l">Leave requests pending</span></div>
+      <div class="stat"><span class="stat-n">{openCount}</span><span class="stat-l">In approval</span></div>
+      <div class="stat"><span class="stat-n">{haltedCount}</span><span class="stat-l">Halted</span></div>
+      <div class="stat"><span class="stat-n">{mine.length}</span><span class="stat-l">Waiting on you</span></div>
+    </div>
+
+    <p class="crossref">
+      Deciding a request the ordinary way is still <a href="/admin/hr/leave">Leave approvals</a>.
+      That path is unchanged: a reporting manager can approve their own report's leave there without
+      holding any capability, exactly as before.
+    </p>
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Waiting on you · {mine.length}</h2>
+    <p class="sec-note">
+      Only requests routed to you, or to someone you are currently standing in for. Holding a
+      standing approval capability does not put the whole company's queue on this list.
+    </p>
+    {mine.length === 0 && <p class="empty">Nothing is waiting on your decision.</p>}
+    {mine.map((row) => (
+      <div class="card card-live">
+        <div class="card-main">
+          <div class="card-title">{row.instance.subjectName || 'Employee'} · {row.instance.summary || 'Leave'}</div>
+          <div class="card-sub">
+            Step {row.step.stepNo} · {viaLabel(row.step.via)}
+            {row.step.dueAt ? ' · due ' + fmtDate(row.step.dueAt) : ''}
+          </div>
+        </div>
+        <form method="POST" class="card-form">
+          <input type="hidden" name="action" value="decide"/>
+          <input type="hidden" name="instanceId" value={row.instance.id}/>
+          <input name="note" class="fi" placeholder="note (optional)"/>
+          <button name="decision" value="approved" class="btn btn-ok">Approve</button>
+          <button name="decision" value="rejected" class="btn btn-no">Reject</button>
+        </form>
+      </div>
+    ))}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Not yet in approval · {notStarted.length}</h2>
+    <p class="sec-note">
+      Pending leave requests with no approval chain attached. Sending one for approval resolves its
+      route from the graph; if the graph cannot name an approver the request halts with the reason,
+      and is never approved by default.
+    </p>
+    {notStarted.length === 0 && <p class="empty">Every pending leave request already has a chain.</p>}
+    {notStarted.map((l: any) => (
+      <div class="card">
+        <div class="card-main">
+          <div class="card-title">{l.full_name || 'Employee'} · <span class="cap">{l.leave_type}</span> · {l.days}d</div>
+          <div class="card-sub">{l.employee_code} · {fmtDate(l.start_date)} to {fmtDate(l.end_date)}</div>
+          {graphReady && previewFor(String(l.id)) && (
+            <div class="route">
+              {previewFor(String(l.id))!.ok
+                ? previewFor(String(l.id))!.approvers.map((a) => (
+                    <span class="hop">
+                      <span class="hop-n">{a.step}</span>
+                      {viaLabel(a.via)} · {a.fullName || 'Unnamed'}
+                      {a.mode === 'parallel' ? ' (parallel)' : ''}
+                      {a.mode === 'executive' ? ' (executive)' : ''}
+                    </span>
+                  ))
+                : <span class="hop hop-halt">Would halt: {previewFor(String(l.id))!.haltReason}</span>}
+            </div>
+          )}
+        </div>
+        <form method="POST" class="card-form">
+          <input type="hidden" name="action" value="start"/>
+          <input type="hidden" name="leaveId" value={String(l.id)}/>
+          <input type="hidden" name="employeeId" value={String(l.employee_id)}/>
+          <input type="hidden" name="summary" value={String(l.days) + ' day(s) ' + String(l.leave_type)}/>
+          <button class="btn btn-go" type="submit">Send for approval</button>
+        </form>
+      </div>
+    ))}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Approval chains · {details.length} of {instances.length}</h2>
+    {details.length === 0 && <p class="empty">No approval chain has been started yet.</p>}
+    {details.map((inst) => (
+      <div class="card card-block">
+        <div class="card-main">
+          <div class="card-title">
+            {inst.subjectName || 'Employee'} · {inst.summary || 'Leave'}
+            <span class={stateClass(inst.state)}>{stateLabel(inst.state)}</span>
+          </div>
+          <div class="card-sub">Raised {fmtDate(inst.createdAt)}{inst.settledAt ? ' · settled ' + fmtDate(inst.settledAt) : ''}</div>
+
+          {inst.haltReason && inst.state === 'halted' && (
+            <div class="halt">
+              <strong>Halted.</strong> {inst.haltReason}
+              <span class="halt-note">
+                Nothing was approved. Record the missing relationship, then resume - the request
+                carries on from where it stopped.
+              </span>
+            </div>
+          )}
+
+          <ol class="steps">
+            {inst.steps.map((s) => (
+              <li class={'step step-' + s.decision}>
+                <span class="step-n">{s.stepNo}</span>
+                <span class="step-body">
+                  <span class="step-who">{viaLabel(s.via)} · {s.approverName || 'Unnamed'}</span>
+                  <span class="step-meta">
+                    {s.decision === 'pending' ? 'Waiting' : stateLabel(s.decision) || s.decision}
+                    {s.decidedAt ? ' · ' + fmtDate(s.decidedAt) : ''}
+                    {s.actedVia ? ' · ' + actedViaLabel(s.actedVia) : ''}
+                    {s.escalatedFromStepId ? ' · added by escalation' : ''}
+                    {s.mode === 'parallel' ? ' · parallel' : ''}
+                    {s.mode === 'executive' ? ' · executive' : ''}
+                  </span>
+                  {s.note && <span class="step-note">{s.note}</span>}
+                </span>
+                {s.decision === 'pending' && inst.state === 'pending' && s.stepNo === inst.currentStep && (
+                  <form method="POST" class="step-form">
+                    <input type="hidden" name="action" value="escalate"/>
+                    <input type="hidden" name="stepId" value={s.id}/>
+                    <button class="btn btn-thin" type="submit">Escalate</button>
+                  </form>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+
+        {inst.state === 'halted' && (
+          <form method="POST" class="card-form">
+            <input type="hidden" name="action" value="resume"/>
+            <input type="hidden" name="instanceId" value={inst.id}/>
+            <button class="btn btn-go" type="submit">Resume routing</button>
+          </form>
+        )}
+      </div>
+    ))}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">How a leave request is routed</h2>
+    <p class="sec-note">
+      The chain below is the SHAPE of the approval, not a claim about who fills it. Every rung is
+      resolved per request, per person, from the Organization Graph at the moment the chain starts.
+    </p>
+    <ol class="chain">
+      <li><span class="hop-n">1</span> Reporting manager - required. No manager recorded means the request halts.</li>
+      <li><span class="hop-n">2</span> Leave approval owner - optional. If nobody owns leave approvals, the chain is one rung and that is complete.</li>
+    </ol>
+    <p class="sec-note">
+      A pending rung becomes escalatable after {leaveDef.escalateAfterHours} hours. Escalation ADDS
+      the next person up the reporting line; it does not take the decision away from the person whose
+      decision it is, and it never approves anything by itself.
+    </p>
+  </div>
+
+  <style>
+    /* MOBILE FIRST. Roughly nine in ten of these users are on a phone, so the base rules are the
+       360px rules and the wider layouts are the exceptions. Nothing here may make the PAGE scroll
+       sideways: every flex child carries min-width:0 (a flex item defaults to min-width:auto, so one
+       long unbroken word - an employee code, a pasted reason - pushes the card wider than the phone)
+       and long text wraps inside its own card. */
+    .wf-page{ max-width:1000px; }
+    .flash{ margin:0 0 16px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3);
+      color:#6ee7b7; border-radius:8px; padding:10px 14px; font-size:13px; overflow-wrap:anywhere; }
+
+    .banner{ display:flex; gap:12px; align-items:flex-start; border-radius:10px; padding:14px;
+      margin:0 0 18px; font-size:13px; line-height:1.5; }
+    .banner-warn{ background:rgba(234,179,8,0.08); border:1px solid rgba(234,179,8,0.35); color:#fde68a; }
+    .banner svg{ flex:0 0 auto; margin-top:2px; }
+    .banner p{ margin:6px 0 0; color:#d8d2bd; }
+    .banner code{ font-family:'Geist Mono',monospace; font-size:12px; background:#111; padding:1px 5px;
+      border-radius:4px; overflow-wrap:anywhere; }
+
+    .stats{ display:flex; flex-wrap:wrap; gap:8px; margin:0 0 16px; }
+    .stat{ flex:1 1 140px; min-width:0; background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px;
+      padding:12px 14px; display:flex; flex-direction:column; gap:2px; }
+    .stat-n{ font-family:'Geist Mono',monospace; font-size:22px; font-weight:700; color:#fff; }
+    .stat-l{ font-size:11px; color:#8a8a94; text-transform:uppercase; letter-spacing:0.08em; }
+
+    .crossref{ font-size:13px; color:#8a8a94; margin:0 0 22px; }
+    .crossref a{ color:#f97316; }
+
+    .sec{ font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:0.16em; text-transform:uppercase;
+      color:#c2410c; font-weight:700; margin:26px 0 6px; }
+    .sec-note{ font-size:12.5px; color:#8a8a94; margin:0 0 12px; line-height:1.55; }
+    .empty{ color:#8a8a94; font-size:13px; margin:0 0 18px; }
+
+    .card{ display:flex; gap:12px; background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px;
+      padding:12px 14px; margin-bottom:8px; flex-wrap:wrap; align-items:flex-start; }
+    .card-live{ border-color:rgba(249,115,22,0.35); }
+    .card-block{ flex-direction:column; }
+    .card-main{ flex:1 1 220px; min-width:0; overflow-wrap:anywhere; }
+    .card-title{ color:#fff; font-weight:700; font-size:14px; display:flex; flex-wrap:wrap; gap:8px;
+      align-items:center; }
+    .card-sub{ color:#8a8a94; font-size:12px; margin-top:2px; }
+    .cap{ text-transform:capitalize; }
+
+    /* Controls reflow rather than sitting in fixed columns: they are independent buttons, not a
+       table row, and a 150px field plus two nowrap buttons is wider than a 360px phone allows. */
+    .card-form{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; flex:1 1 260px; min-width:0; }
+    .fi{ background:#08080b; border:1px solid #262630; border-radius:7px; padding:11px 10px; color:#fff;
+      font-size:13px; outline:none; font-family:inherit; flex:1 1 150px; min-width:0; }
+    /* 44px minimum touch target. A control that needs a second attempt on a phone is a control that
+       gets pressed twice, and this page is full of things that must not happen twice. */
+    .btn{ border:none; border-radius:7px; padding:0 16px; min-height:44px; color:#fff; font-size:12px;
+      font-weight:700; cursor:pointer; font-family:'Geist Mono',monospace; white-space:nowrap;
+      flex:1 1 auto; }
+    .btn-ok{ background:#22c07e; }
+    .btn-no{ background:transparent; border:1px solid #444; color:#fca5a5; }
+    .btn-go{ background:#c2410c; }
+    .btn-thin{ background:transparent; border:1px solid #333; color:#cfd6da; min-height:36px;
+      font-size:11px; padding:0 10px; flex:0 0 auto; }
+
+    .chip{ font-family:'Geist Mono',monospace; font-size:10px; font-weight:700; text-transform:uppercase;
+      letter-spacing:0.08em; border-radius:999px; padding:3px 9px; background:#1a1a1f; color:#8a8a94; }
+    .chip-ok{ background:rgba(34,192,126,0.15); color:#86efac; }
+    .chip-no{ background:rgba(248,113,113,0.12); color:#fca5a5; }
+    .chip-wait{ background:rgba(249,115,22,0.14); color:#fdba74; }
+    .chip-halt{ background:rgba(234,179,8,0.14); color:#fde68a; }
+
+    .route{ display:flex; flex-direction:column; gap:4px; margin-top:8px; }
+    .hop{ font-size:12px; color:#cfd6da; display:flex; gap:7px; align-items:baseline; overflow-wrap:anywhere; }
+    .hop-halt{ color:#fde68a; }
+    .hop-n{ font-family:'Geist Mono',monospace; font-size:10px; color:#8a8a94; border:1px solid #2a2a33;
+      border-radius:4px; padding:1px 5px; flex:0 0 auto; }
+
+    .halt{ margin-top:10px; background:rgba(234,179,8,0.07); border:1px solid rgba(234,179,8,0.28);
+      border-radius:8px; padding:10px 12px; font-size:12.5px; color:#fde68a; line-height:1.5; }
+    .halt-note{ display:block; color:#a9a496; margin-top:5px; }
+
+    .steps{ list-style:none; margin:12px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+    .step{ display:flex; gap:10px; align-items:flex-start; background:#0b0b0f; border:1px solid #17171c;
+      border-radius:8px; padding:9px 11px; flex-wrap:wrap; }
+    .step-approved{ border-color:rgba(34,192,126,0.25); }
+    .step-rejected{ border-color:rgba(248,113,113,0.25); }
+    .step-n{ font-family:'Geist Mono',monospace; font-size:10px; color:#8a8a94; border:1px solid #2a2a33;
+      border-radius:4px; padding:1px 6px; flex:0 0 auto; margin-top:2px; }
+    .step-body{ flex:1 1 180px; min-width:0; display:flex; flex-direction:column; gap:2px; overflow-wrap:anywhere; }
+    .step-who{ color:#e8e8ea; font-size:13px; font-weight:600; }
+    .step-meta{ color:#8a8a94; font-size:11.5px; }
+    .step-note{ color:#a8a8b0; font-size:12px; font-style:italic; }
+    .step-form{ flex:0 0 auto; }
+
+    .chain{ list-style:none; margin:0 0 12px; padding:0; display:flex; flex-direction:column; gap:6px; }
+    .chain li{ display:flex; gap:8px; align-items:baseline; font-size:13px; color:#cfd6da;
+      overflow-wrap:anywhere; }
+
+    @media (max-width:520px){
+      .card-form{ flex:1 1 100%; }
+      .fi{ flex:1 1 100%; }
+      .stat{ flex:1 1 calc(50% - 4px); }
+    }
+  </style>
+</AdminLayout>

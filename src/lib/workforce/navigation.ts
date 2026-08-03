@@ -293,6 +293,28 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'requireTeamLead (team.astro:96): department.lead capability AND users.assigned_department_id, and never an intern.',
   },
   {
+    key: 'organization',
+    label: 'Organization',
+    href: '/portal/organization',
+    icon: 'user',
+    group: 'record',
+    // DRAWER ONLY. `bar: null` keeps the four ranked tabs exactly as they were: this is a reference
+    // surface people open occasionally, not a thumb destination, and taking a bar slot from Tasks or
+    // Messages to give it one would be a worse trade than the extra tap.
+    bar: null,
+    // `worksHere` — an employee record, or admin.access. STRICTLY NARROWER than the page's own gate,
+    // which is "signed in", exactly like Messages, Meet and Mail above and for the same reason: an
+    // applicant does not belong in the staff org chart even though the page would give them an
+    // honest "you are not on the organization graph" screen if they arrived.
+    //
+    // NOT gated on holding the whole-graph capability. That would offer the page ONLY to HR and hide
+    // it from every employee entitled to see their own reporting line — which is most of the people
+    // it was built for. The page scopes itself per viewer in the QUERY; the nav entry only decides
+    // whether the door is worth showing.
+    audience: worksHere,
+    gate: 'Page: signed in. Contents: resolveOrgViewerScope() — employee.manage for the whole graph, a department_head EDGE in the graph for a department subtree, an employee record for your own line. Never a role name.',
+  },
+  {
     key: 'hr',
     label: 'HR',
     href: '/admin/hr/employees',
@@ -399,10 +421,14 @@ export const NAV_BACKLOG: readonly { key: string; reason: string }[] = [
   {
     key: 'reports.direct',
     reason:
-      'A reporting manager with direct reports has NO team surface. ctx.managesPeople is true for them ' +
-      'and the reports.direct widget exists, but nothing anywhere loads it and there is no ' +
-      'directReportsFor(userId). /portal/team is department-lead only and would refuse them, so no entry ' +
-      'may point there for them.',
+      'PARTLY ANSWERED, and worth reading before assuming it still is. A reporting manager with direct ' +
+      'reports now has a place to SEE them: /portal/organization renders their own reporting line plus ' +
+      'their direct reports, resolved from the Organization Graph — but only once the graph has been ' +
+      'backfilled, and only as a read. ctx.managesPeople still comes from ' +
+      'hr_employees.reporting_manager_id, the reports.direct widget still has no loader, and ' +
+      '/portal/team is still department-lead only and would refuse them. What is missing is a WORKING ' +
+      'surface for a manager (their reports\' tasks, leave and hours in one place), not a view of who ' +
+      'they are.',
   },
   {
     key: 'mail.real',
