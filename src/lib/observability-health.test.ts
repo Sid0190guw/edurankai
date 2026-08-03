@@ -5,7 +5,7 @@
 import { readFileSync } from 'node:fs';
 import {
   errorFingerprint, overallStatus, statusHttpCode, cronIntervalHours, cronRunState,
-  relativeAge, deployMarker, releaseTag, CONFIGURED_CRONS, BOOTSTRAP_MODULES,
+  relativeAge, deployMarker, releaseTag, publicErrorSummary, CONFIGURED_CRONS, BOOTSTRAP_MODULES,
 } from './observability-health';
 
 let pass = 0, fail = 0;
@@ -29,6 +29,42 @@ ok('the key is bounded in length', errorFingerprint('e', 'x'.repeat(4000)).lengt
   const keys = new Set<string>();
   for (let i = 0; i < 400; i++) keys.add(errorFingerprint('hire.create', 'insert failed for employee ' + i + ' at 2026-08-0' + (i % 9 + 1)));
   ok('400 occurrences of one fault produce exactly 1 group', keys.size === 1, [...keys]);
+}
+
+// ---- what /api/health is allowed to tell an anonymous caller ----
+// The requirement has two halves and BOTH have to hold: no configuration may survive, and the
+// failure class must. Redacting everything would satisfy the first and break the incident runbook,
+// which has an operator reading this field at minute two of an outage.
+{
+  const cases: { real: string; mustNotContain: string[]; mustContain: string }[] = [
+    { real: 'getaddrinfo ENOTFOUND aws-0-ap-south-1.pooler.supabase.com',
+      mustNotContain: ['supabase', 'pooler', 'aws-0'], mustContain: 'ENOTFOUND' },
+    { real: 'password authentication failed for user "postgres.wjqxabcdefghij"',
+      mustNotContain: ['postgres.wjqx', 'wjqxabcdefghij'], mustContain: 'password authentication failed' },
+    { real: 'connect ECONNREFUSED 10.42.0.7:6543',
+      mustNotContain: ['10.42.0.7', '6543'], mustContain: 'ECONNREFUSED' },
+    { real: 'no pg_hba.conf entry for host "203.0.113.9", user "postgres", database "era"',
+      mustNotContain: ['203.0.113.9', 'era'], mustContain: 'no ' },
+    { real: 'could not connect to postgres://era_user:hunter2@db.internal.example.com:5432/era',
+      mustNotContain: ['hunter2', 'era_user', 'example.com'], mustContain: 'could not connect' },
+    { real: 'Connection terminated unexpectedly',
+      mustNotContain: [], mustContain: 'Connection terminated unexpectedly' },
+    { real: 'timeout expired',
+      mustNotContain: [], mustContain: 'timeout' },
+  ];
+  for (const c of cases) {
+    const out = publicErrorSummary(c.real);
+    const leaked = c.mustNotContain.filter((s) => out.toLowerCase().includes(s.toLowerCase()));
+    ok('no configuration survives: ' + c.real.slice(0, 46), leaked.length === 0, { out, leaked });
+    ok('the failure class survives: ' + c.mustContain, out.toLowerCase().includes(c.mustContain.toLowerCase()), out);
+  }
+  ok('an empty reason still says something', publicErrorSummary('') === 'database unreachable');
+  ok('a null reason still says something', publicErrorSummary(null) === 'database unreachable');
+  ok('whitespace-only still says something', publicErrorSummary('   \n ') === 'database unreachable');
+  ok('the public string is bounded', publicErrorSummary('x'.repeat(5000)).length <= 160);
+  ok('a string that scrubs away entirely is not empty', publicErrorSummary('"a" \'b\' 1.2.3.4').length > 0);
+  // The scrub must not be reversible into a hostname by concatenating what is left.
+  ok('a bare domain leaves no label behind', !publicErrorSummary('host db.abcdefg.supabase.co is unreachable').includes('abcdefg'));
 }
 
 // ---- status roll-up ----

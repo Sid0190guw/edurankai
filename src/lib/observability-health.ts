@@ -152,6 +152,54 @@ export function deployMarker(env: Record<string, string | undefined> = (typeof p
   };
 }
 
+/**
+ * WHAT AN ANONYMOUS CALLER IS ALLOWED TO BE TOLD ABOUT A DATABASE FAILURE.
+ *
+ * /api/health is unauthenticated on purpose, and it reported `e.cause.message` verbatim. That string
+ * is written by the Postgres driver, not by us, and on the failures that matter it CONTAINS THE
+ * CONNECTION CONFIGURATION:
+ *
+ *   getaddrinfo ENOTFOUND aws-0-ap-south-1.pooler.supabase.com   -> the database hostname
+ *   password authentication failed for user "postgres.abcdefgh"  -> the database role
+ *   no pg_hba.conf entry for host "10.0.0.7", user "postgres"    -> host and role
+ *   connect ECONNREFUSED 10.0.0.7:6543                           -> address and port
+ *
+ * So the one endpoint the module's own header promises discloses nothing was the endpoint that
+ * disclosed the most, and only while the site was down and being looked at by strangers.
+ *
+ * REDACTING THE WHOLE STRING WOULD BE THE WRONG FIX. INCIDENT.md section 2 has an operator reading
+ * this field at minute two, and /api/health/deep cannot substitute for it: that route's gate is
+ * `can()`, which resolves the principal FROM THE DATABASE, so during a total database outage the
+ * deep endpoint is unreachable by anybody. Replacing the reason with "error" would delete the only
+ * diagnosis available in exactly the incident it exists for.
+ *
+ * So this keeps the DIAGNOSIS and removes the CONFIGURATION: hostnames, addresses, ports, DSNs and
+ * quoted identifiers are replaced by placeholders; the failure class ("ENOTFOUND", "ECONNREFUSED",
+ * "password authentication failed", "timeout") survives intact. The unredacted message is still
+ * written to edu_error_log and still shown on /admin/ops and /api/health/deep, both behind
+ * `administer`. Pure — no database, no environment.
+ */
+export function publicErrorSummary(message: string | null | undefined): string {
+  const raw = String(message == null ? '' : message);
+  if (!raw.trim()) return 'database unreachable';
+  const scrubbed = raw
+    // DSNs first: postgres://user:pass@host:6543/db would otherwise be picked apart piecemeal.
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<dsn>')
+    // IPv6 before IPv4, because the v4 pattern would bite chunks out of a v6 literal.
+    .replace(/\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b/gi, '<ip>')
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, '<ip>')
+    // Anything with two or more dot-separated labels is a hostname here.
+    .replace(/\b[\w-]+(?:\.[\w-]+)+\b/g, '<host>')
+    // Quoted identifiers carry role names, database names and constraint names.
+    .replace(/"[^"]*"/g, '<redacted>')
+    .replace(/'[^']*'/g, '<redacted>')
+    // Whatever is left that could be a port or an internal id.
+    .replace(/\b\d{2,}\b/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return scrubbed.slice(0, 160) || 'database unreachable';
+}
+
 /** The release string stamped onto every error row, so a fault can be tied to a deploy. Pure. */
 export function releaseTag(env?: Record<string, string | undefined>): string | null {
   const m = deployMarker(env);
@@ -381,7 +429,19 @@ export async function errorGroups(opts: { hours?: number; limit?: number } = {})
         FROM edu_error_log WHERE created_at > now() - (${hours} * INTERVAL '1 hour')
         GROUP BY event ORDER BY MAX(created_at) DESC LIMIT ${limit}`));
       return r.map((x: any) => ({ fingerprint: String(x.fingerprint || 'unknown'), event: String(x.event || ''), message: String(x.message || ''), count: Number(x.count || 0), firstSeen: x.first_seen, lastSeen: x.last_seen, releases: [] }));
-    } catch { return []; }
+    } catch (e: any) {
+      // BOTH READS FAILED, AND AN EMPTY ARRAY IS INDISTINGUISHABLE FROM "NOTHING WENT WRONG".
+      //
+      // The incident board renders [] as "Nothing logged in this window" — reassuring, and the exact
+      // failure mode this whole module was written against. It cannot throw (that would blank the
+      // console an operator is depending on), so it says so on stdout instead of returning quietly.
+      // logEvent, not trackError: writing an error row about not being able to read error rows is a
+      // loop, and the reason the read failed is almost always that the database is unreachable —
+      // which the banner above the panel is already reporting as DOWN.
+      const { logEvent } = await import('@/lib/logger');
+      logEvent('warn', 'ops.error_groups_unreadable', { hours, message: e?.cause?.message || e?.message });
+      return [];
+    }
   }
 }
 

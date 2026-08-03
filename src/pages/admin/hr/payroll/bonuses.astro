@@ -1,0 +1,461 @@
+---
+// /admin/hr/payroll/bonuses — BONUSES AND INCENTIVES.
+//
+// WHAT THIS SCREEN IS FOR. Awarding somebody money on top of their salary — once, or on each run for
+// a stated number of runs — so that it appears as a line on their payslip with the name you gave it.
+//
+// A GROUP AWARD IS SEVERAL AWARDS, AND THE SCREEN SAYS SO. Approval routing is resolved per person
+// from the Organization Graph, so twelve people across three departments genuinely have three
+// different approvers. Awarding to a group therefore raises one request each, and eleven can be
+// approved while one halts — which is reported as exactly that rather than averaged into a colour.
+//
+// THREE THINGS IT DELIBERATELY CANNOT DO:
+//   1. It cannot approve anything. The Approve button acts on the WORKFLOW INSTANCE, and
+//      decideInstance() re-checks that this account is the routed approver or an in-force delegate.
+//      Holding this page confers no authority to decide.
+//   2. It cannot pay anybody directly. An approved award becomes a payslip line on the next payroll
+//      run at or after its effective month, once, and the run records that it was paid.
+//   3. It cannot pay one twice. A one-off pays on one run and a recurring award stops itself after
+//      the number of payouts you set, counted from the ledger rather than from a counter.
+//
+// THE GATE. `payroll.manage` through can(), exactly as the payroll screens beside it.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { isInitialized } from '@/lib/org-graph';
+import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import {
+  ensureBonusSchema, listBonuses, requestBonus, cancelBonus, syncBonusApprovals,
+  bonusKindLabel, bonusStateLabel, BONUS_KINDS, type BonusRow,
+} from '@/lib/payroll-bonuses';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'payroll.manage')) return Astro.redirect('/admin?denied=payroll');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted.
+const PAGE = '/admin/hr/payroll/bonuses';
+const DETAIL_LIMIT = 15;
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const money = (n: any, cur: string) =>
+  (cur || 'INR') + ' ' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function stateTone(s: string): string {
+  const k = String(s || '');
+  if (k === 'spent') return '#86efac';
+  if (k === 'approved') return '#6ee7b7';
+  if (k === 'rejected') return '#fca5a5';
+  if (k === 'halted') return '#fbbf24';
+  if (k === 'cancelled') return '#9aa6b6';
+  return '#67e8f9';
+}
+
+function viaLabel(v: string): string {
+  const k = String(v || '');
+  if (k === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (k === 'department_head') return VIA_LABELS.department_head;
+  if (k === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (k === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+const MONTH_OPTIONS = [
+  { v: 1, l: 'January' }, { v: 2, l: 'February' }, { v: 3, l: 'March' }, { v: 4, l: 'April' },
+  { v: 5, l: 'May' }, { v: 6, l: 'June' }, { v: 7, l: 'July' }, { v: 8, l: 'August' },
+  { v: 9, l: 'September' }, { v: 10, l: 'October' }, { v: 11, l: 'November' }, { v: 12, l: 'December' },
+];
+
+await ensureBonusSchema().catch(() => {});
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (action === 'decide') {
+      const r = await decideInstance(
+        String(fd.get('instance_id') || ''),
+        user as any,
+        String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected',
+        String(fd.get('note') || ''),
+      );
+      flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
+      if (r.ok) {
+        const sync = await syncBonusApprovals(user.id);
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else if (action === 'award') {
+      // WHOLE DEPARTMENT, OR A CHOSEN LIST. The department arm expands to the people actually in it
+      // right now, and each of them still gets their own request and their own approver — the
+      // department is a way of choosing people, never a way of routing one decision for all of them.
+      //
+      // departments.id is a varchar(50) slug in schema.ts and a UUID in db/hr-schema.sql, so the
+      // comparison is ::text on both sides and NEVER ::uuid, which would throw on half the values.
+      const departmentId = String(fd.get('department_id') || '').trim();
+      let employeeIds: string[] = [];
+      if (departmentId) {
+        employeeIds = rowsOf(await db.execute(sql`
+          SELECT id FROM hr_employees
+           WHERE is_active = true AND department_id::text = ${departmentId}
+           ORDER BY full_name ASC LIMIT 200`)).map((x: any) => String(x.id));
+        if (!employeeIds.length) {
+          flash = 'Nobody is currently recorded in that department, so no award was raised.';
+        }
+      } else {
+        employeeIds = fd.getAll('employee_ids').map((x) => String(x)).filter(Boolean);
+      }
+
+      if (employeeIds.length) {
+        const r = await requestBonus({
+          employeeIds,
+          title: String(fd.get('title') || ''),
+          kind: String(fd.get('kind') || ''),
+          amount: Number(fd.get('amount')),
+          occurrences: Number(fd.get('occurrences') || 1),
+          effectiveMonth: Number(fd.get('effective_month')),
+          effectiveYear: Number(fd.get('effective_year')),
+          reason: String(fd.get('reason') || ''),
+          requestedByUserId: user.id,
+        });
+        if (!r.ok) {
+          flash = r.error || 'The award was not saved.';
+        } else {
+          const parts = [(r.ids || []).length + ' award' + ((r.ids || []).length === 1 ? '' : 's') + ' sent for approval. Nobody has been paid.'];
+          if ((r.halted || []).length) {
+            parts.push((r.halted || []).length + ' halted with no approver: ' + (r.halted || [])[0].employee + ' — ' + (r.halted || [])[0].reason);
+          }
+          if ((r.failed || []).length) {
+            parts.push('Not recorded for: ' + (r.failed || []).join(', ') + '.');
+          }
+          flash = parts.join(' ');
+        }
+      }
+    } else if (action === 'cancel') {
+      const r = await cancelBonus(String(fd.get('bonus_id') || ''), user.id);
+      flash = r.ok ? 'Award withdrawn.' : (r.error || 'The award was not withdrawn.');
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    console.error('[admin/hr/payroll/bonuses] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 400)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const synced = await syncBonusApprovals(user.id);
+const graphReady = await isInitialized();
+const awards = await listBonuses({ limit: 400 });
+
+let employees: any[] = [];
+let departments: any[] = [];
+try {
+  employees = rowsOf(await db.execute(sql`
+    SELECT id, full_name, employee_code FROM hr_employees
+     WHERE is_active = true ORDER BY full_name ASC LIMIT 400`));
+  departments = rowsOf(await db.execute(sql`
+    SELECT d.id::text AS id, d.name, COUNT(e.id)::int AS headcount
+      FROM departments d
+      LEFT JOIN hr_employees e ON e.department_id::text = d.id::text AND e.is_active = true
+     GROUP BY d.id::text, d.name
+     ORDER BY d.name ASC LIMIT 100`));
+} catch (e: any) {
+  console.error('[admin/hr/payroll/bonuses] pickers', e?.cause?.message || e?.message);
+}
+
+const open = awards.filter((b) => b.state === 'pending' || b.state === 'halted').slice(0, DETAIL_LIMIT);
+const detail: any[] = [];
+for (const b of open) {
+  let instance: any = null;
+  try {
+    if (b.workflowInstanceId) instance = await getInstance(b.workflowInstanceId);
+  } catch (e: any) {
+    console.error('[admin/hr/payroll/bonuses] instance', e?.cause?.message || e?.message);
+  }
+  const waiting = instance
+    ? (instance.steps || []).filter((s: any) => s.stepNo === instance.currentStep && s.decision === 'pending')
+    : [];
+  detail.push({ b, instance, waiting });
+}
+
+const openCount = awards.filter((b) => b.state === 'pending' || b.state === 'halted').length;
+const approved = awards.filter((b) => b.state === 'approved');
+const settled = awards.filter((b) => ['spent', 'rejected', 'cancelled'].indexOf(b.state) >= 0);
+const haltedCount = awards.filter((b) => b.state === 'halted').length;
+const committed = approved.reduce((s, b) => s + b.amount * b.remainingOccurrences, 0);
+const currency = String(awards[0]?.currency || 'INR');
+
+const now = new Date();
+const thisMonth = now.getMonth() + 1;
+const thisYear = now.getFullYear();
+const yearOptions = [thisYear, thisYear + 1];
+---
+<AdminLayout title="Bonuses and incentives" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Payroll · Bonuses and incentives</p>
+  <h1>Bonuses and incentives</h1>
+  <p class="lede">
+    Money awarded on top of salary — once, or on each run for a set number of runs. An approved award
+    becomes a line on the payslip with the name you gave it, on the first run at or after the month
+    you choose. Awarding to a group raises one request per person, because who approves it is
+    resolved per person from the Organization Graph.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {synced.errors.length > 0 && <div class="flash warn">{synced.errors[0]}</div>}
+  {!graphReady && (
+    <div class="flash warn">
+      The Organization Graph is not yet initialized, so no approver can be resolved for anybody. An
+      award raised now is recorded and halted with that reason rather than approved. Run the graph
+      backfill first.
+    </div>
+  )}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{openCount}</span><span class="tl">Waiting on a decision</span></div>
+    <div class="tile"><span class="tv">{approved.length}</span><span class="tl">Approved, awaiting a run</span></div>
+    <div class="tile"><span class="tv">{haltedCount}</span><span class="tl">Halted</span></div>
+    <div class="tile"><span class="tv">{money(committed, currency)}</span><span class="tl">Approved and still to pay</span></div>
+  </div>
+
+  <details class="panel">
+    <summary>Award a bonus or incentive</summary>
+    <form method="POST" class="form">
+      <input type="hidden" name="action" value="award" />
+      <label>Name of the award
+        <input type="text" name="title" required maxlength="200" placeholder="Printed on the payslip exactly as you write it" />
+      </label>
+      <label>Amount per person, per payout
+        <input type="number" name="amount" step="0.01" min="0.01" required />
+      </label>
+      <label>Paid once, or on several runs
+        <select name="kind" required>
+          <option value="">Choose</option>
+          {BONUS_KINDS.map((k) => <option value={k.key}>{k.label}</option>)}
+        </select>
+        <span class="hint">{BONUS_KINDS.map((k) => k.label + ': ' + k.note).join(' ')}</span>
+      </label>
+      <label>If recurring, how many payouts
+        <input type="number" name="occurrences" step="1" min="1" max="60" value="1" />
+        <span class="hint">Ignored for a one-off. A recurring award stops itself after this many runs.</span>
+      </label>
+      <div class="pair">
+        <label>First paid in
+          <select name="effective_month" required>
+            {MONTH_OPTIONS.map((m) => <option value={m.v} selected={m.v === thisMonth}>{m.l}</option>)}
+          </select>
+        </label>
+        <label>Year
+          <select name="effective_year" required>
+            {yearOptions.map((y) => <option value={y} selected={y === thisYear}>{y}</option>)}
+          </select>
+        </label>
+      </div>
+      <label>A whole department
+        <select name="department_id">
+          <option value="">Not a department award — choose people below</option>
+          {departments.map((d: any) => (
+            <option value={d.id}>{d.name} ({d.headcount} on the books)</option>
+          ))}
+        </select>
+        <span class="hint">
+          Choosing a department awards everybody currently recorded in it. Each person still gets
+          their own request and their own approver.
+        </span>
+      </label>
+      <label>Or choose people
+        <select name="employee_ids" multiple size="8">
+          {employees.map((e: any) => (
+            <option value={e.id}>{e.full_name}{e.employee_code ? ' — ' + e.employee_code : ''}</option>
+          ))}
+        </select>
+        <span class="hint">Hold to select more than one. Ignored when a department is chosen above.</span>
+      </label>
+      <label>Why
+        <textarea name="reason" rows="2" required placeholder="An approver reads this before deciding."></textarea>
+      </label>
+      <button type="submit" class="btn">Send for approval</button>
+      <p class="hint">Nobody is paid by pressing this. It records the award and asks for a decision.</p>
+    </form>
+  </details>
+
+  <h2>Waiting on a decision</h2>
+  {detail.length === 0 ? (
+    <div class="empty">No award is waiting on anybody.</div>
+  ) : (
+    <div class="stack">
+      {detail.map((d: any) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{d.b.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {d.b.title} · {money(d.b.amount, d.b.currency)}
+                {d.b.occurrences > 1 ? ' on each of ' + d.b.occurrences + ' runs' : ''}
+                {' · from ' + (MONTH_OPTIONS[d.b.effectiveMonth - 1]?.l || '') + ' ' + d.b.effectiveYear}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(d.b.state) + ';border-color:' + stateTone(d.b.state) + '55;'}>
+              {bonusStateLabel(d.b.state)}
+            </span>
+          </div>
+
+          <p class="reason">{d.b.reason}</p>
+
+          {d.b.state === 'halted' && (
+            <div class="halt">
+              <strong>Halted.</strong> {d.b.haltReason || 'No approver could be resolved.'}
+              <span class="hint">Nothing has been paid. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+            </div>
+          )}
+
+          {d.instance && d.instance.state === 'pending' && d.waiting.length > 0 && (
+            <div class="waiting">
+              <p class="wl">Waiting on</p>
+              {d.waiting.map((s: any) => (
+                <p class="wn">{viaLabel(s.via)} — {s.approverName || 'a person with no employee record'}</p>
+              ))}
+            </div>
+          )}
+
+          {d.instance && d.instance.state === 'pending' && (
+            <form method="POST" class="decide">
+              <input type="hidden" name="action" value="decide" />
+              <input type="hidden" name="instance_id" value={d.instance.id} />
+              <input type="text" name="note" placeholder="Note for the record (optional)" />
+              <div class="btnrow">
+                <button type="submit" name="decision" value="approved" class="btn ok">Approve</button>
+                <button type="submit" name="decision" value="rejected" class="btn no">Reject</button>
+              </div>
+              <p class="hint">Only the person this was routed to, or somebody standing in for them, can decide it.</p>
+            </form>
+          )}
+
+          <form method="POST" class="inline">
+            <input type="hidden" name="action" value="cancel" />
+            <input type="hidden" name="bonus_id" value={d.b.id} />
+            <button type="submit" class="btn ghost">Withdraw this award</button>
+          </form>
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>Approved, waiting on a payroll run</h2>
+  {approved.length === 0 ? (
+    <div class="empty">Nothing is approved and waiting.</div>
+  ) : (
+    <div class="scroller">
+      <table class="grid">
+        <thead>
+          <tr><th>Person</th><th>Award</th><th>Amount</th><th>Paid</th><th>From</th><th></th></tr>
+        </thead>
+        <tbody>
+          {approved.map((b: BonusRow) => (
+            <tr>
+              <td>{b.employeeName || 'Employee'}</td>
+              <td>{b.title}<span class="tag">{bonusKindLabel(b.kind)}</span></td>
+              <td>{money(b.amount, b.currency)}</td>
+              <td>{b.timesPaid} of {b.occurrences}</td>
+              <td>{MONTH_OPTIONS[b.effectiveMonth - 1]?.l} {b.effectiveYear}</td>
+              <td>
+                {b.timesPaid === 0 && (
+                  <form method="POST">
+                    <input type="hidden" name="action" value="cancel" />
+                    <input type="hidden" name="bonus_id" value={b.id} />
+                    <button type="submit" class="btn ghost small">Withdraw</button>
+                  </form>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )}
+
+  <h2>Settled</h2>
+  {settled.length === 0 ? (
+    <div class="empty">Nothing has been settled yet.</div>
+  ) : (
+    <div class="scroller">
+      <table class="grid">
+        <thead>
+          <tr><th>Person</th><th>Award</th><th>Amount</th><th>Total paid</th><th>Outcome</th><th>Raised</th></tr>
+        </thead>
+        <tbody>
+          {settled.map((b: BonusRow) => (
+            <tr>
+              <td>{b.employeeName || 'Employee'}</td>
+              <td>{b.title}</td>
+              <td>{money(b.amount, b.currency)}</td>
+              <td>{money(b.totalPaid, b.currency)}</td>
+              <td><span class="chip" style={'color:' + stateTone(b.state) + ';border-color:' + stateTone(b.state) + '55;'}>{bonusStateLabel(b.state)}</span></td>
+              <td>{fmtDate(b.createdAt)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 19px; color: #fff; font-weight: 700; overflow-wrap: anywhere; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin-bottom: 16px; }
+  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; }
+  .form { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  select[multiple] { min-height: 190px; }
+  textarea { min-height: 60px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; display: block; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.ok { background: #15803d; }
+  .btn.no { background: #b91c1c; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .btn.small { padding: 8px 12px; font-size: 12px; min-height: 44px; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .tag { font-size: 10px; color: #6e6e78; margin-left: 6px; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; white-space: pre-wrap; }
+  .halt { margin: 12px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #fde68a; line-height: 1.55; }
+  .waiting { margin: 12px 0 0; padding: 10px 12px; background: rgba(103,232,249,0.06); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .wl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .wn { font-size: 12.5px; color: #e8e8ee; margin: 0; }
+  .decide { display: grid; gap: 8px; margin-top: 12px; }
+  .inline { margin-top: 10px; }
+  .scroller { overflow-x: auto; -webkit-overflow-scrolling: touch; background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 8px 12px; }
+  table.grid { width: 100%; border-collapse: collapse; min-width: 640px; }
+  th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #6e6e78; padding: 8px 12px 8px 0; font-weight: 700; white-space: nowrap; }
+  td { font-size: 12.5px; color: #d8d8de; padding: 8px 12px 8px 0; border-top: 1px solid #1a1a1f; white-space: nowrap; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+</style>
+</AdminLayout>

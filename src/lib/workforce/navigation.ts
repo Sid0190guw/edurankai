@@ -453,6 +453,28 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'Signed in, then its own hr_employees lookup; payslipsForEmployee() narrows every row by employee_id. Individual payslips open at /portal/payslip/[id], which re-checks ownership.',
   },
   {
+    key: 'loans',
+    label: 'Loans and advances',
+    href: '/portal/employee/loans',
+    icon: 'book',
+    group: 'record',
+    // DRAWER ONLY, for the same reason Payslips is: the bar holds four tabs at 360px, and a person
+    // opens this when something prompts them to — a repayment showing on a payslip, or needing an
+    // advance — not with a thumb between meetings. Taking a tab from Tasks or Messages would be a
+    // worse trade than the extra tap.
+    bar: null,
+    // EXACTLY the page's own gate in the composition's vocabulary. loans.astro resolves an
+    // hr_employees row for the signed-in account and renders a named empty state when there is none;
+    // loansForEmployee() narrows every row by employee_id, and the POST handler takes the employee id
+    // from the SESSION rather than from the form, so there is no id to change in the address bar.
+    //
+    // NO CAPABILITY HERE, and there must not be one: an employee's account very often carries the
+    // `applicant` role, which holds nothing at all, and gating this on a permission would hide a
+    // person's own borrowing and their own repayments from them.
+    audience: (v) => v.ctx.hasEmployeeRecord,
+    gate: 'Signed in, then its own hr_employees lookup. Every read is narrowed by employee_id; requesting and withdrawing both resolve the employee from the session, never from the form.',
+  },
+  {
     key: 'contract',
     label: 'My contract',
     href: '/portal/employee/contract',
@@ -740,6 +762,21 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     // `knowledge.manage` would hide the leave policy from everybody it was written for.
     audience: worksHere,
     gate: 'Page: signed in. Contents: every read goes through visibilityClause() in src/lib/knowledge-base.ts, which narrows to articles for everyone with a workspace plus restricted ones whose named capability this person actually holds. Acknowledging a policy writes the SESSION user id, never a posted one.',
+  },
+  {
+    key: 'projects',
+    label: 'My projects',
+    href: '/portal/employee/projects',
+    icon: 'grid',
+    group: 'work',
+    bar: 19,
+    // hasEmployeeRecord, and NOT `worksHere` — the narrower of the two, for the same reason 'assets'
+    // uses it. Project membership is keyed on hr_employees.id, so an admin account with no employee
+    // row would open a page that can only say "nothing here". A capability would be wrong in the
+    // other direction: projects.view is the ORG-WIDE portfolio, and an employee needs nothing at all
+    // to see the projects they are on.
+    audience: (v) => v.ctx.hasEmployeeRecord,
+    gate: 'Page: requireEmployee, then listProjects() in src/lib/projects.ts, which puts the whole scope in the WHERE clause: the projects this person is a member of, the ones the Organization Graph records them as running, their department\'s if they head one, and everything only for a holder of projects.view. An empty graph renders "Organization Graph not yet initialized" rather than an empty list.',
   }
 ];
 
@@ -750,13 +787,12 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
 // ---------------------------------------------------------------------------------------------
 
 export const NAV_BACKLOG: readonly { key: string; reason: string }[] = [
-  {
-    key: 'projects',
-    reason:
-      'ABSENT. No projects table, no project_id and no projectId anywhere in src/ or db/ — employee_tasks ' +
-      'has no project relation. Grouping work by project is not answerable from this database, so there ' +
-      'is no route to link to and none may be invented.',
-  },
+  // NOTE FOR ANYONE LOOKING FOR 'projects' HERE: IT HAS SHIPPED, and its entry is in the list above.
+  // The finding that used to sit here — "no projects table, no project_id and no projectId anywhere in
+  // src/ or db/, employee_tasks has no project relation" — was accurate when it was written and is no
+  // longer true of any clause: src/lib/projects.ts carries the register, and employee_tasks.project_id
+  // is declared in src/lib/employee-tasks.ts, in the module that owns that table. src/lib/search-global.ts
+  // still returns the old honest note for its `projects` source and is a separate module's call to make.
   {
     key: 'calendar.meetings',
     reason:

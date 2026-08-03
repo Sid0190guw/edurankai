@@ -1320,6 +1320,11 @@ const MAX_PROBATION_EXTENSION_MONTHS = 6;
 export function ensureProbationDecisionSchema(): Promise<void> {
   return ensureOnce('hr_probation_decisions_v1', async () => {
     try {
+      // hr_probation MUST exist before a table can reference it. Awaited rather than assumed: on a
+      // fresh database the reference would otherwise fail, this guard would re-throw, and the console
+      // would read as permanently empty for a reason nothing on screen could explain.
+      await ensureLifecycleSchema();
+
       await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_probation_decisions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         probation_id UUID NOT NULL REFERENCES hr_probation(id) ON DELETE CASCADE,

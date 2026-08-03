@@ -1,0 +1,706 @@
+---
+// /admin/finance/invoices/[id] — ONE INVOICE, IN EITHER DIRECTION.
+//
+// This is where an invoice is priced, issued, approved for payment, paid and — when it has to be —
+// voided. Which of those the page offers depends on the DIRECTION and the STATE, because billing a
+// client and being billed are different acts:
+//
+//   RECEIVABLE   price the lines, apply the configured tax components, issue it, record what the
+//                client paid (in one payment or several), print the document.
+//   PAYABLE      check what the supplier charged, send it for PAYMENT APPROVAL through the workflow
+//                engine, and record the payment only once the engine says it was approved.
+//
+// NOTHING ON THIS PAGE APPROVES A PAYMENT. The approve and reject buttons post to decideInstance(),
+// which re-checks mayAct() against the POSTED instance id inside the engine — so a finance
+// administrator who is not the requester's manager, department head or executive sponsor sees the
+// chain and cannot decide it. That is the correct and deliberate outcome of keeping routing (Layer 1)
+// and authorization (Layer 2) apart, and no page gate can stand in for it.
+//
+// THE GATE: `invoices.view` OR the `finance` section at edit level — the same two arms as the
+// console, for the reason written out there. Raising, issuing and voiding need `invoices.manage`;
+// recording a payment needs `invoices.pay`, which is asked separately because moving money is its own
+// power.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import {
+  decideInstance,
+  resumeWorkflow,
+  escalateStep,
+  getInstance,
+  STATE_LABELS,
+  VIA_LABELS,
+  ACTED_VIA_LABELS,
+  type WorkflowInstanceView,
+} from '@/lib/workflow';
+import {
+  viewInvoice,
+  listTaxComponents,
+  addLine,
+  removeLine,
+  applyTaxComponents,
+  sendReceivable,
+  submitPayableForPayment,
+  recordPayment,
+  retryWalletCredit,
+  voidInvoice,
+  formatAmount,
+  statusLabel,
+  partyKindLabel,
+  paymentMethodLabel,
+  taxBasisLabel,
+  PAYMENT_METHODS,
+  type InvoiceView,
+  type TaxComponent,
+} from '@/lib/invoices';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+// -------------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted; a const declared under the POST handler that reads it
+// throws on that handler's first line while the page still reports success.
+// -------------------------------------------------------------------------------------------------
+const LIST = '/admin/finance/invoices';
+const invoiceId = String(Astro.params.id || '');
+const PAGE = LIST + '/' + invoiceId;
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function chipClass(display: string): string {
+  const key = String(display || '');
+  if (key === 'paid') return 'chip chip-ok';
+  if (key === 'part_paid') return 'chip chip-wait';
+  if (key === 'overdue') return 'chip chip-no';
+  if (key === 'void') return 'chip chip-void';
+  if (key === 'submitted') return 'chip chip-wait';
+  if (key === 'sent') return 'chip chip-sent';
+  return 'chip';
+}
+
+function stateWords(state: string): string {
+  const key = String(state || '');
+  if (key === 'draft') return STATE_LABELS.draft;
+  if (key === 'pending') return STATE_LABELS.pending;
+  if (key === 'approved') return STATE_LABELS.approved;
+  if (key === 'rejected') return STATE_LABELS.rejected;
+  if (key === 'cancelled') return STATE_LABELS.cancelled;
+  if (key === 'halted') return STATE_LABELS.halted;
+  return key;
+}
+
+function viaWords(via: string | null): string {
+  const key = String(via || '');
+  if (key === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (key === 'department_head') return VIA_LABELS.department_head;
+  if (key === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (key === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return key || 'Approver';
+}
+
+function actedViaWords(v: string | null): string {
+  const key = String(v || '');
+  if (key === 'routed') return ACTED_VIA_LABELS.routed;
+  if (key === 'delegate') return ACTED_VIA_LABELS.delegate;
+  if (key === 'capability') return ACTED_VIA_LABELS.capability;
+  return '';
+}
+
+// THE GATE.
+const financeDesk = await canAccessSection(user, 'finance', 'edit');
+const mayView = can(user as any, 'invoices.view') || financeDesk;
+if (!mayView) return Astro.redirect('/admin');
+const mayManage = can(user as any, 'invoices.manage') || financeDesk;
+/** MOVING MONEY IS ITS OWN POWER — the same split as payouts.approve / payouts.pay. */
+const mayPay = can(user as any, 'invoices.pay') || financeDesk;
+
+// -------------------------------------------------------------------------------------------------
+// WRITES. Every one re-reads the invoice inside the module it calls, against the POSTED id — this
+// page decides what to OFFER, never what may be done.
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+
+  if (action === 'decide') {
+    // NOT gated by mayManage. The engine decides this one, per row, against the posted id: being able
+    // to open this page is not being able to approve a payment, and a page-level gate here would be
+    // exactly the per-user reach that per-row routing exists to remove.
+    const decision = String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected';
+    const r = await decideInstance(String(fd.get('instanceId') || ''), user, decision, String(fd.get('note') || ''));
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not record that decision.');
+    else if (r.changed === false) flash = 'That was already recorded. Nothing changed.';
+    else flash = 'Decision recorded. The payment approval is now ' + stateWords(String(r.state || '')).toLowerCase() + '.';
+  } else if (action === 'payment') {
+    if (!mayPay) {
+      flash = 'Recording a payment is a separate permission from raising invoices.';
+    } else {
+      const r = await recordPayment({
+        invoiceId,
+        amount: String(fd.get('amount') || ''),
+        paidOn: String(fd.get('paid_on') || ''),
+        method: String(fd.get('method') || 'bank'),
+        reference: String(fd.get('reference') || ''),
+        note: String(fd.get('note') || ''),
+      }, String(user.id));
+      if (!r.ok) flash = 'Error: ' + (r.error || 'Could not record that payment.');
+      else flash = r.warning || 'Payment recorded.';
+    }
+  } else if (action === 'wallet-retry') {
+    if (!mayPay) flash = 'Recording a payment is a separate permission from raising invoices.';
+    else {
+      const r = await retryWalletCredit(String(fd.get('paymentId') || ''), String(user.id));
+      if (!r.ok) flash = 'Error: ' + (r.error || 'Could not credit the wallet.');
+      else if (r.changed === false) flash = 'That payment was already credited to the wallet. Nothing changed.';
+      else flash = 'Wallet credited.';
+    }
+  } else if (!mayManage) {
+    flash = 'You can read this invoice, but changing it is a separate permission.';
+  } else if (action === 'add-line') {
+    const r = await addLine(invoiceId, {
+      description: String(fd.get('description') || ''),
+      quantity: String(fd.get('quantity') || ''),
+      unit: String(fd.get('unit') || ''),
+      rate: String(fd.get('rate') || ''),
+    }, String(user.id));
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not add that line.');
+    else flash = r.warning || 'Line added.';
+  } else if (action === 'remove-line') {
+    const r = await removeLine(invoiceId, String(fd.get('lineId') || ''), String(user.id));
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not remove that line.');
+    else if (r.changed === false) flash = 'That line was already gone. Nothing changed.';
+    else flash = 'Line removed.';
+  } else if (action === 'apply-tax') {
+    const codes = fd.getAll('tax_code').map((c) => String(c || ''));
+    const r = await applyTaxComponents(invoiceId, codes, String(user.id));
+    flash = r.ok ? 'Tax components applied.' : 'Error: ' + (r.error || 'Could not apply those components.');
+  } else if (action === 'issue') {
+    const r = await sendReceivable(invoiceId, String(user.id));
+    flash = r.ok
+      ? 'Invoice issued. Print or download the document to send it - this platform records that it was issued, it does not post it.'
+      : 'Error: ' + (r.error || 'Could not issue that invoice.');
+  } else if (action === 'submit') {
+    const r = await submitPayableForPayment(invoiceId, String(user.id));
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not send that for approval.');
+    else if (r.haltReason) flash = 'Halted: ' + r.haltReason + ' Nothing was approved and nothing is payable.';
+    else if (r.changed === false) flash = 'It was already sent for approval. Nothing changed.';
+    else flash = 'Sent for payment approval.';
+  } else if (action === 'void') {
+    const r = await voidInvoice(invoiceId, String(user.id), String(fd.get('reason') || ''));
+    flash = r.ok ? 'Invoice voided. It stays on the record with the reason.' : 'Error: ' + (r.error || 'Could not void that invoice.');
+  } else if (action === 'resume') {
+    const r = await resumeWorkflow(String(fd.get('instanceId') || ''), user);
+    flash = r.ok ? 'Re-routed. It is waiting for approval again.' : 'Still halted: ' + (r.error || '');
+  } else if (action === 'escalate') {
+    const r = await escalateStep(String(fd.get('stepId') || ''), user);
+    flash = r.ok
+      ? 'Escalated. The next person up can now approve it as well.'
+      : 'Not escalated: ' + (r.error || '');
+  }
+
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash));
+}
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+const view: InvoiceView | null = await viewInvoice(invoiceId);
+if (!view) return Astro.redirect(LIST + '?msg=' + encodeURIComponent('That invoice is not available.'));
+
+const inv = view.invoice;
+const isReceivable = inv.direction === 'receivable';
+const isDraft = inv.status === 'draft';
+const isVoid = inv.status === 'void';
+
+const components: TaxComponent[] = isDraft ? await listTaxComponents(false) : [];
+const appliedCodes = view.taxLines.map((t) => t.code);
+
+// The pay approval WITH its steps, for a payable that has been submitted. One extra query, only when
+// there is an instance to read.
+let chain: WorkflowInstanceView | null = null;
+if (view.instance) chain = await getInstance(view.instance.id);
+
+const todayIso = new Date().toISOString().slice(0, 10);
+const payable = !isReceivable;
+const approvedToPay = chain !== null && chain.state === 'approved';
+const canRecordPayment = !isVoid && !isDraft && view.balance > 0 && (isReceivable || approvedToPay);
+---
+<AdminLayout title={inv.invoiceNumber} activeNav="invoices">
+  <div class="admin-page inv-page">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Finance · Invoicing</div>
+      <h1 class="admin-page-title">{inv.invoiceNumber}</h1>
+      <p class="admin-page-sub">
+        {isReceivable ? 'We bill them.' : 'They bill us.'}
+        {' '}
+        {isReceivable
+          ? (inv.partyName || 'No addressee recorded')
+          : (inv.vendorName || inv.partyName || 'No supplier recorded')}
+        {inv.vendorInvoiceRef ? ' · their number ' + inv.vendorInvoiceRef : ''}
+      </p>
+    </div></div>
+
+    {msg && <div class="flash">{msg}</div>}
+
+    <div class="head">
+      <span class={chipClass(view.display)}>{statusLabel(inv.direction, view.display)}</span>
+      <span class="head-m">Issued {fmtDate(inv.issueDate)}</span>
+      {inv.dueDate && <span class="head-m">Due {fmtDate(inv.dueDate)}</span>}
+      <a class="ext" href={LIST + '/print/' + inv.id} target="_blank" rel="noopener noreferrer">Printable document</a>
+      <a class="ext" href={LIST}>All invoices</a>
+    </div>
+
+    {isVoid && (
+      <div class="banner banner-warn">
+        <div>
+          <strong>Void.</strong>
+          <p>
+            {inv.voidReason || 'No reason was recorded.'}
+            {inv.voidedAt ? ' Voided ' + fmtDate(inv.voidedAt) + '.' : ''}
+            {' '}This record is kept deliberately: an invoice that existed is part of the history even
+            when it no longer counts, and nothing in this module deletes one.
+          </p>
+        </div>
+      </div>
+    )}
+
+    <div class="cards">
+      <div class="card">
+        <p class="card-l">Total</p>
+        <p class="card-n">{formatAmount(inv.total, inv.currency)}</p>
+        <p class="card-s">{formatAmount(inv.subtotal, inv.currency)} + {formatAmount(inv.taxTotal, inv.currency)} tax</p>
+      </div>
+      <div class="card">
+        <p class="card-l">Paid</p>
+        <p class="card-n">{formatAmount(view.paidTotal, inv.currency)}</p>
+        <p class="card-s">{view.payments.length} payment{view.payments.length === 1 ? '' : 's'} recorded</p>
+      </div>
+      <div class="card">
+        <p class="card-l">Balance</p>
+        <p class="card-n">{formatAmount(view.balance, inv.currency)}</p>
+        <p class="card-s">{view.balance > 0 ? 'Still outstanding' : 'Nothing outstanding'}</p>
+      </div>
+    </div>
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Lines · {view.lines.length}</h2>
+    {isDraft
+      ? <p class="sec-note">Lines can be changed while this is a draft. Once it is issued or sent for
+          payment approval they are fixed - editing what somebody was asked to agree to, behind their
+          back, is not an edit.</p>
+      : <p class="sec-note">This invoice has been {statusLabel(inv.direction, inv.status).toLowerCase()},
+          so its lines are fixed. A change means voiding it and raising a corrected one.</p>}
+
+    {view.lines.length === 0 && <p class="empty">No lines yet. An invoice with no lines cannot be issued.</p>}
+    {view.lines.length > 0 && (
+      <div class="tablewrap">
+        <table class="tbl">
+          <thead>
+            <tr><th>Description</th><th class="num">Qty</th><th class="num">Rate</th><th class="num">Amount</th><th></th></tr>
+          </thead>
+          <tbody>
+            {view.lines.map((l) => (
+              <tr>
+                <td>{l.description}</td>
+                <td class="num">{l.quantity}{l.unit ? ' ' + l.unit : ''}</td>
+                <td class="num">{formatAmount(l.rate, inv.currency)}</td>
+                <td class="num">{formatAmount(l.amount, inv.currency)}</td>
+                <td class="num">
+                  {mayManage && isDraft && (
+                    <form method="POST">
+                      <input type="hidden" name="action" value="remove-line"/>
+                      <input type="hidden" name="lineId" value={l.id}/>
+                      <button class="btn btn-thin" type="submit">Remove</button>
+                    </form>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {view.taxLines.map((t) => (
+              <tr class="taxrow">
+                <td colspan="3">
+                  {t.label}
+                  {t.basis === 'percent_of_subtotal' ? ' · ' + t.value + '% of subtotal' : ' · ' + taxBasisLabel(t.basis)}
+                </td>
+                <td class="num">{formatAmount(t.amount, inv.currency)}</td>
+                <td></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    {mayManage && isDraft && (
+      <form method="POST" class="grid-form">
+        <input type="hidden" name="action" value="add-line"/>
+        <label class="fl fl-wide">Description<input class="fi" name="description" required placeholder="What is being charged for"/></label>
+        <label class="fl">Quantity<input class="fi" name="quantity" type="number" min="0" step="0.001" value="1" required/></label>
+        <label class="fl">Unit<input class="fi" name="unit" placeholder="hours, licences, months"/></label>
+        <label class="fl">Rate ({inv.currency})<input class="fi" name="rate" type="number" min="0" step="0.01" required/></label>
+        <button class="btn btn-go" type="submit">Add line</button>
+      </form>
+    )}
+
+    <!-- ===================================================================================== -->
+    {mayManage && isDraft && (
+      <div class="taxbox">
+        <h2 class="sec">Tax components</h2>
+        <p class="sec-note">
+          These are the components this organisation has CONFIGURED - a label and a rate somebody
+          recorded, applied to the subtotal. This product ships none and asserts none: what you tick
+          here is printed with the label and rate you chose, and nothing on the document claims
+          compliance with any tax authority. The values are copied onto this invoice when applied, so
+          editing a component later does not restate what this one said.
+        </p>
+        {components.length === 0 && (
+          <p class="empty">
+            No tax components are configured. This invoice will total its lines with no tax line at
+            all. Add components under <a class="ext" href="/admin/finance/invoices/settings">Numbering and tax</a>.
+          </p>
+        )}
+        {components.length > 0 && (
+          <form method="POST">
+            <input type="hidden" name="action" value="apply-tax"/>
+            <div class="checks">
+              {components.map((c) => (
+                <label class="check">
+                  <input type="checkbox" name="tax_code" value={c.code} checked={appliedCodes.indexOf(c.code) >= 0}/>
+                  <span>
+                    {c.label}
+                    {c.basis === 'percent_of_subtotal' ? ' · ' + c.value + '%' : ' · ' + formatAmount(c.value, inv.currency)}
+                  </span>
+                </label>
+              ))}
+            </div>
+            <button class="btn btn-go" type="submit">Apply to this invoice</button>
+          </form>
+        )}
+      </div>
+    )}
+
+    <!-- ===================================================================================== -->
+    {payable && (
+      <div>
+        <h2 class="sec">Payment approval</h2>
+        {!chain && (
+          <p class="sec-note">
+            This bill has not been sent for payment approval yet, so nothing may be paid against it.
+            Approval is routed from the Organization Graph for the employee whose purchase caused it -
+            their reporting manager first, then the department head and the procurement approval owner,
+            and an executive sponsor above the amount on the chain. Nobody is chosen here.
+          </p>
+        )}
+        {chain && (
+          <div class="card-block">
+            <div class="card-title">
+              {chain.summary || 'Payment approval'}
+              <span class={chain.state === 'approved' ? 'chip chip-ok' : chain.state === 'rejected' ? 'chip chip-no' : chain.state === 'halted' ? 'chip chip-halt' : 'chip chip-wait'}>
+                {stateWords(chain.state)}
+              </span>
+            </div>
+            <div class="card-sub">
+              Raised {fmtDate(chain.createdAt)}
+              {chain.amount !== null ? ' · ' + formatAmount(chain.amount, chain.currency) : ''}
+              {chain.settledAt ? ' · settled ' + fmtDate(chain.settledAt) : ''}
+            </div>
+
+            {chain.haltReason && chain.state === 'halted' && (
+              <div class="halt">
+                <strong>Halted.</strong> {chain.haltReason}
+                <span class="halt-note">
+                  Nothing was approved and nothing may be paid. Record the missing relationship in the
+                  Organization Graph, then resume - the approval carries on from where it stopped.
+                </span>
+              </div>
+            )}
+
+            <ol class="steps">
+              {chain.steps.map((s) => (
+                <li class={'step step-' + s.decision}>
+                  <span class="step-n">{s.stepNo}</span>
+                  <span class="step-body">
+                    <span class="step-who">{viaWords(s.via)} · {s.approverName || 'Unnamed'}</span>
+                    <span class="step-meta">
+                      {s.decision === 'pending' ? 'Waiting' : stateWords(s.decision) || s.decision}
+                      {s.decidedAt ? ' · ' + fmtDate(s.decidedAt) : ''}
+                      {s.actedVia ? ' · ' + actedViaWords(s.actedVia) : ''}
+                      {s.escalatedFromStepId ? ' · added by escalation' : ''}
+                      {s.mode === 'parallel' ? ' · parallel' : ''}
+                      {s.mode === 'executive' ? ' · executive' : ''}
+                    </span>
+                    {s.note && <span class="step-note">{s.note}</span>}
+                  </span>
+                  {mayManage && s.decision === 'pending' && chain.state === 'pending' && s.stepNo === chain.currentStep && (
+                    <form method="POST" class="step-form">
+                      <input type="hidden" name="action" value="escalate"/>
+                      <input type="hidden" name="stepId" value={s.id}/>
+                      <button class="btn btn-thin" type="submit">Escalate</button>
+                    </form>
+                  )}
+                </li>
+              ))}
+            </ol>
+
+            {chain.state === 'pending' && (
+              <form method="POST" class="inline-form">
+                <input type="hidden" name="action" value="decide"/>
+                <input type="hidden" name="instanceId" value={chain.id}/>
+                <input class="fi" name="note" placeholder="note (optional)"/>
+                <button class="btn btn-ok" name="decision" value="approved" type="submit">Approve payment</button>
+                <button class="btn btn-no" name="decision" value="rejected" type="submit">Reject</button>
+                <span class="tiny">Only works if this bill was routed to you, or you are standing in for whoever it was.</span>
+              </form>
+            )}
+
+            {mayManage && chain.state === 'halted' && (
+              <form method="POST" class="inline-form">
+                <input type="hidden" name="action" value="resume"/>
+                <input type="hidden" name="instanceId" value={chain.id}/>
+                <button class="btn btn-go" type="submit">Resume routing</button>
+              </form>
+            )}
+          </div>
+        )}
+      </div>
+    )}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Payments · {view.payments.length}</h2>
+    {view.payments.length === 0 && <p class="empty">Nothing has been recorded as paid.</p>}
+    {view.payments.length > 0 && (
+      <div class="tablewrap">
+        <table class="tbl">
+          <thead><tr><th>Date</th><th>Method</th><th>Reference</th><th class="num">Amount</th><th></th></tr></thead>
+          <tbody>
+            {view.payments.map((p) => (
+              <tr>
+                <td>{fmtDate(p.paidOn)}</td>
+                <td>{paymentMethodLabel(p.method)}</td>
+                <td>{p.reference || ''}{p.note ? ' · ' + p.note : ''}</td>
+                <td class="num">{formatAmount(p.amount, p.currency)}</td>
+                <td class="num">
+                  {p.method === 'wallet' && !p.walletCredited && mayPay && (
+                    <form method="POST">
+                      <input type="hidden" name="action" value="wallet-retry"/>
+                      <input type="hidden" name="paymentId" value={p.id}/>
+                      <button class="btn btn-thin" type="submit">Retry wallet credit</button>
+                    </form>
+                  )}
+                  {p.method === 'wallet' && p.walletCredited && <span class="tiny">Wallet credited</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    {canRecordPayment && mayPay && (
+      <form method="POST" class="grid-form">
+        <input type="hidden" name="action" value="payment"/>
+        <label class="fl">Amount ({inv.currency})<input class="fi" name="amount" type="number" min="0.01" step="0.01" required placeholder={String(view.balance)}/></label>
+        <label class="fl">Date<input class="fi" name="paid_on" type="date" value={todayIso}/></label>
+        <label class="fl">Method
+          <select class="fi" name="method">
+            {PAYMENT_METHODS.map((m) => <option value={m}>{paymentMethodLabel(m)}</option>)}
+          </select>
+        </label>
+        <label class="fl">Reference<input class="fi" name="reference" placeholder="Transaction or cheque reference"/></label>
+        <label class="fl fl-wide">Note<input class="fi" name="note" placeholder="Anything worth reading later"/></label>
+        <button class="btn btn-ok" type="submit">Record payment</button>
+      </form>
+    )}
+    {payable && !approvedToPay && !isVoid && (
+      <p class="sec-note">
+        No payment can be recorded against this bill until the workflow engine says the payment was
+        approved. That is checked again at the moment of the write, not when this page was drawn.
+      </p>
+    )}
+    {canRecordPayment && !mayPay && (
+      <p class="sec-note">Recording a payment needs the separate payment permission.</p>
+    )}
+    {inv.payeeEmployeeId && (
+      <p class="sec-note">
+        This bill is payable to {inv.payeeName || 'an employee'}. Choosing the employee-wallet method
+        credits the existing employee wallet ledger - the same one payroll and expense claims use -
+        and never a second ledger of this module's own.
+      </p>
+    )}
+
+    <!-- ===================================================================================== -->
+    {mayManage && !isVoid && (
+      <div class="actions">
+        {isReceivable && isDraft && (
+          <form method="POST" class="inline-form">
+            <input type="hidden" name="action" value="issue"/>
+            <button class="btn btn-ok" type="submit">Issue this invoice</button>
+            <span class="tiny">
+              Records that it was issued today and fixes its lines. It does not send an email - print
+              the document and send it yourself.
+            </span>
+          </form>
+        )}
+        {payable && isDraft && (
+          <form method="POST" class="inline-form">
+            <input type="hidden" name="action" value="submit"/>
+            <button class="btn btn-ok" type="submit">Send for payment approval</button>
+            <span class="tiny">
+              Routes it from the Organization Graph. If no approver can be named it halts with the
+              reason and nothing is approved by default.
+            </span>
+          </form>
+        )}
+        <form method="POST" class="inline-form">
+          <input type="hidden" name="action" value="void"/>
+          <input class="fi" name="reason" placeholder="Why this invoice is being voided" required/>
+          <button class="btn btn-no" type="submit">Void</button>
+          <span class="tiny">
+            Kept on the record with the reason. There is no delete, and an invoice with a payment
+            recorded against it cannot be voided at all.
+          </span>
+        </form>
+      </div>
+    )}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">Details</h2>
+    <dl class="details">
+      <div><dt>Number</dt><dd>{inv.invoiceNumber}</dd></div>
+      <div><dt>Direction</dt><dd>{isReceivable ? 'We bill them' : 'They bill us'}</dd></div>
+      <div><dt>Currency</dt><dd>{inv.currency}</dd></div>
+      {isReceivable && inv.partyKind && <div><dt>They are a</dt><dd>{partyKindLabel(inv.partyKind)}</dd></div>}
+      {isReceivable && inv.partyEmail && <div><dt>Email</dt><dd>{inv.partyEmail}</dd></div>}
+      {isReceivable && inv.partyAddress && <div><dt>Address</dt><dd>{inv.partyAddress}</dd></div>}
+      {isReceivable && inv.partyTaxReference && <div><dt>Tax reference</dt><dd>{inv.partyTaxReference}</dd></div>}
+      {isReceivable && inv.partyReference && <div><dt>Their reference</dt><dd>{inv.partyReference}</dd></div>}
+      {!isReceivable && inv.vendorInvoiceRef && <div><dt>Their invoice number</dt><dd>{inv.vendorInvoiceRef}</dd></div>}
+      {!isReceivable && inv.purchaseRequestId && (
+        <div><dt>Purchase request</dt><dd><a class="ext" href="/admin/procurement">Open the purchasing console</a></dd></div>
+      )}
+      {inv.attachmentUrl && (
+        <div><dt>Their document</dt><dd><a class="ext" href={inv.attachmentUrl} target="_blank" rel="noopener noreferrer">Open the link</a></dd></div>
+      )}
+      {inv.notes && <div><dt>Note</dt><dd>{inv.notes}</dd></div>}
+      {inv.terms && <div><dt>Terms</dt><dd>{inv.terms}</dd></div>}
+      <div><dt>Created</dt><dd>{fmtDate(inv.createdAt)}</dd></div>
+    </dl>
+  </div>
+
+  <style>
+    /* MOBILE FIRST — the base rules are the 360px rules. Wide tables scroll inside their own
+       container; the page itself never scrolls sideways. */
+    .inv-page{ max-width:1040px; }
+    .flash{ margin:0 0 16px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3);
+      color:#6ee7b7; border-radius:8px; padding:10px 14px; font-size:13px; overflow-wrap:anywhere; }
+
+    .head{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:0 0 16px; font-size:12.5px;
+      color:#8a8a94; }
+    .head-m{ overflow-wrap:anywhere; }
+
+    .banner{ display:flex; gap:12px; align-items:flex-start; border-radius:10px; padding:14px;
+      margin:0 0 18px; font-size:13px; line-height:1.5; }
+    .banner-warn{ background:rgba(234,179,8,0.08); border:1px solid rgba(234,179,8,0.35); color:#fde68a; }
+    .banner p{ margin:6px 0 0; color:#d8d2bd; }
+
+    .cards{ display:flex; flex-wrap:wrap; gap:8px; margin:0 0 18px; }
+    .card{ flex:1 1 150px; min-width:0; background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px;
+      padding:12px 14px; }
+    .card-l{ font-size:10px; color:#8a8a94; text-transform:uppercase; letter-spacing:0.09em; }
+    .card-n{ font-family:'Geist Mono',monospace; font-size:19px; font-weight:700; color:#fff; margin-top:4px;
+      overflow-wrap:anywhere; }
+    .card-s{ font-size:11.5px; color:#8a8a94; margin-top:3px; }
+
+    .sec{ font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:0.16em; text-transform:uppercase;
+      color:#c2410c; font-weight:700; margin:26px 0 6px; }
+    .sec-note{ font-size:12.5px; color:#8a8a94; margin:0 0 12px; line-height:1.6; overflow-wrap:anywhere; }
+    .empty{ color:#8a8a94; font-size:13px; margin:0 0 18px; }
+    .tiny{ font-size:11.5px; color:#8a8a94; line-height:1.5; }
+    .ext{ color:#f97316; overflow-wrap:anywhere; }
+
+    .tablewrap{ overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid #1a1a1f;
+      border-radius:10px; background:#0f0f14; margin-bottom:14px; }
+    .tbl{ width:100%; border-collapse:collapse; font-size:12.5px; min-width:560px; }
+    .tbl th{ text-align:left; color:#8a8a94; font-size:10px; text-transform:uppercase; letter-spacing:0.08em;
+      padding:9px 10px; border-bottom:1px solid #1a1a1f; white-space:nowrap; }
+    .tbl td{ padding:9px 10px; border-bottom:1px solid #151519; color:#cfd6da; vertical-align:top; }
+    .tbl td.num, .tbl th.num{ text-align:right; white-space:nowrap; font-family:'Geist Mono',monospace; }
+    .taxrow td{ color:#8a8a94; }
+
+    .grid-form{ display:grid; grid-template-columns:1fr; gap:8px; width:100%; margin:0 0 18px; }
+    .inline-form{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; width:100%; margin:0 0 12px; }
+    .fl{ display:flex; flex-direction:column; gap:4px; font-size:11px; color:#8a8a94;
+      text-transform:uppercase; letter-spacing:0.06em; min-width:0; }
+    .fi{ background:#08080b; border:1px solid #262630; border-radius:7px; padding:11px 10px; color:#fff;
+      font-size:13px; outline:none; font-family:inherit; min-width:0; width:100%; flex:1 1 160px;
+      text-transform:none; letter-spacing:0; }
+    /* 44px minimum touch target, every control. */
+    .btn{ border:none; border-radius:7px; padding:0 16px; min-height:44px; color:#fff; font-size:12px;
+      font-weight:700; cursor:pointer; font-family:'Geist Mono',monospace; white-space:nowrap; }
+    .btn-ok{ background:#22c07e; }
+    .btn-no{ background:transparent; border:1px solid #444; color:#fca5a5; }
+    .btn-go{ background:#c2410c; }
+    .btn-thin{ background:transparent; border:1px solid #333; color:#cfd6da; font-size:11px;
+      min-height:36px; padding:0 10px; }
+
+    .taxbox{ background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px; padding:12px 14px;
+      margin-bottom:14px; }
+    .checks{ display:flex; flex-direction:column; gap:8px; margin:0 0 12px; }
+    .check{ display:flex; gap:9px; align-items:center; font-size:13px; color:#cfd6da; min-height:44px; }
+    .check input{ width:20px; height:20px; flex:0 0 auto; }
+
+    .card-block{ background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px; padding:12px 14px;
+      margin-bottom:12px; }
+    .card-title{ color:#fff; font-weight:700; font-size:14px; display:flex; flex-wrap:wrap; gap:8px;
+      align-items:center; overflow-wrap:anywhere; }
+    .card-sub{ color:#8a8a94; font-size:12px; margin-top:3px; line-height:1.5; }
+
+    .chip{ font-family:'Geist Mono',monospace; font-size:10px; font-weight:700; text-transform:uppercase;
+      letter-spacing:0.08em; border-radius:999px; padding:3px 9px; background:#1a1a1f; color:#8a8a94;
+      display:inline-block; white-space:nowrap; }
+    .chip-ok{ background:rgba(34,192,126,0.15); color:#86efac; }
+    .chip-no{ background:rgba(248,113,113,0.12); color:#fca5a5; }
+    .chip-wait{ background:rgba(249,115,22,0.14); color:#fdba74; }
+    .chip-sent{ background:rgba(59,130,246,0.14); color:#93c5fd; }
+    .chip-void{ background:rgba(148,163,184,0.14); color:#cbd5e1; }
+    .chip-halt{ background:rgba(234,179,8,0.14); color:#fde68a; }
+
+    .halt{ margin-top:10px; background:rgba(234,179,8,0.07); border:1px solid rgba(234,179,8,0.28);
+      border-radius:8px; padding:10px 12px; font-size:12.5px; color:#fde68a; line-height:1.55;
+      overflow-wrap:anywhere; }
+    .halt-note{ display:block; color:#a9a496; margin-top:5px; }
+
+    .steps{ list-style:none; margin:12px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+    .step{ display:flex; gap:10px; align-items:flex-start; background:#0b0b0f; border:1px solid #17171c;
+      border-radius:8px; padding:9px 11px; flex-wrap:wrap; }
+    .step-approved{ border-color:rgba(34,192,126,0.25); }
+    .step-rejected{ border-color:rgba(248,113,113,0.25); }
+    .step-n{ font-family:'Geist Mono',monospace; font-size:10px; color:#8a8a94; border:1px solid #2a2a33;
+      border-radius:4px; padding:1px 6px; flex:0 0 auto; margin-top:2px; }
+    .step-body{ flex:1 1 180px; min-width:0; display:flex; flex-direction:column; gap:2px;
+      overflow-wrap:anywhere; }
+    .step-who{ color:#e8e8ea; font-size:13px; font-weight:600; }
+    .step-meta{ color:#8a8a94; font-size:11.5px; }
+    .step-note{ color:#a8a8b0; font-size:12px; font-style:italic; }
+    .step-form{ flex:0 0 auto; }
+
+    .actions{ margin:18px 0 0; }
+    .details{ margin:0; display:flex; flex-direction:column; gap:8px; }
+    .details div{ display:flex; flex-wrap:wrap; gap:8px; border-bottom:1px solid #151519; padding-bottom:7px; }
+    .details dt{ font-size:11px; color:#8a8a94; text-transform:uppercase; letter-spacing:0.07em;
+      flex:0 0 150px; }
+    .details dd{ margin:0; font-size:13px; color:#cfd6da; flex:1 1 180px; min-width:0;
+      overflow-wrap:anywhere; }
+
+    @media (min-width:620px){
+      .grid-form{ grid-template-columns:repeat(2, minmax(0, 1fr)); align-items:end; }
+      .fl-wide{ grid-column:1 / -1; }
+    }
+  </style>
+</AdminLayout>

@@ -101,12 +101,14 @@ Two ways this codebase reads configuration, and they behave completely different
 | `import.meta.env.X` | At **build time** — Vite substitutes a literal into the bundle | **No effect until you redeploy.** The old value is frozen into the shipped code. |
 
 This is not theoretical. After a build, the literal string `import.meta.env` does not appear anywhere
-in `dist/` — every occurrence has already been replaced. You can confirm it yourself:
+in the output — every occurrence has already been replaced by a literal value. `process.env.X` is
+still there, because it is still read at runtime. Confirm it yourself on a fresh build:
 
 ```bash
 cd /c/Users/user/Projects/edurankai-phase36
-grep -rl "import\.meta\.env" dist/ | wc -l      # -> 0
-grep -rl "process\.env\.CRON_SECRET" dist/ | wc -l   # -> 13 (still read at runtime)
+npm run build                                        # dist/ is cleared and rewritten
+grep -rl "import\.meta\.env" dist/ | wc -l           # -> 0   (all substituted at build time)
+grep -rl "process\.env\.CRON_SECRET" dist/ | wc -l   # -> >0  (still read per invocation)
 ```
 
 **The operational rule: after changing ANY environment variable on Vercel, redeploy.** Waiting does
@@ -322,19 +324,28 @@ reports `known: false` rather than guessing when the variable is absent. The int
 
 ```bash
 curl -s https://edurankai.in/api/health | head -c 400
-#   -> {"status":"ok", ... "release":{"shortCommit":"e27c6a4","ref":"main","environment":"production", ...}}
+#   -> {"status":"ok", ... "release":{"commit":"e27c6a4","ref":"main","environment":"production", ...}}
 ```
 
-`release.shortCommit` must equal the first 7 characters of the SHA from step 1.
+**The field is `release.commit`, and it already holds the SHORT sha.** It is built in
+`src/pages/api/health.ts` from the marker's `shortCommit`, so grepping the response for
+`shortCommit` finds nothing and reads as "the health route did not ship". `release.commit` must
+equal the first 7 characters of the SHA from step 1.
 
-`/api/health` is unauthenticated by design and deliberately thin — reachability, latency, module
-names and the serving commit. It runs exactly two SQL statements, no DDL and no writes, so it is safe
-to poll. It returns **503** when the database is unreachable, which is the only way an external
-monitor can see an outage. `HEAD /api/health` returns the status code with no body.
+`/api/health` is unauthenticated by design and deliberately thin — reachability, latency, how many
+module schemas have run, and the serving commit. It runs exactly two SQL statements, no DDL and no
+writes, so it is safe to poll. It returns **503** when the database is unreachable, which is the only
+way an external monitor can see an outage. `HEAD /api/health` returns the status code with no body.
+
+Because that body is public it is scrubbed: the database error is reduced to its failure class with
+hostnames, addresses, ports and quoted identifiers replaced, and missing module tables are reported
+as a count rather than by name. Full fidelity lives behind the capability.
 
 `/api/health/deep` reports the same plus configuration-disclosing signals (mail host, pool
-internals, queue, cron history). It is gated on `administer` on the platform and fails closed: 401
-unauthenticated, 403 without the capability. It is **not** the endpoint to poll.
+internals, queue, cron history) and the unscrubbed reason. It is gated on `administer` on the
+platform and fails closed: 401 unauthenticated, 403 without the capability. It is **not** the
+endpoint to poll — and because that gate resolves the principal from the database, it is also
+unreachable during a database outage. In that case use `vercel inspect <deployment-url> --logs`.
 
 > **Confirm the route exists on the deployment you are testing.** These routes are recent
 > (`src/pages/api/health.ts`, `src/pages/api/health/deep.ts`, `src/pages/admin/ops/index.astro`) and

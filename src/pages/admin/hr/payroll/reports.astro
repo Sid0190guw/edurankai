@@ -1,0 +1,273 @@
+---
+// /admin/hr/payroll/reports — WHAT PAYROLL COST, AGGREGATED.
+//
+// EVERY FIGURE ON THIS PAGE IS A TOTAL. There is no row per person anywhere on it, and none may be
+// added: a screen listing forty salaries is a screen that gets left open on a laptop in a meeting
+// room, and the number beside somebody's name is not the reader's to have merely because they can
+// run payroll.
+//
+// DEPARTMENTS BELOW THE SUPPRESSION FLOOR ARE NAMED BUT NOT PRICED. A department of one has an
+// "aggregate" that IS that person's salary, and a department of two has one either of them can
+// subtract themselves out of. Those rows still appear, with their headcount and the word withheld,
+// because "withheld" and "no payroll at all" are different facts and the reader must be able to tell
+// which one they are looking at.
+//
+// THE REGISTER IS AN EXPORT, NOT A SCREEN. A payroll register is per person by definition — it is
+// the document handed to whoever moves the money. So it downloads as a CSV, on a deliberate press,
+// and src/lib/payroll-reports.ts writes an audit entry naming who took it and for which run.
+// Downloading a file is an act; scrolling past a list is not.
+//
+// NO COMPLIANCE CLAIM IS MADE ANYWHERE HERE. These are sums of what was written on payslips.
+//
+// THE GATE. `payroll.manage` through can(), the same key the payroll screens beside it use.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import {
+  listRuns, runTotals, departmentTotals, monthlyTotals, payrollYears, registerCsv,
+  MIN_DEPARTMENT_GROUP,
+} from '@/lib/payroll-reports';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'payroll.manage')) return Astro.redirect('/admin?denied=payroll');
+
+// EVERY const BEFORE the branch that reads it. `const` is not hoisted.
+const url = new URL(Astro.request.url);
+const wantExport = url.searchParams.get('export') === 'register';
+const runParam = url.searchParams.get('run') || '';
+const yearParam = Number(url.searchParams.get('year') || 0);
+
+const money = (n: any, cur: string) =>
+  (cur || 'INR') + ' ' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+
+const money2 = (n: any, cur: string) =>
+  (cur || 'INR') + ' ' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// THE EXPORT BRANCH, BEFORE ANY RENDERING. It returns a file rather than a page, so it has to leave
+// before the template runs.
+if (wantExport) {
+  const file = await registerCsv(runParam, String(user.id));
+  if (!file) {
+    return new Response(
+      'That payroll run could not be read, so no register was produced. Nothing was exported.',
+      { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+    );
+  }
+  return new Response(file.csv, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="' + file.filename + '"',
+      // A payroll register must never sit in a shared cache.
+      'Cache-Control': 'no-store, max-age=0',
+    },
+  });
+}
+
+const runs = await listRuns(36);
+const years = await payrollYears();
+const selectedRunId = runParam || (runs.length ? runs[0].id : '');
+const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
+const totals = selectedRunId ? await runTotals(selectedRunId) : null;
+const byDepartment = selectedRunId ? await departmentTotals(selectedRunId) : [];
+
+const currentYear = new Date().getFullYear();
+const selectedYear = yearParam && years.indexOf(yearParam) >= 0
+  ? yearParam
+  : (years.length ? years[0] : currentYear);
+const byMonth = await monthlyTotals(selectedYear);
+
+const yearGross = byMonth.reduce((s, m) => s + m.gross, 0);
+const yearNet = byMonth.reduce((s, m) => s + m.net, 0);
+const yearDeductions = byMonth.reduce((s, m) => s + m.deductions, 0);
+const peakGross = byMonth.reduce((m, x) => Math.max(m, x.gross), 0);
+const currency = totals?.currency || 'INR';
+const suppressedCount = byDepartment.filter((d) => d.suppressed).length;
+---
+<AdminLayout title="Payroll reports" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Payroll · Reports</p>
+  <h1>Payroll reports</h1>
+  <p class="lede">
+    Totals only. What a run cost, how it splits across departments, and how the year has moved.
+    Nobody's individual pay appears on this page. The register — which is per person, because that is
+    what a register is — downloads as a file and is written to the audit log when it is taken.
+  </p>
+
+  <form method="GET" class="picker">
+    <label>Payroll run
+      <select name="run" onchange="this.form.submit()">
+        {runs.length === 0 && <option value="">No payroll run exists yet</option>}
+        {runs.map((r) => (
+          <option value={r.id} selected={r.id === selectedRunId}>{r.periodLabel} — {r.status}</option>
+        ))}
+      </select>
+    </label>
+    <input type="hidden" name="year" value={selectedYear} />
+    <noscript><button type="submit" class="btn">Show this run</button></noscript>
+  </form>
+
+  {runs.length === 0 && (
+    <div class="empty">
+      <p style="font-weight:700;color:#fff;font-size:15px;">No payroll run has been generated yet</p>
+      <p style="margin-top:8px;">Reports are built from the payslips a run produces. Generate one on
+      the payroll screen and the totals appear here — there is nothing missing and nothing delayed.</p>
+    </div>
+  )}
+
+  {totals && (
+    <div>
+      <h2>{totals.periodLabel || (selectedRun?.periodLabel ?? 'This run')}</h2>
+
+      {totals.gaps.length > 0 && (
+        <div class="flash warn">
+          Some of this run could not be read, so the figures below are incomplete:
+          {' ' + totals.gaps.join('; ') + '.'} These are not zeros.
+        </div>
+      )}
+
+      <div class="tiles">
+        <div class="tile"><span class="tv">{totals.headcount}</span><span class="tl">Payslips in this run</span></div>
+        <div class="tile"><span class="tv">{money(totals.gross, currency)}</span><span class="tl">Gross</span></div>
+        <div class="tile"><span class="tv">{money(totals.deductions, currency)}</span><span class="tl">Deductions</span></div>
+        <div class="tile"><span class="tv">{money(totals.net, currency)}</span><span class="tl">Net paid</span></div>
+        <div class="tile"><span class="tv">{money(totals.employerCost, currency)}</span><span class="tl">Employer cost</span></div>
+        <div class="tile"><span class="tv">{money(totals.bonusPaid, currency)}</span><span class="tl">Bonuses in this run</span></div>
+        <div class="tile"><span class="tv">{money(totals.loanRecovered, currency)}</span><span class="tl">Loan repayments recovered</span></div>
+        <div class="tile"><span class="tv">{money(totals.lopDeduction, currency)}</span><span class="tl">Loss of pay</span></div>
+      </div>
+
+      <div class="export">
+        <div>
+          <p class="exl">Payroll register</p>
+          <p class="exs">
+            One row per person: code, name, designation, department, days, basic, gross, deductions,
+            net and employer cost. It downloads as a CSV and the export is recorded against your name.
+          </p>
+        </div>
+        <a class="btn" href={'/admin/hr/payroll/reports?export=register&run=' + selectedRunId}>Download the register</a>
+      </div>
+
+      <h2>By department</h2>
+      {byDepartment.length === 0 ? (
+        <div class="empty">This run produced no payslips, so there is nothing to split.</div>
+      ) : (
+        <div>
+          {suppressedCount > 0 && (
+            <div class="flash">
+              {suppressedCount} department{suppressedCount === 1 ? ' has' : 's have'} fewer than {MIN_DEPARTMENT_GROUP} people
+              in this run, so {suppressedCount === 1 ? 'its total is' : 'their totals are'} withheld —
+              an aggregate over one or two people is those people's pay. The row is still shown so you
+              can tell a withheld department from one with no payroll.
+            </div>
+          )}
+          <div class="scroller">
+            <table class="grid">
+              <thead>
+                <tr><th>Department</th><th>People</th><th>Gross</th><th>Deductions</th><th>Net</th></tr>
+              </thead>
+              <tbody>
+                {byDepartment.map((d) => (
+                  <tr>
+                    <td>{d.departmentName}</td>
+                    <td>{d.headcount}</td>
+                    <td>{d.suppressed ? <span class="withheld">Withheld</span> : money2(d.gross, currency)}</td>
+                    <td>{d.suppressed ? <span class="withheld">Withheld</span> : money2(d.deductions, currency)}</td>
+                    <td>{d.suppressed ? <span class="withheld">Withheld</span> : money2(d.net, currency)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  )}
+
+  <h2>By month</h2>
+  <form method="GET" class="picker">
+    <input type="hidden" name="run" value={selectedRunId} />
+    <label>Year
+      <select name="year" onchange="this.form.submit()">
+        {years.length === 0 && <option value={currentYear}>{currentYear}</option>}
+        {years.map((y) => <option value={y} selected={y === selectedYear}>{y}</option>)}
+      </select>
+    </label>
+    <noscript><button type="submit" class="btn">Show this year</button></noscript>
+  </form>
+
+  {byMonth.length === 0 ? (
+    <div class="empty">No payroll run exists for {selectedYear}.</div>
+  ) : (
+    <div>
+      <div class="tiles">
+        <div class="tile"><span class="tv">{money(yearGross, currency)}</span><span class="tl">Gross across {selectedYear}</span></div>
+        <div class="tile"><span class="tv">{money(yearDeductions, currency)}</span><span class="tl">Deductions</span></div>
+        <div class="tile"><span class="tv">{money(yearNet, currency)}</span><span class="tl">Net paid</span></div>
+        <div class="tile"><span class="tv">{byMonth.length}</span><span class="tl">Runs generated</span></div>
+      </div>
+
+      <div class="scroller">
+        <table class="grid">
+          <thead>
+            <tr><th>Month</th><th>People</th><th>Gross</th><th>Deductions</th><th>Net</th><th>Status</th><th>Share of the year</th></tr>
+          </thead>
+          <tbody>
+            {byMonth.map((m) => (
+              <tr>
+                <td>{m.periodLabel}</td>
+                <td>{m.headcount}</td>
+                <td>{money2(m.gross, currency)}</td>
+                <td>{money2(m.deductions, currency)}</td>
+                <td>{money2(m.net, currency)}</td>
+                <td>{m.status}</td>
+                <td>
+                  <span class="bar" aria-hidden="true">
+                    <span style={'width:' + (peakGross > 0 ? Math.round((m.gross / peakGross) * 100) : 0) + '%;'}></span>
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )}
+
+  <p class="foot">
+    Every figure here is a sum of what was actually written on payslips. Nothing on this page asserts
+    that a deduction was correct, statutory, or sufficient anywhere — the components each payslip was
+    built from are the ones this organisation configured.
+  </p>
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 12.5px; line-height: 1.55; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .picker { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; margin-bottom: 16px; display: grid; gap: 10px; }
+  .picker label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  select { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 18px; color: #fff; font-weight: 700; overflow-wrap: anywhere; }
+  .tl { font-size: 11px; color: #9aa6b6; line-height: 1.4; }
+  .export { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+  .exl { font-size: 13px; color: #fff; font-weight: 700; margin: 0; }
+  .exs { font-size: 11.5px; color: #9aa6b6; margin: 4px 0 0; line-height: 1.55; max-width: 60ch; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; display: inline-flex; align-items: center; text-decoration: none; }
+  .scroller { overflow-x: auto; -webkit-overflow-scrolling: touch; background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 8px 12px; }
+  table.grid { width: 100%; border-collapse: collapse; min-width: 620px; }
+  th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #6e6e78; padding: 8px 12px 8px 0; font-weight: 700; white-space: nowrap; }
+  td { font-size: 12.5px; color: #d8d8de; padding: 8px 12px 8px 0; border-top: 1px solid #1a1a1f; white-space: nowrap; }
+  .withheld { color: #fbbf24; font-size: 11.5px; }
+  .bar { display: block; width: 90px; height: 6px; border-radius: 99px; background: #1a1a1f; overflow: hidden; }
+  .bar span { display: block; height: 100%; background: #67e8f9; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; line-height: 1.6; }
+  .foot { font-size: 11.5px; color: #6e6e78; line-height: 1.6; margin-top: 24px; max-width: 70ch; }
+</style>
+</AdminLayout>

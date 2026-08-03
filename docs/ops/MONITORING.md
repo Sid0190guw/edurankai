@@ -122,10 +122,10 @@ uninstrumented, which means **a genuinely dead cron currently looks identical to
 
 | | |
 | --- | --- |
-| **Where** | `/api/health` -> `schemas`; `/admin/ops` bootstrap panel |
+| **Where** | `/api/health` -> `schemas` (counts only); `/api/health/deep` and the `/admin/ops` bootstrap panel (which tables) |
 | **Source** | `bootstrapStatus()` — one `information_schema` query covering ten tracked module tables at once |
-| **Healthy** | `ran == expected`, `missing: []` |
-| **Degraded** | Non-empty `missing` -> `status: "degraded"`, still **HTTP 200** |
+| **Healthy** | `ran == expected`, `missingCount: 0` |
+| **Degraded** | `missingCount > 0` -> `status: "degraded"`, still **HTTP 200**. The public endpoint gives the count; open `/admin/ops` for the names. |
 | **Means** | There is no migration runner; DDL runs on first use inside the owning module. A table's absence is that module's deployment status. **Absent is not automatically broken** — a module nothing has exercised has simply not bootstrapped yet. |
 | **Action** | Only investigate if the missing table belongs to something that should have run. Cross-reference INCIDENT.md 4.4. |
 
@@ -194,9 +194,20 @@ is exactly why it is the first action in ROLLBACK.md.
 
 ### 2.13 Query performance
 
-`slowQueries()` reads `pg_stat_statements`. **It is not installed on this database.** The panel says
-so in words: "Nothing is being measured — this panel is empty because the data does not exist, not
-because everything is fast." Do not read that panel as a clean bill of health.
+`slowQueries()` reads `pg_stat_statements`. **Whether that extension exists on this database has not
+been observed** — no document in this directory was written with a connection to it, so treat any
+claim here about live database state as inference. The code does not guess: it runs the query, and
+when the extension is absent the panel says so in words — "Nothing is being measured — this panel is
+empty because the data does not exist, not because everything is fast."
+
+Read the panel, not this page. If it shows rows, the extension is installed and the numbers are
+real. If it shows that sentence, there is no query-level performance data at all and an empty panel
+is **not** a clean bill of health. To settle it in one command:
+
+```sql
+SELECT extname FROM pg_extension WHERE extname = 'pg_stat_statements';
+-- no row -> CREATE EXTENSION IF NOT EXISTS pg_stat_statements;  (Supabase: Database -> Extensions)
+```
 
 ---
 
@@ -271,7 +282,9 @@ believed.
 - **Most crons are uninstrumented.** `recordCronRun()` exists; very few routes call it. A dead cron
   and a healthy uninstrumented one both display `never`.
   *To fix:* one line per cron route — `await recordCronRun('/api/cron/x', 'ok', 'processed N')`.
-- **`pg_stat_statements` is not installed.** No query-level performance data exists at all (2.13).
+- **No query-level performance data, unless `pg_stat_statements` happens to be installed** — which
+  has not been observed from here, only handled (2.13). Check the panel before believing either
+  answer.
 - **No CI.** Nothing runs `astro check`, `npm run build`, or the 62 `*.test.ts` files on push. The
   claim on `/admin/hardening` that the authz and secret audits are "CI-enforced" describes an
   intention: `src/lib/security-audit.test.ts` exists and passes, but only when a human runs

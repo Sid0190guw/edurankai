@@ -55,7 +55,7 @@ import { startWorkflow, getInstance } from '@/lib/workflow';
 import { computePay, MONTH_NAMES } from '@/lib/payroll';
 import { outstandingForEmployee, settleLoanOutsidePayroll, loanKindLabel, type LoanRow } from '@/lib/loans';
 import { getBalances, type LeaveBalance } from '@/lib/hr-leave';
-import { clearanceFor, recordSettlementHandoff } from '@/lib/hr-separation';
+import { clearanceFor, recordSettlementHandoff, ensureExitSchema } from '@/lib/hr-separation';
 
 // -------------------------------------------------------------------------------------------------
 // CONSTANTS FIRST
@@ -132,6 +132,12 @@ const AUTO_FINAL_SALARY = 'final_salary';
 export function ensureSettlementSchema(): Promise<void> {
   return ensureOnce('hr_settlements_v1', async () => {
     try {
+      // hr_separations MUST exist before a table can reference it. Awaited here rather than assumed,
+      // exactly as ensureExitSchema() itself awaits ensureSeparationSchema(): on a fresh database the
+      // reference would otherwise fail, this guard would re-throw, and the settlement console would
+      // read as permanently empty for a reason nothing on screen could explain.
+      await ensureExitSchema();
+
       await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_settlements (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         separation_id UUID NOT NULL REFERENCES hr_separations(id) ON DELETE CASCADE,

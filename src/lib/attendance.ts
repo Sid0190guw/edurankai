@@ -50,7 +50,7 @@
 import { db } from './db';
 import { sql } from 'drizzle-orm';
 import { ensureAttendanceSchema, ensureWorkingTimeSchema } from './attendance-schema';
-import { startWorkflow, instanceForRecord, type WorkflowInstanceRow } from './workflow';
+import { startWorkflow, resumeWorkflow, instanceForRecord, type WorkflowInstanceRow } from './workflow';
 
 // -------------------------------------------------------------------------------------------------
 // MODULE CONSTANTS — all above their first use.
@@ -1948,6 +1948,8 @@ export interface WorkingTimeResult extends WriteResult {
   state?: string;
   /** The engine's own sentence when routing could not name an approver. Rendered verbatim. */
   haltReason?: string | null;
+  /** What settling actually did, in words, for a screen to repeat. Never a failure. */
+  note?: string | null;
 }
 
 /**
@@ -2191,7 +2193,7 @@ export async function applyApprovedOvertime(claimId: string): Promise<WorkingTim
       UPDATE hr_overtime_requests SET applied_at = NOW()
        WHERE id = ${claimId}::uuid AND applied_at IS NULL`);
 
-    return { ok: true, id: claimId, changed: true, error: undefined, state: 'approved', haltReason: creditNote || null };
+    return { ok: true, id: claimId, changed: true, state: 'approved', note: creditNote || null };
   } catch (e: any) {
     logFail('applyApprovedOvertime', e);
     return { ok: false, error: errText(e, 'The approved claim could not be applied.') };
@@ -2454,13 +2456,31 @@ export async function submitTimesheet(input: {
     };
   }
 
+  // A RESUBMITTED WEEK WHOSE APPROVAL HALTED IS RE-ROUTED, not left where it was. startWorkflow() is
+  // idempotent on (domain, record_id), so a second submit returns the SAME halted instance rather
+  // than trying again — which would mean a week that halted before the reporting line was recorded
+  // could never be sent to anybody, however many times the person pressed the button. resumeWorkflow
+  // re-resolves the route and refuses anything that is not halted, so it cannot disturb a live or
+  // settled approval.
+  let state = started.state;
+  let haltReason = started.haltReason ?? null;
+  if (started.state === 'halted' && started.instanceId) {
+    const resumed = await resumeWorkflow(started.instanceId, { id: by });
+    if (resumed.ok) {
+      state = resumed.state;
+      haltReason = null;
+    } else {
+      haltReason = resumed.haltReason ?? haltReason;
+    }
+  }
+
   return {
     ok: true,
     changed: true,
     id: timesheetId,
     instanceId: started.instanceId,
-    state: started.state,
-    haltReason: started.haltReason ?? null,
+    state,
+    haltReason,
   };
 }
 

@@ -44,7 +44,7 @@ vercel promote <good-deployment-url>
 Then verify, using DEPLOYMENT.md section 6. Specifically:
 
 ```bash
-curl -s https://edurankai.in/api/health | head -c 300     # release.shortCommit should be the OLD sha
+curl -s https://edurankai.in/api/health | head -c 300     # release.commit should be the OLD short sha
 # or, if /api/health is not deployed:
 curl -s -o /dev/null -w '%{http_code}\n' https://edurankai.in/<route-only-the-bad-deploy-added>
 #   -> 404 means the bad code is genuinely gone

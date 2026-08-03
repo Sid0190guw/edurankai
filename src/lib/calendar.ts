@@ -64,17 +64,55 @@ export async function studentCalendar(userId: string): Promise<any[]> {
 export async function runDeadlineReminders(withinHours = 48): Promise<number> {
   await ensureCalendarSchema(); const { db, sql } = await ctx();
   const due = rows(await db.execute(sql`SELECT id, course_obj_id, title, kind, due_at FROM edu_deadlines WHERE due_at BETWEEN NOW() AND NOW() + (${withinHours} || ' hours')::interval`));
+  if (due.length === 0) return 0;
+
+  // THE WHOLE RECIPIENT LIST IN ONE QUERY, ALREADY DE-DUPLICATED.
+  //
+  // This was a nested loop: one roster read PER DEADLINE, then an "already sent?" SELECT and an
+  // INSERT PER STUDENT PER DEADLINE. Five deadlines on a two-hundred-student course meant
+  // 5 roster reads + 1,000 dedupe reads + 1,000 inserts inside ONE serverless invocation, all
+  // sequential on one pooler connection — and it is reached from an admin endpoint, so a person is
+  // waiting on it. The roster join and the already-sent exclusion are one pass for Postgres, so they
+  // happen there.
+  //
+  // NOT EXISTS reproduces the old skip exactly, and the bulk insert still carries
+  // ON CONFLICT DO NOTHING, so a concurrent run still cannot double-send.
+  //
+  // The id list travels as JSON rather than as a bound array: src/lib/pg-array.ts documents that
+  // postgres-js serialises a JS array into a drizzle template as a record literal, which Postgres
+  // will not cast.
+  const deadlineIds = due.map((d: any) => String(d.id));
+  const byId = new Map(due.map((d: any) => [String(d.id), d]));
+  const targets = rows(await db.execute(sql`
+    SELECT d.id::text AS deadline_id, e.user_id::text AS user_id
+      FROM edu_deadlines d
+      JOIN edu_enrolments e ON e.course_obj_id = d.course_obj_id AND e.status = 'active'
+     WHERE d.id::text IN (SELECT t.x FROM jsonb_array_elements_text(${JSON.stringify(deadlineIds)}::jsonb) AS t(x))
+       AND NOT EXISTS (
+         SELECT 1 FROM edu_reminder_sent r WHERE r.deadline_id = d.id AND r.user_id = e.user_id
+       )`));
+
   const { notify } = await import('@/lib/edu-notify');
   let sent = 0;
-  for (const d of due) {
-    const students = rows(await db.execute(sql`SELECT e.user_id FROM edu_enrolments e WHERE e.course_obj_id = ${d.course_obj_id} AND e.status = 'active'`));
-    for (const s of students) {
-      const done = rows(await db.execute(sql`SELECT 1 FROM edu_reminder_sent WHERE deadline_id = ${d.id} AND user_id = ${s.user_id} LIMIT 1`));
-      if (done.length) continue;
-      await notify(s.user_id, { type: 'deadline', title: 'Upcoming: ' + d.title, body: new Date(d.due_at).toLocaleString(), link: '/aquintutor/calendar' });
-      await db.execute(sql`INSERT INTO edu_reminder_sent (deadline_id, user_id) VALUES (${d.id}, ${s.user_id}) ON CONFLICT DO NOTHING`);
-      sent++;
-    }
+  const landed: Array<{ d: string; u: string }> = [];
+  for (const t of targets) {
+    const d: any = byId.get(String(t.deadline_id));
+    if (!d) continue;
+    // notify() stays per-recipient: that is the sink's interface, and this repair is about the two
+    // round-trips per student that were NOT inherent to sending — the dedupe read and the receipt
+    // insert. Both are gone.
+    await notify(String(t.user_id), { type: 'deadline', title: 'Upcoming: ' + d.title, body: new Date(d.due_at).toLocaleString(), link: '/aquintutor/calendar' });
+    landed.push({ d: String(d.id), u: String(t.user_id) });
+    sent++;
+  }
+
+  // ONE insert for every receipt, instead of one per student per deadline.
+  if (landed.length > 0) {
+    await db.execute(sql`
+      INSERT INTO edu_reminder_sent (deadline_id, user_id)
+      SELECT (p->>'d')::uuid, (p->>'u')::uuid
+        FROM jsonb_array_elements(${JSON.stringify(landed)}::jsonb) AS p
+      ON CONFLICT DO NOTHING`);
   }
   return sent;
 }

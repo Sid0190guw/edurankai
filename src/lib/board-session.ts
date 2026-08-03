@@ -75,6 +75,11 @@ const BOARD_DDL = [
     created_at timestamptz NOT NULL DEFAULT now()
   )`,
   `CREATE INDEX IF NOT EXISTS edu_board_detections_session_idx ON edu_board_detections (session_id, id)`,
+  // recentPhysicalDetections() filters on `source` ACROSS ALL SESSIONS and orders by id — the one
+  // read of this table the session index cannot serve, so it was a sequential scan of a table that
+  // gains a row per detection, on a screen that polls. Leading with source and carrying id DESC
+  // lets the LIMIT stop after the rows it needs instead of sorting the whole table.
+  `CREATE INDEX IF NOT EXISTS edu_board_detections_source_idx ON edu_board_detections (source, id DESC)`,
 ];
 let _ready = false;
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));

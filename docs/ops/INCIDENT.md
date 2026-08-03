@@ -55,17 +55,30 @@ Expected shape:
 ```json
 { "status": "ok",
   "database": { "ok": true, "latencyMs": 41 },
-  "schemas":  { "ran": 10, "expected": 10, "missing": [] },
+  "schemas":  { "ran": 10, "expected": 10, "missingCount": 0 },
   "release":  { "commit": "e27c6a4", "ref": "main", "environment": "production", "known": true },
   "checks":   [ { "name": "database", "ok": true, "critical": true, "detail": "41ms" } ] }
 ```
+
+**This body is public, so it is deliberately reduced.** `database.error` carries the failure CLASS
+with the connection configuration scrubbed out — `getaddrinfo ENOTFOUND <host>`,
+`password authentication failed for user <redacted>`, `connect ECONNREFUSED <ip>:<n>`. That is
+enough to route you to the right section below. Two places hold the unredacted reason: the
+`edu_error_log` row (`/admin/ops`, `/admin/hardening`) and the Vercel runtime log,
+`vercel inspect <deployment-url> --logs`. Which module table is missing is likewise a count here and
+a list on `/api/health/deep` and the `/admin/ops` bootstrap panel.
+
+> **During a total database outage `/api/health/deep` is unreachable by everyone, including you.**
+> Its gate is `can()`, which resolves the principal from the database. That is the fail-closed
+> direction and it is correct, but it means the deep endpoint is not a fallback for 4.1 — the Vercel
+> runtime log is.
 
 How to read it:
 
 | Observation | Meaning | Next |
 | --- | --- | --- |
-| HTTP 503, `database.ok: false` | Database unreachable. `database.error` carries the real Postgres reason (read off `e.cause`, not `e.message`). | 4.1 |
-| HTTP 200, `status: "degraded"` | Serving, something is wrong. Usually `schemas.missing` is non-empty. **Not a page-somebody event.** | 4.4 |
+| HTTP 503, `database.ok: false` | Database unreachable. `database.error` gives the scrubbed class; `vercel inspect <url> --logs` has the verbatim reason (read off `e.cause`, not `e.message`). | 4.1 |
+| HTTP 200, `status: "degraded"` | Serving, something is wrong. Usually `missingCount` is non-zero. **Not a page-somebody event.** | 4.4 |
 | HTTP 200, `status: "ok"` | The database is fine. The fault is in one route. | Section 3 |
 | Connection refused / no response at all | Not the app — DNS, the domain, or Vercel itself. Check `vercel ls` and the Vercel status page. | 4.2 |
 | `release.known: false` | `VERCEL_GIT_COMMIT_SHA` is absent. You are probably not talking to a Vercel deployment. | DEPLOYMENT.md 6 |
@@ -132,8 +145,9 @@ you one of 100 daily deploys.
 ### 4.2 A deploy that fails in about two seconds -> a malformed environment variable
 
 **What you see.** The Vercel deployment goes to `Error` almost immediately — much faster than a real
-compile failure, which takes tens of seconds on this project (a clean server build is roughly 30s).
-There is little or no build log because there was no build.
+compile failure. A clean server build of this project takes **30-60 seconds** (measured locally:
+31s and 51s on two consecutive runs), so anything that dies in about two seconds never compiled at
+all. There is little or no build log, because there was no build.
 
 **Cause.** Whitespace in an environment variable, classically a trailing space or newline in
 `CRON_SECRET`.
@@ -345,8 +359,10 @@ looking.
   alerting path is a defect, not a feature.
 - **No error-rate alarm.** `errorRate()` computes 1h / 24h / 7d volumes, but only when a human loads
   `/admin/ops`. A spike at 3am is invisible until someone opens the page.
-- **No query instrumentation.** `pg_stat_statements` is not installed, so the slow-query panel is
-  empty because the data does not exist, not because everything is fast. It says so.
+- **Query instrumentation is unconfirmed.** Whether `pg_stat_statements` exists on this database has
+  not been observed from here. If the slow-query panel on `/admin/ops` is empty it says so in words
+  — empty because the data does not exist, not because everything is fast. MONITORING.md 2.13 has
+  the one query that settles it.
 - **No status page.** There is no way to tell users the site is down, and no record afterwards of
   when it was.
 - **Most crons are not instrumented.** `recordCronRun()` exists and is adopted by very few routes;

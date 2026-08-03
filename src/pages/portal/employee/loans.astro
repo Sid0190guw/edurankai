@@ -1,0 +1,409 @@
+---
+// /portal/employee/loans — YOUR OWN LOANS AND SALARY ADVANCES.
+//
+// AUTHORISATION IS OWNERSHIP, NOT A ROLE. Every read on this page is narrowed by employee_id in the
+// WHERE clause (loansForEmployee), resolved from the signed-in account. There is no id in the URL,
+// so there is nothing to change in the address bar, and no capability is involved: an employee's own
+// borrowing is theirs, and nobody else's is reachable from here at all. Gating this on a permission
+// would hide a person's own repayments from them, because an employee's account very often carries
+// the `applicant` role, which holds nothing.
+//
+// WHAT THE PAGE IS CAREFUL TO SAY. A request is a request. Pressing the button lends nobody
+// anything: it asks the person the Organization Graph names as your approver. If nothing has been
+// paid out yet, nothing is being deducted, and the screen says that in those words rather than
+// leaving somebody to work out why their payslip is unchanged.
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  loansForEmployee, requestLoan, cancelLoan, loanLedger, loanKindLabel, loanStateLabel,
+  LOAN_KINDS, type LoanRow,
+} from '@/lib/loans';
+import { MONTH_NAMES } from '@/lib/payroll';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/employee/loans');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted.
+const PAGE = '/portal/employee/loans';
+
+// The signed-in account, captured after the guard above. TypeScript's narrowing of `user` does not
+// survive into the closure below — inside a function it is `possibly null` again — and reaching for
+// a non-null assertion there would be the same claim with the checking switched off.
+const account = user;
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+const money = (n: any, cur: string) =>
+  (cur || 'INR') + ' ' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+const statusColour: Record<string, string> = {
+  active: '#2563eb', closed: '#059669', pending: '#d97706',
+  halted: '#b45309', rejected: '#b91c1c', cancelled: '#6b6255',
+};
+
+// The same resolution /portal/employee/payslips and /portal/employee/wallet use: the linked account
+// first, then the three email columns, because the users-to-employees link is not guaranteed to have
+// been filled in.
+async function resolveEmployee(): Promise<{ employee: any | null; failed: boolean }> {
+  try {
+    const employee = rowsOf(await db.execute(sql`
+      SELECT id, full_name, employee_code, currency
+        FROM hr_employees WHERE user_id = ${account.id} AND is_active = true LIMIT 1`))[0]
+      || rowsOf(await db.execute(sql`
+      SELECT id, full_name, employee_code, currency
+        FROM hr_employees
+       WHERE (work_email = ${account.email} OR personal_email = ${account.email} OR email = ${account.email})
+         AND is_active = true LIMIT 1`))[0]
+      || null;
+    return { employee, failed: false };
+  } catch (e: any) {
+    // A failed read and an empty result are different sentences, and this page must not print the
+    // second when the first happened.
+    console.error('[portal/loans] employee lookup', e?.cause?.message || e?.message);
+    return { employee: null, failed: true };
+  }
+}
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const resolved = await resolveEmployee();
+    if (!resolved.employee) {
+      flash = 'This account is not linked to an employee record, so nothing could be requested.';
+    } else {
+      const fd = await Astro.request.formData();
+      const action = String(fd.get('action') || '');
+      // THE EMPLOYEE ID COMES FROM THE SESSION, NEVER FROM THE FORM. A hidden field here would let
+      // somebody raise a loan against a colleague by editing the page.
+      const myEmployeeId = String(resolved.employee.id);
+
+      if (action === 'request') {
+        const r = await requestLoan({
+          employeeId: myEmployeeId,
+          kind: String(fd.get('kind') || ''),
+          purpose: String(fd.get('purpose') || ''),
+          principal: Number(fd.get('principal')),
+          instalments: Number(fd.get('instalments')),
+          interestRatePct: 0,
+          startMonth: Number(fd.get('start_month')),
+          startYear: Number(fd.get('start_year')),
+          requestedByUserId: user.id,
+        });
+        if (r.ok && r.haltReason) {
+          flash = 'Recorded, but it could not be routed to anybody yet: ' + r.haltReason
+            + ' Tell HR — nothing is lost.';
+        } else if (r.ok) {
+          flash = 'Sent for approval. Nothing has been lent and nothing will be deducted until it is approved and paid out.';
+        } else {
+          flash = r.error || 'The request was not saved.';
+        }
+      } else if (action === 'cancel') {
+        // Scoped to this person's own row: cancelLoan is given an id that was rendered from a list
+        // already narrowed by employee_id, and the state guard refuses anything already settled.
+        const loanId = String(fd.get('loan_id') || '');
+        const mine = (await loansForEmployee(myEmployeeId)).some((l) => l.id === loanId);
+        if (!mine) {
+          flash = 'That request is not yours, so nothing was changed.';
+        } else {
+          const r = await cancelLoan(loanId, user.id);
+          flash = r.ok ? 'Request withdrawn.' : (r.error || 'The request was not withdrawn.');
+        }
+      } else {
+        flash = 'That is not something this page does.';
+      }
+    }
+  } catch (e: any) {
+    console.error('[portal/loans] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const { employee, failed: lookupFailed } = await resolveEmployee();
+const loans = employee ? await loansForEmployee(String(employee.id)) : [];
+
+const live = loans.filter((l) => l.state === 'active');
+const openRequests = loans.filter((l) => l.state === 'pending' || l.state === 'halted');
+const past = loans.filter((l) => ['closed', 'rejected', 'cancelled'].indexOf(l.state) >= 0);
+const currency = String(employee?.currency || loans[0]?.currency || 'INR');
+const owed = live.reduce((s, l) => s + l.outstanding, 0);
+const hasOpen = openRequests.length > 0 || live.length > 0;
+
+const ledgers: Record<string, any[]> = {};
+for (const l of live) ledgers[l.id] = await loanLedger(l.id);
+
+const now = new Date();
+const thisMonth = now.getMonth() + 1;
+const nextMonth = thisMonth === 12 ? 1 : thisMonth + 1;
+const nextMonthYear = thisMonth === 12 ? now.getFullYear() + 1 : now.getFullYear();
+const yearOptions = [now.getFullYear(), now.getFullYear() + 1];
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>My loans and advances</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;overflow-x:hidden;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    .wrap{max-width:600px;margin:0 auto;padding:16px 14px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;}
+    .tile{background:#faf7f1;border:1px solid #f0e9dc;border-radius:10px;padding:10px 12px;}
+    .tile .k{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;}
+    .tile .v{font-size:15px;font-weight:700;margin-top:3px;overflow-wrap:anywhere;}
+    .row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:13px 0;border-bottom:1px solid #f2ece0;}
+    .row:last-of-type{border-bottom:none;}
+    .row .t{font-size:15px;font-weight:700;}
+    .row .s{font-size:11.5px;color:#8b8172;margin-top:3px;line-height:1.5;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;}
+    .bar{margin-top:10px;height:6px;border-radius:99px;background:#f0e9dc;overflow:hidden;}
+    .bar span{display:block;height:100%;background:#047857;}
+    .empty{text-align:center;padding:30px 12px;color:#6b6255;font-size:13.5px;line-height:1.6;}
+    .note{background:#faf7f1;border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;font-size:12px;color:#6b6255;line-height:1.6;margin-top:12px;}
+    .warn{background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.28);color:#92400e;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;margin-bottom:14px;}
+    .flash{background:rgba(4,120,87,.08);border:1px solid rgba(4,120,87,.25);color:#065f46;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;margin-bottom:14px;}
+    form.ask{display:grid;gap:12px;margin-top:6px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:grid;gap:5px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcc;color:#1a1510;padding:11px 12px;border-radius:10px;font-size:15px;font-family:inherit;min-height:44px;letter-spacing:normal;text-transform:none;}
+    textarea{min-height:64px;resize:vertical;}
+    .pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;}
+    .hint{font-family:'Inter Tight',system-ui,sans-serif;font-size:11.5px;color:#8b8172;text-transform:none;letter-spacing:normal;font-weight:400;line-height:1.55;}
+    button.go{min-height:44px;padding:0 18px;border:none;border-radius:10px;background:#12100c;color:#fff;font-size:14px;font-weight:700;cursor:pointer;justify-self:start;}
+    button.ghost{min-height:44px;padding:0 14px;border:1px solid #e6ddcc;border-radius:10px;background:transparent;color:#6b6255;font-size:13px;font-weight:600;cursor:pointer;margin-top:10px;}
+    details > summary{cursor:pointer;font-size:12.5px;color:#8b8172;min-height:44px;display:flex;align-items:center;}
+    .scroller{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    table{width:100%;border-collapse:collapse;min-width:300px;}
+    th{text-align:left;font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;padding:6px 10px 6px 0;white-space:nowrap;}
+    td{font-size:12.5px;color:#4a4238;padding:6px 10px 6px 0;border-top:1px solid #f2ece0;white-space:nowrap;}
+    a.inline{color:#c2410c;}
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>My HR</a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Loans</span>
+  <span style="font-size:11px;color:#9a8f7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:34vw;">{employee?.full_name || user.name}</span>
+</nav>
+
+<div class="wrap">
+  {msg && <div class="flash">{msg}</div>}
+
+  {lookupFailed && (
+    <div class="warn">
+      We could not read your employee record just now, so this page cannot tell you whether you have
+      a loan or not. Nothing is lost. Try again in a moment, and tell HR if it keeps happening.
+    </div>
+  )}
+
+  {!lookupFailed && !employee && (
+    <div class="card">
+      <div class="empty">
+        <p style="font-weight:700;color:#1a1510;font-size:15px;">No employee record is linked to this account</p>
+        <p style="margin-top:8px;">A loan or salary advance is recorded against an employee record,
+        and this account is not linked to one. Ask HR to link it — nothing here is missing or delayed,
+        it simply has nowhere to attach to yet.</p>
+      </div>
+    </div>
+  )}
+
+  {employee && (
+    <div>
+      <div class="card">
+        <h3>Where you stand</h3>
+        <div class="tiles">
+          <div class="tile"><div class="k">Still to repay</div><div class="v">{money(owed, currency)}</div></div>
+          <div class="tile"><div class="k">Running</div><div class="v">{live.length}</div></div>
+          <div class="tile"><div class="k">Waiting on approval</div><div class="v">{openRequests.length}</div></div>
+        </div>
+        <div class="note">
+          Repayments come out of your pay automatically once a loan has been approved and the money
+          has actually been paid out. They stop by themselves when the balance reaches zero, and a
+          repayment is never larger than what a month's pay can carry.
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Running now</h3>
+        {live.length === 0 ? (
+          <div class="empty">
+            <p style="font-weight:700;color:#1a1510;font-size:15px;">Nothing is being deducted</p>
+            <p style="margin-top:8px;">You have no loan or advance being repaid from your pay.</p>
+          </div>
+        ) : (
+          <div>
+            {live.map((l: LoanRow) => (
+              <div class="row" style="display:block;">
+                <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
+                  <div style="min-width:0;">
+                    <div class="t">{loanKindLabel(l.kind)}</div>
+                    <div class="s">
+                      {money(l.outstanding, l.currency)} still to repay of {money(l.totalPayable, l.currency)}
+                      {l.interestRatePct > 0 ? ' (including ' + money(l.interestTotal, l.currency) + ' interest)' : ' (interest-free)'}
+                    </div>
+                    <div class="s">
+                      {l.disbursedAt
+                        ? money(l.instalmentAmount, l.currency) + ' each pay run, from ' + (MONTH_NAMES[l.startMonth - 1] || '') + ' ' + l.startYear
+                        : 'Approved, but the money has not been paid out yet — nothing is being deducted.'}
+                    </div>
+                  </div>
+                  <span class="pill" style={`color:${statusColour[l.state] || '#6b6255'};background:${(statusColour[l.state] || '#6b6255')}18;`}>{l.disbursedAt ? 'repaying' : 'not paid out'}</span>
+                </div>
+                <div class="bar" aria-hidden="true">
+                  <span style={'width:' + Math.max(0, Math.min(100, l.totalPayable > 0 ? Math.round((l.recovered / l.totalPayable) * 100) : 0)) + '%;'}></span>
+                </div>
+                {(ledgers[l.id] || []).length > 0 && (
+                  <details style="margin-top:8px;">
+                    <summary>Every repayment taken so far ({(ledgers[l.id] || []).length})</summary>
+                    <div class="scroller">
+                      <table>
+                        <thead><tr><th>Period</th><th>Taken</th></tr></thead>
+                        <tbody>
+                          {(ledgers[l.id] || []).map((i: any) => (
+                            <tr>
+                              <td>{MONTH_NAMES[i.month - 1]} {i.year}</td>
+                              <td>{money(i.amount, l.currency)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {openRequests.length > 0 && (
+        <div class="card">
+          <h3>Waiting on a decision</h3>
+          {openRequests.map((l: LoanRow) => (
+            <div class="row" style="display:block;">
+              <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
+                <div style="min-width:0;">
+                  <div class="t">{loanKindLabel(l.kind)} — {money(l.principal, l.currency)}</div>
+                  <div class="s">Asked for {fmtDate(l.createdAt)} · over {l.instalments} pay run{l.instalments === 1 ? '' : 's'}</div>
+                  <div class="s">{l.purpose}</div>
+                </div>
+                <span class="pill" style={`color:${statusColour[l.state] || '#6b6255'};background:${(statusColour[l.state] || '#6b6255')}18;`}>{loanStateLabel(l.state)}</span>
+              </div>
+              {l.state === 'halted' && (
+                <div class="note" style="margin-top:8px;">
+                  This has not reached an approver yet: {l.haltReason || 'no approver could be resolved.'}
+                  Nothing is lost and nothing is being deducted. Tell HR, and it carries on from where
+                  it stopped once the missing relationship is recorded.
+                </div>
+              )}
+              <form method="POST">
+                <input type="hidden" name="action" value="cancel" />
+                <input type="hidden" name="loan_id" value={l.id} />
+                <button type="submit" class="ghost">Withdraw this request</button>
+              </form>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div class="card">
+        <h3>Ask for a loan or salary advance</h3>
+        {hasOpen ? (
+          <p style="font-size:13.5px;line-height:1.65;color:#4a4238;">
+            You already have a request or an agreement in progress. It has to be settled before
+            another of the same kind can be raised — two deductions in one month against a net that
+            may not carry them is something you would find out about on payday.
+          </p>
+        ) : (
+          <form method="POST" class="ask">
+            <input type="hidden" name="action" value="request" />
+            <label>What you need
+              <select name="kind" required>
+                <option value="">Choose</option>
+                {LOAN_KINDS.map((k) => <option value={k.key}>{k.label}</option>)}
+              </select>
+              <span class="hint">{LOAN_KINDS.map((k) => k.label + ': ' + k.note).join(' ')}</span>
+            </label>
+            <label>Amount
+              <input type="number" name="principal" step="0.01" min="0.01" required />
+            </label>
+            <label>Repaid over how many pay runs
+              <input type="number" name="instalments" step="1" min="1" max="120" required value="1" />
+              <span class="hint">The amount divided across that many runs. The last one is whatever is left.</span>
+            </label>
+            <div class="pair">
+              <label>Repayment starts in
+                <select name="start_month" required>
+                  {MONTH_NAMES.map((m, i) => (
+                    <option value={i + 1} selected={i + 1 === nextMonth}>{m}</option>
+                  ))}
+                </select>
+              </label>
+              <label>Year
+                <select name="start_year" required>
+                  {yearOptions.map((y) => <option value={y} selected={y === nextMonthYear}>{y}</option>)}
+                </select>
+              </label>
+            </div>
+            <label>Why you need it
+              <textarea name="purpose" rows="3" required placeholder="Your approver reads this before deciding."></textarea>
+            </label>
+            <button type="submit" class="go">Send for approval</button>
+            <p class="hint">
+              This lends you nothing on its own. It asks your reporting manager, and whoever else this
+              organisation has named, to decide. Requests raised here carry no interest; a loan with
+              interest is arranged with HR and appears here once it is recorded.
+            </p>
+          </form>
+        )}
+      </div>
+
+      {past.length > 0 && (
+        <div class="card">
+          <h3>Finished and closed</h3>
+          {past.map((l: LoanRow) => (
+            <div class="row">
+              <div style="min-width:0;">
+                <div class="t">{loanKindLabel(l.kind)} — {money(l.principal, l.currency)}</div>
+                <div class="s">
+                  Asked for {fmtDate(l.createdAt)}
+                  {l.closedAt ? ' · cleared ' + fmtDate(l.closedAt) : ''}
+                </div>
+              </div>
+              <span class="pill" style={`color:${statusColour[l.state] || '#6b6255'};background:${(statusColour[l.state] || '#6b6255')}18;`}>{loanStateLabel(l.state)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div class="card">
+        <h3>Somewhere else to look</h3>
+        <p style="font-size:13.5px;line-height:1.65;color:#4a4238;">
+          Repayments appear as a deduction on your payslip, named so you can see which agreement they
+          belong to. Money you have spent on the company's behalf is a claim, not a loan, and is
+          raised separately.
+        </p>
+        <div class="note">
+          <a class="inline" href="/portal/employee/payslips">Open your payslips</a>
+          <span> &middot; </span>
+          <a class="inline" href="/portal/employee/expenses">Expenses and claims</a>
+        </div>
+      </div>
+    </div>
+  )}
+</div>
+</body>
+</html>

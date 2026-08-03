@@ -914,7 +914,8 @@ async function payrollPanels(scope: DashboardScope, from: string, to: string): P
 
       const trend = rows(await db.execute(sql`
         SELECT make_date(year, month, 1) AS bucket,
-               CASE WHEN MAX(total_employees) >= ${MIN_GROUP} THEN COALESCE(SUM(total_net), 0)::int ELSE 0 END AS n
+               CASE WHEN MAX(total_employees) >= ${MIN_GROUP}
+                    THEN COALESCE(SUM(total_net), 0)::float8 ELSE 0 END AS n
           FROM hr_payroll_runs
          WHERE make_date(year, month, 1) >= (date_trunc('month', CURRENT_DATE) - INTERVAL '${sql.raw(String(TREND_MONTHS - 1))} months')
          GROUP BY 1 ORDER BY 1`));
@@ -1396,7 +1397,7 @@ async function financePanels(scope: DashboardScope, from: string, to: string): P
     const vendors = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM procurement_vendors`));
 
     const trend = rows(await db.execute(sql`
-      SELECT date_trunc('month', order_date) AS bucket, COALESCE(SUM(amount), 0)::int AS n
+      SELECT date_trunc('month', order_date) AS bucket, COALESCE(SUM(amount), 0)::float8 AS n
         FROM procurement_orders
        WHERE order_date >= (date_trunc('month', CURRENT_DATE) - INTERVAL '${sql.raw(String(TREND_MONTHS - 1))} months')
        GROUP BY 1 ORDER BY 1`));

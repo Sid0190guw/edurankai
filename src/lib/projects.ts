@@ -1697,7 +1697,7 @@ export async function projectReport(
   }
   if (tasks.ok && tasks.percentComplete !== null) {
     headlines.push(tasks.percentComplete + '% of the work on this project is complete (' +
-      tasks.completed + ' of ' + (tasks.total - 0) + ' tasks), with ' + tasks.blocked + ' blocked.');
+      tasks.completed + ' of ' + tasks.total + ' tasks), with ' + tasks.blocked + ' blocked.');
   } else if (!tasks.ok) {
     headlines.push('Task progress could not be read just now, so no completion figure is shown for it.');
   }

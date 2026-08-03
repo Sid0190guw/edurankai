@@ -397,10 +397,13 @@ async function createWorkingTimeTables(): Promise<void> {
   //
   // NO status COLUMN HERE EITHER. workflow_instances, domain 'timesheet', record_id = this id.
   //
-  // project IS FREE TEXT, and that is an honest limitation rather than a shortcut. There is no
-  // projects table, project_id column or project registry anywhere in src/ or db/ — invented ones
-  // are called out in src/lib/search-global.ts:343 — so a foreign key here would point at nothing.
-  // When a project register exists this column is what a migration reads to fill it in.
+  // project IS FREE TEXT, DELIBERATELY, AND THIS IS THE FOLLOW-UP TO WRITE DOWN. A project register
+  // (src/lib/projects.ts) landed in the same phase as this table, in parallel. A foreign key added
+  // now would couple the timesheet to a schema that was still being written the same week, and a
+  // wrong id is harder to repair than a name. So the column holds what the person typed, and the
+  // migration that turns these names into project ids is a deliberate, reviewable step somebody
+  // takes once both modules have settled. Nothing is lost in the meantime — the text is the answer
+  // to "what was this week's work", which is what the approver is reading it for.
   // -----------------------------------------------------------------------------------------
   await db.execute(sql`
     CREATE TABLE IF NOT EXISTS hr_timesheets (
