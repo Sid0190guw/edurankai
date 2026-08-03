@@ -10,6 +10,7 @@ import { put } from '@vercel/blob';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { generateInterviewQuestions, isLlmConfigured } from '@/lib/llm';
+import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
@@ -25,9 +26,24 @@ function toBase64(buf: Uint8Array): string {
   try { return btoa(bin); } catch { return Buffer.from(buf).toString('base64'); }
 }
 
+// MECHANISM SWAP, IDENTICAL POPULATION. This was `!user || user.role === 'applicant'`, which admits
+// EVERY internal role — not the "Admins only" the message below claims. `interviews.author` is
+// granted in PERMS_BY_ROLE to exactly those ten non-applicant built-in roles and to applicant not at
+// all, so nobody gains or loses access here; the check now names the ability instead of a role, and
+// narrowing it is a one-line grant change rather than an edit to this file.
+//
+// NOT lessons.author, deliberately: writing teaching material and writing the questions a candidate
+// is judged on are different business actions with different intended holders, even though the same
+// ten roles hold both today. See the dedupe note in src/lib/auth/permissions.ts.
+//
+// THE MESSAGE STILL OVERSTATES THE GATE and is left alone rather than quietly reworded: "Admins
+// only" describes a narrower population than either the old test or this capability, and that gap is
+// a reported finding, not something to paper over in a mechanism-only commit.
+//
+// can(), never hasPermission() — see the conversion rule in src/lib/auth/registry.ts.
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'Admins only' }, 403);
+  if (!can(user, 'interviews.author')) return json({ ok: false, error: 'Admins only' }, 403);
   if (!isLlmConfigured()) return json({ ok: false, error: 'Automatic question generation is currently unavailable - please add your questions manually.' }, 503);
 
   let form: FormData;

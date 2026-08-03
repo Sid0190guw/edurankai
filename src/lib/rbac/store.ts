@@ -48,26 +48,47 @@ export async function seedRbac(): Promise<{ roles: number; capabilities: number 
   return { roles: SEED_ROLES.length, capabilities: CORE_CAPABILITIES.length };
 }
 
-// Load the role graph from the DB (falls back to the code roster if unseeded/unreachable).
-async function loadRoleGraph(): Promise<SeedRole[]> {
+/**
+ * Load the role graph from the database.
+ *
+ * AN EMPTY TABLE AND AN UNREADABLE ONE ARE NOT THE SAME ANSWER, and they used to share a `catch`.
+ * No rows means the module has not been seeded yet, and the code roster IS what seedRbac() would
+ * write, so returning it is a correct bootstrap answer and stays. A failed READ means we do not know
+ * what the roles grant — and falling back to the code roster there is fail-OPEN whenever an
+ * administrator has since narrowed a role in the database, because a hiccup would silently restore
+ * the capabilities they removed. That case now reports `degraded`, and the caller turns it into a
+ * denial rather than a guess.
+ */
+async function loadRoleGraph(): Promise<{ graph: SeedRole[]; degraded: boolean }> {
   try {
     const { db, sql } = await ctx();
     const roleRows = rows(await db.execute(sql`SELECT key, surface, inherits FROM rbac_roles`));
-    if (!roleRows.length) return SEED_ROLES;
+    if (!roleRows.length) return { graph: SEED_ROLES, degraded: false };
     const capRows = rows(await db.execute(sql`SELECT role_key, capability FROM rbac_role_capabilities`));
-    return roleRows.map((r: any) => ({
-      key: r.key, surface: r.surface, description: '',
-      inherits: r.inherits ?? [],
-      capabilities: capRows.filter((c: any) => c.role_key === r.key).map((c: any) => c.capability as Capability),
-    }));
-  } catch { return SEED_ROLES; }
+    return {
+      graph: roleRows.map((r: any) => ({
+        key: r.key, surface: r.surface, description: '',
+        inherits: r.inherits ?? [],
+        capabilities: capRows.filter((c: any) => c.role_key === r.key).map((c: any) => c.capability as Capability),
+      })),
+      degraded: false,
+    };
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[rbac] role graph read failed', e?.cause?.message || e?.message);
+    return { graph: SEED_ROLES, degraded: true };
+  }
 }
 
 /** Resolve a full Principal from the existing auth user object (locals.user) or null.
  *  `presentedTokens` (e.g. from an `x-capability-token` header) are validated and the live
  *  ones attached to `Principal.capabilityTokens` for engine Tier 4. */
 export async function resolvePrincipal(user: any, presentedTokens: string[] = []): Promise<Principal> {
-  const graph = await loadRoleGraph();
+  const loaded = await loadRoleGraph();
+  const graph = loaded.graph;
+  // THE ONE FLAG. Any source that did not answer sets it, and the engine denies at Tier 0. See the
+  // note on Principal.contextDegraded in ./types.ts for why a partial read cannot be evaluated.
+  let contextDegraded = loaded.degraded;
   const capsFor = (keys: string[]) => {
     const s = new Set<Capability>();
     for (const k of keys) for (const c of resolveRoleCapabilities(k, graph)) s.add(c);
@@ -75,7 +96,7 @@ export async function resolvePrincipal(user: any, presentedTokens: string[] = []
   };
 
   if (!user?.id) {
-    return { userId: null, sessionValid: true, roles: ['guest'], capabilities: capsFor(['guest']) };
+    return { userId: null, sessionValid: true, contextDegraded, roles: ['guest'], capabilities: capsFor(['guest']) };
   }
 
   const userId: string = user.id;
@@ -101,7 +122,31 @@ export async function resolvePrincipal(user: any, presentedTokens: string[] = []
     }));
     const gl = rows(await db.execute(sql`SELECT 1 FROM rbac_guardian_links WHERE minor_user_id = ${userId} LIMIT 1`));
     hasGuardian = gl.length > 0;
-  } catch { /* DB unreachable -> proceed with the legacy-mapped role only */ }
+  } catch (e: any) {
+    // THE SHADOW PATH THAT USED TO LIVE HERE IS GONE. This catch read
+    // `/* DB unreachable -> proceed with the legacy-mapped role only */` and did exactly that: it
+    // kept the LEGACY_ROLE_MAP role and its inherited capabilities — super_admin maps to
+    // 'superadmin', which carries `administer`, the engine's Tier-2 administrative override — while
+    // throwing away every row of rbac_permission_grants.
+    //
+    // THAT WAS FAIL-OPEN IN THE ONE DIRECTION THAT MATTERS. rbac_permission_grants is where explicit
+    // DENY grants live, and Tier 1 evaluates them before anything else specifically so a deny can
+    // override `administer`. Dropping them meant a principal whose access had been NARROWED by a
+    // deny grant was evaluated as though the deny had never been written — on a gate that stands in
+    // front of real reads and writes through plugins/host.ts and security/authz.ts. Losing an ALLOW
+    // was fail-closed and harmless; losing a DENY was a hole that opened exactly when the database
+    // was least healthy.
+    //
+    // There is now one path and no fallback: unknown permission context is a denial, decided in the
+    // engine so every caller inherits it and the audit row says what actually happened.
+    //
+    // THE COST IS REAL AND IS STATED. While this read is failing, every surface gated by this engine
+    // refuses everyone, including the founder — the same trade canOpenAdmin() already makes for the
+    // /admin door, and the direction AUTHORIZATION_FIRST names for a database timeout. It is an
+    // availability cost, and it is the safe direction.
+    contextDegraded = true;
+    console.error('[rbac] principal context read failed', e?.cause?.message || e?.message);
+  }
 
   if (!roleKeys.length) roleKeys = ['applicant'];   // signed-in but unassigned -> minimal role
   roleKeys = [...new Set(roleKeys)];
@@ -120,7 +165,7 @@ export async function resolvePrincipal(user: any, presentedTokens: string[] = []
     } catch { /* token store unreachable -> no tokens attached */ }
   }
 
-  return { userId, sessionValid: true, roles: roleKeys, capabilities: capsFor(roleKeys), stage: stage as any, hasGuardian, grants, capabilityTokens };
+  return { userId, sessionValid: true, contextDegraded, roles: roleKeys, capabilities: capsFor(roleKeys), stage: stage as any, hasGuardian, grants, capabilityTokens };
 }
 
 export async function writeAudit(e: AuditEntry): Promise<void> {

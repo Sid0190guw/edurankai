@@ -10,6 +10,13 @@ function json(d: any, s = 200) {
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// EXAMINED AND DELIBERATELY NOT CONVERTED, and it is CORRECT AS WRITTEN. Same reasoning as
+// src/pages/api/portal/fee-waivers/submit.ts: an inverse role test confining this endpoint to the
+// APPLICANT side of a two-sided thread. The staff side is src/pages/api/admin/fee-waivers/reply.ts,
+// which is already on denyAdminApi, and the two must not be collapsed into one gate — the senderRole
+// written below ('applicant') is only truthful because of this line.
+//
+// Row ownership is enforced separately and properly: the SELECT below requires user_id = the caller.
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
   if (!user) return json({ ok: false, error: 'unauthorized' }, 401);

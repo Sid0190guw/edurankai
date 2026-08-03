@@ -26,6 +26,7 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
+import { holdsCapability } from '@/lib/auth/capability';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
@@ -423,7 +424,26 @@ export async function purgeLocationsFor(email: string): Promise<number> {
  * Super admin ONLY. This is precise personal location data about identifiable applicants, so it is
  * deliberately narrower than the rest of the applications screen: ordinary recruiters and HR staff
  * can review an application without needing to know which building someone sat in.
+ *
+ * ASKED AS A CAPABILITY, NOT AS A ROLE NAME. This was `user.role === 'super_admin'`.
+ * `locations.view` is granted in PERMS_BY_ROLE to super_admin and to NOBODY else, so the set of
+ * people admitted is byte-for-byte what the role comparison admitted. What changes is that the
+ * question is now "may you read applicant locations?" instead of "are you the founder?", which is a
+ * question the check can still answer after somebody adds the twelfth role.
+ *
+ * THROUGH can(), NEVER THE REGISTRY, and for this data the distinction matters more than usual.
+ * holdsCapability() reads the compiled matrix only. resolvePermissions() would additionally admit
+ * super_admin on the WILDCARD (identical) AND every admin-created role that had been handed the key
+ * — which for GPS-level personal data about identifiable applicants must be a deliberate, audited
+ * decision rather than a side effect of a checkbox. `locations.view` is marked sensitive in
+ * registry.ts for the same reason.
+ *
+ * The extra `isActive` adaptation holdsCapability() makes is unreachable here: it reads "not
+ * explicitly false", and every caller passes Astro.locals.user, whose session would already have
+ * been deleted if the account were deactivated (src/lib/auth/session.ts:59-62).
  */
-export function canViewLocations(user: { role?: string | null } | null | undefined): boolean {
-  return !!user && user.role === 'super_admin';
+export function canViewLocations(
+  user: { role?: string | null; isActive?: boolean | null } | null | undefined,
+): boolean {
+  return holdsCapability(user, 'locations.view');
 }

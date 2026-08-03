@@ -10,6 +10,14 @@ function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
+// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES; THE MISSING TEST IS SESSION OWNERSHIP.
+//
+// No authorization at all, and /api/ has no structural gate. Whoever holds a sessionId can overwrite
+// the BIOMETRIC REFERENCE DESCRIPTOR for an in-progress interview and set preflight_passed = true —
+// i.e. substitute their own face as the candidate's reference, which every later identity check is
+// then measured against. Same class as log-event.ts, turn.ts, end.ts and id-doc.ts in this folder:
+// they all need "is this caller the candidate whose session this is", which no role grant can say.
+// Adding sign-in changes who may call it, so it is reported rather than shipped here.
 export const POST: APIRoute = async ({ request }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

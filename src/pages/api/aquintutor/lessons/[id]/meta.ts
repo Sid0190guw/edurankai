@@ -1,12 +1,15 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
 
 function json(b: any, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } }); }
 
+// MECHANISM SWAP, IDENTICAL POPULATION — `lessons.author` is held by exactly the ten non-applicant
+// built-in roles that passed the `role === 'applicant'` test this replaces. See lesson-blocks/index.ts.
 export const PATCH: APIRoute = async ({ request, locals, params }) => {
   const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'unauthorised' }, 403);
+  if (!can(user, 'lessons.author')) return json({ ok: false, error: 'unauthorised' }, 403);
   const id = params.id as string;
   if (!id) return json({ ok: false, error: 'id required' }, 400);
   let body: any = {};

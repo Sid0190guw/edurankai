@@ -5,12 +5,15 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// THE MACHINE ARM, LEFT EXACTLY AS IT IS. A shared secret is not a role and no capability replaces
+// it. It already fails CLOSED when CRON_SECRET is unset, unlike src/pages/api/cron/*.
 function cronAuthorized(request: Request): boolean {
   const secret = process.env.CRON_SECRET;
   if (!secret) return false;
@@ -90,9 +93,16 @@ async function run(): Promise<{ ok: boolean; nudged: number; skipped: number }> 
   return { ok: true, nudged, skipped };
 }
 
+// TWO ARMS, AND ONLY THE HUMAN ONE MOVED. `jobs.run` is granted in PERMS_BY_ROLE to exactly the ten
+// non-applicant built-in roles that passed `u.role !== 'applicant'`, so the same accounts pass and
+// fail. Moved together with league-settle.ts, which shares the key and the shape.
+//
+// REPORTED AS TOO WIDE, not narrowed here: any internal role — including partner, teacher,
+// technical_moderator and every intern-flagged account — can fan a push notification out to every
+// learner on demand. That is now a grant to withdraw rather than a file to re-audit.
 export const GET: APIRoute = async ({ request, locals }) => {
   const u = (locals as any)?.user;
-  if (!(u && u.role !== 'applicant') && !cronAuthorized(request)) return json({ ok: false, error: 'unauthorized' }, 401);
+  if (!can(u, 'jobs.run') && !cronAuthorized(request)) return json({ ok: false, error: 'unauthorized' }, 401);
   return json(await run());
 };
 export const POST = GET;

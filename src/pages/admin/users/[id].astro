@@ -2,7 +2,7 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ROLE_LABELS } from '@/lib/auth/permissions';
+import { ROLE_LABELS, can } from '@/lib/auth/permissions';
 
 const me = Astro.locals.user;
 if (!me) return Astro.redirect('/admin/login');
@@ -11,14 +11,37 @@ if (me.role === 'applicant') return Astro.redirect('/portal');
 const { id } = Astro.params;
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-const target: any = rows(await db.execute(sql`SELECT * FROM users WHERE id = ${id} LIMIT 1`))[0];
-if (!target) return Astro.redirect('/admin/users');
+// VISIBILITY, AND WHY IT IS NOW IN THE WHERE CLAUSE.
+//
+// This block used to SELECT the whole target row first and redirect afterwards — the exact shape
+// src/lib/auth/workspace-access.ts names, by this file and these line numbers, as the one to avoid:
+// "filtering after the query is not scoping; the row has already been read by then". Every column of
+// somebody else's account entered the request context before anybody asked whether the reader was
+// entitled to it. The scope now narrows the query itself, so an unentitled read returns no row.
+//
+// THE POPULATION IS UNCHANGED, arm for arm:
+//   - `['super_admin','hr'].includes(me.role)` -> can(me, 'employee.manage'), which PERMS_BY_ROLE
+//     grants to exactly super_admin and hr. can() reads that matrix only, never the registry, so no
+//     custom-role grant can widen it.
+//   - `me.role === 'department_head'` -> can(me, 'department.lead'), whose only holder is
+//     department_head (requireTeamLead() refuses even super_admin, so the key is not a rank).
+//   - THE SECOND HALF OF THAT ARM IS A RELATIONSHIP, NOT A ROLE, and stays a per-ROW comparison
+//     against the target's department. No capability can express "this department and not that one",
+//     and granting department.lead more widely to cover leads would let one head open another
+//     department's staff. departments keys are varchar(50) slugs, so both sides compare as TEXT —
+//     ::uuid throws on a slug (see departmentFilter() in workspace-access.ts).
+//   - Anyone else still sees only their own profile.
+// A refused reader and a missing id both land on /admin/users, which is where each of them landed
+// before, so the two are safe to collapse into one answer.
+const myDepartment = String((me as any).assignedDepartmentId || '');
+const visible = can(me as any, 'employee.manage')
+  ? sql.empty()
+  : (can(me as any, 'department.lead') && myDepartment)
+    ? sql` AND (id = ${me.id} OR assigned_department_id::text = ${myDepartment})`
+    : sql` AND id = ${me.id}`;
 
-// Visibility: super admin / HR see everyone; a department head sees members of
-// their own department; otherwise only your own profile.
-const isAuthority = ['super_admin', 'hr'].includes(me.role);
-const sameDeptHead = me.role === 'department_head' && me.assignedDepartmentId && me.assignedDepartmentId === target.assigned_department_id;
-if (!isAuthority && !sameDeptHead && me.id !== target.id) return Astro.redirect('/admin/users');
+const target: any = rows(await db.execute(sql`SELECT * FROM users WHERE id = ${id}${visible} LIMIT 1`))[0];
+if (!target) return Astro.redirect('/admin/users');
 
 // Recent activity (audit log).
 const activity = rows(await db.execute(sql`SELECT action, entity, entity_id, ip_address, created_at FROM audit_log WHERE user_id = ${id} ORDER BY created_at DESC LIMIT 60`));

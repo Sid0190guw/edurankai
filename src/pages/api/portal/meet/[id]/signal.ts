@@ -35,6 +35,21 @@ async function ensure() {
 // presence heartbeat window: a peer is "live" if seen in the last 12s
 const LIVE = `INTERVAL '12 seconds'`;
 
+// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES, AND THERE IS NO CHECK OF ANY KIND HERE.
+//
+// `locals` is never destructured in this file, so neither handler knows who is calling. /api/ has no
+// structural gate (src/middleware.ts isExempt() returns true for it), which means anyone who learns
+// or guesses a room id can join the roster, read every live peer's id and display name, and post and
+// receive SDP/ICE — that is full participation in the meeting mesh, not merely metadata.
+//
+// It is an inconsistency WITHIN one feature rather than a considered design: both siblings under the
+// same prefix, portal/meet/[room]/anim.ts:13 and portal/meet/[room]/breakout.ts:12, require a
+// signed-in user and then a host check.
+//
+// A capability is the wrong instrument — the question is "is this caller a participant in THIS
+// room", which is a per-row fact about a meeting, not an ability a role holds. Requiring sign-in
+// would change who can join a call, so it is reported for a human rather than shipped here.
+
 export const POST: APIRoute = async ({ request, params }) => {
   const roomId = String((params as any).id || '');
   if (!roomId) return json({ ok: false, error: 'room required' }, 400);

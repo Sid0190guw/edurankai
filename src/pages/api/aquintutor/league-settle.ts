@@ -8,12 +8,17 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// THE MACHINE ARM, LEFT EXACTLY AS IT IS. A shared secret is not a role and no capability replaces
+// it; converting it would be inventing a rule, not translating one. Note it already fails CLOSED
+// when CRON_SECRET is unset (`if (!secret) return false`) — unlike the fail-OPEN spelling in
+// src/pages/api/cron/*, which is reported separately and not touched here.
 function cronAuthorized(request: Request): boolean {
   const secret = process.env.CRON_SECRET;
   if (!secret) return false;
@@ -106,10 +111,22 @@ async function settleLastWeek(): Promise<{ ok: boolean; settled: number; promote
   return { ok: true, settled, promoted, demoted, freezes };
 }
 
+// TWO ARMS, AND ONLY THE HUMAN ONE MOVED.
+//
+// The human arm was `user.role !== 'applicant'` behind a variable named `isAdmin` — a name that
+// described a population the test did not enforce, since every internal role passed it including
+// partner, teacher, technical_moderator and every intern-flagged account. `jobs.run` is granted in
+// PERMS_BY_ROLE to exactly those ten non-applicant built-in roles and to applicant not at all, so
+// the same accounts pass and fail: this is a rename of the question, not a change to the answer.
+//
+// THAT POPULATION IS TOO WIDE and is reported rather than silently narrowed here. One call settles
+// the whole XP league — promotions, demotions and reward writes across every learner. Removing a
+// role from it is a policy decision that is now a one-line grant change instead of an edit here.
+//
+// The CRON_SECRET arm is untouched: see cronAuthorized() above.
 export const GET: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
-  const isAdmin = user && user.role !== 'applicant';
-  if (!isAdmin && !cronAuthorized(request)) return json({ ok: false, error: 'unauthorized' }, 401);
+  if (!can(user, 'jobs.run') && !cronAuthorized(request)) return json({ ok: false, error: 'unauthorized' }, 401);
   return json(await settleLastWeek());
 };
 export const POST = GET;

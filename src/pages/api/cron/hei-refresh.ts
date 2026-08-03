@@ -47,6 +47,15 @@ async function ensureState() {
   await db.execute(sql`INSERT INTO hei_miner_state (id, country, next_offset) VALUES ('default', ${COUNTRY}, 0) ON CONFLICT (id) DO NOTHING`);
 }
 
+// EXAMINED AND NOT CHANGED — NO CAPABILITY APPLIES (a shared secret is not a role), BUT THE GUARD
+// BELOW FAILS OPEN in a fourth spelling: the whole check sits inside `if (secret) { ... }`, so when
+// CRON_SECRET is absent or empty there is no check at all and anyone can trigger the HEI mining
+// pipeline. Blast radius is limited — mined rows stay is_published = false, as the header says — but
+// the gate shape is identical to the other three, and the shape is what gets copied into the next
+// cron route somebody writes.
+//
+// See the fuller note in src/pages/api/cron/activity-digest.ts: one decision, four files, made by a
+// human against the deployed environment (this copy may not read .env*).
 export const GET: APIRoute = async ({ request }) => {
   const secret = import.meta.env.CRON_SECRET || process.env.CRON_SECRET;
   if (secret) {

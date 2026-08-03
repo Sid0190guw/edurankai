@@ -3,7 +3,8 @@
 // employee's own reporting manager (same permission chain as payouts). Self-bootstrapping.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { approverRole, holdsHrCapability } from '@/lib/hr-wallet';
+import { approverRole } from '@/lib/hr-wallet';
+import { decidesEveryRequest } from '@/lib/auth/capability';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 async function safe(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
@@ -105,7 +106,11 @@ export async function pendingLeaveForApprover(user: any): Promise<any[]> {
   // leave.approve to exactly super_admin and hr, and 'admin' is not a value of userRoleEnum
   // (src/lib/db/schema.ts:10-16) so that arm could never match an account. can() needs no database,
   // so this list still answers correctly during an outage — and it fails closed, not open.
-  const seesAll = holdsHrCapability(user, 'leave.approve');
+  //
+  // ASKED THROUGH THE SHARED PREDICATE, which is now the only expression of "may decide every
+  // request of this kind" — decideLeave() -> approverRole() and workforce/composer.ts ask the same
+  // function. The list and the enforcement cannot drift apart.
+  const seesAll = decidesEveryRequest(user, 'leave.approve');
 
   try {
     if (seesAll) {

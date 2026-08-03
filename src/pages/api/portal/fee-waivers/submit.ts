@@ -13,6 +13,17 @@ function json(d: any, s = 200) {
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// EXAMINED AND DELIBERATELY NOT CONVERTED, and it is CORRECT AS WRITTEN.
+//
+// This is an INVERSE role test: it does not ask what the caller may do, it restricts the surface to
+// the applicant side of a two-sided flow. No capability can name it — a capability answers "may this
+// person do X", and the answer here is that staff have their own screen (/admin/fee-waivers) and
+// have no business filing a waiver against their own account through the portal endpoint. Granting a
+// key to reproduce "applicants only" would invert the vocabulary, since applicant is the one role
+// that holds nothing in PERMS_BY_ROLE by design.
+//
+// Row ownership is enforced separately and properly, below: getIntent(intentId, user.id) scopes the
+// application to the caller, and the waiver rows are keyed on user_id.
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
   if (!user) return json({ ok: false, error: 'unauthorized' }, 401);

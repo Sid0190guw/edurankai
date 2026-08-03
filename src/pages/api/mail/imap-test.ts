@@ -7,6 +7,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureMailSchema } from '@/lib/mail';
 import { verifyImap } from '@/lib/mail-imap';
+import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -14,8 +15,14 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals }) => {
-  const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'unauthorized' }, 401);
+  // Same swap as its four siblings, and deliberately made in the same commit so the six mail routes
+  // cannot end up disagreeing about who administers mail. `mail.manage` is held by exactly the ten
+  // non-applicant built-in roles — the population `role === 'applicant'` already excluded — so this
+  // changes HOW the question is asked and not WHO may answer it.
+  //
+  // can() only: denyAdminApi()/hasPermission() would each move the set (see verify.ts). No database,
+  // fails closed.
+  if (!can((locals as any).user, 'mail.manage')) return json({ ok: false, error: 'unauthorized' }, 401);
 
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

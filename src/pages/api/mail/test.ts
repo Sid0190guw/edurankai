@@ -9,6 +9,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { getMailboxAddress, getMailConfig, ensureMailSchema } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
+import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -17,7 +18,17 @@ function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'unauthorized' }, 401);
+  // THIS ROUTE SENDS REAL MAIL FROM THE COMPANY MAILBOX, and its gate was `role !== 'applicant'` —
+  // the same power its sibling /api/mail/send.ts already guards with denyAdminApi(). The two still
+  // disagree, and that disagreement is REPORTED rather than closed here: matching send.ts would
+  // remove partner, teacher, technical_moderator and every intern-flagged account, which is a
+  // narrowing, not a mechanism swap, and needs a human decision.
+  //
+  // What lands now is the mechanism only. `mail.manage` is granted to exactly the ten non-applicant
+  // built-in roles, so the population is byte-for-byte what the role-name test admitted. can() reads
+  // the compiled matrix alone, needs no database, and answers false for a missing session, an
+  // inactive account or a role that is not in the matrix.
+  if (!can(user, 'mail.manage')) return json({ ok: false, error: 'unauthorized' }, 401);
 
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

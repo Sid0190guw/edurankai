@@ -39,7 +39,8 @@
 //      ago" quietly becomes false. It must be true the moment it is said.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { requireEmployee, holdsCapability, type Workspace, type WorkspaceUser } from '@/lib/auth/workspace-access';
+import { requireEmployee, type Workspace, type WorkspaceUser } from '@/lib/auth/workspace-access';
+import { leadsDepartment as holdsDepartmentLead, decidesEveryRequest } from '@/lib/auth/capability';
 import { resolvePermissions, holdsPermission, WILDCARD } from '@/lib/auth/registry';
 import { canAccessSection } from '@/lib/auth/permissions';
 import {
@@ -361,7 +362,14 @@ async function compose(
     : 'unknown';
   // An intern is never a team lead, whatever else the account says — the same refusal
   // requireTeamLead() makes, and a per-PERSON condition the capability neither carries nor replaces.
-  const leadsDepartment = holdsCapability(user, 'department.lead') && engagement !== 'internship';
+  //
+  // THE RULE IS NO LONGER WRITTEN HERE. It was
+  // `holdsCapability(user, 'department.lead') && engagement !== 'internship'` — a second, separately
+  // written copy of what requireTeamLead() enforces. Both call leadsDepartment() in
+  // src/lib/auth/capability.ts now. `engagement !== 'internship'` is exactly
+  // `!(workspace && workspace.isIntern)`, which is what passing `workspace` gives: null and
+  // undefined both mean "not resolved" and are treated as NOT an internship, as they were here.
+  const leadsDepartment = holdsDepartmentLead(user, workspace);
   const scopeDepartmentId = leadsDepartment
     ? (workspace?.scopeDepartmentId || String(user.assignedDepartmentId || '').trim() || null)
     : null;
@@ -388,12 +396,17 @@ async function compose(
   // have been true. Dropping a dead comparison removes nothing from anybody — the arms still sitting
   // in hr-leave.ts and hr-wallet.ts are equally dead and are a separate conversion.
   //
-  // DUPLICATION HAZARD, STILL NAMED but much smaller: this decides whether a CARD is shown, while
-  // hr-leave.ts pendingLeaveForApprover() and hr-wallet.ts approverRole() are the enforcement, and
-  // they still compare role strings. Until they are converted too, a role change made there and not
-  // here presents as "the approvals widget stopped working" rather than as an authorisation change.
-  // The card is not the authority: decideLeave() and decideWithdrawal() re-check at the write.
-  const seesEveryRequest = holdsCapability(user, 'leave.approve') || holdsCapability(user, 'payouts.approve');
+  // THE DUPLICATION HAZARD THIS COMMENT USED TO NAME IS CLOSED. It said: "this decides whether a
+  // CARD is shown, while hr-leave.ts pendingLeaveForApprover() and hr-wallet.ts approverRole() are
+  // the enforcement... a role change made there and not here presents as 'the approvals widget
+  // stopped working'." All four call sites — this one, both queues, and the enforcement — now ask
+  // decidesEveryRequest() in src/lib/auth/capability.ts. There is one expression of the rule, so
+  // there is nothing left to change in one place and not the other.
+  //
+  // Called with no capability argument on purpose: one flag gates two widgets (approvals.leave and
+  // approvals.withdrawal), so the question here is "either power". Both queues name their own.
+  // The card is still not the authority: decideLeave() and decideWithdrawal() re-check at the write.
+  const seesEveryRequest = decidesEveryRequest(user);
   // The reporting line, kept as the row-level fact it is. It is a RELATIONSHIP to particular
   // employees, not a role grant, and no capability may stand in for it: granting a key to "cover
   // managers" would hand every manager authority over every employee.

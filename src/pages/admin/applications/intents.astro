@@ -21,8 +21,22 @@ try {
   starters = rows(await db.execute(sql`
     SELECT u.id, u.name, u.email, u.created_at,
       (SELECT COUNT(*)::int FROM applications a WHERE a.applicant_user_id = u.id) AS app_count,
-      (SELECT COUNT(*)::int FROM application_intents i WHERE i.user_id = u.id) AS intent_count,
-      (SELECT i.id FROM application_intents i WHERE i.user_id = u.id ORDER BY i.created_at DESC LIMIT 1) AS intent_id,
+      -- A rejected intent must stop counting, or Reject would change nothing on screen and
+      -- the person would sit in the queue forever. to_jsonb(i)->>'status' rather than i.status
+      -- ON PURPOSE: the column is added on first use by the reject endpoint, so a database
+      -- where nobody has rejected yet has no such column, and a direct i.status reference
+      -- would throw and take the whole page down. This reads as NULL there instead, so the
+      -- query keeps working whether or not the bootstrap has run.
+      (SELECT COUNT(*)::int FROM application_intents i
+        WHERE i.user_id = u.id
+          AND coalesce(to_jsonb(i)->>'status', '') <> 'rejected') AS intent_count,
+      (SELECT COUNT(*)::int FROM application_intents i
+        WHERE i.user_id = u.id
+          AND coalesce(to_jsonb(i)->>'status', '') = 'rejected') AS rejected_count,
+      (SELECT i.id FROM application_intents i
+        WHERE i.user_id = u.id
+          AND coalesce(to_jsonb(i)->>'status', '') <> 'rejected'
+        ORDER BY i.created_at DESC LIMIT 1) AS intent_id,
       (SELECT d.step FROM application_drafts d WHERE (d.user_id = u.id OR lower(d.email) = lower(u.email)) ORDER BY d.updated_at DESC LIMIT 1) AS draft_step,
       (SELECT d.data FROM application_drafts d WHERE (d.user_id = u.id OR lower(d.email) = lower(u.email)) ORDER BY d.updated_at DESC LIMIT 1) AS draft_data,
       (SELECT d.updated_at FROM application_drafts d WHERE (d.user_id = u.id OR lower(d.email) = lower(u.email)) ORDER BY d.updated_at DESC LIMIT 1) AS draft_at
@@ -35,7 +49,13 @@ try {
 
 function stageOf(r: any): { key: string; label: string; css: string } {
   if (Number(r.app_count) > 0) return { key: 'applied', label: 'Applied', css: 'background:rgba(16,185,129,0.14);color:#047857;' };
-  if (Number(r.intent_count) > 0) return { key: 'awaiting_fee', label: 'Form complete - awaiting fee', css: 'background:rgba(250,204,21,0.16);color:#92400e;' };
+  // WAS 'Form complete - awaiting fee'. Nobody has been awaiting a fee since the 2026-07
+  // policy: src/lib/application-fee.ts returns 0 and isFeeExempt() returns true for every
+  // level and engagement type, so no application can owe money. The label survived the
+  // policy and was actively misleading - it explained a stalled applicant as a payment
+  // problem, which hid the real reason their application row was never created.
+  if (Number(r.intent_count) > 0) return { key: 'awaiting_fee', label: 'Form complete - not submitted', css: 'background:rgba(250,204,21,0.16);color:#92400e;' };
+  if (Number(r.rejected_count) > 0) return { key: 'rejected', label: 'Rejected', css: 'background:rgba(159,18,57,0.12);color:#9f1239;' };
   if (r.draft_step) return { key: 'in_progress', label: 'In progress - step ' + Math.min(6, Math.max(1, parseInt(r.draft_step) || 1)) + '/6', css: 'background:rgba(59,130,246,0.14);color:#1d4ed8;' };
   return { key: 'signed_up', label: 'Signed up - not started form', css: 'background:rgba(148,163,184,0.18);color:#475569;' };
 }
@@ -46,6 +66,7 @@ const counts = {
   signed_up: enriched.filter((r) => r.stage.key === 'signed_up').length,
   in_progress: enriched.filter((r) => r.stage.key === 'in_progress').length,
   awaiting_fee: enriched.filter((r) => r.stage.key === 'awaiting_fee').length,
+  rejected: enriched.filter((r) => r.stage.key === 'rejected').length,
   applied: enriched.filter((r) => r.stage.key === 'applied').length,
 };
 const shown = filter === 'all' ? enriched : enriched.filter((r) => r.stage.key === filter);
@@ -69,7 +90,7 @@ function pairs(obj: any, prefix = ''): { label: string; value: string }[] {
 }
 const TABS = [
   { k: 'all', label: 'All' }, { k: 'signed_up', label: 'Signed up only' }, { k: 'in_progress', label: 'In progress' },
-  { k: 'awaiting_fee', label: 'Awaiting fee' }, { k: 'applied', label: 'Applied' },
+  { k: 'awaiting_fee', label: 'Not submitted' }, { k: 'applied', label: 'Applied' }, { k: 'rejected', label: 'Rejected' },
 ];
 ---
 <AdminLayout title="Everyone who started" activeNav="applications">
@@ -107,8 +128,9 @@ const TABS = [
           <div style="padding:0 16px 14px;border-top:1px solid rgba(14,11,8,0.06);">
             {r.stage.key === 'awaiting_fee' && r.intent_id && (
               <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:10px 12px;margin-top:12px;">
-                <span style="font-size:0.8rem;color:#92400e;flex:1;min-width:220px;">Stuck awaiting fee. Approving creates the real application with the fee <strong>waived</strong> - no payment is taken.</span>
-                <button class="approve-intent" data-intent={r.intent_id} data-name={dispName} style="background:#0e7490;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:0.8rem;font-weight:700;cursor:pointer;white-space:nowrap;">Approve &amp; waive fee</button>
+                <span style="font-size:0.8rem;color:#92400e;flex:1;min-width:220px;">Form complete, but no application was created. Applying is <strong>free</strong> - no payment is or was ever due. Approve to create their application, or reject to close it without creating one.</span>
+                <button class="approve-intent" data-intent={r.intent_id} data-name={dispName} style="background:#0e7490;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:0.8rem;font-weight:700;cursor:pointer;white-space:nowrap;">Approve</button>
+                <button class="reject-intent" data-intent={r.intent_id} data-name={dispName} style="background:#fff;color:#9f1239;border:1px solid #fecdd3;border-radius:8px;padding:8px 14px;font-size:0.8rem;font-weight:700;cursor:pointer;white-space:nowrap;">Reject</button>
               </div>
             )}
             {!hasDetail ? <p style="font-size:0.82rem;color:#a99e94;margin:12px 0 0;">Account created - has not filled the form yet. Reach them at {r.email}.</p> : (
@@ -153,7 +175,7 @@ const TABS = [
         btn.addEventListener('click', function (e) {
           e.preventDefault();
           var name = btn.getAttribute('data-name') || 'this applicant';
-          if (!confirm('Approve ' + name + ' and waive the application fee?\n\nThis creates their real application - no payment is taken.')) return;
+          if (!confirm('Approve ' + name + '?\n\nThis creates their real application. Applying is free - no payment is taken.')) return;
           btn.disabled = true; btn.textContent = 'Approving...';
           fetch('/api/admin/applications/approve-intent', {
             method: 'POST', credentials: 'same-origin',
@@ -163,9 +185,34 @@ const TABS = [
             .then(function (r) { return r.json(); })
             .then(function (d) {
               if (d && d.ok) { btn.textContent = 'Approved - opening...'; window.location.href = '/admin/applications/' + d.applicationId; }
-              else { btn.disabled = false; btn.textContent = 'Approve & waive fee'; alert((d && d.error) || 'Could not approve. Please try again.'); }
+              else { btn.disabled = false; btn.textContent = 'Approve'; alert((d && d.error) || 'Could not approve. Please try again.'); }
             })
-            .catch(function () { btn.disabled = false; btn.textContent = 'Approve & waive fee'; alert('Network error - please try again.'); });
+            .catch(function () { btn.disabled = false; btn.textContent = 'Approve'; alert('Network error - please try again.'); });
+        });
+      });
+
+      // Reject WITHOUT creating an application. Until this existed the only way to clear
+      // someone was to approve them first, which manufactured a real application record
+      // for a person nobody intended to advance. A reason is optional but offered, because
+      // the note is the only thing that explains the decision to whoever asks later.
+      document.querySelectorAll('.reject-intent').forEach(function (btn) {
+        btn.addEventListener('click', function (e) {
+          e.preventDefault();
+          var name = btn.getAttribute('data-name') || 'this applicant';
+          if (!confirm('Reject ' + name + '?\n\nNo application is created and no email is sent. Their answers are kept and this can be undone by approving them later.')) return;
+          var note = prompt('Reason (optional) - kept for the record, never shown to the applicant:', '') || '';
+          btn.disabled = true; btn.textContent = 'Rejecting...';
+          fetch('/api/admin/applications/reject-intent', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ intentId: btn.getAttribute('data-intent'), note: note })
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              if (d && d.ok) { btn.textContent = 'Rejected'; window.location.reload(); }
+              else { btn.disabled = false; btn.textContent = 'Reject'; alert((d && d.error) || 'Could not reject. Please try again.'); }
+            })
+            .catch(function () { btn.disabled = false; btn.textContent = 'Reject'; alert('Network error - please try again.'); });
         });
       });
     </script>

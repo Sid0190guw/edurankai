@@ -16,6 +16,21 @@ function json(d: any, s = 200) {
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES, AND THE MISSING TEST IS SESSION OWNERSHIP.
+//
+// There is no authorization here at all: possession of a sessionId string is the only requirement,
+// and /api/ has no structural gate (src/middleware.ts isExempt() returns true for it). So an
+// unauthenticated caller who learns a session id can drive another person's risk_score, strikes_count
+// and tab_switches, and trip the auto-termination below in their name.
+//
+// CLAUDE.md is explicit that automated proctoring is ADVISORY ONLY and a human decides. An
+// unauthenticated writer into the advisory pipeline is the sharp edge of that rule: the strikes are
+// stamped on a named candidate's record and a reviewer reads them as evidence.
+//
+// A capability is the wrong instrument — the question is not "may this person log proctoring events"
+// but "is this caller the candidate whose session this is". That needs the session bound to the
+// signed-in user (or to a one-time token issued when it starts), which changes who can call the
+// route, so it is reported for a human rather than shipped in a mechanism-only pass.
 export const POST: APIRoute = async ({ request, clientAddress }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

@@ -39,9 +39,8 @@
 // (status + hours), never the punch log.
 import { db } from '@/lib/db';
 import { sql, type SQL } from 'drizzle-orm';
-import { can, type Permission } from '@/lib/auth/permissions';
+import { holdsCapability, leadsDepartment } from '@/lib/auth/capability';
 import { resolveIsIntern } from '@/lib/auth/intern-signals';
-import type { User } from '@/lib/db/schema';
 
 // postgres-js resolves to a plain array, never a { rows } object. Declared before everything that
 // uses it: `const` is not hoisted, and a handler reaching a later declaration has taken pages down
@@ -67,35 +66,16 @@ export interface WorkspaceUser {
 }
 
 /**
- * DOES THIS ACCOUNT HOLD A CAPABILITY? The only way this module may ask about authority.
+ * DOES THIS ACCOUNT HOLD A CAPABILITY? Re-exported, NOT reimplemented.
  *
- * `can()` is the pure, database-free test over PERMS_BY_ROLE and it is deliberately the one used
- * here rather than the registry's resolvePermissions(): the registry adds the super_admin WILDCARD
- * and any custom-role grant, so asking IT for 'department.lead' would answer true for the founder
- * and for any admin-created role that was handed the key — widening two gates that today admit
- * exactly one role each. This conversion changes the mechanism and must not touch the policy.
+ * The body used to live here, and a byte-for-byte copy of it lived in src/lib/hr-wallet.ts as
+ * holdsHrCapability(). One rule, two implementations, each free to drift on the next edit. There is
+ * now exactly one, in src/lib/auth/capability.ts, and both modules import it.
  *
- * `key` is typed `Permission`, so a permission string that is not in the union fails to COMPILE.
- * An invented key silently answers false for every role including super_admin, which is how a whole
- * console became unreachable on this project once already.
- *
- * TWO ADAPTATIONS, both preserving exactly what the role comparisons did before:
- *   - the role is trimmed and lowercased, because every test replaced here was written against
- *     `String(user.role || '').trim().toLowerCase()`;
- *   - `isActive` is read as "not explicitly false". can() denies an inactive account, and the tests
- *     this replaces looked at the role alone. In practice the distinction is unreachable —
- *     validateSessionToken() deletes the session and returns null for a deactivated account
- *     (src/lib/auth/session.ts:59-62), so a signed-in user is an active one — but a caller handing
- *     over a narrower object than Astro.locals.user must keep the access it had, not lose it to a
- *     field it never carried.
+ * The name and signature are kept so every existing caller — inside this file and in
+ * src/lib/workforce/composer.ts — is unchanged. Nothing about who holds what has moved.
  */
-export function holdsCapability(user: WorkspaceUser | null | undefined, key: Permission): boolean {
-  if (!user) return false;
-  return can(
-    { role: String(user.role || '').trim().toLowerCase(), isActive: user.isActive !== false } as unknown as User,
-    key,
-  );
-}
+export { holdsCapability, leadsDepartment };
 
 export interface WorkspaceDepartment {
   /** Opaque string. departments.id is varchar(50) (a slug) in src/lib/db/schema.ts:81 and UUID in
@@ -253,14 +233,17 @@ async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<
   if (!user?.id) return { status: 'none', workspace: null };
 
   // A CAPABILITY, NOT A ROLE NAME. This was `role === 'hr' || role === 'super_admin'`, and those two
-  // roles are exactly — and only — the ones PERMS_BY_ROLE grants 'employees.manage' to, so the set
+  // roles are exactly — and only — the ones PERMS_BY_ROLE grants 'employee.manage' to, so the set
   // of people this admits is unchanged. What changes is that the question is now "may you manage
   // employee records?" instead of "are you called HR?", which is the question the enforcement can
   // still answer after somebody adds the twelfth role. src/lib/hr-wallet.ts:151 asked the old
   // question as `role.indexOf('hr') >= 0` and handed approval rights to any role merely CONTAINING
   // those two letters. ('admin' is not a value of the user_role enum, so the branch testing for it
   // in hr-wallet.ts:150 is dead and is not reproduced as a grant.)
-  const isHr = holdsCapability(user, 'employees.manage');
+  //
+  // The key was spelled `employees.manage` until the capability vocabulary was reconciled to the
+  // singular canonical form. Same two roles, same answer for every account; only the spelling moved.
+  const isHr = holdsCapability(user, 'employee.manage');
 
   // THE ONLY WORKING TEAM-LEAD SIGNAL IN THIS DATABASE, and the reason it is a DEPARTMENT and not a
   // list of reports. hr_employees.reporting_manager_id is declared at db/hr-schema.sql:55 and read
@@ -515,7 +498,14 @@ export async function requireTeamLead(
   // An intern is never a team lead, whatever else the account says. The engagement test is
   // per-PERSON and survives the conversion: 'department.lead' says which department you are confined
   // to, never that you are not an intern.
-  if (ws?.isIntern || !holdsCapability(user, 'department.lead')) {
+  //
+  // THE RULE IS NO LONGER WRITTEN HERE. It was `ws?.isIntern || !holdsCapability(user,
+  // 'department.lead')`, and workforce/composer.ts leadsDepartment carried a second, separately
+  // written expression of the same two conditions. Both now call leadsDepartment() in
+  // src/lib/auth/capability.ts. `ws` is null for anyone with no employee record, and
+  // `isIntern: undefined` is treated there as NOT an internship — which is precisely what
+  // `ws?.isIntern` evaluated to here, so the population is identical.
+  if (!leadsDepartment(user, ws)) {
     return deny('not-a-team-lead', 'This screen is for team leads',
       'You are not recorded as leading a department. Your own workspace is at /portal/employee.');
   }
@@ -557,7 +547,7 @@ export async function requireHr(
 
   // The same capability lookupWorkspace() resolves isHr from, asked once more because this gate must
   // answer before any record is read — and admitting exactly the two roles the role test admitted.
-  if (!holdsCapability(user, 'employees.manage')) {
+  if (!holdsCapability(user, 'employee.manage')) {
     return deny('not-hr', 'This screen is for the people team',
       'Your account does not hold HR permissions. Your own workspace is at /portal/employee.');
   }

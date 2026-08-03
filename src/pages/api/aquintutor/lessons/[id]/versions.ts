@@ -1,12 +1,18 @@
 import type { APIRoute } from 'astro';
 import { listVersions, saveVersion, restoreVersion } from '@/lib/aquintutor-authoring';
+import { can } from '@/lib/auth/permissions';
 
 function json(b: any, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { 'content-type': 'application/json' } }); }
+
+// MECHANISM SWAP, IDENTICAL POPULATION — `lessons.author` is held by exactly the ten non-applicant
+// built-in roles that passed the `role === 'applicant'` test this replaces. See lesson-blocks/index.ts.
+// Reading the history and restoring from it share one key here because they shared one test before;
+// splitting them would be a policy change, not a mechanism swap.
 
 // GET  -> list versions for a lesson
 export const GET: APIRoute = async ({ locals, params }) => {
   const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'unauthorised' }, 403);
+  if (!can(user, 'lessons.author')) return json({ ok: false, error: 'unauthorised' }, 403);
   const id = params.id as string;
   if (!id) return json({ ok: false, error: 'id required' }, 400);
   try { return json({ ok: true, versions: await listVersions(id) }); }
@@ -17,7 +23,7 @@ export const GET: APIRoute = async ({ locals, params }) => {
 // POST { action: 'restore', versionId }    -> restore a version (auto-snapshots current first)
 export const POST: APIRoute = async ({ locals, params, request }) => {
   const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'unauthorised' }, 403);
+  if (!can(user, 'lessons.author')) return json({ ok: false, error: 'unauthorised' }, 403);
   const id = params.id as string;
   if (!id) return json({ ok: false, error: 'id required' }, 400);
   let body: any = {};

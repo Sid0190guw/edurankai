@@ -16,6 +16,15 @@ function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
   if (!user) return json({ ok: false, error: 'unauthorized' }, 401);
+  // DELIBERATELY NOT CONVERTED TO A CAPABILITY, AND NOT AN OVERSIGHT — recorded here so a later sweep
+  // does not read it as an unconverted call site.
+  //
+  // This is an INVERSE role test: it restricts TO a role rather than requiring an ability. Every
+  // internal role, including super_admin, is refused, and that is the intended meaning — a fee-waiver
+  // coupon belongs to the candidate paying the fee. No key in the Permission union can express "is an
+  // applicant" (applicant's grant list is empty, which is the whole point of it), and granting any key
+  // to make this pass would open coupon redemption to staff. So the role comparison stays a role
+  // comparison. See src/lib/auth/permissions.ts, where `applicant: []` carries the same reasoning.
   if (user.role !== 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

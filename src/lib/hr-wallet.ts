@@ -6,56 +6,26 @@
 // Self-bootstrapping schema — consistent with the rest of the app.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { can, type Permission } from '@/lib/auth/permissions';
-import type { User } from '@/lib/db/schema';
+import { holdsCapability, decidesEveryRequest, type ApprovalCapability } from '@/lib/auth/capability';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 async function safe(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
 
 /**
- * The standing authority approverRole() is asked about. Named as a type so a caller cannot pass
- * `'leave.edit'` or a hand-typed string that nothing grants: inventing a permission string outside
- * the Permission union is what made an entire console unreachable for every role on this project.
+ * THE DUPLICATE IS GONE. `holdsHrCapability` was a byte-for-byte copy of holdsCapability() in
+ * src/lib/auth/workspace-access.ts, kept separate — the comment here said so — "so the HR money path
+ * has no dependency on the workspace module", and ending "if they are ever consolidated, consolidate
+ * them deliberately and together." This is that consolidation.
  *
- * Two members, because approving time off and approving money are two different powers held by the
- * same people today. Asking with the wrong one would be silently correct right now and silently
- * wrong the day either grant moves — so each caller names its own.
+ * The dependency concern is answered by WHERE the shared copy lives, not by keeping two of them:
+ * src/lib/auth/capability.ts imports src/lib/auth/permissions and nothing else, so this module still
+ * does not reach the workspace module. What it no longer does is carry its own copy of the
+ * adaptation rules, which were one edit away from disagreeing about what `isActive` means.
+ *
+ * The name is kept as an alias because src/lib/hr-leave.ts imports it from here. Same function, same
+ * answer for every account.
  */
-export type ApprovalCapability = Extract<Permission, 'leave.approve' | 'payouts.approve'>;
-
-/**
- * Does this account hold a capability? The only way these two engines may ask about authority.
- *
- * `can()` — the pure, database-free test over PERMS_BY_ROLE — and deliberately NOT the registry's
- * resolvePermissions(): the registry adds the super_admin WILDCARD and every custom-role grant, so
- * asking IT would admit any admin-created role that had been handed the key. The role tests replaced
- * here admitted exactly two built-in roles. This is a mechanism change and must not move the policy.
- *
- * `key` is typed `Permission`, so a string that is not in the union fails to COMPILE. An invented key
- * answers false for every role INCLUDING super_admin, which is how a whole console became unreachable
- * on this project once already.
- *
- * TWO ADAPTATIONS, both there to preserve exactly what the role comparisons did:
- *   - the role is trimmed and lowercased, because every test replaced here read
- *     `String(user.role || '').toLowerCase()`;
- *   - `isActive` is read as "not explicitly false". can() denies an inactive account and the old
- *     tests looked at the role alone. The difference is unreachable through the three call paths
- *     that exist — all pass Astro.locals.user, and validateSessionToken() deletes the session of a
- *     deactivated account (src/lib/auth/session.ts:59-62) — but these functions take `user: any`,
- *     and a caller handing over a narrower object must not lose authority to a field it never
- *     carried.
- *
- * Twin of holdsCapability() in src/lib/auth/workspace-access.ts, which makes the same two adaptations
- * for the workspace gates. Kept separate rather than imported so the HR money path has no dependency
- * on the workspace module; if they are ever consolidated, consolidate them deliberately and together.
- */
-export function holdsHrCapability(user: any, key: Permission): boolean {
-  if (!user) return false;
-  return can(
-    { role: String(user.role || '').trim().toLowerCase(), isActive: user.isActive !== false } as unknown as User,
-    key,
-  );
-}
+export { holdsCapability, holdsCapability as holdsHrCapability, type ApprovalCapability };
 
 let ready: Promise<void> | null = null;
 export function ensureWalletSchema(): Promise<void> {
@@ -212,7 +182,11 @@ export async function pendingWithdrawalsForApprover(user: any): Promise<any[]> {
   // not a value of userRoleEnum (src/lib/db/schema.ts:10-16) so that arm could never match an
   // account. can() reads the built-in matrix only — no database — so this answer survives an outage
   // and cannot be widened by a section-matrix row that merely spells 'payouts'.
-  const seesAll = holdsHrCapability(user, 'payouts.approve');
+  //
+  // ASKED THROUGH THE SHARED PREDICATE. This is one of the four places that expressed "may decide
+  // every request of this kind"; decidesEveryRequest() in src/lib/auth/capability.ts is now the only
+  // expression of it, and approverRole() below — the enforcement — asks the same function.
+  const seesAll = decidesEveryRequest(user, 'payouts.approve');
 
   try {
     if (seesAll) {
@@ -256,7 +230,12 @@ export async function approverRole(
   // roles — and leave.approve / payouts.approve are granted there to exactly super_admin and hr,
   // which is what the three name tests matched. The dropped `role === 'admin'` arm was dead: 'admin'
   // is not a value of userRoleEnum (src/lib/db/schema.ts:10-16), so no account could ever hold it.
-  if (holdsHrCapability(user, capability)) {
+  //
+  // ONE EXPRESSION, FOUR READERS. pendingWithdrawalsForApprover(), pendingLeaveForApprover() and
+  // workforce/composer.ts seesEveryRequest all ask decidesEveryRequest() too, so what a screen
+  // OFFERS and what this function ALLOWS cannot answer differently. They already agreed; they now
+  // cannot stop agreeing.
+  if (decidesEveryRequest(user, capability)) {
     // decided_by_role is an audit column that both /admin/hr/leave and /admin/hr/wallet PRINT, and
     // rows written before this change say 'super_admin' or 'hr_head'. The labels are kept byte-for-
     // byte so the history stays readable and payWithdrawal's old narrowing means the same thing.
@@ -329,7 +308,7 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
   // IDENTICAL SET. payouts.pay is granted in PERMS_BY_ROLE to exactly super_admin and hr — the two
   // roles approverRole() answered 'super_admin' and 'hr_head' for. The 'admin' arm was dead ('admin'
   // is not a value of userRoleEnum), and 'reporting_manager' was refused before and is refused now.
-  if (!holdsHrCapability(user, 'payouts.pay')) return { ok: false, error: 'Only HR/admin can release a payout.' };
+  if (!holdsCapability(user, 'payouts.pay')) return { ok: false, error: 'Only HR/admin can release a payout.' };
 
   let ref = manualRef || null, paidVia = 'manual';
   const KEY = process.env.RAZORPAY_KEY_ID, SEC = process.env.RAZORPAY_KEY_SECRET, ACC = process.env.RAZORPAYX_ACCOUNT_NUMBER;

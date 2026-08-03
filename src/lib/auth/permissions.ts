@@ -43,7 +43,7 @@ export type Permission =
   // still ask canAccessSection() on purpose — see the note at the end of this block, and the comment
   // at the top of each page.
   //
-  // AND IN THE WORKSPACE GATES: `employees.manage` is what requireHr() admits on and what
+  // AND IN THE WORKSPACE GATES: `employee.manage` is what requireHr() admits on and what
   // Workspace.isHr is resolved from; `department.lead` is what requireTeamLead() and the composer's
   // leadsDepartment ask for. Both through holdsCapability() in src/lib/auth/workspace-access.ts,
   // which asks can() — this matrix — and never the registry, so the WILDCARD a super_admin holds
@@ -51,9 +51,106 @@ export type Permission =
   // same accounts it admitted as a role-name test.
   | 'leave.approve'
   | 'payouts.approve' | 'payouts.pay'
-  | 'employees.manage'
+  // RENAMED from `employees.manage` (shipped in 6a0b03b) to the canonical singular spelling. The
+  // grant set is byte-for-byte the same (super_admin + hr) and both call sites in
+  // src/lib/auth/workspace-access.ts moved with it, so this changes the SPELLING and nothing else.
+  // The reason it was worth a rename: every other people key in the ratified vocabulary is singular
+  // (employee.view / employee.create / employee.edit), and one plural outlier is how a check ends up
+  // asking for a permission nobody granted.
+  //
+  // A stale `employees.manage` row is left behind in permission_catalogue on any database that has
+  // already booted this module. It is inert — nothing asks for it, and the two gates that used to
+  // ask went through can() (PERMS_BY_ROLE) rather than the registry, so no custom-role grant of it
+  // ever did anything. Removing the row needs a database change and is listed as a follow-up.
+  | 'employee.manage'
+  // NOT REMOVED, DELIBERATELY, AND AGAINST THE SPRINT BRIEF'S DEFAULT. See the block headed
+  // "WHY department.lead IS STILL HERE" below the matrix. Short version: deleting it changes who may
+  // open a team-lead surface, and there is no organisational data to resolve leadership from.
   | 'department.lead'
-  | 'audit.view';
+  | 'audit.view'
+
+  // =============================================================================================
+  // THE `role !== 'applicant'` FAMILY. Every key in this group replaces the exact test
+  // canAccessSection()'s docblock warns against, and every one of them is granted to EXACTLY the ten
+  // non-applicant built-in roles — including partner, teacher and technical_moderator, which hold no
+  // admin.access and which src/middleware.ts bounces off /admin entirely.
+  //
+  // THAT WIDTH IS NOT AN ENDORSEMENT. It is what the code enforces today, and this sprint changes
+  // HOW authorization is asked, never WHO may do what. Recording the population as a capability is
+  // what makes narrowing it a reviewable, one-line policy decision instead of an archaeology
+  // project across nine files. Each of these is reported as too wide in the accompanying findings.
+  //
+  // WHY NOT AN EXISTING KEY. There is no capability in this union whose holders equal "every
+  // internal role". content.edit is super_admin + hr + marketing + editor; admin.access is the seven
+  // console roles. Converting any of these call sites to either would REMOVE access from real
+  // accounts — a narrowing dressed up as a mechanism swap, which is the defect this sprint exists to
+  // remove rather than to commit.
+  //
+  // CONVERT WITH can(), NOT hasPermission(). can() reads this matrix only. The registry adds the
+  // super_admin WILDCARD (identical here) and any custom-role grant, including keys spelled by the
+  // legacy section matrix as `<page_key>.<action>` — so a registry-based conversion of, say,
+  // tests_restricted.view would silently admit every custom role holding that section checkbox.
+  // =============================================================================================
+
+  // The company mailbox: poll it over IMAP with stored credentials, send from it, probe an SMTP or
+  // IMAP connection, read its DNS posture. Five routes under src/pages/api/mail/ share one test.
+  | 'mail.manage'
+  // AquinTutor lesson authoring, split the way payouts.approve / payouts.pay is split: writing a
+  // lesson and making it live to learners are two powers even though the same ten roles hold both
+  // today. Eight routes ask `lessons.author`; publish.ts alone asks `lessons.publish`.
+  | 'lessons.author' | 'lessons.publish'
+  // Generating interview templates from an uploaded document — LLM spend, and authority over what
+  // candidates are asked. Deliberately NOT folded into lessons.author: teaching material and
+  // candidate assessment are different business actions with different intended populations.
+  | 'interviews.author'
+  // Triggering a scheduled bulk job by hand: the XP league settlement (promotions, demotions and
+  // reward writes across every learner) and the streak push fan-out. Both routes ALSO accept
+  // CRON_SECRET, which is not a role and stays as its own arm.
+  | 'jobs.run'
+  // Reading restricted internal research (the Viśvambhara deep modules gated in src/middleware.ts).
+  | 'research.restricted.view'
+
+  // =============================================================================================
+  // THE super_admin CLUSTER. Five surfaces whose only gate is a literal role comparison against
+  // 'super_admin', each granted below to super_admin and to nobody else. No existing key is a
+  // semantic match: users.view/users.edit are exact-population but describe ACCOUNTS, and an audit
+  // line saying somebody changed an account when they published an applicant's profile or exported
+  // every resume on file is a log that misdescribes what happened.
+  //
+  // SUPER_ADMIN'S WILDCARD LIVES IN THE REGISTRY, NOT IN can(). A new key that is not written into
+  // the super_admin array below answers FALSE for the founder. That omission made an entire console
+  // unreachable on this project once already.
+  // =============================================================================================
+
+  // Publishing an applicant's profile to the public web, and editing its content (/admin/profiles).
+  | 'profiles.manage'
+  // Opening resume submissions — and the unpaginated CSV of every one of them.
+  | 'resumes.view'
+  // Putting spendable balance on an account by email (/admin/credits). Money creation.
+  | 'credits.grant'
+  // Re-driving a captured payment into a materialised application (/admin/paid-stuck).
+  | 'payments.retry'
+  // Precise personal location data about identifiable applicants (src/lib/applicant-location.ts).
+  | 'locations.view'
+
+  // =============================================================================================
+  // THE REST. Each is derived from its own call site; the derivation is written beside the grant.
+  // =============================================================================================
+
+  // The salary screen: base_salary, payslips, payroll runs. super_admin + hr, matching the literal
+  // role list on /admin/hr/payroll today.
+  | 'payroll.manage'
+  // A restricted exam's question bank. Named to match the `tests_restricted` SECTION KEY that
+  // already exists in src/lib/admin-sections.ts ("Restricted Exams — Designated-authority only")
+  // rather than inventing a second spelling for the same authority. See the dedupe note below.
+  | 'tests_restricted.view'
+  // Responding to an emergency: reading the SOS queue and live staff locations, and closing an
+  // active SOS in somebody else's name (/admin/sos).
+  | 'safety.respond'
+  // Approving a hiring requisition (src/lib/hr-requisition.ts decideRequisition).
+  | 'requisitions.approve'
+  // Acting on the live-classroom moderation queue (src/lib/moderation.ts).
+  | 'community.moderate';
 
 // Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
 // drifting away from the real one (/admin/access-preview). Nothing outside this file may decide
@@ -75,9 +172,10 @@ export type Permission =
 //                     answer to 'admin' | 'super_admin' | 'hr_head' — a reporting manager may
 //                     APPROVE a withdrawal and may NOT release the money. Two keys, because it is
 //                     two powers; payWithdrawal now asks for this one directly.
-//   employees.manage  src/lib/auth/workspace-access.ts requireHr(); /admin/hr isHrDesk;
+//   employee.manage   src/lib/auth/workspace-access.ts requireHr(); /admin/hr isHrDesk;
 //                     /admin/hr/completion/[id] isHrDesk; middleware gates /admin/hr/employees on
 //                     the 'employees' section, which only `hr` holds in ROLE_SECTIONS.
+//                     (Spelled `employees.manage` until this commit. Same two roles, new spelling.)
 //   department.lead   src/lib/auth/workspace-access.ts requireTeamLead() (role must be exactly
 //                     'department_head'); src/lib/workforce/composer.ts leadsDepartment.
 //
@@ -105,7 +203,130 @@ export type Permission =
 // conversion that swaps canAccessSection() for a bare can(..., 'leave.approve') would REMOVE access
 // from every custom role that has it today. Convert by accepting either, or by granting the new key
 // to those roles first and verifying it landed.
+//
 // ---------------------------------------------------------------------------------------------
+// WHY department.lead IS STILL HERE, against an instruction to delete it.
+//
+// The ruling was right about the architecture: Team Lead and Department Head are ORGANISATIONAL
+// RELATIONSHIPS, not RBAC permissions, and a capability that encodes a relationship is a category
+// error — "leads one department" must never be spelled the same way as "may administer departments",
+// because the second is a permission a person holds and the first is a fact about one row.
+//
+// It cannot be carried out yet, because THE ORGANISATIONAL DATA DOES NOT EXIST. requireTeamLead()
+// must resolve "is this user the assigned head of THIS department" from org data. There is no such
+// column anywhere: `departments` in src/lib/db/schema.ts:80-90 is (id, name, icon, ...) and in
+// db/hr-schema.sql:31-38 is (id, name, code, description, is_active, created_at). Neither carries a
+// head. hr_employees.reporting_manager_id is declared at db/hr-schema.sql:55 and written by zero
+// lines of application code. The ONLY signal in the product is the pair
+// users.role = 'department_head' + users.assigned_department_id, written together by /admin/users —
+// and the leadership half of that pair is a role name, which is exactly what may not be asked.
+//
+// So every available way to remove this key changes who may open a team-lead surface:
+//   - drop the check                -> every signed-in account with an assigned department becomes a
+//                                      team lead. The widest change available in this file.
+//   - resolve from `departments`    -> the column does not exist, so requireTeamLead() denies
+//                                      EVERYONE, including the department heads it exists for.
+//   - substitute department.manage  -> explicitly forbidden by the ruling, and it would mean that
+//                                      administering departments confers leading one.
+//
+// THE GOVERNING RULE DECIDES IT: a conversion that gives or removes access for any role does not
+// ship, it gets reported. So the key stays exactly as it is, held by department_head and by nobody
+// else, and the three call sites (workspace-access.ts lookupWorkspace/requireTeamLead,
+// workforce/composer.ts leadsDepartment) are untouched.
+//
+// RECOMMENDED ARCHITECTURE, for approval: add `departments.head_user_id UUID REFERENCES users(id)`
+// via ADD COLUMN IF NOT EXISTS inside an ensureOnce() (no migrations exist on this project),
+// backfill it from the existing (role='department_head', assigned_department_id) pairs so nobody
+// loses access on the deploy, give /admin/departments a field to set it, then rewrite
+// requireTeamLead() to ask "does departments.head_user_id = this user, for the department being
+// asked about" and delete department.lead in the same change. That sequence keeps the population
+// identical at every step, which is the only way this key can leave without an outage.
+//
+// ---------------------------------------------------------------------------------------------
+// TWO NAMES CHOSEN OVER THE ONES THE AUDIT ASKED FOR, so the vocabulary stays single-valued.
+//
+//   tests.restricted.view -> tests_restricted.view
+//     `tests_restricted` is ALREADY a section key in src/lib/admin-sections.ts:57, labelled
+//     "Restricted Exams" with the hint "Designated-authority only" — the same authority, already
+//     spelled, already seeded into permission_catalogue as tests_restricted.view/.edit/.delete/
+//     .export by seedCatalogueRows(). Adding `tests.restricted.view` beside it would be two names
+//     for one power, which is the drift this sprint exists to remove. Collision with a
+//     section-derived key is the NORM here, not an exception: users.view, roles.edit, content.edit,
+//     events.view, products.edit, settings.edit, applications.score and audit.view are every one of
+//     them both a union member and a section-derived key.
+//
+//   employees.manage -> employee.manage
+//     The canonical vocabulary is singular for people keys. Identical grant set.
+//
+// AND TWO KEPT SEPARATE THAT LOOK LIKE DUPLICATES BUT ARE NOT:
+//   lessons.author / lessons.publish — same ten roles today, two different powers, split on the
+//     exact precedent of payouts.approve / payouts.pay above: approving a withdrawal and releasing
+//     the money are held by the same people and are still two keys, so that a future grant can
+//     separate them without a code change. Nine call sites, two keys — not a key per call site.
+//   lessons.author / interviews.author — writing teaching material and writing the questions a
+//     candidate is judged on are different business actions on different surfaces.
+//
+// ---------------------------------------------------------------------------------------------
+// HOW THE SIXTEEN NEW GRANTS BELOW WERE DERIVED. Every one from READING the call site.
+//
+//   `role !== 'applicant'` at the call site -> granted to all TEN non-applicant built-in roles:
+//     mail.manage              src/pages/api/mail/{imap-poll:46,56, verify:19, imap-test:18,
+//                              test:20, dns-check:43}
+//     lessons.publish          src/pages/api/aquintutor/lessons/[id]/publish.ts:8
+//     lessons.author           lesson-blocks/{index:8, reorder:8, [id]:8+21, upload:33};
+//                              lessons/[id]/{meta:9, versions:9+20, request-review:8};
+//                              courses/[id]/labs.ts:9+19
+//     interviews.author        src/pages/api/aquintutor/interview/generate-from-doc.ts:30
+//     jobs.run                 src/pages/api/aquintutor/{league-settle.ts:111, streak-nudge.ts:95}
+//                              (each ALSO accepts CRON_SECRET — a separate arm, not a role)
+//     research.restricted.view src/middleware.ts:230, where only `applicant` is asked for an
+//                              approved visvambhara_access_requests row and every other role passes
+//                              unchecked. The applicant arm is a ROW, not a role, and must stay.
+//
+//   `role === 'super_admin'` at the call site -> granted to super_admin ONLY:
+//     profiles.manage          src/pages/admin/profiles/index.astro:8, [userId].astro:7
+//     resumes.view             src/pages/admin/resumes/index.astro:8, [id].astro:7
+//     credits.grant            src/pages/admin/credits.astro:9 (the `'admin'` arm is DEAD — 'admin'
+//                              is not a value of userRoleEnum, so no account can hold it)
+//     payments.retry           src/pages/admin/paid-stuck.astro:8 (same dead arm, in array form)
+//     locations.view           src/lib/applicant-location.ts:427
+//
+//   Everything else, one at a time:
+//     payroll.manage           /admin/hr/payroll/index.astro:10 lists ['super_admin','hr'] literally
+//                              -> those two. A custom role holding the `payroll` section passes
+//                              middleware.ts:59 and is then refused by that line, so it has no access
+//                              today and must gain none: convert with can(), never
+//                              canAccessSection('payroll','edit'), which would ADD it.
+//     tests_restricted.view    /admin/tests/[id].astro:25 reads super_admin || hr — but `hr` does not
+//                              hold the 'tests' section in ROLE_SECTIONS, so middleware redirects hr
+//                              BEFORE that line runs. Observed population is super_admin alone, and
+//                              that is what is granted. Reproducing the dead `hr` arm as a grant
+//                              would hand hr a question bank it cannot reach today.
+//     safety.respond           /admin/sos.astro has NO role check and no PATH_SECTION entry, so
+//                              canOpenAdmin() alone stands in front of live staff GPS. NOT
+//                              population-preserving: see the loud note on the grant itself.
+//     requisitions.approve     src/lib/hr-requisition.ts:86 checks NOBODY. No rule to preserve.
+//     community.moderate       src/lib/moderation.ts:78 checks NOBODY. No rule to preserve.
+// ---------------------------------------------------------------------------------------------
+/**
+ * The six keys that replace a `role !== 'applicant'` test, written ONCE and spread into all ten
+ * non-applicant roles below.
+ *
+ * Declared here rather than typed out ten times because ten hand-maintained copies of one population
+ * is ten chances for them to disagree, and "these six keys are held by exactly the same people" is
+ * the fact that makes the conversions safe. Declared ABOVE PERMS_BY_ROLE because `const` is not
+ * hoisted and a later declaration has taken pages down on this project.
+ *
+ * Deliberately NOT granted to `applicant`, which is the entire content of the test being replaced.
+ */
+const INTERNAL_ROLE_KEYS: Permission[] = [
+  'mail.manage',
+  'lessons.author', 'lessons.publish',
+  'interviews.author',
+  'jobs.run',
+  'research.restricted.view',
+];
+
 export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
   super_admin: [
     'admin.access',
@@ -121,8 +342,23 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // Already holds every one of these: approverRole() answers 'super_admin' first, and
     // getViewableSectionKeys()/canAccessSection() return "unrestricted" for this role. Not
     // 'department.lead' — requireTeamLead() refuses super_admin today and that must not move.
-    'leave.approve', 'payouts.approve', 'payouts.pay', 'employees.manage',
-    'audit.view'
+    'leave.approve', 'payouts.approve', 'payouts.pay', 'employee.manage',
+    'audit.view',
+    ...INTERNAL_ROLE_KEYS,
+    // THE super_admin CLUSTER. Each of these is granted here and NOWHERE ELSE, because each replaces
+    // a literal `user.role !== 'super_admin'` redirect. There is no WILDCARD in can() — an omission
+    // here answers false for the founder and closes the surface to everybody.
+    'profiles.manage', 'resumes.view', 'credits.grant', 'payments.retry', 'locations.view',
+    // /admin/hr/payroll lists ['super_admin','hr'] literally.
+    'payroll.manage',
+    // /admin/tests/[id] admits super_admin || hr, but hr never reaches the line (no 'tests' section).
+    'tests_restricted.view',
+    // NOT population-preserving, and granted narrowly on purpose — see the note on `hr` below.
+    'safety.respond',
+    // NO RULE EXISTS TO PRESERVE at either call site. Granted to the narrowest defensible holder and
+    // reported: enforcing them is a policy decision, and neither call site may be converted until a
+    // human has made it.
+    'requisitions.approve', 'community.moderate'
   ],
   hr: [
     'admin.access',
@@ -140,8 +376,28 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // also the only built-in role carrying 'leave', 'payouts', 'employees' and 'hr' in ROLE_SECTIONS
     // below, which is what the middleware and both page gates actually enforce. Same four abilities,
     // named instead of spelled.
-    'leave.approve', 'payouts.approve', 'payouts.pay', 'employees.manage',
-    'content.view'
+    'leave.approve', 'payouts.approve', 'payouts.pay', 'employee.manage',
+    'content.view',
+    ...INTERNAL_ROLE_KEYS,
+    // /admin/hr/payroll/index.astro:10 names 'hr' in its literal list, and `hr` is the only built-in
+    // role holding the 'payroll' section in ROLE_SECTIONS, so it reaches the page and passes the
+    // line. Exact population, named instead of spelled.
+    'payroll.manage',
+    // NOT POPULATION-PRESERVING, AND THE ONLY GRANT IN THIS FILE THAT ISN'T. /admin/sos.astro has no
+    // role check at all (its only test is `if (!user)`) and no PATH_SECTION entry, so TODAY every
+    // admin-capable role reaches it: super_admin, hr, recruiter, reviewer, department_head,
+    // marketing, editor, plus any custom role granted admin.access. Behind it are the names, emails
+    // and LIVE GPS coordinates of every account seen in the last ten minutes, and a POST that closes
+    // somebody else's emergency. `marketing` and `editor` are the roles the 2026 offer-signing
+    // promotion handed to interns.
+    //
+    // Reproducing that population would be recording an accident as a policy. Narrowing it is a
+    // POLICY DECISION A HUMAN MUST MAKE, so the key is granted to the narrowest defensible holders —
+    // super_admin and hr — and /admin/sos.astro IS NOT CONVERTED in this commit. Converting it would
+    // remove recruiter, reviewer, department_head, marketing, editor and every custom admin.access
+    // role from an emergency screen. Get that approved first; the grant is ready and inert until
+    // then.
+    'safety.respond'
   ],
   recruiter: [
     'admin.access',
@@ -149,12 +405,14 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'applications.view', 'applications.edit', 'applications.score',
     // A recruiter can see who is checking a candidate's letter, but answering on the record is
     // HR's call — read-only here.
-    'offers.view'
+    'offers.view',
+    ...INTERNAL_ROLE_KEYS
   ],
   reviewer: [
     'admin.access',
     'roles.view',
-    'applications.view', 'applications.score'
+    'applications.view', 'applications.score',
+    ...INTERNAL_ROLE_KEYS
   ],
   department_head: [
     'admin.access',
@@ -168,28 +426,43 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // NOT a licence to see the department either. composer.ts adds `engagement !== 'internship'`
     // and requireTeamLead() refuses an intern record outright; both conditions are per-PERSON, they
     // survive this grant, and a conversion must keep them.
-    'department.lead'
+    'department.lead',
+    ...INTERNAL_ROLE_KEYS
   ],
   marketing: [
     'admin.access',
     'content.view', 'content.edit',
     'events.view', 'events.edit',
-    'products.view', 'products.edit'
+    'products.view', 'products.edit',
+    ...INTERNAL_ROLE_KEYS
   ],
   editor: [
     'admin.access',
     'roles.view',
     'events.view', 'events.edit',
     'products.view', 'products.edit',
-    'content.view', 'content.edit'
+    'content.view', 'content.edit',
+    ...INTERNAL_ROLE_KEYS
   ],
+  // The only role that holds nothing, and the only one every key above is withheld from. This empty
+  // array is the whole meaning of the `role !== 'applicant'` tests being replaced.
   applicant: [],
   // AquinTutor-scoped roles hold NO main-admin permission (no admin.access), so
   // the middleware confines them to /aquintutor/admin. Their abilities live in
   // their own panels (partner = host courses, teacher = author, moderator = review).
-  partner: [],
-  teacher: [],
-  technical_moderator: []
+  //
+  // THEY ARE NO LONGER EMPTY, AND THAT IS NOT A WIDENING. Every key added here is one these three
+  // roles ALREADY pass today, because the check at the call site is `role !== 'applicant'` and they
+  // are not applicants — including the lesson-authoring cluster, which is the surface they exist
+  // for, and mail.manage and jobs.run, which they should almost certainly not hold. Writing the
+  // grants down is what makes that second fact reviewable instead of invisible; taking it away is a
+  // policy change and is reported rather than made here.
+  //
+  // None of these keys is admin.access, so src/middleware.ts still bounces all three off /admin,
+  // canOpenAdmin() still refuses them, and ROLE_SECTIONS still gives them no section at all.
+  partner: [...INTERNAL_ROLE_KEYS],
+  teacher: [...INTERNAL_ROLE_KEYS],
+  technical_moderator: [...INTERNAL_ROLE_KEYS]
 };
 
 export function can(user: User | null, perm: Permission): boolean {

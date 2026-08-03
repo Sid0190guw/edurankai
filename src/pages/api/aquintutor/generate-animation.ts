@@ -27,6 +27,19 @@ function clean(code: string): string {
 // defence-in-depth (the client also runs it in a sandboxed, network-less iframe)
 const BANNED = /\b(fetch|XMLHttpRequest|importScripts|eval|Function|WebSocket|localStorage|indexedDB|document|window|globalThis|require|process|cookie)\b|import\s|<\/script/i;
 
+// EXAMINED AND NOT CONVERTED — BUT THIS ROUTE HAS NO AUTHORIZATION AT ALL, AND THAT IS A FINDING,
+// NOT A DESIGN. `locals` is never destructured here, so anyone who knows the path can spend the
+// platform's metered LLM budget with a prompt of their choosing. src/middleware.ts isExempt()
+// returns true for everything under /api/, so nothing else stands in front of this URL.
+//
+// It is the odd one out in its own feature: every sibling board endpoint —
+// aquintutor/board.ts:16, board/compose.ts:18, board/interpret.ts:17, board/assess.ts:12 — requires
+// can(user, 'write', { type: 'AnimationObject' }) through the kernel RBAC layer.
+//
+// NOT FIXED HERE because adding any gate changes who may call it, from "anyone" to "a signed-in
+// account holding a capability", and this sprint changes HOW authorization is asked and never WHO
+// may do what. It is the sharpest item in the accompanying report: matching the four siblings is a
+// one-line change, and it needs a human to accept that anonymous callers lose access.
 export const POST: APIRoute = async ({ request }) => {
   let b: any = {};
   try { b = await request.json(); } catch { return json({ ok: false, error: 'bad json' }, 400); }

@@ -38,6 +38,11 @@ async function ensureSchema() {
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
   if (!user) return json({ ok: false, error: 'unauthorized' }, 401);
+  // DELIBERATELY NOT CONVERTED, same reason as
+  // src/pages/api/portal/fee-waiver-coupons/redeem.ts: this is an INVERSE role test that restricts TO
+  // applicants on their own international-payment request. A capability answers "may this person do
+  // X", never "is this person an applicant", so converting it would invert its meaning and hand the
+  // route to staff. Left as a role comparison on purpose.
   if (user.role !== 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
 
   let body: any = {};

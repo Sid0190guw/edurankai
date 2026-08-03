@@ -65,6 +65,7 @@ import { db } from '@/lib/db';
 import { sql, type SQL } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { employeeFilter, departmentFilter } from '@/lib/auth/workspace-access';
+import { rolesHolding } from '@/lib/auth/capability';
 import { logAudit } from '@/lib/audit';
 
 // postgres-js resolves to a plain array, never a { rows } object. Declared before everything that
@@ -778,6 +779,34 @@ const isAssignerSql = (viewer: string): SQL =>
   sql`(t.assigned_by_user_id IS NOT NULL AND t.assigned_by_user_id::text = ${viewer})`;
 
 /**
+ * THE ROLES THAT HOLD 'department.lead', DERIVED FROM THE CAPABILITY MATRIX — never typed out here.
+ *
+ * This module decides which task rows a viewer may read inside the WHERE clause, deliberately: a row
+ * the viewer may not see is never fetched, and filtering after the query is not access control. A
+ * capability cannot be evaluated in Postgres, so the fragment below has to name roles — and a
+ * hardcoded role name in SQL is exactly the defect this migration removes. rolesHolding() reads
+ * PERMS_BY_ROLE, so a grant added to or taken from 'department.lead' in permissions.ts moves this
+ * fragment with it instead of leaving it behind.
+ *
+ * IDENTICAL POPULATION TODAY. 'department.lead' is granted to department_head and to nobody else
+ * (not even super_admin — it is a scope, not a rank), so this list is exactly ['department_head'],
+ * which is the literal the fragment used to carry.
+ *
+ * HONEST LIMIT, stated because it is the one thing this does NOT fix: rolesHolding() reads the
+ * compiled matrix only, exactly as can() does. A CUSTOM role granted department.lead through the
+ * registry is invisible to it — and equally invisible to requireTeamLead() and to the composer, so
+ * all three still agree. Resolving custom roles here would ADD holders to the task board, which is a
+ * widening and not a mechanism swap.
+ *
+ * Declared ABOVE isLeadSql because `const` is not hoisted and a reader reaching a later declaration
+ * has taken pages down on this project.
+ */
+const LEAD_ROLE_KEYS: readonly string[] = rolesHolding('department.lead');
+const LEAD_ROLE_LIST: SQL = LEAD_ROLE_KEYS.length > 0
+  ? sql.join(LEAD_ROLE_KEYS.map((r) => sql`${r}`), sql`, `)
+  : sql`NULL`;
+
+/**
  * A department head over the assignee's department.
  *
  * users.role is a Postgres enum, so it is cast to text before lower() — `lower(anyenum)` has no
@@ -785,15 +814,40 @@ const isAssignerSql = (viewer: string): SQL =>
  * departments.id is a varchar(50) slug in src/lib/db/schema.ts and a UUID in db/hr-schema.sql, and a
  * ::uuid cast would throw on half the estate. NULL on either side matches nothing, which is the
  * correct answer for a lead whose department was never set.
+ *
+ * `lu.is_active` IS NOW CHECKED, and it is the one behavioural line in this fragment. can() — which
+ * every other lead test resolves through — denies a deactivated account, and this fragment did not,
+ * making it the only lead test in the codebase that did not require the viewer to be active. The
+ * population is unchanged for every reachable path: validateSessionToken() deletes the session and
+ * returns null for a deactivated account (src/lib/auth/session.ts:59-62), so the signed-in viewer
+ * whose id reaches this fragment is an active one either way. What changes is that the SQL now says
+ * what the capability says, instead of relying on a second module to have said it first.
+ *
+ * WHAT IS STILL DIVERGENT, AND WAS NOT FIXED HERE — read this before touching the fragment.
+ * requireTeamLead() and the composer's leadsDepartment() BOTH additionally refuse an internship
+ * engagement; this does not, so an intern holding the department_head role sees, and can move, every
+ * task belonging to their department. Closing it would mean re-expressing the four ordered arms of
+ * src/lib/auth/intern-signals.ts resolveIsIntern() in SQL — a fourth copy of the very rule that file
+ * exists to hold once — or lifting the decision into TypeScript and threading a boolean through
+ * every exported function here, which changes signatures in src/pages. Both are real changes to who
+ * reads which rows, so under the mechanism-not-policy rule the divergence is REPORTED and the code is
+ * left as it is. The fix, when it is approved: resolve the viewer once through resolveWorkspace() and
+ * pass `isIntern` down, so this fragment asks the same question the other two ask.
  */
-const isLeadSql = (viewer: string): SQL => sql`EXISTS (
+const isLeadSql = (viewer: string): SQL => {
+  // No role holds the capability: nobody is a lead by this route. Fail closed rather than emitting
+  // `IN ()`, which is a syntax error and would take every task query down.
+  if (LEAD_ROLE_KEYS.length === 0) return sql`false`;
+  return sql`EXISTS (
     SELECT 1 FROM users lu, hr_employees le
      WHERE le.id = t.employee_id
        AND lu.id::text = ${viewer}
-       AND lower(lu.role::text) = 'department_head'
+       AND lu.is_active = true
+       AND lower(lu.role::text) IN (${LEAD_ROLE_LIST})
        AND lu.assigned_department_id IS NOT NULL
        AND le.department_id IS NOT NULL
        AND lu.assigned_department_id::text = le.department_id::text)`;
+};
 
 const hasCollabRoleSql = (viewer: string, role: TaskCollaboratorRole): SQL => sql`EXISTS (
     SELECT 1 FROM employee_task_collaborators c

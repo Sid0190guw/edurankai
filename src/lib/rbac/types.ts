@@ -61,6 +61,22 @@ export const LIVE_PERMISSION_STATES: PermissionState[] = ['activated', 'inherite
 export interface Principal {
   userId: string | null;                  // null = anonymous
   sessionValid: boolean;
+  /**
+   * THE PERMISSION CONTEXT DID NOT LOAD. Set by resolvePrincipal() when the role graph, the role
+   * assignments or the grants could not be read. It is NOT a denial reason of its own — the engine
+   * turns it into one at Tier 0, because a principal assembled from a partial read cannot be
+   * evaluated safely in either direction.
+   *
+   * THE DIRECTION THIS FIXES. rbac_permission_grants carries explicit DENY grants, and the engine
+   * evaluates them FIRST (Tier 1, engine.ts) precisely so a deny can override everything including
+   * `administer`. When that read failed, this store used to proceed with the legacy-mapped role
+   * alone — dropping every grant, denies included — so a principal whose access had been NARROWED by
+   * a deny grant was evaluated as though the deny had never been written. Losing an allow was
+   * fail-closed and harmless; losing a deny was fail-OPEN on a gate.
+   *
+   * Optional and absent by default, so a hand-built Principal in a test is a fully-resolved one.
+   */
+  contextDegraded?: boolean;
   roles: string[];                        // role keys the user holds
   capabilities: Set<Capability>;          // union of role (inherited) capabilities
   stage?: Stage | null;                   // when a student

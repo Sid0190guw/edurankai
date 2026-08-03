@@ -9,6 +9,10 @@ function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
+// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES; THE MISSING TEST IS SESSION OWNERSHIP.
+// No authorization at all, and /api/ has no structural gate. Anyone holding a sessionId can end
+// someone else's in-progress interview and push an "interview completed" notification naming that
+// candidate to admins. See the fuller note in enroll-face.ts.
 export const POST: APIRoute = async ({ request }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

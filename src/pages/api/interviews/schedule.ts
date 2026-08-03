@@ -3,6 +3,26 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 
+// EXAMINED AND DELIBERATELY NOT CONVERTED. There is no capability whose holders equal the population
+// this route admits today, and every candidate key removes somebody:
+//
+//   TODAY  `!user || user.role === 'applicant'` -> all ten non-applicant built-in roles
+//          (super_admin, hr, recruiter, reviewer, department_head, marketing, editor, partner,
+//          teacher, technical_moderator), including intern-flagged accounts.
+//   applications.edit  -> super_admin, hr, recruiter, department_head. Removes six roles.
+//   the 'interviews' ROLE_SECTIONS set -> hr, recruiter, reviewer, department_head. Different again,
+//                                         and also a removal.
+//   interviews.author  -> exact population, but it means "generate interview questions from a
+//                         document" (see its catalogue entry in src/lib/auth/registry.ts).
+//                         Borrowing it would make one key mean two powers, so the day somebody
+//                         narrows question-generation they would silently narrow scheduling too.
+//                         That is precisely the drift this vocabulary exists to prevent.
+//
+// The governing rule for this sprint is mechanism, not policy: a conversion that gives or removes
+// access for any role is reported, not shipped. WHAT IS NEEDED: an `interviews.schedule` key granted
+// to the same ten non-applicant roles, added to the Permission union and BUILTIN_PERMISSIONS first
+// and verified, after which this line becomes can(user, 'interviews.schedule') with no change in who
+// may call it. Reads applications (name, email, role title) and writes interview_rounds.
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = locals.user;
   if (!user || user.role === 'applicant') {

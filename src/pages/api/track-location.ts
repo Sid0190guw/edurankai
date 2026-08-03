@@ -2,6 +2,17 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 
+// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES; THE MISSING TEST IS ROW OWNERSHIP.
+//
+// `locals` is destructured and never read, so there is no authentication and no authorization, and
+// /api/ has no structural gate. Anyone who supplies a session_id can overwrite the recorded latitude,
+// longitude and street address on that analytics_sessions row — i.e. write a location onto somebody
+// else's session, which is then read as if it were theirs.
+//
+// A capability cannot express "this caller owns this session"; that is a per-row fact. The fix is
+// binding the write to the caller's own analytics session (or signing the session id), and it
+// changes who may call the route, so it is reported for a human rather than shipped in a
+// mechanism-only pass.
 export const POST: APIRoute = async ({ request, locals }) => {
   try {
     const body = await request.json();

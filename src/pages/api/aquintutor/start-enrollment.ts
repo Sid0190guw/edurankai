@@ -30,7 +30,21 @@ export const POST: APIRoute = async ({ request, locals }) => {
     if (cRows.length === 0) return json({ ok: false, error: 'Course not found' }, 404);
     const course = cRows[0] as any;
 
-    // Access gate
+    // EXAMINED AND DELIBERATELY NOT CONVERTED — this is not a permission question at all.
+    //
+    // `isEmployee` is being decided from users.role: anyone who is not an applicant counts as an
+    // employee, which sweeps in partner, teacher and technical_moderator (external AquinTutor scopes,
+    // employees of nobody). Employment is a FACT ABOUT A PERSON held in hr_employees — the table
+    // src/lib/auth/admin-access.ts already reads — not an ability a role grants, so no capability can
+    // express it and converting this to can() would be a category error that also fixes nothing.
+    //
+    // Both arms are affected: an 'employees'-restricted course admits those three scopes today, and
+    // an 'applicants'-restricted course excludes them. Resolving it properly means an active
+    // hr_employees lookup, which changes who can enrol on restricted courses either way, so it is
+    // reported for a human rather than done in a mechanism-only pass.
+    //
+    // Sibling src/pages/api/aquintutor/start-test-enrollment.ts:60 shows the converted pattern for
+    // the paid-test override, which IS a capability question.
     const isEmployee = user.role && user.role !== 'applicant';
     const accessOk = course.access_type === 'public' || course.access_type === 'both' ||
       (course.access_type === 'employees' && isEmployee) ||

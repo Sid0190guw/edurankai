@@ -52,11 +52,19 @@ export async function requireCapability(user: any, cap: Capability, res: Resourc
 export async function requireAdminRole(user: any): Promise<boolean> {
   const { resolvePrincipal, writeAudit } = await import('./store');
   const p = await resolvePrincipal(user);
-  const isAdmin = p.roles.some((r) => ADMIN_ROLE_KEYS.includes(r));
+  // THE ONLY DECISION IN THIS FILE THAT DOES NOT GO THROUGH evaluate(), so the Tier-0 refusal the
+  // engine now makes for an unresolved permission context has to be repeated here or this function
+  // becomes the way around it. `p.roles` after a failed read is the LEGACY_ROLE_MAP guess alone,
+  // which is precisely the shadow answer store.ts stopped returning: admitting on it would let a
+  // database outage hand two admin pages to whoever a stale session claims to be.
+  const isAdmin = p.contextDegraded !== true && p.roles.some((r) => ADMIN_ROLE_KEYS.includes(r));
   await writeAudit({
     userId: p.userId, capability: 'read', resource: 'admin:surface', allow: isAdmin,
-    reason: isAdmin ? 'holds an admin-surface role' : 'no admin-surface role', stage: 'verify-authorization',
-    matchedGrant: null, context: { roles: p.roles }, at: new Date().toISOString(),
+    reason: p.contextDegraded === true
+      ? 'permission context could not be resolved'
+      : (isAdmin ? 'holds an admin-surface role' : 'no admin-surface role'),
+    stage: 'verify-authorization',
+    matchedGrant: null, context: { roles: p.roles, contextDegraded: p.contextDegraded === true }, at: new Date().toISOString(),
   });
   return isAdmin;
 }

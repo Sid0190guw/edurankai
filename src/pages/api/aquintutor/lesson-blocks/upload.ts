@@ -4,6 +4,7 @@
 
 import type { APIRoute } from 'astro';
 import { put } from '@vercel/blob';
+import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -28,9 +29,12 @@ const ALLOWED: { ext: string; mime: string; magic?: number[][] }[] = [
 ];
 function magicMatches(b: Uint8Array, magic?: number[][]) { return !magic || magic.some((sig) => sig.every((x, i) => b[i] === x)); }
 
+// MECHANISM SWAP, IDENTICAL POPULATION — `lessons.author` is held by exactly the ten non-applicant
+// built-in roles that passed the `role === 'applicant'` test this replaces. See lesson-blocks/index.ts.
+// The message already said "Authors only"; now the check asks that question instead of asserting it.
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'Authors only' }, 403);
+  if (!can(user, 'lessons.author')) return json({ ok: false, error: 'Authors only' }, 403);
   let form: FormData;
   try { form = await request.formData(); } catch { return json({ ok: false, error: 'Expected form data' }, 400); }
   const file = form.get('file');

@@ -63,6 +63,16 @@ export function evaluate(p: Principal, capability: Capability, resource: Resourc
   // ---- TIER 0: kernel policy (hard invariants) ----
   if (!p || p.userId === undefined) return deny('kernel-policy', 'no identity', capability, resTok);
   if (p.userId !== null && !p.sessionValid) return deny('kernel-policy', 'session invalid or expired', capability, resTok);
+  // UNKNOWN PERMISSION CONTEXT IS A DENIAL, not a smaller allow. The store sets this when the role
+  // graph, the role assignments or the grants could not be read. The grants table is where explicit
+  // DENY lives, and denies are evaluated below at Tier 1 specifically so they can override
+  // `administer` — so continuing on a partial read would evaluate a principal whose access had been
+  // narrowed by a deny as though the deny did not exist. Given its own reason string rather than
+  // reusing 'session invalid or expired', because an audit row that misnames an outage as a stale
+  // session sends whoever reads it to the wrong system.
+  if (p.contextDegraded === true) {
+    return deny('kernel-policy', 'permission context could not be resolved', capability, resTok);
+  }
   if (!isCapability(capability)) return deny('kernel-policy', `unknown capability "${capability}"`, capability, resTok);
   if (resource.flags?.includes(KERNEL_LOCK_FLAG)) return deny('kernel-policy', 'resource is kernel-locked', capability, resTok);
   const roles = p.roles.length ? p.roles : ['guest'];   // anonymous is treated as guest

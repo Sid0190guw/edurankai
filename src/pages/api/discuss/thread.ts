@@ -18,7 +18,24 @@ export const POST: APIRoute = async ({ request, locals }) => {
   const title = String(body?.title || '').trim();
   const txt = String(body?.body || '').trim();
   const kind = KINDS.has(String(body?.kind || '')) ? String(body.kind) : 'question';
-  // Only staff can post announcements
+  // EXAMINED AND DELIBERATELY NOT CONVERTED — announcement rights.
+  //
+  // TODAY: every non-applicant built-in role may post an ANNOUNCEMENT; an applicant's announcement is
+  // silently downgraded to a question. No capability in the union matches that population for this
+  // power. content.edit is {super_admin, hr, marketing, editor}, so swapping to it would strip
+  // announcement rights from recruiter, reviewer, department_head, partner, teacher and
+  // technical_moderator — a policy narrowing, which this sprint reports rather than ships. The six
+  // internal-role keys that DO have this population (mail.manage, lessons.author, lessons.publish,
+  // interviews.author, jobs.run, research.restricted.view) all name unrelated powers; borrowing one
+  // to gate announcements would make the vocabulary lie.
+  //
+  // WHAT IS NEEDED: an `announcements.publish` key granted to the same ten non-applicant roles, then
+  // this becomes can(user, 'announcements.publish') with nobody added or removed.
+  //
+  // ALSO REPORTED, and NOT changed here because it is a product decision: the downgrade is SILENT.
+  // Someone who asks for an announcement and is not entitled to one gets a question posted under
+  // their name and is told ok:true. Telling them would be better; changing the response shape is not
+  // an authorization fix and does not belong in a mechanism-only commit.
   const isStaff = user.role && user.role !== 'applicant';
   const finalKind = (kind === 'announcement' && !isStaff) ? 'question' : kind;
 

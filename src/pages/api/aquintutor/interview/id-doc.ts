@@ -11,6 +11,12 @@ function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status
 const MAX_BYTES = 12 * 1024 * 1024;
 const ALLOWED: { [e: string]: string } = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', pdf: 'application/pdf' };
 
+// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES; THE MISSING TEST IS SESSION OWNERSHIP.
+//
+// No authorization at all, and /api/ has no structural gate. This is two problems at once: an
+// unauthenticated 12 MB upload into the PUBLIC blob store, and an UPDATE that can replace the ID
+// document a reviewer will look at on any session id the caller names. See the fuller note in
+// enroll-face.ts — the fix is binding the session to its candidate, which no role grant can express.
 export const POST: APIRoute = async ({ request }) => {
   let form: FormData;
   try { form = await request.formData(); } catch { return json({ ok: false, error: 'Expected form data' }, 400); }

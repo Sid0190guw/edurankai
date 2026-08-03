@@ -14,6 +14,10 @@ function json(d: any, s = 200) {
 const VAGUE_THRESHOLD_CHARS = 50;
 const MAX_FOLLOWUPS_PER_SEED = 1; // single follow-up per seed keeps interviews snappy
 
+// EXAMINED AND NOT CONVERTED — NO CAPABILITY APPLIES; THE MISSING TEST IS SESSION OWNERSHIP.
+// No authorization at all, and /api/ has no structural gate. Anyone holding a sessionId can append
+// transcript turns to a named candidate's interview record and drive the follow-up logic. See the
+// fuller note in enroll-face.ts; the whole folder needs one ownership fix, not a capability.
 export const POST: APIRoute = async ({ request }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

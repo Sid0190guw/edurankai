@@ -162,15 +162,31 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
   // WHY THREE OF THEM ARE SENSITIVE. Granting one of these to a custom role hands somebody the power
   // to sign off another person's time away or to move their salary out of the company. That grant is
   // written strictly (assignPermission -> recordStrict): if the audit row naming the granter cannot
-  // be written, the grant is rolled back and the caller is told. `employees.manage` is not flagged,
+  // be written, the grant is rolled back and the caller is told. `employee.manage` is not flagged,
   // matching how the existing HR sections are treated; it is the obvious next candidate if this
   // catalogue is ever reviewed, and it is left to that review rather than decided in passing here.
   //
-  // A LEGACY SECTION-MATRIX ROW CANNOT SPELL ANY OF THESE. customRoleKeys() derives keys as
-  // `<page_key>.<action>` with action fixed to view/edit/delete/export, so no page_key can produce
-  // `.approve`, `.pay`, `.manage` or `.lead`. Unlike admin.access, these need no explicit filter —
-  // but that is a property of the four action names, so anything that widens SECTION_ACTIONS must
-  // re-check this paragraph.
+  // WHICH OF THESE A LEGACY SECTION-MATRIX ROW CAN SPELL — the paragraph that used to say "none of
+  // them", and no longer can.
+  //
+  // customRoleKeys() derives keys as `<page_key>.<action>` with action fixed to
+  // view/edit/delete/export. So no page_key can produce `.approve`, `.pay`, `.manage`, `.lead`,
+  // `.author`, `.publish`, `.run`, `.grant`, `.retry`, `.respond` or `.moderate` — that whole set
+  // needs no filter, and that is a property of the four action names, so anything widening
+  // SECTION_ACTIONS must re-read this.
+  //
+  // THE `.view` KEYS ARE DIFFERENT AND MUST BE TREATED AS SUCH. `tests_restricted.view` is spelled
+  // by the REAL section key tests_restricted (admin-sections.ts:57) — that is deliberate, it is why
+  // the key is named this way, and it is the same overlap users.view / content.edit / audit.view have
+  // always had. `resumes.view`, `locations.view` and `research.restricted.view` have no section, but
+  // page_key is free text written by a form, so a hand-crafted row could spell the first two.
+  //
+  // The consequence is one rule, and it is not optional: CONVERT THESE CALL SITES WITH can(), NEVER
+  // WITH hasPermission()/resolvePermissions(). can() reads PERMS_BY_ROLE alone and therefore admits
+  // exactly the roles named there. A registry-based conversion would additionally admit every custom
+  // role holding the matching section checkbox — for a restricted question bank, for every resume on
+  // file, or for applicant GPS. That is a widening, and it would arrive without anyone granting a
+  // permission.
   'leave.approve': {
     label: 'Approve leave requests',
     group: 'People',
@@ -189,15 +205,138 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     description: 'Send an approved withdrawal to an employee\'s bank account, or record a settlement made outside the gateway. This moves real money and cannot be undone from here.',
     sensitive: true,
   },
-  'employees.manage': {
+  // Spelled `employees.manage` until this commit; renamed to the canonical singular with an
+  // identical grant set (super_admin + hr) and both call sites moved with it. The old catalogue row
+  // survives on any database that has already booted, inert: no code asks for it, and the two gates
+  // that used to ask went through can() rather than this registry, so a custom-role grant of it
+  // never conferred anything. Deleting the row needs a database change and is a follow-up.
+  'employee.manage': {
     label: 'Manage employee records',
     group: 'People',
     description: 'Open the people console and create or change employee records: designation, employment terms, department, reporting line and exit. Never health or wellness data, which no permission grants sight of.',
   },
+  // KEPT AGAINST AN INSTRUCTION TO DELETE IT, because deleting it changes who may open a team-lead
+  // surface and there is no organisational data to resolve leadership from — no `departments` table
+  // in either schema carries a head, and hr_employees.reporting_manager_id is written by no code.
+  // The full reasoning and the recommended migration are in permissions.ts above PERMS_BY_ROLE.
   'department.lead': {
     label: 'Lead a department',
     group: 'People',
     description: 'See the department recorded on your own account — your team\'s roster, attendance and requests, and nobody else\'s. A scope, not a rank: it narrows what is visible to one department rather than widening it.',
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // THE `role !== 'applicant'` FAMILY. Granted to all ten non-applicant built-in roles, because that
+  // is precisely who passes the test each one replaces. An admin granting one of these to a CUSTOM
+  // role should read the description as what it says and not as "internal staff": the built-in width
+  // is inherited history, not a recommendation.
+  // ---------------------------------------------------------------------------------------------
+  'mail.manage': {
+    label: 'Operate the company mailbox',
+    group: 'System',
+    description: 'Fetch the shared inbox over IMAP, send mail from the company address, and test SMTP/IMAP connections using the stored credentials. The connection tests report whether a username and password worked, so this also grants a way to check credentials. Give it to the people who actually run the mailbox.',
+    sensitive: true,
+  },
+  'lessons.author': {
+    label: 'Write lessons',
+    group: 'Content',
+    description: 'Create, edit, reorder and delete the blocks a lesson is made of, upload teaching files, change lesson titles, restore an earlier version and submit a lesson for review. Does not make anything visible to learners — publishing is a separate permission.',
+  },
+  'lessons.publish': {
+    label: 'Publish lessons',
+    group: 'Content',
+    description: 'Make a lesson live to learners. Separate from writing one on purpose: someone can be trusted to draft teaching material without being the person who decides it is ready to teach.',
+  },
+  'interviews.author': {
+    label: 'Generate interview questions',
+    group: 'Hiring',
+    description: 'Turn an uploaded job description or document into a set of interview questions automatically. This decides what candidates are asked, and each generation costs money in AI usage.',
+  },
+  'jobs.run': {
+    label: 'Run a scheduled job by hand',
+    group: 'System',
+    description: 'Trigger a background job immediately instead of waiting for its schedule: settling the weekly learner league (promotions, demotions and rewards for everyone) and sending the streak reminder notifications. One click affects every learner at once.',
+  },
+  'research.restricted.view': {
+    label: 'Read restricted research',
+    group: 'Research',
+    description: 'Open the internal research deep modules, which are otherwise available only to applicants whose access request has been approved. Confidential unpublished work.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // THE super_admin CLUSTER. Each replaces a literal `role !== 'super_admin'` redirect and is
+  // granted to super_admin alone. Written as their own keys rather than borrowed from users.view /
+  // users.edit — those are exact-population but describe ACCOUNTS, and an audit line saying somebody
+  // changed an account when they in fact exported every resume on file is a log that misdescribes
+  // what happened.
+  // ---------------------------------------------------------------------------------------------
+  'profiles.manage': {
+    label: 'Manage applicant profiles',
+    group: 'Hiring',
+    description: 'Edit an applicant\'s profile and publish it to the public web, or take it down again, and delete a profile outright. Publishing puts a real person\'s details on a page anyone can read.',
+    sensitive: true,
+  },
+  'resumes.view': {
+    label: 'View resume submissions',
+    group: 'Hiring',
+    description: 'Open the resumes people have built on the site — including guests who never made an account — and download the whole set as a spreadsheet: full name, email, phone, LinkedIn and summary, with no page limit. One download is every submission on file.',
+    sensitive: true,
+  },
+  'credits.grant': {
+    label: 'Grant account credit',
+    group: 'Finance',
+    description: 'Put spendable balance on any account by email address. The balance can be used to pay fees, so this creates money inside the product and cannot be undone from here.',
+    sensitive: true,
+  },
+  'payments.retry': {
+    label: 'Retry a stuck payment',
+    group: 'Finance',
+    description: 'Re-drive a payment that was captured by the gateway but never turned into an application, so the person gets what they paid for. It acts on a real captured payment.',
+    sensitive: true,
+  },
+  'locations.view': {
+    label: 'See applicant locations',
+    group: 'Hiring',
+    description: 'See the precise place an applicant was when they applied, to GPS accuracy, tied to their name. An application can be reviewed fully without this; grant it only where knowing the physical location is genuinely required.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // THE REST, one call site at a time.
+  // ---------------------------------------------------------------------------------------------
+  'payroll.manage': {
+    label: 'Run payroll',
+    group: 'Finance',
+    description: 'Open the payroll screen and set salaries, generate payslips and mark a month paid. It reads and writes base salary, which is the most sensitive number on an employee\'s record after their health data.',
+    sensitive: true,
+  },
+  // Same key the `tests_restricted` SECTION already spells (src/lib/admin-sections.ts:57,
+  // "Restricted Exams — Designated-authority only"), so the console offers ONE name for this
+  // authority rather than two. Being both a union member and a section-derived key is normal here:
+  // users.view, roles.edit, content.edit, events.view, settings.edit and audit.view all are.
+  'tests_restricted.view': {
+    label: 'Open restricted exam papers',
+    group: 'Assessments',
+    description: 'Open and edit the question bank of an exam marked restricted. Everyone else who can reach the tests section is turned away from these papers, which is the whole point of marking one restricted.',
+  },
+  'safety.respond': {
+    label: 'Respond to emergencies',
+    group: 'People',
+    description: 'Open the emergency console: who has raised an SOS, their name and contact, the live location of everyone signed in during the last ten minutes, and the ability to mark an emergency resolved on somebody else\'s behalf. This is live tracking of colleagues; grant it to the people who actually answer emergencies.',
+    sensitive: true,
+  },
+  'requisitions.approve': {
+    label: 'Approve hiring requisitions',
+    group: 'People',
+    description: 'Sign off a request to hire — the budget and the headcount. NOT ENFORCED ANYWHERE YET: today the requisition library checks nobody, so granting this changes nothing until the check is added, which needs a decision about who signs off the finance stage and who signs off the leadership stage.',
+    sensitive: true,
+  },
+  'community.moderate': {
+    label: 'Moderate community and classrooms',
+    group: 'Content',
+    description: 'Read the moderation queue and act on what is in it: remove a message, allow it, mute or remove somebody from a room. Some of the people involved are minors. NOT ENFORCED ANYWHERE YET: the moderation library records who acted but checks nobody, so granting this changes nothing until the check is added.',
+    sensitive: true,
   },
   'settings.view': { label: 'View settings', group: 'System', description: 'See platform configuration.' },
   'settings.edit': {

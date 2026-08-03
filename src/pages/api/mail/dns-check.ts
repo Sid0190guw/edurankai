@@ -3,6 +3,7 @@
 // using Cloudflare DNS-over-HTTPS so we don't need a DNS lib on the server.
 // Returns a verdict per record so the admin Mail Health page can show pass/fail.
 import type { APIRoute } from 'astro';
+import { can } from '@/lib/auth/permissions';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -39,8 +40,14 @@ async function dohMx(name: string): Promise<{ priority: number; host: string }[]
 }
 
 export const GET: APIRoute = async ({ request, locals }) => {
-  const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
+  // The lowest-value of the mail routes (public DNS records for the sending domain), converted in the
+  // same commit as the other four precisely BECAUSE it shares their gate: four routes asking one
+  // question and a fifth asking another is how they drift apart.
+  //
+  // `mail.manage` is held by exactly the ten non-applicant built-in roles, which is who
+  // `role !== 'applicant'` admitted. Population unchanged. 403 kept as-is — this route always
+  // answered 403 rather than 401 and the status code is not part of this sprint.
+  if (!can((locals as any).user, 'mail.manage')) return json({ ok: false, error: 'forbidden' }, 403);
   const url = new URL(request.url);
   const domain = (url.searchParams.get('domain') || 'edurankai.in').trim();
   if (!/^[a-z0-9.\-]+$/i.test(domain) || domain.length > 200) return json({ ok: false, error: 'invalid domain' }, 400);
