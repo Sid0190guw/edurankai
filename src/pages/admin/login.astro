@@ -17,20 +17,15 @@ async function startSession(userId: string, req: Request, ip: string | undefined
   setSessionCookie(cookies, token, session.expiresAt);
 }
 
-// Authoritative server-side face match — the browser result is never trusted.
-const FACE_2FA_THRESHOLD = 0.6;
-function euclid(a: number[], b: number[]): number {
-  let s = 0; const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) { const d = (a[i] || 0) - (b[i] || 0); s += d * d; }
-  return Math.sqrt(s);
-}
-function normDesc(d: any): number[] | null {
-  if (d == null) return null;
-  if (typeof d === 'string') { try { return normDesc(JSON.parse(d)); } catch { return null; } }
-  if (Array.isArray(d)) return d.map(Number);
-  if (typeof d === 'object') return Object.keys(d).sort((a, b) => Number(a) - Number(b)).map((k) => Number(d[k]));
-  return null;
-}
+// The face comparison is AUTHORITATIVE AND SERVER-SIDE, and the enrolled descriptor stays here.
+//
+// It used to be handed to the browser via `define:vars={{ storedDescriptor: faceDescriptor }}`.
+// Anyone who could load this page for a pending user read the stored biometric template out of the
+// page source, replayed it as their "live" capture, and euclideanDistance returned 0 — a perfect
+// match. That defeated face sign-in and disclosed biometric data. A password can be rotated; a
+// face cannot. The descriptor is now loaded, compared and dropped on the server; the browser only
+// ever sends a capture and receives a boolean.
+import { matchEnrolledFace, hasActiveFaceEnrolment, causeOf } from '@/lib/auth/face';
 
 // Already logged in?
 if (Astro.locals.user) {
@@ -41,7 +36,8 @@ let errorMsg = '';
 let requireFace = false;
 let pendingUserId = '';
 let pendingUserName = '';
-let faceDescriptor = '';
+// A BOOLEAN, not a descriptor. Drawing a viewfinder never required the template.
+let faceEnrolled = false;
 
 // Check if we're in face verification phase
 const pendingId = Astro.cookies.get('face_pending_user')?.value || '';
@@ -52,10 +48,12 @@ if (pendingId) {
   try {
     const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pendingId)).limit(1);
     pendingUserName = u[0]?.name || '';
-    const fd = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${pendingId} AND is_active = true LIMIT 1`);
-    const rows = Array.isArray(fd) ? fd : (fd?.rows || []);
-    faceDescriptor = rows.length > 0 ? JSON.stringify((rows[0] as any).face_descriptor) : '';
-  } catch(e) {}
+    faceEnrolled = await hasActiveFaceEnrolment(pendingId);
+  } catch (e: any) {
+    // Never swallowed silently in an auth path — a bare catch here would hide a total sign-in
+    // outage. The real Postgres reason is on e.cause.
+    console.error('[admin/login] face pending lookup failed:', causeOf(e));
+  }
 }
 
 // Authenticator (TOTP) verification phase — password OK, awaiting the code.
@@ -67,7 +65,11 @@ if (tfaPendingId && !pendingId) {
   try {
     const u = await db.select({ name: users.name }).from(users).where(eq(users.id, tfaPendingId)).limit(1);
     tfaPendingName = u[0]?.name || '';
-  } catch (e) {}
+  } catch (e: any) {
+    // Display name only — a failure here grants nothing and must not block the code entry. Logged
+    // rather than swallowed: a bare catch in a sign-in path hid a total outage on this project.
+    console.error('[admin/login] TOTP pending name lookup failed:', causeOf(e));
+  }
 }
 
 if (Astro.request.method === 'POST') {
@@ -118,26 +120,29 @@ if (Astro.request.method === 'POST') {
     const liveRaw = (fd2.get('live_descriptor') as string) || '';
     if (userId === pendingId) {
       try {
-        const fdRow = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`);
-        const fdr = Array.isArray(fdRow) ? fdRow : (fdRow?.rows || []);
-        const stored = normDesc((fdr[0] as any)?.face_descriptor);
-        let live: number[] | null = null;
-        try { live = normDesc(JSON.parse(liveRaw)); } catch { live = null; }
-        const dist = (stored && live && stored.length === 128 && live.length === 128) ? euclid(stored, live) : 99;
-        const matched = dist < FACE_2FA_THRESHOLD;
+        // Same comparison, same threshold, same module as /api/auth/face-match — so the poll the
+        // camera loop uses and the gate that actually mints the session can never disagree.
+        const { matched, distance } = await matchEnrolledFace(userId, liveRaw);
         await db.execute(sql`
           INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
-          VALUES (${userId}, ${''}, ${pendingUserName || ''}, 'face_login', ${Number.isFinite(dist) ? dist : null}, ${matched}, ${matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
-        `).catch(() => {});
+          VALUES (${userId}, ${''}, ${pendingUserName || ''}, 'face_login', ${Number.isFinite(distance) ? distance : null}, ${matched}, ${matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
+        `).catch((e: any) => { console.error('[admin/login] face audit insert failed:', causeOf(e)); });
         if (!matched) {
-          errorMsg = 'Face not recognised (distance ' + (Number.isFinite(dist) ? dist.toFixed(3) : 'n/a') + '). Try again, or use your password.';
+          // The measured distance is recorded in the audit row above and NOT shown here. A number
+          // on screen is a gradient: it lets someone hill-climb toward the enrolled template one
+          // attempt at a time, which is the same biometric disclosure by a slower road.
+          errorMsg = 'Face not recognised. Try again, or use your password.';
         } else {
           await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`).catch(() => {});
           await startSession(userId, Astro.request, Astro.clientAddress, Astro.cookies);
           Astro.cookies.delete('face_pending_user', { path: '/' });
           return Astro.redirect('/admin');
         }
-      } catch (e: any) { errorMsg = 'Login error. Please try again.'; }
+      } catch (e: any) {
+        // Never swallowed. The user gets a neutral message; the operator gets the real reason.
+        console.error('[admin/login] face verification failed:', causeOf(e));
+        errorMsg = 'Login error. Please try again.';
+      }
     } else {
       errorMsg = 'Session mismatch. Please try again.';
       Astro.cookies.delete('face_pending_user', { path: '/' });
@@ -294,9 +299,13 @@ if (Astro.request.method === 'POST') {
     )}
   </div>
 
-  {requireFace && faceDescriptor && (
+  {requireFace && faceEnrolled && (
     <script is:inline src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js"></script>
-    <script is:inline define:vars={{ storedDescriptor: faceDescriptor }}>
+    <script is:inline>
+    // NOTE: no define:vars, and nothing server-rendered into this script. The enrolled descriptor
+    // is not here, and must never be reintroduced here in any form — not define:vars, not a data
+    // attribute, not a JSON island. The camera capture goes OUT to /api/auth/face-match and a
+    // boolean comes back; the comparison happens on the server.
     var video = document.getElementById('videoEl');
     var verifyBtn = document.getElementById('verifyBtn');
     var statusEl = document.getElementById('faceStatus');
@@ -351,7 +360,16 @@ if (Astro.request.method === 'POST') {
           onVerified();
           return;
         }
-      } catch(e) {}
+      } catch (e) {
+        if (e && e.fatal) {
+          // Server said no, or the pending sign-in expired. Retrying cannot help.
+          setStatus(e.message, '#ef4444');
+          verifyBtn.disabled = false;
+          verifyBtn.textContent = 'Try Again';
+          return;
+        }
+        // Otherwise: a transient detection error. Keep scanning.
+      }
       setTimeout(autoVerify, 800);
     }
 
@@ -374,16 +392,34 @@ if (Astro.request.method === 'POST') {
       }
     }
 
+    // Capture a descriptor from the camera and ask the SERVER whether it matches the enrolled
+    // face. We send our capture; we get back only true or false. The enrolled descriptor is not
+    // in this page and is not in the response.
     async function tryMatch() {
       var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
         .withFaceLandmarks(true).withFaceDescriptor();
       if (!det) return false;
       lastLiveDescriptor = det.descriptor;
-      var stored = JSON.parse(storedDescriptor);
-      var storedArr = Array.isArray(stored) ? stored : Object.values(stored);
-      var storedFloat = new Float32Array(storedArr);
-      var dist = faceapi.euclideanDistance(det.descriptor, storedFloat);
-      return dist < 0.5; // threshold ' lower = stricter
+
+      var res = await fetch('/api/auth/face-match', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          scope: 'admin',
+          liveDescriptor: Array.prototype.slice.call(det.descriptor)
+        })
+      });
+      var data = {};
+      try { data = await res.json(); } catch (e) {}
+      if (!data || data.ok !== true) {
+        // A server or session problem is NOT a face mismatch. Raise it so the loop stops and the
+        // person is told to use another sign-in method rather than scanning forever.
+        var err = new Error((data && data.error) || 'Face check unavailable.');
+        err.fatal = true;
+        throw err;
+      }
+      return data.matched === true;
     }
 
     function onVerified() {

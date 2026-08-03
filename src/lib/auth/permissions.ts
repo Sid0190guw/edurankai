@@ -618,6 +618,34 @@ const ROLE_SECTIONS: Record<string, string[]> = {
 };
 
 /**
+ * BULK EXPORT IS NOT THE SAME RIGHT AS VIEWING, and canAccessSection() used to treat them as one:
+ * its last line is `return action !== 'delete'`, so any section a built-in role could open, it could
+ * also download in full. Viewing an application is one candidate on one screen, with the soft-deleted
+ * rows hidden; exporting it is every candidate who ever applied, as a file that leaves the building.
+ *
+ * A DENYLIST RATHER THAN AN ALLOWLIST, deliberately. Rewriting this as a per-role export allowlist is
+ * the right shape and is filed as a later change: written blind, it would silently remove a download
+ * somebody uses daily, and a lockout is its own outage. This map removes exactly the combination that
+ * is the vulnerability and preserves every other export unchanged.
+ *
+ * EXPORT ONLY. `view` and `edit` are deliberately NOT touched here — narrowing edit in the same pass
+ * would remove ordinary daily access and is a policy decision, not a fix.
+ *
+ * `reviewer` is the entry. Its sections are dashboard / applications / interviews / tests — a
+ * screening role that reads one candidate at a time and has no records-keeping duty. Export on
+ * 'applications' handed it GET /api/export/applications: name, email, phone, location and status for
+ * up to 5000 applicants in one authenticated request. hr, recruiter and department_head keep theirs;
+ * pipeline reporting is those roles' actual job and removing it here would be a policy change, not a
+ * fix.
+ *
+ * A CUSTOM role is unaffected — custom roles are resolved from rolePermissions.canExport, which is
+ * already a separate column and already answers this question honestly.
+ */
+const EXPORT_DENIED_SECTIONS: Record<string, readonly string[]> = {
+  reviewer: ['applications'],
+};
+
+/**
  * The section keys a BUILT-IN role gets when the person has no custom role assigned — the tail of
  * getViewableSectionKeys(), lifted out so it can be answered for a role rather than for a person.
  * Pure: no database, no session, safe to call for every role at once (/admin/access-preview does).
@@ -674,7 +702,8 @@ export async function getViewableSectionKeys(user: { id: string; role: string } 
  *   super_admin           -> allowed
  *   >=1 custom role       -> exactly what those roles grant for this page key + action
  *   else built-in role    -> that role's ROLE_SECTIONS defaults (a granted section implies
- *                            view/edit/export on it; delete stays super_admin-only)
+ *                            view/edit on it; delete stays super_admin-only; export is granted too
+ *                            EXCEPT for the pairs named in EXPORT_DENIED_SECTIONS above)
  *   unknown role          -> DENIED (deny by default; the sidebar filter's "don't restrict"
  *                            fallback is not a safe answer for a write or a bulk export)
  */
@@ -699,6 +728,8 @@ export async function canAccessSection(
   const defaults = ROLE_SECTIONS[user.role];
   if (!defaults) return false;
   if (!defaults.includes(sectionKey)) return false;
+  // Bulk export is decided separately from view/edit — see EXPORT_DENIED_SECTIONS above.
+  if (action === 'export' && (EXPORT_DENIED_SECTIONS[user.role] || []).includes(sectionKey)) return false;
   return action !== 'delete';
 }
 

@@ -2,10 +2,29 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { createApiKey, listApiKeys, revokeApiKey } from '@/lib/api-keys';
 import { SITE } from '@/lib/site';
+import { can } from '@/lib/auth/permissions';
+import { logAudit } from '@/lib/audit';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
+// settings.edit — super_admin alone in PERMS_BY_ROLE, the same guard /admin/app-settings.astro and
+// /admin/feature-flags.astro use for the same reason, and deliberately NOT
+// canAccessSection('settings','edit'), which would additionally admit any CUSTOM role holding the
+// section and is therefore a widening rather than a fix.
+//
+// WHY IT IS NEEDED. `role !== 'applicant'` was the whole in-file gate, and the middleware only ever
+// applied canOpenAdmin() here — so all seven admin-capable roles (super_admin, hr, recruiter,
+// reviewer, department_head, marketing, editor) reached the POST handler below. That handler mints
+// live `erk_live_` partner credentials and revokes existing ones; revoking is a one-click, unconfirmed
+// denial of service against every university/LMS integration pulling /api/v1/*. The confirm() on the
+// revoke form is client-side and is not a control.
+//
+// Declared ABOVE the POST handler on purpose: `const` is not hoisted, and a guard that runs after the
+// write it is guarding is not a guard. src/middleware.ts also maps this path to the 'settings'
+// section, so the refusal normally happens before this frontmatter runs at all; this line is the
+// defence in depth that survives someone editing that table.
+if (!can(user as any, 'settings.edit')) return Astro.redirect('/admin');
 
 let okMsg = '', errMsg = '', newKey = '';
 if (Astro.request.method === 'POST') {
@@ -18,11 +37,15 @@ if (Astro.request.method === 'POST') {
       const created = await createApiKey({ label, organization, createdBy: user.id });
       newKey = created.key;
       okMsg = 'API key created. Copy it now - it is shown only once.';
+      // Audited by prefix only. The secret itself is returned once and never written anywhere.
+      await logAudit({ userId: user.id, action: 'api_key.create', entity: 'api_keys', entityId: created.id, diff: { prefix: created.prefix, organization, label } });
     } else if (action === 'revoke') {
-      await revokeApiKey(fd.get('id') as string);
+      const revokeId = (fd.get('id') as string || '').trim();
+      await revokeApiKey(revokeId);
       okMsg = 'Key revoked.';
+      await logAudit({ userId: user.id, action: 'api_key.revoke', entity: 'api_keys', entityId: revokeId });
     }
-  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+  } catch (e: any) { errMsg = String(e?.cause?.message || e?.message || e).slice(0, 240); }
 }
 
 const keys = await listApiKeys();

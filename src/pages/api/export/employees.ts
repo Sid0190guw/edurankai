@@ -23,6 +23,12 @@ export const GET: APIRoute = async ({ locals }) => {
     const allowed = await canAccessSection(user as any, 'employees', 'export').catch(() => false);
     if (!allowed) return new Response('Forbidden', { status: 403 });
   }
+  // The employee roster carries salary. A bulk download of it is recorded, after the gate.
+  // logAudit swallows its own failure, so this can never turn a permitted export into a 500.
+  {
+    const { logAudit } = await import('@/lib/audit');
+    await logAudit({ userId: (user as any)?.id ?? null, action: 'export.employees', entity: 'hr_employees' });
+  }
   try {
     const r = await db.execute(sql`
       SELECT

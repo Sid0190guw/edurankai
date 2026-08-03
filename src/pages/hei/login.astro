@@ -9,7 +9,21 @@ let errorMsg = '';
 let requireFace = false;
 let pendingUserId = '';
 let pendingUserName = '';
-let faceDescriptor = '';
+// A BOOLEAN, not a descriptor. Drawing a viewfinder never required the enrolled template.
+let faceEnrolled = false;
+
+// The face comparison is AUTHORITATIVE AND SERVER-SIDE, and the enrolled descriptor stays here.
+//
+// It used to be handed to the browser via `define:vars={{ storedDescriptor: faceDescriptor }}`.
+// Anyone who could load this page for a pending user read the stored biometric template out of the
+// page source, replayed it as their "live" capture, and euclideanDistance returned 0 — a perfect
+// match. That defeated face sign-in and disclosed biometric data. A password can be rotated; a
+// face cannot.
+//
+// Worse on THIS surface: the `face_verified` POST below did no comparison of any kind. It checked
+// that the submitted user_id equalled the pending cookie and then minted an institution_admin
+// session, so the entire face step was decided by the browser. Both halves are fixed together.
+import { matchEnrolledFace, hasActiveFaceEnrolment, causeOf } from '@/lib/auth/face';
 
 const pendingId = Astro.cookies.get('hei_face_pending')?.value || '';
 
@@ -20,13 +34,14 @@ if (pendingId) {
     const { db } = await import('@/lib/db');
     const { users } = await import('@/lib/db/schema');
     const { eq } = await import('drizzle-orm');
-    const { sql } = await import('drizzle-orm');
     const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pendingId)).limit(1);
     pendingUserName = u[0]?.name || '';
-    const fd = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${pendingId} AND is_active = true LIMIT 1`);
-    const rows = Array.isArray(fd) ? fd : (fd?.rows || []);
-    faceDescriptor = rows.length > 0 ? JSON.stringify((rows[0] as any).face_descriptor) : '';
-  } catch(e) {}
+    faceEnrolled = await hasActiveFaceEnrolment(pendingId);
+  } catch (e: any) {
+    // Never swallowed silently in an auth path — a bare catch here would hide a total sign-in
+    // outage. The real Postgres reason is on e.cause.
+    console.error('[hei/login] face pending lookup failed:', causeOf(e));
+  }
 }
 
 if (Astro.request.method === 'POST') {
@@ -35,23 +50,42 @@ if (Astro.request.method === 'POST') {
 
   if (action === 'face_verified') {
     const userId = (fd2.get('user_id') as string) || '';
+    const liveRaw = (fd2.get('live_descriptor') as string) || '';
     if (userId === pendingId) {
       try {
         const { db } = await import('@/lib/db');
         const { generateSessionToken, createSession } = await import('@/lib/auth/session');
         const { setSessionCookie } = await import('@/lib/auth/cookie');
         const { sql } = await import('drizzle-orm');
-        await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
-        const token = generateSessionToken();
-        const session = await createSession(token, userId, {
-          userAgent: Astro.request.headers.get('user-agent') || undefined,
-          ipAddress: Astro.clientAddress
-        });
-        setSessionCookie(Astro.cookies, token, session.expiresAt);
-        Astro.cookies.delete('hei_face_pending', { path: '/' });
-        return Astro.redirect('/hei/portal');
-      } catch(e: any) {
-        console.error('[hei/login]', e?.cause?.message || e?.message, e?.stack);
+
+        // THE ACTUAL FACE CHECK. Until now this branch had none: holding the pending cookie and
+        // POSTing action=face_verified with the matching user_id minted a session outright, so the
+        // "second factor" was whatever the browser chose to claim. Same module and same threshold
+        // as /admin/login and /api/auth/face-match.
+        const { matched, distance } = await matchEnrolledFace(userId, liveRaw);
+        await db.execute(sql`
+          INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
+          VALUES (${userId}, ${''}, ${pendingUserName || ''}, 'face_login', ${Number.isFinite(distance) ? distance : null}, ${matched}, ${matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
+        `).catch((e: any) => { console.error('[hei/login] face audit insert failed:', causeOf(e)); });
+
+        if (!matched) {
+          // The measured distance is recorded in the audit row above and NOT shown here — a number
+          // on screen is a gradient an attacker can hill-climb toward the enrolled template.
+          errorMsg = 'Face not recognised. Try again, or use your password.';
+        } else {
+          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
+          const token = generateSessionToken();
+          const session = await createSession(token, userId, {
+            userAgent: Astro.request.headers.get('user-agent') || undefined,
+            ipAddress: Astro.clientAddress
+          });
+          setSessionCookie(Astro.cookies, token, session.expiresAt);
+          Astro.cookies.delete('hei_face_pending', { path: '/' });
+          return Astro.redirect('/hei/portal');
+        }
+      } catch (e: any) {
+        // Never swallowed. The user gets a neutral message; the operator gets the real reason.
+        console.error('[hei/login] face verification failed:', causeOf(e));
         errorMsg = 'Login error. Please try again.';
       }
     } else {
@@ -154,7 +188,7 @@ if (Astro.request.method === 'POST') {
       </form>
     )}
 
-    {requireFace && faceDescriptor && (
+    {requireFace && faceEnrolled && (
       <div class="face-card">
         <div class="cam-wrap">
           <video id="videoEl" autoplay playsinline muted></video>
@@ -166,7 +200,7 @@ if (Astro.request.method === 'POST') {
       </div>
     )}
 
-    {requireFace && !faceDescriptor && (
+    {requireFace && !faceEnrolled && (
       <div style="text-align:center;padding:32px;background:#fff;border:1px solid rgba(0,0,0,0.1);border-radius:16px;">
         <p style="font-size:14px;color:#6b7280;margin:0 0 16px;">Face data not found for this account. Use password sign-in.</p>
         <form method="POST">
@@ -187,16 +221,23 @@ if (Astro.request.method === 'POST') {
 
   </section>
 
-  {requireFace && faceDescriptor && (
+  {requireFace && faceEnrolled && (
     <form id="faceSuccessForm" method="POST" style="display:none;">
       <input type="hidden" name="action" value="face_verified"/>
       <input type="hidden" name="user_id" value={pendingUserId}/>
+      {/* The capture the server re-verifies before it mints a session. Not the enrolled
+          template — this is what the camera just saw. */}
+      <input type="hidden" name="live_descriptor" id="liveDescriptorField" value=""/>
     </form>
   )}
 
-  {requireFace && faceDescriptor && (
+  {requireFace && faceEnrolled && (
     <script is:inline src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js"></script>
-    <script is:inline define:vars={{ storedDescriptor: faceDescriptor }}>
+    <script is:inline>
+      // NOTE: no define:vars, and nothing server-rendered into this script. The enrolled descriptor
+      // is not here, and must never be reintroduced here in any form — not define:vars, not a data
+      // attribute, not a JSON island. The camera capture goes OUT to /api/auth/face-match and a
+      // boolean comes back; the comparison happens on the server, and the form POST re-verifies it.
       var video = document.getElementById('videoEl');
       var verifyBtn = document.getElementById('verifyBtn');
       var camStatus = document.getElementById('camStatus');
@@ -204,6 +245,7 @@ if (Astro.request.method === 'POST') {
       var ovalRing = document.getElementById('ovalRing');
       var verified = false;
       var attempts = 0;
+      var lastLiveDescriptor = null;
 
       function setStatus(msg, color) {
         camStatus.innerHTML = '<span style="background:rgba(0,0,0,0.75);color:' + (color||'#fff') + ';font-size:12px;padding:4px 14px;border-radius:100px;">' + msg + '</span>';
@@ -240,11 +282,29 @@ if (Astro.request.method === 'POST') {
         var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
           .withFaceLandmarks(true).withFaceDescriptor();
         if (!det) return false;
-        var stored = JSON.parse(storedDescriptor);
-        var storedArr = Array.isArray(stored) ? stored : Object.values(stored);
-        var storedFloat = new Float32Array(storedArr);
-        var dist = faceapi.euclideanDistance(det.descriptor, storedFloat);
-        return dist < 0.5;
+        lastLiveDescriptor = det.descriptor;
+
+        // Ask the SERVER whether this capture matches the enrolled face. We send our capture; we
+        // get back only true or false — never a distance, never the enrolled template.
+        var res = await fetch('/api/auth/face-match', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            scope: 'hei',
+            liveDescriptor: Array.prototype.slice.call(det.descriptor)
+          })
+        });
+        var data = {};
+        try { data = await res.json(); } catch (e) {}
+        if (!data || data.ok !== true) {
+          // A server or session problem is NOT a face mismatch. Raise it so the loop stops and the
+          // person is told to use another sign-in method rather than scanning forever.
+          var err = new Error((data && data.error) || 'Face check unavailable.');
+          err.fatal = true;
+          throw err;
+        }
+        return data.matched === true;
       }
 
       async function autoVerifyLoop() {
@@ -253,7 +313,17 @@ if (Astro.request.method === 'POST') {
           return;
         }
         attempts++;
-        try { if (await tryMatch()) { onVerified(); return; } } catch(_) {}
+        try { if (await tryMatch()) { onVerified(); return; } }
+        catch (e) {
+          if (e && e.fatal) {
+            // Server said no, or the pending sign-in expired. Retrying cannot help.
+            setStatus(e.message, '#ef4444');
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = 'Try Again';
+            return;
+          }
+          // Otherwise: a transient detection error. Keep scanning.
+        }
         setTimeout(autoVerifyLoop, 700);
       }
 
@@ -275,7 +345,15 @@ if (Astro.request.method === 'POST') {
         setStatus('Verified! Signing you in...', '#10b981');
         verifyBtn.textContent = 'Verified!';
         verifyBtn.style.background = '#10b981';
-        setTimeout(function() { document.getElementById('faceSuccessForm').submit(); }, 600);
+        setTimeout(function() {
+          // Attach the capture the server accepted. The POST re-verifies it before minting a
+          // session, so an empty or edited field simply fails the check rather than passing.
+          try {
+            var f = document.getElementById('liveDescriptorField');
+            if (f && lastLiveDescriptor) f.value = JSON.stringify(Array.prototype.slice.call(lastLiveDescriptor));
+          } catch (e) {}
+          document.getElementById('faceSuccessForm').submit();
+        }, 600);
       }
 
       init();

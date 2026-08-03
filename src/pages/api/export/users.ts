@@ -23,6 +23,12 @@ export const GET: APIRoute = async ({ locals }) => {
     const allowed = await canAccessSection(user as any, 'users', 'export').catch(() => false);
     if (!allowed) return new Response('Forbidden', { status: 403 });
   }
+  // A bulk download of the user directory is an administrative action and is recorded as one, after
+  // the gate. logAudit swallows its own failure, so it can never turn a permitted export into a 500.
+  {
+    const { logAudit } = await import('@/lib/audit');
+    await logAudit({ userId: (user as any)?.id ?? null, action: 'export.users', entity: 'users' });
+  }
   try {
     const r = await db.execute(sql`
       SELECT

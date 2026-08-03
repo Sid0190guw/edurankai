@@ -101,6 +101,13 @@ const PATH_SECTION: [string, string][] = ([
   ['/admin/audit', 'audit'],
   ['/admin/settings', 'settings'],
   ['/admin/diagnostics', 'settings'],
+  // /admin/api-keys mints live `erk_live_` partner credentials and can revoke every existing one —
+  // a one-click denial of service against every university/LMS integration pulling /api/v1/*. It had
+  // no section entry at all, so the section gate never ran against it and its own in-file gate was
+  // `role !== 'applicant'`. 'settings' is super_admin-only among the built-in roles, which is who
+  // should hold integration credentials. Pairs with the can('settings.edit') guard in the page
+  // itself: either alone is sufficient, and neither depends on the other still being there.
+  ['/admin/api-keys', 'settings'],
 ] as [string, string][]).sort((a, b) => b[0].length - a[0].length);
 
 function resolveAdminSection(path: string): string | null {
@@ -195,6 +202,23 @@ function isPublicCacheable(path: string): boolean {
 
 export const onRequest = defineMiddleware(async (context, next) => {
   const path = new URL(context.request.url).pathname;
+  // THE GUARD PATH. `path` is the raw pathname; `gpath` is the same path with repeated slashes
+  // collapsed, and it is what every AUTHORIZATION test below uses.
+  //
+  // isAdminPath() has normalised since it was written (line 24-28), but the gates that ran after it
+  // did not: the applicant bounce, the AquinTutor-scope bounce, the per-section filter and the
+  // face-2FA gate all tested the raw string. `//admin/finance` is the same resource to a router and a
+  // different string to startsWith(), so canOpenAdmin recognised it as an admin path and refused the
+  // wrong people correctly — while the section filter and the 2FA gate did not recognise it at all
+  // and simply did not run. A staff account that canOpenAdmin admits could therefore reach a section
+  // its role does not hold, without the second factor.
+  //
+  // Declared here, before every handler that reads it (`const` is not hoisted, and that has taken
+  // pages down on this project). normalisePath only collapses '/' runs, and every entry in
+  // PATH_SECTION and in isExempt() is already single-slash, so no request that is allowed today
+  // changes verdict. Left deliberately on `path`: the circuit breaker, the visvambhara block,
+  // isPublicCacheable and everything handed to next() — narrowing the change keeps it auditable.
+  const gpath = normalisePath(path);
 
   // CIRCUIT BREAKER — answered before any database work, deliberately.
   //
@@ -245,7 +269,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // Partner LMS embedding: a valid signed embed_token lets a specific lab load
   // without a login (used by universities iframing our labs via the v1 API).
   async function gatedLabAllowedByEmbed(): Promise<boolean> {
-    if (!isGatedLab(path)) return false;
+    if (!isGatedLab(gpath)) return false;
     try {
       const tok = new URL(context.request.url).searchParams.get('embed_token') || '';
       if (!tok) return false;
@@ -262,7 +286,12 @@ export const onRequest = defineMiddleware(async (context, next) => {
     // No cookie at all. Deny by default reaches nobody-at-all too — see signedOutAdminRedirect.
     const anonAdmin = signedOutAdminRedirect(path);
     if (anonAdmin) return anonAdmin;
-    if (isGatedLab(path) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
+    // gpath, not path — this is the sign-in gate on /aquintutor/teach and it is the same
+    // normalisation asymmetry as the admin gates below: '//aquintutor/teach' is one resource to the
+    // router and a different string to startsWith(), so the raw test simply did not fire and an
+    // anonymous visitor reached the teacher console. Collapsing '/' runs can only ever match MORE
+    // paths, so no request that is permitted today changes verdict.
+    if (isGatedLab(gpath) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(gpath) } });
     // Anonymous + public page -> let the CDN cache it so repeat hits never touch the database.
     if (context.request.method === 'GET' && isPublicCacheable(path)) {
       const res = await next();
@@ -289,7 +318,8 @@ export const onRequest = defineMiddleware(async (context, next) => {
     // the very next request renders the sign-in form normally and nobody can be stuck in a loop.
     const staleAdmin = signedOutAdminRedirect(path);
     if (staleAdmin) return staleAdmin;
-    if (isGatedLab(path) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(path) } });
+    // gpath for the same reason as the anonymous branch above.
+    if (isGatedLab(gpath) && !(await gatedLabAllowedByEmbed())) return new Response(null, { status: 302, headers: { Location: '/aquintutor/login?next=' + encodeURIComponent(gpath) } });
     return next();
   }
   setSessionCookie(context.cookies, token, result.session.expiresAt);
@@ -314,7 +344,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
 
   // Applicants get full access only in the application portal, never the admin
   // panel. Central guard (complements per-page checks).
-  if (result.user.role === 'applicant' && path !== '/admin/login' && (path === '/admin' || path.startsWith('/admin/'))) {
+  if (result.user.role === 'applicant' && gpath !== '/admin/login' && (gpath === '/admin' || gpath.startsWith('/admin/'))) {
     return new Response(null, { status: 302, headers: { Location: '/portal' } });
   }
 
@@ -328,8 +358,8 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // company's other projects: applications, mail, finance, HR). Their own course
   // management lives under /aquintutor/admin/*. Internal staff hold admin.access
   // and are unaffected.
-  if (result.user.role !== 'applicant' && (path === '/admin' || path.startsWith('/admin/'))
-      && path !== '/admin/login' && path !== '/admin/logout'
+  if (result.user.role !== 'applicant' && (gpath === '/admin' || gpath.startsWith('/admin/'))
+      && gpath !== '/admin/login' && gpath !== '/admin/logout'
       && !can(result.user as any, 'admin.access')) {
     // Same table /portal lands these accounts with. It used to be a ternary written out here and
     // nowhere else, which meant /portal had no way to send a teacher to their own console and simply
@@ -387,8 +417,8 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // Permission gate: a user assigned a custom role only reaches sections that
   // role grants view on. Mirrors the sidebar filter so URL-typing can't bypass
   // it. super_admins / unrestricted users return null (no gating).
-  if (result.user.role !== 'applicant' && path.startsWith('/admin/') && path !== '/admin/login' && path !== '/admin/logout') {
-    const sectionKey = resolveAdminSection(path);
+  if (result.user.role !== 'applicant' && gpath.startsWith('/admin/') && gpath !== '/admin/login' && gpath !== '/admin/logout') {
+    const sectionKey = resolveAdminSection(gpath);
     if (sectionKey) {
       const allowed = await getViewableSectionKeys(result.user);
       if (allowed && !allowed.has(sectionKey)) {
@@ -401,7 +431,7 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // protected surface — staff AND applicants. Per founder instruction:
   // every applicant must complete Face 2FA before accessing the portal.
   // Login / signup / enrollment flows are exempt via isExempt(path) above.
-  if (!isExempt(path) && isProtected(path)) {
+  if (!isExempt(gpath) && isProtected(gpath)) {
     const hasFace = await hasFaceEnrolled(result.user.id);
     if (!hasFace) {
       // For applicants, route them through the portal-styled face-setup

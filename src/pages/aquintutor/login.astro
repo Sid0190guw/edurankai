@@ -9,7 +9,22 @@ let errorMsg = '';
 let requireFace = false;
 let pendingUserId = '';
 let pendingUserName = '';
-let faceDescriptor = '';
+// A BOOLEAN, not a descriptor. Drawing a viewfinder never required the enrolled template.
+let faceEnrolled = false;
+
+// The face comparison is AUTHORITATIVE AND SERVER-SIDE, and the enrolled descriptor stays here.
+//
+// It used to be handed to the browser via `define:vars={{ storedDescriptor: faceDescriptor }}`.
+// Anyone who could load this page for a pending user read the stored biometric template out of the
+// page source, replayed it as their "live" capture, and euclideanDistance returned 0 — a perfect
+// match. That defeated face sign-in and disclosed biometric data. A password can be rotated; a
+// face cannot.
+//
+// Worse on THIS surface: the `face_verified` POST below did no comparison of any kind. It checked
+// that the submitted user_id equalled the pending cookie and then minted a session, so the entire
+// face step was decided by the browser. Both halves are fixed together — the descriptor stays on
+// the server, and the server is now the thing that decides.
+import { matchEnrolledFace, hasActiveFaceEnrolment, causeOf } from '@/lib/auth/face';
 
 const pendingId = Astro.cookies.get('aquintutor_face_pending')?.value || '';
 
@@ -20,13 +35,14 @@ if (pendingId) {
     const { db } = await import('@/lib/db');
     const { users } = await import('@/lib/db/schema');
     const { eq } = await import('drizzle-orm');
-    const { sql } = await import('drizzle-orm');
     const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pendingId)).limit(1);
     pendingUserName = u[0]?.name || '';
-    const fd = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${pendingId} AND is_active = true LIMIT 1`);
-    const rows = Array.isArray(fd) ? fd : (fd?.rows || []);
-    faceDescriptor = rows.length > 0 ? JSON.stringify((rows[0] as any).face_descriptor) : '';
-  } catch (_) {}
+    faceEnrolled = await hasActiveFaceEnrolment(pendingId);
+  } catch (e: any) {
+    // Never swallowed silently in an auth path — a bare catch here would hide a total sign-in
+    // outage. The real Postgres reason is on e.cause.
+    console.error('[aquintutor/login] face pending lookup failed:', causeOf(e));
+  }
 }
 
 if (Astro.request.method === 'POST') {
@@ -35,6 +51,7 @@ if (Astro.request.method === 'POST') {
 
   if (action === 'face_verified') {
     const userId = (fd2.get('user_id') as string) || '';
+    const liveRaw = (fd2.get('live_descriptor') as string) || '';
     if (userId === pendingId) {
       try {
         const { db } = await import('@/lib/db');
@@ -43,17 +60,39 @@ if (Astro.request.method === 'POST') {
         const { setSessionCookie } = await import('@/lib/auth/cookie');
         const { eq } = await import('drizzle-orm');
         const { sql } = await import('drizzle-orm');
-        await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
-        const token = generateSessionToken();
-        const session = await createSession(token, userId, {
-          userAgent: Astro.request.headers.get('user-agent') || undefined,
-          ipAddress: Astro.clientAddress
-        });
-        setSessionCookie(Astro.cookies, token, session.expiresAt);
-        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, userId));
-        Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
-        return Astro.redirect('/aquintutor/dashboard');
-      } catch (_) { errorMsg = 'Sign-in error. Please try again.'; }
+
+        // THE ACTUAL FACE CHECK. Until now this branch had none: holding the pending cookie and
+        // POSTing action=face_verified with the matching user_id minted a session outright, so the
+        // "second factor" was whatever the browser chose to claim. Same module and same threshold
+        // as /admin/login and /api/auth/face-match, so the poll the camera loop uses and the gate
+        // that mints the session cannot disagree.
+        const { matched, distance } = await matchEnrolledFace(userId, liveRaw);
+        await db.execute(sql`
+          INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
+          VALUES (${userId}, ${''}, ${pendingUserName || ''}, 'face_login', ${Number.isFinite(distance) ? distance : null}, ${matched}, ${matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
+        `).catch((e: any) => { console.error('[aquintutor/login] face audit insert failed:', causeOf(e)); });
+
+        if (!matched) {
+          // The measured distance is recorded in the audit row above and NOT shown here — a number
+          // on screen is a gradient an attacker can hill-climb toward the enrolled template.
+          errorMsg = 'Face not recognised. Try again, or use your password.';
+        } else {
+          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
+          const token = generateSessionToken();
+          const session = await createSession(token, userId, {
+            userAgent: Astro.request.headers.get('user-agent') || undefined,
+            ipAddress: Astro.clientAddress
+          });
+          setSessionCookie(Astro.cookies, token, session.expiresAt);
+          await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, userId));
+          Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
+          return Astro.redirect('/aquintutor/dashboard');
+        }
+      } catch (e: any) {
+        // Never swallowed. The user gets a neutral message; the operator gets the real reason.
+        console.error('[aquintutor/login] face verification failed:', causeOf(e));
+        errorMsg = 'Sign-in error. Please try again.';
+      }
     } else {
       errorMsg = 'Session mismatch. Please sign in again.';
       Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
@@ -147,7 +186,7 @@ if (Astro.request.method === 'POST') {
         </form>
       )}
 
-      {requireFace && faceDescriptor && (
+      {requireFace && faceEnrolled && (
         <div style="margin-top:32px; background:var(--paper); border:1px solid var(--rule); border-radius:14px; overflow:hidden;">
           <div style="background:#000; aspect-ratio:3/4; position:relative; max-height:380px;">
             <video id="videoEl" autoplay playsinline muted style="width:100%; height:100%; object-fit:cover; transform:scaleX(-1);"></video>
@@ -169,6 +208,9 @@ if (Astro.request.method === 'POST') {
         <form id="faceSuccessForm" method="POST" style="display:none;">
           <input type="hidden" name="action" value="face_verified"/>
           <input type="hidden" name="user_id" value={pendingUserId}/>
+          {/* The capture the server re-verifies before it mints a session. Not the enrolled
+              template — this is what the camera just saw. */}
+          <input type="hidden" name="live_descriptor" id="liveDescriptorField" value=""/>
         </form>
       )}
 
@@ -193,11 +235,15 @@ if (Astro.request.method === 'POST') {
     </div>
   </section>
 
-  {requireFace && faceDescriptor && (
+  {requireFace && faceEnrolled && (
     <script slot="head" is:inline src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js"></script>
   )}
-  {requireFace && faceDescriptor && (
-    <script is:inline define:vars={{ storedDescriptor: faceDescriptor }}>
+  {requireFace && faceEnrolled && (
+    <script is:inline>
+      // NOTE: no define:vars, and nothing server-rendered into this script. The enrolled descriptor
+      // is not here, and must never be reintroduced here in any form — not define:vars, not a data
+      // attribute, not a JSON island. Captures go OUT to /api/auth/face-match and a boolean comes
+      // back; the comparison happens on the server, and the form POST re-verifies it there anyway.
       var video = document.getElementById('videoEl');
       var verifyBtn = document.getElementById('verifyBtn');
       var camStatus = document.getElementById('camStatus');
@@ -205,11 +251,9 @@ if (Astro.request.method === 'POST') {
       var verified = false;
       var attempts = 0;
       var fvOptions;
-      // Strict match threshold: lower = stricter. 0.6 is face-api's default
-      // "same person" line. 0.6 is face-api's recommended match distance; the
-      // median + 60%-of-readings rule below keeps it from accepting a different
-      // person while not locking out the real user (0.45 was far too strict).
-      var MATCH_THRESHOLD = 0.6;
+      var lastLiveDescriptor = null;
+      // The match threshold no longer lives here. It is FACE_2FA_THRESHOLD in src/lib/auth/face.ts
+      // (still 0.6), applied on the server, and this page cannot see or change it.
       function setStatus(msg, color) { camStatus.style.color = color || '#fff'; camStatus.textContent = msg; }
       async function init() {
         try {
@@ -236,9 +280,27 @@ if (Astro.request.method === 'POST') {
           }, 300);
         } catch (e) { setStatus('Camera error: ' + e.message, '#ef4444'); }
       }
-      function storedArr() {
-        var stored = JSON.parse(storedDescriptor);
-        return new Float32Array(Array.isArray(stored) ? stored : Object.values(stored));
+      // Ask the SERVER whether a capture matches the enrolled face. Sends the capture, receives a
+      // boolean — never a distance, never the enrolled template. A non-ok reply is raised as a
+      // fatal error so the loop stops rather than reading a server outage as "wrong face".
+      async function askServer(desc) {
+        var res = await fetch('/api/auth/face-match', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            scope: 'aquintutor',
+            liveDescriptor: Array.prototype.slice.call(desc)
+          })
+        });
+        var data = {};
+        try { data = await res.json(); } catch (e) {}
+        if (!data || data.ok !== true) {
+          var err = new Error((data && data.error) || 'Face check unavailable.');
+          err.fatal = true;
+          throw err;
+        }
+        return data.matched === true;
       }
       // ── Liveness: eye-aspect-ratio blink detection (defeats a static photo) ──
       function eyeAspect(eye) {
@@ -276,8 +338,9 @@ if (Astro.request.method === 'POST') {
         if (isAuto) { setStatus('Center face in the oval', '#7dd3a8'); setTimeout(autoVerifyLoop, 500); }
         else { setStatus(v.msg || 'Face not recognised. Try again.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
       }
-      // One strict reading: requires exactly one clear, close, confident face,
-      // and returns its distance to the enrolled signature (or null on reject).
+      // One strict reading: requires exactly one clear, close, confident face, and returns the
+      // captured descriptor. These are FRAME-QUALITY checks only — they need no enrolled template
+      // and are kept exactly as they were. The identity decision is not made here any more.
       async function measureOnce() {
         var all = await faceapi.detectAllFaces(video, fvOptions).withFaceLandmarks().withFaceDescriptors();
         if (!all || all.length === 0) return { reject: 'no_face' };
@@ -286,36 +349,51 @@ if (Astro.request.method === 'POST') {
         if ((d.detection.score || 0) < 0.6) return { reject: 'low_conf' };
         var vw = video.videoWidth || 640;
         if (d.detection.box.width < vw * 0.22) return { reject: 'too_small' };
-        return { dist: faceapi.euclideanDistance(d.descriptor, storedArr()) };
+        return { desc: d.descriptor };
       }
-      // Multi-frame decision: sample several readings, require the MEDIAN
-      // distance under threshold AND a majority of frames to agree. This stops
-      // a single lucky frame (or a different person) from passing.
+      // Sample up to five good frames and ask the server about each until one matches. The frame
+      // that the server accepted is the one submitted, so the capture the person was told about is
+      // exactly the capture the session-minting POST re-verifies — the UX and the authoritative
+      // gate cannot disagree about which descriptor was checked.
       async function verifyStrict() {
-        var dists = [];
         var samples = 0;
+        var good = 0;
         var lastReject = '';
         while (samples < 5) {
           var r = await measureOnce();
-          if (r.reject) { lastReject = r.reject; if (r.reject === 'multiple') return { ok: false, msg: 'Only your face should be visible.' }; }
-          else { dists.push(r.dist); }
+          if (r.reject) {
+            lastReject = r.reject;
+            if (r.reject === 'multiple') return { ok: false, msg: 'Only your face should be visible.' };
+          } else {
+            good++;
+            if (await askServer(r.desc)) {
+              lastLiveDescriptor = r.desc;
+              return { ok: true };
+            }
+          }
           samples++;
           await new Promise(function(res){ setTimeout(res, 140); });
         }
-        if (dists.length < 3) {
+        if (good < 3) {
           var m = lastReject === 'too_small' ? 'Move closer to the camera.' : lastReject === 'low_conf' ? 'Face not clear - improve lighting.' : 'Center your face in the oval.';
           return { ok: false, msg: m, soft: true };
         }
-        dists.sort(function(a,b){ return a-b; });
-        var median = dists[Math.floor(dists.length / 2)];
-        var passing = dists.filter(function(x){ return x < MATCH_THRESHOLD; }).length;
-        // Median must clear the strict line AND most frames must agree.
-        return { ok: (median < MATCH_THRESHOLD && passing >= Math.ceil(dists.length * 0.6)) };
+        return { ok: false };
       }
       async function autoVerifyLoop() {
         if (verified || attempts > 6) { if (attempts > 6) setStatus('Tap "Verify face" to try again.', '#fbbf24'); return; }
         attempts++;
-        try { await runVerification(true); } catch(_) { setTimeout(autoVerifyLoop, 600); }
+        try { await runVerification(true); }
+        catch (e) {
+          if (e && e.fatal) {
+            // Server said no, or the pending sign-in expired. Retrying cannot help.
+            setStatus(e.message, '#ef4444');
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = 'Try again';
+            return;
+          }
+          setTimeout(autoVerifyLoop, 600);
+        }
       }
       async function doVerify() {
         verifyBtn.disabled = true;
@@ -328,7 +406,15 @@ if (Astro.request.method === 'POST') {
         setStatus('Verified. Signing you in...', '#7dd3a8');
         verifyBtn.textContent = 'Verified';
         verifyBtn.style.background = '#3f8a64';
-        setTimeout(function() { document.getElementById('faceSuccessForm').submit(); }, 600);
+        setTimeout(function() {
+          // Attach the capture the server accepted. The POST re-verifies it before minting a
+          // session, so an empty or edited field simply fails the check rather than passing.
+          try {
+            var f = document.getElementById('liveDescriptorField');
+            if (f && lastLiveDescriptor) f.value = JSON.stringify(Array.prototype.slice.call(lastLiveDescriptor));
+          } catch (e) {}
+          document.getElementById('faceSuccessForm').submit();
+        }, 600);
       }
       init();
     </script>

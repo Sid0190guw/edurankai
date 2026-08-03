@@ -6,12 +6,42 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { can, ensureRbacSchema, seedRbac } from '@/lib/rbac';
-import { SEED_ROLES, STAGES } from '@/lib/rbac/roles';
+import { SEED_ROLES, STAGES, ADMIN_ROLE_KEYS } from '@/lib/rbac/roles';
 import { isCapability } from '@/lib/rbac/capabilities';
 
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 const ROLE_KEYS = SEED_ROLES.map((r) => r.key);
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+// ---- PRIVILEGE SEPARATION INSIDE THIS ENDPOINT -----------------------------------------------
+//
+// Declared at module top BECAUSE `const` IS NOT HOISTED and the POST handler below reads them on
+// its authorization line; a declaration placed after the handler throws on the first request.
+//
+// The gate below asks the kernel engine for `manage` on `{ type: 'rbac' }`. The engine's Tier 6 is
+// `p.capabilities.has(capability)` — it never consults resource.type — so that call reduces to
+// "does this principal hold `manage` anywhere". Two seeded roles do: `registrar` and `dean`. Both
+// therefore passed the ONLY authorization on this endpoint, and the actions below could then be
+// aimed at the caller:
+//
+//   assignRole { userId: <self>, roleKey: 'superadmin' }   -> ROLE_KEYS accepts 'superadmin'
+//   toggleCap  { roleKey: 'registrar', capability: 'administer', on: true }
+//
+// Either one gives the caller `administer`, which is the engine's Tier-2 override and authorises
+// EVERY capability on EVERY resource — platform backup/restore, credential issue/revoke, the
+// plugin host. Self-service escalation in one authenticated POST, logged by can() as an ALLOW.
+//
+// The fix is privilege separation, not a wider gate: the registrar keeps the actions that are the
+// registrar's job (setStage, linkGuardian/unlinkGuardian, and assigning the LEARNER-surface roles),
+// and the two shapes that can hand out staff power now require `administer` as well.
+//
+// Deliberately NOT canOpenAdmin(): an rbac registrar whose users.role is not admin-capable would be
+// locked out of a console they legitimately use, and a lockout is its own outage.
+const PRIVILEGED_ACTIONS: ReadonlySet<string> = new Set(['seed', 'toggleCap', 'createRole']);
+// Assigning or removing ANY admin-surface role (superadmin, registrar, dean, faculty, ...) is a
+// staff-power decision. MAIN_ROLE_KEYS (student/applicant/guardian/researcher/partner/guest) stay
+// available to `manage`, because enrolment and records are what the role exists for.
+const PRIVILEGED_ROLE_KEYS: ReadonlySet<string> = new Set(ADMIN_ROLE_KEYS);
 
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any)?.user;
@@ -22,6 +52,23 @@ export const POST: APIRoute = async ({ request, locals }) => {
   let b: any = {};
   try { b = await request.json(); } catch { return j({ ok: false, error: 'bad json' }, 400); }
   const action = String(b.action || '');
+
+  // Second gate, ABOVE every write below: `administer` for the actions that hand out staff power.
+  // See the note at the top of this file. can() writes its own audit row, so the refusal — and the
+  // grant — are both recorded with the capability that was actually asked for.
+  const needsAdminister = PRIVILEGED_ACTIONS.has(action)
+    || ((action === 'assignRole' || action === 'removeRole') && PRIVILEGED_ROLE_KEYS.has(String(b.roleKey || '')));
+  if (needsAdminister) {
+    const sup = await can(user, 'administer', { type: 'rbac' });
+    if (!sup.allow) {
+      return j({
+        ok: false,
+        error: 'superadmin only (assigning an admin-surface role, or editing the capability matrix)',
+        reason: sup.reason,
+      }, 403);
+    }
+  }
+
   try {
     await ensureRbacSchema();
 
