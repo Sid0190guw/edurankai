@@ -652,8 +652,8 @@ export const WIDGETS: readonly WidgetDefinition[] = [
 
   // ------------------------------------------------------------------ internship
   // The three widgets this whole exercise is about. They are NOT deleted — they are correct, and
-  // they are the point of the intern workspace. They simply require an internship engagement AND a
-  // recorded requirement, so nobody else is measured against a target they never agreed to.
+  // they are the point of the intern workspace. They require an internship engagement; only the one
+  // that states a figure AGAINST A TARGET additionally requires that target to be recorded.
   {
     key: 'credit.position',
     title: 'Credit hours',
@@ -661,17 +661,23 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     dataSource: 'ledgerFor(employeeId, termsFor(employeeId)) (src/lib/credit-ledger.ts:110) over hr_attendance + approved hr_leave_request.',
     requires: [],
     audience: internshipOnly,
-    gate: 'engagement-terms',
     priority: 400,
     size: 'lg',
     render: 'progress',
     href: '/portal/workspace',
     notes:
       'THE WIDGET THAT STARTED THIS. Senior leadership signing in and being shown a credit-hours progress ' +
-      'bar was the reported failure. Two locks: an internship engagement, and a requirement actually ' +
-      'recorded on the row (the gate). Derived live, never stored — do not "optimise" it into a ledger ' +
-      'table, because a stored balance drifts the first time a leave request is cancelled. Zero and unknown ' +
-      'are different facts: the existing card says "no credit-hour requirement recorded" rather than "0%".',
+      'bar was the reported failure. The lock is the internship engagement. Derived live, never stored — do ' +
+      'not "optimise" it into a ledger table, because a stored balance drifts the first time a leave request ' +
+      'is cancelled. ' +
+      'NO `engagement-terms` GATE, DELIBERATELY, and this is the second time it has been reconsidered. ' +
+      'hr_employees.required_credit_hours has exactly ONE writer — the per-person form at ' +
+      '/admin/hr/completion/[id].astro — so it is NULL for almost every intern, and gating on it removed ' +
+      'the credit hours, attendance percentage and days-in figures from the very people the whole surface ' +
+      'exists for. It also contradicted the master spec (§11.4): the card renders "no credit-hour ' +
+      'requirement recorded" rather than "0% complete", because zero and unknown are different facts. The ' +
+      'progress BAR is already suppressed on its own when requiredCreditHours is unset (creditPct === null ' +
+      'in portal/employee.astro), so nothing here can render a bar against a target nobody agreed to.',
   },
   {
     key: 'credit.weeksLeft',
@@ -685,7 +691,10 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'sm',
     render: 'stat',
     href: '/portal/workspace',
-    notes: 'Share one ledgerFor() call with credit.position. Two reads of the same arithmetic can disagree.',
+    notes:
+      'Share one ledgerFor() call with credit.position. Two reads of the same arithmetic can disagree. ' +
+      'This one KEEPS the `engagement-terms` gate: "weeks remaining" is a countdown to a target, and ' +
+      'remainingWeeks() has nothing to count towards when no requirement is recorded.',
   },
   {
     key: 'completion.status',

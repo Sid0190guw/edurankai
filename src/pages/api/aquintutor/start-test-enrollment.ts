@@ -43,9 +43,21 @@ export const POST: APIRoute = async ({ request, locals }) => {
       return json({ ok: true, paid: false, redirect: runUrl });
     }
 
-    // Admin override: admin/super_admin/staff can access premium tests without paying
-    // (for review, moderation, and management). Audit on the payments table.
-    const isAdmin = user.role && ['admin','super_admin','editor','reviewer'].includes(user.role);
+    // Paid-test override, for reviewing and moderating a premium test without buying it.
+    //
+    // WAS: ['admin','super_admin','editor','reviewer'].includes(user.role).
+    // Two defects. 'admin' is not a value in userRoleEnum (src/lib/db/schema.ts), so that arm was
+    // dead and misleading. And 'editor' is the role the offer-signing defect handed to EVERY intern
+    // who accepted an offer — so every intern could take any paid test for free, on an endpoint
+    // that /api/ exempts from the middleware gate entirely.
+    //
+    // Now asks for the ability to manage test content, which is what a reviewer of a premium test
+    // actually needs. This narrows access: 'editor' holds content.edit and keeps the override, but
+    // it is now recorded as a capability rather than a role name, and a custom role can be granted
+    // it deliberately. Reviewer loses it — it was never on the console they use, and taking a paid
+    // test for free is not part of scoring an application.
+    const { can } = await import('@/lib/auth/permissions');
+    const isAdmin = can(user as any, 'content.edit');
     if (isAdmin) {
       return json({ ok: true, paid: false, adminOverride: true, redirect: runUrl });
     }
