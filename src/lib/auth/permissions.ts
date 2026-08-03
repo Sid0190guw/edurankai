@@ -124,8 +124,35 @@ export type Permission =
 
   // Publishing an applicant's profile to the public web, and editing its content (/admin/profiles).
   | 'profiles.manage'
-  // Opening resume submissions — and the unpaginated CSV of every one of them.
+  // Opening resume submissions. READING them, one at a time, on a screen — no longer the CSV of every
+  // one of them, which moved to `reports.export` below.
   | 'resumes.view'
+  // BULK EXPORT. Taking a whole dataset out of the product in one request — the ?export=csv arm of
+  // /admin/resumes today, which returns an unpaginated file of every submission on file including
+  // guests who never made an account.
+  //
+  // WHY IT IS ITS OWN KEY. `resumes.view` gated BOTH opening the screen and downloading the whole
+  // table, and those are not the same act: reading one person's submission because they asked you to
+  // is ordinary, and walking out with every name, email, phone and LinkedIn in the database is not.
+  // One weakened line therefore exported the entire dataset. Viewing must never automatically confer
+  // bulk export, so the export arm now asks for BOTH keys and the view path asks for neither more nor
+  // less than it did before.
+  //
+  // THE NAME IS THE RATIFIED ONE. `reports.export` is the vocabulary's spelling for "take a dataset
+  // out in bulk" — it is the worked example in registry.ts registerPermission() and on
+  // /admin/team/roles — so it is used here rather than inventing `resumes.export`. It is deliberately
+  // NOT resume-specific: it is the key any future bulk-export arm should ask for alongside whatever
+  // permission gates reading that data, so there is one answer to "who may take data out".
+  //
+  // POPULATION UNCHANGED. Granted below to super_admin and to nobody else, which is exactly who could
+  // reach ?export=csv before this key existed (the page gate was, and remains, super_admin-only
+  // `resumes.view`). Nobody gains the export; nobody loses it.
+  //
+  // NO SECTION SPELLS IT. There is no `reports` section in src/lib/admin-sections.ts, so
+  // seedCatalogueRows() derives no `reports.*` key and the section matrix cannot produce this one by
+  // accident — but page_key is free text, so the call site uses can() (PERMS_BY_ROLE alone), never
+  // hasPermission(), for the same reason resumes.view does.
+  | 'reports.export'
   // Putting spendable balance on an account by email (/admin/credits). Money creation.
   | 'credits.grant'
   // Re-driving a captured payment into a materialised application (/admin/paid-stuck).
@@ -286,6 +313,12 @@ export type Permission =
 //   `role === 'super_admin'` at the call site -> granted to super_admin ONLY:
 //     profiles.manage          src/pages/admin/profiles/index.astro:8, [userId].astro:7
 //     resumes.view             src/pages/admin/resumes/index.astro:8, [id].astro:7
+//     reports.export           SPLIT OUT of resumes.view, not derived from a new call site. The
+//                              ?export=csv arm of /admin/resumes/index.astro now asks for
+//                              resumes.view AND this; every other arm of that page is untouched.
+//                              Same single holder (super_admin), so the export population is
+//                              identical before and after — the split narrows what a FUTURE grant of
+//                              resumes.view would hand over, not what anybody holds today.
 //     credits.grant            src/pages/admin/credits.astro:9 (the `'admin'` arm is DEAD — 'admin'
 //                              is not a value of userRoleEnum, so no account can hold it)
 //     payments.retry           src/pages/admin/paid-stuck.astro:8 (same dead arm, in array form)
@@ -349,6 +382,12 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // a literal `user.role !== 'super_admin'` redirect. There is no WILDCARD in can() — an omission
     // here answers false for the founder and closes the surface to everybody.
     'profiles.manage', 'resumes.view', 'credits.grant', 'payments.retry', 'locations.view',
+    // BULK EXPORT — split out of resumes.view, granted to the SAME single role that could already
+    // reach /admin/resumes?export=csv. Before: super_admin (via resumes.view), nobody else. After:
+    // super_admin, nobody else. Every other role's export set is unchanged at empty. Adding it to a
+    // second role here would be a widening, and it is the one edit to this line that must not be made
+    // without a decision on the record.
+    'reports.export',
     // /admin/hr/payroll lists ['super_admin','hr'] literally.
     'payroll.manage',
     // /admin/tests/[id] admits super_admin || hr, but hr never reaches the line (no 'tests' section).

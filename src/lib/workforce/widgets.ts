@@ -181,7 +181,56 @@ export interface WorkspaceContext {
    *  are present; use grantedSection() rather than reading the set directly. */
   sections: ReadonlySet<string>;
   grantedSection: (key: string, action: SectionRequirement['action']) => boolean;
+  /**
+   * TODAY, AS THE DATABASE COUNTS IT — 'YYYY-MM-DD', or null when that read did not happen.
+   *
+   * Six widgets partition on "today" (tasks.dueToday, clock.today, timelog.today,
+   * dailyreport.today, worklog.today, schedule.today) and due_on is compared against CURRENT_DATE
+   * inside Postgres. A second surface computing `new Date()` in the render process disagrees with
+   * the first by a day whenever the process timezone and the session timezone differ, and "due
+   * today" is exactly the claim that must not be off by one. Resolved ONCE here so every widget
+   * partitions on the same day.
+   *
+   * NULL IS NOT "TODAY IS UNKNOWABLE, GUESS" — it is "do not render a day-partitioned claim".
+   */
+  today: string | null;
+  /**
+   * users.id of the person this account reports to, off the viewer's OWN row. Null when none is
+   * recorded, when there is no employee record, or when the read did not happen.
+   *
+   * THE ID-SPACE TRAP, stated where the value lives: hr_employees.reporting_manager_id holds a
+   * USERS id, not an hr_employees id. A loader naming this field must join `m.user_id`, never
+   * `m.id` — the wrong join matches zero rows and reads as "not recorded" rather than failing.
+   */
+  reportingManagerUserId: string | null;
 }
+
+/**
+ * A DOOR WITH A VERB ON IT — "what can this person DO right now", declared beside the widget that
+ * grants it rather than in a second hand-written list.
+ *
+ * WHY IT LIVES HERE AND NOT ON THE PAGE. /portal/index.astro:416 and BottomNav.astro:115 each keep
+ * a static array of links with no capability test at all, so every tab renders for everyone
+ * whatever the composer resolved. A third copy on the workspace would be the same defect again.
+ * Because a quick action hangs off a WidgetDefinition, it is eligible exactly when its widget is:
+ * the composer filters once, and the action list falls out of the answer it already gave.
+ */
+export interface WidgetQuickAction {
+  /** Imperative and true at every moment — the label is not recomputed from live state. */
+  label: string;
+  /** Where the thumb lands. An in-page anchor is legitimate when the control IS on the workspace. */
+  href: string;
+  icon: QuickActionIcon;
+}
+
+/** Named monochrome glyphs the surface maps to inline SVG. NO EMOJI, anywhere, ever. */
+export type QuickActionIcon =
+  | 'clock' | 'note' | 'timer' | 'check' | 'calendar'
+  | 'stamp' | 'wallet' | 'people' | 'doc' | 'person';
+
+export const QUICK_ACTION_ICONS: readonly QuickActionIcon[] = [
+  'clock', 'note', 'timer', 'check', 'calendar', 'stamp', 'wallet', 'people', 'doc', 'person',
+];
 
 /** A predicate over the context. Pure, synchronous, no database, and it must not throw. */
 export type WidgetAudience = (ctx: WorkspaceContext) => boolean;
@@ -214,6 +263,10 @@ export interface WidgetDefinition {
   /** The full surface behind this widget. NULL means there is no page to send them to — either the
    *  widget is the whole thing, or the door is shut and linking would bounce them. */
   href: string | null;
+  /** The verb form of this widget, for the quick-action row. Absent means there is nothing to DO
+   *  here — a card that only reports (a balance, a roster, a manager's name) has no action, and
+   *  inventing one would send someone to a screen that cannot answer them. */
+  quickAction?: WidgetQuickAction;
   /** Render nothing at all when the loader comes back empty, rather than a zero. */
   hideWhenEmpty?: boolean;
   /** Shown when the context could not be resolved. See MINIMAL_WIDGETS. */
@@ -271,6 +324,27 @@ export const HOLDS_EVERY_PERMISSION = '*';
 export const WIDGETS: readonly WidgetDefinition[] = [
   // ------------------------------------------------------------------ attention
   {
+    key: 'welcome.banner',
+    title: 'Welcome',
+    group: 'attention',
+    dataSource:
+      'THE COMPOSED CONTEXT ITSELF — WorkspaceContext plus the Workspace resolveWorkspace() already ' +
+      'returned (identity, designation, department, engagement). NO QUERY OF ITS OWN.',
+    requires: [],
+    audience: anyone,
+    priority: 5,
+    size: 'full',
+    render: 'identity',
+    href: null,
+    minimal: true,
+    notes:
+      'IN MINIMAL_WIDGETS, and that is the point: it needs nothing but the session, so a workspace ' +
+      'whose context could NOT be resolved still opens with a name and a sentence instead of a blank ' +
+      'screen. It states only what was actually read — no greeting invented from a clock the database ' +
+      'did not supply, and no department when ctx.departmentId is null. users has `name`, NOT ' +
+      'full_name. Never render a role name here: the context carries none, deliberately.',
+  },
+  {
     key: 'attention.queue',
     title: 'What needs you today',
     group: 'attention',
@@ -309,6 +383,31 @@ export const WIDGETS: readonly WidgetDefinition[] = [
       '(KNOWN_GAPS.md). Render each row against its own notifications.action_url instead, and set an ' +
       'href here only once that door is opened.',
   },
+  {
+    key: 'schedule.today',
+    title: 'Today',
+    group: 'attention',
+    dataSource:
+      'ASSEMBLED FROM ROWS THAT ALREADY EXIST, and from nothing else: the due-today partition of ' +
+      'myTasksView(employeeId) against ctx.today, approved hr_leave_request rows covering ctx.today ' +
+      'via listLeave({ employeeId }) (src/lib/hr-leave.ts:75), and the first punch of the day from ' +
+      'the clock.today read. No table is invented and no second query is added.',
+    requires: [],
+    audience: withEmployeeRecord,
+    priority: 30,
+    size: 'full',
+    render: 'list',
+    href: '/portal/tasks',
+    notes:
+      'THIS IS NOT A CALENDAR AND MUST NEVER BE TITLED AS ONE. There is no shift, roster, ' +
+      'work_schedule, holiday or staff-meeting table anywhere in src/ or db/ — meetings.today stays ' +
+      'UNREGISTERED below with the evidence, meet_rooms.scheduled_at is written by nothing, and ' +
+      'src/lib/calendar.ts is the LEARNER deadline feed. So this widget shows the day someone ' +
+      'already has on record and says plainly, once, that scheduled meetings are not part of it. ' +
+      'Rendering an empty "no meetings today" would claim a calendar was consulted. ' +
+      'PARTITION ON ctx.today, never on the render process clock: when ctx.today is null the ' +
+      'day-partitioned rows are withheld rather than guessed.',
+  },
 
   // ------------------------------------------------------------------ work
   {
@@ -323,6 +422,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     render: 'task-list',
     component: 'src/components/workforce/TaskCard.astro',
     href: '/portal/tasks',
+    quickAction: { label: 'My tasks', href: '/portal/tasks', icon: 'check' },
     notes:
       'Takes hr_employees.id, NOT users.id. myTasksView rather than listMyTasks + taskCounts because ' +
       'it reports whether the read happened; the other two return [] and zeroes either way.',
@@ -412,10 +512,11 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     href: '/portal/tasks',
     hideWhenEmpty: true,
     notes:
-      'Structurally empty until an assign surface exists: createTask() (employee-tasks.ts:1566) has zero ' +
-      'callers, so nothing in the application can create a task. The engine, the state graph and the ' +
-      'permissions are all correct and complete — what is missing is a form. Say "nothing yet", never ' +
-      '"you have assigned nothing" as a judgement.',
+      'NO LONGER STRUCTURALLY EMPTY. This note said createTask() had zero callers, so nothing in the ' +
+      'application could create a task; that stopped being true at commit 98ef5e3, which added the ' +
+      'assign form at src/pages/portal/tasks/index.astro:424. Rows can now exist. It stays ' +
+      'hideWhenEmpty because most people assign nothing, and the wording stays "nothing yet" rather ' +
+      'than "you have assigned nothing" — the second is a judgement.',
   },
   {
     key: 'tasks.team',
@@ -468,6 +569,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'list',
     href: '/portal/approvals',
+    quickAction: { label: 'Decide requests', href: '/portal/approvals', icon: 'stamp' },
     hideWhenEmpty: true,
     notes:
       'Exclude the viewer\'s OWN pending rows: your request is not an approval waiting on you. The reader ' +
@@ -529,6 +631,12 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'form',
     href: null,
+    // An in-page anchor, because the control IS on the workspace — the punch forms are driven by
+    // element ids (submitClock('clockForm')) and a second copy elsewhere would give two elements the
+    // same id and break the punch that already works. The label is state-free on purpose: "Clock in"
+    // rendered for somebody already clocked in is a lie the quick-action row cannot detect, and this
+    // label is correct at every moment of the day.
+    quickAction: { label: 'Clock in or out', href: '#attendance', icon: 'clock' },
     notes:
       'A FAILED PUNCH READ LOOKS EXACTLY LIKE "clocked out, 0h", so the loader must carry a read-failed ' +
       'flag and the card must say "we could not read your punches" rather than stating somebody\'s day as ' +
@@ -546,6 +654,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'form',
     href: '/portal/workspace',
+    quickAction: { label: 'Log hours', href: '#time-log', icon: 'timer' },
     notes:
       'start_time and end_time are TEXT and order lexicographically, which is correct only for zero-padded ' +
       'HH:MM. There is no admin writer or editor: the portal copy telling people to "ask HR" for older ' +
@@ -562,6 +671,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'form',
     href: null,
+    quickAction: { label: "Write today's report", href: '#daily-report', icon: 'note' },
     notes:
       'One writer, five readers including three admin surfaces — so what is typed here genuinely reaches ' +
       'someone, unlike worklog.today. The table has no runtime DDL anywhere in src/ ' +
@@ -632,6 +742,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'list',
     href: '/portal/employee/leave',
+    quickAction: { label: 'Apply for leave', href: '/portal/employee/leave', icon: 'calendar' },
   },
   {
     key: 'leave.balance',
@@ -726,6 +837,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'stat-row',
     href: '/portal/employee/wallet',
+    quickAction: { label: 'Wallet', href: '/portal/employee/wallet', icon: 'wallet' },
     notes: 'Credits are idempotent on ref=\'payslip:<id>\', so re-running a payroll credit cannot double-pay.',
   },
   {
@@ -818,6 +930,31 @@ export const WIDGETS: readonly WidgetDefinition[] = [
       'matches zero rows and reads as "not recorded" instead of failing. ORDER BY is_active DESC, ' +
       'created_at DESC LIMIT 1 — one human can hold several hr_employees rows. Two display columns only: ' +
       'this is the one row belonging to someone else that a personal workspace may read.',
+  },
+  {
+    key: 'department.card',
+    title: 'Your department',
+    group: 'people',
+    dataSource:
+      'ctx.departmentId + ctx.departmentName, resolved by lookupWorkspace() from ' +
+      'hr_employees.department_id joined to departments.name. NO QUERY OF ITS OWN.',
+    requires: [],
+    audience: withEmployeeRecord,
+    priority: 605,
+    size: 'sm',
+    render: 'identity',
+    href: null,
+    notes:
+      'DISPLAY ONLY, AND SAY SO. ctx.departmentId is documented as self-scope and display; it never ' +
+      'grants the right to see anybody else, and it must never be handed to departmentFilter() to ' +
+      'manufacture a peer list — that is a new authorisation decision, not a rendering one. ' +
+      'NOT hideWhenEmpty, deliberately, and it is the same reasoning as manager.card: ' +
+      'hr_employees.department_id has exactly ONE writer (src/lib/hr/sync.ts, on the ' +
+      'application-to-hire path), so it is permanently NULL for anyone HR added by hand — and an ' +
+      'unrecorded department is not an empty field, it is the reason that person is invisible to ' +
+      'every department list in the product. Hiding the card hides the one sentence that gets it ' +
+      'fixed. A null NAME with a non-null id means the key points at no departments row: say the ' +
+      'code, do not print "null".',
   },
   {
     key: 'reports.direct',
@@ -984,6 +1121,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'list',
     href: '/portal/onboarding',
+    quickAction: { label: 'Joining documents', href: '/portal/onboarding', icon: 'doc' },
     notes:
       'Keyed by users.id, not employee_id (the employee_id column is declared and always NULL). listDocs ' +
       'THROWS rather than returning [] on failure, which is what this needs: an empty list and a failed read ' +
@@ -1068,6 +1206,7 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'list',
     href: '/portal/team-groups',
+    quickAction: { label: 'Community', href: '/portal/team-groups', icon: 'people' },
     notes:
       'The ONLY permitted way to list groups. A group the person is not entitled to is ABSENT from the ' +
       'result, not greyed out and not "request access" — a list of team names is a map of the organisation. ' +
@@ -1125,6 +1264,10 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     size: 'md',
     render: 'identity',
     href: '/portal/profile',
+    // /portal/profile itself is `if (!user)` only and admits every role — the redirect that used to
+    // bounce employees out of their own profile is gone (profile.astro:7-10). /portal/profile/EDIT
+    // still carries it, so no quick action points there.
+    quickAction: { label: 'My profile', href: '/portal/profile', icon: 'person' },
     minimal: true,
     notes:
       'In MINIMAL_WIDGETS because it needs nothing but the session: when the context could not be resolved ' +
@@ -1323,8 +1466,11 @@ export const UNREGISTERED: readonly { key: string; reason: string }[] = [
   {
     key: 'projects.mine',
     reason:
-      'No projects table, no project_id, no projectId anywhere in src/ or db/. Tasks have no project ' +
-      'relation, and grouping is meaningless while createTask() still has no caller (§3.4).',
+      'No projects table, no project_id, no projectId anywhere in src/ or db/ — grep-verified twice. ' +
+      'employee_tasks has no project relation, so "group my work by project" is not a question this ' +
+      'database can answer at all. (The second half of this reason — "and createTask() still has no ' +
+      'caller" — is now out of date: the assign form landed at portal/tasks/index.astro:424. The ' +
+      'missing TABLE is what still blocks it, and that has not changed.)',
   },
   {
     key: 'wellness.summary',
@@ -1394,6 +1540,18 @@ export function validateRegistry(defs: readonly WidgetDefinition[] = WIDGETS): s
     // screen where the thing it needs could not be resolved.
     if (w.minimal && (w.requires.length > 0 || w.requiresSection || w.gate)) {
       problems.push(w.key + ': marked minimal but depends on a permission, a section or a gate');
+    }
+
+    // A quick action with no destination is a button that does nothing, and an unknown icon name
+    // renders as a hole in the row. Both fail silently at runtime, which is why they are checked
+    // here — the composer logs whatever this finds rather than throwing.
+    if (w.quickAction) {
+      const qa = w.quickAction;
+      if (!qa.label) problems.push(w.key + ': quick action has no label');
+      if (!qa.href) problems.push(w.key + ': quick action has no href — a verb with no door');
+      if (QUICK_ACTION_ICONS.indexOf(qa.icon) < 0) {
+        problems.push(w.key + ': quick action icon ' + String(qa.icon) + ' is not in QUICK_ACTION_ICONS');
+      }
     }
   }
   return problems;

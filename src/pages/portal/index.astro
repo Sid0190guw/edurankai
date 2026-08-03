@@ -1,34 +1,61 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import WorkspaceNav from '@/components/workforce/WorkspaceNav.astro';
 import { db } from '@/lib/db';
 import { applications, applicationMessages } from '@/lib/db/schema';
 import { eq, desc, sql } from 'drizzle-orm';
+// THE ONE DECIDER. src/lib/workforce/landing.ts answers "where does this person belong", and it
+// answers it by asking things that already existed: canOpenAdmin() for the console — the SAME
+// function src/middleware.ts asks at the door — and composeWorkspace() for the employee record and
+// the engagement. This page no longer holds a rule of its own about who goes where.
+import { resolveLanding } from '@/lib/workforce/landing';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 
-// REDIRECT LOOP, FIXED. This line was `if (user.role !== 'applicant') redirect('/admin')` — it sent
-// anyone who was not an applicant to the admin console purely because of their role value. The new
-// middleware guard then refused them and sent them back here, and the browser bounced between the
-// two until it gave up with ERR_TOO_MANY_REDIRECTS. Every intern still carrying the 'editor' role
-// from the offer-signing defect was caught in it and could not reach the portal at all.
+// ------------------------------------------------------------------------------------------------
+// WHERE THIS PERSON BELONGS. Declared at the very top, above everything that reads it: `const` is not
+// hoisted, and a block reaching a later declaration has taken pages down in this repo before.
 //
-// The two now agree, because they ask the SAME question. Only send someone to /admin if /admin will
-// actually admit them; otherwise they belong here, which is the whole point of building them a
-// portal of their own. Anyone refused falls through to the applicant view below rather than being
-// thrown at a door that is locked.
-let sendToAdmin = false;
-if (user.role !== 'applicant') {
+// WHY THIS CANNOT LOOP. The full proof is written out at the top of src/lib/workforce/landing.ts;
+// the short form is that every arm below either asks the same question the destination's own guard
+// asks, or leads somewhere terminal:
+//
+//   /portal -> /admin fires only when canOpenAdmin(user).allowed is TRUE, and middleware.ts:353-369
+//   sends /admin -> /portal only when the SAME call on the SAME user is FALSE. They are exact
+//   complements, so at most one of the two can fire and there is no input on which both do. This is
+//   the fix that replaced `if (user.role !== 'applicant') redirect('/admin')`, which decided by role
+//   value while the door decided by right — the disagreement that produced ERR_TOO_MANY_REDIRECTS and
+//   locked every wrongly-promoted intern out of the portal entirely.
+//
+//   /portal -> /portal/employee is terminal: that page redirects on exactly one condition, no
+//   signed-in user, and never back to here.
+//
+//   /portal -> /portal/employee/onboarding is the ONE arm that could cycle, because
+//   onboarding.astro:11 bounces to /portal unconditionally when its own lookup finds nothing, and its
+//   lookup is not the same predicate requireEmployee uses (it does not consider work_email). Nothing
+//   writes work_email today, so the two cannot currently disagree — but "cannot currently" is not a
+//   guarantee, and this page was taken down once already by a redirect pair that agreed until it did
+//   not. So the hop below bounds it: the first pass sets a 20-second cookie, and if we are back here
+//   with that cookie the onboarding arm is skipped and the person goes to /portal/employee, which is
+//   terminal. Any divergence, present or future, costs one extra hop instead of an infinite loop.
+const HOP_COOKIE = 'era_ob_hop';
+const cameBack = Astro.cookies.get(HOP_COOKIE)?.value === '1';
+const landing = await resolveLanding(user as any, { locals: Astro.locals, hop: cameBack });
+
+// The admin arm first, exactly as before, so nothing about who reaches the console changes: an
+// account that canOpenAdmin admits goes there without paying for anything else on this page.
+if (landing.href === '/admin') return Astro.redirect('/admin');
+
+if (landing.reason === 'employee-onboarding') {
+  // Best effort. Losing the cookie costs the loop bound, not the redirect, and a cookie write must
+  // never be the reason a new hire cannot reach their onboarding form.
   try {
-    const { canOpenAdmin } = await import('@/lib/auth/admin-access');
-    sendToAdmin = (await canOpenAdmin(user as any)).allowed;
-  } catch (e: any) {
-    // Never loop on an error. If the check cannot run, keep them here.
-    console.error('[portal] admin check failed', e?.cause?.message || e?.message);
-    sendToAdmin = false;
-  }
+    Astro.cookies.set(HOP_COOKIE, '1', { path: '/', maxAge: 20, httpOnly: true, sameSite: 'lax' });
+  } catch (_) {}
+} else if (cameBack) {
+  try { Astro.cookies.delete(HOP_COOKIE, { path: '/' }); } catch (_) {}
 }
-if (sendToAdmin) return Astro.redirect('/admin');
 
 // Auto-promote any legacy 'pending' account.
 try {
@@ -40,19 +67,25 @@ try {
 // in the BACKGROUND after load via /api/portal/reconcile-self (see script below),
 // which reloads only if it actually recovered something.
 
-// Active employee → employee portal.
+// Employee workspace, AquinTutor panel, or the ambiguous-record explanation. `null` means the person
+// belongs on the page they already asked for, which is the applicant view below. A landing this
+// function could not decide is also null: it never redirects on an error, because a guard that
+// redirects when it does not know the answer is a guard that redirects forever.
+if (landing.href) return Astro.redirect(landing.href);
+
+// The composition, for the navigation. composeWorkspace() memoises on Astro.locals and resolveLanding
+// has already run it for this request, so this costs no queries at all — and it guarantees the nav
+// and the landing decision were resolved from the SAME composition rather than two of them.
+let composed: any = null;
 try {
-  const empCheck = await db.execute(sql`
-    SELECT id, onboarding_status FROM hr_employees
-    WHERE (personal_email = ${user.email} OR email = ${user.email} OR user_id = ${user.id}) AND is_active = true
-    LIMIT 1
-  `);
-  const empRows = Array.isArray(empCheck) ? empCheck : (empCheck?.rows || []);
-  if (empRows.length > 0) {
-    if ((empRows[0] as any).onboarding_status === 'pending') return Astro.redirect('/portal/employee/onboarding');
-    return Astro.redirect('/portal/employee');
-  }
-} catch(_) {}
+  const { composeWorkspace } = await import('@/lib/workforce/composer');
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: '/portal' });
+} catch (e: any) {
+  // A nav that cannot be composed is not rendered. It is never guessed at: an entry somebody cannot
+  // open is worse than no entry.
+  console.error('[portal] compose failed', e?.cause?.message || e?.message);
+  composed = null;
+}
 
 // Applications + last message (single LATERAL join — no N+1).
 let appsWithMessages: any[] = [];
@@ -949,6 +982,12 @@ const noOpenApps = appsWithMessages.length === 0;
   </footer>
 
 </main>
+
+{/* The workspace navigation, rendered from the composition and nothing else. Every entry it offers is
+    a route that exists and that this person is authorised to open; anything they are not, or that has
+    no route yet, is absent rather than greyed out. It renders nothing at all when the composition
+    could not be resolved. <main> already carries pb-16, which clears the fixed bar. */}
+{composed && <WorkspaceNav composed={composed} />}
 
 <script is:inline>
   // Quiet update-stamp on the applications section + close avatar menu on outside click.

@@ -6,6 +6,12 @@ import { sql } from 'drizzle-orm';
 import { getViewableSectionKeys, can } from '@/lib/auth/permissions';
 import { canOpenAdmin } from '@/lib/auth/admin-access';
 import { logEvent } from '@/lib/logger';
+// The AquinTutor scope -> panel table, imported rather than written out again. /portal resolves the
+// landing for the same people with the same table (src/lib/workforce/landing.ts), so the door and the
+// landing cannot come to disagree about where a teacher belongs. That module's top level is a plain
+// array and a type import — it opens no database connection and pulls no page code into the
+// middleware bundle; everything that touches the database in it is behind a dynamic import.
+import { aquinPanelFor } from '@/lib/workforce/landing';
 
 // Every /admin path except this one must pass canOpenAdmin. Exactly one exemption, matched exactly:
 // a prefix test here would let /admin/login-anything through, and a second entry is how an unguarded
@@ -325,11 +331,11 @@ export const onRequest = defineMiddleware(async (context, next) => {
   if (result.user.role !== 'applicant' && (path === '/admin' || path.startsWith('/admin/'))
       && path !== '/admin/login' && path !== '/admin/logout'
       && !can(result.user as any, 'admin.access')) {
-    const r = result.user.role as string;
-    const dest = r === 'teacher' ? '/aquintutor/admin/teacher'
-      : r === 'technical_moderator' ? '/aquintutor/admin/moderator'
-      : '/aquintutor/admin/partner';
-    return new Response(null, { status: 302, headers: { Location: dest } });
+    // Same table /portal lands these accounts with. It used to be a ternary written out here and
+    // nowhere else, which meant /portal had no way to send a teacher to their own console and simply
+    // rendered them the applicant portal instead — the wrong surface, live today. One definition, two
+    // consumers, and the answer cannot drift between them.
+    return new Response(null, { status: 302, headers: { Location: aquinPanelFor(result.user.role as string) } });
   }
 
   // DENY BY DEFAULT — the structural gate, and the only one that a NEW admin page cannot forget.
@@ -350,6 +356,16 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // /admin/login is the single exemption — gating it would lock everyone out of signing in. Note that
   // /admin/logout is NOT exempt: a refused person is bounced with their session intact and signs out
   // at /logout or /portal/logout, which is a smaller cost than a second hole in the guard.
+  //
+  // WHY THIS CANNOT LOOP WITH /portal, stated here as well as there because a redirect pair is only
+  // safe if BOTH ends know the rule. This block sends /admin -> /portal when
+  // canOpenAdmin(user).allowed is FALSE. src/lib/workforce/landing.ts — the only thing that redirects
+  // /portal -> /admin — sends them the other way when the SAME call on the SAME user object is TRUE.
+  // The two conditions are exact complements of one function's answer, so at most one can fire per
+  // request and no input exists on which both do. Nothing else may redirect to /admin from /portal.
+  // If a future rule needs to, it must ask THIS function, not a role value: the loop that produced
+  // ERR_TOO_MANY_REDIRECTS and locked every wrongly-promoted intern out of the portal was exactly a
+  // role test on one side and a rights test on the other.
   if (isAdminPath(path) && !isAdminGuardExempt(path)) {
     const verdict = await canOpenAdmin(result.user as any);
     if (!verdict.allowed) {

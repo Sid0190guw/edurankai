@@ -64,6 +64,22 @@
     } catch (_) {}
   }
 
+  /* Same post, but WAITING for the server to say whether the row was actually written.
+   * sendBeacon deliberately discards the response, which is fine for observability and wrong for the
+   * mandatory-location gate: there the applicant is told "granted" and the server later refuses the
+   * submission for a location it never received. Resolves true only when the server confirms a
+   * usable row was stored. */
+  function sendConfirmed(payload) {
+    try {
+      return fetch(ENDPOINT, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+      })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) { return !!(j && j.stored); })
+        .catch(function () { return false; });
+    } catch (_) { return Promise.resolve(false); }
+  }
+
   var base = function () {
     var i = ids();
     var d = deviceSignals();
@@ -85,28 +101,41 @@
      needs that: the guard exists so an honest applicant is not nagged, but when location is a
      CONDITION of applying the grant must actually be recorded, even if the optional ask already ran
      earlier in the session. */
+  /* Returns a promise of { status, stored }:
+   *   status — what the BROWSER did: 'granted' | 'denied' | 'timeout' | 'unavailable' | 'skipped'
+   *   stored — what the SERVER did: true / false when confirmed (force=true), null when the report
+   *            was fired off without waiting for a reply.
+   * A caller that shows the applicant a result must check both. "The browser said yes" and "we hold
+   * your location" are different facts, and treating the first as the second is what let an applicant
+   * be told they could continue when nothing had been recorded. */
   function askPrecise(force) {
     if (!force) {
-      try { if (sessionStorage.getItem(ASKED)) return; sessionStorage.setItem(ASKED, '1'); } catch (_) {}
+      try { if (sessionStorage.getItem(ASKED)) return Promise.resolve({ status: 'skipped', stored: null }); sessionStorage.setItem(ASKED, '1'); } catch (_) {}
     }
-    if (!navigator.geolocation) { var u = base(); u.status = 'unavailable'; send(u); return; }
-    navigator.geolocation.getCurrentPosition(
-      function (pos) {
-        var g = base();
-        g.status = 'granted';
-        g.latitude = pos.coords.latitude;
-        g.longitude = pos.coords.longitude;
-        g.accuracy = pos.coords.accuracy;
-        send(g);
-      },
-      function (err) {
-        var g = base();
-        // 1 = PERMISSION_DENIED, 2 = POSITION_UNAVAILABLE, 3 = TIMEOUT
-        g.status = err && err.code === 1 ? 'denied' : (err && err.code === 3 ? 'timeout' : 'unavailable');
-        send(g);
-      },
-      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
-    );
+    var deliver = force ? sendConfirmed : function (p) { send(p); return Promise.resolve(null); };
+    if (!navigator.geolocation) {
+      var u = base(); u.status = 'unavailable';
+      return deliver(u).then(function (s) { return { status: 'unavailable', stored: s }; });
+    }
+    return new Promise(function (resolve) {
+      navigator.geolocation.getCurrentPosition(
+        function (pos) {
+          var g = base();
+          g.status = 'granted';
+          g.latitude = pos.coords.latitude;
+          g.longitude = pos.coords.longitude;
+          g.accuracy = pos.coords.accuracy;
+          deliver(g).then(function (s) { resolve({ status: 'granted', stored: s }); });
+        },
+        function (err) {
+          var g = base();
+          // 1 = PERMISSION_DENIED, 2 = POSITION_UNAVAILABLE, 3 = TIMEOUT
+          g.status = err && err.code === 1 ? 'denied' : (err && err.code === 3 ? 'timeout' : 'unavailable');
+          deliver(g).then(function (s) { resolve({ status: g.status, stored: s }); });
+        },
+        { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+      );
+    });
   }
 
   // Only prompt where the page has opted in, so the notice is always on screen alongside it.

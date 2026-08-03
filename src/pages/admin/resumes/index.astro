@@ -10,25 +10,49 @@ if (!user) return Astro.redirect('/admin/login');
 // literal `role !== 'super_admin'` admitted. A new key rather than users.view, which is exact-
 // population but describes the ACCOUNT LIST, not third-party resume submissions.
 //
-// THIS IS THE HIGHEST-CONSEQUENCE LINE IN THE super_admin CLUSTER, and it is the whole gate:
-// /admin/resumes has no PATH_SECTION entry, so nothing but canOpenAdmin() stands in front of it, and
-// the ?export=csv arm a few lines below returns an UNPAGINATED CSV of every submission — full_name,
-// email, phone, linkedin, summary, for guests as well as account holders — on a plain GET, before any
-// POST handler. One weakened line here is a bulk PII export. can(), never hasPermission(): a
-// registry test would additionally admit any custom role whose section row spells `resumes.view`.
+// /admin/resumes has no PATH_SECTION entry, so nothing but canOpenAdmin() stands in front of it and
+// this line is the whole gate on READING submissions. can(), never hasPermission(): a registry test
+// would additionally admit any custom role whose section row spells `resumes.view`.
+//
+// IT IS NO LONGER ALSO THE GATE ON THE BULK EXPORT. Until this commit the same check admitted both
+// opening the screen and the ?export=csv arm below, which returns an UNPAGINATED CSV of every
+// submission — full_name, email, phone, linkedin, summary, for guests as well as account holders — on
+// a plain GET. So one weakened line here exported the whole database, and opening one resume because
+// the person asked you to is a far more ordinary act than walking out with all of them. The export
+// now asks for `reports.export` as well; this line is byte-for-byte the check it always was.
 //
 // MOVES WITH /admin/resumes/[id].astro.
 if (!can(user as any, 'resumes.view')) return Astro.redirect('/admin');
+
+// BULK EXPORT is a second, narrower permission — see the union entry in src/lib/auth/permissions.ts.
+// Granted to super_admin and to nobody else, which is exactly who reached ?export=csv before it
+// existed, so the set of people who can take the dataset out is identical and never wider.
+//
+// DECLARED HERE, ABOVE THE ARM THAT USES IT. `const` is not hoisted and a handler reaching a later
+// declaration has taken pages down on this project. It is read twice: once by the export arm below,
+// once by the toolbar, so the page never offers a button that would refuse.
+const canBulkExport = can(user as any, 'reports.export');
 
 const url = new URL(Astro.request.url);
 const q = (url.searchParams.get('q') || '').trim();
 
 // CSV export of the current filter — the "own the data" path.
+//
+// BOTH keys are required, in this order: resumes.view (already enforced above) says you may see this
+// data at all, reports.export says you may take the whole set out at once. Refused with a 403 rather
+// than a redirect because this URL is a file download, not a screen — a redirect here would hand the
+// caller an HTML page with a CSV's name on it.
 if (url.searchParams.get('export') === 'csv') {
+  if (!canBulkExport) {
+    return new Response('Forbidden', { status: 403, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
+  }
   const all = await exportResumes(q);
   const esc = (v: any) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
   const head = 'id,full_name,email,phone,linkedin,template,level,account,created_at,summary';
   const lines = all.map((r) => [r.id, r.full_name, r.email, r.phone, r.linkedin, r.template, r.level, r.user_id ? 'account' : 'guest', r.created_at ? new Date(r.created_at).toISOString() : '', r.summary].map(esc).join(','));
+  // Every other arm on this page writes an audit row; the one that removes the whole dataset from the
+  // product had none. logAudit() swallows its own failures, so this cannot block the download.
+  await logAudit({ userId: user.id, action: 'resume.export_csv', entity: 'resume_submission', entityId: 'bulk', diff: { count: all.length, filter: q }, ipAddress: Astro.clientAddress });
   return new Response([head, ...lines].join('\n'), {
     headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="resume-submissions.csv"' },
   });
@@ -78,7 +102,9 @@ const fmt = (d: any) => d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asi
         <button type="submit" style="background:#FF4F00;border:none;color:#fff;font-size:13px;font-weight:600;padding:9px 16px;border-radius:8px;cursor:pointer;">Search</button>
         {q && <a href="/admin/resumes" style="background:#15151a;border:1px solid #1a1a1f;color:#8a8a94;font-size:13px;text-decoration:none;padding:9px 14px;border-radius:8px;display:inline-flex;align-items:center;">Clear</a>}
       </form>
-      <a href={'/admin/resumes?export=csv' + (q ? '&q=' + encodeURIComponent(q) : '')} style="background:#15151a;border:1px solid #1a1a1f;color:#e8e8ee;font-size:13px;text-decoration:none;padding:9px 14px;border-radius:8px;font-weight:600;">Export CSV</a>
+      {canBulkExport
+        ? <a href={'/admin/resumes?export=csv' + (q ? '&q=' + encodeURIComponent(q) : '')} style="background:#15151a;border:1px solid #1a1a1f;color:#e8e8ee;font-size:13px;text-decoration:none;padding:9px 14px;border-radius:8px;font-weight:600;">Export CSV</a>
+        : <span title="Bulk export needs the separate Export a dataset in bulk permission." style="background:#15151a;border:1px solid #1a1a1f;color:#6e6e78;font-size:13px;padding:9px 14px;border-radius:8px;font-weight:600;cursor:not-allowed;">Export CSV unavailable</span>}
       <form method="POST" onsubmit={'return confirm(\'Delete ALL ' + (q ? 'submissions matching this search' : items.length + ' submissions') + '? This cannot be undone.\');'}>
         <input type="hidden" name="_action" value="delete_all" />
         <input type="hidden" name="q" value={q} />

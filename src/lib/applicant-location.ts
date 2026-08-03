@@ -96,6 +96,9 @@ export function ensureLocationSchema(): Promise<void> {
     await db.execute(sql`CREATE INDEX IF NOT EXISTS applicant_locations_app_idx ON applicant_locations (application_id, created_at)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS applicant_locations_intent_idx ON applicant_locations (intent_id, created_at)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS applicant_locations_email_idx ON applicant_locations (lower(email))`);
+    // user_id is a lookup key too: it is the ONLY identifier a pre-submission GPS row carries (see
+    // getLocationTrail), so the mandatory-location gate reads by it on every security-classified submit.
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS applicant_locations_user_idx ON applicant_locations (user_id, created_at)`);
   });
 }
 
@@ -151,8 +154,13 @@ export interface RecordInput {
 /**
  * Persist one point. Best-effort by contract: an applicant must never be blocked from applying
  * because location capture failed, so callers should not need their own try/catch.
+ *
+ * RETURNS whether the row was actually written. It still never throws — callers that treat this as
+ * observability can keep ignoring the value. But a caller that TELLS the applicant something was
+ * recorded must not say so on faith: a swallowed insert failure reported as success is precisely how
+ * the mandatory-location gate came to reject applicants who had granted access.
  */
-export async function recordLocation(p: RecordInput): Promise<void> {
+export async function recordLocation(p: RecordInput): Promise<boolean> {
   try {
     await ensureLocationSchema();
     // Coordinates outside the valid range mean a spoofed or broken client; store the row for the
@@ -178,8 +186,13 @@ export async function recordLocation(p: RecordInput): Promise<void> {
         ${p.platform ? String(p.platform).slice(0, 60) : null},
         ${p.screenWh ? String(p.screenWh).slice(0, 24) : null}
       )`);
-  } catch (_) {
-    // Deliberately silent: this is observability, not a gate on the applicant's ability to apply.
+    return true;
+  } catch (e: any) {
+    // Still never rethrown: this is observability, not a gate on the applicant's ability to apply.
+    // But the real Postgres reason lives on e.cause — e.message is only the failed SQL — and losing
+    // it is how a table that was never created looked identical to a successful write.
+    console.error('recordLocation failed:', e?.cause?.message || e?.message);
+    return false;
   }
 }
 
@@ -189,18 +202,27 @@ export async function recordStep(
   step: string,
   ids: { applicationId?: string | null; intentId?: string | null; userId?: string | null; email?: string | null },
   clientAddress?: string,
-): Promise<void> {
+): Promise<boolean> {
   const c = coarseFromRequest(request, clientAddress);
-  await recordLocation({ ...ids, step, source: 'ip', ...c });
+  return await recordLocation({ ...ids, step, source: 'ip', ...c });
 }
 
 /**
  * The full trail for one application, oldest first. Matches on application id, the pre-payment
- * intent id, OR the email — because points are captured before an application row exists, and
- * would otherwise be orphaned once it does.
+ * intent id, the signed-in user id, OR the email — because points are captured before an
+ * application row exists, and would otherwise be orphaned once it does.
+ *
+ * WHY user_id IS IN HERE. The browser posts to /api/apply/location from a page that knows none of
+ * the other three: [data-era-apply] carries no application id (there is no application yet), no
+ * intent id (created only at submit) and no email. The one identifier that endpoint can always
+ * establish is the SESSION — locals.user.id — so the grant row lands with user_id set and the other
+ * three NULL. Matching on those three alone made a genuine grant invisible, and the mandatory-location
+ * gate then failed closed against an applicant who had actually allowed access.
+ *
+ * user_id is UUID in the DDL above, so it is cast exactly as application_id is.
  */
 export async function getLocationTrail(opts: {
-  applicationId?: string | null; intentId?: string | null; email?: string | null;
+  applicationId?: string | null; intentId?: string | null; email?: string | null; userId?: string | null;
 }): Promise<LocationPoint[]> {
   try {
     await ensureLocationSchema();
@@ -209,6 +231,7 @@ export async function getLocationTrail(opts: {
       WHERE (${opts.applicationId || null}::uuid IS NOT NULL AND application_id = ${opts.applicationId || null}::uuid)
          OR (${opts.intentId || null}::text IS NOT NULL AND intent_id = ${opts.intentId || null})
          OR (${opts.email || null}::text IS NOT NULL AND lower(email) = lower(${opts.email || null}))
+         OR (${opts.userId || null}::uuid IS NOT NULL AND user_id = ${opts.userId || null}::uuid)
       ORDER BY created_at ASC
       LIMIT 500`);
     return rows(r).map((x) => ({

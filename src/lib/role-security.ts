@@ -70,6 +70,11 @@ export async function requirePreciseLocation(opts: {
   intentId?: string | null;
   email?: string | null;
   applicationId?: string | null;
+  /** The signed-in applicant. REQUIRED in practice: the grant is recorded during the form, before an
+   *  application or intent exists and without the email being available to the client, so user_id is
+   *  usually the ONLY identifier on the row that proves the location was shared. Omit it and a real
+   *  grant is unfindable and the gate rejects an applicant who did everything asked of them. */
+  userId?: string | null;
 }): Promise<string | null> {
   const sec = await getRoleSecurity(opts.roleId);
   if (!sec.requiresPreciseLocation) return null;
@@ -80,6 +85,7 @@ export async function requirePreciseLocation(opts: {
       applicationId: opts.applicationId || null,
       intentId: opts.intentId || null,
       email: opts.email || null,
+      userId: opts.userId || null,
     });
     const granted = trail.some((p) => p.source === 'gps' && p.gpsStatus === 'granted' && p.latitude != null && p.longitude != null);
     if (granted) return null;

@@ -181,6 +181,11 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
   // always had. `resumes.view`, `locations.view` and `research.restricted.view` have no section, but
   // page_key is free text written by a form, so a hand-crafted row could spell the first two.
   //
+  // `reports.export` IS IN THE SAME POSITION, and it is an `.export` key rather than a `.view` one,
+  // which is precisely the shape a section row CAN spell: there is no `reports` section today, so
+  // seedCatalogueRows() derives nothing, but a hand-typed page_key of `reports` with the Export box
+  // ticked would produce this exact string. Its call site therefore uses can() as well.
+  //
   // The consequence is one rule, and it is not optional: CONVERT THESE CALL SITES WITH can(), NEVER
   // WITH hasPermission()/resolvePermissions(). can() reads PERMS_BY_ROLE alone and therefore admits
   // exactly the roles named there. A registry-based conversion would additionally admit every custom
@@ -280,7 +285,22 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
   'resumes.view': {
     label: 'View resume submissions',
     group: 'Hiring',
-    description: 'Open the resumes people have built on the site — including guests who never made an account — and download the whole set as a spreadsheet: full name, email, phone, LinkedIn and summary, with no page limit. One download is every submission on file.',
+    description: 'Open the resumes people have built on the site — including guests who never made an account — and read them one at a time. Downloading the whole set as a spreadsheet is a SEPARATE permission (Export a dataset in bulk); this one no longer carries it.',
+    sensitive: true,
+  },
+  // BULK EXPORT, split out of resumes.view. Held today by super_admin alone — the same population
+  // that could reach /admin/resumes?export=csv when one key gated both acts — so the split changes
+  // nothing about who can export and everything about what a future grant of resumes.view would
+  // hand over.
+  //
+  // SENSITIVE, so assignPermission() routes a grant through recordStrict(): if the audit row naming
+  // the granter cannot be written, the grant is rolled back. Whoever holds this can remove a whole
+  // dataset of other people's personal details from the product in one request, and that is the
+  // definition of a grant that must be provably on the record.
+  'reports.export': {
+    label: 'Export a dataset in bulk',
+    group: 'System',
+    description: 'Download a whole dataset in one file rather than reading records one at a time — today the complete resume-submission spreadsheet: every person\'s full name, email, phone, LinkedIn and summary, with no page limit and no way to recall the file afterwards. Being allowed to open a record is not a reason to hold this; grant it only where taking the entire set out of the product is genuinely part of the job.',
     sensitive: true,
   },
   'credits.grant': {

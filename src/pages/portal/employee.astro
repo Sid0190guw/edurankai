@@ -1,5 +1,25 @@
 ---
-import BottomNav from '@/components/workforce/BottomNav.astro';
+// THE NAVIGATION IS COMPOSED, NOT DECLARED. WorkspaceNav projects THIS request's composition through
+// src/lib/workforce/navigation.ts and hands the result to BottomNav — the same bar component, the
+// same 44px floor, the same aria-current. It replaces `<BottomNav variant="hr">`, whose SETS array
+// (BottomNav.astro:115) is a static four-tab list with no capability test at all: every tab rendered
+// for everyone, whatever the composer resolved, which is precisely the second decider this build
+// exists to remove. Home now resolves per person (/portal/employee here) instead of pointing at
+// /portal, which redirected straight back for anybody with an employee record.
+import WorkspaceNav from '@/components/workforce/WorkspaceNav.astro';
+// The Home shell. WorkspaceCard makes "there is nothing" and "we could not read it" structurally
+// different branches, so no card on this page can print the reassuring sentence over a failed read.
+// QuickActions renders composeWorkspace().quickActions and holds NO list of its own — the two
+// hand-written arrays it replaces (portal/index.astro:416 and BottomNav.astro:115) test nothing at
+// all, and a third copy is the defect the composer exists to prevent.
+import WorkspaceCard from '@/components/workforce/WorkspaceCard.astro';
+import QuickActions from '@/components/workforce/QuickActions.astro';
+import WelcomeBanner from '@/components/workforce/WelcomeBanner.astro';
+import Timeline from '@/components/workforce/Timeline.astro';
+import AvatarStack from '@/components/workforce/AvatarStack.astro';
+// The same sentence every department-scoped list in this product carries: hr_employees.department_id
+// has exactly one writer, so a hand-created record is invisible and a short list reads as complete.
+import { DEPARTMENT_COVERAGE_NOTICE } from '@/lib/auth/workspace-access';
 // The command centre at the top of this page is built from the workforce set and its tokens, not
 // from a second visual language invented here. StatusBadge and PriorityFlag each carry a distinct
 // SHAPE and a text label, so the triage list still reads with every colour deleted — which is the
@@ -371,22 +391,22 @@ const taskMeta = [
   Number.isFinite(doneCount) && doneCount > 0 ? doneCount + ' finished' : '',
 ].filter(Boolean).join(' · ');
 
-// TODAY, AS THE DATABASE COUNTS IT.
+// TODAY, AS THE DATABASE COUNTS IT — AND IT IS NO LONGER READ HERE.
 //
 // `todayIso` above is `new Date()` in the SERVER's timezone; `due_on` is compared against
 // CURRENT_DATE inside Postgres, in the DATABASE's timezone. The two disagree by a day whenever the
 // process and the session are set differently, and "Due today" is exactly the claim that must not be
-// off by one. If this one-column read fails, the due-today bucket is not rendered AT ALL rather than
-// guessed at from the clock in this process.
-let dbToday = '';
-if (wantDueToday) {
-  try {
-    const r = await db.execute(sql`SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d`);
-    dbToday = String(rowsOf(r)[0]?.d || '');
-  } catch (e: any) {
-    logFail('current date', e);
-  }
-}
+// off by one.
+//
+// This page used to run its own `SELECT CURRENT_DATE` right here. It does not any more: the
+// composer resolves the day ONCE, onto ctx.today, and every day-partitioned widget on every surface
+// now partitions on the same value. Two surfaces asking two clocks is how the workspace and the task
+// board come to disagree about what is due today — and it is one query fewer per request, not one
+// more, because the composer folded it into a read it was already making.
+//
+// Empty string when the composer could not resolve it. The due-today bucket is then not rendered AT
+// ALL rather than guessed at from the clock in this process.
+const dbToday = composed.context.today || '';
 
 // TODAY'S CLOCK. hr_clock_events for this person only — it stores GPS, IP, device and a selfie per
 // punch, and no surface may read it for anybody else.
@@ -492,29 +512,25 @@ if (employeeId && has('payslips.mine')) {
 // hr_employees.id can never match, which is how the same section on /portal/workspace used to read
 // "not recorded" for people whose manager was recorded perfectly well.
 //
-// ORDER BY ... LIMIT 1 is load-bearing, not tidiness: one person can hold more than one
-// hr_employees row (a closed internship plus a current contract), so this can match several rows
-// for a single human. Their current row is the one to show.
+// TWO QUERIES BECAME NONE ON THIS PAGE. The pointer is resolved by the composer onto
+// ctx.reportingManagerUserId (folded into a read it already made), and the name comes from
+// managerNameFor() in src/lib/workforce/loaders.ts, which owns the ORDER BY that matters: one human
+// can hold more than one hr_employees row (a closed internship plus a current contract), so their
+// current row is the one to show.
 //
 // This is the only row belonging to somebody else that this page reads, and it is narrowed to two
 // display columns — no email, no identifier, no employment detail — reached solely through a
 // pointer stored on the viewer's own record.
 let manager: any = null;
+let managerReadFailed = false;
 if (employeeId && has('manager.card')) {
   try {
-    const own = rowsOf(await db.execute(sql`
-      SELECT reporting_manager_id FROM hr_employees WHERE id = ${employeeId} LIMIT 1`))[0];
-    const managerUserId = own?.reporting_manager_id ? String(own.reporting_manager_id) : '';
-    if (managerUserId) {
-      const r = await db.execute(sql`
-        SELECT full_name, designation
-          FROM hr_employees
-         WHERE user_id = ${managerUserId}
-         ORDER BY is_active DESC, created_at DESC
-         LIMIT 1`);
-      manager = rowsOf(r)[0] || null;
-    }
+    const { managerNameFor } = await import('@/lib/workforce/loaders');
+    const found = await managerNameFor(composed.context.reportingManagerUserId);
+    managerReadFailed = !found.ok;
+    manager = found.person;
   } catch (e: any) {
+    managerReadFailed = true;
     logFail('manager', e);
   }
 }
@@ -726,6 +742,105 @@ const memberGroups = myGroups.filter((g: any) => g.isMember);
 const joinableGroups = myGroups.filter((g: any) => !g.isMember && g.kind === 'sub' && g.parentId);
 
 // =================================================================================================
+// THE HOME WIDGETS. Same two rules as everything above: gated on has(...) BEFORE the read, and every
+// one of them reports whether the read HAPPENED.
+//
+// Every loader below lives in src/lib/workforce/loaders.ts rather than in this frontmatter, and that
+// is the change that matters. Fifteen loaders were written inline on this page, which was fine while
+// there was one workspace surface and fatal the moment there were two: the second surface copies the
+// query, the copies drift, and the one that drifts toward showing MORE is the one nobody reports.
+// =================================================================================================
+
+// NOTIFICATIONS. Rows are already written for staff accounts — src/lib/push.ts persists first and
+// pushes second, so the feed fills even with VAPID unset. What an employee has never had is a
+// surface: /portal/notifications.astro:7 redirects every non-applicant to /admin and middleware
+// bounces them back, which is the ping-pong that took /portal down before. So the widget carries
+// href:null and each ROW is rendered against its own notifications.action_url. This card is that
+// missing surface, and it is why the registry's note exists.
+let notifs: any = { ok: false, items: [], unread: 0 };
+if (has('notifications.unread') && user?.id) {
+  try {
+    const { myNotifications } = await import('@/lib/workforce/loaders');
+    notifs = await myNotifications(String(user.id), 5);
+  } catch (e: any) {
+    logFail('notifications', e);
+  }
+}
+
+// DIRECT REPORTS. ctx.managesPeople has been true for reporting managers all along and
+// reports.direct has been registered all along, but NOTHING ANYWHERE LOADED IT — a manager with
+// direct reports had no way to see who they were. Names and designations only.
+let reports: any = { ok: true, people: [], more: 0 };
+if (has('reports.direct') && user?.id) {
+  try {
+    const { directReportsFor } = await import('@/lib/workforce/loaders');
+    reports = await directReportsFor(String(user.id), 6);
+  } catch (e: any) {
+    logFail('direct reports', e);
+    reports = { ok: false, people: [], more: 0 };
+  }
+}
+
+// THE DEPARTMENT A LEAD MAY QUERY. Narrowed by departmentFilter() inside the loader, from
+// ctx.scopeDepartmentId — which comes from the session (users.assigned_department_id) and never from
+// a query string. ctx.departmentId is NOT passed and must never be: that is the person's OWN
+// department, display-only, and handing it to the filter would manufacture a peer list for an
+// ordinary employee — a new authorisation decision smuggled in as a rendering one.
+let roster: any = { ok: true, people: [], more: 0 };
+if (has('team.roster') && composed.context.scopeDepartmentId) {
+  try {
+    const { departmentRoster } = await import('@/lib/workforce/loaders');
+    roster = await departmentRoster({ scopeDepartmentId: composed.context.scopeDepartmentId }, 6);
+  } catch (e: any) {
+    logFail('department roster', e);
+    roster = { ok: false, people: [], more: 0 };
+  }
+}
+// THIS MONTH'S ATTENDANCE. Days RECORDED, never a percentage against a target — the target framing
+// belongs to credit.position, which is internship-only, and putting a completion bar here is exactly
+// the defect the widget registry exists to fix.
+let attMonth: any = { ok: false, present: 0, leave: 0, other: 0, daysRecorded: 0, hours: null };
+if (employeeId && has('attendance.month')) {
+  try {
+    const { attendanceMonth } = await import('@/lib/workforce/loaders');
+    attMonth = await attendanceMonth(employeeId);
+  } catch (e: any) {
+    logFail('attendance month', e);
+  }
+}
+
+// APPROVED LEAVE COVERING TODAY — one of the three things "Today" can honestly say.
+let leaveToday: any = { ok: false, days: [] };
+if (employeeId && has('schedule.today')) {
+  try {
+    const { leaveCovering } = await import('@/lib/workforce/loaders');
+    leaveToday = await leaveCovering(employeeId, composed.context.today);
+  } catch (e: any) {
+    logFail('leave today', e);
+  }
+}
+
+// RECENT ACTIVITY, CAPPED HARD AND ON PURPOSE. listTaskActivity() is PER TASK and there is no
+// cross-task personal activity reader in this codebase; building one means exporting visibleToSql()
+// from employee-tasks.ts, which is a change to a security-critical query and not something a
+// dashboard card gets to force. So it runs for a handful of tasks this page has ALREADY read and
+// this person has ALREADY been authorised for, and says so when there were more.
+let activity: any = { ok: true, entries: [], partial: false };
+if (has('tasks.activity') && user?.id && openTasks.length > 0) {
+  try {
+    const { recentTaskActivity } = await import('@/lib/workforce/loaders');
+    activity = await recentTaskActivity(
+      String(user.id),
+      openTasks.map((t: any) => ({ id: t.id, title: t.title })),
+      { taskCap: 4, entryCap: 6 },
+    );
+  } catch (e: any) {
+    logFail('task activity', e);
+    activity = { ok: false, entries: [], partial: false };
+  }
+}
+
+// =================================================================================================
 // THE COMMAND CENTRE ROWS. Everything below feeds the "Needs you today" section.
 //
 // THE RULE THIS SECTION IS BUILT ON: every number here is an arithmetic partition of rows that
@@ -926,6 +1041,77 @@ const clockCta = clockReadFailed
 // every break taken.
 const showTodayHours = !clockReadFailed && todayHours > 0;
 
+// =================================================================================================
+// "TODAY" — ASSEMBLED FROM ROWS ALREADY READ, AND HONEST ABOUT WHAT IT IS NOT.
+//
+// THIS IS NOT A CALENDAR AND IT MUST NEVER BE TITLED AS ONE. There is no shift, roster,
+// work_schedule, holiday or staff-meeting table anywhere in src/ or db/. meet_rooms.scheduled_at,
+// duration_min, invitees and recurrence are written by NOTHING, the sole INSERT creates an ad-hoc
+// untitled huddle, and the scheduler UI POSTs to /api/meet/rooms, which does not exist as a route.
+// src/lib/calendar.ts is the LEARNER deadline feed, not a staff one. So this section shows the day
+// this person already has ON RECORD — work due, approved leave, the punch that has happened — and
+// says once, plainly, that meetings are not part of it.
+//
+// Rendering an empty "no meetings today" would be the lie: it claims a calendar was consulted.
+// widgets.ts UNREGISTERED records meetings.today and announcements.latest with the same evidence.
+//
+// Not one extra query: every row here was read by a loader further up.
+const scheduleReady = has('schedule.today');
+const scheduleDueTasks = (scheduleReady && attentionTasksOk && dbToday)
+  ? openTasks.filter((t: any) => t.due === dbToday && !t.overdue)
+  : [];
+const scheduleOverdue = (scheduleReady && attentionTasksOk) ? overdueTasks.length : 0;
+const scheduleLeave = scheduleReady && leaveToday.ok ? (leaveToday.days as any[]) : [];
+// Named per source, exactly like the attention section: a day view over a read that did not happen
+// is not an empty day.
+const scheduleGaps: string[] = [];
+if (scheduleReady && !dbToday) scheduleGaps.push('what today\'s date is here');
+if (scheduleReady && wantTaskView && !attentionTasksOk) scheduleGaps.push('your task list');
+if (scheduleReady && !leaveToday.ok && dbToday) scheduleGaps.push('your approved leave');
+if (scheduleReady && clockReadFailed) scheduleGaps.push('today\'s punches');
+const scheduleGapText = scheduleGaps.length === 0
+  ? ''
+  : scheduleGaps.length === 1
+    ? scheduleGaps[0]
+    : scheduleGaps.slice(0, -1).join(', ') + ' and ' + scheduleGaps[scheduleGaps.length - 1];
+const scheduleEmpty =
+  scheduleDueTasks.length === 0 && scheduleOverdue === 0 && scheduleLeave.length === 0
+  && !(showTodayHours || todayEvents.length > 0);
+
+// THE ATTENDANCE SUMMARY LINE. Days recorded, never a percentage: there is no holiday table, so an
+// absence figure would count every weekend against the person. What is not written down is not
+// reported.
+const attendanceMeta = attMonth.ok
+  ? attMonth.daysRecorded + (attMonth.daysRecorded === 1 ? ' day' : ' days')
+  : null;
+
+// PEOPLE. Both lists are names and designations only — the EMPLOYEE_COLUMNS allow-list exists
+// because a SELECT * on this table once dragged gender into a page that displayed none of it.
+const reportPeople = (reports.people as any[]).map((p: any) => ({ id: p.id, name: p.name, role: p.designation }));
+const rosterPeople = (roster.people as any[]).map((p: any) => ({ id: p.id, name: p.name, role: p.designation }));
+
+// THE DEPARTMENT CARD. Display and self-scope only; it is never handed to departmentFilter().
+// A recorded id with no name means the key points at no departments row — say the code rather than
+// printing "null", because that is a data fault somebody can go and fix.
+const deptName = composed.context.departmentName;
+const deptId = composed.context.departmentId;
+const deptLine = deptName || (deptId ? 'Recorded as ' + deptId : '');
+
+// ONE LINE ABOUT THE DAY, for the welcome banner. Built from what has ALREADY been read and stated
+// only when this page is in a position to state it: it says nothing at all when the clock read
+// failed, because "not clocked in yet" over a query that threw is the same lie as an all-clear.
+const bannerStanding = clockReadFailed
+  ? null
+  : !has('clock.today')
+    ? null
+    : currentStatus === 'clocked_in'
+      ? (showTodayHours ? 'You are clocked in, ' + todayHours + 'h on the clock so far today.' : 'You are clocked in.')
+      : currentStatus === 'on_break'
+        ? 'You are on a break.'
+        : todayEvents.length > 0
+          ? 'You have clocked out for today.'
+          : 'You have not clocked in yet today.';
+
 // Identity, for the profile.me card. Straight off the composed workspace, which selects an explicit
 // column list and never `SELECT *` — no gender, no government ids, no bank details, no salary. When
 // no employee record resolved it falls back to the session, because "you are signed in as" is still
@@ -1077,8 +1263,99 @@ const slots = composed.widgets.map((w: any) => w.key);
        underneath it. */
     #attendance{scroll-margin-top:64px;}
 
+    /* =========================================================================
+       THE HOME WIDGETS — shared row, stat and note styles, used by every card
+       rendered through WorkspaceCard. One set of rules rather than one set of
+       inline styles per card, so a change to how a list row reads happens once.
+       Tokens only; nothing here invents a colour or a touch target.
+       ========================================================================= */
+    .rows{display:flex;flex-direction:column;gap:var(--wf-s-2);margin:0;padding:0;list-style:none;}
+    .rows--tight{gap:var(--wf-s-1);margin-top:10px;}
+    .row{margin:0;}
+    /* The whole row is the target where it links, and 44px is the floor. */
+    .row__main{display:flex;flex-direction:column;justify-content:center;gap:2px;
+      min-height:var(--wf-touch);padding:8px 10px;background:var(--wf-veil);
+      border:1px solid var(--wf-line);border-radius:var(--wf-r-sm);text-decoration:none;}
+    a.row__main{transition:var(--wf-tr-feedback);}
+    a.row__main:active{transform:scale(var(--wf-press));}
+    .row--unread .row__main{border-left:3px solid var(--wf-info-accent);}
+    .row__title{font-family:var(--wf-font);font-size:var(--wf-t-meta);font-weight:650;
+      line-height:1.4;color:var(--wf-ink);overflow-wrap:anywhere;}
+    .row__note{font-family:var(--wf-font);font-size:var(--wf-t-micro);line-height:1.45;
+      color:var(--wf-ink-3);overflow-wrap:anywhere;}
+    .rows__gap{margin:10px 0 0;padding:9px 11px;background:var(--wf-due_soon-wash);
+      border:1px solid var(--wf-due_soon-border);border-radius:var(--wf-r-sm);
+      color:var(--wf-due_soon-text);font-family:var(--wf-font);font-size:var(--wf-t-meta);
+      line-height:1.55;}
+
+    .plain{margin:0;font-family:var(--wf-font);font-size:var(--wf-t-meta);line-height:1.55;
+      color:var(--wf-ink-2);overflow-wrap:anywhere;}
+    .plain--quiet{margin-top:6px;font-size:var(--wf-t-micro);color:var(--wf-ink-3);}
+
+    /* auto-fit rather than a fixed count: four figures fit at 360px only if each may fall to 70px,
+       and a fifth would wrap on its own instead of breaking the row. */
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(70px,1fr));gap:var(--wf-s-2);}
+    .stat{display:flex;flex-direction:column;gap:2px;}
+    .stat__label{font-family:var(--wf-font);font-size:var(--wf-t-micro);font-weight:700;
+      letter-spacing:0.06em;text-transform:uppercase;color:var(--wf-ink-3);}
+    .stat__value{font-family:var(--wf-font);font-size:1.25rem;font-weight:700;line-height:1.1;
+      color:var(--wf-ink);}
+
+    .wf-timeline-wrap{display:flex;flex-direction:column;gap:var(--wf-s-2);}
+
+    .absent-note{margin:4px 14px 12px;font-family:var(--wf-font);font-size:var(--wf-t-micro);
+      line-height:1.6;color:var(--wf-ink-3);}
+
+    /* =========================================================================
+       LAYOUT. MOBILE IS THE PRIMARY TARGET, NOT A BREAKPOINT — around nine in
+       ten of these people are on a phone. Everything above is authored for one
+       360px column, and the rules below only WIDEN it; deleting them leaves the
+       phone layout exactly as it is.
+
+       Two columns at 900px, not three: the cards were written at a reading
+       measure of roughly 320-460px and a third column makes each one narrower
+       than the phone it was designed for. `align-items:start` stops a short
+       card stretching to match a tall neighbour.
+       ========================================================================= */
+    .ws-flow{max-width:1120px;margin:0 auto;}
+    @media (min-width:900px){
+      .ws-flow{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;}
+      /* The triage list, the day view and the banner own their row at every width: they are read
+         first and in order, and a triage list in a half-width column is a triage list nobody
+         scans. Everything else flows into whichever column has room.
+         :global() on the three component roots is required, not stylistic: Astro scopes a
+         component's styles with a per-file attribute, and .wb / .qa / .wsc belong to
+         WelcomeBanner, QuickActions and WorkspaceCard, so an unscoped selector written here would
+         compile to an attribute those elements do not carry and would silently never match. */
+      .ws-flow > .cc,
+      .ws-flow > .absent-note,
+      .ws-flow > :global(.wb),
+      .ws-flow > :global(.qa),
+      .ws-flow > :global(.wsc--full){grid-column:1 / -1;}
+    }
+
+    /* LAZY, WITH NO JAVASCRIPT AT ALL.
+       content-visibility:auto tells the browser to skip layout, style and paint
+       for a card that is off screen, and to do that work when it scrolls near —
+       which is the actual cost of a long workspace on a mid-range phone. The
+       contain-intrinsic-size pair reserves a plausible height so the scrollbar
+       does not jump as cards resolve.
+
+       It is applied only BELOW the fold: the banner, the quick actions, the
+       triage list, the day view and the clock are the screen someone opens for,
+       and deferring them would be deferring the point of the page. An
+       IntersectionObserver would do the same job for about 1KB of script and a
+       frame of blank space; this costs nothing and degrades to normal rendering
+       in browsers that do not support it. */
+    @supports (content-visibility: auto){
+      .card, .door, :global(.wsc){content-visibility:auto;contain-intrinsic-size:auto 220px;}
+      /* The screen someone opens the page for. #attendance is a .card and would otherwise be
+         deferred, and it holds the clock-in control the strip above it links to. */
+      .cc, .cc-today, #attendance, :global(.wb), :global(.qa){content-visibility:visible;}
+    }
+
     @media (forced-colors: active){
-      .cc-row,.cc-panel,.cc-today,.cc-task,.door{border-color:CanvasText;}
+      .cc-row,.cc-panel,.cc-today,.cc-task,.door,.row__main,:global(.wsc){border-color:CanvasText;}
     }
   </style>
 </head>
@@ -1112,6 +1389,19 @@ const slots = composed.widgets.map((w: any) => w.key);
     ===================================================================== */}
 {!composed.ok && (
   <div style="padding-top:14px;">
+    {/* HOME IS NEVER BLANK, INCLUDING HERE. welcome.banner is in MINIMAL_WIDGETS precisely so a
+        workspace whose context could not be resolved still opens with a name and a sentence — and
+        the quick actions on this screen are derived from the MINIMAL set, so they are only the
+        doors that need nothing but a session. A screen with an explanation and no way out is how
+        somebody ends up stuck on a page they cannot leave. */}
+    <WelcomeBanner
+      name={identityName}
+      photoUrl={identityPhoto}
+      today={composed.context.today}
+      degraded={true}
+    />
+    <QuickActions actions={composed.quickActions} max={4} />
+
     {composed.denial && (
       <div class="card">
         <div class="card-body">
@@ -1121,15 +1411,9 @@ const slots = composed.widgets.map((w: any) => w.key);
       </div>
     )}
 
-    <div class="card">
-      <div class="card-body" style="display:flex;align-items:center;gap:12px;">
-        <div style="width:48px;height:48px;border-radius:50%;background:rgba(255,79,0,0.1);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#FF4F00;flex-shrink:0;">{String(identityName).charAt(0).toUpperCase()}</div>
-        <div style="min-width:0;">
-          <p style="font-size:15px;font-weight:700;color:#111;margin:0;">{identityName}</p>
-          <p style="font-size:12px;color:#6b7280;margin:2px 0 0;overflow-wrap:anywhere;">{user.email}</p>
-        </div>
-      </div>
-    </div>
+    {/* The identity card that used to sit here is gone: the welcome banner above states the same
+        name and photo, and two copies of somebody's identity on one screen is noise, not
+        reassurance. The email is on /portal/profile, which is one of the doors below. */}
 
     <a class="door" href="/portal/messages">
       <span class="door__mark" aria-hidden="true">
@@ -1182,8 +1466,12 @@ const slots = composed.widgets.map((w: any) => w.key);
   </div>
 )}
 
+{/* ws-flow is one column on a phone and two from 900px. Every child below — including each card the
+    slot map emits, because a Fragment contributes its children directly — becomes a grid item at
+    that width; the widgets that must own their row carry the rule in the stylesheet rather than an
+    inline style, so there is one place to read the layout. */}
 {composed.ok && (
-  <div style="padding-top:14px;">
+  <div class="ws-flow" style="padding-top:14px;">
 
     {/* THE "NO EMPLOYEE PROFILE" STATE, PRESERVED. Signed in, composition sound, and simply no HR
         row linked to this account. It is NOT a failure — a founder or an HR account may legitimately
@@ -1206,6 +1494,29 @@ const slots = composed.widgets.map((w: any) => w.key);
         internship engagement AND a recorded credit-hour requirement, so a founder gets zero. */}
     {(slots as any[]).map((slot: string) => (
       <Fragment>
+
+        {/* THE WELCOME BANNER, AND THE QUICK ACTIONS UNDER IT.
+            welcome.banner is priority 5 and is in MINIMAL_WIDGETS, so it is always first and it
+            survives a degraded composition — which is the whole reason Home is never blank.
+            The action row is rendered here, attached to the banner, because it is DERIVED from the
+            composition rather than being a slot of its own: composeWorkspace() already filtered
+            every action against the widget that grants it, and this page adds nothing to the list.
+            The date comes from ctx.today (the database's day), never from this process's clock. */}
+        {slot === 'welcome.banner' && (
+          <Fragment>
+            <WelcomeBanner
+              name={identityName}
+              designation={composed.workspace?.designation ?? null}
+              employeeCode={composed.workspace?.employeeCode ?? null}
+              departmentName={composed.context.departmentName}
+              photoUrl={identityPhoto}
+              today={composed.context.today}
+              degraded={composed.degraded}
+              standing={bannerStanding}
+            />
+            <QuickActions actions={composed.quickActions} max={8} />
+          </Fragment>
+        )}
 
         {slot === 'attention.queue' && (
           <section class="cc" aria-labelledby="cc-heading">
@@ -1273,6 +1584,87 @@ const slots = composed.widgets.map((w: any) => w.key);
               <a class="cc-more wf-num wf-focusable" href="/portal/tasks">{attentionMore} more on your task board</a>
             )}
           </section>
+        )}
+
+        {/* NOTIFICATIONS. Each row links to its OWN notifications.action_url and the card links
+            nowhere, because /portal/notifications redirects every non-applicant to /admin and
+            middleware bounces them straight back — a tile that ping-pongs is worse than no tile.
+            Rows with no action_url render as plain text rather than a dead link. */}
+        {slot === 'notifications.unread' && (notifs.items.length > 0 || !notifs.ok) && (
+          <WorkspaceCard
+            title="Notifications"
+            meta={notifs.unread > 0 ? notifs.unread + ' unread' : null}
+            failed={!notifs.ok}
+            failedMessage="We could not read your notifications just now, so this is not a statement that you have none. Reload in a moment."
+            note={notifs.ok && notifs.unread > notifs.items.length ? 'Showing the ' + notifs.items.length + ' most recent.' : null}
+          >
+            <ul class="rows">
+              {(notifs.items as any[]).map((n: any) => (
+                <li class={`row ${n.isRead ? '' : 'row--unread'}`}>
+                  {n.actionUrl
+                    ? <a class="row__main wf-focusable" href={n.actionUrl}>
+                        <span class="row__title">{n.title}</span>
+                        {n.body && <span class="row__note">{n.body}</span>}
+                      </a>
+                    : <span class="row__main">
+                        <span class="row__title">{n.title}</span>
+                        {n.body && <span class="row__note">{n.body}</span>}
+                      </span>}
+                </li>
+              ))}
+            </ul>
+          </WorkspaceCard>
+        )}
+
+        {/* TODAY. NOT A CALENDAR — see the block that builds it. Every line is a row that already
+            exists: work due today, work already late, approved leave covering today, and the punch
+            that has happened. The one sentence about meetings is stated once and is the truth. */}
+        {slot === 'schedule.today' && (
+          <WorkspaceCard
+            title="Today"
+            full={true}
+            href={scheduleDueTasks.length > 0 || scheduleOverdue > 0 ? '/portal/tasks' : null}
+            hrefLabel="Task board"
+            failed={scheduleGaps.length > 0 && scheduleEmpty}
+            failedMessage={'We could not read ' + scheduleGapText + ' just now, so this is not a picture of your day. Reload in a moment.'}
+            note="Scheduled meetings are not shown: this workspace has no meeting calendar to read from yet. Live huddles are at Meet."
+          >
+            <ul class="rows">
+              {bannerStanding && (
+                <li class="row"><span class="row__main"><span class="row__title">{bannerStanding}</span></span></li>
+              )}
+              {scheduleOverdue > 0 && (
+                <li class="row">
+                  <a class="row__main wf-focusable" href="/portal/tasks">
+                    <span class="row__title wf-num">{scheduleOverdue === 1 ? 'One task is past its date' : scheduleOverdue + ' tasks are past their date'}</span>
+                    <span class="row__note">Carried into today from an earlier day</span>
+                  </a>
+                </li>
+              )}
+              {(scheduleDueTasks as any[]).map((t: any) => (
+                <li class="row">
+                  <a class="row__main wf-focusable" href={'/portal/tasks/' + t.id}>
+                    <span class="row__title">{t.title}</span>
+                    <span class="row__note">Due today{t.from ? ' · from ' + t.from : ''}</span>
+                  </a>
+                </li>
+              ))}
+              {(scheduleLeave as any[]).map((l: any) => (
+                <li class="row">
+                  <a class="row__main wf-focusable" href="/portal/employee/leave">
+                    <span class="row__title">Approved leave today</span>
+                    <span class="row__note wf-num">{l.type}{l.start && l.end && l.start !== l.end ? ' · ' + l.start + ' to ' + l.end : ''}</span>
+                  </a>
+                </li>
+              ))}
+              {scheduleEmpty && scheduleGaps.length === 0 && (
+                <li class="row"><span class="row__main"><span class="row__title">No work is on record for today</span><span class="row__note">No task of yours is due or late, and no approved leave covers today.</span></span></li>
+              )}
+            </ul>
+            {scheduleGaps.length > 0 && !scheduleEmpty && (
+              <p class="rows__gap">This is incomplete: we could not read {scheduleGapText} just now, so there may be more to your day than is shown here.</p>
+            )}
+          </WorkspaceCard>
         )}
 
         {/* MY TASKS. Rendered only when src/lib/employee-tasks.ts actually loaded — an empty shell
@@ -1351,6 +1743,59 @@ const slots = composed.widgets.map((w: any) => w.key);
               )}
             </div>
           </div>
+        )}
+
+        {/* RECENT ACTIVITY ON YOUR TASKS. Capped to four tasks this page already read and this
+            person was already authorised for — listTaskActivity() is PER TASK and re-derives
+            visibility in SQL per row, so there is no cross-task reader to widen this into. It says
+            so when the trail is partial rather than presenting a slice as the whole record. */}
+        {slot === 'tasks.activity' && (activity.entries.length > 0 || !activity.ok) && (
+          <WorkspaceCard
+            title="Recent activity on your work"
+            failed={!activity.ok}
+            failedMessage="We could not read the activity trail just now. Nothing has been lost."
+            note={activity.partial ? 'Only the most recent of your open tasks are covered here, so this is part of what happened rather than all of it.' : null}
+          >
+            <div class="wf-timeline-wrap">
+              {(activity.entries as any[]).map((e: any) => (
+                <Timeline
+                  actor={e.actor}
+                  actorRole={e.actorRole}
+                  action={e.action + ' on ' + e.taskTitle}
+                  from={e.from}
+                  to={e.to}
+                  kind={e.kind}
+                  at={e.at}
+                  href={'/portal/tasks/' + e.taskId}
+                  note={e.note}
+                />
+              ))}
+            </div>
+          </WorkspaceCard>
+        )}
+
+        {/* WAITING ON YOUR DECISION. Counts and names of NOTHING — no amounts, no reasons, no bank
+            details (the admin withdrawal reader returns account_number, ifsc and upi_id UNMASKED,
+            and none of that may enter a workspace card's render context). The viewer's OWN pending
+            rows are already excluded upstream: your request is not an approval waiting on you.
+            The card is a door; /portal/approvals re-checks authority at the write, every time. */}
+        {slot === 'approvals.leave' && (pendingLeave > 0 || hrQueueFailed) && (
+          <WorkspaceCard
+            title="Leave requests to decide"
+            href={hrQueueFailed ? null : '/portal/approvals'}
+            hrefLabel="Decide"
+            meta={hrQueueFailed ? null : String(pendingLeave)}
+            failed={hrQueueFailed}
+            failedMessage="We could not read the approval queue just now, so this is not a statement that nothing is waiting on you."
+          >
+            <p class="plain">{pendingLeave === 1 ? 'One person is waiting to know whether they can take the days.' : pendingLeave + ' people are waiting to know whether they can take the days.'}</p>
+          </WorkspaceCard>
+        )}
+
+        {slot === 'approvals.withdrawal' && pendingWithdrawals > 0 && !hrQueueFailed && (
+          <WorkspaceCard title="Withdrawals to decide" href="/portal/approvals" hrefLabel="Decide" meta={String(pendingWithdrawals)}>
+            <p class="plain">{pendingWithdrawals === 1 ? 'One withdrawal is waiting on you.' : pendingWithdrawals + ' withdrawals are waiting on you.'} This is money already earned, waiting to be released.</p>
+          </WorkspaceCard>
         )}
 
         {/* THE CLOCK. One widget, two pieces of screen: the strip that STATES where the day stands,
@@ -1509,9 +1954,49 @@ const slots = composed.widgets.map((w: any) => w.key);
           </Fragment>
         )}
 
+        {/* THIS MONTH'S ATTENDANCE. Days RECORDED, and nothing that looks like a target: no
+            percentage, no bar, no "absent" figure. There is no holiday table anywhere in this
+            codebase, so an absence count would charge every weekend to the person; and the
+            against-a-target framing belongs to credit.position, which is internship-only. Never
+            overtime: hr_attendance.overtime_hours has zero writers and is structurally always 0. */}
+        {slot === 'attendance.month' && (
+          <WorkspaceCard
+            title="This month"
+            meta={attendanceMeta}
+            failed={!attMonth.ok}
+            failedMessage="We could not read this month's attendance just now, so nothing here is a statement about your record."
+            empty={attMonth.ok && attMonth.daysRecorded === 0}
+            emptyMessage="No attendance has been recorded for you this month yet. It fills in as you clock in."
+            note="Days that have been recorded. Days with no record — weekends, holidays, anything not yet entered — are not counted either way."
+          >
+            <div class="stats">
+              <div class="stat">
+                <span class="stat__label">Present</span>
+                <span class="stat__value wf-num">{attMonth.present}</span>
+              </div>
+              <div class="stat">
+                <span class="stat__label">On leave</span>
+                <span class="stat__value wf-num">{attMonth.leave}</span>
+              </div>
+              {attMonth.other > 0 && (
+                <div class="stat">
+                  <span class="stat__label">Other</span>
+                  <span class="stat__value wf-num">{attMonth.other}</span>
+                </div>
+              )}
+              {attMonth.hours !== null && (
+                <div class="stat">
+                  <span class="stat__label">Hours</span>
+                  <span class="stat__value wf-num">{attMonth.hours}</span>
+                </div>
+              )}
+            </div>
+          </WorkspaceCard>
+        )}
+
         {/* Hourly / time-period tracking */}
         {slot === 'timelog.today' && (
-          <div class="card">
+          <div class="card" id="time-log">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
               <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Time log (hourly)</p>
               <span style="font-size:12px;font-weight:700;color:#FF4F00;">{loggedHours}h logged</span>
@@ -1543,7 +2028,7 @@ const slots = composed.widgets.map((w: any) => w.key);
 
         {/* Daily work report */}
         {slot === 'dailyreport.today' && (
-          <div class="card">
+          <div class="card" id="daily-report">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
               <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Today's work report</p>
               {todayReport && <span style="font-size:11px;font-weight:600;color:#10b981;">submitted</span>}
@@ -1733,9 +2218,9 @@ const slots = composed.widgets.map((w: any) => w.key);
               {manager ? (
                 <div>
                   <div style="display:flex;align-items:center;gap:12px;">
-                    <div style="width:40px;height:40px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#6b7280;flex-shrink:0;">{String(manager.full_name || '?').charAt(0).toUpperCase()}</div>
+                    <div style="width:40px;height:40px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#6b7280;flex-shrink:0;">{String(manager.name || '?').charAt(0).toUpperCase()}</div>
                     <div style="min-width:0;">
-                      <p style="font-size:14px;font-weight:600;color:#111;margin:0;">{manager.full_name}</p>
+                      <p style="font-size:14px;font-weight:600;color:#111;margin:0;">{manager.name}</p>
                       <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">{manager.designation || 'Reporting manager'}</p>
                     </div>
                   </div>
@@ -1743,12 +2228,87 @@ const slots = composed.widgets.map((w: any) => w.key);
                 </div>
               ) : (
                 <div>
-                  <p style="font-size:13px;font-weight:600;color:#374151;margin:0 0 4px;">Not assigned yet</p>
-                  <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">Ask HR to set your reporting manager on your employee record. Until it is set there is no named approver for your leave or wallet requests.</p>
+                  <p style="font-size:13px;font-weight:600;color:#374151;margin:0 0 4px;">{managerReadFailed ? 'We could not read this just now' : 'Not assigned yet'}</p>
+                  <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">{managerReadFailed
+                    ? 'This is not a statement that you have no reporting manager — the read itself failed. Reload in a moment.'
+                    : 'Ask HR to set your reporting manager on your employee record. Until it is set there is no named approver for your leave or wallet requests.'}</p>
                 </div>
               )}
             </div>
           </div>
+        )}
+
+        {/* YOUR DEPARTMENT. Display and self-scope only — this value is never handed to
+            departmentFilter(), because showing an ordinary employee their peers is a new
+            authorisation decision and not a rendering one. NOT hidden when unset, deliberately:
+            hr_employees.department_id has exactly one writer (the application-to-hire path), so it
+            is permanently NULL for anyone HR added by hand — and that is the reason they are
+            invisible to every department list in the product. The sentence is what gets it fixed. */}
+        {slot === 'department.card' && (
+          <WorkspaceCard
+            title="Your department"
+            empty={!deptLine}
+            emptyMessage="No department is recorded on your employee record. Ask HR to set it — until it is, you do not appear in any department list, including your lead's."
+          >
+            <p class="plain">{deptLine}</p>
+            {!deptName && deptId && (
+              <p class="plain plain--quiet">That key does not match a department we hold a name for. Worth mentioning to HR.</p>
+            )}
+          </WorkspaceCard>
+        )}
+
+        {/* YOUR DIRECT REPORTS. The first surface in the product to read this relation: the widget
+            has been registered and ctx.managesPeople has been true for reporting managers all
+            along, and nothing anywhere loaded it. Names and designations ONLY — never gender,
+            government ids, bank details or salary. */}
+        {slot === 'reports.direct' && (
+          <WorkspaceCard
+            title="Your direct reports"
+            failed={!reports.ok}
+            failedMessage="We could not read who reports to you just now, so this is not a statement that nobody does."
+            empty={reports.ok && reportPeople.length === 0}
+            emptyMessage="Nobody is currently recorded as reporting to you. If that is not right, ask HR to set the reporting manager on their records."
+            note={reports.more > 0 ? 'And ' + reports.more + ' more.' : null}
+          >
+            <AvatarStack people={reportPeople} max={4} size="md" label="People who report to you" />
+            <ul class="rows rows--tight">
+              {(reportPeople as any[]).map((p: any) => (
+                <li class="row">
+                  <span class="row__main">
+                    <span class="row__title">{p.name}</span>
+                    {p.role && <span class="row__note">{p.role}</span>}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </WorkspaceCard>
+        )}
+
+        {/* YOUR DEPARTMENT'S PEOPLE — leads only, narrowed by departmentFilter() inside the loader
+            from the session's assigned department. The coverage notice is not optional: a record
+            with no department cannot appear here, so a short list reads as a complete one. */}
+        {slot === 'team.roster' && (
+          <WorkspaceCard
+            title="People in your department"
+            href="/portal/team"
+            failed={!roster.ok}
+            failedMessage="We could not read your department just now, so this is not a picture of your team."
+            empty={roster.ok && rosterPeople.length === 0}
+            emptyMessage="No active records carry your department yet."
+            note={DEPARTMENT_COVERAGE_NOTICE + (roster.more > 0 ? ' And ' + roster.more + ' more than shown.' : '')}
+          >
+            <AvatarStack people={rosterPeople} max={4} size="md" label="People in your department" />
+            <ul class="rows rows--tight">
+              {(rosterPeople as any[]).map((p: any) => (
+                <li class="row">
+                  <span class="row__main">
+                    <span class="row__title">{p.name}</span>
+                    {p.role && <span class="row__note">{p.role}</span>}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </WorkspaceCard>
         )}
 
         {/* Community. Only the groups this person is entitled to, straight from visibleGroupsFor().
@@ -1861,11 +2421,32 @@ const slots = composed.widgets.map((w: any) => w.key);
       </div>
     </div>
 
+    {/* WHAT IS NOT ON THIS SCREEN, SAID ONCE, IN ONE PLACE.
+        Announcements and a meeting calendar are the two things people look for on a workspace and
+        do not find here, and neither exists in this database: there is no announcements table
+        anywhere in src, db or scripts (discussions.is_pinned cannot substitute — nothing writes
+        it), and there is no staff meeting, shift or roster table (meet_rooms.scheduled_at, invitees
+        and recurrence are written by nothing, and the scheduler UI POSTs to a route that does not
+        exist). Both are recorded in UNREGISTERED in src/lib/workforce/widgets.ts with the evidence.
+        An empty "Announcements" card would be worse than this paragraph: it would claim something
+        was checked and found empty. Saying it plainly, once, at the bottom, is the honest version —
+        and it tells somebody who is waiting for an announcement that none is coming here. */}
+    <p class="absent-note">
+      Company announcements and a meeting calendar are not part of this workspace yet — there is
+      nothing here that is being hidden from you, the capability does not exist. Live huddles happen
+      at Meet, and anything decided in a group is on the discussion board.
+    </p>
+
   </div>
 )}
 
-<!-- Bottom nav -->
-<BottomNav variant="hr" active="hr" />
+<!-- Bottom nav, derived from the SAME composition this page rendered its widgets from.
+     composeWorkspace() memoises on Astro.locals, so this costs no query: the bar and the cards
+     cannot disagree about what this person may reach. `active` is left to resolve from the path —
+     /portal/employee is Home for anyone with an employee record. On a degraded composition the bar
+     collapses on its own to the destinations that need nothing but a session, because eligibility
+     here is expressed as "did the composer keep this widget". -->
+<WorkspaceNav composed={composed} />
 
 <script is:inline>
 // Local-time timestamps

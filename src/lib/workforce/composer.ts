@@ -46,6 +46,7 @@ import { canAccessSection } from '@/lib/auth/permissions';
 import {
   WIDGETS, MINIMAL_WIDGETS, HOLDS_EVERY_PERMISSION, byPriority, validateRegistry,
   type WidgetDefinition, type WorkspaceContext, type Engagement, type SectionRequirement, type WidgetGate,
+  type WidgetQuickAction,
 } from '@/lib/workforce/widgets';
 
 // postgres-js resolves to a plain array, never a { rows } object. Declared at the top, above
@@ -109,6 +110,18 @@ export interface ComposedWorkspace {
   /** Ordered by priority. Eligibility only — whether a widget has anything to SAY is the loader's
    *  answer, and `hideWhenEmpty` says which ones should then render nothing at all. */
   widgets: readonly WidgetDefinition[];
+  /**
+   * WHAT THIS PERSON CAN DO RIGHT NOW — derived from `widgets` above and from nothing else.
+   *
+   * It is not a second list and it must never become one. Every entry is the `quickAction` declared
+   * on a widget that ALREADY PASSED every permission, section, audience and gate check, in the same
+   * priority order, so an action can never be offered to somebody the composer did not admit to the
+   * widget behind it. That is precisely the defect in the two hand-written arrays this replaces:
+   * BottomNav.astro:115 and portal/index.astro:416 are static and test nothing at all.
+   *
+   * A page renders these; a page does not append to them.
+   */
+  quickActions: readonly QuickAction[];
   /** Named sources that did not answer, in words a person can read. */
   contextGaps: readonly string[];
   /** The employee record, for a page that needs the name, code or photo. Null when none resolved. */
@@ -116,6 +129,32 @@ export interface ComposedWorkspace {
   /** Only when opts.explain — every registered widget and why it was kept or dropped. For a
    *  diagnose surface; never rendered to an ordinary reader. */
   explain?: readonly { key: string; kept: boolean; why: string }[];
+}
+
+/** A quick action, plus the widget key it came from — so a surface can trace any button back to the
+ *  eligibility decision that produced it, and so React-style list keys are stable. */
+export interface QuickAction extends WidgetQuickAction {
+  key: string;
+}
+
+/**
+ * Derive the action row from an already-filtered widget list.
+ *
+ * Deduplicated on href: leave.mine and a future leave widget both pointing at
+ * /portal/employee/leave must not produce the same button twice. First one wins, so the priority
+ * order decides which label survives.
+ */
+function quickActionsOf(widgets: readonly WidgetDefinition[]): QuickAction[] {
+  const out: QuickAction[] = [];
+  const seen = new Set<string>();
+  for (const w of widgets) {
+    const qa = w.quickAction;
+    if (!qa || !qa.href || !qa.label) continue;
+    if (seen.has(qa.href)) continue;
+    seen.add(qa.href);
+    out.push({ key: w.key, label: qa.label, href: qa.href, icon: qa.icon });
+  }
+  return out;
 }
 
 export interface ComposeOptions {
@@ -170,18 +209,64 @@ export function invalidateWorkspace(locals: any, userId?: string): void {
  * two admin pages at page load, so on a database where neither has been opened it is absent
  * entirely. Returns null — NOT zero — when the read did not happen, so the caller can say so.
  */
-async function countDirectReports(userId: string): Promise<number | null> {
+/**
+ * TODAY, AS THE DATABASE COUNTS IT — plus how many people report to this account, and the pointer to
+ * whoever this account reports to.
+ *
+ * THE ID-SPACE TRAP, and it is the most likely implementation error in this codebase:
+ * reporting_manager_id holds a USERS id, not an hr_employees id — the same comparison
+ * pendingLeaveForApprover() and approverRole() make. Joining it to hr_employees.id matches zero rows
+ * and reads as "nobody reports to you" rather than erroring. Both uses below compare it as ::text
+ * deliberately: the column is UUID where it exists, and this schema also carries slug keys that
+ * ::uuid would throw on.
+ *
+ * ONE ROUND TRIP FOR ALL THREE, and they are together for a reason rather than by accident. This
+ * replaces countDirectReports(), which was its own query, and it absorbs two more that
+ * /portal/employee was already paying for separately (employee.astro:384 for the date, :505 for the
+ * pointer). So the request makes FEWER queries than before, not more — and the page can no longer
+ * disagree with the composer about what day it is.
+ *
+ * NULL MEANS "DID NOT ANSWER", NEVER "IS NOT SET" for the date: a guessed today is an off-by-one on
+ * every "due today" claim on the screen. The manager pointer legitimately IS null for most people,
+ * so a failed read and an unset column are the same value there — which is safe, because
+ * manager.card's empty branch and its failure branch say the same actionable sentence ("ask HR to
+ * set your reporting manager").
+ *
+ * reporting_manager_id is ALTERed in by only two admin pages at page load, so on a database where
+ * neither has been opened the column does not exist and this statement throws as a whole. The
+ * fallback re-asks for the date alone, so a missing column costs the manager pointer and the report
+ * count — never the date, and never the page.
+ */
+async function readDayAndManager(
+  userId: string,
+  employeeId: string | null,
+): Promise<{ today: string | null; reports: number | null; managerUserId: string | null }> {
+  const empId = String(employeeId || '').trim();
   try {
     const r = await db.execute(sql`
-      SELECT COUNT(*)::int AS n
-        FROM hr_employees
-       WHERE reporting_manager_id::text = ${userId}
-         AND is_active = true`);
-    const n = Number(rows(r)[0]?.n);
-    return Number.isFinite(n) ? n : 0;
+      SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today,
+             (SELECT COUNT(*)::int FROM hr_employees
+               WHERE reporting_manager_id::text = ${userId} AND is_active = true) AS reports,
+             ${empId
+               ? sql`(SELECT m.reporting_manager_id::text FROM hr_employees m WHERE m.id::text = ${empId} LIMIT 1)`
+               : sql`NULL::text`} AS manager_user_id`);
+    const row = rows(r)[0] || {};
+    const n = Number(row.reports);
+    return {
+      today: row.today ? String(row.today) : null,
+      reports: Number.isFinite(n) ? n : 0,
+      managerUserId: row.manager_user_id ? String(row.manager_user_id) : null,
+    };
   } catch (e: any) {
-    logFail('direct reports', e);
-    return null;
+    logFail('day + manager', e);
+    let today: string | null = null;
+    try {
+      const d = await db.execute(sql`SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today`);
+      today = rows(d)[0]?.today ? String(rows(d)[0].today) : null;
+    } catch (e2: any) {
+      logFail('current date', e2);
+    }
+    return { today, reports: null, managerUserId: null };
   }
 }
 
@@ -203,6 +288,8 @@ function emptyContext(userId: string): WorkspaceContext {
     permissions,
     sections,
     grantedSection: () => false,
+    today: null,
+    reportingManagerUserId: null,
   };
 }
 
@@ -237,6 +324,7 @@ export async function composeWorkspace(
       context: emptyContext(''),
       // Not the minimal set. Nobody is signed in, so there is no "own rows" to scope even that to.
       widgets: [],
+      quickActions: [],
       contextGaps: [],
       workspace: null,
     };
@@ -374,13 +462,22 @@ async function compose(
     ? (workspace?.scopeDepartmentId || String(user.assignedDepartmentId || '').trim() || null)
     : null;
 
-  // ---- 4. Direct reports ------------------------------------------------------------------------
-  const reportCount = trustworthy ? await countDirectReports(userId) : null;
-  if (trustworthy && reportCount === null) {
+  // ---- 4. The day, the reporting line, and who reports to this account --------------------------
+  //
+  // Not run at all when the context is untrustworthy: the fail-closed return below hands back the
+  // minimal set regardless, and reading on behalf of somebody whose own record could not be resolved
+  // is a read that should never have happened.
+  const day = trustworthy
+    ? await readDayAndManager(userId, workspace?.employeeId ?? null)
+    : { today: null, reports: null, managerUserId: null };
+  if (trustworthy && day.reports === null) {
     degraded = true;
     contextGaps.push('who reports to you');
   }
-  const directReports = reportCount ?? 0;
+  // NOT added to contextGaps as a failure sentence people read: "we could not read today's date" is
+  // not something a person can act on, and every widget that partitions on the day withholds its
+  // day-partitioned rows on its own when ctx.today is null. It is still logged, above.
+  const directReports = day.reports ?? 0;
 
   // Can decide a leave request or a withdrawal. This is EXACTLY what pendingLeaveForApprover() and
   // pendingWithdrawalsForApprover() will return rows for, so a widget shown here always has a queue
@@ -435,6 +532,8 @@ async function compose(
     permissions,
     sections: sectionGrants,
     grantedSection: (key, action) => sectionGrants.has(key + ':' + action),
+    today: day.today,
+    reportingManagerUserId: day.managerUserId,
   };
 
   // ---- 6. Fail closed ----------------------------------------------------------------------------
@@ -447,6 +546,10 @@ async function compose(
       denial,
       context,
       widgets: minimal,
+      // Derived from the MINIMAL set, so a degraded workspace offers only the doors that need
+      // nothing but a session. It is not emptied: a screen with an explanation and no way out is
+      // how somebody ends up stuck on a page they cannot leave.
+      quickActions: quickActionsOf(minimal),
       contextGaps,
       workspace,
       ...(opts.explain
@@ -546,6 +649,7 @@ async function compose(
     denial,
     context,
     widgets,
+    quickActions: quickActionsOf(widgets),
     contextGaps,
     workspace,
     ...(opts.explain ? { explain } : {}),
