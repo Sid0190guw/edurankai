@@ -153,6 +153,52 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     description: 'Send money back to a payer through the payment gateway, or record a refund made outside it. This moves real money and cannot be undone from here.',
     sensitive: true,
   },
+  // APPROVALS AND PEOPLE. The capabilities docs/workforce-os/AUTHORIZATION_FIRST.md names and the
+  // code did not have. Each is granted in PERMS_BY_ROLE to exactly the roles that hold the equivalent
+  // authority today — the derivation is written out above that matrix, along with the two authorities
+  // (a reporting-manager link, and an intern engagement) that are per-PERSON and therefore cannot be
+  // expressed as a role grant at all.
+  //
+  // WHY THREE OF THEM ARE SENSITIVE. Granting one of these to a custom role hands somebody the power
+  // to sign off another person's time away or to move their salary out of the company. That grant is
+  // written strictly (assignPermission -> recordStrict): if the audit row naming the granter cannot
+  // be written, the grant is rolled back and the caller is told. `employees.manage` is not flagged,
+  // matching how the existing HR sections are treated; it is the obvious next candidate if this
+  // catalogue is ever reviewed, and it is left to that review rather than decided in passing here.
+  //
+  // A LEGACY SECTION-MATRIX ROW CANNOT SPELL ANY OF THESE. customRoleKeys() derives keys as
+  // `<page_key>.<action>` with action fixed to view/edit/delete/export, so no page_key can produce
+  // `.approve`, `.pay`, `.manage` or `.lead`. Unlike admin.access, these need no explicit filter —
+  // but that is a property of the four action names, so anything that widens SECTION_ACTIONS must
+  // re-check this paragraph.
+  'leave.approve': {
+    label: 'Approve leave requests',
+    group: 'People',
+    description: 'Approve or reject an employee\'s leave request, which also writes their attendance for those days. Held today by HR and super admins; a reporting manager can decide their own reports\' requests through the reporting line, not through this permission.',
+    sensitive: true,
+  },
+  'payouts.approve': {
+    label: 'Approve withdrawal requests',
+    group: 'Finance',
+    description: 'Approve or reject an employee\'s request to withdraw their wallet balance. Approving does not release the money — that is a separate permission.',
+    sensitive: true,
+  },
+  'payouts.pay': {
+    label: 'Release a payout',
+    group: 'Finance',
+    description: 'Send an approved withdrawal to an employee\'s bank account, or record a settlement made outside the gateway. This moves real money and cannot be undone from here.',
+    sensitive: true,
+  },
+  'employees.manage': {
+    label: 'Manage employee records',
+    group: 'People',
+    description: 'Open the people console and create or change employee records: designation, employment terms, department, reporting line and exit. Never health or wellness data, which no permission grants sight of.',
+  },
+  'department.lead': {
+    label: 'Lead a department',
+    group: 'People',
+    description: 'See the department recorded on your own account — your team\'s roster, attendance and requests, and nobody else\'s. A scope, not a rank: it narrows what is visible to one department rather than widening it.',
+  },
   'settings.view': { label: 'View settings', group: 'System', description: 'See platform configuration.' },
   'settings.edit': {
     label: 'Edit settings',

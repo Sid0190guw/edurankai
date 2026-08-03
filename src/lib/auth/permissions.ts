@@ -25,11 +25,75 @@ export type Permission =
   // does not invent a new one. `payments.refund` is SENSITIVE in registry.ts — granting it to a
   // custom role must be provably on the record.
   | 'payments.view' | 'payments.refund'
+  // APPROVALS AND PEOPLE. docs/workforce-os/AUTHORIZATION_FIRST.md:68-74 names CanApproveLeave,
+  // CanApprovePayroll, CanManageEmployees and CanManageDepartments as the vocabulary a widget must
+  // declare instead of a role name. None of them existed anywhere — not here, not in
+  // BUILTIN_PERMISSIONS — which is the whole reason src/lib/hr-wallet.ts, src/lib/hr-leave.ts,
+  // src/lib/workforce/composer.ts and src/lib/auth/workspace-access.ts still compare role STRINGS:
+  // there was nothing to translate into. Written in this file's existing dotted style rather than in
+  // the spec's CamelCase, because two naming conventions for one concept is how a check ends up
+  // asking for a permission that nobody granted.
+  //
+  // THIS COMMIT IS MECHANISM, NOT POLICY. Every grant in PERMS_BY_ROLE below reproduces the authority
+  // the code enforces TODAY, derived from the checks listed above the matrix. Nothing yet ASKS for
+  // these keys, so no effective access changes; the conversion of the four role-name tests is a
+  // separate, verifiable step.
+  | 'leave.approve'
+  | 'payouts.approve' | 'payouts.pay'
+  | 'employees.manage'
+  | 'department.lead'
   | 'audit.view';
 
 // Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
 // drifting away from the real one (/admin/access-preview). Nothing outside this file may decide
 // access from it — use can(), which is the single test every other caller already uses.
+//
+// ---------------------------------------------------------------------------------------------
+// HOW THE FIVE APPROVAL/PEOPLE GRANTS BELOW WERE DERIVED. Read this before changing one of them.
+//
+// Each was taken from the checks that enforce the authority today, not from what the shape of the
+// permission suggests it ought to mean:
+//
+//   leave.approve     src/lib/hr-leave.ts decideLeave -> approverRole() (hr-wallet.ts:189);
+//                     pendingLeaveForApprover() seesAll (hr-leave.ts:106);
+//                     /admin/hr/leave gate canAccessSection('leave','edit') and ROLE_SECTIONS below.
+//   payouts.approve   src/lib/hr-wallet.ts decideWithdrawal -> approverRole();
+//                     pendingWithdrawalsForApprover() seesAll (hr-wallet.ts:163);
+//                     /admin/hr/wallet gate canAccessSection('payouts','edit').
+//   payouts.pay       src/lib/hr-wallet.ts payWithdrawal, which narrows approverRole()'s answer to
+//                     'admin' | 'super_admin' | 'hr_head' — a reporting manager may APPROVE a
+//                     withdrawal and may NOT release the money. Two keys, because it is two powers.
+//   employees.manage  src/lib/auth/workspace-access.ts requireHr(); /admin/hr isHrDesk;
+//                     /admin/hr/completion/[id] isHrDesk; middleware gates /admin/hr/employees on
+//                     the 'employees' section, which only `hr` holds in ROLE_SECTIONS.
+//   department.lead   src/lib/auth/workspace-access.ts requireTeamLead() (role must be exactly
+//                     'department_head'); src/lib/workforce/composer.ts leadsDepartment.
+//
+// THE 'admin' ARM IN THOSE CHECKS IS DEAD and is deliberately not reproduced here. 'admin' is not a
+// value of userRoleEnum (src/lib/db/schema.ts:10-16), so no account can hold it and no grant can
+// correspond to it. Dropping a dead arm removes nothing from anybody.
+//
+// TWO AUTHORITIES DELIBERATELY NOT EXPRESSED AS ROLE GRANTS, because they are not role-shaped:
+//
+//   1. THE REPORTING MANAGER. approverRole() returns 'reporting_manager' when
+//      hr_employees.reporting_manager_id equals the user's id. That is a RELATIONSHIP to one
+//      employee, not a role, and it is per-row: the same person may decide Ravi's leave and not
+//      Priya's. A role grant cannot say that, so any conversion of approverRole() must keep that
+//      arm as the row-level check it already is. Granting leave.approve to a role in order to
+//      "cover managers" would hand every manager authority over every employee — a policy change,
+//      and the widest one available here.
+//   2. SUPER_ADMIN IS NOT A TEAM LEAD. requireTeamLead() refuses super_admin today, so
+//      department.lead is granted to department_head ONLY. It is a SCOPING signal (which department
+//      am I confined to), not a rank, and adding it to super_admin would confine the founder to one
+//      department rather than widen anything.
+//
+// CUSTOM ROLES ARE A THIRD PATH THIS MATRIX CANNOT SEE. /admin/hr/leave and /admin/hr/wallet gate on
+// canAccessSection(), which honours a custom role holding the 'leave'/'payouts' section — and the
+// registry resolves those rows as `leave.edit` / `payouts.edit`, NEVER as `leave.approve`. So a
+// conversion that swaps canAccessSection() for a bare can(..., 'leave.approve') would REMOVE access
+// from every custom role that has it today. Convert by accepting either, or by granting the new key
+// to those roles first and verifying it landed.
+// ---------------------------------------------------------------------------------------------
 export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
   super_admin: [
     'admin.access',
@@ -42,6 +106,10 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'settings.view', 'settings.edit',
     'offers.view', 'offers.edit',
     'payments.view', 'payments.refund',
+    // Already holds every one of these: approverRole() answers 'super_admin' first, and
+    // getViewableSectionKeys()/canAccessSection() return "unrestricted" for this role. Not
+    // 'department.lead' — requireTeamLead() refuses super_admin today and that must not move.
+    'leave.approve', 'payouts.approve', 'payouts.pay', 'employees.manage',
     'audit.view'
   ],
   hr: [
@@ -54,6 +122,13 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // /admin/finance has been super_admin + hr since it was written; the refund buttons on it are
     // HR's. Recorded here so the endpoint can ask for the ability instead of for the role name.
     'payments.view', 'payments.refund',
+    // The exact role 'hr' — never a substring — is what approverRole() reads as 'hr_head', what
+    // pendingLeaveForApprover()/pendingWithdrawalsForApprover() treat as "sees every request", what
+    // payWithdrawal() accepts for releasing money, and what requireHr() and isHrDesk admit. It is
+    // also the only built-in role carrying 'leave', 'payouts', 'employees' and 'hr' in ROLE_SECTIONS
+    // below, which is what the middleware and both page gates actually enforce. Same four abilities,
+    // named instead of spelled.
+    'leave.approve', 'payouts.approve', 'payouts.pay', 'employees.manage',
     'content.view'
   ],
   recruiter: [
@@ -72,7 +147,16 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
   department_head: [
     'admin.access',
     'roles.view', 'roles.edit',
-    'applications.view', 'applications.edit', 'applications.score'
+    'applications.view', 'applications.edit', 'applications.score',
+    // The ONLY holder of this key, and the only role requireTeamLead() admits. It grants no approval
+    // authority: department_head holds no HR section in ROLE_SECTIONS and approverRole() returns
+    // nothing for it, so a department head can decide a request today only by being that employee's
+    // reporting manager — a row-level fact this matrix cannot and must not encode.
+    //
+    // NOT a licence to see the department either. composer.ts adds `engagement !== 'internship'`
+    // and requireTeamLead() refuses an intern record outright; both conditions are per-PERSON, they
+    // survive this grant, and a conversion must keep them.
+    'department.lead'
   ],
   marketing: [
     'admin.access',
