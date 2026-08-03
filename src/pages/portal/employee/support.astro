@@ -1,0 +1,404 @@
+---
+// /portal/employee/support — THE EMPLOYEE HELPDESK, from the employee's side.
+//
+// ONE PAGE, TWO VIEWS. The list, and one ticket opened with ?t=<id>. A separate detail route would
+// mean a second gate to keep in step with this one, and on a phone the extra navigation buys
+// nothing — roughly nine in ten of these people are on 360px.
+//
+// WHAT THIS PAGE MAY SHOW. Only this person's OWN tickets: every read is narrowed by their
+// hr_employees.id IN THE WHERE CLAUSE (listTickets({ requesterEmployeeId })), and the single-ticket
+// view re-asks mayViewTicket() on the posted id rather than trusting the one that was rendered. An
+// HR ticket is frequently the thing somebody could not say to their own manager, so a widening here
+// would be the worst kind.
+//
+// NO EMPLOYEE RECORD IS AN HONEST EMPTY STATE, NOT AN ERROR. Tickets are keyed by hr_employees.id;
+// an account with no employee row has no place to raise one from, and the page says exactly that
+// instead of showing an empty list that looks like a bug.
+//
+// EVERY WRITE IS RE-CHECKED IN THE LIBRARY. Nothing on this page decides authorisation: createTicket,
+// replyToTicket and transitionTicket each re-resolve who the actor is and what they may do, on the
+// id that was posted. The buttons below only decide what is OFFERED.
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  createTicket, replyToTicket, transitionTicket, listTickets, getTicket, ticketThread,
+  ticketApproval, ticketSla, formatMinutes, mayViewTicket, canTransition,
+  TICKET_CATEGORIES, TICKET_PRIORITIES, categoryLabel, categoryHint, priorityLabel, statusLabel,
+  type Ticket,
+} from '@/lib/helpdesk';
+// THE APPROVAL QUEUE, from the one engine. An asset request is decided by the person the
+// Organization Graph routes it to — usually a reporting manager, who may hold no helpdesk authority
+// at all — so their queue belongs on the employee surface rather than on the admin console.
+// pendingForApprover() returns ROUTED AND DELEGATED steps only; a capability holder does not see
+// everybody's requests here, which is that function's own documented behaviour.
+import { pendingForApprover, decideInstance, VIA_LABELS } from '@/lib/workflow';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+// ---------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted, and a const declared below the POST handler that reads
+// it throws on that handler's first line — the failure that took down apply step 5 and the
+// /admin/roles/diagnose Repair button on this project.
+// ---------------------------------------------------------------------------------------------
+const PAGE = '/portal/employee/support';
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const fmt = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+const fmtTime = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+};
+
+function statusColour(s: string): string {
+  const k = String(s || '');
+  if (k === 'open') return '#b45309';
+  if (k === 'assigned') return '#1d4ed8';
+  if (k === 'in_progress') return '#7c3aed';
+  if (k === 'resolved') return '#047857';
+  return '#6b6255';
+}
+
+// The person's own employee record. Same two-step lookup the rest of the employee portal uses
+// (user_id first, then any of the three email columns), because hr_employees.user_id is empty for
+// anyone HR added by hand.
+let employee: any = null;
+try {
+  employee = rowsOf(await db.execute(sql`
+    SELECT id, full_name, department_id::text AS department_id FROM hr_employees
+     WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
+  || rowsOf(await db.execute(sql`
+    SELECT id, full_name, department_id::text AS department_id FROM hr_employees
+     WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email})
+       AND is_active = true LIMIT 1`))[0] || null;
+} catch (e: any) {
+  console.error('[support] employee lookup', e?.cause?.message || e?.message);
+}
+
+let flash = '';
+let flashOk = true;
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+
+  if (action === 'raise') {
+    const r = await createTicket({
+      category: String(fd.get('category') || ''),
+      subject: String(fd.get('subject') || ''),
+      body: String(fd.get('body') || ''),
+      priority: String(fd.get('priority') || 'normal'),
+      requesterUserId: String(user.id),
+      requesterEmployeeId: employee?.id || null,
+      assetKind: String(fd.get('asset_kind') || '') || null,
+    });
+    flashOk = r.ok;
+    flash = r.ok
+      ? 'Raised as ' + (r.ref || 'a ticket') + '.' + (r.routeNote ? ' It is not on a desk yet — ' + r.routeNote : '')
+      : (r.error || 'Could not raise that.');
+  } else if (action === 'reply') {
+    const r = await replyToTicket(String(fd.get('id') || ''), user as any, String(fd.get('body') || ''));
+    flashOk = r.ok;
+    flash = r.ok ? 'Reply sent.' : (r.error || 'Could not send that.');
+  } else if (action === 'transition') {
+    const r = await transitionTicket(String(fd.get('id') || ''), user as any, String(fd.get('to') || ''), String(fd.get('note') || ''));
+    flashOk = r.ok;
+    flash = r.ok ? 'Updated.' : (r.error || 'Could not do that.');
+  } else if (action === 'decide') {
+    // decideInstance() re-resolves the step and re-checks mayAct() on the posted id. This page
+    // decides nothing; it only shows the button.
+    const r = await decideInstance(String(fd.get('instance_id') || ''), user as any,
+      String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected', String(fd.get('note') || ''));
+    flashOk = r.ok;
+    flash = r.ok ? 'Decision recorded.' : (r.error || 'Could not record that.');
+  }
+
+  const back = String(fd.get('id') || '') ? PAGE + '?t=' + String(fd.get('id')) : PAGE;
+  return Astro.redirect(back + (back.indexOf('?') >= 0 ? '&' : '?') + 'msg=' + encodeURIComponent(flash) + '&ok=' + (flashOk ? '1' : '0'));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const msgOk = url.searchParams.get('ok') !== '0';
+const openId = url.searchParams.get('t') || '';
+const presetCategory = url.searchParams.get('category') || '';
+
+// The list — narrowed to this person, in the WHERE clause.
+const myTickets: Ticket[] = employee ? await listTickets({ requesterEmployeeId: employee.id, limit: 60 }) : [];
+
+// The opened ticket, re-checked rather than assumed.
+let open: Ticket | null = null;
+let openThread: any[] = [];
+let openApproval: any = null;
+let openSla: any = null;
+let openMoves: string[] = [];
+if (openId) {
+  const candidate = await getTicket(openId);
+  if (candidate) {
+    const allowed = await mayViewTicket(user as any, candidate);
+    if (allowed.ok) {
+      open = candidate;
+      openThread = await ticketThread(candidate.id);
+      openSla = ticketSla(candidate);
+      if (candidate.category === 'asset_request') openApproval = await ticketApproval(candidate.id);
+      // What the REQUESTER may do from here: close it, or send a resolved one back. Offered only
+      // when the state machine actually allows the move.
+      if (canTransition(candidate.status, 'closed').ok) openMoves.push('closed');
+      if (candidate.status === 'resolved' && canTransition(candidate.status, 'in_progress').ok) openMoves.push('in_progress');
+    }
+  }
+}
+
+// Asset-request approvals routed to this person, or delegated to them. Empty for almost everybody,
+// and empty for everybody until the Organization Graph has been backfilled — which is the honest
+// state, not a broken one.
+const pendingApprovals = (await pendingForApprover(String(user.id))).filter((p) => p.instance.domain === 'helpdesk');
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Helpdesk</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:inline-flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    .wrap{max-width:640px;margin:0 auto;padding:16px 14px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:76px;}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:12px 18px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;min-height:44px;}
+    .btn.ghost{background:#faf7f1;color:#1a1510;border:1px solid #e6ddcd;}
+    .row{display:flex;gap:8px;flex-wrap:wrap;}
+    .row > *{flex:1 1 140px;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;display:inline-block;}
+    .tick{display:block;text-decoration:none;color:inherit;padding:12px 0;border-bottom:1px solid #f2ece0;min-height:44px;}
+    .tick:last-child{border-bottom:none;}
+    .meta{font-size:11.5px;color:#9a8f7d;}
+    .msg{border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:14px;line-height:1.5;}
+    .thread{display:flex;flex-direction:column;gap:10px;}
+    .bubble{border-radius:12px;padding:11px 13px;font-size:14px;line-height:1.55;border:1px solid #f0e9db;background:#faf7f1;}
+    .bubble.desk{background:#fff;border-color:#e6ddcd;}
+    .note{font-size:11.5px;color:#9a8f7d;line-height:1.6;}
+    .sla{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+    .slabox{background:#faf7f1;border:1px solid #f0e9db;border-radius:10px;padding:9px 11px;}
+    .tableScroll{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>Workspace</a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Helpdesk</span>
+  <span class="meta">{employee?.full_name || user.name}</span>
+</nav>
+
+<div class="wrap">
+  {msg && (
+    <div class="msg" style={msgOk
+      ? 'background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;'
+      : 'background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:#991b1b;'}>{msg}</div>
+  )}
+
+  {pendingApprovals.length > 0 && (
+    <div class="card">
+      <h3>Asset requests waiting on you</h3>
+      {pendingApprovals.map((p) => (
+        <div style="padding:10px 0;border-bottom:1px solid #f2ece0;">
+          <div style="font-weight:600;font-size:14.5px;">{p.instance.summary || 'An asset request'}</div>
+          <div class="meta">Routed to you as: {p.step.via === 'reporting_manager' ? VIA_LABELS.reporting_manager : p.step.via === 'department_head' ? VIA_LABELS.department_head : p.step.via === 'approval_owner' ? VIA_LABELS.approval_owner : VIA_LABELS.executive_sponsor}{p.instance.subjectName ? ' · raised by ' + p.instance.subjectName : ''}</div>
+          <form method="POST" style="margin-top:8px;">
+            <input type="hidden" name="action" value="decide"/>
+            <input type="hidden" name="instance_id" value={p.instance.id}/>
+            <input name="note" placeholder="A note, if you want to leave one" maxlength="2000"/>
+            <div class="row" style="margin-top:8px;">
+              <button class="btn" name="decision" value="approved">Approve</button>
+              <button class="btn ghost" name="decision" value="rejected">Reject</button>
+            </div>
+          </form>
+        </div>
+      ))}
+      <p class="note" style="margin-top:8px;">Nothing can be issued until the approval settles. Approving here does not issue anything by itself — the desk does that, and cannot before this is approved.</p>
+    </div>
+  )}
+
+  {!employee && (
+    <div class="card">
+      <h3>No employee record</h3>
+      <p style="font-size:14px;line-height:1.6;">Tickets are raised against your employee record, and this account is not linked to one yet. Ask the people desk to link it, and this page will work the moment they do.</p>
+      <p class="note" style="margin-top:8px;">Nothing is hidden from you here — there is simply nowhere to file a ticket from until the record exists.</p>
+    </div>
+  )}
+
+  {employee && !open && (
+    <div>
+      <div class="card">
+        <h3>Raise a ticket</h3>
+        <form method="POST">
+          <input type="hidden" name="action" value="raise"/>
+          <label for="category">Which desk</label>
+          <select id="category" name="category" required>
+            {TICKET_CATEGORIES.map((c) => (
+              <option value={c} selected={c === presetCategory}>{categoryLabel(c)}</option>
+            ))}
+          </select>
+          <p class="note" style="margin-top:6px;">{TICKET_CATEGORIES.map((c) => (<span>{categoryLabel(c)}: {categoryHint(c)}<br/></span>))}</p>
+
+          <label for="subject">Subject</label>
+          <input id="subject" name="subject" maxlength="160" required placeholder="One line the desk can triage"/>
+
+          <label for="body">What do you need</label>
+          <textarea id="body" name="body" rows="4" required placeholder="What is happening, what you have tried, and what you need to be able to do."></textarea>
+
+          <div class="row">
+            <div>
+              <label for="priority">Priority</label>
+              <select id="priority" name="priority">
+                {TICKET_PRIORITIES.map((p) => (<option value={p} selected={p === 'normal'}>{priorityLabel(p)}</option>))}
+              </select>
+            </div>
+            <div>
+              <label for="asset_kind">If it is an asset request</label>
+              <input id="asset_kind" name="asset_kind" maxlength="60" placeholder="Laptop, monitor, licence"/>
+            </div>
+          </div>
+
+          <button class="btn" style="margin-top:14px;">Raise it</button>
+          <p class="note" style="margin-top:8px;">An asset request goes to your reporting manager for approval before anything can be issued. Everything else goes to whoever owns that desk.</p>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3>Your tickets</h3>
+        {myTickets.length === 0 && (
+          <p style="font-size:14px;line-height:1.6;">You have not raised anything yet. When you do, it appears here with everything the desk has said about it.</p>
+        )}
+        {myTickets.map((t) => (
+          <a class="tick" href={PAGE + '?t=' + t.id}>
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+              <div style="min-width:0;">
+                <div style="font-weight:600;font-size:14.5px;word-break:break-word;">{t.subject}</div>
+                <div class="meta" style="margin-top:3px;">{t.ref} · {categoryLabel(t.category)} · raised {fmt(t.createdAt)}</div>
+              </div>
+              <span class="pill" style={'background:rgba(0,0,0,.05);color:' + statusColour(t.status) + ';'}>{statusLabel(t.status)}</span>
+            </div>
+          </a>
+        ))}
+      </div>
+    </div>
+  )}
+
+  {employee && openId && !open && (
+    <div class="card">
+      <h3>Not available</h3>
+      <p style="font-size:14px;line-height:1.6;">That ticket is not available. It may belong to somebody else, or it may not exist.</p>
+      <a class="btn ghost" href={PAGE} style="display:block;text-align:center;text-decoration:none;margin-top:12px;padding-top:12px;">Back to your tickets</a>
+    </div>
+  )}
+
+  {open && (
+    <div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+          <div style="min-width:0;">
+            <div style="font-family:'Fraunces',serif;font-size:19px;font-weight:600;word-break:break-word;">{open.subject}</div>
+            <div class="meta" style="margin-top:4px;">{open.ref} · {categoryLabel(open.category)} · {priorityLabel(open.priority)} priority</div>
+          </div>
+          <span class="pill" style={'background:rgba(0,0,0,.05);color:' + statusColour(open.status) + ';'}>{statusLabel(open.status)}</span>
+        </div>
+
+        {open.assigneeName && (<p class="note" style="margin-top:10px;">On the desk of {open.assigneeName}.</p>)}
+        {!open.assigneeName && open.routeNote && (
+          <p class="note" style="margin-top:10px;">Not on a desk yet — {open.routeNote}. It is still visible to the people desk and you can keep adding to it.</p>
+        )}
+        {!open.assigneeName && !open.routeNote && (<p class="note" style="margin-top:10px;">Not assigned to anybody yet.</p>)}
+      </div>
+
+      {openApproval && (
+        <div class="card">
+          <h3>Approval</h3>
+          <p style="font-size:14px;line-height:1.6;">This is an asset request, so it is decided by the person your reporting line routes it to — not by the helpdesk.</p>
+          <p style="font-size:14px;margin-top:8px;"><strong>State:</strong> {openApproval.state}</p>
+          {openApproval.haltReason && (
+            <p class="note" style="margin-top:6px;">Halted: {openApproval.haltReason}. Nothing can be issued until somebody records the missing relationship.</p>
+          )}
+        </div>
+      )}
+
+      <div class="card">
+        <h3>Timing</h3>
+        <div class="sla">
+          <div class="slabox"><div class="meta">Raised</div><div style="font-size:13.5px;">{fmtTime(openSla.createdAt) || '—'}</div></div>
+          <div class="slabox"><div class="meta">First reply from the desk</div><div style="font-size:13.5px;">{openSla.firstResponseAt ? fmtTime(openSla.firstResponseAt) + ' (' + formatMinutes(openSla.firstResponseMinutes) + ')' : 'not yet'}</div></div>
+          <div class="slabox"><div class="meta">Resolved</div><div style="font-size:13.5px;">{openSla.resolvedAt ? fmtTime(openSla.resolvedAt) + ' (' + formatMinutes(openSla.resolutionMinutes) + ')' : 'not yet'}</div></div>
+          <div class="slabox"><div class="meta">Closed</div><div style="font-size:13.5px;">{openSla.closedAt ? fmtTime(openSla.closedAt) : 'not yet'}</div></div>
+        </div>
+        <p class="note" style="margin-top:8px;">These are the times as they happened. No response target has been agreed anywhere in this product, so none is shown — a promise nobody made is not something to measure people against.</p>
+      </div>
+
+      <div class="card">
+        <h3>Conversation</h3>
+        <div class="thread">
+          {openThread.length === 0 && (<p style="font-size:14px;">Nothing said yet.</p>)}
+          {openThread.map((m: any) => (
+            <div class={'bubble' + (m.sender_role === 'agent' || m.sender_role === 'admin' ? ' desk' : '')}>
+              <div class="meta" style="margin-bottom:4px;">{m.sender_role === 'agent' || m.sender_role === 'admin' ? 'Helpdesk' : 'You'} · {fmtTime(m.created_at)}</div>
+              <div style="white-space:pre-wrap;">{m.body}</div>
+            </div>
+          ))}
+        </div>
+
+        {open.status !== 'closed' && (
+          <form method="POST" style="margin-top:14px;">
+            <input type="hidden" name="action" value="reply"/>
+            <input type="hidden" name="id" value={open.id}/>
+            <label for="reply">Add to this ticket</label>
+            <textarea id="reply" name="body" rows="3" required placeholder="Anything that would help the desk."></textarea>
+            <button class="btn" style="margin-top:10px;">Send</button>
+          </form>
+        )}
+        {open.status === 'closed' && (
+          <p class="note" style="margin-top:12px;">This ticket is closed. Raise a new one and mention {open.ref} if it comes back.</p>
+        )}
+      </div>
+
+      {openMoves.length > 0 && (
+        <div class="card">
+          <h3>Your call</h3>
+          {openMoves.indexOf('in_progress') >= 0 && (
+            <form method="POST" style="margin-bottom:12px;">
+              <input type="hidden" name="action" value="transition"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <input type="hidden" name="to" value="in_progress"/>
+              <label for="reopen">This is not fixed</label>
+              <textarea id="reopen" name="note" rows="2" placeholder="What is still wrong."></textarea>
+              <button class="btn ghost" style="margin-top:8px;">Send it back to the desk</button>
+            </form>
+          )}
+          {openMoves.indexOf('closed') >= 0 && (
+            <form method="POST">
+              <input type="hidden" name="action" value="transition"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <input type="hidden" name="to" value="closed"/>
+              <button class="btn ghost">Close it — this is done</button>
+              <p class="note" style="margin-top:8px;">Closing is final. A recurrence is a new ticket, so the history of this one stays as it happened.</p>
+            </form>
+          )}
+        </div>
+      )}
+
+      <a class="btn ghost" href={PAGE} style="display:block;text-align:center;text-decoration:none;padding-top:12px;">Back to your tickets</a>
+    </div>
+  )}
+</div>
+</body>
+</html>

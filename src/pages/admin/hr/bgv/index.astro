@@ -1,10 +1,32 @@
 ---
+// THE GATE. `user.role !== 'applicant'` used to be the whole of it, and src/lib/auth/permissions.ts
+// says in as many words why that is not an authorisation test: EVERY internal role passes it,
+// including the `editor` role that offer letters auto-assign to candidates who have not yet
+// accepted. On this page that meant a candidate-turned-editor was one guard away from the identity,
+// criminal-record and previous-employment checks run on every other candidate.
+//
+// It is replaced with the same two-level check the sibling HR consoles use
+// (/admin/hr/contracts, /transfers, /promotions, /separation):
+//
+//   READ   canAccessSection(user, 'hr', 'view')  — identical to what src/middleware.ts already
+//          enforces for /admin/hr/* via PATH_SECTION, so nobody who can open this page today loses
+//          it. It is stated here as well because a page that depends on a guard in another file
+//          never being changed is not actually guarded.
+//   WRITE  canAccessSection(user, 'hr', 'edit')  — NEW, and the real repair. Middleware only checks
+//          canView. A custom role granted read-only sight of the HR section passed that check and
+//          could then POST: create a BGV record, or move a check to "clear" and attach an evidence
+//          link. Deciding somebody's background check is not a read.
+//
+// Both consts are declared ABOVE the POST handler that uses them — `const` is not hoisted, and a
+// declaration below its first use has taken pages down on this project.
 import AdminLayout from '@/layouts/AdminLayout.astro';
-import { ensureBgvSchema, createBgvRecord, updateBgvCheck, listBgvRecords, BGV_CHECKS, BGV_STATUS_TONES } from '@/lib/hr-bgv';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { ensureBgvSchema, createBgvRecord, updateBgvCheck, listBgvRecords, BGV_CHECKS, BGV_STATUS_TONES, evidenceColumnFor } from '@/lib/hr-bgv';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+if (!(await canAccessSection(user, 'hr', 'view'))) return Astro.redirect('/admin?denied=hr');
+const mayWrite = await canAccessSection(user, 'hr', 'edit');
 
 await ensureBgvSchema();
 let okMsg = '', errMsg = '';
@@ -12,7 +34,9 @@ if (Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
     const action = (fd.get('action') as string) || 'create';
-    if (action === 'create') {
+    if (!mayWrite) {
+      errMsg = 'You can read the verification register, but recording or deciding a check needs edit access to the HR section.';
+    } else if (action === 'create') {
       await createBgvRecord({
         name: ((fd.get('name') as string) || '').trim().slice(0, 200),
         email: ((fd.get('email') as string) || '').trim().slice(0, 200),
@@ -23,7 +47,12 @@ if (Astro.request.method === 'POST') {
       okMsg = 'BGV record created.';
     } else if (action === 'update_check') {
       const id = fd.get('id') as string; const key = fd.get('key') as string; const status = fd.get('status') as string; const notes = (fd.get('notes') as string) || undefined;
-      const r = await updateBgvCheck(id, key, status, notes); okMsg = r.ok ? 'Check updated.' : 'Failed.';
+      // Evidence is a LINK. Passed as a string (possibly empty) rather than undefined so that
+      // clearing the field clears the column instead of silently keeping a stale link.
+      const evidence = (fd.get('evidence') as string) ?? '';
+      const r = await updateBgvCheck(id, key, status, notes, evidence);
+      // The real reason, on screen. `Failed.` told nobody anything and hid a rejected link.
+      if (r.ok) { okMsg = 'Check updated.'; } else { errMsg = r.error || 'The check was not updated.'; }
     }
   } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
 }
@@ -42,17 +71,31 @@ const STATUS_OPTIONS = ['pending','in_progress','clear','flagged','failed','n/a'
   {okMsg && <div style="background:rgba(74,222,128,0.10);border:1px solid rgba(74,222,128,0.32);color:#86efac;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{okMsg}</div>}
   {errMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{errMsg}</div>}
 
+  {!mayWrite && (
+    <div style="background:#0f0f14;border:1px solid #2a2a2f;color:#8a8a94;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:12.5px;line-height:1.6;">
+      You are reading this register. Recording a new verification, or moving a check to clear or
+      flagged, needs edit access to the HR section — the write forms below are hidden rather than
+      shown and then refused.
+    </div>
+  )}
+
+  {mayWrite && (
   <details style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:0;margin-bottom:18px;">
     <summary style="cursor:pointer;padding:14px 18px;font-size:13px;color:#FF7040;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;font-family:'Geist Mono',monospace;list-style:none;">+ Create BGV record</summary>
     <form method="POST" style="padding:0 18px 18px;display:grid;gap:10px;">
       <input type="hidden" name="action" value="create" />
       <input name="name" placeholder="Candidate name *" required style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;" />
       <input name="email" type="email" placeholder="Candidate email *" required style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;" />
-      <input name="vendor" placeholder="Vendor (e.g. AuthBridge / First Advantage / Internal)" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;" />
+      {/* NO COMPANY NAMES. This placeholder used to list two real background-screening firms by
+          name, which is a standing rule on this project — no competitor and no real company is named
+          in any user-facing copy. The field still takes whatever HR types; it just stops
+          recommending a supplier on the platform's behalf. */}
+      <input name="vendor" placeholder="Who ran the check (an agency name, or Internal)" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12.5px;" />
       <label style="display:flex;gap:8px;align-items:flex-start;font-size:12px;color:#d8d8de;line-height:1.55;"><input name="consent" type="checkbox" required style="margin-top:3px;" /> I confirm the candidate has given written consent to run these checks (DPDPA 2023 + global standard).</label>
       <button type="submit" style="background:#FF4F00;color:#fff;border:none;padding:10px 22px;border-radius:8px;font-size:12.5px;font-weight:800;cursor:pointer;letter-spacing:0.04em;text-transform:uppercase;font-family:'Geist Mono',monospace;justify-self:start;">Create record</button>
     </form>
   </details>
+  )}
 
   <form method="GET" style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
     <select name="status" style="background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:9px 10px;border-radius:6px;font-size:12.5px;">
@@ -77,16 +120,27 @@ const STATUS_OPTIONS = ['pending','in_progress','clear','flagged','failed','n/a'
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin-top:14px;">
               {BGV_CHECKS.map((c) => {
                 const status = r[c.key] || 'pending';
+                const evCol = evidenceColumnFor(c.key);
+                const evidence = evCol && r[evCol] ? String(r[evCol]) : '';
                 return (
                   <form method="POST" style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 14px;">
                     <input type="hidden" name="action" value="update_check" /><input type="hidden" name="id" value={r.id} /><input type="hidden" name="key" value={c.key} />
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><p style="font-size:11.5px;color:#fff;font-weight:700;margin:0;">{c.label}</p><span style={`background:${BGV_STATUS_TONES[status]}22;color:${BGV_STATUS_TONES[status]};font-size:9.5px;font-weight:700;padding:2px 6px;border-radius:100px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;`}>{status}</span></div>
                     <p style="font-size:10.5px;color:#9aa6b6;margin:0 0 6px;">{c.description}</p>
-                    <div style="display:flex;gap:4px;margin-bottom:6px;">
-                      <select name="status" style="flex:1;background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:5px 8px;border-radius:4px;font-size:11px;">{STATUS_OPTIONS.map(s => <option value={s} selected={s === status}>{s}</option>)}</select>
-                      <button type="submit" style="background:#1045BB;color:#fff;border:none;padding:5px 10px;border-radius:4px;font-size:11px;font-weight:700;cursor:pointer;">Save</button>
-                    </div>
-                    <input name="notes" placeholder="Notes (optional)" style="width:100%;background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:5px 8px;border-radius:4px;font-size:11px;" />
+                    {mayWrite && (
+                      <div style="display:flex;gap:4px;margin-bottom:6px;">
+                        <select name="status" style="flex:1;background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:5px 8px;border-radius:4px;font-size:11px;min-height:44px;">{STATUS_OPTIONS.map(s => <option value={s} selected={s === status}>{s}</option>)}</select>
+                        <button type="submit" style="background:#1045BB;color:#fff;border:none;padding:5px 14px;border-radius:4px;font-size:11px;font-weight:700;cursor:pointer;min-height:44px;">Save</button>
+                      </div>
+                    )}
+                    {mayWrite && <input name="notes" placeholder="Notes (optional)" style="width:100%;background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:5px 8px;border-radius:4px;font-size:11px;margin-bottom:6px;min-height:44px;" />}
+                    {mayWrite && <input name="evidence" type="url" value={evidence} placeholder="Evidence link (a link anyone with it can open)" style="width:100%;background:#0f0f14;border:1px solid #2a2a2f;color:#fff;padding:5px 8px;border-radius:4px;font-size:11px;min-height:44px;" />}
+                    {evidence && (
+                      <a href={evidence} target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:5px;margin-top:6px;font-size:10.5px;color:#FF7040;text-decoration:none;min-height:44px;">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                        Open the evidence for this check
+                      </a>
+                    )}
                   </form>
                 );
               })}

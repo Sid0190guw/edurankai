@@ -720,13 +720,43 @@ export const chatChannels = pgTable('chat_channels', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()
 });
 
+/**
+ * chat_messages — ONE table, two kinds of row, and the reason both are described here.
+ *
+ * This declaration used to describe only the channel half (channel_id + body NOT NULL), while
+ * src/pages/portal/messages.astro CREATEd the SAME table name with a thread + ciphertext shape.
+ * CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so one of the two systems was writing
+ * into a table that had no such columns and threw on every INSERT. src/lib/chat-schema.ts is now
+ * the single owner of the DDL and reconciles both shapes additively; this declaration follows it,
+ * because a Drizzle table that disagrees with the live table is how the next caller gets it wrong.
+ *
+ * A THREAD row (the canonical, end-to-end encrypted messenger at /portal/messages) has thread_id,
+ * ciphertext and iv, and a NULL channel_id and body.
+ * A CHANNEL row (the read-only /admin/chat archive) has channel_id and body, and a NULL thread_id.
+ *
+ * NOTHING may be `.notNull()` here that is mandatory for only one of the two: the constraint is
+ * enforced by the writer (portal/messages.astro rejects a send with no ciphertext before it reaches
+ * SQL), not by a column that the other kind of row cannot satisfy. Drizzle is used to READ this
+ * table only — the channel writes are retired, and the thread writes are raw SQL in the portal page.
+ */
 export const chatMessages = pgTable('chat_messages', {
   id: uuid('id').primaryKey().defaultRandom(),
-  channelId: uuid('channel_id').notNull().references(() => chatChannels.id, { onDelete: 'cascade' }),
-  senderUserId: uuid('sender_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  // Thread rows (canonical). No .references() on threadId: chat_threads is created by
+  // src/lib/chat-schema.ts and this file must not imply a constraint the live table may not carry.
+  threadId: uuid('thread_id'),
+  ciphertext: text('ciphertext'),
+  iv: text('iv'),
+  envelope: jsonb('envelope'),
+  attachmentUrl: text('attachment_url'),
+  attachmentMeta: jsonb('attachment_meta'),
+  replyToMessageId: uuid('reply_to_message_id'),
+  // Channel rows (archive).
+  channelId: uuid('channel_id').references(() => chatChannels.id, { onDelete: 'cascade' }),
   senderName: varchar('sender_name', { length: 120 }),
-  body: text('body').notNull(),
+  body: text('body'),
   messageCode: varchar('message_code', { length: 20 }),
+  // Both.
+  senderUserId: uuid('sender_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   editedAt: timestamp('edited_at', { withTimezone: true }),
   deletedAt: timestamp('deleted_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow()

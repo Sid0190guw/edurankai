@@ -4,30 +4,20 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureNotificationsSchema } from '@/lib/notifications-schema';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
-// Memoised so the 20s portal poll doesn't re-run DDL on every request.
-let tableReady: Promise<void> | null = null;
-function ensureTable(): Promise<void> {
-  if (tableReady) return tableReady;
-  tableReady = (async () => {
-    try {
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        title TEXT NOT NULL, body TEXT,
-        type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
-        entity_type TEXT, entity_id TEXT,
-        is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW())`);
-    } catch (_) { tableReady = null; }
-  })();
-  return tableReady;
-}
+// THE TABLE IS NOT CREATED HERE — see the same note in the admin sibling. A private ensureTable()
+// with a narrower CREATE than src/lib/push.ts writes was the fourth copy of this DDL; on a fresh
+// database the 20-second portal poll could easily have been the statement that won, and every later
+// INSERT naming category/priority would then have thrown forever with nothing on screen to show it.
+// One table, one CREATE: src/lib/notifications-schema.ts, additive and safe on a live table.
+// Still memoised internally, so this poll does not re-run DDL on every request.
+const ensureTable = ensureNotificationsSchema;
 
 export const GET: APIRoute = async ({ locals }) => {
   const user = (locals as any).user;

@@ -1,70 +1,39 @@
+// /admin/api/chat/members — RETIRED, both verbs.
+//
+// POST added or removed somebody from a channel; GET listed a channel's members and told the caller
+// whether they could manage it. Neither has a caller left in the repository (the member panel was
+// never wired into /admin/chat), and membership only decides who may write to a private channel — a
+// question the archive no longer asks, because nobody writes to a channel.
+//
+// Both verbs checked `if (!user)` only. GET therefore returned the name, email and internal handle
+// of every member of any channel — including a private one — to any signed-in account, applicants
+// included, while the page it belongs to is gated on the `discussion` section. That is the same
+// defect as send.ts and it is closed the same way: denyAdminApi() first, then the refusal.
+//
+// Existing chat_memberships rows are NOT deleted. They are what a future migration would need to
+// carry these channels into threads.
 import type { APIRoute } from 'astro';
-import { db } from '@/lib/db';
-import { chatChannels, chatMemberships, users } from '@/lib/db/schema';
-import { eq, and, inArray } from 'drizzle-orm';
+import { denyAdminApi } from '@/lib/auth/api-guard';
+import { chatArchivedResponse } from '@/lib/chat-schema';
 
-export const POST: APIRoute = async ({ request, locals }) => {
-  const me = (locals as any).user;
-  if (!me) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
+export const POST: APIRoute = async ({ locals }) => {
+  const denied = await denyAdminApi(locals, {
+    section: 'discussion',
+    action: 'edit',
+    label: 'admin.api.chat.members.write',
+  });
+  if (denied) return denied;
 
-  try {
-    const body = await request.json();
-    const channelSlug = (body.channel || '').trim();
-    const action = (body.action || '').trim();
-    const userId = (body.userId || '').trim();
-
-    if (!channelSlug || !action || !userId) {
-      return new Response(JSON.stringify({ error: 'channel, action, userId required' }), { status: 400 });
-    }
-    if (action !== 'add' && action !== 'remove') {
-      return new Response(JSON.stringify({ error: 'invalid action' }), { status: 400 });
-    }
-
-    const ch = await db.select().from(chatChannels).where(eq(chatChannels.slug, channelSlug)).limit(1);
-    if (ch.length === 0) return new Response(JSON.stringify({ error: 'channel not found' }), { status: 404 });
-
-    // Only creator or super_admin can manage members
-    if (ch[0].createdByUserId !== me.id && me.role !== 'super_admin') {
-      return new Response(JSON.stringify({ error: 'only channel creator or super_admin can manage members' }), { status: 403 });
-    }
-
-    if (action === 'add') {
-      await db.insert(chatMemberships).values({ channelId: ch[0].id, userId }).onConflictDoNothing();
-    } else {
-      await db.delete(chatMemberships)
-        .where(and(eq(chatMemberships.channelId, ch[0].id), eq(chatMemberships.userId, userId)));
-    }
-
-    return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
-  } catch (err: any) {
-    return new Response(JSON.stringify({ error: err.message || 'failed' }), { status: 500 });
-  }
+  return chatArchivedResponse('Changing Discussion channel membership');
 };
 
-export const GET: APIRoute = async ({ request, locals }) => {
-  const me = (locals as any).user;
-  if (!me) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
+export const GET: APIRoute = async ({ locals }) => {
+  const denied = await denyAdminApi(locals, {
+    section: 'discussion',
+    action: 'view',
+    label: 'admin.api.chat.members.read',
+  });
+  if (denied) return denied;
 
-  const url = new URL(request.url);
-  const channelSlug = url.searchParams.get('channel') || '';
-  if (!channelSlug) return new Response(JSON.stringify({ error: 'channel required' }), { status: 400 });
-
-  const ch = await db.select().from(chatChannels).where(eq(chatChannels.slug, channelSlug)).limit(1);
-  if (ch.length === 0) return new Response(JSON.stringify({ error: 'channel not found' }), { status: 404 });
-
-  const memberRows = await db.select({ uid: chatMemberships.userId })
-    .from(chatMemberships).where(eq(chatMemberships.channelId, ch[0].id));
-
-  const memberIds = memberRows.map(r => r.uid);
-  let memberList: any[] = [];
-  if (memberIds.length > 0) {
-    memberList = await db.select({ id: users.id, name: users.name, email: users.email, internalHandle: users.internalHandle })
-      .from(users).where(inArray(users.id, memberIds));
-  }
-
-  return new Response(JSON.stringify({
-    members: memberList,
-    canManage: ch[0].createdByUserId === me.id || me.role === 'super_admin',
-    isPrivate: ch[0].isPrivate
-  }), { headers: { 'Content-Type': 'application/json' } });
+  return chatArchivedResponse('The Discussion channel member list');
 };

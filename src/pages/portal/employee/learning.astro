@@ -1,0 +1,562 @@
+---
+// /portal/employee/learning — THE EMPLOYEE LEARNING SURFACE.
+//
+// =================================================================================================
+// WHAT THIS PAGE IS
+// =================================================================================================
+//
+//   Path        the courses assigned to this person, with their REAL progress and a link into the
+//               existing course player at /portal/courses/<slug>.
+//   Skills      what they can do, at what level, with evidence. Their own to record; a manager or
+//               the people team may assess it.
+//   Calendar    scheduled training sessions, and a sign-up.
+//
+// IT REUSES THE COURSE ENGINE AND BUILDS NO SECOND ONE. training_courses, training_lessons and
+// training_enrollments are the existing machinery; certificates come through src/lib/certificates.ts,
+// which owns the hash-chained ledger. This page links into /portal/courses rather than reimplementing
+// a player, and src/lib/performance-learning.ts explains exactly which gap the one new table fills.
+//
+// EduRankAI IS THE TECHNOLOGY PLATFORM. Courses here are internal training. Accredited partners award
+// credentials; nothing on this page claims otherwise, and the certificate wording says what the
+// certificate is.
+//
+// =================================================================================================
+// POST-REDIRECT-GET, EVERY CONST ABOVE THE HANDLER, NO CLIENT JAVASCRIPT
+// =================================================================================================
+//
+// `const` is not hoisted and a handler reaching a later declaration throws on its first line while
+// the page reports success — that has taken pages down here. Tabs are links; disclosure is native
+// <details>. Mobile first at 360px with a 44px touch floor, and the page never scrolls sideways.
+import { composeWorkspace } from '@/lib/workforce/composer';
+import { resolvePerfViewer, LEARNING_ASSIGN, SKILLS_MANAGE } from '@/lib/performance-scope';
+import {
+  learningPathFor,
+  learningForEmployees,
+  certificatesFor,
+  listTrainingEvents,
+  setTrainingSignup,
+  assignCourse,
+  courseOptions,
+  TRAINING_MODE_LABELS,
+  type LearningItem,
+  type CertificateRow,
+  type TrainingEvent,
+  type CourseOption,
+} from '@/lib/performance-learning';
+import {
+  listSkills,
+  skillsForEmployee,
+  setEmployeeSkill,
+  removeEmployeeSkill,
+  SKILL_LEVELS,
+  SKILL_SOURCE_LABELS,
+  type Skill,
+  type EmployeeSkill,
+} from '@/lib/skills';
+
+const PATH = '/portal/employee/learning';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ---- Constants and helpers, ALL declared above the POST handler ----------------------------------
+const VIEWS = [
+  { key: 'path', label: 'My learning' },
+  { key: 'skills', label: 'Skills' },
+  { key: 'calendar', label: 'Training calendar' },
+] as const;
+
+const back = (msg: string, view: string) =>
+  Astro.redirect(PATH + '?view=' + encodeURIComponent(view) + '&msg=' + encodeURIComponent(msg.slice(0, 300)));
+
+const fmtDate = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+const fmtWhen = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleString('en-GB', {
+    day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+  }) : '';
+
+const STATE_LABELS: Record<string, string> = {
+  not_started: 'Not started',
+  in_progress: 'In progress',
+  complete: 'Complete',
+};
+
+let composed: any = null;
+try {
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: PATH });
+} catch (e: any) {
+  console.error('[portal/employee/learning] compose', e?.cause?.message || e?.message);
+}
+
+const holds = (key: string): boolean => {
+  try {
+    return composed?.context?.holds ? composed.context.holds(key) === true : false;
+  } catch {
+    return false;
+  }
+};
+
+const viewer = await resolvePerfViewer(String(user.id), holds);
+const canAssignOrg = holds(LEARNING_ASSIGN);
+const canManageSkills = holds(SKILLS_MANAGE);
+
+// =================================================================================================
+// WRITES
+// =================================================================================================
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const view = String(fd.get('view') || 'path');
+
+  if (!viewer.employeeId) {
+    return back('This account has no employee record, so there is nothing to save against it.', view);
+  }
+
+  if (action === 'set_skill') {
+    const r = await setEmployeeSkill(viewer, {
+      employeeId: String(fd.get('employee_id') || viewer.employeeId),
+      skillId: String(fd.get('skill_id') || ''),
+      level: Number(fd.get('level') || 1),
+      evidence: String(fd.get('evidence') || ''),
+      evidenceUrl: String(fd.get('evidence_url') || ''),
+      // `skills.manage`, resolved from the composed context and handed down. NOT viewer.managesOrg,
+      // which carries `performance.manage` — a different capability held by the same roles today, so
+      // reading the wrong one would work perfectly until somebody granted one without the other.
+      orgWide: canManageSkills,
+    });
+    return back(r.ok ? 'Skill recorded.' : (r.error || 'Could not record that.'), 'skills');
+  }
+
+  if (action === 'remove_skill') {
+    const r = await removeEmployeeSkill(viewer, String(fd.get('employee_skill_id') || ''), canManageSkills);
+    return back(r.ok ? 'Removed.' : (r.error || 'Could not remove that.'), 'skills');
+  }
+
+  if (action === 'signup') {
+    const r = await setTrainingSignup(
+      viewer.employeeId,
+      viewer.userId,
+      String(fd.get('event_id') || ''),
+      fd.get('going') === '1',
+    );
+    return back(
+      r.ok ? (fd.get('going') === '1' ? 'You are signed up.' : 'You have withdrawn.') : (r.error || 'Could not do that.'),
+      'calendar',
+    );
+  }
+
+  if (action === 'assign') {
+    const r = await assignCourse(viewer, {
+      employeeId: String(fd.get('employee_id') || ''),
+      courseId: String(fd.get('course_id') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      required: fd.get('required') === '1',
+      reason: String(fd.get('reason') || ''),
+      orgWide: canAssignOrg,
+    });
+    return back(r.ok ? 'Course assigned.' : (r.error || 'Could not assign that.'), 'path');
+  }
+
+  return back('That action is not one this page performs.', view);
+}
+
+// =================================================================================================
+// READS
+// =================================================================================================
+const params = Astro.url.searchParams;
+const requested = String(params.get('view') || 'path');
+const view = (VIEWS as readonly { key: string }[]).some((v) => v.key === requested) ? requested : 'path';
+const msg = String(params.get('msg') || '').slice(0, 300);
+
+let path: LearningItem[] = [];
+let teamPath: LearningItem[] = [];
+let certificates: CertificateRow[] = [];
+let courses: CourseOption[] = [];
+if (view === 'path' && viewer.employeeId) {
+  path = await learningPathFor(viewer.employeeId);
+  certificates = await certificatesFor(viewer.userId);
+  if (viewer.reportIds.length > 0) teamPath = await learningForEmployees(viewer.reportIds);
+  if (viewer.reportIds.length > 0 || canAssignOrg) courses = await courseOptions();
+}
+
+let catalogue: Skill[] = [];
+let mySkills: EmployeeSkill[] = [];
+if (view === 'skills' && viewer.employeeId) {
+  catalogue = await listSkills();
+  mySkills = await skillsForEmployee(viewer.employeeId);
+}
+
+let events: TrainingEvent[] = [];
+if (view === 'calendar') {
+  events = await listTrainingEvents({ forEmployeeId: viewer.employeeId });
+}
+
+const recorded = new Set(mySkills.map((s) => s.skillId));
+const unrecorded = catalogue.filter((s) => !recorded.has(s.id));
+const hrefFor = (v: string) => PATH + '?view=' + v;
+const required = path.filter((i) => i.required);
+const optional = path.filter((i) => !i.required);
+---
+
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Learning - EduRankAI</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    html,body{overflow-x:hidden}
+    body{background:#f6f4ef;color:#1a1510;min-height:100vh;padding-bottom:48px;
+      font-family:'Inter Tight',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+      -webkit-text-size-adjust:100%}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;
+      gap:10px;padding:8px 14px;position:sticky;top:0;z-index:40}
+    .top a{color:#9a8f7d;text-decoration:none;display:inline-flex;align-items:center;gap:7px;
+      font-size:14px;min-height:44px}
+    .top strong{color:#fff;font-size:15px;font-weight:700}
+    .top span{color:#9a8f7d;font-size:11px;max-width:34vw;overflow:hidden;text-overflow:ellipsis;
+      white-space:nowrap}
+    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding:10px 14px 2px;
+      scrollbar-width:thin;background:#f6f4ef;position:sticky;top:54px;z-index:30}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:38px;padding:8px 14px;
+      border:1px solid #e6ddcd;border-radius:999px;background:#fff;color:#6b6255;font-size:13px;
+      font-weight:600;text-decoration:none;white-space:nowrap}
+    .tab[aria-current="page"]{background:#1a1510;border-color:#1a1510;color:#fff}
+    .tab:focus-visible{outline:2px solid #c2410c;outline-offset:2px}
+    .wrap{max-width:640px;margin:0 auto;padding:12px 14px}
+    .scope{font-size:12.5px;line-height:1.55;color:#6b6255;margin:2px 0 12px}
+    .flash{background:rgba(5,150,105,.09);border:1px solid rgba(5,150,105,.3);color:#065f46;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:14px;
+      overflow-wrap:anywhere}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:13px;
+      box-shadow:0 8px 26px rgba(26,21,16,.045)}
+    .card h3{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;letter-spacing:.13em;
+      text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 11px}
+    .muted{font-size:12.5px;line-height:1.55;color:#6b6255;overflow-wrap:anywhere}
+    .empty{background:#fbf8f2;border:1px dashed #e0d5c0;border-radius:14px;padding:18px 16px;
+      margin-bottom:13px}
+    .empty b{display:block;font-size:14px;margin-bottom:5px}
+    .item{border:1px solid #ece4d6;border-radius:13px;padding:13px;margin-bottom:10px;background:#fff}
+    .item__top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+    .item__t{font-size:14.5px;font-weight:650;line-height:1.35;overflow-wrap:anywhere}
+    .item a{color:#c2410c;font-size:13px;font-weight:600;text-decoration:none;display:inline-flex;
+      align-items:center;min-height:44px}
+    .pill{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9.5px;font-weight:700;
+      padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;flex:none;
+      background:#f2ece0;color:#6b6255}
+    .pill.done{background:rgba(5,150,105,.12);color:#065f46}
+    .pill.late{background:rgba(220,38,38,.1);color:#991b1b}
+    .bar{height:7px;border-radius:99px;background:#f0e9db;overflow:hidden;margin:9px 0 4px}
+    .bar i{display:block;height:100%;background:#c2410c;border-radius:99px}
+    label{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9.5px;letter-spacing:.1em;
+      text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;
+      padding:11px 12px;font-size:14px;font-family:inherit;color:#1a1510;outline:none;min-height:44px}
+    textarea{min-height:76px;resize:vertical}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c}
+    .row2{display:grid;grid-template-columns:1fr;gap:9px}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:12px 18px;font-size:14px;
+      font-weight:650;cursor:pointer;font-family:inherit;width:100%;min-height:44px;margin-top:12px}
+    .btn.ghost{background:#fff;color:#6b6255;border:1px solid #e6ddcd}
+    .btn.slim{width:auto;padding:9px 14px;font-size:13px;margin-top:0}
+    .kv{display:flex;justify-content:space-between;gap:10px;padding:8px 0;
+      border-bottom:1px solid #f2ece0;font-size:13.5px}
+    .kv:last-child{border-bottom:none}
+    .kv span{color:#6b6255;flex:none}
+    details{border:1px solid #ece4d6;border-radius:12px;background:#fff;margin-bottom:11px;
+      overflow:hidden}
+    details>summary{list-style:none;cursor:pointer;padding:13px 15px;font-size:14px;font-weight:650;
+      min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+    details>summary::-webkit-details-marker{display:none}
+    details>summary::after{content:'+';font-family:ui-monospace,monospace;color:#9a8f7d;font-size:17px}
+    details[open]>summary::after{content:'\2212'}
+    details .inner{padding:0 15px 15px}
+    .lvl{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px}
+    .lvl b{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;font-weight:700;
+      padding:5px 9px;border-radius:99px;background:#f2ece0;color:#6b6255}
+    .foot{font-size:11.5px;line-height:1.6;color:#9a8f7d;padding:14px 2px 0;border-top:1px solid #ece4d6;
+      margin-top:16px;overflow-wrap:anywhere}
+    @media (min-width:560px){ .row2{grid-template-columns:1fr 1fr} }
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee" aria-label="Back to my workspace">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>Workspace
+  </a>
+  <strong>Learning</strong>
+  <span>{viewer.fullName || (user as any).name}</span>
+</nav>
+
+<nav class="tabs" aria-label="Learning views">
+  {VIEWS.map((v) => (
+    <a class="tab" href={hrefFor(v.key)} aria-current={v.key === view ? 'page' : null}>{v.label}</a>
+  ))}
+</nav>
+
+<main class="wrap">
+  {msg && <p class="flash">{msg}</p>}
+
+  {!viewer.employeeId && (
+    <div class="empty">
+      <b>There is no employee record on this account</b>
+      <p class="muted">A learning path, a skill record and a training sign-up are all attached to an
+        employee record, and this account does not have one. The course catalogue is still open to
+        you at <a href="/portal/courses">/portal/courses</a>.</p>
+    </div>
+  )}
+
+  {/* -------------------------------------------------------------------- PATH */}
+  {view === 'path' && viewer.employeeId && (
+    <>
+      {path.length === 0 && (
+        <div class="empty">
+          <b>Nothing has been assigned to you</b>
+          <p class="muted">Courses are assigned by your manager or by the people team. You can start
+            anything in the catalogue on your own at any time —
+            <a href="/portal/courses"> browse the catalogue</a>.</p>
+        </div>
+      )}
+
+      {required.length > 0 && (
+        <div class="card">
+          <h3>Required</h3>
+          <p class="muted">These were assigned as required. Everything else is yours to pace.</p>
+        </div>
+      )}
+
+      {required.concat(optional).map((i) => (
+        <div class="item">
+          <div class="item__top">
+            <div class="item__t">{i.courseTitle}</div>
+            <span class={'pill ' + (i.state === 'complete' ? 'done' : i.overdue ? 'late' : '')}>
+              {i.overdue && i.state !== 'complete' ? 'Overdue' : STATE_LABELS[i.state]}
+            </span>
+          </div>
+          <div class="bar"><i style={'width:' + Math.max(0, Math.min(100, Math.round(i.progressPct || 0))) + '%'}></i></div>
+          <p class="muted">
+            {i.progressPct === null ? 'Not opened yet' : Math.round(i.progressPct) + '% done'}
+            {i.dueOn ? ' · due ' + fmtDate(i.dueOn) : ''}
+            {i.required ? ' · required' : ''}
+          </p>
+          {i.reason && <p class="muted" style="margin-top:5px">Why: {i.reason}</p>}
+          {i.courseSlug
+            ? <a href={'/portal/courses/' + i.courseSlug}>Open the course</a>
+            : <p class="muted" style="margin-top:6px">This course is no longer published, so there is
+                nothing to open. Ask whoever assigned it.</p>}
+        </div>
+      ))}
+
+      <div class="card">
+        <h3>Certificates you have earned</h3>
+        {certificates.length === 0
+          ? <p class="muted">None yet. Completing a course here issues one against your account.
+              EduRankAI is the technology platform — accredited partners award formal credentials, and
+              a course certificate records what you completed here.</p>
+          : certificates.map((c) => (
+            <div class="kv">
+              <span>{fmtDate(c.issuedAt)}</span>
+              <b>{c.courseTitle}{c.grade ? ' — ' + c.grade : ''}</b>
+            </div>
+          ))}
+      </div>
+
+      {(viewer.reportIds.length > 0 || canAssignOrg) && courses.length > 0 && (
+        <details>
+          <summary>Assign a course</summary>
+          <div class="inner">
+            <form method="post">
+              <input type="hidden" name="action" value="assign" />
+              <input type="hidden" name="view" value="path" />
+              <label for="a-who">Who it is for</label>
+              <select id="a-who" name="employee_id" required>
+                <option value="">Choose someone</option>
+                {viewer.reports.map((p) => (
+                  <option value={String(p.employeeId)}>{p.fullName || 'Unnamed record'}</option>
+                ))}
+              </select>
+              {viewer.reports.length === 0 && (
+                <p class="muted" style="margin-top:6px">
+                  {viewer.initialized
+                    ? 'Nobody is recorded as reporting to you in the Organization Graph, so there is nobody to assign to from here.'
+                    : 'The Organization Graph has not been set up yet, so no reporting line can be resolved and there is nobody to list.'}
+                </p>
+              )}
+              <label for="a-course">Course</label>
+              <select id="a-course" name="course_id" required>
+                <option value="">Choose a course</option>
+                {courses.map((c) => <option value={c.id}>{c.title}</option>)}
+              </select>
+              <div class="row2">
+                <div>
+                  <label for="a-due">Due by</label>
+                  <input id="a-due" type="date" name="due_on" />
+                </div>
+                <div>
+                  <label for="a-req">Required</label>
+                  <select id="a-req" name="required">
+                    <option value="0">Recommended</option>
+                    <option value="1">Required</option>
+                  </select>
+                </div>
+              </div>
+              <label for="a-why">Why</label>
+              <textarea id="a-why" name="reason" maxlength="1000"
+                placeholder="Optional. What this is for"></textarea>
+              <button class="btn" type="submit">Assign</button>
+            </form>
+          </div>
+        </details>
+      )}
+
+      {teamPath.length > 0 && (
+        <div class="card">
+          <h3>Your team's learning</h3>
+          {teamPath.map((i) => (
+            <div class="kv">
+              <span>{i.employeeName || 'A colleague'}</span>
+              <b>{i.courseTitle} · {i.state === 'complete' ? 'complete' : Math.round(i.progressPct || 0) + '%'}</b>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  )}
+
+  {/* ------------------------------------------------------------------ SKILLS */}
+  {view === 'skills' && viewer.employeeId && (
+    <>
+      <div class="card">
+        <h3>What the levels mean</h3>
+        {SKILL_LEVELS.map((l) => (
+          <div class="kv"><span>{l.level} · {l.label}</span><b style="font-weight:400;font-size:12.5px;text-align:right">{l.hint}</b></div>
+        ))}
+      </div>
+
+      {catalogue.length === 0 && (
+        <div class="empty">
+          <b>The skill catalogue is empty</b>
+          <p class="muted">Skills are added by the people team before anybody can record a level
+            against one. There is nothing to record yet.</p>
+        </div>
+      )}
+
+      {mySkills.length > 0 && (
+        <div class="card">
+          <h3>Your skills</h3>
+          {mySkills.map((s) => (
+            <div style="border-bottom:1px solid #f2ece0;padding:10px 0">
+              <div class="kv" style="border:none;padding:0">
+                <span>{s.category}</span>
+                <b>{s.skillName}</b>
+              </div>
+              <div class="lvl">
+                <b>Level {s.level} · {s.levelLabel}</b>
+                <b>{SKILL_SOURCE_LABELS[s.source] || s.source}</b>
+              </div>
+              {s.evidence && <p class="muted" style="margin-top:6px">{s.evidence}</p>}
+              {s.evidenceUrl && <p class="muted" style="margin-top:4px"><a href={s.evidenceUrl} rel="noopener noreferrer" target="_blank">Evidence link</a></p>}
+              <form method="post" style="margin-top:7px">
+                <input type="hidden" name="action" value="remove_skill" />
+                <input type="hidden" name="view" value="skills" />
+                <input type="hidden" name="employee_skill_id" value={s.id} />
+                <button class="btn ghost slim" type="submit">Remove</button>
+              </form>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {unrecorded.length > 0 && (
+        <div class="card">
+          <h3>Record a skill</h3>
+          <form method="post">
+            <input type="hidden" name="action" value="set_skill" />
+            <input type="hidden" name="view" value="skills" />
+            <input type="hidden" name="employee_id" value={viewer.employeeId} />
+            <label for="s-skill">Skill</label>
+            <select id="s-skill" name="skill_id" required>
+              <option value="">Choose a skill</option>
+              {unrecorded.map((s) => <option value={s.id}>{s.name} — {s.category}</option>)}
+            </select>
+            <label for="s-level">Level</label>
+            <select id="s-level" name="level" required>
+              {SKILL_LEVELS.map((l) => <option value={l.level}>{l.level} · {l.label}</option>)}
+            </select>
+            <label for="s-ev">Evidence</label>
+            <textarea id="s-ev" name="evidence" maxlength="2000"
+              placeholder="What you did that shows this"></textarea>
+            <label for="s-url">Evidence link</label>
+            <input id="s-url" name="evidence_url" maxlength="500" placeholder="https://" />
+            <p class="muted" style="margin-top:8px">A level you record yourself is marked as your own
+              claim. A manager or the people team can assess it separately.</p>
+            <button class="btn" type="submit">Record skill</button>
+          </form>
+        </div>
+      )}
+
+      {canManageSkills && (
+        <p class="muted">You hold organization-wide skill authority. The catalogue and the department
+          matrix are at <a href="/admin/hr/performance/skills">/admin/hr/performance/skills</a>.</p>
+      )}
+    </>
+  )}
+
+  {/* ---------------------------------------------------------------- CALENDAR */}
+  {view === 'calendar' && (
+    <>
+      {events.length === 0 && (
+        <div class="empty">
+          <b>Nothing is scheduled</b>
+          <p class="muted">Training sessions appear here once the people team schedules them. This is
+            a training calendar only — it is not a general staff calendar, and there is no shift or
+            roster data behind it.</p>
+        </div>
+      )}
+
+      {events.map((ev) => (
+        <div class="item">
+          <div class="item__top">
+            <div class="item__t">{ev.title}</div>
+            <span class={'pill ' + (ev.iAmGoing ? 'done' : '')}>{ev.iAmGoing ? 'Going' : TRAINING_MODE_LABELS[ev.mode] || ev.mode}</span>
+          </div>
+          <p class="muted" style="margin-top:5px">
+            {fmtWhen(ev.startsAt)}{ev.endsAt ? ' to ' + fmtWhen(ev.endsAt) : ''}
+            {ev.location ? ' · ' + ev.location : ''}
+          </p>
+          {ev.description && <p class="muted" style="margin-top:5px">{ev.description}</p>}
+          {ev.courseTitle && <p class="muted" style="margin-top:5px">Course: {ev.courseTitle}</p>}
+          <p class="muted" style="margin-top:5px">
+            {ev.signups} signed up{ev.capacity ? ' of ' + ev.capacity + ' places' : ''}
+            {ev.departmentName ? ' · ' + ev.departmentName : ''}
+          </p>
+          {viewer.employeeId && (
+            <form method="post" style="margin-top:8px">
+              <input type="hidden" name="action" value="signup" />
+              <input type="hidden" name="view" value="calendar" />
+              <input type="hidden" name="event_id" value={ev.id} />
+              <input type="hidden" name="going" value={ev.iAmGoing ? '0' : '1'} />
+              <button class={'btn slim' + (ev.iAmGoing ? ' ghost' : '')} type="submit">
+                {ev.iAmGoing ? 'Withdraw' : 'Sign up'}
+              </button>
+            </form>
+          )}
+        </div>
+      ))}
+    </>
+  )}
+
+  <p class="foot">
+    Courses, progress and certificates come from the existing course engine — this page links into it
+    rather than keeping a second copy. Who may assign learning to whom is resolved from the
+    Organization Graph, one relationship at a time.
+  </p>
+</main>
+</body>
+</html>

@@ -1,24 +1,23 @@
+// GET /admin/api/chat/users — RETIRED READ.
+//
+// This returned every active non-applicant account's name, email and internal handle to any caller
+// that passed `if (!user)` — one line weaker than the page it served, which the middleware gates on
+// the `discussion` section. Its only two callers were the "new channel" and "new direct message"
+// pickers in /admin/chat; both are gone with the channel writes, so a staff directory dump would be
+// left standing behind no feature at all.
+//
+// The gate is still applied before the refusal: an unauthorised caller gets 403, not a hint.
 import type { APIRoute } from 'astro';
-import { db } from '@/lib/db';
-import { users } from '@/lib/db/schema';
-import { sql, asc } from 'drizzle-orm';
+import { denyAdminApi } from '@/lib/auth/api-guard';
+import { chatArchivedResponse } from '@/lib/chat-schema';
 
 export const GET: APIRoute = async ({ locals }) => {
-  const user = (locals as any).user;
-  if (!user) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
-  if (user.role === 'applicant') return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 });
-
-  const list = await db.select({
-    id: users.id,
-    name: users.name,
-    email: users.email,
-    internalHandle: users.internalHandle,
-    role: users.role
-  }).from(users)
-    .where(sql`${users.role} <> 'applicant' AND ${users.isActive} = true`)
-    .orderBy(asc(users.name));
-
-  return new Response(JSON.stringify({ users: list }), {
-    headers: { 'Content-Type': 'application/json' }
+  const denied = await denyAdminApi(locals, {
+    section: 'discussion',
+    action: 'view',
+    label: 'admin.api.chat.users',
   });
+  if (denied) return denied;
+
+  return chatArchivedResponse('The Discussion member picker');
 };

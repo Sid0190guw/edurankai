@@ -1,0 +1,342 @@
+---
+// /admin/helpdesk — THE QUEUE. Every ticket on every desk, for the people who answer them.
+//
+// THE GATE. Two questions, and the wider of them is the SECTION, which is what the sidebar entry in
+// src/lib/admin-nav.ts is gated on too — so the menu and the lock cannot disagree. `helpdesk.manage`
+// is the capability form of the same authority, held by super_admin and hr, and it is what a custom
+// role can be granted directly. Either admits; neither is derived from a role name.
+//
+// OPENING THE QUEUE IS NOT DECIDING ANYTHING. Every write below is re-checked where it binds, on the
+// posted id and not on the rendered one: assignTicket, transitionTicket and replyToTicket each
+// re-resolve who this actor is against THAT ticket. A page gate is a door, not a lock.
+//
+// ROUTING COMES FROM THE ORGANIZATION GRAPH AND NOWHERE ELSE. "Route it again" asks
+// resolveDeskRoute(), which reads an approval_owner edge scoped to 'helpdesk.<category>'. Until the
+// founder runs db/org-graph-backfill.sql the graph is empty, every ticket stays `open` carrying the
+// initialization sentence, and this page says so rather than quietly handing tickets to whoever
+// holds the capability — which would be routing decided by authorization.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { holdsCapability } from '@/lib/auth/capability';
+import { isInitialized } from '@/lib/org-graph';
+import {
+  listTickets, getTicket, ticketThread, ticketApproval, ticketCounts, ticketSla, formatMinutes,
+  assignTicket, transitionTicket, replyToTicket, canTransition, resolveDeskRoute,
+  TICKET_CATEGORIES, TICKET_STATUSES, categoryLabel, statusLabel, priorityLabel,
+  type Ticket,
+} from '@/lib/helpdesk';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const bySection = await canAccessSection(user as any, 'helpdesk', 'view');
+const byCapability = holdsCapability(user as any, 'helpdesk.manage');
+if (!bySection && !byCapability) return Astro.redirect('/admin');
+
+// ---------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted; a const declared under the POST handler that reads it
+// throws on that handler's first line, which took down apply step 5 and the /admin/roles/diagnose
+// Repair button on this project while both reported success.
+// ---------------------------------------------------------------------------------------------
+const PAGE = '/admin/helpdesk';
+
+/** How many open tickets get a live route preview. Each preview is a handful of graph queries; a
+ *  backlog of two hundred must not turn one page load into six hundred round trips. */
+const PREVIEW_LIMIT = 8;
+
+const fmt = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+const fmtTime = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+};
+
+function statusColour(s: string): string {
+  const k = String(s || '');
+  if (k === 'open') return '#b45309';
+  if (k === 'assigned') return '#1d4ed8';
+  if (k === 'in_progress') return '#7c3aed';
+  if (k === 'resolved') return '#047857';
+  return '#6b7280';
+}
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const id = String(fd.get('id') || '');
+  let flash = '';
+  let ok = true;
+
+  if (action === 'route') {
+    const r = await assignTicket(id, user as any, {});
+    ok = r.ok;
+    flash = r.ok ? 'Routed from the organization graph.' : (r.error || r.routeNote || 'Could not route that.');
+  } else if (action === 'assign') {
+    const r = await assignTicket(id, user as any, { employeeId: String(fd.get('employee_id') || '') });
+    ok = r.ok;
+    flash = r.ok ? 'Assigned.' : (r.error || 'Could not assign that.');
+  } else if (action === 'transition') {
+    const r = await transitionTicket(id, user as any, String(fd.get('to') || ''), String(fd.get('note') || ''));
+    ok = r.ok;
+    flash = r.ok ? 'Updated.' : (r.error || 'Could not do that.');
+  } else if (action === 'reply') {
+    const r = await replyToTicket(id, user as any, String(fd.get('body') || ''));
+    ok = r.ok;
+    flash = r.ok ? 'Reply sent.' : (r.error || 'Could not send that.');
+  }
+
+  const back = id ? PAGE + '?t=' + id : PAGE;
+  return Astro.redirect(back + (back.indexOf('?') >= 0 ? '&' : '?') + 'msg=' + encodeURIComponent(flash) + '&ok=' + (ok ? '1' : '0'));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const msgOk = url.searchParams.get('ok') !== '0';
+const openId = url.searchParams.get('t') || '';
+const statusFilter = url.searchParams.get('status') || '';
+const categoryFilter = url.searchParams.get('category') || '';
+
+const graphReady = await isInitialized();
+const counts = await ticketCounts();
+const queue: Ticket[] = await listTickets({
+  status: statusFilter || null,
+  category: categoryFilter || null,
+  openOnly: !statusFilter,
+  limit: 120,
+});
+
+// A live route preview for the unassigned tickets at the top of the queue, so "why is this not on
+// anybody's desk" has an answer on the same screen as the problem.
+const previews: { id: string; note: string }[] = [];
+let previewed = 0;
+for (const t of queue) {
+  if (previewed >= PREVIEW_LIMIT) break;
+  if (t.assigneeEmployeeId) continue;
+  const r = await resolveDeskRoute(t.category, t.requesterEmployeeId);
+  previews.push({ id: t.id, note: r.ok ? 'Would go to ' + (r.fullName || 'the recorded owner') : (r.routeNote || 'no owner resolved') });
+  previewed++;
+}
+function previewFor(id: string): string {
+  for (const p of previews) if (p.id === id) return p.note;
+  return '';
+}
+
+let open: Ticket | null = null;
+let openThread: any[] = [];
+let openApproval: any = null;
+let openSla: any = null;
+let openMoves: string[] = [];
+if (openId) {
+  open = await getTicket(openId);
+  if (open) {
+    openThread = await ticketThread(open.id);
+    openSla = ticketSla(open);
+    if (open.category === 'asset_request') openApproval = await ticketApproval(open.id);
+    for (const s of TICKET_STATUSES) {
+      if (canTransition(open.status, s).ok) openMoves.push(s);
+    }
+  }
+}
+---
+<AdminLayout title="Helpdesk" activeNav="helpdesk">
+  <div style="max-width:900px;">
+    <h1 style="font-family:'Fraunces',serif;font-size:24px;font-weight:600;margin-bottom:6px;">Helpdesk</h1>
+    <p style="font-size:13.5px;color:#6b6255;line-height:1.6;margin-bottom:16px;">
+      Every ticket raised by an employee, on every desk. Tickets are routed from the Organization Graph —
+      an approval owner recorded against each desk — and never from a role name.
+    </p>
+
+    {msg && (
+      <div style={'border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:14px;line-height:1.5;' + (msgOk
+        ? 'background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;'
+        : 'background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:#991b1b;')}>{msg}</div>
+    )}
+
+    {!graphReady && (
+      <div style="background:#fdf6ec;border:1px solid #f0e0c6;border-radius:12px;padding:13px 15px;font-size:13px;line-height:1.6;color:#7a5a2e;margin-bottom:16px;">
+        <strong>Organization Graph not yet initialized.</strong> No desk owner can be resolved until it is,
+        so new tickets stay open and unassigned rather than being handed to whoever holds a permission.
+        Assigning a named person by hand works now and is recorded as such.
+      </div>
+    )}
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+      <div style="flex:1 1 120px;background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 13px;">
+        <div style="font-family:'Fraunces',serif;font-size:22px;font-weight:600;">{counts.open}</div>
+        <div style="font-size:11.5px;color:#9a8f7d;">Open</div>
+      </div>
+      <div style="flex:1 1 120px;background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 13px;">
+        <div style="font-family:'Fraunces',serif;font-size:22px;font-weight:600;">{counts.assigned}</div>
+        <div style="font-size:11.5px;color:#9a8f7d;">Assigned</div>
+      </div>
+      <div style="flex:1 1 120px;background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 13px;">
+        <div style="font-family:'Fraunces',serif;font-size:22px;font-weight:600;">{counts.inProgress}</div>
+        <div style="font-size:11.5px;color:#9a8f7d;">In progress</div>
+      </div>
+      <div style="flex:1 1 120px;background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 13px;">
+        <div style="font-family:'Fraunces',serif;font-size:22px;font-weight:600;">{counts.resolved}</div>
+        <div style="font-size:11.5px;color:#9a8f7d;">Resolved</div>
+      </div>
+    </div>
+
+    {!open && (
+      <div>
+        <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+          <select name="status" aria-label="Status" style="flex:1 1 160px;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#fff;">
+            <option value="">Everything not closed</option>
+            {TICKET_STATUSES.map((s) => (<option value={s} selected={s === statusFilter}>{statusLabel(s)}</option>))}
+          </select>
+          <select name="category" aria-label="Desk" style="flex:1 1 160px;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#fff;">
+            <option value="">Every desk</option>
+            {TICKET_CATEGORIES.map((c) => (<option value={c} selected={c === categoryFilter}>{categoryLabel(c)}</option>))}
+          </select>
+          <button style="flex:0 0 auto;min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 16px;font-size:14px;cursor:pointer;">Filter</button>
+        </form>
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:6px 16px;">
+          {queue.length === 0 && (
+            <p style="font-size:14px;line-height:1.6;padding:18px 0;">Nothing here. Either no tickets have been raised, or none match that filter.</p>
+          )}
+          {queue.map((t) => (
+            <div style="padding:13px 0;border-bottom:1px solid #f2ece0;">
+              <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+                <div style="min-width:0;">
+                  <a href={PAGE + '?t=' + t.id} style="font-weight:600;font-size:14.5px;color:#1a1510;text-decoration:none;word-break:break-word;">{t.subject}</a>
+                  <div style="font-size:11.5px;color:#9a8f7d;margin-top:3px;">
+                    {t.ref} · {categoryLabel(t.category)} · {priorityLabel(t.priority)} · {t.requesterName || 'unknown requester'} · raised {fmt(t.createdAt)}
+                  </div>
+                  <div style="font-size:11.5px;color:#9a8f7d;">
+                    {t.assigneeName ? 'On the desk of ' + t.assigneeName : (previewFor(t.id) || t.routeNote || 'Not assigned')}
+                  </div>
+                </div>
+                <span style={'font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:rgba(0,0,0,.05);color:' + statusColour(t.status) + ';'}>{statusLabel(t.status)}</span>
+              </div>
+              {!t.assigneeEmployeeId && (
+                <form method="POST" style="margin-top:8px;">
+                  <input type="hidden" name="action" value="route"/>
+                  <input type="hidden" name="id" value={t.id}/>
+                  <button style="min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:9px 14px;font-size:13.5px;cursor:pointer;">Route it from the graph</button>
+                </form>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
+
+    {openId && !open && (
+      <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;">
+        <p style="font-size:14px;">That ticket is not available.</p>
+        <p style="margin-top:10px;"><a href={PAGE} style="color:#c2410c;">Back to the queue</a></p>
+      </div>
+    )}
+
+    {open && (
+      <div>
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+          <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+            <div style="min-width:0;">
+              <div style="font-family:'Fraunces',serif;font-size:19px;font-weight:600;word-break:break-word;">{open.subject}</div>
+              <div style="font-size:11.5px;color:#9a8f7d;margin-top:4px;">
+                {open.ref} · {categoryLabel(open.category)} · {priorityLabel(open.priority)} priority · {open.requesterName || 'unknown requester'}
+              </div>
+              <div style="font-size:11.5px;color:#9a8f7d;">
+                {open.assigneeName ? 'On the desk of ' + open.assigneeName + (open.assignedVia ? ' (' + open.assignedVia + ')' : '') : (open.routeNote || 'Not assigned')}
+              </div>
+            </div>
+            <span style={'font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:rgba(0,0,0,.05);color:' + statusColour(open.status) + ';'}>{statusLabel(open.status)}</span>
+          </div>
+          <p style="font-size:14px;line-height:1.6;margin-top:12px;white-space:pre-wrap;">{open.body}</p>
+        </div>
+
+        {openApproval && (
+          <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+            <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:10px;">Approval</h2>
+            <p style="font-size:14px;">State: <strong>{openApproval.state}</strong></p>
+            {openApproval.haltReason && (<p style="font-size:12.5px;color:#9a8f7d;margin-top:6px;line-height:1.6;">Halted: {openApproval.haltReason}</p>)}
+            <p style="font-size:12.5px;color:#9a8f7d;margin-top:6px;line-height:1.6;">
+              An asset request cannot be resolved until this settles approved — the check runs at the write, not here.
+              The decision belongs to whoever the graph routed it to, and it is made on their own workspace.
+            </p>
+          </div>
+        )}
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+          <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:10px;">Timing</h2>
+          <div style="overflow-x:auto;">
+            <table style="border-collapse:collapse;font-size:13px;min-width:420px;">
+              <tbody>
+                <tr><td style="padding:5px 14px 5px 0;color:#9a8f7d;">Raised</td><td>{fmtTime(openSla.createdAt) || '—'}</td></tr>
+                <tr><td style="padding:5px 14px 5px 0;color:#9a8f7d;">First reply from the desk</td><td>{openSla.firstResponseAt ? fmtTime(openSla.firstResponseAt) + ' (' + formatMinutes(openSla.firstResponseMinutes) + ')' : 'not yet'}</td></tr>
+                <tr><td style="padding:5px 14px 5px 0;color:#9a8f7d;">Resolved</td><td>{openSla.resolvedAt ? fmtTime(openSla.resolvedAt) + ' (' + formatMinutes(openSla.resolutionMinutes) + ')' : 'not yet'}</td></tr>
+                <tr><td style="padding:5px 14px 5px 0;color:#9a8f7d;">Closed</td><td>{openSla.closedAt ? fmtTime(openSla.closedAt) : 'not yet'}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:12.5px;color:#9a8f7d;margin-top:8px;line-height:1.6;">
+            Recorded, not judged. No response target is configured anywhere in this product, so none is shown —
+            measuring people against a promise nobody made is worse than measuring nothing.
+          </p>
+        </div>
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+          <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:10px;">Conversation</h2>
+          {openThread.length === 0 && (<p style="font-size:14px;">Nothing said yet.</p>)}
+          {openThread.map((m: any) => (
+            <div style="padding:9px 0;border-bottom:1px solid #f2ece0;">
+              <div style="font-size:11.5px;color:#9a8f7d;">{m.sender_role === 'agent' || m.sender_role === 'admin' ? 'Helpdesk' : 'Requester'} · {fmtTime(m.created_at)}</div>
+              <div style="font-size:14px;line-height:1.55;white-space:pre-wrap;margin-top:3px;">{m.body}</div>
+            </div>
+          ))}
+          {open.status !== 'closed' && (
+            <form method="POST" style="margin-top:12px;">
+              <input type="hidden" name="action" value="reply"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <textarea name="body" rows="3" required placeholder="Reply to the person who raised this" style="width:100%;min-height:66px;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;background:#faf7f1;"></textarea>
+              <button style="margin-top:8px;min-height:44px;background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;font-size:14.5px;font-weight:600;cursor:pointer;">Send</button>
+              <p style="font-size:12.5px;color:#9a8f7d;margin-top:8px;">The first reply from the desk is what sets the first-response time. A requester adding more detail does not.</p>
+            </form>
+          )}
+        </div>
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+          <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:10px;">Move it</h2>
+          {openMoves.length === 0 && (<p style="font-size:14px;">{statusLabel(open.status)} is final. Nothing moves from here.</p>)}
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            {openMoves.map((s) => (
+              <form method="POST" style="flex:0 0 auto;">
+                <input type="hidden" name="action" value="transition"/>
+                <input type="hidden" name="id" value={open.id}/>
+                <input type="hidden" name="to" value={s}/>
+                <button style="min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 15px;font-size:13.5px;cursor:pointer;">{statusLabel(s)}</button>
+              </form>
+            ))}
+          </div>
+
+          <form method="POST" style="margin-top:14px;">
+            <input type="hidden" name="action" value="route"/>
+            <input type="hidden" name="id" value={open.id}/>
+            <button style="min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 15px;font-size:13.5px;cursor:pointer;">Route it from the graph</button>
+          </form>
+
+          <form method="POST" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+            <input type="hidden" name="action" value="assign"/>
+            <input type="hidden" name="id" value={open.id}/>
+            <input name="employee_id" placeholder="hr_employees id of a named assignee" style="flex:1 1 240px;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/>
+            <button style="flex:0 0 auto;min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 15px;font-size:13.5px;cursor:pointer;">Assign by name</button>
+          </form>
+          <p style="font-size:12.5px;color:#9a8f7d;margin-top:8px;line-height:1.6;">
+            Handing a ticket to a named person overrides routing, so it needs the helpdesk authority —
+            being the current assignee is not enough to give somebody else your work.
+          </p>
+        </div>
+
+        <p><a href={PAGE} style="color:#c2410c;">Back to the queue</a></p>
+      </div>
+    )}
+  </div>
+</AdminLayout>

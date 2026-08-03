@@ -131,6 +131,32 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   // middleware.ts already gates it on 'applications' by longest-prefix match — so anyone who can open
   // it by URL now sees the link too, instead of the menu disagreeing with the lock.
   { id: 'starters', label: 'Everyone who started', href: '/admin/applications/intents', icon: 'inbox', section: 'applications' },
+  // RECRUITMENT — the parts of hiring that sit AROUND the pipeline: who your people recommend, who
+  // you said no to and should call back, and what the interview panel actually thought.
+  //
+  // ALL GATED ON THE 'applications' SECTION, which tracks the capabilities the pages themselves ask
+  // for: /admin/recruitment and the talent pool ask can(applications.view), the feedback console asks
+  // can(applications.score), and the referral console additionally asks can(referrals.view) — granted
+  // to exactly the roles holding applications.view. So every account offered one of these links can
+  // open it, and nobody a page would refuse is shown one.
+  //
+  // WHY NOT A NEW `recruitment` SECTION KEY: it would create a checkbox in /admin/team/roles that
+  // nothing enforces, and — because a section nobody has been granted is a section nobody holds — it
+  // would hide these pages from every restricted admin on the day they shipped.
+  {
+    groupId: 'recruitment-group',
+    label: 'Recruitment',
+    icon: 'users',
+    children: [
+      { id: 'recruitment', label: 'Overview', href: '/admin/recruitment', icon: 'grid', section: 'applications' },
+      { id: 'recruitment-referrals', label: 'Referral programme', href: '/admin/recruitment/referrals', icon: 'users', section: 'applications' },
+      { id: 'recruitment-talent-pool', label: 'Talent pool', href: '/admin/recruitment/talent-pool', icon: 'inbox', section: 'applications' },
+      { id: 'recruitment-feedback', label: 'Interview feedback', href: '/admin/recruitment/feedback', icon: 'message-circle', section: 'applications' },
+      // BGV already existed at this URL and is one of the entries this module's header describes as
+      // missing from the layout's hand-maintained list — reachable only by typing the URL.
+      { id: 'recruitment-bgv', label: 'Background verification', href: '/admin/hr/bgv', icon: 'shield', section: 'hr' },
+    ],
+  },
   { id: 'help', label: 'Help Inbox', href: '/admin/help', icon: 'chat', section: 'messages' },
   { id: 'messages', label: 'DMs', href: '/admin/messages', icon: 'chat', section: 'dms' },
   { id: 'chat', label: 'Discussion', href: '/admin/chat', icon: 'message-circle', section: 'discussion' },
@@ -200,11 +226,37 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'hr-requisitions',label: 'Requisitions',    href: '/admin/hr/requisitions',          icon: 'document', section: 'hr' },
       { id: 'hr-bgv',         label: 'BGV (verification)', href: '/admin/hr/bgv',                icon: 'shield',   section: 'hr' },
       { id: 'hr-classification',label: 'Classification register', href: '/admin/hr/classification', icon: 'grid', section: 'hr' },
-      { id: 'hr-separations', label: 'Separations',     href: '/admin/hr/separations',           icon: 'inbox',    section: 'hr' },
+      // THE EMPLOYEE LIFECYCLE. Every one is an /admin/hr/* page, which middleware.ts already gates on
+      // the 'hr' section (longest-prefix match on '/admin/hr'), so mapping them to 'hr' RECORDS the
+      // gate the door already applies rather than inventing a second one. Each page asks the same
+      // question again in its own frontmatter, and every WRITE on them asks for `employee.manage` on
+      // top of it — opening a register is not changing what somebody is engaged as.
+      { id: 'hr-contracts',   label: 'Contracts',       href: '/admin/hr/contracts',             icon: 'document', section: 'hr' },
+      { id: 'hr-transfers',   label: 'Transfers',       href: '/admin/hr/transfers',             icon: 'users',    section: 'hr' },
+      { id: 'hr-promotions',  label: 'Promotions',      href: '/admin/hr/promotions',            icon: 'users',    section: 'hr' },
+      // /admin/hr/separations redirects here — one console over one hr_separations table.
+      { id: 'hr-separations', label: 'Separation and exit', href: '/admin/hr/separation',        icon: 'inbox',    section: 'hr' },
       { id: 'hr-leave',       label: 'Leave',           href: '/admin/hr/leave',                 icon: 'calendar', section: 'leave' },
       { id: 'hr-attendance',  label: 'Attendance',      href: '/admin/hr/attendance',            icon: 'calendar', section: 'attendance' },
       { id: 'hr-payroll',     label: 'Payroll',         href: '/admin/hr/payroll',               icon: 'document', section: 'payroll' },
       { id: 'hr-training',    label: 'Training',        href: '/admin/hr/training',              icon: 'book',     section: 'training' },
+      // PERFORMANCE AND LEARNING. Three /admin/hr/* pages, so middleware's longest-prefix match on
+      // '/admin/hr' already gates them on the 'hr' section — mapping them to 'hr' RECORDS the gate the
+      // door already applies rather than inventing a second one. Each page then asks for its OWN
+      // capability in its frontmatter (performance.manage / skills.manage / learning.assign), and
+      // refuses IN PLACE with a sentence rather than bouncing silently, so somebody who holds the
+      // console but not the desk is told what they are looking at instead of concluding it is broken.
+      //
+      // /admin/hr/performance — the older single-page console — is left exactly where it is. These
+      // are surfaces beside it, not a replacement for it.
+      { id: 'hr-perf-cycles', label: 'Appraisal cycles', href: '/admin/hr/performance/cycles',   icon: 'chart',    section: 'hr' },
+      { id: 'hr-skills',      label: 'Skills',          href: '/admin/hr/performance/skills',    icon: 'grid',     section: 'hr' },
+      { id: 'hr-learning',    label: 'Assigned learning', href: '/admin/hr/performance/learning', icon: 'book',    section: 'hr' },
+      // WORKPLACE SERVICES. New surfaces, new section keys - so nothing here is "newly mapped" from
+      // an older hand-written list: the page, the sidebar entry and the capability were written
+      // together and ask the same question. Only super_admin and `hr` hold these sections today.
+      { id: 'helpdesk',       label: 'Helpdesk',        href: '/admin/helpdesk',                 icon: 'chat',     section: 'helpdesk' },
+      { id: 'assets',         label: 'Asset register',  href: '/admin/assets',                   icon: 'package',  section: 'assets' },
       // NEWLY MAPPED (five). Support and applicant-facing queues follow the surface they belong to;
       // the employee-record ones follow 'hr'.
       { id: 'hr-support',     label: 'Application Support', href: '/admin/hr-support',           icon: 'message-circle', section: 'messages' },
@@ -215,6 +267,29 @@ export const ADMIN_NAV: AdminNavEntry[] = [
     ],
   },
   { id: 'finance', label: 'Finance', href: '/admin/finance', icon: 'package', section: 'finance' },
+  // PROCUREMENT. Gated on 'finance' — the same section each page accepts as one of its two arms, so
+  // the menu and the lock ask one question rather than two that can drift apart. Below super admin
+  // that is `hr` alone in ROLE_SECTIONS, which is exactly who holds `procurement.view` in
+  // PERMS_BY_ROLE, so the two arms admit the same accounts.
+  //
+  // NOT gated on the capability here, deliberately: buildAdminNav() resolves through the registry,
+  // where a CUSTOM role's finance grant spells `finance.edit` and never `procurement.view` — asking
+  // for the capability would hide the link from custom roles whose page gate admits them, which is
+  // the "menu disagrees with the lock" defect this module exists to remove.
+  //
+  // There is no PATH_SECTION entry for /admin/procurement in src/middleware.ts, and that is also
+  // deliberate: adding one would make the middleware the gate and would bounce anybody whose access
+  // comes from the capability arm rather than the section arm. Each page carries its own gate as its
+  // first await, above every read, and every write is re-checked where it binds.
+  {
+    groupId: 'procurement-group',
+    label: 'Procurement',
+    icon: 'package',
+    children: [
+      { id: 'procurement',         label: 'Purchase requests', href: '/admin/procurement',         icon: 'inbox', section: 'finance' },
+      { id: 'procurement-vendors', label: 'Vendors',           href: '/admin/procurement/vendors', icon: 'users', section: 'finance' },
+    ],
+  },
   // NEWLY MAPPED. Partnership records are commercial, not covered by any section; operator-only.
   { id: 'partnerships', label: 'Partnerships', href: '/admin/partnerships', icon: 'package', section: 'settings' },
   // NEWLY MAPPED. Account records — gated with Users, which no built-in role but super admin holds,

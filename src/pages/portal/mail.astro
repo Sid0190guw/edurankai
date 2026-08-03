@@ -1,7 +1,47 @@
 ---
+/**
+ * /portal/mail — THE SECOND MAILBOX. Now a READ-ONLY ARCHIVE, and a door to the real one.
+ *
+ * WHAT THIS PAGE IS. A mailbox built on portal_mail_threads / portal_mail_messages /
+ * portal_mail_thread_state / portal_mail_labels — a schema that exists nowhere else in the product.
+ * It has NO SMTP path and NO IMAP path: nothing in src/lib/mail-transport.ts ever reads these
+ * tables, /api/mail/inbound.ts never writes them, and its "send" is an INSERT plus a row in each
+ * recipient's thread state. So a message composed here NEVER LEFT THE BUILDING, and no external
+ * mail ever arrived in it. It looked like a working mailbox and could not be one.
+ *
+ * WHY IT EXISTED. The real mail system (own SMTP/IMAP, folders, groups, rules, templates, read
+ * receipts — src/lib/mail.ts + mail-transport.ts + mail-groups.ts + mail-advanced.ts) had exactly
+ * one UI mount, src/components/MailClient.astro at /admin/mail, and /api/mail/send gated on
+ * canOpenAdmin(). An employee could not reach any of it, so a parallel mailbox was grown for them.
+ * That is the defect, not the fix: two mail systems is one more than may exist.
+ *
+ * WHAT CHANGED, AND WHAT DELIBERATELY DID NOT. The real client is now mounted for employees at
+ * /portal/employee/mail and /api/mail/* authorises through src/lib/auth/mail-access.ts, so there is
+ * somewhere real to go. This page therefore:
+ *
+ *   - REDIRECTS to /portal/employee/mail when this person has nothing stored here. That is the
+ *     ordinary case, and it is what makes the "Mail" entry in the workspace navigation — which
+ *     still points at /portal/mail — land on the working mailbox for almost everybody.
+ *   - STAYS, READ-ONLY, when they DO have messages here. Live data may exist under this schema and
+ *     it is not this build's to delete or hide. Every message stays readable, starrable, movable
+ *     and labellable; only COMPOSE and REPLY are closed, because those two are the operations that
+ *     silently did nothing useful.
+ *   - REFUSES a send or a reply IN THE HANDLER, with a message on screen, not just by hiding the
+ *     button. A form can be re-posted; a hidden control is not a gate.
+ *
+ * NOTHING IS DROPPED AND NOTHING IS MIGRATED. Copying these rows into mail_messages/mail_box would
+ * be a data migration against live tables, which is the user's to run and not an agent's to
+ * improvise. The follow-up is recorded in the build report.
+ */
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+
+// Declared at the very top, above the POST handler that reads them: `const` is not hoisted, and a
+// handler reaching a later declaration has taken pages down on this project.
+const REAL_MAILBOX = '/portal/employee/mail';
+const CLOSED_MSG = 'This older mailbox no longer sends. Nothing composed here ever reached an address outside the organisation. Your working mailbox is at ' + REAL_MAILBOX + '.';
+const logFail = (tag: string, e: any) => console.error('[portal/mail] ' + tag, e?.cause?.message || e?.message);
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=/portal/mail');
@@ -71,93 +111,39 @@ try {
   console.error('[mail bootstrap]', e);
 }
 
+// --- Does this person have anything stored under the old schema? -------------------------------
+//
+// Asked BEFORE the POST handler and before every list query, because the answer decides whether
+// this page renders at all. Counting thread STATE rows is the right question: a thread exists for a
+// person only when they have a portal_mail_thread_state row for it, which is what every list below
+// joins on.
+//
+// A FAILED COUNT DOES NOT REDIRECT. "I could not read your archive" and "your archive is empty" are
+// different facts and must not collapse into one — sending somebody away on a failed read is how an
+// archive gets quietly orphaned. On failure the page renders with the notice below saying so.
+let legacyCount = 0;
+let legacyKnown = false;
+try {
+  const c = rows(await db.execute(sql`
+    SELECT COUNT(*)::int AS n FROM portal_mail_thread_state WHERE user_id = ${user.id}`))[0] as any;
+  legacyCount = Number(c?.n || 0);
+  legacyKnown = true;
+} catch (e: any) {
+  logFail('legacy count', e);
+}
+if (legacyKnown && legacyCount === 0) return Astro.redirect(REAL_MAILBOX);
+
 // --- POST handlers ---
 let okMsg = '', errMsg = '';
 if (Astro.request.method === 'POST') {
   try {
     const form = await Astro.request.formData();
     const action = String(form.get('action') || '');
-    if (action === 'send') {
-      const subject = String(form.get('subject') || '(no subject)').slice(0, 500);
-      const toRaw = String(form.get('to') || '').trim();
-      const ccRaw = String(form.get('cc') || '').trim();
-      const bccRaw = String(form.get('bcc') || '').trim();
-      const bodyHtml = String(form.get('body_html') || '');
-      const bodyText = String(form.get('body_text') || '');
-      const isEnc = String(form.get('is_encrypted') || '') === '1';
-      const cipher = String(form.get('ciphertext') || '');
-      const attachRaw = String(form.get('attachments') || '[]');
-      const toList = toRaw.split(/[,;\s]+/).filter(Boolean);
-      const ccList = ccRaw.split(/[,;\s]+/).filter(Boolean);
-      const bccList = bccRaw.split(/[,;\s]+/).filter(Boolean);
-      if (!toList.length) { errMsg = 'Need at least one recipient'; }
-      else {
-        const snippet = bodyText.slice(0, 180);
-        const participants = JSON.stringify([user.email, ...toList, ...ccList, ...bccList]);
-        const labels = JSON.stringify([]);
-        const tr = await db.execute(sql`
-          INSERT INTO portal_mail_threads (subject, snippet, participants, last_message_at, has_attachments, labels)
-          VALUES (${subject}, ${snippet}, ${participants}::jsonb, NOW(), ${attachRaw !== '[]'}, ${labels}::jsonb)
-          RETURNING id
-        `);
-        const threadId = rows(tr)[0]?.id;
-        await db.execute(sql`
-          INSERT INTO portal_mail_messages
-            (thread_id, from_user_id, from_email, to_emails, cc_emails, body_html, body_text, attachments, is_encrypted, ciphertext)
-          VALUES
-            (${threadId}, ${user.id}, ${user.email},
-             ${JSON.stringify(toList)}::jsonb, ${JSON.stringify(ccList)}::jsonb,
-             ${isEnc ? '' : bodyHtml}, ${isEnc ? '' : bodyText},
-             ${attachRaw}::jsonb, ${isEnc}, ${isEnc ? cipher : null})
-        `);
-        // sender's state -> sent
-        await db.execute(sql`
-          INSERT INTO portal_mail_thread_state (user_id, thread_id, is_read, folder)
-          VALUES (${user.id}, ${threadId}, true, 'sent')
-          ON CONFLICT (user_id, thread_id) DO UPDATE SET folder = 'sent', is_read = true
-        `);
-        // for each recipient that exists in system, drop in inbox
-        for (const em of [...toList, ...ccList, ...bccList]) {
-          try {
-            const u = await db.execute(sql`SELECT id FROM users WHERE LOWER(email) = LOWER(${em}) LIMIT 1`);
-            const uid = rows(u)[0]?.id;
-            if (uid) {
-              await db.execute(sql`
-                INSERT INTO portal_mail_thread_state (user_id, thread_id, is_read, folder)
-                VALUES (${uid}, ${threadId}, false, 'inbox')
-                ON CONFLICT (user_id, thread_id) DO NOTHING
-              `);
-            }
-          } catch (_) { /* user table shape may differ */ }
-        }
-        okMsg = 'Sent';
-      }
-    } else if (action === 'reply') {
-      const threadId = String(form.get('thread_id') || '');
-      const bodyHtml = String(form.get('body_html') || '');
-      const bodyText = String(form.get('body_text') || '');
-      const isEnc = String(form.get('is_encrypted') || '') === '1';
-      const cipher = String(form.get('ciphertext') || '');
-      if (threadId && bodyText) {
-        const tr = await db.execute(sql`SELECT participants FROM portal_mail_threads WHERE id = ${threadId}::uuid LIMIT 1`);
-        const t = rows(tr)[0];
-        const others = (t?.participants || []).filter((p: string) => p !== user.email);
-        const toJ = JSON.stringify(others);
-        await db.execute(sql`
-          INSERT INTO portal_mail_messages
-            (thread_id, from_user_id, from_email, to_emails, body_html, body_text, is_encrypted, ciphertext)
-          VALUES
-            (${threadId}::uuid, ${user.id}, ${user.email}, ${toJ}::jsonb,
-             ${isEnc ? '' : bodyHtml}, ${isEnc ? '' : bodyText},
-             ${isEnc}, ${isEnc ? cipher : null})
-        `);
-        await db.execute(sql`
-          UPDATE portal_mail_threads
-            SET last_message_at = NOW(), snippet = ${bodyText.slice(0, 180)}
-            WHERE id = ${threadId}::uuid
-        `);
-        okMsg = 'Reply sent';
-      }
+    // THE ARCHIVE DOES NOT SEND. Refused here rather than only in the markup: hiding a form is not
+    // a gate, and this branch is what a re-posted or scripted request meets. The refusal is SHOWN —
+    // a send that reports success and goes nowhere is exactly what this page used to do.
+    if (action === 'send' || action === 'reply') {
+      errMsg = CLOSED_MSG;
     } else if (action === 'toggle_star') {
       const threadId = String(form.get('thread_id') || '');
       await db.execute(sql`
@@ -311,8 +297,6 @@ const threadIdList = threads.map((t: any) => t.id);
   .mail-side { background: #0d0e13; border-right: 1px solid #2a2a35; padding: 14px 10px; overflow-y: auto; }
   .mail-center { background: #0a0a0c; border-right: 1px solid #2a2a35; overflow-y: auto; }
   .mail-right { background: #0a0a0c; overflow-y: auto; display: flex; flex-direction: column; }
-  .compose-btn { width: 100%; background: linear-gradient(135deg, #a78bfa, #67e8f9); color: #0a0a0c; border: none; padding: 12px; border-radius: 10px; font-family: 'Geist Mono', monospace; font-size: 13px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; letter-spacing: 0.5px; }
-  .compose-btn:hover { filter: brightness(1.1); }
   .folder-list { margin-top: 16px; display: flex; flex-direction: column; gap: 2px; }
   .folder-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; color: #c7c7d2; font-family: 'Geist Mono', monospace; font-size: 12px; text-decoration: none; cursor: pointer; }
   .folder-row:hover { background: #14161e; }
@@ -387,8 +371,6 @@ const threadIdList = threads.map((t: any) => t.id);
   .field { display: flex; gap: 10px; align-items: center; border-bottom: 1px solid #1f1f2a; padding: 8px 0; }
   .field label { color: #6b6b7d; font-family: 'Geist Mono', monospace; font-size: 11px; width: 50px; }
   .field input { flex: 1; background: transparent; border: none; color: #e8e8ee; outline: none; font-family: 'Geist Mono', monospace; font-size: 12px; }
-  .compose-editor { min-height: 200px; padding: 12px 0; color: #e8e8ee; font-family: 'Cormorant Garamond', serif; font-size: 15px; outline: none; line-height: 1.6; }
-  .compose-editor:empty:before { content: 'Compose your message...'; color: #4a4a5a; }
   .modal-foot { padding: 12px 18px; border-top: 1px solid #2a2a35; display: flex; gap: 10px; align-items: center; }
   .toast { position: fixed; bottom: 20px; right: 20px; background: #1a1d29; border: 1px solid #67e8f9; color: #67e8f9; padding: 10px 16px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 12px; z-index: 200; }
   .toast.err { border-color: #f87171; color: #f87171; }
@@ -398,14 +380,46 @@ const threadIdList = threads.map((t: any) => t.id);
   .snooze-pop.show { display: block; }
   .snooze-pop button { display: block; width: 100%; background: none; border: none; color: #c7c7d2; text-align: left; padding: 6px 10px; font-family: 'Geist Mono', monospace; font-size: 11px; cursor: pointer; border-radius: 4px; }
   .snooze-pop button:hover { background: #1a1d29; color: #67e8f9; }
+
+  /* The archive banner. First thing on the page at every width, and it names the working mailbox
+     rather than hinting at it. 44px minimum on the link because most readers are on a phone. */
+  .arch-note { background: rgba(251,191,36,0.10); border-bottom: 1px solid rgba(251,191,36,0.28); color: #fbbf24; padding: 10px 14px; font-family: 'Geist Mono', monospace; font-size: 11.5px; line-height: 1.55; display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+  .arch-note strong { color: #fde68a; font-weight: 700; }
+  .arch-go { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 14px; border-radius: 8px; background: #fbbf24; color: #0a0a0c; text-decoration: none; font-weight: 700; white-space: nowrap; }
+  .arch-fail { background: rgba(220,38,38,0.12); border-bottom-color: rgba(220,38,38,0.30); color: #fca5a5; }
+  .arch-closed { margin: 0 0 10px; color: #9aa6b6; font-family: 'Geist Mono', monospace; font-size: 11.5px; line-height: 1.6; }
+
+  /* THIS PAGE HAD NO MEDIA QUERY AT ALL. Three fixed columns totalling 620px meant a phone scrolled
+     the whole page sideways — and around nine in ten readers here are on a phone. Stacking is the
+     minimum this archive needs to be readable; it is not a redesign, and the real client at
+     /portal/employee/mail was built responsive from the start. */
+  @media (max-width: 900px) {
+    .mail-shell { grid-template-columns: 1fr; height: auto; overflow: visible; }
+    .mail-side, .mail-center, .mail-right { border-right: none; border-bottom: 1px solid #2a2a35; overflow-y: visible; }
+    .mail-side { display: flex; flex-wrap: wrap; gap: 6px; }
+    .folder-list { flex-direction: row; flex-wrap: wrap; margin-top: 0; }
+    .kbd-help { display: none; }
+    .arch-note { font-size: 11px; }
+  }
 </style>
+
+{/* legacyKnown is false only when the count query itself did not run. Saying so is the point: the
+    page cannot claim this is a complete archive over a read it could not make. */}
+<div class={'arch-note' + (legacyKnown ? '' : ' arch-fail')}>
+  <span>
+    {legacyKnown
+      ? 'This is an ARCHIVE of an older internal mailbox. Nothing sent here ever reached an address outside the organisation, so it no longer sends. Everything below stays readable.'
+      : 'We could not check this archive just now, so what is below may be incomplete. Nothing has been deleted.'}
+    <strong> Your working mailbox is Mail.</strong>
+  </span>
+  <a class="arch-go" href={REAL_MAILBOX}>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/></svg>
+    Open your mailbox
+  </a>
+</div>
 
 <div class="mail-shell">
   <aside class="mail-side">
-    <button class="compose-btn" id="composeBtn">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
-      COMPOSE
-    </button>
     <div class="folder-list">
       {folders.map(f => {
         const c = counts[f.key] || { unread: 0, total: 0 };
@@ -503,7 +517,7 @@ const threadIdList = threads.map((t: any) => t.id);
       <div class="empty" style="margin: auto;">
         <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
         <div style="font-size: 18px; margin-bottom: 4px;">Select a conversation</div>
-        <div style="font-size: 12px; font-family: 'Geist Mono', monospace;">or press <kbd style="background: #11131a; padding: 1px 5px; border-radius: 3px;">C</kbd> to compose</div>
+        <div style="font-size: 12px; font-family: 'Geist Mono', monospace;">This archive is read-only. New mail is at <a href={REAL_MAILBOX} style="color: #67e8f9;">your mailbox</a>.</div>
       </div>
     )}
 
@@ -576,80 +590,22 @@ const threadIdList = threads.map((t: any) => t.id);
           })}
         </div>
 
+        {/* THE REPLY COMPOSER IS GONE, NOT DISABLED. It posted `action=reply`, which the handler
+            above now refuses; leaving a greyed-out editor on screen would invite somebody to write
+            a reply nobody will ever receive. Replying happens in the real mailbox. */}
         <div class="reply-box">
-          <form method="post" id="replyForm">
-            <input type="hidden" name="action" value="reply" />
-            <input type="hidden" name="thread_id" value={openThread.id} />
-            <input type="hidden" name="body_html" id="replyBodyHtml" />
-            <input type="hidden" name="body_text" id="replyBodyText" />
-            <input type="hidden" name="is_encrypted" id="replyIsEnc" value="0" />
-            <input type="hidden" name="ciphertext" id="replyCipher" />
-            <div class="reply-toolbar">
-              <button class="tb-btn" type="button" data-cmd="bold"><b>B</b></button>
-              <button class="tb-btn" type="button" data-cmd="italic"><i>I</i></button>
-              <button class="tb-btn" type="button" data-cmd="underline"><u>U</u></button>
-              <button class="tb-btn" type="button" data-cmd="link">link</button>
-              <button class="tb-btn" type="button" data-cmd="ul">list</button>
-              <button class="tb-btn" type="button" data-cmd="code">code</button>
-              <button class="tb-btn" type="button" data-cmd="quote">quote</button>
-            </div>
-            <div class="reply-editor" id="replyEditor" contenteditable="true"></div>
-            <div class="reply-actions">
-              <button class="send-btn" type="submit">Send Reply</button>
-              <label class="enc-toggle"><input type="checkbox" id="replyEncToggle" /> encrypt</label>
-            </div>
-          </form>
+          <p class="arch-closed">
+            Replies are closed on this archive. Nothing written here ever reached an address outside
+            the organisation.
+          </p>
+          <a class="arch-go" href={REAL_MAILBOX}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/></svg>
+            Reply from your mailbox
+          </a>
         </div>
       </>
     )}
   </section>
-</div>
-
-<div class="modal-back" id="composeModal">
-  <div class="modal">
-    <div class="modal-head">
-      <h2>New message</h2>
-      <button class="icon-btn" id="closeCompose" type="button">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
-    </div>
-    <form method="post" id="composeForm" style="display: contents;">
-      <input type="hidden" name="action" value="send" />
-      <input type="hidden" name="body_html" id="composeBodyHtml" />
-      <input type="hidden" name="body_text" id="composeBodyText" />
-      <input type="hidden" name="attachments" id="composeAttachments" value="[]" />
-      <input type="hidden" name="is_encrypted" id="composeIsEnc" value="0" />
-      <input type="hidden" name="ciphertext" id="composeCipher" />
-      <div class="modal-body">
-        <div class="field"><label>To</label><input type="text" name="to" required placeholder="recipient@example.com" /></div>
-        <div class="field"><label>Cc</label><input type="text" name="cc" /></div>
-        <div class="field"><label>Bcc</label><input type="text" name="bcc" /></div>
-        <div class="field"><label>Subject</label><input type="text" name="subject" required /></div>
-        <div class="reply-toolbar" style="margin-top: 10px;">
-          <button class="tb-btn" type="button" data-cmd="bold"><b>B</b></button>
-          <button class="tb-btn" type="button" data-cmd="italic"><i>I</i></button>
-          <button class="tb-btn" type="button" data-cmd="underline"><u>U</u></button>
-          <button class="tb-btn" type="button" data-cmd="link">link</button>
-          <button class="tb-btn" type="button" data-cmd="ul">list</button>
-          <button class="tb-btn" type="button" data-cmd="code">code</button>
-          <button class="tb-btn" type="button" data-cmd="quote">quote</button>
-        </div>
-        <div class="compose-editor" id="composeEditor" contenteditable="true"></div>
-        <div class="attach-list" id="composeAttachList"></div>
-      </div>
-      <div class="modal-foot">
-        <button class="send-btn" type="submit">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align: -2px; margin-right: 4px;"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
-          SEND
-        </button>
-        <label class="icon-btn" style="cursor: pointer;">
-          <input type="file" id="composeFile" style="display: none;" multiple />
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
-        </label>
-        <label class="enc-toggle"><input type="checkbox" id="composeEncToggle" /> mark as encrypted</label>
-      </div>
-    </form>
-  </div>
 </div>
 
 <div class="modal-back" id="labelModal">
@@ -670,7 +626,7 @@ const threadIdList = threads.map((t: any) => t.id);
 </div>
 
 <div class="kbd-help">
-  <kbd>j</kbd>/<kbd>k</kbd> nav . <kbd>e</kbd> archive . <kbd>#</kbd> trash . <kbd>s</kbd> star . <kbd>r</kbd> reply . <kbd>c</kbd> compose . <kbd>/</kbd> search
+  <kbd>j</kbd>/<kbd>k</kbd> nav . <kbd>e</kbd> archive . <kbd>#</kbd> trash . <kbd>s</kbd> star . <kbd>/</kbd> search
 </div>
 
 {okMsg && <div class="toast">{okMsg}</div>}
@@ -679,13 +635,6 @@ const threadIdList = threads.map((t: any) => t.id);
 <script is:inline define:vars={{ openId, threadIds: threadIdList }}>
 (function(){
   document.body.classList.add('era-no-fab');
-
-  const composeBtn = document.getElementById('composeBtn');
-  const composeModal = document.getElementById('composeModal');
-  const closeCompose = document.getElementById('closeCompose');
-  composeBtn && composeBtn.addEventListener('click', () => composeModal.classList.add('show'));
-  closeCompose && closeCompose.addEventListener('click', () => composeModal.classList.remove('show'));
-  composeModal && composeModal.addEventListener('click', (e) => { if (e.target === composeModal) composeModal.classList.remove('show'); });
 
   const labelModal = document.getElementById('labelModal');
   const newLabelBtn = document.getElementById('newLabelBtn');
@@ -733,34 +682,6 @@ const threadIdList = threads.map((t: any) => t.id);
     });
   });
 
-  // Attachments
-  const attachInput = document.getElementById('composeFile');
-  const attachList = document.getElementById('composeAttachList');
-  const attachHidden = document.getElementById('composeAttachments');
-  const attached = [];
-  attachInput && attachInput.addEventListener('change', (e) => {
-    const files = Array.from(e.target.files || []);
-    for (const f of files) {
-      if (f.size > 5 * 1024 * 1024) { alert('Max 5 MB per file'); continue; }
-      const reader = new FileReader();
-      reader.onload = () => {
-        attached.push({ name: f.name, size: f.size, type: f.type, dataUrl: reader.result });
-        renderAttach();
-      };
-      reader.readAsDataURL(f);
-    }
-  });
-  function renderAttach() {
-    attachList.innerHTML = '';
-    attached.forEach((a, i) => {
-      const chip = document.createElement('div');
-      chip.className = 'attach-chip';
-      chip.innerHTML = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg> ' + a.name + ' <span class="rm" style="cursor:pointer; color:#f87171; margin-left:4px;">x</span>';
-      chip.querySelector('.rm').addEventListener('click', () => { attached.splice(i, 1); renderAttach(); });
-      attachList.appendChild(chip);
-    });
-    attachHidden.value = JSON.stringify(attached);
-  }
 
   // Crypto - Web Crypto API (PBKDF2 + AES-GCM)
   async function deriveKey(passphrase, salt) {
@@ -809,52 +730,7 @@ const threadIdList = threads.map((t: any) => t.id);
     });
   });
 
-  // Compose submit
-  const composeForm = document.getElementById('composeForm');
-  composeForm && composeForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const editor = document.getElementById('composeEditor');
-    const html = editor.innerHTML;
-    const text = editor.textContent || '';
-    const wantEnc = document.getElementById('composeEncToggle').checked;
-    if (wantEnc) {
-      const pw = prompt('Passphrase to encrypt. Share it with the recipient out of band.');
-      if (!pw) return;
-      const ct = await encryptPayload(text, pw);
-      document.getElementById('composeCipher').value = ct;
-      document.getElementById('composeIsEnc').value = '1';
-      document.getElementById('composeBodyHtml').value = '';
-      document.getElementById('composeBodyText').value = '[encrypted - ' + text.length + ' chars]';
-    } else {
-      document.getElementById('composeBodyHtml').value = html;
-      document.getElementById('composeBodyText').value = text;
-    }
-    composeForm.submit();
-  });
 
-  // Reply submit
-  const replyForm = document.getElementById('replyForm');
-  replyForm && replyForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const editor = document.getElementById('replyEditor');
-    const html = editor.innerHTML;
-    const text = editor.textContent || '';
-    if (!text.trim()) { alert('Empty reply'); return; }
-    const wantEnc = document.getElementById('replyEncToggle').checked;
-    if (wantEnc) {
-      const pw = prompt('Passphrase to encrypt');
-      if (!pw) return;
-      const ct = await encryptPayload(text, pw);
-      document.getElementById('replyCipher').value = ct;
-      document.getElementById('replyIsEnc').value = '1';
-      document.getElementById('replyBodyHtml').value = '';
-      document.getElementById('replyBodyText').value = '[encrypted reply]';
-    } else {
-      document.getElementById('replyBodyHtml').value = html;
-      document.getElementById('replyBodyText').value = text;
-    }
-    replyForm.submit();
-  });
 
   // Thread row click
   document.querySelectorAll('.thread-row').forEach(row => {
@@ -898,12 +774,11 @@ const threadIdList = threads.map((t: any) => t.id);
   document.addEventListener('keydown', (e) => {
     const tag = (e.target.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
-    if (composeModal && composeModal.classList.contains('show')) return;
     if (labelModal && labelModal.classList.contains('show')) return;
+    // 'c' (compose) and 'r' (reply) are gone with the composers they opened. Leaving them bound
+    // would open a box that cannot send, which is the whole fault this archive closes.
     if (e.key === 'j') { e.preventDefault(); cursorIdx++; navTo(cursorIdx); }
     else if (e.key === 'k') { e.preventDefault(); cursorIdx--; navTo(cursorIdx); }
-    else if (e.key === 'c') { e.preventDefault(); composeModal.classList.add('show'); setTimeout(() => document.getElementById('composeEditor').focus(), 50); }
-    else if (e.key === 'r' && openId) { e.preventDefault(); const re = document.getElementById('replyEditor'); re && re.focus(); }
     else if (e.key === 's' && openId) {
       e.preventDefault();
       const fd = new FormData(); fd.append('action', 'toggle_star'); fd.append('thread_id', openId);

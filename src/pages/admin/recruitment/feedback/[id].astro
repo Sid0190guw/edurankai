@@ -1,0 +1,258 @@
+---
+// /admin/recruitment/feedback/[id] — ONE INTERVIEW: THE PANEL, AND WHAT EACH OF THEM SAID.
+//
+// THE GATE IS `applications.score`, the same key as the index and the same population that reaches
+// /admin/interviews today. Panel changes are re-checked inside the POST handler, against the posted
+// form — the rendered button is not the check.
+//
+// THE PANEL IS RESOLVED FROM THE ORGANIZATION GRAPH, AND SAYS SO WHEN IT CANNOT BE.
+// resolvePanelFromOrgGraph() walks application -> department -> the recorded department_head EDGE ->
+// the people holding an in-force `reviewer` edge over that head. Where any link in that chain is
+// missing it returns a SENTENCE naming which link, and this page prints it. Three different
+// sentences for three different facts:
+//
+//     the graph has no data yet          -> the ordinary state until the founder runs the backfill
+//     no head recorded for a department  -> the graph is populated but incomplete here
+//     head recorded, no reviewer edges   -> nobody has been named to review that person's work
+//
+// NOTHING IS EVER GUESSED FROM A JOB TITLE OR A ROLE NAME. A guessed panel would look exactly like a
+// resolved one, which is the entire reason guessing is refused.
+//
+// THE SCORECARD FORM IS NOT REIMPLEMENTED HERE. /admin/interviews/[id]/scorecard.astro already owns
+// that write, one card per interviewer, upserting on its unique index. This page links to it.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import {
+  getFeedbackBundle,
+  assignPanelMember,
+  removePanelMember,
+  assignableInterviewers,
+  recommendationLabel,
+  panelSourceLabel,
+  SCORECARD_DIMENSIONS,
+} from '@/lib/interview-feedback';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'applications.score')) return Astro.redirect('/admin?denied=interviews');
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/admin/recruitment/feedback');
+
+let okMsg = '';
+let errMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  if (action === 'add_panel') {
+    const result = await assignPanelMember({
+      interviewId: String(id),
+      interviewerUserId: String(fd.get('interviewer_user_id') || ''),
+      interviewerName: String(fd.get('interviewer_name') || '') || null,
+      resolvedVia: String(fd.get('resolved_via') || '') === 'org_graph_reviewer' ? 'org_graph_reviewer' : 'named',
+      actorUserId: String(user.id),
+    });
+    if (result.ok) okMsg = result.message || 'Added.'; else errMsg = result.error;
+  } else if (action === 'remove_panel') {
+    const result = await removePanelMember(String(id), String(fd.get('interviewer_user_id') || ''), String(user.id));
+    if (result.ok) okMsg = result.message || 'Removed.'; else errMsg = result.error;
+  } else {
+    errMsg = 'That is not an action this page performs.';
+  }
+}
+
+// ---- Reads, all before the template. ----------------------------------------------------------
+const bundle = await getFeedbackBundle(String(id));
+const interview = bundle.interview;
+const suggestion = bundle.suggestion;
+const candidates = await assignableInterviewers(null);
+
+const candidateName = interview
+  ? ((String(interview.first_name || '') + ' ' + String(interview.last_name || '')).trim() || 'Candidate')
+  : 'Candidate';
+
+const fmtWhen = (v: any) => {
+  if (!v) return 'Not scheduled';
+  try { return new Date(v).toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }); }
+  catch { return String(v); }
+};
+
+// Already-on-the-panel user ids, so the suggestion list can say who is still to be added.
+const onPanel = new Set(bundle.panel.map((p) => p.interviewerUserId));
+
+const inputStyle = 'background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:10px 12px;border-radius:8px;font-size:12.5px;min-height:44px;';
+---
+<AdminLayout title="Interview feedback" activeNav="applications">
+<div style="padding:14px 16px 90px;max-width:1000px;margin:0 auto;">
+  <a href="/admin/recruitment/feedback" style="font-size:11.5px;color:#6e6e78;text-decoration:none;display:inline-flex;align-items:center;gap:5px;min-height:44px;">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+    All interview feedback
+  </a>
+
+  {okMsg && <div style="background:rgba(74,222,128,0.10);border:1px solid rgba(74,222,128,0.32);color:#86efac;border-radius:10px;padding:11px 14px;margin-bottom:12px;font-size:12.5px;line-height:1.55;">{okMsg}</div>}
+  {errMsg && <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:10px;padding:11px 14px;margin-bottom:12px;font-size:12.5px;line-height:1.55;">{errMsg}</div>}
+
+  {!bundle.tablesPresent || !interview ? (
+    <div style="background:#0f0f14;border:1px solid rgba(251,191,36,0.32);border-radius:12px;padding:24px 20px;margin-top:10px;">
+      <p style="font-size:14px;color:#fbbf24;margin:0 0 6px;font-weight:600;">This interview could not be read</p>
+      <p style="font-size:12.5px;color:#9aa6b6;margin:0;line-height:1.6;">
+        Either the interview does not exist, or the interview tables are not present on this database. They
+        were created by a hand-run migration this repository does not carry, so nothing here guesses their
+        shape or invents an empty result.
+      </p>
+      {bundle.error && <p style="font-size:11px;color:#6e6e78;margin:10px 0 0;font-family:'Geist Mono',monospace;overflow-wrap:anywhere;">{bundle.error}</p>}
+    </div>
+  ) : (
+    <div>
+      <h1 style="font-size:24px;color:#fff;margin:2px 0 4px;font-weight:700;">{candidateName}</h1>
+      <p style="font-size:12.5px;color:#9aa6b6;margin:0 0 16px;line-height:1.6;">
+        {interview.role_title_snapshot || 'No role recorded'} · Round {interview.round_number || 1}
+        {interview.round_type ? ' · ' + String(interview.round_type).split('_').join(' ') : ''} · {fmtWhen(interview.scheduled_at)}
+      </p>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px;">
+        {interview.application_id && (
+          <a href={'/admin/applications/' + interview.application_id} style="min-height:44px;display:inline-flex;align-items:center;background:#15151a;border:1px solid #2a2a2f;color:#cfd6da;padding:0 16px;border-radius:8px;font-size:12.5px;text-decoration:none;">Open the application</a>
+        )}
+        <a href={'/admin/interviews/' + interview.id + '/scorecard'} style="min-height:44px;display:inline-flex;align-items:center;background:#FF4F00;color:#fff;padding:0 18px;border-radius:8px;font-size:12.5px;font-weight:700;text-decoration:none;">Submit my scorecard</a>
+      </div>
+
+      <h2 style="font-size:12px;color:#6e6e78;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 10px;">The panel</h2>
+
+      {bundle.panel.length === 0 ? (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:20px;margin-bottom:14px;">
+          <p style="font-size:12.5px;color:#9aa6b6;margin:0;line-height:1.6;">Nobody is on this panel yet. Add the people who will interview, or take the suggestion below if the Organization Graph can resolve one.</p>
+        </div>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
+          {bundle.panel.map((p) => (
+            <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;">
+              <span style="flex:1 1 180px;min-width:0;">
+                <span style="display:block;font-size:13px;color:#fff;font-weight:600;">{p.interviewerName}</span>
+                <span style="display:block;font-size:11px;color:#9aa6b6;">{panelSourceLabel(p.resolvedVia)}</span>
+              </span>
+              <span style={`flex:0 0 auto;font-size:10px;font-weight:700;padding:4px 9px;border-radius:100px;font-family:'Geist Mono',monospace;text-transform:uppercase;letter-spacing:0.05em;background:${p.hasSubmitted ? 'rgba(134,239,172,0.14)' : 'rgba(251,191,36,0.14)'};color:${p.hasSubmitted ? '#86efac' : '#fbbf24'};`}>
+                {p.hasSubmitted ? 'Feedback in' : 'Awaiting'}
+              </span>
+              <form method="POST" style="flex:0 0 auto;">
+                <input type="hidden" name="action" value="remove_panel" />
+                <input type="hidden" name="interviewer_user_id" value={p.interviewerUserId} />
+                <button type="submit" style="background:#15151a;border:1px solid #2a2a2f;color:#9aa6b6;padding:0 14px;min-height:44px;border-radius:8px;font-size:12px;cursor:pointer;">Remove</button>
+              </form>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;margin-bottom:14px;">
+        <p style="font-size:11px;color:#fff;font-weight:700;margin:0 0 6px;">Suggested from the Organization Graph</p>
+        <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 10px;line-height:1.6;">{suggestion ? suggestion.note : 'This interview is not linked to an application, so no department can be resolved.'}</p>
+
+        {suggestion && suggestion.reviewers.length > 0 && (
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            {suggestion.reviewers.map((rv) => (
+              <form method="POST" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;background:#08080a;border:1px solid #1a1a1f;border-radius:10px;padding:10px 12px;">
+                <input type="hidden" name="action" value="add_panel" />
+                <input type="hidden" name="interviewer_user_id" value={rv.userId || ''} />
+                <input type="hidden" name="interviewer_name" value={rv.fullName} />
+                <input type="hidden" name="resolved_via" value="org_graph_reviewer" />
+                <span style="flex:1 1 170px;min-width:0;">
+                  <span style="display:block;font-size:12.5px;color:#cfd6da;font-weight:600;">{rv.fullName}</span>
+                  <span style="display:block;font-size:11px;color:#6e6e78;">{rv.designation || 'Reviewer relationship recorded in the graph'}</span>
+                </span>
+                {!rv.userId ? (
+                  <span style="flex:0 0 auto;font-size:11px;color:#fbbf24;">No signed-in account linked to this employee record</span>
+                ) : onPanel.has(rv.userId) ? (
+                  <span style="flex:0 0 auto;font-size:11px;color:#86efac;">Already on the panel</span>
+                ) : (
+                  <button type="submit" style="flex:0 0 auto;background:#15151a;border:1px solid #2a2a2f;color:#FF7040;padding:0 16px;min-height:44px;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;">Add to the panel</button>
+                )}
+              </form>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;margin-bottom:22px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <input type="hidden" name="action" value="add_panel" />
+        <input type="hidden" name="resolved_via" value="named" />
+        <label style="flex:1 1 220px;min-width:0;">
+          <span style="display:block;font-size:11px;color:#9aa6b6;margin-bottom:5px;">Name an interviewer directly</span>
+          <select name="interviewer_user_id" required style={inputStyle + 'width:100%;'}>
+            <option value="">Pick a colleague</option>
+            {candidates.map((c) => <option value={c.id}>{c.name}</option>)}
+          </select>
+        </label>
+        <button type="submit" style="background:#15151a;border:1px solid #2a2a2f;color:#FF7040;padding:0 18px;min-height:44px;border-radius:8px;font-size:12.5px;font-weight:700;cursor:pointer;align-self:flex-end;">Add to the panel</button>
+      </form>
+
+      <h2 style="font-size:12px;color:#6e6e78;letter-spacing:0.1em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 10px;">Scorecards</h2>
+
+      {bundle.scorecards.length === 0 ? (
+        <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:30px 20px;text-align:center;">
+          <p style="font-size:13px;color:#cfd6da;margin:0 0 6px;font-weight:600;">No feedback submitted yet</p>
+          <p style="font-size:12px;color:#6e6e78;margin:0;line-height:1.6;">Each interviewer submits their own card. Nothing here is averaged from a panel that has not spoken.</p>
+        </div>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          {bundle.scorecards.map((s) => (
+            <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
+              <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                <p style="font-size:13.5px;color:#fff;font-weight:700;margin:0;">{s.interviewerName}</p>
+                <span style="font-size:10px;font-weight:700;padding:4px 9px;border-radius:100px;background:rgba(207,214,218,0.12);color:#cfd6da;font-family:'Geist Mono',monospace;text-transform:uppercase;letter-spacing:0.05em;">{recommendationLabel(s.recommendation)}</span>
+              </div>
+
+              <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;margin-bottom:10px;">
+                <table style="border-collapse:collapse;min-width:420px;width:100%;">
+                  <thead>
+                    <tr>
+                      {SCORECARD_DIMENSIONS.map((d) => (
+                        <th style="text-align:left;font-size:10px;color:#6e6e78;letter-spacing:0.08em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;padding:0 12px 6px 0;white-space:nowrap;">{d.label}</th>
+                      ))}
+                      <th style="text-align:left;font-size:10px;color:#6e6e78;letter-spacing:0.08em;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:700;padding:0 0 6px 0;white-space:nowrap;">Overall</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td style="font-size:16px;color:#fff;font-weight:700;padding:0 12px 0 0;">{s.technical ?? '—'}</td>
+                      <td style="font-size:16px;color:#fff;font-weight:700;padding:0 12px 0 0;">{s.communication ?? '—'}</td>
+                      <td style="font-size:16px;color:#fff;font-weight:700;padding:0 12px 0 0;">{s.problemSolving ?? '—'}</td>
+                      <td style="font-size:16px;color:#fff;font-weight:700;padding:0 12px 0 0;">{s.culture ?? '—'}</td>
+                      <td style="font-size:16px;color:#FF7040;font-weight:700;padding:0;">{s.overall ?? '—'}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              {s.strengths && (
+                <div style="margin-bottom:8px;">
+                  <p style="font-size:10px;color:#6e6e78;letter-spacing:0.09em;text-transform:uppercase;font-family:'Geist Mono',monospace;margin:0 0 3px;">Strengths</p>
+                  <p style="font-size:12.5px;color:#cfd6da;margin:0;line-height:1.6;white-space:pre-wrap;">{s.strengths}</p>
+                </div>
+              )}
+              {s.weaknesses && (
+                <div style="margin-bottom:8px;">
+                  <p style="font-size:10px;color:#6e6e78;letter-spacing:0.09em;text-transform:uppercase;font-family:'Geist Mono',monospace;margin:0 0 3px;">Concerns</p>
+                  <p style="font-size:12.5px;color:#cfd6da;margin:0;line-height:1.6;white-space:pre-wrap;">{s.weaknesses}</p>
+                </div>
+              )}
+              {s.notes && (
+                <div>
+                  <p style="font-size:10px;color:#6e6e78;letter-spacing:0.09em;text-transform:uppercase;font-family:'Geist Mono',monospace;margin:0 0 3px;">Notes (hiring team only)</p>
+                  <p style="font-size:12.5px;color:#cfd6da;margin:0;line-height:1.6;white-space:pre-wrap;">{s.notes}</p>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <p style="font-size:11.5px;color:#6e6e78;margin:22px 0 0;line-height:1.6;max-width:70ch;">
+        None of this is shown to the candidate. Automated proctoring signals are advisory only; a human
+        decides, and the decision is the panel's, recorded in their own words.
+      </p>
+    </div>
+  )}
+</div>
+</AdminLayout>

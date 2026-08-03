@@ -1,0 +1,408 @@
+---
+// /portal/organization — PHASE 5. THE ORGANIZATION VISUALIZATION.
+//
+// =================================================================================================
+// WHAT THIS PAGE IS
+// =================================================================================================
+//
+// A reachable screen that draws the Organization Graph: an org chart, a reporting hierarchy, a
+// department tree, a team tree, and three relationship lists (delegation, approval ownership,
+// mentorship). Search, a department filter, and expand/collapse.
+//
+// IT IS NOT A LIBRARY. Phase 3B shipped the graph as infrastructure that nothing called; this is the
+// surface where a person can finally see it. The URL is /portal/organization and it is registered in
+// src/lib/workforce/navigation.ts, so it appears in the workspace drawer for anyone who works here.
+//
+// =================================================================================================
+// THE ONE THING THAT MUST NOT BE GOT WRONG: THE EMPTY STATE IS THE DEFAULT PATH
+// =================================================================================================
+//
+// The graph is EMPTY until the founder runs db/org-graph-backfill.sql. So the first thing anybody
+// sees on this page is "Organization Graph not yet initialized" — not a bug, not an edge case, the
+// ordinary first render. isInitialized() is what distinguishes it from "you personally have no
+// recorded relationships", and those two get different screens because they are different facts. A
+// page that showed the second when the first is true would tell every employee they report to nobody.
+//
+// AND THERE IS NO ROLE-NAME FALLBACK ANYWHERE BEHIND THIS SCREEN. src/lib/org-chart.ts does not read
+// users.role, does not read users.assigned_department_id, and does not reach for
+// hr_employees.reporting_manager_id when the graph is empty. A chart drawn from role names would
+// look exactly like a chart drawn from data, which is precisely why it is forbidden: it would
+// silently reinstate what Phase 1 spent an enormous amount of work removing, and it would appear to
+// work perfectly.
+//
+// =================================================================================================
+// SCOPING HAPPENS IN THE QUERY. THIS FILE HIDES NOTHING.
+// =================================================================================================
+//
+// composeWorkspace() resolves the viewer once — the same composition the nav is drawn from — and
+// resolveOrgViewerScope() turns it into a scope:
+//
+//   - `employee.manage` (Layer 2, wildcard-aware, via ctx.holds)  -> the whole graph
+//   - a 'department_head' EDGE in the graph (Layer 1, per row)    -> that department's subtree
+//   - an employee record                                          -> their own reporting line
+//   - none of the above                                           -> an explanation, not a chart
+//
+// The second one is the one worth reading twice: a department head is resolved from a RELATIONSHIP
+// ROW, never from the role name that is spelled the same way. An account labelled department_head
+// with no edge in the graph is not a department head here.
+//
+// Every branch the viewer is not entitled to is ABSENT FROM THE RESULT SET. There is no CSS in this
+// file that hides a person, because a person they may not see was never fetched.
+//
+// =================================================================================================
+// NO POST HANDLER, DELIBERATELY
+// =================================================================================================
+//
+// This page reads. Search and filters are a GET form, so the state is in the URL, shareable, and
+// survives a back button. That also sidesteps the const-hoisting trap that has taken pages down on
+// this project: there is no handler above the declarations to reach one early. Every const below is
+// still declared before its first use, in order.
+//
+// CLIENT JAVASCRIPT: 880 bytes, and the page is fully usable without it. That is the WHOLE weight —
+// one `is:inline` script, emitted verbatim into the document (comments and all, because is:inline is
+// not processed), producing no entry in the client bundle and no extra request. 597 bytes of it is
+// code. Expand/collapse itself is native <details> and costs nothing; the script only adds the
+// Expand-all / Collapse-all pair, which stay `hidden` until it runs so nothing dead is ever rendered.
+//
+// MOBILE FIRST — about nine in ten of these people are on a phone. 360px is the design width, every
+// control clears 44px, the view tabs and the tree each scroll inside their OWN container, and the
+// page itself never scrolls sideways.
+import BottomNav from '@/components/workforce/BottomNav.astro';
+import EmptyState from '@/components/workforce/EmptyState.astro';
+import OrgNode from '@/components/workforce/OrgNode.astro';
+import { composeWorkspace } from '@/lib/workforce/composer';
+import {
+  ORG_VIEWS,
+  parseOrgView,
+  resolveOrgViewerScope,
+  buildOrgView,
+  scopeDepartmentOptions,
+  searchPeople,
+} from '@/lib/org-chart';
+
+const PATH = '/portal/organization';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ---- The composition. One per request; composeWorkspace memoises on Astro.locals. ---------------
+let composed: any = null;
+try {
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: PATH });
+} catch (e: any) {
+  // A composition that cannot be built is not guessed at. holds() then answers false for everything,
+  // which lands the viewer on the narrowest scope their employee record allows — the safe direction.
+  console.error('[portal/organization] compose', e?.cause?.message || e?.message);
+}
+
+const holds = (key: string): boolean => {
+  try {
+    return composed?.context?.holds ? composed.context.holds(key) === true : false;
+  } catch {
+    return false;
+  }
+};
+
+// ---- Query state -------------------------------------------------------------------------------
+const params = Astro.url.searchParams;
+const view = parseOrgView(params.get('view'));
+const q = String(params.get('q') || '').trim().slice(0, 80);
+const deptParam = String(params.get('dept') || '').trim().slice(0, 80);
+const focusParam = String(params.get('focus') || '').trim().slice(0, 80);
+
+// ---- Who is looking, and therefore what may be queried -------------------------------------------
+const scope = await resolveOrgViewerScope(String(user.id), holds);
+
+// A department filter is only honoured when it is one of the options the scope itself offers, so the
+// query string cannot name a department the viewer has no claim to. Out-of-scope values are dropped
+// rather than refused: an error message naming the department would confirm it exists.
+const deptOptions = await scopeDepartmentOptions(scope);
+const dept = deptOptions.some((d) => d.id === deptParam) ? deptParam : '';
+
+const model = await buildOrgView(view, scope, {
+  q,
+  departmentId: dept || null,
+  focusEmployeeId: focusParam || null,
+  // The session name, used for ONE node only: the reader's own, and only when the graph could not
+  // hand back their employee row. Seeing "Unnamed record" where your own name belongs reads as a
+  // broken page, and it is the one label this page is entitled to fill in from outside the graph.
+  viewerName: (user as any)?.name ? String((user as any).name) : null,
+});
+
+// On the reporting view a search is a way to CENTRE the line on somebody, not to filter it. Only for
+// viewers whose scope contains more than one person.
+const centreCandidates =
+  view === 'reporting' && q && scope.kind !== 'self' && scope.kind !== 'none'
+    ? await searchPeople(scope, q)
+    : [];
+
+// ---- Small helpers, all declared before the template reads them -----------------------------------
+const hrefFor = (nextView: string) => {
+  const sp = new URLSearchParams();
+  sp.set('view', nextView);
+  if (q) sp.set('q', q);
+  if (dept) sp.set('dept', dept);
+  return PATH + '?' + sp.toString();
+};
+
+const focusHref = (employeeId: string) => {
+  const sp = new URLSearchParams();
+  sp.set('view', 'reporting');
+  sp.set('focus', employeeId);
+  return PATH + '?' + sp.toString();
+};
+
+const fmtDate = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+// The sentence for one edge row. Written as a SENTENCE rather than as "A -> B": an arrow character
+// inside a JSX string is one of the .astro parse traps on this project, and a sentence is what a
+// person on a phone can actually read.
+const edgeSentence = (row: any) => {
+  const subject = row.subject?.fullName || 'Someone';
+  const object = row.object?.fullName || null;
+  const domain = row.scopeId || null;
+  if (row.type === 'temporary_delegate') {
+    return subject + ' is standing in for ' + (object || 'someone whose record is missing');
+  }
+  if (row.type === 'approval_owner') {
+    const what = domain ? domain + ' approvals' : 'approvals';
+    return subject + ' owns ' + what + ' for ' + (object || 'the whole organization');
+  }
+  return subject + ' mentors ' + (object || 'someone whose record is missing');
+};
+
+const hasTrees = model.groups.length > 0;
+const hasEdges = model.edges.length > 0;
+const showsSomething = hasTrees || hasEdges;
+// The department control is offered only where it can narrow something the viewer already has. A
+// person entitled to one line has nothing to filter.
+const showFilters = scope.initialized && scope.kind !== 'none';
+---
+
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Organization - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    /* The page itself never scrolls sideways. Wide things get their own container, below. */
+    html,body{overflow-x:hidden;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;
+      padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .scopeline{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    /* View tabs: their OWN horizontal scroller. Never the page. */
+    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
+      padding:10px 16px 2px;margin:0;scrollbar-width:thin;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;
+      border:1px solid #DFDCD8;border-radius:999px;background:#FDFDFC;color:#564E43;
+      font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .tab:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    form.filters{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0;}
+    form.filters label{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);
+      white-space:nowrap;}
+    .field{flex:1 1 100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;
+      border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    select.field{flex:1 1 160px;}
+    .go{flex:1 1 110px;min-height:44px;padding:10px 16px;border:1px solid #1B1813;border-radius:8px;
+      background:#1B1813;color:#FFFFFF;font:inherit;font-size:0.875rem;font-weight:650;cursor:pointer;}
+    .clear{flex:1 1 110px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;
+      padding:10px 16px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#564E43;
+      font-size:0.875rem;font-weight:600;text-decoration:none;}
+    .viewname{margin:12px 0 0;font-size:1.0625rem;font-weight:700;letter-spacing:-0.01em;
+      line-height:1.3;}
+    .blurb{margin:4px 0 0;font-size:0.8125rem;line-height:1.55;color:#564E43;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;
+      background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .stats{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0;}
+    .stat{flex:1 1 140px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:10px;
+      background:#FDFDFC;}
+    .stat b{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      font-size:1.125rem;line-height:1.2;}
+    .stat span{display:block;margin-top:2px;font-size:0.6875rem;letter-spacing:0.06em;
+      text-transform:uppercase;color:#70685C;}
+    .tools{display:flex;gap:8px;margin:12px 0 0;}
+    .tools button{flex:1 1 auto;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;
+      border-radius:8px;background:#FDFDFC;color:#564E43;font:inherit;font-size:0.8125rem;
+      font-weight:600;cursor:pointer;}
+    .tools button:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .group{margin:12px 0 0;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;
+      overflow:hidden;}
+    .group__head{padding:11px 13px;border-bottom:1px solid #DFDCD8;background:#FDFDFC;}
+    .group__title{margin:0;font-size:0.9375rem;font-weight:680;line-height:1.35;
+      overflow-wrap:anywhere;}
+    .group__sub{margin:2px 0 0;font-size:0.75rem;line-height:1.5;color:#70685C;
+      overflow-wrap:anywhere;}
+    /* A deep tree gets its own horizontal scroller so the PAGE never gets one. */
+    .treebox{padding:6px 8px 10px;overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    .rows{list-style:none;margin:12px 0 0;padding:0;}
+    .row{padding:11px 13px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;
+      margin-bottom:8px;}
+    .row p{margin:0;font-size:0.875rem;line-height:1.5;overflow-wrap:anywhere;}
+    .row small{display:block;margin-top:4px;font-size:0.75rem;color:#70685C;}
+    .centre{margin:12px 0 0;padding:11px 13px;border:1px solid #CDD8EA;border-radius:10px;
+      background:#F1F5FB;}
+    .centre h2{margin:0 0 6px;font-size:0.8125rem;font-weight:700;color:#224E91;}
+    .centre a{display:block;min-height:44px;padding:9px 0;font-size:0.875rem;color:#224E91;
+      overflow-wrap:anywhere;}
+    .foot{margin:16px 0 0;padding:12px 13px;border-top:1px solid #DFDCD8;font-size:0.75rem;
+      line-height:1.6;color:#70685C;}
+    .foot code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:0.6875rem;
+      overflow-wrap:anywhere;}
+    @media (min-width:640px){
+      .field{flex:1 1 240px;}
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Organization</h1>
+    <p class="scopeline">{scope.explanation}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Organization views">
+    {ORG_VIEWS.map((v) => (
+      <a class="tab" href={hrefFor(v.key)} aria-current={v.key === view ? 'page' : null}>{v.label}</a>
+    ))}
+  </nav>
+
+  <main class="wrap">
+    <h2 class="viewname">{model.label}</h2>
+    <p class="blurb">{model.blurb}</p>
+
+    {showFilters && (
+      <form class="filters" method="get" action={PATH}>
+        <input type="hidden" name="view" value={view} />
+        <label for="orgq">Search people</label>
+        <input class="field" id="orgq" type="search" name="q" value={q} maxlength="80"
+          placeholder="Search a name or a job title" autocomplete="off" />
+        {deptOptions.length > 0 && (
+          <select class="field" name="dept" aria-label="Department">
+            <option value="">All departments in view</option>
+            {deptOptions.map((d) => (
+              <option value={d.id} selected={d.id === dept}>{d.name}</option>
+            ))}
+          </select>
+        )}
+        <button class="go" type="submit">Apply</button>
+        {(q || dept) && <a class="clear" href={PATH + '?view=' + view}>Clear</a>}
+      </form>
+    )}
+
+    {model.notice && <p class="notice">{model.notice}</p>}
+
+    {scope.degraded && scope.gaps.length > 0 && (
+      <p class="notice">We could not read {scope.gaps.join(', ')} just now, so this may be incomplete.
+        Nothing shown here is guessed.</p>
+    )}
+
+    {centreCandidates.length > 0 && (
+      <div class="centre">
+        <h2>Show whose line?</h2>
+        {centreCandidates.map((p) => (
+          <a href={focusHref(String(p.employeeId))}>
+            {p.fullName || 'Unnamed record'}{p.designation ? ' — ' + p.designation : ''}
+          </a>
+        ))}
+      </div>
+    )}
+
+    {showsSomething && (
+      <div class="stats">
+        <div class="stat"><b>{hasEdges ? model.edges.length : model.people}</b>
+          <span>{hasEdges ? 'relationships' : 'people in view'}</span></div>
+        {model.unattached !== null && (
+          <div class="stat"><b>{model.unattached}</b><span>no reporting line recorded</span></div>
+        )}
+      </div>
+    )}
+
+    {hasTrees && (
+      <div class="tools" id="org-tools" hidden>
+        <button type="button" data-org="expand">Expand all</button>
+        <button type="button" data-org="collapse">Collapse all</button>
+      </div>
+    )}
+
+    {!showsSomething && (
+      <EmptyState
+        title={model.emptyTitle}
+        body={model.emptyBody}
+        illustration={scope.initialized ? 'search' : 'note'}
+        tone="draft"
+        headingLevel={2}
+      />
+    )}
+
+    {hasTrees && (
+      <div id="org-tree">
+        {model.groups.map((g) => (
+          <section class="group">
+            <div class="group__head">
+              <h2 class="group__title">{g.title}</h2>
+              {g.subtitle && <p class="group__sub">{g.subtitle}</p>}
+              <p class="group__sub">{g.people} {g.people === 1 ? 'person' : 'people'}</p>
+            </div>
+            <div class="treebox">
+              {g.roots.map((n) => <OrgNode node={n} openDepth={2} />)}
+            </div>
+          </section>
+        ))}
+      </div>
+    )}
+
+    {hasEdges && (
+      <ul class="rows">
+        {model.edges.map((row) => (
+          <li class="row">
+            <p>{edgeSentence(row)}</p>
+            <small>
+              {row.effectiveFrom ? 'From ' + fmtDate(row.effectiveFrom) : 'Start date not recorded'}
+              {row.effectiveTo ? ', until ' + fmtDate(row.effectiveTo) : ', open ended'}
+              {row.scopeType === 'department' && row.scopeId ? ' · department scope' : ''}
+            </small>
+          </li>
+        ))}
+      </ul>
+    )}
+
+    <p class="foot">
+      Everything on this page is read from the Organization Graph, which records relationships as
+      dated rows. Nothing here is inferred from a job title or an account setting, and a person you
+      are not entitled to see is not fetched at all rather than hidden. Relationships are recorded by
+      HR; this page does not change them.
+    </p>
+  </main>
+
+  <BottomNav variant="hr" active="" label="Primary" />
+
+  <script is:inline>
+    // PROGRESSIVE ENHANCEMENT ONLY. Expand/collapse already works without this: every node with
+    // reports is a native <details>. This adds the two bulk buttons, and it un-hides them itself so
+    // a browser with no JavaScript never shows a control that does nothing.
+    (function () {
+      var tools = document.getElementById('org-tools');
+      var tree = document.getElementById('org-tree');
+      if (!tools || !tree) return;
+      tools.hidden = false;
+      tools.addEventListener('click', function (ev) {
+        var el = ev.target;
+        while (el && el !== tools && !(el.tagName === 'BUTTON')) el = el.parentNode;
+        if (!el || el === tools) return;
+        var open = el.getAttribute('data-org') === 'expand';
+        var all = tree.getElementsByTagName('details');
+        for (var i = 0; i < all.length; i++) all[i].open = open;
+      });
+    })();
+  </script>
+</body>
+</html>

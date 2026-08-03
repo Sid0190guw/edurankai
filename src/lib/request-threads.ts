@@ -29,14 +29,28 @@ async function ensureSchema() {
   ]) { try { await db.execute(q); } catch (_) {} }
 }
 
-export type RequestType = 'visvambhara_access' | 'fee_waiver';
+// EXTENDED, NOT FORKED. `request_messages` is already keyed by (request_type, request_id) and is
+// already the generic thread store; the employee helpdesk reuses it rather than creating a second
+// messages table that would need its own reader, its own ordering and its own bugs.
+//
+// TWO NEW SENDER ROLES COME WITH IT. 'applicant' and 'admin' describe the candidate-facing threads;
+// a workplace ticket is between an EMPLOYEE and the AGENT working the desk, and calling the agent
+// 'admin' would misdescribe the record - the person answering an IT ticket is frequently not an
+// administrator of anything. The column is VARCHAR(12), so both fit.
+//
+// NO BOOKKEEPING BRANCH IS ADDED BELOW for 'helpdesk_ticket'. Its unread counters, its SLA stamps
+// (first response, resolved) and its notifications are owned by src/lib/helpdesk.ts, which knows
+// what a first response MEANS on a ticket and which side to tell. Reaching back into a helpdesk
+// table from here would put that knowledge in two places.
+export type RequestType = 'visvambhara_access' | 'fee_waiver' | 'helpdesk_ticket';
+export type ThreadSenderRole = 'applicant' | 'admin' | 'employee' | 'agent';
 
 export interface RequestMessage {
   id: string;
   request_type: string;
   request_id: string;
   applicant_user_id: string | null;
-  sender_role: 'applicant' | 'admin';
+  sender_role: ThreadSenderRole;
   sender_user_id: string | null;
   sender_name: string | null;
   body: string;
@@ -58,7 +72,7 @@ export async function postMessage(opts: {
   requestType: RequestType;
   requestId: string;
   applicantUserId: string | null;
-  senderRole: 'applicant' | 'admin';
+  senderRole: ThreadSenderRole;
   senderUserId: string;
   senderName: string;
   body: string;

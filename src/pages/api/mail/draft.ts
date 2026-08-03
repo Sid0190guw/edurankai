@@ -3,7 +3,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { deliverMessage, parseAddressList, getMailboxAddress } from '@/lib/mail';
-import { denyAdminApi } from '@/lib/auth/api-guard';
+import { denyMailApi } from '@/lib/auth/mail-access';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -13,9 +13,11 @@ function escapeHtml(s: string) {
 }
 
 export const POST: APIRoute = async ({ request, locals }) => {
-  // Same surface, same gate as send.ts: the only caller is the composer on /admin/mail, and a draft
-  // is a message one click away from leaving the building. Sign-in alone was not an answer.
-  const denied = await denyAdminApi(locals, { label: 'mail.draft' });
+  // Same surface, same gate as send.ts: the only callers are the composers on /admin/mail and
+  // /portal/employee/mail, and a draft is a message one click away from leaving the building.
+  // Sign-in alone was not an answer, and neither is "may you open the admin console" — see
+  // src/lib/auth/mail-access.ts.
+  const denied = await denyMailApi(locals, { label: 'mail.draft' });
   if (denied) return denied;
   const user = (locals as any).user;
 

@@ -1,0 +1,497 @@
+---
+// /portal/employee/attendance — CHECK IN, CHECK OUT, BREAKS, AND THE WEEK'S TIMESHEET.
+//
+// =================================================================================================
+// WHAT THIS PAGE IS
+// =================================================================================================
+//
+// The surface the attendance engine was built for. hr_attendance and hr_clock_events have existed
+// since the HR module was written and an employee has never had a screen to write to either: the
+// only writer was the HR grid at /admin/hr/attendance, which an employee cannot open. So attendance
+// was something done TO people. This is where a person records their own day.
+//
+// =================================================================================================
+// THE BUTTONS ARE NEVER A LIE
+// =================================================================================================
+//
+// The punch buttons are rendered from allowedPunches(), and the POST handler re-checks the same rule
+// with punchRefusal() on the value that was actually posted. A rendered button is not an
+// authorisation — it is a suggestion, and the write is where the rule binds. So "End break" is never
+// offered when no break is running, and a stale tab that posts one anyway is told why, in a sentence.
+//
+// =================================================================================================
+// GEO AND QR ARE EVIDENCE. THEY DECIDE NOTHING.
+// =================================================================================================
+//
+// A location reading is attached to a punch when the browser offers one and the person agrees; a QR
+// station code is attached when one is scanned or typed. NEITHER CAN REFUSE A PUNCH. The engine has
+// no verdict column to write and this page has no branch that could use one. What the reader sees is
+// a sentence — "recorded about 340 m from Head Office" — and a human decides what that means, if
+// anything. Phone GPS indoors is routinely wrong by hundreds of metres, and a rule built on it would
+// cost somebody a day's pay for standing next to a lift shaft.
+//
+// SCANNING WORKS WITH NO CAMERA LIBRARY. A station's QR encodes this URL with ?qr=<code> on it, so
+// an ordinary phone camera opens the page with the field already filled. Typing the code printed
+// under the QR does the same thing. No scanner bundle ships to anybody.
+//
+// =================================================================================================
+// const BEFORE THE HANDLER
+// =================================================================================================
+//
+// Every const this file's POST handler reads is declared ABOVE it. `const` is not hoisted, and a
+// const declared under the handler throws on the handler's first line — the failure that took down
+// apply step 5 and the /admin/roles/diagnose Repair button on this project, both of which reported
+// success while failing every time.
+//
+// CLIENT JAVASCRIPT: one is:inline script, about 700 bytes, and the page is fully usable without it.
+// It does one thing — asks the browser for a location and fills two hidden inputs — and it un-hides
+// its own button, so a browser that blocks scripts never shows a control that does nothing.
+//
+// MOBILE FIRST. 360px is the design width, every control clears 44px, the timesheet scrolls inside
+// its own container, and the page itself never scrolls sideways.
+import BottomNav from '@/components/workforce/BottomNav.astro';
+import EmptyState from '@/components/workforce/EmptyState.astro';
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  punch,
+  punchesOn,
+  punchLog,
+  computeDay,
+  allowedPunches,
+  weeklyTimesheet,
+  listHolidays,
+  shiftOn,
+  today as attendanceToday,
+  weekStartIso,
+  shiftDateIso,
+  formatMinutes,
+  minutesToHours,
+  shiftSummary,
+  PUNCH_LABELS,
+  STATUS_LABELS,
+  type PunchKind,
+  type DayTotals,
+  type Timesheet,
+} from '@/lib/attendance';
+
+const PATH = '/portal/employee/attendance';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ------------------------------------------------------------------------------------------------
+// CONSTANTS AND HELPERS — ALL OF THEM ABOVE THE POST HANDLER.
+// ------------------------------------------------------------------------------------------------
+
+/** Plain words for a punch, from a function rather than a JSX-read map: a Record<string,string>
+ *  indexed inside JSX is one of this project's known .astro parse hazards. */
+function punchLabel(kind: string): string {
+  if (kind === 'clock_in') return PUNCH_LABELS.clock_in;
+  if (kind === 'clock_out') return PUNCH_LABELS.clock_out;
+  if (kind === 'break_start') return PUNCH_LABELS.break_start;
+  if (kind === 'break_end') return PUNCH_LABELS.break_end;
+  return 'Record';
+}
+
+function statusLabel(status: string | null): string {
+  if (status === 'present') return STATUS_LABELS.present;
+  if (status === 'wfh') return STATUS_LABELS.wfh;
+  if (status === 'on_leave') return STATUS_LABELS.on_leave;
+  if (status === 'absent') return STATUS_LABELS.absent;
+  if (status === 'holiday') return STATUS_LABELS.holiday;
+  return '';
+}
+
+function sourceWord(source: string | null): string {
+  if (source === 'self') return 'you recorded it';
+  if (source === 'admin') return 'HR recorded it';
+  if (source === 'leave') return 'from approved leave';
+  if (source === 'correction') return 'from an approved correction';
+  if (source === 'qr') return 'scanned at a station';
+  return '';
+}
+
+const clockTime = (iso: string | null) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+};
+
+const dayLabel = (iso: string) => {
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+};
+
+// The gate. requireEmployee, because every hr_* table is keyed by employee_id and a screen about
+// your own hours has nothing to scope to without one.
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+let flash = '';
+let flashError = '';
+let advisory = '';
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE. One action, and it is re-checked inside the engine on the posted value.
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST' && employeeId) {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+
+    if (action === 'punch') {
+      const kind = String(form.get('kind') || '');
+      const latRaw = String(form.get('lat') || '');
+      const lonRaw = String(form.get('lon') || '');
+      const accRaw = String(form.get('acc') || '');
+      const res = await punch(employeeId, kind, {
+        lat: latRaw ? Number(latRaw) : null,
+        lon: lonRaw ? Number(lonRaw) : null,
+        accuracy: accRaw ? Number(accRaw) : null,
+        qrCode: String(form.get('qr') || '').trim() || null,
+        workMode: String(form.get('mode') || 'remote'),
+        ipAddress: Astro.request.headers.get('x-forwarded-for'),
+        deviceInfo: Astro.request.headers.get('user-agent'),
+      });
+      if (res.ok) {
+        flash = punchLabel(kind) + ' recorded.';
+        advisory = res.advisory || '';
+      } else {
+        // NEVER SWALLOWED. The engine's sentence is shown as it is, including the database's own
+        // reason when the write itself failed. A punch that silently did nothing is how somebody
+        // finds out at the end of the month that they have no attendance.
+        flashError = res.error || 'That could not be recorded.';
+      }
+    } else {
+      flashError = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    flashError = 'We could not record that: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/attendance] post', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+const now = await attendanceToday();
+const params = Astro.url.searchParams;
+const qrPrefill = String(params.get('qr') || '').trim().slice(0, 120);
+const weekParam = String(params.get('week') || '').trim();
+const anchor = /^\d{4}-\d{2}-\d{2}$/.test(weekParam) ? weekParam : (now || '');
+
+let totals: DayTotals | null = null;
+let options: PunchKind[] = [];
+let log: any[] = [];
+let sheet: Timesheet | null = null;
+let todayShift: any = null;
+let upcomingHolidays: any[] = [];
+
+if (employeeId && now) {
+  totals = computeDay(await punchesOn(employeeId, now));
+  options = allowedPunches(totals);
+  log = await punchLog(employeeId, now);
+  todayShift = await shiftOn(employeeId, now);
+  sheet = await weeklyTimesheet(employeeId, anchor || now);
+  upcomingHolidays = await listHolidays(now, shiftDateIso(now, 45), workspace?.department?.id || null);
+}
+
+const prevWeek = sheet ? shiftDateIso(sheet.weekStart, -7) : '';
+const nextWeek = sheet ? shiftDateIso(sheet.weekStart, 7) : '';
+const thisWeek = now ? weekStartIso(now) : '';
+const showsWeek = !!sheet;
+const balanceMinutes = sheet ? sheet.totalMinutes - sheet.expectedMinutes : 0;
+---
+
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Attendance - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    html,body{overflow-x:hidden;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;
+      padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
+      padding:10px 16px 2px;margin:0;scrollbar-width:thin;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;
+      border:1px solid #DFDCD8;border-radius:999px;background:#FDFDFC;color:#564E43;
+      font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .tab:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;
+      background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;
+      background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;
+      background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .stats{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0;}
+    .stat{flex:1 1 140px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;}
+    .stat b{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      font-size:1.125rem;line-height:1.2;}
+    .stat span{display:block;margin-top:2px;font-size:0.6875rem;letter-spacing:0.06em;
+      text-transform:uppercase;color:#70685C;}
+    .punches{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0;}
+    .punch{flex:1 1 140px;min-height:48px;padding:12px 14px;border:1px solid #1B1813;border-radius:10px;
+      background:#1B1813;color:#FFFFFF;font:inherit;font-size:0.9375rem;font-weight:650;cursor:pointer;}
+    .punch--soft{border-color:#DFDCD8;background:#FDFDFC;color:#1B1813;}
+    .punch:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .fields{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0;}
+    .field{flex:1 1 100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;
+      border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    .lab{display:block;margin:10px 0 4px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .hint{margin:6px 0 0;font-size:0.75rem;line-height:1.55;color:#70685C;}
+    .geo{min-height:44px;padding:10px 14px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;
+      color:#564E43;font:inherit;font-size:0.8125rem;font-weight:600;cursor:pointer;}
+    .weeknav{display:flex;align-items:center;gap:8px;margin:12px 0 0;}
+    .weeknav a{flex:1 1 auto;display:inline-flex;align-items:center;justify-content:center;min-height:44px;
+      padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#564E43;
+      font-size:0.8125rem;font-weight:600;text-decoration:none;}
+    .weeknav b{flex:2 1 auto;text-align:center;font-size:0.8125rem;}
+    /* The timesheet is wide. It gets its own scroller; the PAGE never gets one. */
+    .sheetbox{margin:10px 0 0;overflow-x:auto;-webkit-overflow-scrolling:touch;
+      border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    table{border-collapse:collapse;width:100%;min-width:560px;font-size:0.8125rem;}
+    th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #EFEDE9;white-space:nowrap;}
+    th{font-size:0.6875rem;letter-spacing:0.06em;text-transform:uppercase;color:#70685C;font-weight:650;}
+    tr:last-child td{border-bottom:none;}
+    td.today{font-weight:700;}
+    .rows{list-style:none;margin:10px 0 0;padding:0;}
+    .row{padding:10px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;margin-bottom:8px;}
+    .row p{margin:0;font-size:0.875rem;line-height:1.5;overflow-wrap:anywhere;}
+    .row small{display:block;margin-top:3px;font-size:0.75rem;color:#70685C;overflow-wrap:anywhere;}
+    .links{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0;}
+    .links a{flex:1 1 160px;display:inline-flex;align-items:center;justify-content:center;min-height:44px;
+      padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#1B1813;
+      font-size:0.8125rem;font-weight:600;text-decoration:none;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;
+      line-height:1.6;color:#70685C;}
+    @media (min-width:640px){ .field{flex:1 1 240px;} }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Attendance</h1>
+    <p>{workspace ? workspace.fullName : 'Your working day'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Attendance">
+    <a class="tab" href={PATH} aria-current="page">Today and this week</a>
+    <a class="tab" href={PATH + '/corrections'}>Corrections</a>
+    <a class="tab" href={PATH + '/roster'}>Shifts and roster</a>
+    <a class="tab" href="/portal/employee/calendar">Calendar</a>
+  </nav>
+
+  <main class="wrap">
+    {!gate.ok && (
+      <EmptyState
+        title={gate.title || 'This screen is not available'}
+        body={gate.reason || 'Your employee record is what this screen is built from.'}
+        illustration="note"
+        actionLabel="Back to your workspace"
+        actionHref="/portal/employee"
+      />
+    )}
+
+    {gate.ok && !now && (
+      <p class="bad">
+        We could not read today's date from the database, so nothing on this page is partitioned by
+        day and no punch can be recorded right now. Nothing you have logged is lost. Try again in a
+        moment, and tell HR if it keeps happening.
+      </p>
+    )}
+
+    {flash && <p class="ok">{flash}</p>}
+    {advisory && <p class="notice">{advisory} This is a note kept with your punch. It changes nothing about your day and nobody is penalised by it.</p>}
+    {flashError && <p class="bad">{flashError}</p>}
+
+    {gate.ok && now && totals && (
+      <section class="card">
+        <h2>Today</h2>
+        <p>
+          {totals.clockIn ? 'Checked in at ' + clockTime(totals.clockIn) : 'Not checked in yet'}
+          {totals.clockOut ? ', checked out at ' + clockTime(totals.clockOut) : ''}
+          {totals.onBreak ? '. On a break now.' : ''}
+        </p>
+        <div class="stats">
+          <div class="stat"><b>{formatMinutes(totals.workedMinutes) || '0m'}</b><span>worked today</span></div>
+          <div class="stat"><b>{formatMinutes(totals.breakMinutes) || '0m'}</b><span>on break</span></div>
+          <div class="stat"><b>{todayShift ? shiftSummary(todayShift) : 'None'}</b><span>rostered shift</span></div>
+        </div>
+
+        <form method="POST" action={PATH}>
+          <input type="hidden" name="action" value="punch" />
+          <input type="hidden" name="lat" id="geo-lat" value="" />
+          <input type="hidden" name="lon" id="geo-lon" value="" />
+          <input type="hidden" name="acc" id="geo-acc" value="" />
+
+          <label class="lab" for="mode">Where are you working from</label>
+          <select class="field" id="mode" name="mode">
+            <option value="remote">Remote</option>
+            <option value="onsite">On site</option>
+            <option value="hybrid">Hybrid</option>
+          </select>
+
+          <label class="lab" for="qr">Station code, if you scanned one</label>
+          <input class="field" id="qr" name="qr" type="text" maxlength="120" value={qrPrefill}
+            autocomplete="off" placeholder="Leave empty if you did not scan" />
+          <p class="hint">
+            Scanning a station QR with your phone camera opens this page with the code already filled
+            in. A code that is not recognised is still kept with your punch, exactly as it was read.
+          </p>
+
+          <button class="geo" type="button" id="geo-btn" hidden>Attach my location to this punch</button>
+          <p class="hint" id="geo-state"></p>
+
+          <div class="punches">
+            {options.map((k) => (
+              <button class={k === 'clock_out' || k === 'break_start' ? 'punch punch--soft' : 'punch'}
+                type="submit" name="kind" value={k}>{punchLabel(k)}</button>
+            ))}
+          </div>
+        </form>
+      </section>
+    )}
+
+    {gate.ok && log.length > 0 && (
+      <section class="card">
+        <h2>Today's punches</h2>
+        <ul class="rows">
+          {log.map((e) => (
+            <li class="row">
+              <p>{punchLabel(e.kind)} at {clockTime(e.at)}</p>
+              <small>
+                {e.stationLabel ? 'Scanned at ' + e.stationLabel + '. ' : ''}
+                {!e.stationLabel && e.qrCodeRaw ? 'Code read: ' + e.qrCodeRaw + ' (not a recorded station). ' : ''}
+                {e.lat !== null && e.lon !== null ? 'A location reading was kept with this punch. ' : 'No location reading.'}
+                {e.accuracy !== null && e.accuracy > 200 ? 'The phone called it accurate to about ' + Math.round(e.accuracy) + ' m.' : ''}
+              </small>
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    {showsWeek && sheet && (
+      <section class="card">
+        <h2>This week</h2>
+        <div class="weeknav">
+          <a href={PATH + '?week=' + prevWeek}>Earlier</a>
+          <b>{dayLabel(sheet.weekStart)} to {dayLabel(sheet.weekEnd)}</b>
+          <a href={PATH + '?week=' + nextWeek}>Later</a>
+        </div>
+
+        <div class="stats">
+          <div class="stat"><b>{minutesToHours(sheet.totalMinutes)}</b><span>hours recorded</span></div>
+          <div class="stat"><b>{sheet.noRoster ? 'None' : minutesToHours(sheet.expectedMinutes)}</b><span>hours expected</span></div>
+          <div class="stat"><b>{sheet.noRoster ? '-' : (balanceMinutes >= 0 ? '+' : '') + minutesToHours(balanceMinutes)}</b><span>difference</span></div>
+        </div>
+
+        {sheet.noRoster && (
+          <p class="notice">
+            No shift is rostered for you, so there is nothing to compare your hours against. That is a
+            missing roster entry rather than a problem with your hours. HR sets this on the Shifts and
+            roster screen.
+          </p>
+        )}
+
+        <div class="sheetbox">
+          <table>
+            <thead>
+              <tr><th>Day</th><th>Status</th><th>In</th><th>Out</th><th>Worked</th><th>Expected</th><th>Where it came from</th></tr>
+            </thead>
+            <tbody>
+              {sheet.days.map((d) => (
+                <tr>
+                  <td class={d.isToday ? 'today' : ''}>{d.weekday.slice(0, 3)} {dayLabel(d.dateIso)}</td>
+                  <td>{d.holiday ? d.holiday.name : statusLabel(d.status) || (d.isWorkingDay ? 'Nothing recorded' : 'Not a working day')}</td>
+                  <td>{clockTime(d.clockIn)}</td>
+                  <td>{clockTime(d.clockOut)}</td>
+                  <td>{d.workedMinutes ? formatMinutes(d.workedMinutes) : ''}</td>
+                  <td>{d.expectedMinutes ? formatMinutes(d.expectedMinutes) : ''}</td>
+                  <td>{sourceWord(d.source)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="links">
+          <a href={PATH + '?week=' + thisWeek}>This week</a>
+          <a href={PATH + '/corrections'}>Ask for a day to be corrected</a>
+        </div>
+      </section>
+    )}
+
+    {gate.ok && upcomingHolidays.length > 0 && (
+      <section class="card">
+        <h2>Holidays coming up</h2>
+        <ul class="rows">
+          {upcomingHolidays.map((h) => (
+            <li class="row">
+              <p>{h.name}</p>
+              <small>{dayLabel(h.dateIso)}{h.departmentName ? ', ' + h.departmentName + ' only' : ', whole organization'}{h.isOptional ? ', optional' : ''}</small>
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    <p class="foot">
+      Your punches are recorded against your own employee record and nobody else's. A location
+      reading or a scanned station code is kept as evidence beside a punch and is never used to
+      refuse one, mark one as suspicious or reduce anybody's hours: a person decides what a reading
+      means, and phone location is often wrong indoors. To change a day that is already recorded, ask
+      for a correction; it goes to your reporting manager, who is resolved from the organization
+      graph rather than from anybody's job title.
+    </p>
+  </main>
+
+  <BottomNav variant="hr" active="" label="Primary" />
+
+  <script is:inline>
+    // PROGRESSIVE ENHANCEMENT ONLY. The punch buttons work without this. It asks the browser for a
+    // location and fills three hidden inputs, and it un-hides its own button so a browser with no
+    // JavaScript or no geolocation never shows a control that does nothing. Nothing here can refuse
+    // a punch: it only fills fields the server treats as evidence.
+    (function () {
+      var btn = document.getElementById('geo-btn');
+      var state = document.getElementById('geo-state');
+      if (!btn || !state || !navigator.geolocation) return;
+      btn.hidden = false;
+      btn.addEventListener('click', function () {
+        state.textContent = 'Asking your browser for a location...';
+        navigator.geolocation.getCurrentPosition(
+          function (pos) {
+            document.getElementById('geo-lat').value = String(pos.coords.latitude);
+            document.getElementById('geo-lon').value = String(pos.coords.longitude);
+            document.getElementById('geo-acc').value = String(pos.coords.accuracy || '');
+            state.textContent = 'A location will be attached to your next punch. It is a note, not a check.';
+          },
+          function () {
+            state.textContent = 'Your browser did not share a location. Your punch still works exactly the same.';
+          },
+          { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
+        );
+      });
+    })();
+  </script>
+</body>
+</html>

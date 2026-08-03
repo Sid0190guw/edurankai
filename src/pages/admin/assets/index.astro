@@ -1,0 +1,362 @@
+---
+// /admin/assets — THE ASSET REGISTER. What the company owns, who is holding it, and the whole
+// history of each thing.
+//
+// THE GATE, and it is the same shape as every other console surface here: the `assets` SECTION
+// (which is what the sidebar entry is gated on, so the menu and the lock agree) or the
+// `assets.manage` CAPABILITY (which a custom role can be granted directly). Neither is a role name.
+//
+// EVERY WRITE IS RE-CHECKED IN THE LIBRARY, on the posted id: registerAsset, assignAsset,
+// returnAsset and setAssetStatus each ask holdsCapability() themselves. This page decides what is
+// offered, never what is permitted.
+//
+// WHAT REPLACES WHAT. Until this existed the entire record of company equipment was one boolean on
+// hr_separation — assets_returned — with nothing behind it. Per-asset history and per-employee
+// history are both here, which is what makes that checkbox answerable rather than merely tickable.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { holdsCapability } from '@/lib/auth/capability';
+import {
+  listAssets, getAsset, assetHistory, employeeAssetHistory, assetCounts,
+  registerAsset, assignAsset, returnAsset, setAssetStatus, canChangeStatus,
+  ASSET_KINDS, ASSET_STATUSES, ASSET_CONDITIONS,
+  kindLabel, assetStatusLabel, conditionLabel, eventLabel,
+  type Asset,
+} from '@/lib/assets';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const bySection = await canAccessSection(user as any, 'assets', 'view');
+const byCapability = holdsCapability(user as any, 'assets.manage');
+if (!bySection && !byCapability) return Astro.redirect('/admin');
+
+// CONSTANTS FIRST — `const` is not hoisted, and a const under the POST handler that reads it throws
+// on that handler's first line.
+const PAGE = '/admin/assets';
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const fmt = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+const fmtTime = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+};
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const id = String(fd.get('id') || '');
+  let flash = '';
+  let ok = true;
+  let back = PAGE;
+
+  if (action === 'register') {
+    const costRaw = String(fd.get('cost') || '').trim();
+    const seatsRaw = String(fd.get('licence_seats') || '').trim();
+    const r = await registerAsset({
+      tag: String(fd.get('tag') || ''),
+      kind: String(fd.get('kind') || ''),
+      name: String(fd.get('name') || ''),
+      make: String(fd.get('make') || ''),
+      model: String(fd.get('model') || ''),
+      serialNo: String(fd.get('serial_no') || ''),
+      condition: String(fd.get('condition') || 'good'),
+      purchaseDate: String(fd.get('purchase_date') || '') || null,
+      warrantyUntil: String(fd.get('warranty_until') || '') || null,
+      cost: costRaw ? Number(costRaw) : null,
+      currency: String(fd.get('currency') || '') || null,
+      licenceSeats: seatsRaw ? Number(seatsRaw) : null,
+      licenceExpiresOn: String(fd.get('licence_expires_on') || '') || null,
+      notes: String(fd.get('notes') || ''),
+    }, user as any);
+    ok = r.ok;
+    flash = r.ok ? 'On the register.' : (r.error || 'Could not register that.');
+    if (r.ok && r.id) back = PAGE + '?a=' + r.id;
+  } else if (action === 'assign') {
+    const r = await assignAsset(id, String(fd.get('employee_id') || ''), user as any, {
+      expectedReturnOn: String(fd.get('expected_return_on') || '') || null,
+      note: String(fd.get('note') || ''),
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Issued.' : (r.error || 'Could not issue that.');
+    back = PAGE + '?a=' + id;
+  } else if (action === 'return') {
+    const r = await returnAsset(String(fd.get('assignment_id') || ''), user as any, {
+      condition: String(fd.get('condition') || 'good'),
+      note: String(fd.get('note') || ''),
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Return recorded.' : (r.error || 'Could not record that.');
+    back = PAGE + '?a=' + id;
+  } else if (action === 'status') {
+    const r = await setAssetStatus(id, user as any, String(fd.get('to') || ''), String(fd.get('note') || ''));
+    ok = r.ok;
+    flash = r.ok ? 'Updated.' : (r.error || 'Could not do that.');
+    back = PAGE + '?a=' + id;
+  }
+
+  return Astro.redirect(back + (back.indexOf('?') >= 0 ? '&' : '?') + 'msg=' + encodeURIComponent(flash) + '&ok=' + (ok ? '1' : '0'));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const msgOk = url.searchParams.get('ok') !== '0';
+const openId = url.searchParams.get('a') || '';
+const personId = url.searchParams.get('e') || '';
+const kindFilter = url.searchParams.get('kind') || '';
+const statusFilter = url.searchParams.get('status') || '';
+const q = url.searchParams.get('q') || '';
+
+const counts = await assetCounts();
+const register: Asset[] = await listAssets({ kind: kindFilter || null, status: statusFilter || null, q, limit: 200 });
+
+let open: Asset | null = null;
+let history: any[] = [];
+let openMoves: string[] = [];
+if (openId) {
+  open = await getAsset(openId);
+  if (open) {
+    history = await assetHistory(open.id);
+    for (const s of ASSET_STATUSES) {
+      if (canChangeStatus(open.status, s).ok) openMoves.push(s);
+    }
+  }
+}
+
+// PER-EMPLOYEE HISTORY. Everything one person has ever been issued — the read a separation
+// checklist actually needs.
+let person: any = null;
+let personHistory: any[] = [];
+if (personId) {
+  try {
+    person = rowsOf(await db.execute(sql`
+      SELECT id, full_name, employee_code FROM hr_employees WHERE id = ${personId}::uuid LIMIT 1`))[0] || null;
+  } catch (e: any) {
+    console.error('[assets admin] person lookup', e?.cause?.message || e?.message);
+  }
+  if (person) personHistory = await employeeAssetHistory(String(person.id), 100);
+}
+---
+<AdminLayout title="Asset register" activeNav="assets">
+  <div style="max-width:960px;">
+    <h1 style="font-family:'Fraunces',serif;font-size:24px;font-weight:600;margin-bottom:6px;">Asset register</h1>
+    <p style="font-size:13.5px;color:#6b6255;line-height:1.6;margin-bottom:16px;">
+      Equipment and licences, who is holding each one, and everything that has happened to it. Asking for
+      an asset is a helpdesk ticket approved along the requester's own reporting line — this register issues
+      what was approved.
+    </p>
+
+    {msg && (
+      <div style={'border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:14px;line-height:1.5;' + (msgOk
+        ? 'background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;'
+        : 'background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:#991b1b;')}>{msg}</div>
+    )}
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+      <div style="flex:1 1 120px;background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 13px;">
+        <div style="font-family:'Fraunces',serif;font-size:22px;font-weight:600;">{counts.total}</div>
+        <div style="font-size:11.5px;color:#9a8f7d;">On the register</div>
+      </div>
+      <div style="flex:1 1 120px;background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 13px;">
+        <div style="font-family:'Fraunces',serif;font-size:22px;font-weight:600;">{counts.issued}</div>
+        <div style="font-size:11.5px;color:#9a8f7d;">Issued</div>
+      </div>
+      <div style="flex:1 1 120px;background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 13px;">
+        <div style="font-family:'Fraunces',serif;font-size:22px;font-weight:600;">{counts.inStock}</div>
+        <div style="font-size:11.5px;color:#9a8f7d;">In stock</div>
+      </div>
+      <div style="flex:1 1 120px;background:#fff;border:1px solid #ece4d6;border-radius:12px;padding:11px 13px;">
+        <div style="font-family:'Fraunces',serif;font-size:22px;font-weight:600;">{counts.repair}</div>
+        <div style="font-size:11.5px;color:#9a8f7d;">In repair</div>
+      </div>
+    </div>
+
+    {person && (
+      <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+        <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:10px;">Everything issued to {person.full_name}</h2>
+        {personHistory.length === 0 && (<p style="font-size:14px;">Nothing has ever been issued to this person.</p>)}
+        {personHistory.map((h: any) => (
+          <div style="padding:9px 0;border-bottom:1px solid #f2ece0;">
+            <div style="font-weight:600;font-size:14px;">{h.assetName} <span style="font-weight:400;color:#9a8f7d;">({h.assetTag})</span></div>
+            <div style="font-size:11.5px;color:#9a8f7d;">
+              {kindLabel(h.assetKind || '')} · issued {fmt(h.assignedAt)}
+              {h.returnedAt ? ' · returned ' + fmt(h.returnedAt) + ' ' + conditionLabel(h.returnedCondition || '').toLowerCase() : ' · still held'}
+            </div>
+          </div>
+        ))}
+        <p style="margin-top:12px;"><a href={PAGE} style="color:#c2410c;">Back to the register</a></p>
+      </div>
+    )}
+
+    {!open && !person && (
+      <div>
+        <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+          <input name="q" value={q} placeholder="Tag, name, serial or model" aria-label="Search the register" style="flex:1 1 220px;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#fff;"/>
+          <select name="kind" aria-label="Kind" style="flex:1 1 150px;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#fff;">
+            <option value="">Every kind</option>
+            {ASSET_KINDS.map((k) => (<option value={k} selected={k === kindFilter}>{kindLabel(k)}</option>))}
+          </select>
+          <select name="status" aria-label="State" style="flex:1 1 150px;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#fff;">
+            <option value="">Every state</option>
+            {ASSET_STATUSES.map((s) => (<option value={s} selected={s === statusFilter}>{assetStatusLabel(s)}</option>))}
+          </select>
+          <button style="flex:0 0 auto;min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 16px;font-size:14px;cursor:pointer;">Search</button>
+        </form>
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:6px 16px;margin-bottom:14px;">
+          {register.length === 0 && (<p style="font-size:14px;padding:18px 0;line-height:1.6;">Nothing on the register yet. Add the first thing below — a tag, what it is, and who made it.</p>)}
+          {register.map((a) => (
+            <div style="padding:13px 0;border-bottom:1px solid #f2ece0;display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+              <div style="min-width:0;">
+                <a href={PAGE + '?a=' + a.id} style="font-weight:600;font-size:14.5px;color:#1a1510;text-decoration:none;word-break:break-word;">{a.name}</a>
+                <div style="font-size:11.5px;color:#9a8f7d;margin-top:3px;">
+                  {a.tag} · {kindLabel(a.kind)}{a.model ? ' · ' + a.model : ''}{a.serialNo ? ' · sn ' + a.serialNo : ''}
+                </div>
+                <div style="font-size:11.5px;color:#9a8f7d;">
+                  {a.holderName ? 'Held by ' : 'Condition '}
+                  {a.holderName
+                    ? (<a href={PAGE + '?e=' + a.holderEmployeeId} style="color:#c2410c;">{a.holderName}</a>)
+                    : conditionLabel(a.condition).toLowerCase()}
+                  {a.holderName && a.expectedReturnOn ? ' · due back ' + fmt(a.expectedReturnOn) : ''}
+                </div>
+              </div>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:rgba(0,0,0,.05);">{assetStatusLabel(a.status)}</span>
+            </div>
+          ))}
+        </div>
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;">
+          <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:12px;">Add something to the register</h2>
+          <form method="POST" style="display:flex;flex-wrap:wrap;gap:10px;">
+            <input type="hidden" name="action" value="register"/>
+            <div style="flex:1 1 160px;"><label for="tag" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Asset tag</label><input id="tag" name="tag" required maxlength="60" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 160px;"><label for="kind" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Kind</label><select id="kind" name="kind" required style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;">{ASSET_KINDS.map((k) => (<option value={k}>{kindLabel(k)}</option>))}</select></div>
+            <div style="flex:1 1 240px;"><label for="name" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Name</label><input id="name" name="name" required maxlength="200" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 150px;"><label for="make" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Make</label><input id="make" name="make" maxlength="120" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 150px;"><label for="model" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Model</label><input id="model" name="model" maxlength="120" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 150px;"><label for="serial_no" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Serial number</label><input id="serial_no" name="serial_no" maxlength="120" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 130px;"><label for="condition" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Condition</label><select id="condition" name="condition" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;">{ASSET_CONDITIONS.map((c) => (<option value={c} selected={c === 'good'}>{conditionLabel(c)}</option>))}</select></div>
+            <div style="flex:1 1 150px;"><label for="purchase_date" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Bought on</label><input id="purchase_date" name="purchase_date" type="date" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 150px;"><label for="warranty_until" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Warranty until</label><input id="warranty_until" name="warranty_until" type="date" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 120px;"><label for="cost" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Cost</label><input id="cost" name="cost" inputmode="decimal" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 90px;"><label for="currency" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Currency</label><input id="currency" name="currency" maxlength="8" placeholder="INR" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 120px;"><label for="licence_seats" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Licence seats</label><input id="licence_seats" name="licence_seats" inputmode="numeric" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 160px;"><label for="licence_expires_on" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Licence expires</label><input id="licence_expires_on" name="licence_expires_on" type="date" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <div style="flex:1 1 100%;"><label for="notes" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Notes</label><input id="notes" name="notes" maxlength="2000" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+            <button style="flex:0 0 auto;min-height:44px;background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;font-size:14.5px;font-weight:600;cursor:pointer;">Add it</button>
+          </form>
+          <p style="font-size:12.5px;color:#9a8f7d;margin-top:10px;line-height:1.6;">
+            The tag is unique — it identifies one physical object, so two rows sharing one would mean two
+            histories and no way to tell which is real.
+          </p>
+        </div>
+      </div>
+    )}
+
+    {openId && !open && (
+      <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;">
+        <p style="font-size:14px;">That asset is not on the register.</p>
+        <p style="margin-top:10px;"><a href={PAGE} style="color:#c2410c;">Back to the register</a></p>
+      </div>
+    )}
+
+    {open && (
+      <div>
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+          <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+            <div style="min-width:0;">
+              <div style="font-family:'Fraunces',serif;font-size:19px;font-weight:600;word-break:break-word;">{open.name}</div>
+              <div style="font-size:11.5px;color:#9a8f7d;margin-top:4px;">
+                {open.tag} · {kindLabel(open.kind)}{open.make ? ' · ' + open.make : ''}{open.model ? ' ' + open.model : ''}{open.serialNo ? ' · sn ' + open.serialNo : ''}
+              </div>
+              <div style="font-size:11.5px;color:#9a8f7d;">
+                Condition {conditionLabel(open.condition).toLowerCase()}
+                {open.purchaseDate ? ' · bought ' + fmt(open.purchaseDate) : ''}
+                {open.warrantyUntil ? ' · warranty to ' + fmt(open.warrantyUntil) : ''}
+                {open.licenceSeats ? ' · ' + open.licenceSeats + ' seats' : ''}
+                {open.licenceExpiresOn ? ' · licence to ' + fmt(open.licenceExpiresOn) : ''}
+              </div>
+              {open.holderName && (
+                <div style="font-size:13px;margin-top:8px;">Held by <a href={PAGE + '?e=' + open.holderEmployeeId} style="color:#c2410c;">{open.holderName}</a> since {fmt(open.assignedAt)}{open.expectedReturnOn ? ', due back ' + fmt(open.expectedReturnOn) : ''}.</div>
+              )}
+            </div>
+            <span style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:rgba(0,0,0,.05);">{assetStatusLabel(open.status)}</span>
+          </div>
+          {open.notes && (<p style="font-size:14px;line-height:1.6;margin-top:10px;">{open.notes}</p>)}
+        </div>
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+          <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:12px;">Issue and return</h2>
+
+          {!open.assignmentId && open.status === 'in_stock' && (
+            <form method="POST" style="display:flex;flex-wrap:wrap;gap:10px;">
+              <input type="hidden" name="action" value="assign"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <div style="flex:1 1 240px;"><label for="employee_id" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Issue to (hr_employees id)</label><input id="employee_id" name="employee_id" required style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+              <div style="flex:1 1 160px;"><label for="expected_return_on" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Due back</label><input id="expected_return_on" name="expected_return_on" type="date" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+              <div style="flex:1 1 100%;"><label for="anote" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Note</label><input id="anote" name="note" maxlength="2000" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+              <button style="flex:0 0 auto;min-height:44px;background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;font-size:14.5px;font-weight:600;cursor:pointer;">Issue it</button>
+            </form>
+          )}
+
+          {!open.assignmentId && open.status !== 'in_stock' && (
+            <p style="font-size:14px;line-height:1.6;">Only something in stock can be issued. This one is {assetStatusLabel(open.status).toLowerCase()}.</p>
+          )}
+
+          {open.assignmentId && (
+            <form method="POST" style="display:flex;flex-wrap:wrap;gap:10px;">
+              <input type="hidden" name="action" value="return"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <input type="hidden" name="assignment_id" value={open.assignmentId}/>
+              <div style="flex:1 1 160px;"><label for="rcond" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Came back</label><select id="rcond" name="condition" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;">{ASSET_CONDITIONS.map((c) => (<option value={c} selected={c === 'good'}>{conditionLabel(c)}</option>))}</select></div>
+              <div style="flex:1 1 240px;"><label for="rnote" style="font-size:11.5px;color:#9a8f7d;display:block;margin-bottom:4px;">Note</label><input id="rnote" name="note" maxlength="2000" style="width:100%;min-height:44px;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;background:#faf7f1;"/></div>
+              <button style="flex:0 0 auto;min-height:44px;background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;font-size:14.5px;font-weight:600;cursor:pointer;">Record the return</button>
+              <p style="flex:1 1 100%;font-size:12.5px;color:#9a8f7d;margin:0;line-height:1.6;">Something returned damaged goes to repair rather than straight back into stock.</p>
+            </form>
+          )}
+        </div>
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+          <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:12px;">Move it</h2>
+          {openMoves.length === 0 && (<p style="font-size:14px;">{assetStatusLabel(open.status)} is final. Nothing moves from here.</p>)}
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            {openMoves.map((s) => (
+              <form method="POST" style="flex:0 0 auto;">
+                <input type="hidden" name="action" value="status"/>
+                <input type="hidden" name="id" value={open.id}/>
+                <input type="hidden" name="to" value={s}/>
+                <button style="min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 15px;font-size:13.5px;cursor:pointer;">{assetStatusLabel(s)}</button>
+              </form>
+            ))}
+          </div>
+          <p style="font-size:12.5px;color:#9a8f7d;margin-top:10px;line-height:1.6;">
+            Issued is not in this list on purpose: something becomes issued by an assignment being written,
+            and comes back by a return being recorded. A button that set it directly would produce an asset
+            that is out with nobody.
+          </p>
+        </div>
+
+        <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:18px;margin-bottom:14px;">
+          <h2 style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin-bottom:12px;">History</h2>
+          {history.length === 0 && (<p style="font-size:14px;">Nothing recorded yet.</p>)}
+          {history.map((h: any) => (
+            <div style="padding:9px 0;border-bottom:1px solid #f2ece0;">
+              <div style="font-weight:600;font-size:13.5px;">{eventLabel(h.event)}{h.employeeName ? ' — ' + h.employeeName : ''}</div>
+              <div style="font-size:11.5px;color:#9a8f7d;">{fmtTime(h.createdAt)}{h.note ? ' · ' + h.note : ''}</div>
+            </div>
+          ))}
+        </div>
+
+        <p><a href={PAGE} style="color:#c2410c;">Back to the register</a></p>
+      </div>
+    )}
+  </div>
+</AdminLayout>

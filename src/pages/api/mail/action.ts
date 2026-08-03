@@ -3,6 +3,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureMailSchema } from '@/lib/mail';
+import { denyMailApi } from '@/lib/auth/mail-access';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -11,8 +12,13 @@ function json(d: any, s = 200) {
 const FOLDERS = ['inbox', 'sent', 'drafts', 'archive', 'trash', 'spam'];
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // The SAME question its two siblings ask, so the three endpoints one composer calls cannot answer
+  // differently. Every statement below is already narrowed to `user_id = <caller>`, so this is not
+  // closing a leak — it is refusing to write mailbox rows for an account that has no mailbox, and
+  // it authorises BEFORE the body is read and before ensureMailSchema() runs any DDL.
+  const denied = await denyMailApi(locals, { label: 'mail.action' });
+  if (denied) return denied;
   const user = (locals as any).user;
-  if (!user) return json({ ok: false, error: 'unauthorized' }, 401);
 
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

@@ -1,0 +1,505 @@
+---
+// /admin/hr/performance/cycles — APPRAISAL CYCLES, CALIBRATION AND OUTCOMES.
+//
+// =================================================================================================
+// THE GATE
+// =================================================================================================
+//
+// `performance.manage`, asked with can() — which reads PERMS_BY_ROLE alone and never the registry.
+// That matters: there is no `performance` section in src/lib/admin-sections.ts, but page_key is free
+// text, so a hand-typed custom-role row could spell `performance.manage` and a registry-based check
+// would then admit somebody nobody deliberately granted appraisal ratings to.
+//
+// The key is granted to super_admin + hr, which is exactly who reaches /admin/hr/performance today
+// (middleware maps /admin/hr to the `hr` section, and ROLE_SECTIONS gives that section to `hr`
+// alone). Nobody gains and nobody loses.
+//
+// AND IT REFUSES OUT LOUD. A person with the console but not this desk is told what they are looking
+// at and who opens it, in place. A silent redirect is how people conclude the product is broken and
+// go and ask for a wider role than they need.
+//
+// =================================================================================================
+// WHAT THIS CONSOLE DOES NOT DO
+// =================================================================================================
+//
+// It does not approve an appraisal. Sign-off is routed by src/lib/workflow.ts to the department head
+// — a RELATIONSHIP from the Organization Graph — and `performance.manage` deliberately confers no
+// standing authority on that chain. Running the cycle and signing off a rating are two different
+// powers, and the same desk holding both would mean calibration approving itself.
+//
+// It does not overwrite a manager's rating. Calibration is stored BESIDE it, so an employee
+// disputing an outcome can see what their manager said and what changed it.
+//
+// It does not promote anybody. A promotion recommendation raised from a review is a workflow; the
+// designation on the employee record is the lifecycle console's to change.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { resolvePerfViewer, departmentOptions, PERF_MANAGE } from '@/lib/performance-scope';
+import {
+  listCycles,
+  getCycle,
+  createCycle,
+  advanceStage,
+  captureManagers,
+  reviewsInCycle,
+  calibrate,
+  recordOutcome,
+  ratingDistribution,
+  CYCLE_STAGES,
+  CYCLE_STAGE_LABELS,
+  REVIEW_OUTCOMES,
+  REVIEW_OUTCOME_LABELS,
+  RATING_MAX,
+  type ReviewCycle,
+  type PerformanceReview,
+} from '@/lib/performance';
+
+const PATH = '/admin/hr/performance/cycles';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+
+// ---- Gate, and every const declared above the POST handler --------------------------------------
+const hasConsole = can(user as any, 'admin.access');
+if (!hasConsole) return Astro.redirect('/admin');
+const allowed = can(user as any, PERF_MANAGE);
+
+const RATINGS = [1, 2, 3, 4, 5];
+
+const back = (msg: string, cycleId: string) =>
+  Astro.redirect(PATH + (cycleId ? '?cycle=' + encodeURIComponent(cycleId) : '') + (cycleId ? '&' : '?')
+    + 'msg=' + encodeURIComponent(msg.slice(0, 300)));
+
+const fmtDate = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+// =================================================================================================
+// WRITES — every one skipped when the gate refused. No query runs on the denied path.
+// =================================================================================================
+if (Astro.request.method === 'POST') {
+  if (!allowed) return Astro.redirect(PATH);
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const cycleId = String(fd.get('cycle_id') || '');
+
+  if (action === 'create_cycle') {
+    const r = await createCycle({
+      title: String(fd.get('title') || ''),
+      periodStart: String(fd.get('period_start') || ''),
+      periodEnd: String(fd.get('period_end') || ''),
+      reviewType: String(fd.get('review_type') || 'annual'),
+      selfDueOn: String(fd.get('self_due_on') || ''),
+      managerDueOn: String(fd.get('manager_due_on') || ''),
+      calibrationDueOn: String(fd.get('calibration_due_on') || ''),
+      createdByUserId: String(user.id),
+    });
+    return back(
+      r.ok ? 'Cycle opened, with a review row for every active employee.' : (r.error || 'Could not open that cycle.'),
+      r.id || '',
+    );
+  }
+
+  if (action === 'advance') {
+    const r = await advanceStage(cycleId, String(fd.get('stage') || '') as any, String(user.id));
+    return back(r.ok ? 'Stage moved.' : (r.error || 'Could not move the stage.'), cycleId);
+  }
+
+  if (action === 'capture_managers') {
+    const r = await captureManagers(cycleId);
+    return back(
+      r.filled > 0
+        ? 'Recorded a reporting manager on ' + r.filled + ' review' + (r.filled === 1 ? '' : 's') + ' from the Organization Graph.'
+        : 'No reviews could be matched to a reporting manager. Either they all have one already, or the Organization Graph has no reporting lines yet.',
+      cycleId,
+    );
+  }
+
+  if (action === 'calibrate') {
+    const r = await calibrate(String(fd.get('review_id') || ''), {
+      rating: Number(fd.get('rating')),
+      note: String(fd.get('note') || ''),
+      actorUserId: String(user.id),
+    });
+    return back(r.ok ? 'Calibrated rating recorded beside the manager rating.' : (r.error || 'Could not calibrate that.'), cycleId);
+  }
+
+  if (action === 'outcome') {
+    const r = await recordOutcome(String(fd.get('review_id') || ''), {
+      outcome: String(fd.get('outcome') || ''),
+      note: String(fd.get('note') || ''),
+      actorUserId: String(user.id),
+    });
+    return back(r.ok ? 'Outcome recorded and shared with the employee.' : (r.error || 'Could not record that.'), cycleId);
+  }
+
+  return back('That action is not one this page performs.', cycleId);
+}
+
+// =================================================================================================
+// READS — none of them run when the gate refused.
+// =================================================================================================
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 300);
+const selectedId = String(params.get('cycle') || '');
+const deptFilter = String(params.get('dept') || '');
+
+let cycles: ReviewCycle[] = [];
+let selected: ReviewCycle | null = null;
+let reviews: PerformanceReview[] = [];
+let distribution: { rating: number; count: number }[] = [];
+let departments: { id: string; name: string }[] = [];
+let viewer: any = null;
+
+if (allowed) {
+  viewer = await resolvePerfViewer(String(user.id), (k: string) => can(user as any, k as any));
+  cycles = await listCycles();
+  selected = selectedId ? await getCycle(selectedId) : (cycles[0] || null);
+  departments = await departmentOptions();
+  if (selected) {
+    const dept = departments.some((d) => d.id === deptFilter) ? deptFilter : '';
+    reviews = await reviewsInCycle(selected.id, { departmentId: dept || null });
+    distribution = await ratingDistribution(selected.id);
+  }
+}
+
+const dept = departments.some((d) => d.id === deptFilter) ? deptFilter : '';
+const noManager = reviews.filter((r) => !r.managerEmployeeId).length;
+const maxBar = distribution.reduce((m, d) => (d.count > m ? d.count : m), 0) || 1;
+const cycleHref = (id: string) => PATH + '?cycle=' + id;
+---
+
+<AdminLayout title="Appraisal cycles" activeNav="hr">
+  <style>
+    .pf{max-width:1080px}
+    .pf h1{font-size:22px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px}
+    .pf .lede{font-size:13.5px;line-height:1.6;color:#6b6255;margin:0 0 18px;max-width:70ch}
+    .pf .flash{background:rgba(5,150,105,.09);border:1px solid rgba(5,150,105,.3);color:#065f46;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:16px;
+      overflow-wrap:anywhere}
+    .pf .deny{background:#fbf7f1;border:1px solid #eadecd;color:#6d470d;border-radius:12px;
+      padding:16px;font-size:13.5px;line-height:1.6;max-width:70ch}
+    .pf .grid{display:grid;grid-template-columns:1fr;gap:14px}
+    .pf .card{background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:16px}
+    .pf .card h2{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;
+      letter-spacing:.13em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px}
+    .pf .muted{font-size:12.5px;line-height:1.55;color:#6b6255;overflow-wrap:anywhere}
+    .pf .notice{background:#fbf7f1;border:1px solid #eadecd;color:#6d470d;border-radius:10px;
+      padding:10px 12px;font-size:12.5px;line-height:1.55;margin:10px 0;overflow-wrap:anywhere}
+    .pf label{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;
+      letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;
+      margin:10px 0 4px}
+    .pf input,.pf select,.pf textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;
+      border-radius:9px;padding:10px 12px;font-size:14px;font-family:inherit;color:#1a1510;
+      outline:none;min-height:44px}
+    .pf textarea{min-height:76px;resize:vertical}
+    .pf input:focus,.pf select:focus,.pf textarea:focus{border-color:#c2410c}
+    .pf .row2{display:grid;grid-template-columns:1fr;gap:9px}
+    .pf .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;
+      font-size:14px;font-weight:650;cursor:pointer;font-family:inherit;min-height:44px;margin-top:12px}
+    .pf .btn.ghost{background:#fff;color:#6b6255;border:1px solid #e6ddcd}
+    .pf .btn.slim{padding:9px 14px;font-size:13px;margin-top:0}
+    .pf .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+    .pf .tabs{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;margin-bottom:14px}
+    .pf .tab{flex:none;display:inline-flex;align-items:center;min-height:38px;padding:8px 14px;
+      border:1px solid #e6ddcd;border-radius:999px;background:#fff;color:#6b6255;font-size:13px;
+      font-weight:600;text-decoration:none;white-space:nowrap}
+    .pf .tab[aria-current="page"]{background:#1a1510;border-color:#1a1510;color:#fff}
+    .pf .stats{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0}
+    .pf .stat{flex:1 1 130px;border:1px solid #ece4d6;border-radius:11px;padding:11px 13px;
+      background:#fff}
+    .pf .stat b{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:19px;
+      line-height:1.2}
+    .pf .stat span{display:block;margin-top:3px;font-size:10.5px;letter-spacing:.06em;
+      text-transform:uppercase;color:#9a8f7d}
+    .pf .dist{display:flex;align-items:flex-end;gap:9px;height:110px;margin-top:10px}
+    .pf .dist div{flex:1 1 0;display:flex;flex-direction:column;justify-content:flex-end;
+      align-items:center;gap:5px}
+    .pf .dist i{display:block;width:100%;background:#c2410c;border-radius:5px 5px 0 0;min-height:3px}
+    .pf .dist span{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;
+      color:#6b6255}
+    .pf .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:10px}
+    .pf table{border-collapse:collapse;width:100%;min-width:640px;font-size:13.5px}
+    .pf th{text-align:left;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;
+      letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;padding:8px 10px;
+      border-bottom:1px solid #ece4d6;white-space:nowrap}
+    .pf td{padding:10px;border-bottom:1px solid #f4efe6;vertical-align:top}
+    .pf details{border:1px solid #ece4d6;border-radius:12px;background:#fff;margin-bottom:10px;
+      overflow:hidden}
+    .pf details>summary{list-style:none;cursor:pointer;padding:13px 15px;font-size:14px;
+      font-weight:650;min-height:44px;display:flex;align-items:center;justify-content:space-between}
+    .pf details>summary::-webkit-details-marker{display:none}
+    .pf details .inner{padding:0 15px 15px}
+    @media (min-width:760px){
+      .pf .grid{grid-template-columns:1fr 1fr}
+      .pf .row2{grid-template-columns:1fr 1fr}
+    }
+  </style>
+
+  <div class="pf">
+    <h1>Appraisal cycles</h1>
+    <p class="lede">
+      Self-assessment, manager review, calibration, outcome. Reviews are routed to the person the
+      Organization Graph records as somebody's reporting manager, not to a job title — so a cycle
+      opened before the graph is populated will have no managers on it until it is recaptured.
+    </p>
+
+    {!allowed && (
+      <div class="deny">
+        <p><b>This is the appraisal desk.</b> You hold the admin console but not
+          <code> performance.manage</code>, which is what opens appraisal cycles, calibration and
+          outcomes across the organization.</p>
+        <p style="margin-top:9px">It is held by super admins and by HR. If you write reviews for your
+          own team, you do that from your workspace at
+          <a href="/portal/employee/performance?view=team">/portal/employee/performance</a> — that
+          surface is opened by the reporting relationship, not by this permission.</p>
+      </div>
+    )}
+
+    {allowed && (
+      <>
+        {msg && <p class="flash">{msg}</p>}
+
+        {viewer && !viewer.initialized && (
+          <p class="notice">
+            The Organization Graph has no relationships in it yet, so no reporting manager can be
+            resolved for anybody. Cycles and self-assessments still work; manager reviews and sign-off
+            will halt with a readable reason until the graph is populated.
+          </p>
+        )}
+
+        <div class="tabs">
+          {cycles.map((c) => (
+            <a class="tab" href={cycleHref(c.id)} aria-current={selected && c.id === selected.id ? 'page' : null}>
+              {c.title}
+            </a>
+          ))}
+        </div>
+
+        {cycles.length === 0 && (
+          <div class="card">
+            <h2>No cycles yet</h2>
+            <p class="muted">Open one below. Every active employee gets a review row when a cycle is
+              created, and their reporting manager is captured from the Organization Graph at that
+              moment so a later reorganisation does not rewrite who reviewed whom.</p>
+          </div>
+        )}
+
+        {selected && (
+          <>
+            <div class="card">
+              <h2>{selected.title}</h2>
+              <div class="stats">
+                <div class="stat"><b>{selected.total}</b><span>people in cycle</span></div>
+                <div class="stat"><b>{selected.selfDone}</b><span>self-assessments in</span></div>
+                <div class="stat"><b>{selected.managerDone}</b><span>manager reviews in</span></div>
+                <div class="stat"><b>{selected.calibrated}</b><span>calibrated</span></div>
+              </div>
+              <p class="muted">
+                Stage: {CYCLE_STAGE_LABELS[selected.stage] || selected.stage}
+                {selected.periodStart && selected.periodEnd
+                  ? ' · ' + fmtDate(selected.periodStart) + ' to ' + fmtDate(selected.periodEnd) : ''}
+              </p>
+
+              {noManager > 0 && (
+                <p class="notice">
+                  {noManager} review{noManager === 1 ? ' has' : 's have'} no reporting manager recorded.
+                  Nothing was guessed. Once the Organization Graph is populated, recapture below.
+                </p>
+              )}
+
+              <div class="btns">
+                {CYCLE_STAGES.map((s) => (
+                  <form method="post">
+                    <input type="hidden" name="action" value="advance" />
+                    <input type="hidden" name="cycle_id" value={selected.id} />
+                    <input type="hidden" name="stage" value={s} />
+                    <button class={'btn slim' + (selected.stage === s ? '' : ' ghost')} type="submit"
+                      disabled={selected.stage === s}>
+                      {CYCLE_STAGE_LABELS[s]}
+                    </button>
+                  </form>
+                ))}
+                <form method="post">
+                  <input type="hidden" name="action" value="capture_managers" />
+                  <input type="hidden" name="cycle_id" value={selected.id} />
+                  <button class="btn ghost slim" type="submit">Recapture managers from the graph</button>
+                </form>
+              </div>
+            </div>
+
+            {distribution.length > 0 && (
+              <div class="card">
+                <h2>Rating distribution</h2>
+                <p class="muted">Calibrated rating where one exists, the manager's rating otherwise.</p>
+                <div class="dist">
+                  {RATINGS.map((n) => {
+                    const found = distribution.find((d) => d.rating === n);
+                    const count = found ? found.count : 0;
+                    return (
+                      <div>
+                        <span>{count}</span>
+                        <i style={'height:' + Math.round((count / maxBar) * 80) + 'px'}></i>
+                        <span>{n}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div class="card">
+              <h2>Reviews</h2>
+              <form method="get" style="display:flex;flex-wrap:wrap;gap:9px;align-items:flex-end">
+                <input type="hidden" name="cycle" value={selected.id} />
+                <div style="flex:1 1 200px;min-width:0">
+                  <label for="dept">Department</label>
+                  <select id="dept" name="dept">
+                    <option value="">Every department</option>
+                    {departments.map((d) => <option value={d.id} selected={d.id === dept}>{d.name}</option>)}
+                  </select>
+                </div>
+                <button class="btn slim" type="submit" style="margin-top:0">Filter</button>
+              </form>
+
+              {reviews.length === 0
+                ? <p class="muted" style="margin-top:12px">No reviews match. A cycle seeds one row per
+                    active employee when it is opened.</p>
+                : (
+                  <div class="tablewrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Employee</th><th>Manager</th><th>Self</th><th>Manager rating</th>
+                          <th>Calibrated</th><th>Outcome</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {reviews.map((r) => (
+                          <tr>
+                            <td>{r.employeeName || 'Unnamed record'}<br /><span class="muted">{r.employeeDesignation}</span></td>
+                            <td>{r.managerName || <span class="muted">Not recorded</span>}</td>
+                            <td>{r.selfSubmittedAt ? fmtDate(r.selfSubmittedAt) : <span class="muted">Not in</span>}</td>
+                            <td>{r.overallRating ?? <span class="muted">Not in</span>}</td>
+                            <td>{r.calibratedRating ?? <span class="muted">—</span>}</td>
+                            <td>{r.outcome ? (REVIEW_OUTCOME_LABELS[r.outcome] || r.outcome) : <span class="muted">—</span>}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+            </div>
+
+            {reviews.filter((r) => r.managerSubmittedAt).map((r) => (
+              <details>
+                <summary>{r.employeeName || 'Unnamed record'} — {r.overallRating ?? '—'} of {RATING_MAX}</summary>
+                <div class="inner">
+                  {r.strengths && <><label>Strengths</label><p class="muted">{r.strengths}</p></>}
+                  {r.improvements && <><label>To work on</label><p class="muted">{r.improvements}</p></>}
+                  {r.selfAssessment && <><label>Their self-assessment</label><p class="muted">{r.selfAssessment}</p></>}
+
+                  <form method="post">
+                    <input type="hidden" name="action" value="calibrate" />
+                    <input type="hidden" name="cycle_id" value={selected.id} />
+                    <input type="hidden" name="review_id" value={r.id} />
+                    <div class="row2">
+                      <div>
+                        <label for={'cal-' + r.id}>Calibrated rating</label>
+                        <select id={'cal-' + r.id} name="rating" required>
+                          {RATINGS.map((n) => <option value={n} selected={r.calibratedRating === n}>{n} of {RATING_MAX}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label for={'caln-' + r.id}>Why</label>
+                        <input id={'caln-' + r.id} name="note" maxlength="2000" value={r.calibrationNote} />
+                      </div>
+                    </div>
+                    <p class="muted" style="margin-top:8px">The manager's own rating is kept beside
+                      this, never replaced by it.</p>
+                    <button class="btn slim" type="submit" style="margin-top:10px">Save calibration</button>
+                  </form>
+
+                  <form method="post" style="margin-top:14px">
+                    <input type="hidden" name="action" value="outcome" />
+                    <input type="hidden" name="cycle_id" value={selected.id} />
+                    <input type="hidden" name="review_id" value={r.id} />
+                    <div class="row2">
+                      <div>
+                        <label for={'out-' + r.id}>Outcome</label>
+                        <select id={'out-' + r.id} name="outcome" required>
+                          {REVIEW_OUTCOMES.map((o) => (
+                            <option value={o} selected={r.outcome === o}>{REVIEW_OUTCOME_LABELS[o]}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label for={'outn-' + r.id}>Note for the employee</label>
+                        <input id={'outn-' + r.id} name="note" maxlength="4000" value={r.outcomeNote} />
+                      </div>
+                    </div>
+                    <p class="muted" style="margin-top:8px">Recording an outcome shares the review with
+                      the employee and notifies them. Recommending a promotion here records the
+                      outcome only — the recommendation itself is raised by their manager and goes
+                      through the promotion approval chain.</p>
+                    <button class="btn slim" type="submit" style="margin-top:10px">Record outcome</button>
+                  </form>
+                </div>
+              </details>
+            ))}
+          </>
+        )}
+
+        <div class="card" style="margin-top:16px">
+          <h2>Open a new cycle</h2>
+          <form method="post">
+            <input type="hidden" name="action" value="create_cycle" />
+            <label for="c-title">Title</label>
+            <input id="c-title" name="title" maxlength="200" required placeholder="H2 2026 review" />
+            <div class="row2">
+              <div>
+                <label for="c-start">Period starts</label>
+                <input id="c-start" type="date" name="period_start" required />
+              </div>
+              <div>
+                <label for="c-end">Period ends</label>
+                <input id="c-end" type="date" name="period_end" required />
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="c-type">Kind</label>
+                <select id="c-type" name="review_type">
+                  <option value="annual">Annual</option>
+                  <option value="half_yearly">Half yearly</option>
+                  <option value="quarterly">Quarterly</option>
+                  <option value="probation">Probation</option>
+                </select>
+              </div>
+              <div>
+                <label for="c-selfdue">Self-assessment due</label>
+                <input id="c-selfdue" type="date" name="self_due_on" />
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="c-mgrdue">Manager review due</label>
+                <input id="c-mgrdue" type="date" name="manager_due_on" />
+              </div>
+              <div>
+                <label for="c-caldue">Calibration due</label>
+                <input id="c-caldue" type="date" name="calibration_due_on" />
+              </div>
+            </div>
+            <button class="btn" type="submit">Open cycle</button>
+          </form>
+        </div>
+
+        <p class="muted" style="margin-top:16px;max-width:70ch">
+          Sign-off is not done here. A completed review is sent by the manager to the department head
+          through the one approval engine, and when no approver can be resolved it halts with a
+          sentence naming the missing relationship rather than being approved.
+        </p>
+      </>
+    )}
+  </div>
+</AdminLayout>

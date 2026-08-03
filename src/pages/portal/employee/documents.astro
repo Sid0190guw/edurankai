@@ -1,0 +1,511 @@
+---
+// /portal/employee/documents — THE COMPANY DOCUMENT LIBRARY.
+//
+// DOCUMENTS ARE GOOGLE DRIVE LINKS. THERE IS NO FILE INPUT ON THIS PAGE and there must never be one:
+// nothing is stored on this platform, the reason is storage cost, and the rule is absolute. The form
+// takes a URL, src/lib/documents.ts refuses anything that is not on Drive at the WRITE, and the copy
+// states the "Anyone with the link" requirement because this product deliberately does not call
+// Google to check it.
+//
+// WHAT THIS PERSON MAY SEE is decided in the WHERE clause of listDocuments(): their own documents at
+// any status, published company-wide ones, published department ones for THEIR department, and
+// anything shared with them or their department by name. A curator (documents.manage) sees
+// everything, and that is passed IN as a parameter the page resolved from holdsCapability() — the
+// library never decides authorisation for itself.
+//
+// APPROVAL IS THE WORKFLOW ENGINE'S, NOT THIS PAGE'S. "Send for approval" starts an instance routed
+// along the owner's own reporting line from the Organization Graph. When the graph cannot name
+// anybody the request HALTS with a readable sentence and the document stays a draft — it is never
+// auto-approved and never routed to whoever holds a capability. "Waiting on you" below is the same
+// engine's queue, filtered to documents, and every decision is re-checked inside decideInstance().
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { holdsCapability } from '@/lib/auth/capability';
+import {
+  listDocuments, listFolders, getDocument, documentVersions, documentShares, documentApproval,
+  addDocument, addVersion, submitForApproval, publishDocument, retireDocument, shareDocument,
+  unshareDocument, createFolder, setRetention, canRead, retentionDue,
+  DOCUMENT_CATEGORIES, DOCUMENT_VISIBILITIES, DRIVE_RULE,
+  categoryLabel, visibilityLabel, statusLabel,
+  type LibraryDocument,
+} from '@/lib/documents';
+import { pendingForApprover, decideInstance, VIA_LABELS } from '@/lib/workflow';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+// CONSTANTS FIRST — `const` is not hoisted.
+const PAGE = '/portal/employee/documents';
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const fmt = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+// THE ONE AUTHORIZATION QUESTION THIS PAGE ASKS, asked once, through the shared entry point.
+const curator = holdsCapability(user as any, 'documents.manage');
+
+let employee: any = null;
+try {
+  employee = rowsOf(await db.execute(sql`
+    SELECT id, full_name, department_id::text AS department_id FROM hr_employees
+     WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
+  || rowsOf(await db.execute(sql`
+    SELECT id, full_name, department_id::text AS department_id FROM hr_employees
+     WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email})
+       AND is_active = true LIMIT 1`))[0] || null;
+} catch (e: any) {
+  console.error('[documents page] employee lookup', e?.cause?.message || e?.message);
+}
+
+const myEmployeeId: string | null = employee?.id ? String(employee.id) : null;
+const myDepartmentId: string | null = employee?.department_id ? String(employee.department_id) : null;
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let ok = true;
+  let back = PAGE;
+
+  if (action === 'add') {
+    const r = await addDocument({
+      title: String(fd.get('title') || ''),
+      driveUrl: String(fd.get('drive_url') || ''),
+      category: String(fd.get('category') || 'other'),
+      description: String(fd.get('description') || ''),
+      folderId: String(fd.get('folder_id') || '') || null,
+      visibility: String(fd.get('visibility') || 'private'),
+      ownerUserId: String(user.id),
+      ownerEmployeeId: myEmployeeId,
+      departmentId: myDepartmentId,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Added as a draft. Send it for approval when it is ready.' : (r.error || 'Could not add that.');
+    if (r.ok && r.id) back = PAGE + '?d=' + r.id;
+  } else if (action === 'version') {
+    const id = String(fd.get('id') || '');
+    const r = await addVersion(id, user as any, myEmployeeId, String(fd.get('drive_url') || ''), String(fd.get('change_note') || ''));
+    ok = r.ok;
+    flash = r.ok ? 'New version saved. It is back to draft, because a new version has not been approved.' : (r.error || 'Could not save that.');
+    back = PAGE + '?d=' + id;
+  } else if (action === 'submit') {
+    const id = String(fd.get('id') || '');
+    const r = await submitForApproval(id, user as any, myEmployeeId);
+    ok = r.ok;
+    flash = r.ok ? 'Sent for approval.' : (r.error || r.haltReason || 'Could not send that for approval.');
+    back = PAGE + '?d=' + id;
+  } else if (action === 'publish') {
+    const id = String(fd.get('id') || '');
+    const r = await publishDocument(id, user as any, myEmployeeId);
+    ok = r.ok;
+    flash = r.ok ? 'Published.' : (r.error || 'Could not publish that.');
+    back = PAGE + '?d=' + id;
+  } else if (action === 'retire') {
+    const id = String(fd.get('id') || '');
+    const r = await retireDocument(id, user as any, myEmployeeId, String(fd.get('reason') || ''));
+    ok = r.ok;
+    flash = r.ok ? 'Retired. It is kept, not deleted — what the rule used to say is worth having.' : (r.error || 'Could not retire that.');
+    back = PAGE + '?d=' + id;
+  } else if (action === 'share') {
+    const id = String(fd.get('id') || '');
+    const r = await shareDocument(id, user as any, myEmployeeId, {
+      employeeId: String(fd.get('employee_id') || '') || null,
+      departmentId: String(fd.get('department_id') || '') || null,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Shared.' : (r.error || 'Could not share that.');
+    back = PAGE + '?d=' + id;
+  } else if (action === 'unshare') {
+    const id = String(fd.get('id') || '');
+    const r = await unshareDocument(String(fd.get('share_id') || ''), user as any, myEmployeeId);
+    ok = r.ok;
+    flash = r.ok ? 'Stopped sharing.' : (r.error || 'Could not change that.');
+    back = PAGE + '?d=' + id;
+  } else if (action === 'folder') {
+    const r = await createFolder(String(fd.get('name') || ''), user as any, { description: String(fd.get('description') || '') });
+    ok = r.ok;
+    flash = r.ok ? 'Folder created.' : (r.error || 'Could not create that.');
+  } else if (action === 'retention') {
+    const id = String(fd.get('id') || '');
+    const r = await setRetention(id, user as any, String(fd.get('until') || '') || null, String(fd.get('note') || ''));
+    ok = r.ok;
+    flash = r.ok ? 'Retention recorded. Nothing is deleted by it — it is a date for a person to act on.' : (r.error || 'Could not record that.');
+    back = PAGE + '?d=' + id;
+  } else if (action === 'decide') {
+    // THE APPROVAL DECISION. decideInstance() re-resolves routing and re-checks authorisation on the
+    // posted id; this page decides nothing.
+    const r = await decideInstance(String(fd.get('instance_id') || ''), user as any,
+      String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected', String(fd.get('note') || ''));
+    ok = r.ok;
+    flash = r.ok ? 'Decision recorded.' : (r.error || 'Could not record that.');
+  }
+
+  return Astro.redirect(back + (back.indexOf('?') >= 0 ? '&' : '?') + 'msg=' + encodeURIComponent(flash) + '&ok=' + (ok ? '1' : '0'));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const msgOk = url.searchParams.get('ok') !== '0';
+const openId = url.searchParams.get('d') || '';
+const q = url.searchParams.get('q') || '';
+const folderFilter = url.searchParams.get('folder') || '';
+const categoryFilter = url.searchParams.get('category') || '';
+
+const folders = await listFolders();
+const docs: LibraryDocument[] = await listDocuments({
+  employeeId: myEmployeeId,
+  departmentId: myDepartmentId,
+  curator,
+  folderId: folderFilter || null,
+  category: categoryFilter || null,
+  q,
+  limit: 80,
+});
+
+// The opened document — re-checked with canRead() rather than trusted from the list.
+let open: LibraryDocument | null = null;
+let openVersions: any[] = [];
+let openShares: any[] = [];
+let openApproval: any = null;
+let openIsOwner = false;
+if (openId) {
+  const candidate = await getDocument(openId);
+  if (candidate && await canRead(candidate, { employeeId: myEmployeeId, departmentId: myDepartmentId, curator })) {
+    open = candidate;
+    openVersions = await documentVersions(candidate.id);
+    openApproval = await documentApproval(candidate.id);
+    openIsOwner = (!!myEmployeeId && candidate.ownerEmployeeId === myEmployeeId)
+      || candidate.ownerUserId === String(user.id) || curator;
+    if (openIsOwner) openShares = await documentShares(candidate.id);
+  }
+}
+
+// APPROVALS WAITING ON THIS PERSON, documents only. Routed and delegated only — a capability holder
+// does not see everybody's queue, which is pendingForApprover()'s own documented behaviour.
+const pending = (await pendingForApprover(String(user.id))).filter((p) => p.instance.domain === 'documents');
+
+const today = new Date().toISOString().slice(0, 10);
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Document library</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:inline-flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    .wrap{max-width:680px;margin:0 auto;padding:16px 14px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:66px;}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:12px 18px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;min-height:44px;}
+    .btn.ghost{background:#faf7f1;color:#1a1510;border:1px solid #e6ddcd;}
+    .row{display:flex;gap:8px;flex-wrap:wrap;}
+    .row > *{flex:1 1 150px;}
+    .item{display:block;text-decoration:none;color:inherit;padding:12px 0;border-bottom:1px solid #f2ece0;min-height:44px;}
+    .item:last-child{border-bottom:none;}
+    .meta{font-size:11.5px;color:#9a8f7d;line-height:1.6;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:rgba(0,0,0,.05);}
+    .msg{border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:14px;line-height:1.5;}
+    .rule{background:#fdf6ec;border:1px solid #f0e0c6;border-radius:10px;padding:11px 13px;font-size:12.5px;line-height:1.6;color:#7a5a2e;}
+    details summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-size:13.5px;color:#c2410c;}
+    a.link{color:#c2410c;word-break:break-all;}
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>Workspace</a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Documents</span>
+  <span class="meta">{employee?.full_name || user.name}</span>
+</nav>
+
+<div class="wrap">
+  {msg && (
+    <div class="msg" style={msgOk
+      ? 'background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;'
+      : 'background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:#991b1b;'}>{msg}</div>
+  )}
+
+  {pending.length > 0 && (
+    <div class="card">
+      <h3>Waiting on your decision</h3>
+      {pending.map((p) => (
+        <div style="padding:10px 0;border-bottom:1px solid #f2ece0;">
+          <div style="font-weight:600;font-size:14.5px;">{p.instance.summary || 'A document'}</div>
+          <div class="meta">Routed to you as: {p.step.via === 'reporting_manager' ? VIA_LABELS.reporting_manager : p.step.via === 'department_head' ? VIA_LABELS.department_head : p.step.via === 'approval_owner' ? VIA_LABELS.approval_owner : VIA_LABELS.executive_sponsor}{p.instance.subjectName ? ' · raised by ' + p.instance.subjectName : ''}</div>
+          <form method="POST" style="margin-top:8px;">
+            <input type="hidden" name="action" value="decide"/>
+            <input type="hidden" name="instance_id" value={p.instance.id}/>
+            <input name="note" placeholder="A note, if you want to leave one" maxlength="2000"/>
+            <div class="row" style="margin-top:8px;">
+              <button class="btn" name="decision" value="approved">Approve</button>
+              <button class="btn ghost" name="decision" value="rejected">Reject</button>
+            </div>
+          </form>
+        </div>
+      ))}
+    </div>
+  )}
+
+  {!open && (
+    <div>
+      <div class="card">
+        <h3>Find something</h3>
+        <form method="GET">
+          <input name="q" value={q} placeholder="Search titles and descriptions" aria-label="Search documents"/>
+          <div class="row" style="margin-top:8px;">
+            <select name="folder" aria-label="Folder">
+              <option value="">Every folder</option>
+              {folders.map((f) => (<option value={f.id} selected={f.id === folderFilter}>{f.name} ({f.documentCount})</option>))}
+            </select>
+            <select name="category" aria-label="Category">
+              <option value="">Every category</option>
+              {DOCUMENT_CATEGORIES.map((c) => (<option value={c} selected={c === categoryFilter}>{categoryLabel(c)}</option>))}
+            </select>
+          </div>
+          <button class="btn ghost" style="margin-top:8px;">Search</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3>{curator ? 'Every document' : 'Documents you can open'}</h3>
+        {docs.length === 0 && (
+          <p style="font-size:14px;line-height:1.6;">Nothing here yet{q || folderFilter || categoryFilter ? ' for that search' : ''}. Published company documents, anything shared with you, and your own drafts all appear in this list.</p>
+        )}
+        {docs.map((d) => (
+          <a class="item" href={PAGE + '?d=' + d.id}>
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+              <div style="min-width:0;">
+                <div style="font-weight:600;font-size:14.5px;word-break:break-word;">{d.title}</div>
+                <div class="meta">{categoryLabel(d.category)}{d.folderName ? ' · ' + d.folderName : ''} · v{d.currentVersion}{d.ownerName ? ' · ' + d.ownerName : ''}</div>
+                {retentionDue(d, today) && (<div class="meta" style="color:#b45309;">Retention date passed ({fmt(d.retentionUntil)}) — somebody should decide what happens to it.</div>)}
+              </div>
+              <span class="pill">{statusLabel(d.status)}</span>
+            </div>
+          </a>
+        ))}
+      </div>
+
+      <div class="card">
+        <h3>Add a document</h3>
+        <div class="rule">{DRIVE_RULE}</div>
+        <form method="POST" style="margin-top:10px;">
+          <input type="hidden" name="action" value="add"/>
+          <label for="title">Title</label>
+          <input id="title" name="title" maxlength="200" required/>
+          <label for="drive_url">Google Drive link</label>
+          <input id="drive_url" name="drive_url" type="url" required placeholder="https://drive.google.com/..."/>
+          <label for="description">What it is</label>
+          <textarea id="description" name="description" rows="2"></textarea>
+          <div class="row">
+            <div>
+              <label for="category">Category</label>
+              <select id="category" name="category">
+                {DOCUMENT_CATEGORIES.map((c) => (<option value={c}>{categoryLabel(c)}</option>))}
+              </select>
+            </div>
+            <div>
+              <label for="visibility">Who it is for</label>
+              <select id="visibility" name="visibility">
+                {DOCUMENT_VISIBILITIES.map((v) => (<option value={v}>{visibilityLabel(v)}</option>))}
+              </select>
+            </div>
+          </div>
+          {folders.length > 0 && (
+            <div>
+              <label for="folder_id">Folder</label>
+              <select id="folder_id" name="folder_id">
+                <option value="">No folder</option>
+                {folders.map((f) => (<option value={f.id}>{f.name}</option>))}
+              </select>
+            </div>
+          )}
+          <button class="btn" style="margin-top:12px;">Add it as a draft</button>
+          <p class="meta" style="margin-top:8px;">It starts as a draft whichever audience you pick. Publishing needs an approval, routed to your reporting line.</p>
+        </form>
+      </div>
+
+      {curator && (
+        <div class="card">
+          <h3>Folders</h3>
+          <form method="POST">
+            <input type="hidden" name="action" value="folder"/>
+            <label for="fname">New folder</label>
+            <input id="fname" name="name" maxlength="120" required/>
+            <label for="fdesc">What goes in it</label>
+            <input id="fdesc" name="description" maxlength="500"/>
+            <button class="btn ghost" style="margin-top:10px;">Create folder</button>
+          </form>
+          {folders.length > 0 && (
+            <div style="margin-top:12px;">
+              {folders.map((f) => (
+                <div class="item"><div style="font-weight:600;font-size:14px;">{f.name}</div><div class="meta">{f.documentCount} document{f.documentCount === 1 ? '' : 's'}{f.description ? ' · ' + f.description : ''}</div></div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )}
+
+  {openId && !open && (
+    <div class="card">
+      <h3>Not available</h3>
+      <p style="font-size:14px;line-height:1.6;">That document is not available to you. It may be a draft belonging to somebody else, or it may not exist.</p>
+      <a class="btn ghost" href={PAGE} style="display:block;text-align:center;text-decoration:none;margin-top:12px;padding-top:12px;">Back to the library</a>
+    </div>
+  )}
+
+  {open && (
+    <div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+          <div style="min-width:0;">
+            <div style="font-family:'Fraunces',serif;font-size:19px;font-weight:600;word-break:break-word;">{open.title}</div>
+            <div class="meta" style="margin-top:4px;">{categoryLabel(open.category)}{open.folderName ? ' · ' + open.folderName : ''} · version {open.currentVersion} · {visibilityLabel(open.visibility)}</div>
+          </div>
+          <span class="pill">{statusLabel(open.status)}</span>
+        </div>
+        {open.description && (<p style="font-size:14px;line-height:1.6;margin-top:10px;">{open.description}</p>)}
+        <p style="margin-top:12px;font-size:14px;"><a class="link" href={open.driveUrl} target="_blank" rel="noopener noreferrer">Open the document</a></p>
+        <p class="meta" style="margin-top:6px;">It opens in Google Drive. If it will not open for you, the link has not been set to "Anyone with the link" — tell whoever owns it.</p>
+        {open.retentionUntil && (
+          <p class="meta" style="margin-top:8px;">Retention: keep until {fmt(open.retentionUntil)}{open.retentionNote ? ' — ' + open.retentionNote : ''}. Nothing is deleted automatically.</p>
+        )}
+      </div>
+
+      {openApproval && (
+        <div class="card">
+          <h3>Approval</h3>
+          <p style="font-size:14px;">State: <strong>{openApproval.state}</strong></p>
+          {openApproval.haltReason && (
+            <p class="meta" style="margin-top:6px;">Halted: {openApproval.haltReason}. Record the missing relationship in the organization graph and send it again.</p>
+          )}
+          {!openApproval.haltReason && openApproval.state === 'pending' && (
+            <p class="meta" style="margin-top:6px;">Waiting on the person your reporting line routes it to.</p>
+          )}
+        </div>
+      )}
+
+      <div class="card">
+        <h3>Versions</h3>
+        {openVersions.length === 0 && (<p style="font-size:14px;">No version history recorded.</p>)}
+        {openVersions.map((v: any) => (
+          <div class="item">
+            <div style="font-weight:600;font-size:14px;">v{v.version} · {fmt(v.createdAt)}</div>
+            <div class="meta">{v.changeNote || 'No note'}</div>
+            <div class="meta"><a class="link" href={v.driveUrl} target="_blank" rel="noopener noreferrer">Open this version</a></div>
+          </div>
+        ))}
+      </div>
+
+      {openIsOwner && (
+        <div class="card">
+          <h3>Yours to change</h3>
+
+          <details>
+            <summary>Save a new version</summary>
+            <form method="POST" style="margin-top:6px;">
+              <input type="hidden" name="action" value="version"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <div class="rule">{DRIVE_RULE}</div>
+              <label for="nv">New Google Drive link</label>
+              <input id="nv" name="drive_url" type="url" required placeholder="https://drive.google.com/..."/>
+              <label for="nn">What changed</label>
+              <input id="nn" name="change_note" maxlength="500" required/>
+              <button class="btn ghost" style="margin-top:10px;">Save the version</button>
+            </form>
+          </details>
+
+          {(open.status === 'draft' || open.status === 'in_review') && (
+            <form method="POST" style="margin-top:12px;">
+              <input type="hidden" name="action" value="submit"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <button class="btn">Send for approval</button>
+              <p class="meta" style="margin-top:8px;">It goes to the person the organization graph names for you. If it cannot name anybody, nothing is approved and you will see the reason.</p>
+            </form>
+          )}
+
+          {open.status !== 'published' && open.status !== 'retired' && (
+            <form method="POST" style="margin-top:12px;">
+              <input type="hidden" name="action" value="publish"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <button class="btn ghost">Publish</button>
+              <p class="meta" style="margin-top:8px;">Only works once the approval has settled approved — it is re-read at the moment you press this.</p>
+            </form>
+          )}
+
+          <details style="margin-top:12px;">
+            <summary>Share it with somebody</summary>
+            <form method="POST" style="margin-top:6px;">
+              <input type="hidden" name="action" value="share"/>
+              <input type="hidden" name="id" value={open.id}/>
+              <label for="se">Employee id</label>
+              <input id="se" name="employee_id" placeholder="hr_employees id"/>
+              <label for="sd">Or a department id</label>
+              <input id="sd" name="department_id" placeholder="department id"/>
+              <button class="btn ghost" style="margin-top:10px;">Share</button>
+              <p class="meta" style="margin-top:8px;">Sharing is a read grant. It does not let anybody change the document.</p>
+            </form>
+            {openShares.length > 0 && (
+              <div style="margin-top:10px;">
+                {openShares.map((s: any) => (
+                  <form method="POST" style="display:flex;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid #f2ece0;">
+                    <input type="hidden" name="action" value="unshare"/>
+                    <input type="hidden" name="id" value={open.id}/>
+                    <input type="hidden" name="share_id" value={s.id}/>
+                    <span style="flex:1;font-size:13.5px;">{s.employeeName || s.departmentId || s.employeeId}</span>
+                    <button class="btn ghost" style="width:auto;padding:8px 12px;">Stop</button>
+                  </form>
+                ))}
+              </div>
+            )}
+          </details>
+
+          {curator && (
+            <details style="margin-top:12px;">
+              <summary>Retention</summary>
+              <form method="POST" style="margin-top:6px;">
+                <input type="hidden" name="action" value="retention"/>
+                <input type="hidden" name="id" value={open.id}/>
+                <label for="ru">Keep until</label>
+                <input id="ru" name="until" type="date" value={open.retentionUntil || ''}/>
+                <label for="rn">Why</label>
+                <input id="rn" name="note" maxlength="500" value={open.retentionNote || ''}/>
+                <button class="btn ghost" style="margin-top:10px;">Record it</button>
+                <p class="meta" style="margin-top:8px;">A date for a person to act on. Nothing on this platform deletes a document.</p>
+              </form>
+            </details>
+          )}
+
+          {open.status !== 'retired' && (
+            <details style="margin-top:12px;">
+              <summary>Retire it</summary>
+              <form method="POST" style="margin-top:6px;">
+                <input type="hidden" name="action" value="retire"/>
+                <input type="hidden" name="id" value={open.id}/>
+                <label for="rr">Why it is being retired</label>
+                <input id="rr" name="reason" maxlength="500"/>
+                <button class="btn ghost" style="margin-top:10px;">Retire</button>
+                <p class="meta" style="margin-top:8px;">It stays in the record. What a policy used to say is exactly the thing people need in the arguments where deleting it would be worst.</p>
+              </form>
+            </details>
+          )}
+        </div>
+      )}
+
+      <a class="btn ghost" href={PAGE} style="display:block;text-align:center;text-decoration:none;padding-top:12px;">Back to the library</a>
+    </div>
+  )}
+</div>
+</body>
+</html>

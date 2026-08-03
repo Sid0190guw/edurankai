@@ -1,96 +1,90 @@
 ---
+/**
+ * /portal/meet — THE MEETING SCHEDULER. One half of ONE meeting platform; the other half is the room
+ * itself at /portal/meet/[id]. They are not two systems: this page decides WHEN people meet, that
+ * page is WHERE they meet, and after this build they read and write the same rows.
+ *
+ * WHAT WAS BROKEN HERE, and it was two things that hid each other.
+ *
+ * 1. THIS PAGE CREATED `meet_rooms` AND `meet_participants` WITH A DIFFERENT SHAPE FROM THE ROOM
+ *    PAGE — id TEXT vs UUID, host_user_id INTEGER vs UUID, duration_min vs duration_minutes — in the
+ *    same commit. CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so whichever page was
+ *    opened first on a given database won, and the loser has been failing ever since. Both CREATEs
+ *    are gone; src/lib/meet-schema.ts is the ONE module that owns this DDL and it reconciles the two
+ *    shapes additively (ALTER TABLE ... ADD COLUMN IF NOT EXISTS, nothing dropped, no row rewritten).
+ *
+ * 2. THE SELECT BELOW COULD NOT MATCH ANYBODY. `host_user_id = ${user.id}` compares a UUID string to
+ *    whatever type won the race; under the room page's shape it is a uuid column and the comparison
+ *    works, under this page's own declaration it is INTEGER and the comparison throws. Either way it
+ *    was wrapped in `catch (_) { upcoming = []; }`, so the page rendered "no meetings" and never said
+ *    why. Ids are compared ::text now — the same rule this project already applies to departments.id
+ *    — and a failure is LOGGED and SHOWN rather than swallowed.
+ *
+ * The four fetch() call sites at the bottom of this file POST/GET/PATCH/DELETE /api/meet/rooms,
+ * which did not exist until this build. It does now: src/pages/api/meet/rooms/.
+ */
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureMeetSchema, meetBlockReason } from '@/lib/meet-schema';
+
+// Declared at the very top, above everything that uses them: `const` is not hoisted, and a handler
+// reaching a later declaration has taken pages down on this project.
+// postgres-js resolves to a plain array, never a { rows } object.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const logFail = (tag: string, e: any) => console.error('[portal/meet] ' + tag, e?.cause?.message || e?.message);
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/meet'));
 
-// ---------------------------------------------------------------------------
-// Self-bootstrap meeting tables (idempotent)
-// ---------------------------------------------------------------------------
-try {
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS meet_rooms (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      description TEXT,
-      kind TEXT NOT NULL DEFAULT 'huddle',
-      host_user_id INTEGER NOT NULL,
-      host_email TEXT,
-      host_name TEXT,
-      scheduled_at TIMESTAMPTZ,
-      duration_min INTEGER NOT NULL DEFAULT 30,
-      passcode TEXT,
-      waiting_room BOOLEAN DEFAULT true,
-      record_on_default BOOLEAN DEFAULT false,
-      breakouts_enabled BOOLEAN DEFAULT false,
-      attendee_mute_default BOOLEAN DEFAULT false,
-      raise_hand_enabled BOOLEAN DEFAULT true,
-      recurrence TEXT DEFAULT 'none',
-      invitees JSONB DEFAULT '[]'::jsonb,
-      status TEXT NOT NULL DEFAULT 'scheduled',
-      started_at TIMESTAMPTZ,
-      ended_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_host ON meet_rooms(host_user_id)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_scheduled ON meet_rooms(scheduled_at)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_rooms_status ON meet_rooms(status)`);
-
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS meet_recordings (
-      id TEXT PRIMARY KEY,
-      room_id TEXT NOT NULL,
-      title TEXT,
-      duration_sec INTEGER DEFAULT 0,
-      attendees_count INTEGER DEFAULT 0,
-      transcript_available BOOLEAN DEFAULT false,
-      blob_url TEXT,
-      thumbnail_url TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_meet_recordings_room ON meet_recordings(room_id)`);
-
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS meet_participants (
-      id SERIAL PRIMARY KEY,
-      room_id TEXT NOT NULL,
-      user_id INTEGER,
-      display_name TEXT,
-      email TEXT,
-      joined_at TIMESTAMPTZ DEFAULT NOW(),
-      left_at TIMESTAMPTZ,
-      role TEXT DEFAULT 'attendee'
-    )
-  `);
-} catch (e) { /* swallow — bootstrap is best-effort */ }
+// The one schema-ensure. It creates nothing here and it is the only DDL this page runs.
+//
+// NOT wrapped in try/catch, deliberately: ensureOnce() swallows the rejection it returns
+// (src/lib/ensure-once.ts:24), so a catch here could never fire and would be a comforting lie. The
+// failure comes back through meetBlockReason() instead, which also distinguishes "the ensure did not
+// run" from "this database carries the legacy shape" — two different sentences for two different
+// facts, neither of them a 500.
+await ensureMeetSchema();
+const blockReason = meetBlockReason();
+const canSchedule = !blockReason;
 
 // ---------------------------------------------------------------------------
 // Pull upcoming meetings (where user is host OR invitee)
 // ---------------------------------------------------------------------------
+// `id` here is the ROOM CODE where there is one — it is what goes in the URL, what the room page
+// resolves and what /api/meet/rooms/:id takes. COALESCE, because rooms created before room_code
+// existed still answer to their uuid.
 let upcoming: any[] = [];
+let upcomingError = '';
 try {
   const r = await db.execute(sql`
-    SELECT id, title, description, kind, host_user_id, host_name, host_email,
+    SELECT COALESCE(room_code, id::text) AS id, title, description, kind,
+           host_user_id::text AS host_user_id, host_name, host_email,
            scheduled_at, duration_min, passcode, waiting_room, record_on_default,
            recurrence, invitees, status, created_at
     FROM meet_rooms
     WHERE status IN ('scheduled','live')
-      AND (host_user_id = ${user.id} OR invitees::text ILIKE ${'%' + (user.email || '') + '%'})
+      AND (host_user_id::text = ${user.id} OR invitees::text ILIKE ${'%' + (user.email || '') + '%'})
       AND (scheduled_at IS NULL OR scheduled_at > NOW() - INTERVAL '2 hour')
     ORDER BY COALESCE(scheduled_at, created_at) ASC
     LIMIT 25
   `);
-  upcoming = Array.isArray(r) ? r : ((r as any)?.rows || []);
-} catch (_) { upcoming = []; }
+  upcoming = rowsOf(r);
+} catch (e: any) {
+  // NOT swallowed. An empty list that means "we could not read your meetings" must not look like an
+  // empty list that means "you have none" — that is how this page hid a broken schema for weeks.
+  logFail('upcoming', e);
+  upcoming = [];
+  upcomingError = 'Your meetings could not be read just now. Nothing has been cancelled.';
+}
 
 // ---------------------------------------------------------------------------
 // Past recordings (sorted by created date)
 // ---------------------------------------------------------------------------
+// Every id is joined and compared ::text. meet_recordings.room_id is TEXT and meet_rooms.id may be
+// either type depending on which CREATE won before this build, so `rm.id = rec.room_id` was an
+// operator-does-not-exist error on one of the two shapes.
 let recordings: any[] = [];
 try {
   const r = await db.execute(sql`
@@ -98,15 +92,18 @@ try {
            rec.transcript_available, rec.thumbnail_url, rec.created_at,
            rm.title AS room_title, rm.host_name
     FROM meet_recordings rec
-    LEFT JOIN meet_rooms rm ON rm.id = rec.room_id
-    WHERE rm.host_user_id = ${user.id} OR rec.room_id IN (
-      SELECT DISTINCT room_id FROM meet_participants WHERE user_id = ${user.id}
+    LEFT JOIN meet_rooms rm ON rm.id::text = rec.room_id::text
+    WHERE rm.host_user_id::text = ${user.id} OR rec.room_id::text IN (
+      SELECT DISTINCT room_id::text FROM meet_participants WHERE user_id::text = ${user.id}
     )
     ORDER BY rec.created_at DESC
     LIMIT 12
   `);
-  recordings = Array.isArray(r) ? r : ((r as any)?.rows || []);
-} catch (_) { recordings = []; }
+  recordings = rowsOf(r);
+} catch (e: any) {
+  logFail('recordings', e);
+  recordings = [];
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -172,6 +169,8 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
   @media (max-width: 800px) { .quick-strip { grid-template-columns: 1fr; } }
   .quick-card { background: #fff; border: 1px solid #E8E7DD; border-radius: 18px; padding: 22px 22px 24px; cursor: pointer; transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s; text-align: left; font-family: inherit; color: inherit; display: flex; flex-direction: column; gap: 10px; }
   .quick-card:hover { transform: translateY(-2px); box-shadow: 0 10px 28px -10px rgba(11,14,20,0.12); border-color: #FF4F00; }
+  .quick-card[disabled] { opacity: 0.5; cursor: not-allowed; }
+  .quick-card[disabled]:hover { transform: none; box-shadow: none; border-color: #E8E7DD; }
   .quick-card-icon { width: 38px; height: 38px; border-radius: 10px; background: rgba(255,79,0,0.08); color: #FF4F00; display: grid; place-items: center; }
   .quick-card-title { font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 1.45rem; line-height: 1.15; letter-spacing: -0.01em; }
   .quick-card-blurb { font-size: 0.86rem; color: #5E5D4F; line-height: 1.55; }
@@ -229,6 +228,8 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
   .tpl-feature { font-family: 'Geist Mono', monospace; font-size: 0.65rem; color: #5E5D4F; background: #F6F6F2; padding: 3px 7px; border-radius: 5px; letter-spacing: 0.05em; }
 
   /* Empty states */
+  /* A notice that says what is actually wrong, at a 360px-safe width with no fixed sizing. */
+  .meet-notice { margin: 22px 0 0; padding: 14px 16px; border-radius: 12px; background: rgba(255,79,0,0.07); border: 1px solid rgba(255,79,0,0.24); color: #7a3200; font-size: 0.9rem; line-height: 1.6; }
   .empty { background: #fff; border: 1px dashed #C9C7B6; border-radius: 14px; padding: 38px 22px; text-align: center; color: #5E5D4F; font-size: 0.92rem; }
   .empty strong { display: block; color: #0B0E14; font-family: 'Cormorant Garamond', serif; font-weight: 500; font-size: 1.3rem; margin-bottom: 6px; }
 
@@ -270,16 +271,26 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
     Full-scale video conferencing built into your portal. Encrypted peer-to-peer media, in-browser recording, live captions, breakout spaces, and persistent room links. No external app, no install, no download.
   </p>
 
+  {blockReason && (
+    <p class="meet-notice">{blockReason}</p>
+  )}
+  {upcomingError && (
+    <p class="meet-notice">{upcomingError}</p>
+  )}
+
   <!-- Quick actions strip -->
   <div class="quick-strip">
-    <button class="quick-card" id="qcStart">
+    {/* Disabled is a HINT, not the gate: /api/meet/rooms refuses the same condition server-side, so
+        a re-post from a stale page cannot get through. Join-with-code stays enabled — an existing
+        room is readable even when a new one cannot be recorded. */}
+    <button class="quick-card" id="qcStart" disabled={!canSchedule}>
       <div class="quick-card-icon">
         <svg class="icon-lg" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
       </div>
       <div class="quick-card-title">Start a huddle</div>
       <div class="quick-card-blurb">Open an instant ad-hoc room. Shareable link, no schedule needed.</div>
     </button>
-    <button class="quick-card" id="qcSchedule">
+    <button class="quick-card" id="qcSchedule" disabled={!canSchedule}>
       <div class="quick-card-icon">
         <svg class="icon-lg" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
       </div>
@@ -547,11 +558,14 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
       if (r.ok) {
         window.location.href = '/portal/meet/' + id;
       } else {
-        // Fallback if API endpoint not built — go anyway, the room page will create
-        window.location.href = '/portal/meet/' + id + '?adhoc=1';
+        // /api/meet/rooms exists now, so a failure here is a real refusal with a real reason. It
+        // used to fall through to '?adhoc=1' and open a room the scheduler had no record of, which
+        // is why "Start a huddle" looked like it worked while nothing was ever saved.
+        const err = await r.json().catch(function () { return {}; });
+        toast(err.error || 'The huddle could not be opened.');
       }
     } catch (_) {
-      window.location.href = '/portal/meet/' + id + '?adhoc=1';
+      toast('Network error. The huddle was not opened.');
     }
   });
 

@@ -2,6 +2,7 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureChatSchema, CHAT_CANONICAL_HREF } from '@/lib/chat-schema';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=/portal/messages');
@@ -21,58 +22,17 @@ function shortDate(v: any): string {
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
 }
 
-// --- Self-bootstrap schema ----------------------------------------------------
-await db.execute(sql`
-  CREATE TABLE IF NOT EXISTS chat_threads (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    kind VARCHAR(20) NOT NULL DEFAULT 'direct',
-    title VARCHAR(200),
-    cover_url TEXT,
-    last_message_preview TEXT,
-    last_message_at TIMESTAMPTZ,
-    disappearing_seconds INT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )
-`);
-await db.execute(sql`
-  CREATE TABLE IF NOT EXISTS chat_thread_members (
-    thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL,
-    role VARCHAR(20) NOT NULL DEFAULT 'member',
-    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_read_at TIMESTAMPTZ,
-    notifications_muted BOOLEAN NOT NULL DEFAULT false,
-    public_key_pem TEXT,
-    PRIMARY KEY (thread_id, user_id)
-  )
-`);
-await db.execute(sql`
-  CREATE TABLE IF NOT EXISTS chat_messages (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
-    sender_user_id UUID NOT NULL,
-    ciphertext TEXT NOT NULL,
-    iv TEXT NOT NULL,
-    envelope JSONB DEFAULT '{}'::jsonb,
-    attachment_url TEXT,
-    attachment_meta JSONB,
-    reply_to_message_id UUID,
-    edited_at TIMESTAMPTZ,
-    deleted_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )
-`);
-await db.execute(sql`
-  CREATE TABLE IF NOT EXISTS chat_message_receipts (
-    message_id UUID NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL,
-    delivered_at TIMESTAMPTZ,
-    read_at TIMESTAMPTZ,
-    PRIMARY KEY (message_id, user_id)
-  )
-`);
-await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_messages_thread_idx ON chat_messages (thread_id, created_at DESC)`).catch(()=>{});
-await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_members_user_idx ON chat_thread_members (user_id)`).catch(()=>{});
+// --- Schema -------------------------------------------------------------------
+// The DDL that used to sit here CREATEd chat_messages with the thread/ciphertext shape, while
+// scripts/setup-team-chat.mjs CREATEs the same table name with a channel/body shape. CREATE TABLE
+// IF NOT EXISTS is a NO-OP on an existing table, so the statement that ran second did nothing at
+// all and its system's every INSERT threw from that moment on — invisibly, because the only
+// statement here that errors against the other shape (the thread index) was the one wrapped in
+// `.catch(()=>{})`.
+//
+// ONE module now owns these tables and reconciles both shapes additively: src/lib/chat-schema.ts.
+// Nothing else may CREATE a chat table; a second one recreates the split.
+await ensureChatSchema();
 
 // --- POST handlers ------------------------------------------------------------
 let okMsg = '', errMsg = '';
@@ -149,16 +109,21 @@ if (Astro.request.method === 'POST' && ct.includes('application/json')) {
         UPDATE chat_threads SET last_message_preview = ${'[encrypted]'}, last_message_at = NOW() WHERE id = ${tid}
       `);
       // Notify the other member(s) of the new DM (content is E2E so just a ping).
+      //
+      // The URL used to branch on role and send staff to `/admin/dms`, WHICH IS NOT A ROUTE — there
+      // is no src/pages/admin/dms.astro and never was, so every notification an admin, super_admin,
+      // editor or reviewer received about a direct message led to a 404. The branch is gone rather
+      // than repointed: threads live in exactly one place now, and /portal/messages resolves
+      // ?thread=<id> against the reader's own memberships for everyone (see initialThreadId below).
       try {
         const others = rows(await db.execute(sql`
-          SELECT m.user_id, u.role FROM chat_thread_members m JOIN users u ON u.id = m.user_id
+          SELECT m.user_id FROM chat_thread_members m
           WHERE m.thread_id = ${tid} AND m.user_id <> ${user.id}
         `));
         const { sendPushToUser } = await import('@/lib/push');
         const { notifyUser } = await import('@/lib/notify');
         for (const o of others) {
-          const staff = ['admin', 'super_admin', 'editor', 'reviewer'].includes((o as any).role);
-          const url = (staff ? '/admin/dms' : '/portal/messages') + '?thread=' + tid;
+          const url = CHAT_CANONICAL_HREF + '?thread=' + tid;
           await sendPushToUser((o as any).user_id, {
             type: 'dm',
             title: 'New message from ' + (user.name || 'someone'),
@@ -175,7 +140,11 @@ if (Astro.request.method === 'POST' && ct.includes('application/json')) {
             entityId: tid,
           });
         }
-      } catch (_) {}
+      } catch (e: any) {
+        // The message IS stored, so this must not fail the send — but it is not swallowed either.
+        // A ping that silently stops arriving is indistinguishable from nobody having written.
+        console.error('[portal/messages] dm-notify', e?.cause?.message || e?.message);
+      }
       return new Response(JSON.stringify({ ok: true, id: ins[0].id, created_at: ins[0].created_at }), { headers: { 'content-type': 'application/json' } });
     }
 
@@ -211,7 +180,13 @@ if (Astro.request.method === 'POST' && ct.includes('application/json')) {
           INSERT INTO chat_message_receipts (message_id, user_id, delivered_at, read_at)
           VALUES (${mid}, ${user.id}, NOW(), NOW())
           ON CONFLICT (message_id, user_id) DO UPDATE SET read_at = NOW()
-        `).catch(()=>{});
+        `).catch((e: any) => {
+          // A receipt for ONE message must not fail the read-marking of the other ninety-nine, so
+          // the failure is still tolerated — but it is no longer SILENT. A bare `.catch(()=>{})` on
+          // a write is exactly how the chat_messages shape mismatch stayed invisible. The real
+          // Postgres reason is on e.cause; e.message is only the failed SQL.
+          console.error('[portal/messages] receipt', mid, e?.cause?.message || e?.message);
+        });
       }
       return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
     }
@@ -405,6 +380,7 @@ body.era-has-fab { padding-bottom: 0; }
 .send-btn { background: linear-gradient(135deg, #67e8f9, #a78bfa); border: 0; color: #0a0a0c; }
 .send-btn:hover { filter: brightness(1.1); }
 .reply-bar { background: #1a1c25; border-left: 3px solid #67e8f9; padding: 6px 10px; margin-bottom: 8px; font-family: 'Geist Mono', monospace; font-size: 11px; color: #b0b0bb; display: flex; justify-content: space-between; align-items: center; border-radius: 4px; }
+.send-error { background: rgba(239, 68, 68, 0.12); border-left: 3px solid #ef4444; color: #fca5a5; padding: 8px 10px; margin-bottom: 8px; border-radius: 4px; font-family: 'Geist Mono', monospace; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 
 .emoji-pop { position: absolute; bottom: 60px; right: 80px; background: #11131a; border: 1px solid #2a2a35; border-radius: 10px; padding: 8px; display: none; grid-template-columns: repeat(8, 1fr); gap: 4px; z-index: 50; }
 .emoji-pop.open { display: grid; }
@@ -624,6 +600,11 @@ body.era-has-fab { padding-bottom: 0; }
     <div class="typing" id="typing"></div>
 
     <div class="composer-wrap" id="composerWrap" style="display:none">
+      <!-- The send used to ignore the server's answer entirely: it cleared the box and reloaded the
+           thread whichever way the POST went, so while every INSERT was failing on the schema
+           collision the screen looked like a working messenger that people were being ignored in.
+           This line is how a refused send now says so, and the text stays in the box. -->
+      <div class="send-error" id="sendError" role="alert" style="display:none"></div>
       <div class="reply-bar" id="replyBar" style="display:none">
         <span id="replyBarText"></span>
         <button class="icon-btn" id="replyCancel" style="width:22px;height:22px">
@@ -1172,11 +1153,43 @@ body.era-has-fab { padding-bottom: 0; }
   }
   async function deleteMessage(m) {
     if (!confirm('Delete this message? It will show as deleted for everyone.')) return;
-    await fetch('/portal/messages', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ action: 'delete', message_id: m.id })
-    });
+    // Same reason as send(): a delete that failed used to redraw the thread with the message still
+    // in it and no explanation, which reads as "the delete did not take" only if you look closely.
+    const done = await postAction({ action: 'delete', message_id: m.id });
+    if (!done) return;
     await loadMessages();
+  }
+
+  // Every write goes through here, and the answer is READ. The handler replies
+  // { ok: false, error } with a 400 on a refusal — a missing membership, a malformed payload, or a
+  // database error such as the schema collision this page was repaired for — and the previous code
+  // discarded all of it, cleared the composer and re-rendered as though the message had been sent.
+  // Returns the parsed body on success, or null after showing why not.
+  function showSendError(msg) {
+    const box = $('sendError');
+    box.textContent = msg;
+    box.style.display = '';
+  }
+  function clearSendError() { $('sendError').style.display = 'none'; }
+
+  async function postAction(body) {
+    try {
+      const r = await fetch('/portal/messages', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      let j = null;
+      try { j = await r.json(); } catch (e) { j = null; }
+      if (!r.ok || !j || j.ok !== true) {
+        showSendError('Not sent - ' + ((j && j.error) || ('server returned ' + r.status)) + '. Your text is still here; try again.');
+        return null;
+      }
+      clearSendError();
+      return j;
+    } catch (e) {
+      showSendError('Not sent - ' + (e && e.message ? e.message : 'network error') + '. Your text is still here; try again.');
+      return null;
+    }
   }
 
   async function send() {
@@ -1187,10 +1200,8 @@ body.era-has-fab { padding-bottom: 0; }
 
     if (editingId) {
       const { ciphertext, iv } = await encryptText(t, txt);
-      await fetch('/portal/messages', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action: 'edit', message_id: editingId, ciphertext, iv })
-      });
+      const edited = await postAction({ action: 'edit', message_id: editingId, ciphertext, iv });
+      if (!edited) return;
       editingId = null;
       $('composer').value = '';
       await loadMessages();
@@ -1199,17 +1210,16 @@ body.era-has-fab { padding-bottom: 0; }
 
     const payloadText = txt || '[image]';
     const { ciphertext, iv } = await encryptText(t, payloadText);
-    const body = {
+    const sent = await postAction({
       action: 'send', thread_id: t.id, ciphertext, iv,
       envelope: { v: 1, recipients: (t.members || []).map(m => m.user_id) },
       reply_to_message_id: replyTo ? replyTo.id : null,
       attachment_url: pendingAttachment ? pendingAttachment.dataUrl : null,
       attachment_meta: pendingAttachment ? { name: pendingAttachment.name, size: pendingAttachment.size, encrypted: true } : null
-    };
-    await fetch('/portal/messages', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body)
     });
+    // Nothing is cleared on a refusal: the composer still holds what the person wrote, and the
+    // reply target is still attached to it.
+    if (!sent) return;
     $('composer').value = '';
     pendingAttachment = null;
     replyTo = null;

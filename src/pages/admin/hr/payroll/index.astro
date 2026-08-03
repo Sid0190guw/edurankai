@@ -3,6 +3,22 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { can } from '@/lib/auth/permissions';
 import { db } from '@/lib/db';
 import { sql as sqlExpr } from 'drizzle-orm';
+// THE STATUTORY RATES ARE NO LONGER IN THIS FILE.
+//
+// This page used to compute every payslip from four constants — `basic * 0.12` capped at 1800 for
+// provident fund, `gross * 0.0075` below a gross of 21000 for state insurance, and a professional tax
+// of 200 or 150 by band, commented "(Karnataka/Maharashtra standard)". Those are jurisdiction-specific
+// rules that change, that differ by state and by wage band, and that were being printed on employees'
+// payslips with the percentage next to them as though this product could stand behind them.
+//
+// generateRun() in src/lib/payroll.ts now builds each payslip from components an administrator
+// configures at /admin/hr/payroll/components, with the rates THEY entered. The catalogue starts empty
+// and there is no button that offers to fill in a country's rates.
+//
+// THE CONSEQUENCE IS REAL AND IS STATED ON SCREEN BELOW: until statutory components are configured, a
+// new run deducts none of them, so net pay is higher than a run generated before this change. That is
+// visible on this page, not silent.
+import { generateRun, computePay, listComponents, MONTH_NAMES as PAYROLL_MONTHS } from '@/lib/payroll';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -52,141 +68,25 @@ if (Astro.request.method === 'POST') {
       await db.execute(sqlExpr`ALTER TABLE hr_payslips ADD COLUMN IF NOT EXISTS lop_days NUMERIC(6,2) NOT NULL DEFAULT 0`).catch(() => {});
       await db.execute(sqlExpr`ALTER TABLE hr_payslips ADD COLUMN IF NOT EXISTS lop_deduction NUMERIC(14,2) NOT NULL DEFAULT 0`).catch(() => {});
 
-      // Check if run already exists
-      const existing = await db.execute(sqlExpr`SELECT id FROM hr_payroll_runs WHERE month = ${month} AND year = ${year} LIMIT 1`);
-      const _existingRows = Array.isArray(existing) ? existing : (existing?.rows || []);
-      if (_existingRows.length > 0) {
-        errorMsg = `Payroll run for ${month}/${year} already exists.`;
+      // ONE CALL, and every rate in it came from the component catalogue rather than from this file.
+      // generateRun() is idempotent on (month, year), refuses a second run for a period that already
+      // has one, and reports per-employee failures by name instead of aborting the whole month or
+      // hiding them.
+      const run = await generateRun(month, year, String(user.id), notes);
+      if (!run.ok) {
+        errorMsg = run.error || 'That payroll run could not be created.';
       } else {
-        // Create payroll run
-        const run = await db.execute(sqlExpr`
-          INSERT INTO hr_payroll_runs (month, year, status, notes, processed_by)
-          VALUES (${month}, ${year}, 'draft', ${notes || null}, ${user.id})
-          RETURNING id
-        `);
-        const _runRows = Array.isArray(run) ? run : (run?.rows || []);
-        const runId = (_runRows[0] as any)?.id;
-
-        // Get all active employees with salary structures
-        const employees = await db.execute(sqlExpr`
-          SELECT e.id, e.full_name, e.base_salary, e.currency,
-            ss.basic, ss.hra, ss.da, ss.special_allowance, ss.transport_allowance,
-            ss.medical_allowance, ss.other_allowances, ss.gross_salary,
-            ss.pf_employee, ss.esic_employee, ss.professional_tax, ss.tds,
-            ss.other_deductions, ss.net_salary
-          FROM hr_employees e
-          LEFT JOIN hr_salary_structures ss ON ss.employee_id = e.id
-            AND ss.effective_from <= NOW()
-            AND (ss.effective_to IS NULL OR ss.effective_to >= NOW())
-          WHERE e.is_active = true
-          ORDER BY e.full_name
-        `);
-
-        let totalGross = 0, totalDeductions = 0, totalNet = 0;
-        let empCount = 0;
-
-        const _empRows = (Array.isArray(employees) ? employees : (employees?.rows || [])) as any[];
-        for (const emp of _empRows) {
-          // Use salary structure if exists, else use base_salary as basic
-          const basic = parseFloat(emp.basic || emp.base_salary || 0);
-          const hra = parseFloat(emp.hra || basic * 0.4); // 40% HRA default
-          const da = parseFloat(emp.da || 0);
-          const specialAllowance = parseFloat(emp.special_allowance || 0);
-          const transportAllowance = parseFloat(emp.transport_allowance || 1600);
-          const medicalAllowance = parseFloat(emp.medical_allowance || 1250);
-          const otherAllowances = parseFloat(emp.other_allowances || 0);
-          const gross = basic + hra + da + specialAllowance + transportAllowance + medicalAllowance + otherAllowances;
-
-          // PF: 12% of basic (employee), 12% employer (not deducted from salary)
-          const pfEmployee = Math.min(basic * 0.12, 1800); // capped at 1800
-          // ESIC: 0.75% of gross if gross < 21000
-          const esicEmployee = gross < 21000 ? gross * 0.0075 : 0;
-          // Professional tax (Karnataka/Maharashtra standard)
-          let professionalTax = 0;
-          if (gross > 15000) professionalTax = 200;
-          else if (gross > 10000) professionalTax = 150;
-          const tds = parseFloat(emp.tds || 0);
-          const otherDeductions = parseFloat(emp.other_deductions || 0);
-
-          // Count attendance for this month
-          const attResult = await db.execute(sqlExpr`
-            SELECT 
-              COUNT(*) FILTER (WHERE status = 'present' OR status = 'wfh') as days_worked,
-              COUNT(*) FILTER (WHERE status = 'on_leave') as days_leave,
-              COUNT(*) FILTER (WHERE status = 'absent') as days_absent
-            FROM hr_attendance
-            WHERE employee_id = ${emp.id}
-            AND EXTRACT(MONTH FROM date) = ${month}
-            AND EXTRACT(YEAR FROM date) = ${year}
-          `);
-          const _attRows = Array.isArray(attResult) ? attResult : (attResult?.rows || []);
-          const att = (_attRows[0] || {}) as any;
-
-          // LOSS OF PAY. Unpaid leave and absence used to cost nothing: an employee on a month of
-          // unpaid leave was still paid in full, because the run read the salary structure and
-          // never looked at what the attendance and leave modules recorded.
-          //   LOP days = approved UNPAID leave days falling in this month + days marked absent.
-          //   Paid leave (casual / sick / earned) is not deducted — that is what the allowance is.
-          const daysInMonth = new Date(year, month, 0).getDate();
-          let unpaidDays = 0;
-          try {
-            const up = await db.execute(sqlExpr`
-              SELECT COALESCE(SUM(
-                (LEAST(end_date, make_date(${year}, ${month}, ${daysInMonth}))
-                 - GREATEST(start_date, make_date(${year}, ${month}, 1))) + 1
-              ), 0)::int AS d
-              FROM hr_leave_request
-              WHERE employee_id = ${emp.id} AND status = 'approved' AND leave_type = 'unpaid'
-                AND start_date <= make_date(${year}, ${month}, ${daysInMonth})
-                AND end_date   >= make_date(${year}, ${month}, 1)`);
-            const _u = Array.isArray(up) ? up : (up as any)?.rows || [];
-            unpaidDays = Number((_u[0] as any)?.d || 0);
-          } catch (_) { /* leave module not provisioned yet -> no unpaid days */ }
-
-          const daysAbsent = parseFloat(att.days_absent || 0);
-          const lopDays = Math.min(daysInMonth, Math.max(0, unpaidDays) + Math.max(0, daysAbsent));
-          const perDay = daysInMonth > 0 ? gross / daysInMonth : 0;
-          const lopDeduction = Math.round(perDay * lopDays * 100) / 100;
-
-          const totalDed = pfEmployee + esicEmployee + professionalTax + tds + otherDeductions + lopDeduction;
-          const net = Math.max(0, gross - totalDed);
-
-          await db.execute(sqlExpr`
-            INSERT INTO hr_payslips (
-              payroll_run_id, employee_id, month, year,
-              days_worked, days_leave, days_absent, lop_days, lop_deduction,
-              basic, hra, da, special_allowance, transport_allowance, medical_allowance,
-              other_allowances, gross_salary,
-              pf_employee, esic_employee, professional_tax, tds, other_deductions,
-              total_deductions, net_salary, currency, status
-            ) VALUES (
-              ${runId}, ${emp.id}, ${month}, ${year},
-              ${parseFloat(att.days_worked || 0)}, ${parseFloat(att.days_leave || 0)}, ${daysAbsent}, ${lopDays}, ${lopDeduction},
-              ${basic}, ${hra}, ${da}, ${specialAllowance}, ${transportAllowance}, ${medicalAllowance},
-              ${otherAllowances}, ${gross},
-              ${pfEmployee}, ${esicEmployee}, ${professionalTax}, ${tds}, ${otherDeductions},
-              ${totalDed}, ${net}, ${emp.currency || 'INR'}, 'pending'
-            )
-            ON CONFLICT (payroll_run_id, employee_id) DO NOTHING
-          `);
-
-          totalGross += gross;
-          totalDeductions += totalDed;
-          totalNet += net;
-          empCount++;
+        const parts = [
+          `Payroll run created for ${PAYROLL_MONTHS[month - 1]} ${year} with ${run.employees} employee${run.employees === 1 ? '' : 's'}.`,
+          `Total net ₹${Math.round(run.totalNet).toLocaleString('en-IN')}.`,
+        ];
+        if (run.failed.length) {
+          parts.push(`${run.failed.length} employee${run.failed.length === 1 ? ' was' : 's were'} left out because their payslip could not be written: ${run.failed.join(', ')}. Nobody was paid a wrong amount — they simply have no payslip in this run.`);
         }
-
-        // Update run totals
-        await db.execute(sqlExpr`
-          UPDATE hr_payroll_runs SET
-            total_employees = ${empCount},
-            total_gross = ${totalGross},
-            total_deductions = ${totalDeductions},
-            total_net = ${totalNet}
-          WHERE id = ${runId}
-        `);
-
-        successMsg = `Payroll run created for ${month}/${year} with ${empCount} employees. Total net: ₹${Math.round(totalNet).toLocaleString('en-IN')}`;
+        if (run.noStatutoryComponents) {
+          parts.push('No statutory component is configured, so this run deducted no provident fund, state insurance, professional tax or withholding. Configure them under Components if your jurisdiction requires them, then regenerate.');
+        }
+        successMsg = parts.join(' ');
       }
     } else if (action === 'approve_run') {
       const runId = fd.get('runId') as string;
@@ -227,8 +127,13 @@ if (Astro.request.method === 'POST') {
       // report a failure for a run that has already been marked paid and credited.
       try {
         const { sendPushToUser, sendPushToAdmins } = await import('@/lib/push');
+        // `p.net_pay` — the column this used to select DOES NOT EXIST. hr_payslips carries
+        // `net_salary` (db/hr-schema.sql:262); there has never been a net_pay. So this statement threw
+        // `column p.net_pay does not exist` on every run, the bare `catch (_) {}` around the block
+        // swallowed it, and NOBODY was ever notified that they had been paid — while the page reported
+        // success. The column name is fixed and the value is aliased so the reader below is unchanged.
         const paidRows = await db.execute(sqlExpr`
-          SELECT e.user_id, p.net_pay
+          SELECT e.user_id, p.net_salary AS net_pay
           FROM hr_payslips p
           JOIN hr_employees e ON e.id = p.employee_id
           WHERE p.payroll_run_id = ${runId} AND e.user_id IS NOT NULL`);
@@ -267,10 +172,19 @@ if (Astro.request.method === 'POST') {
       const currency = (fd.get('currency') as string || 'INR').trim();
 
       const gross = basic + hra + da + specialAllowance + transportAllowance + medicalAllowance + otherAllowances;
-      const pfEmployee = Math.min(basic * 0.12, 1800);
-      const esicEmployee = gross < 21000 ? gross * 0.0075 : 0;
-      const professionalTax = gross > 15000 ? 200 : gross > 10000 ? 150 : 0;
-      const totalDed = pfEmployee + esicEmployee + professionalTax + tds;
+
+      // THE THREE HARDCODED STATUTORY FORMULAS THAT USED TO SIT HERE ARE GONE. They were
+      // `Math.min(basic * 0.12, 1800)`, `gross < 21000 ? gross * 0.0075 : 0` and a professional tax
+      // of 200/150 by band — jurisdiction-specific rules, written into a page, stamped onto a salary
+      // record. Those three columns are now written as ZERO on the structure, because this form does
+      // not know them: statutory deductions are components, they are configured at
+      // /admin/hr/payroll/components, and they are applied when a run is generated.
+      //
+      // `tds` and `other_deductions` stay on the structure, because a human types those in here.
+      const pfEmployee = 0;
+      const esicEmployee = 0;
+      const professionalTax = 0;
+      const totalDed = tds;
       const net = gross - totalDed;
 
       // Capture what the salary WAS, so the audit entry records the change and not just the result.
@@ -308,7 +222,13 @@ if (Astro.request.method === 'POST') {
         from: prev ? { gross: Number(prev.gross_salary || 0), net: Number(prev.net_salary || 0), currency: prev.currency } : null,
         to: { gross, net, currency },
       });
-      successMsg = `Salary structure updated. Gross: ${currency} ${gross.toLocaleString('en-IN')}, Net: ${currency} ${net.toLocaleString('en-IN')}`;
+      // The honest net, computed the way a real run will compute it — through the component engine
+      // against the structure that has just been written — rather than by repeating a formula here.
+      // Reporting a net that a run would not reproduce is how a salary conversation goes wrong.
+      const preview = await computePay(empId, { month: currentMonth, year: currentYear });
+      successMsg = `Salary structure updated. Gross ${currency} ${gross.toLocaleString('en-IN')}; `
+        + `net ${preview.currency} ${preview.net.toLocaleString('en-IN')} after the components configured today`
+        + (preview.noStatutoryComponents ? ' (no statutory component is configured, so none was deducted).' : '.');
     }
   } catch (err: any) {
     errorMsg = 'Error: ' + (err.message || 'Unknown');
@@ -346,6 +266,11 @@ const employees = await db.execute(sqlExpr`
   LIMIT 100
 `);
 
+// What a run will actually apply. Read AFTER the POST handler so a component saved elsewhere in this
+// request is reflected, and used only to state a fact on screen — it decides nothing.
+const activeComponents = await listComponents();
+const statutoryConfigured = activeComponents.filter((c) => c.statutory).length;
+
 const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
 function fmt(n: any) {
@@ -371,8 +296,13 @@ function fmt(n: any) {
         inside its own container and the labels keep their full width instead of squashing. */}
     <div style="display:flex;gap:4px;overflow-x:auto;-webkit-overflow-scrolling:touch;">
       {[['runs','Payroll Runs'],['payslips','Payslips'],['salary','Salary Setup']].map(([t, label]) => (
-        <a href={`?tab=${t}`} style={`flex:0 0 auto;white-space:nowrap;text-decoration:none;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;${tab === t ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;color:#8a8a94;'}`}>{label}</a>
+        <a href={`?tab=${t}`} style={`flex:0 0 auto;white-space:nowrap;text-decoration:none;font-size:12px;font-weight:600;padding:9px 12px;border-radius:6px;min-height:44px;display:inline-flex;align-items:center;${tab === t ? 'background:#FF4F00;color:#fff;' : 'background:#15151a;color:#8a8a94;'}`}>{label}</a>
       ))}
+      {/* THE TWO SURFACES THIS PHASE ADDED. Both gated at their own door — Components on
+          payroll.manage (the same key as this page), Claims on expenses.review — so a link here is
+          never wider than what the destination admits. */}
+      <a href="/admin/hr/payroll/components" style="flex:0 0 auto;white-space:nowrap;text-decoration:none;font-size:12px;font-weight:600;padding:9px 12px;border-radius:6px;background:#15151a;color:#8a8a94;min-height:44px;display:inline-flex;align-items:center;">Components</a>
+      <a href="/admin/hr/payroll/claims" style="flex:0 0 auto;white-space:nowrap;text-decoration:none;font-size:12px;font-weight:600;padding:9px 12px;border-radius:6px;background:#15151a;color:#8a8a94;min-height:44px;display:inline-flex;align-items:center;">Claims</a>
     </div>
   </div>
 
@@ -382,6 +312,17 @@ function fmt(n: any) {
   <!-- PAYROLL RUNS TAB -->
   {tab === 'runs' && (
     <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
+      {/* WHAT THIS RUN WILL AND WILL NOT DEDUCT, said before anybody presses the button. The rates
+          that used to live in this file are gone; a run now applies exactly the components that have
+          been configured, and none is assumed. */}
+      <div style={`border-radius:10px;padding:12px 14px;margin-bottom:4px;${statutoryConfigured === 0 ? 'background:rgba(255,159,0,0.07);border:1px solid rgba(255,159,0,0.22);' : 'background:#0f0f14;border:1px solid #1a1a1f;'}`}>
+        <p style={`font-size:12.5px;margin:0;line-height:1.65;${statutoryConfigured === 0 ? 'color:#fbbf24;' : 'color:#8a8a94;'}`}>
+          {statutoryConfigured === 0
+            ? 'No statutory component is configured, so a run generated now deducts no provident fund, state insurance, professional tax or withholding — the run assumes none of them. Those rates are jurisdiction-specific and this product makes no claim about what yours requires.'
+            : statutoryConfigured + ' statutory component' + (statutoryConfigured === 1 ? '' : 's') + ' configured, plus ' + (activeComponents.length - statutoryConfigured) + ' other component' + ((activeComponents.length - statutoryConfigured) === 1 ? '' : 's') + '. Every rate is the one you entered; nothing here is advice on what your jurisdiction requires.'}
+          <a href="/admin/hr/payroll/components" style="color:#FF7040;"> Open components</a>.
+        </p>
+      </div>
       {((Array.isArray(runs) ? runs : (runs?.rows || [])) as any[]).length === 0 && (
         <div style="text-align:center;padding:48px;color:#6e6e78;">
           <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px;opacity:0.7;"><path d="M20 12V8H6a2 2 0 0 1-2-2c0-1.1.9-2 2-2h12v4"/><path d="M4 6v12c0 1.1.9 2 2 2h14v-4"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/></svg>
@@ -567,7 +508,9 @@ function fmt(n: any) {
                 ))}
               </div>
               <div style="background:#15151a;border-radius:8px;padding:8px 10px;font-size:11px;color:#6e6e78;">
-                PF (12% basic, max ₹1800) + ESIC (0.75% if gross &lt;₹21k) + Prof. Tax (₹200 if gross &gt;₹15k) auto-calculated
+                This form sets the fixed part of the salary. Provident fund, state insurance, professional
+                tax and any other statutory deduction are <a href="/admin/hr/payroll/components" style="color:#FF7040;">configured components</a>
+                with rates you set, applied when a run is generated. Nothing is assumed here.
               </div>
               <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:13px;padding:10px;border-radius:8px;cursor:pointer;">Save Salary Structure</button>
             </form>

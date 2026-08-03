@@ -1,0 +1,594 @@
+---
+// /portal/employee/attendance/roster — SHIFTS, THE ROSTER, HOLIDAYS AND QR STATIONS.
+//
+// =================================================================================================
+// TWO AUDIENCES, ONE PAGE, AND THE DIFFERENCE IS A CAPABILITY
+// =================================================================================================
+//
+// EVERY EMPLOYEE reads: the shift they are on, the shift history behind it, and the holidays that
+// apply to them. Those are facts about their own working life and hiding them behind an admin door
+// is how somebody ends up asking a colleague what time they are supposed to start.
+//
+// A HOLDER OF `attendance.roster.manage` also writes: defines shifts, puts people on them, records
+// holidays and registers QR stations.
+//
+// The capability is asked through the composed workspace (ctx.holds), which is wildcard-aware — a
+// super_admin holds '*' and a bare permissions.has('attendance.roster.manage') would answer false
+// for the founder, which is exactly how a console became unreachable on this project once already.
+// The composition is the same one the navigation is drawn from, so the door and the screen cannot
+// disagree.
+//
+// ROSTERING IS NOT APPROVING. Nothing on this page decides a request. An attendance correction is
+// routed by src/lib/workflow.ts to the reporting manager the organization graph names, and holding
+// this capability puts nobody on that route.
+//
+// =================================================================================================
+// THE ROSTER IS DATED, NOT OVERWRITTEN
+// =================================================================================================
+//
+// Putting somebody on a new shift CLOSES their old row and OPENS a new one, in one statement. Last
+// month's timesheet keeps comparing against the shift that was actually in force last month. A
+// shift_id column on hr_employees would be mutated in place and would silently re-score every past
+// week the moment somebody changed teams.
+//
+// const BEFORE THE HANDLER. MOBILE FIRST: 360px, 44px targets, tables scroll in their own container.
+import BottomNav from '@/components/workforce/BottomNav.astro';
+import EmptyState from '@/components/workforce/EmptyState.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import { composeWorkspace } from '@/lib/workforce/composer';
+import {
+  listShifts,
+  createShift,
+  retireShift,
+  assignShift,
+  rosterFor,
+  currentRoster,
+  unrosteredCount,
+  listHolidays,
+  addHoliday,
+  removeHoliday,
+  listQrStations,
+  createQrStation,
+  shiftOn,
+  hmToMinute,
+  minuteToHm,
+  shiftSummary,
+  shiftExpectedMinutes,
+  formatMinutes,
+  today as attendanceToday,
+  shiftDateIso,
+} from '@/lib/attendance';
+
+const PATH = '/portal/employee/attendance/roster';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+// ------------------------------------------------------------------------------------------------
+// CONSTANTS AND HELPERS — ALL ABOVE THE POST HANDLER. `const` is not hoisted.
+// ------------------------------------------------------------------------------------------------
+
+const MANAGE = 'attendance.roster.manage';
+
+/** ISO weekday numbers with their names, for the working-days checkboxes. */
+const WEEKDAYS = [
+  { n: 1, label: 'Mon' },
+  { n: 2, label: 'Tue' },
+  { n: 3, label: 'Wed' },
+  { n: 4, label: 'Thu' },
+  { n: 5, label: 'Fri' },
+  { n: 6, label: 'Sat' },
+  { n: 7, label: 'Sun' },
+];
+
+const dayLabel = (iso: string) => {
+  if (!iso) return '';
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+};
+
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+// The composition, once per request. composeWorkspace memoises on Astro.locals, so a page that
+// composes and then asks a second question pays for one composition.
+let composed: any = null;
+try {
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: PATH });
+} catch (e: any) {
+  // A composition that cannot be built is not guessed at. holds() then answers false, which lands
+  // the reader on the read-only half — the safe direction.
+  console.error('[portal/attendance/roster] compose', e?.cause?.message || e?.message);
+}
+
+const holds = (key: string): boolean => {
+  try {
+    return composed?.context?.holds ? composed.context.holds(key) === true : false;
+  } catch {
+    return false;
+  }
+};
+
+const mayManage = holds(MANAGE);
+
+let flash = '';
+let flashError = '';
+
+// ------------------------------------------------------------------------------------------------
+// WRITES. Every one of them re-checks mayManage on the SERVER, not on the rendered form.
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  if (!mayManage) {
+    flashError = 'You do not hold the capability to change shifts, rosters or holidays.';
+  } else {
+    try {
+      const form = await Astro.request.formData();
+      const action = String(form.get('action') || '');
+
+      if (action === 'create_shift') {
+        const days = form.getAll('days').map((d) => Number(String(d)));
+        const res = await createShift({
+          name: String(form.get('name') || ''),
+          code: String(form.get('code') || '') || null,
+          startMinute: hmToMinute(String(form.get('start') || '')) ?? -1,
+          endMinute: hmToMinute(String(form.get('end') || '')) ?? -1,
+          breakMinutes: Number(form.get('break') || 60),
+          graceMinutes: Number(form.get('grace') || 15),
+          workingDays: days,
+          createdByUserId: String(user.id),
+        });
+        if (res.ok) flash = 'Shift saved.';
+        else flashError = res.error || 'The shift could not be saved.';
+      } else if (action === 'retire_shift') {
+        const res = await retireShift(String(form.get('shift_id') || ''));
+        if (res.ok) flash = 'Shift retired. Rosters that used it keep reading correctly.';
+        else flashError = res.error || 'The shift could not be retired.';
+      } else if (action === 'assign_shift') {
+        const res = await assignShift({
+          employeeId: String(form.get('employee_id') || ''),
+          shiftId: String(form.get('shift_id') || ''),
+          effectiveFrom: String(form.get('from') || ''),
+          note: String(form.get('note') || '') || null,
+          createdByUserId: String(user.id),
+        });
+        if (res.ok) flash = 'Roster updated from that date. The previous shift is closed, not deleted.';
+        else flashError = res.error || 'The roster could not be updated.';
+      } else if (action === 'add_holiday') {
+        const res = await addHoliday({
+          dateIso: String(form.get('date') || ''),
+          name: String(form.get('name') || ''),
+          departmentId: String(form.get('department') || '') || null,
+          isOptional: String(form.get('optional') || '') === 'yes',
+          createdByUserId: String(user.id),
+        });
+        if (res.ok) flash = res.changed ? 'Holiday recorded.' : 'That holiday was already recorded.';
+        else flashError = res.error || 'The holiday could not be saved.';
+      } else if (action === 'remove_holiday') {
+        const res = await removeHoliday(String(form.get('holiday_id') || ''));
+        if (res.ok) flash = 'Holiday removed.';
+        else flashError = res.error || 'The holiday could not be removed.';
+      } else if (action === 'create_station') {
+        const latRaw = String(form.get('lat') || '');
+        const lonRaw = String(form.get('lon') || '');
+        const res = await createQrStation({
+          code: String(form.get('code') || ''),
+          label: String(form.get('label') || ''),
+          lat: latRaw ? Number(latRaw) : null,
+          lon: lonRaw ? Number(lonRaw) : null,
+          radiusM: Number(form.get('radius') || 150),
+          createdByUserId: String(user.id),
+        });
+        if (res.ok) flash = 'Station registered.';
+        else flashError = res.error || 'The station could not be saved.';
+      } else {
+        flashError = 'That is not something this page does.';
+      }
+    } catch (e: any) {
+      flashError = 'We could not do that: ' + (e?.cause?.message || e?.message || 'unknown reason');
+      console.error('[portal/attendance/roster] post', e?.cause?.message || e?.message);
+    }
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+const now = await attendanceToday();
+const windowFrom = now || new Date().toISOString().slice(0, 10);
+const windowTo = shiftDateIso(windowFrom, 180);
+
+const shifts = await listShifts();
+const myShift = employeeId && now ? await shiftOn(employeeId, now) : null;
+const myRoster = employeeId ? await rosterFor(employeeId) : [];
+const holidays = await listHolidays(
+  windowFrom,
+  windowTo,
+  mayManage ? null : (workspace?.department?.id || null),
+);
+
+// Management-only reads. Nothing below is fetched for a reader who cannot act on it.
+let board: any[] = [];
+let unrostered: number | null = null;
+let stations: any[] = [];
+let people: any[] = [];
+let departments: any[] = [];
+
+if (mayManage) {
+  board = await currentRoster();
+  unrostered = await unrosteredCount();
+  stations = await listQrStations();
+  try {
+    const r = await db.execute(sql`
+      SELECT id, full_name FROM hr_employees
+       WHERE is_active = TRUE ORDER BY full_name ASC LIMIT 300`);
+    people = rows(r);
+  } catch (e: any) {
+    console.error('[portal/attendance/roster] people', e?.cause?.message || e?.message);
+  }
+  try {
+    // ::text on both sides, never ::uuid — departments.id is a slug in one schema file and a uuid
+    // in the other, and a cast throws on half the values in the product.
+    const r = await db.execute(sql`SELECT id::text AS id, name FROM departments ORDER BY name ASC LIMIT 200`);
+    departments = rows(r);
+  } catch (e: any) {
+    console.error('[portal/attendance/roster] departments', e?.cause?.message || e?.message);
+  }
+}
+---
+
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>Shifts and roster - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    html,body{overflow-x:hidden;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;
+      padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
+      padding:10px 16px 2px;margin:0;scrollbar-width:thin;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;
+      border:1px solid #DFDCD8;border-radius:999px;background:#FDFDFC;color:#564E43;
+      font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .tab:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;
+      background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;
+      background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;
+      background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .lab{display:block;margin:10px 0 4px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;
+      background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    .pair{display:flex;flex-wrap:wrap;gap:8px;}
+    .pair > div{flex:1 1 140px;min-width:0;}
+    .days{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
+    .day{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:8px 12px;
+      border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;font-size:0.8125rem;}
+    .go{width:100%;min-height:48px;margin-top:12px;padding:12px 16px;border:1px solid #1B1813;
+      border-radius:10px;background:#1B1813;color:#FFFFFF;font:inherit;font-size:0.9375rem;
+      font-weight:650;cursor:pointer;}
+    .go:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .rows{list-style:none;margin:10px 0 0;padding:0;}
+    .row{padding:11px 13px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;margin-bottom:8px;}
+    .row p{margin:0;font-size:0.875rem;line-height:1.5;overflow-wrap:anywhere;}
+    .row small{display:block;margin-top:4px;font-size:0.75rem;line-height:1.55;color:#70685C;
+      overflow-wrap:anywhere;}
+    .mini{min-height:44px;margin-top:8px;padding:9px 12px;border:1px solid #DFDCD8;border-radius:8px;
+      background:#FDFDFC;color:#564E43;font:inherit;font-size:0.8125rem;font-weight:600;cursor:pointer;}
+    .boardbox{margin:10px 0 0;overflow-x:auto;-webkit-overflow-scrolling:touch;
+      border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    table{border-collapse:collapse;width:100%;min-width:520px;font-size:0.8125rem;}
+    th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #EFEDE9;white-space:nowrap;}
+    th{font-size:0.6875rem;letter-spacing:0.06em;text-transform:uppercase;color:#70685C;font-weight:650;}
+    tr:last-child td{border-bottom:none;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;
+      line-height:1.6;color:#70685C;}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Shifts and roster</h1>
+    <p>{mayManage ? 'You can define working time here.' : 'The shift you are on, and the holidays that apply to you.'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Attendance">
+    <a class="tab" href="/portal/employee/attendance">Today and this week</a>
+    <a class="tab" href="/portal/employee/attendance/corrections">Corrections</a>
+    <a class="tab" href={PATH} aria-current="page">Shifts and roster</a>
+    <a class="tab" href="/portal/employee/calendar">Calendar</a>
+  </nav>
+
+  <main class="wrap">
+    {!gate.ok && (
+      <EmptyState
+        title={gate.title || 'This screen is not available'}
+        body={gate.reason || 'A roster is recorded against an employee record.'}
+        illustration="note"
+        actionLabel="Back to your workspace"
+        actionHref="/portal/employee"
+      />
+    )}
+
+    {flash && <p class="ok">{flash}</p>}
+    {flashError && <p class="bad">{flashError}</p>}
+
+    {gate.ok && (
+      <section class="card">
+        <h2>Your shift</h2>
+        <p>
+          {myShift
+            ? shiftSummary(myShift) + ', expecting ' + formatMinutes(shiftExpectedMinutes(myShift)) + ' on a working day'
+            : 'No shift is rostered for you yet. Your hours are still recorded; there is simply nothing to compare them against.'}
+        </p>
+        {myRoster.length > 0 && (
+          <ul class="rows">
+            {myRoster.map((r) => (
+              <li class="row">
+                <p>{r.shift ? r.shift.name : 'Shift no longer defined'}</p>
+                <small>
+                  From {dayLabel(r.effectiveFrom)}
+                  {r.effectiveTo ? ' until ' + dayLabel(r.effectiveTo) : ', still current'}
+                  {r.shift ? '. ' + minuteToHm(r.shift.startMinute) + ' to ' + minuteToHm(r.shift.endMinute) : ''}
+                </small>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    )}
+
+    <section class="card">
+      <h2>Holidays</h2>
+      {holidays.length === 0 && (
+        <p>
+          No holidays are recorded for the next six months. Until somebody records them, attendance
+          cannot tell a holiday from an ordinary day, and a timesheet will expect hours on one.
+        </p>
+      )}
+      <ul class="rows">
+        {holidays.map((h) => (
+          <li class="row">
+            <p>{h.name}</p>
+            <small>
+              {dayLabel(h.dateIso)}
+              {h.departmentName ? ', ' + h.departmentName + ' only' : ', whole organization'}
+              {h.isOptional ? ', optional' : ''}
+            </small>
+            {mayManage && (
+              <form method="POST" action={PATH}>
+                <input type="hidden" name="action" value="remove_holiday" />
+                <input type="hidden" name="holiday_id" value={h.id} />
+                <button class="mini" type="submit">Remove</button>
+              </form>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+
+    {!mayManage && (
+      <p class="notice">
+        Defining shifts, rosters and holidays needs the working-time capability, which you do not
+        hold. That is a deliberate narrow grant rather than a mistake: it sits with the people who
+        run attendance. Everything above is your own record and is yours to read.
+      </p>
+    )}
+
+    {mayManage && (
+      <section class="card">
+        <h2>Who is on what</h2>
+        <p>{board.length} {board.length === 1 ? 'person has' : 'people have'} a current shift.
+          {unrostered !== null ? ' ' + unrostered + ' active ' + (unrostered === 1 ? 'employee has' : 'employees have') + ' none, so nothing is expected of them.' : ''}</p>
+        <div class="boardbox">
+          <table>
+            <thead><tr><th>Person</th><th>Shift</th><th>Since</th></tr></thead>
+            <tbody>
+              {board.map((r) => (
+                <tr>
+                  <td>{r.employeeName || 'Unnamed record'}</td>
+                  <td>{r.shift ? shiftSummary(r.shift) : 'Shift no longer defined'}</td>
+                  <td>{dayLabel(r.effectiveFrom)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    )}
+
+    {mayManage && (
+      <section class="card">
+        <h2>Put somebody on a shift</h2>
+        <p>The previous shift is closed the day before the new one starts, so past weeks keep being
+          scored against the shift that was actually in force.</p>
+        <form method="POST" action={PATH}>
+          <input type="hidden" name="action" value="assign_shift" />
+          <label class="lab" for="ra-person">Person</label>
+          <select class="field" id="ra-person" name="employee_id" required>
+            <option value="">Choose a person</option>
+            {people.map((p) => (<option value={String(p.id)}>{String(p.full_name || 'Unnamed record')}</option>))}
+          </select>
+          <label class="lab" for="ra-shift">Shift</label>
+          <select class="field" id="ra-shift" name="shift_id" required>
+            <option value="">Choose a shift</option>
+            {shifts.map((s) => (<option value={s.id}>{shiftSummary(s)}</option>))}
+          </select>
+          <label class="lab" for="ra-from">From</label>
+          <input class="field" id="ra-from" name="from" type="date" required value={now || ''} />
+          <label class="lab" for="ra-note">A note, if this needs one</label>
+          <input class="field" id="ra-note" name="note" type="text" maxlength="200" autocomplete="off" />
+          <button class="go" type="submit">Update the roster</button>
+        </form>
+      </section>
+    )}
+
+    {mayManage && (
+      <section class="card">
+        <h2>Shifts</h2>
+        <ul class="rows">
+          {shifts.map((s) => (
+            <li class="row">
+              <p>{s.name}</p>
+              <small>
+                {minuteToHm(s.startMinute)} to {minuteToHm(s.endMinute)}, {s.breakMinutes} minute break,
+                {' '}{s.graceMinutes} minute grace. Working days: {s.workingDays.map((d) => WEEKDAYS[d - 1].label).join(', ') || 'none recorded'}.
+              </small>
+              <form method="POST" action={PATH}>
+                <input type="hidden" name="action" value="retire_shift" />
+                <input type="hidden" name="shift_id" value={s.id} />
+                <button class="mini" type="submit">Retire this shift</button>
+              </form>
+            </li>
+          ))}
+        </ul>
+        {shifts.length === 0 && <p>No shifts are defined yet. Until one is, no timesheet can say what was expected.</p>}
+
+        <form method="POST" action={PATH}>
+          <input type="hidden" name="action" value="create_shift" />
+          <label class="lab" for="sh-name">Name</label>
+          <input class="field" id="sh-name" name="name" type="text" maxlength="120" required
+            placeholder="Day shift" />
+          <div class="pair">
+            <div>
+              <label class="lab" for="sh-start">Starts</label>
+              <input class="field" id="sh-start" name="start" type="time" required value="09:00" />
+            </div>
+            <div>
+              <label class="lab" for="sh-end">Ends</label>
+              <input class="field" id="sh-end" name="end" type="time" required value="18:00" />
+            </div>
+          </div>
+          <div class="pair">
+            <div>
+              <label class="lab" for="sh-break">Break, minutes</label>
+              <input class="field" id="sh-break" name="break" type="number" min="0" max="480" value="60" />
+            </div>
+            <div>
+              <label class="lab" for="sh-grace">Grace, minutes</label>
+              <input class="field" id="sh-grace" name="grace" type="number" min="0" max="180" value="15" />
+            </div>
+          </div>
+          <span class="lab">Working days</span>
+          <div class="days">
+            {WEEKDAYS.map((d) => (
+              <label class="day">
+                <input type="checkbox" name="days" value={String(d.n)} checked={d.n <= 5} />
+                {d.label}
+              </label>
+            ))}
+          </div>
+          <button class="go" type="submit">Save this shift</button>
+        </form>
+      </section>
+    )}
+
+    {mayManage && (
+      <section class="card">
+        <h2>Record a holiday</h2>
+        <form method="POST" action={PATH}>
+          <input type="hidden" name="action" value="add_holiday" />
+          <label class="lab" for="ho-date">Date</label>
+          <input class="field" id="ho-date" name="date" type="date" required />
+          <label class="lab" for="ho-name">Name</label>
+          <input class="field" id="ho-name" name="name" type="text" maxlength="160" required />
+          <label class="lab" for="ho-dept">Who it applies to</label>
+          <select class="field" id="ho-dept" name="department">
+            <option value="">The whole organization</option>
+            {departments.map((d) => (<option value={String(d.id)}>{String(d.name)}</option>))}
+          </select>
+          <label class="lab" for="ho-opt">Is it optional</label>
+          <select class="field" id="ho-opt" name="optional">
+            <option value="">No, the office is closed</option>
+            <option value="yes">Yes, people may choose to take it</option>
+          </select>
+          <button class="go" type="submit">Record this holiday</button>
+        </form>
+      </section>
+    )}
+
+    {mayManage && (
+      <section class="card">
+        <h2>QR stations</h2>
+        <p>
+          A station is a code printed on a wall. Its QR should encode
+          {' '}/portal/employee/attendance?qr=THE-CODE, so an ordinary phone camera opens the check-in
+          screen with the code already filled in. No scanner app and no camera library is needed.
+        </p>
+        <p>
+          A location recorded beside a scan is EVIDENCE ONLY. It never refuses a punch, never marks
+          one as suspicious and never reduces anybody's hours. Phone location is often wrong indoors,
+          so the distance is shown as a sentence and a person decides what it means.
+        </p>
+        <ul class="rows">
+          {stations.map((s) => (
+            <li class="row">
+              <p>{s.label}</p>
+              <small>
+                Code {s.code}.
+                {s.lat !== null && s.lon !== null
+                  ? ' Expects people within about ' + s.radiusM + ' m.'
+                  : ' No location recorded, so no distance is ever calculated for it.'}
+              </small>
+            </li>
+          ))}
+        </ul>
+        {stations.length === 0 && <p>No stations are registered. Check-in works without them.</p>}
+        <form method="POST" action={PATH}>
+          <input type="hidden" name="action" value="create_station" />
+          <label class="lab" for="st-label">Name people will recognise</label>
+          <input class="field" id="st-label" name="label" type="text" maxlength="160" required
+            placeholder="Head office, front desk" />
+          <label class="lab" for="st-code">The code its QR encodes</label>
+          <input class="field" id="st-code" name="code" type="text" maxlength="120" required
+            placeholder="HO-FRONT" autocomplete="off" />
+          <div class="pair">
+            <div>
+              <label class="lab" for="st-lat">Latitude, optional</label>
+              <input class="field" id="st-lat" name="lat" type="text" inputmode="decimal" autocomplete="off" />
+            </div>
+            <div>
+              <label class="lab" for="st-lon">Longitude, optional</label>
+              <input class="field" id="st-lon" name="lon" type="text" inputmode="decimal" autocomplete="off" />
+            </div>
+          </div>
+          <label class="lab" for="st-radius">How far away is still normal, in metres</label>
+          <input class="field" id="st-radius" name="radius" type="number" min="0" max="20000" value="150" />
+          <button class="go" type="submit">Register this station</button>
+        </form>
+      </section>
+    )}
+
+    <p class="foot">
+      A roster says what is expected of a working day; it decides nothing about a person. Changing
+      somebody's shift closes the old record and opens a new one, so a timesheet from three months
+      ago still compares against the shift that was in force then. Nothing on this page approves a
+      request: an attendance correction is routed to the reporting manager the organization graph
+      names, and holding the working-time capability does not put you on that route.
+    </p>
+  </main>
+
+  <BottomNav variant="hr" active="" label="Primary" />
+</body>
+</html>

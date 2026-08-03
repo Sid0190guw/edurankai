@@ -36,6 +36,8 @@ export const ADMIN_SECTION_GROUPS: AdminSectionGroup[] = [
       { key: 'payroll', label: 'Payroll', hint: 'Salaries, payslips' },
       { key: 'payouts', label: 'Payouts', hint: 'Disbursements' },
       { key: 'training', label: 'Training' },
+      { key: 'helpdesk', label: 'Helpdesk', hint: 'IT, HR, Finance, Admin and asset-request tickets' },
+      { key: 'assets', label: 'Asset Register', hint: 'Equipment and licences issued to employees' },
       { key: 'finance', label: 'Finance & Payments', hint: 'Razorpay, revenue, fees' },
     ],
   },

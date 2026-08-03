@@ -99,28 +99,18 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
   { type: 'hei_truth_report',   label: 'HEI truth reports',         desc: 'When an HEI truth report is generated',        group: 'Institutional' },
 ];
 
-// In-app notifications feed. Self-bootstrap so /admin/notifications populates
-// even if no migration ran.
-let notificationsReady: Promise<void> | null = null;
-function ensureNotificationsTable(): Promise<void> {
-  if (notificationsReady) return notificationsReady;
-  notificationsReady = (async () => {
-    try {
-      const { sql } = await import('drizzle-orm');
-      await db.execute(sql`CREATE TABLE IF NOT EXISTS notifications (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        title TEXT NOT NULL, body TEXT,
-        type TEXT NOT NULL DEFAULT 'info', action_url TEXT,
-        entity_type TEXT, entity_id TEXT,
-        is_read BOOLEAN DEFAULT false, read_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW())`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS notifications_user_id_idx ON notifications(user_id, created_at DESC)`);
-      await db.execute(sql`CREATE INDEX IF NOT EXISTS notifications_unread_idx ON notifications(user_id, is_read) WHERE is_read = false`);
-    } catch (_) {}
-  })();
-  return notificationsReady;
-}
+// In-app notifications feed. THE TABLE IS NOT CREATED HERE.
+//
+// A private ensureNotificationsTable() used to sit on this spot with a CREATE TABLE IF NOT EXISTS
+// that listed FEWER columns than persistNotification() below writes — no category, no priority, no
+// is_archived, no seen_at/clicked_at. It was also dead: nothing called it, because persistNotification
+// already awaits the canonical ensure. Dead or not it was a second CREATE of a shared table, and
+// CREATE TABLE IF NOT EXISTS is a no-op on an existing one: had anything called it first on a fresh
+// database, every later INSERT naming category/priority would have thrown forever while the code read
+// as though notifications were being delivered.
+//
+// src/lib/notifications-schema.ts is the ONE module that creates this table. It is additive
+// (ALTER ... ADD COLUMN IF NOT EXISTS) so it is safe against a table that pre-dates those columns.
 
 async function persistNotification(userId: string, p: PushPayload) {
   try {
