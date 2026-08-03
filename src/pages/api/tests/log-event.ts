@@ -6,17 +6,25 @@
 //
 // Body: { attemptId, events: [{ type, severity?, detail?, clientTs? }, ...] }
 //
-// We trust the attemptId only to insert rows for that attempt - the admin
-// viewer is the source of truth for what happened. We also enforce:
+// AUTHORISATION. This header used to read "No auth required because anonymous attempts are allowed
+// by the runner; we scope writes by attemptId only". Scoping by an identifier the CALLER SUPPLIES is
+// not scoping: anyone holding an attempt id could write into test_attempt_events, which is the
+// advisory proctoring record a human reads when deciding whether a candidate cheated. Forgeable
+// evidence that looks authoritative is worse than none.
+//
+// Anonymous attempts really are allowed, so the fix is ownership rather than sign-in:
+// attemptAccess() (src/lib/auth/attempt-access.ts) requires the session to be the attempt's
+// candidate, or — for a guest attempt, which has candidate_id NULL — the httpOnly `gat_<test_id>`
+// cookie the runner set when the attempt was created. A real candidate carries one or the other.
+//
+// Still enforced, unchanged:
 //   - attempt must exist
 //   - attempt must be in 'in_progress' (or just submitted/auto_submitted
 //     within last 60s) so we don't keep accepting events forever
-//
-// No auth required because anonymous attempts are allowed by the runner; we
-// scope writes by attemptId only.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { attemptAccess } from '@/lib/auth/attempt-access';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -73,7 +81,7 @@ const ALLOWED_TYPES = new Set([
 
 const SEVERITIES = new Set(['info', 'warn', 'flag']);
 
-export const POST: APIRoute = async ({ request, clientAddress }) => {
+export const POST: APIRoute = async ({ request, locals, cookies, clientAddress }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
@@ -83,14 +91,15 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   if (events.length === 0) return json({ ok: true, inserted: 0 });
   if (events.length > 200) return json({ ok: false, error: 'too many events in one batch (max 200)' }, 400);
 
+  // Ownership first. attemptAccess() also does the "attempt exists" lookup that used to happen
+  // below, so this is one query, not two.
+  const access = await attemptAccess(attemptId, locals, cookies);
+  if (!access.ok) return json({ ok: false, error: access.error }, access.status);
+  const attempt = access.attempt;
+
   const ip = (clientAddress || request.headers.get('x-forwarded-for') || '').toString().split(',')[0].trim().slice(0, 64);
 
   try {
-    // Confirm attempt exists; soft-bail otherwise
-    const a = await db.execute(sql`SELECT id, status, submitted_at FROM test_attempts WHERE id = ${attemptId} LIMIT 1`);
-    const aRows = Array.isArray(a) ? a : (a?.rows || []);
-    if (aRows.length === 0) return json({ ok: false, error: 'attempt not found' }, 404);
-    const attempt = aRows[0] as any;
     const submittedRecently = attempt.submitted_at && (Date.now() - new Date(attempt.submitted_at).getTime() < 60000);
     if (attempt.status !== 'in_progress' && !submittedRecently) {
       return json({ ok: true, inserted: 0, note: 'attempt closed' });

@@ -7,6 +7,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { refundPayment } from '@/lib/razorpay';
 import { logAudit } from '@/lib/audit';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -14,8 +15,21 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
+  // MONEY LEAVES THE COMPANY BELOW THIS LINE, so the gate is here and not further down.
+  //
+  // This used to be `if (!user || user.role === 'applicant') return 403` — the whole authorisation
+  // on an endpoint that issues a real Razorpay refund. Three failures stacked on one URL: the test
+  // admits every internal role including `editor` (the role offer-signing handed to interns);
+  // /api/* is not matched by isAdminPath in src/middleware.ts, so canOpenAdmin, the section gate and
+  // the 2FA gate were all absent; and the AquinTutor partner/teacher/moderator scopes that the
+  // middleware bounces off /admin reached this URL unimpeded.
+  //
+  // `payments.refund` is held by super_admin and hr — which is exactly who /admin/finance, the only
+  // page that calls this endpoint, has always admitted. The capability records that policy; it does
+  // not change it.
+  const denied = await denyAdminApi(locals, { permission: 'payments.refund', label: 'payments.refund' });
+  if (denied) return denied;
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
 
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

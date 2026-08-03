@@ -9,6 +9,7 @@ import { deliverMessage, parseAddressList, getMailboxAddress, logOutbound, getMa
 import { sendExternal } from '@/lib/mail-transport';
 import { expandGroupTokens } from '@/lib/mail-groups';
 import { getSignature, scheduleMessage, rewriteLinksForTracking } from '@/lib/mail-advanced';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -18,8 +19,18 @@ function escapeHtml(s: string) {
 }
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // `if (!user) return 401` was the ENTIRE gate on sending mail from the company mailbox to
+  // arbitrary external addresses — so any signed-in account, including an applicant, could send as
+  // EduRankAI, and could expand `@group:slug` tokens that resolve internal distribution lists.
+  //
+  // The one thing in the product that calls this is the composer in src/components/MailClient.astro,
+  // which is rendered by exactly one page: /admin/mail. So canOpenAdmin is the gate that surface
+  // already has — nobody who can compose today loses the ability. Mail is deliberately absent from
+  // PATH_SECTION (middleware.ts:46-47 calls it a universal path), so there is no section key to ask
+  // for; that omission is what left this URL with nothing at all in front of it.
+  const denied = await denyAdminApi(locals, { label: 'mail.send' });
+  if (denied) return denied;
   const user = (locals as any).user;
-  if (!user) return json({ ok: false, error: 'unauthorized' }, 401);
 
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

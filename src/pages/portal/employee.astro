@@ -1,4 +1,4 @@
-﻿---
+---
 import BottomNav from '@/components/workforce/BottomNav.astro';
 // The command centre at the top of this page is built from the workforce set and its tokens, not
 // from a second visual language invented here. StatusBadge and PriorityFlag each carry a distinct
@@ -12,43 +12,63 @@ import StatusBadge from '@/components/workforce/StatusBadge.astro';
 import '@/styles/workforce.css';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// THE DECIDER. src/lib/workforce/composer.ts answers "what should this person see" ONCE, from the
+// real gates, and this page renders its answer. Nothing below branches on a role, a permission, a
+// department or an engagement type — the moment a second surface answers that question it answers it
+// differently within a month, and the one that answers it too generously is the one nobody notices.
+import { composeWorkspace, hasWidget } from '@/lib/workforce/composer';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 
-let okMsg = '', errorMsg = '';
-let employee: any = null;
-let payslips: any[] = [];
-let todayEvents: any[] = [];
-let currentStatus: 'clocked_out' | 'clocked_in' | 'on_break' = 'clocked_out';
-let todayHours = 0;
-// Whether the PUNCH READ happened. currentStatus and todayHours both default to "clocked out, zero
-// hours", which is indistinguishable from a failed read — and the new strip at the top of the page
-// states today's clock position as a fact. Declared here, with the values it describes, and above
-// the POST handler: `const`/`let` is not hoisted and a handler reaching a later declaration has
-// taken pages down in this repo before.
-let clockReadFailed = false;
+// Declared at the very top, above everything that uses them: `const` is not hoisted, and a handler
+// reaching a later declaration has taken pages down in this repo before.
+// postgres-js resolves to a plain array, never a { rows } object.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const logFail = (tag: string, e: any) => console.error('[portal/employee] ' + tag, e?.cause?.message || e?.message);
 
-// work_email is declared in db/hr-schema.sql but does NOT exist on the production table. The
-// email-fallback lookup below names it, so that query threw, was swallowed by its bare catch, and
-// every person whose HR record is not linked by user_id saw "No employee profile found" — told to
-// ask HR to link an account that was already linked by email.
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const todayIso = new Date().toISOString().split('T')[0];
+// A DATE column comes back from postgres-js as a Date at UTC midnight, so read it in UTC — using
+// local getters would shift a due date by a day for anyone east or west of the server.
+const isoDay = (v: any) => {
+  if (!v) return '';
+  if (typeof v === 'string') return v.slice(0, 10);
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10);
+};
+const dayLabel = (v: any) => {
+  const iso = isoDay(v);
+  if (!iso) return '';
+  const d = new Date(iso + 'T00:00:00Z');
+  return isNaN(d.getTime()) ? iso : d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()];
+};
+
+// =================================================================================================
+// SCHEMA BOOTSTRAP — DDL ONLY, AND IT IS NOT A WIDGET LOADER.
 //
-// The same missing column locked every administrator out of /admin earlier today. Creating it is
-// better than deleting the reference from the four places that use it: the schema declares it, so
-// the next person to write a query will reach for it again. Idempotent, and the two schemas
-// converge instead of quietly disagreeing.
+// This runs above the authorization boundary on purpose, and it is allowed to: it reads no row
+// belonging to anybody, and the identity lookup that RESOLVES the boundary depends on it. The master
+// spec (§3.3) is explicit that ensureOnce-style bootstrapping belongs outside a loader, and
+// docs/KNOWN_GAPS.md records this block as the thing that created work_email and hr_task_log.
+//
+// work_email is declared in db/hr-schema.sql but did NOT exist on the production table. The
+// email-fallback lookup inside workspace-access.ts names it, so without this the composer's own
+// employee lookup throws and every person whose HR record is not linked by user_id is told they have
+// no employee profile — with nothing in the logs to say why.
 //
 // The try/catch has to be INSIDE the ensureOnce callback, not around it. ensureOnce() returns
 // `p.catch(() => {})` (src/lib/ensure-once.ts:24) — it swallows, so an outer catch never fires and a
-// failed ALTER leaves no trace at all. That is precisely the silence this page has already been
-// punished for. Log the real reason, then re-throw: the re-throw is what makes ensureOnce drop its
-// cache entry and try again on the next request rather than remembering the failure forever.
+// failed ALTER leaves no trace at all. Log the real reason, then re-throw: the re-throw is what makes
+// ensureOnce drop its cache entry and try again on the next request rather than remembering the
+// failure forever.
+// =================================================================================================
 try {
   const { ensureOnce } = await import('@/lib/ensure-once');
   // hr_task_log is declared in db/hr-schema.sql but was only ever CREATEd inside the clock-out
   // handler, so on a database where nobody had clocked out yet the table did not exist — and the
-  // read at line ~262 threw on every page load. Same shape as the work_email fault: a table that
+  // read further down threw on every page load. Same shape as the work_email fault: a table that
   // exists in the schema file and not in the database. Created here, before anything reads it.
   await ensureOnce('hr_task_log_v1', async () => {
     await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_task_log (
@@ -67,84 +87,80 @@ try {
     try {
       await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS work_email TEXT`);
     } catch (e: any) {
-      console.error('[portal/employee] work_email ALTER', e?.cause?.message || e?.message);
+      logFail('work_email ALTER', e);
       throw e;
     }
   });
 } catch (e: any) {
-  console.error('[portal/employee] work_email ensure', e?.cause?.message || e?.message);
+  logFail('work_email ensure', e);
 }
 
 // reporting_manager_id has the same shape of problem. It is declared in db/hr-schema.sql, but the
 // only things that ALTER it in are the two admin HR screens, at page load — so on a database where
-// neither has ever been opened the column is simply not there. The `SELECT *` below would not fail
-// on that (it returns whatever columns exist), it would just hand back an object without the field,
-// and the team-leader section would read "not assigned" for someone whose manager IS recorded.
-// Its own ensureOnce key rather than folded into the block above, so one failing cannot mask the
-// other in the logs.
+// neither has ever been opened the column is simply not there. It has to exist BEFORE the composer
+// runs, not inside a widget loader: countDirectReports() reads it to decide who manages people and
+// who may decide an approval, and a missing column there degrades the whole context rather than one
+// card. Its own ensureOnce key rather than folded into the block above, so one failing cannot mask
+// the other in the logs.
 try {
   const { ensureOnce } = await import('@/lib/ensure-once');
   await ensureOnce('hr_employees_reporting_manager_v1', async () => {
     try {
       await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
     } catch (e: any) {
-      console.error('[portal/employee] reporting_manager_id ALTER', e?.cause?.message || e?.message);
+      logFail('reporting_manager_id ALTER', e);
       throw e;
     }
   });
 } catch (e: any) {
-  console.error('[portal/employee] reporting_manager_id ensure', e?.cause?.message || e?.message);
+  logFail('reporting_manager_id ensure', e);
 }
 
-// Find employee linked to this user.
+// =================================================================================================
+// ================================ THE AUTHORIZATION BOUNDARY =====================================
 //
-// These two catches were BARE (`catch(e) {}`). That is not a detail: the missing work_email column
-// threw inside the fallback below, the empty catch ate it, and every person whose record is linked by
-// email alone was told for a day that they had no employee profile — with nothing in the logs to say
-// why. The lookups still fail closed (no record found means the "no employee profile" card, which is
-// correct), but the reason is now on the record.
-try {
-  const r = await db.execute(sql`SELECT * FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  employee = rows[0] || null;
-} catch (e: any) {
-  console.error('[portal/employee] employee lookup by user_id', e?.cause?.message || e?.message);
-}
+// composeWorkspace() resolves the employee record, the permission set, the department scope and who
+// reports to this person, and returns the widgets whose conditions are met. IT RUNS FIRST, and NO
+// widget query may run above this line (docs/workforce-os/AUTHORIZATION_FIRST.md).
+//
+// Why the line sits exactly here: a loader that runs and has its rows discarded during render has
+// still read them. They entered the request context, they can leave through an error page or a log
+// line, the read either appears in the audit trail as an access that should not have happened or
+// does not appear at all, and every person who cannot see the card still pays for it. A widget
+// rendering nothing is not evidence that nothing was read.
+//
+// It is also the FIRST await of the frontmatter and sits above the POST handler, because `const` is
+// not hoisted: a handler reaching a later declaration throws on its own first line while the page
+// still reports success. That is what broke apply step 5 and the /admin/roles/diagnose Repair button.
+// =================================================================================================
+const composed = await composeWorkspace(user, { locals: Astro.locals, next: '/portal/employee' });
 
-// If no direct link, try matching by any email on file (work, personal, or login).
-if (!employee) {
-  try {
-    const r = await db.execute(sql`SELECT * FROM hr_employees WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email}) AND is_active = true LIMIT 1`);
-    const rows = Array.isArray(r) ? r : (r?.rows || []);
-    employee = rows[0] || null;
-    // Link user_id, ONLY onto a record that is not already claimed.
-    //
-    // Without `AND user_id IS NULL` this stamps the signed-in account onto whatever row the email
-    // matched — including a row that already belongs to somebody else. hr_employees has three email
-    // columns and a unique constraint on none of them, so a shared inbox typed into `email`, or a
-    // manager's address entered on a subordinate's record, is enough to make one person's account
-    // permanently point at another person's employee row: their attendance, leave, payslips, credit
-    // hours and now their tasks. The guard is the same one src/lib/auth/workspace-access.ts:238
-    // already uses, and it costs nothing — an unlinked row is the only case this fallback exists for.
-    if (employee) {
-      await db.execute(sql`UPDATE hr_employees SET user_id = ${user.id} WHERE id = ${employee.id} AND user_id IS NULL`)
-        .catch((e: any) => console.error('[portal/employee] user_id backfill', e?.cause?.message || e?.message));
-    }
-  } catch (e: any) {
-    console.error('[portal/employee] employee lookup by email', e?.cause?.message || e?.message);
-  }
-}
+/** Is this widget eligible for this person? The ONLY question this page is allowed to ask. */
+const has = (key: string): boolean => hasWidget(composed, key);
 
-// Declared HERE, above the POST handler, because `const` is not hoisted: a const declared further
-// down this file throws on the handler's first line while the page still reports success. That is
-// what broke apply step 5 and the /admin/roles/diagnose Repair button.
+// hr_employees.id, from the composer's own lookup — every hr_* table is keyed by it and never by
+// users.id. Null when no employee record resolved, which is the ordinary state for a founder or an
+// HR account and NOT an error.
+const employeeId: string | null = composed.workspace?.employeeId ?? null;
+
+// Signed in, composition trustworthy, and simply no HR row linked. The person still gets every
+// widget that needs nothing but their user id; they are also told, because "ask HR to link your
+// record" is a one-sentence fix they cannot make if nobody says it.
+const noEmployeeRecord = composed.ok && !composed.workspace;
+
+// Declared HERE, above the POST handler, for the same hoisting reason as everything else.
 const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done'];
+
+let okMsg = '', errorMsg = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
 
-  if (action === 'clock_event' && employee) {
+  // EVERY WRITE IS GATED ON THE SAME WIDGET THE FORM CAME FROM. A form that was never rendered must
+  // not be postable, and the eligibility answer is already resolved above — so the control and the
+  // write agree by construction instead of by two people remembering to keep them in step.
+  if (action === 'clock_event' && employeeId && has('clock.today')) {
     const eventType = fd.get('event_type') as string;
     const lat = parseFloat(fd.get('lat') as string || '0') || null;
     const lon = parseFloat(fd.get('lon') as string || '0') || null;
@@ -158,7 +174,7 @@ if (Astro.request.method === 'POST') {
       await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_photo TEXT`).catch(() => {});
       await db.execute(sql`
         INSERT INTO hr_clock_events (employee_id, event_type, lat, lon, accuracy, location_name, work_mode, note, face_photo, ip_address, device_info)
-        VALUES (${employee.id}, ${eventType}, ${lat}, ${lon}, ${accuracy}, ${locationName}, ${workMode}, ${note}, ${facePhoto},
+        VALUES (${employeeId}, ${eventType}, ${lat}, ${lon}, ${accuracy}, ${locationName}, ${workMode}, ${note}, ${facePhoto},
           ${Astro.clientAddress}, ${Astro.request.headers.get('user-agent')?.substring(0,200) || null})
       `);
 
@@ -167,7 +183,7 @@ if (Astro.request.method === 'POST') {
       if (eventType === 'clock_in') {
         await db.execute(sql`
           INSERT INTO hr_attendance (employee_id, date, clock_in, status, work_mode, ip_address)
-          VALUES (${employee.id}, ${today}, NOW(), 'present', ${workMode}, ${Astro.clientAddress})
+          VALUES (${employeeId}, ${today}, NOW(), 'present', ${workMode}, ${Astro.clientAddress})
           ON CONFLICT (employee_id, date) DO UPDATE SET clock_in = NOW(), status = 'present', work_mode = ${workMode}
         `).catch(() => {});
         okMsg = 'Clocked in successfully!';
@@ -175,14 +191,14 @@ if (Astro.request.method === 'POST') {
         await db.execute(sql`
           UPDATE hr_attendance SET clock_out = NOW(),
             work_hours = EXTRACT(EPOCH FROM (NOW() - clock_in))/3600
-          WHERE employee_id = ${employee.id} AND date = ${today}
+          WHERE employee_id = ${employeeId} AND date = ${today}
         `).catch(() => {});
         // Capture the wrap-up task summary (what was completed, status, %).
         try {
           const task = (fd.get('task') as string || '').trim();
           if (task) {
             await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_task_log (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), employee_id UUID NOT NULL, log_date DATE NOT NULL, task TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'done', percent INT NOT NULL DEFAULT 100, details TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-            await db.execute(sql`INSERT INTO hr_task_log (employee_id, log_date, task, status, percent, details) VALUES (${employee.id}, ${today}, ${task.slice(0, 500)}, ${(fd.get('task_status') as string) || 'done'}, ${Math.max(0, Math.min(100, parseInt(fd.get('task_percent') as string || '100') || 100))}, ${(fd.get('task_details') as string || '').trim() || null})`);
+            await db.execute(sql`INSERT INTO hr_task_log (employee_id, log_date, task, status, percent, details) VALUES (${employeeId}, ${today}, ${task.slice(0, 500)}, ${(fd.get('task_status') as string) || 'done'}, ${Math.max(0, Math.min(100, parseInt(fd.get('task_percent') as string || '100') || 100))}, ${(fd.get('task_details') as string || '').trim() || null})`);
           }
         } catch (_) {}
         okMsg = 'Clocked out. Have a great day!';
@@ -195,7 +211,7 @@ if (Astro.request.method === 'POST') {
     return Astro.redirect('/portal/employee?msg=' + encodeURIComponent(okMsg || errorMsg));
   }
 
-  if (action === 'daily_report' && employee) {
+  if (action === 'daily_report' && employeeId && has('dailyreport.today')) {
     const workDone = (fd.get('work_done') as string || '').trim();
     const progress = (fd.get('progress') as string || '').trim() || null;
     const blockers = (fd.get('blockers') as string || '').trim() || null;
@@ -206,14 +222,14 @@ if (Astro.request.method === 'POST') {
     try {
       await db.execute(sql`
         INSERT INTO hr_daily_reports (employee_id, report_date, work_done, progress, blockers)
-        VALUES (${employee.id}, ${today}, ${workDone}, ${progress}, ${blockers})
+        VALUES (${employeeId}, ${today}, ${workDone}, ${progress}, ${blockers})
         ON CONFLICT (employee_id, report_date) DO UPDATE SET work_done = EXCLUDED.work_done, progress = EXCLUDED.progress, blockers = EXCLUDED.blockers, updated_at = NOW()
       `);
     } catch (e: any) { return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Could not save report: ' + e.message)); }
     return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Daily report submitted. Thank you!'));
   }
 
-  if (action === 'add_time_log' && employee) {
+  if (action === 'add_time_log' && employeeId && has('timelog.today')) {
     const startTime = (fd.get('start_time') as string || '').trim();
     const endTime = (fd.get('end_time') as string || '').trim();
     const task = (fd.get('task') as string || '').trim();
@@ -228,28 +244,28 @@ if (Astro.request.method === 'POST') {
     }
     const hours = Math.round(((e - s) / 60) * 100) / 100;
     try {
-      await db.execute(sql`INSERT INTO hr_time_logs (employee_id, log_date, start_time, end_time, hours, task) VALUES (${employee.id}, ${today}, ${startTime}, ${endTime}, ${hours}, ${task})`);
+      await db.execute(sql`INSERT INTO hr_time_logs (employee_id, log_date, start_time, end_time, hours, task) VALUES (${employeeId}, ${today}, ${startTime}, ${endTime}, ${hours}, ${task})`);
     } catch (er: any) { return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Could not log: ' + er.message)); }
     return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Logged ' + hours + 'h.'));
   }
-  if (action === 'delete_time_log' && employee) {
+  if (action === 'delete_time_log' && employeeId && has('timelog.today')) {
     const logId = (fd.get('log_id') as string || '').trim();
-    if (logId) await db.execute(sql`DELETE FROM hr_time_logs WHERE id = ${logId} AND employee_id = ${employee.id}`).catch(() => {});
+    if (logId) await db.execute(sql`DELETE FROM hr_time_logs WHERE id = ${logId} AND employee_id = ${employeeId}`).catch((e: any) => logFail('delete time log', e));
     return Astro.redirect('/portal/employee');
   }
 
   // Move a task along.
   //
-  // The actor passed to updateTaskStatus() is `user.id`, a USERS id — NOT employee.id. The library
-  // re-derives the right to write inside the UPDATE's own WHERE clause, matching the actor against
-  // `assigned_by_user_id` or against `hr_employees.user_id` for the assignee. Handing it an
+  // The actor passed to updateTaskStatus() is `user.id`, a USERS id — NOT the hr_employees id. The
+  // library re-derives the right to write inside the UPDATE's own WHERE clause, matching the actor
+  // against `assigned_by_user_id` or against `hr_employees.user_id` for the assignee. Handing it an
   // hr_employees id instead would match neither: every update would update zero rows and refuse
   // with "That task is not available." while looking, from here, exactly like a permission problem.
   // Same class of mistake as joining reporting_manager_id to hr_employees.id.
   //
   // The posted task_id is not trusted on its own — nothing here checks ownership, because the
   // statement that writes is the thing that checks it, and there is no path around that.
-  if (action === 'task_status' && employee) {
+  if (action === 'task_status' && employeeId && has('tasks.mine')) {
     const taskId = (fd.get('task_id') as string || '').trim();
     const nextStatus = (fd.get('status') as string || '').trim();
     // "Blocked" with no stated cause is a task nobody can unblock, so the library requires a reason.
@@ -268,161 +284,63 @@ if (Astro.request.method === 'POST') {
       });
       taskMsg = res?.ok ? 'Task updated.' : (res?.error || 'Could not update that task.');
     } catch (e: any) {
-      console.error('[portal/employee] task_status', e?.cause?.message || e?.message);
+      logFail('task_status', e);
       taskMsg = 'Could not update that task.';
     }
     return Astro.redirect('/portal/employee?msg=' + encodeURIComponent(taskMsg));
   }
 }
 
-// Today's time logs (period tracking)
-let timeLogs: any[] = [];
-let loggedHours = 0;
-if (employee) {
-  try {
-    const today = new Date().toISOString().split('T')[0];
-    const r = await db.execute(sql`SELECT * FROM hr_time_logs WHERE employee_id = ${employee.id} AND log_date = ${today} ORDER BY start_time ASC`);
-    timeLogs = Array.isArray(r) ? r : (r?.rows || []);
-    loggedHours = Math.round(timeLogs.reduce((a: number, l: any) => a + Number(l.hours || 0), 0) * 100) / 100;
-  } catch (e: any) {
-    console.error('[portal/employee] time logs', e?.cause?.message || e?.message);
-  }
-}
-
-// Today's clock-out task summaries
-let taskLogs: any[] = [];
-if (employee) {
-  try {
-    const r = await db.execute(sql`SELECT task, status, percent, details, created_at FROM hr_task_log WHERE employee_id = ${employee.id} AND log_date = CURRENT_DATE ORDER BY created_at DESC`);
-    taskLogs = Array.isArray(r) ? r : (r?.rows || []);
-  } catch (e: any) {
-    console.error('[portal/employee] session summaries', e?.cause?.message || e?.message);
-  }
-}
-
-// Today's daily report (if already submitted)
-let todayReport: any = null;
-if (employee) {
-  try {
-    const today = new Date().toISOString().split('T')[0];
-    const r = await db.execute(sql`SELECT * FROM hr_daily_reports WHERE employee_id = ${employee.id} AND report_date = ${today} LIMIT 1`);
-    const rows = Array.isArray(r) ? r : (r?.rows || []);
-    todayReport = rows[0] || null;
-  } catch (e: any) {
-    console.error('[portal/employee] daily report', e?.cause?.message || e?.message);
-  }
-}
-
-// Get payslips
-if (employee) {
-  try {
-    const r = await db.execute(sql`
-      SELECT ps.*, pr.month, pr.year
-      FROM hr_payslips ps
-      JOIN hr_payroll_runs pr ON ps.payroll_run_id = pr.id
-      WHERE ps.employee_id = ${employee.id}
-      ORDER BY pr.year DESC, pr.month DESC
-      LIMIT 12
-    `);
-    payslips = Array.isArray(r) ? r : (r?.rows || []);
-  } catch (e: any) {
-    console.error('[portal/employee] payslips', e?.cause?.message || e?.message);
-  }
-
-  // Get today's clock events
-  try {
-    const r = await db.execute(sql`
-      SELECT * FROM hr_clock_events
-      WHERE employee_id = ${employee.id} AND DATE(event_time) = CURRENT_DATE
-      ORDER BY event_time ASC
-    `);
-    todayEvents = Array.isArray(r) ? r : (r?.rows || []);
-
-    // Determine current status
-    if (todayEvents.length > 0) {
-      const last = todayEvents[todayEvents.length - 1] as any;
-      if (last.event_type === 'clock_in') currentStatus = 'clocked_in';
-      else if (last.event_type === 'clock_out') currentStatus = 'clocked_out';
-      else if (last.event_type === 'break_start') currentStatus = 'on_break';
-      else if (last.event_type === 'break_end') currentStatus = 'clocked_in';
-    }
-
-    // Calculate today's hours
-    const clockIn = (todayEvents as any[]).find((e: any) => e.event_type === 'clock_in');
-    const clockOut = (todayEvents as any[]).find((e: any) => e.event_type === 'clock_out');
-    if (clockIn) {
-      const end = clockOut ? new Date(clockOut.event_time) : new Date();
-      todayHours = Math.round(((end.getTime() - new Date(clockIn.event_time).getTime()) / 3600000) * 10) / 10;
-    }
-  } catch (e: any) {
-    // Logging only — no control flow changed here. This catch is worth a line because of what its
-    // silence looks like: if the punch READ fails, currentStatus stays 'clocked_out' and the page
-    // offers "Clock In" to somebody who is already clocked in. The clock-in/out WRITE path above is
-    // untouched.
-    //
-    // The flag is new and does exactly one thing: it lets the strip at the top say "we could not
-    // read your punches" instead of printing "Not clocked in · 0h" as a statement about somebody's
-    // day. Nothing below branches on it, so the clock buttons behave exactly as they did.
-    clockReadFailed = true;
-    console.error('[portal/employee] clock events', e?.cause?.message || e?.message);
-  }
-}
-
-const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
-const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-// ---------------------------------------------------------------------------------------------
-// Tasks, team leader, chat and community. Reads only — none of this writes a row.
+// =================================================================================================
+// WIDGET DATA LOADERS. EVERY ONE OF THEM IS BELOW THE BOUNDARY AND EVERY ONE IS GATED ON has(...).
 //
-// Every one of them is scoped to this person in the WHERE clause, and every one has its own
-// try/catch that logs `e?.cause?.message || e?.message`. That is not decoration: each touches a
-// table that may legitimately not exist yet on a given database, and a bare `catch {}` here is
-// exactly what let a missing column tell every employee they had no profile for a whole day while
-// the page rendered a cheerful green flash.
-// ---------------------------------------------------------------------------------------------
+// The gate is not decoration and it is not an optimisation. A loader that runs for somebody who
+// cannot see its card has read their colleagues' rows on their behalf; the fact that the render then
+// discards them changes nothing that already happened. So each read below asks the composer first,
+// and asks nothing else — no role, no permission key, no department, no employment type appears in
+// this file at all.
+//
+// AND THE SECOND RULE: an empty bucket and a failed read are different sentences. Every source
+// records whether it RAN, so no card can print "you have nothing" over a query that threw. That is
+// the same failure shape as a green flash over a write that never landed, and this page has been
+// punished for it twice.
+// =================================================================================================
 
-const todayIso = new Date().toISOString().split('T')[0];
-// A DATE column comes back from postgres-js as a Date at UTC midnight, so read it in UTC — using
-// local getters would shift a due date by a day for anyone east or west of the server.
-const isoDay = (v: any) => {
-  if (!v) return '';
-  if (typeof v === 'string') return v.slice(0, 10);
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10);
-};
-const dayLabel = (v: any) => {
-  const iso = isoDay(v);
-  if (!iso) return '';
-  const d = new Date(iso + 'T00:00:00Z');
-  return isNaN(d.getTime()) ? iso : d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()];
-};
+// Which sources the "Needs you today" section is entitled to draw on. Each row of that section
+// belongs to a widget, so each is gated by ITS widget rather than by one blanket test — which is how
+// the leave and withdrawal queues stopped depending on a role name spelled out on this page.
+const wantAttention = has('attention.queue');
+const wantTaskView = !!employeeId && (has('tasks.mine') || has('tasks.dueToday'));
+const wantDueToday = wantAttention && has('tasks.dueToday');
+const wantBoard = wantAttention && (has('tasks.signoff') || has('tasks.review'));
+const wantLeaveQueue = wantAttention && has('approvals.leave');
+const wantWithdrawalQueue = wantAttention && has('approvals.withdrawal');
+const wantMyDocs = wantAttention && has('onboarding.docs');
+const wantDocReview = wantAttention && has('onboarding.review');
 
 // MY TASKS. src/lib/employee-tasks.ts owns the table, the scoping and the schema ensure; this page
-// only asks it for one person's rows and is handed employee.id — the hr_employees id, which is what
-// every hr_* table is keyed by. (The WRITE above takes user.id instead; the two are different ids
-// for different questions, and the library is explicit about which it wants.)
+// only asks it for one person's rows and is handed the hr_employees id, which is what every hr_*
+// table is keyed by. (The WRITE above takes user.id instead; the two are different ids for different
+// questions, and the library is explicit about which it wants.)
 //
 // myTasksView() is used rather than listMyTasks()+taskCounts() for one reason: it reports whether the
 // read HAPPENED. Both of those return [] and zeroes on failure, so "you have no tasks" and "the query
 // threw" arrive identically — and the card would then print "Nothing on your list right now" at
-// somebody whose task table could not be read. That is a claim, not an absence, and it is the same
-// failure shape as a green flash over a write that did not happen. With `ok` the card can say the
-// honest thing instead. It never throws, so no page state depends on the try/catch here; the catch is
-// for the dynamic import itself, and it logs.
+// somebody whose task table could not be read. That is a claim, not an absence.
 let myTasks: any[] = [];
 let taskTally: any = null;
 let tasksReady = false;
 let tasksFailed = false;
-if (employee?.id) {
+if (wantTaskView) {
   try {
     const { myTasksView } = await import('@/lib/employee-tasks');
-    const view = await myTasksView(employee.id);
+    const view = await myTasksView(employeeId as string);
     myTasks = Array.isArray(view?.tasks) ? view.tasks : [];
     taskTally = view?.counts ?? null;
     tasksReady = true;
     tasksFailed = !view?.ok;
   } catch (e: any) {
-    console.error('[portal/employee] tasks', e?.cause?.message || e?.message);
+    logFail('tasks', e);
   }
 }
 // listMyTasks returns everything, finished work sorted last. This page is the phone screen someone
@@ -453,6 +371,122 @@ const taskMeta = [
   Number.isFinite(doneCount) && doneCount > 0 ? doneCount + ' finished' : '',
 ].filter(Boolean).join(' · ');
 
+// TODAY, AS THE DATABASE COUNTS IT.
+//
+// `todayIso` above is `new Date()` in the SERVER's timezone; `due_on` is compared against
+// CURRENT_DATE inside Postgres, in the DATABASE's timezone. The two disagree by a day whenever the
+// process and the session are set differently, and "Due today" is exactly the claim that must not be
+// off by one. If this one-column read fails, the due-today bucket is not rendered AT ALL rather than
+// guessed at from the clock in this process.
+let dbToday = '';
+if (wantDueToday) {
+  try {
+    const r = await db.execute(sql`SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d`);
+    dbToday = String(rowsOf(r)[0]?.d || '');
+  } catch (e: any) {
+    logFail('current date', e);
+  }
+}
+
+// TODAY'S CLOCK. hr_clock_events for this person only — it stores GPS, IP, device and a selfie per
+// punch, and no surface may read it for anybody else.
+let todayEvents: any[] = [];
+let currentStatus: 'clocked_out' | 'clocked_in' | 'on_break' = 'clocked_out';
+let todayHours = 0;
+// Whether the PUNCH READ happened. currentStatus and todayHours both default to "clocked out, zero
+// hours", which is indistinguishable from a failed read — and the strip at the top of the page
+// states today's clock position as a fact.
+let clockReadFailed = false;
+if (employeeId && has('clock.today')) {
+  try {
+    const r = await db.execute(sql`
+      SELECT * FROM hr_clock_events
+      WHERE employee_id = ${employeeId} AND DATE(event_time) = CURRENT_DATE
+      ORDER BY event_time ASC
+    `);
+    todayEvents = rowsOf(r);
+
+    // Determine current status
+    if (todayEvents.length > 0) {
+      const last = todayEvents[todayEvents.length - 1] as any;
+      if (last.event_type === 'clock_in') currentStatus = 'clocked_in';
+      else if (last.event_type === 'clock_out') currentStatus = 'clocked_out';
+      else if (last.event_type === 'break_start') currentStatus = 'on_break';
+      else if (last.event_type === 'break_end') currentStatus = 'clocked_in';
+    }
+
+    // Calculate today's hours
+    const clockIn = (todayEvents as any[]).find((e: any) => e.event_type === 'clock_in');
+    const clockOut = (todayEvents as any[]).find((e: any) => e.event_type === 'clock_out');
+    if (clockIn) {
+      const end = clockOut ? new Date(clockOut.event_time) : new Date();
+      todayHours = Math.round(((end.getTime() - new Date(clockIn.event_time).getTime()) / 3600000) * 10) / 10;
+    }
+  } catch (e: any) {
+    // Logging only — no control flow changed here. This catch is worth a line because of what its
+    // silence looks like: if the punch READ fails, currentStatus stays 'clocked_out' and the page
+    // offers "Clock In" to somebody who is already clocked in. The clock-in/out WRITE path above is
+    // untouched.
+    clockReadFailed = true;
+    logFail('clock events', e);
+  }
+}
+
+// Today's time logs (period tracking)
+let timeLogs: any[] = [];
+let loggedHours = 0;
+if (employeeId && has('timelog.today')) {
+  try {
+    const r = await db.execute(sql`SELECT * FROM hr_time_logs WHERE employee_id = ${employeeId} AND log_date = ${todayIso} ORDER BY start_time ASC`);
+    timeLogs = rowsOf(r);
+    loggedHours = Math.round(timeLogs.reduce((a: number, l: any) => a + Number(l.hours || 0), 0) * 100) / 100;
+  } catch (e: any) {
+    logFail('time logs', e);
+  }
+}
+
+// Today's clock-out task summaries. Sparse by construction: the only writer is the clock_out branch
+// above, and only when the text field is non-empty.
+let taskLogs: any[] = [];
+if (employeeId && has('worklog.today')) {
+  try {
+    const r = await db.execute(sql`SELECT task, status, percent, details, created_at FROM hr_task_log WHERE employee_id = ${employeeId} AND log_date = CURRENT_DATE ORDER BY created_at DESC`);
+    taskLogs = rowsOf(r);
+  } catch (e: any) {
+    logFail('session summaries', e);
+  }
+}
+
+// Today's daily report (if already submitted)
+let todayReport: any = null;
+if (employeeId && has('dailyreport.today')) {
+  try {
+    const r = await db.execute(sql`SELECT * FROM hr_daily_reports WHERE employee_id = ${employeeId} AND report_date = ${todayIso} LIMIT 1`);
+    todayReport = rowsOf(r)[0] || null;
+  } catch (e: any) {
+    logFail('daily report', e);
+  }
+}
+
+// Payslips. Listed straight from hr_payslips and NEVER through hr-payslip.ts's reader, which SELECTs
+// e.work_email — a column with no writer at all.
+let payslips: any[] = [];
+if (employeeId && has('payslips.mine')) {
+  try {
+    const r = await db.execute(sql`
+      SELECT ps.*, pr.month, pr.year
+      FROM hr_payslips ps
+      JOIN hr_payroll_runs pr ON ps.payroll_run_id = pr.id
+      WHERE ps.employee_id = ${employeeId}
+      ORDER BY pr.year DESC, pr.month DESC
+      LIMIT 12
+    `);
+    payslips = rowsOf(r);
+  } catch (e: any) {
+    logFail('payslips', e);
+  }
+}
+
 // MY TEAM LEADER. reporting_manager_id holds a USERS id, not an hr_employees id — hr-wallet.ts
 // compares it straight to the signed-in user.id — so the lookup is on user_id. Joining it to
 // hr_employees.id can never match, which is how the same section on /portal/workspace used to read
@@ -466,34 +500,178 @@ const taskMeta = [
 // display columns — no email, no identifier, no employment detail — reached solely through a
 // pointer stored on the viewer's own record.
 let manager: any = null;
-if (employee?.reporting_manager_id) {
+if (employeeId && has('manager.card')) {
   try {
-    const r = await db.execute(sql`
-      SELECT full_name, designation
-        FROM hr_employees
-       WHERE user_id = ${employee.reporting_manager_id}
-       ORDER BY is_active DESC, created_at DESC
-       LIMIT 1`);
-    const mrows = Array.isArray(r) ? r : (r?.rows || []);
-    manager = mrows[0] || null;
+    const own = rowsOf(await db.execute(sql`
+      SELECT reporting_manager_id FROM hr_employees WHERE id = ${employeeId} LIMIT 1`))[0];
+    const managerUserId = own?.reporting_manager_id ? String(own.reporting_manager_id) : '';
+    if (managerUserId) {
+      const r = await db.execute(sql`
+        SELECT full_name, designation
+          FROM hr_employees
+         WHERE user_id = ${managerUserId}
+         ORDER BY is_active DESC, created_at DESC
+         LIMIT 1`);
+      manager = rowsOf(r)[0] || null;
+    }
   } catch (e: any) {
-    console.error('[portal/employee] manager', e?.cause?.message || e?.message);
+    logFail('manager', e);
   }
 }
+
+// WAITING ON MY SIGN-OFF, AND WAITING ON MY REVIEW.
+//
+// listBoard() resolves the viewer's roles per row IN SQL (VIEWER_ROLE_COLUMNS), so nothing here can
+// claim a role the database did not grant. Its argument is the USERS id — collaborators are keyed
+// by users.id, not by the hr_employees id, and handing it the wrong one returns an empty board
+// forever rather than an error.
+//
+// A task where the viewer is approver OR lead is counted as sign-off and NOT again as a review, so
+// somebody holding both roles on one task sees it once. Reviewers are only ever added by hand
+// (seedCollaborators creates 'assignee' and 'approver' and nothing else), so an empty review bucket
+// is the ordinary, correct state and is simply absent rather than rendered as a zero.
+let boardOk = false;
+let signOffTasks: any[] = [];
+let reviewTasks: any[] = [];
+if (wantBoard && user?.id) {
+  try {
+    const { listBoard } = await import('@/lib/employee-tasks');
+    const board = await listBoard(user.id, { limit: 400 });
+    boardOk = board?.ok === true;
+    if (boardOk) {
+      const waiting = (board.tasks as any[]).filter((t: any) => t.status === 'under_review');
+      signOffTasks = has('tasks.signoff')
+        ? waiting.filter((t: any) => t.viewerRoles.indexOf('approver') >= 0 || t.viewerRoles.indexOf('lead') >= 0)
+        : [];
+      const signOffIds = new Set(signOffTasks.map((t: any) => t.id));
+      reviewTasks = has('tasks.review')
+        ? waiting.filter((t: any) => !signOffIds.has(t.id) && t.viewerRoles.indexOf('reviewer') >= 0)
+        : [];
+    }
+  } catch (e: any) {
+    logFail('board', e);
+  }
+}
+
+// LEAVE AND WITHDRAWAL REQUESTS WAITING ON A DECISION.
+//
+// THE ROLE TEST THAT USED TO LIVE HERE IS GONE. This page previously read user.role and compared it
+// to three names, which meant a reporting manager — the person a request is actually assigned to —
+// was told nothing, and it meant a role rename silently changed who was told. approvals.leave and
+// approvals.withdrawal carry `approvesRequests`, which the composer derives from the SAME authority
+// pendingLeaveForApprover() and pendingWithdrawalsForApprover() enforce at the read, so a row shown
+// here always has a queue behind it.
+//
+// Counts only — no names, no amounts, no reasons. Own rows are excluded: your own pending request is
+// not an approval waiting on YOU, it is on /portal/employee/leave.
+let pendingLeave = 0;
+let pendingWithdrawals = 0;
+let hrQueueFailed = false;
+if (wantLeaveQueue || wantWithdrawalQueue) {
+  try {
+    const [{ pendingLeaveForApprover }, { pendingWithdrawalsForApprover }] = await Promise.all([
+      import('@/lib/hr-leave'),
+      import('@/lib/hr-wallet'),
+    ]);
+    const [lv, wd] = await Promise.all([
+      wantLeaveQueue ? pendingLeaveForApprover(user) : Promise.resolve([] as any[]),
+      wantWithdrawalQueue ? pendingWithdrawalsForApprover(user) : Promise.resolve([] as any[]),
+    ]);
+    const mine = (r: any) => !!employeeId && String(r.employee_id) === String(employeeId);
+    pendingLeave = (lv as any[]).filter((r: any) => !mine(r)).length;
+    pendingWithdrawals = (wd as any[]).filter((r: any) => !mine(r)).length;
+  } catch (e: any) {
+    hrQueueFailed = true;
+    logFail('approver queue', e);
+  }
+}
+
+// JOINING DOCUMENTS, MINE — the ones a reviewer sent back.
+//
+// listDocs() rather than a COUNT, for two reasons. It is the function that OWNS the table's DDL — its
+// ctx() runs the CREATE TABLE IF NOT EXISTS — so this cannot be the query that discovers the table is
+// missing. And the cap is MAX_DOCS = 5 rows per person, so reading them costs less than the round
+// trip a count would save. It is scoped to user_id inside its own WHERE clause and it THROWS rather
+// than returning [] on failure, which is exactly what this needs.
+let rejectedDocs = 0;
+let docsFailed = false;
+if (wantMyDocs && user?.id) {
+  try {
+    const { listDocs } = await import('@/lib/hr-onboarding');
+    const docs = await listDocs(String(user.id));
+    rejectedDocs = docs.filter((d: any) => d.status === 'rejected').length;
+  } catch (e: any) {
+    docsFailed = true;
+    logFail('joining documents', e);
+  }
+}
+
+// JOINING DOCUMENTS WAITING FOR A REVIEW. onboarding.review requires admin.access AND the employees
+// section at 'edit' — the same test /api/portal/onboarding/documents uses to authorise the review,
+// plus the admin.access that middleware.ts demands at the door, so this count is never put in front
+// of somebody whose only route to act on it is a redirect. A COUNT, not pendingForReview(), which
+// returns names and email addresses for up to 150 people. Own rows are excluded.
+let docsToReview = 0;
+let docReviewFailed = false;
+if (wantDocReview && user?.id) {
+  try {
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM hr_onboarding_documents
+       WHERE status = 'submitted' AND user_id <> ${String(user.id)}`);
+    docsToReview = Number(rowsOf(r)[0]?.n) || 0;
+  } catch (e: any) {
+    docReviewFailed = true;
+    logFail('joining document reviews', e);
+  }
+}
+
+// THE CREDIT POSITION, AND THE GUARD THAT IS NO LONGER HERE.
+//
+// This block used to test `classification === 'intern' || employment_type === 'internship'` on this
+// page. That test is DELETED. It was an interim guard around one card, and two places deciding the
+// same thing is how they drift: the composer answers it now, for every intern widget at once, from
+// the engagement it resolved plus the `engagement-terms` gate — a credit-hour requirement actually
+// RECORDED on the row. So a founder, an executive, a professor or a consultant is not measured
+// against a target they never agreed to, and neither is somebody whose designation merely contains
+// the letters i-n-t-e-r-n.
+//
+// One ledgerFor() call serves both credit widgets. Two reads of the same arithmetic can disagree.
+let credit: any = null;
+let creditTerms: any = null;
+let weeksLeft: number | null = null;
+if (employeeId && (has('credit.position') || has('credit.weeksLeft'))) {
+  try {
+    const { ledgerFor, termsFor } = await import('@/lib/credit-ledger');
+    creditTerms = await termsFor(employeeId);
+    const led = await ledgerFor(employeeId, creditTerms);
+    credit = led.summary;
+    weeksLeft = has('credit.weeksLeft') ? led.weeksRemaining : null;
+  } catch (e: any) {
+    // Never blocks the page over a summary — but never silently either. A credit figure that quietly
+    // stops appearing is exactly the kind of absence nobody reports and nobody notices.
+    logFail('credit', e);
+  }
+}
+const creditPct = credit?.requiredCreditHours
+  ? Math.min(100, Math.round((credit.creditHours / credit.requiredCreditHours) * 100))
+  : null;
 
 // CHAT. Two numbers, and nothing else is possible. chat_messages stores `ciphertext` and `iv`;
 // there is no plaintext column, and the private key is generated in the browser and never leaves
 // localStorage, so no server-rendered page can show what was said. chat_threads.last_message_preview
-// is not a preview either — the send handler writes the literal string '[encrypted]' into it, so
-// rendering that column would print "[encrypted]" at someone.
+// is not a preview either — the send handler writes the literal string '[encrypted]' into it.
+//
+// Messages is part of the Universal Workspace, which AUTHORIZATION_FIRST.md grants to EVERY
+// authenticated member, so it needs no widget eligibility — but the counts are still read only when
+// the composition is trustworthy. On a degraded screen the same card renders as a door with no
+// numbers on it, which is the safe direction.
 //
 // No schema ensure here on purpose: /portal/messages owns these tables, and it also creates a
-// starter thread on first visit. This card must never write, so if the tables are absent it simply
-// shows the link without counts.
+// starter thread on first visit. This card must never write.
 let chatThreads = 0;
 let chatUnread = 0;
 let chatReady = false;
-if (user?.id) {
+if (composed.ok && user?.id) {
   try {
     const r = await db.execute(sql`
       SELECT COUNT(*)::int AS threads,
@@ -506,31 +684,31 @@ if (user?.id) {
              ))::int AS unread
         FROM chat_thread_members m
        WHERE m.user_id = ${user.id}`);
-    const crows = Array.isArray(r) ? r : (r?.rows || []);
+    const crows = rowsOf(r);
     chatThreads = Number(crows[0]?.threads) || 0;
     chatUnread = Number(crows[0]?.unread) || 0;
     chatReady = true;
   } catch (e: any) {
-    console.error('[portal/employee] chat counts', e?.cause?.message || e?.message);
+    logFail('chat counts', e);
   }
 }
 
-// COMMUNITY. visibleGroupsFor() is the only permitted way to list groups, and this page does not
-// go near the work_groups table itself. It returns the groups this person belongs to plus the
-// sub-groups of those — a group they are not entitled to is ABSENT from the result, not greyed
-// out and not "request access", because a list of team names is a map of the organisation.
+// COMMUNITY. visibleGroupsFor() is the only permitted way to list groups, and this page does not go
+// near the work_groups table itself. It returns the groups this person belongs to plus the
+// sub-groups of those — a group they are not entitled to is ABSENT from the result, not greyed out
+// and not "request access", because a list of team names is a map of the organisation.
 //
-// It deliberately selects `has_link`, never `join_url`: a chat invite link is a bearer credential,
-// so the URL is only ever revealed by a POST on /portal/team-groups after membership is re-derived
-// at the moment of access. Nothing below renders a link, and there is no total count of anything
-// unseen — that would be the same map by another route.
+// It deliberately selects `has_link`, never `join_url`: a chat invite link is a bearer credential, so
+// the URL is only ever revealed by a POST on /portal/team-groups after membership is re-derived at
+// the moment of access. Nothing below renders a link, and there is no total count of anything unseen
+// — that would be the same map by another route.
 let myGroups: any[] = [];
-if (user?.id) {
+if (has('groups.mine') && user?.id) {
   try {
     const { visibleGroupsFor } = await import('@/lib/work-groups');
     myGroups = await visibleGroupsFor(user.id);
   } catch (e: any) {
-    console.error('[portal/employee] groups', e?.cause?.message || e?.message);
+    logFail('groups', e);
   }
 }
 const memberGroups = myGroups.filter((g: any) => g.isMember);
@@ -543,242 +721,30 @@ const memberGroups = myGroups.filter((g: any) => g.isMember);
 // refused when they tried. Counting only what the join actually accepts keeps the sentence true.
 const joinableGroups = myGroups.filter((g: any) => !g.isMember && g.kind === 'sub' && g.parentId);
 
-// The credit position, shown to the person it is about. Interns were being measured on
-// credit-hours they could not see; the figures already existed but only on the admin side, so the
-// one person with a stake in them had to ask. Same engine as the completion letter, so what they
-// read here is what the letter will say.
-let credit: any = null;
-let creditTerms: any = null;
-let weeksLeft: number | null = null;
-// CREDIT HOURS ARE AN INTERNSHIP CONCEPT AND ONLY INTERNS SEE THEM.
-//
-// This block ran for anyone with an hr_employees row, so the founder opened his own portal and was
-// shown "40 credit-hours, attendance 100%, days in 5" — an internship progress report on his own
-// company. Credit hours exist to decide whether an intern earns their completion certificate. They
-// mean nothing for a founder, an executive, a professor or a consultant, and showing them makes the
-// whole platform read as an internship attendance portal.
-//
-// The classifier tests classification FIRST (a real column with a real writer -- hr-classification.ts
-// self-bootstraps it and /admin/hr/classification writes it) and only falls back to the free-text
-// employment_type. The order matters: employment_type is free text, and a substring test on it is
-// what makes "Internal Auditor" match "intern". Exact match on the value the HR form actually
-// writes ('Internship'), never includes().
-//
-// This is the interim guard. src/lib/workforce/composer.ts is the real answer and decides this from
-// context for every widget; until it is wired in, gate the one widget that causes the complaint.
-const classification = String(employee?.classification || '').trim().toLowerCase();
-const employmentType = String(employee?.employment_type || '').trim().toLowerCase();
-const isInternEngagement = classification === 'intern' || employmentType === 'internship';
-
-if (employee?.id && isInternEngagement) {
-  try {
-    const { ledgerFor, termsFor } = await import('@/lib/credit-ledger');
-    const { remainingWeeks } = await import('@/lib/credit-hours');
-    creditTerms = await termsFor(employee.id);
-    const led = await ledgerFor(employee.id, creditTerms);
-    credit = led.summary;
-    weeksLeft = remainingWeeks(credit, creditTerms);
-  } catch (e: any) {
-    // Still never blocks the page over a summary — but no longer silently. A credit figure that
-    // quietly stops appearing is exactly the kind of absence nobody reports and nobody notices.
-    console.error('[portal/employee] credit', e?.cause?.message || e?.message);
-  }
-}
-const creditPct = credit?.requiredCreditHours
-  ? Math.min(100, Math.round((credit.creditHours / credit.requiredCreditHours) * 100))
-  : null;
-
 // =================================================================================================
-// THE COMMAND CENTRE. Everything below feeds the two sections at the TOP of the page: what needs
-// this person today, and where their day currently stands.
+// THE COMMAND CENTRE ROWS. Everything below feeds the "Needs you today" section.
 //
 // THE RULE THIS SECTION IS BUILT ON: every number here is an arithmetic partition of rows that
 // already exist, read by code that already writes them. Nothing is claimed that the schema cannot
 // answer, and nothing that cannot be answered is rendered as an empty card, a zero, or a
-// "coming soon" — the four things deliberately ABSENT are listed in the comment above the markup.
-//
-// AND THE SECOND RULE: an empty bucket and a failed read are different sentences. Every source
-// below reports whether it RAN, and the section refuses to print "nothing is waiting on you" over
-// a read that did not happen. That is the same failure shape as a green flash over a write that
-// never landed, and this page has already been punished for it twice.
+// "coming soon" — the things deliberately ABSENT are listed at the end of this script block.
 // =================================================================================================
 
-// TODAY, AS THE DATABASE COUNTS IT.
-//
-// `todayIso` above is `new Date()` in the SERVER's timezone; `due_on` is compared against
-// CURRENT_DATE inside Postgres, in the DATABASE's timezone. The two disagree by a day whenever the
-// process and the session are set differently, and "Due today" is exactly the claim that must not
-// be off by one. `isOverdue` already comes from SQL for this reason; this is the same discipline
-// applied to the other side of the partition. If this one-column read fails, the due-today bucket
-// is not rendered AT ALL rather than guessed at from the clock in this process.
-let dbToday = '';
-try {
-  const r = await db.execute(sql`SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d`);
-  const drows = Array.isArray(r) ? r : (r?.rows || []);
-  dbToday = String(drows[0]?.d || '');
-} catch (e: any) {
-  console.error('[portal/employee] current date', e?.cause?.message || e?.message);
-}
-
-// TASKS: LATE, AND DUE TODAY. Both partitioned out of the list myTasksView already returned, so
-// this costs no extra query and cannot disagree with the "My tasks" card further down the page.
-// `overdue` is Postgres' own IS_OVERDUE flag; `openTasks` has already dropped everything whose
-// legacy status is 'done', which covers completed, cancelled and archived.
-const attentionTasksOk = tasksReady && !tasksFailed;
-const overdueTasks = attentionTasksOk ? openTasks.filter((t: any) => t.overdue) : [];
-const dueTodayTasks = (attentionTasksOk && dbToday)
+// TASKS: LATE, AND DUE TODAY. Both partitioned out of the list myTasksView already returned, so this
+// costs no extra query and cannot disagree with the "My tasks" card further down the page.
+const attentionTasksOk = wantTaskView && tasksReady && !tasksFailed;
+const overdueTasks = (wantAttention && attentionTasksOk) ? openTasks.filter((t: any) => t.overdue) : [];
+const dueTodayTasks = (wantAttention && attentionTasksOk && wantDueToday && dbToday)
   ? openTasks.filter((t: any) => !t.overdue && t.due === dbToday)
   : [];
 
-// WAITING ON MY SIGN-OFF, AND WAITING ON MY REVIEW.
-//
-// listBoard() resolves the viewer's roles per row IN SQL (VIEWER_ROLE_COLUMNS), so nothing here can
-// claim a role the database did not grant. Its argument is the USERS id — collaborators are keyed
-// by users.id, not by hr_employees.id, and handing it the wrong one returns an empty board forever
-// rather than an error.
-//
-// A task where the viewer is approver OR lead is counted as sign-off and NOT again as a review, so
-// somebody holding both roles on one task sees it once. Reviewers are only ever added by hand
-// (seedCollaborators creates 'assignee' and 'approver' and nothing else), so an empty review bucket
-// is the ordinary, correct state and is simply absent rather than rendered as a zero.
-let boardOk = false;
-let signOffTasks: any[] = [];
-let reviewTasks: any[] = [];
-if (user?.id) {
-  try {
-    const { listBoard } = await import('@/lib/employee-tasks');
-    const board = await listBoard(user.id, { limit: 400 });
-    boardOk = board?.ok === true;
-    if (boardOk) {
-      const waiting = (board.tasks as any[]).filter((t: any) => t.status === 'under_review');
-      signOffTasks = waiting.filter((t: any) =>
-        t.viewerRoles.indexOf('approver') >= 0 || t.viewerRoles.indexOf('lead') >= 0);
-      const signOffIds = new Set(signOffTasks.map((t: any) => t.id));
-      reviewTasks = waiting.filter((t: any) =>
-        !signOffIds.has(t.id) && t.viewerRoles.indexOf('reviewer') >= 0);
-    }
-  } catch (e: any) {
-    console.error('[portal/employee] board', e?.cause?.message || e?.message);
-  }
-}
-
-// LEAVE AND WITHDRAWAL REQUESTS WAITING ON A DECISION — AND ONLY FOR SOMEONE WHO CAN ACTUALLY
-// DECIDE ONE.
-//
-// approverRole() (src/lib/hr-wallet.ts:146) grants approval to super_admin, admin, role === 'hr',
-// and to the employee's recorded reporting manager. The manager branch is REAL and is deliberately
-// not surfaced here, because the only two screens in this codebase that call decideLeave() and
-// decideWithdrawal() are /admin/hr/leave and /admin/hr/wallet, and both refuse anyone who is not
-// super_admin / admin / hr — before that, src/middleware.ts refuses /admin entirely to a role
-// without admin.access. So a reporting manager who is not also HR has nowhere to go: putting
-// "2 requests need you" in front of them with no reachable screen is a count that cannot be acted
-// on, which is the thing this section exists to avoid. That gap is a missing portal-side approval
-// surface, and it is reported as such rather than papered over with a link that bounces.
-//
-// The role test is EXACT. /admin/hr/leave uses `role.indexOf('hr') >= 0`, which any role merely
-// containing those two letters passes; matching exactly can only ever show this row to fewer
-// people than the screen admits, never to more.
-//
-// Own rows are excluded: your own pending request is not an approval waiting on YOU, it is on
-// /portal/employee/leave. Counts only — no names, no amounts, no reasons.
-const viewerRole = String(user.role || '').trim().toLowerCase();
-const canDecideHrRequests = viewerRole === 'super_admin' || viewerRole === 'admin' || viewerRole === 'hr';
-let pendingLeave = 0;
-let pendingWithdrawals = 0;
-let hrQueueFailed = false;
-// Counts now come from the SAME readers /portal/approvals renders, rather than a second pair of
-// COUNT queries that could disagree with it. The previous version also gated on role alone, so a
-// reporting manager — the person the request is actually assigned to — saw no count at all and had
-// no way to learn something was waiting on them.
-if (employee?.id) {
-  try {
-    const [{ pendingLeaveForApprover }, { pendingWithdrawalsForApprover }] = await Promise.all([
-      import('@/lib/hr-leave'),
-      import('@/lib/hr-wallet'),
-    ]);
-    const [lv, wd] = await Promise.all([
-      pendingLeaveForApprover(user),
-      pendingWithdrawalsForApprover(user),
-    ]);
-    // Own rows excluded: your own pending request is not an approval waiting on YOU.
-    pendingLeave = lv.filter((r: any) => String(r.employee_id) !== String(employee.id)).length;
-    pendingWithdrawals = wd.filter((r: any) => String(r.employee_id) !== String(employee.id)).length;
-  } catch (e: any) {
-    hrQueueFailed = true;
-    console.error('[portal/employee] approver queue', e?.cause?.message || e?.message);
-  }
-}
-
-// JOINING DOCUMENTS, MINE — the ones a reviewer sent back.
-//
-// hr_onboarding_documents.status is written by real code on BOTH sides, which is the only reason
-// this row exists: addDoc() inserts 'submitted' from /portal/onboarding, and reviewDoc() writes
-// 'rejected' together with a note from the "Send back" button on /admin/hr/onboarding. A rejected
-// row is therefore a state a real person put there, not a column a schema file merely declares.
-//
-// listDocs() rather than a COUNT, for two reasons. It is the function that OWNS the table's DDL —
-// its ctx() runs the CREATE TABLE IF NOT EXISTS — so this cannot be the query that discovers the
-// table is missing. And the cap is MAX_DOCS = 5 rows per person, so reading them costs less than
-// the round trip a count would save. It is scoped to user_id inside its own WHERE clause, it reads
-// only this person's rows, and it THROWS rather than returning [] on failure — which is exactly
-// what this section needs, because an empty list and a failed read must not become the same
-// sentence.
-let rejectedDocs = 0;
-let docsFailed = false;
-if (user?.id) {
-  try {
-    const { listDocs } = await import('@/lib/hr-onboarding');
-    const docs = await listDocs(String(user.id));
-    rejectedDocs = docs.filter((d: any) => d.status === 'rejected').length;
-  } catch (e: any) {
-    docsFailed = true;
-    console.error('[portal/employee] joining documents', e?.cause?.message || e?.message);
-  }
-}
-
-// JOINING DOCUMENTS WAITING FOR A REVIEW — and, again, only for somebody who can reach the screen.
-//
-// Gated on the SAME exact role test as the leave and withdrawal queues above, and deliberately NOT
-// on canAccessSection(user, 'employees', 'edit'), which is what /api/portal/onboarding/documents
-// itself uses to authorise the review. That test can return true for a custom role that does not
-// hold admin.access, and src/middleware.ts bounces precisely that role off /admin — so the wider
-// test would put a count in front of somebody whose only route to act on it is a redirect. Same
-// reasoning and the same three roles as the block above: narrower than the screen admits, never
-// wider.
-//
-// A COUNT, not pendingForReview(): that helper joins `users` and returns names and email addresses
-// for up to 150 people, and none of that belongs in the render context of a page that needs one
-// integer. Own rows are excluded — a document YOU submitted is not a review waiting on YOU.
-let docsToReview = 0;
-let docReviewFailed = false;
-if (canDecideHrRequests && user?.id) {
-  try {
-    const r = await db.execute(sql`
-      SELECT COUNT(*)::int AS n FROM hr_onboarding_documents
-       WHERE status = 'submitted' AND user_id <> ${String(user.id)}`);
-    const orows = Array.isArray(r) ? r : (r?.rows || []);
-    docsToReview = Number(orows[0]?.n) || 0;
-  } catch (e: any) {
-    docReviewFailed = true;
-    console.error('[portal/employee] joining document reviews', e?.cause?.message || e?.message);
-  }
-}
-
-// THE ROWS. Built here rather than as five near-identical blocks of JSX, so the ordering — late
-// first, then today, then other people waiting on you — is one readable list and not a layout
-// accident. Plain object literals with no type annotation: a typed map in .astro JSX does not
-// compile.
-//
 // Each glyph is a distinct SHAPE, not a colour: a clock, a calendar, two ticks, an eye, a card,
-// a folded page, a tray.
-// The row still triages correctly in greyscale, and no emoji appears anywhere.
+// a folded page, a tray. The row still triages correctly in greyscale, and no emoji appears anywhere.
 const GLYPH_LATE = '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.2V12l3.1 1.9"/>';
 const GLYPH_TODAY = '<rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10.2h17M8.5 3v4M15.5 3v4"/>';
 const GLYPH_SIGNOFF = '<path d="m2.8 12.6 3.2 3.2 6.6-7"/><path d="m10.6 15.2 1.4 1.4 6.8-7.2"/>';
 const GLYPH_REVIEW = '<path d="M2.6 12S6.2 6.2 12 6.2 21.4 12 21.4 12 17.8 17.8 12 17.8 2.6 12 2.6 12Z"/><circle cx="12" cy="12" r="2.4"/>';
 const GLYPH_MONEY = '<rect x="2.5" y="5.5" width="19" height="13" rx="2.5"/><path d="M2.5 10.4h19"/>';
-// A page with a folded corner, and a tray. Both distinct in outline from the clock, the calendar,
-// the two ticks, the eye and the card above — the list still triages with every colour deleted.
 const GLYPH_DOC = '<path d="M14 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5Z"/><path d="M14 3.5v5h5"/><path d="M8.8 14.2h6.4"/>';
 const GLYPH_INBOX = '<path d="M3.5 13.6 6.4 5.3A2 2 0 0 1 8.3 4h7.4a2 2 0 0 1 1.9 1.3l2.9 8.3v4a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2Z"/><path d="M3.5 13.6h4l1.4 2.6h6.2l1.4-2.6h4"/>';
 
@@ -790,7 +756,7 @@ overdueTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
   href: '/portal/tasks/' + t.id,
   title: t.title,
   // Deliberately not the word "overdue" shouted in red. The row below it says what to do; this
-  // says what happened. The existing task list on this page made the same call and it holds here.
+  // says what happened.
   note: t.due ? 'Late · was due ' + dayLabel(t.due) : 'Late',
   tone: 'overdue',
   glyph: GLYPH_LATE,
@@ -803,17 +769,14 @@ dueTodayTasks.slice(0, ROW_CAP).forEach((t: any) => attentionRows.push({
   title: t.title,
   note: 'Due today',
   // 'due_soon', not 'due': the tone name has to be a ramp that exists in workforce.css, or the
-  // [data-wf-tone] binding misses and the row silently falls back to the neutral ink — legible, but
-  // no longer distinguishable from an informational row, which is the whole job of this bucket.
+  // [data-wf-tone] binding misses and the row silently falls back to the neutral ink.
   tone: 'due_soon',
   glyph: GLYPH_TODAY,
   priority: t.priority,
 }));
 
 // One summarising row for the whole bucket rather than one row per document, so no cap arithmetic
-// applies to it and the number shown IS the number there is. The wording is the same guidance
-// /portal/workspace already gives, because a person who reads both should not have to work out
-// whether they are being told two different things.
+// applies to it and the number shown IS the number there is.
 if (rejectedDocs > 0) attentionRows.push({
   key: 'docs-back',
   href: '/portal/onboarding',
@@ -874,30 +837,32 @@ if (pendingWithdrawals > 0) attentionRows.push({
   priority: '',
 });
 
-// The headline counts THINGS, not rows: four late tasks are four things even though three are
-// shown. The overflow link is computed over tasks only, because the two queue rows are already a
-// count of everything in them.
+// The headline counts THINGS, not rows: four late tasks are four things even though three are shown.
+// The overflow link is computed over tasks only, because the two queue rows are already a count of
+// everything in them.
 const attentionTaskTotal =
   overdueTasks.length + dueTodayTasks.length + signOffTasks.length + reviewTasks.length;
 const attentionTaskShown =
   Math.min(ROW_CAP, overdueTasks.length) + Math.min(ROW_CAP, dueTodayTasks.length)
   + Math.min(ROW_CAP, signOffTasks.length) + Math.min(ROW_CAP, reviewTasks.length);
 const attentionMore = attentionTaskTotal - attentionTaskShown;
-// The document buckets are counted here but NOT in attentionMore: like the two queue rows, each is
-// a single row that already states its own whole count, so none of it is hidden behind the cap.
 const attentionCount =
   attentionTaskTotal + pendingLeave + pendingWithdrawals + rejectedDocs + docsToReview;
 
-// WHAT THE SECTION IS NOT ALLOWED TO SAY. If any source did not run, "nothing is waiting on you" is
-// not a fact this page is in a position to state, so the all-clear is withheld and the gap is named
-// instead. Each clause is separate so the sentence can say WHICH part is missing.
+// WHAT THE SECTION IS NOT ALLOWED TO SAY. If a source that WAS asked for did not run, "nothing is
+// waiting on you" is not a fact this page is in a position to state, so the all-clear is withheld and
+// the gap is named instead. A source that was never asked for is not a gap — it is a widget this
+// person does not have, and naming it would describe somebody else's job.
 const attentionGaps: string[] = [];
-if (!attentionTasksOk) attentionGaps.push('your own task list');
-else if (!dbToday) attentionGaps.push('what is due today');
-if (!boardOk) attentionGaps.push('anything waiting on your sign-off or review');
+if (wantTaskView && !attentionTasksOk) attentionGaps.push('your own task list');
+else if (wantDueToday && !dbToday) attentionGaps.push('what is due today');
+if (wantBoard && !boardOk) attentionGaps.push('anything waiting on your sign-off or review');
 if (hrQueueFailed) attentionGaps.push('the leave and withdrawal queues');
 if (docsFailed) attentionGaps.push('your joining documents');
 if (docReviewFailed) attentionGaps.push('the joining-document review queue');
+// The composer reports its OWN unanswered sources the same way — "who reports to you" decides whether
+// an approvals row belongs here at all, so a gap there belongs in this sentence too.
+for (const gap of composed.contextGaps) attentionGaps.push(gap);
 const attentionIncomplete = attentionGaps.length > 0;
 
 // TODAY'S STATE. The task currently in flight, off the list already read — `state` is the canonical
@@ -921,12 +886,11 @@ const attentionCountShown = !attentionIncomplete && attentionCount > 0;
 //
 // currentStatus is derived from the LAST punch of the day and defaults to 'clocked_out' — which is
 // also exactly what a FAILED read looks like. clockReadFailed is the only thing that separates the
-// two, so it is tested FIRST here: this strip states somebody's clock position as a fact directly
-// under a heading that says what needs them today, and "Not clocked in yet" printed over a query
-// that threw is the same lie as a green flash over a write that never landed.
+// two, so it is tested FIRST: this strip states somebody's clock position as a fact, and "Not clocked
+// in yet" printed over a query that threw is the same lie as a green flash over a write that never
+// landed.
 //
-// The label on the link is the label on the CONTROL it scrolls to, so the jump does not surprise:
-// the attendance card renders "Clock In" for exactly the state where this says 'Clock in'.
+// The label on the link is the label on the CONTROL it scrolls to, so the jump does not surprise.
 const clockLabel = clockReadFailed
   ? "Today's punches could not be read"
   : currentStatus === 'clocked_in'
@@ -958,29 +922,32 @@ const clockCta = clockReadFailed
 // every break taken.
 const showTodayHours = !clockReadFailed && todayHours > 0;
 
-// THE THINGS THIS SECTION DELIBERATELY DOES NOT SHOW, each because the database cannot answer it
-// and a placeholder would be a lie rather than a gap:
-//   MEETINGS TODAY — meet_rooms.scheduled_at is written by nothing in this repo (the only INSERT is
-//     the ad-hoc huddle at portal/meet/[id].astro:98), and its declared host_user_id INTEGER
-//     contradicts the ::uuid casts in the code that reads it. A card here would query a column no
-//     code has ever populated.
-//   ANNOUNCEMENTS — there is no announcements table anywhere in src, db or scripts. `discussions`
-//     is a peer board, and its is_pinned column is declared and written by nothing.
-//   PERFORMANCE REVIEWS WAITING ON ME — hr_performance_reviews has no reviewer column at all.
-//     Nothing records who reviews whom, so "waiting on me" is unanswerable.
-//   UNREAD COMMENTS / "X IS WAITING FOR YOUR ANSWER" — employee_task_comments has five columns
-//     (id, task_id, author_user_id, body, created_at). No read state, no mentions, no receipts.
-//     The only honest comment number is a total, which is not "waiting on you".
-//   OFFER LETTERS AWAITING MY SIGNATURE — and this one is the reason the joining-documents rows
-//     above are worded as narrowly as they are. Signing is reached by an unguessable token sent to
-//     one person, so there is no per-user inbox to query: "documents needing you" here means the
-//     onboarding credentials and NOTHING else. Widening that sentence would quietly promise an
-//     offer-letter reminder this page cannot deliver.
-//   WHAT LEARNING IS ASSIGNED TO ME — training_enrollments has exactly one writer, and it is the
-//     learner's own first open of a course (portal/courses/[slug].astro). There is no assigner, no
-//     due date and no "required" flag, so "what I have started" is answerable and "what is assigned
-//     to me" is not. This card only ever claims the second, so it is absent.
-// Their absence IS the answer. Do not add an empty card for any of them.
+// Identity, for the profile.me card. Straight off the composed workspace, which selects an explicit
+// column list and never `SELECT *` — no gender, no government ids, no bank details, no salary. When
+// no employee record resolved it falls back to the session, because "you are signed in as" is still
+// the right answer on a screen that could not resolve anything else. users has `name`, NOT full_name.
+const identityName = composed.workspace?.fullName || user.name || user.email || 'Your account';
+const identitySub = composed.workspace
+  ? [composed.workspace.employeeCode, composed.workspace.designation].filter(Boolean).join(' - ')
+  : (user.email || '');
+const identityPhoto = composed.workspace?.photoUrl || '';
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+// THE ORDER OF THE PAGE.
+//
+// There is no hardcoded section order here any more. The composer returns its widgets already sorted
+// by the registry's priority bands — what needs you, your work, decisions, your day, internship,
+// money, people, community, account — and this page walks that list. A widget with no renderer on
+// this surface simply contributes nothing; it is not an error, and it is not something for this file
+// to have an opinion about.
+const slots = composed.widgets.map((w: any) => w.key);
+
+// THE THINGS THIS PAGE DELIBERATELY DOES NOT SHOW, each because the database cannot answer it and a
+// placeholder would be a lie rather than a gap. The full list, with the evidence, is UNREGISTERED in
+// src/lib/workforce/widgets.ts: meetings today, announcements, performance reviews waiting on me,
+// unread comments, offers awaiting my signature, and assigned learning. Their absence IS the answer.
+// Do not add an empty card for any of them.
 ---
 <!doctype html>
 <!-- data-theme="light" PINS the workforce tokens. workforce.css flips its whole ramp inside
@@ -997,6 +964,8 @@ const showTodayHours = !clockReadFailed && todayHours > 0;
   <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
   <style>
     *{box-sizing:border-box;margin:0;padding:0;}
+    /* padding-bottom is load-bearing: BottomNav is position:fixed and takes no space in flow, so
+       this is the only thing keeping the last card clear of it. */
     body{background:#f8f6f1;font-family:system-ui,sans-serif;min-height:100vh;padding-bottom:80px;}
     .topbar{background:#0f0f14;padding:0 16px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:40;}
     .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;margin:0 14px 12px;}
@@ -1005,13 +974,29 @@ const showTodayHours = !clockReadFailed && todayHours > 0;
     .clock-btn{width:100%;border:none;font-size:15px;font-weight:700;padding:16px;border-radius:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;}
     .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;}
     .payslip-row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid #f0f0f0;}
-    /* The bottom bar now comes from src/components/workforce/BottomNav.astro, which brings its
-       own styles. body's padding-bottom below stays: the bar is position:fixed and takes no space
-       in flow, so that padding is the only thing keeping the last card clear of it. */
     .event-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
 
+    /* A door: a full-width tile that carries no data at all. Used for the wallet and leave tiles,
+       which are two separate widgets and so are no longer glued into one hand-made grid, and for
+       every tile of the Universal Workspace fallback. */
+    .door{display:flex;align-items:center;gap:12px;margin:0 14px 12px;padding:14px 15px;
+      background:#fff;border:1px solid #e5e7eb;border-radius:14px;text-decoration:none;
+      min-height:var(--wf-touch);}
+    .door--ink{background:linear-gradient(135deg,#1a1510,#2b241b);border-color:#1a1510;color:#faf6ef;}
+    .door--rust{background:linear-gradient(135deg,#c2410c,#e05a1c);border-color:#c2410c;color:#fff;}
+    .door__mark{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:34px;height:34px;
+      border-radius:10px;background:rgba(255,79,0,0.1);color:#FF4F00;}
+    .door--ink .door__mark,.door--rust .door__mark{background:rgba(255,255,255,0.14);color:currentColor;}
+    .door__body{flex:1 1 auto;min-width:0;}
+    .door__title{display:block;font-size:14px;font-weight:700;color:#111;}
+    .door--ink .door__title,.door--rust .door__title{color:currentColor;}
+    .door__note{display:block;margin-top:2px;font-size:11.5px;color:#6b7280;line-height:1.45;}
+    .door--ink .door__note,.door--rust .door__note{color:currentColor;opacity:.75;}
+    .door__chev{flex:0 0 auto;width:16px;height:16px;color:#9ca3af;}
+    .door--ink .door__chev,.door--rust .door__chev{color:currentColor;opacity:.6;}
+
     /* =========================================================================
-       THE COMMAND CENTRE — the two sections at the top of the page.
+       THE COMMAND CENTRE — the section at the top of the page.
 
        NOT A SECOND DESIGN SYSTEM. Every value below is a token from
        src/styles/workforce.css, which is imported in the frontmatter: colour,
@@ -1089,7 +1074,7 @@ const showTodayHours = !clockReadFailed && todayHours > 0;
     #attendance{scroll-margin-top:64px;}
 
     @media (forced-colors: active){
-      .cc-row,.cc-panel,.cc-today,.cc-task{border-color:CanvasText;}
+      .cc-row,.cc-panel,.cc-today,.cc-task,.door{border-color:CanvasText;}
     }
   </style>
 </head>
@@ -1106,577 +1091,726 @@ const showTodayHours = !clockReadFailed && todayHours > 0;
 
 {msg && <div style="margin:12px 14px 0;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#065f46;border-radius:8px;padding:10px 14px;font-size:13px;">{msg}</div>}
 
-{!employee && (
-  <div style="margin:20px 14px;background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:32px;text-align:center;">
-    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5" style="margin-bottom:12px;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-    <p style="font-size:15px;font-weight:600;color:#111;margin-bottom:6px;">No employee profile found</p>
-    <p style="font-size:13px;color:#6b7280;">Ask HR to link your account to your employee profile.</p>
+{/* =====================================================================
+    THE FALLBACK, AND WHAT IT IS NOT.
+
+    When the composition could not be trusted — the record is closed, two
+    records share this email address, or the lookup itself did not run — this
+    page renders the Universal Workspace and NOTHING else: profile, messages,
+    community and settings, all doors, no business data. It never falls back
+    to the intern dashboard it is replacing, because falling back to the thing
+    being replaced is how a migration silently never completes; and it never
+    renders a scoped card, because a resolution failure is the moment the
+    system knows least about who it is talking to.
+
+    The denial is rendered in full. A blank workspace with no explanation
+    reads as "you have done no work".
+    ===================================================================== */}
+{!composed.ok && (
+  <div style="padding-top:14px;">
+    {composed.denial && (
+      <div class="card">
+        <div class="card-body">
+          <p style="font-size:15px;font-weight:700;color:#111;margin:0 0 6px;">{composed.denial.title}</p>
+          <p style="font-size:13px;color:#4b5563;line-height:1.6;margin:0;">{composed.denial.reason}</p>
+        </div>
+      </div>
+    )}
+
+    <div class="card">
+      <div class="card-body" style="display:flex;align-items:center;gap:12px;">
+        <div style="width:48px;height:48px;border-radius:50%;background:rgba(255,79,0,0.1);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#FF4F00;flex-shrink:0;">{String(identityName).charAt(0).toUpperCase()}</div>
+        <div style="min-width:0;">
+          <p style="font-size:15px;font-weight:700;color:#111;margin:0;">{identityName}</p>
+          <p style="font-size:12px;color:#6b7280;margin:2px 0 0;overflow-wrap:anywhere;">{user.email}</p>
+        </div>
+      </div>
+    </div>
+
+    <a class="door" href="/portal/messages">
+      <span class="door__mark" aria-hidden="true">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </span>
+      <span class="door__body">
+        <span class="door__title">Messages</span>
+        <span class="door__note">End-to-end encrypted. Readable only on a device holding your key.</span>
+      </span>
+      <svg class="door__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+    </a>
+
+    <a class="door" href="/portal/team-groups">
+      <span class="door__mark" aria-hidden="true">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      </span>
+      <span class="door__body">
+        <span class="door__title">Community</span>
+        <span class="door__note">Your team groups.</span>
+      </span>
+      <svg class="door__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+    </a>
+
+    <a class="door" href="/portal/profile">
+      <span class="door__mark" aria-hidden="true">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      </span>
+      <span class="door__body">
+        <span class="door__title">Your profile</span>
+        <span class="door__note">What is recorded about you, and how to correct it.</span>
+      </span>
+      <svg class="door__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+    </a>
+
+    <a class="door" href="/portal/security">
+      <span class="door__mark" aria-hidden="true">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      </span>
+      <span class="door__body">
+        <span class="door__title">Sign-in &amp; security</span>
+        <span class="door__note">Passkeys, face and authenticator settings.</span>
+      </span>
+      <svg class="door__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+    </a>
+
+    {/* Notifications is part of the Universal Workspace and has no door yet: rows ARE written for
+        staff accounts, but /portal/notifications redirects every non-applicant to /admin
+        (docs/KNOWN_GAPS.md). A tile that bounces is worse than no tile, so it is absent until that
+        page opens rather than linked to a redirect. */}
   </div>
 )}
 
-{employee && (
+{composed.ok && (
   <div style="padding-top:14px;">
 
-    {/* =====================================================================
-        WHAT NEEDS YOU TODAY. The first thing on the page, because the question
-        someone opens this at 9am to answer is not "how am I doing" — it is
-        "what happens if I do nothing". Everything in it is an item they can act
-        on, and every row is a direct link to the one screen where they act.
-
-        SEVERAL THINGS ARE ABSENT AND THAT IS THE ANSWER, not an omission:
-        meetings today, announcements, performance reviews waiting on me, unread
-        comments, offer letters awaiting a signature, and assigned learning. The
-        reasons are recorded in the frontmatter at the end of the script block.
-        None of them gets a placeholder card, a zero or a "coming soon", because
-        a card that cannot be filled is a card people learn to trust and then
-        miss something behind.
-        ===================================================================== */}
-    <section class="cc" aria-labelledby="cc-heading">
-      <div class="cc-head">
-        <h2 class="cc-title" id="cc-heading">Needs you today</h2>
-        {attentionCountShown && (
-          <span class="cc-count wf-num">{attentionCount} {attentionCount === 1 ? 'item' : 'items'}</span>
-        )}
+    {/* THE "NO EMPLOYEE PROFILE" STATE, PRESERVED. Signed in, composition sound, and simply no HR
+        row linked to this account. It is NOT a failure — a founder or an HR account may legitimately
+        have none — so the widgets that need nothing but a user id still render below it. What must
+        not happen is silence: "ask HR to link your account" is a one-sentence fix nobody can make if
+        the screen does not say it. */}
+    {noEmployeeRecord && (
+      <div style="margin:0 14px 12px;background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:32px;text-align:center;">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5" style="margin-bottom:12px;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <p style="font-size:15px;font-weight:600;color:#111;margin-bottom:6px;">No employee profile found</p>
+        <p style="font-size:13px;color:#6b7280;">Ask HR to link your account to your employee profile.</p>
       </div>
+    )}
 
-      {attentionRows.length > 0 && (
-        <div class="cc-list">
-          {(attentionRows as any[]).map((r: any) => (
-            <a class="cc-row wf-focusable" href={r.href} data-wf-tone={r.tone}>
-              <span class="cc-row__mark" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" set:html={r.glyph} />
-              </span>
-              <span class="cc-row__body">
-                {/* wf-num on the title, not only on the headline: four of these rows state a
-                    COUNT inside the sentence ("3 joining documents were sent back"), and a
-                    proportional 1 next to a proportional 3 is the one place a triage list can be
-                    misread at a glance. It is inert on the titles that carry no digits. */}
-                <span class="cc-row__title wf-num">{r.title}</span>
-                {/* Same reason: the late rows carry a date here ("was due 4 Aug"). */}
-                <span class="cc-row__note wf-num">{r.note}</span>
-              </span>
-              <span class="cc-row__side">
-                {/* Renders nothing at all for a normal-priority task: a flag on
-                    three quarters of the rows is a flag on none of them. */}
-                <PriorityFlag priority={r.priority} hideNormal={true} />
-                <svg class="cc-row__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
-              </span>
-            </a>
-          ))}
-        </div>
-      )}
+    {/* EVERY SECTION BELOW IS ONE SLOT IN THE COMPOSED LIST, RENDERED IN THE COMPOSER'S ORDER.
+        There is no hand-written sequence here to drift from the registry, and no `if (role === ...)`
+        anywhere on this page: a section exists on screen exactly when the composer put its widget in
+        the list. A widget this surface has no renderer for contributes nothing and is not an error.
+        Intern widgets — credit hours, weeks remaining — appear only when the composer resolved an
+        internship engagement AND a recorded credit-hour requirement, so a founder gets zero. */}
+    {(slots as any[]).map((slot: string) => (
+      <Fragment>
 
-      {/* THE ALL-CLEAR. Shown only when every source actually answered — an
-          empty attention list is good news and reads like it, but it is a claim
-          about somebody's day and this page states it only when it is in a
-          position to know. */}
-      {attentionRows.length === 0 && !attentionIncomplete && (
-        <div class="cc-panel">
-          <EmptyState
-            title="Nothing is waiting on you"
-            body="No task of yours is late or due today, and nobody is waiting on your sign-off. Anything that arrives will show up here first."
-            illustration="check"
-            tone="approved"
-            headingLevel={3}
-            compact
-          />
-        </div>
-      )}
+        {slot === 'attention.queue' && (
+          <section class="cc" aria-labelledby="cc-heading">
+            <div class="cc-head">
+              <h2 class="cc-title" id="cc-heading">Needs you today</h2>
+              {attentionCountShown && (
+                <span class="cc-count wf-num">{attentionCount} {attentionCount === 1 ? 'item' : 'items'}</span>
+              )}
+            </div>
 
-      {/* The other half of that sentence. Named per source, so it says WHICH
-          part is missing rather than a generic apology. */}
-      {attentionIncomplete && (
-        <p class="cc-gap">
-          {attentionRows.length > 0
-            ? 'This list is incomplete: we could not read ' + attentionGapText + ' just now, so there may be more than is shown here.'
-            : 'We could not read ' + attentionGapText + ' just now, so this is not an all-clear. Nothing has been lost. Reload in a moment, and tell HR if it keeps happening.'}
-        </p>
-      )}
-
-      {attentionMore > 0 && (
-        <a class="cc-more wf-num wf-focusable" href="/portal/tasks">{attentionMore} more on your task board</a>
-      )}
-    </section>
-
-    {/* WHERE THE DAY STANDS. Read-only by design: the clock forms live in the
-        attendance card below and are not duplicated here, because they are
-        driven by ids (submitClock('clockForm')) and a second copy would give
-        two elements the same id and break the punch that already works. This
-        strip states the position and jumps to the control. */}
-    <section class="cc-today" aria-label="Where your day stands">
-      <div class="cc-now" data-wf-tone={clockTone}>
-        <span class="cc-now__dot" aria-hidden="true"></span>
-        <p class="cc-now__label">{clockLabel}</p>
-        {showTodayHours && <span class="cc-now__hours wf-num">{todayHours}h</span>}
-        {showTodayHours && (
-          <p class="cc-now__sub">On the clock since your first punch today. Breaks are recorded, but they are not deducted from this figure.</p>
-        )}
-        {clockReadFailed && (
-          <p class="cc-now__sub">This is not a statement that you are clocked out — the read itself failed. Open attendance to see where you actually stand.</p>
-        )}
-      </div>
-
-      {currentTask && (
-        <a class="cc-task wf-focusable" href={'/portal/tasks/' + currentTask.id}>
-          <StatusBadge status="in_progress" size="sm" glyphOnly />
-          <span class="cc-task__body">
-            <span class="cc-task__eyebrow">In progress right now</span>
-            <span class="cc-task__title">{currentTask.title}</span>
-          </span>
-          <svg class="cc-row__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
-        </a>
-      )}
-
-      <a class="cc-cta wf-focusable" href="#attendance">
-        {clockCta}
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-      </a>
-    </section>
-
-    {/* Credit position. Now the first thing BELOW the command centre rather than the first thing on
-        the page: it is what an intern most wants to know, but it is a standing figure, not something
-        that needs them this morning, and the two sections above are the ones that do. It stays high
-        because it was previously visible only to admins - they were being measured on a number they
-        had to ask for. Every figure is computed from recorded attendance and approved leave by the
-        same engine that produces the completion letter, so this and the letter agree. */}
-    {credit && (
-      <div class="card">
-        <div class="card-body">
-          <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;">
-            <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;color:#6b7280;font-weight:700;">Your credit</p>
-            {weeksLeft !== null && weeksLeft > 0 && (
-              <p style="font-size:11px;color:#6b7280;">~{weeksLeft} week{weeksLeft === 1 ? '' : 's'} to go</p>
+            {attentionRows.length > 0 && (
+              <div class="cc-list">
+                {(attentionRows as any[]).map((r: any) => (
+                  <a class="cc-row wf-focusable" href={r.href} data-wf-tone={r.tone}>
+                    <span class="cc-row__mark" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" set:html={r.glyph} />
+                    </span>
+                    <span class="cc-row__body">
+                      {/* wf-num on the title, not only on the headline: four of these rows state a
+                          COUNT inside the sentence ("3 joining documents were sent back"), and a
+                          proportional 1 next to a proportional 3 is the one place a triage list can
+                          be misread at a glance. It is inert on the titles that carry no digits. */}
+                      <span class="cc-row__title wf-num">{r.title}</span>
+                      {/* Same reason: the late rows carry a date here ("was due 4 Aug"). */}
+                      <span class="cc-row__note wf-num">{r.note}</span>
+                    </span>
+                    <span class="cc-row__side">
+                      {/* Renders nothing at all for a normal-priority task: a flag on three quarters
+                          of the rows is a flag on none of them. */}
+                      <PriorityFlag priority={r.priority} hideNormal={true} />
+                      <svg class="cc-row__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+                    </span>
+                  </a>
+                ))}
+              </div>
             )}
-          </div>
 
-          <div style="display:flex;align-items:baseline;gap:6px;margin-top:6px;">
-            <span style="font-size:34px;font-weight:800;color:#0f0f14;line-height:1;">{credit.creditHours}</span>
-            <span style="font-size:13px;color:#6b7280;">
-              {credit.requiredCreditHours ? 'of ' + credit.requiredCreditHours + ' credit-hours' : 'credit-hours'}
-            </span>
-          </div>
-
-          {creditPct !== null && (
-            <div style="margin-top:10px;">
-              <div style="height:8px;background:#eef0f3;border-radius:100px;overflow:hidden;">
-                <div style={`height:100%;width:${creditPct}%;background:${creditPct >= 100 ? '#16a34a' : '#FF4F00'};border-radius:100px;`}></div>
+            {/* THE ALL-CLEAR. Shown only when every source this person actually has answered — an
+                empty attention list is good news and reads like it, but it is a claim about somebody's
+                day and this page states it only when it is in a position to know. */}
+            {attentionRows.length === 0 && !attentionIncomplete && (
+              <div class="cc-panel">
+                <EmptyState
+                  title="Nothing is waiting on you"
+                  body="No task of yours is late or due today, and nobody is waiting on your sign-off. Anything that arrives will show up here first."
+                  illustration="check"
+                  tone="approved"
+                  headingLevel={3}
+                  compact
+                />
               </div>
-              <p style="font-size:11.5px;color:#6b7280;margin-top:5px;">
-                {creditPct >= 100 ? 'Requirement met.' : creditPct + '% of the requirement'}
+            )}
+
+            {/* The other half of that sentence. Named per source, so it says WHICH part is missing
+                rather than a generic apology. */}
+            {attentionIncomplete && (
+              <p class="cc-gap">
+                {attentionRows.length > 0
+                  ? 'This list is incomplete: we could not read ' + attentionGapText + ' just now, so there may be more than is shown here.'
+                  : 'We could not read ' + attentionGapText + ' just now, so this is not an all-clear. Nothing has been lost. Reload in a moment, and tell HR if it keeps happening.'}
               </p>
-            </div>
-          )}
+            )}
 
-          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px;">
-            <div>
-              <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#9ca3af;font-weight:700;">Attendance</p>
-              <p style={`font-size:17px;font-weight:700;margin-top:2px;color:${credit.attendancePct >= 85 ? '#16a34a' : credit.attendancePct >= 70 ? '#b45309' : '#b91c1c'};`}>{credit.attendancePct}%</p>
-            </div>
-            <div>
-              <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#9ca3af;font-weight:700;">Days in</p>
-              <p style="font-size:17px;font-weight:700;margin-top:2px;color:#0f0f14;">{credit.daysPresent}</p>
-            </div>
-            <div>
-              <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#9ca3af;font-weight:700;">Leave</p>
-              <p style="font-size:17px;font-weight:700;margin-top:2px;color:#0f0f14;">{credit.authorisedLeaveDays}</p>
-            </div>
-          </div>
+            {attentionMore > 0 && (
+              <a class="cc-more wf-num wf-focusable" href="/portal/tasks">{attentionMore} more on your task board</a>
+            )}
+          </section>
+        )}
 
-          {/* Surfaced plainly rather than buried: these are the two things that cost someone their
-              certificate, and finding out at the end would be too late to act on. */}
-          {(credit.unauthorisedLeaveDays > 0 || credit.noticeBreaches > 0) && (
-            <div style="margin-top:12px;padding:10px 12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;">
-              {credit.unauthorisedLeaveDays > 0 && (
-                <p style="font-size:12px;color:#9a3412;line-height:1.5;">
-                  <strong>{credit.unauthorisedLeaveDays} day{credit.unauthorisedLeaveDays === 1 ? '' : 's'}</strong> recorded as absent without approved leave.
-                </p>
+        {/* MY TASKS. Rendered only when src/lib/employee-tasks.ts actually loaded — an empty shell
+            would read as "you have no tasks", which is a claim, not an absence. */}
+        {slot === 'tasks.mine' && tasksReady && (
+          <div class="card">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+              <p style="font-size:13px;font-weight:700;color:#111;margin:0;">My tasks</p>
+              {/* No count when the read failed: "0 open" is the same false claim as the empty state,
+                  just smaller and easier to believe. */}
+              {!tasksFailed && <span style="font-size:12px;font-weight:700;color:#FF4F00;">{openTasks.length} open</span>}
+            </div>
+            <div class="card-body">
+              {taskMeta && <p style="font-size:11.5px;color:#6b7280;margin:0 0 10px;">{taskMeta}</p>}
+              {/* Two different empty states, because they are two different facts. "Nothing on your
+                  list" is a statement about your work; it must never be printed when the truth is
+                  that the read failed and this page does not know. */}
+              {tasksFailed && (
+                <p style="font-size:12.5px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:9px 11px;margin:0;line-height:1.5;">Your task list could not be loaded just now, so this is not a list of your work. Nothing has been lost. Reload in a moment, and tell HR if it keeps happening.</p>
               )}
-              {credit.noticeBreaches > 0 && (
-                <p style="font-size:12px;color:#9a3412;line-height:1.5;margin-top:4px;">
-                  <strong>{credit.noticeBreaches}</strong> leave{credit.noticeBreaches === 1 ? '' : 's'} taken without notice beforehand.
-                </p>
+              {!tasksFailed && openTasks.length === 0 && (
+                <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">Nothing on your list right now. Anything assigned to you will appear here, with whatever date it is wanted by.</p>
               )}
-              <p style="font-size:11.5px;color:#9a3412;margin-top:6px;">
-                Both appear on your completion report. Apply for leave before you take it.
-              </p>
-            </div>
-          )}
-
-          {creditTerms?.kind === 'part-time' && !creditTerms?.weeklyHours && (
-            <p style="font-size:11.5px;color:#b45309;margin-top:10px;line-height:1.5;">
-              Your agreed part-time hours are not recorded yet, so credit cannot be calculated. Ask HR to set them.
-            </p>
-          )}
-        </div>
-      </div>
-    )}
-
-    <!-- Employee info -->
-    <div class="card">
-      <div class="card-body" style="display:flex;align-items:center;gap:12px;">
-        {/* Profile photo = the picture taken at face-verification (2FA) enrolment. Falls back to the initial. */}
-        {employee.photo_url
-          ? <img src={employee.photo_url} alt={employee.full_name} width="48" height="48" style="width:48px;height:48px;border-radius:50%;object-fit:cover;flex-shrink:0;border:2px solid rgba(255,79,0,0.25);" />
-          : <div style="width:48px;height:48px;border-radius:50%;background:rgba(255,79,0,0.1);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#FF4F00;flex-shrink:0;">{employee.full_name?.charAt(0).toUpperCase()}</div>}
-        <div>
-          <p style="font-size:15px;font-weight:700;color:#111;margin:0;">{employee.full_name}</p>
-          <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">{employee.employee_code} - {employee.designation}</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- Team leader -->
-    {/* Sits directly under the employee card because it is part of "who you are here", and because
-        this is the person whose name someone needs before they can chase anything: it is the
-        recorded approver for leave and for wallet withdrawals. When nobody is recorded this says
-        so and names the fix, rather than falling back to "HR" or to an admin — showing a plausible
-        approver who is not the recorded one would send people to the wrong desk. */}
-    <div class="card">
-      <div class="card-header">
-        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">My team leader</p>
-      </div>
-      <div class="card-body">
-        {manager ? (
-          <div>
-            <div style="display:flex;align-items:center;gap:12px;">
-              <div style="width:40px;height:40px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#6b7280;flex-shrink:0;">{String(manager.full_name || '?').charAt(0).toUpperCase()}</div>
-              <div style="min-width:0;">
-                <p style="font-size:14px;font-weight:600;color:#111;margin:0;">{manager.full_name}</p>
-                <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">{manager.designation || 'Reporting manager'}</p>
-              </div>
-            </div>
-            <p style="font-size:11.5px;color:#6b7280;margin:10px 0 0;line-height:1.5;">Your leave and wallet requests go to them for approval.</p>
-          </div>
-        ) : (
-          <div>
-            <p style="font-size:13px;font-weight:600;color:#374151;margin:0 0 4px;">Not assigned yet</p>
-            <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">Ask HR to set your reporting manager on your employee record. Until it is set there is no named approver for your leave or wallet requests.</p>
-          </div>
-        )}
-      </div>
-    </div>
-
-    <!-- Wallet + Leave quick links -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:0 14px 12px;">
-      <a href="/portal/employee/wallet" style="display:flex;flex-direction:column;gap:8px;background:linear-gradient(135deg,#1a1510,#2b241b);color:#faf6ef;text-decoration:none;border-radius:14px;padding:15px;">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12V8H6a2 2 0 0 1-2-2c0-1.1.9-2 2-2h12v4"/><path d="M4 6v12c0 1.1.9 2 2 2h14v-4"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/></svg>
-        <div><div style="font-weight:700;font-size:14px;">My wallet</div><div style="font-size:11.5px;opacity:.7;">Salary &amp; withdrawals</div></div>
-      </a>
-      <a href="/portal/employee/leave" style="display:flex;flex-direction:column;gap:8px;background:linear-gradient(135deg,#c2410c,#e05a1c);color:#fff;text-decoration:none;border-radius:14px;padding:15px;">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-        <div><div style="font-weight:700;font-size:14px;">My leave</div><div style="font-size:11.5px;opacity:.85;">Balance &amp; requests</div></div>
-      </a>
-    </div>
-
-    <!-- Clock in/out -->
-    {/* id is the target of the jump link in the strip at the top of the page. Nothing else about
-        this card changed: the forms, their ids and submitClock() are untouched. */}
-    <div class="card" id="attendance">
-      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Attendance Today</p>
-        <div style="display:flex;align-items:center;gap:6px;">
-          <div class="status-dot" style={`background:${currentStatus==='clocked_in'?'#10b981':currentStatus==='on_break'?'#fbbf24':'#d1d5db'};`}></div>
-          <span style="font-size:12px;font-weight:600;color:#374151;text-transform:capitalize;">{currentStatus.replace('_',' ')}</span>
-        </div>
-      </div>
-      <div class="card-body">
-        <div style="text-align:center;margin-bottom:12px;">
-          <div id="liveClock" style="font-size:34px;font-weight:800;color:#111;font-family:ui-monospace,monospace;letter-spacing:1px;line-height:1;">--:--:--</div>
-          <div id="liveDate" style="font-size:12px;color:#6b7280;margin-top:3px;"></div>
-        </div>
-        <div id="locChip" style="display:flex;align-items:center;justify-content:center;gap:7px;background:#f3f4f6;border-radius:99px;padding:8px 14px;font-size:12px;color:#6b7280;margin-bottom:14px;">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-          <span id="locText">Locating you…</span>
-        </div>
-        {todayHours > 0 && (
-          <div style="text-align:center;margin-bottom:14px;">
-            <p style="font-size:36px;font-weight:800;color:#111;font-family:monospace;margin:0;">{todayHours}h</p>
-            <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">worked today</p>
-          </div>
-        )}
-
-        <!-- Today's timeline -->
-        {todayEvents.length > 0 && (
-          <div style="margin-bottom:14px;display:flex;flex-direction:column;gap:6px;">
-            {(todayEvents as any[]).map((e: any) => {
-              const colors = { clock_in:'#10b981', clock_out:'#ef4444', break_start:'#fbbf24', break_end:'#10b981' };
-              const labels = { clock_in:'Clocked in', clock_out:'Clocked out', break_start:'Break started', break_end:'Break ended' };
-              const color = colors[e.event_type] || '#6b7280';
-              return (
-                <div style="display:flex;align-items:center;gap:8px;">
-                  <div class="event-dot" style={`background:${color};`}></div>
-                  <span style="font-size:12px;color:#374151;flex:1;">{labels[e.event_type] || e.event_type}</span>
-                  {e.location_name && <span style="font-size:11px;color:#6b7280;">{e.location_name}</span>}
-                  <span id={`ts-${e.id}`} data-ts={new Date(e.event_time).toISOString()} style="font-size:11px;color:#6b7280;font-family:monospace;"></span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        <!-- Clock action buttons -->
-        <div style="display:flex;flex-direction:column;gap:8px;">
-          {currentStatus === 'clocked_out' && (
-            <form method="POST" id="clockForm">
-              <input type="hidden" name="action" value="clock_event"/>
-              <input type="hidden" name="event_type" value="clock_in"/>
-              <input type="hidden" name="lat" id="lat_in"/>
-              <input type="hidden" name="lon" id="lon_in"/>
-              <input type="hidden" name="accuracy" id="acc_in"/>
-              <input type="hidden" name="location_name" id="loc_in"/>
-              <div style="display:flex;gap-8px;margin-bottom:8px;">
-                <select name="work_mode" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;">
-                  <option value="remote">Remote</option>
-                  <option value="office">Office</option>
-                  <option value="hybrid">Hybrid</option>
-                  <option value="field">Field</option>
-                </select>
-              </div>
-              <button type="button" class="clock-btn" style="background:#10b981;color:#fff;" onclick="submitClock('clockForm')">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-                Clock In
-              </button>
-            </form>
-          )}
-          {currentStatus === 'clocked_in' && (
-            <div style="display:flex;flex-direction:column;gap:10px;">
-              <form method="POST" id="outForm">
-                <input type="hidden" name="action" value="clock_event"/>
-                <input type="hidden" name="event_type" value="clock_out"/>
-                <input type="hidden" name="lat"/><input type="hidden" name="lon"/>
-                <input type="hidden" name="accuracy"/><input type="hidden" name="location_name"/>
-                <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:5px;">Wrapping up — what did you get done?</label>
-                <input name="task" placeholder="e.g. Finished the signup form; fixed 2 bugs" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;"/>
-                <div style="display:flex;gap:8px;margin-top:8px;align-items:center;">
-                  <select name="task_status" style="flex:1;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 10px;font-size:13px;outline:none;">
-                    <option value="done">Completed</option><option value="pending">In progress</option><option value="blocked">Blocked</option>
-                  </select>
-                  <div style="flex:1;display:flex;align-items:center;gap:8px;">
-                    <input type="range" name="task_percent" min="0" max="100" step="5" value="100" oninput="document.getElementById('pctOut').textContent=this.value" style="flex:1;accent-color:#FF4F00;"/>
-                    <span style="font-size:12px;font-weight:700;color:#FF4F00;font-family:monospace;min-width:38px;text-align:right;"><span id="pctOut">100</span>%</span>
-                  </div>
-                </div>
-                <input name="task_details" placeholder="Details / handover (optional)" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-top:8px;"/>
-                <button type="button" class="clock-btn" style="background:#ef4444;color:#fff;margin-top:10px;" onclick="submitClock('outForm')">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-                  Clock Out
-                </button>
-              </form>
-              <form method="POST" id="breakForm">
-                <input type="hidden" name="action" value="clock_event"/>
-                <input type="hidden" name="event_type" value="break_start"/>
-                <input type="hidden" name="lat"/><input type="hidden" name="lon"/>
-                <input type="hidden" name="accuracy"/><input type="hidden" name="location_name"/>
-                <button type="button" class="clock-btn" style="background:transparent;border:1px solid #e5e7eb;color:#374151;" onclick="submitClock('breakForm')">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 8h1a4 4 0 0 1 0 8h-1"/><path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"/><line x1="6" y1="1" x2="6" y2="4"/><line x1="10" y1="1" x2="10" y2="4"/><line x1="14" y1="1" x2="14" y2="4"/></svg>
-                  Take a break
-                </button>
-              </form>
-            </div>
-          )}
-          {currentStatus === 'on_break' && (
-            <form method="POST" id="resumeForm">
-              <input type="hidden" name="action" value="clock_event"/>
-              <input type="hidden" name="event_type" value="break_end"/>
-              <input type="hidden" name="lat"/><input type="hidden" name="lon"/>
-              <input type="hidden" name="accuracy"/><input type="hidden" name="location_name"/>
-              <button type="button" class="clock-btn" style="background:#10b981;color:#fff;" onclick="submitClock('resumeForm')">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                Resume Work
-              </button>
-            </form>
-          )}
-        </div>
-      </div>
-    </div>
-
-    <!-- My tasks -->
-    {/* Placed after attendance because this is where the day's work already lives, and before the
-        clock-out summaries below, which are a different thing entirely: those are what this person
-        typed at the end of a session, this is what is outstanding. Rendered only when
-        src/lib/employee-tasks.ts actually loaded — an empty shell would read as "you have no
-        tasks", which is a claim, not an absence. */}
-    {tasksReady && (
-      <div class="card">
-        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-          <p style="font-size:13px;font-weight:700;color:#111;margin:0;">My tasks</p>
-          {/* No count when the read failed: "0 open" is the same false claim as the empty state,
-              just smaller and easier to believe. */}
-          {!tasksFailed && <span style="font-size:12px;font-weight:700;color:#FF4F00;">{openTasks.length} open</span>}
-        </div>
-        <div class="card-body">
-          {taskMeta && <p style="font-size:11.5px;color:#6b7280;margin:0 0 10px;">{taskMeta}</p>}
-          {/* Two different empty states, because they are two different facts. "Nothing on your list"
-              is a statement about your work; it must never be printed when the truth is that the read
-              failed and this page does not know. */}
-          {tasksFailed && (
-            <p style="font-size:12.5px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:9px 11px;margin:0;line-height:1.5;">Your task list could not be loaded just now, so this is not a list of your work. Nothing has been lost. Reload in a moment, and tell HR if it keeps happening.</p>
-          )}
-          {!tasksFailed && openTasks.length === 0 && (
-            <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">Nothing on your list right now. Anything assigned to you will appear here, with whatever date it is wanted by.</p>
-          )}
-          {openTasks.length > 0 && (
-            <div style="display:flex;flex-direction:column;gap:14px;">
-              {(openTasks as any[]).map((t: any) => {
-                // Bare object literals inside the map, matching the timeline above. Nothing here is
-                // red — not urgent, not overdue. A date that has passed is information, and
-                // colouring it like an emergency on somebody's own HR page is a way of shouting at
-                // them about work they very likely already know is late. `normal` is the default
-                // priority and gets no chip at all: a badge on every row labels nothing.
-                const prioText = { urgent:'#9a3412', high:'#b45309', low:'#9ca3af' };
-                const prioBg = { urgent:'rgba(154,49,18,0.10)', high:'rgba(180,83,9,0.10)', low:'#f9fafb' };
-                const dueToday = !!t.due && t.due === todayIso;
-                const dueColor = t.overdue ? '#b45309' : dueToday ? '#FF4F00' : '#6b7280';
-                const dueText = !t.due ? '' : t.overdue ? 'Was due ' + dayLabel(t.due) : dueToday ? 'Due today' : 'Due ' + dayLabel(t.due);
-                return (
-                  <div style="border-bottom:1px solid #f0f0f0;padding-bottom:14px;">
-                    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;">
-                      <span style="font-size:13px;font-weight:600;color:#111;flex:1;min-width:140px;line-height:1.4;">{t.title}</span>
-                      {t.priority !== 'normal' && (
-                        <span style={`font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 8px;border-radius:99px;color:${prioText[t.priority] || '#6b7280'};background:${prioBg[t.priority] || '#f3f4f6'};`}>{t.priority}</span>
-                      )}
-                    </div>
-                    {t.detail && <p style="font-size:12px;color:#6b7280;margin:3px 0 0;line-height:1.5;">{t.detail}</p>}
-                    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;margin-top:4px;">
-                      {dueText && <span style={`font-size:11.5px;font-weight:600;color:${dueColor};`}>{dueText}</span>}
-                      {t.from && <span style="font-size:11.5px;color:#9ca3af;">from {t.from}</span>}
-                    </div>
-                    {t.status === 'blocked' && t.blockedReason && (
-                      <p style="font-size:11.5px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:7px 9px;margin:6px 0 0;line-height:1.45;">Blocked: {t.blockedReason}</p>
-                    )}
-                    {/* Plain form POST to this same page, no JS involved: the select and the button
-                        are the whole control. The reason field is always present rather than
-                        revealed on change, because revealing it would need a script and, without
-                        one, choosing Blocked would be a control that refuses every time — the
-                        library requires a stated cause before it will accept that status. */}
-                    <form method="POST" style="margin-top:8px;">
-                      <input type="hidden" name="action" value="task_status"/>
-                      <input type="hidden" name="task_id" value={t.id}/>
-                      <div style="display:flex;gap:6px;align-items:center;">
-                        <select name="status" aria-label="Status of this task" style="flex:1;min-width:0;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 10px;font-size:12.5px;outline:none;">
-                          <option value="open" selected={t.status === 'open'}>Not started</option>
-                          <option value="in_progress" selected={t.status === 'in_progress'}>In progress</option>
-                          <option value="blocked" selected={t.status === 'blocked'}>Blocked</option>
-                          <option value="done" selected={t.status === 'done'}>Done</option>
-                        </select>
-                        <button type="submit" style="background:#111;color:#fff;border:none;font-size:12.5px;font-weight:600;padding:10px 14px;border-radius:8px;cursor:pointer;flex-shrink:0;">Update</button>
+              {openTasks.length > 0 && (
+                <div style="display:flex;flex-direction:column;gap:14px;">
+                  {(openTasks as any[]).map((t: any) => {
+                    // Bare object literals inside the map: a typed map in .astro JSX does not compile.
+                    // Nothing here is red — not urgent, not overdue. A date that has passed is
+                    // information, and colouring it like an emergency on somebody's own HR page is a
+                    // way of shouting at them about work they very likely already know is late.
+                    // `normal` is the default priority and gets no chip at all.
+                    const prioText = { urgent:'#9a3412', high:'#b45309', low:'#9ca3af' };
+                    const prioBg = { urgent:'rgba(154,49,18,0.10)', high:'rgba(180,83,9,0.10)', low:'#f9fafb' };
+                    const dueToday = !!t.due && t.due === todayIso;
+                    const dueColor = t.overdue ? '#b45309' : dueToday ? '#FF4F00' : '#6b7280';
+                    const dueText = !t.due ? '' : t.overdue ? 'Was due ' + dayLabel(t.due) : dueToday ? 'Due today' : 'Due ' + dayLabel(t.due);
+                    return (
+                      <div style="border-bottom:1px solid #f0f0f0;padding-bottom:14px;">
+                        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;">
+                          <span style="font-size:13px;font-weight:600;color:#111;flex:1;min-width:140px;line-height:1.4;">{t.title}</span>
+                          {t.priority !== 'normal' && (
+                            <span style={`font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 8px;border-radius:99px;color:${prioText[t.priority] || '#6b7280'};background:${prioBg[t.priority] || '#f3f4f6'};`}>{t.priority}</span>
+                          )}
+                        </div>
+                        {t.detail && <p style="font-size:12px;color:#6b7280;margin:3px 0 0;line-height:1.5;">{t.detail}</p>}
+                        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;margin-top:4px;">
+                          {dueText && <span style={`font-size:11.5px;font-weight:600;color:${dueColor};`}>{dueText}</span>}
+                          {t.from && <span style="font-size:11.5px;color:#9ca3af;">from {t.from}</span>}
+                        </div>
+                        {t.status === 'blocked' && t.blockedReason && (
+                          <p style="font-size:11.5px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:7px 9px;margin:6px 0 0;line-height:1.45;">Blocked: {t.blockedReason}</p>
+                        )}
+                        {/* Plain form POST to this same page, no JS involved: the select and the
+                            button are the whole control. The reason field is always present rather
+                            than revealed on change, because revealing it would need a script and,
+                            without one, choosing Blocked would be a control that refuses every time —
+                            the library requires a stated cause before it will accept that status. */}
+                        <form method="POST" style="margin-top:8px;">
+                          <input type="hidden" name="action" value="task_status"/>
+                          <input type="hidden" name="task_id" value={t.id}/>
+                          <div style="display:flex;gap:6px;align-items:center;">
+                            <select name="status" aria-label="Status of this task" style="flex:1;min-width:0;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 10px;font-size:12.5px;outline:none;">
+                              <option value="open" selected={t.status === 'open'}>Not started</option>
+                              <option value="in_progress" selected={t.status === 'in_progress'}>In progress</option>
+                              <option value="blocked" selected={t.status === 'blocked'}>Blocked</option>
+                              <option value="done" selected={t.status === 'done'}>Done</option>
+                            </select>
+                            <button type="submit" style="background:#111;color:#fff;border:none;font-size:12.5px;font-weight:600;padding:10px 14px;border-radius:8px;cursor:pointer;flex-shrink:0;">Update</button>
+                          </div>
+                          <input name="blocked_reason" aria-label="If blocked, what is blocking it" placeholder="If blocked, what is blocking it?" value={t.blockedReason} maxlength="2000" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:12px;outline:none;margin-top:6px;"/>
+                        </form>
                       </div>
-                      <input name="blocked_reason" aria-label="If blocked, what is blocking it" placeholder="If blocked, what is blocking it?" value={t.blockedReason} maxlength="2000" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:12px;outline:none;margin-top:6px;"/>
-                    </form>
-                  </div>
-                );
-              })}
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          )}
-        </div>
-      </div>
-    )}
-
-    {/* MEETINGS — deliberately absent, and this comment is the section.
-        There is no meetings table in this codebase: no `meetings`, no `hr_meetings`, no staff
-        calendar of any kind. The near misses are all something else — `interview_rounds` and
-        `manual_interviews` are CANDIDATE hiring interviews keyed to `applications`, and
-        `aq_study_plan` is a learner's own study block. Rendering an empty "No upcoming meetings"
-        card would be worse than rendering nothing: it states as fact that there are none, when in
-        truth nothing is being read, and someone would miss a meeting trusting it.
-        If this is ever built, mirror aq_study_plan (src/lib/aquintutor-calendar.ts) for the shape
-        and self-bootstrap it with ensureOnce, and the card belongs right here. */}
-    {taskLogs.length > 0 && (
-      <div class="card">
-        <div class="card-header"><p style="font-size:13px;font-weight:700;color:#111;margin:0;">Today's session summaries</p></div>
-        <div class="card-body" style="display:flex;flex-direction:column;gap:8px;">
-          {(taskLogs as any[]).map((t: any) => (
-            <div style="border-bottom:1px solid #f0f0f0;padding-bottom:8px;">
-              <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">
-                <span style="font-size:13px;color:#111;font-weight:600;flex:1;">{t.task}</span>
-                <span style={`font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 8px;border-radius:99px;color:${t.status==='done'?'#059669':t.status==='blocked'?'#dc2626':'#d97706'};background:${t.status==='done'?'rgba(5,150,105,.12)':t.status==='blocked'?'rgba(220,38,38,.12)':'rgba(217,119,6,.12)'};`}>{t.status}</span>
-                <span style="font-size:12px;font-family:monospace;color:#FF4F00;font-weight:700;min-width:38px;text-align:right;">{t.percent}%</span>
-              </div>
-              {t.details && <div style="font-size:12px;color:#6b7280;margin-top:3px;">{t.details}</div>}
-            </div>
-          ))}
-        </div>
-      </div>
-    )}
-
-    <!-- Hourly / time-period tracking -->
-    <div class="card">
-      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Time log (hourly)</p>
-        <span style="font-size:12px;font-weight:700;color:#FF4F00;">{loggedHours}h logged</span>
-      </div>
-      <div class="card-body">
-        <p style="font-size:12px;color:#6b7280;margin:0 0 10px;line-height:1.5;">Log each block of work through the day — from / to and what you did.</p>
-        {(timeLogs as any[]).length > 0 && (
-          <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;">
-            {(timeLogs as any[]).map((l: any) => (
-              <div style="display:flex;align-items:flex-start;gap:8px;background:#f9fafb;border:1px solid #f0f0f0;border-radius:8px;padding:8px 10px;">
-                <span style="font-size:11px;font-weight:700;color:#FF4F00;font-family:monospace;white-space:nowrap;">{l.start_time}-{l.end_time}</span>
-                <span style="font-size:12.5px;color:#374151;flex:1;">{l.task}</span>
-                <span style="font-size:11px;color:#9ca3af;white-space:nowrap;">{l.hours}h</span>
-                <form method="POST" style="margin:0;"><input type="hidden" name="action" value="delete_time_log"/><input type="hidden" name="log_id" value={l.id}/><button type="submit" style="background:none;border:none;color:#ef4444;font-size:11px;cursor:pointer;padding:0;">×</button></form>
-              </div>
-            ))}
           </div>
         )}
-        <form method="POST" style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;">
-          <input type="hidden" name="action" value="add_time_log"/>
-          <div><label style="font-size:10px;color:#6b7280;display:block;">From</label><input name="start_time" type="time" required style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:13px;"/></div>
-          <div><label style="font-size:10px;color:#6b7280;display:block;">To</label><input name="end_time" type="time" required style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:13px;"/></div>
-          <div style="flex:1;min-width:140px;"><label style="font-size:10px;color:#6b7280;display:block;">What did you do?</label><input name="task" required placeholder="e.g. Built the signup form" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:13px;"/></div>
-          <button type="submit" style="background:#111;color:#fff;border:none;font-size:13px;font-weight:600;padding:9px 16px;border-radius:8px;cursor:pointer;">Add</button>
-        </form>
-      </div>
-    </div>
 
-    <!-- Daily work report -->
-    <div class="card">
-      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Today's work report</p>
-        {todayReport && <span style="font-size:11px;font-weight:600;color:#10b981;">submitted</span>}
-      </div>
-      <div class="card-body">
-        <p style="font-size:12px;color:#6b7280;margin:0 0 10px;line-height:1.5;">A short written report of what you did today is part of your attendance. {todayReport ? 'You can edit and resubmit.' : ''}</p>
-        <form method="POST">
-          <input type="hidden" name="action" value="daily_report" />
-          <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">What did you do today? *</label>
-          <textarea name="work_done" required rows="3" placeholder="Tasks completed, work done..." style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;resize:vertical;">{todayReport ? todayReport.work_done : ''}</textarea>
-          <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Progress / what's next</label>
-          <textarea name="progress" rows="2" placeholder="Progress on ongoing work, plan for tomorrow..." style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;resize:vertical;">{todayReport && todayReport.progress ? todayReport.progress : ''}</textarea>
-          <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Blockers (optional)</label>
-          <input name="blockers" placeholder="Anything blocking you?" value={todayReport && todayReport.blockers ? todayReport.blockers : ''} style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:10px;" />
-          <button type="submit" style="width:100%;background:#FF4F00;color:#fff;border:none;font-size:14px;font-weight:700;padding:12px;border-radius:10px;cursor:pointer;">{todayReport ? 'Update report' : 'Submit report'}</button>
-        </form>
-      </div>
-    </div>
+        {/* THE CLOCK. One widget, two pieces of screen: the strip that STATES where the day stands,
+            and the card that CHANGES it. They are not duplicated — the forms live in the card only,
+            because they are driven by ids (submitClock('clockForm')) and a second copy would give two
+            elements the same id and break the punch that already works. The strip's link jumps to the
+            card, which is now directly beneath it. */}
+        {slot === 'clock.today' && (
+          <Fragment>
+            <section class="cc-today" aria-label="Where your day stands">
+              <div class="cc-now" data-wf-tone={clockTone}>
+                <span class="cc-now__dot" aria-hidden="true"></span>
+                <p class="cc-now__label">{clockLabel}</p>
+                {showTodayHours && <span class="cc-now__hours wf-num">{todayHours}h</span>}
+                {showTodayHours && (
+                  <p class="cc-now__sub">On the clock since your first punch today. Breaks are recorded, but they are not deducted from this figure.</p>
+                )}
+                {clockReadFailed && (
+                  <p class="cc-now__sub">This is not a statement that you are clocked out — the read itself failed. Open attendance to see where you actually stand.</p>
+                )}
+              </div>
 
-    <!-- Payslips -->
-    <div class="card">
-      <div class="card-header">
-        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Payslips</p>
-      </div>
-      <div class="card-body" style="padding:0;">
-        {payslips.length === 0 && <p style="font-size:13px;color:#6b7280;text-align:center;padding:24px;">No payslips yet.</p>}
-        {(payslips as any[]).map((ps: any) => (
-          <div class="payslip-row" style="padding:12px 16px;">
-            <div>
-              <p style="font-size:14px;font-weight:600;color:#111;margin:0;">{MONTHS[(ps.month||1)-1]} {ps.year}</p>
-              <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">Net: {ps.currency||'INR'} {Number(ps.net_salary||0).toLocaleString()}</p>
+              {currentTask && (
+                <a class="cc-task wf-focusable" href={'/portal/tasks/' + currentTask.id}>
+                  <StatusBadge status="in_progress" size="sm" glyphOnly />
+                  <span class="cc-task__body">
+                    <span class="cc-task__eyebrow">In progress right now</span>
+                    <span class="cc-task__title">{currentTask.title}</span>
+                  </span>
+                  <svg class="cc-row__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+                </a>
+              )}
+
+              <a class="cc-cta wf-focusable" href="#attendance">
+                {clockCta}
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+              </a>
+            </section>
+
+            <div class="card" id="attendance">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+                <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Attendance Today</p>
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <div class="status-dot" style={`background:${currentStatus==='clocked_in'?'#10b981':currentStatus==='on_break'?'#fbbf24':'#d1d5db'};`}></div>
+                  <span style="font-size:12px;font-weight:600;color:#374151;text-transform:capitalize;">{currentStatus.replace('_',' ')}</span>
+                </div>
+              </div>
+              <div class="card-body">
+                <div style="text-align:center;margin-bottom:12px;">
+                  <div id="liveClock" style="font-size:34px;font-weight:800;color:#111;font-family:ui-monospace,monospace;letter-spacing:1px;line-height:1;">--:--:--</div>
+                  <div id="liveDate" style="font-size:12px;color:#6b7280;margin-top:3px;"></div>
+                </div>
+                <div id="locChip" style="display:flex;align-items:center;justify-content:center;gap:7px;background:#f3f4f6;border-radius:99px;padding:8px 14px;font-size:12px;color:#6b7280;margin-bottom:14px;">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+                  <span id="locText">Locating you…</span>
+                </div>
+                {todayHours > 0 && (
+                  <div style="text-align:center;margin-bottom:14px;">
+                    <p style="font-size:36px;font-weight:800;color:#111;font-family:monospace;margin:0;">{todayHours}h</p>
+                    <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">worked today</p>
+                  </div>
+                )}
+
+                {todayEvents.length > 0 && (
+                  <div style="margin-bottom:14px;display:flex;flex-direction:column;gap:6px;">
+                    {(todayEvents as any[]).map((e: any) => {
+                      const colors = { clock_in:'#10b981', clock_out:'#ef4444', break_start:'#fbbf24', break_end:'#10b981' };
+                      const labels = { clock_in:'Clocked in', clock_out:'Clocked out', break_start:'Break started', break_end:'Break ended' };
+                      const color = colors[e.event_type] || '#6b7280';
+                      return (
+                        <div style="display:flex;align-items:center;gap:8px;">
+                          <div class="event-dot" style={`background:${color};`}></div>
+                          <span style="font-size:12px;color:#374151;flex:1;">{labels[e.event_type] || e.event_type}</span>
+                          {e.location_name && <span style="font-size:11px;color:#6b7280;">{e.location_name}</span>}
+                          <span id={`ts-${e.id}`} data-ts={new Date(e.event_time).toISOString()} style="font-size:11px;color:#6b7280;font-family:monospace;"></span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div style="display:flex;flex-direction:column;gap:8px;">
+                  {currentStatus === 'clocked_out' && (
+                    <form method="POST" id="clockForm">
+                      <input type="hidden" name="action" value="clock_event"/>
+                      <input type="hidden" name="event_type" value="clock_in"/>
+                      <input type="hidden" name="lat" id="lat_in"/>
+                      <input type="hidden" name="lon" id="lon_in"/>
+                      <input type="hidden" name="accuracy" id="acc_in"/>
+                      <input type="hidden" name="location_name" id="loc_in"/>
+                      <div style="display:flex;gap-8px;margin-bottom:8px;">
+                        <select name="work_mode" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;">
+                          <option value="remote">Remote</option>
+                          <option value="office">Office</option>
+                          <option value="hybrid">Hybrid</option>
+                          <option value="field">Field</option>
+                        </select>
+                      </div>
+                      <button type="button" class="clock-btn" style="background:#10b981;color:#fff;" onclick="submitClock('clockForm')">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        Clock In
+                      </button>
+                    </form>
+                  )}
+                  {currentStatus === 'clocked_in' && (
+                    <div style="display:flex;flex-direction:column;gap:10px;">
+                      <form method="POST" id="outForm">
+                        <input type="hidden" name="action" value="clock_event"/>
+                        <input type="hidden" name="event_type" value="clock_out"/>
+                        <input type="hidden" name="lat"/><input type="hidden" name="lon"/>
+                        <input type="hidden" name="accuracy"/><input type="hidden" name="location_name"/>
+                        <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:5px;">Wrapping up — what did you get done?</label>
+                        <input name="task" placeholder="e.g. Finished the signup form; fixed 2 bugs" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;"/>
+                        <div style="display:flex;gap:8px;margin-top:8px;align-items:center;">
+                          <select name="task_status" style="flex:1;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 10px;font-size:13px;outline:none;">
+                            <option value="done">Completed</option><option value="pending">In progress</option><option value="blocked">Blocked</option>
+                          </select>
+                          <div style="flex:1;display:flex;align-items:center;gap:8px;">
+                            <input type="range" name="task_percent" min="0" max="100" step="5" value="100" oninput="document.getElementById('pctOut').textContent=this.value" style="flex:1;accent-color:#FF4F00;"/>
+                            <span style="font-size:12px;font-weight:700;color:#FF4F00;font-family:monospace;min-width:38px;text-align:right;"><span id="pctOut">100</span>%</span>
+                          </div>
+                        </div>
+                        <input name="task_details" placeholder="Details / handover (optional)" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-top:8px;"/>
+                        <button type="button" class="clock-btn" style="background:#ef4444;color:#fff;margin-top:10px;" onclick="submitClock('outForm')">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+                          Clock Out
+                        </button>
+                      </form>
+                      <form method="POST" id="breakForm">
+                        <input type="hidden" name="action" value="clock_event"/>
+                        <input type="hidden" name="event_type" value="break_start"/>
+                        <input type="hidden" name="lat"/><input type="hidden" name="lon"/>
+                        <input type="hidden" name="accuracy"/><input type="hidden" name="location_name"/>
+                        <button type="button" class="clock-btn" style="background:transparent;border:1px solid #e5e7eb;color:#374151;" onclick="submitClock('breakForm')">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 8h1a4 4 0 0 1 0 8h-1"/><path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"/><line x1="6" y1="1" x2="6" y2="4"/><line x1="10" y1="1" x2="10" y2="4"/><line x1="14" y1="1" x2="14" y2="4"/></svg>
+                          Take a break
+                        </button>
+                      </form>
+                    </div>
+                  )}
+                  {currentStatus === 'on_break' && (
+                    <form method="POST" id="resumeForm">
+                      <input type="hidden" name="action" value="clock_event"/>
+                      <input type="hidden" name="event_type" value="break_end"/>
+                      <input type="hidden" name="lat"/><input type="hidden" name="lon"/>
+                      <input type="hidden" name="accuracy"/><input type="hidden" name="location_name"/>
+                      <button type="button" class="clock-btn" style="background:#10b981;color:#fff;" onclick="submitClock('resumeForm')">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                        Resume Work
+                      </button>
+                    </form>
+                  )}
+                </div>
+              </div>
             </div>
-            <a href={`/portal/payslip/${ps.id}`} target="_blank" style="background:#111;color:#fff;text-decoration:none;font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;display:flex;align-items:center;gap:5px;">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Download
-            </a>
-          </div>
-        ))}
-      </div>
-    </div>
+          </Fragment>
+        )}
 
-    <!-- Chat -->
-    {/* A link-out, near the bottom, so it cannot push attendance below the fold. Counts only: the
-        messages themselves are end-to-end encrypted and the key never leaves the browser, so there
-        is nothing here that could show content even if it wanted to. Saying that plainly matters —
-        someone who believes a server can read their messages behaves differently in them. */}
+        {/* Hourly / time-period tracking */}
+        {slot === 'timelog.today' && (
+          <div class="card">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+              <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Time log (hourly)</p>
+              <span style="font-size:12px;font-weight:700;color:#FF4F00;">{loggedHours}h logged</span>
+            </div>
+            <div class="card-body">
+              <p style="font-size:12px;color:#6b7280;margin:0 0 10px;line-height:1.5;">Log each block of work through the day — from / to and what you did.</p>
+              {(timeLogs as any[]).length > 0 && (
+                <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;">
+                  {(timeLogs as any[]).map((l: any) => (
+                    <div style="display:flex;align-items:flex-start;gap:8px;background:#f9fafb;border:1px solid #f0f0f0;border-radius:8px;padding:8px 10px;">
+                      <span style="font-size:11px;font-weight:700;color:#FF4F00;font-family:monospace;white-space:nowrap;">{l.start_time}-{l.end_time}</span>
+                      <span style="font-size:12.5px;color:#374151;flex:1;">{l.task}</span>
+                      <span style="font-size:11px;color:#9ca3af;white-space:nowrap;">{l.hours}h</span>
+                      <form method="POST" style="margin:0;"><input type="hidden" name="action" value="delete_time_log"/><input type="hidden" name="log_id" value={l.id}/><button type="submit" style="background:none;border:none;color:#ef4444;font-size:11px;cursor:pointer;padding:0;">×</button></form>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <form method="POST" style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;">
+                <input type="hidden" name="action" value="add_time_log"/>
+                <div><label style="font-size:10px;color:#6b7280;display:block;">From</label><input name="start_time" type="time" required style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:13px;"/></div>
+                <div><label style="font-size:10px;color:#6b7280;display:block;">To</label><input name="end_time" type="time" required style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:13px;"/></div>
+                <div style="flex:1;min-width:140px;"><label style="font-size:10px;color:#6b7280;display:block;">What did you do?</label><input name="task" required placeholder="e.g. Built the signup form" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:13px;"/></div>
+                <button type="submit" style="background:#111;color:#fff;border:none;font-size:13px;font-weight:600;padding:9px 16px;border-radius:8px;cursor:pointer;">Add</button>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* Daily work report */}
+        {slot === 'dailyreport.today' && (
+          <div class="card">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+              <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Today's work report</p>
+              {todayReport && <span style="font-size:11px;font-weight:600;color:#10b981;">submitted</span>}
+            </div>
+            <div class="card-body">
+              <p style="font-size:12px;color:#6b7280;margin:0 0 10px;line-height:1.5;">A short written report of what you did today is part of your attendance. {todayReport ? 'You can edit and resubmit.' : ''}</p>
+              <form method="POST">
+                <input type="hidden" name="action" value="daily_report" />
+                <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">What did you do today? *</label>
+                <textarea name="work_done" required rows="3" placeholder="Tasks completed, work done..." style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;resize:vertical;">{todayReport ? todayReport.work_done : ''}</textarea>
+                <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Progress / what's next</label>
+                <textarea name="progress" rows="2" placeholder="Progress on ongoing work, plan for tomorrow..." style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;resize:vertical;">{todayReport && todayReport.progress ? todayReport.progress : ''}</textarea>
+                <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Blockers (optional)</label>
+                <input name="blockers" placeholder="Anything blocking you?" value={todayReport && todayReport.blockers ? todayReport.blockers : ''} style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:10px;" />
+                <button type="submit" style="width:100%;background:#FF4F00;color:#fff;border:none;font-size:14px;font-weight:700;padding:12px;border-radius:10px;cursor:pointer;">{todayReport ? 'Update report' : 'Submit report'}</button>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* What was typed at clock-out. hideWhenEmpty in the registry, and honoured: an empty card
+            here would imply somebody read it, and this table has no admin reader at all. */}
+        {slot === 'worklog.today' && taskLogs.length > 0 && (
+          <div class="card">
+            <div class="card-header"><p style="font-size:13px;font-weight:700;color:#111;margin:0;">Today's session summaries</p></div>
+            <div class="card-body" style="display:flex;flex-direction:column;gap:8px;">
+              {(taskLogs as any[]).map((t: any) => (
+                <div style="border-bottom:1px solid #f0f0f0;padding-bottom:8px;">
+                  <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">
+                    <span style="font-size:13px;color:#111;font-weight:600;flex:1;">{t.task}</span>
+                    <span style={`font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 8px;border-radius:99px;color:${t.status==='done'?'#059669':t.status==='blocked'?'#dc2626':'#d97706'};background:${t.status==='done'?'rgba(5,150,105,.12)':t.status==='blocked'?'rgba(220,38,38,.12)':'rgba(217,119,6,.12)'};`}>{t.status}</span>
+                    <span style="font-size:12px;font-family:monospace;color:#FF4F00;font-weight:700;min-width:38px;text-align:right;">{t.percent}%</span>
+                  </div>
+                  {t.details && <div style="font-size:12px;color:#6b7280;margin-top:3px;">{t.details}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* My leave — a door. Its own widget, so it stands on its own rather than being glued into a
+            hand-made two-up grid with the wallet: the composer may hand this person one, both or
+            neither, and a grid that assumed both would render a hole. */}
+        {slot === 'leave.mine' && (
+          <a class="door door--rust" href="/portal/employee/leave">
+            <span class="door__mark" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+            </span>
+            <span class="door__body">
+              <span class="door__title">My leave</span>
+              <span class="door__note">Balance &amp; requests</span>
+            </span>
+            <svg class="door__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+          </a>
+        )}
+
+        {/* CREDIT POSITION — AN INTERNSHIP WIDGET, AND THE ONE THIS WHOLE EXERCISE IS ABOUT.
+            It is on this screen because the composer resolved an internship engagement AND a
+            recorded credit-hour requirement. Nobody else reaches this slot at all: there is no test
+            on this page to get wrong, and no founder is measured against a target they never agreed
+            to. Every figure is computed from recorded attendance and approved leave by the same
+            engine that produces the completion letter, so this and the letter agree. */}
+        {slot === 'credit.position' && credit && (
+          <div class="card">
+            <div class="card-body">
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;">
+                <p style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;color:#6b7280;font-weight:700;">Your credit</p>
+                {weeksLeft !== null && weeksLeft > 0 && (
+                  <p style="font-size:11px;color:#6b7280;">~{weeksLeft} week{weeksLeft === 1 ? '' : 's'} to go</p>
+                )}
+              </div>
+
+              <div style="display:flex;align-items:baseline;gap:6px;margin-top:6px;">
+                <span style="font-size:34px;font-weight:800;color:#0f0f14;line-height:1;">{credit.creditHours}</span>
+                <span style="font-size:13px;color:#6b7280;">
+                  {credit.requiredCreditHours ? 'of ' + credit.requiredCreditHours + ' credit-hours' : 'credit-hours'}
+                </span>
+              </div>
+
+              {creditPct !== null && (
+                <div style="margin-top:10px;">
+                  <div style="height:8px;background:#eef0f3;border-radius:100px;overflow:hidden;">
+                    <div style={`height:100%;width:${creditPct}%;background:${creditPct >= 100 ? '#16a34a' : '#FF4F00'};border-radius:100px;`}></div>
+                  </div>
+                  <p style="font-size:11.5px;color:#6b7280;margin-top:5px;">
+                    {creditPct >= 100 ? 'Requirement met.' : creditPct + '% of the requirement'}
+                  </p>
+                </div>
+              )}
+
+              <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px;">
+                <div>
+                  <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#9ca3af;font-weight:700;">Attendance</p>
+                  <p style={`font-size:17px;font-weight:700;margin-top:2px;color:${credit.attendancePct >= 85 ? '#16a34a' : credit.attendancePct >= 70 ? '#b45309' : '#b91c1c'};`}>{credit.attendancePct}%</p>
+                </div>
+                <div>
+                  <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#9ca3af;font-weight:700;">Days in</p>
+                  <p style="font-size:17px;font-weight:700;margin-top:2px;color:#0f0f14;">{credit.daysPresent}</p>
+                </div>
+                <div>
+                  <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#9ca3af;font-weight:700;">Leave</p>
+                  <p style="font-size:17px;font-weight:700;margin-top:2px;color:#0f0f14;">{credit.authorisedLeaveDays}</p>
+                </div>
+              </div>
+
+              {/* Surfaced plainly rather than buried: these are the two things that cost someone their
+                  certificate, and finding out at the end would be too late to act on. */}
+              {(credit.unauthorisedLeaveDays > 0 || credit.noticeBreaches > 0) && (
+                <div style="margin-top:12px;padding:10px 12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;">
+                  {credit.unauthorisedLeaveDays > 0 && (
+                    <p style="font-size:12px;color:#9a3412;line-height:1.5;">
+                      <strong>{credit.unauthorisedLeaveDays} day{credit.unauthorisedLeaveDays === 1 ? '' : 's'}</strong> recorded as absent without approved leave.
+                    </p>
+                  )}
+                  {credit.noticeBreaches > 0 && (
+                    <p style="font-size:12px;color:#9a3412;line-height:1.5;margin-top:4px;">
+                      <strong>{credit.noticeBreaches}</strong> leave{credit.noticeBreaches === 1 ? '' : 's'} taken without notice beforehand.
+                    </p>
+                  )}
+                  <p style="font-size:11.5px;color:#9a3412;margin-top:6px;">
+                    Both appear on your completion report. Apply for leave before you take it.
+                  </p>
+                </div>
+              )}
+
+              {creditTerms?.kind === 'part-time' && !creditTerms?.weeklyHours && (
+                <p style="font-size:11.5px;color:#b45309;margin-top:10px;line-height:1.5;">
+                  Your agreed part-time hours are not recorded yet, so credit cannot be calculated. Ask HR to set them.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* My wallet — a door. */}
+        {slot === 'wallet.balance' && (
+          <a class="door door--ink" href="/portal/employee/wallet">
+            <span class="door__mark" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12V8H6a2 2 0 0 1-2-2c0-1.1.9-2 2-2h12v4"/><path d="M4 6v12c0 1.1.9 2 2 2h14v-4"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/></svg>
+            </span>
+            <span class="door__body">
+              <span class="door__title">My wallet</span>
+              <span class="door__note">Salary &amp; withdrawals</span>
+            </span>
+            <svg class="door__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+          </a>
+        )}
+
+        {/* Payslips. hideWhenEmpty, and honoured: a card that says "no payslips yet" on the screen of
+            somebody who is not on payroll is a fact about a different job. */}
+        {slot === 'payslips.mine' && payslips.length > 0 && (
+          <div class="card">
+            <div class="card-header">
+              <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Payslips</p>
+            </div>
+            <div class="card-body" style="padding:0;">
+              {(payslips as any[]).map((ps: any) => (
+                <div class="payslip-row" style="padding:12px 16px;">
+                  <div>
+                    <p style="font-size:14px;font-weight:600;color:#111;margin:0;">{MONTHS[(ps.month||1)-1]} {ps.year}</p>
+                    <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">Net: {ps.currency||'INR'} {Number(ps.net_salary||0).toLocaleString()}</p>
+                  </div>
+                  <a href={`/portal/payslip/${ps.id}`} target="_blank" style="background:#111;color:#fff;text-decoration:none;font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;display:flex;align-items:center;gap:5px;">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    Download
+                  </a>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* MY TEAM LEADER. This is the person whose name someone needs before they can chase
+            anything: the recorded approver for leave and for wallet withdrawals. The registry marks
+            it hideWhenEmpty and the empty branch is kept anyway, deliberately — an unrecorded
+            reporting manager is not an empty list, it is a MISSING APPROVER, and hiding the card
+            would hide the one sentence that gets it fixed. Falling back to "HR" or to an admin would
+            be worse still: a plausible approver who is not the recorded one sends people to the
+            wrong desk. */}
+        {slot === 'manager.card' && (
+          <div class="card">
+            <div class="card-header">
+              <p style="font-size:13px;font-weight:700;color:#111;margin:0;">My team leader</p>
+            </div>
+            <div class="card-body">
+              {manager ? (
+                <div>
+                  <div style="display:flex;align-items:center;gap:12px;">
+                    <div style="width:40px;height:40px;border-radius:50%;background:#f3f4f6;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#6b7280;flex-shrink:0;">{String(manager.full_name || '?').charAt(0).toUpperCase()}</div>
+                    <div style="min-width:0;">
+                      <p style="font-size:14px;font-weight:600;color:#111;margin:0;">{manager.full_name}</p>
+                      <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">{manager.designation || 'Reporting manager'}</p>
+                    </div>
+                  </div>
+                  <p style="font-size:11.5px;color:#6b7280;margin:10px 0 0;line-height:1.5;">Your leave and wallet requests go to them for approval.</p>
+                </div>
+              ) : (
+                <div>
+                  <p style="font-size:13px;font-weight:600;color:#374151;margin:0 0 4px;">Not assigned yet</p>
+                  <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">Ask HR to set your reporting manager on your employee record. Until it is set there is no named approver for your leave or wallet requests.</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Community. Only the groups this person is entitled to, straight from visibleGroupsFor().
+            Anything else is absent rather than locked: a list of team names someone cannot join is a
+            map of the organisation. No join_url is fetched or rendered anywhere here — the link is a
+            bearer credential and is revealed only by the POST on /portal/team-groups. */}
+        {slot === 'groups.mine' && (
+          <div class="card">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+              <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Community</p>
+              <a href="/portal/team-groups" style="font-size:12px;font-weight:700;color:#FF4F00;text-decoration:none;">Open</a>
+            </div>
+            <div class="card-body">
+              {memberGroups.length === 0 && (
+                <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">You are not in a team group yet. Groups are added when your onboarding is completed — ask HR if that has been done and you still see this.</p>
+              )}
+              {memberGroups.length > 0 && (
+                <div style="display:flex;flex-direction:column;gap:8px;">
+                  {(memberGroups.slice(0, 5) as any[]).map((g: any) => (
+                    <a href="/portal/team-groups" style="display:flex;align-items:center;gap:10px;text-decoration:none;background:#f9fafb;border:1px solid #f0f0f0;border-radius:10px;padding:10px 11px;">
+                      <div style="width:28px;height:28px;border-radius:8px;background:rgba(255,79,0,0.1);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                      </div>
+                      <div style="min-width:0;flex:1;">
+                        <div style="font-size:13px;font-weight:600;color:#111;">{g.name}</div>
+                        <div style="font-size:11px;color:#6b7280;margin-top:1px;">{g.memberCount} member{g.memberCount === 1 ? '' : 's'}{g.hasLink ? ' · chat link inside' : ''}</div>
+                      </div>
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2" style="flex-shrink:0;"><polyline points="9 18 15 12 9 6"/></svg>
+                    </a>
+                  ))}
+                </div>
+              )}
+              {joinableGroups.length > 0 && (
+                <p style="font-size:11.5px;color:#6b7280;margin:10px 0 0;line-height:1.5;">
+                  {joinableGroups.length} group{joinableGroups.length === 1 ? '' : 's'} inside these you can join.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Your record, as it is held. Identity and engagement only — this reads the composed
+            workspace, which selects an explicit column list, so no gender, no government ids, no
+            bank details and no salary are ever in scope on this page. */}
+        {slot === 'profile.me' && (
+          <div class="card">
+            <div class="card-body" style="display:flex;align-items:center;gap:12px;">
+              {/* Profile photo = the picture taken at face-verification (2FA) enrolment. Falls back to the initial. */}
+              {identityPhoto
+                ? <img src={identityPhoto} alt={identityName} width="48" height="48" style="width:48px;height:48px;border-radius:50%;object-fit:cover;flex-shrink:0;border:2px solid rgba(255,79,0,0.25);" />
+                : <div style="width:48px;height:48px;border-radius:50%;background:rgba(255,79,0,0.1);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#FF4F00;flex-shrink:0;">{String(identityName).charAt(0).toUpperCase()}</div>}
+              <div style="min-width:0;">
+                <p style="font-size:15px;font-weight:700;color:#111;margin:0;">{identityName}</p>
+                {identitySub && <p style="font-size:12px;color:#6b7280;margin:2px 0 0;overflow-wrap:anywhere;">{identitySub}</p>}
+              </div>
+            </div>
+          </div>
+        )}
+
+      </Fragment>
+    ))}
+
+    {/* MESSAGES — the Universal Workspace tile, which AUTHORIZATION_FIRST.md gives to every
+        authenticated member, so it needs no eligibility and carries no business data. Counts only:
+        the messages themselves are end-to-end encrypted and the key never leaves the browser, so
+        there is nothing here that could show content even if it wanted to. Saying that plainly
+        matters — someone who believes a server can read their messages behaves differently in them. */}
     <div class="card">
       <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
         <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Chat</p>
@@ -1697,44 +1831,6 @@ const showTodayHours = !clockReadFailed && todayHours > 0;
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
           Open chat
         </a>
-      </div>
-    </div>
-
-    <!-- Community -->
-    {/* Only the groups this person is entitled to, straight from visibleGroupsFor(). Anything else
-        is absent rather than locked: a list of team names someone cannot join is a map of the
-        organisation. No join_url is fetched or rendered anywhere here — the link is a bearer
-        credential and is revealed only by the POST on /portal/team-groups. */}
-    <div class="card">
-      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
-        <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Community</p>
-        <a href="/portal/team-groups" style="font-size:12px;font-weight:700;color:#FF4F00;text-decoration:none;">Open</a>
-      </div>
-      <div class="card-body">
-        {memberGroups.length === 0 && (
-          <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">You are not in a team group yet. Groups are added when your onboarding is completed — ask HR if that has been done and you still see this.</p>
-        )}
-        {memberGroups.length > 0 && (
-          <div style="display:flex;flex-direction:column;gap:8px;">
-            {(memberGroups.slice(0, 5) as any[]).map((g: any) => (
-              <a href="/portal/team-groups" style="display:flex;align-items:center;gap:10px;text-decoration:none;background:#f9fafb;border:1px solid #f0f0f0;border-radius:10px;padding:10px 11px;">
-                <div style="width:28px;height:28px;border-radius:8px;background:rgba(255,79,0,0.1);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FF4F00" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-                </div>
-                <div style="min-width:0;flex:1;">
-                  <div style="font-size:13px;font-weight:600;color:#111;">{g.name}</div>
-                  <div style="font-size:11px;color:#6b7280;margin-top:1px;">{g.memberCount} member{g.memberCount === 1 ? '' : 's'}{g.hasLink ? ' · chat link inside' : ''}</div>
-                </div>
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="2" style="flex-shrink:0;"><polyline points="9 18 15 12 9 6"/></svg>
-              </a>
-            ))}
-          </div>
-        )}
-        {joinableGroups.length > 0 && (
-          <p style="font-size:11.5px;color:#6b7280;margin:10px 0 0;line-height:1.5;">
-            {joinableGroups.length} group{joinableGroups.length === 1 ? '' : 's'} inside these you can join.
-          </p>
-        )}
       </div>
     </div>
 

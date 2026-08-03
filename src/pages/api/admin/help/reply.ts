@@ -3,14 +3,17 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // Writes a reply AS the company to a member of the public, so this is `messages` edit.
+  const denied = await denyAdminApi(locals, { section: 'messages', action: 'edit', label: 'help.reply' });
+  if (denied) return denied;
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
 
   let body: any;
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

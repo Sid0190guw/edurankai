@@ -8,13 +8,18 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { logAudit } from '@/lib/audit';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
+  // Same capability as the gateway refund, deliberately. This one does not call Razorpay, but it
+  // writes the books to say a refund happened — and a payment marked refunded that never was is a
+  // finance record nobody can trust. See refund.ts for why `role !== 'applicant'` was not a gate.
+  const denied = await denyAdminApi(locals, { permission: 'payments.refund', label: 'payments.refund-manual' });
+  if (denied) return denied;
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
 
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }

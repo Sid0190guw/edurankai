@@ -14,6 +14,17 @@ export type Permission =
   // including super_admin and the console redirected everyone away — firms could be charged for a
   // verification that no human could then open and answer.
   | 'offers.view' | 'offers.edit'
+  // Money leaving the company. /api/admin/payments/refund and refund-manual used to be gated by
+  // `user.role !== 'applicant'` — the exact test warned against in canAccessSection() below — on an
+  // endpoint that issues a REAL Razorpay refund. Every internal role passed it, including the
+  // `editor` the 2026 offer-signing promotion handed to every intern, and /api/* is not covered by
+  // the /admin middleware gate, so nothing else stood in front of that URL.
+  //
+  // The refund console itself (/admin/finance) has always been super_admin + hr, so these are
+  // granted to exactly those two: the capability records the policy the product already had, it
+  // does not invent a new one. `payments.refund` is SENSITIVE in registry.ts — granting it to a
+  // custom role must be provably on the record.
+  | 'payments.view' | 'payments.refund'
   | 'audit.view';
 
 // Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
@@ -30,6 +41,7 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'users.view', 'users.edit',
     'settings.view', 'settings.edit',
     'offers.view', 'offers.edit',
+    'payments.view', 'payments.refund',
     'audit.view'
   ],
   hr: [
@@ -39,6 +51,9 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     'events.view', 'events.edit',
     // HR issues the offer letters, so HR answers the verifications that come back against them.
     'offers.view', 'offers.edit',
+    // /admin/finance has been super_admin + hr since it was written; the refund buttons on it are
+    // HR's. Recorded here so the endpoint can ask for the ability instead of for the role name.
+    'payments.view', 'payments.refund',
     'content.view'
   ],
   recruiter: [

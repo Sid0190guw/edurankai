@@ -5,6 +5,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { postMessage } from '@/lib/request-threads';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -12,8 +13,11 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // See thread.ts: no section key exists for this surface, so this is canOpenAdmin — the same gate
+  // /admin/visvambhara-access has, applied to the URL that was reachable without it.
+  const denied = await denyAdminApi(locals, { label: 'visvambhara-access.reply' });
+  if (denied) return denied;
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
   const requestId = (body.requestId || '').toString();

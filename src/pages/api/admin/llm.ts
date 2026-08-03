@@ -7,15 +7,21 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { getConfig, saveConfig, chat, activeModel, ensureLlmSchema } from '@/lib/llm/gateway';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 function mask(k: string): string { return k ? (k.slice(0, 4) + '••••' + k.slice(-4)) : ''; }
-function isSuper(u: any): boolean { return !!u && u.role === 'super_admin'; }
+// `isSuper(u) { return u.role === 'super_admin' }` named a role. `settings.edit` names the ability,
+// and in the compiled matrix super_admin is the only built-in role that holds it — so the set of
+// people who may configure the LLM provider and its keys is unchanged. What it adds is that a
+// custom role can be granted this deliberately, by name, with a strict audit row (settings.edit is
+// flagged sensitive in registry.ts), instead of the answer being unreachable without a deploy.
+const LLM_PERMISSION = 'settings.edit' as const;
 
 export const GET: APIRoute = async ({ url, locals }) => {
-  const user = (locals as any)?.user;
-  if (!isSuper(user)) return j({ error: 'forbidden' }, 403);
+  const denied = await denyAdminApi(locals, { permission: LLM_PERMISSION, label: 'llm.get' });
+  if (denied) return denied;
   await ensureLlmSchema();
 
   if (url.searchParams.get('export') === 'jsonl') {
@@ -40,8 +46,8 @@ export const GET: APIRoute = async ({ url, locals }) => {
 };
 
 export const POST: APIRoute = async ({ request, locals }) => {
-  const user = (locals as any)?.user;
-  if (!isSuper(user)) return j({ error: 'forbidden' }, 403);
+  const denied = await denyAdminApi(locals, { permission: LLM_PERMISSION, label: 'llm.post' });
+  if (denied) return denied;
   let b: any = {};
   try { b = await request.json(); } catch { return j({ error: 'bad json' }, 400); }
 

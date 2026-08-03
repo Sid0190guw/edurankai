@@ -146,6 +146,13 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     description: 'Change an account\'s role, department or active status. Whoever holds this can change who else can do anything.',
     sensitive: true,
   },
+  'payments.view': { label: 'View payments', group: 'Finance', description: 'Open the finance console and read payment records, including payer email addresses and amounts.' },
+  'payments.refund': {
+    label: 'Refund a payment',
+    group: 'Finance',
+    description: 'Send money back to a payer through the payment gateway, or record a refund made outside it. This moves real money and cannot be undone from here.',
+    sensitive: true,
+  },
   'settings.view': { label: 'View settings', group: 'System', description: 'See platform configuration.' },
   'settings.edit': {
     label: 'Edit settings',

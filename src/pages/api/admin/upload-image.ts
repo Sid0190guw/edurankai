@@ -4,6 +4,7 @@
 
 import type { APIRoute } from 'astro';
 import { put } from '@vercel/blob';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -18,8 +19,11 @@ const ALLOWED = [
 function magicMatches(b: Uint8Array, magic: number[][]) { return magic.some((sig) => sig.every((x, i) => b[i] === x)); }
 
 export const POST: APIRoute = async ({ request, locals }) => {
-  const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'Admins only' }, 403);
+  // Writes to the PUBLIC blob store, so the resulting URL is unauthenticated forever. Publishing
+  // an asset is `content` edit — the capability every role that can reach the pages calling this
+  // (events, content) already holds.
+  const denied = await denyAdminApi(locals, { section: 'content', action: 'edit', label: 'upload-image' });
+  if (denied) return denied;
   let form: FormData;
   try { form = await request.formData(); } catch { return json({ ok: false, error: 'Expected form data' }, 400); }
   const file = form.get('file');

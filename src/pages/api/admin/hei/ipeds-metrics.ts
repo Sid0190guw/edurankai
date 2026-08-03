@@ -19,14 +19,15 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { fetchIpedsMetrics } from '@/lib/hei-ipeds';
 
+import { denyAdminApi } from '@/lib/auth/api-guard';
+
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
-function guard(locals: any) {
-  const u = locals?.user;
-  if (!u) return 'sign in required';
-  if (u.role === 'applicant') return 'not permitted';
-  return null;
-}
+// The local `guard(locals)` this replaces returned 'not permitted' only for role === 'applicant',
+// so every other role — including the AquinTutor scopes the middleware keeps out of /admin — could
+// drive the HEI ingesters. `hei_institutions` is the section /admin/hei/crawlers (the only caller)
+// already resolves to in middleware.ts:85, so the URL and the page now answer the same question.
+const HEI_SECTION = 'hei_institutions';
 
 async function ensureCols() {
   await db.execute(sql`ALTER TABLE hei_institutions ADD COLUMN IF NOT EXISTS ipeds_unit_id TEXT`);
@@ -35,7 +36,8 @@ async function ensureCols() {
 }
 
 export const GET: APIRoute = async ({ locals }) => {
-  const bad = guard(locals); if (bad) return j({ ok: false, error: bad }, 403);
+  const denied = await denyAdminApi(locals, { section: HEI_SECTION, action: 'view', label: 'hei.read' });
+  if (denied) return denied;
   try {
     await ensureCols();
     const r = rows(await db.execute(sql`SELECT
@@ -48,7 +50,8 @@ export const GET: APIRoute = async ({ locals }) => {
 };
 
 export const POST: APIRoute = async ({ request, locals }) => {
-  const bad = guard(locals); if (bad) return j({ ok: false, error: bad }, 403);
+  const denied = await denyAdminApi(locals, { section: HEI_SECTION, action: 'edit', label: 'hei.write' });
+  if (denied) return denied;
   let b: any = {};
   try { b = await request.json(); } catch { /* defaults */ }
   const year = parseInt(b.year, 10) || 2023;

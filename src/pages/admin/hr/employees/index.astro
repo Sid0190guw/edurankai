@@ -3,6 +3,7 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql as sqlExpr, eq, ilike, or, desc } from 'drizzle-orm';
 import { pgTable, uuid, varchar, boolean, date, text, decimal, timestamp } from 'drizzle-orm/pg-core';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -35,6 +36,34 @@ try {
   await db.execute(sqlExpr`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
 } catch (_) {}
 
+// Same for the department column, which the add form below now writes and the cards below now read.
+// The ensureOnce key is shared with src/pages/admin/hr/employees/[id].astro on purpose: the DDL is
+// identical and idempotent, so whichever page is opened first pays for it once per server process.
+// VARCHAR(50) matches departments.id in src/lib/db/schema.ts:80, which is a SLUG — never ::uuid.
+await ensureOnce('hr_employees_department_id_v1', async () => {
+  await db.execute(sqlExpr`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS department_id VARCHAR(50)`);
+});
+
+// The department register, read BEFORE the POST handler because the handler validates the submitted
+// department against it. `const` is not hoisted — below the handler, its first line would throw.
+// `id::text` keeps the comparison text-on-text; the ids are slugs like 'engineering'.
+let departmentOptions: any[] = [];
+try {
+  const deptRes = await db.execute(sqlExpr`
+    SELECT id::text AS id, name, is_visible FROM departments ORDER BY sort_order ASC, name ASC LIMIT 300`);
+  departmentOptions = (Array.isArray(deptRes) ? deptRes : ((deptRes as any)?.rows || [])) as any[];
+} catch (e: any) {
+  console.error('[hr-employees] department list:', e?.cause?.message || e?.message);
+  try {
+    const deptAlt = await db.execute(sqlExpr`SELECT id::text AS id, name FROM departments ORDER BY name ASC LIMIT 300`);
+    departmentOptions = (Array.isArray(deptAlt) ? deptAlt : ((deptAlt as any)?.rows || [])) as any[];
+  } catch (e2: any) {
+    console.error('[hr-employees] department list fallback:', e2?.cause?.message || e2?.message);
+    departmentOptions = [];
+  }
+}
+const departmentIds = new Set(departmentOptions.map((d: any) => String(d.id)));
+
 let errorMsg = '';
 let successMsg = '';
 
@@ -53,9 +82,18 @@ if (Astro.request.method === 'POST') {
       const joiningDate = (fd.get('joiningDate') as string || '').trim();
       const baseSalary = (fd.get('baseSalary') as string || '').trim();
       const currency = (fd.get('currency') as string || 'INR').trim();
+      // Captured here so a hand-added record is not born contextless. Until this field existed,
+      // department_id was written by exactly one code path — src/lib/hr/sync.ts, when an application
+      // turns 'hired' — so everyone added by hand had it NULL permanently and could not appear in
+      // any department-scoped list, with nothing on those lists to say they were missing.
+      const departmentId = (fd.get('departmentId') as string || '').trim();
 
       if (!fullName || !email) {
         errorMsg = 'Full name and email are required.';
+      } else if (departmentId && !departmentIds.has(departmentId)) {
+        // Not merely dropped: a department id matching nothing puts the person in no list while the
+        // record reads as assigned, which is harder to notice than an unassigned one.
+        errorMsg = 'That department is not on the department register. Nothing was added — pick one from the list, or leave it unset.';
       } else {
         // Generate employee code
         const count = await db.execute(sqlExpr`SELECT COUNT(*) as n FROM hr_employees`);
@@ -64,10 +102,16 @@ if (Astro.request.method === 'POST') {
         const code = 'ERA-EMP-' + String(n).padStart(4, '0');
 
         await db.execute(sqlExpr`
-          INSERT INTO hr_employees (employee_code, full_name, email, phone, designation, employment_type, work_mode, joining_date, base_salary, currency, employment_status)
-          VALUES (${code}, ${fullName}, ${email}, ${phone || null}, ${designation || null}, ${employmentType}, ${workMode}, ${joiningDate || null}, ${baseSalary ? parseFloat(baseSalary) : null}, ${currency}, 'active')
+          INSERT INTO hr_employees (employee_code, full_name, email, phone, designation, department_id, employment_type, work_mode, joining_date, base_salary, currency, employment_status)
+          VALUES (${code}, ${fullName}, ${email}, ${phone || null}, ${designation || null}, ${departmentId || null}, ${employmentType}, ${workMode}, ${joiningDate || null}, ${baseSalary ? parseFloat(baseSalary) : null}, ${currency}, 'active')
         `);
-        successMsg = `Employee ${fullName} added. Code: ${code}`;
+        // The reporting manager is deliberately not on this form: it is a longer decision than an
+        // add dialog should carry (the target must be an active employee with a sign-in, and the
+        // chain has to be checked for loops), so it is set on the record itself. Say so, rather
+        // than let a new record sit with no approver and no mention of it.
+        successMsg = `Employee ${fullName} added. Code: ${code}.`
+          + (departmentId ? '' : ' No department set, so they appear in no department list yet.')
+          + ' Open the record to set a reporting manager — until one is set, nobody can approve their leave or withdrawals.';
       }
     } else if (action === 'deactivate') {
       const id = fd.get('id') as string;
@@ -79,7 +123,10 @@ if (Astro.request.method === 'POST') {
       successMsg = 'Employee activated.';
     }
   } catch (err: any) {
-    errorMsg = 'Error: ' + (err.message || 'Unknown');
+    // e.cause carries the real Postgres reason; err.message is only the failed SQL.
+    const reason = err?.cause?.message || err?.message || 'Unknown';
+    console.error('[hr-employees] ' + String(action || 'unknown action') + ':', reason);
+    errorMsg = 'Error: ' + reason;
   }
 }
 
@@ -102,9 +149,17 @@ const totalPages = Math.ceil(totalCount / perPage);
 // The reporting manager comes back as a correlated scalar subquery, not a join: reporting_manager_id
 // holds a USERS id, and a join on m.user_id would duplicate an employee card if two employee rows
 // ever shared one login. A missing manager renders as "Not set" — which is the point of showing it.
+//
+// The department name is fetched the same way, and compared `::text` on BOTH sides. departments.id
+// is a varchar(50) slug in src/lib/db/schema.ts:80 while db/hr-schema.sql:54 declares a UUID column
+// against a UUID departments table that does not exist in that form; casting either side ::uuid
+// throws "invalid input syntax for type uuid" on a value like 'engineering' and takes the whole
+// list down. Text on both sides is correct under either shape.
 const employees = await db.execute(sqlExpr`
   SELECT e.id, e.employee_code, e.full_name, e.email, e.phone, e.designation, e.employment_type, e.work_mode, e.employment_status, e.joining_date, e.base_salary, e.currency, e.is_active,
     e.reporting_manager_id,
+    e.department_id,
+    (SELECT d.name FROM departments d WHERE d.id::text = e.department_id::text LIMIT 1) AS department_name,
     (SELECT m.full_name FROM hr_employees m WHERE m.user_id = e.reporting_manager_id ORDER BY m.is_active DESC LIMIT 1) AS manager_name
   FROM hr_employees e
   WHERE (${statusFilter === 'all'} OR e.employment_status = ${statusFilter})
@@ -221,6 +276,19 @@ const s = (_statsRows[0] || {}) as any;
             <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Salary</p>
             <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;">{emp.base_salary ? `${emp.currency || 'INR'} ${parseFloat(emp.base_salary).toLocaleString('en-IN')}` : 'Unpaid'}</p>
           </div>
+          {/* Department, shown with the same weight as the reporting line because the two together
+              are what every workspace and every team list is built from. Unset is called out rather
+              than left blank: departmentFilter() in src/lib/auth/workspace-access.ts matches on this
+              column, so a record without one is missing from every department-scoped screen and none
+              of them says so. */}
+          <div style={`border-radius:6px;padding:6px 8px;grid-column:1/-1;${emp.department_name ? 'background:#15151a;' : 'background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.22);'}`}>
+            <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Department</p>
+            {emp.department_name
+              ? <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{emp.department_name}</p>
+              : emp.department_id
+                ? <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Set to "{emp.department_id}", which is not on the register</p>
+                : <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Not set. They appear in no department list.</p>}
+          </div>
           {/* A missing reporting manager is not a cosmetic gap: approverRole() in src/lib/hr-wallet.ts
               lets the reporting manager approve this person's leave and wallet withdrawals, so an
               unset one means every request escalates to HR or an admin. Visible on the card so it
@@ -292,6 +360,23 @@ const s = (_statsRows[0] || {}) as any;
         <div>
           <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Designation</label>
           <input type="text" name="designation" placeholder="Software Engineer" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+        </div>
+        <div style="grid-column:1/-1;">
+          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Department</label>
+          <select name="departmentId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+            <option value="" selected>No department set</option>
+            {departmentOptions.map((d: any) => (
+              <option value={String(d.id)}>{d.name}{d.is_visible === false ? ' (not listed publicly)' : ''}</option>
+            ))}
+          </select>
+          <p style="font-size:10.5px;color:#6e6e78;margin:5px 0 0;line-height:1.5;">
+            Sets which team and department lists this person appears in. Optional for now, so existing records can still be added and corrected — but a record added without one is in no list until it is set on the record itself.
+          </p>
+          {departmentOptions.length === 0 && (
+            <p style="font-size:10.5px;color:#fbbf24;margin:4px 0 0;line-height:1.5;">
+              No departments could be read, so there is nothing to choose. Create them under Departments first.
+            </p>
+          )}
         </div>
         <div>
           <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Employment Type</label>

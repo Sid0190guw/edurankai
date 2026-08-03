@@ -19,25 +19,27 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { fetchNirf, NIRF_CATEGORIES, NIRF_BANDS, nirfUrl } from '@/lib/hei-nirf';
 import { slugify } from '@/lib/hei-miner';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
-function guard(locals: any) {
-  const u = locals?.user;
-  if (!u) return 'sign in required';
-  if (u.role === 'applicant') return 'not permitted';
-  return null;
-}
+// The local `guard(locals)` this replaces returned 'not permitted' only for role === 'applicant',
+// so every other role — including the AquinTutor scopes the middleware keeps out of /admin — could
+// drive the HEI ingesters. `hei_institutions` is the section /admin/hei/crawlers (the only caller)
+// already resolves to in middleware.ts:85, so the URL and the page now answer the same question.
+const HEI_SECTION = 'hei_institutions';
 
 export const GET: APIRoute = async ({ locals }) => {
-  const bad = guard(locals); if (bad) return j({ ok: false, error: bad }, 403);
+  const denied = await denyAdminApi(locals, { section: HEI_SECTION, action: 'view', label: 'hei.nirf.get' });
+  if (denied) return denied;
   let ranked = 0;
   try { ranked = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM hei_institutions WHERE nirf_rank IS NOT NULL`))[0]?.c || 0; } catch (_) {}
   return j({ ok: true, categories: Object.keys(NIRF_CATEGORIES), bands: NIRF_BANDS, years: [2024, 2023, 2022], storedWithNirfRank: ranked });
 };
 
 export const POST: APIRoute = async ({ request, locals }) => {
-  const bad = guard(locals); if (bad) return j({ ok: false, error: bad }, 403);
+  const denied = await denyAdminApi(locals, { section: HEI_SECTION, action: 'edit', label: 'hei.nirf.post' });
+  if (denied) return denied;
   let b: any = {};
   try { b = await request.json(); } catch { /* defaults */ }
   const category = String(b.category || 'Engineering');

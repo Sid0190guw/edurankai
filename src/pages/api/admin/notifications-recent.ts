@@ -6,6 +6,7 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -34,8 +35,13 @@ function ensureTable(): Promise<void> {
 }
 
 export const GET: APIRoute = async ({ locals }) => {
+  // The admin bell feed, polled by AdminLayout on every admin page. Rows are already scoped to
+  // user_id, so no capability is needed beyond "may open an admin surface" — but that question was
+  // never asked: `role !== 'applicant'` admitted the AquinTutor partner/teacher/moderator scopes the
+  // middleware bounces off /admin, and any wrongly-promoted intern.
+  const denied = await denyAdminApi(locals, { label: 'notifications-recent.get' });
+  if (denied) return denied;
   const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'unauthorized' }, 401);
   await ensureTable();
   const list = rows(await db.execute(sql`
     SELECT id, title, body, type, action_url, is_read, created_at
@@ -47,8 +53,9 @@ export const GET: APIRoute = async ({ locals }) => {
 };
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  const denied = await denyAdminApi(locals, { label: 'notifications-recent.post' });
+  if (denied) return denied;
   const user = (locals as any).user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'unauthorized' }, 401);
   let body: any = {}; try { body = await request.json(); } catch {}
   await ensureTable();
   if (body.action === 'mark_read' && body.id) {

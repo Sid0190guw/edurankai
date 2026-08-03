@@ -4,15 +4,19 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
 export const GET: APIRoute = async ({ request, locals }) => {
-  const user = (locals as any)?.user;
-  if (!user) return json({ ok: false, error: 'auth required' }, 401);
-  if (user.role === 'applicant') return json({ ok: false, error: 'admin only' }, 403);
+  // A named candidate's per-attempt proctoring log. That is the `tests_proctoring` section
+  // (middleware.ts:68), and the sentinel page this feeds sits under /admin/tests, which the same
+  // section family already gates. Proctoring output is advisory and a human decides on it — so the
+  // set of humans who may read it is not "everyone who is not an applicant".
+  const denied = await denyAdminApi(locals, { section: 'tests_proctoring', action: 'view', label: 'tests.attempt-events' });
+  if (denied) return denied;
 
   const url = new URL(request.url);
   const attemptId = (url.searchParams.get('id') || '').trim();

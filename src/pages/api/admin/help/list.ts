@@ -4,14 +4,17 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
 export const GET: APIRoute = async ({ request, locals }) => {
-  const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
+  // The whole applicant support inbox. middleware.ts:50 maps /admin/help to the `messages` section,
+  // so that is what this asks for — before the first SELECT, not after it.
+  const denied = await denyAdminApi(locals, { section: 'messages', action: 'view', label: 'help.list' });
+  if (denied) return denied;
 
   const url = new URL(request.url);
   const status = url.searchParams.get('status') || 'open';

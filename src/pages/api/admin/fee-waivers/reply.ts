@@ -4,6 +4,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { postMessage } from '@/lib/request-threads';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -11,8 +12,11 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // Applicant financial-hardship threads. No section key exists for fee waivers — see
+  // generate-coupon.ts for why this applies canOpenAdmin rather than inventing one here.
+  const denied = await denyAdminApi(locals, { label: 'fee-waivers.reply' });
+  if (denied) return denied;
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
   const id = (body.requestId || '').toString();

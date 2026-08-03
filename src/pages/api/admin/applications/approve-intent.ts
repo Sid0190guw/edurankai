@@ -9,6 +9,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { materialiseFromIntent, lastMaterialiseError } from '@/lib/fee-waiver';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -16,8 +17,11 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // Materialising an intent waives a real fee, so it is `applications` edit — the section that
+  // guards /admin/applications/intents, the only page that calls this.
+  const denied = await denyAdminApi(locals, { section: 'applications', action: 'edit', label: 'applications.approve-intent' });
+  if (denied) return denied;
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
 
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'bad json' }, 400); }

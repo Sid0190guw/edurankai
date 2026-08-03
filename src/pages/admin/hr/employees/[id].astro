@@ -2,6 +2,7 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql as sqlExpr } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -28,6 +29,118 @@ try {
 try {
   await db.execute(sqlExpr`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
 } catch (_) {}
+
+// The org column, and the other half of the same dependency: reporting_manager_id says who approves,
+// department_id says which lists a person appears in at all.
+//
+// Its own statement, for the reason given above. VARCHAR(50) because departments.id is a varchar(50)
+// SLUG (src/lib/db/schema.ts:80) — db/hr-schema.sql:54 declares this column
+// `UUID REFERENCES departments(id)`, which describes a departments table that does not exist in that
+// form (docs/KNOWN_GAPS.md). Compared and written as TEXT everywhere; never cast ::uuid.
+// ADD COLUMN IF NOT EXISTS is a no-op wherever the column is already there, so the live type wins.
+//
+// Behind ensureOnce (src/lib/ensure-once.ts) because nothing on this request depends on it having
+// just run: one DDL round-trip per server process instead of one per page load.
+await ensureOnce('hr_employees_department_id_v1', async () => {
+  await db.execute(sqlExpr`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS department_id VARCHAR(50)`);
+});
+
+// THE RECORD BEING EDITED, read BEFORE the POST handler because the handler validates against it:
+// its own user id (the self-report and cycle tests below) and its stored values (the re-post
+// exception). `const` is not hoisted — declared under the handler, the first line of that handler
+// would throw on every submit.
+//
+// A failed read is kept apart from "no such row". Both render nothing, but only one of them means
+// the validation below cannot be trusted, and that one has to refuse rather than guess.
+let subject: any = null;
+let subjectReadFailed = false;
+try {
+  const subjRes = await db.execute(sqlExpr`
+    SELECT id, full_name, user_id, reporting_manager_id, department_id
+      FROM hr_employees WHERE id = ${id} LIMIT 1`);
+  const subjRows = (Array.isArray(subjRes) ? subjRes : ((subjRes as any)?.rows || [])) as any[];
+  subject = subjRows[0] || null;
+} catch (e: any) {
+  subjectReadFailed = true;
+  console.error('[hr-employee] subject read:', e?.cause?.message || e?.message);
+}
+const subjectUserId = subject?.user_id ? String(subject.user_id) : '';
+const subjectName = subject?.full_name ? String(subject.full_name) : 'This employee';
+const storedManagerId = subject?.reporting_manager_id ? String(subject.reporting_manager_id) : '';
+const storedDepartmentId = (subject?.department_id === null || subject?.department_id === undefined)
+  ? '' : String(subject.department_id).trim();
+
+// The department register. Read before the POST handler for the same reason: the handler refuses a
+// department that is not on it. `id::text` so the comparison is text on both sides — casting a slug
+// like 'engineering' to ::uuid throws "invalid input syntax for type uuid".
+//
+// The fallback query exists because sort_order / is_visible belong to the schema.ts shape of this
+// table; an environment carrying the other declared shape has neither, and a department picker that
+// vanishes because of an ORDER BY is a worse outcome than an unsorted one.
+let departmentOptions: any[] = [];
+try {
+  const deptRes = await db.execute(sqlExpr`
+    SELECT id::text AS id, name, is_visible FROM departments ORDER BY sort_order ASC, name ASC LIMIT 300`);
+  departmentOptions = (Array.isArray(deptRes) ? deptRes : ((deptRes as any)?.rows || [])) as any[];
+} catch (e: any) {
+  console.error('[hr-employee] department list:', e?.cause?.message || e?.message);
+  try {
+    const deptAlt = await db.execute(sqlExpr`SELECT id::text AS id, name FROM departments ORDER BY name ASC LIMIT 300`);
+    departmentOptions = (Array.isArray(deptAlt) ? deptAlt : ((deptAlt as any)?.rows || [])) as any[];
+  } catch (e2: any) {
+    console.error('[hr-employee] department list fallback:', e2?.cause?.message || e2?.message);
+    departmentOptions = [];
+  }
+}
+const departmentIds = new Set(departmentOptions.map((d: any) => String(d.id)));
+const departmentNames = new Map<string, string>(
+  departmentOptions.map((d: any) => [String(d.id), String(d.name || d.id)] as [string, string])
+);
+
+// How far up a reporting line is worth walking. Twelve is far beyond any real chain here and still
+// cheap: the walk only runs when a manager is actually being set, and stops the moment it reaches
+// someone with no manager of their own.
+const MANAGER_CHAIN_MAX_DEPTH = 12;
+
+// Walk a reporting line UPWARDS from a users id.
+//
+// Each hop reads the employee row that OWNS that login — reporting_manager_id stores a USERS id, not
+// an hr_employees id — and then follows that row's own manager. Bounded twice, and both bounds are
+// load-bearing: the visited set means a loop already sitting in the data cannot spin this walk
+// forever, and the depth cap means an unexpectedly long chain still terminates.
+//
+// `failed` is separate from an empty chain on purpose. A chain that ends because nobody is above
+// that person is a proven answer; a chain that ends because the query threw is not, and the caller
+// refuses on the second rather than treating a database hiccup as proof of no cycle.
+async function walkManagerChain(startUserId: string) {
+  const chain: Array<{ userId: string; name: string }> = [];
+  const seen = new Set<string>();
+  let cursor = String(startUserId || '');
+  for (let depth = 0; depth < MANAGER_CHAIN_MAX_DEPTH; depth++) {
+    if (!cursor) return { chain, looped: false, truncated: false, failed: false };
+    if (seen.has(cursor)) return { chain, looped: true, truncated: false, failed: false };
+    seen.add(cursor);
+    let row: any = null;
+    try {
+      const r = await db.execute(sqlExpr`
+        SELECT full_name, reporting_manager_id FROM hr_employees
+         WHERE user_id = ${cursor}
+         ORDER BY is_active DESC, created_at DESC
+         LIMIT 1`);
+      const rr = (Array.isArray(r) ? r : ((r as any)?.rows || [])) as any[];
+      row = rr[0] || null;
+    } catch (e: any) {
+      console.error('[hr-employee] manager chain:', e?.cause?.message || e?.message);
+      return { chain, looped: false, truncated: false, failed: true };
+    }
+    // That login has no employee row at all, so the line stops here — it cannot reach anyone else.
+    if (!row) return { chain, looped: false, truncated: false, failed: false };
+    chain.push({ userId: cursor, name: String(row.full_name || 'an unnamed record') });
+    cursor = row.reporting_manager_id ? String(row.reporting_manager_id) : '';
+  }
+  // Out of depth. `truncated` only when there was still someone left to look at.
+  return { chain, looped: false, truncated: !!cursor, failed: false };
+}
 
 // Who may be recorded as a reporting manager.
 //
@@ -119,10 +232,39 @@ if (Astro.request.method === 'POST') {
       const panNumber = (fd.get('panNumber') as string || '').trim();
       const aadhaarNumber = (fd.get('aadhaarNumber') as string || '').trim();
       const reportingManagerId = (fd.get('reportingManagerId') as string || '').trim();
+      const departmentIdInput = (fd.get('departmentId') as string || '').trim();
+
+      // ---------------------------------------------------------------------------------------
+      // ORG ASSIGNMENT, VALIDATED SERVER-SIDE.
+      //
+      // Every refusal below names the specific thing that was wrong. This one form also saves
+      // designation, salary, PAN and four dates; "Could not save" would leave HR guessing which of
+      // eleven fields it objected to, and the usual next move is to try the same thing again.
+      //
+      // Nothing is written unless every check passes — a partial save here would record an approval
+      // authority while reporting a failure.
+      // ---------------------------------------------------------------------------------------
+      let refusal = '';
+
+      // The record itself could not be read, so none of the tests below mean anything. Refusing is
+      // the safe direction: writing approval authority that could not be checked is the outcome
+      // that cannot be withdrawn afterwards.
+      if (!refusal && subjectReadFailed) {
+        refusal = 'This record could not be read just now, so the reporting line could not be checked. Nothing was saved. Reload the page and try again.';
+      }
+
+      // NOBODY IS THEIR OWN APPROVER. The select already excludes this person by USER id, so this
+      // can only arrive by a posted value — which is exactly why it is tested here as well.
+      if (!refusal && reportingManagerId && subjectUserId && reportingManagerId === subjectUserId) {
+        refusal = subjectName + ' cannot be their own reporting manager. Approval is checked against the signed-in account, so this would let them approve their own leave and their own wallet withdrawals. Pick someone else, or choose "No reporting manager set".';
+      }
 
       // Approval authority is being written here, so an id that did not come from the offered list
       // is refused outright rather than quietly dropped: a posted value could otherwise point at
-      // any user in the system and hand them approval rights over this employee.
+      // any user in the system and hand them approval rights over this employee. The list is built
+      // from ACTIVE employees with a linked user_id, which is the "must be an active employee with
+      // a login" rule — an employee with no sign-in can never match the signed-in account and so
+      // could never approve anything.
       //
       // With ONE exception, and it matters. The select deliberately still offers the manager already
       // on file when that person has since left or been deactivated — labelled, so the record never
@@ -131,20 +273,50 @@ if (Astro.request.method === 'POST') {
       // about a manager the person editing never touched, and the only way out would be to change
       // the reporting line to make an unrelated correction. Re-posting the value already stored
       // grants nothing that is not already granted, so it is accepted; anything else is not.
-      let managerAccepted = !reportingManagerId || managerUserIds.has(reportingManagerId);
-      if (!managerAccepted) {
-        const curRes = await db.execute(sqlExpr`SELECT reporting_manager_id FROM hr_employees WHERE id = ${id} LIMIT 1`);
-        const curRows = (Array.isArray(curRes) ? curRes : ((curRes as any)?.rows || [])) as any[];
-        managerAccepted = curRows.length > 0
-          && String(curRows[0]?.reporting_manager_id || '') === reportingManagerId;
+      if (!refusal && reportingManagerId
+          && !managerUserIds.has(reportingManagerId)
+          && reportingManagerId !== storedManagerId) {
+        refusal = 'That reporting manager is not an active employee with a linked sign-in. Nothing was saved — pick someone from the list.';
       }
 
-      if (!managerAccepted) {
-        errorMsg = 'That reporting manager is not an active employee with a login. Nothing was saved — pick someone from the list.';
+      // NO CYCLES. A loop makes every approval chain infinite: a request escalating past this person
+      // arrives back at them, and the "who approves this" question has no answer at any depth.
+      // Skipped when this employee has no linked login, because reporting_manager_id stores a USERS
+      // id — with none, no chain can pass through them and there is nothing to loop back to.
+      if (!refusal && reportingManagerId && subjectUserId) {
+        const walk = await walkManagerChain(reportingManagerId);
+        const hitSelf = walk.chain.findIndex((s) => s.userId === subjectUserId);
+        if (walk.failed) {
+          refusal = 'The reporting line above that person could not be read, so this could not be checked for a loop. Nothing was saved — try again in a moment.';
+        } else if (hitSelf >= 0) {
+          const path = walk.chain.slice(0, hitSelf + 1).map((s) => s.name).join(' reports to ');
+          refusal = 'That would make the reporting line circular: ' + path + '. ' + subjectName + ' would end up approving their own requests through the chain, and an approval that loops never reaches anybody. Pick a manager from outside ' + subjectName + "'s own reporting line.";
+        } else if (walk.looped) {
+          const path = walk.chain.map((s) => s.name).join(' reports to ');
+          refusal = 'That person is already inside a reporting loop (' + path + '), so nothing above them can approve anything either. Nothing was saved — break that loop first, then set this.';
+        } else if (walk.truncated) {
+          refusal = 'The reporting line above that person runs more than ' + MANAGER_CHAIN_MAX_DEPTH + ' levels deep, so it could not be checked for a loop. Nothing was saved — shorten that chain first.';
+        }
+      }
+
+      // DEPARTMENT. Deliberately optional (see the note beside the field), but a value that is not
+      // on the register is refused rather than stored: a department id that matches nothing places
+      // this person in no list at all while the record reads as assigned. Same re-post exception as
+      // the manager above, so a record carrying a department that has since been removed does not
+      // block every other edit on the page.
+      if (!refusal && departmentIdInput
+          && !departmentIds.has(departmentIdInput)
+          && departmentIdInput !== storedDepartmentId) {
+        refusal = 'That department is not on the department register. Nothing was saved — pick one from the list, or leave it unset.';
+      }
+
+      if (refusal) {
+        errorMsg = refusal;
       } else {
         await db.execute(sqlExpr`
           UPDATE hr_employees SET
             designation = ${designation || null},
+            department_id = ${departmentIdInput || null},
             employment_type = ${employmentType || null},
             work_mode = ${workMode || null},
             joining_date = ${joiningDate || null},
@@ -158,7 +330,14 @@ if (Astro.request.method === 'POST') {
             updated_at = NOW()
           WHERE id = ${id}
         `);
-        successMsg = 'Employment details updated.';
+        // Say what is still missing rather than only what was saved. The two org fields are what
+        // every department list and every approval chain is built from, and a plain "updated" on a
+        // record that still has neither reads as finished.
+        const gaps: string[] = [];
+        if (!departmentIdInput) gaps.push('no department');
+        if (!reportingManagerId) gaps.push('no reporting manager');
+        successMsg = 'Employment details updated.'
+          + (gaps.length ? ' Still ' + gaps.join(' and ') + ' on this record.' : '');
       }
     } else if (action === 'update_bank') {
       const bankAccountNumber = (fd.get('bankAccountNumber') as string || '').trim();
@@ -367,7 +546,11 @@ if (Astro.request.method === 'POST') {
       successMsg = 'Employee reactivated. Login restored.';
     }
   } catch (err: any) {
-    errorMsg = 'Error: ' + (err.message || 'Unknown');
+    // The real Postgres reason is on e.cause; err.message alone is just the failed SQL, which is
+    // what made this page report an unreadable wall of statement text and nothing about the cause.
+    const reason = err?.cause?.message || err?.message || 'Unknown';
+    console.error('[hr-employee] ' + String(action || 'unknown action') + ':', reason);
+    errorMsg = 'Error: ' + reason;
   }
 }
 
@@ -392,6 +575,28 @@ if (currentManagerId && !managerUserIds.has(currentManagerId)) {
     }
   } catch (_) {}
 }
+
+// Same treatment for the department on file: a stored id that is not on the register is shown as
+// itself rather than silently falling back to "No department set", because those are different facts
+// and only one of them is a data problem to chase.
+const currentDepartmentId = (emp.department_id === null || emp.department_id === undefined)
+  ? '' : String(emp.department_id).trim();
+const currentDepartmentName = departmentNames.get(currentDepartmentId) || '';
+
+// "Not on the register" and "the register could not be read" are kept apart, and the difference is
+// not cosmetic. This form is a full-record save: whatever the select posts becomes the stored value,
+// so a stored department with no matching <option> would be posted as empty and CLEARED — losing an
+// assignment because a lookup query failed. The option below therefore always carries the current
+// value, whatever the reason it is unrecognised; only the accusation that it is gone is withheld.
+const departmentRegisterRead = departmentOptions.length > 0;
+const currentDepartmentUnrecognised = !!currentDepartmentId && !departmentIds.has(currentDepartmentId);
+const currentDepartmentOptionLabel = !currentDepartmentUnrecognised ? ''
+  : departmentRegisterRead
+    ? 'Recorded department "' + currentDepartmentId + '" is not on the register'
+    : 'Recorded department "' + currentDepartmentId + '" — register unavailable, keeping it';
+const staleDepartmentLabel = (currentDepartmentUnrecognised && departmentRegisterRead)
+  ? 'Recorded department "' + currentDepartmentId + '" is not on the department register'
+  : '';
 
 // Leave balances, read from the table the leave workflow actually writes.
 //
@@ -481,7 +686,7 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
         </div>}
       <div>
         <h1 style="font-size:16px;font-weight:700;color:#fff;margin:0;">{emp.full_name}</h1>
-        <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;">{emp.designation || 'No designation'} · <span style="font-family:'Geist Mono',monospace;">{emp.employee_code}</span></p>
+        <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;">{emp.designation || 'No designation'} · <span style="font-family:'Geist Mono',monospace;">{emp.employee_code}</span>{currentDepartmentName ? ' · ' + currentDepartmentName : ''}</p>
       </div>
       <span style={`margin-left:auto;font-size:9px;font-weight:700;padding:3px 8px;border-radius:100px;text-transform:uppercase;${emp.employment_status === 'active' ? 'background:rgba(16,185,129,0.15);color:#6ee7b7;' : 'background:rgba(239,68,68,0.15);color:#fca5a5;'}`}>
         {emp.employment_status}
@@ -492,6 +697,25 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
   <!-- Messages -->
   {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
+
+  {/* NO DEPARTMENT SET — surfaced on the record itself, not left to be discovered.
+      Department-scoped lists are built by matching this column (departmentFilter() in
+      src/lib/auth/workspace-access.ts), so a record without one is absent from every one of them
+      and nothing on those screens says anybody is missing. Saving is still allowed: most existing
+      rows have no department, and a hard requirement would lock HR out of correcting them. */}
+  {!currentDepartmentId && (
+    <div style="margin:12px 16px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.22);color:#fbbf24;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.55;display:flex;gap:8px;align-items:flex-start;">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;margin-top:2px;"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span>No department set. Every department-scoped list is built by matching this field, so this person appears in none of them — a team lead looking at their own team sees a shorter list with nothing to say anyone is missing. Set it on the Employment tab.</span>
+    </div>
+  )}
+
+  {staleDepartmentLabel && (
+    <div style="margin:12px 16px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.22);color:#fbbf24;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.55;display:flex;gap:8px;align-items:flex-start;">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;margin-top:2px;"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span>{staleDepartmentLabel}. The record reads as assigned but matches no department, so it behaves exactly like an unassigned one. Pick a department that exists on the Employment tab.</span>
+    </div>
+  )}
 
   <!-- Tab Navigation -->
   <div style="overflow-x:auto;border-bottom:1px solid #1a1a1f;padding:0 16px;">
@@ -594,6 +818,31 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
             <input type="text" name="designation" value={emp.designation || ''} placeholder="Senior Engineer" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
           </div>
           <div style="grid-column:1/-1;">
+            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Department</label>
+            <select name="departmentId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+              <option value="" selected={!currentDepartmentId}>No department set</option>
+              {currentDepartmentOptionLabel && <option value={currentDepartmentId} selected>{currentDepartmentOptionLabel}</option>}
+              {departmentOptions.map((d: any) => (
+                <option value={String(d.id)} selected={String(d.id) === currentDepartmentId}>
+                  {d.name}{d.is_visible === false ? ' (not listed publicly)' : ''}
+                </option>
+              ))}
+            </select>
+            <p style="font-size:10.5px;color:#6e6e78;margin:5px 0 0;line-height:1.5;">
+              Decides which team and department lists this person appears in. Not required to save: most records created before this field existed have none, and refusing to save without one would lock HR out of correcting the very records that need it.
+            </p>
+            {!currentDepartmentId && (
+              <p style="font-size:10.5px;color:#fbbf24;margin:4px 0 0;line-height:1.5;">
+                Nothing is set, so this person is in no department list at all. Until one is chosen, a lead viewing their own team will not see them.
+              </p>
+            )}
+            {departmentOptions.length === 0 && (
+              <p style="font-size:10.5px;color:#fbbf24;margin:4px 0 0;line-height:1.5;">
+                The department register could not be read, so there is nothing to choose from. Create departments under Departments in the admin menu, then set one here.
+              </p>
+            )}
+          </div>
+          <div style="grid-column:1/-1;">
             <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Reporting Manager</label>
             <select name="reportingManagerId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
               <option value="" selected={!currentManagerId}>No reporting manager set</option>
@@ -606,6 +855,9 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
             </select>
             <p style="font-size:10.5px;color:#6e6e78;margin:5px 0 0;line-height:1.5;">
               This person can approve this employee's leave and wallet withdrawals. Everyone active is listed, but someone with no linked sign-in is shown greyed out and cannot be chosen: approval is checked against the signed-in account, so naming them would record a reporting line that silently never works. Link their account from their own profile to make them selectable.
+            </p>
+            <p style="font-size:10.5px;color:#6e6e78;margin:4px 0 0;line-height:1.5;">
+              Nobody may report to themselves, or to anyone who already reports to them directly or further up the line. The whole chain is checked on save, and a circular one is refused with the names in it: an approval that loops back never reaches anyone who can decide it.
             </p>
             {managerOptions.length === 0 && (
               <p style="font-size:10.5px;color:#fbbf24;margin:4px 0 0;line-height:1.5;">

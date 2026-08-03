@@ -3,14 +3,16 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
 
 export const GET: APIRoute = async ({ request, locals }) => {
-  const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
+  // Reads one visitor's support conversation. Same section as the inbox it opens from.
+  const denied = await denyAdminApi(locals, { section: 'messages', action: 'view', label: 'help.thread' });
+  if (denied) return denied;
   const url = new URL(request.url);
   const id = url.searchParams.get('id');
   if (!id) return json({ ok: false, error: 'id required' }, 400);

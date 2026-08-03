@@ -2,8 +2,9 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { attemptAccess } from '@/lib/auth/attempt-access';
 
-export const POST: APIRoute = async ({ request, clientAddress }) => {
+export const POST: APIRoute = async ({ request, locals, cookies, clientAddress }) => {
   try {
     const body = await request.json();
     const { attemptId, answers, flagged } = body;
@@ -14,8 +15,19 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
       });
     }
 
+    // Submits AND GRADES the attempt, awards XP against candidate_id and can auto-issue an event
+    // artifact. It previously loaded any attempt by id and did all of that with no check that the
+    // caller owned it. Authorised first, so the SELECT * below runs only for the person whose paper
+    // it is (docs/workforce-os/AUTHORIZATION_FIRST.md: no query above the boundary).
+    const access = await attemptAccess(String(attemptId), locals, cookies);
+    if (!access.ok) {
+      return new Response(JSON.stringify({ ok: false, error: access.error }), {
+        status: access.status, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     // Get attempt + test
-    const attR = await db.execute(sql`SELECT * FROM test_attempts WHERE id = ${attemptId} LIMIT 1`);
+    const attR = await db.execute(sql`SELECT * FROM test_attempts WHERE id = ${access.attempt.id} LIMIT 1`);
     const attRows = Array.isArray(attR) ? attR : (attR?.rows || []);
     const attempt = attRows[0] as any;
     if (!attempt) {

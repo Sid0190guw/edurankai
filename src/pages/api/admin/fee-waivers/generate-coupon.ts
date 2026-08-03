@@ -6,6 +6,7 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { generateCoupon } from '@/lib/fee-waiver-coupons';
 import { postMessage } from '@/lib/request-threads';
+import { denyAdminApi } from '@/lib/auth/api-guard';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -13,8 +14,15 @@ function json(d: any, s = 200) {
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request, locals }) => {
+  // Mints a coupon with real money value. No section key exists for fee waivers — /admin/fee-waivers
+  // is absent from PATH_SECTION in src/middleware.ts, so every admin-capable role can open the page
+  // today. Narrowing the API below what the page allows would take the tool away from people who
+  // use it, so this applies the gate the page already has and no more: canOpenAdmin, which is what
+  // /api/* was missing entirely. A `waivers` section key is the durable fix and is a policy
+  // decision, not a refactor.
+  const denied = await denyAdminApi(locals, { label: 'fee-waivers.generate-coupon' });
+  if (denied) return denied;
   const user = (locals as any)?.user;
-  if (!user || user.role === 'applicant') return json({ ok: false, error: 'forbidden' }, 403);
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
