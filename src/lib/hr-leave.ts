@@ -1,9 +1,9 @@
 // HRMS leave management. Employees apply for leave against an annual allowance
-// per type; requests are approved or rejected by the reporting manager, HR head,
-// admin or super-admin (same permission chain as payouts). Self-bootstrapping.
+// per type; requests are approved or rejected by whoever holds `leave.approve`, or by that
+// employee's own reporting manager (same permission chain as payouts). Self-bootstrapping.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { approverRole } from '@/lib/hr-wallet';
+import { approverRole, holdsHrCapability } from '@/lib/hr-wallet';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 async function safe(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
@@ -89,9 +89,8 @@ export async function listLeave(opts: { employeeId?: string; status?: string } =
  * cover never gets arranged because nobody knows they are the blocker.
  *
  * The authority test is the same one decideLeave() enforces, expressed in SQL rather than repeated
- * in prose: super_admin and admin see every pending request; the exact role 'hr' sees every pending
- * request; everyone else sees only the requests of employees whose reporting_manager_id is their own
- * USERS id. Anyone else sees nothing.
+ * in prose: whoever holds `leave.approve` sees every pending request; everyone else sees only the
+ * requests of employees whose reporting_manager_id is their own USERS id. Anyone else sees nothing.
  *
  * Deciding is still re-checked by decideLeave() through approverRole(). This function decides what
  * to SHOW; it is never the permission itself. A list is not an authorisation.
@@ -100,10 +99,13 @@ export async function pendingLeaveForApprover(user: any): Promise<any[]> {
   if (!user?.id) return [];
   await ensureLeaveSchema();
 
-  const role = String(user.role || '').toLowerCase();
-  // Exact match, never a substring. `role.indexOf('hr') >= 0` used to let any role merely containing
-  // those two letters approve leave, which at 1100+ admin-created roles is a matter of spelling.
-  const seesAll = role === 'super_admin' || role === 'admin' || role === 'hr';
+  // WAS `role === 'super_admin' || role === 'admin' || role === 'hr'`, and before that the substring
+  // test `role.indexOf('hr') >= 0` that handed leave approval to any role merely spelled with those
+  // two letters. Same people as the exact-match version, asked as a capability: PERMS_BY_ROLE grants
+  // leave.approve to exactly super_admin and hr, and 'admin' is not a value of userRoleEnum
+  // (src/lib/db/schema.ts:10-16) so that arm could never match an account. can() needs no database,
+  // so this list still answers correctly during an outage — and it fails closed, not open.
+  const seesAll = holdsHrCapability(user, 'leave.approve');
 
   try {
     if (seesAll) {
@@ -144,7 +146,9 @@ export async function decideLeave(id: string, user: any, decision: 'approved' | 
   const l = (await safe(sql`SELECT * FROM hr_leave_request WHERE id = ${id} LIMIT 1`))[0];
   if (!l) return { ok: false, error: 'Request not found.' };
   if (l.status !== 'pending') return { ok: false, error: 'Already ' + l.status + '.' };
-  const role = await approverRole(user, l.employee_id);
+  // THE ENFORCEMENT. pendingLeaveForApprover() decides what to SHOW; this decides what may be DONE.
+  // Two checks on one rule are only a problem when they can diverge — this is the one that binds.
+  const role = await approverRole(user, l.employee_id, 'leave.approve');
   if (!role) return { ok: false, error: 'You are not permitted to decide this request.' };
   await db.execute(sql`UPDATE hr_leave_request SET status = ${decision}, decided_by = ${user.id}, decided_by_role = ${role}, decided_at = NOW(), decision_note = ${note || null} WHERE id = ${id}`);
 

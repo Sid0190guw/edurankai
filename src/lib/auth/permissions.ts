@@ -34,10 +34,21 @@ export type Permission =
   // the spec's CamelCase, because two naming conventions for one concept is how a check ends up
   // asking for a permission that nobody granted.
   //
-  // THIS COMMIT IS MECHANISM, NOT POLICY. Every grant in PERMS_BY_ROLE below reproduces the authority
-  // the code enforces TODAY, derived from the checks listed above the matrix. Nothing yet ASKS for
-  // these keys, so no effective access changes; the conversion of the four role-name tests is a
-  // separate, verifiable step.
+  // MECHANISM, NOT POLICY. Every grant in PERMS_BY_ROLE below reproduces the authority the code
+  // enforced when the keys were added, derived from the checks listed above the matrix.
+  //
+  // NOW ASKED FOR, in the money and time-off engines, each holding the same population it did as a
+  // role-name test: hr-wallet.ts approverRole()/pendingWithdrawalsForApprover()/payWithdrawal() and
+  // hr-leave.ts pendingLeaveForApprover(). The two PAGE gates (/admin/hr/wallet, /admin/hr/leave)
+  // still ask canAccessSection() on purpose — see the note at the end of this block, and the comment
+  // at the top of each page.
+  //
+  // AND IN THE WORKSPACE GATES: `employees.manage` is what requireHr() admits on and what
+  // Workspace.isHr is resolved from; `department.lead` is what requireTeamLead() and the composer's
+  // leadsDepartment ask for. Both through holdsCapability() in src/lib/auth/workspace-access.ts,
+  // which asks can() — this matrix — and never the registry, so the WILDCARD a super_admin holds
+  // cannot turn the founder into a department-scoped team lead. Every one of those gates admits the
+  // same accounts it admitted as a role-name test.
   | 'leave.approve'
   | 'payouts.approve' | 'payouts.pay'
   | 'employees.manage'
@@ -60,9 +71,10 @@ export type Permission =
 //   payouts.approve   src/lib/hr-wallet.ts decideWithdrawal -> approverRole();
 //                     pendingWithdrawalsForApprover() seesAll (hr-wallet.ts:163);
 //                     /admin/hr/wallet gate canAccessSection('payouts','edit').
-//   payouts.pay       src/lib/hr-wallet.ts payWithdrawal, which narrows approverRole()'s answer to
-//                     'admin' | 'super_admin' | 'hr_head' — a reporting manager may APPROVE a
-//                     withdrawal and may NOT release the money. Two keys, because it is two powers.
+//   payouts.pay       src/lib/hr-wallet.ts payWithdrawal, which used to narrow approverRole()'s
+//                     answer to 'admin' | 'super_admin' | 'hr_head' — a reporting manager may
+//                     APPROVE a withdrawal and may NOT release the money. Two keys, because it is
+//                     two powers; payWithdrawal now asks for this one directly.
 //   employees.manage  src/lib/auth/workspace-access.ts requireHr(); /admin/hr isHrDesk;
 //                     /admin/hr/completion/[id] isHrDesk; middleware gates /admin/hr/employees on
 //                     the 'employees' section, which only `hr` holds in ROLE_SECTIONS.

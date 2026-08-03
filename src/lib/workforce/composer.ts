@@ -13,12 +13,14 @@
 //      the permission set (resolvePermissions) and a count of direct reports. Widgets receive facts,
 //      never a database handle, so fifty widget definitions cost no queries at all.
 //
-//   2. IT IS THE ONLY PLACE A ROLE BECOMES A CAPABILITY. widgets.ts cannot test a role — the context
-//      has no `role` field. The mapping happens here, ONCE, with exact string equality and never a
-//      substring test, mirroring the authority the writers themselves enforce (hr-leave.ts:106,
-//      hr-wallet.ts:189, workspace-access.ts:181-194). `role.indexOf('hr') >= 0` let any role merely
-//      CONTAINING those two letters approve leave and withdrawals; at 1100+ admin-created roles that
-//      is a matter of spelling, and approval authority must never depend on spelling.
+//   2. IT ASKS FOR CAPABILITIES, NEVER FOR ROLE NAMES. widgets.ts cannot test a role — the context
+//      has no `role` field — and neither can this file any more: `leadsDepartment` and
+//      `seesEveryRequest` are resolved through holdsCapability(), the same test the workspace gates
+//      enforce with, so a card and the query behind it cannot answer differently. What they replaced
+//      was string equality against role names, which was already the careful version;
+//      `role.indexOf('hr') >= 0` in the original let any role merely CONTAINING those two letters
+//      approve leave and withdrawals. At 1100+ admin-created roles that is a matter of spelling, and
+//      approval authority must never depend on spelling.
 //
 //   3. IT FAILS CLOSED, TOWARD THE MINIMAL SET. An unresolvable context yields MINIMAL_WIDGETS —
 //      the widgets scoped by users.id alone — and never the full registry. Every other gate in this
@@ -37,7 +39,7 @@
 //      ago" quietly becomes false. It must be true the moment it is said.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { requireEmployee, type Workspace, type WorkspaceUser } from '@/lib/auth/workspace-access';
+import { requireEmployee, holdsCapability, type Workspace, type WorkspaceUser } from '@/lib/auth/workspace-access';
 import { resolvePermissions, holdsPermission, WILDCARD } from '@/lib/auth/registry';
 import { canAccessSection } from '@/lib/auth/permissions';
 import {
@@ -336,23 +338,30 @@ async function compose(
     contextGaps.push('what you are allowed to do');
   }
 
-  // ---- 3. Role -> capability. The ONLY place in this feature where a role is named. -------------
+  // ---- 3. Capabilities. NO ROLE NAME IS COMPARED IN THIS FILE ANY MORE. -------------------------
   //
-  // Exact equality, never a substring. Duplicated from workspace-access.ts:181-194 rather than read
-  // off the Workspace object for one reason: the Workspace is null precisely for the people these
-  // flags exist to serve — an HR account or a founder with no hr_employees row of their own. Reading
-  // isHr off a null object would hand them the narrowest screen in the product.
+  // These were `role === 'department_head'` and `role === 'super_admin' || 'admin' || 'hr'`, written
+  // out here rather than read off the Workspace object for one reason that still holds: the
+  // Workspace is null precisely for the people these flags exist to serve — an HR account or a
+  // founder with no hr_employees row of their own — so reading isHr off a null object would hand
+  // them the narrowest screen in the product. What has changed is WHAT is written out: the same
+  // holdsCapability() the gates enforce with, so the card shown here and the query behind it cannot
+  // answer differently.
+  //
+  // `role` survives for exactly one use, at step 8: canAccessSection() takes an actor and resolves
+  // the legacy section matrix itself. It is not compared to anything here.
   const role = String(user.role || '').trim().toLowerCase();
 
-  // The team-lead signal, and the whole of it: users.role='department_head' plus
-  // users.assigned_department_id, written together by /admin/users. hr_employees.reporting_manager_id
-  // is a different question (below) and answers "who approves for whom", not "who leads what".
+  // The team-lead signal, and the whole of it: 'department.lead' — held by department_head and by
+  // nobody else — plus users.assigned_department_id, written together by /admin/users.
+  // hr_employees.reporting_manager_id is a different question (below) and answers "who approves for
+  // whom", not "who leads what".
   const engagement: Engagement = workspace
     ? (workspace.isIntern ? 'internship' : 'employment')
     : 'unknown';
   // An intern is never a team lead, whatever else the account says — the same refusal
-  // requireTeamLead() makes at workspace-access.ts:422.
-  const leadsDepartment = role === 'department_head' && engagement !== 'internship';
+  // requireTeamLead() makes, and a per-PERSON condition the capability neither carries nor replaces.
+  const leadsDepartment = holdsCapability(user, 'department.lead') && engagement !== 'internship';
   const scopeDepartmentId = leadsDepartment
     ? (workspace?.scopeDepartmentId || String(user.assignedDepartmentId || '').trim() || null)
     : null;
@@ -369,21 +378,25 @@ async function compose(
   // pendingWithdrawalsForApprover() will return rows for, so a widget shown here always has a queue
   // behind it and an approver is never told about work they cannot reach.
   //
-  // 'admin' is not a value of the user_role enum today, so that arm is dead — it is kept because the
-  // two readers above test for it, and this flag drifting out of step with them is the failure that
-  // shows an empty approvals screen to somebody who was promised two decisions.
-  // THE ONE PLACE A ROLE NAME MAY APPEAR, and only because something must translate role into
-  // capability. Widgets never see this — they receive `approvesRequests` and cannot ask who holds it.
+  // BOTH KEYS, because one flag gates two widgets — approvals.leave and approvals.withdrawal — and
+  // they are two powers, not one. They are held by the same two roles today, so the answer is
+  // unchanged; asking for both means that if a future grant separates them, the flag widens with
+  // whichever power a person actually holds instead of quietly following leave alone.
   //
-  // DUPLICATION HAZARD, DELIBERATELY NAMED: this mirrors the authority in hr-leave.ts
-  // pendingLeaveForApprover() and hr-wallet.ts approverRole(). Those are the enforcement; this is
-  // only what decides whether a card is shown. If the authority changes there and not here, the
-  // card silently disappears for someone who can still act — a bug that presents as "the approvals
-  // widget stopped working" rather than as an authorisation change. Change both together.
+  // THE 'admin' ARM IS GONE. It was kept here to mirror the two readers, but 'admin' is not a value
+  // of userRoleEnum (src/lib/db/schema.ts:10-16), so no account can hold it and the arm could never
+  // have been true. Dropping a dead comparison removes nothing from anybody — the arms still sitting
+  // in hr-leave.ts and hr-wallet.ts are equally dead and are a separate conversion.
   //
-  // Exact match. `role.indexOf('hr') >= 0` in the original gave approval authority over leave and
-  // money to any role whose NAME contained those two letters.
-  const seesEveryRequest = role === 'super_admin' || role === 'admin' || role === 'hr';
+  // DUPLICATION HAZARD, STILL NAMED but much smaller: this decides whether a CARD is shown, while
+  // hr-leave.ts pendingLeaveForApprover() and hr-wallet.ts approverRole() are the enforcement, and
+  // they still compare role strings. Until they are converted too, a role change made there and not
+  // here presents as "the approvals widget stopped working" rather than as an authorisation change.
+  // The card is not the authority: decideLeave() and decideWithdrawal() re-check at the write.
+  const seesEveryRequest = holdsCapability(user, 'leave.approve') || holdsCapability(user, 'payouts.approve');
+  // The reporting line, kept as the row-level fact it is. It is a RELATIONSHIP to particular
+  // employees, not a role grant, and no capability may stand in for it: granting a key to "cover
+  // managers" would hand every manager authority over every employee.
   const approvesRequests = seesEveryRequest || directReports > 0;
 
   // ---- 5. The context ---------------------------------------------------------------------------

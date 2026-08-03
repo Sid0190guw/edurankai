@@ -86,11 +86,17 @@ export const ADMIN_CAPABLE_ROLES: ReadonlySet<string> = new Set(
  * Matches intern / interns / internship / interning at a word start, and deliberately NOT "Internal
  * Auditor" or "Internal Communications".
  *
- * intern-guard.ts and workspace-access.ts both use a plain `includes('intern')`, which also matches
- * "Internal". They can afford it: the worst case there is one person seeing their own screen instead
- * of another. Here the worst case is refusing an internal-audit lead — or the founder — entry to the
- * console that runs the company, so the test is tightened by exactly the one prefix that produces
- * real false positives. If those two files are ever fixed, they should adopt this expression.
+ * THIS IS NOW THE ONLY FREE-TEXT INTERNSHIP TEST IN THE CODEBASE, which is what this comment used to
+ * ask for. intern-guard.ts and workspace-access.ts each carried a plain `includes('intern')` that
+ * also matched "Internal"; both now go through src/lib/auth/intern-signals.ts, which asks the
+ * structured signals first and calls isInternshipRecord() below as its last arm. The door, the guard
+ * and the workspace gate therefore judge these two columns identically — an "Internal Auditor" is no
+ * longer admitted by one and demoted out of their role by another.
+ *
+ * Keep it here rather than moving it: this is the gate whose false positive is worst. Refusing an
+ * internal-audit lead — or the founder — entry to the console that runs the company is a different
+ * order of failure from showing somebody the wrong workspace, and the expression belongs beside the
+ * check that cannot afford to be wrong.
  */
 export const INTERNSHIP_PATTERN = /\bintern(?!al)/i;
 

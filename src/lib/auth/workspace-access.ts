@@ -39,6 +39,9 @@
 // (status + hours), never the punch log.
 import { db } from '@/lib/db';
 import { sql, type SQL } from 'drizzle-orm';
+import { can, type Permission } from '@/lib/auth/permissions';
+import { resolveIsIntern } from '@/lib/auth/intern-signals';
+import type { User } from '@/lib/db/schema';
 
 // postgres-js resolves to a plain array, never a { rows } object. Declared before everything that
 // uses it: `const` is not hoisted, and a handler reaching a later declaration has taken pages down
@@ -59,6 +62,39 @@ export interface WorkspaceUser {
   email?: string | null;
   role?: string | null;
   assignedDepartmentId?: string | null;
+  /** users.is_active. Read only by holdsCapability() — see the note there about why it is optional. */
+  isActive?: boolean | null;
+}
+
+/**
+ * DOES THIS ACCOUNT HOLD A CAPABILITY? The only way this module may ask about authority.
+ *
+ * `can()` is the pure, database-free test over PERMS_BY_ROLE and it is deliberately the one used
+ * here rather than the registry's resolvePermissions(): the registry adds the super_admin WILDCARD
+ * and any custom-role grant, so asking IT for 'department.lead' would answer true for the founder
+ * and for any admin-created role that was handed the key — widening two gates that today admit
+ * exactly one role each. This conversion changes the mechanism and must not touch the policy.
+ *
+ * `key` is typed `Permission`, so a permission string that is not in the union fails to COMPILE.
+ * An invented key silently answers false for every role including super_admin, which is how a whole
+ * console became unreachable on this project once already.
+ *
+ * TWO ADAPTATIONS, both preserving exactly what the role comparisons did before:
+ *   - the role is trimmed and lowercased, because every test replaced here was written against
+ *     `String(user.role || '').trim().toLowerCase()`;
+ *   - `isActive` is read as "not explicitly false". can() denies an inactive account, and the tests
+ *     this replaces looked at the role alone. In practice the distinction is unreachable —
+ *     validateSessionToken() deletes the session and returns null for a deactivated account
+ *     (src/lib/auth/session.ts:59-62), so a signed-in user is an active one — but a caller handing
+ *     over a narrower object than Astro.locals.user must keep the access it had, not lose it to a
+ *     field it never carried.
+ */
+export function holdsCapability(user: WorkspaceUser | null | undefined, key: Permission): boolean {
+  if (!user) return false;
+  return can(
+    { role: String(user.role || '').trim().toLowerCase(), isActive: user.isActive !== false } as unknown as User,
+    key,
+  );
 }
 
 export interface WorkspaceDepartment {
@@ -167,18 +203,64 @@ type WorkspaceLookup =
   | { status: 'ok'; workspace: Workspace }
   | { status: 'none' | 'failed' | 'ambiguous'; workspace: null };
 
+/**
+ * The two STRUCTURED intern signals, for one employee. Read separately from the identity lookup
+ * above, and on purpose.
+ *
+ * `classification`, `classification_reviewed_at` and `application_id` are all self-bootstrapped by
+ * other modules (src/lib/hr-classification.ts:15-19, src/lib/hr/sync.ts), which on this project is
+ * the declared-but-not-existing class that has taken five surfaces down in a week. Folding them into
+ * EMPLOYEE_COLUMNS would mean a missing column throws the identity query and every portal page
+ * reports "no employee profile found". Here a failure costs the two structured arms and nothing
+ * else: resolveIsIntern() falls through to the substring test, which is exactly today's answer.
+ *
+ * COST, stated rather than hidden: one extra single-row indexed lookup per workspace resolution, on
+ * every surface behind this gate. It cannot be made conditional — the structured arms can both add
+ * an intern the substring test misses and remove one it wrongly claims, so the answer is never known
+ * in advance.
+ */
+async function internSignals(employeeId: string): Promise<{
+  classification: string | null;
+  classificationReviewedAt: string | null;
+  seniority: string | null;
+}> {
+  const none = { classification: null, classificationReviewedAt: null, seniority: null };
+  if (!employeeId) return none;
+  try {
+    // roles.level is reachable ONLY through hr_employees.application_id, which the manual "Add
+    // employee" form does not write — so seniority is null for anyone HR added by hand, and the rule
+    // degrades to the arms below it rather than treating null as a "no".
+    const sig = rows(await db.execute(sql`
+      SELECT e.classification, e.classification_reviewed_at, ro.level AS seniority
+        FROM hr_employees e
+        LEFT JOIN applications a ON a.id = e.application_id
+        LEFT JOIN roles ro ON ro.id = a.role_id
+       WHERE e.id = ${employeeId}
+       LIMIT 1`))[0];
+    if (!sig) return none;
+    return {
+      classification: asText(sig.classification),
+      classificationReviewedAt: asText(sig.classification_reviewed_at),
+      seniority: asText(sig.seniority),
+    };
+  } catch (e: any) {
+    logFail('[workspace-access] intern signals', e);
+    return none;
+  }
+}
+
 async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<WorkspaceLookup> {
   if (!user?.id) return { status: 'none', workspace: null };
 
-  const role = String(user.role || '').trim().toLowerCase();
-
-  // Exact equality, never a substring test. src/lib/hr-wallet.ts:151 grants HR approval rights on
-  // `role.indexOf('hr') >= 0`, which any role merely CONTAINING those two letters passes.
-  // super_admin is included because that role already holds every HR permission in
-  // src/lib/auth/permissions.ts:20-31; refusing it here would only push the founder back to the
-  // console that shows strictly more. ('admin' is not a value of the user_role enum, so the branch
-  // testing for it in hr-wallet.ts:150 is dead — it is not reproduced here.)
-  const isHr = role === 'hr' || role === 'super_admin';
+  // A CAPABILITY, NOT A ROLE NAME. This was `role === 'hr' || role === 'super_admin'`, and those two
+  // roles are exactly — and only — the ones PERMS_BY_ROLE grants 'employees.manage' to, so the set
+  // of people this admits is unchanged. What changes is that the question is now "may you manage
+  // employee records?" instead of "are you called HR?", which is the question the enforcement can
+  // still answer after somebody adds the twelfth role. src/lib/hr-wallet.ts:151 asked the old
+  // question as `role.indexOf('hr') >= 0` and handed approval rights to any role merely CONTAINING
+  // those two letters. ('admin' is not a value of the user_role enum, so the branch testing for it
+  // in hr-wallet.ts:150 is dead and is not reproduced as a grant.)
+  const isHr = holdsCapability(user, 'employees.manage');
 
   // THE ONLY WORKING TEAM-LEAD SIGNAL IN THIS DATABASE, and the reason it is a DEPARTMENT and not a
   // list of reports. hr_employees.reporting_manager_id is declared at db/hr-schema.sql:55 and read
@@ -190,7 +272,12 @@ async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<
   // console (src/pages/admin/users.astro:40 and :216) alongside the 'department_head' role. That
   // pair is the entire mechanism. When a real manager link is populated, it belongs here, next to
   // this comment, and not copied into a page.
-  const isTeamLead = role === 'department_head';
+  //
+  // 'department.lead' is held by department_head and by NOBODY else — not even super_admin, which is
+  // deliberate and is written out in permissions.ts above the matrix: the key is a SCOPE (one
+  // department) rather than a rank, so granting it to the founder would confine them instead of
+  // widening anything. Same single role as `role === 'department_head'` admitted before.
+  const isTeamLead = holdsCapability(user, 'department.lead');
   const scopeDepartmentId = isTeamLead ? (String(user.assignedDepartmentId || '').trim() || null) : null;
 
   const email = String(user.email || '').trim().toLowerCase();
@@ -263,17 +350,25 @@ async function lookupWorkspace(user: WorkspaceUser | null | undefined): Promise<
     }
   }
 
-  // employment_type is free text written inconsistently ('Internship' from the HR edit form,
-  // 'full_time' from the auto-hire path in hr/sync.ts:72), so the designation is tested too: a role
-  // titled "... Intern" is the same person however their type was recorded. This is the same test as
-  // intern-guard.ts:48-52, deliberately — the guard that BLOCKS interns from /admin and the gate
-  // that GIVES them their own screen must never disagree about who is an intern.
-  // Known shared flaw: a designation like "Internal Auditor" also contains 'intern'. The effect is
-  // more restriction, never more exposure, so it fails in the safe direction — but fix both together.
+  // WHO IS AN INTERN — asked in order, and no longer asked here at all.
+  //
+  // This used to be a bare substring test on employment_type and designation, duplicated verbatim in
+  // intern-guard.ts. employment_type is free text written inconsistently ('Internship' from the HR
+  // edit form, 'full_time' for EVERY hire from the auto-hire path at hr/sync.ts:72), so designation
+  // was tested too — and a designation like "Internal Auditor" then matched. Both copies are gone:
+  // src/lib/auth/intern-signals.ts holds the one ordered rule, and the guard that BLOCKS interns from
+  // /admin now imports the same function as this gate, which GIVES them their own screen. They can no
+  // longer disagree about who is an intern, because there is nothing left to disagree with.
+  //
+  // The substring test is still in there, as the LAST arm — it is the only signal a hand-added record
+  // carries. What is new is that two structured values are asked first.
   const employmentType = asText(row.employment_type);
   const designation = asText(row.designation);
-  const isIntern = String(employmentType || '').toLowerCase().includes('intern')
-    || String(designation || '').toLowerCase().includes('intern');
+  const isIntern = resolveIsIntern({
+    ...(await internSignals(String(row.id))),
+    employmentType,
+    designation,
+  });
 
   // Deactivation writes both flags (src/pages/admin/hr/employees/index.astro:67), so both are
   // checked. Anything other than an explicit 'inactive' counts as working, so a value like
@@ -417,9 +512,10 @@ export async function requireTeamLead(
       'Something went wrong resolving what you lead. Try again in a moment, and tell HR if it keeps happening.');
   }
 
-  // An intern is never a team lead, whatever else the account says.
-  const role = String(user.role || '').trim().toLowerCase();
-  if (ws?.isIntern || role !== 'department_head') {
+  // An intern is never a team lead, whatever else the account says. The engagement test is
+  // per-PERSON and survives the conversion: 'department.lead' says which department you are confined
+  // to, never that you are not an intern.
+  if (ws?.isIntern || !holdsCapability(user, 'department.lead')) {
     return deny('not-a-team-lead', 'This screen is for team leads',
       'You are not recorded as leading a department. Your own workspace is at /portal/employee.');
   }
@@ -459,8 +555,9 @@ export async function requireHr(
       '/portal/login?next=' + encodeURIComponent(next));
   }
 
-  const role = String(user.role || '').trim().toLowerCase();
-  if (role !== 'hr' && role !== 'super_admin') {
+  // The same capability lookupWorkspace() resolves isHr from, asked once more because this gate must
+  // answer before any record is read — and admitting exactly the two roles the role test admitted.
+  if (!holdsCapability(user, 'employees.manage')) {
     return deny('not-hr', 'This screen is for the people team',
       'Your account does not hold HR permissions. Your own workspace is at /portal/employee.');
   }

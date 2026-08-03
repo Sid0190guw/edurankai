@@ -1,13 +1,61 @@
 // HRMS wallet + payouts. Salary is disbursed into an employee wallet (a
 // double-entry ledger); the employee connects a bank account; withdrawals are
-// requested by the employee and must be approved by their reporting manager, an
-// HR head, an admin or a super-admin before being paid out via Razorpay (RazorpayX
-// Payouts). Self-bootstrapping schema — consistent with the rest of the app.
+// requested by the employee and must be approved by someone who holds
+// `payouts.approve` — or by that employee's own reporting manager — before being
+// released by someone who holds `payouts.pay` via Razorpay (RazorpayX Payouts).
+// Self-bootstrapping schema — consistent with the rest of the app.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can, type Permission } from '@/lib/auth/permissions';
+import type { User } from '@/lib/db/schema';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 async function safe(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
+
+/**
+ * The standing authority approverRole() is asked about. Named as a type so a caller cannot pass
+ * `'leave.edit'` or a hand-typed string that nothing grants: inventing a permission string outside
+ * the Permission union is what made an entire console unreachable for every role on this project.
+ *
+ * Two members, because approving time off and approving money are two different powers held by the
+ * same people today. Asking with the wrong one would be silently correct right now and silently
+ * wrong the day either grant moves — so each caller names its own.
+ */
+export type ApprovalCapability = Extract<Permission, 'leave.approve' | 'payouts.approve'>;
+
+/**
+ * Does this account hold a capability? The only way these two engines may ask about authority.
+ *
+ * `can()` — the pure, database-free test over PERMS_BY_ROLE — and deliberately NOT the registry's
+ * resolvePermissions(): the registry adds the super_admin WILDCARD and every custom-role grant, so
+ * asking IT would admit any admin-created role that had been handed the key. The role tests replaced
+ * here admitted exactly two built-in roles. This is a mechanism change and must not move the policy.
+ *
+ * `key` is typed `Permission`, so a string that is not in the union fails to COMPILE. An invented key
+ * answers false for every role INCLUDING super_admin, which is how a whole console became unreachable
+ * on this project once already.
+ *
+ * TWO ADAPTATIONS, both there to preserve exactly what the role comparisons did:
+ *   - the role is trimmed and lowercased, because every test replaced here read
+ *     `String(user.role || '').toLowerCase()`;
+ *   - `isActive` is read as "not explicitly false". can() denies an inactive account and the old
+ *     tests looked at the role alone. The difference is unreachable through the three call paths
+ *     that exist — all pass Astro.locals.user, and validateSessionToken() deletes the session of a
+ *     deactivated account (src/lib/auth/session.ts:59-62) — but these functions take `user: any`,
+ *     and a caller handing over a narrower object must not lose authority to a field it never
+ *     carried.
+ *
+ * Twin of holdsCapability() in src/lib/auth/workspace-access.ts, which makes the same two adaptations
+ * for the workspace gates. Kept separate rather than imported so the HR money path has no dependency
+ * on the workspace module; if they are ever consolidated, consolidate them deliberately and together.
+ */
+export function holdsHrCapability(user: any, key: Permission): boolean {
+  if (!user) return false;
+  return can(
+    { role: String(user.role || '').trim().toLowerCase(), isActive: user.isActive !== false } as unknown as User,
+    key,
+  );
+}
 
 let ready: Promise<void> | null = null;
 export function ensureWalletSchema(): Promise<void> {
@@ -150,17 +198,21 @@ export async function listWithdrawals(opts: { employeeId?: string; status?: stri
  * with this status"; neither tells an approver what is waiting on them, so requests sit unanswered
  * while everyone assumes someone else is looking.
  *
- * Same authority as approverRole(), expressed in SQL: super_admin and admin and the exact role 'hr'
- * see every pending request; everyone else sees only employees whose reporting_manager_id is their
- * own USERS id. decideWithdrawal() still re-checks through approverRole() — this decides what to
- * show, never what may be done.
+ * Same authority as approverRole(), expressed in SQL: whoever holds `payouts.approve` sees every
+ * pending request; everyone else sees only employees whose reporting_manager_id is their own USERS
+ * id. decideWithdrawal() still re-checks through approverRole() — this decides what to show, never
+ * what may be done.
  */
 export async function pendingWithdrawalsForApprover(user: any): Promise<any[]> {
   if (!user?.id) return [];
   await ensureWalletSchema();
 
-  const role = String(user.role || '').toLowerCase();
-  const seesAll = role === 'super_admin' || role === 'admin' || role === 'hr';
+  // WAS `role === 'super_admin' || role === 'admin' || role === 'hr'`. Same people, asked as a
+  // capability: PERMS_BY_ROLE grants payouts.approve to exactly super_admin and hr, and 'admin' is
+  // not a value of userRoleEnum (src/lib/db/schema.ts:10-16) so that arm could never match an
+  // account. can() reads the built-in matrix only — no database — so this answer survives an outage
+  // and cannot be widened by a section-matrix row that merely spells 'payouts'.
+  const seesAll = holdsHrCapability(user, 'payouts.approve');
 
   try {
     if (seesAll) {
@@ -186,22 +238,40 @@ export async function pendingWithdrawalsForApprover(user: any): Promise<any[]> {
   }
 }
 
-export async function approverRole(user: any, employeeId: string): Promise<string | null> {
+export async function approverRole(
+  user: any,
+  employeeId: string,
+  capability: ApprovalCapability,
+): Promise<string | null> {
   if (!user) return null;
-  const role = (user.role || '').toLowerCase();
-  if (role === 'super_admin') return 'super_admin';
-  if (role === 'admin') return 'admin';
 
-  // EXACT match, not a substring test.
+  // THE STANDING AUTHORITY, asked as a capability rather than spelled as a role.
   //
-  // This was `role.indexOf('hr') >= 0`, so ANY role whose name merely contained the letters "hr"
-  // was treated as HR head and could approve leave and wallet withdrawals. It was safe only by the
-  // accident of the current role list, and this organisation is heading for 1100+ roles created
-  // from the admin panel — "Chief HR Officer" would have passed, and so would anything else with
-  // those two letters anywhere in it. Approval authority must never depend on spelling.
-  if (role === 'hr') return 'hr_head';
+  // It was `role.indexOf('hr') >= 0` once, so ANY role whose name merely contained the letters "hr"
+  // could approve leave and wallet withdrawals; then it was three exact role names. Both forms make
+  // approval authority a property of a STRING. Now the question is "may this person approve", and
+  // PERMS_BY_ROLE is the one place that answers it.
+  //
+  // IDENTICAL SET, NOT A WIDER ONE. can() consults the built-in matrix only — no database, no custom
+  // roles — and leave.approve / payouts.approve are granted there to exactly super_admin and hr,
+  // which is what the three name tests matched. The dropped `role === 'admin'` arm was dead: 'admin'
+  // is not a value of userRoleEnum (src/lib/db/schema.ts:10-16), so no account could ever hold it.
+  if (holdsHrCapability(user, capability)) {
+    // decided_by_role is an audit column that both /admin/hr/leave and /admin/hr/wallet PRINT, and
+    // rows written before this change say 'super_admin' or 'hr_head'. The labels are kept byte-for-
+    // byte so the history stays readable and payWithdrawal's old narrowing means the same thing.
+    // Reading user.role here decides only what the record is CALLED — never who may act.
+    // HONEST LIMIT: a role granted this capability later would be recorded as 'hr_head'. Give it its
+    // own label at that point; do not let the label decide anything.
+    return String(user.role || '').toLowerCase() === 'super_admin' ? 'super_admin' : 'hr_head';
+  }
 
   // The employee's own reporting manager may approve.
+  //
+  // KEPT EXACTLY AS IT WAS, and it must stay that way: this is a RELATIONSHIP to one employee, not a
+  // role. The same manager may decide Ravi's request and not Priya's, which no role grant can say.
+  // Granting leave.approve to a role "to cover managers" would hand every manager authority over
+  // every employee — the widest policy change available in this file.
   //
   // This previously probed `reporting_manager_user_id` and `manager_user_id` — neither column
   // exists. The errors were swallowed by safe(), so the branch silently returned nothing every
@@ -223,7 +293,9 @@ export async function decideWithdrawal(id: string, user: any, decision: 'approve
   const w = (await safe(sql`SELECT * FROM hr_withdrawal WHERE id = ${id} LIMIT 1`))[0];
   if (!w) return { ok: false, error: 'Withdrawal not found.' };
   if (w.status !== 'pending') return { ok: false, error: 'Already ' + w.status + '.' };
-  const role = await approverRole(user, w.employee_id);
+  // THE ENFORCEMENT. The page gate decides what to SHOW; this decides what may be DONE, and it runs
+  // on every posted decision including one whose id was typed into the form by hand.
+  const role = await approverRole(user, w.employee_id, 'payouts.approve');
   if (!role) return { ok: false, error: 'You are not permitted to approve this withdrawal.' };
   await db.execute(sql`UPDATE hr_withdrawal SET status = ${decision}, decided_by = ${user.id}, decided_by_role = ${role}, decided_at = NOW(), decision_note = ${note || null} WHERE id = ${id}`);
   await hrAudit(user.id, 'hr.withdrawal.' + decision, String(id),
@@ -246,8 +318,18 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
   const w = (await safe(sql`SELECT w.*, b.account_number, b.ifsc, b.holder, b.upi_id FROM hr_withdrawal w LEFT JOIN hr_bank_account b ON w.bank_account_id = b.id WHERE w.id = ${id} LIMIT 1`))[0];
   if (!w) return { ok: false, error: 'Not found.' };
   if (w.status !== 'approved') return { ok: false, error: 'Only approved withdrawals can be paid.' };
-  const role = await approverRole(user, w.employee_id);
-  if (!role || (role !== 'admin' && role !== 'super_admin' && role !== 'hr_head')) return { ok: false, error: 'Only HR/admin can release a payout.' };
+
+  // RELEASING MONEY IS ITS OWN POWER. This was `approverRole()` followed by throwing away three of
+  // its four answers — `role !== 'admin' && role !== 'super_admin' && role !== 'hr_head'` — which is
+  // a long way of saying "approving is not releasing": a reporting manager may APPROVE a withdrawal
+  // and may NOT send the money. That distinction now has a name, so it can be read at a glance and
+  // granted deliberately, and the row-level reporting-manager lookup no longer runs only to have its
+  // answer discarded.
+  //
+  // IDENTICAL SET. payouts.pay is granted in PERMS_BY_ROLE to exactly super_admin and hr — the two
+  // roles approverRole() answered 'super_admin' and 'hr_head' for. The 'admin' arm was dead ('admin'
+  // is not a value of userRoleEnum), and 'reporting_manager' was refused before and is refused now.
+  if (!holdsHrCapability(user, 'payouts.pay')) return { ok: false, error: 'Only HR/admin can release a payout.' };
 
   let ref = manualRef || null, paidVia = 'manual';
   const KEY = process.env.RAZORPAY_KEY_ID, SEC = process.env.RAZORPAY_KEY_SECRET, ACC = process.env.RAZORPAYX_ACCOUNT_NUMBER;
