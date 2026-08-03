@@ -112,7 +112,25 @@ export const NOTIFICATION_TYPES: { type: string; label: string; desc: string; gr
 // src/lib/notifications-schema.ts is the ONE module that creates this table. It is additive
 // (ALTER ... ADD COLUMN IF NOT EXISTS) so it is safe against a table that pre-dates those columns.
 
-async function persistNotification(userId: string, p: PushPayload) {
+// ONE STATEMENT FOR THE WHOLE AUDIENCE.
+//
+// This was persistNotification(userId, payload), and sendPushToAdmins below called it as
+// `await Promise.all(eligibleIds.map((id) => persistNotification(id, payload)))` — one INSERT per
+// member of staff, all issued CONCURRENTLY. That is the exact shape that took this site down once
+// before: a single serverless invocation asking the Supabase transaction pooler for as many
+// simultaneous connections as there are admins, on a path nineteen call sites use. At 60 staff that
+// is 60 concurrent statements per notification, and notifications arrive in bursts.
+//
+// The recipient list is now unrolled INSIDE Postgres, so a fan-out to any headcount costs ONE
+// statement on ONE connection. The de-dupe predicate is unchanged, only correlated to the unrolled
+// id instead of a bound one.
+//
+// The ids travel as a JSON string, not as a JS array: src/lib/pg-array.ts documents that
+// `${jsArray}::uuid[]` is serialised by postgres-js as a record literal and rejected by Postgres.
+// notifications.user_id is UUID, hence the per-element cast.
+async function persistNotifications(userIds: string[], p: PushPayload) {
+  const ids = (userIds || []).filter((x) => typeof x === 'string' && x.length > 0);
+  if (ids.length === 0) return;
   try {
     const { sql } = await import('drizzle-orm');
     await ensureNotificationsSchema();
@@ -126,15 +144,16 @@ async function persistNotification(userId: string, p: PushPayload) {
     // messages — distinct body/title pass straight through.
     await db.execute(sql`
       INSERT INTO notifications (user_id, title, body, type, action_url, category, priority)
-      SELECT ${userId}, ${p.title}, ${p.body}, ${p.type}, ${p.url}, ${category}, ${priority}
+      SELECT t.x::uuid, ${p.title}, ${p.body}, ${p.type}, ${p.url}, ${category}, ${priority}
+        FROM jsonb_array_elements_text(${JSON.stringify(ids)}::jsonb) AS t(x)
       WHERE NOT EXISTS (
-        SELECT 1 FROM notifications
-        WHERE user_id = ${userId}
-          AND type = ${p.type}
-          AND title = ${p.title}
-          AND COALESCE(body, '') = COALESCE(${p.body}, '')
-          AND COALESCE(action_url, '') = COALESCE(${p.url}, '')
-          AND created_at > NOW() - INTERVAL '2 minutes'
+        SELECT 1 FROM notifications n
+        WHERE n.user_id = t.x::uuid
+          AND n.type = ${p.type}
+          AND n.title = ${p.title}
+          AND COALESCE(n.body, '') = COALESCE(${p.body}, '')
+          AND COALESCE(n.action_url, '') = COALESCE(${p.url}, '')
+          AND n.created_at > NOW() - INTERVAL '2 minutes'
       )
     `);
   } catch (e) { /* silent — never block delivery */ }
@@ -205,7 +224,7 @@ export async function sendPushToAdmins(payload: PushPayload, excludeUserId?: str
     // Persist in-app notifications for every eligible admin FIRST. This is the
     // source of truth for the bell + /admin/notifications feed and is what
     // the user actually sees if the browser push is missed / stripped / muted.
-    await Promise.all(eligibleIds.map((id) => persistNotification(id, payload)));
+    await persistNotifications(eligibleIds, payload);
 
     // If VAPID isn't configured, the in-app bell is everything — stop here.
     if (!vapidConfigured) return;
@@ -250,7 +269,7 @@ export async function sendPushToUser(userId: string, payload: PushPayload): Prom
   if (!userId) return;
   // Persist to in-app feed regardless of VAPID config so the bell still shows
   // activity even before push is wired.
-  await persistNotification(userId, payload);
+  await persistNotifications([userId], payload);
   if (!VAPID_PUBLIC || !VAPID_PRIVATE) return;
   try {
     const subs = await db.select().from(pushSubscriptions).where(eq(pushSubscriptions.userId, userId));

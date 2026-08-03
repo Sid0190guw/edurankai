@@ -18,16 +18,25 @@
 // this route existed the room page treated an unrecognised code as "make me a new room", so two
 // people typing the same code each got a different empty room. One code, one row, one meeting.
 //
-// AUTHORIZATION. Signed in to create — the SAME question /portal/meet itself asks, deliberately
-// unchanged: widening or narrowing who may hold a meeting is a policy decision and belongs to a
-// human, not to a build that was asked to repair a route. Everything after creation is scoped to the
-// host in the WHERE clause (see ./[id].ts), so this endpoint can never read or alter somebody
-// else's meeting.
+// AUTHORIZATION — THROUGH THE CAPABILITY REGISTRY, BEFORE ANY READ. canScheduleMeeting()
+// (src/lib/meet-access.ts) resolves the composition with composeWorkspace() and applies the SAME
+// predicate navigation.ts already publishes for this destination — `worksHere`, i.e. an employee
+// record or `admin.access` — so the endpoint cannot be more generous than the menu that leads to it.
+// It fails closed: composeWorkspace denies on a failed lookup and resolvePermissions resolves to an
+// EMPTY set on error, so a database hiccup refuses a meeting rather than authorising one. The gate
+// runs on the first line of the handler, before the body is read and before any SELECT — filtering
+// after fetching is prohibited (docs/workforce-os/AUTHORIZATION_FIRST.md), and a query that ran for
+// an unauthorised principal has already happened whatever the response says.
+//
+// Everything AFTER creation is narrowed to the host in the WHERE clause (see ./[id].ts) — strictly
+// stronger than any capability test — so this endpoint can never read or alter somebody else's
+// meeting, and nobody who already has a meeting is left unable to cancel it.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureMeetSchema, meetBlockReason, normaliseRoomCode } from '@/lib/meet-schema';
 import { readMeetingBody } from '@/lib/meet-request';
+import { canScheduleMeeting } from '@/lib/meet-access';
 import { logEvent } from '@/lib/logger';
 
 // Declared at the very top, above the handler that uses them: `const` is not hoisted, and a handler
@@ -45,6 +54,15 @@ const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || '
 export const POST: APIRoute = async ({ request, locals }) => {
   const user = (locals as any).user;
   if (!user?.id) return json({ ok: false, error: 'unauthorized' }, 401);
+
+  // Authorization FIRST — before the body is read and before any statement runs.
+  const gate = await canScheduleMeeting(user, { locals, next: '/portal/meet' });
+  if (!gate.ok) {
+    logEvent('warn', 'meet.rooms.create-denied', { userId: user.id, retryable: gate.retryable });
+    // 503 only when the gate could not TELL — "come back later" over a settled refusal is a lie the
+    // caller will act on. A decided "not for you" is 403 and stays 403.
+    return json({ ok: false, error: gate.reason }, gate.retryable ? 503 : 403);
+  }
 
   let body: any = {};
   try {

@@ -238,6 +238,14 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'hr-separations', label: 'Separation and exit', href: '/admin/hr/separation',        icon: 'inbox',    section: 'hr' },
       { id: 'hr-leave',       label: 'Leave',           href: '/admin/hr/leave',                 icon: 'calendar', section: 'leave' },
       { id: 'hr-attendance',  label: 'Attendance',      href: '/admin/hr/attendance',            icon: 'calendar', section: 'attendance' },
+      // WORKING TIME. Both are /admin/hr/* pages, so middleware's longest-prefix match already gates
+      // them; mapping them to `attendance` RECORDS the desk they belong to rather than inventing a
+      // second gate, and each page asks the same question again in its own frontmatter (the
+      // `attendance` section at edit level OR attendance.roster.manage — the capability that already
+      // means "defines working time: shifts, rosters, the holiday list"). Neither approves anything:
+      // an overtime claim and an attendance correction are routed per row from the Organization Graph.
+      { id: 'hr-holidays',    label: 'Holiday calendar', href: '/admin/hr/holidays',             icon: 'calendar', section: 'attendance' },
+      { id: 'hr-attendance-reports', label: 'Attendance reports', href: '/admin/hr/attendance/reports', icon: 'chart', section: 'attendance' },
       { id: 'hr-payroll',     label: 'Payroll',         href: '/admin/hr/payroll',               icon: 'document', section: 'payroll' },
       { id: 'hr-training',    label: 'Training',        href: '/admin/hr/training',              icon: 'book',     section: 'training' },
       // PERFORMANCE AND LEARNING. Three /admin/hr/* pages, so middleware's longest-prefix match on
@@ -256,7 +264,24 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // an older hand-written list: the page, the sidebar entry and the capability were written
       // together and ask the same question. Only super_admin and `hr` hold these sections today.
       { id: 'helpdesk',       label: 'Helpdesk',        href: '/admin/helpdesk',                 icon: 'chat',     section: 'helpdesk' },
+      // THE STAFF HANDBOOK. It lives UNDER /admin/helpdesk on purpose — it is what the desk hands
+      // somebody INSTEAD of a ticket — so middleware's longest-prefix match already gates it on the
+      // same 'helpdesk' section this entry names. Menu, door and page ask one question. WRITING needs
+      // `knowledge.manage` on top of it, asked by the page; READING an article is gated by the
+      // article's own audience in the WHERE clause and needs no permission of its own.
+      { id: 'helpdesk-knowledge', label: 'Knowledge base', href: '/admin/helpdesk/knowledge',    icon: 'book',     section: 'helpdesk' },
       { id: 'assets',         label: 'Asset register',  href: '/admin/assets',                   icon: 'package',  section: 'assets' },
+      // AGGREGATE REPORTING. Both pages ask can(user, 'analytics.view') in their own frontmatter, and
+      // that capability is held by super_admin and `hr` — which is exactly the population the 'hr'
+      // section admits, since `hr` is the only built-in role carrying it and super_admin is
+      // unrestricted. The menu therefore offers these to the same accounts the page admits.
+      //
+      // NOT 'audit' — which is what the /admin/analytics prefix resolved to in middleware.ts, and
+      // which `hr` does not hold in ROLE_SECTIONS. That mismatch bounced every hr account off the
+      // workforce console before its own gate ever ran; it is fixed at the door too, in the two
+      // PATH_SECTION entries added there.
+      { id: 'workforce-analytics', label: 'Workforce analytics', href: '/admin/analytics/workforce', icon: 'chart', section: 'hr' },
+      { id: 'domain-dashboards', label: 'Domain dashboards', href: '/admin/analytics/domains/executive', icon: 'chart', section: 'hr' },
       // NEWLY MAPPED (five). Support and applicant-facing queues follow the surface they belong to;
       // the employee-record ones follow 'hr'.
       { id: 'hr-support',     label: 'Application Support', href: '/admin/hr-support',           icon: 'message-circle', section: 'messages' },
@@ -397,6 +422,11 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   { id: 'observability', label: 'Observability', href: '/admin/observability', icon: 'shield', section: 'settings' },
   { id: 'jobs', label: 'Background jobs', href: '/admin/jobs', icon: 'package', section: 'settings' },
   { id: 'hardening', label: 'Hardening & ops', href: '/admin/hardening', icon: 'shield', section: 'settings' },
+  // The incident board — what is broken, right now, in one view. 'settings' for the same reason as
+  // every other operator screen here: no built-in role but super_admin holds it, and the page itself
+  // asks for `administer` on the platform, so the link is never offered more widely than the lock
+  // behind it allows. An operator screen with no sidebar entry is a screen nobody opens at 2am.
+  { id: 'ops', label: 'Ops console', href: '/admin/ops', icon: 'chart', section: 'settings' },
   { id: 'backup', label: 'Backup & integrity', href: '/admin/backup', icon: 'package', section: 'settings' },
   { id: 'users', label: 'Users', href: '/admin/users', icon: 'users', section: 'users' },
   { id: 'analytics', label: 'Analytics', href: '/admin/analytics', icon: 'chart', section: 'audit' },

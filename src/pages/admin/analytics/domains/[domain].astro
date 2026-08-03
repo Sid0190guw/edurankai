@@ -1,0 +1,393 @@
+---
+// /admin/analytics/domains/<domain> — THE DOMAIN DASHBOARDS. Nine of them, one page.
+//
+// =================================================================================================
+// WHY ONE ROUTE AND NOT NINE FILES
+// =================================================================================================
+//
+// Every dashboard renders the same three things — metrics, bands, one trend chart — over a different
+// query set. Nine .astro files would be nine copies of this markup and this stylesheet, and the day
+// somebody fixed the suppression label they would fix it in one of them. The DOMAIN is the parameter;
+// src/lib/analytics-domains.ts is where the difference lives.
+//
+// =================================================================================================
+// THE GATE, AND WHY THERE ARE TWO OF THEM
+// =================================================================================================
+//
+//   1. `analytics.view` (can(), the built-in matrix) — super_admin and hr, the two roles that already
+//      hold employee.manage and can therefore already read every individual employee record one at a
+//      time. This hands them the AGGREGATE instead, which is the narrower artefact.
+//   2. THE ORGANIZATION GRAPH decides WHOSE numbers. resolveDashboardScope() asks the same function
+//      /portal/organization asks: `employee.manage` sees the organization, a department_head EDGE
+//      sees that department, anybody else sees NOTHING here and is told why. A department head who
+//      opens this sees their department and not the company — and never because of a role name.
+//
+// Both are re-asked on every load. There is no POST handler on this page at all: the domain and the
+// period live in the URL, so the state is shareable and there is nothing above the declarations that
+// could reach a const early.
+//
+// =================================================================================================
+// WHAT IS NOT HERE, AND CANNOT BE ADDED WITHOUT DELETING A QUERY
+// =================================================================================================
+//
+// No row per person. No drill-down. No export of individuals. No wellness data of any kind — not
+// aggregated, not counted, not joined; the protection is the absence of the query in
+// src/lib/analytics-domains.ts, not a permission somebody could widen later. No salary, gender, date
+// of birth, government id or bank column. The payroll dashboard reads a payroll RUN's own totals and
+// never a payslip.
+//
+// CLIENT JAVASCRIPT: NONE. Zero bytes added. The bars are CSS widths and the trend chart is inline
+// SVG rendered on the server; the tooltips are native <title> elements.
+// MOBILE FIRST: 360px, 44px targets, one column, and the only thing that scrolls sideways is the tab
+// strip and the chart's own container.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { resolvePermissions, holdsPermission } from '@/lib/auth/registry';
+import {
+  DOMAIN_DASHBOARDS,
+  parseDomainKey,
+  resolveDashboardScope,
+  buildDomainDashboard,
+  MIN_GROUP,
+  TOO_FEW_LABEL,
+} from '@/lib/analytics-domains';
+
+const BASE = '/admin/analytics/domains';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+// THE CAPABILITY GATE. See the header: middleware maps this path to a section, but the capability is
+// what this console is documented to be gated on, and it is asked here where it cannot be forgotten.
+if (!can(user as any, 'analytics.view')) return Astro.redirect('/admin');
+
+// ------------------------------------------------------------------------------------------------
+// EVERY CONST BEFORE ITS FIRST USE. `const` is not hoisted, and a const declared below the code that
+// reads it throws on that code's first line — the failure that took down apply step 5 here.
+// ------------------------------------------------------------------------------------------------
+
+const params = Astro.url.searchParams;
+const domain = parseDomainKey(Astro.params.domain);
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const todayIso = new Date().toISOString().slice(0, 10);
+const defaultFrom = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+const fromParam = String(params.get('from') || '');
+const toParam = String(params.get('to') || '');
+const from = DATE_RE.test(fromParam) ? fromParam : defaultFrom;
+const to = DATE_RE.test(toParam) ? toParam : todayIso;
+
+// Wildcard-aware, so a super admin's '*' answers true. A bare set-membership test here would hide
+// every dashboard from the founder, which is exactly how a console became unreachable on this
+// project once already.
+const resolved = await resolvePermissions(String(user.id), { locals: Astro.locals });
+const holds = (key: string): boolean => {
+  try {
+    return holdsPermission(resolved, key);
+  } catch {
+    return false;
+  }
+};
+
+const scope = await resolveDashboardScope(String(user.id), holds);
+const model = await buildDomainDashboard(domain, { from, to }, scope);
+
+const hrefFor = (key: string) =>
+  BASE + '/' + encodeURIComponent(key) + '?from=' + encodeURIComponent(from) + '&to=' + encodeURIComponent(to);
+
+/** The widest visible band, so the bars share one scale. A suppressed band contributes nothing. */
+const widestIn = (bands: any[]): number => {
+  let max = 0;
+  for (const b of bands) if (!b.suppressed && typeof b.count === 'number' && b.count > max) max = b.count;
+  return max;
+};
+
+/** Bar width as a percentage. A suppressed band gets NO bar: an empty bar beside "too few to
+ *  report" still draws a shape somebody would try to read. */
+const barWidth = (count: number | null, max: number): string => {
+  if (count === null || max <= 0) return '0%';
+  return String(Math.max(4, Math.round((count / max) * 100))) + '%';
+};
+
+// ------------------------------------------------------------------------------------------------
+// THE TREND CHART, laid out on the server.
+//
+// One series, so there is no legend and no categorical palette to validate — identity is carried by
+// the title. Columns are thin with a 2px surface gap, 3px rounded data-ends, anchored to a recessive
+// baseline. Only two points are labelled directly (the tallest and the last), because a number over
+// every column is noise. A suppressed month is a GAP with a marker, never a zero-height bar.
+// ------------------------------------------------------------------------------------------------
+
+const CHART_W = 360;
+const CHART_H = 132;
+const PLOT_H = 96;
+const SLOT = 30;
+const BAR_W = 20;
+
+const chartGeometry = (points: any[], max: number) => {
+  const slots = Math.max(points.length, 1);
+  const width = Math.max(CHART_W, slots * SLOT);
+  return points.map((p: any, i: number) => {
+    const x = i * SLOT + (SLOT - BAR_W) / 2;
+    const value = typeof p.value === 'number' ? p.value : 0;
+    const h = max > 0 && value > 0 ? Math.max(3, Math.round((value / max) * PLOT_H)) : 0;
+    return {
+      label: String(p.label || ''),
+      value: p.value,
+      suppressed: p.suppressed === true,
+      x,
+      y: PLOT_H - h,
+      h,
+      mid: x + BAR_W / 2,
+      width,
+      tallest: false,
+    };
+  });
+};
+
+const chartViewBox = (points: any[]) =>
+  '0 0 ' + String(Math.max(CHART_W, Math.max(points.length, 1) * SLOT)) + ' ' + String(CHART_H);
+
+const isTallest = (bar: any, max: number) => typeof bar.value === 'number' && bar.value === max && max > 0;
+
+const fmtNumber = (n: number) => Math.round(n).toLocaleString('en-IN');
+---
+
+<AdminLayout title={'Analytics: ' + model.label} activeNav="domain-dashboards">
+  <div class="dd">
+    <header class="dd__head">
+      <h1>{model.label}</h1>
+      <p>{model.explanation}</p>
+      <p class="dd__scope">
+        <span class="dd__chip">{model.scope.label}</span>
+        {model.scope.kind === 'departments' && (
+          <span class="dd__chipnote">Resolved from the organization graph, not from a role name.</span>
+        )}
+      </p>
+    </header>
+
+    <nav class="dd__tabs" aria-label="Dashboards">
+      {DOMAIN_DASHBOARDS.map((d) => (
+        <a class="dd__tab" href={hrefFor(d.key)} aria-current={d.key === domain ? 'page' : null}>{d.label}</a>
+      ))}
+    </nav>
+
+    {model.periodMatters && (
+      <form class="dd__period" method="get" action={BASE + '/' + domain}>
+        <label for="dd-from">From</label>
+        <input class="dd__field" id="dd-from" name="from" type="date" value={from} max={todayIso} />
+        <label for="dd-to">To</label>
+        <input class="dd__field" id="dd-to" name="to" type="date" value={to} max={todayIso} />
+        <button class="dd__go" type="submit">Apply</button>
+      </form>
+    )}
+
+    {!model.periodMatters && (
+      <p class="dd__note">
+        This dashboard describes the organization as it stands now. These records are updated in
+        place, so there is no way to ask what the numbers were on a past date, and a date filter here
+        would be decoration over a figure that ignored it.
+      </p>
+    )}
+
+    <p class="dd__rule">
+      Anything covering fewer than {MIN_GROUP} people is not reported. Below that a count stops being
+      a statistic and starts describing somebody. When a band is withheld its breakdown total is
+      withheld with it, because the missing number would otherwise be one subtraction away. No query
+      behind this page returns a row per person, and no individual health or wellness data is read
+      here by anybody, including the founder.
+    </p>
+
+    {model.degraded && (
+      <p class="dd__warn">
+        Part of this dashboard could not be read, so it is incomplete. What could not be read is named
+        on the panel it belongs to. Nothing here is estimated to fill a gap.
+      </p>
+    )}
+
+    {model.panels.length === 0 && (
+      <section class="dd__panel">
+        <h2>Nothing in scope</h2>
+        <p class="dd__blurb">{model.scope.note}</p>
+      </section>
+    )}
+
+    {model.panels.map((panel) => (
+      <section class="dd__panel">
+        <h2>{panel.label}</h2>
+        <p class="dd__blurb">{panel.blurb}</p>
+
+        {!panel.available && <p class="dd__warn">{panel.note}</p>}
+
+        {panel.metrics.length > 0 && (
+          <div class="dd__metrics">
+            {panel.metrics.map((m) => (
+              <div class="dd__metric">
+                <b>{m.suppressed ? TOO_FEW_LABEL : (m.value === null ? 'Not available' : m.value)}</b>
+                <span>{m.label}</span>
+                {m.hint && <small>{m.hint}</small>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {panel.bands.length > 0 && (
+          <div class="dd__bands">
+            <h3>{panel.bandsTitle}</h3>
+            {panel.bands.map((b) => (
+              <div class="dd__band">
+                <div class="dd__bandtop">
+                  <span>{b.label}</span>
+                  <strong>{b.suppressed ? TOO_FEW_LABEL : fmtNumber(Number(b.count))}</strong>
+                </div>
+                <div class="dd__track">
+                  <div class="dd__fill" style={'width:' + barWidth(b.count, widestIn(panel.bands))}></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {panel.chart && panel.chart.points.length > 0 && (
+          <figure class="dd__chart">
+            <figcaption>{panel.chart.title}</figcaption>
+            <div class="dd__plot">
+              <svg
+                viewBox={chartViewBox(panel.chart.points)}
+                role="img"
+                aria-label={panel.chart.title + '. ' + panel.chart.basis}
+              >
+                <line x1="0" y1={PLOT_H} x2={Math.max(CHART_W, panel.chart.points.length * SLOT)} y2={PLOT_H} class="dd__axis" />
+                {chartGeometry(panel.chart.points, panel.chart.max).map((bar) => (
+                  <g>
+                    {bar.suppressed ? (
+                      <circle cx={bar.mid} cy={PLOT_H - 5} r="2.5" class="dd__gap">
+                        <title>{bar.label + ': fewer than ' + MIN_GROUP + ', so it is not reported'}</title>
+                      </circle>
+                    ) : (
+                      <rect x={bar.x} y={bar.y} width={BAR_W} height={bar.h} rx="3" class="dd__col">
+                        <title>{bar.label + ': ' + fmtNumber(Number(bar.value || 0)) + ' ' + (panel.chart?.unit || '')}</title>
+                      </rect>
+                    )}
+                    <text x={bar.mid} y={PLOT_H + 14} class="dd__xlabel">{bar.label}</text>
+                    {isTallest(bar, panel.chart?.max || 0) && (
+                      <text x={bar.mid} y={Math.max(10, bar.y - 5)} class="dd__vlabel">{fmtNumber(Number(bar.value || 0))}</text>
+                    )}
+                  </g>
+                ))}
+              </svg>
+            </div>
+            <p class="dd__basis">{panel.chart.basis}</p>
+            {panel.chart.suppressedPoints > 0 && (
+              <p class="dd__note">
+                {panel.chart.suppressedPoints} month{panel.chart.suppressedPoints === 1 ? '' : 's'} held
+                fewer than {MIN_GROUP} and {panel.chart.suppressedPoints === 1 ? 'is' : 'are'} shown as a
+                gap rather than a small bar. A gap is not a zero, and this caption is here so it is not
+                read as one.
+              </p>
+            )}
+          </figure>
+        )}
+
+        <p class="dd__basis"><b>What this counts:</b> {panel.basis}</p>
+        {panel.available && panel.note && <p class="dd__note">{panel.note}</p>}
+        {panel.available && panel.metrics.length === 0 && panel.bands.length === 0 && !panel.chart && !panel.note && (
+          <p class="dd__note">There is nothing recorded to report on for this period.</p>
+        )}
+      </section>
+    ))}
+
+    <p class="dd__foot">
+      Every figure on this page is a count, a sum or an average across a group, and every one of them
+      says what it counts and over what period. No query behind it returns a row per person and there
+      is nowhere here to reach one. Individual health and wellness data is never read on this screen by
+      anyone, including the founder: that is enforced by there being no such query, rather than by a
+      permission somebody could widen later.
+    </p>
+  </div>
+</AdminLayout>
+
+<style>
+  .dd { max-width: 860px; margin: 0 auto; padding: 4px 0 32px; }
+  .dd__head h1 { margin: 0; font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
+  .dd__head p { margin: 6px 0 0; font-size: 0.8125rem; line-height: 1.6; color: #564E43; }
+  .dd__scope { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+  .dd__chip { display: inline-flex; align-items: center; min-height: 26px; padding: 3px 11px;
+    border-radius: 999px; background: #1B1813; color: #FFFFFF; font-size: 0.75rem; font-weight: 650; }
+  .dd__chipnote { font-size: 0.75rem; color: #70685C; }
+
+  .dd__tabs { display: flex; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    padding: 12px 0 2px; margin: 0; scrollbar-width: thin; }
+  .dd__tab { flex: none; display: inline-flex; align-items: center; min-height: 44px; padding: 8px 14px;
+    border: 1px solid #DFDCD8; border-radius: 999px; background: #FDFDFC; color: #564E43;
+    font-size: 0.8125rem; font-weight: 600; text-decoration: none; white-space: nowrap; }
+  .dd__tab[aria-current="page"] { background: #1B1813; border-color: #1B1813; color: #FFFFFF; }
+  .dd__tab:focus-visible { outline: 2px solid #6F52E5; outline-offset: 2px; }
+
+  .dd__period { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0 0; }
+  .dd__period label { font-size: 0.75rem; font-weight: 650; color: #564E43; }
+  .dd__field { flex: 1 1 140px; min-width: 0; min-height: 44px; padding: 10px 12px;
+    border: 1px solid #DFDCD8; border-radius: 8px; background: #FDFDFC; color: #1B1813;
+    font: inherit; font-size: 0.875rem; }
+  .dd__go { flex: 1 1 110px; min-height: 44px; padding: 10px 16px; border: 1px solid #1B1813;
+    border-radius: 8px; background: #1B1813; color: #FFFFFF; font: inherit; font-size: 0.875rem;
+    font-weight: 650; cursor: pointer; }
+  .dd__go:focus-visible { outline: 2px solid #6F52E5; outline-offset: 2px; }
+
+  .dd__rule { margin: 14px 0 0; padding: 11px 13px; border: 1px solid #CDD8EA; border-radius: 10px;
+    background: #F1F5FB; font-size: 0.8125rem; line-height: 1.6; color: #224E91; }
+  .dd__warn { margin: 12px 0 0; padding: 10px 12px; border: 1px solid #EADECD; border-radius: 10px;
+    background: #FBF7F1; font-size: 0.8125rem; line-height: 1.55; color: #6D470D; }
+  .dd__note { margin: 12px 0 0; font-size: 0.75rem; line-height: 1.6; color: #70685C; }
+  .dd__basis { margin: 12px 0 0; font-size: 0.75rem; line-height: 1.6; color: #70685C; }
+  .dd__basis b { color: #564E43; }
+
+  .dd__panel { margin: 16px 0 0; padding: 14px; border: 1px solid #DFDCD8; border-radius: 12px;
+    background: #FDFDFC; }
+  .dd__panel h2 { margin: 0; font-size: 1rem; font-weight: 680; letter-spacing: -0.01em; }
+  .dd__blurb { margin: 4px 0 0; font-size: 0.8125rem; line-height: 1.55; color: #564E43; }
+
+  .dd__metrics { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0 0; }
+  .dd__metric { flex: 1 1 180px; min-width: 0; padding: 11px 13px; border: 1px solid #DFDCD8;
+    border-radius: 10px; background: #F8F8F6; }
+  .dd__metric b { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 1.375rem; line-height: 1.15; overflow-wrap: anywhere; }
+  .dd__metric span { display: block; margin-top: 3px; font-size: 0.6875rem; letter-spacing: 0.06em;
+    text-transform: uppercase; color: #70685C; }
+  .dd__metric small { display: block; margin-top: 6px; font-size: 0.75rem; line-height: 1.5; color: #70685C; }
+
+  .dd__bands { margin: 16px 0 0; }
+  .dd__bands h3 { margin: 0 0 8px; font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase;
+    color: #70685C; font-weight: 650; }
+  .dd__band { margin-bottom: 10px; }
+  .dd__bandtop { display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+    font-size: 0.8125rem; }
+  .dd__bandtop span { overflow-wrap: anywhere; }
+  .dd__bandtop strong { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: nowrap; }
+  .dd__track { margin-top: 4px; height: 8px; border-radius: 999px; background: #EFEDE9; overflow: hidden; }
+  .dd__fill { height: 100%; background: #1B1813; }
+
+  .dd__chart { margin: 18px 0 0; }
+  .dd__chart figcaption { font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase;
+    color: #70685C; font-weight: 650; margin-bottom: 8px; }
+  /* The ONLY horizontally scrolling container on the page besides the tab strip. The page itself
+     never scrolls sideways at 360px. */
+  .dd__plot { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .dd__plot svg { display: block; width: 100%; min-width: 320px; height: auto; }
+  .dd__col { fill: #1B1813; }
+  .dd__gap { fill: #C4BFB6; }
+  .dd__axis { stroke: #DFDCD8; stroke-width: 1; }
+  .dd__xlabel { fill: #70685C; font-size: 8px; text-anchor: middle;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .dd__vlabel { fill: #1B1813; font-size: 9px; text-anchor: middle; font-weight: 700;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  .dd__foot { margin: 20px 0 0; padding: 14px 0 0; border-top: 1px solid #DFDCD8;
+    font-size: 0.75rem; line-height: 1.7; color: #70685C; }
+
+  @media (forced-colors: active) {
+    .dd__fill, .dd__col { background: CanvasText; fill: CanvasText; }
+    .dd__gap { fill: GrayText; }
+  }
+</style>

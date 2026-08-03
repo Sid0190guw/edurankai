@@ -23,6 +23,18 @@ export async function runSecurityScan(windowMinutes = 60): Promise<{ inserted: n
   const now = new Date();
   const start = new Date(now.getTime() - windowMinutes * 60_000);
 
+  // `created_at >= start` on audit_log is the hot predicate of this entire scan. Without an index it
+  // is a sequential scan of the fastest-growing table in the database, run on a schedule. The ensure
+  // is idempotent (CREATE INDEX IF NOT EXISTS) and memoised to one round-trip per process.
+  //
+  // The three window reads below are deliberately NOT capped with a LIMIT. Every detector in
+  // detectors.ts is a counter over the rows it is handed, so truncating the window would silently
+  // lower a burst count and could suppress a real signal — a security regression dressed up as a
+  // performance win. What bounds the work is the window itself, which the caller sets, and the index
+  // is what makes reading that window cheap. Recorded here so this reads as a decision, not an
+  // oversight, to whoever audits it next.
+  try { const { ensureAuditIndexes } = await import('@/lib/audit'); await ensureAuditIndexes(); } catch { /* index work must never stop a scan */ }
+
   let audit: AuditRow[] = [], rbac: RbacAuditRow[] = [], sessions: SessionRow[] = [];
   try { audit = rows(await db.execute(sql`SELECT user_id AS "userId", action, entity, ip_address AS "ipAddress", created_at AS "createdAt" FROM audit_log WHERE created_at >= ${start}`)).map((r: any) => ({ ...r, createdAt: new Date(r.createdAt) })); } catch { /* table may not exist yet */ }
   try { rbac = rows(await db.execute(sql`SELECT user_id AS "userId", capability, allow, reason, at FROM rbac_audit WHERE at >= ${start}`)).map((r: any) => ({ ...r, at: new Date(r.at) })); } catch { /* */ }

@@ -1,0 +1,357 @@
+---
+// /portal/employee/attendance/overtime — CLAIM EXTRA HOURS. NOTHING HERE CREDITS ANYTHING.
+//
+// =================================================================================================
+// THE ONE RULE THIS PAGE EXISTS TO ENFORCE
+// =================================================================================================
+//
+// Extra minutes beyond a shift are ARITHMETIC. They are a subtraction of two numbers, one of which
+// came from a phone that may have been in somebody's pocket at midnight. If that subtraction turned
+// itself into comp off or into pay, a clock nobody stopped would become a day off or a day's wages.
+//
+// So: the number is shown, a person CLAIMS it, and the reporting manager the Organization Graph
+// names decides. src/lib/workflow.ts routes it, domain 'overtime'. When the graph cannot name an
+// approver the claim HALTS with a readable sentence, rendered here verbatim. There is no
+// auto-approve path, no fallback to a role name, and no approve button on this page.
+//
+// COMP OFF IS CREDITED ONLY BY AN APPROVAL. applyApprovedOvertimeClaims() runs when this page loads
+// and writes the ledger for claims the ENGINE has already approved - it re-reads the instance and
+// refuses anything that is not 'approved'. Crediting is keyed on the claim id, so a reload cannot
+// credit twice.
+//
+// =================================================================================================
+// LATE AND EARLY ARE ADVISORY. A HUMAN DECIDES.
+// =================================================================================================
+//
+// The day panel says, in words, if the check-in was after the shift start or the check-out before
+// the shift end. Nothing is stored, nothing is counted, nothing is deducted, and no screen anywhere
+// adds these up. Phone clocks, network drops and rosters changed after the fact all produce these
+// numbers honestly and wrongly, which is exactly why they are sentences for a person to read.
+//
+// MOBILE FIRST. 360px, 44px targets, no page-level sideways scroll.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  dayAgainstShift,
+  requestOvertime,
+  overtimeFor,
+  withdrawOvertime,
+  applyApprovedOvertimeClaims,
+  punchesOn,
+  breakSegments,
+  formatMinutes,
+  shiftSummary,
+  shiftDateIso,
+  today as attendanceToday,
+  type DayAgainstShift,
+  type OvertimeClaim,
+} from '@/lib/attendance';
+import { compOffBalance } from '@/lib/hr-leave';
+import { STATE_LABELS } from '@/lib/workflow';
+
+const PATH = '/portal/employee/attendance/overtime';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function stateLabel(state: string | null | undefined): string {
+  if (state === 'draft') return STATE_LABELS.draft;
+  if (state === 'pending') return STATE_LABELS.pending;
+  if (state === 'approved') return STATE_LABELS.approved;
+  if (state === 'rejected') return STATE_LABELS.rejected;
+  if (state === 'cancelled') return STATE_LABELS.cancelled;
+  if (state === 'halted') return STATE_LABELS.halted;
+  return 'Not sent';
+}
+
+const dayLabel = (iso: string) => {
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+};
+
+const clockTime = (iso: string | null) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+};
+
+let flash = '';
+let flashError = '';
+let notice = '';
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST' && employeeId) {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+
+    if (action === 'claim') {
+      const hours = Number(String(form.get('hours') || '0'));
+      const res = await requestOvertime({
+        employeeId,
+        workDate: String(form.get('work_date') || ''),
+        minutes: Math.round((isFinite(hours) ? hours : 0) * 60),
+        reason: String(form.get('reason') || ''),
+        convertTo: String(form.get('convert_to') || 'comp_off') === 'pay' ? 'pay' : 'comp_off',
+        requestedByUserId: String(user.id),
+      });
+      if (res.ok) {
+        flash = 'Claim sent for approval.';
+        if (res.state === 'halted' && res.haltReason) {
+          notice = 'It could not be routed: ' + res.haltReason +
+            '. It is saved and nobody has approved it. Once that relationship is recorded it carries on from here.';
+        }
+      } else {
+        flashError = res.error || 'That claim could not be filed.';
+      }
+    } else if (action === 'withdraw') {
+      const res = await withdrawOvertime(String(form.get('id') || ''), employeeId);
+      if (res.ok) flash = res.changed === false ? 'That claim was already withdrawn or applied.' : 'Claim withdrawn.';
+      else flashError = res.error || 'That could not be withdrawn.';
+    } else {
+      flashError = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    flashError = 'We could not record that: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/overtime] post', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+const now = await attendanceToday();
+
+// Reconcile first: approvals decided on somebody else's screen reach the ledger here.
+let credited = 0;
+if (employeeId) credited = await applyApprovedOvertimeClaims(employeeId, 20);
+
+const dateParam = String(Astro.url.searchParams.get('date') || '').trim();
+const chosen = DATE_RE.test(dateParam) ? dateParam : (now ? shiftDateIso(now, -1) : '');
+
+let day: DayAgainstShift | null = null;
+let breaks: any[] = [];
+let claims: OvertimeClaim[] = [];
+let compOff: any = null;
+
+if (employeeId && chosen) {
+  day = await dayAgainstShift(employeeId, chosen);
+  breaks = breakSegments(await punchesOn(employeeId, chosen));
+  claims = await overtimeFor(employeeId, 20);
+  compOff = await compOffBalance(employeeId);
+}
+
+const suggestedHours = day && day.overtimeMinutes > 0
+  ? String(Math.round((day.overtimeMinutes / 60) * 100) / 100)
+  : '';
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Overtime - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;-webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 2px;margin:0;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;border:1px solid #DFDCD8;border-radius:999px;
+      background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .stats{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0;}
+    .stat{flex:1 1 140px;min-width:0;padding:10px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;}
+    .stat b{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:1.125rem;line-height:1.2;overflow-wrap:anywhere;}
+    .stat span{display:block;margin-top:2px;font-size:0.6875rem;letter-spacing:0.06em;text-transform:uppercase;color:#70685C;}
+    .lab{display:block;margin:10px 0 4px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    .go{width:100%;min-height:48px;margin:12px 0 0;padding:12px 14px;border:1px solid #1B1813;border-radius:10px;background:#1B1813;color:#fff;font:inherit;font-size:0.9375rem;font-weight:650;cursor:pointer;}
+    .thin{min-height:44px;padding:10px 14px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#564E43;font:inherit;font-size:0.8125rem;font-weight:600;cursor:pointer;}
+    .rows{list-style:none;margin:10px 0 0;padding:0;}
+    .row{padding:10px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;margin-bottom:8px;}
+    .row p{margin:0;font-size:0.875rem;line-height:1.5;overflow-wrap:anywhere;}
+    .row small{display:block;margin-top:3px;font-size:0.75rem;color:#70685C;overflow-wrap:anywhere;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Overtime</h1>
+    <p>{workspace ? workspace.fullName : 'Extra hours'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Attendance">
+    <a class="tab" href="/portal/employee/attendance">Today and this week</a>
+    <a class="tab" href={PATH} aria-current="page">Overtime</a>
+    <a class="tab" href="/portal/employee/attendance/corrections">Corrections</a>
+    <a class="tab" href="/portal/employee/attendance/approvals">Waiting on me</a>
+    <a class="tab" href="/portal/employee/timesheet">Timesheet</a>
+  </nav>
+
+  <main class="wrap">
+    {!gate.ok && (
+      <section class="card">
+        <h2>{gate.title || 'This screen is not available'}</h2>
+        <p>{gate.reason || 'Your employee record is what this screen is built from.'}</p>
+      </section>
+    )}
+
+    {gate.ok && !now && (
+      <p class="bad">
+        We could not read today's date from the database, so no claim can be checked against a day
+        right now. Nothing you have logged is lost.
+      </p>
+    )}
+
+    {flash && <p class="ok">{flash}</p>}
+    {notice && <p class="notice">{notice}</p>}
+    {flashError && <p class="bad">{flashError}</p>}
+    {credited > 0 && <p class="ok">{credited} approved claim(s) have just been credited to your comp off.</p>}
+
+    {gate.ok && compOff && (
+      <section class="card">
+        <h2>Comp off</h2>
+        <div class="stats">
+          <div class="stat"><b>{compOff.available}</b><span>days available</span></div>
+          <div class="stat"><b>{compOff.expiringSoon}</b><span>expiring in 30 days</span></div>
+          <div class="stat"><b>{compOff.nextExpiry ? dayLabel(compOff.nextExpiry) : 'None'}</b><span>next expiry</span></div>
+        </div>
+        <p style="margin-top:8px;">Spend it from the <a href="/portal/employee/leave">leave screen</a>, choosing Comp off as the type.</p>
+      </section>
+    )}
+
+    {gate.ok && (
+      <section class="card">
+        <h2>Pick a day</h2>
+        <form method="GET" action={PATH}>
+          <label class="lab" for="date">Which day did you work extra?</label>
+          <input class="field" id="date" name="date" type="date" value={chosen} max={now || undefined}/>
+          <button class="go" type="submit">Show that day</button>
+        </form>
+      </section>
+    )}
+
+    {gate.ok && chosen && day && (
+      <section class="card">
+        <h2>{dayLabel(chosen)}</h2>
+        <p>
+          {day.shift ? shiftSummary(day.shift) : 'No shift is rostered for you on this day, so nothing was expected of it.'}
+          {day.holiday ? ' · ' + day.holiday.name : ''}
+        </p>
+        <div class="stats">
+          <div class="stat"><b>{formatMinutes(day.workedMinutes) || '0m'}</b><span>worked</span></div>
+          <div class="stat"><b>{formatMinutes(day.expectedMinutes) || '0m'}</b><span>rostered</span></div>
+          <div class="stat"><b>{formatMinutes(day.breakMinutes) || '0m'}</b><span>on break</span></div>
+          <div class="stat"><b>{formatMinutes(day.overtimeMinutes) || '0m'}</b><span>over the shift</span></div>
+        </div>
+        {day.punctuality.sentence && <p class="notice">{day.punctuality.sentence}</p>}
+        {day.nonWorkingDay && day.workedMinutes > 0 && (
+          <p class="notice">
+            This was not a working day for you, so all of it counts as over the shift. A worked
+            holiday earns comp off in the same way, once it is approved.
+          </p>
+        )}
+        {breaks.length > 0 && (
+          <ul class="rows">
+            {breaks.map((b) => (
+              <li class="row">
+                <p>Break · {formatMinutes(b.minutes) || 'just started'}</p>
+                <small>{clockTime(b.start)}{b.end ? ' to ' + clockTime(b.end) : ' · still running'}</small>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    )}
+
+    {gate.ok && chosen && day && day.overtimeMinutes > 0 && (
+      <section class="card">
+        <h2>Claim it</h2>
+        <form method="POST" action={PATH}>
+          <input type="hidden" name="action" value="claim"/>
+          <input type="hidden" name="work_date" value={chosen}/>
+          <label class="lab" for="hours">Hours to claim</label>
+          <input class="field" id="hours" name="hours" type="number" min="0.25" max="12" step="0.25" value={suggestedHours} required/>
+          <label class="lab" for="convert_to">What you would like for it</label>
+          <select class="field" id="convert_to" name="convert_to">
+            <option value="comp_off">Comp off, added to my balance</option>
+            <option value="pay">Paid with my salary</option>
+          </select>
+          <label class="lab" for="reason">What were the extra hours for?</label>
+          <input class="field" id="reason" name="reason" maxlength="1000" required placeholder="One line is enough"/>
+          <button class="go" type="submit">Send to my manager</button>
+          <p style="margin-top:8px;font-size:0.75rem;line-height:1.55;color:#70685C;">
+            You cannot claim more than your punches support. If a punch is missing, ask for an
+            <a href="/portal/employee/attendance/corrections"> attendance correction</a> first, then
+            claim. Choosing paid records the hours on the day for payroll to read; it does not pay
+            anybody by itself.
+          </p>
+        </form>
+      </section>
+    )}
+
+    {gate.ok && chosen && day && day.overtimeMinutes <= 0 && (
+      <p class="notice">
+        Your punches for this day show nothing over the rostered shift, so there is nothing to claim.
+        If a punch is missing, ask for a correction on that day first.
+      </p>
+    )}
+
+    {gate.ok && claims.length > 0 && (
+      <section class="card">
+        <h2>Your claims</h2>
+        <ul class="rows">
+          {claims.map((c) => (
+            <li class="row">
+              <p>{dayLabel(c.workDate)} · {formatMinutes(c.minutes)} · {c.convertTo === 'pay' ? 'asked as pay' : 'asked as comp off'}</p>
+              <small>
+                {stateLabel(c.workflow?.state)}
+                {c.appliedAt ? ' · credited' : ''}
+                {c.withdrawnAt ? ' · withdrawn' : ''}
+                {c.workedHoliday ? ' · worked holiday' : ''}
+              </small>
+              <small>{c.reason}</small>
+              {c.workflow?.haltReason && <small>{c.workflow.haltReason}</small>}
+              {!c.appliedAt && !c.withdrawnAt && (
+                <form method="POST" action={PATH} style="margin-top:8px;">
+                  <input type="hidden" name="action" value="withdraw"/>
+                  <input type="hidden" name="id" value={c.id}/>
+                  <button class="thin" type="submit">Withdraw</button>
+                </form>
+              )}
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    <p class="foot">
+      Nothing on this page credits anybody. Extra minutes are worked out from your own punches and the
+      shift you were rostered on; a person claims them and a manager decides. Late and early notes are
+      for a human to read and are never deducted from anything.
+    </p>
+  </main>
+</body>
+</html>

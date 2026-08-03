@@ -3,7 +3,8 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { auditLog, users } from '@/lib/db/schema';
 import { can } from '@/lib/auth/permissions';
-import { eq, desc, sql, and, gte, lte } from 'drizzle-orm';
+import { eq, desc, sql, and, gte, lte, inArray } from 'drizzle-orm';
+import { ensureAuditIndexes } from '@/lib/audit';
 
 const currentUser = Astro.locals.user!;
 if (!can(currentUser, 'audit.view')) return Astro.redirect('/admin');
@@ -16,6 +17,12 @@ const daysBack = parseInt(url.searchParams.get('days') || '30', 10);
 
 const sinceDate = new Date();
 sinceDate.setDate(sinceDate.getDate() - daysBack);
+
+// Every read below is filtered on created_at / action / entity / user_id. Those indexes are
+// DECLARED in the Drizzle model but this project has no migration runner, so they exist on the live
+// database only if drizzle-kit was pointed at it — see the note in src/lib/audit.ts. The ensure is
+// idempotent (CREATE INDEX IF NOT EXISTS), memoised per process, and never blocks the page.
+ensureAuditIndexes();
 
 // Build conditions
 const conditions: any[] = [gte(auditLog.createdAt, sinceDate)];
@@ -37,15 +44,42 @@ const entries = await db.select({
   .orderBy(desc(auditLog.createdAt))
   .limit(500);
 
-// Get all users for name lookup + filter dropdown
-const allUsers = await db.select({ id: users.id, name: users.name, email: users.email }).from(users);
-const userMap = Object.fromEntries(allUsers.map(u => [u.id, u]));
+// FILTER FACETS — ONE BOUNDED QUERY, NOT TWO FULL SCANS OF audit_log.
+//
+// This was `db.selectDistinct({ action }).from(auditLog)` and the same for entity: two SELECT
+// DISTINCT statements with NO date bound on the fastest-growing table in the database, run on every
+// load of this page. audit_log gets a row per admin write and per login; the two scans get slower
+// forever and never stop. Both are now restricted to the SAME window the entries list already uses
+// (audit_created_idx covers created_at), capped, and folded into a single round-trip alongside the
+// actor ids.
+//
+// The facets are the values PRESENT IN THE WINDOW, which is also the honest set: an action that
+// stopped being emitted a year ago used to sit in this dropdown and return nothing when chosen.
+const facetsRaw = await db.execute(sql`
+  SELECT 'action' AS kind, v FROM (SELECT DISTINCT action AS v FROM audit_log WHERE created_at >= ${sinceDate} ORDER BY action LIMIT 300) a
+  UNION ALL
+  SELECT 'entity' AS kind, v FROM (SELECT DISTINCT entity AS v FROM audit_log WHERE created_at >= ${sinceDate} ORDER BY entity LIMIT 300) b
+  UNION ALL
+  SELECT 'actor' AS kind, v FROM (SELECT DISTINCT user_id::text AS v FROM audit_log WHERE created_at >= ${sinceDate} AND user_id IS NOT NULL LIMIT 500) c`);
+const facetRows = (Array.isArray(facetsRaw) ? facetsRaw : ((facetsRaw as any)?.rows || [])) as any[];
+const uniqueActions = facetRows.filter(r => r.kind === 'action').map(r => String(r.v)).sort();
+const uniqueEntities = facetRows.filter(r => r.kind === 'entity').map(r => String(r.v)).sort();
 
-// Unique actions + entities for filter dropdowns
-const uniqueActionsRaw = await db.selectDistinct({ action: auditLog.action }).from(auditLog);
-const uniqueEntitiesRaw = await db.selectDistinct({ entity: auditLog.entity }).from(auditLog);
-const uniqueActions = uniqueActionsRaw.map(r => r.action).sort();
-const uniqueEntities = uniqueEntitiesRaw.map(r => r.entity).sort();
+// NAMES FOR THE PEOPLE ON SCREEN, NOT FOR EVERY ACCOUNT THAT EXISTS.
+//
+// This was `SELECT id, name, email FROM users` with no bound — a full scan of the table that holds
+// every applicant as well as every member of staff, to label at most 500 rows and to fill a <select>
+// that listed every candidate who has ever signed up. The lookup is now exactly the actors in the
+// window plus whoever is currently selected in the filter, so it is bounded by audit activity.
+const actorIds = Array.from(new Set([
+  ...facetRows.filter(r => r.kind === 'actor').map(r => String(r.v)),
+  ...entries.map(e => e.userId).filter(Boolean).map(String),
+  ...(userFilter ? [userFilter] : []),
+]));
+const allUsers = actorIds.length > 0
+  ? await db.select({ id: users.id, name: users.name, email: users.email }).from(users).where(inArray(users.id, actorIds))
+  : [];
+const userMap = Object.fromEntries(allUsers.map(u => [u.id, u]));
 
 // Action color coding
 const actionStyle = (action: string): string => {

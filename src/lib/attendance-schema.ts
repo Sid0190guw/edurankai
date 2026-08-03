@@ -60,6 +60,23 @@
 //     under its first use has taken pages down on this project.
 //   - The real Postgres reason is on e.cause. e.message is only the SQL that failed.
 
+// =================================================================================================
+// THE SECOND ENSURE IN THIS FILE, AND WHY IT IS A SECOND ONE RATHER THAN MORE STATEMENTS ABOVE
+// =================================================================================================
+//
+// ensureWorkingTimeSchema() at the bottom creates the OVERTIME and TIMESHEET tables and adds the
+// half-day columns to hr_attendance. It is a separate ensureOnce key from 'attendance_v1' for one
+// mechanical reason: ensureOnce memoises per key per PROCESS, so a running server that has already
+// resolved 'attendance_v1' would never execute statements appended to it. A new key runs on the next
+// request in that same process. Nothing here re-declares a table the first ensure creates.
+//
+// NO SECOND DAY TABLE, NO SECOND PUNCH LOG, NO SECOND HOLIDAY LIST. Overtime is a CLAIM about a day
+// that hr_attendance already holds, and it writes its settled result into that row's existing
+// overtime_hours column (db/hr-schema.sql:133). A timesheet is a WEEKLY DECLARATION a person signs,
+// which is a different fact from the punches, so it has its own rows and deliberately does not
+// overwrite hr_attendance — two writers for one day's hours is the fault this file's header warns
+// about.
+
 import { db } from './db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from './ensure-once';
@@ -256,4 +273,169 @@ async function createAttendanceTables(): Promise<void> {
   await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS qr_station_id UUID`);
   await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS qr_code_raw TEXT`);
   await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS source TEXT`);
+}
+
+// =================================================================================================
+// WORKING TIME: OVERTIME CLAIMS, WEEKLY TIMESHEETS, AND THE HOLIDAY LOCATION
+// =================================================================================================
+
+/**
+ * The second half of the attendance storage. Idempotent, safe on every request, own ensureOnce key.
+ *
+ * Re-throws after logging exactly as ensureAttendanceSchema() does, so ensureOnce drops the failed
+ * run from its cache and the next call retries rather than a transient error poisoning the process.
+ */
+export function ensureWorkingTimeSchema(): Promise<void> {
+  return ensureOnce('working_time_v1', async () => {
+    try {
+      await createWorkingTimeTables();
+    } catch (e: any) {
+      logFail('ensureWorkingTimeSchema', e);
+      throw e;
+    }
+  });
+}
+
+async function createWorkingTimeTables(): Promise<void> {
+  // -----------------------------------------------------------------------------------------
+  // HOLIDAYS GAIN A LOCATION. Null means everywhere.
+  //
+  // A holiday list without one is unusable in this country: a state holiday is a working day two
+  // states away, and an organisation with people in both had to choose which half of its staff
+  // the calendar would be wrong for. department_id already scopes by TEAM; location scopes by
+  // WHERE SOMEBODY IS, and the two are independent questions.
+  //
+  // THE UNIQUENESS KEY HAS TO WIDEN WITH IT. hr_holidays_date_scope is
+  // (holiday_date, COALESCE(department_id,'')), so two DIFFERENT regional holidays falling on one
+  // date would collide and the second would be silently dropped by ON CONFLICT DO NOTHING. The
+  // wider index is created FIRST and the narrow one dropped only if that succeeded, so there is
+  // no instant at which the table has no uniqueness at all. If the create fails, the drop does not
+  // run and the old, stricter rule stays in force.
+  // -----------------------------------------------------------------------------------------
+  await db.execute(sql`ALTER TABLE hr_holidays ADD COLUMN IF NOT EXISTS location TEXT`);
+  let wideIndex = false;
+  try {
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS hr_holidays_date_scope_loc
+        ON hr_holidays (holiday_date, COALESCE(department_id, ''), COALESCE(location, ''))`);
+    wideIndex = true;
+  } catch (e: any) {
+    logFail('hr_holidays_date_scope_loc', e);
+  }
+  if (wideIndex) {
+    try {
+      await db.execute(sql`DROP INDEX IF EXISTS hr_holidays_date_scope`);
+    } catch (e: any) {
+      // Uniqueness is still enforced, just more strictly than intended. Worth a log, not a failure.
+      logFail('drop hr_holidays_date_scope', e);
+    }
+  }
+
+  // -----------------------------------------------------------------------------------------
+  // HALF DAYS ON THE DAY ROW.
+  //
+  // hr_attendance.status is one word for a whole day, and a half day is not one of the words it
+  // can say. Without these two columns an approved half-day leave has to be rendered as either a
+  // full 'on_leave' day (the person is recorded absent for a day they worked half of) or as
+  // nothing at all (the leave they were granted vanishes from the day). Both are wrong in a way
+  // payroll reads.
+  //
+  // leave_units is the FRACTION OF THE DAY that was leave: 0.5 for a half day, 0.13 for an hour of
+  // an eight-hour day, 1 for a whole one. leave_type says which allowance it came out of.
+  // -----------------------------------------------------------------------------------------
+  await db.execute(sql`ALTER TABLE hr_attendance ADD COLUMN IF NOT EXISTS leave_units NUMERIC(4,2)`);
+  await db.execute(sql`ALTER TABLE hr_attendance ADD COLUMN IF NOT EXISTS leave_type TEXT`);
+
+  // -----------------------------------------------------------------------------------------
+  // OVERTIME CLAIMS. THE FACTS OF THE CLAIM — AND NOT ITS APPROVAL.
+  //
+  // NO status COLUMN, for the same reason hr_attendance_corrections has none: whether a claim is
+  // waiting, approved, rejected or halted is answered by workflow_instances keyed on
+  // (domain = 'overtime', record_id = this row's id). src/lib/workflow.ts is the only approval
+  // engine in this codebase and a status column here would be a second one.
+  //
+  // OVERTIME IS NEVER CREDITED AUTOMATICALLY, and this table is why it cannot be: extra minutes
+  // computed from punches are a NUMBER ON A SCREEN until a person claims them and an approver the
+  // organization graph named says yes. Only then does applied_at get a timestamp and only then
+  // does anything become comp off or pay. A stuck clock must never turn into a day's wages.
+  //
+  // convert_to records what the claim ASKS for. It decides nothing on its own.
+  // -----------------------------------------------------------------------------------------
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS hr_overtime_requests (
+      id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      employee_id          UUID NOT NULL,
+      work_date            DATE NOT NULL,
+      minutes              INT NOT NULL,
+      reason               TEXT NOT NULL,
+      convert_to           TEXT NOT NULL DEFAULT 'comp_off',
+      worked_holiday       BOOLEAN NOT NULL DEFAULT FALSE,
+      requested_by_user_id UUID,
+      applied_at           TIMESTAMPTZ,
+      withdrawn_at         TIMESTAMPTZ,
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+  await db.execute(sql`
+    CREATE INDEX IF NOT EXISTS hr_overtime_emp_idx
+      ON hr_overtime_requests (employee_id, work_date DESC)`);
+  try {
+    // One LIVE claim per person per day. A withdrawn one does not block a corrected re-claim.
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS hr_overtime_one_live
+        ON hr_overtime_requests (employee_id, work_date) WHERE withdrawn_at IS NULL`);
+  } catch (e: any) {
+    logFail('hr_overtime_one_live', e);
+  }
+
+  // -----------------------------------------------------------------------------------------
+  // WEEKLY TIMESHEETS. A DECLARATION, not a second attendance record.
+  //
+  // The punches say what the clock saw. The timesheet is what the PERSON says their week was, in
+  // their own words, per day, with a mode and — where the work has one — a project. Approving it
+  // does NOT rewrite hr_attendance, deliberately: two writers for one day's hours is how "on
+  // leave" and "present" end up both true, and this file's header says so.
+  //
+  // NO status COLUMN HERE EITHER. workflow_instances, domain 'timesheet', record_id = this id.
+  //
+  // project IS FREE TEXT, and that is an honest limitation rather than a shortcut. There is no
+  // projects table, project_id column or project registry anywhere in src/ or db/ — invented ones
+  // are called out in src/lib/search-global.ts:343 — so a foreign key here would point at nothing.
+  // When a project register exists this column is what a migration reads to fill it in.
+  // -----------------------------------------------------------------------------------------
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS hr_timesheets (
+      id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      employee_id          UUID NOT NULL,
+      week_start           DATE NOT NULL,
+      note                 TEXT,
+      submitted_by_user_id UUID,
+      submitted_at         TIMESTAMPTZ,
+      withdrawn_at         TIMESTAMPTZ,
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+  try {
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS hr_timesheet_emp_week
+        ON hr_timesheets (employee_id, week_start)`);
+  } catch (e: any) {
+    logFail('hr_timesheet_emp_week', e);
+  }
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS hr_timesheet_entries (
+      id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      timesheet_id UUID NOT NULL,
+      work_date    DATE NOT NULL,
+      minutes      INT NOT NULL DEFAULT 0,
+      work_mode    TEXT,
+      project      TEXT,
+      note         TEXT,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+  try {
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS hr_timesheet_entry_day
+        ON hr_timesheet_entries (timesheet_id, work_date)`);
+  } catch (e: any) {
+    logFail('hr_timesheet_entry_day', e);
+  }
 }

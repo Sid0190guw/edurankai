@@ -69,17 +69,23 @@ export interface NotificationsView {
 /**
  * This person's own notifications, newest first.
  *
- * ROWS ARE ALREADY BEING WRITTEN FOR EMPLOYEES. src/lib/push.ts persists FIRST and pushes second
- * (push.ts:259), so the feed fills even with VAPID unset — what an employee has never had is a
- * SURFACE. /portal/notifications.astro:7 redirects every non-applicant to /admin, and middleware
- * then bounces anyone without admin.access straight back, which is the ping-pong shape that took
- * /portal down before. That is exactly why widgets.ts sets href:null on notifications.unread and
- * says to render each row against its OWN action_url: linking to the inbox would send an employee
- * into a redirect loop, and linking nowhere would hide notifications they are already receiving.
+ * ROWS HAVE ALWAYS BEEN WRITTEN FOR EMPLOYEES; THE SURFACE IS NEW. src/lib/push.ts persists FIRST
+ * and pushes second (push.ts:259), so the feed fills even with VAPID unset — what an employee never
+ * had was a page. /portal/notifications.astro used to carry
+ * `if (user.role !== 'applicant') return Astro.redirect('/admin')`, and middleware bounced anyone
+ * without admin.access straight back: the ping-pong shape that took /portal down before. That is why
+ * widgets.ts used to set href:null on notifications.unread. The role-name test is gone, the page
+ * gates on "signed in" and narrows every read by user_id, and the widget now links to it. Each row
+ * still carries its OWN action_url, which is what a row click follows — the widget href is only the
+ * "see all" target, so a row never loses the thing it is about.
  *
- * Scoped in the WHERE clause by users.id. No ensure-DDL here on purpose — src/lib/push.ts and
- * /api/portal/notifications-recent both own the table's creation, and a read is not the place to
- * discover it is missing. A missing table returns ok:false, which the card can state.
+ * Scoped in the WHERE clause by users.id. No ensure-DDL here on purpose, and the reason is now
+ * stronger than "a read is not the place to discover a missing table": src/lib/notifications-schema.ts
+ * is the SINGLE owner of that CREATE. push.ts and both notifications-recent endpoints each used to
+ * carry their own copy in a NARROWER shape, and CREATE TABLE IF NOT EXISTS is a no-op on an existing
+ * table — so whichever ran first decided whether `category` and `priority` existed at all, and every
+ * later INSERT naming them threw forever. Adding a fourth CREATE here would put that back.
+ * A missing table returns ok:false, which the card can state.
  */
 export async function myNotifications(userId: string, limit = 5): Promise<NotificationsView> {
   const uid = String(userId || '').trim();

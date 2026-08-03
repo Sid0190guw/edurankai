@@ -74,6 +74,18 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { logAudit } from '@/lib/audit';
+// LOANS AND BONUSES ARE READ FROM THEIR OWN MODULES, NEVER RECOMPUTED HERE.
+//
+// src/lib/loans.ts owns the loan agreement and the recovery ledger; src/lib/payroll-bonuses.ts owns
+// the award and the payout ledger. This file asks each of them what a person's pay should gain or
+// lose this month and records the answer against the payslip it just wrote. It does not query
+// hr_salary_loans or hr_bonus_awards directly and it must not start to: a second arithmetic over one
+// ledger is how an employee's loan screen and their payslip end up disagreeing by a few hundred
+// rupees with no way to say which is wrong.
+//
+// The dependency runs ONE WAY — payroll imports loans, loans never imports payroll.
+import { plannedRecoveries, recordRecovery, type LoanCharge } from '@/lib/loans';
+import { plannedBonuses, recordBonusPayout, type BonusCharge } from '@/lib/payroll-bonuses';
 
 // -------------------------------------------------------------------------------------------------
 // MODULE CONSTANTS — all above the functions that use them.
@@ -601,6 +613,33 @@ export interface PayComputation {
   net: number;
   /** Gross plus every employer share — what the employee costs the company for the month. */
   employerCost: number;
+  /**
+   * GROSS BEFORE ANY BONUS — basic plus the recurring earning components, and nothing else.
+   *
+   * This is the figure loss of pay and every percentage-of-gross deduction are computed against, and
+   * the separation is deliberate. A person who was absent two days has not forfeited two days of a
+   * one-off award they were given for something entirely different, and an administrator who set a
+   * percentage against a monthly salary did not set it against an award that happens once. Folding a
+   * bonus into that base would quietly change both numbers in the month somebody was rewarded, which
+   * is the month they are most likely to check.
+   */
+  regularGross: number;
+  /** Every approved bonus and incentive falling in this month. Part of gross, outside the base above. */
+  bonusTotal: number;
+  /** Loan and salary-advance recovery deducted this month. */
+  loanRecovery: number;
+  /**
+   * True when a loan repayment had to be REDUCED because the month's pay could not carry it.
+   *
+   * A deduction is never allowed to push net pay below zero, and the ledger records what was actually
+   * taken rather than what was planned — otherwise a loan would show as repaid by money the person
+   * never had, and the shortfall would vanish. The screen must say this out loud when it happens.
+   */
+  loanRecoveryReduced: boolean;
+  /** The awards that produced the bonus lines, for the caller to write into the payout ledger. */
+  bonusCharges: BonusCharge[];
+  /** The loans that produced the recovery lines, at the amounts ACTUALLY applied. */
+  loanCharges: LoanCharge[];
   lopDays: number;
   lopDeduction: number;
   daysWorked: number;
@@ -643,6 +682,8 @@ export async function computePay(
   const empty: PayComputation = {
     employeeId, currency: 'INR', basic: 0, earnings: [], deductions: [],
     grossEarnings: 0, totalDeductions: 0, net: 0, employerCost: 0,
+    regularGross: 0, bonusTotal: 0, loanRecovery: 0, loanRecoveryReduced: false,
+    bonusCharges: [], loanCharges: [],
     lopDays: 0, lopDeduction: 0, daysWorked: 0, daysLeave: 0, daysAbsent: 0,
     noStatutoryComponents: true, gaps,
   };
@@ -716,7 +757,10 @@ export async function computePay(
     });
   }
 
-  const grossEarnings = round2(basic + earnings.reduce((s, l) => s + l.amount, 0));
+  // REGULAR GROSS — basic plus the recurring earnings, and no bonus. See PayComputation.regularGross
+  // for why the two are kept apart; every band test, every percentage and the loss-of-pay day rate
+  // below are computed against THIS number, not against a month that happened to carry an award.
+  const regularGross = round2(basic + earnings.reduce((s, l) => s + l.amount, 0));
 
   // ---- attendance and loss of pay ------------------------------------------------------------------
   //
@@ -760,7 +804,7 @@ export async function computePay(
   }
 
   const lopDays = Math.min(daysInMonth, Math.max(0, unpaidDays) + Math.max(0, daysAbsent));
-  const perDay = daysInMonth > 0 ? grossEarnings / daysInMonth : 0;
+  const perDay = daysInMonth > 0 ? regularGross / daysInMonth : 0;
   const lopDeduction = round2(perDay * lopDays);
 
   if (lopDeduction > 0) {
@@ -790,14 +834,14 @@ export async function computePay(
     if (c.statutory) statutoryConfigured = true;
     const o = overrideBy.get(c.id);
     if (o && !o.enabled) continue;
-    if (!withinBand(c, grossEarnings)) continue;
+    if (!withinBand(c, regularGross)) continue;
     const value = o && o.employeeValue !== null ? o.employeeValue : c.employeeValue;
     const raw = c.basis === 'percent_of_basic' ? basic * (value / 100)
-      : c.basis === 'percent_of_gross' ? grossEarnings * (value / 100)
+      : c.basis === 'percent_of_gross' ? regularGross * (value / 100)
         : value;
     const amount = applyCap(raw, c.capAmount);
     const employerRaw = c.basis === 'percent_of_basic' ? basic * (c.employerValue / 100)
-      : c.basis === 'percent_of_gross' ? grossEarnings * (c.employerValue / 100)
+      : c.basis === 'percent_of_gross' ? regularGross * (c.employerValue / 100)
         : c.employerValue;
     const employerAmount = applyCap(employerRaw, c.employerCapAmount);
     if (amount <= 0 && employerAmount <= 0) continue;
@@ -806,6 +850,80 @@ export async function computePay(
       rate: value, amount, employerAmount, statutory: c.statutory, sortOrder: c.sortOrder,
     });
   }
+
+  // ---- BONUSES AND INCENTIVES ----------------------------------------------------------------------
+  //
+  // Approved awards only, and each of them counted once. src/lib/payroll-bonuses.ts decides which
+  // awards fall in this month and stops a one-off from ever paying twice; this file only prints what
+  // it is told and, later, records that the payout happened. A bonus is an EARNING, so it is part of
+  // gross and part of net — it simply is not part of the base the deductions above were priced from.
+  let bonusCharges: BonusCharge[] = [];
+  try {
+    bonusCharges = await plannedBonuses(employeeId, { month, year });
+  } catch (e: any) {
+    logFail('computePay.bonuses', e);
+    gaps.push('approved bonuses for this month');
+  }
+  for (const b of bonusCharges) {
+    earnings.push({
+      code: 'bonus:' + b.bonusId,
+      label: b.label,
+      kind: 'earning', basis: 'fixed', rate: b.amount, amount: b.amount,
+      employerAmount: 0, statutory: false, sortOrder: 30,
+    });
+  }
+  const bonusTotal = round2(bonusCharges.reduce((s, b) => s + b.amount, 0));
+  const grossEarnings = round2(regularGross + bonusTotal);
+
+  // ---- LOAN AND SALARY-ADVANCE RECOVERY -------------------------------------------------------------
+  //
+  // LAST, AND CAPPED AT WHAT THE MONTH CAN CARRY. Everything else has already been deducted, so the
+  // room left is exactly gross minus those deductions. A repayment is reduced to fit that room and
+  // the REDUCED figure is what goes on the payslip AND into the loan ledger — because recording the
+  // full instalment while deducting less would show a loan as repaid with money the person never
+  // had, and the shortfall would disappear from every screen at once.
+  //
+  // A recovery reduced to zero produces no line at all rather than a zero line, and the caller is
+  // told through loanRecoveryReduced so it can say so instead of showing a repayment that silently
+  // did not happen.
+  const deductionsBeforeLoans = round2(deductions.reduce((s, l) => s + l.amount, 0));
+  let room = round2(Math.max(0, grossEarnings - deductionsBeforeLoans));
+
+  let plannedLoans: LoanCharge[] = [];
+  try {
+    plannedLoans = await plannedRecoveries(employeeId, { month, year });
+  } catch (e: any) {
+    logFail('computePay.loans', e);
+    gaps.push('loan and advance balances');
+  }
+
+  const loanCharges: LoanCharge[] = [];
+  let loanRecoveryReduced = false;
+  for (const c of plannedLoans) {
+    const applied = round2(Math.min(c.amount, room));
+    if (applied < c.amount) loanRecoveryReduced = true;
+    if (applied <= 0) continue;
+    room = round2(room - applied);
+    // Carry the shortfall into what is still owed AFTER this month, so the caller and the payslip
+    // both describe the balance the ledger will actually hold.
+    const remainingAfter = round2(c.remainingAfter + (c.amount - applied));
+    const adjusted: LoanCharge = {
+      ...c,
+      amount: applied,
+      interestPart: round2(Math.min(c.interestPart, applied)),
+      principalPart: round2(applied - Math.min(c.interestPart, applied)),
+      remainingAfter,
+      finalInstalment: remainingAfter <= 0,
+    };
+    loanCharges.push(adjusted);
+    deductions.push({
+      code: 'loan:' + c.loanId,
+      label: c.label,
+      kind: 'deduction', basis: 'fixed', rate: applied, amount: applied,
+      employerAmount: 0, statutory: false, sortOrder: 70,
+    });
+  }
+  const loanRecovery = round2(loanCharges.reduce((s, c) => s + c.amount, 0));
 
   earnings.sort((a, b) => a.sortOrder - b.sortOrder || a.label.localeCompare(b.label));
   deductions.sort((a, b) => a.sortOrder - b.sortOrder || a.label.localeCompare(b.label));
@@ -825,6 +943,12 @@ export async function computePay(
     totalDeductions,
     net: round2(Math.max(0, grossEarnings - totalDeductions)),
     employerCost: round2(grossEarnings + employerShare),
+    regularGross,
+    bonusTotal,
+    loanRecovery,
+    loanRecoveryReduced,
+    bonusCharges,
+    loanCharges,
     lopDays,
     lopDeduction,
     daysWorked,
@@ -852,6 +976,16 @@ export interface RunSummary {
   failed: string[];
   /** True when no statutory component is configured. The caller MUST say so on screen. */
   noStatutoryComponents: boolean;
+  /**
+   * PAYSLIPS THAT WERE WRITTEN, BUT WHOSE LOAN OR BONUS LEDGER ROW WAS NOT.
+   *
+   * A different and worse failure from a payslip that could not be written at all, which is why it
+   * has its own list and its own words. The pay document already says a repayment was deducted, or a
+   * bonus paid; if the ledger did not record it, the loan balance stays high and the person is
+   * charged again next month, or the one-off bonus pays a second time. The caller MUST show these —
+   * they are the one thing on this summary that somebody has to go and fix by hand.
+   */
+  ledgerWarnings: string[];
 }
 
 /**
@@ -875,7 +1009,7 @@ export async function generateRun(
   const y = Math.round(Number(year) || 0);
   const blank: RunSummary = {
     ok: false, employees: 0, totalGross: 0, totalDeductions: 0, totalNet: 0,
-    totalEmployerCost: 0, failed: [], noStatutoryComponents: true,
+    totalEmployerCost: 0, failed: [], noStatutoryComponents: true, ledgerWarnings: [],
   };
   if (m < 1 || m > 12) return { ...blank, error: 'Pick a month between January and December.' };
   if (y < 2000 || y > 2100) return { ...blank, error: 'That is not a year this payroll covers.' };
@@ -905,6 +1039,7 @@ export async function generateRun(
 
     let totalGross = 0, totalDeductions = 0, totalNet = 0, totalEmployerCost = 0, count = 0;
     const failed: string[] = [];
+    const ledgerWarnings: string[] = [];
     let noStatutory = true;
 
     for (const emp of employees) {
@@ -965,6 +1100,48 @@ export async function generateRun(
             ON CONFLICT (payslip_id, code) DO NOTHING`);
         }
 
+        // ---- THE TWO LEDGERS, WRITTEN AFTER THE PAYSLIP EXISTS AND NEVER BEFORE ------------------
+        //
+        // Order matters. A ledger row pointing at a payslip that was never written would show a loan
+        // repaid out of pay that does not exist. Both writes are idempotent on (record, run), so a
+        // month generated twice recovers nothing extra and pays no bonus twice.
+        //
+        // A FAILURE HERE DOES NOT ABORT THE RUN AND IS NOT SWALLOWED. The payslip is already written
+        // and correct; what is missing is the record that the money moved. The employee's name and
+        // the reason go into ledgerWarnings, which the caller shows, because this is the one class of
+        // failure somebody has to go and repair by hand.
+        for (const charge of pay.loanCharges) {
+          const w = await recordRecovery({
+            charge, payrollRunId: runId, payslipId: slipId, month: m, year: y,
+          });
+          if (!w.ok) {
+            ledgerWarnings.push(
+              String(emp.full_name || empId) + ': a loan repayment of ' + charge.amount
+              + ' was deducted on the payslip but was NOT written to the loan ledger. '
+              + 'The balance will still show as owed. ' + (w.error || ''),
+            );
+          }
+        }
+        for (const charge of pay.bonusCharges) {
+          const w = await recordBonusPayout({
+            charge, payrollRunId: runId, payslipId: slipId, month: m, year: y,
+          });
+          if (!w.ok) {
+            ledgerWarnings.push(
+              String(emp.full_name || empId) + ': the bonus "' + charge.label
+              + '" was paid on the payslip but was NOT written to the award ledger. '
+              + 'It may be paid again next month. ' + (w.error || ''),
+            );
+          }
+        }
+        if (pay.loanRecoveryReduced) {
+          ledgerWarnings.push(
+            String(emp.full_name || empId)
+            + ': a loan repayment was reduced because this month\'s pay could not carry the full '
+            + 'instalment. Only what was actually deducted has been recovered; the rest is still owed.',
+          );
+        }
+
         totalGross += pay.grossEarnings;
         totalDeductions += pay.totalDeductions;
         totalNet += pay.net;
@@ -987,6 +1164,7 @@ export async function generateRun(
       diff: {
         month: m, year: y, employees: count, totalGross: round2(totalGross),
         totalNet: round2(totalNet), failed, noStatutoryComponents: noStatutory,
+        ledgerWarnings: ledgerWarnings.length,
       },
     });
 
@@ -994,7 +1172,7 @@ export async function generateRun(
       ok: true, runId, employees: count,
       totalGross: round2(totalGross), totalDeductions: round2(totalDeductions),
       totalNet: round2(totalNet), totalEmployerCost: round2(totalEmployerCost),
-      failed, noStatutoryComponents: noStatutory,
+      failed, noStatutoryComponents: noStatutory, ledgerWarnings,
     };
   } catch (e: any) {
     logFail('generateRun', e);

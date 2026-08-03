@@ -396,6 +396,33 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
   },
 
   // ---------------------------------------------------------------------------------------------
+  // INVOICES. Three keys, and none of them approves a payment.
+  //
+  // A bill somebody sent us is paid only against an APPROVED workflow instance, routed per row from
+  // the Organization Graph to the requester's own manager, department head and — above the amount on
+  // that chain — an executive sponsor. An admin reading these should read them as what they say:
+  // seeing the money owed in both directions, raising and voiding documents, and recording that an
+  // approved payment moved. Granting all three does not make its holder anybody's approver.
+  // ---------------------------------------------------------------------------------------------
+  'invoices.view': {
+    label: 'See what we are owed and what we owe',
+    group: 'Finance',
+    description: 'Open the invoicing console: every invoice we have raised for a client or partner, every bill a supplier has sent us, what each one totals, what is still outstanding, what is overdue, and the printable document for each. It shows commercial detail across the whole organization, not one team. It does NOT let the holder approve paying anything.',
+  },
+  'invoices.manage': {
+    label: 'Raise, issue and void invoices',
+    group: 'Finance',
+    description: 'Create an invoice, price it line by line, apply the tax components this organization has configured, issue it, record a supplier bill against an approved purchase request, and VOID an invoice with a stated reason — there is no delete, because an invoice that was issued is a record. Also configures the numbering series and the tax component catalogue, which decide what every future invoice is numbered and charged. It confers no approval over any payment.',
+    sensitive: true,
+  },
+  'invoices.pay': {
+    label: 'Record a payment against an invoice',
+    group: 'Finance',
+    description: 'Record that money moved against an invoice, including a part payment. For a bill somebody sent us this is refused unless the workflow engine says the payment was approved by the people it was routed to — this key records the movement, it never authorises it. Where the payee is an employee, the amount is credited to the existing employee wallet ledger and nowhere else.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
   // PERFORMANCE, SKILLS AND LEARNING. Read the description of each one as what it SAYS: "across the
   // whole organization, without a relationship". None of them makes the holder anybody's manager —
   // seeing one person's goals, writing their appraisal or assigning them a course is resolved from
@@ -448,6 +475,11 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     group: 'People',
     description: 'Record company equipment and licences, issue them to named employees, take them back, log damage and retire them. As well as a hardware list this is a claim about people - who is holding what, and since when - and it is what a separation checklist is settled against.',
   },
+  'knowledge.manage': {
+    label: 'Write the staff handbook',
+    group: 'Content',
+    description: 'Write and publish knowledge-base articles and company policies - the answers the helpdesk offers somebody before they raise a ticket. Publishing a CHANGED policy starts a new version, and because acknowledgements are recorded against a version, that re-opens the acknowledgement for everybody: this key decides what the whole company is asked to read. It does NOT widen what the holder may read. An article names the capability that unlocks it and that is applied in the query, so a knowledge manager can publish an article restricted to payroll and still be unable to open it afterwards. Reading needs no permission of its own.',
+  },
   'documents.manage': {
     label: 'Curate the document library',
     group: 'Content',
@@ -488,6 +520,26 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     label: 'Price and submit a referral reward',
     group: 'Hiring',
     description: 'Record that a referral earns an amount, and send that amount into approval. It does NOT approve the reward and it does NOT pay it: the decision belongs to whoever the Organization Graph routes the request to, and releasing the money is a separate permission in the payouts console. Whoever holds this decides what a referral is worth, so grant it where pricing a payment is genuinely part of the job.',
+    sensitive: true,
+  },
+
+  // ---------------------------------------------------------------------------------------------
+  // PROJECTS. NEITHER KEY MAKES ANYBODY A PROJECT MANAGER, and both descriptions say so in words a
+  // person granting them will actually read. "Runs this project" is the `project_manager` edge in
+  // org_relationships, scoped to ONE project and effective-dated, resolved per row by
+  // src/lib/org-graph.ts. There is deliberately no key here that means "may run projects": a
+  // capability cannot say "this project and not that one", so such a key would hand every holder
+  // authority over every project in the company the moment it was granted to a second role.
+  // ---------------------------------------------------------------------------------------------
+  'projects.view': {
+    label: 'See every project in the organization',
+    group: 'People',
+    description: 'Open the portfolio: every project, whoever it belongs to — its owner, its members and what percentage of their time each is allocated, its milestones and deliverables, its risk register, and planned budget against actual spend. It shows work across the whole company, not one team. It does NOT let the holder change any project, assign anybody to one, or approve anything. Anyone who is ON a project already sees that project without this key.',
+  },
+  'projects.manage': {
+    label: 'Keep the project register',
+    group: 'People',
+    description: 'Create a project, change its name, code, description, department, dates and status, set the PLANNED budget, retire it, and record who runs it. Recording a project manager writes an effective-dated relationship into the Organization Graph — it does not make the holder that manager, and it confers no authority over the project\'s work, its people or its spending. Actual spend is never entered here: it is read from the expense claims and purchase requests that already carry a project reference, so there is one record of company money and not two.',
     sensitive: true,
   },
 };

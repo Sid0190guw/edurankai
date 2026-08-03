@@ -1,0 +1,210 @@
+---
+// /portal/employee/attendance/approvals — WORKING-TIME APPROVALS WAITING ON THIS PERSON.
+//
+// =================================================================================================
+// WHY THIS IS IN THE PORTAL AND NOT IN /admin
+// =================================================================================================
+//
+// The person who approves an overtime claim is the claimant's REPORTING MANAGER, resolved per row
+// from the Organization Graph. Most reporting managers have no admin access at all, so an approvals
+// queue behind /admin would mean the routed approver could not reach the thing routed to them - the
+// request would sit pending until it escalated, and the hours would quietly be lost. So it lives
+// where the people it is addressed to already are.
+//
+// =================================================================================================
+// THE LIST IS NOT THE PERMISSION
+// =================================================================================================
+//
+// pendingForApprover() answers "what is routed to you, or delegated to you, right now" - it does not
+// admit capability holders, deliberately, because standing authority means somebody MAY act on a
+// request that reaches them, not that every request in the company belongs on their personal list.
+//
+// AND THE LIST IS NOT WHAT DECIDES. decideStep() re-asks the whole question at the moment of the
+// write: the instance must still be pending, the step must be the current rung, and mayAct() must
+// say this signed-in user is the routed approver or their in-force delegate. A posted step id for
+// somebody else's queue is refused by the engine, not by the absence of a button here.
+//
+// AFTER AN APPROVAL, THE SETTLEMENT IS RECONCILED rather than assumed: applyApprovedOvertime() and
+// applyApprovedCorrections() re-read the instance and write only what the engine has actually
+// approved. A page that wrote the credit itself would be a second approval path.
+//
+// MOBILE FIRST. This is a screen people clear on a phone between two other things.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  pendingForApprover,
+  decideStep,
+  domainLabel,
+  STATE_LABELS,
+  type PendingApproval,
+} from '@/lib/workflow';
+import { applyApprovedOvertimeClaims, applyApprovedCorrections } from '@/lib/attendance';
+
+const PATH = '/portal/employee/attendance/approvals';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+
+/** The domains this screen is about. Anything else waiting on this person lives on its own queue. */
+const WORKING_TIME_DOMAINS = ['overtime', 'timesheet', 'attendance'];
+const DECISIONS = ['approved', 'rejected'];
+
+const when = (iso: string | null) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+};
+
+let flash = '';
+let flashError = '';
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const stepId = String(form.get('step_id') || '');
+    const decision = String(form.get('decision') || '');
+    const note = String(form.get('note') || '').trim().slice(0, 500);
+
+    if (!stepId || DECISIONS.indexOf(decision) < 0) {
+      flashError = 'That decision could not be read. Nothing was changed.';
+    } else {
+      const res = await decideStep(stepId, user as any, decision as any, note);
+      if (res.ok) {
+        flash = res.changed === false
+          ? 'That was already decided. Nothing was changed.'
+          : (decision === 'approved' ? 'Approved.' : 'Declined.');
+        if (decision === 'approved' && res.changed !== false) {
+          // Settle what the engine has now approved. Both re-read the instance and refuse anything
+          // that is not 'approved', so this cannot credit something that was not decided.
+          const credited = await applyApprovedOvertimeClaims(null, 20);
+          await applyApprovedCorrections(null, 20);
+          if (credited > 0) flash += ' ' + credited + ' overtime claim(s) credited.';
+        }
+      } else {
+        flashError = res.error || 'That decision could not be recorded.';
+      }
+    }
+  } catch (e: any) {
+    flashError = 'That decision could not be recorded: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/attendance/approvals] decide', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+let waiting: PendingApproval[] = [];
+if (gate.ok) {
+  const all = await pendingForApprover(String(user.id));
+  waiting = all.filter((p) => WORKING_TIME_DOMAINS.indexOf(String(p.instance.domain)) >= 0);
+}
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Working time approvals - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;-webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 2px;margin:0;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;border:1px solid #DFDCD8;border-radius:999px;
+      background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .chip{display:inline-block;margin:0 6px 6px 0;padding:3px 9px;border-radius:999px;background:#EFEDE9;color:#564E43;
+      font-size:0.6875rem;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;}
+    .lab{display:block;margin:10px 0 4px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    .acts{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0;}
+    .yes,.no{flex:1 1 140px;min-height:48px;padding:12px 14px;border-radius:10px;font:inherit;font-size:0.9375rem;font-weight:650;cursor:pointer;}
+    .yes{border:1px solid #1B1813;background:#1B1813;color:#fff;}
+    .no{border:1px solid #DFDCD8;background:#FDFDFC;color:#8A2C21;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Waiting on you</h1>
+    <p>{workspace ? workspace.fullName : 'Working time approvals'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Attendance">
+    <a class="tab" href="/portal/employee/attendance">Today and this week</a>
+    <a class="tab" href="/portal/employee/attendance/overtime">Overtime</a>
+    <a class="tab" href="/portal/employee/timesheet">Timesheet</a>
+    <a class="tab" href={PATH} aria-current="page">Waiting on me</a>
+  </nav>
+
+  <main class="wrap">
+    {!gate.ok && (
+      <section class="card">
+        <h2>{gate.title || 'This screen is not available'}</h2>
+        <p>{gate.reason || 'Your employee record is what this screen is built from.'}</p>
+      </section>
+    )}
+
+    {flash && <p class="ok">{flash}</p>}
+    {flashError && <p class="bad">{flashError}</p>}
+
+    {gate.ok && waiting.length === 0 && (
+      <section class="card">
+        <h2>Nothing is waiting on you</h2>
+        <p>
+          Overtime claims, timesheets and attendance corrections from the people who report to you
+          appear here when they are routed to you. If somebody says they sent you one and it is not
+          here, their reporting line may not be recorded on the organization graph yet, in which case
+          their request will say so on their own screen.
+        </p>
+      </section>
+    )}
+
+    {gate.ok && waiting.map((item) => (
+      <section class="card">
+        <h2>{domainLabel(item.instance.domain)} · {item.instance.subjectName || 'A colleague'}</h2>
+        <p>{item.instance.summary || 'No summary was recorded with this request.'}</p>
+        <p style="margin-top:6px;">
+          <span class="chip">{STATE_LABELS.pending}</span>
+          <span class="chip">Raised {when(item.instance.createdAt)}</span>
+          {item.step.dueAt && <span class="chip">Due {when(item.step.dueAt)}</span>}
+        </p>
+        <form method="POST" action={PATH}>
+          <input type="hidden" name="step_id" value={item.step.id}/>
+          <label class="lab" for={'note_' + item.step.id}>A note, if you want one</label>
+          <input class="field" id={'note_' + item.step.id} name="note" maxlength="500" placeholder="Optional, and the person sees it"/>
+          <div class="acts">
+            <button class="yes" type="submit" name="decision" value="approved">Approve</button>
+            <button class="no" type="submit" name="decision" value="rejected">Decline</button>
+          </div>
+        </form>
+      </section>
+    ))}
+
+    <p class="foot">
+      You are shown only what is routed to you or delegated to you. Approving an overtime claim
+      credits comp off against that claim once, and never twice; approving a timesheet records that
+      you recognise the week and changes no attendance row. Leave approvals live on
+      <a href="/portal/approvals"> your leave approvals screen</a>.
+    </p>
+  </main>
+</body>
+</html>

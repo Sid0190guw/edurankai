@@ -1,0 +1,525 @@
+---
+// /admin/finance/invoices — THE INVOICING CONSOLE, IN BOTH DIRECTIONS.
+//
+// WHAT IT SHOWS: what we have billed clients and partners, what suppliers have billed us, what each
+// one totals, what is still outstanding and what is overdue — and, for a supplier bill, whether the
+// payment has been approved and by whom.
+//
+// WHAT IT IS NOT: a way to approve a payment. Paying a supplier bill requires an APPROVED workflow
+// instance, routed per row from the Organization Graph to the requester's own manager, department
+// head and — above the amount declared on that chain — an executive sponsor. src/lib/invoices.ts
+// re-reads that decision from the engine at the moment of the write, so opening this console gives
+// nobody authority over anybody's payment.
+//
+// THE GATE, STATED EXACTLY. `invoices.view` OR the `finance` section at edit level. Both, because a
+// CUSTOM role holding the finance section resolves through the registry as `finance.edit` and NEVER
+// as `invoices.view` — gating on the capability alone would shut out every custom role that can open
+// /admin/finance today, which is a narrowing dressed up as a mechanism change. The same reasoning is
+// written out on /admin/procurement and /admin/hr/leave/workflow.
+//
+// The middleware already gates the whole /admin/finance subtree on the `finance` section for custom
+// roles (src/middleware.ts PATH_SECTION), so this page's gate is the second of two and the narrower.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import { isInitialized } from '@/lib/org-graph';
+import { listRequests, viewRequests, formatAmount as procAmount } from '@/lib/procurement';
+import { STATE_LABELS } from '@/lib/workflow';
+import {
+  listInvoices,
+  withTotals,
+  listSeries,
+  invoiceSummary,
+  createReceivable,
+  createPayable,
+  billedPurchaseRequestIds,
+  payApprovalChain,
+  payApprovalThreshold,
+  formatAmount,
+  statusLabel,
+  partyKindLabel,
+  PARTY_KINDS,
+  DEFAULT_CURRENCY,
+  type InvoiceListRow,
+  type InvoiceSeries,
+} from '@/lib/invoices';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+// -------------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted, and a const declared under the POST handler that reads it
+// throws on that handler's first line while the page still reports success.
+// -------------------------------------------------------------------------------------------------
+const PAGE = '/admin/finance/invoices';
+const LIST_LIMIT = 40;
+/** How many purchase requests are read to find the approved, unbilled ones. Each costs a workflow
+ *  lookup, so this is bounded on purpose rather than "all of them". */
+const REQUEST_SCAN = 25;
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Plain words from a function, not a typed map — a `Record<string,string>` read inside JSX is one of
+ *  this project's known .astro parse hazards. */
+function chipClass(display: string): string {
+  const key = String(display || '');
+  if (key === 'paid') return 'chip chip-ok';
+  if (key === 'part_paid') return 'chip chip-wait';
+  if (key === 'overdue') return 'chip chip-no';
+  if (key === 'void') return 'chip chip-void';
+  if (key === 'submitted') return 'chip chip-wait';
+  if (key === 'sent') return 'chip chip-sent';
+  return 'chip';
+}
+
+function instanceLabel(state: string): string {
+  const key = String(state || '');
+  if (key === 'draft') return STATE_LABELS.draft;
+  if (key === 'pending') return STATE_LABELS.pending;
+  if (key === 'approved') return STATE_LABELS.approved;
+  if (key === 'rejected') return STATE_LABELS.rejected;
+  if (key === 'cancelled') return STATE_LABELS.cancelled;
+  if (key === 'halted') return STATE_LABELS.halted;
+  return key;
+}
+
+function viaWords(via: string): string {
+  const key = String(via || '');
+  if (key === 'reporting_manager') return 'Reporting manager';
+  if (key === 'department_head') return 'Department head';
+  if (key === 'approval_owner') return 'Approval owner';
+  if (key === 'executive_sponsor') return 'Executive sponsor';
+  return key || 'Approver';
+}
+
+// THE GATE. Read the note at the top of this file before narrowing either arm.
+const financeDesk = await canAccessSection(user, 'finance', 'edit');
+const mayView = can(user as any, 'invoices.view') || financeDesk;
+if (!mayView) return Astro.redirect('/admin');
+
+/**
+ * MAY THIS PERSON RAISE, ISSUE OR VOID A DOCUMENT?
+ *
+ * Creating an invoice, recording a supplier bill and voiding either sit behind this. Deciding a
+ * PAYMENT APPROVAL does not — that is mayAct() inside the engine, on the posted id, and no page gate
+ * can stand in for it.
+ */
+const mayManage = can(user as any, 'invoices.manage') || financeDesk;
+
+// -------------------------------------------------------------------------------------------------
+// WRITES
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let goto = PAGE;
+
+  if (!mayManage) {
+    flash = 'You can read the invoicing record, but raising and voiding invoices is a separate permission.';
+  } else if (action === 'create-receivable') {
+    const r = await createReceivable({
+      seriesId: String(fd.get('series_id') || ''),
+      partyKind: String(fd.get('party_kind') || 'client'),
+      partyName: String(fd.get('party_name') || ''),
+      partyEmail: String(fd.get('party_email') || ''),
+      partyAddress: String(fd.get('party_address') || ''),
+      partyTaxReference: String(fd.get('party_tax_reference') || ''),
+      partyReference: String(fd.get('party_reference') || ''),
+      currency: String(fd.get('currency') || DEFAULT_CURRENCY),
+      issueDate: String(fd.get('issue_date') || ''),
+      dueDate: String(fd.get('due_date') || ''),
+      terms: String(fd.get('terms') || ''),
+    }, String(user.id));
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not create that invoice.');
+    else {
+      flash = 'Invoice created as a draft. Add its lines, then issue it.';
+      goto = PAGE + '/' + r.id;
+    }
+  } else if (action === 'create-payable') {
+    const r = await createPayable({
+      seriesId: String(fd.get('series_id') || ''),
+      purchaseRequestId: String(fd.get('purchase_request_id') || ''),
+      vendorName: String(fd.get('vendor_name') || ''),
+      vendorInvoiceRef: String(fd.get('vendor_invoice_ref') || ''),
+      currency: String(fd.get('currency') || DEFAULT_CURRENCY),
+      issueDate: String(fd.get('issue_date') || ''),
+      dueDate: String(fd.get('due_date') || ''),
+      attachmentUrl: String(fd.get('attachment_url') || ''),
+      notes: String(fd.get('notes') || ''),
+    }, String(user.id));
+    if (!r.ok) flash = 'Error: ' + (r.error || 'Could not record that bill.');
+    else {
+      flash = r.warning || 'Bill recorded as a draft. Check the amount, then send it for payment approval.';
+      goto = PAGE + '/' + r.id;
+    }
+  }
+
+  return Astro.redirect(goto + '?msg=' + encodeURIComponent(flash));
+}
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+
+// Asked ONCE for the whole page: "the graph has no rows" and "this person has no manager" are
+// different facts that render differently, and asking per row would be a query per row for an answer
+// that cannot change mid-render.
+const graphReady = await isInitialized();
+
+const summary = await invoiceSummary();
+const series: InvoiceSeries[] = await listSeries();
+const receivableSeries = series.filter((s) => s.direction === 'receivable' && s.isActive);
+const payableSeries = series.filter((s) => s.direction === 'payable' && s.isActive);
+
+const receivables: InvoiceListRow[] = await withTotals(await listInvoices({ direction: 'receivable', limit: LIST_LIMIT }));
+const payables: InvoiceListRow[] = await withTotals(await listInvoices({ direction: 'payable', limit: LIST_LIMIT }));
+
+// APPROVED PURCHASES NOT YET BILLED. The link that stops an approved purchase becoming a second,
+// unrelated record: recording the bill from here carries the vendor and the approved amount across.
+const billed = await billedPurchaseRequestIds();
+const scanned = await viewRequests(await listRequests({ status: 'submitted', limit: REQUEST_SCAN }));
+const billable = scanned.filter(
+  (v) => v.instance !== null && v.instance.state === 'approved' && !billed.has(v.request.id),
+);
+
+const chain = payApprovalChain();
+const threshold = payApprovalThreshold();
+const todayIso = new Date().toISOString().slice(0, 10);
+---
+<AdminLayout title="Invoices" activeNav="">
+  <div class="admin-page inv-page">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">Finance · Invoicing</div>
+      <h1 class="admin-page-title">Invoices</h1>
+      <p class="admin-page-sub">
+        Money we are owed and money we owe, kept apart because they are different things. Paying a
+        supplier bill is an approval routed from the Organization Graph for each purchase - opening
+        this console does not make anybody an approver.
+      </p>
+    </div></div>
+
+    {msg && <div class="flash">{msg}</div>}
+
+    {!graphReady && (
+      <div class="banner banner-warn">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+        <div>
+          <strong>Organization Graph not yet initialized.</strong>
+          <p>
+            No relationships have been recorded, so no supplier bill can be routed to anybody for
+            payment approval and every submission will halt with that reason. Invoices we raise are
+            unaffected - nobody approves billing a client. This is not a fault and there is
+            deliberately no fallback: guessing an approver from a job title would hand somebody
+            authority over another team's money. Run <code>db/org-graph-backfill.sql</code>, then reload.
+          </p>
+        </div>
+      </div>
+    )}
+
+    {!mayManage && (
+      <div class="banner banner-note">
+        <div>
+          <strong>Read access.</strong>
+          <p>
+            You can see every invoice, bill and payment. Raising an invoice, recording a bill,
+            voiding either and configuring the numbering need the separate invoicing permission.
+          </p>
+        </div>
+      </div>
+    )}
+
+    <div class="stats">
+      <div class="stat"><span class="stat-n">{summary.receivableOpen}</span><span class="stat-l">Owed to us</span></div>
+      <div class="stat"><span class="stat-n">{formatAmount(summary.receivableOutstanding, DEFAULT_CURRENCY)}</span><span class="stat-l">Outstanding</span></div>
+      <div class="stat"><span class="stat-n">{summary.receivableOverdue}</span><span class="stat-l">Overdue</span></div>
+      <div class="stat"><span class="stat-n">{summary.payableOpen}</span><span class="stat-l">We owe</span></div>
+      <div class="stat"><span class="stat-n">{formatAmount(summary.payableOutstanding, DEFAULT_CURRENCY)}</span><span class="stat-l">To pay</span></div>
+      <div class="stat"><span class="stat-n">{summary.awaitingPayApproval}</span><span class="stat-l">Awaiting approval</span></div>
+    </div>
+
+    {summary.degraded && (
+      <p class="crossref">
+        Those figures could not be read just now, so they are shown as zero rather than as a fact.
+        Reload before treating them as the answer.
+      </p>
+    )}
+
+    <p class="crossref">
+      Numbering series and tax components are at <a href="/admin/finance/invoices/settings">Numbering and tax</a>.
+      Purchase requests and orders are at <a href="/admin/procurement">Procurement</a>, and payments
+      taken from learners are at <a href="/admin/finance">Payments and revenue</a> - a different record
+      with a different shape, not duplicated here.
+    </p>
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">We bill them · {receivables.length}</h2>
+    <p class="sec-note">
+      An invoice we raise for a client or a partner. It is priced on its own screen, issued when it is
+      right, and paid in one payment or several. Nothing here is deleted: an invoice that was issued is
+      voided with a reason and kept.
+    </p>
+
+    {mayManage && (
+      <details class="maker">
+        <summary>Raise an invoice</summary>
+        <form method="POST" class="grid-form">
+          <input type="hidden" name="action" value="create-receivable"/>
+          <label class="fl">Billed to<input class="fi" name="party_name" required placeholder="Who is being billed"/></label>
+          <label class="fl">They are a
+            <select class="fi" name="party_kind">
+              {PARTY_KINDS.map((k) => <option value={k}>{partyKindLabel(k)}</option>)}
+            </select>
+          </label>
+          <label class="fl">Email<input class="fi" name="party_email" type="email" placeholder="Where it will be sent"/></label>
+          <label class="fl">Their reference<input class="fi" name="party_reference" placeholder="Their order or PO number"/></label>
+          <label class="fl">Tax reference<input class="fi" name="party_tax_reference" placeholder="Printed as given; not validated"/></label>
+          <label class="fl">Address<input class="fi" name="party_address" placeholder="Billing address"/></label>
+          <label class="fl">Issue date<input class="fi" name="issue_date" type="date" value={todayIso}/></label>
+          <label class="fl">Due date<input class="fi" name="due_date" type="date"/></label>
+          <label class="fl">Currency<input class="fi" name="currency" value={DEFAULT_CURRENCY} maxlength="8"/></label>
+          <label class="fl">Numbering
+            <select class="fi" name="series_id">
+              {receivableSeries.map((s) => <option value={s.id}>{s.code} · {s.prefix}</option>)}
+            </select>
+          </label>
+          <label class="fl fl-wide">Terms<input class="fi" name="terms" placeholder="Payment terms printed on the document"/></label>
+          <button class="btn btn-go" type="submit">Create draft invoice</button>
+        </form>
+        {receivableSeries.length === 0 && (
+          <p class="warn-note">
+            There is no active numbering series for invoices we raise, so no number can be issued.
+            Add one under <a href="/admin/finance/invoices/settings">Numbering and tax</a> first.
+          </p>
+        )}
+      </details>
+    )}
+
+    {receivables.length === 0 && <p class="empty">No invoice has been raised yet.</p>}
+    {receivables.length > 0 && (
+      <div class="tablewrap">
+        <table class="tbl">
+          <thead>
+            <tr><th>Number</th><th>Billed to</th><th class="num">Total</th><th class="num">Balance</th><th>Due</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            {receivables.map((r) => (
+              <tr>
+                <td><a class="ext" href={PAGE + '/' + r.invoice.id}>{r.invoice.invoiceNumber}</a></td>
+                <td>{r.invoice.partyName || 'No addressee'}</td>
+                <td class="num">{formatAmount(r.invoice.total, r.invoice.currency)}</td>
+                <td class="num">{formatAmount(r.balance, r.invoice.currency)}</td>
+                <td>{fmtDate(r.invoice.dueDate)}</td>
+                <td><span class={chipClass(r.display)}>{statusLabel('receivable', r.display)}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">They bill us · {payables.length}</h2>
+    <p class="sec-note">
+      A bill a supplier sent us. Recording it against the purchase request it came from is what stops
+      an approved purchase turning into a second, unrelated record - and the approved amount is carried
+      across as the first line. Paying it needs the approval below; nothing on this page can grant that.
+    </p>
+
+    {mayManage && (
+      <details class="maker">
+        <summary>Record a supplier bill</summary>
+        <p class="sec-note">
+          {billable.length > 0
+            ? 'These purchase requests are approved and not yet billed. Picking one carries its vendor and approved amount onto the bill.'
+            : 'No approved purchase request is waiting to be billed. A bill can still be recorded without one - it will need the same payment approval either way.'}
+        </p>
+        <form method="POST" class="grid-form">
+          <input type="hidden" name="action" value="create-payable"/>
+          <label class="fl fl-wide">Against a purchase request
+            <select class="fi" name="purchase_request_id">
+              <option value="">Not linked to a purchase request</option>
+              {billable.map((v) => (
+                <option value={v.request.id}>
+                  {v.request.item}
+                  {v.request.estimatedCost !== null ? ' · ' + procAmount(v.request.estimatedCost, v.request.currency) : ''}
+                  {v.request.requesterName ? ' · ' + v.request.requesterName : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label class="fl">Supplier<input class="fi" name="vendor_name" placeholder="Who billed us"/></label>
+          <label class="fl">Their invoice number<input class="fi" name="vendor_invoice_ref" placeholder="The number on their document"/></label>
+          <label class="fl">Bill date<input class="fi" name="issue_date" type="date" value={todayIso}/></label>
+          <label class="fl">Due date<input class="fi" name="due_date" type="date"/></label>
+          <label class="fl">Currency<input class="fi" name="currency" value={DEFAULT_CURRENCY} maxlength="8"/></label>
+          <label class="fl">Numbering
+            <select class="fi" name="series_id">
+              {payableSeries.map((s) => <option value={s.id}>{s.code} · {s.prefix}</option>)}
+            </select>
+          </label>
+          <label class="fl fl-wide">Link to their document<input class="fi" name="attachment_url" type="url" placeholder="https:// - a shared link, never an upload"/></label>
+          <label class="fl fl-wide">Note<input class="fi" name="notes" placeholder="Anything worth reading later"/></label>
+          <button class="btn btn-go" type="submit">Record bill as draft</button>
+        </form>
+        {payableSeries.length === 0 && (
+          <p class="warn-note">
+            There is no active numbering series for supplier bills. Add one under
+            <a href="/admin/finance/invoices/settings"> Numbering and tax</a> first.
+          </p>
+        )}
+      </details>
+    )}
+
+    {payables.length === 0 && <p class="empty">No supplier bill has been recorded yet.</p>}
+    {payables.length > 0 && (
+      <div class="tablewrap">
+        <table class="tbl">
+          <thead>
+            <tr><th>Number</th><th>Supplier</th><th class="num">Total</th><th class="num">Balance</th><th>Due</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            {payables.map((r) => (
+              <tr>
+                <td><a class="ext" href={PAGE + '/' + r.invoice.id}>{r.invoice.invoiceNumber}</a></td>
+                <td>
+                  {r.invoice.vendorName || r.invoice.partyName || 'No supplier recorded'}
+                  {r.invoice.vendorInvoiceRef ? ' · ' + r.invoice.vendorInvoiceRef : ''}
+                </td>
+                <td class="num">{formatAmount(r.invoice.total, r.invoice.currency)}</td>
+                <td class="num">{formatAmount(r.balance, r.invoice.currency)}</td>
+                <td>{fmtDate(r.invoice.dueDate)}</td>
+                <td><span class={chipClass(r.display)}>{statusLabel('payable', r.display)}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    <!-- ===================================================================================== -->
+    <h2 class="sec">How paying a supplier bill is approved</h2>
+    <p class="sec-note">
+      The chain below is the SHAPE of the approval, not a claim about who fills it. Every rung is
+      resolved per bill, from the Organization Graph, for the employee whose purchase caused it - and
+      it is declared as data in the approval engine rather than written into this page, so what is on
+      screen is what will be applied.
+    </p>
+    <ol class="chainlist">
+      {chain.map((r) => (
+        <li>
+          <span class="hop-n">{r.step}</span>
+          <span>
+            {viaWords(r.via)}
+            {r.parallel ? ' - shares this step with the other approver; both must approve' : ''}
+            {r.optional ? ' - optional, skipped when the organisation has not named one' : ''}
+            {r.minAmount !== null ? ' - only at or above ' + formatAmount(r.minAmount, DEFAULT_CURRENCY) : ''}
+          </span>
+        </li>
+      ))}
+    </ol>
+    <p class="sec-note">
+      {threshold !== null
+        ? 'Payments at or above ' + formatAmount(threshold, DEFAULT_CURRENCY) + ' add the executive rung. That figure belongs to the chain declaration and is read from it here rather than restated.'
+        : 'This chain has no amount threshold on it today.'}
+      When a required rung resolves nobody, the approval HALTS with the reason and nothing is ever paid
+      by default - which is the whole reason the halted state exists. An approver sees the request in
+      their own approvals queue labelled as a procurement request, with the invoice number and supplier
+      in its summary, because it walks the procurement chain rather than a second one invented here.
+    </p>
+    <p class="sec-note">
+      {instanceLabel('halted')} bills, and everything else waiting on somebody, are decided on the
+      approver's own queue at <a class="ext" href="/portal/approvals">their approvals screen</a>.
+    </p>
+  </div>
+
+  <style>
+    /* MOBILE FIRST — the base rules are the 360px rules; wider layouts are the exception. Nothing may
+       make the PAGE scroll sideways: the tables scroll inside their own container and every flex
+       child carries min-width:0, because a flex item defaults to min-width:auto and one long unbroken
+       word (a pasted link, an invoice number) would otherwise push a card wider than the phone. */
+    .inv-page{ max-width:1080px; }
+    .flash{ margin:0 0 16px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3);
+      color:#6ee7b7; border-radius:8px; padding:10px 14px; font-size:13px; overflow-wrap:anywhere; }
+
+    .banner{ display:flex; gap:12px; align-items:flex-start; border-radius:10px; padding:14px;
+      margin:0 0 18px; font-size:13px; line-height:1.5; }
+    .banner-warn{ background:rgba(234,179,8,0.08); border:1px solid rgba(234,179,8,0.35); color:#fde68a; }
+    .banner-note{ background:rgba(148,163,184,0.08); border:1px solid rgba(148,163,184,0.28); color:#cbd5e1; }
+    .banner svg{ flex:0 0 auto; margin-top:2px; }
+    .banner p{ margin:6px 0 0; color:#d8d2bd; }
+    .banner code{ font-family:'Geist Mono',monospace; font-size:12px; background:#111; padding:1px 5px;
+      border-radius:4px; overflow-wrap:anywhere; }
+
+    .stats{ display:flex; flex-wrap:wrap; gap:8px; margin:0 0 16px; }
+    .stat{ flex:1 1 140px; min-width:0; background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px;
+      padding:12px 14px; display:flex; flex-direction:column; gap:2px; }
+    .stat-n{ font-family:'Geist Mono',monospace; font-size:18px; font-weight:700; color:#fff;
+      overflow-wrap:anywhere; }
+    .stat-l{ font-size:11px; color:#8a8a94; text-transform:uppercase; letter-spacing:0.08em; }
+
+    .crossref{ font-size:13px; color:#8a8a94; margin:0 0 22px; line-height:1.6; }
+    .crossref a, .ext{ color:#f97316; overflow-wrap:anywhere; }
+
+    .sec{ font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:0.16em; text-transform:uppercase;
+      color:#c2410c; font-weight:700; margin:26px 0 6px; }
+    .sec-note{ font-size:12.5px; color:#8a8a94; margin:0 0 12px; line-height:1.6; overflow-wrap:anywhere; }
+    .empty{ color:#8a8a94; font-size:13px; margin:0 0 18px; }
+    .warn-note{ font-size:12.5px; color:#fde68a; margin:8px 0 0; line-height:1.6; }
+    .warn-note a{ color:#fdba74; }
+
+    .maker{ background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px; padding:12px 14px;
+      margin-bottom:12px; }
+    .maker summary{ cursor:pointer; color:#fff; font-size:13px; font-weight:700; min-height:32px;
+      display:flex; align-items:center; }
+
+    .grid-form{ display:grid; grid-template-columns:1fr; gap:8px; width:100%; margin-top:10px; }
+    .fl{ display:flex; flex-direction:column; gap:4px; font-size:11px; color:#8a8a94;
+      text-transform:uppercase; letter-spacing:0.06em; min-width:0; }
+    .fi{ background:#08080b; border:1px solid #262630; border-radius:7px; padding:11px 10px; color:#fff;
+      font-size:13px; outline:none; font-family:inherit; min-width:0; width:100%;
+      text-transform:none; letter-spacing:0; }
+    /* 44px minimum touch target. A control that needs a second attempt on a phone is a control that
+       gets pressed twice, and this page is full of things that must not happen twice. */
+    .btn{ border:none; border-radius:7px; padding:0 16px; min-height:44px; color:#fff; font-size:12px;
+      font-weight:700; cursor:pointer; font-family:'Geist Mono',monospace; white-space:nowrap; }
+    .btn-go{ background:#c2410c; }
+
+    /* A wide table scrolls INSIDE this box. The page itself never scrolls sideways. */
+    .tablewrap{ overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid #1a1a1f;
+      border-radius:10px; background:#0f0f14; margin-bottom:14px; }
+    .tbl{ width:100%; border-collapse:collapse; font-size:12.5px; min-width:560px; }
+    .tbl th{ text-align:left; color:#8a8a94; font-size:10px; text-transform:uppercase; letter-spacing:0.08em;
+      padding:9px 10px; border-bottom:1px solid #1a1a1f; white-space:nowrap; }
+    .tbl td{ padding:9px 10px; border-bottom:1px solid #151519; color:#cfd6da; vertical-align:top; }
+    .tbl td.num, .tbl th.num{ text-align:right; white-space:nowrap; font-family:'Geist Mono',monospace; }
+
+    .chip{ font-family:'Geist Mono',monospace; font-size:10px; font-weight:700; text-transform:uppercase;
+      letter-spacing:0.08em; border-radius:999px; padding:3px 9px; background:#1a1a1f; color:#8a8a94;
+      display:inline-block; white-space:nowrap; }
+    .chip-ok{ background:rgba(34,192,126,0.15); color:#86efac; }
+    .chip-no{ background:rgba(248,113,113,0.12); color:#fca5a5; }
+    .chip-wait{ background:rgba(249,115,22,0.14); color:#fdba74; }
+    .chip-sent{ background:rgba(59,130,246,0.14); color:#93c5fd; }
+    .chip-void{ background:rgba(148,163,184,0.14); color:#cbd5e1; }
+
+    .chainlist{ list-style:none; margin:0 0 12px; padding:0; display:flex; flex-direction:column; gap:7px; }
+    .chainlist li{ display:flex; gap:8px; align-items:baseline; font-size:13px; color:#cfd6da;
+      overflow-wrap:anywhere; line-height:1.55; }
+    .hop-n{ font-family:'Geist Mono',monospace; font-size:10px; color:#8a8a94; border:1px solid #2a2a33;
+      border-radius:4px; padding:1px 5px; flex:0 0 auto; }
+
+    @media (min-width:620px){
+      .grid-form{ grid-template-columns:repeat(2, minmax(0, 1fr)); align-items:end; }
+      .fl-wide{ grid-column:1 / -1; }
+      .stat{ flex:1 1 150px; }
+    }
+  </style>
+</AdminLayout>

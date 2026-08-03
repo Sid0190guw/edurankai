@@ -49,7 +49,7 @@
 
 import { db } from './db';
 import { sql } from 'drizzle-orm';
-import { ensureAttendanceSchema } from './attendance-schema';
+import { ensureAttendanceSchema, ensureWorkingTimeSchema } from './attendance-schema';
 import { startWorkflow, instanceForRecord, type WorkflowInstanceRow } from './workflow';
 
 // -------------------------------------------------------------------------------------------------
@@ -713,6 +713,14 @@ export interface Holiday {
   /** Null means the whole organization. TEXT, never cast ::uuid. */
   departmentId: string | null;
   departmentName: string | null;
+  /**
+   * Where this holiday applies. Null means everywhere.
+   *
+   * A free-text place name rather than a foreign key, because this product has no office or site
+   * register to point at. It is matched case-insensitively against the employee's own recorded
+   * location — see src/lib/holidays.ts, which owns that comparison.
+   */
+  location: string | null;
   isOptional: boolean;
 }
 
@@ -723,6 +731,7 @@ function mapHoliday(row: any): Holiday {
     name: String(row?.name ?? ''),
     departmentId: row?.department_id ? String(row.department_id) : null,
     departmentName: row?.department_name ? String(row.department_name) : null,
+    location: row?.location ? String(row.location) : null,
     isOptional: row?.is_optional === true,
   };
 }
@@ -744,12 +753,13 @@ export async function listHolidays(
   const dept = departmentId ? String(departmentId).trim() : '';
   try {
     await ensureAttendanceSchema();
+    await ensureWorkingTimeSchema();
     const scope = dept
       ? sql`AND (h.department_id IS NULL OR h.department_id::text = ${dept}::text)`
       : sql``;
     const r = await db.execute(sql`
       SELECT h.id, h.holiday_date, h.name, h.department_id::text AS department_id,
-             h.is_optional, d.name AS department_name
+             h.location, h.is_optional, d.name AS department_name
         FROM hr_holidays h
         LEFT JOIN departments d ON d.id::text = h.department_id::text
        WHERE h.holiday_date >= ${from}::date
@@ -768,6 +778,8 @@ export async function addHoliday(input: {
   dateIso: string;
   name: string;
   departmentId?: string | null;
+  /** Where it applies. Omit for the whole organization. */
+  location?: string | null;
   isOptional?: boolean;
   createdByUserId?: string | null;
 }): Promise<WriteResult> {
@@ -776,19 +788,22 @@ export async function addHoliday(input: {
   if (!isDateIso(dateIso)) return { ok: false, error: 'That is not a date.' };
   if (!name) return { ok: false, error: 'A holiday needs a name.' };
   const dept = input?.departmentId ? String(input.departmentId).trim().slice(0, 80) : null;
+  const location = input?.location ? String(input.location).trim().slice(0, 120) : null;
   const optional = input?.isOptional === true;
   const by = isUuid(input?.createdByUserId) ? String(input.createdByUserId) : null;
 
   try {
     await ensureAttendanceSchema();
+    await ensureWorkingTimeSchema();
     const r = await db.execute(sql`
-      INSERT INTO hr_holidays (holiday_date, name, department_id, is_optional, created_by)
-      VALUES (${dateIso}::date, ${name}, ${dept}::text, ${optional}, ${by}::uuid)
+      INSERT INTO hr_holidays (holiday_date, name, department_id, location, is_optional, created_by)
+      VALUES (${dateIso}::date, ${name}, ${dept}::text, ${location}::text, ${optional}, ${by}::uuid)
       ON CONFLICT DO NOTHING
       RETURNING id`);
     const list = rows(r);
-    // No returned row means that date already carries a holiday for that scope. Re-entering it is
-    // not an error — it is somebody making sure, and the answer is "it is already there".
+    // No returned row means that date already carries a holiday for that exact scope — same
+    // department, same location. Re-entering it is not an error; it is somebody making sure, and
+    // the honest answer is "it is already there".
     return list.length
       ? { ok: true, id: String(list[0].id), changed: true }
       : { ok: true, changed: false };
@@ -1677,5 +1692,961 @@ export async function applyApprovedCorrections(employeeId?: string | null, limit
     // Nothing to reconcile is not an error.
     logFail('applyApprovedCorrections', e);
     return 0;
+  }
+}
+
+// =================================================================================================
+// BREAKS — WHAT THE DAY WAS ACTUALLY MADE OF
+// =================================================================================================
+
+/** One break, as it happened. `end` is null while the person is still on it. */
+export interface BreakSegment {
+  start: string;
+  end: string | null;
+  minutes: number;
+  /** True while it is still running. Its minutes are counted to now, not to nothing. */
+  open: boolean;
+}
+
+/**
+ * Every break in a day, in order. PURE.
+ *
+ * computeDay() already TOTALS breaks — this SEPARATES them, because a person looking at "2h 10m on
+ * break" needs to see it was four breaks and not one two-hour lunch before they can tell whether the
+ * number is right. Multiple breaks a day is the ordinary case and always has been: hr_clock_events
+ * has accepted repeated break_start/break_end pairs since it was written.
+ *
+ * AN OPEN BREAK IS COUNTED TO NOW, so the screen can say "on a break, 12 minutes so far". It is
+ * still excluded from worked time by computeDay(), which closes it at clock_out or leaves it open —
+ * this function reports it, it does not re-decide it.
+ */
+export function breakSegments(events: PunchEvent[], nowIso?: string | null): BreakSegment[] {
+  const sorted = (events || [])
+    .filter((e) => e && isPunchKind(e.kind) && e.at)
+    .map((e) => ({ kind: e.kind as PunchKind, ms: Date.parse(e.at), at: e.at }))
+    .filter((e) => !isNaN(e.ms))
+    .sort((a, b) => a.ms - b.ms);
+
+  const nowMs = nowIso ? Date.parse(nowIso) : Date.now();
+  const out: BreakSegment[] = [];
+  let openAt: { ms: number; at: string } | null = null;
+
+  for (const e of sorted) {
+    if (e.kind === 'break_start') {
+      if (!openAt) openAt = { ms: e.ms, at: e.at };
+    } else if (e.kind === 'break_end' || e.kind === 'clock_out') {
+      if (openAt) {
+        out.push({
+          start: openAt.at,
+          end: e.at,
+          minutes: Math.max(0, Math.round((e.ms - openAt.ms) / 60000)),
+          open: false,
+        });
+        openAt = null;
+      }
+    }
+  }
+  if (openAt) {
+    out.push({
+      start: openAt.at,
+      end: null,
+      minutes: Math.max(0, Math.round(((isNaN(nowMs) ? openAt.ms : nowMs) - openAt.ms) / 60000)),
+      open: true,
+    });
+  }
+  return out;
+}
+
+/** Worked time with breaks taken out. computeDay() already does this; named for the screens. */
+export function netWorkedMinutes(totals: DayTotals): number {
+  return Math.max(0, Number(totals?.workedMinutes) || 0);
+}
+
+// =================================================================================================
+// PUNCTUALITY — ADVISORY, AND ADVISORY BY CONSTRUCTION
+// =================================================================================================
+//
+// LATE ARRIVAL AND EARLY DEPARTURE ARE SENTENCES, NOT VERDICTS, and nothing here or in
+// attendance-schema.ts stores them. That absence is the design, and it is the same one the geo and
+// QR columns were built with: the moment a `late_minutes` column exists, some screen filters on it,
+// somebody sorts by it, and a person loses money to a shift that was changed after they were
+// rostered on it, or to a phone that could not reach the network at 08:58.
+//
+// So this is computed WHEN SOMEBODY LOOKS, from the punches and the shift in force on that day, and
+// a human reads it and decides what it means, if anything. There is no threshold, no flag, and no
+// count anywhere in this codebase that adds these up into a consequence.
+
+export interface Punctuality {
+  /** Minutes after the shift start (plus its grace) that the first check-in happened. 0 if not late. */
+  lateMinutes: number;
+  /** Minutes before the shift end that the last check-out happened. 0 if not early. */
+  earlyMinutes: number;
+  /** A sentence for a person, or null when there is nothing worth saying. */
+  sentence: string | null;
+  /** True when there was no rostered shift, so there is nothing to be late for. */
+  noShift: boolean;
+}
+
+/**
+ * How the day sat against the shift. PURE, and it returns WORDS beside its numbers on purpose.
+ *
+ * TIMES ARE READ IN UTC, matching how every attendance screen in this product renders a clock time
+ * (see clockTime() in /portal/employee/attendance). Both sides of the comparison therefore use one
+ * clock. Mixing the process timezone into one side would make somebody in a different timezone
+ * permanently four hours late.
+ */
+export function punctuality(shift: Shift | null, totals: DayTotals | null): Punctuality {
+  const none: Punctuality = { lateMinutes: 0, earlyMinutes: 0, sentence: null, noShift: !shift };
+  if (!shift || !totals) return none;
+
+  const minuteOfDay = (iso: string | null): number | null => {
+    if (!iso) return null;
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return null;
+    return d.getUTCHours() * 60 + d.getUTCMinutes();
+  };
+
+  const inMin = minuteOfDay(totals.clockIn);
+  const outMin = minuteOfDay(totals.clockOut);
+  const grace = Math.max(0, Number(shift.graceMinutes) || 0);
+
+  let late = 0;
+  if (inMin !== null) late = Math.max(0, inMin - (shift.startMinute + grace));
+
+  let early = 0;
+  // A shift that crosses midnight cannot be compared this way without a second date, and guessing
+  // would report every night-shift check-out as hours early. Left at zero and said so.
+  const crossesMidnight = shift.endMinute <= shift.startMinute;
+  if (outMin !== null && !crossesMidnight) early = Math.max(0, shift.endMinute - outMin);
+
+  const parts: string[] = [];
+  if (late > 0) {
+    parts.push(
+      'Checked in ' + formatMinutes(late) + ' after ' + minuteToHm(shift.startMinute) +
+      (grace ? ' plus the ' + grace + '-minute grace period' : '') + '.',
+    );
+  }
+  if (early > 0) {
+    parts.push('Checked out ' + formatMinutes(early) + ' before ' + minuteToHm(shift.endMinute) + '.');
+  }
+  if (!parts.length) return { lateMinutes: 0, earlyMinutes: 0, sentence: null, noShift: false };
+
+  parts.push('This is a note for a person to read. Nothing is deducted and nobody is penalised by it.');
+  return { lateMinutes: late, earlyMinutes: early, sentence: parts.join(' '), noShift: false };
+}
+
+// =================================================================================================
+// OVERTIME — A CLAIM, ROUTED FOR APPROVAL, NEVER CREDITED BY ARITHMETIC
+// =================================================================================================
+
+/** What comp off a length of overtime is worth, in days. PURE. */
+export function compOffUnitsFor(minutes: number, dayMinutes: number): number {
+  const m = Number(minutes) || 0;
+  const d = Number(dayMinutes) || 0;
+  if (m <= 0 || d <= 0) return 0;
+  // Nearest half day, capped at two. A quarter of a shift rounds up to half a day; anything shorter
+  // is recorded as overtime hours and earns no day, which the caller says out loud rather than
+  // dropping silently.
+  return Math.min(2, Math.round((m / d) * 2) / 2);
+}
+
+/** What one day looked like against its shift — the numbers an overtime claim is made from. */
+export interface DayAgainstShift {
+  dateIso: string;
+  shift: Shift | null;
+  workedMinutes: number;
+  expectedMinutes: number;
+  breakMinutes: number;
+  overtimeMinutes: number;
+  punctuality: Punctuality;
+  holiday: Holiday | null;
+  /** True when the shift does not roster this weekday, or a holiday falls on it. */
+  nonWorkingDay: boolean;
+}
+
+/**
+ * Read one day and compare it with the shift that was in force ON THAT DAY.
+ *
+ * Extra minutes are DERIVED here and stored nowhere. Nothing in this function writes, credits or
+ * flags anything — it produces the number a person then claims through requestOvertime().
+ */
+export async function dayAgainstShift(employeeId: string, dateIso: string): Promise<DayAgainstShift | null> {
+  if (!isUuid(employeeId) || !isDateIso(dateIso)) return null;
+  try {
+    await ensureAttendanceSchema();
+    await ensureWorkingTimeSchema();
+
+    const totals = computeDay(await punchesOn(employeeId, dateIso));
+    const shift = await shiftOn(employeeId, dateIso);
+    const wd = isoWeekday(dateIso) || 0;
+    const departmentId = await departmentOf(employeeId);
+    const holidays = await listHolidays(dateIso, dateIso, departmentId);
+    const holiday = holidays.find((h) => !h.isOptional && !h.location) || null;
+
+    const rostered = !!shift && shift.workingDays.includes(wd);
+    const nonWorkingDay = !rostered || !!holiday;
+    const expected = rostered && !holiday ? shiftExpectedMinutes(shift) : 0;
+
+    // A day the roster does not expect any hours on is ALL overtime when somebody worked it — that
+    // is what a worked holiday or a called-in Sunday is.
+    const worked = totals.workedMinutes;
+    const overtime = Math.max(0, worked - expected);
+
+    return {
+      dateIso,
+      shift,
+      workedMinutes: worked,
+      expectedMinutes: expected,
+      breakMinutes: totals.breakMinutes,
+      overtimeMinutes: overtime,
+      punctuality: punctuality(shift, totals),
+      holiday,
+      nonWorkingDay,
+    };
+  } catch (e: any) {
+    logFail('dayAgainstShift', e);
+    return null;
+  }
+}
+
+export interface OvertimeClaim {
+  id: string;
+  employeeId: string;
+  employeeName: string | null;
+  workDate: string;
+  minutes: number;
+  reason: string;
+  /** What the claim ASKS for: 'comp_off' or 'pay'. It decides nothing on its own. */
+  convertTo: string;
+  workedHoliday: boolean;
+  appliedAt: string | null;
+  withdrawnAt: string | null;
+  createdAt: string | null;
+  /** The APPROVAL, from workflow_instances. Null means the workflow could not be started at all. */
+  workflow: WorkflowInstanceRow | null;
+}
+
+function mapOvertime(row: any, wf: WorkflowInstanceRow | null): OvertimeClaim {
+  return {
+    id: String(row?.id ?? ''),
+    employeeId: String(row?.employee_id ?? ''),
+    employeeName: row?.employee_name ? String(row.employee_name) : null,
+    workDate: row?.work_date ? String(row.work_date).slice(0, 10) : '',
+    minutes: Number(row?.minutes) || 0,
+    reason: String(row?.reason ?? ''),
+    convertTo: String(row?.convert_to ?? 'comp_off'),
+    workedHoliday: row?.worked_holiday === true,
+    appliedAt: row?.applied_at ? new Date(row.applied_at).toISOString() : null,
+    withdrawnAt: row?.withdrawn_at ? new Date(row.withdrawn_at).toISOString() : null,
+    createdAt: row?.created_at ? new Date(row.created_at).toISOString() : null,
+    workflow: wf,
+  };
+}
+
+export interface WorkingTimeResult extends WriteResult {
+  instanceId?: string;
+  state?: string;
+  /** The engine's own sentence when routing could not name an approver. Rendered verbatim. */
+  haltReason?: string | null;
+}
+
+/**
+ * CLAIM OVERTIME FOR A DAY.
+ *
+ * The row is written FIRST and the workflow started against it, so the instance's record_id points
+ * at something that exists. If routing then fails the engine still creates the instance in state
+ * 'halted' carrying the sentence that names the missing relationship, so the claim is visible and
+ * resumable rather than lost.
+ *
+ * THERE IS NO AUTO-APPROVE PATH AND NO ROLE FALLBACK. If the Organization Graph cannot name a
+ * reporting manager, the claim halts and says so.
+ *
+ * THE MINUTES ARE CHECKED AGAINST THE DAY. A claim for more overtime than the punches support is
+ * refused with the real numbers in the sentence — not because the employee is suspected of anything,
+ * but because a typed 480 where 48 was meant is the ordinary mistake and it becomes a day's pay.
+ */
+export async function requestOvertime(input: {
+  employeeId: string;
+  workDate: string;
+  minutes: number;
+  reason: string;
+  convertTo?: 'comp_off' | 'pay';
+  requestedByUserId?: string | null;
+}): Promise<WorkingTimeResult> {
+  const employeeId = String(input?.employeeId || '');
+  const workDate = String(input?.workDate || '');
+  const reason = String(input?.reason || '').trim().slice(0, 1000);
+  const minutes = Math.round(Number(input?.minutes) || 0);
+  const convertTo = input?.convertTo === 'pay' ? 'pay' : 'comp_off';
+  const by = isUuid(input?.requestedByUserId) ? String(input.requestedByUserId) : null;
+
+  if (!isUuid(employeeId)) return { ok: false, error: 'That is not an employee record.' };
+  if (!isDateIso(workDate)) return { ok: false, error: 'Choose the day you worked the extra hours.' };
+  if (minutes <= 0) return { ok: false, error: 'A claim needs some minutes in it.' };
+  if (minutes > MAX_DAY_MINUTES) return { ok: false, error: 'That is more than a day. Check the number.' };
+  if (reason.length < 5) {
+    return { ok: false, error: 'Say what the extra hours were for. Your manager decides this, and one line is enough.' };
+  }
+
+  const now = await today();
+  if (!now) {
+    return { ok: false, error: 'We could not read the date from the database, so we will not guess which day this belongs to.' };
+  }
+  if (workDate > now) return { ok: false, error: 'That day has not happened yet.' };
+  const age = daysBetweenIso(workDate, now);
+  if (age !== null && age > CORRECTION_WINDOW_DAYS) {
+    return {
+      ok: false,
+      error: 'That day is more than ' + CORRECTION_WINDOW_DAYS + ' days ago, which is past the window for a claim. Ask HR to look at it directly.',
+    };
+  }
+
+  const day = await dayAgainstShift(employeeId, workDate);
+  if (!day) return { ok: false, error: 'We could not read that day, so the claim was not saved.' };
+  if (day.overtimeMinutes <= 0) {
+    return {
+      ok: false,
+      error: 'Your punches for ' + workDate + ' show ' + (formatMinutes(day.workedMinutes) || 'no time') +
+        ' worked against ' + (formatMinutes(day.expectedMinutes) || 'no expected hours') +
+        ', so there is nothing over. If a punch is missing, ask for a correction first.',
+    };
+  }
+  if (minutes > day.overtimeMinutes) {
+    return {
+      ok: false,
+      error: 'Your punches support ' + formatMinutes(day.overtimeMinutes) + ' over the shift on ' + workDate +
+        '. Claim that or less, or ask for a correction if a punch is wrong.',
+    };
+  }
+
+  let claimId = '';
+  try {
+    await ensureWorkingTimeSchema();
+    const r = await db.execute(sql`
+      INSERT INTO hr_overtime_requests
+        (employee_id, work_date, minutes, reason, convert_to, worked_holiday, requested_by_user_id)
+      VALUES
+        (${employeeId}::uuid, ${workDate}::date, ${minutes}, ${reason}, ${convertTo},
+         ${!!day.holiday}, ${by}::uuid)
+      RETURNING id`);
+    const list = rows(r);
+    if (!list.length) {
+      return { ok: false, error: 'You already have a claim open for that day. Withdraw it before filing another.' };
+    }
+    claimId = String(list[0].id);
+  } catch (e: any) {
+    logFail('requestOvertime.insert', e);
+    return { ok: false, error: errText(e, 'The claim could not be saved.') };
+  }
+
+  const started = await startWorkflow({
+    domain: 'overtime',
+    recordId: claimId,
+    subjectEmployeeId: employeeId,
+    requestedByUserId: by,
+    createdByUserId: by,
+    summary: 'Overtime on ' + workDate + ': ' + formatMinutes(minutes) +
+      (convertTo === 'pay' ? ', asked to be paid' : ', asked as comp off'),
+  });
+
+  if (!started.ok) {
+    return {
+      ok: false,
+      id: claimId,
+      error: 'Your claim was saved but it could not be sent for approval: ' +
+        (started.error || 'the approval engine did not say why') +
+        '. Nothing is lost - tell HR and it can be sent again.',
+    };
+  }
+
+  return {
+    ok: true,
+    changed: started.changed !== false,
+    id: claimId,
+    instanceId: started.instanceId,
+    state: started.state,
+    haltReason: started.haltReason ?? null,
+  };
+}
+
+/** Overtime claims for one employee, newest day first, each with its approval state. */
+export async function overtimeFor(employeeId: string, limit = 30): Promise<OvertimeClaim[]> {
+  if (!isUuid(employeeId)) return [];
+  const n = Math.min(Math.max(Number(limit) || 30, 1), LIST_LIMIT);
+  try {
+    await ensureWorkingTimeSchema();
+    const r = await db.execute(sql`
+      SELECT o.*, e.full_name AS employee_name
+        FROM hr_overtime_requests o
+        LEFT JOIN hr_employees e ON e.id = o.employee_id
+       WHERE o.employee_id = ${employeeId}::uuid
+       ORDER BY o.work_date DESC, o.created_at DESC
+       LIMIT ${n}`);
+    const out: OvertimeClaim[] = [];
+    for (const row of rows(r)) {
+      out.push(mapOvertime(row, await instanceForRecord('overtime', String(row.id))));
+    }
+    return out;
+  } catch (e: any) {
+    logFail('overtimeFor', e);
+    return [];
+  }
+}
+
+/** Withdraw a claim that has not been applied. */
+export async function withdrawOvertime(claimId: string, employeeId: string): Promise<WriteResult> {
+  if (!isUuid(claimId) || !isUuid(employeeId)) return { ok: false, error: 'That is not an overtime claim.' };
+  try {
+    await ensureWorkingTimeSchema();
+    const r = await db.execute(sql`
+      UPDATE hr_overtime_requests SET withdrawn_at = NOW()
+       WHERE id = ${claimId}::uuid AND employee_id = ${employeeId}::uuid
+         AND applied_at IS NULL AND withdrawn_at IS NULL
+      RETURNING id`);
+    return rows(r).length ? { ok: true, id: claimId, changed: true } : { ok: true, changed: false };
+  } catch (e: any) {
+    logFail('withdrawOvertime', e);
+    return { ok: false, error: errText(e, 'The claim could not be withdrawn.') };
+  }
+}
+
+/**
+ * APPLY AN APPROVED OVERTIME CLAIM.
+ *
+ * THE GUARD IS THE POINT: this re-reads the workflow instance and refuses unless the ENGINE says
+ * 'approved'. No argument lets a caller assert approval and no path in this file credits anything
+ * without that check. Applying is idempotent — applied_at is written in the same breath, and the
+ * comp-off ledger is keyed on this claim's id so a retry credits once.
+ *
+ * TWO THINGS HAPPEN, IN THIS ORDER:
+ *   1. The minutes are written onto the day (hr_attendance.overtime_hours, a column that has existed
+ *      since the HR schema was written and that nothing has ever filled in).
+ *   2. If the claim asked for comp off, the ledger is credited through src/lib/hr-leave.ts. If it
+ *      asked for pay, NOTHING here pays anybody: the hours are on the day for payroll to read, which
+ *      is a person's decision on a payroll run and not an automatic transfer.
+ */
+export async function applyApprovedOvertime(claimId: string): Promise<WorkingTimeResult> {
+  if (!isUuid(claimId)) return { ok: false, error: 'That is not an overtime claim.' };
+
+  try {
+    await ensureWorkingTimeSchema();
+    const list = rows(await db.execute(sql`
+      SELECT * FROM hr_overtime_requests WHERE id = ${claimId}::uuid LIMIT 1`));
+    if (!list.length) return { ok: false, error: 'That claim no longer exists.' };
+    const claim = list[0];
+    if (claim.applied_at) return { ok: true, id: claimId, changed: false };
+    if (claim.withdrawn_at) return { ok: false, error: 'That claim was withdrawn.' };
+
+    const wf = await instanceForRecord('overtime', claimId);
+    if (!wf) return { ok: false, error: 'That claim has no approval attached, so there is nothing to apply.' };
+    if (wf.state !== 'approved') {
+      return { ok: false, error: 'That claim is ' + wf.state + ', not approved, so nothing is credited.' };
+    }
+
+    const minutes = Number(claim.minutes) || 0;
+    const workDate = String(claim.work_date).slice(0, 10);
+    const employeeId = String(claim.employee_id);
+    const hours = minutesToHours(minutes);
+
+    await db.execute(sql`
+      INSERT INTO hr_attendance (employee_id, date, overtime_hours, status, work_mode, source)
+      VALUES (${employeeId}::uuid, ${workDate}::date, ${hours}, 'present', 'remote', 'overtime')
+      ON CONFLICT (employee_id, date) DO UPDATE
+        SET overtime_hours = ${hours}`);
+
+    let creditNote = '';
+    if (String(claim.convert_to) === 'comp_off') {
+      const shift = await shiftOn(employeeId, workDate);
+      const dayMinutes = shiftExpectedMinutes(shift) || 8 * 60;
+      const units = compOffUnitsFor(minutes, dayMinutes);
+      if (units > 0) {
+        // Dynamically imported: src/lib/hr-leave.ts imports this module back for shift lengths, and a
+        // static pair would be a load-time cycle.
+        const { creditCompOff } = await import('@/lib/hr-leave');
+        const credited = await creditCompOff({
+          employeeId,
+          units,
+          source: claim.worked_holiday === true ? 'holiday_work' : 'overtime',
+          sourceRef: claimId,
+          earnedOn: workDate,
+          note: 'Approved overtime on ' + workDate + ' (' + formatMinutes(minutes) + ')',
+        });
+        if (!credited.ok) {
+          // NOT SWALLOWED. The day carries the hours; the ledger does not. Say so, so somebody can
+          // fix it rather than the employee discovering the missing day months later.
+          return {
+            ok: false,
+            id: claimId,
+            error: 'The hours were recorded on ' + workDate + ' but the comp off could not be credited: ' +
+              (credited.error || 'no reason given') + '. The claim has not been marked applied, so it can be retried.',
+          };
+        }
+        creditNote = units + ' day(s) of comp off credited.';
+      } else {
+        creditNote = 'Recorded as overtime hours. It is shorter than a quarter of a shift, so it earns no comp-off day.';
+      }
+    }
+
+    await db.execute(sql`
+      UPDATE hr_overtime_requests SET applied_at = NOW()
+       WHERE id = ${claimId}::uuid AND applied_at IS NULL`);
+
+    return { ok: true, id: claimId, changed: true, error: undefined, state: 'approved', haltReason: creditNote || null };
+  } catch (e: any) {
+    logFail('applyApprovedOvertime', e);
+    return { ok: false, error: errText(e, 'The approved claim could not be applied.') };
+  }
+}
+
+/**
+ * Apply every overtime claim the engine has approved and that has not been credited yet.
+ *
+ * Called when an overtime screen loads, for the same reason applyApprovedCorrections() is: the
+ * approval and the credit are two separate facts, and without this reconciliation somebody would see
+ * an "Approved" chip over a comp-off balance that had not moved.
+ */
+export async function applyApprovedOvertimeClaims(employeeId?: string | null, limit = 20): Promise<number> {
+  const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  try {
+    await ensureWorkingTimeSchema();
+    const scope = isUuid(employeeId) ? sql`AND o.employee_id = ${employeeId}::uuid` : sql``;
+    const r = await db.execute(sql`
+      SELECT o.id
+        FROM hr_overtime_requests o
+        JOIN workflow_instances w ON w.domain = 'overtime' AND w.record_id = o.id::text
+       WHERE o.applied_at IS NULL AND o.withdrawn_at IS NULL AND w.state = 'approved'
+         ${scope}
+       ORDER BY o.work_date DESC
+       LIMIT ${n}`);
+    let applied = 0;
+    for (const row of rows(r)) {
+      const res = await applyApprovedOvertime(String(row.id));
+      if (res.ok && res.changed) applied++;
+    }
+    return applied;
+  } catch (e: any) {
+    logFail('applyApprovedOvertimeClaims', e);
+    return 0;
+  }
+}
+
+// =================================================================================================
+// WEEKLY TIMESHEETS — WHAT THE PERSON SAYS THE WEEK WAS
+// =================================================================================================
+
+export interface TimesheetEntryInput {
+  dateIso: string;
+  minutes: number;
+  workMode?: string | null;
+  project?: string | null;
+  note?: string | null;
+}
+
+export interface TimesheetEntry {
+  id: string;
+  dateIso: string;
+  weekday: string;
+  minutes: number;
+  workMode: string | null;
+  project: string | null;
+  note: string | null;
+}
+
+export interface SubmittedTimesheet {
+  id: string;
+  employeeId: string;
+  employeeName: string | null;
+  weekStart: string;
+  weekEnd: string;
+  note: string | null;
+  submittedAt: string | null;
+  withdrawnAt: string | null;
+  entries: TimesheetEntry[];
+  totalMinutes: number;
+  workflow: WorkflowInstanceRow | null;
+}
+
+function mapTimesheetEntry(row: any): TimesheetEntry {
+  const dateIso = row?.work_date ? String(row.work_date).slice(0, 10) : '';
+  return {
+    id: String(row?.id ?? ''),
+    dateIso,
+    weekday: weekdayName(dateIso),
+    minutes: Number(row?.minutes) || 0,
+    workMode: row?.work_mode ? String(row.work_mode) : null,
+    project: row?.project ? String(row.project) : null,
+    note: row?.note ? String(row.note) : null,
+  };
+}
+
+/** One submitted week for one person, with its entries and its approval. Null when never submitted. */
+export async function timesheetFor(employeeId: string, anyDayInWeek: string): Promise<SubmittedTimesheet | null> {
+  if (!isUuid(employeeId)) return null;
+  const weekStart = weekStartIso(isDateIso(anyDayInWeek) ? anyDayInWeek : '');
+  if (!isDateIso(weekStart)) return null;
+  try {
+    await ensureWorkingTimeSchema();
+    const head = rows(await db.execute(sql`
+      SELECT t.*, e.full_name AS employee_name
+        FROM hr_timesheets t
+        LEFT JOIN hr_employees e ON e.id = t.employee_id
+       WHERE t.employee_id = ${employeeId}::uuid AND t.week_start = ${weekStart}::date
+       LIMIT 1`));
+    if (!head.length) return null;
+    const id = String(head[0].id);
+    const entries = rows(await db.execute(sql`
+      SELECT * FROM hr_timesheet_entries WHERE timesheet_id = ${id}::uuid ORDER BY work_date ASC`))
+      .map(mapTimesheetEntry);
+    return {
+      id,
+      employeeId,
+      employeeName: head[0].employee_name ? String(head[0].employee_name) : null,
+      weekStart,
+      weekEnd: shiftDateIso(weekStart, 6),
+      note: head[0].note ? String(head[0].note) : null,
+      submittedAt: head[0].submitted_at ? new Date(head[0].submitted_at).toISOString() : null,
+      withdrawnAt: head[0].withdrawn_at ? new Date(head[0].withdrawn_at).toISOString() : null,
+      entries,
+      totalMinutes: entries.reduce((sum, e) => sum + e.minutes, 0),
+      workflow: await instanceForRecord('timesheet', id),
+    };
+  } catch (e: any) {
+    logFail('timesheetFor', e);
+    return null;
+  }
+}
+
+/** The weeks this person has submitted, newest first. */
+export async function timesheetsFor(employeeId: string, limit = 12): Promise<SubmittedTimesheet[]> {
+  if (!isUuid(employeeId)) return [];
+  const n = Math.min(Math.max(Number(limit) || 12, 1), 52);
+  try {
+    await ensureWorkingTimeSchema();
+    const heads = rows(await db.execute(sql`
+      SELECT week_start FROM hr_timesheets
+       WHERE employee_id = ${employeeId}::uuid
+       ORDER BY week_start DESC LIMIT ${n}`));
+    const out: SubmittedTimesheet[] = [];
+    for (const h of heads) {
+      const t = await timesheetFor(employeeId, String(h.week_start).slice(0, 10));
+      if (t) out.push(t);
+    }
+    return out;
+  } catch (e: any) {
+    logFail('timesheetsFor', e);
+    return [];
+  }
+}
+
+/**
+ * SUBMIT A WEEK FOR APPROVAL.
+ *
+ * A RESUBMISSION IS ALLOWED ONLY WHILE NOTHING HAS SETTLED. Once the engine has approved a week, the
+ * rows are evidence of what somebody signed off and this refuses to rewrite them — a changed mind is
+ * a conversation with the approver, not a silent edit under an approval that already happened. That
+ * is the same discipline workflow.ts applies to its own terminal states.
+ *
+ * ENTRIES ARE UPSERTED PER DAY, so a resubmission corrects the days it names and leaves the rest.
+ *
+ * IT DOES NOT WRITE hr_attendance. The punches are what the clock saw; this is what the person says.
+ * Two writers for one day's hours is the fault attendance-schema.ts's header warns about, and a
+ * timesheet that overwrote punches would let anybody rewrite their own recorded attendance.
+ */
+export async function submitTimesheet(input: {
+  employeeId: string;
+  weekStart: string;
+  entries: TimesheetEntryInput[];
+  note?: string | null;
+  submittedByUserId?: string | null;
+}): Promise<WorkingTimeResult> {
+  const employeeId = String(input?.employeeId || '');
+  if (!isUuid(employeeId)) return { ok: false, error: 'That is not an employee record.' };
+  const weekStart = weekStartIso(String(input?.weekStart || ''));
+  if (!isDateIso(weekStart)) return { ok: false, error: 'That is not a week.' };
+  const weekEnd = shiftDateIso(weekStart, 6);
+  const note = input?.note ? String(input.note).slice(0, 1000) : null;
+  const by = isUuid(input?.submittedByUserId) ? String(input.submittedByUserId) : null;
+
+  const clean: TimesheetEntryInput[] = [];
+  for (const e of input?.entries || []) {
+    const dateIso = String(e?.dateIso || '');
+    if (!isDateIso(dateIso) || dateIso < weekStart || dateIso > weekEnd) continue;
+    const minutes = Math.max(0, Math.min(MAX_DAY_MINUTES, Math.round(Number(e?.minutes) || 0)));
+    const mode = WORK_MODES.includes(String(e?.workMode) as WorkMode) ? String(e?.workMode) : null;
+    clean.push({
+      dateIso,
+      minutes,
+      workMode: mode,
+      project: e?.project ? String(e.project).trim().slice(0, 160) : null,
+      note: e?.note ? String(e.note).trim().slice(0, 400) : null,
+    });
+  }
+  if (!clean.length) return { ok: false, error: 'A timesheet needs at least one day on it.' };
+  if (!clean.some((e) => e.minutes > 0)) {
+    return { ok: false, error: 'Every day on that timesheet is zero. Put some hours on it, or leave the week unsubmitted.' };
+  }
+
+  const existing = await timesheetFor(employeeId, weekStart);
+  if (existing?.workflow && (existing.workflow.state === 'approved' || existing.workflow.state === 'rejected')) {
+    return {
+      ok: false,
+      error: 'That week has already been ' + existing.workflow.state +
+        '. It cannot be rewritten - talk to your manager and, if it needs changing, ask for an attendance correction on the days concerned.',
+    };
+  }
+
+  let timesheetId = existing?.id || '';
+  try {
+    await ensureWorkingTimeSchema();
+    if (!timesheetId) {
+      const ins = rows(await db.execute(sql`
+        INSERT INTO hr_timesheets (employee_id, week_start, note, submitted_by_user_id, submitted_at)
+        VALUES (${employeeId}::uuid, ${weekStart}::date, ${note}, ${by}::uuid, NOW())
+        ON CONFLICT DO NOTHING
+        RETURNING id`));
+      if (!ins.length) {
+        // The unique index won a race the read could not see. Read the winner back.
+        const raced = await timesheetFor(employeeId, weekStart);
+        if (!raced) return { ok: false, error: 'The timesheet was not saved and the database did not say why.' };
+        timesheetId = raced.id;
+      } else {
+        timesheetId = String(ins[0].id);
+      }
+    } else {
+      await db.execute(sql`
+        UPDATE hr_timesheets
+           SET note = ${note}, submitted_by_user_id = ${by}::uuid, submitted_at = NOW(), withdrawn_at = NULL
+         WHERE id = ${timesheetId}::uuid`);
+    }
+
+    for (const e of clean) {
+      await db.execute(sql`
+        INSERT INTO hr_timesheet_entries (timesheet_id, work_date, minutes, work_mode, project, note)
+        VALUES (${timesheetId}::uuid, ${e.dateIso}::date, ${e.minutes}, ${e.workMode}, ${e.project}, ${e.note})
+        ON CONFLICT (timesheet_id, work_date) DO UPDATE
+          SET minutes = EXCLUDED.minutes,
+              work_mode = EXCLUDED.work_mode,
+              project = EXCLUDED.project,
+              note = EXCLUDED.note`);
+    }
+  } catch (e: any) {
+    logFail('submitTimesheet', e);
+    return { ok: false, error: errText(e, 'The timesheet could not be saved.') };
+  }
+
+  const total = clean.reduce((sum, e) => sum + e.minutes, 0);
+  const started = await startWorkflow({
+    domain: 'timesheet',
+    recordId: timesheetId,
+    subjectEmployeeId: employeeId,
+    requestedByUserId: by,
+    createdByUserId: by,
+    summary: 'Timesheet for the week of ' + weekStart + ': ' + formatMinutes(total),
+  });
+
+  if (!started.ok) {
+    return {
+      ok: false,
+      id: timesheetId,
+      error: 'Your timesheet was saved but it could not be sent for approval: ' +
+        (started.error || 'the approval engine did not say why') +
+        '. Nothing is lost - tell HR and it can be sent again.',
+    };
+  }
+
+  return {
+    ok: true,
+    changed: true,
+    id: timesheetId,
+    instanceId: started.instanceId,
+    state: started.state,
+    haltReason: started.haltReason ?? null,
+  };
+}
+
+/** Withdraw a submitted week that has not settled. */
+export async function withdrawTimesheet(timesheetId: string, employeeId: string): Promise<WriteResult> {
+  if (!isUuid(timesheetId) || !isUuid(employeeId)) return { ok: false, error: 'That is not a timesheet.' };
+  try {
+    await ensureWorkingTimeSchema();
+    const r = await db.execute(sql`
+      UPDATE hr_timesheets SET withdrawn_at = NOW()
+       WHERE id = ${timesheetId}::uuid AND employee_id = ${employeeId}::uuid AND withdrawn_at IS NULL
+      RETURNING id`);
+    return rows(r).length ? { ok: true, id: timesheetId, changed: true } : { ok: true, changed: false };
+  } catch (e: any) {
+    logFail('withdrawTimesheet', e);
+    return { ok: false, error: errText(e, 'The timesheet could not be withdrawn.') };
+  }
+}
+
+// =================================================================================================
+// REPORTS — PER EMPLOYEE AND PER DEPARTMENT
+// =================================================================================================
+//
+// AGGREGATES OVER A PERIOD, built from hr_attendance and nothing else. No wellness, health or
+// personal data is joined into either of these and none is available to join: they read days,
+// statuses, hours and the leave UNITS on a day — never why somebody was away.
+
+export interface AttendanceReportRow {
+  employeeId: string;
+  name: string;
+  code: string | null;
+  departmentId: string | null;
+  departmentName: string | null;
+  recordedDays: number;
+  presentDays: number;
+  wfhDays: number;
+  leaveDays: number;
+  absentDays: number;
+  holidayDays: number;
+  workedMinutes: number;
+  overtimeMinutes: number;
+  /** Part-day leave taken on days that are otherwise worked. */
+  partialLeaveUnits: number;
+}
+
+function mapReportRow(row: any): AttendanceReportRow {
+  return {
+    employeeId: String(row?.employee_id ?? ''),
+    name: String(row?.full_name ?? ''),
+    code: row?.employee_code ? String(row.employee_code) : null,
+    departmentId: row?.department_id ? String(row.department_id) : null,
+    departmentName: row?.department_name ? String(row.department_name) : null,
+    recordedDays: Number(row?.recorded_days) || 0,
+    presentDays: Number(row?.present_days) || 0,
+    wfhDays: Number(row?.wfh_days) || 0,
+    leaveDays: Number(row?.leave_days) || 0,
+    absentDays: Number(row?.absent_days) || 0,
+    holidayDays: Number(row?.holiday_days) || 0,
+    workedMinutes: Math.round((Number(row?.work_hours) || 0) * 60),
+    overtimeMinutes: Math.round((Number(row?.overtime_hours) || 0) * 60),
+    partialLeaveUnits: Math.round((Number(row?.partial_leave) || 0) * 100) / 100,
+  };
+}
+
+export interface ReportRange {
+  from: string;
+  to: string;
+  departmentId?: string | null;
+  employeeId?: string | null;
+  limit?: number;
+}
+
+/**
+ * One row per employee for a period.
+ *
+ * ONE QUERY, GROUPED IN POSTGRES rather than a loop of per-person reads: an HR desk asking for a
+ * month across two hundred people would otherwise be two hundred round trips on a pooled connection.
+ *
+ * department_id is compared as ::text on BOTH sides. departments.id is a varchar slug in
+ * src/lib/db/schema.ts and a UUID in db/hr-schema.sql, and a ::uuid cast throws on half of them.
+ */
+export async function employeeAttendanceReport(opts: ReportRange): Promise<AttendanceReportRow[]> {
+  const from = String(opts?.from || '');
+  const to = String(opts?.to || '');
+  if (!isDateIso(from) || !isDateIso(to) || to < from) return [];
+  const n = Math.min(Math.max(Number(opts?.limit) || 200, 1), 500);
+  const dept = opts?.departmentId ? String(opts.departmentId).trim() : '';
+  try {
+    await ensureAttendanceSchema();
+    await ensureWorkingTimeSchema();
+    const deptScope = dept ? sql`AND e.department_id::text = ${dept}::text` : sql``;
+    const empScope = isUuid(opts?.employeeId) ? sql`AND e.id = ${String(opts?.employeeId)}::uuid` : sql``;
+    const r = await db.execute(sql`
+      SELECT e.id AS employee_id, e.full_name, e.employee_code,
+             e.department_id::text AS department_id, d.name AS department_name,
+             COUNT(a.id)::int AS recorded_days,
+             COUNT(*) FILTER (WHERE a.status = 'present')::int  AS present_days,
+             COUNT(*) FILTER (WHERE a.status = 'wfh')::int      AS wfh_days,
+             COUNT(*) FILTER (WHERE a.status = 'on_leave')::int AS leave_days,
+             COUNT(*) FILTER (WHERE a.status = 'absent')::int   AS absent_days,
+             COUNT(*) FILTER (WHERE a.status = 'holiday')::int  AS holiday_days,
+             COALESCE(SUM(a.work_hours), 0)     AS work_hours,
+             COALESCE(SUM(a.overtime_hours), 0) AS overtime_hours,
+             COALESCE(SUM(CASE WHEN a.status <> 'on_leave' THEN a.leave_units ELSE 0 END), 0) AS partial_leave
+        FROM hr_employees e
+        LEFT JOIN departments d ON d.id::text = e.department_id::text
+        LEFT JOIN hr_attendance a
+               ON a.employee_id = e.id
+              AND a.date >= ${from}::date
+              AND a.date <= ${to}::date
+       WHERE e.is_active = TRUE
+         ${deptScope}
+         ${empScope}
+       GROUP BY e.id, e.full_name, e.employee_code, e.department_id, d.name
+       ORDER BY e.full_name ASC
+       LIMIT ${n}`);
+    return rows(r).map(mapReportRow);
+  } catch (e: any) {
+    logFail('employeeAttendanceReport', e);
+    return [];
+  }
+}
+
+export interface DepartmentAttendanceRow {
+  departmentId: string | null;
+  departmentName: string;
+  employees: number;
+  recordedDays: number;
+  presentDays: number;
+  wfhDays: number;
+  leaveDays: number;
+  absentDays: number;
+  workedMinutes: number;
+  overtimeMinutes: number;
+  /** Average worked minutes per RECORDED day, so a small team is not flattered by a big one. */
+  averageMinutesPerRecordedDay: number;
+}
+
+/** The same period, one row per department. Aggregate only; there is no drill-down to a person. */
+export async function departmentAttendanceReport(opts: ReportRange): Promise<DepartmentAttendanceRow[]> {
+  const from = String(opts?.from || '');
+  const to = String(opts?.to || '');
+  if (!isDateIso(from) || !isDateIso(to) || to < from) return [];
+  try {
+    await ensureAttendanceSchema();
+    await ensureWorkingTimeSchema();
+    const r = await db.execute(sql`
+      SELECT e.department_id::text AS department_id,
+             COALESCE(d.name, 'No department recorded') AS department_name,
+             COUNT(DISTINCT e.id)::int AS employees,
+             COUNT(a.id)::int AS recorded_days,
+             COUNT(*) FILTER (WHERE a.status = 'present')::int  AS present_days,
+             COUNT(*) FILTER (WHERE a.status = 'wfh')::int      AS wfh_days,
+             COUNT(*) FILTER (WHERE a.status = 'on_leave')::int AS leave_days,
+             COUNT(*) FILTER (WHERE a.status = 'absent')::int   AS absent_days,
+             COALESCE(SUM(a.work_hours), 0)     AS work_hours,
+             COALESCE(SUM(a.overtime_hours), 0) AS overtime_hours
+        FROM hr_employees e
+        LEFT JOIN departments d ON d.id::text = e.department_id::text
+        LEFT JOIN hr_attendance a
+               ON a.employee_id = e.id
+              AND a.date >= ${from}::date
+              AND a.date <= ${to}::date
+       WHERE e.is_active = TRUE
+       GROUP BY e.department_id, d.name
+       ORDER BY department_name ASC
+       LIMIT 100`);
+    return rows(r).map((row: any) => {
+      const recorded = Number(row?.recorded_days) || 0;
+      const worked = Math.round((Number(row?.work_hours) || 0) * 60);
+      return {
+        departmentId: row?.department_id ? String(row.department_id) : null,
+        departmentName: String(row?.department_name ?? 'No department recorded'),
+        employees: Number(row?.employees) || 0,
+        recordedDays: recorded,
+        presentDays: Number(row?.present_days) || 0,
+        wfhDays: Number(row?.wfh_days) || 0,
+        leaveDays: Number(row?.leave_days) || 0,
+        absentDays: Number(row?.absent_days) || 0,
+        workedMinutes: worked,
+        overtimeMinutes: Math.round((Number(row?.overtime_hours) || 0) * 60),
+        averageMinutesPerRecordedDay: recorded > 0 ? Math.round(worked / recorded) : 0,
+      };
+    });
+  } catch (e: any) {
+    logFail('departmentAttendanceReport', e);
+    return [];
   }
 }

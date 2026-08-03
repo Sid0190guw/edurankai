@@ -206,6 +206,46 @@ export const WORKFLOW_DOMAINS = [
   // ---------------------------------------------------------------------------------------------
   'helpdesk',
   'documents',
+  // ---------------------------------------------------------------------------------------------
+  // PAY. Three things payroll does that move money or change what somebody is, and not one of them
+  // may be a direct write.
+  //
+  // `loan` covers BOTH a loan and a salary advance, ONE domain for the two, because they are the
+  // same act with different words: the company hands over money now and recovers it from later pay
+  // runs. src/lib/loans.ts holds them in ONE table with a `kind` discriminator for the same reason —
+  // two tables would mean two recovery engines, and the second one to be written would be the one
+  // that forgets to stop deducting when the balance clears.
+  //
+  // `bonus` is money going the other way, and it is NOT the same domain: a bonus is decided ABOUT
+  // somebody rather than asked for BY them, so it starts at a different rung (see below).
+  //
+  // `confirmation` is the end of a probation — confirm, extend, or terminate. It changes whether a
+  // person is permanently employed, which is precisely the class of change that must never be a bare
+  // UPDATE on hr_probation.
+  // ---------------------------------------------------------------------------------------------
+  'loan',
+  'bonus',
+  'confirmation',
+  // ---------------------------------------------------------------------------------------------
+  // WORKING TIME. Two domains, added with the overtime and weekly-timesheet surfaces.
+  //
+  // BOTH ARE HERE RATHER THAN INSIDE src/lib/attendance.ts FOR ONE REASON: they are approvals, and
+  // this file is the only approval engine in this codebase. An overtime claim decided by a rule
+  // inside the attendance module would be a second engine, and within a month the two would
+  // disagree about who signs off an evening's extra hours.
+  //
+  // WHY OVERTIME MUST BE AN APPROVAL AT ALL. Minutes beyond a shift are ARITHMETIC — a subtraction
+  // of two numbers, one of which came from a phone that may have been left in a pocket. Turning
+  // that subtraction straight into comp off or into pay would mean a clock somebody forgot to stop
+  // becomes a day off or a day's wages. So the minutes are a number on a screen until a person
+  // claims them and the reporting manager the Organization Graph names says yes.
+  //
+  // WHY A TIMESHEET IS AN APPROVAL AND NOT A SAVE. A submitted week is a person's own account of
+  // what they did, and it is read by whoever bills or plans against it. Approving it is somebody
+  // saying they recognise the week; without that it is a form that goes nowhere.
+  // ---------------------------------------------------------------------------------------------
+  'overtime',
+  'timesheet',
 ] as const;
 
 export type WorkflowDomain = (typeof WORKFLOW_DOMAINS)[number];
@@ -658,7 +698,124 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     ],
     escalateAfterHours: 72,
     approvalUrl: '/portal/employee/documents',
-  }
+  },
+
+  // ===============================================================================================
+  // PAY. THREE CHAINS, AND `capability: null` ON ALL THREE.
+  //
+  // `payroll.manage` exists and it is the key that opens the payroll consoles and sets salaries. It
+  // is NOT standing authority to approve a loan, a bonus or a confirmation, and mapping it here
+  // would hand the payroll desk the power to approve its own disbursement — a per-USER grant
+  // silently replacing a per-ROW relationship, which is the exact defect the three-layer split
+  // exists to remove. Only the person the graph routed to, or their in-force delegate, may decide.
+  // ===============================================================================================
+
+  // A LOAN OR A SALARY ADVANCE. The company hands money over now and recovers it from later pay.
+  //
+  // The manager is rung one because they are the person who knows the request is real and who will
+  // still be managing the person while it is recovered. The approval owner — whoever the
+  // organisation has named to own pay approvals — is rung two, and OPTIONAL for the usual reason:
+  // naming one is a policy choice a small company may not have made.
+  //
+  // The executive rung above 200,000 mirrors `travel` exactly and is NOT optional. Above that
+  // threshold the rung either resolves an executive sponsor or the request HALTS; it is never
+  // skipped. A large sum leaving the company on nobody's authority is the outcome this engine
+  // exists to make impossible, and "we could not find an executive" is a reason to stop, not a
+  // reason to proceed.
+  loan: {
+    key: 'loan',
+    label: 'Loan or salary advance',
+    capability: null,
+    route: [
+      { step: 1, via: 'reporting_manager' },
+      { step: 2, via: 'approval_owner', optional: true },
+      { step: 3, via: 'executive_sponsor', minAmount: 200000 },
+    ],
+    escalateAfterHours: 72,
+    approvalUrl: '/admin/hr/payroll/loans',
+  },
+
+  // A BONUS OR INCENTIVE.
+  //
+  // THE FIRST RUNG IS THE DEPARTMENT HEAD, NOT THE REPORTING MANAGER, and that is the same reasoning
+  // `appraisal` and `recruitment` above already carry: a bonus is almost always PROPOSED by the
+  // person's own manager, so routing the approval back to that manager would record an approval that
+  // no second human ever looked at. The head is REQUIRED, so a department with no recorded head
+  // halts with a readable sentence rather than paying somebody on nobody's say-so.
+  //
+  // A GROUP BONUS IS N AWARDS, NOT ONE. src/lib/payroll-bonuses.ts raises one award row per person
+  // and starts one instance per award, because routing is resolved per ROW from the graph: twelve
+  // people across three departments genuinely have three different approvers, and a single instance
+  // would have to pick one of them and call it the answer for everybody.
+  bonus: {
+    key: 'bonus',
+    label: 'Bonus or incentive',
+    capability: null,
+    route: [
+      { step: 1, via: 'department_head' },
+      { step: 2, via: 'approval_owner', optional: true },
+      { step: 3, via: 'executive_sponsor', minAmount: 200000 },
+    ],
+    escalateAfterHours: 96,
+    approvalUrl: '/admin/hr/payroll/bonuses',
+  },
+
+  // THE END OF A PROBATION — confirm, extend, or terminate.
+  //
+  // Same shape as `separation`, and for the same reason: both settle whether somebody is employed
+  // here. The reporting manager is required because they are the only person with first-hand
+  // evidence of how the probation actually went, and a confirmation nobody vouched for is a
+  // confirmation that happened because a date passed. The approval-owner rung is optional.
+  //
+  // The department head is NOT a rung here, deliberately, unlike `promotion`. A confirmation is the
+  // ordinary end of a probation that happens for every single joiner, and making every one of them
+  // wait on a department head that most departments have not recorded yet would mean nobody is ever
+  // confirmed — which reads on the record as an entire workforce left on probation indefinitely.
+  confirmation: {
+    key: 'confirmation',
+    label: 'Probation outcome',
+    capability: null,
+    route: [
+      { step: 1, via: 'reporting_manager' },
+      { step: 2, via: 'approval_owner', optional: true },
+    ],
+    escalateAfterHours: 72,
+    approvalUrl: '/admin/hr/contracts/probation',
+  },
+
+  // ===============================================================================================
+  // WORKING TIME. ONE RUNG EACH, AND capability: null ON BOTH.
+  //
+  // ONE RUNG, for the reason `attendance` above already gives: these are small factual claims about
+  // days that have already happened, and a three-rung chain for "I stayed two hours late on Tuesday"
+  // means nobody ever claims anything and the hours are simply lost.
+  //
+  // capability: null — there is no key in permissions.ts whose holders mean "may approve anybody's
+  // overtime". `attendance.roster.manage` is about DEFINING working time (shifts, rosters, the
+  // holiday list); mapping it here would hand every holder standing authority to sign off overtime
+  // for the whole company, which is exactly the per-user reach the three-layer split removes. So
+  // only the person the Organization Graph routed to, or their in-force delegate, may decide one.
+  //
+  // WHEN NOBODY CAN BE RESOLVED THE CLAIM HALTS and says which relationship is missing. It is never
+  // auto-approved, and hr_overtime_requests has no status column of its own for anything to write a
+  // pretend approval into.
+  // ===============================================================================================
+  overtime: {
+    key: 'overtime',
+    label: 'Overtime claim',
+    capability: null,
+    route: [{ step: 1, via: 'reporting_manager' }],
+    escalateAfterHours: 72,
+    approvalUrl: '/portal/employee/attendance/approvals',
+  },
+  timesheet: {
+    key: 'timesheet',
+    label: 'Weekly timesheet',
+    capability: null,
+    route: [{ step: 1, via: 'reporting_manager' }],
+    escalateAfterHours: 96,
+    approvalUrl: '/portal/employee/attendance/approvals',
+  },
 };
 
 /** The chain a domain uses, for a screen that wants to explain the process before anything starts. */

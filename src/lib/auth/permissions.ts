@@ -241,6 +241,42 @@ export type Permission =
   // an employee's account frequently carries the `applicant` role, which holds nothing at all.
   | 'procurement.view' | 'procurement.manage'
   // =============================================================================================
+  // INVOICES — money we are owed, and money we owe. Three keys, and NOT ONE OF THEM APPROVES
+  // ANYTHING.
+  //
+  // Paying a supplier bill requires an APPROVED workflow instance, routed per ROW from the
+  // Organization Graph for the employee whose purchase caused it: their reporting manager, their
+  // department head, the procurement approval owner, and an executive sponsor at or above the amount
+  // declared on that chain. src/lib/invoices.ts reads that decision from the engine at the moment of
+  // the write and refuses everything else. Holding `invoices.pay` means "may record that an approved
+  // payment moved"; it puts nobody on an approval route and cannot approve a bill for itself.
+  //
+  //   invoices.view    open the invoicing console: what we have billed, what has been billed to us,
+  //                    what is outstanding, what is overdue, and the printable document.
+  //   invoices.manage  raise, price and issue an invoice, record a supplier bill against a purchase
+  //                    request, configure the numbering series and the tax components, and VOID an
+  //                    invoice with a reason. There is no delete anywhere in that module.
+  //   invoices.pay     record a payment against an invoice — for a bill somebody sent us, only once
+  //                    the workflow engine says the payment was approved.
+  //
+  // SPLIT ON THE EXACT PRECEDENT OF payouts.approve / payouts.pay and procurement.view /
+  // procurement.manage: the same two roles hold all three today, and they stay three keys so a future
+  // grant can separate reading the ledger from raising a document from moving money without a code
+  // change.
+  //
+  // GRANTED TO super_admin AND hr — the population holding the equivalent authority TODAY.
+  // /admin/finance has been super_admin + hr since it was written, `hr` is the only built-in role
+  // below super_admin carrying `finance` and `payouts` in ROLE_SECTIONS, and those same two hold
+  // procurement.view/manage and payouts.pay. This records the population the product already has; it
+  // invents no wider one.
+  //
+  // THE CONSOLE ALSO ACCEPTS canAccessSection(user, 'finance', 'edit'), for the reason
+  // /admin/procurement and /admin/hr/leave/workflow both state: a CUSTOM role holding the finance
+  // section resolves through the registry as `finance.edit` and NEVER as `invoices.view`, so gating
+  // on the capability alone would shut out every custom role that can open /admin/finance today.
+  // =============================================================================================
+  | 'invoices.view' | 'invoices.manage' | 'invoices.pay'
+  // =============================================================================================
   // WORKPLACE SERVICES - helpdesk, asset register, document library.
   //
   // THERE IS NO EQUIVALENT AUTHORITY TO PRESERVE, and that is a fact about the codebase rather than
@@ -277,6 +313,32 @@ export type Permission =
   // through the Organization Graph by src/lib/workflow.ts, and holding this key confers no approval
   // over anybody. Publishing what an approval already settled is this key; deciding it is not.
   | 'documents.manage'
+  // WRITING THE STAFF HANDBOOK (src/lib/knowledge-base.ts): create an article or a policy, edit one,
+  // publish a version, archive one, and read the acknowledgement record for a policy.
+  //
+  // ONE KEY, FOR WRITING ONLY. Reading is NOT gated on it and must never be: an article carries an
+  // `audience`, and a restricted article names the capability that unlocks it, applied in the WHERE
+  // clause of every read. So "who may read the interview-scoring guidance" is answered by the
+  // interviewing capability the article itself names, not by a second permission here — which is why
+  // there is no `knowledge.view`. Minting one would create two ways to answer the same question and
+  // they would disagree within a release.
+  //
+  // WHY NOT `documents.manage`. That key curates the LINK LIBRARY: folders, retention and sharing of
+  // Google Drive links to files that live elsewhere. This one writes TEXT that lives in this database,
+  // is searched, is versioned, and can be acknowledged. Reusing the documents key would hand the power
+  // to rewrite the leave policy to whoever was made a librarian, and would make either grant
+  // impossible to narrow later without moving the other.
+  //
+  // POPULATION: super_admin + hr — exactly the holders of `helpdesk.manage` and `documents.manage`,
+  // the two adjacent workplace-services keys, and the people who answer these questions by hand today.
+  // Nobody gains sight of anything: an article is written to be read, and publishing is the act this
+  // key controls.
+  //
+  // WHAT IT DOES NOT BUY: reading a restricted article whose capability the holder does not have. A
+  // knowledge manager can PUBLISH an article restricted to `payroll.manage` and, without that key,
+  // cannot open it afterwards. That is deliberate — the audience is a property of the article, not a
+  // privilege of the author.
+  | 'knowledge.manage'
   // =============================================================================================
   // WORKING TIME AND AGGREGATE REPORTING (src/lib/attendance.ts, src/lib/analytics-workforce.ts).
   //
@@ -413,7 +475,44 @@ export type Permission =
   | 'skills.manage'
   // Assign a course to anybody in the organization, and schedule the training calendar. A manager
   // assigns to their own reports through the graph; this is the org-wide version.
-  | 'learning.assign';
+  | 'learning.assign'
+
+  // =============================================================================================
+  // PROJECTS. TWO KEYS, AND NEITHER OF THEM MAKES ANYBODY A PROJECT MANAGER.
+  //
+  // READ THIS BEFORE GRANTING EITHER. "Runs this project" is an ORGANISATIONAL RELATIONSHIP — the
+  // `project_manager` edge in org_relationships, scoped to ONE project, effective-dated, resolved
+  // per ROW by src/lib/org-graph.ts (isProjectManager / getManagedProjectIds / getProjectManager).
+  // It is not spelled anywhere in this union and it must never be: a capability cannot say "this
+  // project and not that one", so a key meaning "may run projects" would hand every holder authority
+  // over every project in the company. That is the per-ROW-to-per-USER collapse this architecture
+  // exists to prevent, and it is one careless grant away at all times.
+  //
+  // WHAT THE TWO KEYS ACTUALLY DO is therefore narrow, and org-wide by construction:
+  //   projects.view    the PORTFOLIO read — every project, whether or not you are on it.
+  //   projects.manage  the REGISTER write — create a project, change its definition, set its planned
+  //                    budget, retire it, and record who runs it as a graph edge.
+  //
+  // A member needs NEITHER of these to work on their own project, and a project manager needs
+  // NEITHER to run theirs: both are answered from the graph and from project_members. Somebody
+  // holding no permission at all in this product still sees, and works, every project they are on.
+  //
+  // NO PRIOR POPULATION TO PRESERVE — there was no projects table, no project_id and no projects
+  // module anywhere in src/ or db/ before this commit (src/lib/search-global.ts said so in words, and
+  // src/lib/workforce/navigation.ts carried it in NAV_BACKLOG). So these follow the precedent set by
+  // procurement.view / assets.manage: granted to the NARROWEST DEFENSIBLE HOLDERS, super_admin and
+  // hr, and enforced at every call site from the first deploy. Nobody loses anything, because nobody
+  // had anything.
+  // =============================================================================================
+
+  // Open the portfolio: every project in the organization, its dates, its owner, its members, its
+  // milestones, its risk register and its budget variance. It grants no authority over any project
+  // and puts the holder on no approval route.
+  | 'projects.view'
+  // Create a project, change its name, code, description, department, dates and status, set its
+  // PLANNED budget, retire it, and record who runs it. Recording a project manager writes an
+  // effective-dated edge into the Organization Graph; it does not make the holder that manager.
+  | 'projects.manage';
 
 // Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
 // drifting away from the real one (/admin/access-preview). Nothing outside this file may decide
@@ -641,10 +740,17 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // request to a supplier. Neither decides an approval — routing does that, per request, from the
     // Organization Graph. No prior population to preserve: there was no purchasing module.
     'procurement.view', 'procurement.manage',
+    // INVOICES. The same three-way split, and the same population: whoever already reads the
+    // purchasing record and releases a payout. None of the three approves a payment — a supplier
+    // bill is paid only against an APPROVED workflow instance, routed per row from the graph.
+    'invoices.view', 'invoices.manage', 'invoices.pay',
     // WORKPLACE SERVICES. No prior authority to preserve - there was no helpdesk, no asset
     // register and no document library anywhere in this codebase. Granted to the narrowest
     // defensible holder, and enforced at every call site from day one.
-    'helpdesk.manage', 'assets.manage', 'documents.manage',
+    // `knowledge.manage` joins them for the same reason and with the same population: it writes the
+    // staff handbook the helpdesk deflects tickets to. Reading is scoped by the article's own
+    // audience in the WHERE clause, so this key widens nobody's sight of anything.
+    'helpdesk.manage', 'assets.manage', 'documents.manage', 'knowledge.manage',
     // WORKING TIME AND AGGREGATE REPORTING. Narrowest defensible holders, matching whoever already
     // administers attendance and whoever already reads every employee record one at a time. Neither
     // key approves anything: an attendance correction routes per row from the Organization Graph.
@@ -660,7 +766,11 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // hold this desk" panel. Adding them here makes the code match the population every one of those
     // comments already claims. Nobody but super_admin gains anything, and super_admin is unrestricted
     // in the section filter these pages also sit behind.
-    'performance.manage', 'skills.manage', 'learning.assign'
+    'performance.manage', 'skills.manage', 'learning.assign',
+    // PROJECTS. The portfolio read and the project register. NEITHER makes the founder the manager
+    // of any project — that is a `project_manager` edge in the Organization Graph, scoped to one
+    // project, and /admin/projects resolves it per row exactly like every other surface here.
+    'projects.view', 'projects.manage'
   ],
   hr: [
     'admin.access',
@@ -708,18 +818,34 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // is the only non-super_admin role that reaches /admin/hr/performance and /admin/hr/training
     // today. Exact population, named instead of spelled — nobody gains and nobody loses.
     'performance.manage', 'skills.manage', 'learning.assign',
+    // PROJECTS. `hr` already holds the org-wide reads that a portfolio is made of — every employee
+    // record (employee.manage), the whole claim queue (expenses.review), the purchasing record
+    // (procurement.view) and aggregate reporting (analytics.view) — so a register of what the
+    // company is working on adds no reach it does not have. It confers nothing over any single
+    // project: whoever RUNS a project is a `project_manager` edge in the Organization Graph, and no
+    // grant on this line can create one. The matching 'projects' section is added to this role's
+    // ROLE_SECTIONS list below, so the sidebar entry, the page gate and the capability admit exactly
+    // the same accounts rather than three overlapping sets.
+    'projects.view', 'projects.manage',
     // PROCUREMENT. `hr` is the only built-in role below super_admin holding the `finance` and
     // `payouts` sections in ROLE_SECTIONS, and /admin/finance has been super_admin + hr since it was
     // written — so the people who already handle company money handle the purchasing record too.
     // The console accepts EITHER this key or the `finance` section, so no custom role that can open
     // /admin/finance today is shut out of the purchasing console tomorrow.
     'procurement.view', 'procurement.manage',
+    // INVOICES. `hr` already holds payouts.pay (releasing an employee payout) and procurement.manage
+    // (committing the company to a supplier), so recording what we billed and what we paid is
+    // authority this role has in substance today. It confers no approval: paying a supplier bill
+    // needs an approved chain, resolved per row from the Organization Graph, not a key.
+    'invoices.view', 'invoices.manage', 'invoices.pay',
     // WORKPLACE SERVICES. The people desk already answers, informally, the questions these
     // three modules formalise - who is holding which laptop, what the joining paperwork says,
     // and whatever an employee could not raise with their own manager. `hr` is also the only
     // built-in role holding the matching 'helpdesk' and 'assets' sections in ROLE_SECTIONS
     // below, so the sidebar, the page gate and the capability admit exactly the same accounts.
-    'helpdesk.manage', 'assets.manage', 'documents.manage',
+    // `knowledge.manage` sits with them: the people desk already writes these answers out by hand in
+    // reply to the same five questions, and this is where those answers go instead.
+    'helpdesk.manage', 'assets.manage', 'documents.manage', 'knowledge.manage',
     // WORKING TIME AND AGGREGATE REPORTING. `hr` is the only built-in role holding the `attendance`
     // section in ROLE_SECTIONS below, so it is already the role that administers attendance; and it
     // holds employee.manage, so it can already read every employee record one at a time. Both keys
@@ -882,6 +1008,12 @@ const ROLE_SECTIONS: Record<string, string[]> = {
     'dashboard', 'applications', 'offers', 'messages', 'dms', 'discussion',
     'hr', 'employees', 'leave', 'attendance', 'payroll', 'payouts', 'training', 'finance',
     'helpdesk', 'assets',
+    // 'projects' is NEW, and it is added here for the same reason 'helpdesk' and 'assets' were: the
+    // sidebar entry is gated on the section, the console accepts the section OR the capability, and
+    // `hr` is granted projects.view/projects.manage above — so without this line the desk would hold
+    // the key and never be offered the door. It reveals no project to anybody who is not on one:
+    // /admin/projects is the portfolio, and the portfolio is exactly what the capability describes.
+    'projects',
     'roles', 'departments', 'interviews', 'interviews_manual', 'interviews_ai',
     'events', 'content', 'custom_offer',
   ],

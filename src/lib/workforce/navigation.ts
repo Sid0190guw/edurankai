@@ -337,6 +337,51 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'requireEmployee. Every punch, timesheet and correction is scoped to the caller\'s own employee id in the query; the write re-checks the punch rule on the POSTED value rather than on the rendered buttons.',
   },
   {
+    key: 'weekly-timesheet',
+    label: 'Timesheet',
+    href: '/portal/employee/timesheet',
+    icon: 'calendar',
+    group: 'time',
+    // DRAWER ONLY. A timesheet is filled in once a week, usually on a Friday, and giving it one of
+    // the four thumb slots would push out something people tap every day. NOT a duplicate of the
+    // 'timesheet' entry above it: that one opens /portal/employee/attendance, which is where a
+    // person CHECKS IN. This is the weekly declaration they submit for approval, which is a
+    // different act on a different table.
+    bar: null,
+    // EXACTLY the page's own gate in the composition's vocabulary. timesheet.astro runs
+    // requireEmployee and renders its named denial without one, and all three of these widgets carry
+    // withEmployeeRecord - so the entry is true for precisely the accounts the page admits.
+    audience: keptAny('attendance.month', 'clock.today', 'timelog.today'),
+    gate: 'requireEmployee. Every read and write is scoped to the caller\'s own employee id; approval is routed by src/lib/workflow.ts to the reporting manager from the Organization Graph, and the page has no approve button of its own.',
+  },
+  {
+    key: 'overtime',
+    label: 'Overtime',
+    href: '/portal/employee/attendance/overtime',
+    icon: 'calendar',
+    group: 'time',
+    // DRAWER ONLY, same reasoning: claiming extra hours is occasional, not daily.
+    bar: null,
+    audience: keptAny('attendance.month', 'clock.today', 'timelog.today'),
+    gate: 'requireEmployee. A claim is checked against the caller\'s OWN punches and shift, routed through src/lib/workflow.ts, and comp off is credited only when the engine says approved. Nothing on the page credits anything.',
+  },
+  {
+    key: 'time-approvals',
+    label: 'Approvals waiting on you',
+    href: '/portal/employee/attendance/approvals',
+    icon: 'checklist',
+    group: 'time',
+    // DRAWER ONLY. Offered to every employee rather than gated on managing anybody, DELIBERATELY:
+    // who approves what is resolved PER ROW from the Organization Graph, not from a capability, so
+    // there is no per-user predicate that could answer "is this person an approver" without asking
+    // the graph. The page itself is honest when the answer is nobody - it says nothing is waiting on
+    // you - and pendingForApprover() returns only what is routed or delegated to the caller, so an
+    // employee who approves nothing sees an empty list rather than somebody else's requests.
+    bar: null,
+    audience: keptAny('attendance.month', 'clock.today', 'timelog.today'),
+    gate: 'requireEmployee, then pendingForApprover(user.id) - routed and delegated steps only, never capability holders. decideStep() re-checks routing and mayAct() at the moment of the write, so a posted step id for somebody else\'s queue is refused by the engine.',
+  },
+  {
     key: 'calendar',
     label: 'Calendar',
     href: '/portal/employee/calendar',
@@ -675,6 +720,26 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     // spends ten minutes looking for the travel policy in their own PAN card upload.
     audience: worksHere,
     gate: 'Page: signed in. Contents: listDocuments() narrows in the WHERE clause to what this person owns, what is published to the company or their department, and what is shared with them by name. The curator arm is a capability the page resolves and passes in.',
+  },
+  {
+    key: 'knowledge',
+    label: 'Knowledge base',
+    href: '/portal/employee/knowledge',
+    icon: 'book',
+    group: 'work',
+    // DRAWER ONLY, and ranked immediately after the helpdesk it deflects for: somebody looking for
+    // the answer and somebody about to ask for it are the same person one screen apart.
+    bar: 19,
+    // `worksHere` — an employee record, or admin.access — which is EXACTLY what the page means by
+    // "everyone with a workspace" and exactly what makeViewer() computes as hasWorkspace. An
+    // applicant has no workspace and is offered nothing; the page would show them an empty library
+    // anyway, and offering it would be a promise it does not keep.
+    //
+    // DELIBERATELY NOT A CAPABILITY. Reading the handbook needs no permission of its own: the
+    // article names its own audience and that is applied in the WHERE clause. Gating the ENTRY on
+    // `knowledge.manage` would hide the leave policy from everybody it was written for.
+    audience: worksHere,
+    gate: 'Page: signed in. Contents: every read goes through visibilityClause() in src/lib/knowledge-base.ts, which narrows to articles for everyone with a workspace plus restricted ones whose named capability this person actually holds. Acknowledging a policy writes the SESSION user id, never a posted one.',
   }
 ];
 
@@ -777,9 +842,10 @@ export const NAV_BACKLOG: readonly { key: string; reason: string }[] = [
       'employee-profile entry above. It is a NEW page with its own requireEmployee gate rather than ' +
       'an edit to the loop: /portal/profile/edit:7 still redirects every non-applicant to /admin, and ' +
       'middleware bounces anyone without admin.access straight back, which is the loop shape that ' +
-      'took /portal down before. THREE PAGES STILL CARRY THAT LINE and still have no entry pointing ' +
-      'at them — /portal/notifications:7, /portal/requests/index:6, /portal/wallet:10. Each is a ' +
-      'one-line page fix, not a module.',
+      'took /portal down before. /portal/notifications HAS NOW HAD THAT LINE REMOVED — it gates on ' +
+      '"signed in", narrows every read by user_id, and has the notifications entry above pointing at ' +
+      'it — so TWO PAGES still carry it with no entry pointing at them: /portal/requests/index:7 and ' +
+      '/portal/wallet:11. Each is a one-line page fix, not a module.',
   },
 ];
 

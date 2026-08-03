@@ -442,9 +442,11 @@ export const SLOT_CAPS: Readonly<Record<SlotName, number>> = {
  * by users.id alone, so it survives a degraded composition, and together they guarantee a composed
  * page is never blank and never useless.
  *
- * notifications.unread carries href: null on purpose — /portal/notifications redirects every
- * non-applicant to /admin, so there is no portal inbox to link to yet. Render each row against its
- * own notifications.action_url.
+ * notifications.unread now links to /portal/notifications. It used to carry href: null because that
+ * page redirected every non-applicant to /admin and middleware bounced them straight back — a loop,
+ * which is worse than no link. That role-name test is gone; the page gates on "signed in" and
+ * narrows every read to the reader's own user_id. Each row still renders against its own
+ * notifications.action_url — the widget href is only the "see all" target.
  */
 export const UNIVERSAL_BASELINE: Readonly<{ attention: readonly string[]; quiet: readonly string[] }> = {
   attention: ['attention.queue'],

@@ -368,20 +368,25 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     key: 'notifications.unread',
     title: 'Unread notifications',
     group: 'attention',
-    dataSource: 'notifications WHERE user_id = self AND is_read = false (table created by src/lib/push.ts:110).',
+    dataSource: 'notifications WHERE user_id = self AND is_read = false (table created by src/lib/notifications-schema.ts — the ONE owner of that DDL; push.ts and both notifications-recent endpoints used to CREATE it too, in narrower shapes).',
     requires: [],
     audience: anyone,
     priority: 20,
     size: 'md',
     render: 'list',
-    href: null,
+    href: '/portal/notifications',
     hideWhenEmpty: true,
     minimal: true,
     notes:
-      'href is null ON PURPOSE. /portal/notifications.astro:8 redirects every non-applicant to /admin, ' +
-      'so an employee has no portal inbox to link to even though rows ARE written for them ' +
-      '(KNOWN_GAPS.md). Render each row against its own notifications.action_url instead, and set an ' +
-      'href here only once that door is opened.',
+      'THE DOOR IS OPEN NOW, so this href is no longer null. It used to be, on purpose: ' +
+      '/portal/notifications.astro carried `if (user.role !== \'applicant\') return ' +
+      'Astro.redirect(\'/admin\')`, so linking an employee at their own inbox threw them at a console ' +
+      'middleware then bounced them off — a redirect loop, which is worse than no link. That role-name ' +
+      'test is gone and the page now gates on "signed in" alone, narrowing every read to the reader\'s ' +
+      'own user_id. Rows have always been written for employees (src/lib/push.ts persists first and ' +
+      'pushes second), so nothing about the DATA changed here; only the surface. Each row still renders ' +
+      'against its own notifications.action_url — this href is the "see all" target, not a replacement ' +
+      'for the per-row links.',
   },
   {
     key: 'schedule.today',
@@ -1244,10 +1249,13 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     href: '/portal/meet',
     hideWhenEmpty: true,
     notes:
-      'WHO IS IN A ROOM RIGHT NOW — a presence heartbeat, and the only meeting fact this database can state. ' +
-      'Scheduled meetings are NOT registered: meet_rooms.scheduled_at, duration_min, invitees and recurrence ' +
-      'are written by nothing, the sole INSERT creates an ad-hoc untitled huddle, and the scheduler UI POSTs ' +
-      'to /api/meet/rooms, which does not exist. Never present presence as a calendar.',
+      'WHO IS IN A ROOM RIGHT NOW — a presence heartbeat, and NOT a calendar. Never present it as one. ' +
+      'The REASON has changed and the old one must not be quoted again: scheduled meetings used to be ' +
+      'unregistered because meet_rooms.scheduled_at, duration_min, invitees and recurrence were written by ' +
+      'nothing — the scheduler POSTed to /api/meet/rooms and no such route existed. THAT ROUTE EXISTS NOW ' +
+      '(src/pages/api/meet/rooms/index.ts and ./[id].ts) and writes all four, so a scheduled meeting IS ' +
+      'recorded. What remains true is narrower: this widget reads PRESENCE, which answers "who is in a room" ' +
+      'and never "what is on today". meetings.today in UNREGISTERED records the gap that is left.',
   },
 
   // ------------------------------------------------------------------ account
@@ -1407,11 +1415,17 @@ export const UNREGISTERED: readonly { key: string; reason: string }[] = [
   {
     key: 'meetings.today',
     reason:
-      'meet_rooms.scheduled_at, duration_min, invitees and recurrence are written by NOTHING; the sole ' +
-      'INSERT creates an ad-hoc untitled huddle, host_user_id is declared INTEGER against ::uuid casts in ' +
-      'its own reader, and the scheduler UI POSTs to /api/meet/rooms, which does not exist. Needs the ' +
-      'staff_meetings + staff_meeting_invitees pair (architecture doc §3.8). huddle.active is what CAN be ' +
-      'answered today.',
+      'THE ORIGINAL REASON IS NO LONGER TRUE AND IS RECORDED HERE ONLY SO IT IS NOT RE-DISCOVERED: ' +
+      'scheduled_at / duration_min / invitees / recurrence were written by nothing, the sole INSERT made an ' +
+      'ad-hoc untitled huddle, host_user_id was declared INTEGER in one CREATE and UUID in another, and the ' +
+      'scheduler POSTed to /api/meet/rooms, which did not exist. All four are fixed: src/lib/meet-schema.ts ' +
+      'is now the single owner of the meet_* DDL and reconciles the two shapes additively, and ' +
+      'src/pages/api/meet/rooms/{index,[id]}.ts write and update every one of those columns. ' +
+      'WHY IT IS STILL UNREGISTERED, on the narrower ground that survives: a meeting recorded in meet_rooms ' +
+      'belongs to its HOST (every read in ./[id].ts is narrowed by host_user_id), and `invitees` is a jsonb ' +
+      'list of email strings with no membership row and no accepted/declined state — so "what is on MY day" ' +
+      'cannot be answered for an invitee, only for a host. That needs the staff_meeting_invitees half of the ' +
+      'pair (architecture doc §3.8). huddle.active is what CAN be answered for everyone today.',
   },
   {
     key: 'announcements.latest',

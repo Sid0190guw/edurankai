@@ -15,6 +15,13 @@
 // same query that would have served the host — the filter is not applied after fetching, it IS the
 // fetch. The passcode is returned by GET, which is why this is host-only and not participant-wide.
 //
+// AND DELIBERATELY NOT canScheduleMeeting(). ./index.ts gates CREATION through the capability
+// registry, because calling a new meeting is the ability the registry has an opinion about. These
+// three do not repeat that test, and the omission is the point: a person whose employee record is
+// closed tomorrow must still be able to CANCEL the meeting they called today rather than leave a
+// room open with invitees walking into it. Ownership is the stronger gate here, not the weaker one —
+// it is per-row, it is in the statement, and no capability can substitute for it.
+//
 // It creates no table. src/lib/meet-schema.ts owns the meeting DDL; see its header for the two
 // conflicting CREATEs this replaced.
 import type { APIRoute } from 'astro';

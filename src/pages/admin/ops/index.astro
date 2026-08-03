@@ -1,0 +1,283 @@
+---
+// /admin/ops — the screen somebody opens at 2am.
+//
+// It answers ONE question in ONE view: what is broken. The failing checks are hoisted to the top as
+// a single banner, and everything under it is evidence for that banner — not five links to five
+// other pages. /admin/hardening keeps the security posture; this is the incident board.
+//
+// WHY IT LOOKS LIKE THIS. Two real failures on this project were invisible rather than loud: a gate
+// refused a request and wrote no error row anywhere, and a hire failed silently for eleven days
+// because the reason lived on e.cause and was discarded. So every panel here prefers a noisy,
+// honest answer to a reassuring blank one — a panel with no data says WHY it has no data
+// ("pg_stat_statements is not installed", "no run recorded") instead of rendering an empty table
+// that reads as healthy.
+//
+// ERROR GROUPING. edu_error_log rows are collapsed on the fingerprint logger.ts stores at write
+// time, so the same fault 400 times is one row with count 400. That is done in SQL: the page never
+// pulls 400 rows in order to count them.
+//
+// NO CLIENT JAVASCRIPT. Refresh is a link. A dashboard that polls on a timer is how a leaked
+// interval exhausted the connection pooler and took this site down; an operator can press refresh.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/rbac';
+import { queueHealth } from '@/lib/job-queue';
+import {
+  quickHealth, errorGroups, errorRate, cronStatus, poolSignals, slowQueries,
+  bootstrapStatus, mailReachability, recordRelease, relativeAge,
+} from '@/lib/observability-health';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+const gate = await can(user, 'administer', { type: 'platform' });
+if (!gate.allow) return Astro.redirect('/admin');
+
+const url = new URL(Astro.request.url);
+const hours = Math.min(720, Math.max(1, Number(url.searchParams.get('hours')) || 24));
+
+// Note the serving commit on an operator page load (not from the polled /api/health, which must not
+// write). Failures inside it are logged by the module itself and must not blank the console.
+await recordRelease().catch(() => {});
+
+const health = await quickHealth().catch(() => null);
+const groups = await errorGroups({ hours, limit: 60 }).catch(() => []);
+const rate = await errorRate().catch(() => ({ lastHour: 0, last24h: 0, last7d: 0, distinct24h: 0 }));
+const crons = await cronStatus().catch(() => []);
+const pool = await poolSignals().catch(() => ({ available: false, total: 0, active: 0, idle: 0, idleInTransaction: 0, maxConnections: null, note: 'unavailable' }));
+const slow = await slowQueries(8).catch(() => ({ available: false, note: 'unavailable', rows: [] }));
+const boot = await bootstrapStatus().catch(() => []);
+const mail = await mailReachability().catch(() => ({ configured: false, mode: 'unknown', host: null, port: null, reachable: null, detail: 'unavailable', source: 'none' }));
+const queue = await queueHealth().catch(() => ({ pending: 0, processing: 0, failed: 0, done: 0 }));
+
+const release = health ? health.release : null;
+const dbOk = !!health && health.database.ok;
+const dbLatency = health ? health.database.latencyMs : -1;
+const overdueCrons = crons.filter((c) => c.state === 'overdue');
+const neverCrons = crons.filter((c) => c.state === 'never');
+const missingSchemas = boot.filter((b) => !b.present);
+
+// THE BANNER. Every broken thing, named, in one place. Order matters: the database first, because
+// nothing below it is trustworthy while it is down.
+const broken: { what: string; detail: string }[] = [];
+if (!dbOk) broken.push({ what: 'Database unreachable', detail: (health && health.database.error) || 'SELECT 1 did not answer' });
+if (dbOk && dbLatency > 1500) broken.push({ what: 'Database latency high', detail: dbLatency + 'ms for a SELECT 1' });
+if (queue.failed > 0) broken.push({ what: queue.failed + ' failed background job(s)', detail: 'Retry them at /admin/jobs' });
+if (rate.lastHour > 0) broken.push({ what: rate.lastHour + ' error(s) in the last hour', detail: rate.distinct24h + ' distinct fault(s) in 24h' });
+if (overdueCrons.length) broken.push({ what: overdueCrons.length + ' overdue scheduled job(s)', detail: overdueCrons.map((c) => c.path).join(', ') });
+if (mail.configured && mail.reachable === false) broken.push({ what: 'Mail transport not answering', detail: mail.host + ':' + mail.port + ' did not accept a TCP connection' });
+if (!mail.configured) broken.push({ what: 'No mail transport configured', detail: 'Outbound mail would not leave the building' });
+if (pool.available && pool.idleInTransaction > 0) broken.push({ what: pool.idleInTransaction + ' connection(s) idle in transaction', detail: 'This is what exhausted the pooler the day the whole site went down' });
+
+const statusWord = !dbOk ? 'DOWN' : (broken.length ? 'DEGRADED' : 'HEALTHY');
+const statusColor = !dbOk ? '#fca5a5' : (broken.length ? '#e8c46a' : '#6ee7b7');
+
+const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:14px 16px;margin-bottom:14px;';
+const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;";
+const MONO = "font-family:'Geist Mono',monospace;";
+const SCROLL = 'overflow-x:auto;-webkit-overflow-scrolling:touch;';
+const TH = 'padding:8px;text-align:left;font-size:10.5px;color:#8a8a94;text-transform:uppercase;white-space:nowrap;';
+const TD = 'padding:8px;vertical-align:top;color:#d6d6de;font-size:12.5px;';
+const TAB = 'width:100%;border-collapse:collapse;min-width:640px;';
+const PILL = 'display:inline-block;padding:2px 8px;border-radius:999px;font-size:10.5px;font-weight:700;';
+const LINK = 'color:#9bd1ff;min-height:44px;display:inline-flex;align-items:center;';
+
+function stateColor(s: string): string {
+  if (s === 'ok') return '#6ee7b7';
+  if (s === 'overdue') return '#fca5a5';
+  return '#8a8a94';
+}
+function tileValueColor(bad: boolean): string {
+  return bad ? '#fca5a5' : '#e6e6ee';
+}
+---
+<AdminLayout title="Ops console" activeNav="ops">
+  <div style="max-width:1080px;margin:0 auto;padding:16px;">
+    <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px;">Ops · incident board</p>
+    <h1 style="font-size:20px;font-weight:800;color:#fff;margin:0;">What is broken</h1>
+    <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;line-height:1.6;">
+      Live signals for this deployment. Machine-readable at <a href="/api/health" style={LINK}>/api/health</a> (public, returns 503 when the database is unreachable) and <a href="/api/health/deep" style={LINK}>/api/health/deep</a> (operator only). Security posture lives at <a href="/admin/hardening" style={LINK}>/admin/hardening</a>.
+    </p>
+
+    <div style={'border-radius:14px;padding:14px 16px;margin:14px 0;border:1px solid ' + statusColor + '33;background:' + statusColor + '0f;'}>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={statusColor} stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 2 3 7v6c0 5 3.8 8.4 9 9 5.2-.6 9-4 9-9V7z"></path>
+          <path d="M9 12l2 2 4-4"></path>
+        </svg>
+        <span style={'font-weight:800;font-size:15px;color:' + statusColor + ';' + MONO}>{statusWord}</span>
+        <span style="font-size:12px;color:#8a8a94;">checked {health ? new Date(health.at).toLocaleString() : 'never'}</span>
+        <a href={'/admin/ops?hours=' + hours} style={'margin-left:auto;' + LINK + 'font-size:12.5px;padding:0 12px;border:1px solid #2a2a33;border-radius:10px;'}>Refresh</a>
+      </div>
+      {broken.length ? (
+        <ul style="margin:10px 0 0;padding-left:18px;color:#d6d6de;font-size:13px;line-height:1.8;">
+          {broken.map((b) => (
+            <li><b style="color:#fff;">{b.what}</b><span style="color:#8a8a94;"> — {b.detail}</span></li>
+          ))}
+        </ul>
+      ) : (
+        <p style="margin:10px 0 0;font-size:13px;color:#8a8a94;">No failing check. The database answers, no job has failed, no schedule is overdue, and nothing has been logged in the last hour.</p>
+      )}
+    </div>
+
+    <div style={CARD}>
+      <p style={HD}>Deploy marker</p>
+      {release && release.known ? (
+        <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:#d6d6de;">
+          <span style={MONO + 'color:#9bd1ff;'}>{release.shortCommit}</span>
+          <span>branch <b style={MONO}>{release.ref}</b></span>
+          <span>env <b style={MONO}>{release.environment}</b></span>
+          <span>region <b style={MONO}>{release.region || 'n/a'}</b></span>
+          {release.message ? <span style="color:#8a8a94;max-width:100%;">{release.message}</span> : null}
+        </div>
+      ) : (
+        <p style="font-size:12.5px;color:#8a8a94;margin:0;line-height:1.6;">No commit recorded. These values come from the variables the hosting platform already injects at runtime (VERCEL_GIT_COMMIT_SHA and friends) rather than a new variable somebody has to remember to set — locally none of them exist, so this is what a local or non-platform run honestly looks like.</p>
+      )}
+      <p style="font-size:11.5px;color:#8a8a94;margin:8px 0 0;line-height:1.6;">Every error row written from now on carries this release tag, so a fault can be tied to the deploy that introduced it.</p>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px;">
+      <div style={CARD + 'margin:0;'}>
+        <p style={HD}>Database</p>
+        <p style={'margin:0;font-size:22px;font-weight:800;' + MONO + 'color:' + tileValueColor(!dbOk || dbLatency > 1500)}>{dbOk ? dbLatency + 'ms' : 'down'}</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:4px 0 0;">SELECT 1 round trip</p>
+      </div>
+      <div style={CARD + 'margin:0;'}>
+        <p style={HD}>Errors 1h / 24h</p>
+        <p style={'margin:0;font-size:22px;font-weight:800;' + MONO + 'color:' + tileValueColor(rate.lastHour > 0)}>{rate.lastHour} / {rate.last24h}</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:4px 0 0;">{rate.distinct24h} distinct in 24h, {rate.last7d} in 7d</p>
+      </div>
+      <div style={CARD + 'margin:0;'}>
+        <p style={HD}>Job queue</p>
+        <p style={'margin:0;font-size:22px;font-weight:800;' + MONO + 'color:' + tileValueColor(queue.failed > 0)}>{queue.failed}</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:4px 0 0;">failed · {queue.pending} pending · {queue.processing} running</p>
+      </div>
+      <div style={CARD + 'margin:0;'}>
+        <p style={HD}>Connections</p>
+        <p style={'margin:0;font-size:22px;font-weight:800;' + MONO + 'color:' + tileValueColor(pool.available && pool.idleInTransaction > 0)}>{pool.available ? pool.active + '/' + pool.total : 'n/a'}</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:4px 0 0;">{pool.available ? 'active/total · ' + pool.idleInTransaction + ' idle in txn' : 'not visible through this pooler'}</p>
+      </div>
+    </div>
+
+    <div style={CARD}>
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+        <p style={HD + 'margin:0;'}>Errors, grouped ({groups.length} distinct, last {hours}h)</p>
+        <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;">
+          <a href="/admin/ops?hours=1" style={LINK + 'font-size:11.5px;padding:0 10px;border:1px solid #2a2a33;border-radius:8px;'}>1h</a>
+          <a href="/admin/ops?hours=24" style={LINK + 'font-size:11.5px;padding:0 10px;border:1px solid #2a2a33;border-radius:8px;'}>24h</a>
+          <a href="/admin/ops?hours=168" style={LINK + 'font-size:11.5px;padding:0 10px;border:1px solid #2a2a33;border-radius:8px;'}>7d</a>
+        </span>
+      </div>
+      {groups.length ? (
+        <div style={SCROLL}>
+          <table style={TAB}>
+            <thead><tr>
+              <th style={TH}>Count</th><th style={TH}>Event</th><th style={TH}>Message</th><th style={TH}>First seen</th><th style={TH}>Last seen</th><th style={TH}>Release</th>
+            </tr></thead>
+            <tbody>
+              {groups.map((g) => (
+                <tr style="border-top:1px solid #1a1a1f;">
+                  <td style={TD + MONO + 'color:' + (g.count > 10 ? '#fca5a5' : '#e8c46a') + ';font-weight:800;'}>{g.count}</td>
+                  <td style={TD + 'color:#fca5a5;white-space:nowrap;'}>{g.event}</td>
+                  <td style={TD + 'color:#8a8a94;max-width:420px;'}>{g.message}</td>
+                  <td style={TD + MONO + 'font-size:11px;color:#8a8a94;white-space:nowrap;'}>{relativeAge(g.firstSeen)}</td>
+                  <td style={TD + MONO + 'font-size:11px;color:#8a8a94;white-space:nowrap;'}>{relativeAge(g.lastSeen)}</td>
+                  <td style={TD + MONO + 'font-size:11px;color:#9bd1ff;white-space:nowrap;'}>{g.releases.length ? g.releases.join(', ') : 'unknown'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p style="font-size:12.5px;color:#8a8a94;margin:0;line-height:1.6;">Nothing logged in this window. Worth knowing what that does and does not prove: it proves no code path called trackError, not that nothing failed. A refusal or a rejected write that returns quietly still writes no row — if a user reports a failure that is invisible here, the missing trackError call is itself the bug.</p>
+      )}
+      <p style="font-size:11.5px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">Grouped on a fingerprint computed when the row is written (ids, timestamps and literals normalised), so one fault recurring 400 times is one row with a count of 400. Full un-grouped tail at <a href="/admin/hardening" style={LINK}>/admin/hardening</a>.</p>
+    </div>
+
+    <div style={CARD}>
+      <p style={HD}>Scheduled jobs ({overdueCrons.length} overdue, {neverCrons.length} not instrumented)</p>
+      <div style={SCROLL}>
+        <table style={TAB}>
+          <thead><tr><th style={TH}>State</th><th style={TH}>Path</th><th style={TH}>Schedule</th><th style={TH}>Last run</th><th style={TH}>Evidence</th></tr></thead>
+          <tbody>
+            {crons.map((c) => (
+              <tr style="border-top:1px solid #1a1a1f;">
+                <td style={TD}><span style={PILL + 'color:' + stateColor(c.state) + ';border:1px solid ' + stateColor(c.state) + '55;'}>{c.state}</span></td>
+                <td style={TD + MONO + 'font-size:11.5px;white-space:nowrap;'}>{c.path}</td>
+                <td style={TD + MONO + 'font-size:11.5px;color:#8a8a94;white-space:nowrap;'}>{c.schedule}</td>
+                <td style={TD + MONO + 'font-size:11.5px;color:#8a8a94;white-space:nowrap;'}>{relativeAge(c.lastRunAt)}</td>
+                <td style={TD + 'font-size:11.5px;color:#8a8a94;'}>{c.source}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p style="font-size:11.5px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">
+        Schedules mirror the deployment config, and a test fails if the two drift apart, so a new scheduled job cannot be added without appearing here. "not instrumented" means no run has ever been recorded for that path — which is NOT the same as failed, and is shown as its own state rather than dressed up as a red alert. A route opts in with one line: <span style={MONO + 'color:#9bd1ff;'}>await recordCronRun('/api/cron/thing', 'ok', 'processed 12')</span>. Two paths are already observable because the modules behind them keep their own last-run timestamp. Note the tier here allows DAILY schedules only.
+      </p>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;">
+      <div style={CARD + 'margin:0;'}>
+        <p style={HD}>Self-bootstrap status ({boot.length - missingSchemas.length}/{boot.length})</p>
+        <div style={SCROLL}>
+          <table style={TAB + 'min-width:0;'}>
+            <tbody>
+              {boot.map((b) => (
+                <tr style="border-top:1px solid #1a1a1f;">
+                  <td style={TD + 'white-space:nowrap;'}>
+                    <span style={PILL + 'color:' + (b.present ? '#6ee7b7' : '#8a8a94') + ';border:1px solid ' + (b.present ? '#6ee7b755' : '#2a2a33') + ';'}>{b.present ? 'ran' : 'not yet'}</span>
+                  </td>
+                  <td style={TD}>{b.module}</td>
+                  <td style={TD + MONO + 'font-size:11px;color:#8a8a94;'}>{b.table}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p style="font-size:11.5px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">There is no migration runner in this deployment: each module creates its own tables on first use. So "has this shipped here?" is answered by whether the table exists. "not yet" means nothing has exercised that module on this database — it is a fact, not necessarily a fault.</p>
+      </div>
+
+      <div style={CARD + 'margin:0;'}>
+        <p style={HD}>Connection pool</p>
+        {pool.available ? (
+          <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:13px;">
+            <span style={MONO + 'color:#9bd1ff;'}>active {pool.active}</span>
+            <span style={MONO + 'color:#8a8a94;'}>idle {pool.idle}</span>
+            <span style={MONO + 'color:' + (pool.idleInTransaction > 0 ? '#fca5a5' : '#8a8a94') + ';'}>idle in txn {pool.idleInTransaction}</span>
+            <span style={MONO + 'color:#d6d6de;'}>total {pool.total}{pool.maxConnections ? ' / ' + pool.maxConnections : ''}</span>
+          </div>
+        ) : <p style="font-size:12.5px;color:#8a8a94;margin:0;">Not readable through this connection.</p>}
+        <p style="font-size:11.5px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">{pool.note}</p>
+
+        <p style={HD + 'margin-top:16px;'}>Mail transport</p>
+        <p style="font-size:12.5px;color:#d6d6de;margin:0;">
+          <span style={PILL + 'color:' + (mail.reachable === true ? '#6ee7b7' : mail.reachable === false ? '#fca5a5' : '#8a8a94') + ';border:1px solid #2a2a33;'}>{mail.reachable === true ? 'reachable' : mail.reachable === false ? 'unreachable' : 'not tested'}</span>
+          <span style={MONO + 'font-size:11.5px;color:#8a8a94;margin-left:8px;'}>{mail.host ? mail.host + ':' + mail.port : 'no host'} · config from {mail.source}</span>
+        </p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:8px 0 0;line-height:1.6;">{mail.detail} A bounded TCP connect with a 2.5s timeout — it never authenticates and never sends a message, so it cannot cost a delivery.</p>
+      </div>
+    </div>
+
+    <div style={CARD}>
+      <p style={HD}>Slowest observed statements</p>
+      {slow.available && slow.rows.length ? (
+        <div style={SCROLL}>
+          <table style={TAB}>
+            <thead><tr><th style={TH}>Mean</th><th style={TH}>Max</th><th style={TH}>Calls</th><th style={TH}>Statement</th></tr></thead>
+            <tbody>
+              {slow.rows.map((q) => (
+                <tr style="border-top:1px solid #1a1a1f;">
+                  <td style={TD + MONO + 'white-space:nowrap;color:' + (q.meanMs > 500 ? '#fca5a5' : '#e6e6ee') + ';'}>{q.meanMs}ms</td>
+                  <td style={TD + MONO + 'white-space:nowrap;color:#8a8a94;'}>{q.maxMs}ms</td>
+                  <td style={TD + MONO + 'white-space:nowrap;color:#8a8a94;'}>{q.calls}</td>
+                  <td style={TD + MONO + 'font-size:11px;color:#8a8a94;max-width:520px;'}>{q.query}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p style="font-size:12.5px;color:#8a8a94;margin:0;line-height:1.6;">{slow.note}</p>
+      )}
+    </div>
+  </div>
+</AdminLayout>

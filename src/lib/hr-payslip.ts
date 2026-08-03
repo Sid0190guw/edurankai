@@ -244,3 +244,193 @@ export function renderPayslipHtml(ps: any, opts: { autoPrint?: boolean } = {}): 
 </body>
 </html>`;
 }
+
+// =================================================================================================
+// THE FULL AND FINAL SETTLEMENT STATEMENT
+// =================================================================================================
+//
+// A payslip-style document, and it lives HERE rather than in src/lib/settlement.ts on purpose: this
+// file already owns what a pay document looks like in this product, and a second HTML document with
+// its own fonts, its own money formatting and its own footer would drift from the payslip within a
+// month. The settlement module owns the ARITHMETIC; this file owns the PAGE.
+//
+// WHAT THE DOCUMENT IS CAREFUL TO SAY:
+//   - it is a statement of a figure that has been agreed, not a receipt for money that has moved.
+//     The settlement is handed off for payment as a separate, recorded act, and a document that
+//     reads like a receipt would have people believing they had been paid;
+//   - each computed line carries the note explaining how it was reached, because the person reading
+//     it has just lost their income and "Salary for 14 days" with no method behind it is the line
+//     that starts an argument;
+//   - the same footer disclaimer the payslip carries. No statutory or compliance claim is made here
+//     either, and none of these figures is advice about what any rule requires of anybody.
+
+/** The shape this renderer needs. Structural only, so settlement.ts is not imported for its types. */
+export interface SettlementStatementInput {
+  employeeName: string | null;
+  employeeCode: string | null;
+  designation?: string | null;
+  currency: string;
+  state: string;
+  stateLabel: string;
+  lastWorkingDay: string | null;
+  finalMonthLabel?: string | null;
+  settledReference?: string | null;
+  settledAt?: string | null;
+  notes?: string | null;
+  lines: {
+    label: string;
+    kind: string;
+    amount: number;
+    note?: string | null;
+  }[];
+  totalEarnings: number;
+  totalDeductions: number;
+  netPayable: number;
+}
+
+/** One statement row. The note is printed under the label, small — it is the method, not decoration. */
+function settlementRow(
+  line: SettlementStatementInput['lines'][number],
+  currency: string,
+): string {
+  const deduction = String(line.kind) === 'deduction';
+  const note = line.note
+    ? `<div style="color:#9ca3af;font-size:10px;margin-top:2px;line-height:1.4;">${esc(line.note)}</div>`
+    : '';
+  return `<tr><td>${esc(line.label)}${note}</td>`
+    + `<td${deduction ? ' class="deduction-color"' : ''}>${deduction ? '- ' : ''}`
+    + `${esc(currency)} ${fmt(line.amount)}</td></tr>`;
+}
+
+/** The printable settlement statement. `autoPrint` opens the browser print dialog. */
+export function renderSettlementHtml(
+  s: SettlementStatementInput,
+  opts: { autoPrint?: boolean } = {},
+): string {
+  // CONSTANTS ABOVE THE TEMPLATE THAT READS THEM. `const` is not hoisted, and a declaration below its
+  // first use throws on the first line of whatever reads it.
+  const autoPrint = opts.autoPrint !== false;
+  const currency = s.currency || 'INR';
+  const earnings = (s.lines || []).filter((l) => String(l.kind) !== 'deduction');
+  const deductions = (s.lines || []).filter((l) => String(l.kind) === 'deduction');
+  const negative = Number(s.netPayable) < 0;
+
+  const earningsHtml = earnings.length
+    ? earnings.map((l) => settlementRow(l, currency)).join('')
+    : '<tr><td colspan="2" style="color:#9ca3af;">Nothing is owed to this person on this statement.</td></tr>';
+
+  const deductionsHtml = deductions.length
+    ? deductions.map((l) => settlementRow(l, currency)).join('')
+    : '<tr><td colspan="2" style="color:#9ca3af;">Nothing is being recovered.</td></tr>';
+
+  // A HANDED-OFF STATEMENT SAYS SO, AND ONE THAT HAS NOT SAYS THAT INSTEAD. The difference between
+  // "agreed" and "paid" is the whole reason this banner exists.
+  const handoffHtml = s.settledReference
+    ? `<div class="total-row" style="margin-top:10px;">
+         <span style="font-weight:600;">Handed off for payment</span>
+         <span style="font-weight:700;">${esc(s.settledReference)}</span>
+       </div>`
+    : `<div class="total-row" style="margin-top:10px;">
+         <span style="font-weight:600;color:#b45309;">Not yet handed off for payment</span>
+         <span style="font-size:11px;color:#6b7280;">This is a statement of the agreed figure, not a receipt.</span>
+       </div>`;
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Full and final settlement - ${esc(s.employeeName || 'Employee')}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: Arial, sans-serif; font-size: 12px; color: #1a1a1a; background: #fff; padding: 20px; }
+  .header { background: #FF4F00; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+  .header h1 { font-size: 20px; font-weight: 700; }
+  .header p { font-size: 12px; opacity: 0.85; margin-top: 4px; }
+  .badge { background: rgba(255,255,255,0.2); padding: 3px 10px; border-radius: 100px; font-size: 11px; display: inline-block; margin-top: 8px; }
+  .body { border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px; padding: 20px; }
+  .employee-info { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #e5e7eb; }
+  .info-group label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; display: block; margin-bottom: 2px; }
+  .info-group span { font-size: 13px; font-weight: 600; color: #111; }
+  .section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7280; margin-bottom: 8px; }
+  .pay-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .pay-table { width: 100%; }
+  .pay-table tr td { padding: 6px 0; border-bottom: 1px solid #f3f4f6; font-size: 12px; vertical-align: top; }
+  .pay-table tr td:last-child { text-align: right; font-weight: 500; white-space: nowrap; }
+  .pay-table tr:last-child td { border-bottom: none; }
+  .total-row { background: #f9fafb; border-radius: 6px; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .net-pay { background: #FF4F00; color: white; border-radius: 6px; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
+  .net-pay.owed { background: #b91c1c; }
+  .net-pay .label { font-size: 12px; opacity: 0.9; }
+  .net-pay .amount { font-size: 20px; font-weight: 700; }
+  .notes { margin-top: 14px; background: #f9fafb; border-radius: 6px; padding: 10px 12px; font-size: 11.5px; color: #4b5563; line-height: 1.6; }
+  .footer { margin-top: 20px; padding-top: 12px; border-top: 1px solid #e5e7eb; text-align: center; font-size: 10px; color: #9ca3af; line-height: 1.6; }
+  .deduction-color { color: #ef4444; }
+  .printbar { max-width: 780px; margin: 0 auto 12px; text-align: right; }
+  .printbar button { font: inherit; font-weight: 700; background: #111; color: #fff; border: 0; border-radius: 8px; padding: 9px 16px; cursor: pointer; }
+  @media (max-width: 640px) {
+    .employee-info, .pay-grid { grid-template-columns: 1fr; }
+  }
+  @media print { body { padding: 0; } .printbar { display: none; } }
+</style>
+</head>
+<body>
+  <div class="printbar"><button type="button" onclick="window.print()">Print / Save as PDF</button></div>
+  <div class="header">
+    <h1>EduRankAI</h1>
+    <p>Full and final settlement</p>
+    <span class="badge">${esc(s.stateLabel || s.state || '')}</span>
+  </div>
+  <div class="body">
+    <div class="employee-info">
+      <div class="info-group"><label>Employee Name</label><span>${esc(s.employeeName || '-')}</span></div>
+      <div class="info-group"><label>Employee Code</label><span>${esc(s.employeeCode || '-')}</span></div>
+      <div class="info-group"><label>Designation</label><span>${esc(s.designation || '-')}</span></div>
+      <div class="info-group"><label>Last Working Day</label><span>${esc(s.lastWorkingDay || 'Not recorded')}</span></div>
+      <div class="info-group"><label>Final Pay Month</label><span>${esc(s.finalMonthLabel || '-')}</span></div>
+      <div class="info-group"><label>Currency</label><span>${esc(currency)}</span></div>
+    </div>
+
+    <div class="pay-grid">
+      <div>
+        <p class="section-title">Owed to the employee</p>
+        <table class="pay-table">${earningsHtml}</table>
+        <div class="total-row" style="margin-top:8px;">
+          <span style="font-weight:600;">Total owed</span>
+          <span style="font-weight:700;">${esc(currency)} ${fmt(s.totalEarnings)}</span>
+        </div>
+      </div>
+      <div>
+        <p class="section-title">Recovered from the settlement</p>
+        <table class="pay-table">${deductionsHtml}</table>
+        <div class="total-row" style="margin-top:8px;">
+          <span style="font-weight:600;">Total recovered</span>
+          <span style="font-weight:700;color:#ef4444;">- ${esc(currency)} ${fmt(s.totalDeductions)}</span>
+        </div>
+        ${handoffHtml}
+      </div>
+    </div>
+
+    <div class="net-pay${negative ? ' owed' : ''}">
+      <div>
+        <div class="label">${negative ? 'Owed by the employee' : 'Net settlement'}</div>
+        <div style="font-size:10px;opacity:0.75;">${negative ? 'Recoveries exceed what is due' : 'Payable on handoff'}</div>
+      </div>
+      <div class="amount">${esc(currency)} ${fmt(Math.abs(Number(s.netPayable) || 0))}</div>
+    </div>
+
+    ${s.notes ? `<div class="notes">${esc(s.notes)}</div>` : ''}
+
+    <div class="footer">
+      <p>This is a computer-generated statement of an agreed settlement figure. It is not a receipt,
+         and it does not confirm that any payment has been made.</p>
+      <p>Every figure above is either read from this organisation's own records or entered by an
+         administrator. It is a record of what was agreed, not advice on what any tax, contribution
+         or employment rule requires of you.</p>
+      <p>EduRankAI &bull; hr@edurankai.in &bull; Generated on ${new Date().toLocaleDateString('en-IN')}</p>
+    </div>
+  </div>
+  ${autoPrint ? `<script>window.onload = function() { window.print(); }<\/script>` : ''}
+</body>
+</html>`;
+}
