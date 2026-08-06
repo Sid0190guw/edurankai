@@ -1,0 +1,577 @@
+---
+// /admin/hr/separation/settlement — FULL AND FINAL SETTLEMENT.
+//
+// WHAT THIS SCREEN DOES, IN THE ORDER THE WORK HAPPENS:
+//   1. Open a settlement against a separation. The two figures this product can stand behind are
+//      filled in for you: salary for the days actually worked in the final month, and the balance
+//      outstanding on any loan or salary advance, READ from the loan ledger rather than recomputed.
+//   2. Add what only a person can decide — leave encashment, notice pay, gratuity, anything being
+//      recovered. The facts you need are shown beside the field: the unused balance per leave type,
+//      and the person's own per-day figure. THIS PRODUCT HOLDS NO ENCASHMENT RULE and does not
+//      pretend to; a default that looks like a rule is a rule.
+//   3. Send the figure for approval. Routed by src/lib/workflow.ts. Once it leaves draft, nothing on
+//      the statement can change — a figure somebody approved must not move underneath them.
+//   4. Hand it off for payment, with a reference. NOTHING HERE PAYS ANYBODY. Handing off closes the
+//      loans this statement recovered and records the handoff on the separation, through the
+//      functions that already own those writes.
+//
+// IT REFUSES TO HAND OFF while asset clearance is unsigned, while the figure is unapproved, or when
+// the net is negative — and it says all three at once rather than one per attempt.
+//
+// THE GATE. The 'hr' section to open it, and `employee.manage` to write, exactly as the separation
+// console beside it. Reading an exit is not settling one.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import { listSeparations } from '@/lib/hr-separation';
+import {
+  ensureSettlementSchema, settlementFacts, listSettlements, getSettlement,
+  settlementForSeparation, openSettlement, refreshComputedLines, addSettlementLine,
+  removeSettlementLine, requestSettlementApproval, syncSettlementApprovals, finaliseSettlement,
+  settlementStateLabel,
+} from '@/lib/settlement';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'hr', 'edit'))) return Astro.redirect('/admin');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted.
+const PAGE = '/admin/hr/separation/settlement';
+const mayWrite = can(user as any, 'employee.manage');
+
+const money = (n: any, cur: string) =>
+  (cur || 'INR') + ' ' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function stateTone(s: string): string {
+  const k = String(s || '');
+  if (k === 'settled') return '#86efac';
+  if (k === 'approved') return '#6ee7b7';
+  if (k === 'rejected') return '#fca5a5';
+  if (k === 'halted') return '#fbbf24';
+  if (k === 'cancelled') return '#9aa6b6';
+  if (k === 'draft') return '#c4b5fd';
+  return '#67e8f9';
+}
+
+function viaLabel(v: string): string {
+  const k = String(v || '');
+  if (k === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (k === 'department_head') return VIA_LABELS.department_head;
+  if (k === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (k === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+await ensureSettlementSchema().catch(() => {});
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  let back = PAGE;
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+    const focusId = String(fd.get('settlement_id') || '');
+    if (focusId) back = PAGE + '?id=' + encodeURIComponent(focusId);
+
+    if (action === 'decide') {
+      // THE WORKFLOW INSTANCE. decideInstance() re-checks that this account is the routed approver
+      // or an in-force delegate; reaching this page proves nothing about that.
+      const r = await decideInstance(
+        String(fd.get('instance_id') || ''),
+        user as any,
+        String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected',
+        String(fd.get('note') || ''),
+      );
+      flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
+      if (r.ok) {
+        const sync = await syncSettlementApprovals();
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else if (!mayWrite) {
+      flash = 'You can read settlements, but preparing one needs the employee-records permission.';
+    } else if (action === 'open') {
+      const r = await openSettlement(String(fd.get('separation_id') || ''), user.id);
+      if (r.ok && r.id) {
+        back = PAGE + '?id=' + encodeURIComponent(r.id);
+        flash = r.changed
+          ? 'Settlement opened. The figures this product can stand behind are filled in; the rest is yours to enter.'
+          : 'That settlement is already open.';
+        if (r.error) flash += ' ' + r.error;
+      } else {
+        flash = r.error || 'The settlement was not opened.';
+      }
+    } else if (action === 'recompute') {
+      const r = await refreshComputedLines(focusId, user.id);
+      flash = r.ok
+        ? 'Recalculated. Only the computed lines were replaced; everything you typed is untouched.'
+        : (r.error || 'The figures were not recalculated.');
+    } else if (action === 'add_line') {
+      const r = await addSettlementLine({
+        settlementId: focusId,
+        label: String(fd.get('label') || ''),
+        kind: String(fd.get('kind') || ''),
+        amount: Number(fd.get('amount')),
+        note: String(fd.get('note') || ''),
+        actorUserId: user.id,
+      });
+      flash = r.ok ? 'Line added.' : (r.error || 'The line was not added.');
+    } else if (action === 'remove_line') {
+      const r = await removeSettlementLine(String(fd.get('line_id') || ''), user.id);
+      flash = r.ok ? 'Line removed.' : (r.error || 'The line was not removed.');
+    } else if (action === 'send') {
+      const r = await requestSettlementApproval(focusId, user.id);
+      if (r.ok && r.haltReason) flash = 'Sent, but it is halted: ' + r.haltReason;
+      else if (r.ok) flash = 'Sent for approval. The statement is now fixed and nothing has been paid.';
+      else flash = r.error || 'The approval was not started.';
+    } else if (action === 'finalise') {
+      const r = await finaliseSettlement({
+        settlementId: focusId,
+        reference: String(fd.get('reference') || ''),
+        actorUserId: user.id,
+      });
+      if (r.ok) {
+        flash = 'Handed off for payment. Any loan balance on this statement has been closed.'
+          + (r.error ? ' One thing needs checking: ' + r.error : '');
+      } else {
+        flash = (r.blockers && r.blockers.length ? r.blockers.join(' ') : (r.error || 'The settlement was not handed off.'));
+      }
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    console.error('[admin/hr/separation/settlement] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(back + (back.indexOf('?') >= 0 ? '&' : '?') + 'msg=' + encodeURIComponent(flash.slice(0, 400)));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const focusParam = url.searchParams.get('id') || '';
+
+const synced = await syncSettlementApprovals();
+const settlements = await listSettlements(150);
+const focus = focusParam ? await getSettlement(focusParam) : null;
+const facts = focus ? await settlementFacts(focus.separationId) : null;
+
+let instance: any = null;
+if (focus && focus.workflowInstanceId) {
+  try {
+    instance = await getInstance(focus.workflowInstanceId);
+  } catch (e: any) {
+    console.error('[admin/hr/separation/settlement] instance', e?.cause?.message || e?.message);
+  }
+}
+const waiting = instance
+  ? (instance.steps || []).filter((s: any) => s.stepNo === instance.currentStep && s.decision === 'pending')
+  : [];
+
+// Separations that could have a settlement but do not yet. A read per row, capped, so one page load
+// on a phone is not two hundred round trips.
+let awaiting: any[] = [];
+if (!focus) {
+  let seps: any[] = [];
+  try {
+    seps = await listSeparations();
+  } catch (e: any) {
+    console.error('[admin/hr/separation/settlement] separations', e?.cause?.message || e?.message);
+  }
+  const openSeps = seps.filter((s: any) => !s.closed_at).slice(0, 30);
+  for (const s of openSeps) {
+    const existing = await settlementForSeparation(String(s.id));
+    if (!existing) {
+      awaiting.push({
+        id: String(s.id),
+        name: s.employee_name ? String(s.employee_name) : 'Employee',
+        lastWorkingDay: s.last_working_day ? String(s.last_working_day).slice(0, 10) : null,
+        approvalState: String(s.approval_state || 'not_requested'),
+      });
+    }
+  }
+}
+
+const openCount = settlements.filter((s) => ['draft', 'pending', 'halted', 'approved'].indexOf(s.state) >= 0).length;
+const settledCount = settlements.filter((s) => s.state === 'settled').length;
+const encashable = (facts?.leaveBalances || []).filter((b) => b.allowance > 0);
+---
+<AdminLayout title="Full and final settlement" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Separation · Full and final settlement</p>
+  <h1>Full and final settlement</h1>
+  <p class="lede">
+    What is owed and what is recovered when somebody leaves, in one statement, with the method behind
+    every computed line written next to it. Nothing on this page pays anybody: an approved settlement
+    is handed off with a reference, exactly as the rest of the exit is.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {synced.errors.length > 0 && <div class="flash warn">{synced.errors[0]}</div>}
+  {!mayWrite && (
+    <div class="flash warn">You can read settlements. Preparing or handing one off needs the employee-records permission.</div>
+  )}
+
+  {!focus && (
+    <div>
+      <div class="tiles">
+        <div class="tile"><span class="tv">{openCount}</span><span class="tl">In progress</span></div>
+        <div class="tile"><span class="tv">{settledCount}</span><span class="tl">Handed off</span></div>
+        <div class="tile"><span class="tv">{awaiting.length}</span><span class="tl">Exits with no settlement yet</span></div>
+      </div>
+
+      <h2>Exits with no settlement opened</h2>
+      {awaiting.length === 0 ? (
+        <div class="empty">Every open exit has a settlement.</div>
+      ) : (
+        <div class="stack">
+          {awaiting.map((a: any) => (
+            <div class="card">
+              <div class="cardhead">
+                <div>
+                  <p class="name">{a.name}</p>
+                  <p class="sub">
+                    {a.lastWorkingDay ? 'Last working day ' + fmtDate(a.lastWorkingDay) : 'No last working day recorded yet'}
+                    {' · separation ' + a.approvalState.replace('_', ' ')}
+                  </p>
+                </div>
+              </div>
+              {!a.lastWorkingDay && (
+                <div class="halt">
+                  <strong>No last working day.</strong>
+                  <span class="hint">
+                    The final month is calculated from it, so the salary line cannot be worked out
+                    until it is set on the separation console. A settlement can still be opened; that
+                    line will simply be missing and the screen will say so.
+                  </span>
+                </div>
+              )}
+              {mayWrite && (
+                <form method="POST" class="inline">
+                  <input type="hidden" name="action" value="open" />
+                  <input type="hidden" name="separation_id" value={a.id} />
+                  <button type="submit" class="btn">Open a settlement</button>
+                </form>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <h2>Settlements</h2>
+      {settlements.length === 0 ? (
+        <div class="empty">No settlement has been opened yet.</div>
+      ) : (
+        <div class="scroller">
+          <table class="grid">
+            <thead>
+              <tr><th>Person</th><th>Last working day</th><th>Net</th><th>State</th><th></th></tr>
+            </thead>
+            <tbody>
+              {settlements.map((s) => (
+                <tr>
+                  <td>{s.employeeName || 'Employee'}</td>
+                  <td>{fmtDate(s.lastWorkingDay) || 'Not recorded'}</td>
+                  <td>{money(s.netPayable, s.currency)}</td>
+                  <td><span class="chip" style={'color:' + stateTone(s.state) + ';border-color:' + stateTone(s.state) + '55;'}>{settlementStateLabel(s.state)}</span></td>
+                  <td><a class="btn small" href={PAGE + '?id=' + s.id}>Open</a></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )}
+
+  {focus && (
+    <div>
+      <p class="back"><a class="link" href={PAGE}>Back to every settlement</a></p>
+
+      <div class="card">
+        <div class="cardhead">
+          <div>
+            <p class="name">{focus.employeeName || 'Employee'}</p>
+            <p class="sub">
+              {focus.employeeCode ? focus.employeeCode + ' · ' : ''}
+              {facts?.lastWorkingDay ? 'Last working day ' + fmtDate(facts.lastWorkingDay) : 'No last working day recorded'}
+              {facts?.finalMonthLabel ? ' · final month ' + facts.finalMonthLabel : ''}
+            </p>
+          </div>
+          <span class="chip" style={'color:' + stateTone(focus.state) + ';border-color:' + stateTone(focus.state) + '55;'}>
+            {settlementStateLabel(focus.state)}
+          </span>
+        </div>
+
+        {facts && facts.gaps.length > 0 && (
+          <div class="halt">
+            <strong>Some of this could not be read, so the figures are incomplete:</strong>
+            <span class="hint">{facts.gaps.join('; ')}. These are not zeros.</span>
+          </div>
+        )}
+
+        {facts && facts.finalMonthAlreadyPaid && (
+          <div class="waiting">
+            <p class="wl">Payroll has already run for the final month</p>
+            <p class="wn">
+              No salary line is proposed, because paying it twice costs the company and this person
+              has already been paid for that month.
+            </p>
+          </div>
+        )}
+
+        <div class="scroller" style="margin-top:14px;">
+          <table class="grid">
+            <thead><tr><th>Line</th><th>Owed</th><th>Recovered</th><th></th></tr></thead>
+            <tbody>
+              {focus.lines.length === 0 && (
+                <tr><td colspan="4" style="color:#6e6e78;">Nothing on this statement yet.</td></tr>
+              )}
+              {focus.lines.map((l) => (
+                <tr>
+                  <td>
+                    {l.label}
+                    {l.note && <div class="note">{l.note}</div>}
+                    <span class="tag">{l.source === 'auto' ? 'Computed' : 'Entered'}</span>
+                  </td>
+                  <td>{l.kind === 'earning' ? money(l.amount, focus.currency) : ''}</td>
+                  <td class="neg">{l.kind === 'deduction' ? '- ' + money(l.amount, focus.currency) : ''}</td>
+                  <td>
+                    {mayWrite && focus.state === 'draft' && (
+                      <form method="POST">
+                        <input type="hidden" name="action" value="remove_line" />
+                        <input type="hidden" name="settlement_id" value={focus.id} />
+                        <input type="hidden" name="line_id" value={l.id} />
+                        <button type="submit" class="btn ghost small">Remove</button>
+                      </form>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <dl class="terms">
+          <div><dt>Total owed</dt><dd>{money(focus.totalEarnings, focus.currency)}</dd></div>
+          <div><dt>Total recovered</dt><dd class="neg">- {money(focus.totalDeductions, focus.currency)}</dd></div>
+          <div><dt>{focus.netPayable < 0 ? 'Owed by the employee' : 'Net settlement'}</dt><dd><strong>{money(Math.abs(focus.netPayable), focus.currency)}</strong></dd></div>
+        </dl>
+
+        <p class="sub" style="margin-top:12px;">
+          <a class="link" href={'/admin/hr/separation/statement/' + focus.id} target="_blank" rel="noopener noreferrer">Open the printable statement</a>
+        </p>
+      </div>
+
+      {facts && (
+        <div class="card">
+          <h3>The facts, so nothing has to be guessed</h3>
+          <dl class="terms">
+            <div><dt>Regular monthly gross</dt><dd>{money(facts.regularGross, facts.currency)}</dd></div>
+            <div><dt>Per day of the final month</dt><dd>{money(facts.perDayRate, facts.currency)} ({facts.finalMonthDays} days)</dd></div>
+            <div><dt>Days worked in the final month</dt><dd>{facts.finalMonthDaysWorked}</dd></div>
+            <div><dt>Loan and advance balance</dt><dd>{money(facts.loanOutstandingTotal, facts.currency)} across {facts.loans.length} agreement{facts.loans.length === 1 ? '' : 's'}</dd></div>
+            <div><dt>Asset clearance</dt><dd>{facts.assetsCleared ? 'Signed off' : (facts.assetsClearanceStatus === 'blocked' ? 'Blocked' : 'Still pending')}</dd></div>
+          </dl>
+
+          <h3 style="margin-top:16px;">Unused leave on file</h3>
+          {encashable.length === 0 ? (
+            <p class="sub">No leave type with an annual allowance is recorded.</p>
+          ) : (
+            <div class="scroller">
+              <table class="grid">
+                <thead><tr><th>Type</th><th>Allowance</th><th>Used</th><th>Unused</th><th>At the day rate</th></tr></thead>
+                <tbody>
+                  {encashable.map((b) => (
+                    <tr>
+                      <td>{b.name}</td>
+                      <td>{b.allowance}</td>
+                      <td>{b.used}</td>
+                      <td>{Number.isFinite(b.remaining) ? b.remaining : '—'}</td>
+                      <td>{Number.isFinite(b.remaining) ? money(Number(b.remaining) * facts.perDayRate, facts.currency) : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p class="foot">
+            These are facts, not a proposal. This product holds no rule about which leave is
+            encashable or at what rate, and it will not invent one — if leave is being paid out, enter
+            it as a line below with the figure this organisation has actually decided on.
+          </p>
+        </div>
+      )}
+
+      {mayWrite && focus.state === 'draft' && (
+        <div class="card">
+          <h3>Add a line</h3>
+          <form method="POST" class="form">
+            <input type="hidden" name="action" value="add_line" />
+            <input type="hidden" name="settlement_id" value={focus.id} />
+            <label>What it is
+              <input type="text" name="label" required maxlength="200" placeholder="Leave encashment, notice pay, gratuity, a recovery" />
+            </label>
+            <label>Owed to them, or recovered from them
+              <select name="kind" required>
+                <option value="earning">Owed to them</option>
+                <option value="deduction">Recovered from them</option>
+              </select>
+            </label>
+            <label>Amount
+              <input type="number" name="amount" step="0.01" min="0.01" required />
+              <span class="hint">A recovery is entered as a positive number in the recovered column.</span>
+            </label>
+            <label>How it was worked out
+              <textarea name="note" rows="2" placeholder="Printed on the statement under the line. The person reading it has just lost their income."></textarea>
+            </label>
+            <button type="submit" class="btn">Add this line</button>
+          </form>
+
+          <div class="btnrow" style="margin-top:14px;">
+            <form method="POST">
+              <input type="hidden" name="action" value="recompute" />
+              <input type="hidden" name="settlement_id" value={focus.id} />
+              <button type="submit" class="btn ghost">Recalculate the computed lines</button>
+            </form>
+            <form method="POST">
+              <input type="hidden" name="action" value="send" />
+              <input type="hidden" name="settlement_id" value={focus.id} />
+              <button type="submit" class="btn">Send for approval</button>
+            </form>
+          </div>
+          <p class="hint">
+            Once it is sent, nothing on the statement can change. A figure somebody approved must not
+            move underneath them.
+          </p>
+        </div>
+      )}
+
+      {focus.state === 'halted' && (
+        <div class="card">
+          <div class="halt">
+            <strong>Halted.</strong> {focus.haltReason || 'No approver could be resolved.'}
+            <span class="hint">Nothing has been paid. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+          </div>
+        </div>
+      )}
+
+      {instance && instance.state === 'pending' && (
+        <div class="card">
+          <h3>Waiting on a decision</h3>
+          {waiting.map((s: any) => (
+            <p class="wn">{viaLabel(s.via)} — {s.approverName || 'a person with no employee record'}</p>
+          ))}
+          <form method="POST" class="decide">
+            <input type="hidden" name="action" value="decide" />
+            <input type="hidden" name="settlement_id" value={focus.id} />
+            <input type="hidden" name="instance_id" value={instance.id} />
+            <input type="text" name="note" placeholder="Note for the record (optional)" />
+            <div class="btnrow">
+              <button type="submit" name="decision" value="approved" class="btn ok">Approve this figure</button>
+              <button type="submit" name="decision" value="rejected" class="btn no">Reject</button>
+            </div>
+            <p class="hint">Only the person this was routed to, or somebody standing in for them, can decide it.</p>
+          </form>
+        </div>
+      )}
+
+      {mayWrite && focus.state === 'approved' && (
+        <div class="card">
+          <h3>Hand it off for payment</h3>
+          <p class="sub">
+            Nothing here moves money. Pay the settlement through whatever this organisation actually
+            uses, then record the reference. Doing so closes any loan balance on this statement and
+            records the handoff against the exit.
+          </p>
+          {facts && !facts.assetsCleared && (
+            <div class="halt">
+              <strong>Asset clearance is {facts.assetsClearanceStatus === 'blocked' ? 'blocked' : 'still pending'}.</strong>
+              <span class="hint">
+                The handoff is refused until it is signed off on the separation console. Handing over
+                the final money while equipment is still out removes the only leverage anybody has to
+                get it back, and that should be a deliberate decision recorded there, not an accident
+                here.
+              </span>
+            </div>
+          )}
+          <form method="POST" class="decide">
+            <input type="hidden" name="action" value="finalise" />
+            <input type="hidden" name="settlement_id" value={focus.id} />
+            <input type="text" name="reference" required maxlength="300" placeholder="Where it was paid — a reference somebody can follow" />
+            <button type="submit" class="btn">Record the handoff</button>
+          </form>
+        </div>
+      )}
+
+      {focus.state === 'settled' && (
+        <div class="card">
+          <h3>Handed off</h3>
+          <p class="sub">
+            {money(focus.netPayable, focus.currency)} on {fmtDate(focus.settledAt)}
+            {focus.settledReference ? ' — ' + focus.settledReference : ''}.
+            Any loan balance on this statement has been closed against it.
+          </p>
+        </div>
+      )}
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  h3 { font-size: 11px; color: #9aa6b6; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 10px; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .back { font-size: 12.5px; margin-bottom: 12px; }
+  .link { color: #FF7040; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 22px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+  .cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .name { font-size: 15px; color: #fff; font-weight: 700; margin: 0; }
+  .sub { font-size: 12px; color: #9aa6b6; margin: 4px 0 0; line-height: 1.55; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .tag { display: inline-block; font-size: 9.5px; color: #6e6e78; letter-spacing: 0.08em; text-transform: uppercase; margin-top: 4px; }
+  .note { font-size: 11px; color: #6e6e78; line-height: 1.5; margin-top: 3px; white-space: normal; max-width: 46ch; }
+  .terms { display: grid; gap: 6px; margin: 14px 0 0; }
+  .terms div { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; border-bottom: 1px dashed #1a1a1f; padding-bottom: 5px; }
+  .terms dt { color: #9aa6b6; margin: 0; }
+  .terms dd { color: #e8e8ee; margin: 0; text-align: right; }
+  .neg { color: #fca5a5; }
+  .form { display: grid; gap: 12px; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 60px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; display: block; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; display: inline-flex; align-items: center; text-decoration: none; }
+  .btn.ok { background: #15803d; }
+  .btn.no { background: #b91c1c; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .btn.small { padding: 8px 12px; font-size: 12px; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .decide { display: grid; gap: 8px; margin-top: 12px; }
+  .inline { margin-top: 10px; }
+  .halt { margin: 12px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #fde68a; line-height: 1.55; }
+  .waiting { margin: 12px 0 0; padding: 10px 12px; background: rgba(103,232,249,0.06); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .wl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .wn { font-size: 12.5px; color: #e8e8ee; margin: 0 0 4px; }
+  .scroller { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table.grid { width: 100%; border-collapse: collapse; min-width: 520px; }
+  th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #6e6e78; padding: 8px 12px 8px 0; font-weight: 700; white-space: nowrap; }
+  td { font-size: 12.5px; color: #d8d8de; padding: 8px 12px 8px 0; border-top: 1px solid #1a1a1f; vertical-align: top; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+  .foot { font-size: 11.5px; color: #6e6e78; line-height: 1.6; margin-top: 12px; max-width: 70ch; }
+</style>
+</AdminLayout>

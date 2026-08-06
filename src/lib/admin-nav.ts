@@ -232,13 +232,46 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // question again in its own frontmatter, and every WRITE on them asks for `employee.manage` on
       // top of it — opening a register is not changing what somebody is engaged as.
       { id: 'hr-contracts',   label: 'Contracts',       href: '/admin/hr/contracts',             icon: 'document', section: 'hr' },
+      // PROBATION AND CONFIRMATION. Under contracts because a probation is a TERM of the engagement
+      // ('probationary' is one of the contract types in src/lib/contracts.ts) and confirmation is the
+      // moment that term ends. Gated on 'hr' like every other /admin/hr path; the page then asks for
+      // `employee.manage` before it will let anybody raise a decision.
+      { id: 'hr-probation',   label: 'Probation and confirmation', href: '/admin/hr/contracts/probation', icon: 'shield', section: 'hr' },
       { id: 'hr-transfers',   label: 'Transfers',       href: '/admin/hr/transfers',             icon: 'users',    section: 'hr' },
-      { id: 'hr-promotions',  label: 'Promotions',      href: '/admin/hr/promotions',            icon: 'users',    section: 'hr' },
+      // ONE REGISTER FOR PROMOTIONS, DEMOTIONS AND RE-DESIGNATIONS. They are one table and one
+      // approval chain (DESIGNATION_CHANGE_KINDS in src/lib/hr-lifecycle.ts), so they are ONE entry —
+      // a second link to the same console under a different word would be two doors into one room,
+      // and people would come to believe the two behaved differently.
+      { id: 'hr-promotions',  label: 'Designation changes', href: '/admin/hr/promotions',        icon: 'users',    section: 'hr' },
       // /admin/hr/separations redirects here — one console over one hr_separations table.
       { id: 'hr-separations', label: 'Separation and exit', href: '/admin/hr/separation',        icon: 'inbox',    section: 'hr' },
+      // FULL AND FINAL SETTLEMENT. A surface BESIDE the separation console rather than inside it:
+      // working out the money owed on an exit is a different job from closing the exit, and the two
+      // are often done by different people on different days.
+      { id: 'hr-settlement',  label: 'Final settlement', href: '/admin/hr/separation/settlement', icon: 'document', section: 'hr' },
       { id: 'hr-leave',       label: 'Leave',           href: '/admin/hr/leave',                 icon: 'calendar', section: 'leave' },
       { id: 'hr-attendance',  label: 'Attendance',      href: '/admin/hr/attendance',            icon: 'calendar', section: 'attendance' },
+      // WORKING TIME. Both are /admin/hr/* pages, so middleware's longest-prefix match already gates
+      // them; mapping them to `attendance` RECORDS the desk they belong to rather than inventing a
+      // second gate, and each page asks the same question again in its own frontmatter (the
+      // `attendance` section at edit level OR attendance.roster.manage — the capability that already
+      // means "defines working time: shifts, rosters, the holiday list"). Neither approves anything:
+      // an overtime claim and an attendance correction are routed per row from the Organization Graph.
+      { id: 'hr-holidays',    label: 'Holiday calendar', href: '/admin/hr/holidays',             icon: 'calendar', section: 'attendance' },
+      { id: 'hr-attendance-reports', label: 'Attendance reports', href: '/admin/hr/attendance/reports', icon: 'chart', section: 'attendance' },
       { id: 'hr-payroll',     label: 'Payroll',         href: '/admin/hr/payroll',               icon: 'document', section: 'payroll' },
+      // THE THREE PAY SURFACES BESIDE THE RUN, all on the `payroll` section — the same section the
+      // run itself carries, because each of them reads or writes what people are paid. Every one of
+      // the three then asks for `payroll.manage` through can() in its own frontmatter, which is
+      // strictly NARROWER: a custom role granted the `payroll` section checkbox passes middleware and
+      // is still refused at the page. Mapping the menu to the section rather than to the capability
+      // is deliberate and matches how procurement is mapped a few lines below — buildAdminNav()
+      // resolves through the registry, where a custom role's grant is spelled as a SECTION and never
+      // as the capability, so asking for the capability here would hide links from roles the page
+      // itself admits.
+      { id: 'hr-loans',       label: 'Loans and advances', href: '/admin/hr/payroll/loans',      icon: 'package',  section: 'payroll' },
+      { id: 'hr-bonuses',     label: 'Bonuses and incentives', href: '/admin/hr/payroll/bonuses', icon: 'chart',   section: 'payroll' },
+      { id: 'hr-pay-reports', label: 'Payroll reports', href: '/admin/hr/payroll/reports',       icon: 'chart',    section: 'payroll' },
       { id: 'hr-training',    label: 'Training',        href: '/admin/hr/training',              icon: 'book',     section: 'training' },
       // PERFORMANCE AND LEARNING. Three /admin/hr/* pages, so middleware's longest-prefix match on
       // '/admin/hr' already gates them on the 'hr' section — mapping them to 'hr' RECORDS the gate the
@@ -256,7 +289,34 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // an older hand-written list: the page, the sidebar entry and the capability were written
       // together and ask the same question. Only super_admin and `hr` hold these sections today.
       { id: 'helpdesk',       label: 'Helpdesk',        href: '/admin/helpdesk',                 icon: 'chat',     section: 'helpdesk' },
+      // THE STAFF HANDBOOK. It lives UNDER /admin/helpdesk on purpose — it is what the desk hands
+      // somebody INSTEAD of a ticket — so middleware's longest-prefix match already gates it on the
+      // same 'helpdesk' section this entry names. Menu, door and page ask one question. WRITING needs
+      // `knowledge.manage` on top of it, asked by the page; READING an article is gated by the
+      // article's own audience in the WHERE clause and needs no permission of its own.
+      { id: 'helpdesk-knowledge', label: 'Knowledge base', href: '/admin/helpdesk/knowledge',    icon: 'book',     section: 'helpdesk' },
       { id: 'assets',         label: 'Asset register',  href: '/admin/assets',                   icon: 'package',  section: 'assets' },
+      // PROJECTS. Both pages gate on canAccessSection('projects','view') OR the 'projects.view'
+      // capability, so the menu entry and the door ask the same question — the section is the one
+      // named here, and `hr` carries it in ROLE_SECTIONS alongside the capability grant.
+      //
+      // NEITHER ENTRY IS WHERE A PROJECT IS RUN. Milestones, people, work and risks are managed at
+      // /portal/employee/projects/[id] by whoever the Organization Graph records as running the
+      // project, who is not an administrator and needs nothing in this sidebar. These two are the
+      // register and the portfolio timeline.
+      { id: 'projects',       label: 'Projects',        href: '/admin/projects',                 icon: 'grid',     section: 'projects' },
+      { id: 'projects-roadmap', label: 'Project roadmap', href: '/admin/projects/roadmap',       icon: 'chart',    section: 'projects' },
+      // AGGREGATE REPORTING. Both pages ask can(user, 'analytics.view') in their own frontmatter, and
+      // that capability is held by super_admin and `hr` — which is exactly the population the 'hr'
+      // section admits, since `hr` is the only built-in role carrying it and super_admin is
+      // unrestricted. The menu therefore offers these to the same accounts the page admits.
+      //
+      // NOT 'audit' — which is what the /admin/analytics prefix resolved to in middleware.ts, and
+      // which `hr` does not hold in ROLE_SECTIONS. That mismatch bounced every hr account off the
+      // workforce console before its own gate ever ran; it is fixed at the door too, in the two
+      // PATH_SECTION entries added there.
+      { id: 'workforce-analytics', label: 'Workforce analytics', href: '/admin/analytics/workforce', icon: 'chart', section: 'hr' },
+      { id: 'domain-dashboards', label: 'Domain dashboards', href: '/admin/analytics/domains/executive', icon: 'chart', section: 'hr' },
       // NEWLY MAPPED (five). Support and applicant-facing queues follow the surface they belong to;
       // the employee-record ones follow 'hr'.
       { id: 'hr-support',     label: 'Application Support', href: '/admin/hr-support',           icon: 'message-circle', section: 'messages' },
@@ -288,6 +348,22 @@ export const ADMIN_NAV: AdminNavEntry[] = [
     children: [
       { id: 'procurement',         label: 'Purchase requests', href: '/admin/procurement',         icon: 'inbox', section: 'finance' },
       { id: 'procurement-vendors', label: 'Vendors',           href: '/admin/procurement/vendors', icon: 'users', section: 'finance' },
+    ],
+  },
+  // INVOICES. Gated on 'finance' for exactly the reasons written above the procurement group: the
+  // menu and the lock must ask ONE question, and buildAdminNav() resolves through the registry where a
+  // custom role's finance grant spells `finance.edit` and never `invoices.view`. Asking for the
+  // capability here would hide the link from custom roles whose page gate admits them.
+  //
+  // These pages sit UNDER /admin/finance, so src/middleware.ts PATH_SECTION already gates the subtree
+  // on the same 'finance' section for custom roles — no new entry there, and no second question.
+  {
+    groupId: 'invoices-group',
+    label: 'Invoices',
+    icon: 'document',
+    children: [
+      { id: 'invoices',          label: 'Invoices',          href: '/admin/finance/invoices',          icon: 'document', section: 'finance' },
+      { id: 'invoice-settings',  label: 'Numbering & tax',   href: '/admin/finance/invoices/settings', icon: 'package',  section: 'finance' },
     ],
   },
   // NEWLY MAPPED. Partnership records are commercial, not covered by any section; operator-only.
@@ -397,6 +473,11 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   { id: 'observability', label: 'Observability', href: '/admin/observability', icon: 'shield', section: 'settings' },
   { id: 'jobs', label: 'Background jobs', href: '/admin/jobs', icon: 'package', section: 'settings' },
   { id: 'hardening', label: 'Hardening & ops', href: '/admin/hardening', icon: 'shield', section: 'settings' },
+  // The incident board — what is broken, right now, in one view. 'settings' for the same reason as
+  // every other operator screen here: no built-in role but super_admin holds it, and the page itself
+  // asks for `administer` on the platform, so the link is never offered more widely than the lock
+  // behind it allows. An operator screen with no sidebar entry is a screen nobody opens at 2am.
+  { id: 'ops', label: 'Ops console', href: '/admin/ops', icon: 'chart', section: 'settings' },
   { id: 'backup', label: 'Backup & integrity', href: '/admin/backup', icon: 'package', section: 'settings' },
   { id: 'users', label: 'Users', href: '/admin/users', icon: 'users', section: 'users' },
   { id: 'analytics', label: 'Analytics', href: '/admin/analytics', icon: 'chart', section: 'audit' },

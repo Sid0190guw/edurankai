@@ -45,8 +45,13 @@
 //   Documents    Their own joining documents, keyed by users.id, which is how that table is keyed.
 //   Policies     Published content pages for anyone signed in; unpublished drafts only for a holder
 //                of `content.view`, which is the capability the content console already asks for.
-//   Projects     ABSENT. There is no projects table in this database. It returns an honest note.
-//   Announcements ABSENT, for the same reason. See the note on each.
+//   Projects     NOT SEARCHABLE FROM HERE YET, which is NOT the same as absent — this line said
+//                "there is no projects table" and that stopped being true when src/lib/projects.ts
+//                landed. The register exists; scoping a project search per viewer is
+//                resolveProjectScope() in that module, and threading it through this module's viewer
+//                and hit shapes is a change this module has not made. It returns an honest note
+//                naming the route somebody should open instead. See projectSource() below.
+//   Announcements ABSENT — there is no such table. See the note on it.
 //
 // NO SOURCE RETURNS AN EMAIL ADDRESS, A PHONE NUMBER, A SALARY, A GOVERNMENT ID OR ANYTHING FROM A
 // wellness_* TABLE. A search result is a signpost — a name, what the thing is, and where to open it.
@@ -336,18 +341,27 @@ async function departmentSource(
 }
 
 /**
- * PROJECTS. There is no project system in this database.
+ * PROJECTS. A project system NOW EXISTS, and this source has not been wired to it yet.
  *
- * Stated rather than silently omitted, and stated with the evidence, so the next person does not
- * spend an afternoon rediscovering it: employee_tasks has no project relation, and there is no
- * projects table, project_id column or projectId anywhere in src/ or db/. Inventing a projects
- * source here would mean inventing a table, and a search that quietly drops a whole category is how
- * somebody concludes their project was deleted.
+ * WHAT CHANGED. The original note here said there was no projects table, no project_id and no
+ * projectId anywhere in src/ or db/. Every clause of that was true when it was written and none of it
+ * is true now: src/lib/projects.ts carries the register, and employee_tasks.project_id is declared in
+ * src/lib/employee-tasks.ts, in the module that owns that table. A note still saying "there is no
+ * project system" would be this module telling somebody their work does not exist while a link to it
+ * sits in their own navigation.
+ *
+ * WHY THIS IS STILL `unavailable` RATHER THAN A SEARCH. Scoping a project search correctly means
+ * resolving, per viewer, the projects they are a member of, the ones the Organization Graph records
+ * them as running, and their department's if they head one — that is resolveProjectScope() in
+ * src/lib/projects.ts, and threading it through this module's viewer and hit shapes is a change to a
+ * module the projects work does not own. A half-scoped project search is worse than none: it would
+ * either leak the portfolio or silently drop the viewer's own projects. So the honest state is
+ * recorded and the route is named, which is what somebody looking for a project needs from this box.
  */
 function projectSource(): SearchSourceResult {
   return unavailable(
     'projects',
-    'There is no project system in this product yet: no projects table, and tasks do not belong to a project. This is a missing module, not an empty search. Nothing here is hidden from you.',
+    'Projects are not searchable from here yet. The project register does exist: open /portal/employee/projects for the projects you are on. Nothing about them is hidden from you by this box.',
     null,
   );
 }

@@ -98,6 +98,24 @@ const PATH_SECTION: [string, string][] = ([
   ['/admin/content', 'content'],
   ['/admin/users', 'users'],
   ['/admin/analytics', 'audit'],
+  // WORKFORCE ANALYTICS IS NOT WEBSITE ANALYTICS, AND THE DOOR HAD THE WRONG KEY ON IT.
+  //
+  // '/admin/analytics' is the WEBSITE traffic console and 'audit' is the right section for it. But
+  // the prefix match above also covered /admin/analytics/workforce, whose capability
+  // (`analytics.view`) is documented in permissions.ts and registry.ts as being held by super_admin
+  // AND hr — and `hr` does not hold the 'audit' section in ROLE_SECTIONS. So every hr account was
+  // bounced to /admin?denied=audit before the page's own gate ever ran, while the page's header
+  // said middleware had no key for that path at all.
+  //
+  // Longest-prefix wins (the sort below), so these two entries take precedence over the line above
+  // for exactly these two subtrees and change nothing about the traffic console. 'hr' is the section
+  // whose built-in holders — super_admin (unrestricted) and hr — are precisely the holders of
+  // `analytics.view`, so the door now admits the population the capability was written for and the
+  // capability check on the page stays the real lock. A custom role granted `analytics.view` but not
+  // the 'hr' section is still refused here; that is the fail-closed direction and it is worth a
+  // decision on the record rather than a wider prefix.
+  ['/admin/analytics/workforce', 'hr'],
+  ['/admin/analytics/domains', 'hr'],
   ['/admin/audit', 'audit'],
   ['/admin/settings', 'settings'],
   ['/admin/diagnostics', 'settings'],

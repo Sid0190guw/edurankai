@@ -1,0 +1,299 @@
+---
+// /portal/employee/knowledge — THE HANDBOOK, from the employee's side. Search it, read it, and
+// acknowledge the policies that ask for it.
+//
+// ONE PAGE, TWO VIEWS. The library, and one article opened with ?a=<slug>. A separate detail route
+// would mean a second gate to keep in step with this one, and on a phone the extra navigation buys
+// nothing — roughly nine in ten of these people are on 360px.
+//
+// WHAT THIS PERSON MAY SEE IS DECIDED IN THE QUERY. Every read goes through src/lib/knowledge-base.ts
+// with a viewer built from THIS session, and visibilityClause() narrows it in the WHERE clause:
+// articles for everybody with a workspace, plus restricted ones whose named capability this person
+// actually holds. An article they may not read is never fetched, so there is no version of this page
+// with it hidden underneath. An unknown slug and a restricted article give the same answer, on
+// purpose — "you are not allowed to see this" would confirm it exists.
+//
+// ACKNOWLEDGING IS THEIR OWN ACT. The user id comes from the session and never from a form field, so
+// no shape of request acknowledges a policy on somebody else's behalf, and the article is re-read
+// through the same visibility clause before the row is written.
+//
+// NO EMPLOYEE RECORD IS AN HONEST STATE, NOT AN ERROR: an admin account with no hr_employees row
+// still reads the handbook, because the audience is "everyone with a workspace" and that is what a
+// workspace means here.
+//
+// const BEFORE THE POST HANDLER. `const` is not hoisted.
+// CLIENT JAVASCRIPT: NONE. The markdown is rendered on the server.
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { resolvePermissions } from '@/lib/auth/registry';
+import {
+  makeViewer, listArticles, searchArticles, getArticle, acknowledgePolicy, myAckState,
+  outstandingPolicies, categoryCounts, renderArticleHtml, excerpt,
+  KB_CATEGORIES, kbCategoryLabel, kindLabel, audienceLabel,
+  type KbArticle,
+} from '@/lib/knowledge-base';
+
+const PAGE = '/portal/employee/knowledge';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PAGE));
+
+// ---------------------------------------------------------------------------------------------
+// CONSTANTS FIRST.
+// ---------------------------------------------------------------------------------------------
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const fmt = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+// The person's own employee record. The same two-step lookup the rest of the employee portal uses
+// (user_id first, then any of the three email columns), because hr_employees.user_id is empty for
+// anyone HR added by hand.
+let employee: any = null;
+try {
+  employee = rowsOf(await db.execute(sql`
+    SELECT id, full_name FROM hr_employees
+     WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
+  || rowsOf(await db.execute(sql`
+    SELECT id, full_name FROM hr_employees
+     WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email})
+       AND is_active = true LIMIT 1`))[0] || null;
+} catch (e: any) {
+  console.error('[knowledge] employee lookup', e?.cause?.message || e?.message);
+}
+
+const resolved = await resolvePermissions(String(user.id), { locals: Astro.locals });
+const viewer = makeViewer(user as any, {
+  permissions: resolved.permissions,
+  employeeId: employee?.id || null,
+});
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let ok = true;
+
+  if (action === 'acknowledge') {
+    const r = await acknowledgePolicy(viewer, String(fd.get('id') || ''));
+    ok = r.ok;
+    flash = r.ok
+      ? (r.changed ? 'Recorded. Thank you for reading it.' : 'You had already confirmed this version.')
+      : (r.error || 'Could not record that.');
+  } else {
+    ok = false;
+    flash = 'That is not something this page does.';
+  }
+
+  const slug = String(fd.get('slug') || '');
+  const back = slug ? PAGE + '?a=' + encodeURIComponent(slug) : PAGE;
+  return Astro.redirect(back + (back.indexOf('?') >= 0 ? '&' : '?') + 'msg=' + encodeURIComponent(flash) + '&ok=' + (ok ? '1' : '0'));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const msgOk = url.searchParams.get('ok') !== '0';
+const openKey = String(url.searchParams.get('a') || '').trim().slice(0, 120);
+const q = String(url.searchParams.get('q') || '').trim().slice(0, 120);
+const categoryFilter = String(url.searchParams.get('category') || '');
+
+const open: KbArticle | null = openKey ? await getArticle(viewer, openKey) : null;
+const openHtml = open ? renderArticleHtml(open.body) : '';
+const openAck = open ? await myAckState(viewer, open) : null;
+
+const hits = !open && q ? await searchArticles(viewer, q, 30) : [];
+const articles: KbArticle[] = open
+  ? []
+  : q
+    ? hits.map((h) => h.article)
+    : await listArticles(viewer, { category: categoryFilter || null, limit: 120 });
+
+const outstanding = await outstandingPolicies(viewer);
+const counts = await categoryCounts(viewer);
+const countFor = (key: string): number => {
+  const found = counts.find((c) => c.category === key);
+  return found ? found.count : 0;
+};
+
+const hrefForCategory = (c: string) => (c ? PAGE + '?category=' + encodeURIComponent(c) : PAGE);
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Knowledge base</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:inline-flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    .wrap{max-width:640px;margin:0 auto;padding:16px 14px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px;}
+    input{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    input:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:12px 18px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;min-height:44px;}
+    .btn.ghost{background:#faf7f1;color:#1a1510;border:1px solid #e6ddcd;}
+    .row{display:flex;gap:8px;flex-wrap:wrap;}
+    .row > *{flex:1 1 140px;}
+    .meta{font-size:11.5px;color:#9a8f7d;line-height:1.6;}
+    .msg{border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:14px;line-height:1.5;}
+    .note{font-size:11.5px;color:#9a8f7d;line-height:1.6;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px;margin-bottom:12px;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:44px;padding:8px 14px;border:1px solid #e6ddcd;border-radius:99px;background:#fff;color:#5b5346;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#12100c;border-color:#12100c;color:#fff;}
+    .item{display:block;text-decoration:none;color:inherit;padding:12px 0;border-bottom:1px solid #f2ece0;min-height:44px;}
+    .item:last-child{border-bottom:none;}
+    .item strong{font-size:15px;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;display:inline-block;}
+    .body{font-size:15px;line-height:1.75;color:#1a1510;overflow-wrap:anywhere;}
+    .body h2,.body h3,.body h4{margin:18px 0 6px;font-size:16px;font-weight:700;}
+    .body p{margin:10px 0;}
+    .body ul,.body ol{margin:10px 0 10px 20px;}
+    .body li{margin:4px 0;}
+    .body blockquote{margin:12px 0;padding:8px 12px;border-left:3px solid #e6ddcd;background:#faf7f1;color:#5b5346;}
+    .body code{font-family:'JetBrains Mono',monospace;font-size:13px;background:#f2ece0;padding:1px 5px;border-radius:4px;}
+    .body img{max-width:100%;height:auto;}
+    .tag{display:inline-block;padding:3px 10px;border-radius:99px;border:1px solid #e6ddcd;background:#faf7f1;font-size:11px;color:#5b5346;margin:0 6px 6px 0;}
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>Workspace</a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Knowledge base</span>
+  <span class="meta">{employee?.full_name || user.name}</span>
+</nav>
+
+<div class="wrap">
+  {msg && (
+    <div class="msg" style={msgOk
+      ? 'background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;'
+      : 'background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:#991b1b;'}>{msg}</div>
+  )}
+
+  {!open && outstanding.length > 0 && (
+    <div class="card">
+      <h3>Policies waiting for you to confirm</h3>
+      {outstanding.map((p) => (
+        <a class="item" href={PAGE + '?a=' + encodeURIComponent(p.slug)}>
+          <strong>{p.title}</strong>
+          <div class="meta">
+            Version {p.version}{p.effectiveFrom ? ' · in force from ' + fmt(p.effectiveFrom) : ''}
+          </div>
+        </a>
+      ))}
+      <p class="note" style="margin-top:8px;">
+        A policy you confirmed before does not carry forward when it is rewritten — that is why one
+        you have read can appear here again. Open it and you will see what it says now.
+      </p>
+    </div>
+  )}
+
+  {open && (
+    <div class="card">
+      <p style="margin-bottom:10px;"><a href={PAGE} style="color:#5b5346;font-size:13px;">Back to the knowledge base</a></p>
+      <h1 style="font-family:'Fraunces',serif;font-size:22px;line-height:1.25;margin-bottom:8px;">{open.title}</h1>
+      <div class="meta">
+        {kindLabel(open.kind)} · {kbCategoryLabel(open.category)} · version {open.version}
+        {open.effectiveFrom ? ' · in force from ' + fmt(open.effectiveFrom) : ''}
+        {open.audience === 'restricted' ? ' · ' + audienceLabel(open.audience, open.requiredCapability) : ''}
+      </div>
+      {open.summary && <p style="margin-top:10px;font-size:14px;line-height:1.6;color:#5b5346;">{open.summary}</p>}
+      {open.tags.length > 0 && (
+        <p style="margin-top:10px;">{open.tags.map((t) => <span class="tag">{t}</span>)}</p>
+      )}
+      <hr style="border:none;border-top:1px solid #f2ece0;margin:14px 0;" />
+      <div class="body" set:html={openHtml} />
+    </div>
+  )}
+
+  {open && open.kind === 'policy' && open.ackRequired && (
+    <div class="card">
+      <h3>Acknowledgement</h3>
+      {openAck?.acknowledged && (
+        <p style="font-size:14px;line-height:1.6;">
+          You confirmed version {open.version} on {fmt(openAck.acknowledgedAt)}. Nothing else is needed
+          unless this policy is rewritten.
+        </p>
+      )}
+      {!openAck?.acknowledged && (
+        <form method="POST">
+          <input type="hidden" name="action" value="acknowledge" />
+          <input type="hidden" name="id" value={open.id} />
+          <input type="hidden" name="slug" value={open.slug} />
+          <p style="font-size:14px;line-height:1.6;margin-bottom:10px;">
+            Confirm that you have read version {open.version} of this policy. It is recorded against
+            this version, so if the policy is rewritten you will be asked again — and what you
+            confirmed today stays as it was written today.
+          </p>
+          <button class="btn" type="submit">I have read this</button>
+        </form>
+      )}
+      <p class="note" style="margin-top:10px;">
+        This is your own record and nobody can make it for you. Whoever owns the policy sees how many
+        people have confirmed the current version; they do not see a list of who has not.
+      </p>
+    </div>
+  )}
+
+  {!open && (
+    <div class="card">
+      <h3>Search</h3>
+      <form method="get" action={PAGE}>
+        <input name="q" type="search" value={q} maxlength="120"
+          placeholder="Laptop, leave, expenses, notice period" />
+        <button class="btn" type="submit" style="margin-top:10px;">Search</button>
+      </form>
+      <p class="note" style="margin-top:10px;">
+        Searches titles, summaries, tags and the text of every article you can read. Nothing you
+        cannot read is searched, so a result can never be a sentence from somewhere you were not meant
+        to look.
+      </p>
+    </div>
+  )}
+
+  {!open && !q && (
+    <div class="tabs">
+      <a class="tab" href={PAGE} aria-current={!categoryFilter ? 'page' : null}>Everything</a>
+      {KB_CATEGORIES.map((c) => (
+        <a class="tab" href={hrefForCategory(c)} aria-current={categoryFilter === c ? 'page' : null}>
+          {kbCategoryLabel(c)} {countFor(c) > 0 ? '(' + countFor(c) + ')' : ''}
+        </a>
+      ))}
+    </div>
+  )}
+
+  {!open && (
+    <div class="card">
+      <h3>{q ? 'Results' : categoryFilter ? kbCategoryLabel(categoryFilter) : 'Everything you can read'}</h3>
+      {articles.length === 0 && (
+        <p style="font-size:14px;line-height:1.6;">
+          {q
+            ? 'Nothing matches that. If it is something the desk answers often, ask them to write it down — that is what this library is for.'
+            : 'Nothing has been published here yet. Raising a ticket still works exactly as it did.'}
+        </p>
+      )}
+      {articles.map((a) => (
+        <a class="item" href={PAGE + '?a=' + encodeURIComponent(a.slug)}>
+          <strong>{a.title}</strong>
+          <div class="meta">{kindLabel(a.kind)} · {kbCategoryLabel(a.category)}{a.updatedAt ? ' · updated ' + fmt(a.updatedAt) : ''}</div>
+          {excerpt(a) && <p style="margin-top:4px;font-size:13.5px;line-height:1.55;color:#5b5346;">{excerpt(a)}</p>}
+        </a>
+      ))}
+    </div>
+  )}
+
+  {!open && (
+    <p class="note">
+      Cannot find the answer? <a href="/portal/employee/support" style="color:#c2410c;">Raise a ticket</a>.
+      Nothing here can refuse you one, and the desk would rather answer twice than have you stuck.
+    </p>
+  )}
+</div>
+</body>
+</html>

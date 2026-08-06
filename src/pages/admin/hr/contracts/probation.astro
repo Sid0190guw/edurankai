@@ -1,0 +1,412 @@
+---
+// /admin/hr/contracts/probation — PROBATION AND CONFIRMATION.
+//
+// WHY IT SITS UNDER CONTRACTS. A probation is a TERM OF THE ENGAGEMENT — 'probationary' is one of the
+// contract types in src/lib/contracts.ts, and confirmation is the moment that term ends and somebody
+// stops being provisional. Putting it beside the contract register keeps the whole question of what
+// somebody is engaged as in one place, rather than scattering it across a console per verb.
+//
+// WHAT CHANGED, AND WHY IT MATTERS. hr_probation and its 30/60/90 reviews have existed here since
+// the lifecycle work, but confirming, extending and terminating were DIRECT WRITES — anybody who
+// could reach the employee console could confirm a person or end their employment during probation,
+// and the only record of the decision was the row it changed. Each of those is now a REQUEST, routed
+// by src/lib/workflow.ts from the Organization Graph, applied only once that engine says 'approved'.
+//
+// NOTHING AUTO-CONFIRMS ON A DATE. A probation whose end date has passed with no decision is listed
+// here as overdue and stays open. An automatic confirmation is a confirmation nobody made.
+//
+// THE GATE. The 'hr' section to open it — the same gate middleware already applies to every
+// /admin/hr path — and `employee.manage` to raise anything, which is the key the transfer, promotion
+// and separation consoles already require for their writes. Opening a register is not deciding
+// somebody's employment.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection, can } from '@/lib/auth/permissions';
+import { isInitialized } from '@/lib/org-graph';
+import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import {
+  ensureLifecycleSchema, ensureProbationDecisionSchema,
+  listOpenProbations, listProbationDecisions, requestProbationDecision,
+  cancelProbationDecision, syncProbationDecisions,
+  probationOutcomeLabel, PROBATION_OUTCOMES,
+  type ProbationRow, type ProbationDecisionRow,
+} from '@/lib/hr-lifecycle';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!(await canAccessSection(user, 'hr', 'edit'))) return Astro.redirect('/admin');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted.
+const PAGE = '/admin/hr/contracts/probation';
+const mayWrite = can(user as any, 'employee.manage');
+const DETAIL_LIMIT = 12;
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function stateLabel(s: string): string {
+  const k = String(s || '');
+  if (k === 'pending') return 'Waiting for approval';
+  if (k === 'approved') return 'Approved';
+  if (k === 'applied') return 'Applied';
+  if (k === 'rejected') return 'Rejected';
+  if (k === 'cancelled') return 'Withdrawn';
+  if (k === 'halted') return 'Halted';
+  return k;
+}
+
+function stateTone(s: string): string {
+  const k = String(s || '');
+  if (k === 'applied') return '#86efac';
+  if (k === 'approved') return '#6ee7b7';
+  if (k === 'rejected') return '#fca5a5';
+  if (k === 'halted') return '#fbbf24';
+  if (k === 'cancelled') return '#9aa6b6';
+  return '#67e8f9';
+}
+
+function viaLabel(v: string): string {
+  const k = String(v || '');
+  if (k === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (k === 'department_head') return VIA_LABELS.department_head;
+  if (k === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (k === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+function dueWords(p: ProbationRow): string {
+  if (p.daysRemaining === null) return 'No end date recorded';
+  if (p.daysRemaining < 0) return Math.abs(p.daysRemaining) + ' day' + (Math.abs(p.daysRemaining) === 1 ? '' : 's') + ' overdue';
+  if (p.daysRemaining === 0) return 'Ends today';
+  return p.daysRemaining + ' day' + (p.daysRemaining === 1 ? '' : 's') + ' left';
+}
+
+await ensureLifecycleSchema().catch(() => {});
+await ensureProbationDecisionSchema().catch(() => {});
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (action === 'decide') {
+      // THE WORKFLOW INSTANCE, not the probation row. decideInstance() re-checks that this account is
+      // the routed approver or an in-force delegate; reaching this page proves nothing about that.
+      const r = await decideInstance(
+        String(fd.get('instance_id') || ''),
+        user as any,
+        String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected',
+        String(fd.get('note') || ''),
+      );
+      flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
+      if (r.ok) {
+        const sync = await syncProbationDecisions(user.id);
+        if (sync.applied) flash += ' ' + sync.applied + ' approved decision applied to the employee record.';
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else if (!mayWrite) {
+      flash = 'You can read probations, but deciding one needs the employee-records permission.';
+    } else if (action === 'request') {
+      const r = await requestProbationDecision({
+        probationId: String(fd.get('probation_id') || ''),
+        outcome: String(fd.get('outcome') || ''),
+        extendMonths: Number(fd.get('extend_months') || 0),
+        effectiveDate: String(fd.get('effective_date') || ''),
+        reason: String(fd.get('reason') || ''),
+        letterUrl: String(fd.get('letter_url') || ''),
+        requestedByUserId: user.id,
+      });
+      if (r.ok && r.haltReason) flash = 'Recorded, but it is halted: ' + r.haltReason;
+      else if (r.ok) flash = 'Sent for approval. Nothing on the employee record has changed yet.';
+      else flash = r.error || 'The decision was not saved.';
+    } else if (action === 'cancel') {
+      const r = await cancelProbationDecision(String(fd.get('decision_id') || ''), user.id);
+      flash = r.ok ? 'Request withdrawn.' : (r.error || 'The request was not withdrawn.');
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    console.error('[admin/hr/contracts/probation] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const synced = await syncProbationDecisions(user.id);
+const graphReady = await isInitialized();
+const probations = await listOpenProbations(200);
+const decisions = await listProbationDecisions({ limit: 200 });
+
+const open = decisions.filter((d) => d.state === 'pending' || d.state === 'halted').slice(0, DETAIL_LIMIT);
+const detail: any[] = [];
+for (const d of open) {
+  let instance: any = null;
+  try {
+    if (d.workflowInstanceId) instance = await getInstance(d.workflowInstanceId);
+  } catch (e: any) {
+    console.error('[admin/hr/contracts/probation] instance', e?.cause?.message || e?.message);
+  }
+  const waiting = instance
+    ? (instance.steps || []).filter((s: any) => s.stepNo === instance.currentStep && s.decision === 'pending')
+    : [];
+  detail.push({ d, instance, waiting });
+}
+
+const settled = decisions.filter((d) => d.state !== 'pending' && d.state !== 'halted');
+const overdue = probations.filter((p) => p.overdue);
+const undecided = probations.filter((p) => !p.decisionInProgress);
+const today = new Date().toISOString().slice(0, 10);
+---
+<AdminLayout title="Probation and confirmation" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Contracts · Probation</p>
+  <h1>Probation and confirmation</h1>
+  <p class="lede">
+    Every probation that is still running, when each one is due, and the decision that ends it.
+    Confirming somebody, extending their probation and ending their employment during it are all
+    approved before anything on the employee record moves. Nothing here confirms anybody because a
+    date passed.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {synced.errors.length > 0 && <div class="flash warn">{synced.errors[0]}</div>}
+  {!mayWrite && (
+    <div class="flash warn">You can read this register. Raising a probation decision needs the employee-records permission.</div>
+  )}
+  {!graphReady && (
+    <div class="flash warn">
+      The Organization Graph is not yet initialized, so no approver can be resolved for anybody. A
+      decision raised now is recorded and halted with that reason rather than approved. Run the graph
+      backfill first.
+    </div>
+  )}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{probations.length}</span><span class="tl">Probations running</span></div>
+    <div class="tile"><span class="tv">{overdue.length}</span><span class="tl">Past their end date</span></div>
+    <div class="tile"><span class="tv">{detail.length}</span><span class="tl">Decisions waiting</span></div>
+  </div>
+
+  {overdue.length > 0 && (
+    <div class="flash warn">
+      {overdue.length} probation{overdue.length === 1 ? ' has' : 's have'} passed the end date with no
+      decision recorded. Nothing has confirmed them and nothing will — a probation ends when somebody
+      decides it does.
+    </div>
+  )}
+
+  <h2>Probations running</h2>
+  {probations.length === 0 ? (
+    <div class="empty">Nobody is on probation.</div>
+  ) : (
+    <div class="stack">
+      {probations.map((p: ProbationRow) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{p.employeeName || 'Employee'}</p>
+              <p class="sub">
+                Started {fmtDate(p.startDate)} · {p.durationMonths} month{p.durationMonths === 1 ? '' : 's'}
+                {p.extensionCount > 0 ? ' · extended ' + p.extensionCount + ' time' + (p.extensionCount === 1 ? '' : 's') : ''}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + (p.overdue ? '#fbbf24' : '#67e8f9') + ';border-color:' + (p.overdue ? '#fbbf2455' : '#67e8f955') + ';'}>
+              {dueWords(p)}
+            </span>
+          </div>
+
+          <dl class="terms">
+            <div><dt>Ends on</dt><dd>{fmtDate(p.endsOn) || 'Not recorded'}</dd></div>
+            <div><dt>Status</dt><dd>{p.status === 'extended' ? 'Extended' : 'Active'}</dd></div>
+          </dl>
+
+          {p.decisionInProgress ? (
+            <div class="waiting">
+              <p class="wl">A decision is already in progress</p>
+              <p class="wn">It is listed below. Settle that one before raising another.</p>
+            </div>
+          ) : mayWrite ? (
+            <details class="inner">
+              <summary>Decide this probation</summary>
+              <form method="POST" class="form">
+                <input type="hidden" name="action" value="request" />
+                <input type="hidden" name="probation_id" value={p.id} />
+                <label>What is being decided
+                  <select name="outcome" required>
+                    <option value="">Choose</option>
+                    {PROBATION_OUTCOMES.map((o) => <option value={o.key}>{o.label}</option>)}
+                  </select>
+                  <span class="hint">{PROBATION_OUTCOMES.map((o) => o.label + ': ' + o.note).join(' ')}</span>
+                </label>
+                <label>If extending, by how many months
+                  <input type="number" name="extend_months" step="1" min="1" max="6" value="1" />
+                  <span class="hint">Ignored unless the outcome is an extension.</span>
+                </label>
+                <label>Effective date<input type="date" name="effective_date" required value={today} /></label>
+                <label>Reason
+                  <textarea name="reason" rows="3" required placeholder="An approver reads this before deciding. Ending an employment needs it written out in full."></textarea>
+                </label>
+                <label>Letter link
+                  <input type="url" name="letter_url" placeholder="https://" maxlength="1000" />
+                  <span class="hint">
+                    A link to the confirmation or termination letter, shared so the person receiving it
+                    can open it. Nothing is uploaded here.
+                  </span>
+                </label>
+                <button type="submit" class="btn">Send for approval</button>
+              </form>
+            </details>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>Decisions waiting on approval</h2>
+  {detail.length === 0 ? (
+    <div class="empty">No probation decision is waiting on anybody.</div>
+  ) : (
+    <div class="stack">
+      {detail.map((x: any) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{x.d.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {probationOutcomeLabel(x.d.outcome)}
+                {x.d.outcome === 'extend' && x.d.extendMonths ? ' by ' + x.d.extendMonths + ' month' + (x.d.extendMonths === 1 ? '' : 's') : ''}
+                {' · effective ' + fmtDate(x.d.effectiveDate)} · raised {fmtDate(x.d.createdAt)}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(x.d.state) + ';border-color:' + stateTone(x.d.state) + '55;'}>
+              {stateLabel(x.d.state)}
+            </span>
+          </div>
+
+          <p class="reason">{x.d.reason}</p>
+
+          {x.d.letterUrl && (
+            <p class="sub"><a class="link" href={x.d.letterUrl} target="_blank" rel="noopener noreferrer">Open the letter</a></p>
+          )}
+
+          {x.d.state === 'halted' && (
+            <div class="halt">
+              <strong>Halted.</strong> {x.d.haltReason || 'No approver could be resolved.'}
+              <span class="hint">Nothing on the employee record has changed. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+            </div>
+          )}
+
+          {x.instance && x.instance.state === 'pending' && x.waiting.length > 0 && (
+            <div class="waiting">
+              <p class="wl">Waiting on</p>
+              {x.waiting.map((s: any) => (
+                <p class="wn">{viaLabel(s.via)} — {s.approverName || 'a person with no employee record'}</p>
+              ))}
+            </div>
+          )}
+
+          {x.instance && x.instance.state === 'pending' && (
+            <form method="POST" class="decide">
+              <input type="hidden" name="action" value="decide" />
+              <input type="hidden" name="instance_id" value={x.instance.id} />
+              <input type="text" name="note" placeholder="Note for the record (optional)" />
+              <div class="btnrow">
+                <button type="submit" name="decision" value="approved" class="btn ok">Approve</button>
+                <button type="submit" name="decision" value="rejected" class="btn no">Reject</button>
+              </div>
+              <p class="hint">Only the person this was routed to, or somebody standing in for them, can decide it.</p>
+            </form>
+          )}
+
+          {mayWrite && (
+            <form method="POST" class="inline">
+              <input type="hidden" name="action" value="cancel" />
+              <input type="hidden" name="decision_id" value={x.d.id} />
+              <button type="submit" class="btn ghost">Withdraw this request</button>
+            </form>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>Settled</h2>
+  {settled.length === 0 ? (
+    <div class="empty">Nothing has been settled yet.</div>
+  ) : (
+    <div class="stack">
+      {settled.map((d: ProbationDecisionRow) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{d.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {probationOutcomeLabel(d.outcome)} · effective {fmtDate(d.effectiveDate)}
+                {d.appliedAt ? ' · applied ' + fmtDate(d.appliedAt) : ''}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(d.state) + ';border-color:' + stateTone(d.state) + '55;'}>
+              {stateLabel(d.state)}
+            </span>
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+
+  <p class="foot">
+    {undecided.length} probation{undecided.length === 1 ? '' : 's'} currently ha{undecided.length === 1 ? 's' : 've'} no
+    decision in progress. Contracts, transfers and promotions are on their own registers.
+  </p>
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 22px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .link { color: #FF7040; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; white-space: pre-wrap; }
+  .terms { display: grid; gap: 6px; margin: 12px 0 0; }
+  .terms div { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; border-bottom: 1px dashed #1a1a1f; padding-bottom: 5px; }
+  .terms dt { color: #9aa6b6; margin: 0; }
+  .terms dd { color: #e8e8ee; margin: 0; text-align: right; }
+  .inner { margin-top: 12px; border-top: 1px solid #1a1a1f; padding-top: 6px; }
+  .inner > summary { cursor: pointer; font-size: 12px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; min-height: 44px; display: flex; align-items: center; }
+  .form { display: grid; gap: 12px; padding-bottom: 8px; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 70px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; display: block; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.ok { background: #15803d; }
+  .btn.no { background: #b91c1c; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .halt { margin: 12px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #fde68a; line-height: 1.55; }
+  .waiting { margin: 12px 0 0; padding: 10px 12px; background: rgba(103,232,249,0.06); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .wl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .wn { font-size: 12.5px; color: #e8e8ee; margin: 0; }
+  .decide { display: grid; gap: 8px; margin-top: 12px; }
+  .inline { margin-top: 10px; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+  .foot { font-size: 11.5px; color: #6e6e78; line-height: 1.6; margin-top: 24px; max-width: 70ch; }
+</style>
+</AdminLayout>

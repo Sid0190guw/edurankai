@@ -1,0 +1,270 @@
+---
+// /admin/hr/holidays — THE HOLIDAY CALENDAR, YEAR BY YEAR.
+//
+// hr_attendance.status has accepted 'holiday' since the HR schema was written and nothing ever wrote
+// it, because no screen said which days were holidays. Until this list is filled in, every day in a
+// leave request is charged as an ordinary day and a public holiday inside somebody's week off costs
+// them a day of their allowance.
+//
+// WHAT A LOCATION CAN AND CANNOT DO - SAY IT ON THE SCREEN, BECAUSE IT IS NOT OBVIOUS.
+// A holiday can carry a place name. This product has no office register and hr_employees has no
+// location column, so nothing here can work out who is at that place. A holiday with a location is
+// therefore SHOWN to everybody and taken off NOBODY's leave automatically. To make a regional
+// holiday actually count, scope it to a DEPARTMENT as well - department is a relationship this
+// product records, so it is the one that can decide anything. The form says so, in those words.
+//
+// AN OPTIONAL (RESTRICTED) HOLIDAY IS NEVER DEDUCTED EITHER. It is a day somebody may take, so it
+// stays a working day until they ask for it - which is what the weekly timesheet already assumes.
+//
+// STORAGE IS src/lib/attendance-schema.ts's ONE hr_holidays TABLE. This page creates nothing and
+// writes through src/lib/holidays.ts, which re-exports the single writer. There is no second
+// holiday table and there must never be one.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import {
+  holidaysInYear,
+  holidayYears,
+  holidayLocations,
+  addHoliday,
+  removeHoliday,
+  yearBounds,
+} from '@/lib/holidays';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+// -------------------------------------------------------------------------------------------------
+// CONSTANTS FIRST. `const` is not hoisted and a const under the POST handler throws on its first
+// line while the page still reports success.
+// -------------------------------------------------------------------------------------------------
+const PAGE = '/admin/hr/holidays';
+
+// THE SAME QUESTION THE DOOR ASKS. middleware.ts maps /admin/hr/* to the `hr` section, and the
+// attendance console sits behind the `attendance` section - so this accepts EITHER that section at
+// edit level OR `attendance.roster.manage`, the capability that already means "defines working time:
+// shifts, rosters, the holiday list". Gating on the capability alone would shut out a custom role
+// that can open /admin/hr/attendance today.
+const attendanceDesk = await canAccessSection(user, 'attendance', 'edit');
+const mayManage = can(user as any, 'attendance.roster.manage') || attendanceDesk;
+if (!mayManage) return Astro.redirect('/admin');
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const thisYear = new Date().getFullYear();
+
+// -------------------------------------------------------------------------------------------------
+// WRITES
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const backYear = String(fd.get('year') || String(thisYear));
+  let flash = '';
+
+  if (action === 'add') {
+    const r = await addHoliday({
+      dateIso: String(fd.get('date') || ''),
+      name: String(fd.get('name') || ''),
+      departmentId: String(fd.get('department_id') || '') || null,
+      location: String(fd.get('location') || '') || null,
+      isOptional: String(fd.get('is_optional') || '') === 'on',
+      createdByUserId: String(user.id),
+    });
+    if (!r.ok) flash = 'Error: ' + (r.error || 'That holiday could not be saved.');
+    else if (r.changed === false) flash = 'That date already carries a holiday for the same department and place. Nothing changed.';
+    else flash = 'Holiday recorded.';
+  } else if (action === 'remove') {
+    const r = await removeHoliday(String(fd.get('id') || ''));
+    flash = r.ok ? 'Holiday removed. Leave already approved against it is unchanged.' : 'Error: ' + (r.error || 'It could not be removed.');
+  } else {
+    flash = 'That is not something this page does.';
+  }
+
+  return Astro.redirect(PAGE + '?year=' + encodeURIComponent(backYear) + '&msg=' + encodeURIComponent(flash));
+}
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+const params = new URL(Astro.request.url).searchParams;
+const msg = params.get('msg') || '';
+const yearParam = Number(params.get('year'));
+const year = Number.isInteger(yearParam) && yearParam >= 1970 && yearParam <= 2999 ? yearParam : thisYear;
+const bounds = yearBounds(year);
+
+const holidays = await holidaysInYear(year, { includeOptional: true });
+const knownYears = await holidayYears();
+const locations = await holidayLocations();
+
+let departments: any[] = [];
+try {
+  departments = rowsOf(await db.execute(sql`SELECT id::text AS id, name FROM departments ORDER BY name ASC LIMIT 200`));
+} catch (e: any) {
+  console.error('[admin/hr/holidays] departments', e?.cause?.message || e?.message);
+}
+
+const yearOptions = [...new Set([thisYear - 1, thisYear, thisYear + 1, ...knownYears])].sort((a, b) => b - a);
+const orgWide = holidays.filter((h) => !h.departmentId && !h.location);
+const scoped = holidays.filter((h) => !!h.departmentId || !!h.location);
+
+const fmt = (iso: string) => {
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+};
+---
+<AdminLayout title="Holiday calendar" activeNav="">
+  <div class="admin-page hol-page">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">HR Management · Working time</div>
+      <h1 class="admin-page-title">Holiday calendar</h1>
+      <p class="admin-page-sub">
+        Named days off, per year. A holiday inside a leave request is not charged against anybody's
+        allowance, and attendance does not read it as absence. Until a year is filled in, every day
+        in that year is an ordinary working day.
+      </p>
+    </div></div>
+
+    {msg && <div class="flash">{msg}</div>}
+
+    <p class="crossref">
+      Working time also lives on <a href="/admin/hr/attendance">Attendance</a> and
+      <a href="/admin/hr/attendance/reports"> attendance reports</a>.
+      Shifts and rosters are on <a href="/portal/employee/attendance/roster">the roster screen</a>.
+    </p>
+
+    <form method="GET" action={PAGE} class="yearbar">
+      <label class="fl">Year
+        <select class="fi" name="year">
+          {yearOptions.map((y) => (<option value={y} selected={y === year}>{y}</option>))}
+        </select>
+      </label>
+      <button class="btn btn-thin" type="submit">Show that year</button>
+    </form>
+
+    <div class="card card-block">
+      <div class="card-title">Record a holiday</div>
+      <form method="POST" action={PAGE} class="grid-form">
+        <input type="hidden" name="action" value="add"/>
+        <input type="hidden" name="year" value={year}/>
+        <label class="fl">Date<input class="fi" name="date" type="date" required min={bounds.from} max={bounds.to}/></label>
+        <label class="fl">Name<input class="fi" name="name" required maxlength="160" placeholder="What the day is called"/></label>
+        <label class="fl">Department
+          <select class="fi" name="department_id">
+            <option value="">Everyone</option>
+            {departments.map((d) => (<option value={String(d.id)}>{d.name}</option>))}
+          </select>
+        </label>
+        <label class="fl">Place
+          <input class="fi" name="location" maxlength="120" list="known-locations" placeholder="Optional"/>
+        </label>
+        <datalist id="known-locations">
+          {locations.map((l) => (<option value={l}></option>))}
+        </datalist>
+        <label class="fl fl-wide chk">
+          <input type="checkbox" name="is_optional"/>
+          <span>Optional (restricted) holiday. People may take it; it is not deducted for anybody automatically.</span>
+        </label>
+        <button class="btn btn-go" type="submit">Record it</button>
+      </form>
+      <p class="hint">
+        A place on its own does not narrow who the holiday applies to: this product does not record
+        which office anybody sits in, so a holiday with only a place is shown to everyone and
+        deducted from nobody. To make a regional holiday actually count, choose the department it
+        belongs to as well.
+      </p>
+    </div>
+
+    <h2 class="sec">Everyone · {orgWide.length}</h2>
+    {orgWide.length === 0 && (
+      <p class="empty">
+        No organization-wide holidays recorded for {year}. Every day of that year is currently
+        charged as an ordinary day on leave requests.
+      </p>
+    )}
+    {orgWide.map((h) => (
+      <div class="card">
+        <div class="card-main">
+          <div class="card-title">{h.name}{h.isOptional && <span class="chip">Optional</span>}</div>
+          <div class="card-sub">{fmt(h.dateIso)}</div>
+        </div>
+        <form method="POST" action={PAGE} class="inline-form">
+          <input type="hidden" name="action" value="remove"/>
+          <input type="hidden" name="id" value={h.id}/>
+          <input type="hidden" name="year" value={year}/>
+          <button class="btn btn-thin" type="submit">Remove</button>
+        </form>
+      </div>
+    ))}
+
+    <h2 class="sec">Scoped to a department or a place · {scoped.length}</h2>
+    {scoped.length === 0 && <p class="empty">Nothing scoped this year.</p>}
+    {scoped.map((h) => (
+      <div class="card">
+        <div class="card-main">
+          <div class="card-title">
+            {h.name}
+            {h.isOptional && <span class="chip">Optional</span>}
+            {h.location && <span class="chip">{h.location}</span>}
+          </div>
+          <div class="card-sub">
+            {fmt(h.dateIso)}
+            {h.departmentName ? ' · ' + h.departmentName : ''}
+            {h.location && !h.departmentId
+              ? ' · shown to everyone, deducted from nobody, because no department is set'
+              : ''}
+          </div>
+        </div>
+        <form method="POST" action={PAGE} class="inline-form">
+          <input type="hidden" name="action" value="remove"/>
+          <input type="hidden" name="id" value={h.id}/>
+          <input type="hidden" name="year" value={year}/>
+          <button class="btn btn-thin" type="submit">Remove</button>
+        </form>
+      </div>
+    ))}
+  </div>
+
+  <style>
+    /* MOBILE FIRST: the base rules are the 360px rules. min-width:0 on every flex child, because a
+       flex item defaults to min-width:auto and a long unbroken word would push the card wider than
+       the phone and make the PAGE scroll sideways. */
+    .hol-page{ max-width:1000px; }
+    .flash{ margin:0 0 16px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3);
+      color:#6ee7b7; border-radius:8px; padding:10px 14px; font-size:13px; overflow-wrap:anywhere; }
+    .crossref{ font-size:13px; color:#8a8a94; margin:0 0 16px; line-height:1.6; overflow-wrap:anywhere; }
+    .crossref a{ color:#f97316; }
+    .yearbar{ display:flex; gap:8px; align-items:end; flex-wrap:wrap; margin:0 0 16px; }
+    .sec{ font-family:'Geist Mono',monospace; font-size:11px; letter-spacing:0.16em; text-transform:uppercase;
+      color:#c2410c; font-weight:700; margin:26px 0 8px; }
+    .empty{ color:#8a8a94; font-size:13px; margin:0 0 18px; line-height:1.6; }
+    .hint{ color:#8a8a94; font-size:12px; margin:10px 0 0; line-height:1.6; }
+    .card{ display:flex; gap:12px; background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px;
+      padding:12px 14px; margin-bottom:8px; flex-wrap:wrap; align-items:flex-start; }
+    .card-block{ flex-direction:column; }
+    .card-main{ flex:1 1 220px; min-width:0; overflow-wrap:anywhere; }
+    .card-title{ color:#fff; font-weight:700; font-size:14px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .card-sub{ color:#8a8a94; font-size:12px; margin-top:3px; line-height:1.5; overflow-wrap:anywhere; }
+    .grid-form{ display:grid; grid-template-columns:1fr; gap:8px; width:100%; margin-top:12px; }
+    .inline-form{ display:flex; gap:6px; flex-wrap:wrap; flex:0 0 auto; }
+    .fl{ display:flex; flex-direction:column; gap:4px; font-size:11px; color:#8a8a94;
+      text-transform:uppercase; letter-spacing:0.06em; min-width:0; }
+    .chk{ flex-direction:row; align-items:flex-start; gap:8px; text-transform:none; letter-spacing:0;
+      font-size:12px; line-height:1.5; color:#cfd6da; }
+    .chk input{ margin-top:2px; width:20px; height:20px; }
+    .fi{ background:#08080b; border:1px solid #262630; border-radius:7px; padding:11px 10px; color:#fff;
+      font-size:13px; outline:none; font-family:inherit; width:100%; min-width:0; text-transform:none; letter-spacing:0; }
+    /* 44px minimum touch target - a control that needs a second attempt gets pressed twice. */
+    .btn{ border:none; border-radius:7px; padding:0 16px; min-height:44px; color:#fff; font-size:12px;
+      font-weight:700; cursor:pointer; font-family:'Geist Mono',monospace; white-space:nowrap; }
+    .btn-go{ background:#c2410c; }
+    .btn-thin{ background:transparent; border:1px solid #333; color:#cfd6da; font-size:11px; }
+    .chip{ font-family:'Geist Mono',monospace; font-size:10px; font-weight:700; text-transform:uppercase;
+      letter-spacing:0.08em; border-radius:999px; padding:3px 9px; background:#1a1a1f; color:#8a8a94; }
+    @media (min-width:620px){
+      .grid-form{ grid-template-columns:repeat(2, minmax(0, 1fr)); align-items:end; }
+      .fl-wide{ grid-column:1 / -1; }
+    }
+  </style>
+</AdminLayout>

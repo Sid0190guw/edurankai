@@ -20,6 +20,14 @@
  *    why. Ids are compared ::text now — the same rule this project already applies to departments.id
  *    — and a failure is LOGGED and SHOWN rather than swallowed.
  *
+ * 3. "PAST RECORDINGS" WAS A PANEL FOR DATA THAT CANNOT EXIST. `meet_recordings` is CREATEd and read
+ *    and is written by NOTHING — no INSERT for it exists anywhere in this repository. The panel
+ *    promised "when you record a meeting it lands here with a transcript and download", and every
+ *    card linked to /portal/meet/recording/<id>, a route that does not exist either. Recording is
+ *    real, but it is entirely local: /portal/meet/[id] runs MediaRecorder over a composed canvas and
+ *    downloads the .webm to the recorder's own device (see startRecording there). Nothing is
+ *    uploaded, so nothing can be listed. The query is gone and the panel now says that.
+ *
  * The four fetch() call sites at the bottom of this file POST/GET/PATCH/DELETE /api/meet/rooms,
  * which did not exist until this build. It does now: src/pages/api/meet/rooms/.
  */
@@ -27,6 +35,7 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureMeetSchema, meetBlockReason } from '@/lib/meet-schema';
+import { canScheduleMeeting } from '@/lib/meet-access';
 
 // Declared at the very top, above everything that uses them: `const` is not hoisted, and a handler
 // reaching a later declaration has taken pages down on this project.
@@ -46,7 +55,15 @@ if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/po
 // run" from "this database carries the legacy shape" — two different sentences for two different
 // facts, neither of them a 500.
 await ensureMeetSchema();
-const blockReason = meetBlockReason();
+
+// Two independent reasons a meeting cannot be created, kept apart because they are different facts
+// and lead to different actions: the STORE cannot take one (meetBlockReason), or THIS PERSON may not
+// call one (canScheduleMeeting — composeWorkspace + the capability registry, the same `worksHere`
+// audience navigation.ts:271-279 already publishes for this destination). POST /api/meet/rooms asks
+// both again server-side, so the disabled button below is a hint and never the gate.
+const schemaBlock = meetBlockReason();
+const scheduleGate = await canScheduleMeeting(user, { locals: Astro.locals, next: '/portal/meet' });
+const blockReason = schemaBlock || (scheduleGate.ok ? '' : scheduleGate.reason);
 const canSchedule = !blockReason;
 
 // ---------------------------------------------------------------------------
@@ -80,30 +97,25 @@ try {
 }
 
 // ---------------------------------------------------------------------------
-// Past recordings (sorted by created date)
+// Past recordings — NOT QUERIED, AND THAT IS THE FIX
 // ---------------------------------------------------------------------------
-// Every id is joined and compared ::text. meet_recordings.room_id is TEXT and meet_rooms.id may be
-// either type depending on which CREATE won before this build, so `rm.id = rec.room_id` was an
-// operator-does-not-exist error on one of the two shapes.
-let recordings: any[] = [];
-try {
-  const r = await db.execute(sql`
-    SELECT rec.id, rec.room_id, rec.title, rec.duration_sec, rec.attendees_count,
-           rec.transcript_available, rec.thumbnail_url, rec.created_at,
-           rm.title AS room_title, rm.host_name
-    FROM meet_recordings rec
-    LEFT JOIN meet_rooms rm ON rm.id::text = rec.room_id::text
-    WHERE rm.host_user_id::text = ${user.id} OR rec.room_id::text IN (
-      SELECT DISTINCT room_id::text FROM meet_participants WHERE user_id::text = ${user.id}
-    )
-    ORDER BY rec.created_at DESC
-    LIMIT 12
-  `);
-  recordings = rowsOf(r);
-} catch (e: any) {
-  logFail('recordings', e);
-  recordings = [];
-}
+// There was a SELECT here, over meet_recordings joined to meet_rooms, feeding a grid of cards. It
+// could only ever return zero rows: `meet_recordings` has NO INSERT anywhere in this repository —
+// not in src/, not in db/, not in scripts/ — so the table is created, indexed, read, and never
+// written. A panel whose empty state reads "when you record a meeting it lands here" is a promise
+// the product cannot keep, and every card it would have rendered linked to
+// /portal/meet/recording/<id>, which is not a route either.
+//
+// Recording itself is REAL and it is LOCAL. /portal/meet/[id] composes a canvas, runs MediaRecorder
+// over its captureStream and hands the .webm straight to the browser's download — nothing is
+// uploaded and no row is written. The panel below says exactly that instead of implying a library.
+//
+// WHAT WOULD HAVE TO EXIST FIRST, so the next person does not start in the wrong place: a writer.
+// An upload endpoint that puts the blob behind the storage interface (docs/, sovereignty: an
+// S3-compatible target, not a proprietary blob store), an INSERT into meet_recordings carrying
+// room_id/duration_sec/attendees_count, a retention decision — a meeting recording is personal data
+// and somebody has to say for how long it is kept — and a playback route. Restore the reader and
+// this panel in the same change as the writer, never before it.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -121,15 +133,6 @@ function fmtTimeUntil(d: Date | string | null): string {
   if (hrs < 24) return `in ${hrs} hr`;
   const days = Math.round(hrs / 24);
   return `in ${days} day${days === 1 ? '' : 's'}`;
-}
-
-function fmtDuration(sec: number): string {
-  if (!sec) return '—';
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  if (m < 60) return `${m}m ${s.toString().padStart(2, '0')}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${(m % 60).toString().padStart(2, '0')}m`;
 }
 
 function fmtScheduled(d: Date | string | null): string {
@@ -150,7 +153,7 @@ const TEMPLATES = [
   { id: 'classroom', title: 'Classroom',        duration: 60, kind: 'classroom', desc: 'Teaching session with raise-hand and roll call.', features: ['Raise-hand','Roll call','Recording on'] },
 ];
 
-const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.length };
+const QUICK = { upcomingCount: upcoming.length };
 ---
 <BaseLayout title="Video meetings · Portal" description="Schedule, join, and review video meetings — built into your portal.">
 
@@ -189,8 +192,17 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
   .meta-pill { font-family: 'Geist Mono', monospace; font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; padding: 4px 9px; border-radius: 6px; background: #F6F6F2; color: #3B3A30; }
   .meta-pill.live { background: rgba(255,79,0,0.12); color: #FF4F00; }
   .meta-pill.soon { background: rgba(167,139,250,0.18); color: #6d4cc0; }
-  .meet-row-actions { display: flex; gap: 8px; align-items: center; }
-  .btn { font-family: 'Geist Mono', monospace; font-size: 0.78rem; letter-spacing: 0.1em; text-transform: uppercase; padding: 9px 14px; border-radius: 9px; border: 1px solid transparent; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; font-weight: 600; transition: all 0.15s; }
+  .meet-row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  /* Three buttons plus a title do not fit beside each other on a 360px screen, and a row that does
+     not fit is what makes the whole page scroll sideways. Under 600px the actions go under. */
+  @media (max-width: 600px) {
+    .meet-row { grid-template-columns: 1fr; padding: 16px; }
+    .meet-row-actions { justify-content: flex-start; }
+    .meet-row-actions .btn { flex: 1 1 auto; }
+  }
+  /* min-height 44px: this portal is read on a phone by roughly nine readers in ten, and a 33px-tall
+     button is a mis-tap. It changes nothing on a desktop, where the row is already taller. */
+  .btn { font-family: 'Geist Mono', monospace; font-size: 0.78rem; letter-spacing: 0.1em; text-transform: uppercase; padding: 9px 14px; min-height: 44px; border-radius: 9px; border: 1px solid transparent; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-weight: 600; transition: all 0.15s; }
   .btn-primary { background: #FF4F00; color: #fff; border-color: #FF4F00; }
   .btn-primary:hover { background: #e64600; }
   .btn-primary:disabled { background: #c9c7b6; border-color: #c9c7b6; cursor: not-allowed; }
@@ -199,20 +211,16 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
   .btn-danger { background: #fff; color: #b91c1c; border-color: #fecaca; }
   .btn-danger:hover { background: #fef2f2; }
 
-  /* Recordings grid */
-  .rec-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
-  .rec-card { background: #fff; border: 1px solid #E8E7DD; border-radius: 14px; overflow: hidden; transition: transform 0.15s, box-shadow 0.15s; text-decoration: none; color: inherit; display: flex; flex-direction: column; }
-  .rec-card:hover { transform: translateY(-2px); box-shadow: 0 12px 28px -12px rgba(11,14,20,0.14); }
-  .rec-thumb { aspect-ratio: 16/9; background: linear-gradient(135deg, #1a1a1f 0%, #2a2a35 50%, #0e0e14 100%); position: relative; display: grid; place-items: center; color: rgba(255,255,255,0.4); }
-  .rec-thumb svg { width: 38px; height: 38px; }
-  .rec-thumb .play-overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,0.2); opacity: 0; transition: opacity 0.15s; }
-  .rec-card:hover .play-overlay { opacity: 1; }
-  .play-overlay-btn { width: 50px; height: 50px; border-radius: 50%; background: rgba(255,79,0,0.92); color: #fff; display: grid; place-items: center; }
-  .rec-duration { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.78); color: #fff; padding: 2px 7px; border-radius: 5px; font-family: 'Geist Mono', monospace; font-size: 0.72rem; }
-  .rec-body { padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 8px; }
-  .rec-title { font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 1.15rem; line-height: 1.25; letter-spacing: -0.005em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .rec-meta { font-family: 'Geist Mono', monospace; font-size: 0.7rem; color: #9C9A85; letter-spacing: 0.05em; display: flex; flex-wrap: wrap; gap: 10px; }
-  .pill-mini { background: rgba(167,139,250,0.16); color: #6d4cc0; padding: 2px 8px; border-radius: 6px; font-family: 'Geist Mono', monospace; font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; }
+  /* A panel that states a fact instead of listing rows that cannot exist. Stacks under 560px so it
+     reads on a 360px phone with no horizontal scroll. */
+  .fact-panel { display: flex; gap: 16px; align-items: flex-start; background: #fff; border: 1px solid #E8E7DD; border-radius: 14px; padding: 20px; }
+  @media (max-width: 560px) { .fact-panel { flex-direction: column; gap: 12px; padding: 18px 16px; } }
+  .fact-icon { flex: 0 0 auto; width: 42px; height: 42px; border-radius: 11px; background: rgba(255,79,0,0.08); color: #FF4F00; display: grid; place-items: center; }
+  .fact-body { min-width: 0; }
+  .fact-body strong { display: block; font-family: 'Cormorant Garamond', serif; font-weight: 600; font-size: 1.3rem; letter-spacing: -0.01em; color: #0B0E14; margin-bottom: 8px; }
+  .fact-body p { margin: 0 0 10px; font-size: 0.92rem; line-height: 1.7; color: #3B3A30; }
+  .fact-body p:last-child { margin-bottom: 0; }
+  .fact-muted { color: #5E5D4F !important; font-size: 0.86rem !important; }
 
   /* Templates */
   .tpl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
@@ -251,7 +259,9 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
   .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border: 1px solid #E8E7DD; border-radius: 9px; background: #fff; cursor: pointer; }
   .toggle-row span { font-size: 0.86rem; color: #3B3A30; }
   .toggle-row input { transform: scale(1.1); accent-color: #FF4F00; }
+  .field-note { margin: 0 0 16px; font-size: 0.82rem; line-height: 1.6; color: #5E5D4F; background: #F6F6F2; border-radius: 9px; padding: 10px 12px; }
   .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 8px; padding-top: 16px; border-top: 1px solid #E8E7DD; }
+  @media (max-width: 560px) { .modal { padding: 22px 16px 24px; border-radius: 14px; } .modal-actions .btn { flex: 1 1 auto; } }
 
   /* Toast */
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #0B0E14; color: #FBFAF4; padding: 11px 18px; border-radius: 10px; font-family: 'Geist Mono', monospace; font-size: 0.82rem; letter-spacing: 0.05em; z-index: 200; display: none; }
@@ -268,7 +278,7 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
   <p class="eyebrow">Portal &middot; Video meetings</p>
   <h1 class="hero-title">Meet in <em>your platform.</em></h1>
   <p class="hero-sub">
-    Full-scale video conferencing built into your portal. Encrypted peer-to-peer media, in-browser recording, live captions, breakout spaces, and persistent room links. No external app, no install, no download.
+    Video conferencing built into your portal. Encrypted peer-to-peer media, live captions, breakout spaces, persistent room links, and recording that stays on your own device. No external app and nothing to install.
   </p>
 
   {blockReason && (
@@ -302,7 +312,7 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
         <svg class="icon-lg" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
       </div>
       <div class="quick-card-title">Join with code</div>
-      <div class="quick-card-blurb">Enter a 6-character room code shared with you.</div>
+      <div class="quick-card-blurb">Enter the room code somebody shared with you.</div>
     </button>
   </div>
 
@@ -381,44 +391,29 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
     ))}
   </div>
 
-  <!-- Past recordings -->
+  <!-- Recordings. No list, because there is nothing that could be in one — see the frontmatter. -->
   <div class="section-h">
-    <h2>Past recordings</h2>
-    <span class="count">{QUICK.recordingCount} on file</span>
+    <h2>Recordings</h2>
+    <span class="count">Saved on your device</span>
   </div>
 
-  {recordings.length === 0 ? (
-    <div class="empty">
-      <strong>No recordings yet.</strong>
-      When you record a meeting it lands here with a transcript and download.
+  <div class="fact-panel">
+    <div class="fact-icon" aria-hidden="true">
+      <svg class="icon-lg" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
     </div>
-  ) : (
-    <div class="rec-grid">
-      {recordings.map((r: any) => (
-        <a href={`/portal/meet/recording/${r.id}`} class="rec-card">
-          <div class="rec-thumb">
-            {r.thumbnail_url ? <img src={r.thumbnail_url} alt="" style="width:100%;height:100%;object-fit:cover;" /> : (
-              <svg viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-            )}
-            <div class="play-overlay">
-              <div class="play-overlay-btn">
-                <svg class="icon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-              </div>
-            </div>
-            <div class="rec-duration">{fmtDuration(r.duration_sec)}</div>
-          </div>
-          <div class="rec-body">
-            <div class="rec-title">{r.title || r.room_title || 'Untitled meeting'}</div>
-            <div class="rec-meta">
-              <span>{new Date(r.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' })}</span>
-              <span>{r.attendees_count || 0} attendees</span>
-            </div>
-            {r.transcript_available && <span class="pill-mini">Transcript ready</span>}
-          </div>
-        </a>
-      ))}
+    <div class="fact-body">
+      <strong>Recording saves to your own device.</strong>
+      <p>
+        When you start a recording in a room, your browser composes the meeting and writes the video
+        file straight to your downloads. It is not uploaded and this platform keeps no copy, so there
+        is no library here to browse and nothing of yours is stored on a server you do not control.
+      </p>
+      <p class="fact-muted">
+        Shared, searchable recordings with transcripts are not available yet. When they are, they will
+        appear in this panel.
+      </p>
     </div>
-  )}
+  </div>
 
 </main>
 
@@ -490,6 +485,16 @@ const QUICK = { upcomingCount: upcoming.length, recordingCount: recordings.lengt
         <label class="toggle-row"><span>Breakouts enabled</span><input type="checkbox" name="breakoutsEnabled" id="schBreak" /></label>
         <label class="toggle-row"><span>Attendees muted on entry</span><input type="checkbox" name="attendeeMuteDefault" id="schMute" /></label>
       </div>
+
+      {/* Said here, once, at the moment somebody is deciding. These four settings are STORED with the
+          meeting and shown to the host, and the room does not enforce them yet: the room's own Lock
+          control is what actually holds people, and recording is started by hand and saved to the
+          recorder's device. Leaving the passcode field looking like a door somebody has to open is
+          the same kind of lie as a recordings panel with nothing in it. */}
+      <p class="field-note">
+        These are saved with the meeting and shown to you as the host. The room does not enforce them
+        on entry yet — to keep people out, use the Lock control inside the room.
+      </p>
 
       <div class="modal-actions">
         <button type="button" class="btn btn-ghost" id="schCancel">Cancel</button>

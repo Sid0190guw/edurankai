@@ -614,7 +614,10 @@ export function ensureTaskSchema(): Promise<void> {
   // The key is v2 because the second pass adds tables and columns. A running process that already
   // ensured v1 is a process running the old code, so there is no version of this that skips the new
   // DDL and then queries it.
-  return ensureOnce('employee_tasks_v2', async () => {
+  // v3 because the third pass adds employee_tasks.project_id. A running process that already ensured
+  // v2 is a process running the old code, so there is no version of this that skips the new DDL and
+  // then queries it.
+  return ensureOnce('employee_tasks_v3', async () => {
     try {
       await ensureTaskTables();
     } catch (e: any) {
@@ -720,6 +723,41 @@ async function ensureTaskTables(): Promise<void> {
         ON employee_task_collaborators (task_id, user_id, role)`);
     } catch (e: any) {
       logFail('ensureTaskSchema collaborators unique index', e);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // THIRD PASS — THE PROJECT REFERENCE, AND WHY IT IS ONE COLUMN HERE RATHER THAN A TABLE THERE.
+    //
+    // src/lib/projects.ts needs "the tasks on this project". There were exactly two ways to give it
+    // one, and only one of them is safe:
+    //
+    //   A SECOND TASK TABLE, or a project_tasks join table with its own status column, would mean a
+    //   second set of transition rules, a second definition of who may assign work, and a second
+    //   answer to "may this person see this task" — three things that would start agreeing and end
+    //   up disagreeing. On this project two CREATE TABLE IF NOT EXISTS for one table with different
+    //   shapes already meant no encrypted message could be sent for four months.
+    //
+    //   ONE NULLABLE COLUMN ON THIS TABLE, declared HERE, in the module that owns the table. Every
+    //   task is still an employee_tasks row; TRANSITIONS, visibleToSql(), moveTask() and the whole
+    //   collaborator model apply to a project task exactly as they do to any other, because it IS
+    //   any other. A project is a label on the work, not a different kind of work.
+    //
+    // NO FOREIGN KEY to `projects`. This module must not assume another module's table exists — the
+    // same rule procurement.ts states about the asset register — and a task whose project row is
+    // deleted should lose its label, not vanish. listProjectTasks() reads it as text and a project
+    // that is gone simply matches nothing.
+    //
+    // NOTHING ABOVE THIS LINE NAMES project_id. myTasksView(), listMyTasks(), listTasksForTeam(),
+    // taskCounts(), listBoard(), getTaskView() and moveTask() are byte-for-byte unaffected: their
+    // column lists are explicit, so an added column is invisible to them. If this ALTER fails, the
+    // project surfaces fail closed and say so; every existing task surface keeps working.
+    // -------------------------------------------------------------------------------------------
+    try {
+      await db.execute(sql`ALTER TABLE employee_tasks ADD COLUMN IF NOT EXISTS project_id UUID`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS employee_tasks_project_idx
+        ON employee_tasks (project_id, status)`);
+    } catch (e: any) {
+      logFail('ensureTaskSchema project_id', e);
     }
 }
 
@@ -2126,6 +2164,336 @@ export async function removeCollaborator(
     return { ok: true };
   } catch (e: any) {
     logFail('removeCollaborator', e);
+    return { ok: false, error: WRITE_FAILED };
+  }
+}
+
+// =================================================================================================
+// PROJECT TASKS — ADDITIVE. Nothing above this line changes behaviour because of anything below it.
+// =================================================================================================
+//
+// A PROJECT TASK IS AN ORDINARY TASK WITH A LABEL ON IT. It is the same row in the same table, moved
+// by the same moveTask() through the same TRANSITIONS graph, read through the same visibleToSql(),
+// and commented on and staffed through the same collaborator model. The only thing project_id adds
+// is the answer to "which project is this for". Everything a project surface does to a task — accept
+// it, block it, review it, complete it — it does by calling the functions already above.
+//
+// WHAT IS DIFFERENT, AND IT IS EXACTLY ONE THING: WHO MAY PUT WORK ON SOMEBODY'S LIST.
+//
+// createTask() admits three assigners, re-derived from the target's own row: the person themselves,
+// their recorded reporting manager, and a department head scoped to that department. A PROJECT
+// MANAGER is none of those, and running a project without being able to hand out its work is not
+// running it. So createProjectTask() adds a FOURTH arm — and the shape of that arm is the point:
+//
+//   IT IS A RELATIONSHIP, RESOLVED PER ROW, FROM THE ORGANIZATION GRAPH. `project_manager` is a
+//   value of org_relationships.type, scoped to ONE project. It is never users.role, never a
+//   capability, and never a boolean the caller passes — a caller-supplied "I am the PM" flag would
+//   be the caller's claim about itself, which is precisely what the INSERT ... SELECT shape in this
+//   file exists to refuse. The edge is checked BY THE DATABASE, IN THE SAME STATEMENT AS THE WRITE,
+//   against the effective-dated row, so an edge closed a moment ago cannot be spent a moment later.
+//
+//   IT REACHES NO FURTHER THAN THE PROJECT. The clause requires scope_id = this project id, so
+//   running project A confers nothing at all on project B and nothing outside projects. That is the
+//   difference between a per-row relationship and a per-user grant, and it is the difference this
+//   whole architecture exists to keep.
+//
+// The one SQL fragment below is the only place in this module that reads org_relationships, and it
+// reads exactly the edge src/lib/org-graph.ts documents (isProjectManager / getManagedProjectIds
+// answer the same question in TypeScript, for surfaces that need it before a write).
+
+/**
+ * "This user runs that project", as an in-force graph edge, for use inside a write.
+ *
+ * Effective dating is checked here the same way org-graph.ts checks it: status active,
+ * effective_from at or before now, effective_to null or in the future. scope_id is TEXT and the
+ * project id is compared as text — org_relationships.scope_id holds department slugs too, and a
+ * ::uuid cast would throw the first time one arrives.
+ */
+const runsProjectSql = (viewerUserId: string, projectId: string): SQL => {
+  const v = String(viewerUserId || '').trim();
+  const p = String(projectId || '').trim();
+  if (!v || !p) return sql`false`;
+  return sql`EXISTS (
+    SELECT 1
+      FROM org_relationships r
+      JOIN hr_employees pe ON pe.id = r.subject_employee_id
+     WHERE r.type = 'project_manager'
+       AND r.scope_type = 'project'
+       AND r.scope_id = ${p}
+       AND r.status = 'active'
+       AND r.effective_from <= NOW()
+       AND (r.effective_to IS NULL OR r.effective_to > NOW())
+       AND pe.user_id::text = ${v})`;
+};
+
+/** A project task, as a board task plus the project it belongs to. */
+export interface ProjectBoardTask extends BoardTask {
+  projectId: string | null;
+}
+
+const mapProjectTask = (r: any): ProjectBoardTask => ({
+  ...mapBoardTask(r),
+  projectId: r.project_id ? String(r.project_id) : null,
+});
+
+/**
+ * THE TASKS ON ONE PROJECT THAT THIS VIEWER MAY SEE.
+ *
+ * Scoped by visibleToSql() exactly as the board is: being on a project does NOT hand somebody every
+ * task on it. They see the ones they are the assignee, the assigner, a collaborator or the
+ * department lead of — the same four routes, unwidened. A project manager sees the rest because the
+ * project surface asks with `includeAll` only after resolving that relationship from the graph, and
+ * that decision is made by src/lib/projects.ts, never claimed here.
+ *
+ * @param includeAll pass ONLY after org-graph has confirmed the viewer runs this project, or after a
+ *                   projects.view capability check. It widens the read to every task on the project.
+ */
+export async function listProjectTasks(
+  viewerUserId: string,
+  projectId: string,
+  opts: { includeAll?: boolean; includeArchived?: boolean; limit?: number } = {},
+): Promise<{ ok: boolean; reason: 'ok' | 'no-viewer' | 'lookup-failed'; tasks: ProjectBoardTask[] }> {
+  const viewer = String(viewerUserId || '').trim();
+  const project = String(projectId || '').trim();
+  if (!viewer || !project) return { ok: false, reason: 'no-viewer', tasks: [] };
+
+  try {
+    await ensureTaskSchema();
+    const scopeClause = opts.includeAll === true ? sql`true` : visibleToSql(viewer);
+    const archivedClause = opts.includeArchived === true ? sql`` : sql`AND ${CANON} <> 'archived'`;
+    const limit = Math.min(Math.max(Number(opts.limit) || 300, 1), 1000);
+
+    const list = rows(await db.execute(sql`
+      SELECT ${BOARD_TASK_COLUMNS}, t.project_id, ${VIEWER_ROLE_COLUMNS(viewer)}
+        FROM employee_tasks t
+       WHERE t.project_id::text = ${project}
+         AND ${scopeClause}
+         ${archivedClause}
+       ORDER BY (${CANON} IN (${statusList(CLOSED_STATUSES)})),
+                (t.due_on IS NULL), t.due_on ASC,
+                CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+                t.created_at DESC
+       LIMIT ${limit}`)).map(mapProjectTask);
+
+    return { ok: true, reason: 'ok', tasks: list };
+  } catch (e: any) {
+    logFail('listProjectTasks', e);
+    // ok:false, never an empty list presented as fact. "This project has no work on it" is a claim.
+    return { ok: false, reason: 'lookup-failed', tasks: [] };
+  }
+}
+
+/** Progress on one project's work, in the same buckets the rest of this module counts in. */
+export interface ProjectTaskProgress {
+  ok: boolean;
+  total: number;
+  open: number;
+  inProgress: number;
+  blocked: number;
+  completed: number;
+  overdue: number;
+  /** Completed as a percentage of everything not cancelled or archived. Null when there is nothing. */
+  percentComplete: number | null;
+}
+
+/**
+ * Counts for a project's whole task set, WITHOUT a per-row visibility filter — deliberately.
+ *
+ * This is an aggregate: it returns seven integers and no titles, no names and no descriptions. A
+ * member seeing "14 tasks, 9 done" for a project they are on discloses nothing about who is doing
+ * what, and a progress bar built only from the tasks one person can see would report a different
+ * completion figure to every member of the same project. Rows are never returned from here; the
+ * function that lists tasks is listProjectTasks(), which IS filtered.
+ */
+export async function projectTaskProgress(projectId: string): Promise<ProjectTaskProgress> {
+  const empty: ProjectTaskProgress = {
+    ok: false, total: 0, open: 0, inProgress: 0, blocked: 0, completed: 0, overdue: 0, percentComplete: null,
+  };
+  const project = String(projectId || '').trim();
+  if (!project) return empty;
+
+  try {
+    await ensureTaskSchema();
+    const r = rows(await db.execute(sql`
+      SELECT COUNT(*)::int AS total_count,
+             COUNT(*) FILTER (WHERE ${CANON} IN ('draft', 'assigned', 'accepted'))::int           AS open_count,
+             COUNT(*) FILTER (WHERE ${CANON} IN ('in_progress', 'under_review', 'approved'))::int AS in_progress_count,
+             COUNT(*) FILTER (WHERE ${CANON} = 'blocked')::int                                    AS blocked_count,
+             COUNT(*) FILTER (WHERE ${CANON} = 'completed')::int                                  AS done_count,
+             COUNT(*) FILTER (WHERE ${IS_OVERDUE})::int                                           AS overdue_count,
+             COUNT(*) FILTER (WHERE ${CANON} NOT IN ('cancelled', 'archived'))::int               AS counted
+        FROM employee_tasks t
+       WHERE t.project_id::text = ${project}`))[0];
+
+    if (!r) return empty;
+    const counted = Number(r.counted) || 0;
+    const done = Number(r.done_count) || 0;
+    return {
+      ok: true,
+      total: Number(r.total_count) || 0,
+      open: Number(r.open_count) || 0,
+      inProgress: Number(r.in_progress_count) || 0,
+      blocked: Number(r.blocked_count) || 0,
+      completed: done,
+      overdue: Number(r.overdue_count) || 0,
+      // Cancelled and archived work is excluded from BOTH sides. Counting a cancelled task as
+      // outstanding would make a finished project look unfinished forever; counting it as done would
+      // let a project be completed by cancelling everything on it.
+      percentComplete: counted > 0 ? Math.round((done / counted) * 100) : null,
+    };
+  } catch (e: any) {
+    logFail('projectTaskProgress', e);
+    return empty;
+  }
+}
+
+/**
+ * PUT WORK ON SOMEBODY'S LIST, FOR A PROJECT.
+ *
+ * Identical to createTask() in every respect except the fourth assigner arm and the project_id it
+ * writes. It is a separate function rather than an optional argument on createTask() so that the
+ * widened arm can only ever be reached by a caller that named a project: there is no value of any
+ * parameter to createTask() that turns the project-manager route on.
+ *
+ * The INSERT is still an INSERT ... SELECT. The right to assign is evaluated by the database, in the
+ * same statement, against the target's own row and the graph's own edge. Nothing the caller says
+ * about itself is believed, here or anywhere else in this file.
+ */
+export async function createProjectTask(input: {
+  projectId: string;
+  employeeId: string;
+  assignedByUserId: string;
+  title: string;
+  description?: string | null;
+  priority?: TaskPriority;
+  dueOn?: string | null;
+  scopeDepartmentId?: string | null;
+  status?: 'draft' | 'assigned';
+  ipAddress?: string | null;
+}): Promise<{ ok: boolean; id?: string; error?: string }> {
+  const title = (input.title || '').trim();
+  const assigner = String(input.assignedByUserId || '').trim();
+  const employeeId = String(input.employeeId || '').trim();
+  const projectId = String(input.projectId || '').trim();
+
+  if (title.length < 3) return { ok: false, error: 'Give the task a title.' };
+  if (!employeeId || !assigner || !projectId) return { ok: false, error: NOT_AVAILABLE };
+  if (!UUID_RE.test(assigner)) return { ok: false, error: NOT_AVAILABLE };
+  if (!UUID_RE.test(projectId)) return { ok: false, error: NOT_AVAILABLE };
+
+  const priority: TaskPriority = PRIORITIES.indexOf(input.priority as TaskPriority) >= 0
+    ? (input.priority as TaskPriority) : 'normal';
+  const status: TaskStatus = input.status === 'draft' ? 'draft' : 'assigned';
+
+  const dueRaw = String(input.dueOn || '').trim();
+  if (dueRaw && !/^\d{4}-\d{2}-\d{2}$/.test(dueRaw)) {
+    return { ok: false, error: 'Give the due date as YYYY-MM-DD, or leave it empty.' };
+  }
+  const dueOn = dueRaw || null;
+
+  const scope = String(input.scopeDepartmentId || '').trim();
+  const leadClause = scope ? sql`OR e.department_id::text = ${scope}` : sql``;
+
+  try {
+    await ensureTaskSchema();
+    const r = rows(await db.execute(sql`
+      INSERT INTO employee_tasks
+        (employee_id, assigned_by_user_id, title, description, priority, status, due_on, project_id)
+      SELECT e.id, ${assigner}::uuid, ${title.slice(0, 300)},
+             ${(input.description || '').trim().slice(0, 4000) || null},
+             ${priority}, ${status}, ${dueOn}::date, ${projectId}::uuid
+        FROM hr_employees e
+       WHERE e.id::text = ${employeeId}
+         AND e.is_active = true
+         AND (
+           e.user_id::text = ${assigner}
+           OR e.reporting_manager_id::text = ${assigner}
+           ${leadClause}
+           OR ${runsProjectSql(assigner, projectId)}
+         )
+      RETURNING id, employee_id`))[0];
+
+    if (!r?.id) return { ok: false, error: NOT_AVAILABLE };
+
+    await logAudit({
+      userId: assigner,
+      action: 'task.assign',
+      entity: 'employee_task',
+      entityId: String(r.id),
+      diff: { employeeId: r.employee_id, projectId, title: title.slice(0, 300), priority, dueOn, status },
+      ipAddress: input.ipAddress || undefined,
+    });
+
+    await seedCollaborators(String(r.id), String(r.employee_id), assigner);
+
+    return { ok: true, id: String(r.id) };
+  } catch (e: any) {
+    logFail('createProjectTask', e);
+    return { ok: false, error: WRITE_FAILED };
+  }
+}
+
+/**
+ * Move an EXISTING task onto a project, or off one (pass null).
+ *
+ * The authority is the same as any other change to the shape of a task — the assigner or the
+ * department lead (MANAGE) — or the project manager of the project it is being moved ONTO, checked
+ * in the same statement, against the graph. Somebody who runs project A cannot pull a task off
+ * project B, because the arm they qualify under only ever names the destination.
+ */
+export async function setTaskProject(
+  taskId: string,
+  actorUserId: string,
+  projectId: string | null,
+  opts: { ipAddress?: string | null } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const actor = String(actorUserId || '').trim();
+  const id = String(taskId || '').trim();
+  const project = projectId === null ? null : (String(projectId || '').trim() || null);
+
+  if (!actor || !id) return { ok: false, error: NOT_AVAILABLE };
+  if (project && !UUID_RE.test(project)) return { ok: false, error: NOT_AVAILABLE };
+
+  try {
+    await ensureTaskSchema();
+
+    const snap = await readTaskAccess(id, actor);
+    if (!snap) return { ok: false, error: NOT_AVAILABLE };
+
+    const manageSql = actorHasAnyRoleSql(actor, MANAGE);
+    const authority = project
+      ? sql`(${manageSql} OR ${runsProjectSql(actor, project)})`
+      : manageSql;
+
+    const updated = rows(await db.execute(sql`
+      UPDATE employee_tasks AS t
+         SET project_id = ${project}::uuid,
+             updated_at = NOW()
+       WHERE ${eq(sql`t.id`, id)}
+         AND ${authority}
+      RETURNING t.id`));
+
+    if (updated.length === 0) {
+      return {
+        ok: false,
+        error: project
+          ? 'Moving a task onto a project is for the person who assigned it, the department lead, or whoever runs that project.'
+          : 'Taking a task off a project is for the person who assigned it or the department lead.',
+      };
+    }
+
+    await logAudit({
+      userId: actor,
+      action: 'task.project.set',
+      entity: 'employee_task',
+      entityId: snap.id,
+      diff: { taskTitle: snap.title, employeeId: snap.employeeId, projectId: project, byRoles: snap.roles },
+      ipAddress: opts.ipAddress || undefined,
+    });
+
+    return { ok: true };
+  } catch (e: any) {
+    logFail('setTaskProject', e);
     return { ok: false, error: WRITE_FAILED };
   }
 }

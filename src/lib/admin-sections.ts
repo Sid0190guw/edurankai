@@ -38,6 +38,7 @@ export const ADMIN_SECTION_GROUPS: AdminSectionGroup[] = [
       { key: 'training', label: 'Training' },
       { key: 'helpdesk', label: 'Helpdesk', hint: 'IT, HR, Finance, Admin and asset-request tickets' },
       { key: 'assets', label: 'Asset Register', hint: 'Equipment and licences issued to employees' },
+      { key: 'projects', label: 'Projects', hint: 'Portfolio, milestones, resourcing and budget. Who RUNS a project is an org-graph relationship, never this key.' },
       { key: 'finance', label: 'Finance & Payments', hint: 'Razorpay, revenue, fees' },
     ],
   },

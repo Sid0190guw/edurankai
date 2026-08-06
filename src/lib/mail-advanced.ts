@@ -194,6 +194,40 @@ export async function recordClick(messageId: string, url: string, ip?: string, u
 
 // ---------- campaign analytics ----------
 // Opens come from mail_reads (the tracking pixel); clicks from mail_link_clicks.
+
+/**
+ * Open + click counts PER MESSAGE for a whole batch of messages, in exactly two statements.
+ *
+ * WHY THIS EXISTS. /admin/mail/analytics grouped up to 400 sends into up to 30 campaigns and then
+ * called campaignStats() once per campaign, sequentially — 60 round-trips in a single page render,
+ * each one waiting on the last. Every number that loop produced is a sum over per-message counts,
+ * so the two GROUP BY message_id reads below carry all of it and the roll-up happens in memory:
+ * 60 statements become 2, whatever the campaign count is. Both tables are already indexed on
+ * message_id (mail_reads_msg_idx in mail.ts, mail_click_msg_idx above).
+ *
+ * Maps are keyed by message id and a message with no opens/clicks is simply ABSENT — which is what
+ * makes "how many messages in this campaign were opened" the count of keys present, with no second
+ * DISTINCT query.
+ *
+ * `= ANY(${ids})` is the parameter form campaignStats() below and the recipient/delivery reads on
+ * that page already use. It is kept rather than "improved": this is a performance repair, and
+ * changing how the array binds would be an unverified behaviour change riding along with it.
+ */
+export async function campaignStatsByMessage(messageIds: string[]): Promise<{ opens: Record<string, number>; clicks: Record<string, number> }> {
+  await ensureMailAdvancedSchema();
+  const ids = (messageIds || []).filter((x) => typeof x === 'string' && x.length > 0);
+  const opens: Record<string, number> = {};
+  const clicks: Record<string, number> = {};
+  if (!ids.length) return { opens, clicks };
+  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_reads WHERE message_id = ANY(${ids}) GROUP BY message_id`).catch(() => [] as any))) {
+    opens[String(r.message_id)] = Number(r.c) || 0;
+  }
+  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_link_clicks WHERE message_id = ANY(${ids}) GROUP BY message_id`).catch(() => [] as any))) {
+    clicks[String(r.message_id)] = Number(r.c) || 0;
+  }
+  return { opens, clicks };
+}
+
 export async function campaignStats(messageIds: string[]): Promise<{ opens: number; clicks: number; openedMsgs: number; clickedMsgs: number }> {
   await ensureMailAdvancedSchema();
   if (!messageIds.length) return { opens: 0, clicks: 0, openedMsgs: 0, clickedMsgs: 0 };

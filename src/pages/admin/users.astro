@@ -7,7 +7,7 @@ import { can, ROLE_LABELS, DEPARTMENT_SCOPED_ROLES } from '@/lib/auth/permission
 import { hashPassword } from '@/lib/auth/password';
 import { sendEmail, brandedEmail } from '@/lib/email';
 import { logAudit } from '@/lib/audit';
-import { asc, eq, desc } from 'drizzle-orm';
+import { asc, eq, desc, inArray } from 'drizzle-orm';
 import { sql } from 'drizzle-orm';
 
 const currentUser = Astro.locals.user!;
@@ -258,31 +258,69 @@ try {
   await db.execute(sql`UPDATE users SET access_status = 'approved', updated_at = NOW() WHERE access_status = 'pending' AND role = 'applicant'`);
 } catch (_) {}
 
-const allUsers = await db.select().from(users).orderBy(desc(users.createdAt));
+// EVERY ROW OF `users` USED TO BE LOADED TWICE PER PAGE VIEW, THEN FILTERED IN JAVASCRIPT.
+//
+//   1. `db.select().from(users)` — SELECT * , every column, every row, no cap.
+//   2. a second full scan for access_status / waiver / photo, whose only use is a per-row lookup.
+//
+// Applicants share this table with staff, so it is the largest people table on the deployment and
+// it grows with every signup — the two scans get slower forever. The filter tabs and the five
+// counters were then computed by walking the whole array in memory, so an "Admins" view costing one
+// bounded query instead pulled every applicant across the wire to throw them away.
+//
+// Now: the counters are ONE aggregate that transfers five integers, the list is filtered and capped
+// IN SQL, and the raw access columns are read only for the rows actually on screen.
+const PAGE_CAP = 250;
 
-// Access status + waiver fields live on raw columns (not in the Drizzle model).
-const accessRowsRaw = await db.execute(sql`SELECT id, access_status, waiver_requested, waiver_reason, waiver_proof_url, photo_url FROM users`);
-const accessRows = Array.isArray(accessRowsRaw) ? accessRowsRaw : (accessRowsRaw?.rows || []);
+// The counters. COUNT(*) FILTER does all five in one pass, and access_status is read here rather
+// than reconstructed from a row array. The whole thing is guarded because access_status is a raw
+// column outside the Drizzle model — the UPDATE above is guarded for the same reason — and a header
+// of zeroes is a better failure than a page that will not render.
+const counts = { admins: 0, applicants: 0, inactive: 0, pending: 0, total: 0 };
+try {
+  const cRaw = await db.execute(sql`
+    SELECT COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE role <> 'applicant')::int AS admins,
+           COUNT(*) FILTER (WHERE role = 'applicant')::int AS applicants,
+           COUNT(*) FILTER (WHERE is_active = false)::int AS inactive,
+           COUNT(*) FILTER (WHERE COALESCE(access_status, 'approved') = 'pending')::int AS pending
+      FROM users`);
+  const cRows = Array.isArray(cRaw) ? cRaw : ((cRaw as any)?.rows || []);
+  Object.assign(counts, (cRows[0] as any) || {});
+} catch (e: any) {
+  console.error('[admin/users] counts', e?.cause?.message || e?.message);
+}
+
+// The list. One filter clause, applied in SQL, capped. 'all' keeps its previous meaning (no filter).
+const filterCond =
+  filter === 'admins' ? sql`role <> 'applicant'` :
+  filter === 'applicants' ? sql`role = 'applicant'` :
+  filter === 'inactive' ? sql`is_active = false` :
+  filter === 'pending' ? sql`COALESCE(access_status, 'approved') = 'pending'` :
+  sql`true`;
+const filteredUsers = await db.select().from(users)
+  .where(filterCond)
+  .orderBy(desc(users.createdAt))
+  .limit(PAGE_CAP);
+
+// Access status + waiver fields live on raw columns (not in the Drizzle model) — read for the rows
+// on screen only. `pageIds` is also what narrows the custom-role assignment read further down.
+const pageIds = filteredUsers.map(u => u.id);
 const accessMap: Record<string, any> = {};
-for (const a of (accessRows as any[])) accessMap[a.id] = a;
-const isPending = (uid: string) => (accessMap[uid]?.access_status || 'approved') === 'pending';
-
-let filteredUsers = allUsers;
-if (filter === 'admins') filteredUsers = allUsers.filter(u => u.role !== 'applicant');
-else if (filter === 'applicants') filteredUsers = allUsers.filter(u => u.role === 'applicant');
-else if (filter === 'inactive') filteredUsers = allUsers.filter(u => !u.isActive);
-else if (filter === 'pending') filteredUsers = allUsers.filter(u => isPending(u.id));
+if (pageIds.length > 0) {
+  try {
+    const accessRowsRaw = await db.execute(sql`
+      SELECT id, access_status, waiver_requested, waiver_reason, waiver_proof_url, photo_url
+        FROM users WHERE ${inArray(users.id, pageIds)}`);
+    const accessRows = Array.isArray(accessRowsRaw) ? accessRowsRaw : ((accessRowsRaw as any)?.rows || []);
+    for (const a of (accessRows as any[])) accessMap[a.id] = a;
+  } catch (e: any) {
+    console.error('[admin/users] access columns', e?.cause?.message || e?.message);
+  }
+}
 
 const allDepts = await db.select().from(departments).orderBy(asc(departments.sortOrder));
 const deptMap = Object.fromEntries(allDepts.map(d => [d.id, d.name]));
-
-const counts = {
-  admins: allUsers.filter(u => u.role !== 'applicant').length,
-  applicants: allUsers.filter(u => u.role === 'applicant').length,
-  inactive: allUsers.filter(u => !u.isActive).length,
-  pending: allUsers.filter(u => isPending(u.id)).length,
-  total: allUsers.length
-};
 
 const ROLES_AVAILABLE = Object.keys(ROLE_LABELS).filter(r => r !== 'applicant');
 
@@ -291,7 +329,12 @@ let customRoles: { id: string; name: string; color: string | null }[] = [];
 const userRolesMap: Record<string, string[]> = {};
 try {
   customRoles = await db.select({ id: teamRoles.id, name: teamRoles.name, color: teamRoles.color }).from(teamRoles).orderBy(asc(teamRoles.name));
-  const assignRows = await db.select({ userId: userRoleAssignments.userId, roleId: userRoleAssignments.roleId }).from(userRoleAssignments);
+  // Narrowed to the rows on screen. This read had no WHERE clause at all: every assignment for
+  // every account, to answer a question asked only about the users in the table below.
+  const assignRows = pageIds.length > 0
+    ? await db.select({ userId: userRoleAssignments.userId, roleId: userRoleAssignments.roleId })
+        .from(userRoleAssignments).where(inArray(userRoleAssignments.userId, pageIds))
+    : [];
   for (const a of assignRows) { (userRolesMap[a.userId] ||= []).push(a.roleId); }
 } catch (e) {}
 ---
@@ -493,6 +536,9 @@ try {
             })}
             {filteredUsers.length === 0 && (
               <tr><td colspan="5" style="text-align:center;padding:30px;color:#6e6e78;font-size:13px;">No users in this view.</td></tr>
+            )}
+            {filteredUsers.length >= PAGE_CAP && (
+              <tr><td colspan="5" style="padding:14px 12px;color:#a0a0ab;font-size:11.5px;line-height:1.6;">Showing the {PAGE_CAP} most recently created accounts in this view. The counts above are over every account; use the tabs to narrow the view.</td></tr>
             )}
           </tbody>
         </table>

@@ -409,6 +409,41 @@ const isIsoDate = (v: unknown): v is string =>
 
 export type MoveState = 'pending' | 'approved' | 'rejected' | 'applied' | 'halted' | 'cancelled';
 
+/**
+ * WHAT KIND OF DESIGNATION CHANGE THIS IS — and why all three share ONE table.
+ *
+ * A promotion, a demotion and a sideways change of title are the SAME MECHANICAL ACT: an
+ * effective-dated change to designation and grade on the employee record, approved by the reporting
+ * manager and then the department head. They differ in what they MEAN, not in what they do.
+ *
+ * So there is one hr_promotions table with a `kind` column and one approval chain, rather than a
+ * second table and a second chain for demotions. Two tables would be two apply paths, and the second
+ * one written would be the one that forgets to snapshot the previous designation — at which point a
+ * demoted person's record would say they had always held the lower title.
+ *
+ * The WORD still matters and is recorded, because "promotion" on an audit trail where a demotion
+ * happened is a lie the record tells about somebody for the rest of their career. Nothing infers the
+ * kind from whether a grade string sorts lower; a human states it.
+ *
+ * NOTE that a demotion does NOT change who somebody reports to, exactly as a promotion does not. A
+ * change that also moves the reporting line is a transfer, raised separately, because the two are
+ * approved by different chains.
+ */
+export const DESIGNATION_CHANGE_KINDS = [
+  { key: 'promotion', label: 'Promotion', note: 'A move up in designation, grade, or both.' },
+  { key: 'demotion', label: 'Demotion', note: 'A move down. Recorded as such, never dressed up as a re-designation.' },
+  { key: 'designation_change', label: 'Designation change', note: 'A change of title at the same level.' },
+] as const;
+
+export type DesignationChangeKind = (typeof DESIGNATION_CHANGE_KINDS)[number]['key'];
+
+const DESIGNATION_CHANGE_KEYS = new Set<string>(DESIGNATION_CHANGE_KINDS.map((k) => k.key));
+
+export function designationChangeLabel(key: string): string {
+  for (const k of DESIGNATION_CHANGE_KINDS) if (k.key === key) return k.label;
+  return 'Designation change';
+}
+
 export interface MoveResult {
   ok: boolean;
   id?: string;
@@ -480,6 +515,13 @@ export function ensureMoveSchema(): Promise<void> {
         ON hr_promotions(state, created_at DESC)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_promotions_emp_idx
         ON hr_promotions(employee_id, created_at DESC)`);
+
+      // KIND. Its own ADD COLUMN statement, additive and defaulted, so every row written before this
+      // existed reads as the promotion it was recorded as — not as an unknown, and not as a blank
+      // that a screen would have to guess at. See DESIGNATION_CHANGE_KINDS for why demotions live in
+      // this table rather than a second one.
+      await db.execute(sql`ALTER TABLE hr_promotions
+        ADD COLUMN IF NOT EXISTS kind VARCHAR(30) NOT NULL DEFAULT 'promotion'`);
     } catch (e: any) {
       logMoveFail('ensureMoveSchema', e);
       throw e; // ensureOnce drops the failed run so the next call retries. See workflow-schema.ts.
@@ -570,6 +612,8 @@ export interface PromotionRow {
   id: string;
   employeeId: string;
   employeeName: string | null;
+  /** promotion | demotion | designation_change. See DESIGNATION_CHANGE_KINDS. */
+  kind: string;
   fromDesignation: string | null;
   toDesignation: string;
   fromGrade: string | null;
@@ -588,6 +632,7 @@ function mapPromotion(r: any): PromotionRow {
     id: String(r?.id ?? ''),
     employeeId: String(r?.employee_id ?? ''),
     employeeName: r?.employee_name ? String(r.employee_name) : null,
+    kind: DESIGNATION_CHANGE_KEYS.has(String(r?.kind)) ? String(r.kind) : 'promotion',
     fromDesignation: r?.from_designation ? String(r.from_designation) : null,
     toDesignation: String(r?.to_designation ?? ''),
     fromGrade: r?.from_grade ? String(r.from_grade) : null,
@@ -776,24 +821,54 @@ export interface PromotionInput {
   effectiveDate: string;
   reason: string;
   requestedByUserId?: string | null;
+  /**
+   * promotion | demotion | designation_change. Defaults to 'promotion' so every existing caller
+   * keeps working unchanged — this parameter was added, not substituted.
+   */
+  kind?: string | null;
 }
 
-/** Ask for a designation and/or grade change. WRITES A REQUEST. CHANGES NOBODY'S TITLE. */
+/**
+ * Ask for a designation and/or grade change — up, down, or sideways. WRITES A REQUEST. CHANGES
+ * NOBODY'S TITLE.
+ *
+ * ONE FUNCTION FOR ALL THREE, deliberately: a separate requestDemotion() would be a second place the
+ * previous designation could fail to be snapshotted, and it is the demotion case where losing that
+ * snapshot does real harm to a person's record. The three differ only in the WORD recorded against
+ * them, and a human states that word — nothing here infers a demotion from whether a grade string
+ * happens to sort lower, because grade strings in this product are free text.
+ */
 export async function requestPromotion(input: PromotionInput): Promise<MoveResult> {
   const employeeId = String(input?.employeeId || '').trim();
-  if (!isMoveUuid(employeeId)) return { ok: false, error: 'Choose the person being promoted.' };
+  if (!isMoveUuid(employeeId)) return { ok: false, error: 'Choose the person this is for.' };
+
+  const kind = DESIGNATION_CHANGE_KEYS.has(String(input?.kind || 'promotion'))
+    ? String(input?.kind || 'promotion')
+    : '';
+  if (!kind) {
+    return { ok: false, error: 'Say whether this is a promotion, a demotion or a change of title at the same level. The record carries that word for the rest of somebody\'s career.' };
+  }
+  const kindWord = designationChangeLabel(kind).toLowerCase();
 
   const toDesignation = String(input?.toDesignation || '').trim().slice(0, 200);
-  if (!toDesignation) return { ok: false, error: 'A promotion needs the new designation.' };
+  if (!toDesignation) return { ok: false, error: 'A ' + kindWord + ' needs the new designation.' };
 
   const toGrade = input?.toGrade ? String(input.toGrade).trim().slice(0, 40) : null;
 
   const effective = String(input?.effectiveDate || '').trim();
-  if (!isIsoDate(effective)) return { ok: false, error: 'A promotion needs the date it takes effect.' };
+  if (!isIsoDate(effective)) return { ok: false, error: 'A ' + kindWord + ' needs the date it takes effect.' };
 
   const reason = String(input?.reason || '').trim();
   if (reason.length < 5) {
-    return { ok: false, error: 'Write the reason for this promotion — an approver reads it before deciding.' };
+    return { ok: false, error: 'Write the reason for this ' + kindWord + ' — an approver reads it before deciding.' };
+  }
+  // A DEMOTION NEEDS MORE THAN FIVE WORDS. It is the change most likely to be contested afterwards,
+  // and the reason on the row is the whole of what the record will be able to say about why.
+  if (kind === 'demotion' && reason.length < 20) {
+    return {
+      ok: false,
+      error: 'Write the reason for this demotion in full. It is the only account the record will carry of why somebody was moved down, and one line is not enough.',
+    };
   }
 
   const requestedBy = isMoveUuid(input?.requestedByUserId) ? String(input.requestedByUserId) : null;
@@ -807,7 +882,7 @@ export async function requestPromotion(input: PromotionInput): Promise<MoveResul
     if (!empRows.length) return { ok: false, error: 'That employee record could not be found.' };
     const emp = empRows[0] as any;
     if (emp.is_active === false) {
-      return { ok: false, error: 'That employee record is closed. A person who has left cannot be promoted.' };
+      return { ok: false, error: 'That employee record is closed. A person who has left cannot have their designation changed.' };
     }
 
     const sameTitle = String(emp.designation || '').trim() === toDesignation;
@@ -816,32 +891,42 @@ export async function requestPromotion(input: PromotionInput): Promise<MoveResul
       return { ok: false, error: 'That is the designation and grade this person already holds.' };
     }
 
+    // ONE OPEN CHANGE AT A TIME, ACROSS ALL THREE KINDS. A pending promotion and a pending demotion
+    // over one person would both apply and the last writer would win silently.
     const openAlready = rows(await db.execute(sql`
-      SELECT id FROM hr_promotions
+      SELECT id, kind FROM hr_promotions
        WHERE employee_id = ${employeeId}::uuid AND state IN ('pending', 'halted', 'approved') LIMIT 1`));
     if (openAlready.length) {
-      return { ok: false, error: 'A promotion for this person is already in progress. Settle that one first.' };
+      return {
+        ok: false,
+        error: 'A ' + designationChangeLabel(String((openAlready[0] as any).kind || 'promotion')).toLowerCase()
+          + ' for this person is already in progress. Settle that one first.',
+      };
     }
 
     const ins = rows(await db.execute(sql`
       INSERT INTO hr_promotions
-        (employee_id, from_designation, to_designation, from_grade, to_grade,
+        (employee_id, kind, from_designation, to_designation, from_grade, to_grade,
          effective_date, reason, state, requested_by_user_id)
       VALUES
-        (${employeeId}::uuid, ${emp.designation || null}::text, ${toDesignation},
+        (${employeeId}::uuid, ${kind}, ${emp.designation || null}::text, ${toDesignation},
          ${emp.grade || null}::text, ${toGrade}::text, ${effective}::date, ${reason},
          'pending', ${requestedBy}::uuid)
       RETURNING id`));
-    if (!ins.length) return { ok: false, error: 'The promotion request was not saved. Nothing was changed.' };
+    if (!ins.length) return { ok: false, error: 'The request was not saved. Nothing was changed.' };
     const promotionId = String(ins[0].id);
 
+    // THE SAME 'promotion' DOMAIN FOR ALL THREE. The chain that decides a change of designation and
+    // grade is the same chain whichever direction the change goes in, and forking it would create a
+    // second answer to "who signs off what somebody is called".
     const wf = await startWorkflow({
       domain: 'promotion',
       recordId: promotionId,
       subjectEmployeeId: employeeId,
       requestedByUserId: requestedBy,
       createdByUserId: requestedBy,
-      summary: 'Promotion for ' + (emp.full_name || 'an employee') + ' to ' + toDesignation,
+      summary: designationChangeLabel(kind) + ' for ' + (emp.full_name || 'an employee')
+        + ' to ' + toDesignation,
     });
 
     if (!wf.ok) {
@@ -863,11 +948,11 @@ export async function requestPromotion(input: PromotionInput): Promise<MoveResul
 
     await logAudit({
       userId: requestedBy,
-      action: 'promotion.requested',
+      action: kind + '.requested',
       entity: 'hr_promotion',
       entityId: promotionId,
       diff: {
-        employeeId, fromDesignation: emp.designation || null, toDesignation,
+        employeeId, kind, fromDesignation: emp.designation || null, toDesignation,
         fromGrade: emp.grade || null, toGrade, effectiveDate: effective,
         workflowInstanceId: wf.instanceId || null, state: halted ? 'halted' : 'pending',
         haltReason: wf.haltReason || null,
@@ -877,7 +962,7 @@ export async function requestPromotion(input: PromotionInput): Promise<MoveResul
     return { ok: true, id: promotionId, changed: true, haltReason: wf.haltReason || null };
   } catch (e: any) {
     logMoveFail('requestPromotion', e);
-    return { ok: false, error: 'The promotion request was not saved: ' + reasonOf(e) };
+    return { ok: false, error: 'The request was not saved: ' + reasonOf(e) };
   }
 }
 
@@ -1162,11 +1247,14 @@ async function applyApprovedPromotion(p: PromotionRow, actorUserId: string | nul
 
     await logAudit({
       userId: actorUserId,
-      action: 'promotion.applied',
+      // The WORD is preserved onto the applied entry too. An audit trail that records every
+      // designation change as "promotion.applied" is a record that lies about what happened to
+      // somebody, and it is the demotion case where that matters.
+      action: (p.kind || 'promotion') + '.applied',
       entity: 'hr_promotion',
       entityId: p.id,
       diff: {
-        employeeId: p.employeeId, effectiveDate: p.effectiveDate,
+        employeeId: p.employeeId, kind: p.kind, effectiveDate: p.effectiveDate,
         from: { designation: p.fromDesignation, grade: p.fromGrade },
         to: { designation: p.toDesignation, grade: p.toGrade },
         workflowInstanceId: p.workflowInstanceId,
@@ -1177,5 +1265,535 @@ async function applyApprovedPromotion(p: PromotionRow, actorUserId: string | nul
   } catch (e: any) {
     logMoveFail('applyApprovedPromotion', e);
     return { ok: false, error: 'The promotion could not be applied: ' + reasonOf(e) };
+  }
+}
+
+// =================================================================================================
+// PROBATION OUTCOMES — CONFIRM, EXTEND, TERMINATE, WITH AN APPROVAL BEHIND EACH
+// =================================================================================================
+//
+// WHAT WAS MISSING, AND WHY IT MATTERED. hr_probation and its 30/60/90 reviews have existed here
+// since the lifecycle manual work, and confirmEmployee(), extendProbation() and
+// terminateOnProbation() have existed alongside them — as DIRECT WRITES. Anybody who could reach the
+// employee console could confirm a person, extend their probation, or end their employment during
+// it, and the only record of the decision was the row it changed.
+//
+// Confirming somebody is the moment they stop being provisional; terminating on probation is the
+// moment they lose their job with the shortest notice this product ever records. Neither of those is
+// a field edit. Both are now REQUESTS, routed by src/lib/workflow.ts on the 'confirmation' domain,
+// and applied only once that engine says 'approved'.
+//
+// THE THREE EXISTING FUNCTIONS ARE NOT REPLACED AND NOT DEPRECATED — they are what APPLY calls once
+// the decision exists. That is deliberate: rewriting the apply logic here would be a second writer
+// of hr_probation and of hr_employees.confirmation_date, and the second writer is the one that
+// forgets to bring the employee record into step. This layer decides WHETHER; those functions do
+// WHAT, exactly as they already did.
+//
+// NOTHING AUTO-CONFIRMS ON A DATE. A probation whose end date has passed with no decision stays
+// visibly open, and the console lists it as overdue. An automatic confirmation is a confirmation
+// nobody made, and an automatic termination does not bear thinking about.
+
+/** The three ways a probation can end. A human states which; nothing is inferred from a rating. */
+export const PROBATION_OUTCOMES = [
+  { key: 'confirm', label: 'Confirm', note: 'The person is confirmed in post. Probation ends.' },
+  { key: 'extend', label: 'Extend', note: 'Probation runs on for a further period, with a stated reason.' },
+  { key: 'terminate', label: 'End employment', note: 'Employment ends during probation. The reason is on the record.' },
+] as const;
+
+export type ProbationOutcome = (typeof PROBATION_OUTCOMES)[number]['key'];
+
+const PROBATION_OUTCOME_KEYS = new Set<string>(PROBATION_OUTCOMES.map((o) => o.key));
+
+export function probationOutcomeLabel(key: string): string {
+  for (const o of PROBATION_OUTCOMES) if (o.key === key) return o.label;
+  return String(key || 'Decision');
+}
+
+const MAX_PROBATION_EXTENSION_MONTHS = 6;
+
+/**
+ * The decision table. Its OWN ensureOnce guard, separate from ensureLifecycleSchema() above, for the
+ * same reason ensureMoveSchema() has one: that function predates this work and is awaited by several
+ * existing surfaces, so a failure in new DDL hung off it would silently disable the probation and
+ * PIP consoles too.
+ */
+export function ensureProbationDecisionSchema(): Promise<void> {
+  return ensureOnce('hr_probation_decisions_v1', async () => {
+    try {
+      // hr_probation MUST exist before a table can reference it. Awaited rather than assumed: on a
+      // fresh database the reference would otherwise fail, this guard would re-throw, and the console
+      // would read as permanently empty for a reason nothing on screen could explain.
+      await ensureLifecycleSchema();
+
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_probation_decisions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        probation_id UUID NOT NULL REFERENCES hr_probation(id) ON DELETE CASCADE,
+        employee_id UUID NOT NULL,
+        outcome VARCHAR(20) NOT NULL,
+        extend_months INT,
+        effective_date DATE NOT NULL,
+        reason TEXT NOT NULL,
+        letter_url TEXT,
+        state VARCHAR(20) NOT NULL DEFAULT 'pending',
+        halt_reason TEXT,
+        workflow_instance_id UUID,
+        requested_by_user_id UUID,
+        applied_at TIMESTAMPTZ,
+        applied_by_user_id UUID,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_prob_decisions_state_idx
+        ON hr_probation_decisions(state, created_at DESC)`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_prob_decisions_prob_idx
+        ON hr_probation_decisions(probation_id, created_at DESC)`);
+    } catch (e: any) {
+      logMoveFail('ensureProbationDecisionSchema', e);
+      throw e; // ensureOnce drops the failed run so the next call retries.
+    }
+  });
+}
+
+export interface ProbationRow {
+  id: string;
+  employeeId: string;
+  employeeName: string | null;
+  employeeCode: string | null;
+  startDate: string | null;
+  scheduledEndDate: string | null;
+  extendedToDate: string | null;
+  /** The date the probation actually runs to — the extension where there is one. */
+  endsOn: string | null;
+  durationMonths: number;
+  status: string;
+  extensionCount: number;
+  /** Negative when the end date has already passed with no decision recorded. */
+  daysRemaining: number | null;
+  overdue: boolean;
+  /** True when a decision on this probation is already routed and waiting. */
+  decisionInProgress: boolean;
+}
+
+/**
+ * Probations that are still running, with the date each one is due and whether it is overdue.
+ *
+ * OVERDUE IS COMPUTED, NEVER ACTED ON. The list says a probation ended three weeks ago and nobody
+ * decided anything; it does not decide anything itself. See the header.
+ */
+export async function listOpenProbations(limit = 200): Promise<ProbationRow[]> {
+  const lim = Math.min(Math.max(Number(limit) || 200, 1), 400);
+  try {
+    await ensureLifecycleSchema();
+    await ensureProbationDecisionSchema();
+    const r = await db.execute(sql`
+      SELECT p.*, e.full_name AS employee_name, e.employee_code AS employee_code,
+             EXISTS (
+               SELECT 1 FROM hr_probation_decisions d
+                WHERE d.probation_id = p.id AND d.state IN ('pending', 'halted', 'approved')
+             ) AS decision_in_progress
+        FROM hr_probation p
+        LEFT JOIN hr_employees e ON e.id = p.employee_id
+       WHERE p.status IN ('active', 'extended')
+       ORDER BY COALESCE(p.extended_to_date, p.scheduled_end_date) ASC
+       LIMIT ${lim}`);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return rows(r).map((x: any) => {
+      const endsOn = x.extended_to_date
+        ? String(x.extended_to_date).slice(0, 10)
+        : (x.scheduled_end_date ? String(x.scheduled_end_date).slice(0, 10) : null);
+      let daysRemaining: number | null = null;
+      if (endsOn) {
+        const end = new Date(endsOn + 'T00:00:00');
+        if (!isNaN(end.getTime())) {
+          daysRemaining = Math.round((end.getTime() - today.getTime()) / 86400000);
+        }
+      }
+      return {
+        id: String(x.id),
+        employeeId: String(x.employee_id),
+        employeeName: x.employee_name ? String(x.employee_name) : null,
+        employeeCode: x.employee_code ? String(x.employee_code) : null,
+        startDate: x.start_date ? String(x.start_date).slice(0, 10) : null,
+        scheduledEndDate: x.scheduled_end_date ? String(x.scheduled_end_date).slice(0, 10) : null,
+        extendedToDate: x.extended_to_date ? String(x.extended_to_date).slice(0, 10) : null,
+        endsOn,
+        durationMonths: Number(x.duration_months) || 0,
+        status: String(x.status || 'active'),
+        extensionCount: Number(x.extension_count) || 0,
+        daysRemaining,
+        overdue: daysRemaining !== null && daysRemaining < 0,
+        decisionInProgress: x.decision_in_progress === true,
+      };
+    });
+  } catch (e: any) {
+    logMoveFail('listOpenProbations', e);
+    return [];
+  }
+}
+
+export interface ProbationDecisionRow {
+  id: string;
+  probationId: string;
+  employeeId: string;
+  employeeName: string | null;
+  outcome: string;
+  extendMonths: number | null;
+  effectiveDate: string | null;
+  reason: string;
+  letterUrl: string | null;
+  state: string;
+  haltReason: string | null;
+  workflowInstanceId: string | null;
+  appliedAt: string | null;
+  createdAt: string | null;
+}
+
+function mapProbationDecision(r: any): ProbationDecisionRow {
+  return {
+    id: String(r?.id ?? ''),
+    probationId: String(r?.probation_id ?? ''),
+    employeeId: String(r?.employee_id ?? ''),
+    employeeName: r?.employee_name ? String(r.employee_name) : null,
+    outcome: String(r?.outcome ?? ''),
+    extendMonths: r?.extend_months === null || r?.extend_months === undefined ? null : Number(r.extend_months),
+    effectiveDate: r?.effective_date ? String(r.effective_date).slice(0, 10) : null,
+    reason: String(r?.reason ?? ''),
+    letterUrl: r?.letter_url ? String(r.letter_url) : null,
+    state: String(r?.state ?? 'pending'),
+    haltReason: r?.halt_reason ? String(r.halt_reason) : null,
+    workflowInstanceId: r?.workflow_instance_id ? String(r.workflow_instance_id) : null,
+    appliedAt: r?.applied_at ? new Date(r.applied_at).toISOString() : null,
+    createdAt: r?.created_at ? new Date(r.created_at).toISOString() : null,
+  };
+}
+
+/** Probation decisions, open ones first. Fails closed to an empty list. */
+export async function listProbationDecisions(
+  opts: { state?: string; employeeId?: string; limit?: number } = {},
+): Promise<ProbationDecisionRow[]> {
+  const limit = Math.min(Math.max(Number(opts.limit) || 150, 1), 400);
+  try {
+    await ensureProbationDecisionSchema();
+    const stateFilter = opts.state ? sql`AND d.state = ${String(opts.state)}` : sql``;
+    const empFilter = isMoveUuid(opts.employeeId)
+      ? sql`AND d.employee_id = ${String(opts.employeeId)}::uuid`
+      : sql``;
+    const r = await db.execute(sql`
+      SELECT d.*, e.full_name AS employee_name
+        FROM hr_probation_decisions d
+        LEFT JOIN hr_employees e ON e.id = d.employee_id
+       WHERE TRUE ${stateFilter} ${empFilter}
+       ORDER BY (d.state IN ('pending', 'halted')) DESC, d.created_at DESC
+       LIMIT ${limit}`);
+    return rows(r).map(mapProbationDecision);
+  } catch (e: any) {
+    logMoveFail('listProbationDecisions', e);
+    return [];
+  }
+}
+
+export interface ProbationDecisionInput {
+  probationId: string;
+  outcome: string;
+  extendMonths?: number | null;
+  effectiveDate: string;
+  reason: string;
+  /** Google Drive link to the confirmation or termination letter. A LINK — nothing is uploaded here. */
+  letterUrl?: string | null;
+  requestedByUserId?: string | null;
+}
+
+/**
+ * Ask for a probation to be confirmed, extended, or ended. WRITES A REQUEST. CONFIRMS NOBODY.
+ *
+ * The letter is a LINK, never an upload, by the standing rule in this codebase: documents of any
+ * kind are links, and the only stored upload anywhere here is a small profile photo.
+ */
+export async function requestProbationDecision(input: ProbationDecisionInput): Promise<MoveResult> {
+  const probationId = String(input?.probationId || '').trim();
+  if (!isMoveUuid(probationId)) return { ok: false, error: 'That probation could not be identified.' };
+
+  const outcome = PROBATION_OUTCOME_KEYS.has(String(input?.outcome)) ? String(input.outcome) : '';
+  if (!outcome) {
+    return { ok: false, error: 'Say what is being decided — confirm, extend, or end employment.' };
+  }
+
+  const effective = String(input?.effectiveDate || '').trim();
+  if (!isIsoDate(effective)) return { ok: false, error: 'A probation decision needs the date it takes effect.' };
+
+  const reason = String(input?.reason || '').trim();
+  if (reason.length < 5) {
+    return { ok: false, error: 'Write the reason — an approver reads it before deciding.' };
+  }
+  // ENDING SOMEBODY'S EMPLOYMENT NEEDS MORE THAN A LINE, for the same reason a demotion does: the
+  // reason on this row is the whole of what the record will be able to say about why it happened.
+  if (outcome === 'terminate' && reason.length < 20) {
+    return {
+      ok: false,
+      error: 'Write the reason for ending this employment in full. One line is not enough for the only account the record will carry.',
+    };
+  }
+
+  let extendMonths: number | null = null;
+  if (outcome === 'extend') {
+    extendMonths = Math.round(Number(input?.extendMonths) || 0);
+    if (extendMonths < 1 || extendMonths > MAX_PROBATION_EXTENSION_MONTHS) {
+      return {
+        ok: false,
+        error: 'An extension has to be between 1 and ' + MAX_PROBATION_EXTENSION_MONTHS + ' months.',
+      };
+    }
+  }
+
+  const rawLetter = String(input?.letterUrl || '').trim();
+  if (rawLetter && !/^https:\/\/[^\s]+$/i.test(rawLetter)) {
+    return { ok: false, error: 'The letter has to be an https link that opens for the person receiving it. Nothing is uploaded here.' };
+  }
+  const letterUrl = rawLetter ? rawLetter.slice(0, 1000) : null;
+
+  const requestedBy = isMoveUuid(input?.requestedByUserId) ? String(input.requestedByUserId) : null;
+
+  try {
+    await ensureLifecycleSchema();
+    await ensureProbationDecisionSchema();
+
+    const probRows = rows(await db.execute(sql`
+      SELECT p.id, p.employee_id, p.status, e.full_name, e.is_active
+        FROM hr_probation p
+        LEFT JOIN hr_employees e ON e.id = p.employee_id
+       WHERE p.id = ${probationId}::uuid LIMIT 1`));
+    if (!probRows.length) return { ok: false, error: 'That probation could not be found.' };
+    const prob = probRows[0] as any;
+    const status = String(prob.status || '');
+    if (status !== 'active' && status !== 'extended') {
+      return { ok: false, error: 'That probation is already ' + status + ', so there is nothing left to decide.' };
+    }
+    if (prob.is_active === false) {
+      return { ok: false, error: 'That employee record is closed.' };
+    }
+
+    const openAlready = rows(await db.execute(sql`
+      SELECT id FROM hr_probation_decisions
+       WHERE probation_id = ${probationId}::uuid AND state IN ('pending', 'halted', 'approved') LIMIT 1`));
+    if (openAlready.length) {
+      return { ok: false, error: 'A decision on this probation is already in progress. Settle that one first.' };
+    }
+
+    const employeeId = String(prob.employee_id);
+    const ins = rows(await db.execute(sql`
+      INSERT INTO hr_probation_decisions
+        (probation_id, employee_id, outcome, extend_months, effective_date, reason, letter_url,
+         state, requested_by_user_id)
+      VALUES
+        (${probationId}::uuid, ${employeeId}::uuid, ${outcome}, ${extendMonths}, ${effective}::date,
+         ${reason}, ${letterUrl}, 'pending', ${requestedBy}::uuid)
+      RETURNING id`));
+    if (!ins.length) return { ok: false, error: 'The decision was not saved. Nothing was changed.' };
+    const decisionId = String(ins[0].id);
+
+    const wf = await startWorkflow({
+      domain: 'confirmation',
+      recordId: decisionId,
+      subjectEmployeeId: employeeId,
+      requestedByUserId: requestedBy,
+      createdByUserId: requestedBy,
+      summary: probationOutcomeLabel(outcome) + ' — probation of '
+        + (prob.full_name || 'an employee') + ', effective ' + effective,
+    });
+
+    if (!wf.ok) {
+      await db.execute(sql`
+        UPDATE hr_probation_decisions SET state = 'halted',
+               halt_reason = ${String(wf.error || 'The approval could not be started.')}, updated_at = NOW()
+         WHERE id = ${decisionId}::uuid`);
+      return { ok: false, id: decisionId, error: wf.error || 'The approval could not be started.' };
+    }
+
+    const halted = wf.state === 'halted';
+    await db.execute(sql`
+      UPDATE hr_probation_decisions
+         SET workflow_instance_id = ${wf.instanceId}::uuid,
+             state = ${halted ? 'halted' : 'pending'},
+             halt_reason = ${wf.haltReason || null}::text,
+             updated_at = NOW()
+       WHERE id = ${decisionId}::uuid`);
+
+    await logAudit({
+      userId: requestedBy,
+      action: 'probation.' + outcome + '.requested',
+      entity: 'hr_probation_decision',
+      entityId: decisionId,
+      diff: {
+        probationId, employeeId, outcome, extendMonths, effectiveDate: effective,
+        workflowInstanceId: wf.instanceId || null, state: halted ? 'halted' : 'pending',
+        haltReason: wf.haltReason || null,
+      },
+    });
+
+    return { ok: true, id: decisionId, changed: true, haltReason: wf.haltReason || null };
+  } catch (e: any) {
+    logMoveFail('requestProbationDecision', e);
+    return { ok: false, error: 'The decision was not saved: ' + reasonOf(e) };
+  }
+}
+
+/** Withdraw a probation decision that has not been decided. */
+export async function cancelProbationDecision(
+  id: string,
+  actorUserId: string | null,
+): Promise<MoveResult> {
+  if (!isMoveUuid(id)) return { ok: false, error: 'That decision could not be identified.' };
+  try {
+    await ensureProbationDecisionSchema();
+    const wrote = rows(await db.execute(sql`
+      UPDATE hr_probation_decisions SET state = 'cancelled', updated_at = NOW()
+       WHERE id = ${id}::uuid AND state IN ('pending', 'halted') RETURNING id`));
+    if (!wrote.length) {
+      return { ok: false, error: 'That decision has already been settled, so it cannot be withdrawn.' };
+    }
+    await logAudit({
+      userId: isMoveUuid(actorUserId) ? String(actorUserId) : null,
+      action: 'probation.decision.cancelled', entity: 'hr_probation_decision', entityId: id, diff: {},
+    });
+    return { ok: true, id, changed: true };
+  } catch (e: any) {
+    logMoveFail('cancelProbationDecision', e);
+    return { ok: false, error: 'The decision was not withdrawn: ' + reasonOf(e) };
+  }
+}
+
+/**
+ * Mirror the engine's decisions onto open probation decisions, and APPLY the approved ones.
+ *
+ * A reconcile rather than a callback, exactly as syncMoves() above is and for the same reason: a
+ * completion callback would make the approval engine import the HR modules, which is a dependency in
+ * the wrong direction and a second place a confirmation could be written from.
+ *
+ * IT APPROVES NOTHING. It reads a decision the engine already made, and then calls the three
+ * existing apply functions — confirmEmployee(), extendProbation(), terminateOnProbation() — rather
+ * than reimplementing what they do.
+ */
+export async function syncProbationDecisions(actorUserId?: string | null): Promise<{
+  applied: number;
+  settled: number;
+  errors: string[];
+}> {
+  const out = { applied: 0, settled: 0, errors: [] as string[] };
+  const actor = isMoveUuid(actorUserId) ? String(actorUserId) : null;
+
+  try {
+    await ensureLifecycleSchema();
+    await ensureProbationDecisionSchema();
+
+    const open = rows(await db.execute(sql`
+      SELECT * FROM hr_probation_decisions
+       WHERE state IN ('pending', 'halted', 'approved') AND workflow_instance_id IS NOT NULL
+       ORDER BY created_at ASC LIMIT 100`));
+
+    for (const raw of open) {
+      const d = mapProbationDecision(raw);
+      const instance = await readInstance(d.workflowInstanceId, out.errors);
+      if (!instance) continue;
+
+      if (instance.state === 'approved' && d.state !== 'applied') {
+        const r = await applyProbationDecision(d, actor);
+        if (r.ok) out.applied += 1;
+        else out.errors.push(r.error || 'A probation decision could not be applied.');
+        continue;
+      }
+      if (instance.state === 'rejected' || instance.state === 'cancelled') {
+        try {
+          await db.execute(sql`
+            UPDATE hr_probation_decisions
+               SET state = ${instance.state === 'rejected' ? 'rejected' : 'cancelled'}, updated_at = NOW()
+             WHERE id = ${d.id}::uuid AND state IN ('pending', 'halted', 'approved')`);
+          out.settled += 1;
+        } catch (e: any) {
+          logMoveFail('syncProbationDecisions.settle', e);
+          out.errors.push('A decision could not be written down: ' + reasonOf(e));
+        }
+        continue;
+      }
+      if (instance.state === 'halted' && d.state !== 'halted') {
+        try {
+          await db.execute(sql`
+            UPDATE hr_probation_decisions SET state = 'halted', halt_reason = ${instance.haltReason}::text,
+                   updated_at = NOW()
+             WHERE id = ${d.id}::uuid`);
+        } catch (e: any) {
+          logMoveFail('syncProbationDecisions.halt', e);
+          out.errors.push('A halt could not be recorded: ' + reasonOf(e));
+        }
+      }
+    }
+  } catch (e: any) {
+    logMoveFail('syncProbationDecisions', e);
+    out.errors.push('The approvals could not be read: ' + reasonOf(e));
+  }
+  return out;
+}
+
+/**
+ * APPLY ONE APPROVED PROBATION DECISION, through the functions that already own the write.
+ *
+ * ORDER MATTERS. The probation record is written FIRST, by the existing function; the decision row
+ * is marked applied only after that returns. If confirmEmployee() throws — and it deliberately
+ * propagates, because it also has to bring hr_employees.confirmation_date into step — the decision
+ * stays approved-but-not-applied, visible on the console with the reason. A decision marked applied
+ * over a write that failed is two records disagreeing about whether somebody is confirmed, which is
+ * the fault class this whole layer exists to remove.
+ */
+async function applyProbationDecision(
+  d: ProbationDecisionRow,
+  actorUserId: string | null,
+): Promise<MoveResult> {
+  try {
+    if (d.outcome === 'confirm') {
+      // confirmEmployee() needs a user id for the record. The requester is the honest answer when
+      // the reconcile is running without an actor — it is who asked for it, and the approval trail
+      // on the workflow instance carries who agreed.
+      const by = actorUserId || d.employeeId;
+      await confirmEmployee({
+        probationId: d.probationId,
+        confirmedByUserId: by,
+        letterUrl: d.letterUrl || undefined,
+      });
+    } else if (d.outcome === 'extend') {
+      const r = await extendProbation({
+        probationId: d.probationId,
+        months: Number(d.extendMonths) || 1,
+        reason: d.reason,
+      });
+      if (!r.ok) {
+        return { ok: false, error: 'The probation was not extended: ' + (r.error || 'it could not be found') };
+      }
+    } else if (d.outcome === 'terminate') {
+      await terminateOnProbation({ probationId: d.probationId, reason: d.reason });
+    } else {
+      return { ok: false, error: 'That decision has an outcome this console does not recognise, so nothing was applied.' };
+    }
+
+    await db.execute(sql`
+      UPDATE hr_probation_decisions
+         SET state = 'applied', applied_at = NOW(), applied_by_user_id = ${actorUserId}::uuid,
+             updated_at = NOW()
+       WHERE id = ${d.id}::uuid`);
+
+    await logAudit({
+      userId: actorUserId,
+      action: 'probation.' + d.outcome + '.applied',
+      entity: 'hr_probation_decision',
+      entityId: d.id,
+      diff: {
+        probationId: d.probationId, employeeId: d.employeeId, outcome: d.outcome,
+        extendMonths: d.extendMonths, effectiveDate: d.effectiveDate,
+        workflowInstanceId: d.workflowInstanceId,
+      },
+    });
+    return { ok: true, id: d.id, changed: true };
+  } catch (e: any) {
+    logMoveFail('applyProbationDecision', e);
+    return { ok: false, error: 'The probation decision could not be applied: ' + reasonOf(e) };
   }
 }

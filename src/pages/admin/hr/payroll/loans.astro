@@ -1,0 +1,495 @@
+---
+// /admin/hr/payroll/loans — EMPLOYEE LOANS AND SALARY ADVANCES.
+//
+// WHAT THIS SCREEN IS FOR. Somebody needs money now and will pay it back out of later pay runs. The
+// register records the agreement, routes it for approval, records that the money actually went out,
+// and then shows the balance coming down one payroll run at a time until it clears by itself.
+//
+// THREE THINGS IT DELIBERATELY CANNOT DO:
+//   1. It cannot approve anything. Every request is routed by src/lib/workflow.ts from the
+//      Organization Graph, and the Approve button below acts on the WORKFLOW INSTANCE — only the
+//      person that engine routed to, or somebody standing in for them, can press it and have it
+//      count. Holding this page confers no authority to decide.
+//   2. It cannot pay anybody. "Record disbursement" writes down that the money went out through
+//      whatever this organisation actually uses, with a reference. Nothing here moves money.
+//   3. It cannot deduct anything by itself. The per-run recovery happens inside the payroll run,
+//      capped at what that month's pay can carry, and it stops the moment the balance reaches zero.
+//
+// THE GATE. `payroll.manage` through can(), exactly as /admin/hr/payroll and its components screen
+// do — PERMS_BY_ROLE only, so a custom role holding the `payroll` SECTION checkbox (which passes
+// middleware) is still refused here. This register carries what people owe the company.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { isInitialized } from '@/lib/org-graph';
+import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import {
+  ensureLoanSchema, listLoans, requestLoan, cancelLoan, recordDisbursement,
+  syncLoanApprovals, loanLedger, loanKindLabel, loanStateLabel, LOAN_KINDS,
+  type LoanRow,
+} from '@/lib/loans';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'payroll.manage')) return Astro.redirect('/admin?denied=payroll');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted, and a declaration below
+// its first use throws on the handler's first line while the page still reports success.
+const PAGE = '/admin/hr/payroll/loans';
+const DETAIL_LIMIT = 12;
+
+function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+const money = (n: any, cur: string) =>
+  (cur || 'INR') + ' ' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function stateTone(s: string): string {
+  const k = String(s || '');
+  if (k === 'closed') return '#86efac';
+  if (k === 'active') return '#6ee7b7';
+  if (k === 'rejected') return '#fca5a5';
+  if (k === 'halted') return '#fbbf24';
+  if (k === 'cancelled') return '#9aa6b6';
+  return '#67e8f9';
+}
+
+function viaLabel(v: string): string {
+  const k = String(v || '');
+  if (k === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (k === 'department_head') return VIA_LABELS.department_head;
+  if (k === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (k === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+const MONTH_OPTIONS = [
+  { v: 1, l: 'January' }, { v: 2, l: 'February' }, { v: 3, l: 'March' }, { v: 4, l: 'April' },
+  { v: 5, l: 'May' }, { v: 6, l: 'June' }, { v: 7, l: 'July' }, { v: 8, l: 'August' },
+  { v: 9, l: 'September' }, { v: 10, l: 'October' }, { v: 11, l: 'November' }, { v: 12, l: 'December' },
+];
+
+await ensureLoanSchema().catch(() => {});
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (action === 'decide') {
+      // THE WORKFLOW INSTANCE, not the loan row. decideInstance() re-checks that this account is the
+      // routed approver or an in-force delegate; reaching this page proves nothing about that.
+      const r = await decideInstance(
+        String(fd.get('instance_id') || ''),
+        user as any,
+        String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected',
+        String(fd.get('note') || ''),
+      );
+      flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
+      if (r.ok) {
+        const sync = await syncLoanApprovals(user.id);
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else if (action === 'request') {
+      const r = await requestLoan({
+        employeeId: String(fd.get('employee_id') || ''),
+        kind: String(fd.get('kind') || ''),
+        purpose: String(fd.get('purpose') || ''),
+        principal: Number(fd.get('principal')),
+        instalments: Number(fd.get('instalments')),
+        interestRatePct: Number(fd.get('interest_rate') || 0),
+        startMonth: Number(fd.get('start_month')),
+        startYear: Number(fd.get('start_year')),
+        requestedByUserId: user.id,
+      });
+      if (r.ok && r.haltReason) flash = 'Recorded, but it is halted: ' + r.haltReason;
+      else if (r.ok) flash = 'Sent for approval. No money has moved and nothing is being deducted.';
+      else flash = r.error || 'The request was not saved.';
+    } else if (action === 'cancel') {
+      const r = await cancelLoan(String(fd.get('loan_id') || ''), user.id);
+      flash = r.ok ? 'Request withdrawn.' : (r.error || 'The request was not withdrawn.');
+    } else if (action === 'disburse') {
+      const r = await recordDisbursement({
+        loanId: String(fd.get('loan_id') || ''),
+        reference: String(fd.get('reference') || ''),
+        actorUserId: user.id,
+      });
+      flash = r.ok
+        ? 'Disbursement recorded. Recovery starts with the next payroll run at or after the start month.'
+        : (r.error || 'The disbursement was not recorded.');
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[admin/hr/payroll/loans] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const synced = await syncLoanApprovals(user.id);
+const graphReady = await isInitialized();
+const loans = await listLoans({ limit: 250 });
+
+let employees: any[] = [];
+try {
+  employees = rowsOf(await db.execute(sql`
+    SELECT id, full_name, employee_code FROM hr_employees
+     WHERE is_active = true ORDER BY full_name ASC LIMIT 400`));
+} catch (e: any) {
+  console.error('[admin/hr/payroll/loans] employees', e?.cause?.message || e?.message);
+}
+
+const open = loans.filter((l) => l.state === 'pending' || l.state === 'halted').slice(0, DETAIL_LIMIT);
+const detail: any[] = [];
+for (const l of open) {
+  let instance: any = null;
+  try {
+    if (l.workflowInstanceId) instance = await getInstance(l.workflowInstanceId);
+  } catch (e: any) {
+    console.error('[admin/hr/payroll/loans] instance', e?.cause?.message || e?.message);
+  }
+  const waiting = instance
+    ? (instance.steps || []).filter((s: any) => s.stepNo === instance.currentStep && s.decision === 'pending')
+    : [];
+  detail.push({ l, instance, waiting });
+}
+
+const active = loans.filter((l) => l.state === 'active');
+const settled = loans.filter((l) => ['closed', 'rejected', 'cancelled'].indexOf(l.state) >= 0);
+const awaitingDisbursement = active.filter((l) => !l.disbursedAt);
+const outstandingTotal = active.reduce((s, l) => s + l.outstanding, 0);
+const currency = String(loans[0]?.currency || 'INR');
+
+// The ledger for the live agreements only. Each is one query, and a long history must not turn one
+// page load on a phone into hundreds of round trips.
+const ledgers: Record<string, any[]> = {};
+for (const l of active.slice(0, DETAIL_LIMIT)) {
+  ledgers[l.id] = await loanLedger(l.id);
+}
+
+const now = new Date();
+const thisMonth = now.getMonth() + 1;
+const thisYear = now.getFullYear();
+const yearOptions = [thisYear, thisYear + 1];
+---
+<AdminLayout title="Loans and salary advances" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR · Payroll · Loans and advances</p>
+  <h1>Loans and salary advances</h1>
+  <p class="lede">
+    Money lent to somebody and recovered from their later pay. A loan and a salary advance are the
+    same act with different words, so they are recorded here together and recovered the same way. The
+    deduction appears on the payslip, it is capped at what that month's pay can carry, and it stops
+    on its own the moment the balance reaches zero.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {synced.errors.length > 0 && <div class="flash warn">{synced.errors[0]}</div>}
+  {!graphReady && (
+    <div class="flash warn">
+      The Organization Graph is not yet initialized, so no approver can be resolved for anybody. A
+      request raised now is recorded and halted with that reason rather than approved. Run the graph
+      backfill first.
+    </div>
+  )}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{detail.length}</span><span class="tl">Waiting on a decision</span></div>
+    <div class="tile"><span class="tv">{active.length}</span><span class="tl">Live agreements</span></div>
+    <div class="tile"><span class="tv">{awaitingDisbursement.length}</span><span class="tl">Approved, not paid out</span></div>
+    <div class="tile"><span class="tv">{money(outstandingTotal, currency)}</span><span class="tl">Outstanding in total</span></div>
+  </div>
+
+  <details class="panel">
+    <summary>Raise a loan or salary advance</summary>
+    <form method="POST" class="form">
+      <input type="hidden" name="action" value="request" />
+      <label>Who is this for
+        <select name="employee_id" required>
+          <option value="">Choose a person</option>
+          {employees.map((e: any) => (
+            <option value={e.id}>{e.full_name}{e.employee_code ? ' — ' + e.employee_code : ''}</option>
+          ))}
+        </select>
+      </label>
+      <label>What kind
+        <select name="kind" required>
+          <option value="">Choose</option>
+          {LOAN_KINDS.map((k) => <option value={k.key}>{k.label}</option>)}
+        </select>
+        <span class="hint">
+          {LOAN_KINDS.map((k) => k.label + ': ' + k.note).join(' ')}
+        </span>
+      </label>
+      <label>What it is for
+        <textarea name="purpose" rows="2" required placeholder="An approver reads this before deciding."></textarea>
+      </label>
+      <label>Amount
+        <input type="number" name="principal" step="0.01" min="0.01" required />
+      </label>
+      <label>Recovered over how many pay runs
+        <input type="number" name="instalments" step="1" min="1" max="120" required value="1" />
+      </label>
+      <label>Flat annual interest rate
+        <input type="number" name="interest_rate" step="0.001" min="0" max="100" value="0" />
+        <span class="hint">
+          Enter 0 for an interest-free advance. Where a rate is entered the total interest is the
+          amount multiplied by the rate, multiplied by the number of runs divided by twelve. It is
+          flat and uncompounded, and this product makes no claim that it matches any lending rule.
+        </span>
+      </label>
+      <div class="pair">
+        <label>Recovery starts in
+          <select name="start_month" required>
+            {MONTH_OPTIONS.map((m) => (
+              <option value={m.v} selected={m.v === thisMonth}>{m.l}</option>
+            ))}
+          </select>
+        </label>
+        <label>Year
+          <select name="start_year" required>
+            {yearOptions.map((y) => <option value={y} selected={y === thisYear}>{y}</option>)}
+          </select>
+        </label>
+      </div>
+      <button type="submit" class="btn">Send for approval</button>
+      <p class="hint">
+        Nothing is lent and nothing is deducted by pressing this. It records the agreement and asks
+        the people the Organization Graph names to approve it.
+      </p>
+    </form>
+  </details>
+
+  <h2>Waiting on a decision</h2>
+  {detail.length === 0 ? (
+    <div class="empty">Nothing is waiting on anybody.</div>
+  ) : (
+    <div class="stack">
+      {detail.map((d: any) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{d.l.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {loanKindLabel(d.l.kind)} · {money(d.l.principal, d.l.currency)} over {d.l.instalments} run{d.l.instalments === 1 ? '' : 's'} · raised {fmtDate(d.l.createdAt)}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(d.l.state) + ';border-color:' + stateTone(d.l.state) + '55;'}>
+              {loanStateLabel(d.l.state)}
+            </span>
+          </div>
+
+          <dl class="terms">
+            <div><dt>Amount</dt><dd>{money(d.l.principal, d.l.currency)}</dd></div>
+            <div><dt>Interest</dt><dd>{d.l.interestRatePct > 0 ? d.l.interestRatePct + '% flat, ' + money(d.l.interestTotal, d.l.currency) + ' in total' : 'None'}</dd></div>
+            <div><dt>Total repayable</dt><dd>{money(d.l.totalPayable, d.l.currency)}</dd></div>
+            <div><dt>Each run</dt><dd>{money(d.l.instalmentAmount, d.l.currency)}</dd></div>
+          </dl>
+
+          <p class="reason">{d.l.purpose}</p>
+
+          {d.l.state === 'halted' && (
+            <div class="halt">
+              <strong>Halted.</strong> {d.l.haltReason || 'No approver could be resolved.'}
+              <span class="hint">Nothing has been lent and nothing is being deducted. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+            </div>
+          )}
+
+          {d.instance && d.instance.state === 'pending' && d.waiting.length > 0 && (
+            <div class="waiting">
+              <p class="wl">Waiting on</p>
+              {d.waiting.map((s: any) => (
+                <p class="wn">{viaLabel(s.via)} — {s.approverName || 'a person with no employee record'}</p>
+              ))}
+            </div>
+          )}
+
+          {d.instance && d.instance.state === 'pending' && (
+            <form method="POST" class="decide">
+              <input type="hidden" name="action" value="decide" />
+              <input type="hidden" name="instance_id" value={d.instance.id} />
+              <input type="text" name="note" placeholder="Note for the record (optional)" />
+              <div class="btnrow">
+                <button type="submit" name="decision" value="approved" class="btn ok">Approve</button>
+                <button type="submit" name="decision" value="rejected" class="btn no">Reject</button>
+              </div>
+              <p class="hint">Only the person this was routed to, or somebody standing in for them, can decide it.</p>
+            </form>
+          )}
+
+          <form method="POST" class="inline">
+            <input type="hidden" name="action" value="cancel" />
+            <input type="hidden" name="loan_id" value={d.l.id} />
+            <button type="submit" class="btn ghost">Withdraw this request</button>
+          </form>
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>Live agreements</h2>
+  {active.length === 0 ? (
+    <div class="empty">Nobody has a loan or advance running.</div>
+  ) : (
+    <div class="stack">
+      {active.map((l: LoanRow) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{l.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {loanKindLabel(l.kind)} · {money(l.principal, l.currency)}
+                {l.interestRatePct > 0 ? ' at ' + l.interestRatePct + '% flat' : ' interest-free'}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(l.state) + ';border-color:' + stateTone(l.state) + '55;'}>
+              {l.disbursedAt ? 'Recovering' : 'Not paid out yet'}
+            </span>
+          </div>
+
+          <dl class="terms">
+            <div><dt>Total repayable</dt><dd>{money(l.totalPayable, l.currency)}</dd></div>
+            <div><dt>Recovered so far</dt><dd>{money(l.recovered, l.currency)} over {l.instalmentsPaid} run{l.instalmentsPaid === 1 ? '' : 's'}</dd></div>
+            <div><dt>Still outstanding</dt><dd>{money(l.outstanding, l.currency)}</dd></div>
+            <div><dt>Each run</dt><dd>{money(l.instalmentAmount, l.currency)}, from {MONTH_OPTIONS[l.startMonth - 1]?.l} {l.startYear}</dd></div>
+          </dl>
+
+          <div class="bar" aria-hidden="true">
+            <span style={'width:' + Math.max(0, Math.min(100, l.totalPayable > 0 ? Math.round((l.recovered / l.totalPayable) * 100) : 0)) + '%;'}></span>
+          </div>
+
+          {!l.disbursedAt && (
+            <div class="halt">
+              <strong>Approved, but the money has not gone out.</strong>
+              <span class="hint">
+                Nothing is being deducted until a disbursement is recorded — a repayment for money
+                that never arrived is not something this product will do. Pay it out through whatever
+                this organisation uses, then record the reference here.
+              </span>
+              <form method="POST" class="decide" style="margin-top:10px;">
+                <input type="hidden" name="action" value="disburse" />
+                <input type="hidden" name="loan_id" value={l.id} />
+                <input type="text" name="reference" required maxlength="300" placeholder="Where it was paid out — a reference somebody can follow" />
+                <button type="submit" class="btn">Record disbursement</button>
+              </form>
+            </div>
+          )}
+
+          {l.disbursedAt && (
+            <p class="sub" style="margin-top:10px;">
+              Paid out {fmtDate(l.disbursedAt)}{l.disbursedReference ? ' — ' + l.disbursedReference : ''}
+            </p>
+          )}
+
+          {(ledgers[l.id] || []).length > 0 && (
+            <details class="ledger">
+              <summary>Every repayment taken ({(ledgers[l.id] || []).length})</summary>
+              <div class="scroller">
+                <table>
+                  <thead><tr><th>Period</th><th>Amount</th><th>Of which interest</th></tr></thead>
+                  <tbody>
+                    {(ledgers[l.id] || []).map((i: any) => (
+                      <tr>
+                        <td>{MONTH_OPTIONS[i.month - 1]?.l} {i.year}</td>
+                        <td>{money(i.amount, l.currency)}</td>
+                        <td>{money(i.interestPart, l.currency)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>Settled</h2>
+  {settled.length === 0 ? (
+    <div class="empty">Nothing has been settled yet.</div>
+  ) : (
+    <div class="stack">
+      {settled.map((l: LoanRow) => (
+        <div class="card">
+          <div class="cardhead">
+            <div>
+              <p class="name">{l.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {loanKindLabel(l.kind)} · {money(l.principal, l.currency)} · raised {fmtDate(l.createdAt)}
+                {l.closedAt ? ' · cleared ' + fmtDate(l.closedAt) : ''}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(l.state) + ';border-color:' + stateTone(l.state) + '55;'}>
+              {loanStateLabel(l.state)}
+            </span>
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 19px; color: #fff; font-weight: 700; overflow-wrap: anywhere; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin-bottom: 16px; }
+  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; }
+  .form { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 60px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; display: block; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.ok { background: #15803d; }
+  .btn.no { background: #b91c1c; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; white-space: pre-wrap; }
+  .terms { display: grid; gap: 6px; margin: 12px 0 0; }
+  .terms div { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; border-bottom: 1px dashed #1a1a1f; padding-bottom: 5px; }
+  .terms dt { color: #9aa6b6; margin: 0; }
+  .terms dd { color: #e8e8ee; margin: 0; text-align: right; }
+  .bar { margin-top: 12px; height: 6px; border-radius: 99px; background: #1a1a1f; overflow: hidden; }
+  .bar span { display: block; height: 100%; background: #6ee7b7; }
+  .halt { margin: 12px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; font-size: 12.5px; color: #fde68a; line-height: 1.55; }
+  .waiting { margin: 12px 0 0; padding: 10px 12px; background: rgba(103,232,249,0.06); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .wl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .wn { font-size: 12.5px; color: #e8e8ee; margin: 0; }
+  .decide { display: grid; gap: 8px; margin-top: 12px; }
+  .inline { margin-top: 10px; }
+  .ledger { margin-top: 12px; border-top: 1px solid #1a1a1f; padding-top: 10px; }
+  .ledger > summary { cursor: pointer; font-size: 12px; color: #9aa6b6; min-height: 44px; display: flex; align-items: center; }
+  .scroller { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; min-width: 340px; }
+  th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #6e6e78; padding: 6px 10px 6px 0; font-weight: 700; white-space: nowrap; }
+  td { font-size: 12.5px; color: #d8d8de; padding: 6px 10px 6px 0; border-top: 1px solid #1a1a1f; white-space: nowrap; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+</style>
+</AdminLayout>

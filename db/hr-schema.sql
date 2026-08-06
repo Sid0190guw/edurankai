@@ -295,6 +295,24 @@ CREATE TABLE IF NOT EXISTS hr_leave_request (
 CREATE INDEX IF NOT EXISTS hr_leave_status ON hr_leave_request (status, requested_at DESC);
 CREATE INDEX IF NOT EXISTS hr_leave_emp    ON hr_leave_request (employee_id, start_date DESC);
 
+-- PART DAYS. These four columns exist in the runtime definition (createLeaveTables() in
+-- src/lib/hr-leave.ts) and were missing from this file, which is the divergence this header claims
+-- not to have: two CREATE TABLE IF NOT EXISTS statements for one table with DIFFERENT SHAPES.
+-- CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so whichever definition ran second
+-- silently added nothing -- the same mechanism by which hr_employees.work_email was declared here,
+-- absent from the live table, and locked every administrator out of /admin for a day.
+--
+-- It self-heals today only because ensureLeaveSchema() asserts them with ADD COLUMN IF NOT EXISTS on
+-- every boot. A database provisioned from THIS FILE ALONE would have an hr_leave_request that every
+-- half-day and hourly request fails to write to. Asserted here so the two definitions agree.
+--
+-- days STAYS AN INT and is not redefined: it is the calendar span the request occupies, and every
+-- row already written means exactly that. day_units is what the request COSTS.
+ALTER TABLE hr_leave_request ADD COLUMN IF NOT EXISTS day_units NUMERIC(6,2);
+ALTER TABLE hr_leave_request ADD COLUMN IF NOT EXISTS hours     NUMERIC(6,2);
+ALTER TABLE hr_leave_request ADD COLUMN IF NOT EXISTS day_part  TEXT;
+ALTER TABLE hr_leave_request ADD COLUMN IF NOT EXISTS unit      TEXT NOT NULL DEFAULT 'full';
+
 -- ---------------------------------------------------------------------------
 -- Wallet / payouts — also created at runtime by ensureWalletSchema()
 -- ---------------------------------------------------------------------------

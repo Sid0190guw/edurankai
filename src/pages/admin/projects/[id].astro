@@ -1,0 +1,500 @@
+---
+// /admin/projects/[id] — ONE PROJECT'S RECORD, AND THE STATUS REPORT COMPUTED FROM IT.
+//
+// WHAT IS HERE AND WHAT IS DELIBERATELY NOT. This is the REGISTER: the definition, who the graph
+// records as running it, what it was budgeted at, what it has actually cost, and a status report
+// assembled at read time. Adding people, setting milestones, handing out work and grading risks are
+// NOT here — they are at /portal/employee/projects/[id], because whoever runs a project is an
+// organisational relationship rather than an administrator, and putting their daily work behind an
+// admin gate would mean granting the console to everybody who runs anything.
+//
+// THERE IS NO STORED REPORT. projectReport() recomputes every figure from the rows that hold the
+// facts. A stored report is a number that was true once, and the first time somebody reads a stale
+// one out in a meeting the whole module stops being believed.
+//
+// THE SPEND LINK IS ONE COLUMN. Attaching a claim or a purchase to a project writes project_id on
+// the record that already exists in src/lib/expenses.ts or src/lib/procurement.ts. It changes no
+// amount, no status and no approval, and it creates no second ledger — the budget panel SUMS those
+// rows rather than keeping a copy of them.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { holdsCapability } from '@/lib/auth/capability';
+import {
+  projectReport,
+  projectDetail,
+  projectAllocation,
+  listLinkedSpend,
+  listAttachableSpend,
+  updateProject,
+  setProjectManager,
+  linkSpendToProject,
+  departmentOptions,
+  employeeOptions,
+  formatAmount,
+  projectStatusLabel,
+  milestoneStatusLabel,
+  riskStatusLabel,
+  riskGradeLabel,
+  memberCapacityLabel,
+  GRAPH_NOT_READY,
+} from '@/lib/projects';
+
+const user = Astro.locals.user;
+const projectId = String(Astro.params.id || '');
+if (!user) return Astro.redirect('/admin/login');
+
+const bySection = await canAccessSection(user as any, 'projects', 'view');
+const byCapability = holdsCapability(user as any, 'projects.view');
+if (!bySection && !byCapability) return Astro.redirect('/admin');
+
+// CONSTANTS FIRST — `const` is not hoisted, and a const under the POST handler that reads it throws
+// on that handler's first line while the page still reports success.
+const PAGE = '/admin/projects/' + projectId;
+
+const fmt = (d: string | null) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Plain words from a function — a typed map read inside JSX is a known .astro parse hazard. */
+function chipClass(status: string): string {
+  if (status === 'active' || status === 'met') return 'chip chip-ok';
+  if (status === 'on_hold' || status === 'mitigating') return 'chip chip-wait';
+  if (status === 'cancelled' || status === 'missed' || status === 'realised') return 'chip chip-no';
+  if (status === 'completed' || status === 'closed') return 'chip chip-done';
+  return 'chip';
+}
+
+const mayManage = holdsCapability(user as any, 'projects.manage');
+const ip = Astro.request.headers.get('x-forwarded-for') || null;
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let ok = true;
+
+  if (action === 'update') {
+    const r = await updateProject(user as any, projectId, {
+      name: String(fd.get('name') || ''),
+      description: String(fd.get('description') || ''),
+      departmentId: String(fd.get('department_id') || ''),
+      startOn: String(fd.get('start_on') || ''),
+      targetOn: String(fd.get('target_on') || ''),
+      budgetPlanned: String(fd.get('budget_planned') || ''),
+      currency: String(fd.get('currency') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Project updated.' : (r.error || 'That could not be saved.');
+  } else if (action === 'set-manager') {
+    const chosen = String(fd.get('manager_employee_id') || '');
+    const r = await setProjectManager(user as any, projectId, chosen || null, {
+      effectiveFrom: String(fd.get('effective_from') || ''),
+      note: String(fd.get('note') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok
+      ? (chosen
+          ? 'Recorded in the Organization Graph. The outgoing relationship was closed rather than overwritten, so the history is intact.'
+          : 'The project manager relationship was closed. Nobody is recorded as running this project now.')
+      : (r.error || 'That could not be saved.');
+  } else if (action === 'link-spend') {
+    const raw = String(fd.get('record') || '');
+    const sep = raw.indexOf(':');
+    const kind = sep > 0 ? raw.slice(0, sep) : '';
+    const recordId = sep > 0 ? raw.slice(sep + 1) : '';
+    const r = await linkSpendToProject(user as any, kind as any, recordId, projectId, { ipAddress: ip });
+    ok = r.ok;
+    flash = r.ok ? 'Attached to this project. The record itself is unchanged apart from that reference.' : (r.error || 'That could not be saved.');
+  } else {
+    ok = false;
+    flash = 'That action is not one this page performs.';
+  }
+
+  return Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(flash));
+}
+
+const msg = Astro.url.searchParams.get('msg') || '';
+const err = Astro.url.searchParams.get('err') || '';
+
+const report = await projectReport(user as any, projectId);
+const detail = report ? await projectDetail(user as any, projectId) : null;
+const allocation = report ? await projectAllocation(projectId) : null;
+const spend = report ? await listLinkedSpend(projectId) : [];
+const attachable = report && mayManage ? await listAttachableSpend(projectId) : [];
+const departments = report && mayManage ? await departmentOptions() : [];
+const people = report && mayManage ? await employeeOptions() : [];
+---
+<AdminLayout title={report ? report.project.code + ' ' + report.project.name : 'Project'} activeNav="projects">
+  <div class="pwrap">
+    {msg && <div class="flash">{msg}</div>}
+    {err && <div class="bad">{err}</div>}
+
+    {!report && (
+      <div class="card">
+        <h3>Not available</h3>
+        <p class="empty">
+          That project is not available. The portfolio shows every project to whoever holds it; without
+          that, a project is visible to its members, whoever the Organization Graph records as running
+          it, and the head of its department.
+        </p>
+        <p class="note"><a class="link" href="/admin/projects">Back to the portfolio</a></p>
+      </div>
+    )}
+
+    {report && (
+      <div class="card">
+        <div class="head">
+          <div class="head-main">
+            <span class="mono muted">{report.project.code}</span>
+            <h1>{report.project.name}</h1>
+          </div>
+          <div>
+            <span class={chipClass(report.project.status)}>{projectStatusLabel(report.project.status)}</span>
+            {report.project.isOverdue && <span class="chip chip-late">Past target</span>}
+          </div>
+        </div>
+        {report.project.description && <p class="empty">{report.project.description}</p>}
+        <p class="note">
+          <a class="link" href={'/portal/employee/projects/' + report.project.id}>Open the working view</a>
+          {' '}— where this project is actually run. Milestones, people, work and risks are managed there
+          by whoever runs it, without needing this console.
+        </p>
+      </div>
+    )}
+
+    {report && (
+      <div class="card">
+        <h3>Status report</h3>
+        {report.headlines.length === 0 && <p class="empty">Nothing stands out on this project right now.</p>}
+        <ul class="heads">
+          {report.headlines.map((h) => (<li>{h}</li>))}
+        </ul>
+        <div class="stats">
+          <div class="stat">
+            <span class="n">{report.tasks.ok ? (report.tasks.percentComplete === null ? '-' : report.tasks.percentComplete + '%') : '-'}</span>
+            <span class="l">Work complete</span>
+          </div>
+          <div class="stat"><span class="n">{report.milestonesMet} / {report.milestonesTotal}</span><span class="l">Milestones met</span></div>
+          <div class="stat"><span class={report.milestonesOverdue > 0 ? 'n bad-n' : 'n'}>{report.milestonesOverdue}</span><span class="l">Milestones late</span></div>
+          <div class="stat"><span class="n">{report.deliverablesAccepted} / {report.deliverablesTotal}</span><span class="l">Deliverables accepted</span></div>
+          <div class="stat"><span class={report.risksSevere > 0 ? 'n bad-n' : 'n'}>{report.risksOpen}</span><span class="l">Open risks</span></div>
+          <div class="stat"><span class={report.overAllocatedPeople > 0 ? 'n bad-n' : 'n'}>{report.overAllocatedPeople}</span><span class="l">Over-allocated</span></div>
+        </div>
+        <p class="note">
+          Every figure here is computed when this page loads, from the rows that hold the fact. There is
+          no stored report, because a stored report is a number that was true once.
+        </p>
+      </div>
+    )}
+
+    {report && (
+      <div class="card">
+        <h3>Budget</h3>
+        <div class="stats">
+          <div class="stat">
+            <span class="n small">{report.budget.planned === null ? 'Not set' : formatAmount(report.budget.planned, report.budget.currency)}</span>
+            <span class="l">Planned</span>
+          </div>
+          <div class="stat"><span class="n small">{formatAmount(report.budget.actual, report.budget.currency)}</span><span class="l">Actual</span></div>
+          <div class="stat">
+            <span class={report.budget.variance !== null && report.budget.variance < 0 ? 'n small bad-n' : 'n small'}>
+              {report.budget.variance === null ? '-' : formatAmount(report.budget.variance, report.budget.currency)}
+            </span>
+            <span class="l">Variance</span>
+          </div>
+          <div class="stat"><span class="n small">{formatAmount(report.budget.expenseActual, report.budget.currency)}</span><span class="l">Claims ({report.budget.expenseCount})</span></div>
+          <div class="stat"><span class="n small">{formatAmount(report.budget.procurementCommitted, report.budget.currency)}</span><span class="l">Purchases ({report.budget.procurementCount})</span></div>
+        </div>
+        {report.budget.notes.map((n) => (<p class="note">{n}</p>))}
+
+        {spend.length > 0 && (
+          <div class="tablewrap">
+            <table>
+              <thead><tr><th>What</th><th>Kind</th><th>Status</th><th>When</th><th>Amount</th></tr></thead>
+              <tbody>
+                {spend.map((s) => (
+                  <tr>
+                    <td>{s.title}</td>
+                    <td>{s.kind === 'expense' ? 'Expense claim' : 'Purchase order'}</td>
+                    <td class="mono">{s.status}</td>
+                    <td class="mono">{fmt(s.on) || '-'}</td>
+                    <td class="mono">{formatAmount(s.amount, s.currency)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {mayManage && attachable.length > 0 && (
+          <form method="POST">
+            <input type="hidden" name="action" value="link-spend"/>
+            <label for="s-rec">Attach an approved claim or a submitted purchase request</label>
+            <select id="s-rec" name="record">
+              {attachable.map((s) => (
+                <option value={s.kind + ':' + s.id}>
+                  {(s.kind === 'expense' ? 'Claim' : 'Purchase') + ' — ' + s.title + ' — ' + formatAmount(s.amount, s.currency)}
+                </option>
+              ))}
+            </select>
+            <button class="btn" type="submit">Attach to this project</button>
+            <p class="note">
+              This writes one reference on the existing record. It does not change the amount, the
+              status or the approval, it cannot create or approve a claim, and it stores no copy of the
+              money here — the figures above are a sum of those rows, read every time this page loads.
+            </p>
+          </form>
+        )}
+        {mayManage && attachable.length === 0 && (
+          <p class="note">
+            There is no approved claim or submitted purchase request waiting to be attached. Spend
+            reaches a project by being attached here after it has been approved through its own chain,
+            never by being typed in.
+          </p>
+        )}
+      </div>
+    )}
+
+    {report && (
+      <div class="card">
+        <h3>Who runs it</h3>
+        {!report.owner.graphReady && (
+          <div class="warn">
+            <strong>Organization Graph not yet initialized.</strong>
+            <p>{GRAPH_NOT_READY}</p>
+          </div>
+        )}
+        {report.owner.graphReady && (
+          <p class="empty">
+            {report.owner.owner
+              ? (report.owner.owner.fullName || 'Recorded, but the name could not be read') +
+                (report.owner.owner.designation ? ' — ' + report.owner.owner.designation : '')
+              : 'Nobody is recorded as running this project.'}
+          </p>
+        )}
+        {report.owner.others.length > 0 && (
+          <p class="note">
+            Also recorded: {report.owner.others.map((o) => o.fullName || 'unnamed').join(', ')}. More than
+            one open relationship means "who runs this" has more than one answer, which is worth fixing.
+          </p>
+        )}
+
+        {mayManage && (
+          <form method="POST">
+            <input type="hidden" name="action" value="set-manager"/>
+            <label for="m-who">Record who runs this project</label>
+            <select id="m-who" name="manager_employee_id">
+              <option value="">Nobody — close the relationship</option>
+              {people.map((p) => (
+                <option value={p.employeeId} selected={!!report.owner.owner && report.owner.owner.employeeId === p.employeeId}>
+                  {p.fullName}{p.designation ? ' - ' + p.designation : ''}
+                </option>
+              ))}
+            </select>
+            <label for="m-from">Effective from</label>
+            <input id="m-from" type="date" name="effective_from"/>
+            <label for="m-note">Note</label>
+            <input id="m-note" type="text" name="note" maxlength="200" placeholder="Why the handover, for the record"/>
+            <button class="btn" type="submit">Record it</button>
+            <p class="note">
+              This writes an effective-dated relationship into the Organization Graph and CLOSES the
+              outgoing one at the same instant rather than overwriting it, so "who ran this in March"
+              stays answerable. It is never resolved from a job title or a role name, and holding the
+              register capability does not make anybody the manager of anything.
+            </p>
+          </form>
+        )}
+      </div>
+    )}
+
+    {report && mayManage && (
+      <div class="card">
+        <h3>Definition</h3>
+        <form method="POST">
+          <input type="hidden" name="action" value="update"/>
+          <label for="e-name">Name</label>
+          <input id="e-name" type="text" name="name" value={report.project.name} maxlength="200"/>
+          <div class="row2">
+            <div>
+              <label for="e-dept">Department</label>
+              <select id="e-dept" name="department_id">
+                <option value="">Not recorded</option>
+                {departments.map((d) => (
+                  <option value={d.id} selected={d.id === report.project.departmentId}>{d.name}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label for="e-cur">Currency</label>
+              <input id="e-cur" type="text" name="currency" value={report.project.currency} maxlength="8"/>
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="e-start">Start</label>
+              <input id="e-start" type="date" name="start_on" value={report.project.startOn || ''}/>
+            </div>
+            <div>
+              <label for="e-target">Target</label>
+              <input id="e-target" type="date" name="target_on" value={report.project.targetOn || ''}/>
+            </div>
+          </div>
+          <label for="e-budget">Planned budget</label>
+          <input id="e-budget" type="text" name="budget_planned" inputmode="decimal"
+                 value={report.project.budgetPlanned === null ? '' : String(report.project.budgetPlanned)}/>
+          <label for="e-desc">Description</label>
+          <textarea id="e-desc" name="description">{report.project.description || ''}</textarea>
+          <button class="btn" type="submit">Save the definition</button>
+        </form>
+        <p class="note">
+          Only PLANNED budget is set here. Actual spend has no field anywhere in this module: it comes
+          from the claims and purchase orders attached above.
+        </p>
+      </div>
+    )}
+
+    {detail && (
+      <div class="card">
+        <h3>People and allocation</h3>
+        {detail.members.length === 0 && <p class="empty">Nobody has been added to this project.</p>}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Person</th><th>Capacity</th><th>On this</th><th>Total today</th><th>From</th><th>To</th></tr></thead>
+            <tbody>
+              {detail.members.map((m) => {
+                const person = allocation ? allocation.people.find((p) => p.employeeId === m.employeeId) : null;
+                return (
+                  <tr>
+                    <td>{m.fullName || 'Unnamed'}</td>
+                    <td>{memberCapacityLabel(m.capacity)}</td>
+                    <td class="mono">{m.allocationPct}%</td>
+                    <td class={person && person.overAllocated ? 'mono bad-n' : 'mono'}>{person ? person.totalPct + '%' : '-'}</td>
+                    <td class="mono">{fmt(m.fromOn) || '-'}</td>
+                    <td class="mono">{fmt(m.toOn) || '-'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {allocation && !allocation.ok && (
+          <p class="note">
+            The cross-project totals could not be read just now, so the "total today" column is blank
+            rather than showing a figure that would understate what somebody has promised.
+          </p>
+        )}
+        <p class="note">
+          Over-allocation is surfaced and never acted on. Nothing in this module reassigns anybody or
+          reduces a percentage: it is a number for two people to talk about.
+        </p>
+      </div>
+    )}
+
+    {detail && (
+      <div class="card">
+        <h3>Milestones</h3>
+        {detail.milestones.length === 0 && <p class="empty">No milestones have been set.</p>}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Milestone</th><th>Status</th><th>Due</th><th>Met</th><th>Deliverables</th></tr></thead>
+            <tbody>
+              {detail.milestones.map((m) => (
+                <tr>
+                  <td>{m.name}</td>
+                  <td>
+                    <span class={chipClass(m.status)}>{milestoneStatusLabel(m.status)}</span>
+                    {m.isOverdue && <span class="chip chip-late">Late</span>}
+                  </td>
+                  <td class="mono">{fmt(m.dueOn) || '-'}</td>
+                  <td class="mono">{fmt(m.completedOn) || '-'}</td>
+                  <td class="mono">{m.deliverablesAccepted} / {m.deliverableCount}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    )}
+
+    {detail && (
+      <div class="card">
+        <h3>Risk register</h3>
+        {detail.risks.length === 0 && <p class="empty">No risks have been raised on this project.</p>}
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Risk</th><th>Likelihood</th><th>Impact</th><th>Severity</th><th>Owner</th><th>Status</th></tr></thead>
+            <tbody>
+              {detail.risks.map((r) => (
+                <tr>
+                  <td>{r.title}</td>
+                  <td class="mono">{riskGradeLabel(r.likelihood)}</td>
+                  <td class="mono">{riskGradeLabel(r.impact)}</td>
+                  <td class="mono">{r.severityLabel}</td>
+                  <td>{r.ownerName || 'Not recorded'}</td>
+                  <td><span class={chipClass(r.status)}>{riskStatusLabel(r.status)}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p class="note">
+          Severity is likelihood times impact, and it is advisory. It orders the register; it closes
+          nothing, escalates nothing and decides nothing about anybody.
+        </p>
+      </div>
+    )}
+  </div>
+
+  <style>
+    /* MOBILE FIRST. Base rules are the 360px rules; every wide table sits in its OWN overflow
+       container so the PAGE never scrolls sideways. */
+    .pwrap{max-width:1100px;margin:0 auto;padding:4px 0 40px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:16px;margin-bottom:14px;}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    .head{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;}
+    .head-main{min-width:0;flex:1 1 220px;}
+    h1{font-family:'Fraunces',serif;font-size:22px;line-height:1.25;overflow-wrap:anywhere;margin-top:2px;}
+    .muted{color:#9a8f7d;}
+    .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:12px 0;}
+    .stat{background:#faf7f1;border:1px solid #f0e8d9;border-radius:12px;padding:12px;min-width:0;}
+    .stat .n{display:block;font-family:'Fraunces',serif;font-size:24px;font-weight:700;line-height:1.1;overflow-wrap:anywhere;}
+    .stat .n.small{font-size:15px;}
+    .bad-n{color:#9a2c2c;}
+    .stat .l{display:block;font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;margin-top:4px;}
+    .heads{margin:0 0 4px;padding-left:18px;}
+    .heads li{font-size:14px;line-height:1.6;color:#3c352c;overflow-wrap:anywhere;margin-bottom:4px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:12px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:64px;}
+    .row2{display:grid;grid-template-columns:1fr;gap:10px;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:0 18px;min-height:44px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;margin-top:12px;}
+    .flash{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:12px;line-height:1.5;overflow-wrap:anywhere;}
+    .bad{background:rgba(220,38,38,.07);border:1px solid rgba(220,38,38,.3);color:#8a1c1c;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px;line-height:1.55;overflow-wrap:anywhere;}
+    .warn{background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.32);color:#7c4a03;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px;line-height:1.55;overflow-wrap:anywhere;}
+    .warn p{margin-top:6px;}
+    .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    table{width:100%;border-collapse:collapse;min-width:620px;}
+    th{text-align:left;font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;padding:8px 10px;border-bottom:1px solid #ece4d6;white-space:nowrap;}
+    td{padding:10px;border-bottom:1px solid #f6f1e7;font-size:14px;vertical-align:top;overflow-wrap:anywhere;}
+    .mono{font-family:'JetBrains Mono',monospace;font-size:12px;white-space:nowrap;}
+    .chip{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:#f1ece1;color:#6b6255;white-space:nowrap;display:inline-block;margin:1px 2px 1px 0;}
+    .chip-ok{background:rgba(5,150,105,.12);color:#065f46;}
+    .chip-no{background:rgba(220,38,38,.1);color:#9a2c2c;}
+    .chip-wait{background:rgba(217,119,6,.12);color:#8a5206;}
+    .chip-done{background:rgba(15,118,110,.12);color:#0f766e;}
+    .chip-late{background:rgba(220,38,38,.12);color:#9a2c2c;}
+    .empty{font-size:13.5px;color:#6b6255;line-height:1.55;}
+    .note{font-size:12px;color:#9a8f7d;line-height:1.55;margin-top:10px;overflow-wrap:anywhere;}
+    a.link{color:#c2410c;}
+    @media (min-width:640px){
+      .stats{grid-template-columns:repeat(3,1fr);}
+      .row2{grid-template-columns:1fr 1fr;}
+      .btn{width:auto;}
+    }
+    @media (min-width:960px){ .stats{grid-template-columns:repeat(6,1fr);} }
+  </style>
+</AdminLayout>

@@ -1,0 +1,388 @@
+---
+// /portal/employee/timesheet — THE WEEK, IN THE PERSON'S OWN WORDS, SENT FOR APPROVAL.
+//
+// =================================================================================================
+// WHY THIS IS NOT THE ATTENDANCE PAGE
+// =================================================================================================
+//
+// /portal/employee/attendance shows what the CLOCK saw: punches, breaks, and the hours those add up
+// to. This page is what the PERSON says the week was - hours per day, where they worked, and which
+// piece of work it went to. They are different claims and they are stored separately on purpose:
+// approving a timesheet does NOT rewrite hr_attendance, because two writers for one day's hours is
+// how "on leave" and "present" both end up true, and because a timesheet that overwrote punches
+// would let anybody rewrite their own recorded attendance.
+//
+// THE PUNCHES ARE OFFERED AS A STARTING POINT and nothing more. Each day is pre-filled with the
+// hours the clock recorded, and the person can change any of them - that is the whole point of
+// asking. What they submit is what goes for approval.
+//
+// =================================================================================================
+// APPROVAL IS THE ENGINE'S, NOT THIS PAGE'S
+// =================================================================================================
+//
+// submitTimesheet() starts a workflow in src/lib/workflow.ts, domain 'timesheet', one rung: the
+// reporting manager the Organization Graph names. THIS PAGE HAS NO APPROVE BUTTON and no way to
+// reach one. When the graph cannot name an approver the request HALTS with a readable sentence,
+// which is rendered here verbatim - it is never auto-approved and it never falls back to a role.
+//
+// PROJECT IS FREE TEXT, and the reason is written out in src/lib/attendance-schema.ts: a project
+// register (src/lib/projects.ts) landed in the same phase as this screen, in parallel, and pointing
+// a foreign key at a schema that was still being written the same week is how you get ids nobody can
+// repair. The typed name answers the question the approver is actually reading it for, and turning
+// those names into project ids is a deliberate migration once both modules have settled.
+//
+// MOBILE FIRST: each day is its own block rather than a table row, because seven columns of inputs
+// on a 360px phone is a form nobody completes.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  weeklyTimesheet,
+  timesheetFor,
+  timesheetsFor,
+  submitTimesheet,
+  withdrawTimesheet,
+  weekStartIso,
+  shiftDateIso,
+  formatMinutes,
+  weekdayName,
+  today as attendanceToday,
+  WORK_MODES,
+  type Timesheet,
+  type SubmittedTimesheet,
+} from '@/lib/attendance';
+import { STATE_LABELS } from '@/lib/workflow';
+
+const PATH = '/portal/employee/timesheet';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+/** Minutes from an 'hours' box. Accepts 7, 7.5, blank. Never NaN, never negative. */
+function minutesFromHours(raw: unknown): number {
+  const n = Number(String(raw ?? '').trim());
+  if (!isFinite(n) || n <= 0) return 0;
+  return Math.round(Math.min(n, 20) * 60);
+}
+
+function stateLabel(state: string | null | undefined): string {
+  if (state === 'draft') return STATE_LABELS.draft;
+  if (state === 'pending') return STATE_LABELS.pending;
+  if (state === 'approved') return STATE_LABELS.approved;
+  if (state === 'rejected') return STATE_LABELS.rejected;
+  if (state === 'cancelled') return STATE_LABELS.cancelled;
+  if (state === 'halted') return STATE_LABELS.halted;
+  return 'Not sent yet';
+}
+
+const dayLabel = (iso: string) => {
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+};
+
+let flash = '';
+let flashError = '';
+let haltReason = '';
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST' && employeeId) {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || '');
+
+    if (action === 'submit') {
+      const weekStart = weekStartIso(String(form.get('week_start') || ''));
+      const entries = [];
+      for (let i = 0; i < 7; i++) {
+        const dateIso = String(form.get('date_' + i) || '');
+        if (!dateIso) continue;
+        entries.push({
+          dateIso,
+          minutes: minutesFromHours(form.get('hours_' + i)),
+          workMode: String(form.get('mode_' + i) || '') || null,
+          project: String(form.get('project_' + i) || '') || null,
+          note: String(form.get('note_' + i) || '') || null,
+        });
+      }
+      const res = await submitTimesheet({
+        employeeId,
+        weekStart,
+        entries,
+        note: String(form.get('note') || ''),
+        submittedByUserId: String(user.id),
+      });
+      if (res.ok) {
+        flash = 'Timesheet sent for approval.';
+        haltReason = res.haltReason || '';
+      } else {
+        // NEVER SWALLOWED. The engine's sentence is shown as it is.
+        flashError = res.error || 'That could not be submitted.';
+      }
+    } else if (action === 'withdraw') {
+      const res = await withdrawTimesheet(String(form.get('id') || ''), employeeId);
+      if (res.ok) flash = res.changed === false ? 'That week was already withdrawn.' : 'Timesheet withdrawn.';
+      else flashError = res.error || 'That could not be withdrawn.';
+    } else {
+      flashError = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    flashError = 'We could not save that: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/timesheet] post', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+const now = await attendanceToday();
+const weekParam = String(Astro.url.searchParams.get('week') || '').trim();
+const anchor = /^\d{4}-\d{2}-\d{2}$/.test(weekParam) ? weekParam : (now || '');
+const weekStart = anchor ? weekStartIso(anchor) : '';
+
+let sheet: Timesheet | null = null;
+let submitted: SubmittedTimesheet | null = null;
+let recent: SubmittedTimesheet[] = [];
+
+if (employeeId && weekStart) {
+  sheet = await weeklyTimesheet(employeeId, weekStart);
+  submitted = await timesheetFor(employeeId, weekStart);
+  recent = await timesheetsFor(employeeId, 8);
+}
+
+const settled = !!submitted?.workflow && (submitted.workflow.state === 'approved' || submitted.workflow.state === 'rejected');
+const prevWeek = weekStart ? shiftDateIso(weekStart, -7) : '';
+const nextWeek = weekStart ? shiftDateIso(weekStart, 7) : '';
+const thisWeek = now ? weekStartIso(now) : '';
+
+/** The hours box for a day: what was submitted before, else what the clock recorded. */
+function prefillHours(dateIso: string): string {
+  const prior = submitted?.entries.find((e) => e.dateIso === dateIso);
+  if (prior) return String(Math.round((prior.minutes / 60) * 100) / 100);
+  const day = sheet?.days.find((d) => d.dateIso === dateIso);
+  const mins = day && day.workedMinutes ? day.workedMinutes : 0;
+  return mins ? String(Math.round((mins / 60) * 100) / 100) : '';
+}
+function prefillMode(dateIso: string): string {
+  const prior = submitted?.entries.find((e) => e.dateIso === dateIso);
+  if (prior?.workMode) return prior.workMode;
+  const day = sheet?.days.find((d) => d.dateIso === dateIso);
+  return day?.workMode === 'onsite' || day?.workMode === 'hybrid' ? day.workMode : 'remote';
+}
+function prefillProject(dateIso: string): string {
+  return submitted?.entries.find((e) => e.dateIso === dateIso)?.project || '';
+}
+function prefillNote(dateIso: string): string {
+  return submitted?.entries.find((e) => e.dateIso === dateIso)?.note || '';
+}
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Timesheet - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 2px;margin:0;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;border:1px solid #DFDCD8;
+      border-radius:999px;background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:12px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .weeknav{display:flex;align-items:center;gap:8px;margin:12px 0 0;}
+    .weeknav a{flex:1 1 auto;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:10px 12px;
+      border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;}
+    .weeknav b{flex:2 1 auto;text-align:center;font-size:0.8125rem;}
+    .day{margin:10px 0 0;padding:11px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;}
+    .day h3{margin:0 0 6px;font-size:0.875rem;font-weight:680;}
+    .day small{display:block;font-size:0.75rem;color:#70685C;margin-bottom:6px;overflow-wrap:anywhere;}
+    .grid{display:grid;grid-template-columns:1fr;gap:8px;}
+    .lab{display:block;margin:0 0 3px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    .go{width:100%;min-height:48px;margin:12px 0 0;padding:12px 14px;border:1px solid #1B1813;border-radius:10px;background:#1B1813;color:#fff;font:inherit;font-size:0.9375rem;font-weight:650;cursor:pointer;}
+    .thin{width:100%;min-height:44px;margin:8px 0 0;padding:10px 14px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#564E43;font:inherit;font-size:0.8125rem;font-weight:600;cursor:pointer;}
+    .rows{list-style:none;margin:10px 0 0;padding:0;}
+    .row{padding:10px 12px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;margin-bottom:8px;}
+    .row p{margin:0;font-size:0.875rem;line-height:1.5;overflow-wrap:anywhere;}
+    .row small{display:block;margin-top:3px;font-size:0.75rem;color:#70685C;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+    @media (min-width:640px){ .grid{grid-template-columns:repeat(2, minmax(0,1fr));} }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Timesheet</h1>
+    <p>{workspace ? workspace.fullName : 'Your week'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Time">
+    <a class="tab" href="/portal/employee/attendance">Attendance</a>
+    <a class="tab" href={PATH} aria-current="page">Timesheet</a>
+    <a class="tab" href="/portal/employee/attendance/overtime">Overtime</a>
+    <a class="tab" href="/portal/employee/attendance/approvals">Waiting on me</a>
+    <a class="tab" href="/portal/employee/leave">Leave</a>
+  </nav>
+
+  <main class="wrap">
+    {!gate.ok && (
+      <section class="card">
+        <h2>{gate.title || 'This screen is not available'}</h2>
+        <p>{gate.reason || 'Your employee record is what this screen is built from.'}</p>
+      </section>
+    )}
+
+    {gate.ok && !now && (
+      <p class="bad">
+        We could not read today's date from the database, so this page cannot tell which week you are
+        looking at. Nothing you have logged is lost. Try again in a moment.
+      </p>
+    )}
+
+    {flash && <p class="ok">{flash}</p>}
+    {haltReason && <p class="notice">{haltReason}</p>}
+    {flashError && <p class="bad">{flashError}</p>}
+
+    {gate.ok && weekStart && (
+      <section class="card">
+        <h2>Week of {dayLabel(weekStart)}</h2>
+        <p>
+          {submitted
+            ? 'Submitted ' + (submitted.submittedAt ? dayLabel(String(submitted.submittedAt).slice(0, 10)) : '') + ' · ' + stateLabel(submitted.workflow?.state) + ' · ' + (formatMinutes(submitted.totalMinutes) || '0m') + ' declared'
+            : 'Not submitted yet. The hours below are what your punches recorded; change any of them before you send it.'}
+        </p>
+        {submitted?.workflow?.haltReason && (
+          <p class="notice" style="margin-top:8px;">
+            This week could not be routed for approval: {submitted.workflow.haltReason}. It is not
+            approved and nobody has been asked. Once the missing relationship is recorded on the
+            organization graph it can be sent again.
+          </p>
+        )}
+        <div class="weeknav">
+          <a href={PATH + '?week=' + prevWeek} rel="prev">Earlier</a>
+          <b>{dayLabel(weekStart)} to {dayLabel(shiftDateIso(weekStart, 6))}</b>
+          <a href={PATH + '?week=' + nextWeek} rel="next">Later</a>
+        </div>
+        {thisWeek && thisWeek !== weekStart && (
+          <div class="weeknav"><a href={PATH + '?week=' + thisWeek}>Back to this week</a></div>
+        )}
+      </section>
+    )}
+
+    {gate.ok && weekStart && settled && (
+      <p class="notice">
+        This week has already been {submitted?.workflow?.state}. It is kept exactly as it was signed
+        off - a settled approval is evidence. If a day on it is wrong, ask for an attendance
+        correction on that day instead.
+      </p>
+    )}
+
+    {gate.ok && weekStart && !settled && (
+      <form method="POST" action={PATH}>
+        <input type="hidden" name="action" value="submit"/>
+        <input type="hidden" name="week_start" value={weekStart}/>
+
+        {[0, 1, 2, 3, 4, 5, 6].map((i) => {
+          const dateIso = shiftDateIso(weekStart, i);
+          const day = sheet ? sheet.days.find((d) => d.dateIso === dateIso) : null;
+          return (
+            <div class="day">
+              <h3>{weekdayName(dateIso)} · {dayLabel(dateIso)}</h3>
+              <small>
+                {day && day.holiday ? day.holiday.name + ' · ' : ''}
+                {day && day.status === 'on_leave' ? 'Recorded as leave · ' : ''}
+                Clock recorded {day && day.workedMinutes ? formatMinutes(day.workedMinutes) : 'nothing'}
+                {day && day.expectedMinutes ? ' against ' + formatMinutes(day.expectedMinutes) + ' rostered' : ''}
+              </small>
+              <input type="hidden" name={'date_' + i} value={dateIso}/>
+              <div class="grid">
+                <div>
+                  <label class="lab" for={'hours_' + i}>Hours</label>
+                  <input class="field" id={'hours_' + i} name={'hours_' + i} type="number" min="0" max="20" step="0.25" value={prefillHours(dateIso)} placeholder="0"/>
+                </div>
+                <div>
+                  <label class="lab" for={'mode_' + i}>Where</label>
+                  <select class="field" id={'mode_' + i} name={'mode_' + i}>
+                    {WORK_MODES.map((m) => (
+                      <option value={m} selected={prefillMode(dateIso) === m}>{m === 'remote' ? 'Remote' : (m === 'onsite' ? 'On site' : 'Hybrid')}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label class="lab" for={'project_' + i}>Project or piece of work</label>
+                  <input class="field" id={'project_' + i} name={'project_' + i} maxlength="160" value={prefillProject(dateIso)} placeholder="Optional"/>
+                </div>
+                <div>
+                  <label class="lab" for={'note_' + i}>Note</label>
+                  <input class="field" id={'note_' + i} name={'note_' + i} maxlength="400" value={prefillNote(dateIso)} placeholder="Optional"/>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+
+        <div class="card">
+          <label class="lab" for="note">Anything about the week</label>
+          <input class="field" id="note" name="note" maxlength="1000" value={submitted?.note || ''} placeholder="Optional"/>
+          <button class="go" type="submit">{submitted ? 'Resubmit for approval' : 'Send for approval'}</button>
+          <p style="margin-top:8px;font-size:0.75rem;line-height:1.55;color:#70685C;">
+            This goes to your reporting manager. It does not change your recorded attendance - the
+            punches stay exactly as they are, and this sits beside them as your account of the week.
+          </p>
+        </div>
+      </form>
+    )}
+
+    {gate.ok && submitted && !settled && (
+      <form method="POST" action={PATH}>
+        <input type="hidden" name="action" value="withdraw"/>
+        <input type="hidden" name="id" value={submitted.id}/>
+        <button class="thin" type="submit">Withdraw this week</button>
+      </form>
+    )}
+
+    {gate.ok && recent.length > 0 && (
+      <section class="card">
+        <h2>Weeks you have submitted</h2>
+        <ul class="rows">
+          {recent.map((t) => (
+            <li class="row">
+              <p>{dayLabel(t.weekStart)} to {dayLabel(t.weekEnd)} · {formatMinutes(t.totalMinutes) || '0m'}</p>
+              <small>
+                {stateLabel(t.workflow?.state)}
+                {t.withdrawnAt ? ' · withdrawn' : ''}
+                {t.workflow?.haltReason ? ' · ' + t.workflow.haltReason : ''}
+              </small>
+              <small><a href={PATH + '?week=' + t.weekStart}>Open that week</a></small>
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    <p class="foot">
+      A timesheet is your account of the week. Your punches are the clock's, and neither one rewrites
+      the other. Approving a timesheet records that your manager recognises the week; it does not
+      change a single attendance row.
+    </p>
+  </main>
+</body>
+</html>

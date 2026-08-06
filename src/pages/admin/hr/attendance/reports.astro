@@ -1,0 +1,250 @@
+---
+// /admin/hr/attendance/reports — ATTENDANCE OVER A PERIOD, PER PERSON AND PER DEPARTMENT.
+//
+// =================================================================================================
+// WHAT IS COUNTED, AND WHAT IS DELIBERATELY NOT AVAILABLE TO COUNT
+// =================================================================================================
+//
+// Days, statuses, hours, overtime and part-day leave, read from hr_attendance and grouped in
+// Postgres. NOTHING HERE SAYS WHY SOMEBODY WAS AWAY. There is no health, wellness or medical data
+// joined into either report and none is reachable from these queries - a leave day is a leave day.
+//
+// LATE ARRIVALS AND EARLY DEPARTURES ARE NOT ON THIS PAGE AND ARE NOT COUNTED ANYWHERE. They are
+// computed when a person looks at one day, phrased as a sentence, and stored nowhere - because a
+// column that counts them becomes a column somebody sorts by, and then a phone that could not get a
+// GPS fix costs somebody money. That is a decision in the data model, not a preference in the UI.
+//
+// TWO REPORTS, NOT ONE. The per-person report answers "how has this month gone for the people I am
+// responsible for"; the department report answers "how is the organization doing", aggregate only,
+// with no drill-down to a person. They are separate because they are read by different people for
+// different reasons.
+//
+// MOBILE FIRST: both tables scroll inside their own container. The PAGE never scrolls sideways.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import {
+  employeeAttendanceReport,
+  departmentAttendanceReport,
+  formatMinutes,
+  today as attendanceToday,
+  type AttendanceReportRow,
+  type DepartmentAttendanceRow,
+} from '@/lib/attendance';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const PAGE = '/admin/hr/attendance/reports';
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// The same gate as the holiday calendar and for the same reason: EITHER the `attendance` section at
+// edit level OR `attendance.roster.manage`. `analytics.view` also admits, because this is exactly
+// the kind of aggregate the analytics console already grants - and its holders (super_admin, hr) are
+// the same two accounts either way.
+const attendanceDesk = await canAccessSection(user, 'attendance', 'edit');
+const mayRead = can(user as any, 'attendance.roster.manage') || can(user as any, 'analytics.view') || attendanceDesk;
+if (!mayRead) return Astro.redirect('/admin');
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+const params = new URL(Astro.request.url).searchParams;
+const now = (await attendanceToday()) || new Date().toISOString().slice(0, 10);
+const monthStart = now.slice(0, 8) + '01';
+
+const fromParam = String(params.get('from') || '');
+const toParam = String(params.get('to') || '');
+const from = DATE_RE.test(fromParam) ? fromParam : monthStart;
+const to = DATE_RE.test(toParam) && toParam >= from ? toParam : now;
+const departmentId = String(params.get('department') || '').trim();
+const view = String(params.get('view') || 'people') === 'departments' ? 'departments' : 'people';
+
+let departments: any[] = [];
+try {
+  departments = rowsOf(await db.execute(sql`SELECT id::text AS id, name FROM departments ORDER BY name ASC LIMIT 200`));
+} catch (e: any) {
+  console.error('[admin/hr/attendance/reports] departments', e?.cause?.message || e?.message);
+}
+
+let people: AttendanceReportRow[] = [];
+let byDepartment: DepartmentAttendanceRow[] = [];
+if (view === 'people') {
+  people = await employeeAttendanceReport({ from, to, departmentId: departmentId || null, limit: 400 });
+} else {
+  byDepartment = await departmentAttendanceReport({ from, to });
+}
+
+const totalRecorded = people.reduce((s, r) => s + r.recordedDays, 0);
+const totalWorked = people.reduce((s, r) => s + r.workedMinutes, 0);
+const totalOvertime = people.reduce((s, r) => s + r.overtimeMinutes, 0);
+const withNothing = people.filter((r) => r.recordedDays === 0).length;
+
+const fmtDate = (iso: string) => {
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+};
+---
+<AdminLayout title="Attendance reports" activeNav="">
+  <div class="admin-page rep-page">
+    <div class="admin-page-header"><div class="admin-page-title-block">
+      <div class="admin-page-eyebrow">HR Management · Working time</div>
+      <h1 class="admin-page-title">Attendance reports</h1>
+      <p class="admin-page-sub">
+        {fmtDate(from)} to {fmtDate(to)}. Days, hours and approved overtime, counted from the
+        attendance record. Nothing here says why anybody was away.
+      </p>
+    </div></div>
+
+    <p class="crossref">
+      Days are recorded on <a href="/admin/hr/attendance">Attendance</a>, holidays on
+      <a href="/admin/hr/holidays"> the holiday calendar</a>, and leave on
+      <a href="/admin/hr/leave"> leave approvals</a>.
+    </p>
+
+    <form method="GET" action={PAGE} class="filters">
+      <label class="fl">From<input class="fi" type="date" name="from" value={from}/></label>
+      <label class="fl">To<input class="fi" type="date" name="to" value={to}/></label>
+      <label class="fl">Department
+        <select class="fi" name="department">
+          <option value="">Everyone</option>
+          {departments.map((d) => (<option value={String(d.id)} selected={String(d.id) === departmentId}>{d.name}</option>))}
+        </select>
+      </label>
+      <label class="fl">Report
+        <select class="fi" name="view">
+          <option value="people" selected={view === 'people'}>Per person</option>
+          <option value="departments" selected={view === 'departments'}>Per department</option>
+        </select>
+      </label>
+      <button class="btn btn-go" type="submit">Show it</button>
+    </form>
+
+    {view === 'people' && (
+      <div>
+        <div class="stats">
+          <div class="stat"><b>{people.length}</b><span>active people</span></div>
+          <div class="stat"><b>{totalRecorded}</b><span>days recorded</span></div>
+          <div class="stat"><b>{formatMinutes(totalWorked) || '0m'}</b><span>hours worked</span></div>
+          <div class="stat"><b>{formatMinutes(totalOvertime) || '0m'}</b><span>approved overtime</span></div>
+        </div>
+
+        {withNothing > 0 && (
+          <p class="note">
+            {withNothing} of these people have no attendance row at all in this period. That is an
+            absence of DATA, not a claim that they did not work: somebody who never checks in and
+            whose days were never recorded by HR looks the same here as somebody who was away.
+          </p>
+        )}
+
+        {people.length === 0 && (
+          <p class="empty">
+            Nobody matches that period and department. Attendance rows are written when a person
+            checks in, when HR records a day, when leave is approved, or when a correction is applied.
+          </p>
+        )}
+
+        {people.length > 0 && (
+          <div class="scroller">
+            <table>
+              <thead>
+                <tr>
+                  <th>Person</th><th>Department</th><th>Recorded</th><th>Present</th>
+                  <th>From home</th><th>Leave</th><th>Absent</th><th>Part-day leave</th>
+                  <th>Worked</th><th>Overtime</th>
+                </tr>
+              </thead>
+              <tbody>
+                {people.map((r) => (
+                  <tr>
+                    <td>{r.name}{r.code ? ' · ' + r.code : ''}</td>
+                    <td>{r.departmentName || 'Not recorded'}</td>
+                    <td>{r.recordedDays}</td>
+                    <td>{r.presentDays}</td>
+                    <td>{r.wfhDays}</td>
+                    <td>{r.leaveDays}</td>
+                    <td>{r.absentDays}</td>
+                    <td>{r.partialLeaveUnits || 0}</td>
+                    <td>{formatMinutes(r.workedMinutes) || '0m'}</td>
+                    <td>{formatMinutes(r.overtimeMinutes) || '0m'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    )}
+
+    {view === 'departments' && (
+      <div>
+        {byDepartment.length === 0 && (
+          <p class="empty">No departments have anybody active against them for this period.</p>
+        )}
+        {byDepartment.length > 0 && (
+          <div class="scroller">
+            <table>
+              <thead>
+                <tr>
+                  <th>Department</th><th>People</th><th>Recorded</th><th>Present</th>
+                  <th>From home</th><th>Leave</th><th>Absent</th><th>Worked</th>
+                  <th>Overtime</th><th>Average a day</th>
+                </tr>
+              </thead>
+              <tbody>
+                {byDepartment.map((d) => (
+                  <tr>
+                    <td>{d.departmentName}</td>
+                    <td>{d.employees}</td>
+                    <td>{d.recordedDays}</td>
+                    <td>{d.presentDays}</td>
+                    <td>{d.wfhDays}</td>
+                    <td>{d.leaveDays}</td>
+                    <td>{d.absentDays}</td>
+                    <td>{formatMinutes(d.workedMinutes) || '0m'}</td>
+                    <td>{formatMinutes(d.overtimeMinutes) || '0m'}</td>
+                    <td>{formatMinutes(d.averageMinutesPerRecordedDay) || '0m'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p class="note">
+          Averages are per RECORDED day, not per calendar day, so a small team is not flattered by a
+          large one. A department with nothing recorded shows zeros, which means no rows were written
+          for it - not that nobody worked.
+        </p>
+      </div>
+    )}
+  </div>
+
+  <style>
+    /* MOBILE FIRST. The tables are wide by nature; each gets its own scroller so the PAGE does not. */
+    .rep-page{ max-width:1200px; }
+    .crossref{ font-size:13px; color:#8a8a94; margin:0 0 16px; line-height:1.6; overflow-wrap:anywhere; }
+    .crossref a{ color:#f97316; }
+    .filters{ display:grid; grid-template-columns:1fr; gap:8px; margin:0 0 18px; }
+    .fl{ display:flex; flex-direction:column; gap:4px; font-size:11px; color:#8a8a94;
+      text-transform:uppercase; letter-spacing:0.06em; min-width:0; }
+    .fi{ background:#08080b; border:1px solid #262630; border-radius:7px; padding:11px 10px; color:#fff;
+      font-size:13px; outline:none; font-family:inherit; width:100%; min-width:0; text-transform:none; letter-spacing:0; }
+    .btn{ border:none; border-radius:7px; padding:0 16px; min-height:44px; color:#fff; font-size:12px;
+      font-weight:700; cursor:pointer; font-family:'Geist Mono',monospace; white-space:nowrap; }
+    .btn-go{ background:#c2410c; }
+    .stats{ display:flex; flex-wrap:wrap; gap:8px; margin:0 0 14px; }
+    .stat{ flex:1 1 150px; min-width:0; background:#0f0f14; border:1px solid #1a1a1f; border-radius:10px; padding:12px 14px; }
+    .stat b{ display:block; color:#fff; font-family:'Geist Mono',monospace; font-size:18px; overflow-wrap:anywhere; }
+    .stat span{ display:block; margin-top:3px; color:#8a8a94; font-size:11px; text-transform:uppercase; letter-spacing:0.06em; }
+    .note{ color:#8a8a94; font-size:12.5px; margin:12px 0 0; line-height:1.6; overflow-wrap:anywhere; }
+    .empty{ color:#8a8a94; font-size:13px; margin:0 0 18px; line-height:1.6; }
+    .scroller{ overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid #1a1a1f; border-radius:10px; background:#0f0f14; }
+    table{ border-collapse:collapse; width:100%; min-width:820px; font-size:12.5px; }
+    th,td{ padding:9px 10px; text-align:left; border-bottom:1px solid #1a1a1f; white-space:nowrap; color:#cfd6da; }
+    th{ font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:0.08em; text-transform:uppercase; color:#8a8a94; }
+    tr:last-child td{ border-bottom:none; }
+    @media (min-width:620px){ .filters{ grid-template-columns:repeat(2, minmax(0,1fr)); align-items:end; } }
+    @media (min-width:900px){ .filters{ grid-template-columns:repeat(5, minmax(0,1fr)); } }
+  </style>
+</AdminLayout>

@@ -2,7 +2,7 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { adminConversations, adminMessages, users } from '@/lib/db/schema';
-import { eq, or, and, desc, ne } from 'drizzle-orm';
+import { eq, or, and, desc, ne, inArray, sql } from 'drizzle-orm';
 import { CHAT_CANONICAL_HREF } from '@/lib/chat-schema';
 
 const currentUser = Astro.locals.user!;
@@ -24,21 +24,26 @@ if (!currentUser || currentUser.role === 'applicant') return Astro.redirect('/po
 // the message missing and no explanation anywhere on screen.
 const errorMsg = '';
 
-const allAdmins = await db.select({ id: users.id, name: users.name, email: users.email, role: users.role }).from(users).where(ne(users.id, currentUser.id));
-const userMap: Record<string, any> = {};
-allAdmins.forEach(u => { userMap[u.id] = u; });
+// HOW MANY QUERIES THIS FRONTMATTER USED TO COST, AND WHY IT MATTERED.
+//
+// Before: 1 (every row of `users`) + 1 (every conversation, no cap) + 2 PER CONVERSATION, issued
+// CONCURRENTLY through Promise.all, + 1 unbounded message read. With 40 archived conversations that
+// is 83 statements per page load and 80 of them wanting a pooler connection at the same instant.
+// Concurrent-fan-out inside one serverless invocation is the shape that took this site down before,
+// and `users` on this deployment holds every applicant, not just staff — so the very first query was
+// a full scan of the largest people table to build a name map for at most a few dozen ids.
+//
+// After: 4 statements, none of them a full table scan, all of them bounded.
+//
+// Conversations are capped. This page is a read-only archive of a retired DM mechanism (see the
+// note above), so an older-than-the-cap conversation is unreachable rather than lost, and the cap is
+// stated on screen instead of silently truncating.
+const CONVO_CAP = 200;
 
 const myConvos = await db.select().from(adminConversations)
   .where(or(eq(adminConversations.userAId, currentUser.id), eq(adminConversations.userBId, currentUser.id)))
-  .orderBy(desc(adminConversations.lastMessageAt));
-
-const convoSummaries = await Promise.all(myConvos.map(async (c) => {
-  const otherId = c.userAId === currentUser.id ? c.userBId : c.userAId;
-  const lastMsg = await db.select().from(adminMessages).where(eq(adminMessages.conversationId, c.id)).orderBy(desc(adminMessages.createdAt)).limit(1);
-  const unread = await db.select({ id: adminMessages.id }).from(adminMessages)
-    .where(and(eq(adminMessages.conversationId, c.id), ne(adminMessages.senderUserId, currentUser.id), eq(adminMessages.readByRecipient, false)));
-  return { id: c.id, otherUser: userMap[otherId] || null, lastMessage: lastMsg[0] || null, lastMessageAt: c.lastMessageAt, unreadCount: unread.length };
-}));
+  .orderBy(desc(adminConversations.lastMessageAt))
+  .limit(CONVO_CAP);
 
 const url = new URL(Astro.request.url);
 const openConvId = url.searchParams.get('c') || '';
@@ -47,15 +52,77 @@ const openConvId = url.searchParams.get('c') || '';
 let openMessages: any[] = [];
 let otherUser: any = null;
 
-if (openConvId) {
+const convoIds = myConvos.map(c => c.id);
+const otherIdOf = (c: { userAId: string; userBId: string }) => (c.userAId === currentUser.id ? c.userBId : c.userAId);
+
+// THE OPEN CONVERSATION IS RESOLVED FIRST so its counterparty joins the SAME name lookup as the
+// list, rather than forcing a second read of `users`. The membership test below is unchanged: a
+// conversation the viewer is not a party to still renders nothing.
+let openConvo: typeof myConvos[number] | null = myConvos.find(c => c.id === openConvId) || null;
+if (openConvId && !openConvo) {
   const found = await db.select().from(adminConversations).where(eq(adminConversations.id, openConvId)).limit(1);
-  if (found.length > 0 && (found[0].userAId === currentUser.id || found[0].userBId === currentUser.id)) {
-    const otherId = found[0].userAId === currentUser.id ? found[0].userBId : found[0].userAId;
-    otherUser = userMap[otherId];
-    await db.update(adminMessages).set({ readByRecipient: true, readAt: new Date() })
-      .where(and(eq(adminMessages.conversationId, openConvId), ne(adminMessages.senderUserId, currentUser.id), eq(adminMessages.readByRecipient, false)));
-    openMessages = await db.select().from(adminMessages).where(eq(adminMessages.conversationId, openConvId)).orderBy(adminMessages.createdAt);
+  if (found.length > 0 && (found[0].userAId === currentUser.id || found[0].userBId === currentUser.id)) openConvo = found[0];
+}
+
+// ONE name lookup for exactly the counterparties on screen, instead of one row per user account.
+const otherIds = Array.from(new Set([
+  ...myConvos.map(otherIdOf),
+  ...(openConvo ? [otherIdOf(openConvo)] : []),
+].filter(Boolean) as string[]));
+const userMap: Record<string, any> = {};
+if (otherIds.length > 0) {
+  const people = await db.select({ id: users.id, name: users.name, email: users.email, role: users.role })
+    .from(users).where(inArray(users.id, otherIds));
+  people.forEach(u => { userMap[u.id] = u; });
+}
+
+// ONE last-message read for every conversation at once. DISTINCT ON picks the newest row per
+// conversation inside Postgres; the ORDER BY leader must match the DISTINCT ON key, which is why
+// conversation_id is ordered first and created_at second.
+const lastByConvo: Record<string, any> = {};
+const unreadByConvo: Record<string, number> = {};
+if (convoIds.length > 0) {
+  const lastRaw = await db.execute(sql`
+    SELECT DISTINCT ON (conversation_id) conversation_id, id, body, sender_user_id, created_at
+      FROM admin_messages
+     WHERE ${inArray(adminMessages.conversationId, convoIds)}
+     ORDER BY conversation_id, created_at DESC`);
+  for (const m of (Array.isArray(lastRaw) ? lastRaw : ((lastRaw as any)?.rows || [])) as any[]) {
+    lastByConvo[String(m.conversation_id)] = { id: m.id, body: m.body, senderUserId: m.sender_user_id, createdAt: m.created_at };
   }
+  // ONE unread count for every conversation at once. This used to fetch the unread ROWS per
+  // conversation and take .length of them in JavaScript — the count is done in Postgres now, so a
+  // long-unread thread transfers one integer instead of every message in it.
+  const unreadRaw = await db.execute(sql`
+    SELECT conversation_id, COUNT(*)::int AS n
+      FROM admin_messages
+     WHERE ${inArray(adminMessages.conversationId, convoIds)}
+       AND sender_user_id <> ${currentUser.id}
+       AND read_by_recipient = false
+     GROUP BY conversation_id`);
+  for (const m of (Array.isArray(unreadRaw) ? unreadRaw : ((unreadRaw as any)?.rows || [])) as any[]) {
+    unreadByConvo[String(m.conversation_id)] = Number(m.n) || 0;
+  }
+}
+
+const convoSummaries = myConvos.map((c) => ({
+  id: c.id,
+  otherUser: userMap[otherIdOf(c)] || null,
+  lastMessage: lastByConvo[c.id] || null,
+  lastMessageAt: c.lastMessageAt,
+  unreadCount: unreadByConvo[c.id] || 0,
+}));
+
+if (openConvo) {
+  otherUser = userMap[otherIdOf(openConvo)];
+  await db.update(adminMessages).set({ readByRecipient: true, readAt: new Date() })
+    .where(and(eq(adminMessages.conversationId, openConvo.id), ne(adminMessages.senderUserId, currentUser.id), eq(adminMessages.readByRecipient, false)));
+  // Capped: an open thread had no bound at all, so a long one rendered every message it ever held.
+  openMessages = await db.select().from(adminMessages)
+    .where(eq(adminMessages.conversationId, openConvo.id))
+    .orderBy(desc(adminMessages.createdAt))
+    .limit(300);
+  openMessages.reverse(); // newest-300, shown oldest-first as before
 }
 
 const totalUnread = convoSummaries.reduce((s, c) => s + c.unreadCount, 0);
@@ -142,6 +209,9 @@ const roleColor: Record<string,string> = { super_admin:'#f97316', admin:'#FF4F00
           </a>
         );
       })}
+      {convoSummaries.length >= CONVO_CAP && (
+        <p style="padding:12px 16px;font-size:10.5px;color:#6e6e78;margin:0;line-height:1.5;">Showing the {CONVO_CAP} most recent conversations. Older ones are still stored and are not shown here.</p>
+      )}
     </div>
   </div>
 

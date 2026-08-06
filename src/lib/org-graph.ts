@@ -516,6 +516,206 @@ export async function isDepartmentHead(
   }
 }
 
+/**
+ * EVERY DEPARTMENT THIS EMPLOYEE HEADS, as of a date. The inverse of getDepartmentHead().
+ *
+ * ADDED FOR THE PROJECTS MODULE, and added HERE for the same reason getReviewers() was: a project
+ * list has to be scoped IN THE WHERE CLAUSE to "my department's projects", which needs the SET of
+ * departments this person heads, not a yes/no about one of them. The alternative was a second query
+ * against org_relationships written from outside this file — the exact drift the header forbids, and
+ * the way two modules start disagreeing about who heads what.
+ *
+ * Returns department ids as TEXT, never uuid: departments.id is a varchar(50) slug in
+ * src/lib/db/schema.ts and a UUID in db/hr-schema.sql, so a cast would throw on half the estate.
+ */
+export async function getHeadedDepartmentIds(
+  employeeId: string,
+  opts?: AsOfOptions,
+): Promise<string[]> {
+  if (!isUuid(employeeId)) return [];
+  const at = asOfIso(opts);
+  if (!at) return [];
+  try {
+    await ensureOrgGraphSchema();
+    const r = await db.execute(sql`
+      SELECT DISTINCT r.scope_id AS scope_id
+        FROM org_relationships r
+       WHERE r.type = 'department_head'
+         AND r.scope_type = 'department'
+         AND r.scope_id IS NOT NULL
+         AND r.subject_employee_id = ${employeeId}::uuid
+         AND ${inForce('r', at)}`);
+    return rows(r).map((row) => String(row.scope_id)).filter(Boolean);
+  } catch (e: any) {
+    logFail('getHeadedDepartmentIds', e);
+    return [];
+  }
+}
+
+/** The same answer for a signed-in caller, who holds a users.id and not an employee id. */
+export async function userHeadedDepartmentIds(
+  userId: string,
+  opts?: AsOfOptions,
+): Promise<string[]> {
+  const emp = await employeeIdForUser(userId);
+  if (!emp) return [];
+  return getHeadedDepartmentIds(emp, opts);
+}
+
+// -------------------------------------------------------------------------------------------------
+// PROJECT MANAGEMENT — the `project_manager` edge, read in both directions.
+//
+// READ THE VOCABULARY NOTE ABOVE BEFORE CHANGING ANY OF THIS. `project_manager` is a RELATIONSHIP
+// TYPE: "<subject> runs the project in scope_id and directs <object> inside it". It is NOT a role, it
+// is NOT a capability, and there is no value of users.role that means it. A projects module that
+// decided who runs a project from users.role would have turned a per-ROW relationship back into a
+// per-USER grant — every "manager" running every project — which is the precise regression Phase 1
+// removed and the reason these four resolvers live in this file instead of in that one.
+//
+// TWO SHAPES OF THE SAME EDGE, and both are deliberate:
+//   object IS NULL   -> "subject RUNS this project". A project is run, like a department is headed,
+//                       without naming one person it is run over.
+//   object IS NOT NULL -> "subject directs THAT person on this project". A dotted line bounded by the
+//                       project, which is what makes isResponsibleFor() count it (project_manager is
+//                       in RESPONSIBILITY_TYPES) without giving anybody reach outside the project.
+//
+// The resolvers below answer the FIRST shape — who runs it — because that is the question a project
+// surface asks. The second shape is already answered by isResponsibleFor().
+//
+// scope_id IS TEXT. A project id is a uuid and is compared as text here, exactly as a department slug
+// is, because org_relationships.scope_id holds both and a ::uuid cast would throw on the slug.
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * Who runs this project, as of a date? Null when nobody does, and null on any error.
+ *
+ * A project can carry more than one open project_manager edge (the partial unique index only forbids
+ * the SAME subject twice), so this returns the most recently started one and getProjectManagers()
+ * returns the whole set. A surface that shows one name should show that one; a surface that decides
+ * something should ask isProjectManager() about the actual actor rather than compare names.
+ */
+export async function getProjectManager(
+  projectId: string,
+  opts?: AsOfOptions,
+): Promise<OrgPerson | null> {
+  const list = await getProjectManagers(projectId, opts);
+  return list.length ? list[0] : null;
+}
+
+/** Everyone who runs this project, as of a date. Most recently started first. Empty on error. */
+export async function getProjectManagers(
+  projectId: string,
+  opts?: AsOfOptions,
+): Promise<OrgPerson[]> {
+  const project = typeof projectId === 'string' ? projectId.trim() : '';
+  if (!project) return [];
+  const at = asOfIso(opts);
+  if (!at) return [];
+  try {
+    await ensureOrgGraphSchema();
+    const r = await db.execute(sql`
+      SELECT ${PERSON_COLS}
+        FROM org_relationships r
+        JOIN hr_employees e ON e.id = r.subject_employee_id
+       WHERE r.type = 'project_manager'
+         AND r.scope_type = 'project'
+         AND r.scope_id = ${project}
+         AND r.object_employee_id IS NULL
+         AND ${inForce('r', at)}
+       ORDER BY r.effective_from DESC`);
+    return rows(r).map(mapPerson);
+  } catch (e: any) {
+    logFail('getProjectManagers', e);
+    return [];
+  }
+}
+
+/**
+ * Does this employee run this project, as of a date?
+ *
+ * THIS IS NOT `users.role === 'department_head'` and it is not a capability check. It is the per-row
+ * fact "the graph records this person as running THIS project", which is the only thing that may
+ * decide who edits a project, adds a member or moves a milestone.
+ */
+export async function isProjectManager(
+  employeeId: string,
+  projectId: string,
+  opts?: AsOfOptions,
+): Promise<boolean> {
+  const project = typeof projectId === 'string' ? projectId.trim() : '';
+  if (!isUuid(employeeId) || !project) return false;
+  const at = asOfIso(opts);
+  if (!at) return false;
+  try {
+    await ensureOrgGraphSchema();
+    const r = await db.execute(sql`
+      SELECT 1 AS ok
+        FROM org_relationships r
+       WHERE r.type = 'project_manager'
+         AND r.scope_type = 'project'
+         AND r.scope_id = ${project}
+         AND r.subject_employee_id = ${employeeId}::uuid
+         AND ${inForce('r', at)}
+       LIMIT 1`);
+    return rows(r).length > 0;
+  } catch (e: any) {
+    logFail('isProjectManager', e);
+    return false;
+  }
+}
+
+/** The same question for a signed-in caller. False on error and false with no employee record. */
+export async function userIsProjectManager(
+  userId: string,
+  projectId: string,
+  opts?: AsOfOptions,
+): Promise<boolean> {
+  const emp = await employeeIdForUser(userId);
+  if (!emp) return false;
+  return isProjectManager(emp, projectId, opts);
+}
+
+/**
+ * EVERY PROJECT THIS EMPLOYEE RUNS, as of a date, as scope ids.
+ *
+ * This is what a project list scopes ITS WHERE CLAUSE with. Fetching every project and hiding rows
+ * afterwards is not access control — by then the row is already in the page's memory — so the ids
+ * come back here and go into the query as a bound list.
+ */
+export async function getManagedProjectIds(
+  employeeId: string,
+  opts?: AsOfOptions,
+): Promise<string[]> {
+  if (!isUuid(employeeId)) return [];
+  const at = asOfIso(opts);
+  if (!at) return [];
+  try {
+    await ensureOrgGraphSchema();
+    const r = await db.execute(sql`
+      SELECT DISTINCT r.scope_id AS scope_id
+        FROM org_relationships r
+       WHERE r.type = 'project_manager'
+         AND r.scope_type = 'project'
+         AND r.scope_id IS NOT NULL
+         AND r.subject_employee_id = ${employeeId}::uuid
+         AND ${inForce('r', at)}`);
+    return rows(r).map((row) => String(row.scope_id)).filter(Boolean);
+  } catch (e: any) {
+    logFail('getManagedProjectIds', e);
+    return [];
+  }
+}
+
+/** The same list for a signed-in caller. Empty on error and empty with no employee record. */
+export async function userManagedProjectIds(
+  userId: string,
+  opts?: AsOfOptions,
+): Promise<string[]> {
+  const emp = await employeeIdForUser(userId);
+  if (!emp) return [];
+  return getManagedProjectIds(emp, opts);
+}
+
 /** This employee's mentor, as of a date. Support, not authority — see RESPONSIBILITY_TYPES. */
 export async function getMentor(
   employeeId: string,

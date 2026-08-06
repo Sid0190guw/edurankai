@@ -337,6 +337,51 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'requireEmployee. Every punch, timesheet and correction is scoped to the caller\'s own employee id in the query; the write re-checks the punch rule on the POSTED value rather than on the rendered buttons.',
   },
   {
+    key: 'weekly-timesheet',
+    label: 'Timesheet',
+    href: '/portal/employee/timesheet',
+    icon: 'calendar',
+    group: 'time',
+    // DRAWER ONLY. A timesheet is filled in once a week, usually on a Friday, and giving it one of
+    // the four thumb slots would push out something people tap every day. NOT a duplicate of the
+    // 'timesheet' entry above it: that one opens /portal/employee/attendance, which is where a
+    // person CHECKS IN. This is the weekly declaration they submit for approval, which is a
+    // different act on a different table.
+    bar: null,
+    // EXACTLY the page's own gate in the composition's vocabulary. timesheet.astro runs
+    // requireEmployee and renders its named denial without one, and all three of these widgets carry
+    // withEmployeeRecord - so the entry is true for precisely the accounts the page admits.
+    audience: keptAny('attendance.month', 'clock.today', 'timelog.today'),
+    gate: 'requireEmployee. Every read and write is scoped to the caller\'s own employee id; approval is routed by src/lib/workflow.ts to the reporting manager from the Organization Graph, and the page has no approve button of its own.',
+  },
+  {
+    key: 'overtime',
+    label: 'Overtime',
+    href: '/portal/employee/attendance/overtime',
+    icon: 'calendar',
+    group: 'time',
+    // DRAWER ONLY, same reasoning: claiming extra hours is occasional, not daily.
+    bar: null,
+    audience: keptAny('attendance.month', 'clock.today', 'timelog.today'),
+    gate: 'requireEmployee. A claim is checked against the caller\'s OWN punches and shift, routed through src/lib/workflow.ts, and comp off is credited only when the engine says approved. Nothing on the page credits anything.',
+  },
+  {
+    key: 'time-approvals',
+    label: 'Approvals waiting on you',
+    href: '/portal/employee/attendance/approvals',
+    icon: 'checklist',
+    group: 'time',
+    // DRAWER ONLY. Offered to every employee rather than gated on managing anybody, DELIBERATELY:
+    // who approves what is resolved PER ROW from the Organization Graph, not from a capability, so
+    // there is no per-user predicate that could answer "is this person an approver" without asking
+    // the graph. The page itself is honest when the answer is nobody - it says nothing is waiting on
+    // you - and pendingForApprover() returns only what is routed or delegated to the caller, so an
+    // employee who approves nothing sees an empty list rather than somebody else's requests.
+    bar: null,
+    audience: keptAny('attendance.month', 'clock.today', 'timelog.today'),
+    gate: 'requireEmployee, then pendingForApprover(user.id) - routed and delegated steps only, never capability holders. decideStep() re-checks routing and mayAct() at the moment of the write, so a posted step id for somebody else\'s queue is refused by the engine.',
+  },
+  {
     key: 'calendar',
     label: 'Calendar',
     href: '/portal/employee/calendar',
@@ -406,6 +451,28 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     // own pay from them.
     audience: (v) => v.ctx.hasEmployeeRecord,
     gate: 'Signed in, then its own hr_employees lookup; payslipsForEmployee() narrows every row by employee_id. Individual payslips open at /portal/payslip/[id], which re-checks ownership.',
+  },
+  {
+    key: 'loans',
+    label: 'Loans and advances',
+    href: '/portal/employee/loans',
+    icon: 'book',
+    group: 'record',
+    // DRAWER ONLY, for the same reason Payslips is: the bar holds four tabs at 360px, and a person
+    // opens this when something prompts them to — a repayment showing on a payslip, or needing an
+    // advance — not with a thumb between meetings. Taking a tab from Tasks or Messages would be a
+    // worse trade than the extra tap.
+    bar: null,
+    // EXACTLY the page's own gate in the composition's vocabulary. loans.astro resolves an
+    // hr_employees row for the signed-in account and renders a named empty state when there is none;
+    // loansForEmployee() narrows every row by employee_id, and the POST handler takes the employee id
+    // from the SESSION rather than from the form, so there is no id to change in the address bar.
+    //
+    // NO CAPABILITY HERE, and there must not be one: an employee's account very often carries the
+    // `applicant` role, which holds nothing at all, and gating this on a permission would hide a
+    // person's own borrowing and their own repayments from them.
+    audience: (v) => v.ctx.hasEmployeeRecord,
+    gate: 'Signed in, then its own hr_employees lookup. Every read is narrowed by employee_id; requesting and withdrawing both resolve the employee from the session, never from the form.',
   },
   {
     key: 'contract',
@@ -675,6 +742,41 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     // spends ten minutes looking for the travel policy in their own PAN card upload.
     audience: worksHere,
     gate: 'Page: signed in. Contents: listDocuments() narrows in the WHERE clause to what this person owns, what is published to the company or their department, and what is shared with them by name. The curator arm is a capability the page resolves and passes in.',
+  },
+  {
+    key: 'knowledge',
+    label: 'Knowledge base',
+    href: '/portal/employee/knowledge',
+    icon: 'book',
+    group: 'work',
+    // DRAWER ONLY, and ranked immediately after the helpdesk it deflects for: somebody looking for
+    // the answer and somebody about to ask for it are the same person one screen apart.
+    bar: 19,
+    // `worksHere` — an employee record, or admin.access — which is EXACTLY what the page means by
+    // "everyone with a workspace" and exactly what makeViewer() computes as hasWorkspace. An
+    // applicant has no workspace and is offered nothing; the page would show them an empty library
+    // anyway, and offering it would be a promise it does not keep.
+    //
+    // DELIBERATELY NOT A CAPABILITY. Reading the handbook needs no permission of its own: the
+    // article names its own audience and that is applied in the WHERE clause. Gating the ENTRY on
+    // `knowledge.manage` would hide the leave policy from everybody it was written for.
+    audience: worksHere,
+    gate: 'Page: signed in. Contents: every read goes through visibilityClause() in src/lib/knowledge-base.ts, which narrows to articles for everyone with a workspace plus restricted ones whose named capability this person actually holds. Acknowledging a policy writes the SESSION user id, never a posted one.',
+  },
+  {
+    key: 'projects',
+    label: 'My projects',
+    href: '/portal/employee/projects',
+    icon: 'grid',
+    group: 'work',
+    bar: 19,
+    // hasEmployeeRecord, and NOT `worksHere` — the narrower of the two, for the same reason 'assets'
+    // uses it. Project membership is keyed on hr_employees.id, so an admin account with no employee
+    // row would open a page that can only say "nothing here". A capability would be wrong in the
+    // other direction: projects.view is the ORG-WIDE portfolio, and an employee needs nothing at all
+    // to see the projects they are on.
+    audience: (v) => v.ctx.hasEmployeeRecord,
+    gate: 'Page: requireEmployee, then listProjects() in src/lib/projects.ts, which puts the whole scope in the WHERE clause: the projects this person is a member of, the ones the Organization Graph records them as running, their department\'s if they head one, and everything only for a holder of projects.view. An empty graph renders "Organization Graph not yet initialized" rather than an empty list.',
   }
 ];
 
@@ -685,13 +787,12 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
 // ---------------------------------------------------------------------------------------------
 
 export const NAV_BACKLOG: readonly { key: string; reason: string }[] = [
-  {
-    key: 'projects',
-    reason:
-      'ABSENT. No projects table, no project_id and no projectId anywhere in src/ or db/ — employee_tasks ' +
-      'has no project relation. Grouping work by project is not answerable from this database, so there ' +
-      'is no route to link to and none may be invented.',
-  },
+  // NOTE FOR ANYONE LOOKING FOR 'projects' HERE: IT HAS SHIPPED, and its entry is in the list above.
+  // The finding that used to sit here — "no projects table, no project_id and no projectId anywhere in
+  // src/ or db/, employee_tasks has no project relation" — was accurate when it was written and is no
+  // longer true of any clause: src/lib/projects.ts carries the register, and employee_tasks.project_id
+  // is declared in src/lib/employee-tasks.ts, in the module that owns that table. src/lib/search-global.ts
+  // still returns the old honest note for its `projects` source and is a separate module's call to make.
   {
     key: 'calendar.meetings',
     reason:
@@ -777,9 +878,10 @@ export const NAV_BACKLOG: readonly { key: string; reason: string }[] = [
       'employee-profile entry above. It is a NEW page with its own requireEmployee gate rather than ' +
       'an edit to the loop: /portal/profile/edit:7 still redirects every non-applicant to /admin, and ' +
       'middleware bounces anyone without admin.access straight back, which is the loop shape that ' +
-      'took /portal down before. THREE PAGES STILL CARRY THAT LINE and still have no entry pointing ' +
-      'at them — /portal/notifications:7, /portal/requests/index:6, /portal/wallet:10. Each is a ' +
-      'one-line page fix, not a module.',
+      'took /portal down before. /portal/notifications HAS NOW HAD THAT LINE REMOVED — it gates on ' +
+      '"signed in", narrows every read by user_id, and has the notifications entry above pointing at ' +
+      'it — so TWO PAGES still carry it with no entry pointing at them: /portal/requests/index:7 and ' +
+      '/portal/wallet:11. Each is a one-line page fix, not a module.',
   },
 ];
 

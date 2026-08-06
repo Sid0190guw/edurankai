@@ -1,0 +1,1033 @@
+---
+// /portal/employee/projects/[id] — ONE PROJECT, FROM THE INSIDE.
+//
+// WHO CAN OPEN IT, decided in the WHERE clause by src/lib/projects.ts and never on this page: a
+// member, whoever the Organization Graph records as running it, the head of its department, or
+// somebody holding projects.view. getProject() returns null for everybody else, and this page renders
+// the same sentence whether the project does not exist or is not theirs — an id prober learns nothing
+// either way.
+//
+// A PROJECT MANAGER IS NOT AN ADMINISTRATOR. Everything somebody needs to RUN a project is on this
+// page: add people, set milestones, record deliverables, hand out work, raise and grade risks, move
+// the project through its lifecycle. Making them open /admin to do it would mean handing the admin
+// console to everybody who runs anything, which is the widest possible reading of a per-project
+// relationship. Every one of those writes re-derives the relationship from the graph inside the
+// library — this page decides what is OFFERED, never what is permitted.
+//
+// TASKS ARE EMPLOYEE TASKS. There is no second task table and no second set of transition rules: the
+// list is listProjectTasks() and every move goes through moveTask(), the same engine the personal
+// task list and the department board already use. The buttons are rendered from the task's own
+// allowedTransitions, so a control that exists only to be refused is never drawn.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  projectDetail,
+  projectAuthority,
+  projectAllocation,
+  listLinkedSpend,
+  buildTimeline,
+  addMember,
+  updateMember,
+  removeMember,
+  addMilestone,
+  updateMilestone,
+  addDeliverable,
+  updateDeliverable,
+  addRisk,
+  updateRisk,
+  setProjectStatus,
+  employeeOptions,
+  formatAmount,
+  projectStatusLabel,
+  milestoneStatusLabel,
+  deliverableStatusLabel,
+  riskGradeLabel,
+  riskStatusLabel,
+  memberCapacityLabel,
+  allowedProjectStatuses,
+  MEMBER_CAPACITIES,
+  MILESTONE_STATUSES,
+  DELIVERABLE_STATUSES,
+  RISK_GRADES,
+  RISK_STATUSES,
+  GRAPH_NOT_READY,
+} from '@/lib/projects';
+import { listProjectTasks, createProjectTask, moveTask, STATUS_LABELS } from '@/lib/employee-tasks';
+
+const user = Astro.locals.user;
+const projectId = String(Astro.params.id || '');
+if (!user) return Astro.redirect('/portal/login?next=/portal/employee/projects/' + projectId);
+
+// -------------------------------------------------------------------------------------------------
+// CONSTANTS FIRST — `const` is not hoisted, and a const under the POST handler that reads it throws
+// on that handler's first line while the page still reports success.
+// -------------------------------------------------------------------------------------------------
+const PAGE = '/portal/employee/projects/' + projectId;
+
+const fmtDate = (d: string | null) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Plain words from a function, never a typed map indexed inside JSX. */
+function chipClass(status: string): string {
+  if (status === 'active' || status === 'met' || status === 'accepted') return 'chip chip-ok';
+  if (status === 'on_hold' || status === 'in_progress' || status === 'submitted' || status === 'mitigating') return 'chip chip-wait';
+  if (status === 'cancelled' || status === 'missed' || status === 'rejected' || status === 'realised') return 'chip chip-no';
+  if (status === 'completed' || status === 'closed') return 'chip chip-done';
+  return 'chip';
+}
+
+function taskStatusLabel(status: string): string {
+  if (status === 'draft') return STATUS_LABELS.draft;
+  if (status === 'assigned') return STATUS_LABELS.assigned;
+  if (status === 'accepted') return STATUS_LABELS.accepted;
+  if (status === 'in_progress') return STATUS_LABELS.in_progress;
+  if (status === 'blocked') return STATUS_LABELS.blocked;
+  if (status === 'under_review') return STATUS_LABELS.under_review;
+  if (status === 'approved') return STATUS_LABELS.approved;
+  if (status === 'completed') return STATUS_LABELS.completed;
+  if (status === 'cancelled') return STATUS_LABELS.cancelled;
+  if (status === 'archived') return STATUS_LABELS.archived;
+  return status;
+}
+
+const gate = await requireEmployee(user, PAGE);
+const ip = Astro.request.headers.get('x-forwarded-for') || null;
+
+// -------------------------------------------------------------------------------------------------
+// WRITES. Every one of them is re-authorised inside the library against the posted id: what this
+// page renders is a convenience and never the authorisation.
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let ok = true;
+
+  if (!gate.ok) {
+    ok = false;
+    flash = gate.reason || 'Your employee record is not available, so nothing was saved.';
+  } else if (action === 'add-member') {
+    const r = await addMember(user as any, {
+      projectId,
+      employeeId: String(fd.get('employee_id') || ''),
+      capacity: String(fd.get('capacity') || ''),
+      allocationPct: String(fd.get('allocation_pct') || '0'),
+      fromOn: String(fd.get('from_on') || ''),
+      toOn: String(fd.get('to_on') || ''),
+      note: String(fd.get('note') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Added to the project.' : (r.error || 'That could not be saved.');
+  } else if (action === 'update-member') {
+    const r = await updateMember(user as any, {
+      projectId,
+      memberId: String(fd.get('member_id') || ''),
+      capacity: String(fd.get('capacity') || ''),
+      allocationPct: String(fd.get('allocation_pct') || '0'),
+      fromOn: String(fd.get('from_on') || ''),
+      toOn: String(fd.get('to_on') || ''),
+      note: String(fd.get('note') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Allocation updated.' : (r.error || 'That could not be saved.');
+  } else if (action === 'remove-member') {
+    const r = await removeMember(user as any, projectId, String(fd.get('member_id') || ''), { ipAddress: ip });
+    ok = r.ok;
+    flash = r.ok ? 'Taken off the project. The record of their time on it is kept.' : (r.error || 'That could not be saved.');
+  } else if (action === 'add-milestone') {
+    const r = await addMilestone(user as any, {
+      projectId,
+      name: String(fd.get('name') || ''),
+      description: String(fd.get('description') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      sortOrder: String(fd.get('sort_order') || '0'),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Milestone set.' : (r.error || 'That could not be saved.');
+  } else if (action === 'update-milestone') {
+    const r = await updateMilestone(user as any, {
+      projectId,
+      milestoneId: String(fd.get('milestone_id') || ''),
+      name: String(fd.get('name') || ''),
+      description: String(fd.get('description') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      status: String(fd.get('status') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Milestone updated.' : (r.error || 'That could not be saved.');
+  } else if (action === 'add-deliverable') {
+    const r = await addDeliverable(user as any, {
+      projectId,
+      milestoneId: String(fd.get('milestone_id') || ''),
+      name: String(fd.get('name') || ''),
+      description: String(fd.get('description') || ''),
+      linkUrl: String(fd.get('link_url') || ''),
+      ownerEmployeeId: String(fd.get('owner_employee_id') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Deliverable recorded.' : (r.error || 'That could not be saved.');
+  } else if (action === 'update-deliverable') {
+    const r = await updateDeliverable(user as any, {
+      projectId,
+      deliverableId: String(fd.get('deliverable_id') || ''),
+      name: String(fd.get('name') || ''),
+      description: String(fd.get('description') || ''),
+      linkUrl: String(fd.get('link_url') || ''),
+      milestoneId: String(fd.get('milestone_id') || ''),
+      ownerEmployeeId: String(fd.get('owner_employee_id') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      status: String(fd.get('status') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Deliverable updated.' : (r.error || 'That could not be saved.');
+  } else if (action === 'add-risk') {
+    const r = await addRisk(user as any, {
+      projectId,
+      title: String(fd.get('title') || ''),
+      description: String(fd.get('description') || ''),
+      likelihood: String(fd.get('likelihood') || ''),
+      impact: String(fd.get('impact') || ''),
+      ownerEmployeeId: String(fd.get('owner_employee_id') || ''),
+      mitigation: String(fd.get('mitigation') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Risk raised.' : (r.error || 'That could not be saved.');
+  } else if (action === 'update-risk') {
+    const r = await updateRisk(user as any, {
+      projectId,
+      riskId: String(fd.get('risk_id') || ''),
+      title: String(fd.get('title') || ''),
+      description: String(fd.get('description') || ''),
+      likelihood: String(fd.get('likelihood') || ''),
+      impact: String(fd.get('impact') || ''),
+      ownerEmployeeId: String(fd.get('owner_employee_id') || ''),
+      mitigation: String(fd.get('mitigation') || ''),
+      status: String(fd.get('status') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Risk updated.' : (r.error || 'That could not be saved.');
+  } else if (action === 'project-status') {
+    const r = await setProjectStatus(user as any, projectId, String(fd.get('status') || ''), {
+      reason: String(fd.get('reason') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Project status updated.' : (r.error || 'That could not be saved.');
+  } else if (action === 'assign-task') {
+    const r = await createProjectTask({
+      projectId,
+      employeeId: String(fd.get('employee_id') || ''),
+      assignedByUserId: String(user.id),
+      title: String(fd.get('title') || ''),
+      description: String(fd.get('description') || ''),
+      priority: String(fd.get('priority') || 'normal') as any,
+      dueOn: String(fd.get('due_on') || ''),
+      scopeDepartmentId: gate.ok ? gate.scopeDepartmentId : null,
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Task assigned.' : (r.error || 'That could not be saved.');
+  } else if (action === 'move-task') {
+    const r = await moveTask(String(fd.get('task_id') || ''), String(user.id), String(fd.get('to') || ''), {
+      reason: String(fd.get('reason') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    flash = r.ok ? 'Task moved.' : (r.error || 'That could not be saved.');
+  } else {
+    ok = false;
+    flash = 'That action is not one this page performs.';
+  }
+
+  return Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(flash));
+}
+
+const msg = Astro.url.searchParams.get('msg') || '';
+const err = Astro.url.searchParams.get('err') || '';
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+const detail = gate.ok ? await projectDetail(user as any, projectId) : null;
+const auth = gate.ok ? await projectAuthority(user as any, projectId) : null;
+const mayEdit = !!auth?.mayEdit;
+
+const tasks = detail ? await listProjectTasks(String(user.id), projectId, { includeAll: mayEdit }) : null;
+const allocation = detail ? await projectAllocation(projectId) : null;
+const spend = detail ? await listLinkedSpend(projectId) : [];
+const people = detail && mayEdit ? await employeeOptions() : [];
+
+const milestoneTimeline = detail
+  ? buildTimeline(detail.milestones.map((m) => ({
+      id: m.id,
+      label: m.name,
+      startOn: null,
+      endOn: m.dueOn,
+      status: m.status,
+      overdue: m.isOverdue,
+    })), { from: detail.project.startOn, to: detail.project.targetOn })
+  : null;
+
+const today = new Date().toISOString().slice(0, 10);
+const onwardStatuses = detail ? allowedProjectStatuses(detail.project.status) : [];
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>{detail ? detail.project.code + ' ' + detail.project.name : 'Project'}</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    /* MOBILE FIRST — the base rules are the 360px rules, and nothing may scroll the page sideways. */
+    .wrap{max-width:760px;margin:0 auto;padding:14px 12px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 10px;}
+    h1{font-family:'Fraunces',serif;font-size:22px;line-height:1.25;overflow-wrap:anywhere;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:64px;}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:0 18px;min-height:44px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;margin-top:10px;}
+    .btn-thin{background:transparent;border:1px solid #e0d6c4;color:#6b6255;font-size:13px;}
+    .btn-no{background:transparent;border:1px solid #d6cbb8;color:#9a2c2c;}
+    .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .flash{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:12px;overflow-wrap:anywhere;line-height:1.5;}
+    .bad{background:rgba(220,38,38,.07);border:1px solid rgba(220,38,38,.3);color:#8a1c1c;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px;line-height:1.55;overflow-wrap:anywhere;}
+    .warn{background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.32);color:#7c4a03;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px;line-height:1.55;overflow-wrap:anywhere;}
+    .item{border-bottom:1px solid #f2ece0;padding:12px 0;}
+    .item:last-child{border-bottom:none;}
+    .item-top{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;}
+    .item-title{font-weight:700;font-size:15px;flex:1 1 160px;min-width:0;overflow-wrap:anywhere;}
+    .meta{font-size:12px;color:#9a8f7d;margin-top:3px;overflow-wrap:anywhere;line-height:1.5;}
+    .chip{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:#f1ece1;color:#6b6255;white-space:nowrap;}
+    .chip-ok{background:rgba(5,150,105,.12);color:#065f46;}
+    .chip-no{background:rgba(220,38,38,.1);color:#9a2c2c;}
+    .chip-wait{background:rgba(217,119,6,.12);color:#8a5206;}
+    .chip-done{background:rgba(15,118,110,.12);color:#0f766e;}
+    .chip-late{background:rgba(220,38,38,.12);color:#9a2c2c;}
+    .empty{font-size:13.5px;color:#6b6255;line-height:1.55;}
+    .note{font-size:12px;color:#9a8f7d;line-height:1.55;margin-top:8px;overflow-wrap:anywhere;}
+    details{border-top:1px solid #f2ece0;padding-top:8px;margin-top:10px;}
+    summary{font-size:13.5px;font-weight:600;cursor:pointer;min-height:44px;display:flex;align-items:center;}
+    .acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
+    .acts form{flex:1 1 130px;min-width:0;margin:0;}
+    .acts .btn{margin-top:0;}
+    .kv{display:flex;flex-wrap:wrap;gap:10px 18px;margin-top:8px;}
+    .kv div{min-width:0;}
+    .kv dt{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;}
+    .kv dd{font-size:14px;font-weight:600;overflow-wrap:anywhere;}
+    .money{font-family:'Fraunces',serif;font-size:24px;font-weight:700;}
+    .over{color:#9a2c2c;}
+    .tl{position:relative;margin-top:4px;}
+    .tl-axis{position:relative;height:16px;margin-bottom:6px;}
+    .tl-axis span{position:absolute;top:0;transform:translateX(-50%);font-family:'JetBrains Mono',monospace;font-size:9px;color:#b3a894;white-space:nowrap;}
+    .tl-body{position:relative;}
+    .tl-today{position:absolute;top:0;bottom:0;width:1px;background:rgba(194,65,12,.45);z-index:1;}
+    .tl-row{position:relative;padding:7px 0;border-bottom:1px solid #f6f1e7;z-index:2;}
+    .tl-row:last-child{border-bottom:none;}
+    .tl-name{font-size:13px;font-weight:600;overflow-wrap:anywhere;line-height:1.4;}
+    .tl-dates{font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#9a8f7d;margin:2px 0 4px;}
+    .tl-track{display:block;width:100%;height:12px;background:#faf7f1;border-radius:6px;}
+    a.link{color:#c2410c;overflow-wrap:anywhere;}
+    #alloc-hint{font-size:12.5px;line-height:1.5;margin-top:6px;color:#7c4a03;}
+    @media (min-width:560px){ .acts form{flex:0 0 auto;} .btn{width:auto;} }
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee/projects">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+    Projects
+  </a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Project</span>
+  <a href="/portal/employee" style="font-size:12px;">My HR</a>
+</nav>
+
+<div class="wrap">
+  {msg && <div class="flash">{msg}</div>}
+  {err && <div class="bad">{err}</div>}
+
+  {!gate.ok && (
+    <div class="card">
+      <h3>{gate.title || 'Not available'}</h3>
+      <p class="empty">{gate.reason || 'Your employee record is not available.'}</p>
+    </div>
+  )}
+
+  {gate.ok && !detail && (
+    <div class="card">
+      <h3>Not available</h3>
+      <p class="empty">
+        That project is not available. You see the projects you are a member of, the ones the
+        Organization Graph records you as running, and your department's if you head one.
+      </p>
+    </div>
+  )}
+
+  {detail && (
+    <div class="card">
+      <div class="item-top">
+        <div class="item-title">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#9a8f7d;letter-spacing:.08em;display:block;">{detail.project.code}</span>
+          <h1>{detail.project.name}</h1>
+        </div>
+        <span class={chipClass(detail.project.status)}>{projectStatusLabel(detail.project.status)}</span>
+        {detail.project.isOverdue && <span class="chip chip-late">Past target</span>}
+      </div>
+
+      {detail.project.description && <p class="empty" style="margin-top:8px;">{detail.project.description}</p>}
+      {detail.project.statusReason && <p class="note">Reason on record: {detail.project.statusReason}</p>}
+
+      <dl class="kv">
+        <div><dt>Department</dt><dd>{detail.project.departmentName || 'Not recorded'}</dd></div>
+        <div><dt>Start</dt><dd>{fmtDate(detail.project.startOn) || 'Not set'}</dd></div>
+        <div><dt>Target</dt><dd>{fmtDate(detail.project.targetOn) || 'Not set'}</dd></div>
+        <div><dt>Runs the project</dt>
+          <dd>
+            {!detail.owner.graphReady
+              ? 'Not resolvable yet'
+              : (detail.owner.owner ? (detail.owner.owner.fullName || 'Recorded, not named') : 'Nobody recorded')}
+          </dd>
+        </div>
+      </dl>
+
+      {!detail.owner.graphReady && (
+        <div class="warn" style="margin-top:12px;">
+          <strong>Organization Graph not yet initialized.</strong>
+          <p style="margin-top:6px;">{GRAPH_NOT_READY}</p>
+        </div>
+      )}
+
+      {mayEdit && onwardStatuses.length > 0 && (
+        <details>
+          <summary>Move this project</summary>
+          <form method="POST">
+            <input type="hidden" name="action" value="project-status"/>
+            <label for="p-status">New status</label>
+            <select id="p-status" name="status">
+              {onwardStatuses.map((s) => (<option value={s}>{projectStatusLabel(s)}</option>))}
+            </select>
+            <label for="p-reason">Reason (required to put on hold or cancel)</label>
+            <textarea id="p-reason" name="reason" placeholder="Say what it is waiting on, so the record explains itself later."></textarea>
+            <button class="btn" type="submit">Save status</button>
+          </form>
+        </details>
+      )}
+    </div>
+  )}
+
+  {detail && (
+    <div class="card">
+      <h3>Progress</h3>
+      <dl class="kv">
+        <div><dt>Work complete</dt>
+          <dd>{detail.tasks.ok ? (detail.tasks.percentComplete === null ? 'No tasks yet' : detail.tasks.percentComplete + '%') : 'Could not be read'}</dd>
+        </div>
+        <div><dt>Tasks</dt>
+          <dd>{detail.tasks.ok ? detail.tasks.completed + ' of ' + detail.tasks.total : '-'}</dd>
+        </div>
+        <div><dt>Blocked</dt><dd>{detail.tasks.ok ? detail.tasks.blocked : '-'}</dd></div>
+        <div><dt>Milestones met</dt><dd>{detail.project.milestonesMet} of {detail.project.milestoneCount}</dd></div>
+      </dl>
+      {!detail.tasks.ok && (
+        <p class="note">
+          The task figures could not be read just now, so none are shown. That is a failed read, not a
+          claim that there is no work on this project.
+        </p>
+      )}
+    </div>
+  )}
+
+  {detail && milestoneTimeline && detail.milestones.length > 0 && (
+    <div class="card">
+      <h3>Roadmap</h3>
+      <div class="tl">
+        <div class="tl-axis">
+          {milestoneTimeline.ticks.map((t) => (<span style={'left:' + t.leftPct + '%;'}>{t.label}</span>))}
+        </div>
+        <div class="tl-body">
+          {milestoneTimeline.todayPct !== null && (<div class="tl-today" style={'left:' + milestoneTimeline.todayPct + '%;'}></div>)}
+          {milestoneTimeline.bars.map((b) => (
+            <div class="tl-row">
+              <div class="tl-name">{b.label}</div>
+              <div class="tl-dates">{b.undated ? 'No due date recorded' : 'Due ' + fmtDate(b.endOn)}</div>
+              <svg class="tl-track" width="100%" height="12" role="img"
+                   aria-label={b.label + (b.undated ? ': no due date recorded' : ': due ' + b.endOn)}>
+                <rect x={b.leftPct + '%'} y="1" width={b.widthPct + '%'} height="10" rx="5"
+                      fill={b.overdue ? '#b91c1c' : (b.status === 'met' ? '#0f766e' : '#c2410c')}
+                      opacity={b.undated ? '0.6' : '1'}></rect>
+              </svg>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )}
+
+  {detail && (
+    <div class="card">
+      <h3>Milestones and deliverables</h3>
+      {detail.milestones.length === 0 && <p class="empty">No milestones have been set for this project yet.</p>}
+      {detail.milestones.map((m) => (
+        <div class="item">
+          <div class="item-top">
+            <div class="item-title">{m.name}</div>
+            <span class={chipClass(m.status)}>{milestoneStatusLabel(m.status)}</span>
+            {m.isOverdue && <span class="chip chip-late">Past due</span>}
+          </div>
+          <div class="meta">
+            {m.dueOn ? 'Due ' + fmtDate(m.dueOn) : 'No due date'}
+            {m.completedOn ? ' | met ' + fmtDate(m.completedOn) : ''}
+            {' | ' + m.deliverablesAccepted + ' of ' + m.deliverableCount + ' deliverables accepted'}
+          </div>
+          {m.description && <div class="meta">{m.description}</div>}
+          {mayEdit && (
+            <details>
+              <summary>Update this milestone</summary>
+              <form method="POST">
+                <input type="hidden" name="action" value="update-milestone"/>
+                <input type="hidden" name="milestone_id" value={m.id}/>
+                <label>Name</label>
+                <input type="text" name="name" value={m.name} maxlength="200"/>
+                <div class="row2">
+                  <div>
+                    <label>Due date</label>
+                    <input type="date" name="due_on" value={m.dueOn || ''}/>
+                  </div>
+                  <div>
+                    <label>Status</label>
+                    <select name="status">
+                      {MILESTONE_STATUSES.map((s) => (
+                        <option value={s} selected={s === m.status}>{milestoneStatusLabel(s)}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <label>Description</label>
+                <textarea name="description">{m.description || ''}</textarea>
+                <button class="btn" type="submit">Save milestone</button>
+              </form>
+            </details>
+          )}
+        </div>
+      ))}
+
+      {mayEdit && (
+        <details>
+          <summary>Set a new milestone</summary>
+          <form method="POST">
+            <input type="hidden" name="action" value="add-milestone"/>
+            <label for="ms-name">Name</label>
+            <input id="ms-name" type="text" name="name" required maxlength="200" placeholder="What has to be true by then"/>
+            <div class="row2">
+              <div>
+                <label for="ms-due">Due date</label>
+                <input id="ms-due" type="date" name="due_on"/>
+              </div>
+              <div>
+                <label for="ms-order">Order</label>
+                <input id="ms-order" type="number" name="sort_order" value="0" min="0" max="999"/>
+              </div>
+            </div>
+            <label for="ms-desc">Description</label>
+            <textarea id="ms-desc" name="description"></textarea>
+            <button class="btn" type="submit">Set milestone</button>
+          </form>
+        </details>
+      )}
+    </div>
+  )}
+
+  {detail && (
+    <div class="card">
+      <h3>Deliverables</h3>
+      {detail.deliverables.length === 0 && <p class="empty">Nothing has been recorded as a deliverable on this project yet.</p>}
+      {detail.deliverables.map((d) => (
+        <div class="item">
+          <div class="item-top">
+            <div class="item-title">{d.name}</div>
+            <span class={chipClass(d.status)}>{deliverableStatusLabel(d.status)}</span>
+            {d.isOverdue && <span class="chip chip-late">Past due</span>}
+          </div>
+          <div class="meta">
+            {d.milestoneName ? 'Against ' + d.milestoneName : 'Not tied to a milestone'}
+            {d.dueOn ? ' | due ' + fmtDate(d.dueOn) : ''}
+            {d.ownerName ? ' | ' + d.ownerName : ' | no owner recorded'}
+          </div>
+          {d.linkUrl && (
+            <div class="meta">
+              <a class="link" href={d.linkUrl} target="_blank" rel="noopener noreferrer">Open the document</a>
+            </div>
+          )}
+          {(mayEdit || (auth && d.ownerEmployeeId && d.ownerEmployeeId === auth.employeeId)) && (
+            <details>
+              <summary>Update this deliverable</summary>
+              <form method="POST">
+                <input type="hidden" name="action" value="update-deliverable"/>
+                <input type="hidden" name="deliverable_id" value={d.id}/>
+                <label>Name</label>
+                <input type="text" name="name" value={d.name} maxlength="200"/>
+                <label>Document link (a share link, never an upload)</label>
+                <input type="url" name="link_url" value={d.linkUrl || ''} placeholder="https://"/>
+                <div class="row2">
+                  <div>
+                    <label>Due date</label>
+                    <input type="date" name="due_on" value={d.dueOn || ''}/>
+                  </div>
+                  <div>
+                    <label>Status</label>
+                    <select name="status">
+                      {DELIVERABLE_STATUSES.map((s) => (
+                        <option value={s} selected={s === d.status}>{deliverableStatusLabel(s)}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <input type="hidden" name="milestone_id" value={d.milestoneId || ''}/>
+                <input type="hidden" name="owner_employee_id" value={d.ownerEmployeeId || ''}/>
+                <label>Description</label>
+                <textarea name="description">{d.description || ''}</textarea>
+                <button class="btn" type="submit">Save deliverable</button>
+              </form>
+              {!mayEdit && (
+                <p class="note">
+                  You own this deliverable, so you can update it and mark it submitted. Accepting it is
+                  for whoever runs the project: accepting your own work is not a review.
+                </p>
+              )}
+            </details>
+          )}
+        </div>
+      ))}
+
+      {mayEdit && (
+        <details>
+          <summary>Record a deliverable</summary>
+          <form method="POST">
+            <input type="hidden" name="action" value="add-deliverable"/>
+            <label for="d-name">Name</label>
+            <input id="d-name" type="text" name="name" required maxlength="200"/>
+            <label for="d-ms">Against which milestone</label>
+            <select id="d-ms" name="milestone_id">
+              <option value="">Not tied to a milestone</option>
+              {detail.milestones.map((m) => (<option value={m.id}>{m.name}</option>))}
+            </select>
+            <label for="d-owner">Owner</label>
+            <select id="d-owner" name="owner_employee_id">
+              <option value="">No owner recorded</option>
+              {people.map((p) => (<option value={p.employeeId}>{p.fullName}</option>))}
+            </select>
+            <label for="d-link">Document link (a share link, never an upload)</label>
+            <input id="d-link" type="url" name="link_url" placeholder="https://"/>
+            <label for="d-due">Due date</label>
+            <input id="d-due" type="date" name="due_on"/>
+            <label for="d-desc">Description</label>
+            <textarea id="d-desc" name="description"></textarea>
+            <button class="btn" type="submit">Record deliverable</button>
+          </form>
+        </details>
+      )}
+    </div>
+  )}
+
+  {detail && tasks && (
+    <div class="card">
+      <h3>Work on this project</h3>
+      {!tasks.ok && (
+        <p class="empty">
+          The task list could not be read just now. Nothing is lost. This is a failed read, not a
+          statement that there is no work here.
+        </p>
+      )}
+      {tasks.ok && tasks.tasks.length === 0 && (
+        <p class="empty">
+          {mayEdit
+            ? 'No work has been put on this project yet.'
+            : 'None of the work on this project is assigned to you or shared with you.'}
+        </p>
+      )}
+      {tasks.ok && tasks.tasks.map((t) => (
+        <div class="item">
+          <div class="item-top">
+            <div class="item-title">{t.title}</div>
+            <span class={chipClass(t.status)}>{taskStatusLabel(t.status)}</span>
+            {t.isOverdue && <span class="chip chip-late">Overdue</span>}
+          </div>
+          <div class="meta">
+            {t.employeeName || 'Unnamed'}
+            {t.dueOn ? ' | due ' + fmtDate(t.dueOn) : ' | no due date'}
+            {t.blockedReason ? ' | blocked: ' + t.blockedReason : ''}
+          </div>
+          {t.allowedTransitions.length > 0 && (
+            <div class="acts">
+              {t.allowedTransitions.map((s) => (
+                <form method="POST">
+                  <input type="hidden" name="action" value="move-task"/>
+                  <input type="hidden" name="task_id" value={t.id}/>
+                  <input type="hidden" name="to" value={s}/>
+                  {(s === 'blocked' || s === 'cancelled') && (
+                    <input type="text" name="reason" placeholder={s === 'blocked' ? 'What is blocking it?' : 'Why cancel it?'} required minlength="5"/>
+                  )}
+                  <button class="btn btn-thin" type="submit">{taskStatusLabel(s)}</button>
+                </form>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+
+      {mayEdit && (
+        <details>
+          <summary>Put work on somebody's list</summary>
+          <form method="POST">
+            <input type="hidden" name="action" value="assign-task"/>
+            <label for="t-who">Who</label>
+            <select id="t-who" name="employee_id" required>
+              <option value="">Choose a person</option>
+              {detail.members.map((m) => (<option value={m.employeeId}>{m.fullName || m.employeeId}</option>))}
+            </select>
+            <label for="t-title">Task</label>
+            <input id="t-title" type="text" name="title" required minlength="3" maxlength="300"/>
+            <div class="row2">
+              <div>
+                <label for="t-due">Due date</label>
+                <input id="t-due" type="date" name="due_on"/>
+              </div>
+              <div>
+                <label for="t-pri">Priority</label>
+                <select id="t-pri" name="priority">
+                  <option value="low">Low</option>
+                  <option value="normal" selected>Normal</option>
+                  <option value="high">High</option>
+                  <option value="urgent">Urgent</option>
+                </select>
+              </div>
+            </div>
+            <label for="t-desc">Detail</label>
+            <textarea id="t-desc" name="description"></textarea>
+            <button class="btn" type="submit">Assign</button>
+          </form>
+          <p class="note">
+            This creates an ordinary task on that person's own list, in the same system as every other
+            task they have. It moves through the same states and the same rules; the only difference is
+            that it is labelled with this project.
+          </p>
+        </details>
+      )}
+    </div>
+  )}
+
+  {detail && (
+    <div class="card">
+      <h3>Who is on it</h3>
+      {detail.members.length === 0 && <p class="empty">Nobody has been added to this project yet.</p>}
+      {detail.members.map((m) => {
+        const person = allocation ? allocation.people.find((p) => p.employeeId === m.employeeId) : null;
+        return (
+          <div class="item">
+            <div class="item-top">
+              <div class="item-title">{m.fullName || 'Unnamed'}</div>
+              <span class="chip">{memberCapacityLabel(m.capacity)}</span>
+              {person && person.overAllocated && <span class="chip chip-late">{person.totalPct}% total</span>}
+            </div>
+            <div class="meta">
+              {m.designation || 'No designation recorded'} | {m.allocationPct}% on this project
+              {m.fromOn ? ' | from ' + fmtDate(m.fromOn) : ''}
+              {m.toOn ? ' to ' + fmtDate(m.toOn) : ''}
+            </div>
+            {person && person.overAllocated && (
+              <div class="meta over">
+                Committed to {person.totalPct}% across {person.entries.length} projects today. Nothing has
+                been changed automatically and nothing will be.
+              </div>
+            )}
+            {mayEdit && (
+              <details>
+                <summary>Change this allocation</summary>
+                <form method="POST">
+                  <input type="hidden" name="action" value="update-member"/>
+                  <input type="hidden" name="member_id" value={m.id}/>
+                  <div class="row2">
+                    <div>
+                      <label>Capacity</label>
+                      <select name="capacity">
+                        {MEMBER_CAPACITIES.map((c) => (
+                          <option value={c} selected={c === m.capacity}>{memberCapacityLabel(c)}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label>Allocation %</label>
+                      <input type="number" name="allocation_pct" value={m.allocationPct} min="0" max="100"/>
+                    </div>
+                  </div>
+                  <div class="row2">
+                    <div>
+                      <label>From</label>
+                      <input type="date" name="from_on" value={m.fromOn || ''}/>
+                    </div>
+                    <div>
+                      <label>To</label>
+                      <input type="date" name="to_on" value={m.toOn || ''}/>
+                    </div>
+                  </div>
+                  <button class="btn" type="submit">Save allocation</button>
+                </form>
+                <form method="POST" style="margin-top:8px;">
+                  <input type="hidden" name="action" value="remove-member"/>
+                  <input type="hidden" name="member_id" value={m.id}/>
+                  <button class="btn btn-no" type="submit">Take off the project</button>
+                </form>
+              </details>
+            )}
+          </div>
+        );
+      })}
+
+      {mayEdit && (
+        <details>
+          <summary>Add somebody</summary>
+          <form method="POST" id="add-member-form">
+            <input type="hidden" name="action" value="add-member"/>
+            <label for="m-who">Who</label>
+            <select id="m-who" name="employee_id" required data-alloc-employee>
+              <option value="">Choose a person</option>
+              {people.map((p) => (<option value={p.employeeId}>{p.fullName}{p.designation ? ' - ' + p.designation : ''}</option>))}
+            </select>
+            <div class="row2">
+              <div>
+                <label for="m-cap">Capacity</label>
+                <select id="m-cap" name="capacity">
+                  {MEMBER_CAPACITIES.map((c) => (<option value={c} selected={c === 'contributor'}>{memberCapacityLabel(c)}</option>))}
+                </select>
+              </div>
+              <div>
+                <label for="m-pct">Allocation %</label>
+                <input id="m-pct" type="number" name="allocation_pct" value="0" min="0" max="100"/>
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="m-from">From</label>
+                <input id="m-from" type="date" name="from_on" value={today} data-alloc-from/>
+              </div>
+              <div>
+                <label for="m-to">To</label>
+                <input id="m-to" type="date" name="to_on" data-alloc-to/>
+              </div>
+            </div>
+            <p id="alloc-hint"></p>
+            <button class="btn" type="submit">Add to the project</button>
+          </form>
+          <p class="note">
+            Over-allocation is never refused here. If somebody is already committed elsewhere the total
+            is shown and the membership is still recorded: how a person's month works is a conversation
+            between people, and a sum in a database does not get to have it for them.
+          </p>
+        </details>
+      )}
+    </div>
+  )}
+
+  {detail && (
+    <div class="card">
+      <h3>Budget</h3>
+      <dl class="kv">
+        <div><dt>Planned</dt><dd class="money">{detail.budget.planned === null ? 'Not set' : formatAmount(detail.budget.planned, detail.budget.currency)}</dd></div>
+        <div><dt>Actual</dt><dd class="money">{formatAmount(detail.budget.actual, detail.budget.currency)}</dd></div>
+        <div><dt>Variance</dt>
+          <dd class={detail.budget.variance !== null && detail.budget.variance < 0 ? 'money over' : 'money'}>
+            {detail.budget.variance === null ? '-' : formatAmount(detail.budget.variance, detail.budget.currency)}
+          </dd>
+        </div>
+      </dl>
+      <p class="note">
+        Actual spend is read from the approved expense claims ({detail.budget.expenseCount}) and purchase
+        orders ({detail.budget.procurementCount}) that carry this project's reference. Nothing is copied
+        into the project: those records are the company's, and this is a view of them.
+      </p>
+      {detail.budget.notes.map((n) => (<p class="note">{n}</p>))}
+      {spend.length > 0 && (
+        <details>
+          <summary>What makes up that figure</summary>
+          {spend.map((s) => (
+            <div class="item">
+              <div class="item-top">
+                <div class="item-title">{s.title}</div>
+                <span class="chip">{formatAmount(s.amount, s.currency)}</span>
+              </div>
+              <div class="meta">{s.kind === 'expense' ? 'Expense claim' : 'Purchase order'} | {s.status}{s.on ? ' | ' + fmtDate(s.on) : ''}</div>
+            </div>
+          ))}
+        </details>
+      )}
+    </div>
+  )}
+
+  {detail && (
+    <div class="card">
+      <h3>Risk register</h3>
+      {detail.risks.length === 0 && <p class="empty">No risks have been raised on this project.</p>}
+      {detail.risks.map((r) => (
+        <div class="item">
+          <div class="item-top">
+            <div class="item-title">{r.title}</div>
+            <span class={chipClass(r.status)}>{riskStatusLabel(r.status)}</span>
+            <span class="chip">{r.severityLabel}</span>
+          </div>
+          <div class="meta">
+            Likelihood {riskGradeLabel(r.likelihood)} | impact {riskGradeLabel(r.impact)}
+            {r.ownerName ? ' | owned by ' + r.ownerName : ' | no owner recorded'}
+          </div>
+          {r.description && <div class="meta">{r.description}</div>}
+          {r.mitigation && <div class="meta">Mitigation: {r.mitigation}</div>}
+          <details>
+            <summary>Update this risk</summary>
+            <form method="POST">
+              <input type="hidden" name="action" value="update-risk"/>
+              <input type="hidden" name="risk_id" value={r.id}/>
+              <input type="hidden" name="title" value={r.title}/>
+              <div class="row2">
+                <div>
+                  <label>Likelihood</label>
+                  <select name="likelihood">
+                    {RISK_GRADES.map((g) => (<option value={g} selected={g === r.likelihood}>{riskGradeLabel(g)}</option>))}
+                  </select>
+                </div>
+                <div>
+                  <label>Impact</label>
+                  <select name="impact">
+                    {RISK_GRADES.map((g) => (<option value={g} selected={g === r.impact}>{riskGradeLabel(g)}</option>))}
+                  </select>
+                </div>
+              </div>
+              <label>Status</label>
+              <select name="status">
+                {RISK_STATUSES.map((s) => (<option value={s} selected={s === r.status}>{riskStatusLabel(s)}</option>))}
+              </select>
+              <label>Owner</label>
+              <select name="owner_employee_id">
+                <option value="">No owner recorded</option>
+                {detail.members.map((m) => (
+                  <option value={m.employeeId} selected={m.employeeId === r.ownerEmployeeId}>{m.fullName || m.employeeId}</option>
+                ))}
+              </select>
+              <label>Mitigation</label>
+              <textarea name="mitigation">{r.mitigation || ''}</textarea>
+              <label>Description</label>
+              <textarea name="description">{r.description || ''}</textarea>
+              <button class="btn" type="submit">Save risk</button>
+            </form>
+            {!mayEdit && (
+              <p class="note">
+                You can grade a risk and record what is being done about it. Closing or accepting one is
+                for whoever runs the project, because that says the project has decided to live with it.
+              </p>
+            )}
+          </details>
+        </div>
+      ))}
+
+      <details>
+        <summary>Raise a risk</summary>
+        <form method="POST">
+          <input type="hidden" name="action" value="add-risk"/>
+          <label for="r-title">What could go wrong</label>
+          <input id="r-title" type="text" name="title" required minlength="5" maxlength="200"/>
+          <div class="row2">
+            <div>
+              <label for="r-like">Likelihood</label>
+              <select id="r-like" name="likelihood">
+                {RISK_GRADES.map((g) => (<option value={g} selected={g === 'medium'}>{riskGradeLabel(g)}</option>))}
+              </select>
+            </div>
+            <div>
+              <label for="r-imp">Impact</label>
+              <select id="r-imp" name="impact">
+                {RISK_GRADES.map((g) => (<option value={g} selected={g === 'medium'}>{riskGradeLabel(g)}</option>))}
+              </select>
+            </div>
+          </div>
+          <label for="r-owner">Owner</label>
+          <select id="r-owner" name="owner_employee_id">
+            <option value="">No owner recorded</option>
+            {detail.members.map((m) => (<option value={m.employeeId}>{m.fullName || m.employeeId}</option>))}
+          </select>
+          <label for="r-mit">What is being done about it</label>
+          <textarea id="r-mit" name="mitigation"></textarea>
+          <label for="r-desc">Detail</label>
+          <textarea id="r-desc" name="description"></textarea>
+          <button class="btn" type="submit">Raise it</button>
+        </form>
+        <p class="note">
+          Anybody on this project can raise a risk. The person who can see a problem coming is usually
+          not the person running the work.
+        </p>
+      </details>
+    </div>
+  )}
+</div>
+
+{/* define:vars must NOT be combined with is:inline — that pairing is a known .astro parse hazard on
+    this project. define:vars alone emits the value into the module scope, which is what is wanted. */}
+<script define:vars={{ projectId }}>
+  // PROGRESSIVE ENHANCEMENT, AND NOTHING MORE. The server computes and renders the same allocation
+  // figure on every load and after every write; this only fetches it a step earlier, while somebody is
+  // still choosing who to add. With JavaScript off the page behaves exactly as it does with it on,
+  // one round trip later. Nothing here decides anything and nothing here is authorisation: the
+  // endpoint re-derives the caller's authority over this project on every request.
+  (function () {
+    var form = document.getElementById('add-member-form');
+    var hint = document.getElementById('alloc-hint');
+    if (!form || !hint) return;
+    var who = form.querySelector('[data-alloc-employee]');
+    var from = form.querySelector('[data-alloc-from]');
+    var to = form.querySelector('[data-alloc-to]');
+    if (!who) return;
+
+    function refresh() {
+      var employeeId = who.value;
+      if (!employeeId) { hint.textContent = ''; return; }
+      var url = '/api/portal/projects/allocation?projectId=' + encodeURIComponent(projectId) +
+        '&employeeId=' + encodeURIComponent(employeeId) +
+        (from && from.value ? '&from=' + encodeURIComponent(from.value) : '') +
+        (to && to.value ? '&to=' + encodeURIComponent(to.value) : '');
+      hint.textContent = 'Checking what they are already committed to...';
+      fetch(url, { headers: { accept: 'application/json' } })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (!d || !d.ok) {
+            // Never draw "0%, plenty of room" over a read that failed.
+            hint.textContent = d && d.error ? d.error : 'Their current allocation could not be read.';
+            return;
+          }
+          var n = d.entries ? d.entries.length : 0;
+          hint.textContent = d.totalPct + '% already committed across ' + n + ' project' + (n === 1 ? '' : 's') +
+            (d.overAllocated ? '. They are already over 100%; adding more is still allowed and is a conversation to have.' : '.');
+        })
+        .catch(function () { hint.textContent = 'Their current allocation could not be read.'; });
+    }
+
+    who.addEventListener('change', refresh);
+    if (from) from.addEventListener('change', refresh);
+    if (to) to.addEventListener('change', refresh);
+  })();
+</script>
+</body>
+</html>

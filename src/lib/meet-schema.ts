@@ -336,9 +336,19 @@ export function getMeetShape(): MeetShape {
  * and both must resolve. `id::text` rather than `${code}::uuid`: casting the PARAMETER throws on a
  * non-uuid string, and casting the COLUMN is safe under either id type — the same rule this project
  * already applies to departments.id.
+ *
+ * lower() ON BOTH SIDES OF THE ID ARM, and this is not cosmetic. Every caller normalises the URL
+ * segment through normaliseRoomCode(), which UPPERCASES — correct for a room code, whose alphabet is
+ * uppercase by construction, and fatal for a uuid, because Postgres renders `uuid::text` in
+ * LOWERCASE hex. `id::text = 'A3F1…'` is therefore false for the very row it is looking for. The
+ * consequence was silent and specific: every room that predates room_code (all of them — the only
+ * writer before this build was the ad-hoc INSERT in the room page, which stored no code) is
+ * addressed by its uuid, so Edit and Cancel answered 404 on it, and opening /portal/meet/<uuid>
+ * failed to find it and created a SECOND empty room beside it. One code, one room means one uuid,
+ * one room too.
  */
 export function roomLookupSql(segment: string) {
-  return sql`(room_code = ${segment} OR id::text = ${segment})`;
+  return sql`(room_code = ${segment} OR lower(id::text) = lower(${segment}))`;
 }
 
 /**

@@ -1,0 +1,328 @@
+---
+// /admin/projects — THE PORTFOLIO, and the register behind it.
+//
+// THE GATE is the same shape as every other console surface here: the `projects` SECTION (which is
+// what the sidebar entry is gated on, so the menu and the lock agree) or the `projects.view`
+// CAPABILITY (which a custom role can be granted directly). Neither is a role name.
+//
+// WHAT THIS PAGE IS NOT. It is not where projects are RUN. Running a project — adding people, setting
+// milestones, handing out work, grading risks — happens at /portal/employee/projects/[id], because a
+// project manager is an organisational relationship and not an administrator, and making them open
+// the admin console to do their job would mean handing the console to everybody who runs anything.
+// This is the register: what exists, who runs it, what it was budgeted at, and what it has cost.
+//
+// EVERY WRITE IS RE-AUTHORISED IN THE LIBRARY, on the posted id. createProject() and
+// setProjectManager() each ask holdsCapability('projects.manage') themselves. This page decides what
+// is OFFERED, never what is permitted.
+//
+// SCOPE IS STILL IN THE QUERY. listProjects() takes the signed-in account and resolves its own scope
+// — a portfolio holder sees everything, and somebody who reaches this page through a custom role
+// holding only the section still sees exactly what the capability layer says they may. The page does
+// not widen anything by being under /admin.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { holdsCapability } from '@/lib/auth/capability';
+import {
+  listProjects,
+  createProject,
+  departmentOptions,
+  employeeOptions,
+  formatAmount,
+  projectStatusLabel,
+  PROJECT_STATUSES,
+  GRAPH_NOT_READY,
+  type Project,
+} from '@/lib/projects';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const bySection = await canAccessSection(user as any, 'projects', 'view');
+const byCapability = holdsCapability(user as any, 'projects.view');
+if (!bySection && !byCapability) return Astro.redirect('/admin');
+
+// CONSTANTS FIRST — `const` is not hoisted, and a const under the POST handler that reads it throws
+// on that handler's first line while the page still reports success.
+const PAGE = '/admin/projects';
+
+const fmt = (d: string | null) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Plain words from a function — a typed map read inside JSX is a known .astro parse hazard. */
+function chipClass(status: string): string {
+  if (status === 'active') return 'chip chip-ok';
+  if (status === 'on_hold') return 'chip chip-wait';
+  if (status === 'cancelled') return 'chip chip-no';
+  if (status === 'completed') return 'chip chip-done';
+  return 'chip';
+}
+
+const mayManage = holdsCapability(user as any, 'projects.manage');
+const ip = Astro.request.headers.get('x-forwarded-for') || null;
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let ok = true;
+
+  if (action === 'create') {
+    const r = await createProject(user as any, {
+      code: String(fd.get('code') || ''),
+      name: String(fd.get('name') || ''),
+      description: String(fd.get('description') || ''),
+      departmentId: String(fd.get('department_id') || ''),
+      startOn: String(fd.get('start_on') || ''),
+      targetOn: String(fd.get('target_on') || ''),
+      budgetPlanned: String(fd.get('budget_planned') || ''),
+      currency: String(fd.get('currency') || ''),
+      managerEmployeeId: String(fd.get('manager_employee_id') || ''),
+      ipAddress: ip,
+    });
+    ok = r.ok;
+    // createProject can succeed AND report that the manager edge did not open. Both facts are said.
+    flash = r.ok ? (r.error || 'Project created.') : (r.error || 'That could not be saved.');
+  } else {
+    ok = false;
+    flash = 'That action is not one this page performs.';
+  }
+
+  return Astro.redirect(PAGE + '?' + (ok ? 'msg=' : 'err=') + encodeURIComponent(flash));
+}
+
+const msg = Astro.url.searchParams.get('msg') || '';
+const err = Astro.url.searchParams.get('err') || '';
+const filterStatus = Astro.url.searchParams.get('status') || '';
+const search = Astro.url.searchParams.get('q') || '';
+
+const view = await listProjects(user as any, {
+  status: filterStatus,
+  search,
+  includeClosed: true,
+  limit: 300,
+});
+
+const departments = await departmentOptions();
+const people = mayManage ? await employeeOptions() : [];
+
+const counts = {
+  active: view.projects.filter((p) => p.status === 'active').length,
+  planning: view.projects.filter((p) => p.status === 'planning').length,
+  onHold: view.projects.filter((p) => p.status === 'on_hold').length,
+  overdue: view.projects.filter((p) => p.isOverdue).length,
+};
+
+const totalPlanned = view.projects.reduce((sum: number, p: Project) => sum + (p.budgetPlanned || 0), 0);
+---
+<AdminLayout title="Projects" activeNav="projects">
+  <div class="pwrap">
+    {msg && <div class="flash">{msg}</div>}
+    {err && <div class="bad">{err}</div>}
+
+    {!view.ok && (
+      <div class="bad">
+        <strong>The project register could not be read just now.</strong>
+        <p>Nothing is lost and nothing has changed. This is a failed read, not a statement that there
+        are no projects.</p>
+      </div>
+    )}
+
+    {view.ok && !view.graphReady && (
+      <div class="warn">
+        <strong>Organization Graph not yet initialized.</strong>
+        <p>{GRAPH_NOT_READY}</p>
+        <p>Projects can still be created and staffed. Until the graph carries relationships, no project
+        will show a manager, and nobody will be able to run one without holding the register
+        capability — which is the honest state of the record rather than a guess at who is in charge.</p>
+      </div>
+    )}
+
+    <div class="stats">
+      <div class="stat"><span class="n">{counts.active}</span><span class="l">Active</span></div>
+      <div class="stat"><span class="n">{counts.planning}</span><span class="l">Planning</span></div>
+      <div class="stat"><span class="n">{counts.onHold}</span><span class="l">On hold</span></div>
+      <div class="stat"><span class={counts.overdue > 0 ? 'n bad-n' : 'n'}>{counts.overdue}</span><span class="l">Past target</span></div>
+      <div class="stat"><span class="n small">{formatAmount(totalPlanned, 'INR')}</span><span class="l">Planned budget</span></div>
+    </div>
+
+    <div class="card">
+      <form method="GET" class="filters">
+        <div>
+          <label for="f-q">Search</label>
+          <input id="f-q" type="search" name="q" value={search} placeholder="Name or code"/>
+        </div>
+        <div>
+          <label for="f-status">Status</label>
+          <select id="f-status" name="status">
+            <option value="">Every status</option>
+            {PROJECT_STATUSES.map((s) => (<option value={s} selected={s === filterStatus}>{projectStatusLabel(s)}</option>))}
+          </select>
+        </div>
+        <button class="btn btn-thin" type="submit">Apply</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Projects</h3>
+      {view.ok && view.projects.length === 0 && (
+        <p class="empty">
+          {search || filterStatus
+            ? 'No project matches that filter.'
+            : 'No projects have been created yet.'}
+        </p>
+      )}
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Code</th><th>Project</th><th>Status</th><th>Department</th>
+              <th>Target</th><th>Milestones</th><th>People</th><th>Risks</th><th>Planned</th>
+            </tr>
+          </thead>
+          <tbody>
+            {view.projects.map((p) => (
+              <tr>
+                <td class="mono"><a href={'/admin/projects/' + p.id}>{p.code}</a></td>
+                <td><a href={'/admin/projects/' + p.id}>{p.name}</a></td>
+                <td>
+                  <span class={chipClass(p.status)}>{projectStatusLabel(p.status)}</span>
+                  {p.isOverdue && <span class="chip chip-late">Late</span>}
+                </td>
+                <td>{p.departmentName || 'Not recorded'}</td>
+                <td class="mono">{fmt(p.targetOn) || '-'}</td>
+                <td class="mono">{p.milestonesMet} / {p.milestoneCount}</td>
+                <td class="mono">{p.memberCount}</td>
+                <td class="mono">{p.openRiskCount}</td>
+                <td class="mono">{p.budgetPlanned === null ? '-' : formatAmount(p.budgetPlanned, p.currency)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="note">
+        A project is opened here to read its record. It is RUN from the working view, which is where
+        whoever the Organization Graph records as running it does their job without needing this
+        console at all.
+      </p>
+    </div>
+
+    {mayManage && (
+      <div class="card">
+        <h3>Create a project</h3>
+        <form method="POST">
+          <input type="hidden" name="action" value="create"/>
+          <div class="row2">
+            <div>
+              <label for="c-code">Code</label>
+              <input id="c-code" type="text" name="code" required maxlength="40" placeholder="ERA-2026-01"/>
+            </div>
+            <div>
+              <label for="c-name">Name</label>
+              <input id="c-name" type="text" name="name" required minlength="3" maxlength="200"/>
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="c-dept">Department</label>
+              <select id="c-dept" name="department_id">
+                <option value="">Not recorded</option>
+                {departments.map((d) => (<option value={d.id}>{d.name}</option>))}
+              </select>
+            </div>
+            <div>
+              <label for="c-mgr">Who runs it</label>
+              <select id="c-mgr" name="manager_employee_id">
+                <option value="">Nobody yet</option>
+                {people.map((p) => (<option value={p.employeeId}>{p.fullName}</option>))}
+              </select>
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="c-start">Start</label>
+              <input id="c-start" type="date" name="start_on"/>
+            </div>
+            <div>
+              <label for="c-target">Target</label>
+              <input id="c-target" type="date" name="target_on"/>
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="c-budget">Planned budget</label>
+              <input id="c-budget" type="text" name="budget_planned" inputmode="decimal" placeholder="0"/>
+            </div>
+            <div>
+              <label for="c-cur">Currency</label>
+              <input id="c-cur" type="text" name="currency" value="INR" maxlength="8"/>
+            </div>
+          </div>
+          <label for="c-desc">Description</label>
+          <textarea id="c-desc" name="description"></textarea>
+          <button class="btn" type="submit">Create project</button>
+        </form>
+        <p class="note">
+          Choosing who runs it writes an effective-dated relationship into the Organization Graph, not a
+          column on the project. That is what keeps "who ran this in March" answerable after a handover,
+          and it is why the person who runs a project is never resolved from a job title or a role name.
+        </p>
+      </div>
+    )}
+
+    {!mayManage && (
+      <p class="note">
+        You are reading the portfolio. Creating or changing a project needs the project register
+        capability, which is a separate grant from being able to see what the company is working on.
+      </p>
+    )}
+  </div>
+
+  <style>
+    /* MOBILE FIRST — roughly nine in ten of these people are on a phone. The base rules are the 360px
+       rules; the wide table lives in its OWN overflow container so the PAGE never scrolls sideways. */
+    .pwrap{max-width:1100px;margin:0 auto;padding:4px 0 40px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:16px;margin-bottom:14px;}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:14px;}
+    .stat{background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:14px;min-width:0;}
+    .stat .n{display:block;font-family:'Fraunces',serif;font-size:26px;font-weight:700;line-height:1.1;overflow-wrap:anywhere;}
+    .stat .n.small{font-size:16px;}
+    .stat .bad-n,.bad-n{color:#9a2c2c;}
+    .stat .l{display:block;font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;margin-top:4px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:64px;}
+    .row2{display:grid;grid-template-columns:1fr;gap:10px;}
+    .filters{display:grid;grid-template-columns:1fr;gap:10px;align-items:end;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:0 18px;min-height:44px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;margin-top:12px;}
+    .btn-thin{background:transparent;border:1px solid #e0d6c4;color:#6b6255;margin-top:0;}
+    .flash{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:12px;line-height:1.5;overflow-wrap:anywhere;}
+    .bad{background:rgba(220,38,38,.07);border:1px solid rgba(220,38,38,.3);color:#8a1c1c;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px;line-height:1.55;overflow-wrap:anywhere;}
+    .warn{background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.32);color:#7c4a03;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:12px;line-height:1.55;overflow-wrap:anywhere;}
+    .warn p,.bad p{margin-top:6px;}
+    .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    table{width:100%;border-collapse:collapse;min-width:760px;}
+    th{text-align:left;font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;padding:8px 10px;border-bottom:1px solid #ece4d6;white-space:nowrap;}
+    td{padding:10px;border-bottom:1px solid #f6f1e7;font-size:14px;vertical-align:top;}
+    td a{color:#1a1510;text-decoration:none;font-weight:600;}
+    td a:hover{color:#c2410c;}
+    .mono{font-family:'JetBrains Mono',monospace;font-size:12px;white-space:nowrap;}
+    .chip{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:#f1ece1;color:#6b6255;white-space:nowrap;display:inline-block;margin:1px 2px 1px 0;}
+    .chip-ok{background:rgba(5,150,105,.12);color:#065f46;}
+    .chip-no{background:rgba(220,38,38,.1);color:#9a2c2c;}
+    .chip-wait{background:rgba(217,119,6,.12);color:#8a5206;}
+    .chip-done{background:rgba(15,118,110,.12);color:#0f766e;}
+    .chip-late{background:rgba(220,38,38,.12);color:#9a2c2c;}
+    .empty{font-size:13.5px;color:#6b6255;line-height:1.55;}
+    .note{font-size:12px;color:#9a8f7d;line-height:1.55;margin-top:10px;overflow-wrap:anywhere;}
+    @media (min-width:640px){
+      .stats{grid-template-columns:repeat(5,1fr);}
+      .row2{grid-template-columns:1fr 1fr;}
+      .filters{grid-template-columns:2fr 1fr auto;}
+      .btn{width:auto;}
+    }
+  </style>
+</AdminLayout>
