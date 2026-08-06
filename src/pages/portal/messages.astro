@@ -669,7 +669,10 @@ body.era-has-fab { padding-bottom: 0; }
 .link-btn:disabled { color: #6b6b7a; cursor: default; text-decoration: none; }
 .search-progress { font-family: 'Geist Mono', monospace; font-size: 10px; color: #67e8f9; margin-top: 8px; line-height: 1.6; }
 .search-results { border-top: 1px solid #2a2a35; }
-.search-hit { display: block; width: 100%; text-align: left; background: transparent; border: 0; border-bottom: 1px solid #1a1c25; padding: 10px 14px; cursor: pointer; color: inherit; }
+/* box-sizing is load-bearing on this page: there is no global border-box reset, so width:100%
+   plus horizontal padding pushes an element wider than the column that holds it, and at 360px
+   that is a sideways scroll on the whole page. Same trap as the fingerprint button below. */
+.search-hit { display: block; width: 100%; box-sizing: border-box; text-align: left; background: transparent; border: 0; border-bottom: 1px solid #1a1c25; padding: 10px 14px; cursor: pointer; color: inherit; }
 .search-hit:hover { background: #161823; }
 .search-hit .hit-thread { font-family: 'Cormorant Garamond', serif; font-size: 15px; }
 .search-hit .hit-snip { font-family: 'Geist Mono', monospace; font-size: 10px; color: #8a8a99; margin-top: 3px; overflow-wrap: anywhere; }
@@ -677,7 +680,7 @@ body.era-has-fab { padding-bottom: 0; }
 
 .mention-pop { display: none; background: #11131a; border: 1px solid #2a2a35; border-radius: 10px; margin-bottom: 8px; max-height: 180px; overflow-y: auto; }
 .mention-pop.open { display: block; }
-.mention-pop button { display: block; width: 100%; text-align: left; background: transparent; border: 0; color: #e8e8ee; padding: 10px 12px; cursor: pointer; font-family: 'Cormorant Garamond', serif; font-size: 15px; min-height: 44px; }
+.mention-pop button { display: block; width: 100%; box-sizing: border-box; text-align: left; background: transparent; border: 0; color: #e8e8ee; padding: 10px 12px; cursor: pointer; font-family: 'Cormorant Garamond', serif; font-size: 15px; min-height: 44px; }
 .mention-pop button:hover, .mention-pop button[aria-selected='true'] { background: #1c2030; color: #67e8f9; }
 .msg-mention { color: #67e8f9; font-weight: 600; }
 .msg-mention.me { background: rgba(103, 232, 249, 0.18); border-radius: 4px; padding: 0 3px; }
@@ -1319,8 +1322,14 @@ body.era-has-fab { padding-bottom: 0; }
   /**
    * The key for a thread, plus a PLAIN SENTENCE when there is not one.
    * Returns { key, problem, readOnly }. `problem` is shown to the reader verbatim.
+   *
+   * `passive` is set by the cross-conversation search, which walks every thread this reader has.
+   * Opening a group provisions it — it makes the group key if none exists and seals copies to
+   * members who hold none — and doing that as a side effect of typing in a search box would fire
+   * a burst of writes across dozens of conversations nobody asked to open. Passive decrypts with
+   * a key already held and otherwise gives up quietly.
    */
-  async function threadKey(thread) {
+  async function threadKey(thread, passive) {
     if (!thread) return { key: null, problem: 'No conversation is open.' };
     var cached = KEYS[thread.id];
     var members = thread.members || [];
@@ -1371,6 +1380,8 @@ body.era-has-fab { padding-bottom: 0; }
           problem: 'This group\'s key was sealed to a different browser. Keys never leave the device that made them, so this browser cannot open the group until a member re-shares it from a device that can read it.'
         };
       }
+    } else if (passive) {
+      return { key: null, readOnly: true, problem: 'This browser holds no key for this group.' };
     } else if (!infoMembers.some(function (m) { return m.has_wrapped_key; })) {
       // Nobody holds a key yet, so this group has never been written to. Whoever opens it first
       // makes the key and seals a copy to every member who has published one. If two people do this
@@ -1406,12 +1417,16 @@ body.era-has-fab { padding-bottom: 0; }
       };
     }
 
-    KEYS[thread.id] = { tag: gtag, key: key };
+    // Cached against the epoch the SERVER just reported, not the one the thread row happened to
+    // carry. If those disagreed, the tag never matched and every reload re-ran the whole key
+    // exchange over the network.
+    thread.key_epoch = info.epoch || thread.key_epoch || 1;
+    KEYS[thread.id] = { tag: 'g:' + thread.key_epoch, key: key };
 
     // SELF-HEALING MEMBERSHIP. Anyone who can read the group seals a copy for every member who has
     // published a public key and holds none. Without this, `add_member` puts a person in a group
     // whose entire contents are noise to them, permanently, with nothing on screen to explain it.
-    var need = infoMembers.filter(function (m) { return !m.has_wrapped_key && m.public_key_pem && m.user_id !== ME.id; });
+    var need = passive ? [] : infoMembers.filter(function (m) { return !m.has_wrapped_key && m.public_key_pem && m.user_id !== ME.id; });
     if (need.length) {
       try {
         var raw = await window.crypto.subtle.exportKey('raw', key);
@@ -1508,9 +1523,12 @@ body.era-has-fab { padding-bottom: 0; }
 
   // The line under the stream. It used to claim YOU were typing, to you, from a "stub" with no
   // transport behind it. It now carries only things that actually happened.
+  // `typing` is kept in the class list: it carries the row's height and padding, and dropping it
+  // made the whole stream jump every time a status appeared or cleared.
+  var connectionBad = false;
   function setStatus(text, bad) {
     var n = $('typing');
-    n.className = 'status-line' + (bad ? ' bad' : '');
+    n.className = 'typing status-line' + (bad ? ' bad' : '');
     stamp(n);
     n.textContent = text || '';
   }
@@ -1622,7 +1640,7 @@ body.era-has-fab { padding-bottom: 0; }
     $('addMemberRow').style.display = t.kind === 'group' ? '' : 'none';
     $('addMemberNote').textContent = '';
     $('composerWrap').style.display = '';
-    await loadMessages({ reset: true });
+    await loadMessages();
   }
 
   function renderMembers(t) {
@@ -2038,7 +2056,10 @@ body.era-has-fab { padding-bottom: 0; }
   async function pollOnce() {
     if (document.visibilityState !== 'visible') return;
     var res = await api({ action: 'poll', thread_id: activeId || '' });
-    if (!res.ok) { setStatus('Not connected: ' + res.error, true); return; }
+    if (!res.ok) { connectionBad = true; setStatus('Not connected, so new messages are not arriving: ' + res.error, true); return; }
+    // Cleared only if THIS is what put it there, so a "Sent" or a key warning is not wiped by the
+    // next heartbeat five seconds later.
+    if (connectionBad) { connectionBad = false; setStatus(''); }
 
     var incoming = res.threads || [];
     var merged = [];
@@ -2121,7 +2142,13 @@ body.era-has-fab { padding-bottom: 0; }
 
   async function contentSearch() {
     var q = String($('threadSearch').value || '').trim();
-    if (!q || contentSearchRunning) return;
+    if (contentSearchRunning) return;
+    if (!q) {
+      var p0 = $('searchProgress');
+      p0.style.display = '';
+      p0.textContent = 'Type what you are looking for in the box above first.';
+      return;
+    }
     contentSearchRunning = true;
     var btn = $('btnSearchText');
     btn.disabled = true;
@@ -2150,7 +2177,7 @@ body.era-has-fab { padding-bottom: 0; }
             return { user_id: m.user_id, name: m.full_name || m.email || 'Unknown', email: m.email || '', role: m.role, public_key_pem: m.public_key_pem || null, has_wrapped_key: !!m.has_wrapped_key };
           });
           t.kind = res.kind || t.kind;
-          kres = await threadKey(t);
+          kres = await threadKey(t, true);   // passive: a search must not provision keys
         }
         var list = res.messages || [];
         for (var mi = 0; mi < list.length; mi++) {
@@ -2241,7 +2268,9 @@ body.era-has-fab { padding-bottom: 0; }
     var ta = $('composer');
     var upto = ta.value.slice(0, ta.selectionStart);
     var rest = ta.value.slice(ta.selectionStart);
-    var replaced = upto.replace(/@([\w.\- ]{0,30})$/, '@' + m.name + ' ');
+    // Function replacement, not a string: a name containing `$` would otherwise be read as a
+    // replacement pattern and the wrong text would land in the box.
+    var replaced = upto.replace(/@([\w.\- ]{0,30})$/, function () { return '@' + m.name + ' '; });
     ta.value = replaced + rest;
     ta.selectionStart = ta.selectionEnd = replaced.length;
     $('mentionPop').classList.remove('open');

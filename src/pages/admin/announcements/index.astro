@@ -1,0 +1,345 @@
+---
+// /admin/announcements — COMPANY ANNOUNCEMENTS, from the publisher's side.
+//
+// THE GATE. `announcements.publish` — the named authority — OR the `hr` section, which is what a
+// CUSTOM role is granted in /admin/team/roles and which the registry resolves as `hr.view`, never as
+// the capability. Accepting either is the documented way to convert without narrowing: gating on the
+// capability alone would shut out every custom role that can open the people desk today.
+//
+// THE DOOR IS NOT THE LOCK. src/middleware.ts has no PATH_SECTION entry for /admin/announcements, so
+// the only structural gate on this URL is canOpenAdmin() — which admits every admin-capable role.
+// The check below is therefore the real gate, and EVERY WRITE is re-checked inside
+// src/lib/announcements.ts against the posted id rather than against whatever this page rendered.
+// A PATH_SECTION entry mapping '/admin/announcements' to 'hr' would tighten the door as well; it is
+// reported rather than made here, because src/middleware.ts is being edited by other work in
+// parallel and a conflict there takes down every admin route, not this one.
+//
+// ONE SELECT FOR THE AUDIENCE, and no client JavaScript anywhere on this page. The audience and its
+// scope travel as a single value ("department:<id>"), parsed by parseScopeChoice() against the
+// options THIS SERVER built — so a hand-made request cannot invent a scope label, and an id that has
+// since disappeared is refused rather than quietly published to everybody.
+//
+// const BEFORE THE POST HANDLER. `const` is not hoisted; a const declared under the handler that
+// reads it throws on that handler's first line — the failure that took down apply step 5 and the
+// /admin/roles/diagnose Repair button here while both reported success.
+//
+// MOBILE FIRST: 360px, 44px targets, one column, and nothing that scrolls the page sideways.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { holdsCapability } from '@/lib/auth/capability';
+import {
+  buildFeedViewer, createAnnouncement, listAnnouncements, announcementCounts,
+  departmentOptions, projectOptions, locationOptions, parseScopeChoice, parseLinks, audienceReach,
+  audienceLabel, statusLabel, statusColour, excerpt,
+  type Announcement, type ScopeOption,
+} from '@/lib/announcements';
+
+const PAGE = '/admin/announcements';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const byCapability = holdsCapability(user as any, 'announcements.publish');
+const bySection = await canAccessSection(user as any, 'hr', 'view');
+if (!byCapability && !bySection) return Astro.redirect('/admin');
+
+// ---------------------------------------------------------------------------------------------
+// CONSTANTS FIRST.
+// ---------------------------------------------------------------------------------------------
+
+const viewer = await buildFeedViewer(user as any);
+
+const fmt = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+const departments: ScopeOption[] = await departmentOptions();
+const projects: ScopeOption[] = await projectOptions();
+const locations: ScopeOption[] = await locationOptions();
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let ok = true;
+  let newId = '';
+
+  if (action === 'create') {
+    const scope = parseScopeChoice(fd.get('scope'), { departments, projects, locations });
+    if (!scope.ok || !scope.value) {
+      ok = false;
+      flash = scope.error || 'Pick who this announcement is for.';
+    } else {
+      const r = await createAnnouncement(user as any, viewer, {
+        title: String(fd.get('title') || ''),
+        summary: String(fd.get('summary') || ''),
+        body: String(fd.get('body') || ''),
+        audience: scope.value.audience,
+        scopeId: scope.value.scopeId,
+        scopeLabel: scope.value.scopeLabel,
+        urgent: String(fd.get('urgent') || '') === 'on',
+        ackRequired: String(fd.get('ack_required') || '') === 'on',
+        expiresAt: String(fd.get('expires_at') || '') || null,
+        links: parseLinks(fd.get('links')),
+      });
+      ok = r.ok;
+      newId = r.ok && r.id ? String(r.id) : '';
+      flash = r.ok
+        ? 'Saved as a draft. Nobody can see it until you publish it.'
+        : (r.error || 'Could not save that.');
+    }
+  } else {
+    ok = false;
+    flash = 'That is not something this page does.';
+  }
+
+  const back = newId ? PAGE + '/' + newId : PAGE;
+  return Astro.redirect(back + (back.indexOf('?') >= 0 ? '&' : '?') + 'msg=' + encodeURIComponent(flash) + '&ok=' + (ok ? '1' : '0'));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const msgOk = url.searchParams.get('ok') !== '0';
+const audienceFilter = String(url.searchParams.get('audience') || '');
+
+const counts = await announcementCounts();
+const list: Announcement[] = await listAnnouncements(viewer, {
+  includeUnpublished: true,
+  audience: audienceFilter || null,
+  limit: 150,
+});
+
+const hrefFor = (a: string) => (a ? PAGE + '?audience=' + encodeURIComponent(a) : PAGE);
+// Every ACTIVE employee, not the sum of the department counts — those two differ by everybody with
+// no department recorded, and quietly publishing the smaller number would understate the reach of a
+// company-wide notice to the person deciding whether to send one.
+const companyReach = await audienceReach('company', null);
+---
+
+<AdminLayout title="Announcements" activeNav="announcements">
+  <div class="an">
+    <header class="an__head">
+      <h1>Announcements</h1>
+      <p>
+        What the company is told, who it goes to, and when it stops being shown. A notice carries an
+        audience — everyone, one department, one project or one working location — and that audience
+        is applied in the query behind every reader's feed, so somebody outside it never receives the
+        row at all.
+      </p>
+    </header>
+
+    {msg && <p class={msgOk ? 'an__ok' : 'an__warn'}>{msg}</p>}
+
+    {!byCapability && (
+      <p class="an__note">
+        You can read this console but not publish from it. Writing, publishing or taking down a
+        company notice needs the announcements capability, because publishing a revised notice asks
+        the whole company to read it again.
+      </p>
+    )}
+
+    <div class="an__metrics">
+      <div class="an__metric"><b>{counts.published}</b><span>Live now</span></div>
+      <div class="an__metric"><b>{counts.drafts}</b><span>Drafts</span></div>
+      <div class="an__metric"><b>{counts.urgent}</b><span>Marked urgent</span></div>
+      <div class="an__metric"><b>{counts.awaitingAck}</b><span>Ask for a confirmation</span></div>
+      <div class="an__metric"><b>{counts.expired}</b><span>Expired on their own</span></div>
+    </div>
+
+    <nav class="an__tabs" aria-label="Filter by audience">
+      <a class="an__tab" href={hrefFor('')} aria-current={!audienceFilter ? 'page' : null}>Everything</a>
+      <a class="an__tab" href={hrefFor('company')} aria-current={audienceFilter === 'company' ? 'page' : null}>Company</a>
+      <a class="an__tab" href={hrefFor('department')} aria-current={audienceFilter === 'department' ? 'page' : null}>Department</a>
+      <a class="an__tab" href={hrefFor('project')} aria-current={audienceFilter === 'project' ? 'page' : null}>Project</a>
+      <a class="an__tab" href={hrefFor('location')} aria-current={audienceFilter === 'location' ? 'page' : null}>Location</a>
+      <a class="an__tab" href="/admin/announcements/recognition">Recognition</a>
+    </nav>
+
+    {byCapability && (
+      <details class="an__compose">
+        <summary>Write an announcement</summary>
+        <form method="POST">
+          <input type="hidden" name="action" value="create" />
+
+          <label for="an-title">Title</label>
+          <input class="an__field" id="an-title" name="title" required maxlength="200"
+            placeholder="Office closed on Friday for maintenance" />
+
+          <label for="an-summary">One-line summary</label>
+          <input class="an__field" id="an-summary" name="summary" maxlength="400"
+            placeholder="What somebody gets from this without opening it" />
+
+          <label for="an-scope">Who it is for</label>
+          <select class="an__field" id="an-scope" name="scope">
+            <option value="company">Everyone in the company{companyReach > 0 ? ' (' + companyReach + ' people on record)' : ''}</option>
+            {departments.length > 0 && (
+              <optgroup label="One department">
+                {departments.map((d) => (
+                  <option value={'department:' + d.id}>{d.label} ({d.people})</option>
+                ))}
+              </optgroup>
+            )}
+            {projects.length > 0 && (
+              <optgroup label="One project">
+                {projects.map((p) => (
+                  <option value={'project:' + p.id}>{p.label} ({p.people})</option>
+                ))}
+              </optgroup>
+            )}
+            {locations.length > 0 && (
+              <optgroup label="One working location">
+                {locations.map((l) => (
+                  <option value={'location:' + l.id}>{l.label} ({l.people})</option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+          <p class="an__hint">
+            The number beside each is how many active people it covers right now. A department
+            audience resolves through the employee records, a project audience through project
+            membership and the Organization Graph. Neither resolves through anybody's role.
+          </p>
+
+          <label for="an-body">The announcement</label>
+          <textarea class="an__field an__area" id="an-body" name="body" required rows="9"
+            placeholder="Markdown. Headings, lists, links and bold. It is rendered on the server; nothing is sent to the browser to draw it."></textarea>
+
+          <label for="an-links">Attachments, one per line</label>
+          <textarea class="an__field an__links" id="an-links" name="links" rows="3"
+            placeholder="Maintenance schedule | https://drive.google.com/..."></textarea>
+          <p class="an__hint">
+            Links only — documents of any kind live on Drive with anyone-with-the-link access, and
+            nothing is ever uploaded here. Format is an optional label, a vertical bar, then the
+            address. Anything that is not an http or https address is dropped.
+          </p>
+
+          <label for="an-expires">Stop showing it after</label>
+          <input class="an__field" id="an-expires" name="expires_at" type="date" />
+          <p class="an__hint">
+            Optional, and it is the read that enforces it — an expired notice simply stops appearing,
+            with no job to run and nothing to remember. The row stays on the record.
+          </p>
+
+          <label class="an__check">
+            <input type="checkbox" name="urgent" />
+            <span>Urgent — sorts to the top and sends a notification</span>
+          </label>
+
+          <label class="an__check">
+            <input type="checkbox" name="ack_required" />
+            <span>Ask each person to confirm they have read it</span>
+          </label>
+          <p class="an__hint">
+            A confirmation is recorded against the VERSION somebody read. Revising a published notice
+            starts a new version and re-opens the confirmation for everybody — which is the point of
+            recording it, and worth knowing before you edit a policy notice for a typo.
+          </p>
+
+          <button class="an__submit" type="submit">Save as a draft</button>
+          <p class="an__hint">
+            Saving does not publish. Nobody sees a draft, including the people it is addressed to.
+          </p>
+        </form>
+      </details>
+    )}
+
+    <section class="an__list">
+      <h2>{audienceFilter ? 'Scoped to ' + audienceFilter : 'Everything, newest first'}</h2>
+      {list.length === 0 && (
+        <p class="an__note">
+          Nothing here yet. The first notice worth writing is the one currently being repeated in
+          five separate messages.
+        </p>
+      )}
+      {list.map((a) => (
+        <a class="an__row" href={PAGE + '/' + a.id}>
+          <div class="an__rowtop">
+            <strong>{a.title}</strong>
+            <span class="an__pill" style={'color:' + statusColour(a.status)}>{statusLabel(a.status)}</span>
+          </div>
+          <div class="an__meta">
+            {audienceLabel(a.audience, a.scopeLabel)}
+            {a.urgent ? ' · Urgent' : ''}
+            {a.pinned ? ' · Pinned' : ''}
+            {a.ackRequired ? ' · Asks for a confirmation' : ''}
+            {' · v' + a.version}
+            {a.expiresAt ? ' · stops ' + fmt(a.expiresAt) : ''}
+            {a.publishedAt ? ' · published ' + fmt(a.publishedAt) : ''}
+          </div>
+          {excerpt(a) && <p class="an__excerpt">{excerpt(a)}</p>}
+        </a>
+      ))}
+    </section>
+
+    <p class="an__foot">
+      Nothing on this console approves anything, and nothing on it is routed for approval. Publishing
+      is a standing authority, so the approval engine is deliberately not involved — which also means
+      no notice can be waved through here because no approver could be found.
+    </p>
+  </div>
+</AdminLayout>
+
+<style>
+  .an { max-width: 860px; margin: 0 auto; padding: 4px 0 32px; }
+  .an__head h1 { margin: 0; font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
+  .an__head p { margin: 6px 0 0; font-size: 0.8125rem; line-height: 1.6; color: #564E43; }
+
+  .an__ok, .an__warn, .an__note { margin: 12px 0 0; padding: 10px 12px; border-radius: 10px;
+    font-size: 0.8125rem; line-height: 1.55; }
+  .an__ok { border: 1px solid #BFE3D0; background: #F1FAF5; color: #065F46; }
+  .an__warn { border: 1px solid #EADECD; background: #FBF7F1; color: #6D470D; }
+  .an__note { border: 1px solid #DFDCD8; background: #F8F8F6; color: #564E43; }
+
+  .an__metrics { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0 0; }
+  .an__metric { flex: 1 1 130px; min-width: 0; padding: 11px 13px; border: 1px solid #DFDCD8;
+    border-radius: 10px; background: #F8F8F6; }
+  .an__metric b { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 1.375rem; line-height: 1.15; }
+  .an__metric span { display: block; margin-top: 3px; font-size: 0.6875rem; letter-spacing: 0.06em;
+    text-transform: uppercase; color: #70685C; }
+
+  .an__tabs { display: flex; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    padding: 12px 0 2px; margin: 0; scrollbar-width: thin; }
+  .an__tab { flex: none; display: inline-flex; align-items: center; min-height: 44px; padding: 8px 14px;
+    border: 1px solid #DFDCD8; border-radius: 999px; background: #FDFDFC; color: #564E43;
+    font-size: 0.8125rem; font-weight: 600; text-decoration: none; white-space: nowrap; }
+  .an__tab[aria-current="page"] { background: #1B1813; border-color: #1B1813; color: #FFFFFF; }
+
+  .an__compose { margin: 14px 0 0; border: 1px solid #DFDCD8; border-radius: 12px; background: #FDFDFC;
+    padding: 4px 14px 14px; }
+  .an__compose > summary { min-height: 44px; display: flex; align-items: center; cursor: pointer;
+    font-size: 0.875rem; font-weight: 650; }
+  .an__compose label { display: block; margin: 14px 0 5px; font-size: 0.75rem; font-weight: 650;
+    color: #564E43; }
+  .an__check { display: flex; align-items: center; gap: 9px; min-height: 44px; margin-top: 10px; }
+  .an__check input { width: 20px; height: 20px; }
+  .an__check span { font-size: 0.8125rem; font-weight: 500; color: #1B1813; }
+
+  .an__field { width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid #DFDCD8;
+    border-radius: 8px; background: #FDFDFC; color: #1B1813; font: inherit; font-size: 0.875rem; }
+  .an__area { min-height: 190px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8125rem; line-height: 1.6; }
+  .an__links { min-height: 80px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8125rem; }
+  .an__hint { margin: 6px 0 0; font-size: 0.75rem; line-height: 1.55; color: #70685C; }
+  .an__submit { width: 100%; margin-top: 16px; min-height: 44px; padding: 10px 16px;
+    border: 1px solid #1B1813; border-radius: 8px; background: #1B1813; color: #FFFFFF; font: inherit;
+    font-size: 0.875rem; font-weight: 650; cursor: pointer; }
+  .an__submit:focus-visible { outline: 2px solid #6F52E5; outline-offset: 2px; }
+
+  .an__list { margin: 22px 0 0; }
+  .an__list h2 { margin: 0 0 6px; font-size: 0.9375rem; font-weight: 700; }
+  .an__row { display: block; padding: 13px 0; border-bottom: 1px solid #EFEDE9; text-decoration: none;
+    color: inherit; min-height: 44px; }
+  .an__row:last-child { border-bottom: none; }
+  .an__rowtop { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .an__rowtop strong { font-size: 0.9375rem; overflow-wrap: anywhere; }
+  .an__pill { flex: none; font-size: 0.6875rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.05em; }
+  .an__meta { margin-top: 4px; font-size: 0.75rem; line-height: 1.55; color: #70685C;
+    overflow-wrap: anywhere; }
+  .an__excerpt { margin: 6px 0 0; font-size: 0.8125rem; line-height: 1.6; color: #564E43; }
+  .an__foot { margin: 24px 0 0; font-size: 0.75rem; line-height: 1.6; color: #70685C; }
+</style>

@@ -371,7 +371,10 @@ export interface ColleagueOption {
 export async function searchColleagues(viewer: FeedViewer, q: string, limit = 20): Promise<ColleagueOption[]> {
   if (!viewer.hasWorkspace) return [];
   const term = String(q || '').trim().slice(0, SEARCH_MAX);
-  const n = Math.min(Math.max(Number(limit) || 20, 1), 50);
+  // The ceiling is headcount-shaped, not page-shaped: the portal renders this as a native <select>
+  // with no client JavaScript, so a cap that silently dropped the second half of the alphabet would
+  // make some colleagues unthankable and give no sign of it.
+  const n = Math.min(Math.max(Number(limit) || 20, 1), 500);
   try {
     const pattern = '%' + term.replace(/[%_\\]/g, (m) => '\\' + m) + '%';
     const selfPart = viewer.employeeId
@@ -670,9 +673,9 @@ export async function recognitionOverview(): Promise<RecognitionOverview> {
         COUNT(*) FILTER (WHERE status = 'withdrawn')::int AS withdrawn,
         COUNT(*) FILTER (WHERE status = 'removed')::int AS removed,
         COUNT(DISTINCT from_employee_id) FILTER (
-          WHERE status = 'visible' AND created_at >= NOW() - (${WINDOW_DAYS} * INTERVAL '1 day'))::int AS senders,
+          WHERE status = 'visible' AND created_at >= NOW() - ((${WINDOW_DAYS})::int * INTERVAL '1 day'))::int AS senders,
         COUNT(DISTINCT to_employee_id) FILTER (
-          WHERE status = 'visible' AND created_at >= NOW() - (${WINDOW_DAYS} * INTERVAL '1 day'))::int AS receivers
+          WHERE status = 'visible' AND created_at >= NOW() - ((${WINDOW_DAYS})::int * INTERVAL '1 day'))::int AS receivers
       FROM recognitions`))[0] || {};
 
     let headcount = 0;

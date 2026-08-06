@@ -149,6 +149,21 @@ function isExempt(path: string): boolean {
   if (path === '/hei/register' || path === '/hei/claim') return true;
   if (path.startsWith('/portal/claim/')) return true;
   if (path === '/logout' || path === '/portal/logout' || path === '/admin/logout' || path === '/hei/logout') return true;
+  // THE SIGN-OUT CONFIRMATION MUST BE EXEMPT TOO, or the gate below eats the way out.
+  //
+  // /portal/logout stopped answering GET with a session delete (a GET that destroys state gets fired
+  // by a prefetch or a link preview) and now redirects to /portal/sign-out, which carries the POST
+  // button. But /portal/sign-out matches isProtected() via the `/portal/` prefix and was not listed
+  // here, so a signed-in user WITHOUT a face enrollment was bounced off it to /enroll-face — and
+  // /enroll-face's own "Sign out" is a plain link to /portal/login that clears nothing. That account
+  // had no way to end its session at all: every portal page is face-gated, so the drawer holding the
+  // POST button is unreachable, and typing /portal/logout — which used to work, because it is
+  // exempt and used to sign you out on the GET — now lands on a page the gate refuses.
+  //
+  // Exempting it is safe: the page reads Astro.locals.user, which middleware sets only from an
+  // already-validated session, and shows that person their own name and address and nothing else.
+  // It grants no access to any surface; it is the door out.
+  if (path === '/portal/sign-out') return true;
   return false;
 }
 

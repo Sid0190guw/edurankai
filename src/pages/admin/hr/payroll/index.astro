@@ -119,15 +119,39 @@ if (Astro.request.method === 'POST') {
       // employees had nothing to withdraw. Credit the ledger here; the call is idempotent by
       // payslip ref, so re-clicking Mark Paid cannot pay anyone twice.
       let payoutMsg = '';
+      // Which employees' money is actually in the ledger. Only these people may be told their
+      // salary was credited; everybody else is told the truth instead (see the notify block below).
+      let walletOk = new Set<string>();
+      let walletCreditFailed = false;
       try {
         const { creditPayrollRun } = await import('@/lib/hr-wallet');
         const res = await creditPayrollRun(runId, user.id);
-        payoutMsg = res.credited > 0
-          ? ` ${res.credited} wallet${res.credited === 1 ? '' : 's'} credited (₹${Math.round(res.total).toLocaleString('en-IN')}).`
-          : ' Wallets were already credited for this run.';
-        await audit(user.id, 'hr.payroll.paid', runId, { credited: res.credited, total: res.total });
+        walletOk = new Set(res.walletOk.map(String));
+        // "NOTHING TO DO" AND "NOTHING WORKED" MUST NOT READ THE SAME.
+        // This used to be `credited > 0 ? "...credited" : "Wallets were already credited for this
+        // run."` — so a total failure of the credit step (which returned credited:0 with its error
+        // swallowed) printed as reassurance while every employee was pushed "credited to your wallet".
+        const bits: string[] = [];
+        if (res.credited > 0) bits.push(`${res.credited} wallet${res.credited === 1 ? '' : 's'} credited (₹${Math.round(res.total).toLocaleString('en-IN')})`);
+        if (res.alreadyCredited > 0) bits.push(`${res.alreadyCredited} ${res.alreadyCredited === 1 ? 'was' : 'were'} already credited by an earlier run of this step`);
+        if (res.credited === 0 && res.alreadyCredited === 0) bits.push('no wallet was credited');
+        payoutMsg = ' ' + bits.join('; ') + '.';
+        if (res.failures.length) {
+          walletCreditFailed = true;
+          errorMsg = res.failures.length + ' salary payment' + (res.failures.length === 1 ? '' : 's')
+            + ' did NOT reach a wallet, so ' + (res.failures.length === 1 ? 'that person has' : 'those people have')
+            + ' nothing to withdraw even though the run is marked paid. Credit them by hand from Payouts. '
+            + res.failures.join(' ');
+        }
+        await audit(user.id, 'hr.payroll.paid', runId, { credited: res.credited, alreadyCredited: res.alreadyCredited, total: res.total, failed: res.failures.length });
       } catch (e: any) {
-        payoutMsg = ' Wallet credit could not be completed — open Payouts and check before telling anyone they have been paid.';
+        // The real Postgres reason is on `.cause`; `.message` is only the failed SQL.
+        console.error('[payroll] creditPayrollRun failed for run', runId, '-', e?.cause?.message || e?.message);
+        walletCreditFailed = true;
+        payoutMsg = '';
+        errorMsg = 'The run is marked paid but NO wallet was credited, so nobody can withdraw anything: '
+          + (e?.cause?.message || e?.message || 'unknown database error')
+          + ' Credit the wallets from Payouts before telling anyone they have been paid.';
       }
       successMsg = 'Payroll marked as paid.' + payoutMsg;
 
@@ -143,32 +167,61 @@ if (Astro.request.method === 'POST') {
         // swallowed it, and NOBODY was ever notified that they had been paid — while the page reported
         // success. The column name is fixed and the value is aliased so the reader below is unchanged.
         const paidRows = await db.execute(sqlExpr`
-          SELECT e.user_id, p.net_salary AS net_pay
+          SELECT e.id AS employee_id, e.user_id, p.net_salary AS net_pay
           FROM hr_payslips p
           JOIN hr_employees e ON e.id = p.employee_id
           WHERE p.payroll_run_id = ${runId} AND e.user_id IS NOT NULL`);
         const paid = (Array.isArray(paidRows) ? paidRows : ((paidRows as any)?.rows || [])) as any[];
+        let notified = 0;
+        const notifyFailed: string[] = [];
         for (const row of paid) {
+          // NEVER TELL SOMEBODY THEIR MONEY ARRIVED WHEN IT DID NOT. Every employee on the run used
+          // to be pushed "has been credited to your wallet" regardless of what the wallet step
+          // actually did — the single most misleading message this module can send.
+          const inWallet = walletOk.has(String(row.employee_id));
+          const amount = row.net_pay != null ? 'Rs ' + Math.round(Number(row.net_pay)).toLocaleString('en-IN') : null;
           try {
             await sendPushToUser(row.user_id, {
               type: 'payroll_run',
-              title: 'Salary credited',
-              body: row.net_pay != null
-                ? 'Your payslip is ready and Rs ' + Math.round(Number(row.net_pay)).toLocaleString('en-IN') + ' has been credited to your wallet.'
-                : 'Your payslip is ready and your salary has been credited to your wallet.',
+              title: inWallet ? 'Salary credited' : 'Payslip ready',
+              body: inWallet
+                ? (amount
+                    ? 'Your payslip is ready and ' + amount + ' has been credited to your wallet.'
+                    : 'Your payslip is ready and your salary has been credited to your wallet.')
+                : (amount
+                    ? 'Your payslip for this run is ready (' + amount + '). The wallet credit has not gone through yet — HR is completing it.'
+                    : 'Your payslip for this run is ready. The wallet credit has not gone through yet — HR is completing it.'),
               url: '/portal/employee',
               tag: 'payroll-' + runId,
             });
-          } catch (_) {}
+            notified++;
+          } catch (e: any) {
+            // Non-fatal — the run IS paid and must not roll back — but never silent.
+            console.error('[payroll] could not notify user', row.user_id, '-', e?.cause?.message || e?.message);
+            notifyFailed.push(String(row.user_id));
+          }
+        }
+        if (notifyFailed.length) {
+          errorMsg = (errorMsg ? errorMsg + ' ' : '')
+            + notifyFailed.length + ' employee' + (notifyFailed.length === 1 ? '' : 's')
+            + ' could not be notified that payroll was run. Tell them another way.';
         }
         await sendPushToAdmins({
           type: 'payroll_run',
           title: 'Payroll marked paid',
-          body: paid.length + ' employee' + (paid.length === 1 ? '' : 's') + ' notified.' + payoutMsg.trim(),
+          body: notified + ' of ' + paid.length + ' employee' + (paid.length === 1 ? '' : 's') + ' notified.'
+            + (walletCreditFailed ? ' WALLET CREDIT INCOMPLETE — check Payouts.' : payoutMsg.trim()),
           url: '/admin/hr/payroll',
           tag: 'payroll-admin-' + runId,
         }, user.id);
-      } catch (_) {}
+      } catch (e: any) {
+        // WAS `catch (_) {}`. The run is already paid and credited, so this cannot abort — but an
+        // admin who is not told that nobody was notified will assume everyone knows.
+        console.error('[payroll] notification step failed for run', runId, '-', e?.cause?.message || e?.message);
+        errorMsg = (errorMsg ? errorMsg + ' ' : '')
+          + 'Payroll is marked paid, but the notifications could not be sent, so no employee has been told. ('
+          + (e?.cause?.message || e?.message || 'unknown error') + ')';
+      }
     } else if (action === 'update_salary') {
       const empId = fd.get('empId') as string;
       const basic = parseFloat(fd.get('basic') as string || '0');
@@ -241,7 +294,11 @@ if (Astro.request.method === 'POST') {
         + (preview.noStatutoryComponents ? ' (no statutory component is configured, so none was deducted).' : '.');
     }
   } catch (err: any) {
-    errorMsg = 'Error: ' + (err.message || 'Unknown');
+    // `.message` on a drizzle/postgres-js error is only the failed SQL text; the reason is on `.cause`.
+    // Printing the SQL to an admin and dropping the reason on the floor is how these faults survive.
+    const real = err?.cause?.message || err?.message;
+    console.error('[payroll] action failed -', real, err?.message);
+    errorMsg = 'Error: ' + (real || 'Unknown');
   }
 }
 

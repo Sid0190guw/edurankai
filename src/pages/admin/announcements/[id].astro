@@ -1,0 +1,452 @@
+---
+// /admin/announcements/[id] — ONE ANNOUNCEMENT: revise it, publish it, pin it, take it down, and
+// read who has confirmed which version.
+//
+// THE GATE is the same pair the index carries — `announcements.publish` OR the `hr` section — and it
+// is not the lock. Every write on this page calls back into src/lib/announcements.ts, which
+// re-checks the capability AGAINST THE POSTED ID rather than against whatever this page rendered.
+//
+// WHAT THE ACKNOWLEDGEMENT PANEL SHOWS, and the line is deliberate: the people who HAVE confirmed
+// are NAMED, because each of them performed that act on purpose and being able to show it is the
+// whole reason to keep the record. The people who have NOT are a COUNT. A screen listing the names
+// of everybody who has not read the code of conduct is a shame list, and the count is the number
+// that actually tells the owner of a notice that a reminder is due.
+//
+// WHO LEADS THE AUDIENCE comes from the Organization Graph and from nowhere else — and the graph is
+// EMPTY until the founder runs the backfill, so this page asks isInitialized() and prints
+// "Organization Graph not yet initialized" rather than "no head on record". Those are different
+// statements and printing the second when the first is true tells everybody they answer to nobody.
+//
+// const BEFORE THE POST HANDLER. `const` is not hoisted.
+// CLIENT JAVASCRIPT: NONE. Every control is a form.
+// MOBILE FIRST: 360px, 44px targets, one column, no page-level sideways scroll.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { canAccessSection } from '@/lib/auth/permissions';
+import { holdsCapability } from '@/lib/auth/capability';
+import {
+  buildFeedViewer, getAnnouncement, updateAnnouncement, publishAnnouncement, setPinned,
+  archiveAnnouncement, ackRecord, listVersions, renderAnnouncementHtml, scopeLeadership,
+  departmentOptions, projectOptions, locationOptions, parseScopeChoice, parseLinks, linksToText,
+  scopeChoiceValue, audienceLabel, statusLabel, statusColour, audienceReach,
+  type Announcement, type ScopeOption,
+} from '@/lib/announcements';
+
+const BASE = '/admin/announcements';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+
+const byCapability = holdsCapability(user as any, 'announcements.publish');
+const bySection = await canAccessSection(user as any, 'hr', 'view');
+if (!byCapability && !bySection) return Astro.redirect('/admin');
+
+// ---------------------------------------------------------------------------------------------
+// CONSTANTS FIRST.
+// ---------------------------------------------------------------------------------------------
+
+const id = String(Astro.params.id || '');
+const viewer = await buildFeedViewer(user as any);
+
+const fmt = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+const fmtTime = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+};
+/** An ISO instant as the yyyy-mm-dd a date input wants. Empty when there is none. */
+const asDateValue = (iso: string | null) => (iso ? String(iso).slice(0, 10) : '');
+
+const departments: ScopeOption[] = await departmentOptions();
+const projects: ScopeOption[] = await projectOptions();
+const locations: ScopeOption[] = await locationOptions();
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let ok = true;
+
+  if (action === 'update') {
+    const scope = parseScopeChoice(fd.get('scope'), { departments, projects, locations });
+    if (!scope.ok || !scope.value) {
+      ok = false;
+      flash = scope.error || 'Pick who this announcement is for.';
+    } else {
+      const r = await updateAnnouncement(user as any, viewer, id, {
+        title: String(fd.get('title') || ''),
+        summary: String(fd.get('summary') || ''),
+        body: String(fd.get('body') || ''),
+        audience: scope.value.audience,
+        scopeId: scope.value.scopeId,
+        scopeLabel: scope.value.scopeLabel,
+        urgent: String(fd.get('urgent') || '') === 'on',
+        ackRequired: String(fd.get('ack_required') || '') === 'on',
+        expiresAt: String(fd.get('expires_at') || '') || null,
+        links: parseLinks(fd.get('links')),
+        changeNote: String(fd.get('change_note') || ''),
+      });
+      ok = r.ok;
+      flash = r.ok ? 'Saved.' : (r.error || 'Could not save that.');
+    }
+  } else if (action === 'publish') {
+    const r = await publishAnnouncement(user as any, viewer, id);
+    ok = r.ok;
+    flash = r.ok
+      ? (r.changed
+          ? 'Published. ' + (r.notified
+              ? 'A notification was issued for ' + r.notified + ' people — that is how many it was sent for, not a delivery receipt.'
+              : 'No notification was sent: only urgent notices and ones asking for a confirmation send one.')
+          : 'It was already published. Nothing changed.')
+      : (r.error || 'Could not publish that.');
+  } else if (action === 'pin' || action === 'unpin') {
+    const r = await setPinned(user as any, viewer, id, action === 'pin');
+    ok = r.ok;
+    flash = r.ok
+      ? (action === 'pin' ? 'Pinned to the top of every feed that can see it.' : 'Unpinned.')
+      : (r.error || 'Could not change that.');
+  } else if (action === 'archive') {
+    const r = await archiveAnnouncement(user as any, viewer, id, String(fd.get('reason') || ''));
+    ok = r.ok;
+    flash = r.ok
+      ? 'Taken down. The row stays on the record with your reason on it — nothing is deleted here.'
+      : (r.error || 'Could not take it down.');
+  } else {
+    ok = false;
+    flash = 'That is not something this page does.';
+  }
+
+  const back = BASE + '/' + id;
+  return Astro.redirect(back + '?msg=' + encodeURIComponent(flash) + '&ok=' + (ok ? '1' : '0'));
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const msgOk = url.searchParams.get('ok') !== '0';
+
+const item: Announcement | null = await getAnnouncement(viewer, id);
+const bodyHtml = item ? renderAnnouncementHtml(item.body) : '';
+const record = item ? await ackRecord(viewer, item) : null;
+const versions = item ? await listVersions(viewer, id) : [];
+const leadership = item ? await scopeLeadership(item.audience, item.scopeId) : null;
+const reach = item ? await audienceReach(item.audience, item.scopeId) : 0;
+const currentScope = item ? scopeChoiceValue(item) : 'company';
+const linksText = item ? linksToText(item.links) : '';
+const expired = !!(item?.expiresAt && new Date(item.expiresAt).getTime() <= Date.now());
+---
+
+<AdminLayout title={item ? item.title : 'Announcement'} activeNav="announcements">
+  <div class="an">
+    <p class="an__back"><a href={BASE}>Back to announcements</a></p>
+
+    {msg && <p class={msgOk ? 'an__ok' : 'an__warn'}>{msg}</p>}
+
+    {!item && (
+      <p class="an__note">
+        That announcement is not available. It may have been taken down, or the address may be wrong.
+      </p>
+    )}
+
+    {item && (
+      <article class="an__doc">
+        <h1>{item.title}</h1>
+        <p class="an__meta">
+          <span class="an__pill" style={'color:' + statusColour(item.status)}>{statusLabel(item.status)}</span>
+          {' · ' + audienceLabel(item.audience, item.scopeLabel)}
+          {' · version ' + item.version}
+          {item.urgent ? ' · Urgent' : ''}
+          {item.pinned ? ' · Pinned' : ''}
+          {item.publishedAt ? ' · published ' + fmt(item.publishedAt) : ''}
+          {item.expiresAt ? (expired ? ' · expired ' + fmt(item.expiresAt) : ' · stops showing ' + fmt(item.expiresAt)) : ''}
+        </p>
+        {item.summary && <p class="an__summary">{item.summary}</p>}
+        <div class="an__body" set:html={bodyHtml}></div>
+
+        {item.links.length > 0 && (
+          <div class="an__links">
+            <h3>Attached links</h3>
+            <ul>
+              {item.links.map((l) => (
+                <li><a href={l.url} rel="noopener noreferrer" target="_blank">{l.label}</a></li>
+              ))}
+            </ul>
+            <p class="an__hint">
+              Links, never uploads. Whoever opens one needs access to it where it lives.
+            </p>
+          </div>
+        )}
+
+        {item.status === 'archived' && item.archiveReason && (
+          <p class="an__note">Taken down: {item.archiveReason}</p>
+        )}
+      </article>
+    )}
+
+    {item && (
+      <section class="an__panel">
+        <h2>Who it reaches</h2>
+        <p class="an__body-note">
+          {reach} active {reach === 1 ? 'person is' : 'people are'} inside this audience right now.
+          {record && record.reachable < reach
+            ? ' ' + (reach - record.reachable) + ' of them have no sign-in on record, so they can read it ' +
+              'when they open the feed but cannot be notified in-app. That is a real gap, not a rounding.'
+            : ''}
+        </p>
+        {leadership && !leadership.initialized && (
+          <p class="an__note">{leadership.note}</p>
+        )}
+        {leadership && leadership.initialized && leadership.people.length > 0 && (
+          <p class="an__body-note">
+            The Organization Graph records
+            {leadership.people.map((p) => ' ' + (p.fullName || 'someone') + (p.designation ? ' (' + p.designation + ')' : '')).join(',')}
+            {' '}as leading this group. That is shown for context and decides nothing here.
+          </p>
+        )}
+        {leadership && leadership.initialized && leadership.people.length === 0 && leadership.note && (
+          <p class="an__body-note">{leadership.note}</p>
+        )}
+      </section>
+    )}
+
+    {item && item.ackRequired && record && (
+      <section class="an__panel">
+        <h2>Confirmations for version {item.version}</h2>
+        <p class="an__body-note">
+          {record.acknowledged.length} confirmed · {record.outstanding} have not yet.
+        </p>
+        <p class="an__hint">
+          The people who confirmed are named because each of them did that deliberately. The people
+          who have not are a number, on purpose — a list of their names would be a shame list, and the
+          count is what tells you a reminder is due.
+        </p>
+        {record.acknowledged.length === 0 && (
+          <p class="an__body-note">Nobody has confirmed this version yet.</p>
+        )}
+        {record.acknowledged.length > 0 && (
+          <ul class="an__acks">
+            {record.acknowledged.map((a) => (
+              <li><strong>{a.name}</strong><span>{fmtTime(a.at)}</span></li>
+            ))}
+          </ul>
+        )}
+      </section>
+    )}
+
+    {item && versions.length > 0 && (
+      <section class="an__panel">
+        <h2>Earlier versions</h2>
+        <p class="an__hint">
+          What this notice said before it was revised. Confirmations are recorded per version, so a
+          person who confirmed version 1 has not confirmed version 2 — that is what a revision means.
+        </p>
+        <ul class="an__versions">
+          {versions.map((v) => (
+            <li>
+              <strong>Version {v.version}</strong>
+              <span>{v.title}</span>
+              {v.changeNote && <em>{v.changeNote}</em>}
+              <span>{v.authorName ? v.authorName + ' · ' : ''}{fmtTime(v.createdAt)}</span>
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    {item && byCapability && (
+      <section class="an__panel">
+        <h2>Actions</h2>
+        <div class="an__actions">
+          {item.status !== 'published' && (
+            <form method="POST">
+              <input type="hidden" name="action" value="publish" />
+              <button class="an__btn an__btn--go" type="submit">Publish it</button>
+            </form>
+          )}
+          {item.status === 'published' && !item.pinned && (
+            <form method="POST">
+              <input type="hidden" name="action" value="pin" />
+              <button class="an__btn" type="submit">Pin to the top</button>
+            </form>
+          )}
+          {item.pinned && (
+            <form method="POST">
+              <input type="hidden" name="action" value="unpin" />
+              <button class="an__btn" type="submit">Unpin</button>
+            </form>
+          )}
+        </div>
+
+        {item.status !== 'archived' && (
+          <form method="POST" class="an__archive">
+            <input type="hidden" name="action" value="archive" />
+            <label for="an-reason">Take it down, and say why</label>
+            <input class="an__field" id="an-reason" name="reason" maxlength="300" required
+              placeholder="Superseded by the revised maintenance schedule" />
+            <button class="an__btn an__btn--warn" type="submit">Take it down</button>
+            <p class="an__hint">
+              Not a delete — there is no delete here. What the company was told in March is a question
+              this record exists to answer, and a removed row answers nothing.
+            </p>
+          </form>
+        )}
+      </section>
+    )}
+
+    {item && byCapability && (
+      <details class="an__compose">
+        <summary>Revise this announcement</summary>
+        <form method="POST">
+          <input type="hidden" name="action" value="update" />
+
+          <label for="an-title">Title</label>
+          <input class="an__field" id="an-title" name="title" required maxlength="200" value={item.title} />
+
+          <label for="an-summary">One-line summary</label>
+          <input class="an__field" id="an-summary" name="summary" maxlength="400" value={item.summary} />
+
+          <label for="an-scope">Who it is for</label>
+          <select class="an__field" id="an-scope" name="scope">
+            <option value="company" selected={currentScope === 'company'}>Everyone in the company</option>
+            {departments.length > 0 && (
+              <optgroup label="One department">
+                {departments.map((d) => (
+                  <option value={'department:' + d.id} selected={currentScope === 'department:' + d.id}>{d.label} ({d.people})</option>
+                ))}
+              </optgroup>
+            )}
+            {projects.length > 0 && (
+              <optgroup label="One project">
+                {projects.map((p) => (
+                  <option value={'project:' + p.id} selected={currentScope === 'project:' + p.id}>{p.label} ({p.people})</option>
+                ))}
+              </optgroup>
+            )}
+            {locations.length > 0 && (
+              <optgroup label="One working location">
+                {locations.map((l) => (
+                  <option value={'location:' + l.id} selected={currentScope === 'location:' + l.id}>{l.label} ({l.people})</option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+
+          <label for="an-body">The announcement</label>
+          <textarea class="an__field an__area" id="an-body" name="body" required rows="10">{item.body}</textarea>
+
+          <label for="an-links">Attachments, one per line</label>
+          <textarea class="an__field an__linksbox" id="an-links" name="links" rows="3">{linksText}</textarea>
+
+          <label for="an-expires">Stop showing it after</label>
+          <input class="an__field" id="an-expires" name="expires_at" type="date" value={asDateValue(item.expiresAt)} />
+
+          <label class="an__check">
+            <input type="checkbox" name="urgent" checked={item.urgent} />
+            <span>Urgent</span>
+          </label>
+
+          <label class="an__check">
+            <input type="checkbox" name="ack_required" checked={item.ackRequired} />
+            <span>Ask each person to confirm they have read it</span>
+          </label>
+
+          <label for="an-note">What changed</label>
+          <input class="an__field" id="an-note" name="change_note" maxlength="300"
+            placeholder="Corrected the date of the shutdown" />
+          <p class="an__hint">
+            Saving a PUBLISHED notice starts version {item.version + 1} and re-opens every
+            confirmation, including from people who already gave one. That is deliberate, and it is
+            why a typo fix is worth a moment's thought when confirmations are being asked for.
+          </p>
+
+          <button class="an__submit" type="submit">Save</button>
+        </form>
+      </details>
+    )}
+  </div>
+</AdminLayout>
+
+<style>
+  .an { max-width: 820px; margin: 0 auto; padding: 4px 0 32px; }
+  .an__back { margin: 0 0 10px; font-size: 0.8125rem; }
+  .an__back a { color: #564E43; }
+
+  .an__ok, .an__warn, .an__note { margin: 0 0 14px; padding: 10px 12px; border-radius: 10px;
+    font-size: 0.8125rem; line-height: 1.55; }
+  .an__ok { border: 1px solid #BFE3D0; background: #F1FAF5; color: #065F46; }
+  .an__warn { border: 1px solid #EADECD; background: #FBF7F1; color: #6D470D; }
+  .an__note { border: 1px solid #DFDCD8; background: #F8F8F6; color: #564E43; }
+
+  .an__doc h1 { margin: 0; font-size: 1.25rem; font-weight: 700; line-height: 1.3;
+    letter-spacing: -0.01em; overflow-wrap: anywhere; }
+  .an__meta { margin: 8px 0 0; font-size: 0.75rem; line-height: 1.6; color: #70685C;
+    overflow-wrap: anywhere; }
+  .an__pill { font-size: 0.6875rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.05em; }
+  .an__summary { margin: 10px 0 0; font-size: 0.9375rem; line-height: 1.6; color: #1B1813;
+    font-weight: 550; }
+
+  .an__body { margin: 14px 0 0; font-size: 0.9375rem; line-height: 1.75; color: #1B1813;
+    overflow-wrap: anywhere; }
+  .an__body :global(h2), .an__body :global(h3) { margin: 18px 0 6px; font-size: 1rem; font-weight: 700; }
+  .an__body :global(p) { margin: 10px 0; }
+  .an__body :global(ul), .an__body :global(ol) { margin: 10px 0 10px 20px; }
+  .an__body :global(li) { margin: 4px 0; }
+  .an__body :global(blockquote) { margin: 12px 0; padding: 8px 12px; border-left: 3px solid #DFDCD8;
+    background: #F8F8F6; color: #564E43; }
+  .an__body :global(pre) { overflow-x: auto; padding: 10px 12px; background: #F3F1ED; border-radius: 8px; }
+  .an__body :global(img) { max-width: 100%; height: auto; }
+  .an__body :global(table) { display: block; overflow-x: auto; max-width: 100%; }
+
+  .an__links { margin: 16px 0 0; }
+  .an__links h3 { margin: 0 0 6px; font-size: 0.8125rem; font-weight: 700; }
+  .an__links ul { margin: 0; padding-left: 18px; }
+  .an__links li { margin: 4px 0; font-size: 0.875rem; overflow-wrap: anywhere; }
+
+  .an__panel { margin: 26px 0 0; padding: 14px; border: 1px solid #DFDCD8; border-radius: 12px;
+    background: #FDFDFC; }
+  .an__panel h2 { margin: 0 0 8px; font-size: 0.9375rem; font-weight: 700; }
+  .an__body-note { margin: 0 0 6px; font-size: 0.8125rem; line-height: 1.6; color: #564E43; }
+  .an__hint { margin: 6px 0 0; font-size: 0.75rem; line-height: 1.55; color: #70685C; }
+
+  .an__acks, .an__versions { list-style: none; margin: 10px 0 0; padding: 0; }
+  .an__acks li, .an__versions li { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline;
+    padding: 9px 0; border-bottom: 1px solid #EFEDE9; font-size: 0.8125rem; }
+  .an__acks li:last-child, .an__versions li:last-child { border-bottom: none; }
+  .an__acks span, .an__versions span { color: #70685C; font-size: 0.75rem; }
+  .an__versions em { flex: 1 1 100%; color: #564E43; font-style: normal; font-size: 0.8125rem; }
+
+  .an__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .an__btn { min-height: 44px; padding: 10px 16px; border: 1px solid #DFDCD8; border-radius: 8px;
+    background: #FDFDFC; color: #1B1813; font: inherit; font-size: 0.875rem; font-weight: 600;
+    cursor: pointer; }
+  .an__btn--go { background: #1B1813; border-color: #1B1813; color: #FFFFFF; }
+  .an__btn--warn { border-color: #C08A3E; color: #6D470D; margin-top: 10px; }
+  .an__btn:focus-visible { outline: 2px solid #6F52E5; outline-offset: 2px; }
+
+  .an__archive { margin-top: 16px; }
+  .an__archive label { display: block; margin: 0 0 5px; font-size: 0.75rem; font-weight: 650;
+    color: #564E43; }
+
+  .an__compose { margin: 22px 0 0; border: 1px solid #DFDCD8; border-radius: 12px; background: #FDFDFC;
+    padding: 4px 14px 14px; }
+  .an__compose > summary { min-height: 44px; display: flex; align-items: center; cursor: pointer;
+    font-size: 0.875rem; font-weight: 650; }
+  .an__compose label { display: block; margin: 14px 0 5px; font-size: 0.75rem; font-weight: 650;
+    color: #564E43; }
+  .an__check { display: flex; align-items: center; gap: 9px; min-height: 44px; margin-top: 10px; }
+  .an__check input { width: 20px; height: 20px; }
+  .an__check span { font-size: 0.8125rem; font-weight: 500; color: #1B1813; }
+
+  .an__field { width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid #DFDCD8;
+    border-radius: 8px; background: #FDFDFC; color: #1B1813; font: inherit; font-size: 0.875rem; }
+  .an__area { min-height: 200px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8125rem; line-height: 1.6; }
+  .an__linksbox { min-height: 80px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8125rem; }
+  .an__submit { width: 100%; margin-top: 16px; min-height: 44px; padding: 10px 16px;
+    border: 1px solid #1B1813; border-radius: 8px; background: #1B1813; color: #FFFFFF; font: inherit;
+    font-size: 0.875rem; font-weight: 650; cursor: pointer; }
+</style>

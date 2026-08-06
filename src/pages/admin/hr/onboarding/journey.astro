@@ -1,0 +1,498 @@
+---
+// /admin/hr/onboarding/journey — THE ONBOARDING JOURNEY: the template, and who is stuck.
+//
+// WHAT CHANGED. Onboarding here was one form a joiner filled in. Everything that actually has to
+// happen in somebody's first fortnight — equipment, accounts, introductions, the reading, the
+// policies they must acknowledge — lived in mail threads and in somebody's memory. This screen holds
+// the template that says what this company does for a joiner, and the running checklists that say how
+// far each one has got and WHO it is waiting on.
+//
+// EVERY STEP HAS AN OWNER, OR SAYS PLAINLY THAT IT CANNOT YET. Owners are RELATIONSHIPS resolved per
+// joiner from the Organization Graph (reporting manager, department head, the onboarding owner) — not
+// role names and never users.role. Before the graph is backfilled, items carry the sentence "the
+// organization graph has not been built yet" rather than "no manager", because those are different
+// facts and only one of them is the founder's to fix. Press "Re-resolve owners" after the backfill and
+// every waiting item picks up its owner without being re-created and without disturbing anything
+// already done.
+//
+// NOTHING IS SEEDED. The template is empty until somebody records a step. There is a button that adds
+// a SUGGESTED starter checklist, and it writes nothing until it is pressed; every step it adds is
+// editable and retirable afterwards.
+//
+// THIS SCREEN DOES NOT REPLACE /admin/hr/onboarding, which reviews the joining CREDENTIALS (Google
+// Drive links a hire submits). That module still owns those; a `documents` step here points at it.
+//
+// THE GATE. `employee.manage` through can() — the people-desk capability, held today by exactly the
+// accounts that run onboarding. A narrower `onboarding.manage` key would be better and is reported as
+// a follow-up rather than minted here, because the Permission union lives in src/lib/auth, which
+// another workstream owns.
+//
+// NO CLIENT JAVASCRIPT. Every action is a plain form POST.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { isInitialized } from '@/lib/org-graph';
+import {
+  ensureJourneySchema, listTemplateSteps, addTemplateStep, setStepActive, setStepDocument,
+  addStarterSteps, startJourney, reresolveOwners, listJourneys, employeesWithoutJourney,
+  stepCategoryLabel, ownerViaLabel, itemStateLabel,
+  STEP_CATEGORIES, OWNER_VIA, STARTER_STEPS,
+  type TemplateStep, type Journey, type JourneyItem,
+} from '@/lib/onboarding-journey';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'employee.manage')) return Astro.redirect('/admin?denied=onboarding');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted.
+const PAGE = '/admin/hr/onboarding/journey';
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+const dueLabel = (day: number) => {
+  const n = Number(day) || 0;
+  if (n === 0) return 'On the joining day';
+  if (n > 0) return 'Day ' + n + ' after joining';
+  return Math.abs(n) + ' day' + (Math.abs(n) === 1 ? '' : 's') + ' before joining';
+};
+
+function itemTone(item: JourneyItem): string {
+  if (item.state === 'done') return '#6ee7b7';
+  if (item.state === 'not_applicable') return '#9aa6b6';
+  if (!item.ownerEmployeeId) return '#fbbf24';
+  if (item.state === 'blocked') return '#fca5a5';
+  if (item.overdue) return '#fca5a5';
+  return '#67e8f9';
+}
+
+await ensureJourneySchema().catch(() => {});
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (action === 'add_step') {
+      const r = await addTemplateStep({
+        title: String(fd.get('title') || ''),
+        description: String(fd.get('description') || ''),
+        category: String(fd.get('category') || 'other'),
+        ownerVia: String(fd.get('owner_via') || ''),
+        dueDay: Number(fd.get('due_day') || 0),
+        readingUrl: String(fd.get('reading_url') || ''),
+        requiresAcknowledgement: String(fd.get('requires_acknowledgement') || '') === 'on',
+        employmentType: String(fd.get('employment_type') || ''),
+        sortOrder: Number(fd.get('sort_order') || 100),
+        actorUserId: user.id,
+      });
+      flash = r.ok
+        ? 'Step added to the template. Journeys already running pick it up the next time one is started or topped up.'
+        : (r.error || 'The step was not saved.');
+    } else if (action === 'starter') {
+      const r = await addStarterSteps(user.id);
+      if (!r.ok) flash = r.error || 'The starter checklist was not added.';
+      else if (r.added === 0) flash = 'Nothing was added - every suggested step is already on the template.';
+      else flash = r.added + ' suggested step' + (r.added === 1 ? '' : 's') + ' added. Edit or retire any of them.';
+    } else if (action === 'retire_step' || action === 'restore_step') {
+      const r = await setStepActive(String(fd.get('step_id') || ''), action === 'restore_step', user.id);
+      flash = r.ok ? 'Saved.' : (r.error || 'That was not changed.');
+    } else if (action === 'set_document') {
+      const r = await setStepDocument(
+        String(fd.get('step_id') || ''),
+        String(fd.get('reading_url') || ''),
+        String(fd.get('requires_acknowledgement') || '') === 'on',
+        user.id,
+      );
+      flash = r.ok ? 'Document link saved.' : (r.error || 'The document link was not saved.');
+    } else if (action === 'start_journey') {
+      const r = await startJourney(String(fd.get('employee_id') || ''), user.id);
+      if (!r.ok) flash = r.error || 'The journey was not started.';
+      else if (r.unowned && r.unowned > 0) {
+        flash = 'Checklist started. ' + r.unowned + ' step' + (r.unowned === 1 ? '' : 's')
+          + ' could not resolve an owner yet - each says why on the checklist, and nothing is lost.';
+      } else flash = 'Checklist started, and every step has an owner.';
+    } else if (action === 'reresolve') {
+      const r = await reresolveOwners(user.id, String(fd.get('journey_id') || '') || null);
+      if (!r.ok) flash = r.error || 'The owners could not be re-resolved.';
+      else if (r.resolved === 0 && r.stillUnowned === 0) flash = 'Nothing needed re-resolving - every waiting step already has an owner.';
+      else flash = r.resolved + ' step' + (r.resolved === 1 ? '' : 's') + ' now has an owner'
+        + (r.stillUnowned > 0 ? '; ' + r.stillUnowned + ' still cannot resolve one and say why.' : '.');
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[admin/hr/onboarding/journey] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const graphReady = await isInitialized();
+const steps = await listTemplateSteps({ includeInactive: true });
+const activeSteps = steps.filter((s) => s.isActive);
+const retiredSteps = steps.filter((s) => !s.isActive);
+const journeys = await listJourneys(80);
+const notStarted = await employeesWithoutJourney(40);
+
+const running = journeys.filter((j) => !j.progress.complete);
+const finished = journeys.filter((j) => j.progress.complete);
+const unownedTotal = journeys.reduce((s, j) => s + j.progress.unowned, 0);
+const overdueTotal = journeys.reduce((s, j) => s + j.progress.overdue, 0);
+---
+<AdminLayout title="Onboarding journey" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR &middot; Onboarding &middot; Journey</p>
+  <h1>Onboarding journey</h1>
+  <p class="lede">
+    What this company actually does for a new joiner, as a tracked sequence rather than a form. Each
+    step has an owner resolved from the Organization Graph and a due date counted from that person's
+    joining date. The joiner sees their own progress on their portal; you see who is stuck and where.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+
+  {!graphReady && (
+    <div class="flash warn">
+      The Organization Graph has not been built yet, so no step can resolve a reporting manager, a
+      department head or an onboarding owner. Checklists still start and every step still appears
+      &mdash; each one saying, in those words, that the graph is not built rather than that somebody
+      has no manager. Once the founder runs the backfill, press &ldquo;Re-resolve owners&rdquo; and
+      every waiting step picks up its owner. Nothing has to be re-created.
+    </div>
+  )}
+
+  {graphReady && unownedTotal > 0 && (
+    <div class="flash warn">
+      {unownedTotal} step{unownedTotal === 1 ? '' : 's'} across all checklists cannot resolve an owner.
+      Each says exactly which relationship is missing. A step nobody owns is the step that never
+      happens, so these are the ones worth fixing first.
+    </div>
+  )}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{activeSteps.length}</span><span class="tl">Steps on the template</span></div>
+    <div class="tile"><span class="tv">{running.length}</span><span class="tl">Journeys running</span></div>
+    <div class="tile"><span class="tv">{unownedTotal}</span><span class="tl">Steps with no owner</span></div>
+    <div class="tile"><span class="tv">{overdueTotal}</span><span class="tl">Steps past their date</span></div>
+  </div>
+
+  <form method="POST" class="barform">
+    <input type="hidden" name="action" value="reresolve" />
+    <button type="submit" class="btn ghost small">Re-resolve owners on every waiting step</button>
+  </form>
+
+  <h2>The template</h2>
+  {activeSteps.length === 0 ? (
+    <div class="empty">
+      <p class="ec">The template has no steps yet.</p>
+      <p class="es">
+        Nothing has been invented for you. Add the steps this company genuinely does for a joiner
+        below, or start from a suggested checklist and change it &mdash; nothing is written until you
+        press the button, and every step it adds can be edited or retired.
+      </p>
+      <form method="POST" class="mid">
+        <input type="hidden" name="action" value="starter" />
+        <button type="submit" class="btn small">Add {STARTER_STEPS.length} suggested steps</button>
+      </form>
+    </div>
+  ) : (
+    <div class="stack">
+      {activeSteps.map((s: TemplateStep) => (
+        <div class="card">
+          <div class="cardhead">
+            <div class="grow">
+              <p class="name">{s.title}</p>
+              <p class="sub">
+                {stepCategoryLabel(s.category)} &middot; {ownerViaLabel(s.ownerVia)} &middot; {dueLabel(s.dueDay)}
+                {s.employmentType ? ' · only for ' + s.employmentType : ''}
+              </p>
+            </div>
+            {s.requiresAcknowledgement && <span class="chip">Must be acknowledged</span>}
+          </div>
+          {s.description && <p class="reason">{s.description}</p>}
+          {s.readingUrl && (
+            <p class="docline">
+              <a class="link" href={s.readingUrl} target="_blank" rel="noopener noreferrer">Open the document</a>
+            </p>
+          )}
+          <details class="sub-panel">
+            <summary>Document and acknowledgement</summary>
+            <form method="POST" class="form tight">
+              <input type="hidden" name="action" value="set_document" />
+              <input type="hidden" name="step_id" value={s.id} />
+              <label>Google Drive link
+                <input name="reading_url" maxlength="500" value={s.readingUrl || ''} placeholder="https://drive.google.com/..." />
+                <span class="hint">
+                  Documents of any kind are links here and are never uploaded. Share it as
+                  &ldquo;Anyone with the link - Viewer&rdquo;.
+                </span>
+              </label>
+              <label class="check">
+                <input type="checkbox" name="requires_acknowledgement" checked={s.requiresAcknowledgement} />
+                <span>The joiner must acknowledge this document, and only the joiner can do it</span>
+              </label>
+              <button type="submit" class="btn small">Save</button>
+            </form>
+            <form method="POST" class="form tight">
+              <input type="hidden" name="action" value="retire_step" />
+              <input type="hidden" name="step_id" value={s.id} />
+              <p class="hint">
+                Retiring keeps it off new checklists. Journeys already carrying it keep it &mdash; what
+                somebody was asked to do is part of their record.
+              </p>
+              <button type="submit" class="btn ghost small">Retire this step</button>
+            </form>
+          </details>
+        </div>
+      ))}
+    </div>
+  )}
+
+  <details class="panel">
+    <summary>Add a step</summary>
+    <form method="POST" class="form">
+      <input type="hidden" name="action" value="add_step" />
+      <label>What has to happen
+        <input name="title" required maxlength="250" placeholder="Something the owner will understand at a glance" />
+      </label>
+      <label>The detail
+        <textarea name="description" rows="3" maxlength="2000" placeholder="Optional. What good looks like."></textarea>
+      </label>
+      <div class="pair">
+        <label>Kind of step
+          <select name="category">
+            {STEP_CATEGORIES.map((c) => <option value={c.key}>{c.label}</option>)}
+          </select>
+        </label>
+        <label>Who owns it
+          <select name="owner_via" required>
+            {OWNER_VIA.map((o) => <option value={o.key}>{o.label}</option>)}
+          </select>
+        </label>
+      </div>
+      <p class="hint block">
+        The owner is a RELATIONSHIP, resolved for each joiner from the Organization Graph on the day
+        their checklist starts &mdash; never a person named here, who would be the wrong person the
+        moment they changed team. The onboarding owner is one approval-owner relationship scoped to
+        the domain &ldquo;onboarding&rdquo;, and it covers every joiner.
+      </p>
+      <div class="pair">
+        <label>Due, in days from joining
+          <input type="number" name="due_day" value="0" min="-30" max="365" required />
+          <span class="hint">0 is the joining day. Negative is before it.</span>
+        </label>
+        <label>Order
+          <input type="number" name="sort_order" value="100" min="1" max="9999" />
+        </label>
+      </div>
+      <label>Only for one employment type
+        <input name="employment_type" maxlength="100" placeholder="Leave empty for everybody" />
+        <span class="hint">Matched against the employment type on the employee record, ignoring case and spacing.</span>
+      </label>
+      <label>Google Drive link
+        <input name="reading_url" maxlength="500" placeholder="https://drive.google.com/... (optional)" />
+      </label>
+      <label class="check">
+        <input type="checkbox" name="requires_acknowledgement" />
+        <span>The joiner must acknowledge this document (needs the link above)</span>
+      </label>
+      <button type="submit" class="btn">Add this step</button>
+    </form>
+  </details>
+
+  {retiredSteps.length > 0 && (
+    <details class="panel">
+      <summary>Retired steps ({retiredSteps.length})</summary>
+      <div class="form">
+        {retiredSteps.map((s: TemplateStep) => (
+          <div class="rowline">
+            <span class="rt">{s.title}</span>
+            <form method="POST">
+              <input type="hidden" name="action" value="restore_step" />
+              <input type="hidden" name="step_id" value={s.id} />
+              <button type="submit" class="btn ghost small">Put back</button>
+            </form>
+          </div>
+        ))}
+      </div>
+    </details>
+  )}
+
+  <h2>Who is stuck</h2>
+  {running.length === 0 ? (
+    <div class="empty">
+      <p class="ec">No checklist is running.</p>
+      <p class="es">Start one for a joiner below. It needs at least one step on the template first.</p>
+    </div>
+  ) : (
+    <div class="stack">
+      {running.map((j: Journey) => (
+        <div class="card">
+          <div class="cardhead">
+            <div class="grow">
+              <p class="name">{j.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {j.employeeCode ? j.employeeCode + ' · ' : ''}
+                {j.joiningDate ? 'joined ' + fmtDate(j.joiningDate) : 'no joining date recorded'}
+                {' · '}{j.progress.done} of {j.progress.total} done
+              </p>
+            </div>
+            <span class="chip">{j.progress.percent}%</span>
+          </div>
+
+          <div class="bar"><span style={'width:' + j.progress.percent + '%;'}></span></div>
+
+          <div class="scroller">
+            <table>
+              <thead>
+                <tr><th>Step</th><th>Owner</th><th>Due</th><th>State</th></tr>
+              </thead>
+              <tbody>
+                {j.items.map((i: JourneyItem) => (
+                  <tr>
+                    <td class="wrapcell">
+                      {i.title}
+                      {i.ownerUnresolvedReason && <span class="why">{i.ownerUnresolvedReason}</span>}
+                      {i.note && <span class="why note">{i.note}</span>}
+                    </td>
+                    <td>{i.ownerName || 'Nobody yet'}</td>
+                    <td>{i.dueOn ? fmtDate(i.dueOn) : 'No date'}</td>
+                    <td style={'color:' + itemTone(i) + ';'}>
+                      {itemStateLabel(i.state)}{i.overdue ? ' (late)' : ''}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="btnrow">
+            <form method="POST">
+              <input type="hidden" name="action" value="reresolve" />
+              <input type="hidden" name="journey_id" value={j.id} />
+              <button type="submit" class="btn ghost small">Re-resolve owners</button>
+            </form>
+            <form method="POST">
+              <input type="hidden" name="action" value="start_journey" />
+              <input type="hidden" name="employee_id" value={j.employeeId} />
+              <button type="submit" class="btn ghost small">Top up from the template</button>
+            </form>
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+
+  <h2>Start a checklist</h2>
+  {activeSteps.length === 0 ? (
+    <div class="empty">Add at least one step to the template first, or there is nothing to track.</div>
+  ) : notStarted.length === 0 ? (
+    <div class="empty">Every active employee already has a checklist.</div>
+  ) : (
+    <div class="stack">
+      {notStarted.map((e) => (
+        <div class="card">
+          <div class="cardhead">
+            <div class="grow">
+              <p class="name">{e.fullName}</p>
+              <p class="sub">
+                {e.employeeCode ? e.employeeCode + ' · ' : ''}
+                {e.joiningDate ? 'joins ' + fmtDate(e.joiningDate) : 'no joining date recorded, so steps will have no dates'}
+              </p>
+            </div>
+            <form method="POST">
+              <input type="hidden" name="action" value="start_journey" />
+              <input type="hidden" name="employee_id" value={e.id} />
+              <button type="submit" class="btn small">Start</button>
+            </form>
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+
+  {finished.length > 0 && (
+    <div>
+      <h2>Finished</h2>
+      <div class="stack">
+        {finished.map((j: Journey) => (
+          <div class="card dim">
+            <div class="cardhead">
+              <div class="grow">
+                <p class="name">{j.employeeName || 'Employee'}</p>
+                <p class="sub">{j.progress.total} steps &middot; completed {fmtDate(j.completedAt)}</p>
+              </div>
+              <span class="chip">Done</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.55; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 14px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 19px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .barform { margin-bottom: 10px; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin: 16px 0; }
+  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; }
+  .form { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .form.tight { padding: 12px 0 0; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  .form label.check { display: flex; align-items: flex-start; gap: 9px; text-transform: none; letter-spacing: normal; font-size: 13px; color: #d8d8de; font-weight: 400; line-height: 1.5; }
+  .form label.check input { width: 20px; height: 20px; min-height: 20px; flex: 0 0 auto; margin-top: 1px; }
+  .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 66px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.55; display: block; }
+  .hint.block { margin: 0; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.small { padding: 10px 16px; font-size: 12.5px; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .card.dim { opacity: 0.62; }
+  .cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .grow { min-width: 0; flex: 1 1 220px; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; overflow-wrap: anywhere; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; color: #d8d8de; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; }
+  .docline { margin: 10px 0 0; font-size: 12.5px; }
+  .link { color: #9bd1ff; }
+  .bar { margin: 12px 0; height: 6px; border-radius: 99px; background: #1a1a1f; overflow: hidden; }
+  .bar span { display: block; height: 100%; background: #6ee7b7; }
+  .scroller { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; min-width: 460px; }
+  th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #6e6e78; padding: 6px 12px 6px 0; font-weight: 700; white-space: nowrap; }
+  td { font-size: 12.5px; color: #d8d8de; padding: 8px 12px 8px 0; border-top: 1px solid #1a1a1f; vertical-align: top; white-space: nowrap; }
+  td.wrapcell { white-space: normal; min-width: 200px; }
+  .why { display: block; font-size: 11px; color: #fde68a; margin-top: 4px; line-height: 1.5; white-space: normal; }
+  .why.note { color: #9aa6b6; }
+  .rowline { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; border-top: 1px solid #1a1a1f; padding-top: 10px; }
+  .rt { font-size: 13px; color: #d8d8de; }
+  .sub-panel { margin-top: 12px; border-top: 1px solid #1a1a1f; }
+  .sub-panel > summary { cursor: pointer; font-size: 12px; color: #9aa6b6; min-height: 44px; display: flex; align-items: center; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 28px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+  .ec { color: #d8d8de; font-size: 14px; font-weight: 700; margin: 0; }
+  .es { color: #6e6e78; font-size: 12.5px; margin: 8px auto 0; line-height: 1.6; max-width: 56ch; }
+  .mid { margin-top: 14px; display: flex; justify-content: center; }
+</style>
+</AdminLayout>

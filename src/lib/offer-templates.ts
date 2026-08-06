@@ -579,18 +579,31 @@ export function resolveRequestedTemplateId(raw: string | null | undefined): stri
 interface SelectionRule {
   readonly levels?: readonly RoleLevel[];
   readonly engagements?: readonly EngagementKind[];
+  /**
+   * Allows the rule to fire when no level is recorded anywhere. Set ONLY on the two programme
+   * rules, and only because their engagement kind is itself the positive statement: an engagement
+   * type reading "Internship" IS the fields saying intern. It is not a fallback — a title or a
+   * level naming any seniority makes `level` non-null and the rule stops matching immediately.
+   */
+  readonly allowUnknownLevel?: boolean;
   readonly use: string;
 }
 
 /**
  * Every rule requires a POSITIVE match on both dimensions it names. A rule naming levels does not
- * fire on an unknown level, and a rule naming engagements does not fire on an unknown engagement.
- * That is what removes the intern fallback: an internship letter now requires the fields to say
- * intern AND internship, and anything short of that lands on NEUTRAL.
+ * fire on an unknown level (unless it opts in above), and a rule naming engagements does not fire
+ * on an unknown engagement. That is what removes the intern fallback: an internship letter now
+ * requires the fields to say internship, and anything short of that lands on NEUTRAL.
+ *
+ * Note the asymmetry, and that it is deliberate: the seniority templates do NOT opt into an
+ * unknown level, because their copy claims a seniority the fields have not established. An
+ * unmatched full-time offer is written from the neutral template and says less. Only the trainee
+ * programmes may be identified by their engagement alone, and they are the ones the safety check
+ * below refuses for anybody above trainee rank.
  */
 const SELECTION_RULES: readonly SelectionRule[] = [
-  { levels: ['Intern'], engagements: ['internship'], use: INTERNSHIP.id },
-  { levels: ['Apprentice'], engagements: ['apprenticeship'], use: APPRENTICESHIP.id },
+  { levels: ['Intern'], engagements: ['internship'], allowUnknownLevel: true, use: INTERNSHIP.id },
+  { levels: ['Apprentice'], engagements: ['apprenticeship'], allowUnknownLevel: true, use: APPRENTICESHIP.id },
   { levels: ['C-Level'], engagements: ['full-time', 'part-time'], use: EXECUTIVE.id },
   { levels: ['C-Level'], engagements: ['contract'], use: EXECUTIVE.id },
   { levels: ['Lead'], engagements: ['full-time', 'part-time'], use: LEADERSHIP.id },
@@ -707,7 +720,13 @@ export function decideOfferTemplate(
   let chosen: OfferTemplate = NEUTRAL;
   let matchedRule = false;
   for (const rule of SELECTION_RULES) {
-    if (rule.levels && (!level || !rule.levels.includes(level))) continue;
+    if (rule.levels) {
+      if (level) {
+        if (!rule.levels.includes(level)) continue;
+      } else if (!rule.allowUnknownLevel) {
+        continue;
+      }
+    }
     if (rule.engagements && (!engagement || !rule.engagements.includes(engagement))) continue;
     const candidate = getOfferTemplate(rule.use);
     if (candidate && templatePermits(candidate, level, engagement)) {
@@ -839,32 +858,52 @@ interface ResolvedFields {
   [key: string]: string;
 }
 
+/**
+ * A field value dropped into the MIDDLE of a sentence must not bring its own full stop with it.
+ * The compensation presets end in one ("...(finalised at offer)."), and the template supplies the
+ * sentence's own, which printed "offer).." on a real letter. Trailing punctuation is stripped for
+ * inline use only; the value is untouched everywhere it is quoted whole.
+ */
+function inline(v: string): string {
+  return v.replace(/[\s.;,]+$/, '');
+}
+
+/** A value quoted as a whole sentence keeps its punctuation, and is given one if it has none. */
+function sentence(v: string): string {
+  const s = v.trim();
+  if (!s) return '';
+  return /[.!?]$/.test(s) ? s : s + '.';
+}
+
 function resolveFields(fields: AgreedFields, decision: OfferTemplateDecision): ResolvedFields {
   const org = txt(fields.org) || DEFAULT_ORG;
   const department = txt(fields.department);
   const reportingTo = txt(fields.reportingTo);
   const compensation = txt(fields.compensation);
+  const duration = txt(fields.duration);
   const employmentType = txt(fields.employmentType) || engagementLabel(decision.engagement);
 
   return {
     org,
     candidateName: txt(fields.candidateName),
     firstName: txt(fields.candidateName).split(' ')[0] || '',
-    roleTitle: txt(fields.roleTitle) || 'the role described in this letter',
-    department,
-    departmentClause: department ? ' within ' + department : '',
-    employmentType: employmentType || 'the engagement described in this letter',
-    employmentTypeClause: employmentType ? ' It is recorded as **' + employmentType + '**.' : '',
-    workMode: txt(fields.workMode) || 'the agreed work arrangement',
-    duration: txt(fields.duration) || 'the agreed term',
-    durationClause: txt(fields.duration) ? ' It runs for **' + txt(fields.duration) + '**.' : '',
-    hoursCommitment: txt(fields.hoursCommitment) || 'the agreed hours',
-    joiningDate: txt(fields.joiningDate) || 'a mutually agreed date',
-    reportingTo,
-    reportingClause: reportingTo ? ' You will report to **' + reportingTo + '**.' : '',
-    compensation: compensation || 'as recorded in the offer summary',
+    roleTitle: inline(txt(fields.roleTitle)) || 'the role described in this letter',
+    department: inline(department),
+    departmentClause: department ? ' within ' + inline(department) : '',
+    employmentType: inline(employmentType) || 'the engagement described in this letter',
+    employmentTypeClause: employmentType ? ' It is recorded as **' + inline(employmentType) + '**.' : '',
+    workMode: inline(txt(fields.workMode)) || 'the agreed work arrangement',
+    duration: inline(duration) || 'the agreed term',
+    durationClause: duration ? ' It runs for **' + inline(duration) + '**.' : '',
+    hoursCommitment: inline(txt(fields.hoursCommitment)) || 'the agreed hours',
+    joiningDate: inline(txt(fields.joiningDate)) || 'a mutually agreed date',
+    reportingTo: inline(reportingTo),
+    reportingClause: reportingTo ? ' You will report to **' + inline(reportingTo) + '**.' : '',
+    compensation: inline(compensation) || 'as recorded in the offer summary',
+    // Quoted whole: the internship presets record a conversion reward and a completion award here,
+    // and every word of that has to reach the person the letter is about.
     compensationClause: compensationCarriesDetail(compensation)
-      ? ' The compensation terms recorded against this engagement are: ' + compensation
+      ? ' The compensation terms recorded against this engagement are: ' + sentence(compensation)
       : '',
   };
 }
@@ -1075,55 +1114,69 @@ export function auditTemplateCopy(): TemplateAuditResult[] {
 
 export interface TemplateGridEntry {
   readonly templateId: string;
+  readonly label: string;
   readonly opening: string;
+  readonly welcome: string;
   readonly engagementTerms: string;
   readonly engagementTermsWithStipend: string;
   readonly progression: string;
   readonly completion: string;
   readonly closing: string;
+  readonly summaryFields: readonly SummaryFieldKey[];
 }
 
 export interface TemplateGrid {
-  /** key: employmentType + '|' + ('senior' | 'standard') */
+  /** key: employmentType + '|' + (RoleLevel | 'unknown') */
   readonly byKey: Record<string, TemplateGridEntry>;
-  /** Serialised so the preview can run the ONE senior-title test without owning the pattern. */
-  readonly seniorTitleSource: string;
+  /** Used when the preview sees an employment type the grid was not built for. Never the intern one. */
+  readonly fallback: TemplateGridEntry;
+  /**
+   * The title-to-level patterns, IN ORDER, so the preview reads a role title exactly the way
+   * inferLevelFromTitle() does — most senior match first — without holding a second copy of the
+   * rules. Order is the safety property here, which is why it is shipped rather than reimplemented.
+   */
+  readonly titlePatterns: readonly { readonly source: string; readonly level: RoleLevel }[];
   readonly noStipendSource: string;
+  /** Label for each summary field, so the preview does not keep its own copy of them. */
+  readonly fieldLabels: Record<string, string>;
 }
-
-const SENIOR_TITLE_PATTERN =
-  /\b(chief|c[-\s]?level|cxo|president|vice[-\s]president|vp|head\s+of|director|principal|lead|leader|manager|architect|senior|sr\.?|staff)\b/i;
 
 function gridEntry(templateId: string): TemplateGridEntry {
   const t = getOfferTemplate(templateId) || NEUTRAL;
   return {
     templateId: t.id,
+    label: t.label,
     opening: t.opening,
+    welcome: t.welcome,
     engagementTerms: t.engagementTerms,
     engagementTermsWithStipend: t.engagementTermsWithStipend || t.engagementTerms,
     progression: t.progression,
     completion: t.completion || '',
     closing: t.closing,
+    summaryFields: t.summaryFields,
   };
 }
 
+/**
+ * The grid is EXHAUSTIVE, not an approximation: every employment type the form offers, crossed
+ * with every level the platform has plus "no level recorded", each cell decided by the real
+ * selector. The preview reads a title into a level using the shipped patterns and looks the cell
+ * up, so what it shows is what the issued letter will say.
+ */
 export function buildTemplateGrid(employmentTypes: readonly string[]): TemplateGrid {
   const byKey: Record<string, TemplateGridEntry> = {};
+  const levelKeys: (RoleLevel | null)[] = [...ROLE_LEVELS, null];
   for (const et of employmentTypes) {
-    for (const bucket of ['standard', 'senior']) {
-      // A senior bucket is expressed as a role title the selector will read as senior; the grid
-      // therefore records what the real selector decides, not an approximation of it.
-      const decision = decideOfferTemplate({
-        employmentType: et,
-        roleTitle: bucket === 'senior' ? 'Chief Officer' : 'Associate',
-        level: bucket === 'senior' ? 'C-Level' : null,
-      });
-      byKey[et + '|' + bucket] = gridEntry(decision.template.id);
+    for (const lvl of levelKeys) {
+      const decision = decideOfferTemplate({ employmentType: et, level: lvl, roleTitle: '' });
+      byKey[et + '|' + (lvl || 'unknown')] = gridEntry(decision.template.id);
     }
   }
   return {
     byKey,
-    seniorTitleSource: SENIOR_TITLE_PATTERN.source,
+    fallback: gridEntry(NEUTRAL.id),
+    titlePatterns: TITLE_LEVEL_PATTERNS.map((p) => ({ source: p.pattern.source, level: p.level })),
     noStipendSource: NO_STIPEND_PATTERN.source,
+    fieldLabels: { ...FIELD_LABELS },
   };
 }

@@ -76,23 +76,74 @@ export async function coverWithCredit(opts: {
 
   // Synthetic order id so the existing payments + effects machinery works.
   const orderId = 'CREDIT-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+
+  // STEP 1 — debit. If this fails nothing has happened yet, so the caller can safely fall back to a
+  // card order.
   try {
-    // Debit the wallet first.
     await db.execute(sql`
       INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id)
       VALUES (${userId}, ${-Math.round(amountPaise)}, ${'Paid with credit: ' + (opts.label || purpose)}, ${referenceType}, ${referenceId})
     `);
-    // Record a paid payments row.
+  } catch (e: any) {
+    const real = e?.cause?.message || e?.message;
+    console.error('[credit] wallet debit failed for user', userId, 'order', orderId, '-', real);
+    return { covered: false, error: 'Your credit balance could not be used just now, so nothing was deducted. Please pay by card or try again.' };
+  }
+
+  // STEP 2 — the payments row, WHICH IS NOT OPTIONAL. It used to end in `.catch(() => {})`, and the
+  // consequence was the worst shape available in this file: the wallet is already debited above, and
+  // applyPaidEffects() looks the order up in `payments` and returns immediately when there is no row
+  // (payment-effects.ts:103). So a failure here charged the user, delivered nothing, wrote no record
+  // that could ever be reconciled, and still returned covered:true. The debit is now REVERSED and the
+  // caller is told to use another method.
+  try {
     await db.execute(sql`
       INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
       VALUES (${orderId}, ${Math.round(amountPaise)}, 'INR', 'paid', ${purpose}, ${referenceType}, ${referenceId}, ${userId},
         ${opts.email || 'credit@edurankai.in'}, ${sql.raw("'" + JSON.stringify({ credit: true }).replace(/'/g, "''") + "'::jsonb")})
-    `).catch(() => {});
-    // Run the same downstream effects as a real capture (materialise app, mark fee paid, etc.).
+    `);
+  } catch (e: any) {
+    const real = e?.cause?.message || e?.message;
+    console.error('[credit] payments row could not be written for order', orderId, 'user', userId, '- reversing the debit -', real);
+    let reversed = false;
+    try {
+      await db.execute(sql`
+        INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id)
+        VALUES (${userId}, ${Math.round(amountPaise)}, ${'Reversed (payment could not be recorded): ' + (opts.label || purpose)}, ${referenceType}, ${referenceId})
+      `);
+      reversed = true;
+    } catch (e2: any) {
+      console.error('[credit] REVERSAL ALSO FAILED — user', userId, 'is short', Math.round(amountPaise), 'paise with nothing delivered -', e2?.cause?.message || e2?.message);
+      try {
+        const { sendPushToAdmins } = await import('@/lib/push');
+        await sendPushToAdmins({
+          type: 'credit_debit_stranded',
+          title: 'Wallet credit taken, nothing delivered',
+          body: 'Rs ' + Math.round(amountPaise / 100) + ' was deducted from a user\'s credit balance, the payment could not be recorded, and the reversal failed. This needs a manual refund. Order ' + orderId + '.',
+          url: '/admin/finance',
+          tag: 'credit-stranded-' + orderId,
+        });
+      } catch (e3: any) {
+        console.error('[credit] could not even alert admins about the stranded debit:', e3?.cause?.message || e3?.message);
+      }
+    }
+    return {
+      covered: false,
+      error: reversed
+        ? 'That could not be paid from your credit balance. Nothing was deducted — please pay by card or try again.'
+        : 'That could not be paid from your credit balance and the deduction could not be undone automatically. Our team has been alerted; please contact support before paying again.',
+    };
+  }
+
+  // STEP 3 — downstream effects. The payment is real and recorded by this point, so a failure here
+  // must NOT be reported as "your credit was not used": it was. applyPaidEffects records and alerts
+  // its own failures; this only makes sure a thrown one is not mistaken for a failed payment.
+  try {
     const { applyPaidEffects } = await import('@/lib/payment-effects');
     const r = await applyPaidEffects(orderId, 'credit');
     return { covered: true, applicationId: (r && (r as any).applicationId) || undefined };
   } catch (e: any) {
-    return { covered: false, error: String(e?.message || e).slice(0, 160) };
+    console.error('[credit] paid from credit but the downstream effects failed for order', orderId, '-', e?.cause?.message || e?.message);
+    return { covered: true, error: 'Your credit was used and the payment is recorded, but setting up what you paid for did not finish. Our team has been alerted.' };
   }
 }

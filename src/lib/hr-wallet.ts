@@ -59,7 +59,30 @@ export function ensureWalletSchema(): Promise<void> {
         decided_by UUID, decided_by_role TEXT, decided_at TIMESTAMPTZ, decision_note TEXT,
         payout_ref TEXT, paid_at TIMESTAMPTZ)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_withdrawal_status ON hr_withdrawal (status, requested_at DESC)`);
-    } catch (_) { ready = null; }
+      // IDEMPOTENCY FOR SALARY, ENFORCED BY THE DATABASE RATHER THAN BY A RACE.
+      //
+      // creditPayrollRun() skips a payslip whose ref already exists, but that read-then-write is not
+      // atomic: two Mark Paid clicks landing together both see no row and both credit the same
+      // payslip. db/hr-schema.sql:333 creates a NON-unique index for this lookup and this module
+      // created none at all, so on a database bootstrapped only by the lib the lookup was also
+      // unindexed. A UNIQUE index closes the race and keeps the lookup fast.
+      //
+      // ADDITIVE AND NON-FATAL. If a live database already contains a duplicated ref the index
+      // cannot be built; that must not take the wallet module down, so the failure is logged loudly
+      // (it means somebody has been paid twice and it needs a human) and the rest still works —
+      // creditPayrollRun's own SELECT guard continues to cover the non-concurrent case.
+      try {
+        await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS hr_wallet_txn_ref_uniq ON hr_wallet_txn (ref) WHERE ref IS NOT NULL`);
+      } catch (e: any) {
+        console.error('[hr-wallet] could not create the UNIQUE index on hr_wallet_txn.ref — duplicate refs may already exist, which means a payslip was credited more than once:', e?.cause?.message || e?.message);
+      }
+    } catch (e: any) {
+      // WAS `catch (_) { ready = null; }` — a silent reset that retried forever and never said what
+      // was wrong. Still retries (that is correct: a transient outage should not permanently poison
+      // the module), but the reason is now on the log.
+      console.error('[hr-wallet] ensureWalletSchema failed, will retry on next call:', e?.cause?.message || e?.message);
+      ready = null;
+    }
   })();
   return ready;
 }
@@ -97,33 +120,98 @@ function mask(acc: string): string { const a = (acc || '').replace(/\s/g, ''); r
  * IDEMPOTENT: each credit carries ref 'payslip:<id>', and an existing txn with that ref is
  * skipped. Marking a run paid twice (double submit, retry, an HR user re-clicking) must not pay
  * anyone twice.
+ *
+ * NOTHING HERE IS ALLOWED TO FAIL QUIETLY. This function used to read its payslips through safe(),
+ * which is `try { ... } catch { return [] }` — so ANY failure of that SELECT produced an empty list,
+ * the credit loop never ran, and it returned {credited:0, skipped:0} with no error anywhere. The
+ * caller reads credited===0 as "already credited", so a TOTAL wallet-credit failure was rendered to
+ * the admin as reassurance while the run was already marked paid and every employee was pushed
+ * "Rs X has been credited to your wallet". The per-payslip INSERT had the same shape: `catch { skipped++ }`.
+ *
+ * Now: the SELECT failure THROWS (the caller must not be able to mistake it for success), and every
+ * payslip that could not be credited is logged with e.cause.message and returned in `failures` as a
+ * sentence an admin can act on. `alreadyCredited` is reported separately from `skipped` so "nothing
+ * to do" and "nothing worked" can never look alike again.
  */
-export async function creditPayrollRun(runId: string, byUserId: string | null): Promise<{ credited: number; skipped: number; total: number }> {
+export interface PayrollCreditResult {
+  credited: number;
+  skipped: number;
+  total: number;
+  /** Payslips already in the ledger from an earlier Mark Paid — genuinely fine. */
+  alreadyCredited: number;
+  /** One readable sentence per payslip that could NOT be credited. Empty means every payslip landed. */
+  failures: string[];
+  /** employee_ids whose salary is in the wallet ledger now — credited on this pass or already there. */
+  walletOk: string[];
+}
+
+export async function creditPayrollRun(runId: string, byUserId: string | null): Promise<PayrollCreditResult> {
   await ensureWalletSchema();
-  const slips = await safe(sql`
-    SELECT ps.id, ps.employee_id, ps.net_salary, ps.currency, pr.month, pr.year
-    FROM hr_payslips ps JOIN hr_payroll_runs pr ON ps.payroll_run_id = pr.id
-    WHERE ps.payroll_run_id = ${runId}`);
+
+  let slips: any[];
+  try {
+    slips = rows(await db.execute(sql`
+      SELECT ps.id, ps.employee_id, ps.net_salary, ps.currency, pr.month, pr.year
+      FROM hr_payslips ps JOIN hr_payroll_runs pr ON ps.payroll_run_id = pr.id
+      WHERE ps.payroll_run_id = ${runId}`));
+  } catch (e: any) {
+    const real = e?.cause?.message || e?.message;
+    console.error('[hr-wallet] creditPayrollRun could not read the payslips for run', runId, '-', real);
+    // THROWS ON PURPOSE. Returning {credited:0} here is indistinguishable from "already credited",
+    // which is exactly how a failed payroll credit came to be reported as a success.
+    throw new Error('Could not read the payslips for this run, so no wallet was credited: ' + (real || 'unknown database error'));
+  }
 
   const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December'];
-  let credited = 0, skipped = 0, total = 0;
+  let credited = 0, skipped = 0, total = 0, alreadyCredited = 0;
+  const failures: string[] = [];
+  const walletOk: string[] = [];
 
   for (const s of slips) {
     const amount = Number(s.net_salary || 0);
-    if (!(amount > 0) || !s.employee_id) { skipped++; continue; }
+    const who = String(s.employee_id || 'unknown employee');
+    if (!s.employee_id) {
+      skipped++;
+      failures.push('A payslip on this run (' + String(s.id) + ') has no employee linked to it, so nothing could be credited for it.');
+      continue;
+    }
+    if (!(amount > 0)) {
+      // A zero/negative net is a legitimate outcome (full loss of pay), not a failure — but it is
+      // still worth saying out loud, because the employee will be notified about a payslip.
+      skipped++;
+      continue;
+    }
     const ref = 'payslip:' + s.id;
-    const dupe = await safe(sql`SELECT id FROM hr_wallet_txn WHERE ref = ${ref} LIMIT 1`);
-    if (dupe.length) { skipped++; continue; }
+    let dupe: any[];
+    try {
+      dupe = rows(await db.execute(sql`SELECT id FROM hr_wallet_txn WHERE ref = ${ref} LIMIT 1`));
+    } catch (e: any) {
+      const real = e?.cause?.message || e?.message;
+      console.error('[hr-wallet] duplicate check failed for', ref, '-', real);
+      skipped++;
+      failures.push('Could not check whether employee ' + who + ' had already been credited, so ₹' + Math.round(amount).toLocaleString('en-IN') + ' was NOT credited (' + (real || 'database error') + ').');
+      continue;
+    }
+    if (dupe.length) { alreadyCredited++; walletOk.push(who); continue; }
+
     const period = (MONTHS[(Number(s.month) || 1) - 1] || '') + ' ' + (s.year || '');
     try {
       await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, currency, kind, note, ref, created_by)
         VALUES (${s.employee_id}, 'credit', ${amount}, ${s.currency || 'INR'}, 'salary',
                 ${'Salary for ' + period.trim()}, ${ref}, ${byUserId})`);
-      credited++; total += amount;
-    } catch { skipped++; }
+      credited++; total += amount; walletOk.push(who);
+    } catch (e: any) {
+      const real = String(e?.cause?.message || e?.message || '');
+      // The UNIQUE index on ref is the concurrency guard: losing that race means somebody else
+      // credited this exact payslip a moment ago, which is the desired outcome, not a failure.
+      if (/duplicate key|unique constraint/i.test(real)) { alreadyCredited++; walletOk.push(who); continue; }
+      console.error('[hr-wallet] wallet credit FAILED for payslip', s.id, 'employee', who, '-', real);
+      skipped++;
+      failures.push('Employee ' + who + ' was NOT credited ₹' + Math.round(amount).toLocaleString('en-IN') + ' (' + (real || 'database error') + ').');
+    }
   }
-  return { credited, skipped, total };
+  return { credited, skipped, total, alreadyCredited, failures, walletOk };
 }
 
 export async function listBankAccounts(employeeId: string): Promise<any[]> {

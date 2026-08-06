@@ -164,6 +164,12 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   // Verification requests raised by scanning the QR on an issued offer letter. Firms pay for these,
   // so an unlinked console meant money could be taken for a request nobody could open and answer.
   { id: 'offer-verifications', label: 'Offer Verifications', href: '/admin/offer-verifications', icon: 'shield', section: 'offers' },
+  // The template catalogue, its structural checks, and every issued letter re-decided from the
+  // fields that were actually agreed. Linked because a review screen nobody can reach reviews
+  // nothing: the governing template used to be an invisible column on the offer record, which is
+  // how an internship letter reached a Chief AI Officer. /admin/offer maps to the 'offers' section
+  // in src/middleware.ts, so this entry is offered to exactly the accounts the door admits.
+  { id: 'offer-templates', label: 'Offer Templates', href: '/admin/offer/templates', icon: 'document', section: 'offers' },
   {
     groupId: 'mail-group',
     label: 'Mail',
@@ -220,6 +226,15 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'hr',             label: 'Overview',        href: '/admin/hr',                       icon: 'home',     section: 'hr' },
       { id: 'hr-employees',   label: 'Employees',       href: '/admin/hr/employees',             icon: 'users',    section: 'employees' },
       { id: 'hr-onboarding',  label: 'Joining documents', href: '/admin/hr/onboarding',          icon: 'document', section: 'employees' },
+      // THE ONBOARDING JOURNEY — the tracked sequence a joiner works through (equipment, accounts,
+      // introductions, first-week reading, policy acknowledgements), each step with an owner resolved
+      // per joiner from the Organization Graph and a due date counted from their joining date. Filed
+      // under `employees` beside the joining-documents screen because they are the two halves of one
+      // arrival, and BOTH are /admin/hr/* paths, which middleware already gates on the 'hr' section by
+      // longest-prefix match. The page then asks for `employee.manage` in its own frontmatter, which
+      // is strictly narrower. It does NOT replace /admin/hr/onboarding: that reviews the credentials,
+      // this tracks everything else that has to happen.
+      { id: 'hr-onboarding-journey', label: 'Onboarding journey', href: '/admin/hr/onboarding/journey', icon: 'grid', section: 'employees' },
       // NEWLY MAPPED (four). Every one is an /admin/hr/* page, and middleware.ts already gates
       // /admin/hr/* on 'hr' — so an HR account can open all four by typing the URL today while the
       // sidebar pretends they do not exist. Mapping them to 'hr' makes the menu tell the truth.
@@ -272,6 +287,16 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       { id: 'hr-loans',       label: 'Loans and advances', href: '/admin/hr/payroll/loans',      icon: 'package',  section: 'payroll' },
       { id: 'hr-bonuses',     label: 'Bonuses and incentives', href: '/admin/hr/payroll/bonuses', icon: 'chart',   section: 'payroll' },
       { id: 'hr-pay-reports', label: 'Payroll reports', href: '/admin/hr/payroll/reports',       icon: 'chart',    section: 'payroll' },
+      // BENEFITS. Two surfaces: the CATALOGUE of what the company offers (with eligibility recorded
+      // as data, never as a rule inside a component) and the QUEUE of elections people have made.
+      // Mapped to the `hr` section rather than `payroll`, deliberately — a benefit is not pay, holds
+      // no amount, and reaches nobody's payslip; filing it under payroll would put the catalogue
+      // behind the key that sets salaries. Both are /admin/hr/* paths, so middleware's longest-prefix
+      // match already gates them on 'hr', and each page then asks for `employee.manage` through can(),
+      // which is strictly narrower than the section checkbox. NEITHER entry approves anything: an
+      // election is routed per row from the Organization Graph by src/lib/workflow.ts.
+      { id: 'hr-benefits',    label: 'Benefits catalogue', href: '/admin/hr/benefits',           icon: 'package',  section: 'hr' },
+      { id: 'hr-benefit-elections', label: 'Benefit elections', href: '/admin/hr/benefits/enrolments', icon: 'inbox', section: 'hr' },
       { id: 'hr-training',    label: 'Training',        href: '/admin/hr/training',              icon: 'book',     section: 'training' },
       // PERFORMANCE AND LEARNING. Three /admin/hr/* pages, so middleware's longest-prefix match on
       // '/admin/hr' already gates them on the 'hr' section — mapping them to 'hr' RECORDS the gate the
@@ -296,6 +321,27 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // article's own audience in the WHERE clause and needs no permission of its own.
       { id: 'helpdesk-knowledge', label: 'Knowledge base', href: '/admin/helpdesk/knowledge',    icon: 'book',     section: 'helpdesk' },
       { id: 'assets',         label: 'Asset register',  href: '/admin/assets',                   icon: 'package',  section: 'assets' },
+      // ANNOUNCEMENTS AND RECOGNITION. Mapped to 'hr' — the section whose built-in holders are
+      // super_admin (unrestricted) and `hr`, which is exactly the population granted
+      // `announcements.publish` and `recognition.moderate` in permissions.ts. Both pages accept
+      // EITHER the section OR the capability, so the menu entry and the door admit the same accounts
+      // rather than two overlapping sets, and a CUSTOM role holding the people-desk section is not
+      // shut out of a console it can already reach — the registry spells a custom grant as a section
+      // and never as the capability.
+      //
+      // MAPPING TO THE SECTION IS NOT THE LOCK, and here that matters more than usual: middleware.ts
+      // has no PATH_SECTION entry for '/admin/announcements', so the only structural gate on the URL
+      // is canOpenAdmin(). Each page therefore asks the real question in its own frontmatter, and
+      // every WRITE is re-checked against the posted id inside src/lib/announcements.ts and
+      // src/lib/recognition.ts. A middleware entry mapping that prefix to 'hr' would tighten the door
+      // too and is reported rather than made, because that file is being edited in parallel.
+      //
+      // NEITHER ENTRY IS WHERE RECOGNITION HAPPENS. Sending one needs no capability at all and is
+      // done at /portal/feed/company by anybody with an employee record; this console shows AGGREGATE
+      // counts and can take one down. There is no leaderboard behind either link and no query that
+      // could build one.
+      { id: 'announcements',  label: 'Announcements',   href: '/admin/announcements',            icon: 'message-circle', section: 'hr' },
+      { id: 'recognition',    label: 'Recognition',     href: '/admin/announcements/recognition', icon: 'chart',   section: 'hr' },
       // PROJECTS. Both pages gate on canAccessSection('projects','view') OR the 'projects.view'
       // capability, so the menu entry and the door ask the same question — the section is the one
       // named here, and `hr` carries it in ROLE_SECTIONS alongside the capability grant.

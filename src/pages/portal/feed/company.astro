@@ -1,0 +1,553 @@
+---
+// /portal/feed/company — THE COMPANY FEED. Announcements, recognition and milestones, on one page.
+//
+// WHY IT IS A SIBLING OF /portal/feed RATHER THAN PART OF IT. /portal/feed is the LEARNER feed —
+// reels, clips, AR filters and likes, over feed_posts. This is the WORKPLACE feed, over
+// announcements and recognitions, for people with an employee record. Same word, different product,
+// different audience; merging them would put a maintenance notice between two physics reels.
+//
+// EVERYTHING ON THIS PAGE IS SCOPED IN THE QUERY. src/lib/announcements.ts narrows every read by
+// this reader's own department, projects and working location; src/lib/recognition.ts narrows by the
+// audience the sender chose. A row this person may not see is never fetched, so there is no version
+// of this page with something hidden underneath it. Nothing is filtered client-side, because that is
+// a light switch and not privacy.
+//
+// BIRTHDAYS AND ANNIVERSARIES ARE OPT-IN, DEFAULT OFF. A date of birth is personal data, and
+// surfacing it to the whole company by default is a privacy failure dressed as a nice touch. The
+// switches are at the bottom of this page, they belong to the person themselves, and the employee id
+// they write against comes from the SESSION — there is no surface anywhere, admin included, that can
+// switch somebody else's birthday on. A birthday milestone carries the day and month and never the
+// year, because the year is the part that makes a date of birth an identifier.
+//
+// SENDING RECOGNITION NEEDS NO PERMISSION and none is checked. Anybody with an employee record may
+// thank anybody else, in any direction. The rules, enforced server-side, are: not to yourself, and
+// say what they actually did.
+//
+// const BEFORE THE POST HANDLER. `const` is not hoisted.
+// CLIENT JAVASCRIPT: NONE. Every control is a form or a <details>.
+// MOBILE FIRST: 360px, 44px targets, one column, nothing that scrolls the page sideways.
+import {
+  buildFeedViewer, listAnnouncements, getAnnouncement, outstandingAcks, acknowledgeAnnouncement,
+  renderAnnouncementHtml, upcomingMilestones, milestoneLabel, getCelebrationOptIn,
+  setCelebrationOptIn, audienceLabel, excerpt,
+  type Announcement, type Milestone,
+} from '@/lib/announcements';
+import {
+  listRecognition, sendRecognition, withdrawRecognition, removeRecognition, searchColleagues,
+  myRecognitionCounts, recognitionTagLabel, visibilityLabel, RECOGNITION_TAGS,
+  type Recognition, type ColleagueOption,
+} from '@/lib/recognition';
+
+const PAGE = '/portal/feed/company';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PAGE));
+
+// ---------------------------------------------------------------------------------------------
+// CONSTANTS FIRST.
+// ---------------------------------------------------------------------------------------------
+
+const viewer = await buildFeedViewer(user as any);
+
+const fmt = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+const fmtDay = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+};
+
+/**
+ * When a milestone falls, as a sortable instant.
+ *
+ * A birthday and an anniversary are stored as MM-DD precisely so the year of birth never leaves the
+ * employee record; this puts them on THIS year's calendar for ordering, and nothing derived from it
+ * is ever shown as a year. A new joiner already carries a real date.
+ */
+const milestoneAt = (m: Milestone): number => {
+  const raw = String(m.on || '');
+  const iso = raw.length === 5 ? new Date().getFullYear() + '-' + raw : raw;
+  const d = new Date(iso + 'T12:00:00');
+  return isNaN(d.getTime()) ? Date.now() : d.getTime();
+};
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  let flash = '';
+  let ok = true;
+  let anchor = '';
+
+  if (action === 'acknowledge') {
+    const r = await acknowledgeAnnouncement(viewer, String(fd.get('id') || ''));
+    ok = r.ok;
+    flash = r.ok
+      ? (r.changed ? 'Recorded. Thank you for reading it.' : 'You had already confirmed this version.')
+      : (r.error || 'Could not record that.');
+  } else if (action === 'thank') {
+    const r = await sendRecognition(viewer, {
+      toEmployeeId: String(fd.get('to') || ''),
+      message: String(fd.get('message') || ''),
+      tag: String(fd.get('tag') || 'none'),
+      visibility: String(fd.get('visibility') || 'team'),
+    });
+    ok = r.ok;
+    anchor = '#recognition';
+    flash = r.ok ? 'Sent. They have been told.' : (r.error || 'Could not send that.');
+  } else if (action === 'withdraw') {
+    const r = await withdrawRecognition(viewer, String(fd.get('id') || ''));
+    ok = r.ok;
+    anchor = '#recognition';
+    flash = r.ok ? 'Withdrawn.' : (r.error || 'Could not withdraw that.');
+  } else if (action === 'remove') {
+    const r = await removeRecognition(user as any, viewer, String(fd.get('id') || ''), String(fd.get('reason') || ''));
+    ok = r.ok;
+    anchor = '#recognition';
+    flash = r.ok ? 'Taken down, with your reason on the record.' : (r.error || 'Could not take that down.');
+  } else if (action === 'celebrations') {
+    const r = await setCelebrationOptIn(viewer, {
+      showBirthday: String(fd.get('show_birthday') || '') === 'on',
+      showAnniversary: String(fd.get('show_anniversary') || '') === 'on',
+      showJoining: String(fd.get('show_joining') || '') === 'on',
+    });
+    ok = r.ok;
+    anchor = '#celebrations';
+    flash = r.ok
+      ? 'Saved. Anything you left switched off stays off, and nobody else can switch it on for you.'
+      : (r.error || 'Could not save that.');
+  } else {
+    ok = false;
+    flash = 'That is not something this page does.';
+  }
+
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash) + '&ok=' + (ok ? '1' : '0') + anchor);
+}
+
+const url = new URL(Astro.request.url);
+const msg = url.searchParams.get('msg') || '';
+const msgOk = url.searchParams.get('ok') !== '0';
+const openId = String(url.searchParams.get('a') || '').trim();
+const whoQuery = String(url.searchParams.get('who') || '').trim().slice(0, 80);
+
+const open: Announcement | null = openId ? await getAnnouncement(viewer, openId) : null;
+const openHtml = open ? renderAnnouncementHtml(open.body) : '';
+
+const outstanding: Announcement[] = await outstandingAcks(viewer);
+const announcements: Announcement[] = open ? [] : await listAnnouncements(viewer, { limit: 60 });
+const recognitions: Recognition[] = await listRecognition(viewer, { limit: 40 });
+const milestones: Milestone[] = await upcomingMilestones(viewer, 7);
+const colleagues: ColleagueOption[] = await searchColleagues(viewer, whoQuery, 500);
+const mine = await myRecognitionCounts(viewer);
+const optIn = await getCelebrationOptIn(viewer);
+
+const pinned = announcements.filter((a) => a.pinned);
+const unpinned = announcements.filter((a) => !a.pinned);
+
+/**
+ * ONE CHRONOLOGICAL STREAM. Announcements, recognitions and milestones share a timeline rather than
+ * three separate lists, because "what has happened here lately" is one question. Pinned notices are
+ * lifted out above it — a pin is somebody saying "read this whatever else arrived".
+ */
+type StreamItem =
+  | { kind: 'announcement'; at: number; announcement: Announcement }
+  | { kind: 'recognition'; at: number; recognition: Recognition }
+  | { kind: 'milestone'; at: number; milestone: Milestone };
+
+const stream: StreamItem[] = [
+  ...unpinned.map((a) => ({
+    kind: 'announcement' as const,
+    at: new Date(a.publishedAt || a.createdAt || 0).getTime() || 0,
+    announcement: a,
+  })),
+  ...recognitions.map((r) => ({
+    kind: 'recognition' as const,
+    at: new Date(r.createdAt || 0).getTime() || 0,
+    recognition: r,
+  })),
+  ...milestones.map((m) => ({ kind: 'milestone' as const, at: milestoneAt(m), milestone: m })),
+].sort((a, b) => b.at - a.at);
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Company feed</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:inline-flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    .wrap{max-width:640px;margin:0 auto;padding:16px 14px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:16px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
+    h1{font-family:'Fraunces',serif;font-size:22px;line-height:1.25;margin-bottom:8px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:10px 0 4px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:11px 12px;font-size:15px;font-family:inherit;color:#1a1510;outline:none;min-height:44px;}
+    textarea{min-height:96px;line-height:1.6;}
+    input:focus,select:focus,textarea:focus{border-color:#c2410c;}
+    .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:12px 18px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;min-height:44px;}
+    .btn.ghost{background:#faf7f1;color:#1a1510;border:1px solid #e6ddcd;}
+    .btn.small{width:auto;padding:10px 14px;font-size:13px;}
+    .row{display:flex;gap:8px;flex-wrap:wrap;}
+    .row > *{flex:1 1 150px;}
+    .meta{font-size:11.5px;color:#9a8f7d;line-height:1.6;overflow-wrap:anywhere;}
+    .msg{border-radius:10px;padding:11px 14px;font-size:13.5px;margin-bottom:14px;line-height:1.5;}
+    .note{font-size:11.5px;color:#9a8f7d;line-height:1.6;}
+    .item{display:block;text-decoration:none;color:inherit;padding:12px 0;border-bottom:1px solid #f2ece0;}
+    .item:last-child{border-bottom:none;}
+    .item strong{font-size:15px;overflow-wrap:anywhere;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;display:inline-block;}
+    .pill.urgent{background:rgba(194,65,12,.1);color:#9a3412;}
+    .pill.ack{background:rgba(5,150,105,.1);color:#065f46;}
+    .pill.pin{background:rgba(26,21,16,.06);color:#5b5346;}
+    .body{font-size:15px;line-height:1.75;color:#1a1510;overflow-wrap:anywhere;}
+    .body h2,.body h3,.body h4{margin:18px 0 6px;font-size:16px;font-weight:700;}
+    .body p{margin:10px 0;}
+    .body ul,.body ol{margin:10px 0 10px 20px;}
+    .body li{margin:4px 0;}
+    .body blockquote{margin:12px 0;padding:8px 12px;border-left:3px solid #e6ddcd;background:#faf7f1;color:#5b5346;}
+    .body pre{overflow-x:auto;padding:10px 12px;background:#f2ece0;border-radius:8px;}
+    .body table{display:block;overflow-x:auto;max-width:100%;}
+    .body img{max-width:100%;height:auto;}
+    .check{display:flex;align-items:center;gap:10px;min-height:44px;margin-top:6px;}
+    .check input{width:20px;height:20px;min-height:20px;}
+    .check span{font-size:13.5px;}
+    .glyph{flex:none;width:26px;height:26px;border-radius:99px;background:#faf7f1;border:1px solid #e6ddcd;display:inline-flex;align-items:center;justify-content:center;color:#5b5346;}
+    .streamrow{display:flex;gap:10px;align-items:flex-start;padding:13px 0;border-bottom:1px solid #f2ece0;}
+    .streamrow:last-child{border-bottom:none;}
+    .streamrow .grow{flex:1 1 auto;min-width:0;}
+    .quote{margin:6px 0 0;font-size:14.5px;line-height:1.65;overflow-wrap:anywhere;}
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>Workspace</a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Company feed</span>
+  <span class="meta">{viewer.fullName || user.name}</span>
+</nav>
+
+<div class="wrap">
+  {msg && (
+    <div class="msg" style={msgOk
+      ? 'background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;'
+      : 'background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);color:#991b1b;'}>{msg}</div>
+  )}
+
+  {!viewer.hasWorkspace && (
+    <div class="card">
+      <h3>Nothing to show</h3>
+      <p class="note">
+        This feed is for people with a workspace here. Your account does not have one yet, so there is
+        nothing scoped to you to show. That is an honest empty state, not an error.
+      </p>
+    </div>
+  )}
+
+  {open && (
+    <div class="card">
+      <p style="margin-bottom:10px;"><a href={PAGE} style="color:#5b5346;font-size:13px;">Back to the feed</a></p>
+      <h1>{open.title}</h1>
+      <p class="meta">
+        {audienceLabel(open.audience, open.scopeLabel)}
+        {' · version ' + open.version}
+        {open.publishedAt ? ' · ' + fmt(open.publishedAt) : ''}
+        {open.expiresAt ? ' · stops showing ' + fmt(open.expiresAt) : ''}
+        {open.authorName ? ' · ' + open.authorName : ''}
+      </p>
+      {open.urgent && <p style="margin-top:8px;"><span class="pill urgent">Urgent</span></p>}
+      {open.summary && <p style="margin-top:10px;font-size:15px;font-weight:600;line-height:1.6;">{open.summary}</p>}
+      <div class="body" style="margin-top:12px;" set:html={openHtml}></div>
+
+      {open.links.length > 0 && (
+        <div style="margin-top:14px;">
+          <h3>Links</h3>
+          {open.links.map((l) => (
+            <p style="margin:4px 0;font-size:14px;overflow-wrap:anywhere;">
+              <a href={l.url} rel="noopener noreferrer" target="_blank" style="color:#c2410c;">{l.label}</a>
+            </p>
+          ))}
+          <p class="note" style="margin-top:6px;">
+            Links, never uploads. You will need access to the document where it lives.
+          </p>
+        </div>
+      )}
+
+      {open.ackRequired && !open.acknowledged && (
+        <form method="POST" style="margin-top:16px;">
+          <input type="hidden" name="action" value="acknowledge" />
+          <input type="hidden" name="id" value={open.id} />
+          <button class="btn" type="submit">I have read this</button>
+          <p class="note" style="margin-top:6px;">
+            Recorded against version {open.version}. If this notice is rewritten later you will be
+            asked again, because you will not have read the new one.
+          </p>
+        </form>
+      )}
+      {open.ackRequired && open.acknowledged && (
+        <p class="note" style="margin-top:14px;">You confirmed you have read version {open.version}.</p>
+      )}
+    </div>
+  )}
+
+  {!open && outstanding.length > 0 && (
+    <div class="card">
+      <h3>Waiting for you to confirm</h3>
+      {outstanding.map((a) => (
+        <a class="item" href={PAGE + '?a=' + encodeURIComponent(a.id)}>
+          <strong>{a.title}</strong>
+          <div class="meta">
+            {a.urgent ? 'Urgent · ' : ''}version {a.version}
+            {a.publishedAt ? ' · ' + fmt(a.publishedAt) : ''}
+          </div>
+        </a>
+      ))}
+      <p class="note" style="margin-top:8px;">
+        A confirmation you gave before does not carry forward when a notice is rewritten — that is why
+        one you have read can appear here again.
+      </p>
+    </div>
+  )}
+
+  {!open && pinned.length > 0 && (
+    <div class="card">
+      <h3>Pinned</h3>
+      {pinned.map((a) => (
+        <a class="item" href={PAGE + '?a=' + encodeURIComponent(a.id)}>
+          <strong>{a.title}</strong>
+          <div class="meta">
+            {audienceLabel(a.audience, a.scopeLabel)}
+            {a.expiresAt ? ' · until ' + fmt(a.expiresAt) : ''}
+          </div>
+          {excerpt(a) && <p class="quote">{excerpt(a)}</p>}
+        </a>
+      ))}
+    </div>
+  )}
+
+  {!open && (
+    <div class="card" id="recognition">
+      <h3>Thank a colleague</h3>
+      {!viewer.employeeId && (
+        <p class="note">
+          Recognition is between colleagues on the employee record, and there is no employee record
+          linked to this account yet. You can read the feed; you cannot send one from here.
+        </p>
+      )}
+      {viewer.employeeId && (
+        <form method="POST">
+          <input type="hidden" name="action" value="thank" />
+
+          <label for="rc-to">Who</label>
+          <select id="rc-to" name="to" required>
+            <option value="">Pick a colleague</option>
+            {colleagues.map((c) => (
+              <option value={c.employeeId}>
+                {c.name}{c.designation ? ' — ' + c.designation : ''}{c.departmentName ? ' (' + c.departmentName + ')' : ''}
+              </option>
+            ))}
+          </select>
+          {colleagues.length === 0 && (
+            <p class="note" style="margin-top:6px;">
+              {whoQuery
+                ? 'No active colleague matches that name.'
+                : 'No active colleagues on record to thank yet.'}
+            </p>
+          )}
+
+          <label for="rc-msg">What they did</label>
+          <textarea id="rc-msg" name="message" required minlength="12" maxlength="1200"
+            placeholder="Be specific. What did they actually do, and what difference did it make?"></textarea>
+
+          <div class="row">
+            <div>
+              <label for="rc-tag">Tag, if you want one</label>
+              <select id="rc-tag" name="tag">
+                {RECOGNITION_TAGS.map((t) => <option value={t}>{recognitionTagLabel(t)}</option>)}
+              </select>
+            </div>
+            <div>
+              <label for="rc-vis">Who can see it</label>
+              <select id="rc-vis" name="visibility">
+                <option value="team">Our teams only</option>
+                <option value="company">Everyone in the company</option>
+              </select>
+            </div>
+          </div>
+
+          <button class="btn" style="margin-top:14px;" type="submit">Send it</button>
+          <p class="note" style="margin-top:8px;">
+            Anybody can send one to anybody, in any direction — there is no permission behind this and
+            no check that you are senior to them. You cannot send one to yourself. They are told; their
+            manager is not copied, and neither is anyone else.
+          </p>
+        </form>
+      )}
+      {viewer.employeeId && colleagues.length > 12 && (
+        <form method="get" action={PAGE} style="margin-top:12px;">
+          <label for="rc-who">Long list? Narrow it by name</label>
+          <div class="row">
+            <input id="rc-who" name="who" type="search" maxlength="80" value={whoQuery} placeholder="Part of a name" />
+            <button class="btn ghost small" type="submit">Narrow</button>
+          </div>
+        </form>
+      )}
+      {viewer.employeeId && (
+        <p class="note" style="margin-top:10px;">
+          You have received {mine.received} and sent {mine.sent}. Yours alone — nothing on this page or
+          anywhere else ranks people by either number.
+        </p>
+      )}
+    </div>
+  )}
+
+  {!open && (
+    <div class="card">
+      <h3>Lately</h3>
+      {stream.length === 0 && (
+        <p class="note">
+          Nothing here yet. No announcement has been published to you, nobody has sent a recognition
+          you can see, and no celebration has been opted into. That is an empty feed, not a broken one.
+        </p>
+      )}
+
+      {stream.map((entry) => (
+        <div class="streamrow">
+          <span class="glyph" aria-hidden="true">
+            {entry.kind === 'announcement' && (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l18-5v12L3 13v-2z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg>
+            )}
+            {entry.kind === 'recognition' && (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1.1L12 21.2l7.8-7.7 1-1.1a5.5 5.5 0 0 0 0-7.8z"/></svg>
+            )}
+            {entry.kind === 'milestone' && (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 6.9H21l-5.4 4.2 2 6.9-5.6-4.2L6.4 20l2-6.9L3 8.9h6.6z"/></svg>
+            )}
+          </span>
+
+          <div class="grow">
+            {entry.kind === 'announcement' && (
+              <a class="item" style="padding:0;border:none;" href={PAGE + '?a=' + encodeURIComponent(entry.announcement.id)}>
+                <strong>{entry.announcement.title}</strong>
+                <div class="meta" style="margin-top:3px;">
+                  {audienceLabel(entry.announcement.audience, entry.announcement.scopeLabel)}
+                  {entry.announcement.publishedAt ? ' · ' + fmtDay(entry.announcement.publishedAt) : ''}
+                  {entry.announcement.expiresAt ? ' · until ' + fmtDay(entry.announcement.expiresAt) : ''}
+                </div>
+                <div style="margin-top:5px;display:flex;gap:6px;flex-wrap:wrap;">
+                  {entry.announcement.urgent && <span class="pill urgent">Urgent</span>}
+                  {entry.announcement.ackRequired && !entry.announcement.acknowledged && <span class="pill ack">Needs your confirmation</span>}
+                </div>
+                {excerpt(entry.announcement) && <p class="quote">{excerpt(entry.announcement)}</p>}
+              </a>
+            )}
+
+            {entry.kind === 'recognition' && (
+              <div>
+                <strong style="font-size:14.5px;">
+                  {entry.recognition.fromName} thanked {entry.recognition.toName}
+                </strong>
+                <p class="quote">{entry.recognition.message}</p>
+                <div class="meta" style="margin-top:4px;">
+                  {recognitionTagLabel(entry.recognition.tag)} · {visibilityLabel(entry.recognition.visibility)}
+                  {entry.recognition.createdAt ? ' · ' + fmtDay(entry.recognition.createdAt) : ''}
+                </div>
+                {entry.recognition.mine && (
+                  <form method="POST" style="margin-top:6px;">
+                    <input type="hidden" name="action" value="withdraw" />
+                    <input type="hidden" name="id" value={entry.recognition.id} />
+                    <button class="btn ghost small" type="submit">Withdraw this</button>
+                  </form>
+                )}
+                {viewer.canModerateRecognition && !entry.recognition.mine && (
+                  <form method="POST" style="margin-top:6px;">
+                    <input type="hidden" name="action" value="remove" />
+                    <input type="hidden" name="id" value={entry.recognition.id} />
+                    <div class="row">
+                      <input name="reason" maxlength="300" required placeholder="Reason for taking it down" />
+                      <button class="btn ghost small" type="submit">Take it down</button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            )}
+
+            {entry.kind === 'milestone' && (
+              <div>
+                <strong style="font-size:14.5px;">{entry.milestone.name}</strong>
+                <div class="meta" style="margin-top:3px;">
+                  {milestoneLabel(entry.milestone)}
+                  {entry.milestone.designation ? ' · ' + entry.milestone.designation : ''}
+                  {entry.milestone.departmentName ? ' · ' + entry.milestone.departmentName : ''}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )}
+
+  {!open && (
+    <div class="card" id="celebrations">
+      <h3>Your celebration settings</h3>
+      <p class="note" style="margin-bottom:10px;">
+        Off unless you say otherwise. A date of birth is personal data, and this product does not put
+        yours in front of the company because somebody thought it would be a nice touch. Nobody — not
+        an administrator, not the founder — can switch these on for you: they are written against your
+        own record, from your own session.
+      </p>
+
+      {!viewer.employeeId && (
+        <p class="note">
+          These settings belong to an employee record, and there is no employee record linked to this
+          account yet.
+        </p>
+      )}
+
+      {viewer.employeeId && (
+        <form method="POST">
+          <input type="hidden" name="action" value="celebrations" />
+
+          <label class="check">
+            <input type="checkbox" name="show_birthday" checked={optIn.showBirthday} />
+            <span>Show my birthday on the company feed</span>
+          </label>
+          {!optIn.hasBirthday && (
+            <p class="note">
+              There is no date of birth on your employee record, so this switch would show nothing
+              even if you turned it on. That is a gap in the record, not in this setting.
+            </p>
+          )}
+          <p class="note">The day and month only. The year is never shown to anybody here.</p>
+
+          <label class="check">
+            <input type="checkbox" name="show_anniversary" checked={optIn.showAnniversary} />
+            <span>Show my work anniversary</span>
+          </label>
+
+          <label class="check">
+            <input type="checkbox" name="show_joining" checked={optIn.showJoining} />
+            <span>Let the feed welcome me as a new joiner for my first 30 days</span>
+          </label>
+          {!optIn.hasJoiningDate && (
+            <p class="note">
+              There is no joining date on your employee record, so the last two would show nothing.
+            </p>
+          )}
+
+          <button class="btn ghost" style="margin-top:14px;" type="submit">Save these settings</button>
+        </form>
+      )}
+    </div>
+  )}
+
+  <p class="note" style="margin-top:6px;">
+    What appears here is decided in the query, from your own employee record, project membership and
+    working location — never from your role, and never hidden in the page after being fetched.
+  </p>
+</div>
+</body>
+</html>

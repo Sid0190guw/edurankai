@@ -9,6 +9,83 @@ import { fetchOrderPayments } from '@/lib/razorpay';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// ---------------------------------------------------------------------------
+// A FAILED EFFECT ON A CAPTURED PAYMENT IS NOT ALLOWED TO BE SILENT.
+//
+// Every downstream effect below used to end in `.catch(() => {})`. The money is already taken and
+// `payments.status` is already 'paid' by the time these run, so a swallowed failure means: an
+// applicant paid and vanished from the hiring queue; a user paid the activation fee and stayed
+// locked out; a wallet top-up was captured and never credited. Nothing was logged, and both the
+// browser /verify path and the webhook returned success.
+//
+// This is the one path in the app with no user sitting in front of it (the webhook has no session),
+// so "make it visible" means three things: log the real Postgres reason, persist it on the payments
+// row so the order can be found and repaired, and alert admins ONCE per order — the existing
+// materialise path already learned that lesson, because reconcile re-runs this code on every portal
+// page load and un-guarded alerts buried admins in duplicates.
+// ---------------------------------------------------------------------------
+let effectCols: Promise<void> | null = null;
+function ensureEffectColumns(): Promise<void> {
+  if (effectCols) return effectCols;
+  effectCols = (async () => {
+    try {
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS effect_error TEXT`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS effect_error_at TIMESTAMPTZ`);
+    } catch (e: any) {
+      console.error('[payments] could not add the effect_error columns:', e?.cause?.message || e?.message);
+      effectCols = null; // transient failures must not permanently disable the recorder
+    }
+  })();
+  return effectCols;
+}
+
+/**
+ * Run one downstream effect of a captured payment. Returns true if it landed.
+ *
+ * On failure the effect does NOT throw — the other effects for this order, and the caller's own
+ * "payment succeeded" answer, are still correct and must not be rolled back. But the failure is
+ * logged with `e.cause.message` (the real reason; `e.message` is only the failed SQL), written to
+ * payments.effect_error, and pushed to admins with a sentence naming what the payer did not get.
+ */
+async function runEffect(
+  orderId: string,
+  what: string,
+  consequence: string,
+  run: () => Promise<unknown>,
+): Promise<boolean> {
+  try {
+    await run();
+    return true;
+  } catch (e: any) {
+    const real = String(e?.cause?.message || e?.message || e);
+    console.error('[payments] PAID BUT NOT APPLIED —', what, 'for order', orderId, '-', real);
+    let alreadyFlagged = false;
+    try {
+      await ensureEffectColumns();
+      const prev = rows(await db.execute(sql`SELECT effect_error FROM payments WHERE order_id = ${orderId} LIMIT 1`))[0] as any;
+      alreadyFlagged = !!(prev && prev.effect_error);
+      await db.execute(sql`UPDATE payments SET effect_error = ${(what + ': ' + real).slice(0, 500)}, effect_error_at = NOW() WHERE order_id = ${orderId}`);
+    } catch (e2: any) {
+      console.error('[payments] could not even record the effect failure for order', orderId, '-', e2?.cause?.message || e2?.message);
+    }
+    if (!alreadyFlagged) {
+      try {
+        const { sendPushToAdmins } = await import('@/lib/push');
+        await sendPushToAdmins({
+          type: 'payment_effect_failed',
+          title: 'Payment taken but not applied',
+          body: consequence + ' Order ' + orderId + '. Reason: ' + real.slice(0, 110),
+          url: '/admin/finance',
+          tag: 'effect-fail-' + orderId,
+        });
+      } catch (e3: any) {
+        console.error('[payments] admin alert for the failed effect could not be sent:', e3?.cause?.message || e3?.message);
+      }
+    }
+    return false;
+  }
+}
+
 // Defensive coercion — a single malformed field (an over-long string, a
 // non-numeric score, a level outside the enum) must never sink a PAID
 // application's insert and push it into the stuck-recovery path.
@@ -333,50 +410,65 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
   // pending_payment -> submitted so it joins the live queue. Without this flip
   // the candidate row stays hidden under the pending tab and admins never see it.
   if (pay.purpose === 'application_fee' || pay.reference_type === 'application') {
-    try { await db.execute(sql`ALTER TYPE application_status ADD VALUE IF NOT EXISTS 'pending_payment'`); } catch (_) {}
-    await db.execute(sql`
-      UPDATE applications SET
-        fee_paid = true,
-        fee_payment_id = ${paymentId},
-        fee_paid_at = NOW(),
-        status = CASE WHEN status = 'pending_payment' THEN 'submitted' ELSE status END,
-        updated_at = NOW()
-      WHERE id = ${pay.reference_id}
-    `).catch(() => {});
+    try { await db.execute(sql`ALTER TYPE application_status ADD VALUE IF NOT EXISTS 'pending_payment'`); } catch (e: any) {
+      console.error('[payments] could not ensure the pending_payment status value:', e?.cause?.message || e?.message);
+    }
+    // The comment three lines up says that without this flip the candidate stays hidden and admins
+    // never see them — and the statement then swallowed its own failure, producing exactly the
+    // "paid but lost application" this module exists to prevent.
+    await runEffect(orderId, 'mark application fee paid + submit',
+      'An applicant paid the processing fee and their application has NOT joined the live queue, so no admin can see them.',
+      () => db.execute(sql`
+        UPDATE applications SET
+          fee_paid = true,
+          fee_payment_id = ${paymentId},
+          fee_paid_at = NOW(),
+          status = CASE WHEN status = 'pending_payment' THEN 'submitted' ELSE status END,
+          updated_at = NOW()
+        WHERE id = ${pay.reference_id}
+      `));
     return { applicationId: pay.reference_id };
   }
 
   // AquinTutor partnership Starter fee (one-time CHF 100) -> mark the partnership
   // application's starter fee paid so the team can onboard. Self-bootstrapping cols.
   if (pay.purpose === 'partnership_starter' || pay.reference_type === 'partnership_application') {
-    try {
-      await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS starter_fee_paid BOOLEAN NOT NULL DEFAULT false`);
-      await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS fee_payment_id TEXT`);
-      await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS fee_paid_at TIMESTAMPTZ`);
-      await db.execute(sql`UPDATE partnership_applications SET starter_fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), updated_at = NOW() WHERE id = ${pay.reference_id}`);
-    } catch (_) {}
+    await runEffect(orderId, 'mark partnership Starter fee paid',
+      'A partner paid the one-time Starter fee and it was NOT recorded, so onboarding will not open for them.',
+      async () => {
+        await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS starter_fee_paid BOOLEAN NOT NULL DEFAULT false`);
+        await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS fee_payment_id TEXT`);
+        await db.execute(sql`ALTER TABLE partnership_applications ADD COLUMN IF NOT EXISTS fee_paid_at TIMESTAMPTZ`);
+        await db.execute(sql`UPDATE partnership_applications SET starter_fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), updated_at = NOW() WHERE id = ${pay.reference_id}`);
+      });
     try {
       const { sendPushToAdmins } = await import('@/lib/push');
       await sendPushToAdmins({ type: 'partnership_starter_paid', title: 'Partnership Starter fee paid', body: 'A partner paid the one-time CHF 100 Starter fee — ready to verify and onboard.', url: '/admin/finance', tag: 'pship-' + pay.reference_id });
-    } catch (_) {}
+    } catch (e: any) {
+      console.error('[payments] partnership Starter fee admin alert failed for', pay.reference_id, '-', e?.cause?.message || e?.message);
+    }
     return { applicationId: pay.reference_id };
   }
 
   // 1 CHF registration/activation fee -> approve the user's account.
   if (pay.purpose === 'registration_fee' || pay.reference_type === 'user') {
-    await db.execute(sql`
-      UPDATE users SET reg_fee_paid = true, reg_fee_payment_id = ${paymentId}, access_status = 'approved', updated_at = NOW()
-      WHERE id = ${pay.reference_id}
-    `).catch(() => {});
+    await runEffect(orderId, 'approve account after registration fee',
+      'A user paid the activation fee and their account was NOT approved, so they are locked out of what they just paid for.',
+      () => db.execute(sql`
+        UPDATE users SET reg_fee_paid = true, reg_fee_payment_id = ${paymentId}, access_status = 'approved', updated_at = NOW()
+        WHERE id = ${pay.reference_id}
+      `));
     return;
   }
 
   // Event level fee -> mark the progress paid + auto-issue (no-test levels).
   if (pay.purpose === 'event_level' || pay.reference_type === 'event_level') {
-    await db.execute(sql`
-      UPDATE event_level_progress SET fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), status = 'paid', updated_at = NOW()
-      WHERE id = ${pay.reference_id}
-    `).catch(() => {});
+    await runEffect(orderId, 'mark event level fee paid',
+      'A participant paid an event level fee and the level was NOT marked paid, so they cannot proceed.',
+      () => db.execute(sql`
+        UPDATE event_level_progress SET fee_paid = true, fee_payment_id = ${paymentId}, fee_paid_at = NOW(), status = 'paid', updated_at = NOW()
+        WHERE id = ${pay.reference_id}
+      `));
     try {
       const prog = rows(await db.execute(sql`
         SELECT elp.registration_id, elp.level_id, elp.event_id, el.auto_issue_artifact, el.test_id
@@ -387,24 +479,31 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
         const { issueArtifact } = await import('@/lib/issue-artifact');
         await issueArtifact({ registrationId: prog.registration_id, eventId: prog.event_id, levelId: prog.level_id, artifactType: prog.auto_issue_artifact, autoIssued: true });
       }
-    } catch (_) {}
+    } catch (e: any) {
+      // Non-fatal: the fee IS paid and recorded above. But an artifact that was supposed to issue
+      // automatically and did not is a person waiting for a credential that will never arrive.
+      console.error('[payments] auto-issue after event level fee failed for', pay.reference_id, '-', e?.cause?.message || e?.message);
+    }
     return;
   }
 
   // Wallet recharge -> add the paid amount to the user's account credit.
   // Idempotent on the order id so webhook + verify + reconcile never double-credit.
   if (pay.purpose === 'wallet_recharge' || pay.reference_type === 'wallet') {
-    try {
-      const dup = rows(await db.execute(sql`SELECT 1 FROM account_credit_ledger WHERE ref_id = ${orderId} LIMIT 1`).catch(() => []));
-      if (!dup.length) {
+    // MONEY IN, NOTHING OUT, NO TRACE — that was the old shape here: the ledger INSERT ended in
+    // `.catch(() => {})` inside a `catch (_) {}`, so a top-up could be captured by Razorpay, marked
+    // paid, and never reach the user's balance with nothing written anywhere.
+    await runEffect(orderId, 'credit wallet top-up',
+      'A user paid to top up their wallet and the balance was NOT credited.',
+      async () => {
+        const dup = rows(await db.execute(sql`SELECT 1 FROM account_credit_ledger WHERE ref_id = ${orderId} LIMIT 1`));
+        if (dup.length) return; // already credited by verify/webhook/reconcile — idempotent
         const amt = Number(rows(await db.execute(sql`SELECT amount_paise FROM payments WHERE order_id = ${orderId} LIMIT 1`))[0]?.amount_paise) || 0;
-        if (amt > 0) {
-          const { ensureCreditSchema } = await import('@/lib/account-credit');
-          await ensureCreditSchema();
-          await db.execute(sql`INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id) VALUES (${pay.user_id || pay.reference_id}, ${amt}, 'Wallet top-up', 'recharge', ${orderId})`).catch(() => {});
-        }
-      }
-    } catch (_) {}
+        if (!(amt > 0)) throw new Error('the payment row carries no amount_paise, so there is nothing to credit');
+        const { ensureCreditSchema } = await import('@/lib/account-credit');
+        await ensureCreditSchema();
+        await db.execute(sql`INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id) VALUES (${pay.user_id || pay.reference_id}, ${amt}, 'Wallet top-up', 'recharge', ${orderId})`);
+      });
     return;
   }
 }

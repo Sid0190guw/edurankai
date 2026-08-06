@@ -1394,7 +1394,7 @@ export async function updateAnnouncement(
              ack_required = ${v.ackRequired},
              expires_at = ${v.expiresAt}::timestamptz,
              links = ${v.linksJson}::jsonb,
-             version = version + ${wasPublished ? 1 : 0},
+             version = version + (${wasPublished ? 1 : 0})::int,
              updated_at = NOW()
        WHERE id = ${id}::uuid`);
 
@@ -1794,7 +1794,7 @@ export async function upcomingMilestones(viewer: FeedViewer, days = 7): Promise<
            to_char(e.date_of_birth, 'MM-DD') = ANY (
              SELECT to_char(gs, 'MM-DD')
                FROM generate_series(NOW() - INTERVAL '2 days',
-                                    NOW() + (${window} * INTERVAL '1 day'),
+                                    NOW() + ((${window})::int * INTERVAL '1 day'),
                                     INTERVAL '1 day') AS gs
            )
          )
@@ -1827,7 +1827,7 @@ export async function upcomingMilestones(viewer: FeedViewer, days = 7): Promise<
            to_char(e.joining_date, 'MM-DD') = ANY (
              SELECT to_char(gs, 'MM-DD')
                FROM generate_series(NOW() - INTERVAL '2 days',
-                                    NOW() + (${window} * INTERVAL '1 day'),
+                                    NOW() + ((${window})::int * INTERVAL '1 day'),
                                     INTERVAL '1 day') AS gs
            )
          )

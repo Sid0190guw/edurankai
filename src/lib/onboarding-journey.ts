@@ -1164,6 +1164,16 @@ export async function setItemState(input: ActOnItemInput): Promise<JourneyResult
     const isOwner = row.owner_user_id && String(row.owner_user_id) === actor;
     const isJoiner = row.joiner_user_id && String(row.joiner_user_id) === actor;
     if (!isOwner && !isJoiner && input?.isHrDesk !== true) {
+      // TWO DIFFERENT REFUSALS, because they need two different actions. An employee record with no
+      // linked account cannot match anybody, so the joiner is refused on their own checklist and has
+      // no way of knowing why — that is a broken link for HR to fix, not a permission problem.
+      if (!row.joiner_user_id && !row.owner_user_id) {
+        return {
+          ok: false,
+          error: 'This step cannot be moved yet: neither the joiner nor its owner has a sign-in '
+            + 'account linked to their employee record. Ask HR to link them.',
+        };
+      }
       return {
         ok: false,
         error: 'This step belongs to somebody else. Only its owner, the joiner, or the people desk can move it.',
@@ -1228,7 +1238,16 @@ export async function acknowledgeItem(itemId: string, actorUserId: string | null
     if (!list.length) return { ok: false, error: 'That step could not be found.' };
     const row = list[0] as any;
 
-    if (!row.joiner_user_id || String(row.joiner_user_id) !== actor) {
+    if (!row.joiner_user_id) {
+      // The employee record carries no linked sign-in account, so NOBODY can match — including the
+      // joiner looking straight at their own checklist. Say which thing is broken.
+      return {
+        ok: false,
+        error: 'This employee record has no sign-in account linked to it, so an acknowledgement '
+          + 'cannot be attributed to anybody. Ask HR to link the account first.',
+      };
+    }
+    if (String(row.joiner_user_id) !== actor) {
       return { ok: false, error: 'Only the person this checklist belongs to can acknowledge a policy on it.' };
     }
     if (row.requires_acknowledgement !== true) {

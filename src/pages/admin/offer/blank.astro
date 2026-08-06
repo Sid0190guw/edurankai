@@ -4,6 +4,8 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { applications, brandProfiles, offerLetters } from '@/lib/db/schema';
 import { eq, asc } from 'drizzle-orm';
+import { buildTemplateGrid } from '@/lib/offer-templates';
+import { ENGAGEMENT_POLICIES, shortCommitment } from '@/lib/engagement-policy';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -70,7 +72,12 @@ const defaults = {
   employmentType: 'Internship',
   workMode: 'Remote',
   duration: '3 Months',
-  hoursCommitment: '2.5 hrs/day, 5 days/week',
+  // From src/lib/engagement-policy.ts. The old default, "2.5 hrs/day, 5 days/week", appears
+  // nowhere in the published internship policy — that is six days and about 40 hours of TOTAL
+  // ENGAGEMENT, of which five hours a day is project work and 1 hour 40 minutes is well-being.
+  // This form prefills the internship because the rest of its defaults do; the offer page resolves
+  // the correct policy for the level regardless of what is typed here.
+  hoursCommitment: shortCommitment(ENGAGEMENT_POLICIES['Intern']),
   compensation: 'Unpaid',
   reportingTo: '',
   offerDate: today,
@@ -84,6 +91,18 @@ const defaults = {
 };
 
 const brandsJson = JSON.stringify(brands);
+
+// THE PREVIEW HAD ITS OWN COPY OF THE LETTER, and its own intern fallback:
+// `bodyTemplates[empType] || bodyTemplates.Internship`, plus a hardcoded opening reading "we are
+// pleased to extend this formal offer of an <employment type>". That is the same failure as the one
+// on the candidate-facing letter, in a second place, drifting independently.
+//
+// The sentences now come from src/lib/offer-templates.ts. Selection cannot run in the browser on
+// every keystroke, so the REAL selector runs here, on the server, once per employment type the form
+// offers, crossed with "does the role title read as senior". The preview looks the answer up; it
+// owns no rules and no copy. The fallback entry is the neutral template, never the intern one.
+const EMPLOYMENT_TYPES = ['Internship', 'Apprenticeship', 'Full-Time', 'Contract', 'Part-Time'];
+const templateGridJson = JSON.stringify(buildTemplateGrid(EMPLOYMENT_TYPES));
 ---
 <Layout title="Offer Letter Builder" description="Professional offer letter builder with brand switching.">
 <style is:global>
@@ -299,7 +318,14 @@ const brandsJson = JSON.stringify(brands);
 
           </div>
         </article>
-        <p class="text-[0.7rem] text-white/40 mt-3 text-center">Live preview · updates as you type</p>
+        {/* Which template the agreed fields select, named on screen while the letter is being
+            written. The template used to be invisible until after it had been sent. */}
+        <p class="text-[0.7rem] text-white/40 mt-3 text-center">
+          Live preview · updates as you type · <span id="ol_templateBadge">Template: —</span>
+        </p>
+        <p class="text-[0.7rem] text-white/40 mt-1 text-center">
+          <a href="/admin/offer/templates" class="underline hover:text-white/70">What each template says, and every issued letter checked against it</a>
+        </p>
       </div>
     </div>
 
@@ -308,7 +334,7 @@ const brandsJson = JSON.stringify(brands);
   <script is:inline src="/era/era-qr.js"></script>
   <script is:inline src="/era/era-pdf.js"></script>
 
-  <script is:inline define:vars={{ brandsJson, realOfferToken }}>
+  <script is:inline define:vars={{ brandsJson, realOfferToken, templateGridJson }}>
     (function() {
       var brands = JSON.parse(brandsJson);
       var brandMap = {};
@@ -332,66 +358,150 @@ const brandsJson = JSON.stringify(brands);
         return (h >>> 0).toString(36).toUpperCase().padStart(8, '0').substring(0, 8);
       }
 
-      var bodyTemplates = {
-        Internship: 'This Internship is offered on the terms summarised herein. You will work <b>{workMode}</b>, committing <b>{hoursCommitment}</b>. The engagement runs for <b>{duration}</b>, commencing <b>{joiningDate}</b>. You will receive mid-point and final reviews assessed via {brandName}\'s rubric-based evaluation. Outstanding performers receive a Letter of Recommendation; all successful completers receive a Certificate of Completion. By accepting, you confirm you have read and agree to {brandName}\'s Recruitment Policy and Code of Conduct.',
-        Apprenticeship: 'This Apprenticeship engagement is offered on the terms summarised herein. You will work <b>{workMode}</b> committing <b>{hoursCommitment}</b>, for <b>{duration}</b>, commencing <b>{joiningDate}</b>. Apprentices follow a structured competency pathway with periodic rubric evaluations.',
-        'Full-Time': 'This offer is contingent on completion of pre-employment requirements. Your employment commences on <b>{joiningDate}</b> as a Full-Time employee. Onboarding details will be confirmed within 7 days of acceptance. Compensation: <b>{compensation}</b>. Work mode: <b>{workMode}</b>.',
-        Contract: 'This Contract engagement runs <b>{duration}</b>, commencing <b>{joiningDate}</b>. Compensation: <b>{compensation}</b>. Deliverables and milestones will be confirmed in the accompanying Statement of Work.',
-        'Part-Time': 'This Part-Time engagement commences <b>{joiningDate}</b>, running for <b>{duration}</b>. Hours: <b>{hoursCommitment}</b>. Compensation: <b>{compensation}</b>.'
-      };
+      // ---------------------------------------------------------------------------------------
+      // THE PREVIEW OWNS NO SENTENCES. Every line below comes out of the grid the server built
+      // from src/lib/offer-templates.ts using the real selector. What is left here is filling in
+      // {placeholders} and turning **emphasis** into <b> — no template choice, no fallback rule,
+      // and in particular no "default to the internship copy".
+      // ---------------------------------------------------------------------------------------
+      var templateGrid = JSON.parse(templateGridJson);
+      var noStipendRe = new RegExp(templateGrid.noStipendSource, 'i');
+      // The title-to-level patterns and THEIR ORDER come from the library. Order is the safety
+      // property: a title is read at the highest seniority it matches, so "Senior Intern" resolves
+      // to Senior and can never reach an internship letter. Nothing here decides that; this only
+      // walks the list it was handed.
+      var titlePatterns = [];
+      for (var tp = 0; tp < templateGrid.titlePatterns.length; tp++) {
+        titlePatterns.push({
+          re: new RegExp(templateGrid.titlePatterns[tp].source, 'i'),
+          level: templateGrid.titlePatterns[tp].level
+        });
+      }
+      function levelFromTitle(title) {
+        for (var i = 0; i < titlePatterns.length; i++) {
+          if (titlePatterns[i].re.test(title || '')) return titlePatterns[i].level;
+        }
+        return 'unknown';
+      }
 
-      function renderBody() {
-        var first = (val('f_candidateName') || '').split(' ')[0] || 'Candidate';
-        var empType = val('f_employmentType') || 'Internship';
-        var role = val('f_roleTitle') || '—';
-        var dept = val('f_department');
+      function esc(s) {
+        return String(s == null ? '' : s)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+      // Template strings are ours and may carry **emphasis**; every VALUE substituted into them is
+      // escaped first, so nothing an admin types can become markup in the preview.
+      function boldify(s) {
+        var parts = String(s).split('**'), out = '';
+        for (var i = 0; i < parts.length; i++) {
+          out += (i % 2 === 1) ? ('<b>' + parts[i] + '</b>') : parts[i];
+        }
+        return out;
+      }
+      function fill(tmpl, values) {
+        return String(tmpl).replace(/\{(\w+)\}/g, function(m, k) {
+          return Object.prototype.hasOwnProperty.call(values, k) ? values[k] : '';
+        }).replace(/[ \t]{2,}/g, ' ').trim();
+      }
+
+      // The grid is exhaustive - every employment type crossed with every level, plus "no level
+      // recorded" - so this is a lookup, not an approximation of the real decision.
+      function currentTemplate() {
+        var empType = val('f_employmentType') || '';
+        var lvl = levelFromTitle(val('f_roleTitle'));
+        return templateGrid.byKey[empType + '|' + lvl] || templateGrid.fallback;
+      }
+
+      function letterValues() {
         var brandSlug = val('f_brandSlug') || 'edurankai';
         var brand = brandMap[brandSlug] || brandMap['edurankai'];
         var brandName = brand ? brand.name : 'EduRankAI';
+        var dept = val('f_department');
+        var empType = val('f_employmentType');
+        var duration = val('f_duration');
+        var reportingTo = val('f_reportingTo');
+        var comp = val('f_compensation');
         var joining = fmtDate(val('f_joiningDate'));
-        var workMode = val('f_workMode') || '—';
-        var hoursCommit = val('f_hoursCommitment') || '—';
-        var duration = val('f_duration') || '—';
-        var comp = val('f_compensation') || '—';
+        if (joining === '—') joining = 'a mutually agreed date';
+        var compDetail = comp.replace(noStipendRe, '').replace(/^[\s.,;:-]+/, '');
+        // A value dropped into the MIDDLE of a sentence must not bring its own full stop with it:
+        // the compensation presets end in one, and the template supplies the sentence's own.
+        function inl(s) { return String(s || '').replace(/[\s.;,]+$/, ''); }
+        function sen(s) { s = String(s || '').trim(); return !s ? '' : (/[.!?]$/.test(s) ? s : s + '.'); }
+        return {
+          org: esc(brandName),
+          roleTitle: esc(inl(val('f_roleTitle')) || 'the role described in this letter'),
+          department: esc(inl(dept)),
+          departmentClause: dept ? ' within ' + esc(inl(dept)) : '',
+          employmentType: esc(inl(empType) || 'the engagement described in this letter'),
+          employmentTypeClause: empType ? ' It is recorded as **' + esc(inl(empType)) + '**.' : '',
+          workMode: esc(inl(val('f_workMode')) || 'the agreed work arrangement'),
+          duration: esc(inl(duration) || 'the agreed term'),
+          durationClause: duration ? ' It runs for **' + esc(inl(duration)) + '**.' : '',
+          hoursCommitment: esc(inl(val('f_hoursCommitment')) || 'the agreed hours'),
+          joiningDate: esc(joining),
+          reportingTo: esc(inl(reportingTo)),
+          reportingClause: reportingTo ? ' You will report to **' + esc(inl(reportingTo)) + '**.' : '',
+          compensation: esc(inl(comp) || 'as recorded in the offer summary'),
+          compensationClause: compDetail.length > 3
+            ? ' The compensation terms recorded against this engagement are: ' + esc(sen(comp))
+            : ''
+        };
+      }
+
+      function renderBody() {
+        var first = (val('f_candidateName') || '').split(' ')[0] || 'Candidate';
+        var t = currentTemplate();
+        var v = letterValues();
+        var comp = val('f_compensation');
+        // The stipend variant is a property of the unpaid programmes only; for every other
+        // template both strings are identical, so this branch cannot introduce one.
+        var terms = (comp && !noStipendRe.test(comp)) ? t.engagementTermsWithStipend : t.engagementTerms;
+
+        var paras = [t.opening, t.welcome, terms, t.progression, t.completion, t.closing];
+        var html = '<p>Dear <b>' + esc(first) + '</b>,</p>';
+        for (var i = 0; i < paras.length; i++) {
+          if (!paras[i]) continue;
+          html += '<p>' + boldify(fill(paras[i], v)) + '</p>';
+        }
+
         var customNote = val('f_customNote');
+        if (customNote) {
+          html += '<p style="font-style:italic;color:#5a5a60;border-left:2px solid rgba(255,79,0,0.3);padding-left:10px;">' + esc(customNote) + '</p>';
+        }
+        $('ol_body').innerHTML = html;
 
-        var deptText = dept ? (' within the <b>' + dept + '</b> team') : '';
-        var intro = '<p>Dear <b>' + first + '</b>,</p>' +
-          '<p>We are pleased to extend this formal offer of an <b>' + empType + '</b> for the position of <b>' + role + '</b>' + deptText + ' at <b>' + brandName + '</b>. Following a thorough evaluation of your application and conversations, we are confident you demonstrate the capability, character, and commitment we look for.</p>';
-
-        var bodyTmpl = bodyTemplates[empType] || bodyTemplates.Internship;
-        var bodyParagraph = bodyTmpl
-          .replace(/\{workMode\}/g, workMode)
-          .replace(/\{hoursCommitment\}/g, hoursCommit)
-          .replace(/\{duration\}/g, duration)
-          .replace(/\{joiningDate\}/g, joining)
-          .replace(/\{compensation\}/g, comp)
-          .replace(/\{brandName\}/g, brandName);
-
-        var note = customNote ? ('<p style="font-style:italic;color:#5a5a60;border-left:2px solid rgba(255,79,0,0.3);padding-left:10px;">' + customNote.replace(/</g,'&lt;') + '</p>') : '';
-
-        $('ol_body').innerHTML = intro + '<p>' + bodyParagraph + '</p>' + note;
+        var badge = $('ol_templateBadge');
+        if (badge) badge.textContent = 'Template: ' + t.label;
       }
 
       function renderSummary() {
-        var rows = [
-          ['Position', val('f_roleTitle')],
-          ['Department', val('f_department')],
-          ['Employment Type', val('f_employmentType')],
-          ['Work Mode', val('f_workMode')],
-          ['Duration', val('f_duration')],
-          ['Joining Date', fmtDate(val('f_joiningDate'))],
-          ['Reporting To', val('f_reportingTo')],
-          ['Working Hours', val('f_hoursCommitment')],
-          ['Compensation', val('f_compensation')],
-          ['Response Deadline', fmtDate(val('f_responseDeadline'))],
-          ['Offer Expires', fmtDate(val('f_expiryDate'))]
-        ];
+        // Which rows belong on this letter is the template's decision, not a fixed list. A
+        // permanent appointment has no Duration and a contract has no Working Hours; printing
+        // either is the document admitting it does not know what it is describing.
+        var t = currentTemplate();
+        var fieldValues = {
+          roleTitle: val('f_roleTitle'),
+          department: val('f_department'),
+          employmentType: val('f_employmentType'),
+          workMode: val('f_workMode'),
+          duration: val('f_duration'),
+          hoursCommitment: val('f_hoursCommitment'),
+          joiningDate: fmtDate(val('f_joiningDate')),
+          reportingTo: val('f_reportingTo'),
+          compensation: val('f_compensation')
+        };
+        var rows = [];
+        for (var fi = 0; fi < t.summaryFields.length; fi++) {
+          var fk = t.summaryFields[fi];
+          rows.push([templateGrid.fieldLabels[fk] || fk, fieldValues[fk]]);
+        }
+        rows.push(['Response Deadline', fmtDate(val('f_responseDeadline'))]);
+        rows.push(['Offer Expires', fmtDate(val('f_expiryDate'))]);
         var html = '';
         for (var i = 0; i < rows.length; i++) {
           var k = rows[i][0], v = rows[i][1];
           if (!v || v === '—') continue;
-          html += '<tr style="border-bottom:1px solid rgba(0,0,0,0.05);"><td style="padding:7px 0;color:#6b6b76;width:40%;">' + k + '</td><td style="padding:7px 0;color:#0a0a0c;font-weight:500;">' + v + '</td></tr>';
+          html += '<tr style="border-bottom:1px solid rgba(0,0,0,0.05);"><td style="padding:7px 0;color:#6b6b76;width:40%;">' + esc(k) + '</td><td style="padding:7px 0;color:#0a0a0c;font-weight:500;">' + esc(v) + '</td></tr>';
         }
         $('ol_summary').innerHTML = html;
       }
@@ -446,8 +556,11 @@ const brandsJson = JSON.stringify(brands);
 
         var role = val('f_roleTitle') || '—';
         var dept = val('f_department');
-        var emp = val('f_employmentType') || 'Internship';
-        $('ol_re').textContent = 'Offer of ' + emp + ' — ' + role + (dept ? ', ' + dept : '');
+        // NOT `|| 'Internship'`. An empty employment type used to make the subject line of every
+        // unfilled letter read "Offer of Internship", which is the same junior-by-default habit
+        // that produced the Chief AI Officer internship offer.
+        var emp = val('f_employmentType');
+        $('ol_re').textContent = 'Offer of ' + (emp ? emp + ' — ' : '') + role + (dept ? ', ' + dept : '');
 
         $('ol_tileDuration').textContent = val('f_duration') || '—';
         $('ol_tileWorkMode').textContent = val('f_workMode') || '—';
@@ -569,6 +682,8 @@ const brandsJson = JSON.stringify(brands);
       the way the candidate-facing copy is. This is a module script, so it loads before the user can
       trigger generation. */}
   <script>
+    // @ts-ignore - the qrcode package ships no type declarations and @types/qrcode is not a
+    // dependency here. The import is a plain default export; nothing about it is ambiguous.
     import QRCode from 'qrcode';
     (window as any).QRCode = QRCode;
   </script>
