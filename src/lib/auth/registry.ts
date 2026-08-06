@@ -542,6 +542,28 @@ export const BUILTIN_PERMISSIONS: Record<Permission, PermissionMeta> = {
     description: 'Create a project, change its name, code, description, department, dates and status, set the PLANNED budget, retire it, and record who runs it. Recording a project manager writes an effective-dated relationship into the Organization Graph — it does not make the holder that manager, and it confers no authority over the project\'s work, its people or its spending. Actual spend is never entered here: it is read from the expense claims and purchase requests that already carry a project reference, so there is one record of company money and not two.',
     sensitive: true,
   },
+
+  // ---------------------------------------------------------------------------------------------
+  // ANNOUNCEMENTS AND RECOGNITION. Neither key approves anything — there is no approval in either
+  // module, because publishing a notice is a standing authority rather than a per-row routing
+  // question, so src/lib/workflow.ts is deliberately not involved. The full derivation of both grant
+  // sets is written above PERMS_BY_ROLE in src/lib/auth/permissions.ts.
+  //
+  // WHAT NEITHER KEY GATES, and the descriptions below say so to whoever is granting them: READING
+  // an announcement (decided by the notice's own audience, in the WHERE clause) and SENDING
+  // recognition (which needs no capability at all, on purpose).
+  // ---------------------------------------------------------------------------------------------
+  'announcements.publish': {
+    label: 'Publish company announcements',
+    group: 'Content',
+    description: 'Write a company notice and decide who it goes to — everyone, one department, one project or one working location — mark it urgent, pin it, set the date it stops being shown, publish it, revise it and take it down with a reason. Revising a PUBLISHED notice starts a new version, and because acknowledgements are recorded against a version, that re-opens the acknowledgement for everybody: this key decides what the whole company is asked to read and confirm. It does NOT widen what the holder may read — a notice reaches the audience it names, resolved from employee records and project membership, never from anybody\'s role. The acknowledgement record it opens NAMES the people who confirmed, because each of them performed that act deliberately, and reports the people who have not as a COUNT. Nothing behind this key can list the names of people who have not read something.',
+    sensitive: true,
+  },
+  'recognition.moderate': {
+    label: 'Take down a recognition',
+    group: 'People',
+    description: 'Remove a thank-you one colleague sent another, with a reason that is kept on the row. Nothing is deleted — "somebody removed a recognition about me" is a thing the person it was about is entitled to have a record of. It grants NO wider read: a recognition sent to one team stays visible to that team only, including to whoever holds this, and the aggregate console shows counts plus only the ones the sender already made company-wide. SENDING recognition needs no permission and this is not one; anybody with an employee record may thank anybody else, in any direction, and there is no check anywhere that the sender is senior to the recipient.',
+  },
 };
 
 /** Every built-in permission key, at runtime. Derived — it cannot drift from the union. */

@@ -11,39 +11,54 @@ const firstName = user.name ? user.name.split(' ')[0] : 'there';
 const hour = new Date().getHours();
 const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
 
-// Load all dashboard data
-let stats = { leads: 0, drafts: 0, replies: 0, published: 0, sources: 0, surveys: 0, rti: 0, coverage: 0, legal: 0 };
+// Load all dashboard data.
+//
+// Every number below used to come from ONE query with nine sub-selects, wrapped in catch(e) {}.
+// Several of the tables it reads — hei_leads, hei_right_of_reply, hei_survey_responses,
+// hei_rti_filings, hei_legal_queue — are created nowhere in this repository, neither in
+// src/lib/db/schema.ts nor by any CREATE TABLE. One missing table fails the whole statement, so
+// the catch left all nine at their zero defaults and the headline underneath announced "The desk
+// is clear." That is a dashboard reporting an all-clear it never actually read.
+//
+// Each count is read on its own now, and one that cannot be read stays null instead of becoming a
+// zero. Null renders as "not available" and is named in a notice, so a number on this page is
+// either measured or openly absent, never invented.
+type Stat = number | null;
+let stats: { leads: Stat; drafts: Stat; replies: Stat; published: Stat; sources: Stat; surveys: Stat; rti: Stat; coverage: Stat; legal: Stat } =
+  { leads: null, drafts: null, replies: null, published: null, sources: null, surveys: null, rti: null, coverage: null, legal: null };
+const unreadable: string[] = [];
 let leads: any[] = [];
 let crawlers: any[] = [];
 let auditLog: any[] = [];
 let workbench: any[] = [];
 let pendingFindings = 0;
 
-try {
-  const r = await db.execute(sql`
-    SELECT
-      (SELECT COUNT(*)::int FROM hei_leads WHERE status NOT IN ('promoted','dismissed')) as leads,
-      (SELECT COUNT(*)::int FROM hei_findings WHERE status = 'draft') as drafts,
-      (SELECT COUNT(*)::int FROM hei_right_of_reply WHERE status IN ('sent','pending')) as replies,
-      (SELECT COUNT(*)::int FROM hei_institutions WHERE is_published = true) as published,
-      (SELECT COALESCE(SUM(sources_count),0)::int FROM hei_crawlers WHERE status = 'active') as sources,
-      (SELECT COUNT(*)::int FROM hei_survey_responses) as surveys,
-      (SELECT COUNT(*)::int FROM hei_rti_filings) as rti,
-      (SELECT COUNT(*)::int FROM hei_institutions) as coverage,
-      (SELECT COUNT(*)::int FROM hei_legal_queue WHERE status = 'open') as legal
-  `);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  if (rows[0]) {
-    const d = rows[0] as any;
-    stats = {
-      leads: Number(d.leads)||0, drafts: Number(d.drafts)||0,
-      replies: Number(d.replies)||0, published: Number(d.published)||0,
-      sources: Number(d.sources)||0, surveys: Number(d.surveys)||0,
-      rti: Number(d.rti)||0, coverage: Number(d.coverage)||0,
-      legal: Number(d.legal)||0
-    };
+async function readCount(label: string, q: any): Promise<Stat> {
+  try {
+    const r = await db.execute(q);
+    const rr = Array.isArray(r) ? r : (r?.rows || []);
+    const v = Number((rr[0] as any)?.n);
+    return Number.isFinite(v) ? v : 0;
+  } catch (_) {
+    unreadable.push(label);
+    return null;
   }
-} catch(e) {}
+}
+
+stats = {
+  leads: await readCount('lead queue', sql`SELECT COUNT(*)::int AS n FROM hei_leads WHERE status NOT IN ('promoted','dismissed')`),
+  drafts: await readCount('draft findings', sql`SELECT COUNT(*)::int AS n FROM hei_findings WHERE status = 'draft'`),
+  replies: await readCount('right-of-reply', sql`SELECT COUNT(*)::int AS n FROM hei_right_of_reply WHERE status IN ('sent','pending')`),
+  published: await readCount('published institutions', sql`SELECT COUNT(*)::int AS n FROM hei_institutions WHERE is_published = true`),
+  sources: await readCount('ingestion sources', sql`SELECT COALESCE(SUM(sources_count),0)::int AS n FROM hei_crawlers WHERE status = 'active'`),
+  surveys: await readCount('survey responses', sql`SELECT COUNT(*)::int AS n FROM hei_survey_responses`),
+  rti: await readCount('RTI filings', sql`SELECT COUNT(*)::int AS n FROM hei_rti_filings`),
+  coverage: await readCount('institutions covered', sql`SELECT COUNT(*)::int AS n FROM hei_institutions`),
+  legal: await readCount('legal queue', sql`SELECT COUNT(*)::int AS n FROM hei_legal_queue WHERE status = 'open'`),
+};
+
+/** A count for display: the number when it was read, an honest dash when it was not. */
+function statText(v: Stat): string { return v === null ? '--' : String(v); }
 
 // Leads
 try {
@@ -239,13 +254,19 @@ const pipeline = [
   <div class="hx-head">
     <div>
       <p class="hx-eyebrow">HEI · Editorial Control Plane</p>
-      <h1 class="hx-title">{greeting}, {firstName}. {stats.drafts > 0 ? `${stats.drafts} finding${stats.drafts > 1 ? 's' : ''} awaiting review.` : 'The desk is clear.'}</h1>
+      <h1 class="hx-title">{greeting}, {firstName}. {stats.drafts === null ? 'The review queue could not be read.' : (stats.drafts > 0 ? `${stats.drafts} finding${stats.drafts > 1 ? 's' : ''} awaiting review.` : 'The desk is clear.')}</h1>
       <p class="hx-sub">
-        {stats.coverage} institutions tracked · continuous ingestion across {stats.sources} sources.
-        {stats.leads > 0 ? ` ${stats.leads} lead${stats.leads>1?'s':''} in queue.` : ''}
-        {stats.replies > 0 ? ` ${stats.replies} in the right-of-reply window.` : ''}
-        {stats.legal > 0 ? ` ${stats.legal} in legal review.` : ''}
+        {statText(stats.coverage)} institutions tracked · continuous ingestion across {statText(stats.sources)} sources.
+        {stats.leads !== null && stats.leads > 0 ? ` ${stats.leads} lead${stats.leads>1?'s':''} in queue.` : ''}
+        {stats.replies !== null && stats.replies > 0 ? ` ${stats.replies} in the right-of-reply window.` : ''}
+        {stats.legal !== null && stats.legal > 0 ? ` ${stats.legal} in legal review.` : ''}
       </p>
+      {unreadable.length > 0 && (
+        <p style="margin:10px 0 0;padding:10px 12px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.1);border-radius:9px;color:#fca5a5;font-size:12.5px;line-height:1.6;max-width:640px;">
+          Shown as <strong>--</strong> because it could not be read: {unreadable.join(', ')}.
+          These datasets have no table in this deployment, so treat any all-clear on this page as unconfirmed.
+        </p>
+      )}
     </div>
     <div style="text-align:right;">
       <div class="hx-live"><span class="hx-dot"></span>{activeCrawlers} pipeline{activeCrawlers===1?'':'s'} active</div>
@@ -267,7 +288,7 @@ const pipeline = [
               <span class="hx-node-ic" style={`background:${n.color}1f;color:${n.color};`}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" set:html={PIPE_ICON[n.key]}></svg>
               </span>
-              <span class="hx-node-count" style={`color:${n.count>0?'#fff':'#3a3a45'};`}>{n.count}</span>
+              <span class="hx-node-count" style={`color:${n.count===null?'#6e6e78':(n.count>0?'#fff':'#3a3a45')};`} title={n.count===null?'This count could not be read':''}>{statText(n.count)}</span>
             </div>
             <div><div class="hx-node-label">{n.label}</div><div class="hx-node-sub">{n.sub}</div></div>
           </a>
@@ -281,10 +302,10 @@ const pipeline = [
 
   <!-- KPI row -->
   <div class="hx-kpis">
-    <a href="/admin/hei/surveys" class="hx-kpi"><div class="hx-kpi-num" style="color:#a78bfa;">{stats.surveys}</div><div class="hx-kpi-label">Survey responses</div></a>
-    <a href="/admin/hei/rti" class="hx-kpi"><div class="hx-kpi-num" style="color:#f97316;">{stats.rti}</div><div class="hx-kpi-label">RTI filings tracked</div></a>
-    <a href="/admin/hei/legal" class="hx-kpi"><div class="hx-kpi-num" style="color:#ef4444;">{stats.legal}</div><div class="hx-kpi-label">Legal queue (open)</div></a>
-    <a href="/admin/hei/institutions" class="hx-kpi"><div class="hx-kpi-num" style="color:#10b981;">{stats.coverage}</div><div class="hx-kpi-label">Institutions covered</div></a>
+    <a href="/admin/hei/surveys" class="hx-kpi"><div class="hx-kpi-num" style={'color:' + (stats.surveys === null ? '#6e6e78' : '#a78bfa') + ';'}>{statText(stats.surveys)}</div><div class="hx-kpi-label">{stats.surveys === null ? 'Survey responses (not available)' : 'Survey responses'}</div></a>
+    <a href="/admin/hei/rti" class="hx-kpi"><div class="hx-kpi-num" style={'color:' + (stats.rti === null ? '#6e6e78' : '#f97316') + ';'}>{statText(stats.rti)}</div><div class="hx-kpi-label">{stats.rti === null ? 'RTI filings (not available)' : 'RTI filings tracked'}</div></a>
+    <a href="/admin/hei/legal" class="hx-kpi"><div class="hx-kpi-num" style={'color:' + (stats.legal === null ? '#6e6e78' : '#ef4444') + ';'}>{statText(stats.legal)}</div><div class="hx-kpi-label">{stats.legal === null ? 'Legal queue (not available)' : 'Legal queue (open)'}</div></a>
+    <a href="/admin/hei/institutions" class="hx-kpi"><div class="hx-kpi-num" style={'color:' + (stats.coverage === null ? '#6e6e78' : '#10b981') + ';'}>{statText(stats.coverage)}</div><div class="hx-kpi-label">{stats.coverage === null ? 'Institutions covered (not available)' : 'Institutions covered'}</div></a>
   </div>
 
   <!-- Two-column work area -->

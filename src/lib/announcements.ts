@@ -861,6 +861,61 @@ export async function locationOptions(): Promise<ScopeOption[]> {
   }
 }
 
+export interface ScopeChoice {
+  audience: AnnouncementAudience;
+  scopeId: string | null;
+  scopeLabel: string;
+}
+
+/**
+ * ONE SELECT, NOT TWO, AND NO CLIENT JAVASCRIPT.
+ *
+ * The compose form offers a single list — "Everyone in the company", then the departments, then the
+ * projects, then the locations — and the value carries both halves as `audience:scope`. Two coupled
+ * selects would need a script to keep them in step, and a script inside a JSX conditional breaks
+ * .astro parsing here; three always-visible scope selects would ask the publisher to ignore two of
+ * them. This asks one question once.
+ *
+ * THE LABEL IS RESOLVED FROM THE OPTIONS THE SERVER BUILT, never from the posted text, so a hand-
+ * crafted request cannot put an arbitrary string on an announcement, and an id that is not in the
+ * list falls back to "everyone in the company" being REFUSED rather than silently published to all.
+ */
+export function parseScopeChoice(raw: unknown, options: {
+  departments?: ScopeOption[];
+  projects?: ScopeOption[];
+  locations?: ScopeOption[];
+}): { ok: boolean; error?: string; value?: ScopeChoice } {
+  const s = String(raw ?? '').trim();
+  if (!s || s === 'company') {
+    return { ok: true, value: { audience: 'company', scopeId: null, scopeLabel: '' } };
+  }
+  const cut = s.indexOf(':');
+  if (cut < 0) return { ok: false, error: 'Pick who this announcement is for.' };
+  const audience = s.slice(0, cut);
+  const scopeId = s.slice(cut + 1).trim().slice(0, SCOPE_MAX);
+  if (!isAnnouncementAudience(audience) || audience === 'company' || !scopeId) {
+    return { ok: false, error: 'Pick who this announcement is for.' };
+  }
+  const pool =
+    audience === 'department' ? options.departments || []
+    : audience === 'project' ? options.projects || []
+    : options.locations || [];
+  const found = pool.find((o) => o.id === scopeId);
+  if (!found) {
+    return {
+      ok: false,
+      error: 'That ' + audience + ' is not on the list any more. Pick again — nothing was saved.',
+    };
+  }
+  return { ok: true, value: { audience, scopeId, scopeLabel: found.label } };
+}
+
+/** The value a stored announcement corresponds to, so the edit form re-selects the right option. */
+export function scopeChoiceValue(a: Announcement): string {
+  if (a.audience === 'company' || !a.scopeId) return 'company';
+  return a.audience + ':' + a.scopeId;
+}
+
 /**
  * THE USER IDS AN AUDIENCE REACHES. Used to notify, and to count.
  *

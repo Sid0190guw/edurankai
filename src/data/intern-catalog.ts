@@ -11,18 +11,26 @@
 // Imported alongside ROLE_CATALOG via the existing gap-filling "Import role catalog" button
 // in /admin/roles: idempotent by slug/title, never overwrites an edited role.
 import type { CatalogRole } from './role-catalog';
+import {
+  ENGAGEMENT_POLICIES, hoursPerWeek, projectHoursPerDay, wellbeingHoursPerDay,
+} from '@/lib/engagement-policy';
 
 const REMOTE_IN = 'Remote / Hybrid (India)';
+const INTERN_POLICY = ENGAGEMENT_POLICIES['Intern'];
 
-// Shared "Terms of Engagement" — the standard internship structure across the whole catalog,
-// matching the founder's specified 6-day week / ~40 hour split (project work + holistic
-// well-being time), unless a specific role overrides it.
+// Shared "Terms of Engagement" — the standard internship structure across the whole catalog.
+//
+// The numbers are READ FROM src/lib/engagement-policy.ts rather than typed here. They were typed
+// here, and again in the careers page, and in two admin offer forms, and in two policy pages, and
+// by the time anyone compared them they gave six different answers to "how many hours?". The 1.67
+// was itself a rounding artefact of 1 hour 40 minutes that never added up: six days of 1.67 is
+// 10.02 hours, and twelve weeks of that is 120.24.
 const STANDARD_TERMS = {
   internshipMode: 'Full-Time' as const,
-  workingDaysPerWeek: 6,
-  hoursPerWeek: 40,
-  projectHoursPerDay: 5,
-  wellbeingHoursPerDay: 1.67,
+  workingDaysPerWeek: INTERN_POLICY.daysPerWeek ?? 6,
+  hoursPerWeek: hoursPerWeek(INTERN_POLICY) ?? 40,
+  projectHoursPerDay: projectHoursPerDay(INTERN_POLICY) ?? 5,
+  wellbeingHoursPerDay: wellbeingHoursPerDay(INTERN_POLICY) ?? 1.67,
   engagementNotes: [
     'Interns are expected to maintain professionalism, creativity, confidentiality, and timely completion of assigned responsibilities.',
     'Weekly mentor reviews and evaluations will be conducted.',
