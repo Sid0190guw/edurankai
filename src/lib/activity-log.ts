@@ -77,18 +77,33 @@ export interface ActivityEvent {
   clientTs?: number;
 }
 
-export async function logActivity(e: ActivityEvent): Promise<void> {
+/**
+ * Returns false when the event was NOT recorded.
+ *
+ * This is the encrypted per-session activity trail a human reads when deciding whether somebody
+ * cheated. It ended in `.catch(() => {})`, so the trail could develop silent gaps — and a gap in an
+ * evidence log is not neutral, because a reviewer reads absence as "nothing happened". Still
+ * non-fatal (a failed log line must never break a candidate's test) but no longer silent.
+ */
+export async function logActivity(e: ActivityEvent): Promise<boolean> {
   await ensureSchema();
   const { ciphertext, iv } = encrypt(e.detail || '');
-  await db.execute(sql`
-    INSERT INTO activity_events (user_id, session_id, journey_stage, ref_id, event_type, severity, minute_bucket, ciphertext, iv, client_ts)
-    VALUES (${e.userId || null}, ${e.sessionId}, ${e.stage || 'general'}, ${e.refId || null}, ${e.type}, ${e.severity || 'info'}, ${e.minuteBucket ?? null}, ${ciphertext}, ${iv}, ${e.clientTs || null})
-  `).catch(() => {});
+  try {
+    await db.execute(sql`
+      INSERT INTO activity_events (user_id, session_id, journey_stage, ref_id, event_type, severity, minute_bucket, ciphertext, iv, client_ts)
+      VALUES (${e.userId || null}, ${e.sessionId}, ${e.stage || 'general'}, ${e.refId || null}, ${e.type}, ${e.severity || 'info'}, ${e.minuteBucket ?? null}, ${ciphertext}, ${iv}, ${e.clientTs || null})
+    `);
+    return true;
+  } catch (err: any) {
+    console.error('[activity-log] event NOT recorded for session', e.sessionId, 'type', e.type, '-', err?.cause?.message || err?.message);
+    return false;
+  }
 }
 
+/** Returns how many events were actually STORED — `n` used to count events merely attempted. */
 export async function logBatch(events: ActivityEvent[]): Promise<number> {
   let n = 0;
-  for (const e of events.slice(0, 200)) { await logActivity(e); n++; }
+  for (const e of events.slice(0, 200)) { if (await logActivity(e)) n++; }
   return n;
 }
 

@@ -125,7 +125,12 @@ export async function reviewDoc(id: number, status: DocStatus, by: string, note?
     const { logAudit } = await import('@/lib/audit');
     await logAudit({ userId: by, action: 'hr.onboarding_doc.' + status, entity: 'hr_onboarding_document',
       entityId: String(id), diff: { status, note: note || null } });
-  } catch (_) {}
+  } catch (e: any) {
+    // The decision itself is already committed above, so this cannot abort — but audit_log is the
+    // ONLY record of who verified a new hire's credential and why, and a bare catch here meant that
+    // record could vanish with nothing anywhere noting that it had.
+    console.error('[hr-onboarding] the audit record for document', id, 'review by', by, 'was NOT written -', e?.cause?.message || e?.message);
+  }
 }
 /** Everything awaiting HR, newest first, with who submitted it. */
 export async function pendingForReview(limit = 100): Promise<any[]> {

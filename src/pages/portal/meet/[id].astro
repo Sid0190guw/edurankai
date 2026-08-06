@@ -185,6 +185,22 @@ if (Astro.request.method === 'POST' && room) {
       if (t) await db.execute(sql`UPDATE meet_rooms SET title=${t} WHERE id=${room.id}::uuid`);
       actionResult = { ok: true };
     }
+
+    // A REFUSAL IS NOT A SUCCESS. Four of the branches above are `&& isHost`, so a non-host who
+    // posts create_poll, create_breakout, end, lock or set_title matches NO branch at all:
+    // actionResult stayed null, the status stayed 200, and the client — which reads only the status
+    // — toasted "Poll launched" over a poll that was never created. An unmatched action now answers
+    // 403 so the honest message the client already prints for a failure can actually fire.
+    if (!actionResult) {
+      const hostOnly = ['create_poll', 'create_breakout', 'end', 'lock', 'set_title'];
+      actionResult = {
+        ok: false,
+        error: hostOnly.indexOf(actionName) >= 0
+          ? 'Only the host can do that.'
+          : 'That action was not recognised.',
+      };
+      Astro.response.status = 403;
+    }
   } catch (e: any) {
     // NOT swallowed, and NOT reported as success. Every client action here is a fetch() to this same
     // URL that reads `r.ok` and nothing else — and the page answered 200 whatever happened, because
@@ -937,9 +953,18 @@ const myDisplayName = user.email?.split('@')[0] || 'Guest';
         <section class="mt-panel-section" data-tab-body="people">
           <input class="mt-pl-search" id="peopleSearch" placeholder="Search people..."/>
 
+          {/* "MUTE ALL" IS GONE, AND IT IS BETTER GONE THAN PRESENT.
+              Its handler called toggleMic() — the HOST's own microphone — and then toasted "Asked
+              all to mute". There is no mute action in the server handler at all (the only actions
+              are join, chat, create_poll, vote, create_breakout, end, lock and set_title) and no
+              signalling path that could carry the request to a peer. So the button muted the one
+              person it was not aimed at, claimed an authority over the room that does not exist,
+              and did the opposite of what it said on the second click.
+              Removed rather than left in place: a control that lies about what it did is worse than
+              a control that is absent. Restoring it means adding a real server action and a peer
+              signal, not re-binding this button. */}
           {isHost && (
             <div style="display:flex;gap:6px;margin-bottom:10px;">
-              <button class="mt-btn" id="muteAllBtn" style="flex:1;">Mute all</button>
               <button class="mt-btn" id="lockBtn" style="flex:1;">{isLocked ? 'Unlock' : 'Lock'}</button>
             </div>
           )}
@@ -2246,7 +2271,17 @@ async function submitPoll() {
   fd.append('action', 'create_poll');
   fd.append('question', q);
   fd.append('options', JSON.stringify(opts));
-  await fetch(location.pathname, { method: 'POST', body: fd });
+  // READ THE RESPONSE BEFORE CLAIMING ANYTHING. This used to fire the POST, ignore what came back,
+  // close the sheet and toast "Poll launched" — so a non-host, an expired session and a 500 all
+  // produced the same confident message over a poll that does not exist.
+  let ok = false;
+  try {
+    const r = await fetch(location.pathname, { method: 'POST', body: fd });
+    ok = r.ok;
+  } catch (e) {
+    ok = false;
+  }
+  if (!ok) { toast('The poll was not created. You may not be the host, or the connection dropped.'); return; }
   closeModal('pollModal');
   toast('Poll launched');
   setTimeout(() => location.reload(), 500);
@@ -2257,8 +2292,15 @@ async function votePoll(pollId, choice) {
   fd.append('action', 'vote');
   fd.append('poll_id', pollId);
   fd.append('choice', choice);
-  await fetch(location.pathname, { method: 'POST', body: fd });
-  toast('Vote recorded');
+  // A vote that never reached the server was indistinguishable from one that did.
+  let ok = false;
+  try {
+    const r = await fetch(location.pathname, { method: 'POST', body: fd });
+    ok = r.ok;
+  } catch (e) {
+    ok = false;
+  }
+  toast(ok ? 'Vote recorded' : 'Your vote did not reach the room. Try again.');
 }
 
 /* ==========================================================================
@@ -2270,6 +2312,10 @@ async function submitBreakouts() {
   const prefix = ($('#boPrefix').value || 'Group').trim().slice(0, 60);
   // Round-robin split of non-host participants
   const pool = state.participants.filter(p => p.id !== userId).map(p => p.name);
+  // COUNT WHAT ACTUALLY OPENED. This fired N posts, read none of them, and then announced N rooms —
+  // so a host refused by the server was told they had opened rooms that do not exist, and every
+  // participant was left waiting to be moved into one.
+  let opened = 0;
   for (let i = 0; i < count; i++) {
     const members = pool.filter((_, idx) => idx % count === i);
     const fd = new FormData();
@@ -2277,10 +2323,19 @@ async function submitBreakouts() {
     fd.append('label', `${prefix} ${i+1}`);
     fd.append('participants', JSON.stringify(members));
     fd.append('minutes', String(mins));
-    await fetch(location.pathname, { method: 'POST', body: fd });
+    try {
+      const r = await fetch(location.pathname, { method: 'POST', body: fd });
+      if (r.ok) opened++;
+    } catch (e) { /* counted as not opened */ }
+  }
+  if (opened === 0) {
+    toast('No breakout room was opened. You may not be the host, or the connection dropped.');
+    return;
   }
   closeModal('boModal');
-  toast(`Opened ${count} breakouts`);
+  toast(opened === count
+    ? `Opened ${opened} breakouts`
+    : `Opened only ${opened} of ${count} breakouts — the rest failed.`);
   setTimeout(() => location.reload(), 500);
 }
 
@@ -2546,6 +2601,27 @@ function closeModal(id) { $('#' + id).classList.remove('open'); }
    ========================================================================== */
 async function endCall() {
   if (!confirm(isHost ? 'End the meeting for everyone?' : 'Leave the meeting?')) return;
+
+  // THE HOST ANSWERED "END THE MEETING FOR EVERYONE?" WITH YES, AND THAT HAS TO BE TRUE.
+  //
+  // This POST used to sit inside `try { ... } catch {}` AFTER the media teardown, and the function
+  // navigated to /portal regardless — so if the request never landed, the host left and the room
+  // stayed open for every other participant, with nothing said. It runs FIRST now, before any track
+  // is stopped, so a host who is told it failed still has a working camera and microphone and is
+  // still in the meeting they meant to close.
+  if (isHost) {
+    const fd = new FormData(); fd.append('action', 'end');
+    let ended = false;
+    try {
+      const r = await fetch(location.pathname, { method: 'POST', body: fd });
+      ended = r.ok;
+    } catch (e) { ended = false; }
+    if (!ended) {
+      alert('The meeting could NOT be ended for everyone — the room is still open and the others can stay in it. You have not left. Check your connection and try again.');
+      return;
+    }
+  }
+
   try {
     stopRecording();
     stopCaptions();
@@ -2553,11 +2629,10 @@ async function endCall() {
     if (state.screenStream) state.screenStream.getTracks().forEach(t => t.stop());
     if (state.pcLocal) state.pcLocal.close();
     if (state.pcRemote) state.pcRemote.close();
-    if (isHost) {
-      const fd = new FormData(); fd.append('action', 'end');
-      await fetch(location.pathname, { method: 'POST', body: fd });
-    }
-  } catch {}
+  } catch (e) {
+    // Local teardown is best effort and must never trap somebody in the call — but say why.
+    console.error('[meet] endCall local teardown failed', e);
+  }
   location.href = '/portal';
 }
 
@@ -2611,7 +2686,14 @@ async function init() {
       clearTimeout(titleTimer);
       titleTimer = setTimeout(async () => {
         const fd = new FormData(); fd.append('action', 'set_title'); fd.append('title', titleInp.value);
-        await fetch(location.pathname, { method: 'POST', body: fd });
+        // The response was ignored, so a host could keep typing a title that was never saved and
+        // find the old one still there after a reload.
+        try {
+          const r = await fetch(location.pathname, { method: 'POST', body: fd });
+          if (!r.ok) toast('The room title was not saved.');
+        } catch (e) {
+          toast('The room title was not saved — you appear to be offline.');
+        }
       }, 600);
     });
   }
@@ -2660,10 +2742,17 @@ async function init() {
     $('#pollSubmit')?.addEventListener('click', submitPoll);
     $('#createBreakoutBtn')?.addEventListener('click', () => openModal('boModal'));
     $('#boSubmit')?.addEventListener('click', submitBreakouts);
-    $('#muteAllBtn')?.addEventListener('click', () => { toggleMic(); toast('Asked all to mute'); });
+    // The Mute all binding is gone with its button — see the note beside the People panel markup.
     $('#lockBtn')?.addEventListener('click', async () => {
       const fd = new FormData(); fd.append('action', 'lock'); fd.append('locked', isLockedFlag ? '0' : '1');
-      await fetch(location.pathname, { method: 'POST', body: fd });
+      // A rejected lock used to reload to an unchanged room with no explanation, which reads as
+      // "the room is unlocked" — the opposite of what the host just asked for.
+      let ok = false;
+      try {
+        const r = await fetch(location.pathname, { method: 'POST', body: fd });
+        ok = r.ok;
+      } catch (e) { ok = false; }
+      if (!ok) { toast('The room lock did not change. Try again.'); return; }
       location.reload();
     });
   }

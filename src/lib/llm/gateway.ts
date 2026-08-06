@@ -124,7 +124,13 @@ export async function logUsage(userId: string | null, feature: string, c: LlmCon
     await ensureLlmSchema();
     await db.execute(sql`INSERT INTO ai_usage_log (user_id, feature, provider, model, prompt_chars, completion_chars, prompt_tokens, completion_tokens, latency_ms, status)
       VALUES (${userId}, ${feature}, ${c.provider}, ${activeModel(c)}, ${promptChars}, ${completionChars}, ${pt ?? null}, ${ct ?? null}, ${latencyMs}, ${status})`);
-  } catch (_) {}
+  } catch (e: any) {
+    // This table is BOTH the cost record and the input to underRateLimit(). A row lost here makes
+    // spend attribution drift and slackens the rate limit by exactly one request, and a bare catch
+    // meant nothing anywhere showed that it was happening. Still non-fatal: a lost log line must
+    // never fail the user's actual request.
+    console.error('[llm] ai_usage_log write failed for feature', feature, '-', e?.cause?.message || e?.message);
+  }
 }
 
 export async function logTrainingExample(userId: string | null, feature: string, c: LlmConfig, system: string, messages: ChatMessage[], completion: string): Promise<void> {
@@ -133,7 +139,11 @@ export async function logTrainingExample(userId: string | null, feature: string,
     await ensureLlmSchema();
     await db.execute(sql`INSERT INTO ai_training_example (user_id, feature, provider, model, system, messages, completion)
       VALUES (${userId}, ${feature}, ${c.provider}, ${activeModel(c)}, ${system.slice(0, 8000)}, ${JSON.stringify(messages).slice(0, 60000)}::jsonb, ${completion.slice(0, 20000)})`);
-  } catch (_) {}
+  } catch (e: any) {
+    // An administrator switched training capture ON. If the corpus is silently losing rows, the
+    // setting is telling them something that is not happening.
+    console.error('[llm] ai_training_example write failed for feature', feature, '-', e?.cause?.message || e?.message);
+  }
 }
 
 /**

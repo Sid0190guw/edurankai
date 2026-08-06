@@ -16,6 +16,10 @@ if (!id) return Astro.redirect('/admin/applications');
 
 let errorMsg = '';
 let successMsg = '';
+// Declared before the POST handler that assigns it. There is NO EMAIL FALLBACK on this page, so the
+// push is the only thing that tells a candidate an offer exists — and it sat inside a bare catch
+// while the page printed "Offer sent." A candidate who is never told has not been sent anything.
+let candidateNotTold = '';
 
 const found = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
 if (found.length === 0) return Astro.redirect('/admin/applications');
@@ -109,7 +113,12 @@ if (Astro.request.method === 'POST') {
           body: 'Offer extended to the candidate. A formal offer letter will follow.',
           isSystem: true
         });
-      } catch (_) {}
+      } catch (e: any) {
+        // The thread entry is what the candidate reads on their application page. The stage change
+        // above has committed, so this cannot abort — but it must not vanish either.
+        console.error('[offer-letter] the "offer extended" thread message was not written for', id, '-', e?.cause?.message || e?.message);
+        candidateNotTold = 'The offer stage was recorded, but the note explaining it was NOT added to the candidate\'s thread.';
+      }
       // Nothing on this page notified anyone: this branch bypasses [id].astro entirely, so
       // neither pushNotify.applicationStatus nor pushApplicant.offerExtended ran, and this file
       // sends no email either. The candidate learned about their offer only if an admin told them
@@ -129,7 +138,12 @@ if (Astro.request.method === 'POST') {
             url: '/portal/applications/' + id,
             tag: 'offer-extended-' + id,
           });
-        } catch (_) {}
+        } catch (e: any) {
+          console.error('[offer-letter] "offer extended" notification failed for', id, '-', e?.cause?.message || e?.message);
+          candidateNotTold = 'The candidate was NOT notified that an offer has been extended — tell them yourself.';
+        }
+      } else {
+        candidateNotTold = 'This application has no portal account attached, so the candidate could not be notified that an offer has been extended.';
       }
       try {
         const { sendPushToAdmins } = await import('@/lib/push');
@@ -140,7 +154,10 @@ if (Astro.request.method === 'POST') {
           url: '/admin/applications/' + id,
           tag: 'offer-extended-admin-' + id,
         }, user.id);
-      } catch (_) {}
+      } catch (e: any) {
+        // Admin-side notice only — never blocks the offer, but never silent either.
+        console.error('[offer-letter] admin notification failed -', e?.cause?.message || e?.message);
+      }
       app.status = 'offer';
       successMsg = 'Offer extension confirmed. Application stage is now "Offer". Send the formal letter below when ready.';
     } else if (action === 'generate') {
@@ -243,7 +260,12 @@ if (Astro.request.method === 'POST') {
                   url: '/portal/offer/' + existingOffer.token,   // straight to the signable document
                   tag: 'offer-letter-' + id,
                 });
-              } catch (_) {}
+              } catch (e: any) {
+                console.error('[offer-letter] candidate notification failed for application', id, '-', e?.cause?.message || e?.message);
+                candidateNotTold = 'The candidate was NOT notified that their offer letter is ready — send them the link yourself.';
+              }
+            } else {
+              candidateNotTold = 'This offer has no portal account attached, so nobody could be notified — send the candidate the link yourself.';
             }
             try {
               const { sendPushToAdmins } = await import('@/lib/push');
@@ -254,7 +276,10 @@ if (Astro.request.method === 'POST') {
                 url: '/admin/applications/' + id,
                 tag: 'offer-letter-admin-' + id,
               }, user.id);
-            } catch (_) {}
+            } catch (e: any) {
+              // Admin-side notice only — never blocks the offer, but never silent either.
+              console.error('[offer-letter] admin notification failed -', e?.cause?.message || e?.message);
+            }
             successMsg = acct?.isNew
               ? 'Offer sent. TEMPORARY PASSWORD (copy now, shown once): ' + tempPw + ' — email ' + candidateEmail + (acct.handle ? ' OR handle ' + acct.handle : '') + '. Token: ' + existingOffer.token + '.'
               : 'Offer sent. Token: ' + existingOffer.token + '.';
@@ -318,7 +343,12 @@ if (Astro.request.method === 'POST') {
                   url: '/portal/offer/' + token,   // straight to the signable document
                   tag: 'offer-letter-' + id,
                 });
-              } catch (_) {}
+              } catch (e: any) {
+                console.error('[offer-letter] candidate notification failed for application', id, '-', e?.cause?.message || e?.message);
+                candidateNotTold = 'The candidate was NOT notified that their offer letter is ready — send them the link yourself.';
+              }
+            } else {
+              candidateNotTold = 'No portal account was created for this candidate, so nobody could be notified — send them the offer link yourself.';
             }
             try {
               const { sendPushToAdmins } = await import('@/lib/push');
@@ -329,7 +359,10 @@ if (Astro.request.method === 'POST') {
                 url: '/admin/applications/' + id,
                 tag: 'offer-letter-admin-' + id,
               }, user.id);
-            } catch (_) {}
+            } catch (e: any) {
+              // Admin-side notice only — never blocks the offer, but never silent either.
+              console.error('[offer-letter] admin notification failed -', e?.cause?.message || e?.message);
+            }
             if (accountIsNew) {
               successMsg = 'Offer letter sent. Login at edurankai.in/admin/login with email ' + candidateEmail + (internalHandle ? ' OR handle ' + internalHandle : '') + '. TEMPORARY PASSWORD (shown once, copy now and send to the candidate): ' + plaintextPw + ' — they should change it after first sign-in. Offer token: ' + token + '.';
             } else {
@@ -349,8 +382,16 @@ if (Astro.request.method === 'POST') {
       successMsg = 'Offer withdrawn.';
     }
   } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown');
+    // `.message` on a drizzle error is only the failed SQL; the reason lives on `.cause`.
+    const real = err?.cause?.message || err?.message;
+    console.error('[offer-letter] action failed for application', id, '-', real);
+    errorMsg = 'Failed: ' + (real || 'Unknown');
   }
+
+  // "Offer sent." was printed whatever happened to the notification. It is still printed — the
+  // letter IS sent and the token IS valid — but the one thing that reaches the candidate is now
+  // reported separately when it did not happen.
+  if (candidateNotTold) errorMsg = (errorMsg ? errorMsg + ' ' : '') + candidateNotTold;
 
   const refresh = await db.select().from(offerLetters).where(eq(offerLetters.applicationId, id)).limit(1);
   existingOffer = refresh.length > 0 ? refresh[0] : null;

@@ -9,7 +9,21 @@ import { sql } from 'drizzle-orm';
 import { holdsCapability, decidesEveryRequest, type ApprovalCapability } from '@/lib/auth/capability';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
-async function safe(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
+/**
+ * A read that answers "nothing" rather than throwing.
+ *
+ * KEPT for the LIST screens, where an empty table and an unreadable one both render as "no rows"
+ * and neither is dangerous. It is NOT used by creditPayrollRun() any more: there, an empty list was
+ * indistinguishable from "already credited" and turned a total wallet-credit failure into a
+ * reassuring message. Note that getBalance() still reports ₹0 on a failed read — that is a wrong
+ * number shown to an employee, so the reason is at least on the log now instead of nowhere.
+ */
+async function safe(q: any): Promise<any[]> {
+  try { return rows(await db.execute(q)); } catch (e: any) {
+    console.error('[hr-wallet] read failed, returning no rows:', e?.cause?.message || e?.message);
+    return [];
+  }
+}
 
 /**
  * THE DUPLICATE IS GONE. `holdsHrCapability` was a byte-for-byte copy of holdsCapability() in

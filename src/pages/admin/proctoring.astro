@@ -5,7 +5,8 @@
 // which event types are recorded.
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { can } from '@/lib/rbac';
-import { proctoredAttempts, eventsForSession, getEnabledTypes, EVENT_TYPES } from '@/lib/proctor';
+import { flashFailed } from '@/lib/flash-tone';
+import { proctoredAttempts, eventsForSession, getEnabledTypes, setEnabledTypes, EVENT_TYPES } from '@/lib/proctor';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -13,9 +14,65 @@ const gate = await can(user, 'audit', { type: 'proctoring' });
 if (!gate.allow) return Astro.redirect('/admin');
 const canConfigure = (await can(user, 'configure', { type: 'proctoring' })).allow;
 
+// -------------------------------------------------------------------------------------------
+// THE ONLY WRITE ON THIS PAGE POSTS NATIVELY NOW.
+//
+// It was a type="button" with an inline click handler calling fetch(). Three things were wrong
+// with that, and the third is the one that hurts:
+//
+//   1. No form. With scripting off, slow, or thrown, "Save policy" was a coloured rectangle. The
+//      page is tappable long before an inline script has run on a mid-range Android.
+//   2. The fetch had a .then() and no .catch(). A dropped connection — the normal condition on the
+//      network these people are actually on — rejected the promise, nothing was written, and NO
+//      message appeared. The reader had every reason to believe the policy had been saved.
+//   3. What this setting controls is which proctoring signals are RECORDED against a candidate.
+//      Silently failing to save it means the console keeps showing yesterday's policy while a
+//      human makes advisory decisions about real people from it.
+//
+// PAGE_PATH, MSG and the redirect helper are declared BEFORE the handler on purpose: `const` is
+// not hoisted, and a const referenced from above its declaration throws on the handler's first
+// line while the page still renders as though nothing happened.
+//
+// The gate here is the SAME one /api/admin/proctoring enforces — can(configure, proctoring) — and
+// it is re-asked at the write rather than inferred from the button having been rendered.
+// -------------------------------------------------------------------------------------------
+const PAGE_PATH = '/admin/proctoring';
+
+if (Astro.request.method === 'POST') {
+  let redirectTo = PAGE_PATH;
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+    const back = String(fd.get('s') || '').trim();
+    const suffix = back ? '&s=' + encodeURIComponent(back) : '';
+    if (action !== 'set_policy') {
+      redirectTo = PAGE_PATH + '?msg=' + encodeURIComponent('That is not something this page does.') + suffix;
+    } else if (!canConfigure) {
+      redirectTo = PAGE_PATH + '?msg=' + encodeURIComponent('Nothing was saved: changing the proctoring policy needs the configure permission.') + suffix;
+    } else {
+      // Only names this build knows. An unrecognised type posted from anywhere is dropped rather
+      // than stored, so the recorded-signal list can never contain something no reader understands.
+      const posted = fd.getAll('types').map((t) => String(t));
+      const types = posted.filter((t) => (EVENT_TYPES as readonly string[]).includes(t));
+      await setEnabledTypes(types);
+      redirectTo = PAGE_PATH + '?msg=' + encodeURIComponent(
+        types.length === 0
+          ? 'Saved. No signal types are recorded now, so no new proctoring events will be written.'
+          : 'Saved. ' + types.length + ' signal type' + (types.length === 1 ? '' : 's') + ' will be recorded.',
+      ) + suffix;
+    }
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[admin/proctoring POST]', e?.cause?.message || e?.message, e?.stack);
+    redirectTo = PAGE_PATH + '?msg=' + encodeURIComponent('Nothing was saved: ' + (e?.cause?.message || e?.message || 'the policy could not be written.'));
+  }
+  return Astro.redirect(redirectTo);
+}
+
 const attempts = await proctoredAttempts(50).catch(() => []);
 const enabled = await getEnabledTypes().catch(() => [...EVENT_TYPES]);
 const sel = (Astro.url.searchParams.get('s') || '').trim();
+const msg = (Astro.url.searchParams.get('msg') || '').trim();
 const events = sel ? await eventsForSession(sel).catch(() => []) : [];
 
 const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;margin-bottom:16px;';
@@ -28,15 +85,34 @@ function fmt(ms: any) { try { return new Date(Number(ms)).toLocaleString('en-IN'
     <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px;">ATLAS proctoring</p>
     <h1 style="font-size:22px;font-weight:800;color:#fff;margin:0;">Proctor review</h1>
     <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;max-width:760px;line-height:1.55;">Text signals only — no video/audio/images ever leave a student's device. Risk is <b>advisory</b>: a human reviews and decides; nothing here penalizes a candidate automatically.</p>
-    <div id="msg" style="display:none;margin:12px 0;padding:9px 13px;border-radius:8px;font-size:13px;"></div>
+    {/* The result of the save, rendered by the SERVER into the response that follows it, so it is
+        present whether or not any script ran. role is alert when the sentence reports a failure and
+        status when it does not — flashFailed() reads the text rather than a second parameter. */}
+    {msg && (
+      <div role={flashFailed(msg) ? 'alert' : 'status'}
+           style={'margin:12px 0;padding:9px 13px;border-radius:8px;font-size:13px;' + (flashFailed(msg)
+             ? 'background:rgba(239,68,68,0.12);color:#fca5a5;'
+             : 'background:rgba(16,185,129,0.12);color:#6ee7b7;')}>{msg}</div>
+    )}
 
     {canConfigure ? (
       <div style={CARD}>
         <p style={HD}>Policy — recorded event types</p>
-        <div style="display:flex;flex-wrap:wrap;gap:10px;">{EVENT_TYPES.map((t) => (
-          <label style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#cfd6da;"><input type="checkbox" class="polType" value={t} checked={enabled.includes(t)} /> {t}</label>
-        ))}</div>
-        <button id="polSave" type="button" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:700;padding:8px 14px;border-radius:6px;cursor:pointer;margin-top:10px;">Save policy</button>
+        {/* A real form. The checkboxes share the name `types`, so the browser posts one entry per
+            ticked box and an untouched form posts none — which is the honest encoding of "record
+            nothing" rather than a special case to remember.
+            The 44px label rows are for a thumb: these were 12.5px text with a default checkbox,
+            which is roughly a 13px target on a phone. `s` rides along so saving does not throw away
+            the attempt the reviewer had open. */}
+        <form method="POST">
+          <input type="hidden" name="action" value="set_policy" />
+          {sel && <input type="hidden" name="s" value={sel} />}
+          <div style="display:flex;flex-wrap:wrap;gap:10px;">{EVENT_TYPES.map((t) => (
+            <label style="display:inline-flex;align-items:center;gap:7px;min-height:44px;padding:0 10px 0 4px;font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#cfd6da;cursor:pointer;"><input type="checkbox" name="types" value={t} checked={enabled.includes(t)} style="width:18px;height:18px;accent-color:#FF4F00;" /> {t}</label>
+          ))}</div>
+          <button type="submit" style="min-height:44px;background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:700;padding:8px 18px;border-radius:6px;cursor:pointer;margin-top:10px;">Save policy</button>
+        </form>
+        <p style="font-size:11.5px;color:#6e6e78;margin:10px 0 0;line-height:1.55;">Unticking a type stops it being recorded from now on. Signals already recorded are not removed, and nothing here penalises anybody — a human still reviews and decides.</p>
       </div>
     ) : null}
 
@@ -53,6 +129,20 @@ function fmt(ms: any) { try { return new Date(Number(ms)).toLocaleString('en-IN'
       </div>
       <div style={CARD}>
         <p style={HD}>Event log</p>
+        {/* THE FULL ACTIVITY LOG FOR THIS SESSION, WHICH WAS UNREACHABLE FROM HERE.
+            /admin/proctoring/[session] renders the decrypted activity log through
+            src/lib/activity-log.ts and NOTHING linked it — that page's own back link points at
+            /admin/tests/attempts, which does not link forward, so the only way in was to type a
+            session id into the address bar. This console shows the proctor SIGNALS; that page shows
+            what actually happened in the session. A reviewer deciding whether a signal means
+            anything needs the second one, and the whole product rule here is that a human decides.
+            Its gate is wider than this console's (signed in and not an applicant, versus
+            can(audit, proctoring) here), so everybody offered this link can open it. Full width and
+            44px tall: at 720px this column stacks under the attempt list. */}
+        {sel && (
+          <a href={'/admin/proctoring/' + encodeURIComponent(sel)}
+             style="display:flex;align-items:center;min-height:44px;margin:-4px 0 8px;color:#67e8f9;text-decoration:none;font-size:11.5px;font-family:'Geist Mono',monospace;letter-spacing:0.05em;">Open the full activity log for this session</a>
+        )}
         {!sel ? <p style="font-size:12.5px;color:#6e6e78;margin:0;">Select an attempt to review its signals.</p> :
           events.length === 0 ? <p style="font-size:12.5px;color:#6e6e78;margin:0;">No events recorded for this session.</p> :
           <div style="display:flex;flex-direction:column;gap:3px;font-family:'Geist Mono',monospace;font-size:11.5px;">{events.map((e: any) => (
@@ -62,15 +152,10 @@ function fmt(ms: any) { try { return new Date(Number(ms)).toLocaleString('en-IN'
     </div>
   </div>
 
-  <script is:inline>
-    (function () {
-      var save = document.getElementById('polSave'); if (!save) return; var msg = document.getElementById('msg');
-      save.addEventListener('click', function () {
-        var types = Array.prototype.slice.call(document.querySelectorAll('.polType:checked')).map(function (c) { return c.value; });
-        fetch('/api/admin/proctoring', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'setPolicy', enabledTypes: types }) })
-          .then(function (r) { return r.json(); }).then(function (j) { msg.style.display = 'block'; msg.textContent = j.ok ? 'Saved.' : (j.error || 'Failed'); msg.style.background = j.ok ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)'; msg.style.color = j.ok ? '#6ee7b7' : '#fca5a5'; });
-      });
-    })();
-  </script>
+  {/* THE INLINE SCRIPT IS GONE, NOT REPLACED. It was the only writer on this page and it was the
+      whole defect; leaving a decorating copy behind would put two writers on one control. The page
+      now ships zero bytes of JavaScript of its own — which on the connection these consoles are
+      opened over is the fastest version of it that has existed. /api/admin/proctoring is untouched
+      and still serves whatever else calls it. */}
   <style>@media (max-width:720px){ .proc-grid{ grid-template-columns:1fr !important; } }</style>
 </AdminLayout>

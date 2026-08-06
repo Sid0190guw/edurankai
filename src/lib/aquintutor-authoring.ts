@@ -11,7 +11,14 @@ let ready: Promise<void> | null = null;
 // Run one statement, swallow its error so a single failure never aborts the
 // rest of the bootstrap. (Previously all statements shared one try-block, so
 // one early ALTER failure skipped every later ALTER and left columns missing.)
-async function ex(q: any): Promise<void> { try { await db.execute(q); } catch (_) {} }
+async function ex(q: any): Promise<void> {
+  try { await db.execute(q); } catch (e: any) {
+    // Continuing past a failed statement is correct here — one bad ALTER must not skip every later
+    // one. Doing it in silence is not: a column that never got created shows up much later as a
+    // whole surface throwing on a name, which is how sort_order/description survived for so long.
+    console.error('[aquintutor-authoring] schema statement failed (continuing):', e?.cause?.message || e?.message);
+  }
+}
 export function ensureAquintutorAuthoringSchema(): Promise<void> {
   if (ready) return ready;
   ready = (async () => {

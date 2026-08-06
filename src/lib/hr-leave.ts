@@ -929,7 +929,11 @@ export async function cancelLeave(id: string, employeeId: string): Promise<void>
   }
 }
 
-export async function decideLeave(id: string, user: any, decision: 'approved' | 'rejected', note: string): Promise<{ ok: boolean; error?: string }> {
+/**
+ * `warning` is set when the decision WAS committed but something that should have accompanied it
+ * was not — today, the audit record. Callers reporting success should append it rather than drop it.
+ */
+export async function decideLeave(id: string, user: any, decision: 'approved' | 'rejected', note: string): Promise<{ ok: boolean; error?: string; warning?: string }> {
   await ensureLeaveSchema();
   const l = (await safe(sql`SELECT * FROM hr_leave_request WHERE id = ${id} LIMIT 1`))[0];
   if (!l) return { ok: false, error: 'Request not found.' };
@@ -956,7 +960,15 @@ export async function decideLeave(id: string, user: any, decision: 'approved' | 
       userId: String(user.id), action: 'hr.leave.' + decision, entity: 'hr_leave_request', entityId: String(id),
       diff: { employeeId: l.employee_id, leaveType: l.leave_type, days: l.days, units: l.day_units ?? l.days, unit: l.unit || 'full', from: l.start_date, to: l.end_date, byRole: role, note: note || null },
     });
-  } catch (_) {}
+  } catch (e: any) {
+    // audit.ts is the single audit surface in this codebase, and this row is the only record of WHO
+    // approved a person's leave. The decision is already committed, so this must not fail the
+    // operation — but it was a bare catch, so the accountability could disappear in total silence.
+    // The caller is handed a warning so a screen can say the decision stands and the trail does not.
+    const real = e?.cause?.message || e?.message;
+    console.error('[hr-leave] the audit record for leave', id, decision, 'was NOT written -', real);
+    return { ok: true, warning: 'The decision is saved, but it could not be written to the audit log, so there is no permanent record of who made it.' };
+  }
 
   return { ok: true };
 }
