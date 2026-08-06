@@ -231,7 +231,19 @@ function isPublicCacheable(path: string): boolean {
 }
 
 export const onRequest = defineMiddleware(async (context, next) => {
-  const path = new URL(context.request.url).pathname;
+  // NORMALISED ONCE, HERE, AND EVERY GATE BELOW READS THIS VALUE.
+  //
+  // normalisePath() was added for the canOpenAdmin gate alone, and the four other gates in this file
+  // kept testing the raw pathname with startsWith('/admin/') — so `//admin/finance` reached
+  // canOpenAdmin (which normalises) but slipped past the applicant bounce, the AquinTutor-scope
+  // bounce, the PATH_SECTION permission gate and the face-enrolment gate, all of which compared the
+  // raw string. A gate that does not recognise the path is a gate that admits, and collapsing the
+  // slashes in one place is the only way the five cannot disagree about which path they are judging.
+  //
+  // Nothing downstream sees a rewritten request: next() still runs against context.request. This
+  // value is used only to DECIDE, and for the `next=` parameter on the sign-in redirects, where the
+  // collapsed form is the one that should be returned to anyway.
+  const path = normalisePath(new URL(context.request.url).pathname);
 
   // CIRCUIT BREAKER — answered before any database work, deliberately.
   //

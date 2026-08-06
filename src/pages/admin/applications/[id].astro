@@ -17,6 +17,11 @@ if (!id) return Astro.redirect('/admin/applications');
 let app: any = null;
 let errorMsg = '';
 let successMsg = '';
+// What the HR sync actually did, kept separate from successMsg so a status change that worked and
+// an employee record that did not can be told apart on the screen. `const` is not hoisted and these
+// are assigned inside the POST handler below, so they are declared here, above it.
+let hrSyncWarning = '';
+let hrSyncNote = '';
 
 const STATUS_LABELS: Record<string, string> = {
   submitted: 'Submitted',
@@ -80,11 +85,30 @@ if (Astro.request.method === 'POST') {
           });
         }
         // Push notification to other admins
-        // HR sync: hired -> create employee, withdrawn -> offboard
+        // HR sync: hired -> create employee, withdrawn -> offboard.
+        //
+        // THE RESULT IS READ. This call used to sit inside an empty catch, and the module behind it
+        // swallowed its own exceptions too, so a failed hire produced "Status updated" and no
+        // employee record — invisible for eleven days the last time it happened. It still must not
+        // throw (the status change above already succeeded and must not be reported as having
+        // failed), but whatever it reports now goes on the screen.
         try {
           const { onApplicationStatusChange } = await import('@/lib/hr/sync');
-          await onApplicationStatusChange(id, newStatus, oldStatus || '', user.id);
-        } catch (_) {}
+          const hrSync = await onApplicationStatusChange(id, newStatus, oldStatus || '', user.id);
+          if (hrSync && !hrSync.ok) {
+            hrSyncWarning = newStatus === 'hired'
+              ? 'Status is now Hired, but NO employee record was created: ' + (hrSync.error || 'unknown reason') + ' — add them at /admin/hr/employees, or this hire exists nowhere in HR.'
+              : 'Status updated, but the employee record was NOT closed: ' + (hrSync.error || 'unknown reason') + ' — they may still hold employee access.';
+          } else if (hrSync && hrSync.action === 'created') {
+            hrSyncNote = 'Employee record created: ' + (hrSync.employeeCode || '');
+          } else if (hrSync && hrSync.action === 'already_exists') {
+            hrSyncNote = 'Already on the employee register' + (hrSync.employeeCode ? ' as ' + hrSync.employeeCode : '') + '; no second record was created.';
+          } else if (hrSync && hrSync.action === 'offboarded') {
+            hrSyncNote = 'Employee record closed.';
+          }
+        } catch (e: any) {
+          hrSyncWarning = 'Status updated, but the HR sync could not run: ' + (e?.cause?.message || e?.message || 'unknown reason');
+        }
         try {
           const { pushNotify, pushApplicant } = await import('@/lib/push');
           const appRow = await db.select({ firstName: applications.firstName, lastName: applications.lastName, id: applications.id, applicantUserId: applications.applicantUserId, roleTitleSnapshot: applications.roleTitleSnapshot }).from(applications).where(eq(applications.id, id)).limit(1);
@@ -120,7 +144,7 @@ if (Astro.request.method === 'POST') {
             });
           } catch (_) {}
         }
-        successMsg = 'Status updated and applicant notified in thread';
+        successMsg = 'Status updated and applicant notified in thread' + (hrSyncNote ? ' — ' + hrSyncNote : '');
       }
     } else if (action === 'send_message') {
       const body = (fd.get('body') as string || '').trim();

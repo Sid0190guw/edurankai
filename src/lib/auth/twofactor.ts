@@ -77,16 +77,26 @@ function safeEqStr(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
-/** Verify a 6-digit TOTP against a base32 secret, ±`window` 30s steps for clock drift. */
-export function verifyTotp(secretB32: string, token: string, window = 1): boolean {
+/**
+ * Which 30-second step a code belongs to, or null when it matches none inside the drift window.
+ *
+ * The step NUMBER is what makes single-use enforcement possible. A boolean says only "this code is
+ * valid right now", which stays true for the whole ±window and is therefore still true on a replay.
+ */
+export function matchTotpStep(secretB32: string, token: string, window = 1): number | null {
   const code = (token || '').replace(/\s/g, '');
-  if (!/^\d{6}$/.test(code)) return false;
+  if (!/^\d{6}$/.test(code)) return null;
   const secret = base32Decode(secretB32);
   const step = Math.floor(Date.now() / 1000 / 30);
   for (let i = -window; i <= window; i++) {
-    if (safeEqStr(hotp(secret, step + i), code)) return true;
+    if (safeEqStr(hotp(secret, step + i), code)) return step + i;
   }
-  return false;
+  return null;
+}
+
+/** Verify a 6-digit TOTP against a base32 secret, ±`window` 30s steps for clock drift. */
+export function verifyTotp(secretB32: string, token: string, window = 1): boolean {
+  return matchTotpStep(secretB32, token, window) !== null;
 }
 
 /** otpauth:// URI — tap it on a phone to add the account, or scan as a QR. */

@@ -107,7 +107,9 @@ export async function getBalance(employeeId: string): Promise<Balance> {
   const r = (await safe(sql`SELECT
       COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0)::float AS bal
     FROM hr_wallet_txn WHERE employee_id = ${employeeId}`))[0] || {};
-  const pend = (await safe(sql`SELECT COALESCE(SUM(amount),0)::float AS p FROM hr_withdrawal WHERE employee_id = ${employeeId} AND status IN ('pending','approved')`))[0] || {};
+  // 'paying' is money already handed to the payout channel and not yet confirmed. It is NOT available
+  // to request again, so it counts as pending exactly like 'pending' and 'approved' do.
+  const pend = (await safe(sql`SELECT COALESCE(SUM(amount),0)::float AS p FROM hr_withdrawal WHERE employee_id = ${employeeId} AND status IN ('pending','approved','paying')`))[0] || {};
   const balance = Number(r.bal || 0), pending = Number(pend.p || 0);
   return { balance, currency: 'INR', pending, available: Math.max(0, balance - pending) };
 }
@@ -235,19 +237,61 @@ export async function listBankAccounts(employeeId: string): Promise<any[]> {
 }
 export async function addBankAccount(employeeId: string, f: { holder: string; account_number: string; ifsc: string; bank_name?: string; upi_id?: string }): Promise<void> {
   await ensureWalletSchema();
-  await db.execute(sql`UPDATE hr_bank_account SET is_primary = false WHERE employee_id = ${employeeId}`).catch(() => {});
+  // WAS `.catch(() => {})`. If this demotion fails the next insert makes a SECOND primary account,
+  // and payWithdrawal pays whichever the request happened to name — with nothing anywhere saying two
+  // exist. The insert still proceeds (an account the employee can see beats no account at all), but
+  // the reason is on the log instead of nowhere.
+  await db.execute(sql`UPDATE hr_bank_account SET is_primary = false WHERE employee_id = ${employeeId}`)
+    .catch((e: any) => {
+      console.error('[hr-wallet] could not clear the previous primary bank account for employee',
+        employeeId, '- there may now be two marked primary:', e?.cause?.message || e?.message);
+    });
   await db.execute(sql`INSERT INTO hr_bank_account (employee_id, holder, account_number, ifsc, bank_name, upi_id, is_primary)
     VALUES (${employeeId}, ${f.holder.slice(0, 120)}, ${(f.account_number || '').replace(/\s/g, '').slice(0, 30)}, ${(f.ifsc || '').toUpperCase().slice(0, 15)}, ${(f.bank_name || '').slice(0, 120)}, ${(f.upi_id || '').slice(0, 80)}, true)`);
 }
 
 // ---- withdrawals ----
+/**
+ * Ask to withdraw from the wallet.
+ *
+ * THE BALANCE TEST AND THE INSERT ARE ONE STATEMENT, and that is the whole point of the shape below.
+ * It used to read the balance, compare it in JavaScript, and then insert — so two requests submitted
+ * together (a double tap, a retried POST) both saw the same available balance and both were written,
+ * and an employee could have more requested than they hold. The ledger sums and the pending sum are
+ * now computed inside the INSERT ... SELECT ... WHERE, against the same snapshot the row is written
+ * from, so the second request finds the first one already counted in `pending` and inserts nothing.
+ *
+ * Zero rows back is therefore NOT a database failure: it is the refusal, and it is reported as one
+ * with the balance re-read so the sentence names a real number.
+ */
 export async function requestWithdrawal(employeeId: string, amount: number, bankAccountId: string | null, note: string): Promise<{ ok: boolean; error?: string }> {
   await ensureWalletSchema();
-  const bal = await getBalance(employeeId);
   if (!(amount > 0)) return { ok: false, error: 'Enter an amount.' };
-  if (amount > bal.available) return { ok: false, error: 'Amount exceeds your available balance (₹' + bal.available.toFixed(2) + ').' };
-  await db.execute(sql`INSERT INTO hr_withdrawal (employee_id, amount, bank_account_id, note) VALUES (${employeeId}, ${amount}, ${bankAccountId}, ${note || null})`);
-  return { ok: true };
+  try {
+    const wrote = rows(await db.execute(sql`
+      INSERT INTO hr_withdrawal (employee_id, amount, bank_account_id, note)
+      SELECT ${employeeId}::uuid, ${amount}, ${bankAccountId}, ${note || null}
+       WHERE ${amount} <= (
+         COALESCE((SELECT SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END)
+                     FROM hr_wallet_txn WHERE employee_id = ${employeeId}::uuid), 0)
+         - COALESCE((SELECT SUM(amount) FROM hr_withdrawal
+                      WHERE employee_id = ${employeeId}::uuid AND status IN ('pending', 'approved', 'paying')), 0)
+       )
+      RETURNING id`));
+    if (!wrote.length) {
+      const bal = await getBalance(employeeId);
+      return {
+        ok: false,
+        error: 'Amount exceeds your available balance (₹' + bal.available.toFixed(2) + ').'
+          + (bal.pending > 0 ? ' ₹' + bal.pending.toFixed(2) + ' is already requested and not yet paid.' : ''),
+      };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    // NOT SWALLOWED. A request that was not written must never read as one that was.
+    console.error('[hr-wallet] requestWithdrawal failed for employee', employeeId, '-', e?.cause?.message || e?.message);
+    return { ok: false, error: 'That request could not be saved just now. Nothing was changed — try again in a moment.' };
+  }
 }
 export async function listWithdrawals(opts: { employeeId?: string; status?: string } = {}): Promise<any[]> {
   await ensureWalletSchema();
@@ -378,7 +422,11 @@ export async function decideWithdrawal(id: string, user: any, decision: 'approve
   // on every posted decision including one whose id was typed into the form by hand.
   const role = await approverRole(user, w.employee_id, 'payouts.approve');
   if (!role) return { ok: false, error: 'You are not permitted to approve this withdrawal.' };
-  await db.execute(sql`UPDATE hr_withdrawal SET status = ${decision}, decided_by = ${user.id}, decided_by_role = ${role}, decided_at = NOW(), decision_note = ${note || null} WHERE id = ${id}`);
+  // THE PRECONDITION IS RESTATED IN THE WRITE. Reading 'pending' and then updating unconditionally
+  // means two decisions landing together both take effect and the second silently overwrites the
+  // first — including an approval overwriting a rejection on a request for money.
+  const decided = rows(await db.execute(sql`UPDATE hr_withdrawal SET status = ${decision}, decided_by = ${user.id}, decided_by_role = ${role}, decided_at = NOW(), decision_note = ${note || null} WHERE id = ${id} AND status = 'pending' RETURNING id`));
+  if (!decided.length) return { ok: false, error: 'That request was decided by somebody else while this page was open. Reload it.' };
   await hrAudit(user.id, 'hr.withdrawal.' + decision, String(id),
     { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, byRole: role, note: note || null });
   return { ok: true };
@@ -412,6 +460,32 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
   // is not a value of userRoleEnum), and 'reporting_manager' was refused before and is refused now.
   if (!holdsCapability(user, 'payouts.pay')) return { ok: false, error: 'Only HR/admin can release a payout.' };
 
+  // ---- CLAIM THE REQUEST BEFORE ANY MONEY MOVES ---------------------------------------------------
+  //
+  // This function used to read status='approved', call RazorpayX, and THEN update the row. Two people
+  // pressing Release in the same second — or one person double-submitting a form on a slow phone —
+  // both read 'approved', both sent a payout instruction to the bank, and the employee was paid
+  // TWICE with two debit rows to match. Nothing on any screen said so.
+  //
+  // The claim below is a single conditional UPDATE, so exactly one caller can move a request out of
+  // 'approved'. The loser is told plainly. 'paying' is a real state that means "handed to the payout
+  // channel, not yet confirmed": it is counted as pending against the balance, and if a process dies
+  // between the claim and the bank's answer the row STAYS 'paying' rather than being retried
+  // automatically — an automatic retry there is how a payout gets sent a second time.
+  const claimed = rows(await db.execute(sql`
+    UPDATE hr_withdrawal SET status = 'paying' WHERE id = ${id} AND status = 'approved' RETURNING id`));
+  if (!claimed.length) {
+    return { ok: false, error: 'That payout is already being released, or has been released. Reload the page before trying again.' };
+  }
+  /** Put the request back where it was, so a failed payout can be retried deliberately. */
+  const releaseClaim = async (why: string) => {
+    try {
+      await db.execute(sql`UPDATE hr_withdrawal SET status = 'approved' WHERE id = ${id} AND status = 'paying'`);
+    } catch (e: any) {
+      console.error('[hr-wallet] payout', id, 'failed (' + why + ') AND the request could not be put back to approved — it is stuck at "paying":', e?.cause?.message || e?.message);
+    }
+  };
+
   let ref = manualRef || null, paidVia = 'manual';
   const KEY = process.env.RAZORPAY_KEY_ID, SEC = process.env.RAZORPAY_KEY_SECRET, ACC = process.env.RAZORPAYX_ACCOUNT_NUMBER;
   if (!manualRef && KEY && SEC && ACC && w.account_number) {
@@ -424,13 +498,52 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
           queue_if_low_balance: true, narration: 'Salary withdrawal' }),
       });
       const j: any = await res.json();
-      if (!res.ok) return { ok: false, error: 'Razorpay: ' + (j?.error?.description || res.status) };
+      if (!res.ok) {
+        await releaseClaim('gateway refused');
+        return { ok: false, error: 'Razorpay: ' + (j?.error?.description || res.status) };
+      }
       ref = j.id; paidVia = 'razorpayx';
-    } catch (e: any) { return { ok: false, error: 'Payout failed: ' + (e?.message || 'network') }; }
+    } catch (e: any) {
+      // A NETWORK ERROR IS NOT PROOF THE PAYOUT DID NOT HAPPEN. The instruction may have reached the
+      // bank; the answer did not reach us. So the request is left at 'paying' for a human to check
+      // against the payout channel rather than put back where a second press would resend it.
+      console.error('[hr-wallet] payout request to RazorpayX did not return for withdrawal', id, '-', e?.message);
+      return {
+        ok: false,
+        error: 'The payout instruction was sent but no confirmation came back, so this request is held at '
+          + '"being released". Check the payout channel for the reference before releasing it again — '
+          + 'pressing again could pay twice.',
+      };
+    }
   }
-  await db.execute(sql`UPDATE hr_withdrawal SET status = 'paid', payout_ref = ${ref}, paid_at = NOW() WHERE id = ${id}`);
-  await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, kind, note, ref, created_by)
-    VALUES (${w.employee_id}, 'debit', ${w.amount}, 'withdrawal', ${'Withdrawal via ' + paidVia}, ${ref}, ${user.id})`);
+
+  // THE DEBIT REF IS THE WITHDRAWAL, NOT THE GATEWAY'S ID. hr_wallet_txn.ref carries a UNIQUE index,
+  // so keying the debit on this request makes the ledger write idempotent by construction: a repeat
+  // can only ever collide with its own earlier row. It was the payout reference before, which is
+  // neither unique across manual entries (two payouts typed with the same UTR collide and the second
+  // debit is LOST while the request still says paid) nor present at all when none is given.
+  const debitRef = 'withdrawal:' + String(id);
+  try {
+    await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, kind, note, ref, created_by)
+      VALUES (${w.employee_id}, 'debit', ${w.amount}, 'withdrawal', ${'Withdrawal via ' + paidVia + (ref ? ' (' + ref + ')' : '')}, ${debitRef}, ${user.id})`);
+  } catch (e: any) {
+    const real = String(e?.cause?.message || e?.message || '');
+    if (!/duplicate key|unique constraint/i.test(real)) {
+      // THE MONEY HAS LEFT AND THE LEDGER DOES NOT KNOW. Not swallowed: the request is marked paid so
+      // nobody releases it a second time, and the caller is told the balance is now wrong.
+      console.error('[hr-wallet] payout', id, 'was released but the wallet debit FAILED -', real);
+      await db.execute(sql`UPDATE hr_withdrawal SET status = 'paid', payout_ref = ${ref}, paid_at = NOW() WHERE id = ${id} AND status = 'paying'`).catch(() => {});
+      await hrAudit(user.id, 'hr.withdrawal.paid_debit_failed', String(id),
+        { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, paidVia, payoutRef: ref, error: real });
+      return {
+        ok: false,
+        error: 'The payout was released but the wallet was NOT debited, so the balance now reads higher '
+          + 'than it is. Do not release it again — record the correction by hand. (' + (real || 'database error') + ')',
+      };
+    }
+  }
+
+  await db.execute(sql`UPDATE hr_withdrawal SET status = 'paid', payout_ref = ${ref}, paid_at = NOW() WHERE id = ${id} AND status = 'paying'`);
   await hrAudit(user.id, 'hr.withdrawal.paid', String(id),
     { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, paidVia, payoutRef: ref });
   return { ok: true, ref: ref || undefined };

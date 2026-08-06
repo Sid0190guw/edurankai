@@ -1,11 +1,33 @@
 // GET/POST /api/mail/scheduled-send  — cron: deliver due scheduled emails.
-// Protected by CRON_SECRET (Authorization: Bearer <secret> or ?secret=).
+// Protected by CRON_SECRET (Authorization: Bearer <secret>, x-cron-secret, or ?secret=/?key=).
+//
+// IT USED TO FAIL OPEN, IN THE FIRST LINE OF ITS GUARD:
+//
+//     const secret = process.env.CRON_SECRET;
+//     if (!secret) return true; // if no secret configured, allow (cron-only path)
+//
+// This is the same spelling that was removed from four job endpoints in src/pages/api/cron/* and
+// src/pages/api/payments/reconcile.ts; this one was missed because it lives under /api/mail. Nothing
+// else stands in front of the URL — src/middleware.ts isExempt() returns true for everything under
+// /api/ — so with CRON_SECRET absent, empty, or damaged by a pasted newline (which has happened on
+// this project's Vercel dashboard before), ANY anonymous caller could POST here and make the platform
+// deliver up to 50 queued messages from the company mailbox to external addresses, repeatedly.
+//
+// It now uses the one helper, src/lib/auth/cron-auth.ts, which fails CLOSED, trims the configured
+// value, compares in constant time, and accepts the same three shapes this endpoint already accepted
+// so no scheduler entry has to change. A `?key=` form is additionally accepted now (the helper takes
+// both names); nothing that worked before stops working.
+//
+// The trade is deliberate and stated in that helper: with no secret configured, scheduled mail stops
+// going out — visibly, on /admin/mail (the message stays queued) — instead of the endpoint standing
+// open. src/pages/admin/mail/health.astro already reports whether CRON_SECRET is present.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { dueScheduled, markScheduled, rewriteLinksForTracking } from '@/lib/mail-advanced';
 import { deliverMessage, parseAddressList, logOutbound, getMailConfig, getMailboxAddress } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
+import { cronAuth } from '@/lib/auth/cron-auth';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
@@ -66,17 +88,18 @@ async function run() {
   return { ok: true, processed: due.length, sent, failed };
 }
 
-function authed(request: Request, url: URL): boolean {
-  const secret = process.env.CRON_SECRET;
-  if (!secret) return true; // if no secret configured, allow (cron-only path)
-  const auth = request.headers.get('authorization') || '';
-  if (auth === 'Bearer ' + secret) return true;
-  if (url.searchParams.get('secret') === secret) return true;
-  return false;
-}
-
 export const GET: APIRoute = async ({ request, url }) => {
-  if (!authed(request, url)) return json({ ok: false, error: 'unauthorized' }, 401);
-  try { return json(await run()); } catch (e: any) { return json({ ok: false, error: String(e?.message || e) }, 500); }
+  const gate = cronAuth(request, url);
+  if (!gate.allowed) {
+    // The two refusals are different facts and the operator needs to tell them apart: one is a
+    // deployment that never had the secret, the other is a caller sending the wrong one.
+    return json({
+      ok: false,
+      error: gate.reason === 'not-configured'
+        ? 'CRON_SECRET is not set on this deployment, so no scheduled mail can be sent. Nothing has been delivered and nothing has been lost — the queue is intact.'
+        : 'unauthorized',
+    }, 401);
+  }
+  try { return json(await run()); } catch (e: any) { return json({ ok: false, error: String(e?.cause?.message || e?.message || e) }, 500); }
 };
 export const POST = GET;

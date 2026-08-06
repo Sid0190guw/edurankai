@@ -14,6 +14,10 @@ export const POST: APIRoute = async ({ locals }) => {
     const account = user.email || user.internalHandle || user.name || 'account';
     return json({ ok: true, secret, formatted: formatSecret(secret), otpauth: otpauthUri(secret, account) });
   } catch (e: any) {
-    return json({ ok: false, error: e?.cause?.message || e?.message || 'Could not start setup' }, 500);
+    // NEVER RETURNED VERBATIM. The real Postgres reason is on e.cause and e.message is only the SQL
+    // that failed, so echoing either hands a failed statement — table and column names included — to
+    // the caller while writing nothing anywhere an operator would look. The log gets the truth.
+    console.error('[api/2fa/start]', e?.cause?.message || e?.message, e?.stack);
+    return json({ ok: false, error: 'Could not start authenticator setup. Please try again.' }, 500);
   }
 };

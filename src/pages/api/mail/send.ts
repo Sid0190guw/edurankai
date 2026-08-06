@@ -127,10 +127,15 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
     // Delete the draft this was sent from. The composer now SENDS draftId (it never used to), so
     // "save draft, then send" stops leaving a permanent twin of the message sitting in Drafts.
+    //
+    // BOTH statements name the owner. The second one did not: `WHERE id = <draftId> AND is_draft`
+    // matched any account's draft, and mail_box cascades off mail_messages, so posting somebody
+    // else's draft id as `draftId` on a send of your own deleted THEIR unsent message. Same defect,
+    // same fix, as /api/mail/draft.ts — kept identical on purpose so the two cannot drift.
     if (body.draftId) {
       try {
         await db.execute(sql`DELETE FROM mail_box WHERE user_id = ${user.id} AND message_id = ${body.draftId} AND folder = 'drafts'`);
-        await db.execute(sql`DELETE FROM mail_messages WHERE id = ${body.draftId} AND is_draft = true`);
+        await db.execute(sql`DELETE FROM mail_messages WHERE id = ${body.draftId} AND is_draft = true AND from_user_id = ${user.id}`);
       } catch (e: any) {
         // The message HAS been sent by this point; a stranded draft is a nuisance, not a loss, and
         // must not turn a successful send into a failure. Logged, never silent.
