@@ -4,6 +4,7 @@
 // active today. Level is sqrt-based: level = floor(sqrt(xp/100)) + 1.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { logEvent } from '@/lib/logger';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
@@ -21,7 +22,33 @@ async function ensureSchema() {
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       source VARCHAR(40) NOT NULL, ref_id UUID, delta INTEGER NOT NULL, reason TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await reconcileXpEventsColumns();
   } catch (_) {}
+}
+
+// xp_events is created by TWO modules with DIFFERENT shapes: this one (ref_id/delta/reason) and
+// src/lib/gamification.ts (source_id/xp_amount). CREATE TABLE IF NOT EXISTS means whichever module
+// touches the database first wins and the other module's every INSERT then throws on a column that
+// is not there — the loser's XP log silently stops recording. Neither shape can be dropped without
+// losing rows already written under it, so both are reconciled to the union instead: every column
+// from both shapes present, and the two amount columns nullable so an INSERT written for either
+// shape is accepted. Both writers populate both amount columns, so both readers see a number.
+// Keep this function identical to reconcileXpEventsColumns() in src/lib/gamification.ts.
+export async function reconcileXpEventsColumns(): Promise<void> {
+  await db.execute(sql`ALTER TABLE xp_events ADD COLUMN IF NOT EXISTS source_id VARCHAR(140)`);
+  await db.execute(sql`ALTER TABLE xp_events ADD COLUMN IF NOT EXISTS xp_amount INT`);
+  await db.execute(sql`ALTER TABLE xp_events ADD COLUMN IF NOT EXISTS ref_id UUID`);
+  await db.execute(sql`ALTER TABLE xp_events ADD COLUMN IF NOT EXISTS delta INTEGER`);
+  await db.execute(sql`ALTER TABLE xp_events ADD COLUMN IF NOT EXISTS reason TEXT`);
+  await db.execute(sql`ALTER TABLE xp_events ALTER COLUMN xp_amount DROP NOT NULL`);
+  await db.execute(sql`ALTER TABLE xp_events ALTER COLUMN delta DROP NOT NULL`);
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** ref_id is a UUID column; a non-UUID reference goes to source_id instead of throwing. */
+function asUuid(v: any): string | null {
+  const s = String(v ?? '').trim();
+  return UUID_RE.test(s) ? s : null;
 }
 
 export type XpSource =
@@ -128,10 +155,20 @@ export async function awardXp(p: XpAward): Promise<{ xp: number; level: number; 
     }
   } catch (_) {}
 
-  await db.execute(sql`
-    INSERT INTO xp_events (user_id, source, ref_id, delta, reason)
-    VALUES (${p.userId}, ${p.source}, ${p.refId || null}, ${p.delta}, ${p.reason || null})
-  `).catch(() => {});
+  // Both amount columns are written so a reader on either historic shape sees the award. The
+  // failure is LOGGED rather than dropped: this is the append-only XP audit trail, and a silent
+  // catch here is how it would stop recording without anything on any screen saying so.
+  try {
+    await db.execute(sql`
+      INSERT INTO xp_events (user_id, source, ref_id, source_id, delta, xp_amount, reason)
+      VALUES (${p.userId}, ${p.source}, ${asUuid(p.refId)}, ${p.refId ? String(p.refId).slice(0, 140) : null},
+              ${p.delta}, ${p.delta}, ${p.reason || null})
+    `);
+  } catch (e: any) {
+    logEvent('error', 'xp.event_log_write_failed', {
+      userId: p.userId, source: p.source, reason: e?.cause?.message || e?.message || 'unknown',
+    });
+  }
 
   return { xp: newXp, level: newLevel, streak: newStreak, awarded: p.delta, leveledUp };
 }
@@ -192,7 +229,7 @@ export async function setDailyGoal(userId: string, goal: number): Promise<void> 
 export async function getRecentXpEvents(userId: string, limit = 8): Promise<{ source: string; delta: number; reason: string | null; created_at: string }[]> {
   await ensureSchema();
   return rows(await db.execute(sql`
-    SELECT source, delta, reason, created_at FROM xp_events
+    SELECT source, COALESCE(delta, xp_amount) AS delta, reason, created_at FROM xp_events
     WHERE user_id = ${userId} ORDER BY created_at DESC LIMIT ${limit}
   `)) as any;
 }

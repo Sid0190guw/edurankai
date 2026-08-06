@@ -3,6 +3,8 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 
+import { reconcileXpEventsColumns } from '@/lib/xp';
+
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 let ready: Promise<void> | null = null;
 
@@ -44,6 +46,11 @@ export function ensureGamificationSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_xp_events_user ON xp_events(user_id, created_at DESC)`);
+      // xp_events is ALSO created by src/lib/xp.ts with a different shape (ref_id/delta/reason).
+      // CREATE TABLE IF NOT EXISTS means only the first module to run wins, and the other one's
+      // every INSERT then throws on a missing column. Reconcile to the union of both shapes so
+      // neither module's XP log can be silently lost. See the twin in src/lib/xp.ts.
+      await reconcileXpEventsColumns();
     } catch (_) {}
   })();
   return ready;
@@ -79,7 +86,8 @@ export async function awardXp(userId: string, source: string, amount: number, so
   const xp = Math.max(0, Math.floor(amount || 0));
   if (xp === 0) return { ok: true, totalXp: 0, level: 1, leveledUp: false };
   try {
-    await db.execute(sql`INSERT INTO xp_events (user_id, source, source_id, xp_amount) VALUES (${userId}, ${source}, ${sourceId || null}, ${xp})`);
+    // Both amount columns are written so a reader on either historic shape of xp_events sees it.
+    await db.execute(sql`INSERT INTO xp_events (user_id, source, source_id, xp_amount, delta) VALUES (${userId}, ${source}, ${sourceId || null}, ${xp}, ${xp})`);
     // Ensure the streak row exists
     await db.execute(sql`INSERT INTO learner_streaks (user_id, total_xp, level) VALUES (${userId}, 0, 1) ON CONFLICT (user_id) DO NOTHING`);
     const before = rows(await db.execute(sql`SELECT total_xp, level FROM learner_streaks WHERE user_id = ${userId} LIMIT 1`))[0];
@@ -195,7 +203,7 @@ export async function getLearnerStats(userId: string) {
       rank = Number(ahead?.c || 0) + 1;
     }
     const recentXp = rows(await db.execute(sql`
-      SELECT source, source_id, xp_amount, created_at
+      SELECT source, COALESCE(source_id, ref_id::text) AS source_id, COALESCE(xp_amount, delta) AS xp_amount, created_at
       FROM xp_events WHERE user_id = ${userId}
       ORDER BY created_at DESC LIMIT 12
     `));

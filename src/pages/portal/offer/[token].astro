@@ -4,10 +4,13 @@ import { db } from '@/lib/db';
 import { markOfferOpened } from '@/lib/track';
 import { offerLetters, applications, applicationMessages } from '@/lib/db/schema';
 import { eq, and } from 'drizzle-orm';
+import { decideOfferTemplate, renderOfferLetter, emphasize, type AgreedFields } from '@/lib/offer-templates';
+// Working time, per level, from one module. See src/lib/engagement-policy.ts.
 import {
-  decideOfferTemplate, renderOfferLetter, emphasize, summaryFieldLabel,
-  type AgreedFields
-} from '@/lib/offer-templates';
+  ENGAGEMENT_POLICIES, resolveEngagementPolicy, isInternshipPolicy, INTERN_WORD,
+  shortCommitment, describeCommitment, describeProgrammeTotal, formatMinutes,
+  WELLBEING_ASSESSED_AS,
+} from '@/lib/engagement-policy';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -108,6 +111,34 @@ if (!agreedLevel) {
 // Declared HERE, above the POST handler, because the signing audit entry records which template
 // governed the letter the person actually signed. A const is not hoisted; declaring it below the
 // handler would throw on the first line of every acceptance.
+// WORKING TIME COMES FROM THE POLICY MODULE, NOT FROM A FREE-TEXT BOX.
+//
+// `hoursCommitment` is typed by hand into an admin form. It has been arriving as a bare "40 hours"
+// -- which is the TOTAL ENGAGEMENT for an internship, of which only five hours a day is project
+// work -- and as literally nothing, in which case the letter read "the agreed hours". Both leave
+// the recipient to guess what they owe. src/lib/engagement-policy.ts answers it per level, and it
+// cannot state a counted total without its split.
+//
+// Declared HERE, above the POST handler and above `letterFields`, because a const is not hoisted
+// and the signing path renders this letter.
+const resolvedPolicy = resolveEngagementPolicy({
+  level: agreedLevel,
+  engagementType: c.employmentType,
+  roleTitle: c.roleTitle || offer.roleTitle || '',
+});
+// A letter that is not an internship must never inherit internship hours, whatever the level field
+// happens to say. That is the same failure that put "unpaid internship" into a Chief AI Officer's
+// offer, arriving through a different door.
+const engagementPolicy = (isInternshipPolicy(resolvedPolicy)
+  && !INTERN_WORD.test(String(c.employmentType || ''))
+  && !INTERN_WORD.test(String(agreedLevel || '')))
+  ? ENGAGEMENT_POLICIES['Mid']
+  : resolvedPolicy;
+const policyHours = shortCommitment(engagementPolicy);
+const hoursExplainer = describeCommitment(engagementPolicy);
+const programmeTotal = describeProgrammeTotal(engagementPolicy);
+const hoursWereAgreed = !!String(c.hoursCommitment || '').trim();
+
 const letterFields: AgreedFields = {
   level: agreedLevel,
   roleTitle: c.roleTitle || offer.roleTitle || '',
@@ -115,7 +146,9 @@ const letterFields: AgreedFields = {
   department: c.department || offer.department || '',
   workMode: c.workMode || '',
   duration: c.duration || '',
-  hoursCommitment: c.hoursCommitment || '',
+  // The agreed field still wins wherever one exists — it is what was actually negotiated. The
+  // policy only fills the silence, so no letter goes out saying "the agreed hours" again.
+  hoursCommitment: c.hoursCommitment || policyHours,
   joiningDate: formatDate(c.joiningDate),
   reportingTo: c.reportingTo || '',
   compensation: c.compensation || '',
@@ -346,44 +379,25 @@ if (offer.expiryDate && !isSigned) {
   else if (daysLeft <= 3) expiryStatus = 'warning';
 }
 
-const TEMPLATE_INTROS: Record<string, string> = {
-  intern: 'We are pleased to extend this formal offer of an internship for the position of',
-  fulltime: 'We are pleased to extend this formal full-time employment offer for the position of',
-  contract: 'We are pleased to extend this contract engagement offer for the position of',
-  leadership: 'We are honored to extend this leadership offer for the position of'
-};
+// THE LETTER, AS PARTS. Emphasis is carried as data ({ text, bold }) rather than as markup, so a
+// field value typed by an admin is rendered through normal JSX escaping and can never become HTML.
+// Nothing in this document is passed to set:html except the QR we generated ourselves.
+const openingParts = emphasize(letter.opening);
+const welcomeParts = emphasize(letter.welcome);
+const termsParts = emphasize(letter.engagementTerms);
+const progressionParts = emphasize(letter.progression);
+const completionParts = letter.completion ? emphasize(letter.completion) : [];
+const closingParts = emphasize(letter.closing);
 
-// WHO THIS PERSON IS, decided ONCE and used everywhere below.
-//
-// This was `TEMPLATE_INTROS[templateType] || TEMPLATE_INTROS.intern`, so an offer whose template
-// was unset or unrecognised told the recipient we were pleased to offer them an internship --
-// including a full-time hire, including a C-level executive. The most junior possible reading is
-// the worst available default: it is the one that insults the person receiving it.
-//
-// The fallback now runs the other way. An engagement is an internship only when something
-// POSITIVELY says so, and anything senior is excluded outright. \bintern(?!al) is the same
-// word-boundary pattern src/lib/auth/admin-access.ts uses, so "Internal Auditor" is never read
-// as an intern.
-const SENIOR_LEVELS = /\b(c-level|chief|executive|director|vp|vice[- ]president|head|lead|principal|senior|manager)\b/i;
-const declaredIntern = offer.templateType === 'intern'
-  || /\bintern(?!al)/i.test(String(c.employmentType || ''))
-  || /\bintern(?!al)/i.test(String(c.roleTitle || ''));
-const seniorEngagement = offer.templateType === 'leadership'
-  || SENIOR_LEVELS.test(String(c.roleTitle || ''))
-  || SENIOR_LEVELS.test(String(c.level || ''));
-const isIntern = declaredIntern && !seniorEngagement;
+// WHICH SUMMARY FIELDS ARE RELEVANT is part of the template, not a fixed list. A permanent
+// appointment has no "Duration", and a contract has no "Working Hours"; printing "TBD" against
+// either one is the document admitting it does not know what it is describing.
+const showsDuration = letter.summaryKeys.indexOf('duration') !== -1;
+const showsHours = letter.summaryKeys.indexOf('hoursCommitment') !== -1;
 
-// THE TEMPLATE DOES NOT GET THE LAST WORD. A real offer went out reading "we are pleased to extend
-// this formal offer of an internship for the position of Chief AI Officer", and "This Full-Time is
-// offered on an unpaid basis in accordance with EduRankAI's Internship Policy" -- because somebody
-// started from the intern template and then filled in senior, full-time fields. The template is a
-// starting point; the FIELDS are what was actually agreed, so the fields win.
-const templateKey = TEMPLATE_INTROS[offer.templateType] ? offer.templateType : '';
-const introKey = seniorEngagement
-  ? (templateKey === 'contract' ? 'contract' : 'leadership')
-  : (isIntern ? 'intern' : (templateKey && templateKey !== 'intern' ? templateKey : 'fulltime'));
-const intro = TEMPLATE_INTROS[introKey];
-const joiningTxt = formatDate(c.joiningDate) || 'a mutually agreed date';
+// The PDF reads the SAME sentences. `bodyParas` is what the generator prints when supplied, and
+// the irrelevant summary fields are blanked here because the generator skips empty values - that
+// is how a template's field relevance reaches the printed copy without a second copy of the rules.
 const offerPdfData = {
   refNumber: offer.refNumber || '',
   offerDate: formatDate(offer.offerDate),
@@ -393,11 +407,11 @@ const offerPdfData = {
   candidateCity: c.candidateCity || '',
   roleTitle: c.roleTitle || offer.roleTitle || '',
   department: c.department || offer.department || '',
-  employmentType: c.employmentType || '',
+  employmentType: letter.engagementLabel,
   workMode: c.workMode || '',
-  duration: c.duration || '',
-  hoursCommitment: c.hoursCommitment || '',
-  compensation: c.compensation || 'To be discussed',
+  duration: showsDuration ? (c.duration || '') : '',
+  hoursCommitment: showsHours ? (c.hoursCommitment || '') : '',
+  compensation: c.compensation || '',
   integrityHash: offer.integrityHash || '',
   internalHandle: internalHandle || '',
   verifyUrl: verifyUrl,
@@ -405,19 +419,7 @@ const offerPdfData = {
   signedAt: offer.signedAt ? formatDateTimeIST(offer.signedAt) : '',
   signatoryName: (c.signatoryName || 'Siddharth Prasad'),
   signatoryTitle: (c.signatoryTitle || 'Founder & CEO'),
-  bodyParas: [
-    intro + ' ' + (c.roleTitle || '') + ' within ' + (c.department ? c.department : 'the team') + ' at EduRankAI. Following a thorough evaluation of your application and conversations, we are confident you demonstrate the capability, character, and commitment we look for.',
-    isIntern
-      ? ('This ' + (c.employmentType || 'internship') + ' is offered on an unpaid basis in accordance with EduRankAI\'s Internship Policy. You will work ' + (c.workMode || 'Remote') + ', committing ' + (c.hoursCommitment || 'the agreed hours') + ' of focused effort. The engagement runs for ' + (c.duration || 'the agreed term') + ', commencing ' + joiningTxt + '. Compensation: ' + (c.compensation || 'To be discussed') + '.')
-      : ('This is a ' + (c.employmentType || 'role') + ' engagement, work mode ' + (c.workMode || 'Remote') + ', for ' + (c.duration || 'the agreed term') + ', commencing ' + joiningTxt + '. Compensation: ' + (c.compensation || 'as discussed') + '.'),
-    // WAS UNCONDITIONAL. Mid-point reviews, a Certificate of Completion and "successful completers"
-    // are internship language, and every offer carried them -- so a Chief Technology Officer was
-    // told they would receive a certificate for completing us.
-    isIntern
-      ? 'You will receive a mid-point review and a final review, assessed via EduRankAI\'s rubric-based evaluation. Outstanding performers receive a Letter of Recommendation; all successful completers receive a Certificate of Completion.'
-      : 'Your performance will be reviewed on the cycle that applies to your role, against objectives agreed with you after joining.',
-    'By accepting, you confirm you have read and agree to EduRankAI\'s Recruitment and Work Policy and Code of Conduct.'
-  ]
+  bodyParas: letter.paragraphs
 };
 ---
 <BaseLayout title={'Offer Letter - ' + c.candidateName} description="Your EduRankAI offer letter">
@@ -446,6 +448,28 @@ const offerPdfData = {
         </button>
       </div>
     </div>
+
+    {/* WHY THIS LETTER READS THE WAY IT DOES — staff only, never printed, never shown to the
+        candidate. The template used to be a hidden column somebody set by hand on a form, and
+        nobody could see afterwards which one had governed the letter. It is now decided from the
+        agreed fields, and this is where a human checks that decision against what they meant to
+        send, BEFORE anything is signed. */}
+    {isAdmin && (
+      <div class={'doc-note no-print ' + (templateDecision.notes.length > 0 ? 'doc-note--warn' : 'doc-note--time')}>
+        <svg class="doc-note__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M9 13h6" /><path d="M9 17h4" /></svg>
+        <div>
+          <p class="doc-note__eyebrow">Viewing as staff &nbsp;|&nbsp; template provenance</p>
+          <p class="doc-note__sm">
+            Written from <strong>{letter.templateLabel}</strong>. Level read as <strong>{templateDecision.level || 'not recorded'}</strong> (source: {templateDecision.levelSource}), engagement read as <strong>{templateDecision.engagement || 'not recorded'}</strong> (source: {templateDecision.engagementSource}). Unpaid clause <strong>{letter.showsUnpaidClause ? 'shown' : 'not shown'}</strong>; completion certificate <strong>{letter.awardsCompletionCertificate ? 'promised' : 'not promised'}</strong>.
+          </p>
+          {templateDecision.overrideRequested && (
+            <p class="doc-note__sm">Template requested by hand: <strong>{templateDecision.overrideRequested}</strong> &mdash; {templateDecision.overrideAccepted ? 'accepted' : 'refused'}.</p>
+          )}
+          {templateDecision.notes.map((n) => (<p class="doc-note__quote">{n}</p>))}
+          <p class="doc-note__sm"><a href="/admin/offer/templates" class="doc-link">Review every issued offer against its template</a></p>
+        </div>
+      </div>
+    )}
 
     {errorMsg && (
       <div class="doc-note doc-note--warn no-print" role="alert">
@@ -539,8 +563,10 @@ const offerPdfData = {
             </div>
           )}
           <span class="doc-cover__rule" aria-hidden="true"></span>
-          <h1 class="doc-h1"><span class="doc-h1__re">Re: </span>Offer of {c.employmentType} &nbsp;|&nbsp; {c.roleTitle}{c.department && (<span>, {c.department}</span>)}</h1>
-          <p class="doc-badge">{c.employmentType} &nbsp;|&nbsp; {c.department || c.roleTitle}</p>
+          {/* The engagement name comes from the resolved template, so a letter with an empty
+              employmentType field reads "Offer of Full-Time" rather than "Offer of". */}
+          <h1 class="doc-h1"><span class="doc-h1__re">Re: </span>Offer of {letter.engagementLabel} &nbsp;|&nbsp; {c.roleTitle}{c.department && (<span>, {c.department}</span>)}</h1>
+          <p class="doc-badge">{letter.engagementLabel} &nbsp;|&nbsp; {c.department || c.roleTitle}</p>
         </div>
       </header>
 
@@ -558,10 +584,8 @@ const offerPdfData = {
             </svg>
             <span><strong>Congratulations{(c.candidateName || '').split(' ')[0] ? ', ' + (c.candidateName || '').split(' ')[0] : ''}.</strong> You have been selected, and we are genuinely glad it is you.</span>
           </p>
-          <p>{intro} <strong>{c.roleTitle}</strong>{c.department && (<span> within the <strong>{c.department}</strong></span>)} at <strong>EduRankAI</strong>. Following a thorough evaluation of your application and conversations, we are confident you demonstrate the capability, character, and commitment we look for.</p>
-          <p>{isIntern
-            ? 'Plenty of people applied. You are here because of how you thought about the problems we put in front of you, and we are looking forward to what you build while you are with us.'
-            : 'Plenty of capable people applied. You are here because of the judgement and the standard you brought to every conversation, and we are looking forward to the work you will lead here.'}</p>
+          <p>{openingParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
+          <p>{welcomeParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
         </div>
       </section>
 
@@ -569,19 +593,17 @@ const offerPdfData = {
       <section class="doc-panel" data-reveal aria-labelledby="pnl-offer">
         <p class="doc-kicker"><span class="doc-kicker__n">02</span></p>
         <h2 class="doc-h2" id="pnl-offer">The offer at a glance</h2>
+        {/* WHICH FACTS ARE WORTH PULLING OUT depends on the engagement. A permanent appointment
+            led with "Duration: TBD", which told the reader nothing except that the letter was
+            filled in from a form built for internships. The template names its own facts, and a
+            fact with no value is left out rather than printed as TBD. */}
         <div class="doc-grid">
-          <div class="fact">
-            <p class="fact__k">Duration</p>
-            <p class="fact__v">{c.duration || 'TBD'}</p>
-          </div>
-          <div class="fact">
-            <p class="fact__k">Work Mode</p>
-            <p class="fact__v">{c.workMode || 'Remote'}</p>
-          </div>
-          <div class="fact doc-grid__wide">
-            <p class="fact__k">Compensation</p>
-            <p class="fact__v">{c.compensation || 'TBD'}</p>
-          </div>
+          {letter.glance.map((f) => (
+            <div class="fact">
+              <p class="fact__k">{f.label}</p>
+              <p class="fact__v">{f.value}</p>
+            </div>
+          ))}
         </div>
       </section>
 
@@ -590,43 +612,54 @@ const offerPdfData = {
         <p class="doc-kicker"><span class="doc-kicker__n">03</span></p>
         <h2 class="doc-h2" id="pnl-terms">Engagement terms</h2>
         <div class="doc-prose">
-          {/* isIntern, NOT templateType. An offer started from the intern template and then filled
-              in with senior full-time terms told a Chief AI Officer their role was unpaid under the
-              Internship Policy. The agreed fields decide, never the template somebody happened to
-              open first. */}
-          {isIntern && (
-            <p>This {c.employmentType} is offered on an <strong>unpaid basis</strong> in accordance with EduRankAI's Internship Policy. You will work <strong>{c.workMode}</strong>, committing <strong>{c.hoursCommitment}</strong> of focused effort. The engagement runs for <strong>{c.duration}</strong>, commencing <strong>{formatDate(c.joiningDate) || 'a mutually agreed date'}</strong>.</p>
+          {/* The unpaid clause is not a branch here. It is a property of the internship and
+              apprenticeship templates in src/lib/offer-templates.ts, and no other template holds
+              the sentence at all - which is why a senior letter cannot render it however the form
+              was filled in. */}
+          <p>{termsParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
+
+          {/* WORKING TIME, STATED RATHER THAN IMPLIED.
+              A bare hours figure is the thing the founder objected to, and he was right: for an
+              internship "40 hours" is the TOTAL ENGAGEMENT, and only five hours a day of it is
+              project work. Someone reading 40 on its own concludes they owe forty hours of task
+              output. Everything below comes from src/lib/engagement-policy.ts, which is incapable
+              of printing a counted total without its split -- and which, for a director or a chief
+              officer, prints no hour count at all, because a position of management sits outside
+              the working-hours provisions of the statute and a daily figure there would be
+              inaccurate rather than strict. */}
+          <p class="doc-prose__note"><strong>Working time.</strong> {hoursExplainer}</p>
+          {programmeTotal && (<p class="doc-prose__note">{programmeTotal} The total is your engagement, not your task output.</p>)}
+          {hoursWereAgreed && (
+            <p class="doc-prose__note">Where the hours recorded in your summary below differ from the standard structure, the recorded figure is the one that governs your engagement.</p>
           )}
-          {!isIntern && (
-            <p>This offer is contingent on completion of pre-employment requirements. Your employment commences on <strong>{formatDate(c.joiningDate) || 'a mutually agreed date'}</strong> as a <strong>{c.employmentType}</strong> employee. Onboarding details will be confirmed within 7 days of acceptance.</p>
-          )}
+          <p class="doc-prose__note">{engagementPolicy.statutoryNote}</p>
+          <p class="doc-prose__note"><strong>How this is measured.</strong> {engagementPolicy.measuredBy}</p>
         </div>
       </section>
 
       {/* ---------------------------------------------------------------- 04 REVIEW */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-review">
         <p class="doc-kicker"><span class="doc-kicker__n">04</span></p>
-        <h2 class="doc-h2" id="pnl-review">Review and assessment</h2>
+        <h2 class="doc-h2" id="pnl-review">{letter.awardsCompletionCertificate ? 'Review, and what you leave with' : 'Review and progression'}</h2>
         <div class="doc-prose">
-          <p>You will receive a mid-point review and final review, assessed via EduRankAI's rubric-based evaluation.</p>
+          <p>{progressionParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
+          {/* MID-POINT REVIEWS, A CERTIFICATE OF COMPLETION AND "SUCCESSFUL COMPLETERS" WERE
+              UNCONDITIONAL SECTIONS OF THIS LETTER. Every offer carried them, so a Chief Technology
+              Officer was told in writing that they would receive a certificate for completing us.
+              Completion copy now exists only on the two templates that award one, and this block
+              renders only when the governing template is one of them. */}
+          {completionParts.length > 0 && (
+            <p>{completionParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
+          )}
         </div>
       </section>
 
-      {/* ---------------------------------------------------------------- 05 ON COMPLETION */}
-      <section class="doc-panel" data-reveal aria-labelledby="pnl-completion">
-        <p class="doc-kicker"><span class="doc-kicker__n">05</span></p>
-        <h2 class="doc-h2" id="pnl-completion">On completion</h2>
-        <div class="doc-prose">
-          <p>Outstanding performers receive a Letter of Recommendation; all successful completers receive a Certificate of Completion.</p>
-        </div>
-      </section>
-
-      {/* ---------------------------------------------------------------- 06 POLICIES */}
+      {/* ---------------------------------------------------------------- 05 POLICIES */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-policy">
-        <p class="doc-kicker"><span class="doc-kicker__n">06</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">05</span></p>
         <h2 class="doc-h2" id="pnl-policy">Terms you are agreeing to</h2>
         <div class="doc-prose">
-          <p>By accepting, you confirm you have read and agree to EduRankAI's Recruitment and Work Policy and Code of Conduct.</p>
+          <p>{closingParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
           {c.customNote && (<p class="doc-prose__note">{c.customNote}</p>)}
         </div>
       </section>
@@ -651,28 +684,25 @@ const offerPdfData = {
       </section>
       )}
 
-      {/* ---------------------------------------------------------------- 07 OFFER SUMMARY */}
+      {/* ---------------------------------------------------------------- 06 OFFER SUMMARY */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-summary">
-        <p class="doc-kicker"><span class="doc-kicker__n">07</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">06</span></p>
         <h2 class="doc-h2" id="pnl-summary">Offer Summary</h2>
+        {/* Rows come from the template's own list of relevant fields, in its own order, and an
+            empty value drops the row instead of printing a blank one. A permanent appointment no
+            longer carries an empty "Duration"; a contract no longer carries "Working Hours". */}
         <div class="doc-grid">
-          <div class="sum"><p class="sum__k">Position</p><p class="sum__v">{c.roleTitle}</p></div>
-          {c.department && (<div class="sum"><p class="sum__k">Department</p><p class="sum__v">{c.department}</p></div>)}
-          <div class="sum"><p class="sum__k">Employment Type</p><p class="sum__v">{c.employmentType}</p></div>
-          <div class="sum"><p class="sum__k">Work Mode</p><p class="sum__v">{c.workMode}</p></div>
-          <div class="sum"><p class="sum__k">Duration</p><p class="sum__v">{c.duration}</p></div>
-          {c.joiningDate && (<div class="sum"><p class="sum__k">Joining Date</p><p class="sum__v">{formatDate(c.joiningDate)}</p></div>)}
-          {c.reportingTo && (<div class="sum"><p class="sum__k">Reporting To</p><p class="sum__v">{c.reportingTo}</p></div>)}
-          {c.hoursCommitment && (<div class="sum"><p class="sum__k">Working Hours</p><p class="sum__v">{c.hoursCommitment}</p></div>)}
-          <div class="sum"><p class="sum__k">Compensation</p><p class="sum__v">{c.compensation}</p></div>
+          {letter.summary.map((row) => (
+            <div class="sum"><p class="sum__k">{row.label}</p><p class="sum__v">{row.value}</p></div>
+          ))}
           {offer.expiryDate && (<div class="sum"><p class="sum__k">Offer Expires</p><p class="sum__v">{formatDate(offer.expiryDate)}</p></div>)}
           <div class="sum doc-grid__wide"><p class="sum__k">Integrity Hash</p><p class="sum__v sum__v--hash">{offer.integrityHash}</p></div>
         </div>
       </section>
 
-      {/* ---------------------------------------------------------------- 08 AUTHORISATION */}
+      {/* ---------------------------------------------------------------- 07 AUTHORISATION */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-auth">
-        <p class="doc-kicker"><span class="doc-kicker__n">08</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">07</span></p>
         <h2 class="doc-h2" id="pnl-auth">Authorisation</h2>
         <div class="doc-sign">
           <div>
@@ -705,9 +735,9 @@ const offerPdfData = {
         </section>
       )}
 
-      {/* ---------------------------------------------------------------- 09 ACCESS */}
+      {/* ---------------------------------------------------------------- 08 ACCESS */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-access">
-        <p class="doc-kicker"><span class="doc-kicker__n">09</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">08</span></p>
         <h2 class="doc-h2" id="pnl-access">Access Credentials</h2>
         {offer.createdUserId ? (
           <div class="doc-access">
@@ -743,9 +773,9 @@ const offerPdfData = {
         )}
       </section>
 
-      {/* ---------------------------------------------------------------- 10 VERIFICATION */}
+      {/* ---------------------------------------------------------------- 09 VERIFICATION */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-verify">
-        <p class="doc-kicker"><span class="doc-kicker__n">10</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">09</span></p>
         <h2 class="doc-h2" id="pnl-verify">Verification</h2>
         <div class="verify">
           <div class="verify__top">

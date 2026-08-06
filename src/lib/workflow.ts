@@ -246,6 +246,21 @@ export const WORKFLOW_DOMAINS = [
   // ---------------------------------------------------------------------------------------------
   'overtime',
   'timesheet',
+  // ---------------------------------------------------------------------------------------------
+  // BENEFITS. One domain, for ELECTING a benefit that has to be chosen — a cover level, an
+  // allowance somebody opts into (src/lib/benefits.ts).
+  //
+  // ADDED HERE RATHER THAN GIVEN A PATH OF ITS OWN INSIDE THE BENEFITS MODULE, for the reason this
+  // array's own header states: an election decided by a rule inside src/lib/benefits.ts would be a
+  // second approval engine, and within a month the two would disagree about who signs off an
+  // employee opting into cover.
+  //
+  // WHAT IS NOT HERE. Most benefits need no election at all — they apply to whoever the eligibility
+  // rules cover, and the catalogue simply says how to claim them. Only a benefit HR marked as
+  // needing an election starts one of these. Wrapping every entitlement in an approval would mean
+  // nobody ever receives anything they are already owed.
+  // ---------------------------------------------------------------------------------------------
+  'benefits',
 ] as const;
 
 export type WorkflowDomain = (typeof WORKFLOW_DOMAINS)[number];
@@ -815,6 +830,40 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     route: [{ step: 1, via: 'reporting_manager' }],
     escalateAfterHours: 96,
     approvalUrl: '/portal/employee/attendance/approvals',
+  },
+
+  // ===============================================================================================
+  // ELECTING A BENEFIT.
+  //
+  // ONE RUNG, AND IT IS DELIBERATELY NOT THE REPORTING MANAGER. Read this before changing it.
+  //
+  // What somebody elects says things about them that are not their line manager's business: which
+  // cover level they need says something about their health, and adding a dependant says something
+  // about their family. Routing an election through the manager would make every one of those a
+  // disclosure to the person who writes their appraisal, in exchange for a sign-off the manager has
+  // no basis to give — they do not know what the policy costs or who it covers. So the rung is the
+  // BENEFITS APPROVAL OWNER: an `approval_owner` edge scoped to the domain 'benefits', which is the
+  // desk that actually administers the scheme.
+  //
+  // THE RUNG IS REQUIRED, NOT OPTIONAL, and that is the whole safety property. Where an organisation
+  // has named nobody, every election HALTS with "no approval owner is recorded for this kind of
+  // request" and waits on the queue until the founder records that one edge. The alternative — an
+  // optional rung — would leave the chain empty, and resolveRoute() would then halt anyway rather
+  // than settle it approved. Making it required simply says WHICH relationship is missing, which is
+  // the sentence somebody can act on.
+  //
+  // `capability: null`, like every domain but `leave`. There is no key in permissions.ts whose
+  // holders mean "may approve anybody's benefit election"; the key that opens the benefits console
+  // is about CONFIGURING what the company offers, and mapping it here would let the desk that wrote
+  // the policy approve people into it unilaterally.
+  // ===============================================================================================
+  benefits: {
+    key: 'benefits',
+    label: 'Benefit election',
+    capability: null,
+    route: [{ step: 1, via: 'approval_owner' }],
+    escalateAfterHours: 96,
+    approvalUrl: '/admin/hr/benefits/enrolments',
   },
 };
 

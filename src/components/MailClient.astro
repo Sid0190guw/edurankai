@@ -11,6 +11,7 @@
 // basePath drives navigation only; the three write endpoints are absolute (/api/mail/{send,draft,
 // action}) and each authorises through denyMailApi(), so both mounts meet the same gate.
 import { getFolderCounts, getMailboxAddress, listFolder, getThreadMessages, markThreadRead, FOLDERS } from '@/lib/mail';
+import type { FolderListing } from '@/lib/mail';
 
 const { user, basePath = '/admin/mail' } = Astro.props as { user: any; basePath?: string };
 
@@ -19,19 +20,39 @@ const folderParam = url.searchParams.get('folder') || 'inbox';
 const starred = folderParam === 'starred';
 const folder = starred ? 'inbox' : (folderParam as any);
 const q = url.searchParams.get('q') || '';
+const label = url.searchParams.get('label') || null;
 const threadId = url.searchParams.get('thread') || '';
 
 let counts: Record<string, number> = {};
 let myAddress = '';
-let list: any[] = [];
+let listing: FolderListing | null = null;
 let dbReady = true;
+// The reason, kept, so the banner can say what went wrong instead of guessing.
+let mailError = '';
 try {
   counts = await getFolderCounts(user.id);
   myAddress = await getMailboxAddress(user.id);
-  list = await listFolder(user.id, folder, q, starred);
-} catch (e) {
+  // THE MAIL LIST WAS DEAD. listFolder was rewritten to take (userId, opts) and to return a
+  // FolderListing OBJECT — { rows, query, filtered, scopeLabel } — and this, its only caller in
+  // the repository, was never changed off the old (userId, folder, q, starred) positional form.
+  // Two consequences, and neither announced itself: `folder`, `q` and `starred` were all dropped
+  // on the floor (the second argument was a string where an options object was expected, so every
+  // listing ignored the folder you clicked and the terms you searched), and `list` then held an
+  // object, so `list.length === 0` was `undefined === 0` — false, hiding the empty state — and
+  // `list.map(...)` threw TypeError while rendering. Both mail mounts answered 500.
+  listing = await listFolder(user.id, { folder, starred, label, query: q });
+} catch (e: any) {
+  // NOT SWALLOWED. The real Postgres reason is on e.cause; e.message is only the failed SQL.
   dbReady = false;
+  mailError = String(e?.cause?.message || e?.message || 'unknown error');
+  console.error('[MailClient] listing failed:', mailError);
 }
+const list: any[] = listing ? listing.rows : [];
+// What is actually on screen, from the listing itself rather than from the folder in the URL: a
+// search with `in:anywhere` or a label pseudo-folder does not return the folder you are standing in.
+const scopeLabel = listing ? listing.scopeLabel : '';
+const filtered = !!(listing && listing.filtered);
+const queryNote = listing && listing.query && listing.query.active ? listing.query.describe : '';
 
 let thread: any[] = [];
 let threadSubject = '';
@@ -102,9 +123,14 @@ const folderLinks = [
 ---
 
 <div class="mailc" data-base={basePath}>
+  {/* This banner used to read "Mailboxes are being set up. Once the database migration runs, your
+      inbox will appear here." for EVERY failure — a dropped connection, a bad query, a permission
+      error — which told people to wait for a migration that was not pending and would never come.
+      It now says that the mail could not be loaded, and what the server actually reported. */}
   {!dbReady && (
     <div style="padding:9px 16px;background:rgba(251,191,36,0.12);border-bottom:1px solid rgba(251,191,36,0.28);color:#fbbf24;font-size:12px;">
-      Mailboxes are being set up. Once the database migration runs, your inbox will appear here.
+      Your mail could not be loaded, so this list is empty for a reason that is not "no mail":
+      {' '}{mailError}
     </div>
   )}
   <!-- Header -->
@@ -144,10 +170,21 @@ const folderLinks = [
 
     <!-- Thread list -->
     <div class="mc-list">
+      {/* What this list is actually showing. A search for `in:anywhere`, or a label, returns mail
+          from outside the folder highlighted in the rail, and without this line the rail is simply
+          wrong about where you are. */}
+      {dbReady && filtered && (
+        <div class="mc-scope">
+          {scopeLabel}{queryNote ? ' - ' + queryNote : ''}
+          <a href={`${basePath}?folder=${folderParam}`}>clear</a>
+        </div>
+      )}
       {list.length === 0 && (
         <div class="mc-empty">
           <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.5"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/></svg>
-          <p>{q ? 'No mail matches your search.' : 'Nothing here yet.'}</p>
+          {/* "Nothing here yet" is only true when the listing succeeded. When it failed, an empty
+              list means the mail was not read, not that there is none. */}
+          <p>{!dbReady ? 'This list could not be loaded - see the message above.' : (filtered ? 'No mail matches that.' : 'Nothing here yet.')}</p>
         </div>
       )}
       {list.map((t: any) => (
@@ -334,6 +371,8 @@ const folderLinks = [
 .mc-rail-badge{ background:var(--mc-accent); color:#fff; font-size:10px; font-weight:800; border-radius:100px; padding:1px 7px; }
 
 .mc-list{ border-right:1px solid var(--mc-border); overflow-y:auto; background:var(--mc-bg); }
+.mc-scope{ display:flex; gap:8px; align-items:center; justify-content:space-between; padding:8px 14px; font-size:11px; border-bottom:1px solid var(--mc-border); color:var(--mc-mid); }
+.mc-scope a{ color:inherit; text-decoration:underline; text-underline-offset:2px; min-height:44px; display:inline-flex; align-items:center; }
 .mc-row{ display:flex; align-items:flex-start; gap:10px; padding:11px 12px; border-bottom:1px solid var(--mc-border); text-decoration:none; color:var(--mc-text); position:relative; }
 .mc-row:hover{ background:var(--mc-soft); }
 .mc-row.sel{ background:var(--o-brand-soft, rgba(255,79,0,0.12)); }
@@ -494,9 +533,16 @@ const folderLinks = [
     if (sched) { var dt = new Date(sched); if (!isNaN(dt.getTime())) p.scheduledAt = dt.toISOString(); }
     return p;
   }
+  // A 500 that returns an HTML error page used to make r.json() throw, and every caller caught that
+  // as "Network error" — so a server fault and an unplugged cable read identically, and neither
+  // said which. The status is reported when the body cannot be read.
   async function post(url, data){
     const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
-    return r.json();
+    try {
+      return await r.json();
+    } catch (e) {
+      return { ok:false, error: 'the server answered ' + r.status + ' with a response this page could not read' };
+    }
   }
   const sendBtn = $('mcSend');
   if (sendBtn) sendBtn.addEventListener('click', async function(){
