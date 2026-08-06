@@ -5,6 +5,11 @@ import { sql } from 'drizzle-orm';
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 
+// Declared above every handler and every reader below - `const` is not hoisted, and a handler
+// reaching a later declaration throws on its first line while the page still looks fine.
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const logFail = (tag: string, e: any) => console.error('[portal/courses/slug] ' + tag, e?.cause?.message || e?.message);
+
 const { slug } = Astro.params;
 let course: any = null;
 let modules: any[] = [];
@@ -12,12 +17,23 @@ let lessons: any[] = [];
 let enrollment: any = null;
 let completedLessonIds: string[] = [];
 let certificate: any = null;
+// Did each read RUN? An empty bucket and an unreadable one are different sentences, and the
+// screens below used to print the first one over the second.
+let lessonsOk = false;
+let progressOk = false;
 
 try {
   const r = await db.execute(sql`SELECT * FROM training_courses WHERE slug = ${slug} AND is_published = true LIMIT 1`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   course = rows[0] || null;
-} catch(e) {}
+} catch(e) {
+  // A course that could not be READ is not a course that does not exist. Sending somebody to the
+  // catalogue as though the page were gone hides an outage behind a 'not found'.
+  logFail('course', e);
+  return new Response('This course could not be loaded just now. Please try again in a moment.', {
+    status: 503, headers: { 'content-type': 'text/plain; charset=utf-8' },
+  });
+}
 
 if (!course) return Astro.redirect('/portal/courses');
 
@@ -37,51 +53,73 @@ try {
     enrollment = er[0];
     await db.execute(sql`UPDATE training_courses SET enrolled_count = enrolled_count + 1 WHERE id = ${course.id}`);
   }
-} catch(e) {}
+} catch(e) { logFail('enrollment', e); }
 
 try {
   const r = await db.execute(sql`SELECT * FROM training_modules WHERE course_id = ${course.id} ORDER BY sort_order`);
   modules = Array.isArray(r) ? r : (r?.rows || []);
   const r2 = await db.execute(sql`SELECT * FROM training_lessons WHERE course_id = ${course.id} ORDER BY sort_order`);
   lessons = Array.isArray(r2) ? r2 : (r2?.rows || []);
-} catch(e) {}
+  lessonsOk = true;
+} catch(e) { logFail('modules + lessons', e); }
 
 if (enrollment) {
   try {
     const r = await db.execute(sql`SELECT lesson_id FROM training_progress WHERE enrollment_id = ${enrollment.id}`);
     const rows = Array.isArray(r) ? r : (r?.rows || []);
     completedLessonIds = (rows as any[]).map((r: any) => r.lesson_id);
-  } catch(e) {}
+    progressOk = true;
+  } catch(e) { logFail('progress', e); }
 }
 
 try {
   const r = await db.execute(sql`SELECT * FROM training_certificates WHERE course_id = ${course.id} AND user_id = ${user.id} LIMIT 1`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   certificate = rows[0] || null;
-} catch(e) {}
+} catch(e) { logFail('certificate', e); }
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
-  if (fd.get('action') === 'complete_lesson' && enrollment) {
+  if (fd.get('action') === 'complete_lesson') {
     const lessonId = fd.get('lesson_id') as string;
-    try {
-      await db.execute(sql`INSERT INTO training_progress (enrollment_id, lesson_id) VALUES (${enrollment.id}, ${lessonId}) ON CONFLICT DO NOTHING`);
-      const total = lessons.length;
-      const done = completedLessonIds.length + 1;
-      const pct = total > 0 ? Math.min(100, Math.round((done/total)*100)) : 0;
-      await db.execute(sql`UPDATE training_enrollments SET progress_pct=${pct}, last_lesson_id=${lessonId}, updated_at=NOW() WHERE id=${enrollment.id}`);
-      if (pct >= 100 && !certificate) {
-        const certNum = 'ERA-CERT-' + Date.now().toString(36).toUpperCase();
-        await db.execute(sql`INSERT INTO training_certificates (course_id,user_id,enrollment_id,certificate_number) VALUES (${course.id},${user.id},${enrollment.id},${certNum}) ON CONFLICT DO NOTHING`);
-      }
-    } catch(e) {}
-    return Astro.redirect(`/portal/courses/${slug}?lesson=${lessonId}&done=1`);
+    // THE BANNER USED TO BE UNCONDITIONAL. `?done=1` was appended to the redirect whether the
+    // INSERT landed or threw, and the catch was empty, so a failed write rendered "Lesson
+    // completed!" over a lesson that is still outstanding — and the reason never reached a log.
+    // It also fell straight through when `enrollment` was null (its own read having failed), so
+    // the button did nothing at all and said nothing about it.
+    let saved = false;
+    if (!enrollment) {
+      logFail('complete_lesson', new Error('no enrolment resolved for user ' + user.id + ' on course ' + course.id));
+    } else {
+      try {
+        await db.execute(sql`INSERT INTO training_progress (enrollment_id, lesson_id) VALUES (${enrollment.id}, ${lessonId}) ON CONFLICT DO NOTHING`);
+        // The percentage is only trustworthy when BOTH the lesson list and the existing progress
+        // were read. Writing one derived from a partial read would overwrite a correct figure with
+        // a lower one, so the completion row still lands and the percentage is left alone.
+        if (lessonsOk && progressOk) {
+          const total = lessons.length;
+          const done = completedLessonIds.includes(lessonId) ? completedLessonIds.length : completedLessonIds.length + 1;
+          const pct = total > 0 ? Math.min(100, Math.round((done/total)*100)) : 0;
+          await db.execute(sql`UPDATE training_enrollments SET progress_pct=${pct}, last_lesson_id=${lessonId}, updated_at=NOW() WHERE id=${enrollment.id}`);
+          if (pct >= 100 && !certificate) {
+            const certNum = 'ERA-CERT-' + Date.now().toString(36).toUpperCase();
+            await db.execute(sql`INSERT INTO training_certificates (course_id,user_id,enrollment_id,certificate_number) VALUES (${course.id},${user.id},${enrollment.id},${certNum}) ON CONFLICT DO NOTHING`);
+          }
+        } else {
+          await db.execute(sql`UPDATE training_enrollments SET last_lesson_id=${lessonId}, updated_at=NOW() WHERE id=${enrollment.id}`);
+        }
+        saved = true;
+      } catch(e) { logFail('complete_lesson', e); }
+    }
+    return Astro.redirect(`/portal/courses/${slug}?lesson=${lessonId}&` + (saved ? 'done=1' : 'err=save'));
   }
 }
 
 const urlP = new URL(Astro.request.url).searchParams;
 const activeLessonId = urlP.get('lesson') || lessons[0]?.id || '';
 const justDone = urlP.get('done') === '1';
+// One code, from this page's own redirect, never anything variable off the request.
+const saveFailed = urlP.get('err') === 'save';
 const activeLesson = (lessons as any[]).find((l: any) => l.id === activeLessonId) || lessons[0] || null;
 const progressPct = enrollment?.progress_pct || 0;
 const currentIdx = activeLesson ? (lessons as any[]).findIndex((l: any) => l.id === activeLesson.id) : -1;
@@ -323,6 +361,20 @@ const typeColors: Record<string,string> = {video:'#ef4444',text:'#60a5fa',quiz:'
 
   <!-- Main content -->
   <div class="main">
+    {/* Both notices sit ABOVE the lesson block on purpose: the lesson block does not render at
+        all when the lesson list could not be read, which is precisely when there is something
+        to say. */}
+    {saveFailed && (
+      <div style="margin:14px 16px 0;background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.32);border-radius:10px;padding:10px 14px;display:flex;align-items:center;gap:8px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#b91c1c" stroke-width="2.2"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="13"/><line x1="12" y1="16.5" x2="12" y2="16.6"/></svg>
+        <p style="font-size:13px;color:#991b1b;margin:0;">We could not record that lesson as complete. Nothing you did is lost - try marking it again in a moment.</p>
+      </div>
+    )}
+    {!lessonsOk && (
+      <div style="margin:14px 16px 0;background:rgba(250,204,21,0.14);border:1px solid rgba(250,204,21,0.35);border-radius:10px;padding:10px 14px;">
+        <p style="font-size:13px;color:#92400e;margin:0;">We could not read this course's lessons just now. This is a problem on our side, not an empty course - please try again shortly.</p>
+      </div>
+    )}
     {activeLesson && (
       <div>
         {/* Video player at top for video lessons */}
@@ -450,7 +502,7 @@ const typeColors: Record<string,string> = {video:'#ef4444',text:'#60a5fa',quiz:'
       </div>
     )}
 
-    {lessons.length === 0 && (
+    {lessons.length === 0 && lessonsOk && (
       <div style="display:flex;align-items:center;justify-content:center;height:100%;flex-direction:column;gap:12px;color:#8B8175;padding:48px;">
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
         <p style="font-size:15px;font-weight:600;color:#1A1612;">No lessons yet</p>

@@ -2,52 +2,44 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
+import {
+  CRM_STAGES, ensureCrmSchema, dbReason, listDeals, dealStats,
+  listContacts, listActivities, listOpenTasks, listContactOptions, closeTask,
+} from '@/lib/crm';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=/portal/crm');
 
-function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-
-// Self-bootstrap schema
-try {
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_contacts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    owner_user_id UUID,
-    full_name VARCHAR(200) NOT NULL,
-    email VARCHAR(200), phone VARCHAR(40), company VARCHAR(200),
-    role VARCHAR(120), location VARCHAR(120),
-    source VARCHAR(80),
-    pipeline_stage VARCHAR(40) NOT NULL DEFAULT 'lead',
-    lifetime_value_chf NUMERIC(12,2),
-    tags JSONB DEFAULT '[]'::jsonb,
-    notes TEXT,
-    last_contacted_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_activities (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    contact_id UUID REFERENCES crm_contacts(id) ON DELETE CASCADE,
-    user_id UUID, kind VARCHAR(20),
-    summary TEXT, payload JSONB DEFAULT '{}'::jsonb,
-    due_at TIMESTAMPTZ, completed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_deals (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    contact_id UUID REFERENCES crm_contacts(id) ON DELETE CASCADE,
-    owner_user_id UUID, title TEXT NOT NULL,
-    amount_chf NUMERIC(12,2), stage VARCHAR(40) DEFAULT 'qualified',
-    close_date DATE, probability_pct INT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_contacts_stage ON crm_contacts(pipeline_stage)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_contacts_owner ON crm_contacts(owner_user_id)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_activities_contact ON crm_activities(contact_id)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_activities_due ON crm_activities(due_at)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_deals_stage ON crm_deals(stage)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_deals_contact ON crm_deals(contact_id)`);
-} catch (e) { console.error('crm bootstrap', e); }
+// AUTHORISATION. THIS PAGE HAD NONE.
+//
+// The only gate was `if (!user)`, and src/middleware.ts protects /portal/* by sign-in alone. So any
+// signed-in account at all — an applicant who registered five minutes ago, a parent, a student —
+// could open /portal/crm and read every contact's name, email, phone, company and lifetime value,
+// and INSERT contacts and deals into the company pipeline. Customer contact details are exactly the
+// class of data that must not be readable by whoever happens to hold a portal session.
+//
+// The capability is asked of src/lib/auth/permissions.ts (never users.role), and `admin.access` is
+// the key whose holders are the seven console roles — the same population src/middleware.ts admits
+// to /admin, where every other internal business tool on this codebase lives. The refusal below
+// says what is missing rather than bouncing the person to /portal with no explanation.
+const mayUseCrm = can(user as any, 'admin.access');
+if (!mayUseCrm) {
+  return new Response(
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>CRM — not available for this account</title></head>' +
+    '<body style="margin:0;background:#FAF8F5;color:#0E0B08;font-family:Georgia,serif;">' +
+    '<main style="max-width:640px;margin:0 auto;padding:80px 24px;">' +
+    '<p style="font-family:ui-monospace,monospace;font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:#FF4F00;margin:0 0 16px;">Portal &middot; CRM</p>' +
+    '<h1 style="font-size:34px;font-weight:500;margin:0 0 16px;">This console is not open to your account.</h1>' +
+    '<p style="font-size:17px;line-height:1.6;color:#5d4a3a;margin:0 0 12px;">The CRM holds customer contact details — names, addresses, phone numbers and account values. Reading it requires the <strong>admin.access</strong> capability, which your account does not hold.</p>' +
+    '<p style="font-size:15px;line-height:1.6;color:#5d4a3a;margin:0 0 28px;">If you need it for your work, ask an administrator to grant it; nothing about this page changes until they do.</p>' +
+    '<p style="margin:0;"><a href="/portal" style="font-family:ui-monospace,monospace;font-size:12px;letter-spacing:0.06em;text-transform:uppercase;color:#0E0B08;border:1px solid #1d160f33;border-radius:8px;padding:10px 16px;text-decoration:none;">Back to the portal</a></p>' +
+    '</main></body></html>',
+    { status: 403, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } },
+  );
+}
 
 let okMsg = '', errMsg = '';
 
@@ -56,9 +48,14 @@ let okMsg = '', errMsg = '';
 // `const stages` sits further down this file, below the POST block, and `const` is not hoisted —
 // referencing it from inside the handler would throw on the first line of every POST rather than
 // validating anything. This is the same shape that broke apply step 5 and the roles Repair button
-// on this project, and it is why the list is declared here and the one below is derived from it
+// on this project, and it is why the list is derived from the one vocabulary in src/lib/crm.ts
 // rather than written out twice.
-const STAGES = ['lead', 'qualified', 'proposal', 'negotiation', 'won', 'lost'] as const;
+const STAGES = CRM_STAGES;
+
+// The six CREATE TABLE + six CREATE INDEX statements that used to run on EVERY page load now live
+// behind a once-per-process guard in src/lib/crm.ts, and they report failure instead of being
+// swallowed: if the schema is not there, every panel below says so rather than rendering empty.
+const schemaBoot = await ensureCrmSchema();
 
 // POST handlers
 if (Astro.request.method === 'POST') {
@@ -138,9 +135,25 @@ if (Astro.request.method === 'POST') {
           VALUES (${contactId}::uuid, ${user.id}, ${title}, ${amount}, ${stage}, ${closeDate ? sql`${closeDate}::date` : sql`NULL`}, ${prob})`);
         okMsg = 'Deal created.';
       }
+    } else if (action === 'close_task') {
+      // THE TASKS PANEL LISTED WORK AND OFFERED NO WAY TO FINISH IT. crm_activities.completed_at was
+      // written only by log_activity (which sets it for non-task kinds), so an open task could never
+      // leave the "due in the next 7 days" list — the panel could only grow. This is the write that
+      // closes one, and it appends a note so the timeline records who closed it and when.
+      const taskId = String(form.get('task_id') || '');
+      if (!taskId) {
+        errMsg = 'No task was named. Nothing was closed.';
+      } else {
+        const done = await closeTask(taskId, user.id);
+        okMsg = done ? 'Task closed.' : '';
+        if (!done) errMsg = 'That task is already closed, or it no longer exists.';
+      }
     }
   } catch (e: any) {
-    errMsg = e?.message || 'Action failed.';
+    // postgres-js puts the failed SQL in e.message and the actual Postgres complaint on e.cause.
+    // Reporting e.message alone showed the operator their own statement and never the reason.
+    errMsg = dbReason(e);
+    console.error('[crm] POST ' + String(action) + ' failed:', errMsg);
   }
 }
 

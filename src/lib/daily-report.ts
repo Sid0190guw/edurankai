@@ -218,6 +218,30 @@ export function ensureDailyReportSchema(): Promise<void> {
       await db.execute(sql`
         CREATE INDEX IF NOT EXISTS hr_daily_report_rev_idx
           ON hr_daily_report_revisions (report_id, revision DESC)`);
+      // ONE SNAPSHOT PER REVISION, AND THE DATABASE IS WHAT SAYS SO.
+      //
+      // The index above is not unique, so two submits landing together both snapshotted the SAME
+      // revision number and the text in between existed in neither the trail nor the live row — it
+      // was simply gone, while the counter jumped by two and both screens told their author they had
+      // filed the next revision. submitReport() now takes the row lock that makes that impossible;
+      // this index is what makes it impossible to have MISSED a case.
+      //
+      // ADDITIVE AND NON-FATAL. A trail that already carries a duplicated (report_id, revision) pair
+      // cannot take the index, and that must not stop the module loading — it is logged with the
+      // query to run, because the duplicate itself is the evidence that somebody's edit was lost.
+      try {
+        await db.execute(sql`
+          CREATE UNIQUE INDEX IF NOT EXISTS hr_daily_report_rev_uniq
+            ON hr_daily_report_revisions (report_id, revision)`);
+      } catch (e: any) {
+        console.error(
+          '[daily-report] could not create hr_daily_report_rev_uniq. Two snapshots of one revision '
+          + 'already exist, which means a report edit was overwritten with no copy kept. Check with: '
+          + 'SELECT report_id, revision, count(*) FROM hr_daily_report_revisions '
+          + 'GROUP BY report_id, revision HAVING count(*) > 1; -- reason: '
+          + String(e?.cause?.message || e?.message || 'unknown database error'),
+        );
+      }
     } catch (e: any) {
       // Re-thrown after logging so ensureOnce drops the failed run from its cache and the next
       // request retries, matching ensureAttendanceSchema()'s discipline.
@@ -858,39 +882,68 @@ export async function submitReport(input: SubmitInput): Promise<SubmitResult> {
        WHERE employee_id = ${employeeId}::uuid AND report_date = ${dateIso}::date
        LIMIT 1`));
     const existing = existingRows.length ? mapReport(existingRows[0]) : null;
-    const nextRevision = existing ? existing.revision + 1 : 0;
 
-    // The trace of what is being replaced, written BEFORE the overwrite. If this insert fails the
-    // whole submit fails: an update that loses the previous text with no record of it is worse than
-    // a refused submit, and the person can simply press the button again.
-    if (existing) {
-      await db.execute(sql`
+    // =============================================================================================
+    // THE SNAPSHOT AND THE OVERWRITE ARE ONE TRANSACTION, AND THE SNAPSHOT READS THE LIVE ROW
+    // =============================================================================================
+    //
+    // It used to be: SELECT the row, INSERT a snapshot built from the values JavaScript had just
+    // read, then UPSERT. The counter in the upsert is atomic (`revision_count + 1`), so nobody
+    // noticed that the SNAPSHOT was not. Two submits of the same (employee, date) — a double-tapped
+    // button on a slow phone, or the author on two devices — both read revision 3 and both wrote a
+    // snapshot OF revision 3. The counter went to 5, the trail showed "revision 3" twice, and
+    // revision 4's text, the first person's actual edit, existed in no snapshot and no live row.
+    // It was not recoverable from anywhere, and both screens said the submit had worked.
+    //
+    // Two changes, and both are needed:
+    //   * the snapshot is now INSERT ... SELECT straight from hr_daily_reports, so it copies what the
+    //     row ACTUALLY holds at that instant rather than what was read a round-trip earlier, and
+    //   * FOR UPDATE takes the row lock, so the second submitter waits for the first to commit and
+    //     then snapshots the first submitter's text under its own revision number.
+    // The transaction means a failed snapshot rolls the overwrite back: losing the previous text
+    // with no copy of it is worse than a refused submit, and the person can simply press again.
+    //
+    // HONEST LIMIT: two submits for a date that has NO row yet cannot be serialised this way — there
+    // is no row to lock. One inserts revision 0 and the other updates to revision 1 with nothing
+    // snapshotted, because at the moment each looked there was genuinely nothing to snapshot. The
+    // unique index on (report_id, revision) is what would surface it.
+    let written: any[] = [];
+    await db.transaction(async (tx: any) => {
+      await tx.execute(sql`
         INSERT INTO hr_daily_report_revisions
           (report_id, employee_id, report_date, revision, report_url, work_done, blockers, replaced_by_user_id)
-        VALUES
-          (${existing.id}::uuid, ${employeeId}::uuid, ${dateIso}::date, ${existing.revision},
-           ${existing.url}, ${existing.summary}, ${existing.blockers}, ${userId}::uuid)`);
-    }
+        SELECT r.id, r.employee_id, r.report_date, COALESCE(r.revision_count, 0),
+               r.report_url, r.work_done, r.blockers, ${userId}::uuid
+          FROM hr_daily_reports r
+         WHERE r.employee_id = ${employeeId}::uuid AND r.report_date = ${dateIso}::date
+         FOR UPDATE`);
 
-    const written = rows(await db.execute(sql`
-      INSERT INTO hr_daily_reports
-        (employee_id, report_date, work_done, blockers, report_url, sharing_ack,
-         revision_count, submitted_by_user_id, updated_at)
-      VALUES
-        (${employeeId}::uuid, ${dateIso}::date, ${summary}, ${blockers}, ${link.url}, ${sharingAck},
-         0, ${userId}::uuid, NOW())
-      ON CONFLICT (employee_id, report_date) DO UPDATE
-        SET work_done            = EXCLUDED.work_done,
-            blockers             = EXCLUDED.blockers,
-            report_url           = EXCLUDED.report_url,
-            sharing_ack          = EXCLUDED.sharing_ack,
-            revision_count       = hr_daily_reports.revision_count + 1,
-            last_revised_at      = NOW(),
-            submitted_by_user_id = EXCLUDED.submitted_by_user_id,
-            updated_at           = NOW()
-      RETURNING id`));
+      written = rows(await tx.execute(sql`
+        INSERT INTO hr_daily_reports
+          (employee_id, report_date, work_done, blockers, report_url, sharing_ack,
+           revision_count, submitted_by_user_id, updated_at)
+        VALUES
+          (${employeeId}::uuid, ${dateIso}::date, ${summary}, ${blockers}, ${link.url}, ${sharingAck},
+           0, ${userId}::uuid, NOW())
+        ON CONFLICT (employee_id, report_date) DO UPDATE
+          SET work_done            = EXCLUDED.work_done,
+              blockers             = EXCLUDED.blockers,
+              report_url           = EXCLUDED.report_url,
+              sharing_ack          = EXCLUDED.sharing_ack,
+              revision_count       = hr_daily_reports.revision_count + 1,
+              last_revised_at      = NOW(),
+              submitted_by_user_id = EXCLUDED.submitted_by_user_id,
+              updated_at           = NOW()
+        RETURNING id, revision_count`));
+    });
 
     const reportId = written.length && written[0]?.id ? String(written[0].id) : (existing?.id || null);
+    // The revision number REPORTED is the one the database landed on, not one derived from a read
+    // taken before the write. Those two disagreed under exactly the concurrency above, so both
+    // authors were told they had filed revision 4.
+    const nextRevision = written.length && written[0]?.revision_count != null
+      ? Number(written[0].revision_count) || 0
+      : (existing ? existing.revision + 1 : 0);
 
     // ---------------------------------------------------------------------------------------------
     // AFTER THE COMMIT. Neither of these may take the submit down — the report IS filed by now, and

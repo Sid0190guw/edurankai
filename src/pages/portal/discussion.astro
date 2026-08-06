@@ -6,44 +6,78 @@ import { sql } from 'drizzle-orm';
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 
-let okMsg = '';
+// The real Postgres reason is on e.cause; e.message is only the failed SQL. Declared above the
+// handler that calls it - `const` is not hoisted.
+const logFail = (tag: string, e: any) => console.error('[portal/discussion] ' + tag, e?.cause?.message || e?.message);
+
+// FIXED VOCABULARY, never anything variable off the request. The banner is rendered from a code,
+// so nothing a person can type reaches the markup through the address bar.
+const FLASH: Record<string, { ok: boolean; text: string }> = {
+  posted: { ok: true, text: 'Posted.' },
+  reacted: { ok: true, text: 'Reaction saved.' },
+  short: { ok: false, text: 'Write at least three characters before posting.' },
+  post_failed: { ok: false, text: 'That post did not save. Nothing was lost - copy your text and try again in a moment.' },
+  react_failed: { ok: false, text: 'That reaction did not save. Try again in a moment.' },
+};
 
 // Handle post
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
-  try {
-    if (action === 'post') {
-      const body = (fd.get('body') as string || '').trim();
-      const category = fd.get('category') as string || 'general';
-      const parentId = fd.get('parent_id') as string || null;
-      if (body && body.length >= 3) {
+  const parentId = (fd.get('parent_id') as string || '').trim();
+  // Back where they were: a reply belongs to the thread it was written in, not the index.
+  const back = parentId ? ('/portal/discussion?post=' + encodeURIComponent(parentId)) : '/portal/discussion';
+  let code = '';
+  if (action === 'post') {
+    const body = (fd.get('body') as string || '').trim();
+    const category = fd.get('category') as string || 'general';
+    // A POST THAT THREW USED TO REDIRECT EXACTLY LIKE ONE THAT LANDED. The catch was empty, the
+    // reason never reached a log, and `okMsg` was assigned and then thrown away by the redirect -
+    // so a person who lost a long reply had no way to know it, and no way to know why.
+    if (!body || body.length < 3) {
+      code = 'short';
+    } else {
+      try {
         await db.execute(sql`
           INSERT INTO discussions (user_id, body, category, parent_id)
-          VALUES (${user.id}, ${body}, ${category}, ${parentId||null})
+          VALUES (${user.id}, ${body}, ${category}, ${parentId || null})
         `);
-        okMsg = 'Posted!';
+        code = 'posted';
+      } catch (e) {
+        logFail('post', e);
+        code = 'post_failed';
       }
-    } else if (action === 'react') {
-      const postId = fd.get('post_id') as string;
-      const emoji = fd.get('emoji') as string || 'like';
+    }
+  } else if (action === 'react') {
+    const postId = (fd.get('post_id') as string || '').trim();
+    const emoji = fd.get('emoji') as string || 'like';
+    try {
       await db.execute(sql`
         INSERT INTO discussion_reactions (post_id, user_id, emoji)
         VALUES (${postId}, ${user.id}, ${emoji})
         ON CONFLICT (post_id, user_id) DO UPDATE SET emoji = ${emoji}
-      `).catch(() => {});
+      `);
+      code = 'reacted';
+    } catch (e) {
+      logFail('react', e);
+      code = 'react_failed';
     }
-  } catch(e) {}
-  return Astro.redirect('/portal/discussion');
+  }
+  return Astro.redirect(back + (code ? ((back.indexOf('?') >= 0 ? '&' : '?') + 'msg=' + code) : ''));
 }
 
 const url = new URL(Astro.request.url);
 const cat = url.searchParams.get('cat') || 'all';
 const viewId = url.searchParams.get('post') || '';
+const flash = FLASH[url.searchParams.get('msg') || ''] || null;
 
 let posts: any[] = [];
 let viewPost: any = null;
 let replies: any[] = [];
+// Did each read RUN? "Nobody has posted" and "we could not read the board" are different
+// sentences and this page used to print the first one over the second.
+let postsOk = false;
+let threadOk = false;
 
 // Ensure discussion tables exist
 try {
@@ -68,7 +102,7 @@ try {
       UNIQUE(post_id, user_id)
     )
   `);
-} catch(e) {}
+} catch(e) { logFail('schema bootstrap', e); }
 
 try {
   const catFilter = cat !== 'all' ? sql`AND d.category = ${cat}` : sql``;
@@ -81,7 +115,8 @@ try {
     ORDER BY d.is_pinned DESC, d.created_at DESC LIMIT 50
   `);
   posts = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+  postsOk = true;
+} catch(e) { logFail('posts', e); }
 
 if (viewId) {
   try {
@@ -98,7 +133,8 @@ if (viewId) {
       WHERE d.parent_id = ${viewId} AND d.is_deleted = false ORDER BY d.created_at ASC
     `);
     replies = Array.isArray(r2) ? r2 : (r2?.rows || []);
-  } catch(e) {}
+    threadOk = true;
+  } catch(e) { logFail('thread ' + viewId, e); }
 }
 
 function timeAgo(d: any) {
@@ -162,6 +198,29 @@ const ROLE_COLOR: Record<string,string> = { super_admin:'#f97316', admin:'#FF4F0
   {!viewId && <button onclick="document.getElementById('composeSheet').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-size:12px;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer;">+ Post</button>}
 </nav>
 
+{flash && (
+  <div style={`margin:12px;padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.5;background:${flash.ok ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)'};border:1px solid ${flash.ok ? 'rgba(16,185,129,0.32)' : 'rgba(239,68,68,0.32)'};color:${flash.ok ? '#6ee7b7' : '#fca5a5'};`}>
+    {flash.text}
+  </div>
+)}
+
+{/* A thread that was ASKED for and could not be shown. Without this the page rendered nothing at
+    all - no list, no thread, no explanation - because the list block is suppressed whenever a
+    post id is in the address bar. */}
+{viewId && !viewPost && (
+  <div style="margin:12px;padding:18px;border-radius:12px;background:#0f0f14;border:1px solid #1a1a1f;text-align:center;">
+    <p style="font-size:14px;font-weight:600;color:#fff;margin:0 0 6px;">
+      {threadOk ? 'That discussion is no longer there' : 'We could not open that discussion'}
+    </p>
+    <p style="font-size:13px;color:#6e6e78;margin:0 0 12px;line-height:1.55;">
+      {threadOk
+        ? 'It may have been removed by its author.'
+        : 'This is a problem on our side, not a missing post. Please try again in a moment.'}
+    </p>
+    <a href="/portal/discussion" style="color:#FF7040;font-size:13px;font-weight:600;text-decoration:none;">Back to Community</a>
+  </div>
+)}
+
 {/* Thread view */}
 {viewPost && (
   <div>
@@ -219,8 +278,14 @@ const ROLE_COLOR: Record<string,string> = { super_admin:'#f97316', admin:'#FF4F0
     {posts.length === 0 && (
       <div style="text-align:center;padding:60px 24px;color:#6e6e78;">
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5" style="margin-bottom:14px;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-        <p style="font-size:15px;font-weight:600;color:#fff;margin-bottom:6px;">No posts yet</p>
-        <p style="font-size:13px;">Be the first to post something!</p>
+        <p style="font-size:15px;font-weight:600;color:#fff;margin-bottom:6px;">
+          {postsOk ? 'No posts yet' : 'We could not load the board'}
+        </p>
+        <p style="font-size:13px;">
+          {postsOk
+            ? 'Be the first to post something!'
+            : 'This is a problem on our side, not an empty community. Please try again in a moment.'}
+        </p>
       </div>
     )}
 

@@ -55,10 +55,37 @@ import { decidesEveryRequest } from '@/lib/auth/capability';
 import { leaveSpan, observedDates, type HolidayScope } from '@/lib/holidays';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
-async function safe(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
 
+// Declared ABOVE safe(), which calls it. `const` is not hoisted and a helper under its first reader
+// has taken pages down on this project.
 const logFail = (tag: string, e: any) =>
   console.error('[hr-leave] ' + tag, e?.cause?.message || e?.message);
+
+/**
+ * A read that degrades to "nothing" rather than throwing — AND SAYS SO IN THE LOG.
+ *
+ * The bare `catch { return [] }` this replaces made a FAILED read and an EMPTY table the same
+ * observable fact, with nothing written down anywhere. Every screen behind it showed "no leave
+ * requests" and no operator could tell the difference between a person with no leave and a query
+ * that had died. The tolerance is kept, because a broken read must not blank a whole console; the
+ * silence is not.
+ *
+ * WHERE THE ANSWER DECIDES SOMETHING RATHER THAN RENDERS SOMETHING, DO NOT USE THIS — use
+ * strictRead() below, which throws so the caller can refuse.
+ */
+async function safe(q: any, tag = 'read'): Promise<any[]> {
+  try {
+    return rows(await db.execute(q));
+  } catch (e: any) {
+    logFail('safe.' + tag, e);
+    return [];
+  }
+}
+
+/** The same read with no tolerance: it throws, so a caller that is about to grant something can refuse. */
+async function strictRead(q: any): Promise<any[]> {
+  return rows(await db.execute(q));
+}
 
 const errText = (e: any, fallback: string) =>
   String(e?.cause?.message || e?.message || fallback).slice(0, 400);
@@ -260,8 +287,17 @@ async function createLeaveTables(): Promise<void> {
 // PURE HELPERS
 // -------------------------------------------------------------------------------------------------
 
+/**
+ * Calendar days from a to b, both ends included.
+ *
+ * PARSED AS UTC ('T00:00:00Z'), not as local midnight. The old form parsed in the process timezone
+ * and every consumer of the result then formatted with toISOString(), which is UTC — arithmetic in
+ * one zone, formatting in another. On this server the two happen to agree; anywhere they do not, a
+ * leave range silently gains or loses its first day. src/lib/attendance.ts already does its date
+ * arithmetic this way and this now matches it.
+ */
 function daysBetween(a: string, b: string): number {
-  const d1 = new Date(a + 'T00:00:00'), d2 = new Date(b + 'T00:00:00');
+  const d1 = new Date(a + 'T00:00:00Z'), d2 = new Date(b + 'T00:00:00Z');
   if (isNaN(d1.getTime()) || isNaN(d2.getTime()) || d2 < d1) return 0;
   return Math.round((d2.getTime() - d1.getTime()) / 86400000) + 1;
 }
@@ -526,6 +562,16 @@ export async function consumeCompOff(
       };
     }
 
+    // WHAT THIS CALL HAS ALREADY TAKEN, so a refusal half way through can put it back.
+    //
+    // Each credit is its own UPDATE and there is no transaction around the loop. When a concurrent
+    // request wins the race for the last half day, the UPDATEs that already succeeded STAY
+    // COMMITTED — and applyLeave() then abandons the request without writing a row. The old code
+    // returned "nothing was taken twice" and left those units consumed against a leave request that
+    // does not exist: comp off the person earned, silently gone, with nothing on any screen saying
+    // where. Declared before the loop that writes it; `const` is not hoisted.
+    let taken = 0;
+
     for (const c of credits) {
       if (need <= 0) break;
       const left = round2(Math.max(0, (Number(c.units) || 0) - (Number(c.consumed_units) || 0)));
@@ -538,13 +584,27 @@ export async function consumeCompOff(
          WHERE id = ${String(c.id)}::uuid
            AND consumed_units + ${take} <= units
         RETURNING id`));
-      if (wrote.length) need = round2(need - take);
+      if (wrote.length) {
+        need = round2(need - take);
+        taken = round2(taken + take);
+      }
     }
 
     if (need > 0) {
-      // Somebody else spent it between the read and the write. Honest, and recoverable: nothing
-      // partial is left dangling because the leave request is only written after this succeeds.
-      return { ok: false, error: 'Your comp off was spent by another request a moment ago. Nothing was taken twice.' };
+      // Somebody else spent it between the read and the write. Hand back whatever THIS call did
+      // manage to take before returning the refusal — see the note on `taken` above.
+      if (taken > 0) {
+        const back = await refundCompOff(employeeId, taken);
+        if (!back.ok) {
+          return {
+            ok: false,
+            error: 'Your comp off was spent by another request a moment ago, and ' + taken +
+              ' day(s) this attempt had already taken could not be put back (' +
+              (back.error || 'no reason given') + '). Nothing was filed. Ask HR to check your comp-off ledger.',
+          };
+        }
+      }
+      return { ok: false, error: 'Your comp off was spent by another request a moment ago. Nothing was taken, and nothing was filed.' };
     }
     return { ok: true, changed: true };
   } catch (e: any) {
@@ -573,6 +633,19 @@ export async function refundCompOff(employeeId: string, units: number): Promise<
          WHERE id = ${String(c.id)}::uuid AND consumed_units >= ${back}
         RETURNING id`));
       if (wrote.length) give = round2(give - back);
+    }
+    if (give > 0) {
+      // A SHORT REFUND IS NOT A SUCCESS. This returned { ok: true } whatever happened, so a refund
+      // that could only find part of what it was giving back reported the same thing as one that
+      // found all of it — and every caller here is a compensating action for a write that already
+      // failed, which is exactly when nobody is watching. Say what is still missing.
+      const short = round2(give);
+      logFail('refundCompOff.short', new Error(short + ' day(s) of comp off could not be returned to ' + employeeId));
+      return {
+        ok: false,
+        changed: true,
+        error: short + ' day(s) of comp off could not be put back — there is no consumed credit left to return them to.',
+      };
     }
     return { ok: true, changed: true };
   } catch (e: any) {
@@ -611,14 +684,26 @@ export interface LeaveBalance {
  * COMP OFF DOES NOT COME FROM THIS TABLE. Its allowance is the ledger, so its row is filled from
  * compOffBalance() — approved comp-off requests have already consumed the credits, which is why the
  * ledger is the whole truth and subtracting the requests again would double-count them.
+ *
+ * `strict` IS WHAT STOPS A FAILED READ FROM GRANTING LEAVE. The aggregate below used to be a
+ * tolerant read: when it threw, used and pending came back as zero and every allowance reported
+ * ITSELF as remaining. A screen rendering that is merely wrong; applyLeave() checking against it
+ * lets somebody file their thirteenth casual day out of twelve, and the row is then real. Display
+ * callers keep the tolerant behaviour so a broken query cannot blank a console — the one caller
+ * that GRANTS something passes strict and refuses instead.
  */
-export async function getBalances(employeeId: string, year?: number): Promise<LeaveBalance[]> {
+export async function getBalances(
+  employeeId: string,
+  year?: number,
+  opts: { strict?: boolean } = {},
+): Promise<LeaveBalance[]> {
   await ensureLeaveSchema();
   const y = year || new Date().getFullYear();
-  const agg = await safe(sql`SELECT leave_type,
+  const aggQuery = sql`SELECT leave_type,
       COALESCE(SUM(CASE WHEN status='approved' THEN COALESCE(day_units, days) ELSE 0 END),0)::numeric AS used,
       COALESCE(SUM(CASE WHEN status='pending'  THEN COALESCE(day_units, days) ELSE 0 END),0)::numeric AS pending
-    FROM hr_leave_request WHERE employee_id = ${employeeId} AND EXTRACT(YEAR FROM start_date) = ${y} GROUP BY leave_type`);
+    FROM hr_leave_request WHERE employee_id = ${employeeId} AND EXTRACT(YEAR FROM start_date) = ${y} GROUP BY leave_type`;
+  const agg = opts.strict ? await strictRead(aggQuery) : await safe(aggQuery, 'getBalances');
   const map: Record<string, any> = {};
   agg.forEach((r) => { map[r.leave_type] = r; });
 
@@ -774,8 +859,22 @@ export async function applyLeave(
   }
 
   // THE BALANCE CHECK. Work from home and unpaid leave are uncounted by definition.
+  //
+  // STRICT, AND THAT IS THE POINT OF THE ARGUMENT. A balance that could not be read is not a full
+  // allowance; it is an unknown, and granting against an unknown is how somebody ends up with more
+  // days off than they have. The refusal is temporary and says so.
   if (meta.source === 'allowance' && meta.allowance > 0) {
-    const bal = (await getBalances(employeeId, Number(start.slice(0, 4)))).find((b) => b.id === type);
+    let balances: LeaveBalance[];
+    try {
+      balances = await getBalances(employeeId, Number(start.slice(0, 4)), { strict: true });
+    } catch (e: any) {
+      logFail('applyLeave.balance', e);
+      return {
+        ok: false,
+        error: 'Your leave balance could not be read just now, so nothing was filed. Try again in a moment.',
+      };
+    }
+    const bal = balances.find((b) => b.id === type);
     const remaining = bal ? Number(bal.remaining) : 0;
     if (isFinite(remaining) && dayUnits > remaining) {
       return {
@@ -1012,8 +1111,10 @@ export async function markLeaveAttendance(l: any): Promise<number> {
     }
   }
 
-  const start = new Date(String(row.start_date).slice(0, 10) + 'T00:00:00');
-  const end = new Date(String(row.end_date).slice(0, 10) + 'T00:00:00');
+  // UTC, because the loop below formats each day with toISOString(). Parsing these as LOCAL midnight
+  // and then printing them as UTC is how a leave day gets stamped onto the wrong date.
+  const start = new Date(String(row.start_date).slice(0, 10) + 'T00:00:00Z');
+  const end = new Date(String(row.end_date).slice(0, 10) + 'T00:00:00Z');
   if (isNaN(start.getTime()) || isNaN(end.getTime()) || end < start) return 0;
   const span = Math.round((end.getTime() - start.getTime()) / 86400000) + 1;
   if (span > MAX_SPAN_DAYS) return 0;

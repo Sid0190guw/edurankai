@@ -19,6 +19,10 @@ import { sql as sqlExpr } from 'drizzle-orm';
 // new run deducts none of them, so net pay is higher than a run generated before this change. That is
 // visible on this page, not silent.
 import { generateRun, computePay, listComponents, MONTH_NAMES as PAYROLL_MONTHS } from '@/lib/payroll';
+// safeRows keeps "there are no payroll runs" apart from "we could not read the payroll runs" —
+// on this screen the second one, rendered as the first, invites somebody to generate a duplicate
+// month. clip/confirmAttr keep a long or apostrophe-bearing name from breaking a card or a prompt.
+import { safeRows, clip, confirmAttr, dbReason, pageParam } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -100,19 +104,63 @@ if (Astro.request.method === 'POST') {
       }
     } else if (action === 'approve_run') {
       const runId = fd.get('runId') as string;
-      await db.execute(sqlExpr`
+      // THE WRITE RE-STATES THE PRECONDITION THE BUTTON WAS DRAWN UNDER.
+      //
+      // This was `WHERE id = ${runId}` with nothing else, and its result was never looked at. Two
+      // consequences, both reachable with one finger:
+      //   * This page renders its flash on the POST RESPONSE — there is no redirect — so a browser
+      //     refresh re-submits. Re-posting Approve against a run already marked PAID walked it
+      //     backwards to 'approved' and every payslip from 'paid' to 'approved', while paid_at
+      //     stayed set: a console showing money as not yet paid that had already left the account.
+      //   * It printed "Payroll run approved." whether or not any row matched, so a runId for a run
+      //     that had been deleted, or that somebody else had just approved, read as success.
+      //
+      // `AND status = 'draft'` makes the second press match nothing, and RETURNING makes that
+      // visible instead of silent.
+      const appRows = await db.execute(sqlExpr`
         UPDATE hr_payroll_runs SET status = 'approved', approved_by = ${user.id}, approved_at = NOW()
-        WHERE id = ${runId}
+        WHERE id = ${runId} AND status = 'draft'
+        RETURNING id, month, year
       `);
-      await db.execute(sqlExpr`UPDATE hr_payslips SET status = 'approved' WHERE payroll_run_id = ${runId}`);
-      await audit(user.id, 'hr.payroll.approved', runId, {});
-      successMsg = 'Payroll run approved.';
+      const approved = (Array.isArray(appRows) ? appRows : ((appRows as any)?.rows || [])) as any[];
+      if (!approved.length) {
+        // Say WHICH of the two it is. "Nothing happened" is not a message somebody can act on.
+        const cur = await db.execute(sqlExpr`SELECT status FROM hr_payroll_runs WHERE id = ${runId}`);
+        const curRow = ((Array.isArray(cur) ? cur : ((cur as any)?.rows || [])) as any[])[0];
+        errorMsg = curRow
+          ? 'Nothing was approved: that run is already ' + String(curRow.status || 'in an unknown state')
+            + ', and only a draft can be approved. If you meant to pay it, use Mark Paid.'
+          : 'Nothing was approved: there is no payroll run with that id any more. Reload the page.';
+      } else {
+        // Payslips follow the run, and only the ones still in the state the run just left.
+        await db.execute(sqlExpr`UPDATE hr_payslips SET status = 'approved' WHERE payroll_run_id = ${runId} AND status = 'draft'`);
+        await audit(user.id, 'hr.payroll.approved', runId, {});
+        successMsg = 'Payroll run approved for ' + (PAYROLL_MONTHS[(approved[0].month || 1) - 1] || '?') + ' ' + approved[0].year + '.';
+      }
     } else if (action === 'mark_paid') {
       const runId = fd.get('runId') as string;
-      await db.execute(sqlExpr`
-        UPDATE hr_payroll_runs SET status = 'paid', paid_at = NOW() WHERE id = ${runId}
+      // SAME GUARD, AND IT MATTERS MORE HERE. Re-posting this (a refresh of the POST response)
+      // rewrote paid_at = NOW() on the run AND on every payslip, destroying the date the money
+      // actually moved — the one field a payroll question three months later turns on. With
+      // `AND status = 'approved'` the second press matches nothing and the original date stands.
+      const runPaidRes = await db.execute(sqlExpr`
+        UPDATE hr_payroll_runs SET status = 'paid', paid_at = NOW()
+        WHERE id = ${runId} AND status = 'approved'
+        RETURNING id
       `);
-      await db.execute(sqlExpr`UPDATE hr_payslips SET status = 'paid', paid_at = NOW() WHERE payroll_run_id = ${runId}`);
+      const paidNow = (Array.isArray(runPaidRes) ? runPaidRes : ((runPaidRes as any)?.rows || [])) as any[];
+      if (!paidNow.length) {
+        const cur = await db.execute(sqlExpr`SELECT status, paid_at FROM hr_payroll_runs WHERE id = ${runId}`);
+        const curRow = ((Array.isArray(cur) ? cur : ((cur as any)?.rows || [])) as any[])[0];
+        errorMsg = curRow
+          ? (String(curRow.status) === 'paid'
+              ? 'That run was already marked paid' + (curRow.paid_at ? ' on ' + new Date(curRow.paid_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '')
+                + '. Nothing was changed and that date has not been overwritten. If a wallet is still empty, credit it from Payouts.'
+              : 'Nothing was marked paid: that run is ' + String(curRow.status || 'in an unknown state')
+                + ', and only an approved run can be paid.')
+          : 'Nothing was marked paid: there is no payroll run with that id any more. Reload the page.';
+      } else {
+      await db.execute(sqlExpr`UPDATE hr_payslips SET status = 'paid', paid_at = NOW() WHERE payroll_run_id = ${runId} AND status <> 'paid'`);
 
       // Money must actually land somewhere. Marking a run paid used to change two status columns
       // and stop, so wallet balances stayed at zero no matter how many months had been paid and
@@ -222,6 +270,7 @@ if (Astro.request.method === 'POST') {
           + 'Payroll is marked paid, but the notifications could not be sent, so no employee has been told. ('
           + (e?.cause?.message || e?.message || 'unknown error') + ')';
       }
+      } // end of the "this press actually moved the run from approved to paid" branch
     } else if (action === 'update_salary') {
       const empId = fd.get('empId') as string;
       const basic = parseFloat(fd.get('basic') as string || '0');
@@ -319,44 +368,83 @@ const showRunModal = url.searchParams.get('new') === '1';
 /** Where the sheet's Cancel/close returns to — the tab you were on, without ?new. */
 const runModalBack = '?tab=' + encodeURIComponent(tab) + (selectedRunId ? '&run=' + encodeURIComponent(selectedRunId) : '');
 
-// Payroll runs
-const runs = await db.execute(sqlExpr`SELECT * FROM hr_payroll_runs ORDER BY year DESC, month DESC LIMIT 24`);
+// EVERY READ BELOW WAS A BARE TOP-LEVEL AWAIT. On a database where hr_payroll_runs or
+// hr_salary_structures has not been created — which is the state of every fresh deployment, and the
+// state this page is most likely to be opened in first — the whole console answered with an
+// unexplained 500 rather than with the sentence that would have told somebody what to do.
+//
+// Failing SOFT is only half the fix. A `catch (_) { [] }` here would render "No payroll runs yet"
+// over a read that failed, and the button under that message creates a run. Both facts are carried.
 
-// Payslips for selected run
-const payslips = selectedRunId ? await db.execute(sqlExpr`
+// Payroll runs
+const runsRes = await safeRows('[payroll] run list', () =>
+  db.execute(sqlExpr`SELECT * FROM hr_payroll_runs ORDER BY year DESC, month DESC LIMIT 24`));
+const runRows = runsRes.rows;
+
+// Payslips for selected run. PAGED: a run for a few thousand employees rendered every payslip card
+// into one column, and this is the tab HR opens on a phone the morning after a run.
+const PAYSLIP_PER_PAGE = 50;
+const payslipCountRes = selectedRunId
+  ? await safeRows('[payroll] payslip count', () => db.execute(
+      sqlExpr`SELECT COUNT(*)::int AS n FROM hr_payslips WHERE payroll_run_id = ${selectedRunId}`))
+  : null;
+const payslipTotal = payslipCountRes && payslipCountRes.ok ? Number(payslipCountRes.rows[0]?.n ?? 0) : 0;
+const payslipPages = Math.max(1, Math.ceil(payslipTotal / PAYSLIP_PER_PAGE));
+const payslipPage = pageParam(url.searchParams.get('p'), payslipPages);
+const payslipsRes = selectedRunId ? await safeRows('[payroll] payslips for run', () => db.execute(sqlExpr`
   SELECT ps.*, e.full_name, e.employee_code, e.designation
   FROM hr_payslips ps
   JOIN hr_employees e ON ps.employee_id = e.id
   WHERE ps.payroll_run_id = ${selectedRunId}
   ORDER BY e.full_name
-`) : null;
+  LIMIT ${PAYSLIP_PER_PAGE} OFFSET ${(payslipPage - 1) * PAYSLIP_PER_PAGE}
+`)) : null;
+const payslipRows = payslipsRes ? payslipsRes.rows : null;
 
-const selectedRun = selectedRunId ? ((Array.isArray(runs) ? runs : (runs?.rows || [])) as any[]).find(r => r.id === selectedRunId) : null;
+const selectedRun = selectedRunId ? runRows.find((r: any) => String(r.id) === selectedRunId) : null;
+/** A run id in the URL that is not in the (latest 24) list. Not the same as "no run selected". */
+const selectedRunMissing = !!selectedRunId && !selectedRun && runsRes.ok;
 
 // Employees for salary setup
 const EMPLOYEE_LIMIT = 100;
-const employees = await db.execute(sqlExpr`
+const employeesRes = await safeRows('[payroll] salary setup list', () => db.execute(sqlExpr`
   SELECT e.id, e.full_name, e.employee_code, e.base_salary, e.currency,
     ss.basic, ss.hra, ss.da, ss.special_allowance, ss.transport_allowance,
-    ss.medical_allowance, ss.gross_salary, ss.net_salary, ss.tds
+    ss.medical_allowance, ss.other_allowances, ss.gross_salary, ss.net_salary, ss.tds
   FROM hr_employees e
   LEFT JOIN hr_salary_structures ss ON ss.employee_id = e.id
     AND ss.effective_from <= NOW() AND (ss.effective_to IS NULL OR ss.effective_to >= NOW())
   WHERE e.is_active = true
   ORDER BY e.full_name
   LIMIT ${EMPLOYEE_LIMIT}
-`);
-// postgres-js hands back a plain array; normalise once here rather than in three places in the body.
-const employeeRows = (Array.isArray(employees) ? employees : ((employees as any)?.rows || [])) as any[];
-const runRows = (Array.isArray(runs) ? runs : ((runs as any)?.rows || [])) as any[];
-const payslipRows = payslips
-  ? ((Array.isArray(payslips) ? payslips : ((payslips as any)?.rows || [])) as any[])
-  : null;
+`));
+const employeeRows = employeesRes.rows;
 
 // What a run will actually apply. Read AFTER the POST handler so a component saved elsewhere in this
 // request is reflected, and used only to state a fact on screen — it decides nothing.
-const activeComponents = await listComponents();
+//
+// listComponents() swallows its own failure and returns [] (src/lib/payroll.ts safeEnsure), so a
+// zero here means EITHER nothing is configured OR the catalogue could not be read. The banner below
+// says "no statutory component is configured" in both cases, which is a claim this page cannot
+// actually make. componentsReadOk records which it was.
+let componentsReadOk = true;
+let activeComponents: Awaited<ReturnType<typeof listComponents>> = [];
+try {
+  activeComponents = await listComponents();
+} catch (e: any) {
+  componentsReadOk = false;
+  console.error('[payroll] component catalogue could not be read -', dbReason(e));
+}
 const statutoryConfigured = activeComponents.filter((c) => c.statutory).length;
+
+// One banner naming every read that did not answer.
+const readFailures: string[] = [];
+if (!runsRes.ok) readFailures.push('the list of payroll runs');
+if (payslipsRes && !payslipsRes.ok) readFailures.push('the payslips on the selected run');
+if (payslipCountRes && !payslipCountRes.ok) readFailures.push('how many payslips that run carries');
+if (!employeesRes.ok) readFailures.push('the employees on Salary Setup');
+if (!componentsReadOk) readFailures.push('the salary component catalogue');
+const firstReadError = runsRes.error || (payslipsRes && payslipsRes.error) || employeesRes.error || null;
 
 const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
@@ -396,24 +484,52 @@ function fmt(n: any) {
   {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
 
+  {/* WHAT COULD NOT BE READ, ON THE SCREEN THAT CREATES PAYROLL RUNS. Without this, a failed read
+      of hr_payroll_runs renders as "No payroll runs yet" directly above a button that creates one —
+      and generateRun() refuses a second run for a period that already has one, so the person is
+      told the month exists after being told it does not. */}
+  {readFailures.length > 0 && (
+    <div style="margin:12px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.6;">
+      <strong style="color:#fecaca;">Part of this page could not be read, so what is blank below is unknown rather than empty.</strong>
+      Not read: {readFailures.join('; ')}. Do not generate a run on the strength of an empty list here —
+      check the month first.
+      {firstReadError && <span style="display:block;margin-top:6px;color:#f87171;font-family:'Geist Mono',monospace;font-size:11px;overflow-wrap:anywhere;">{clip(firstReadError, 300)}</span>}
+    </div>
+  )}
+
   <!-- PAYROLL RUNS TAB -->
   {tab === 'runs' && (
     <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
       {/* WHAT THIS RUN WILL AND WILL NOT DEDUCT, said before anybody presses the button. The rates
           that used to live in this file are gone; a run now applies exactly the components that have
           been configured, and none is assumed. */}
-      <div style={`border-radius:10px;padding:12px 14px;margin-bottom:4px;${statutoryConfigured === 0 ? 'background:rgba(255,159,0,0.07);border:1px solid rgba(255,159,0,0.22);' : 'background:#0f0f14;border:1px solid #1a1a1f;'}`}>
-        <p style={`font-size:12.5px;margin:0;line-height:1.65;${statutoryConfigured === 0 ? 'color:#fbbf24;' : 'color:#8a8a94;'}`}>
-          {statutoryConfigured === 0
+      {/* THREE STATES, NOT TWO. "No statutory component is configured" is a claim about the
+          catalogue; listComponents() returns [] both when the catalogue is empty AND when the read
+          of it failed, and this banner used to assert the first for both. */}
+      <div style={`border-radius:10px;padding:12px 14px;margin-bottom:4px;${!componentsReadOk ? 'background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.3);' : statutoryConfigured === 0 ? 'background:rgba(255,159,0,0.07);border:1px solid rgba(255,159,0,0.22);' : 'background:#0f0f14;border:1px solid #1a1a1f;'}`}>
+        <p style={`font-size:12.5px;margin:0;line-height:1.65;${!componentsReadOk ? 'color:#fca5a5;' : statutoryConfigured === 0 ? 'color:#fbbf24;' : 'color:#8a8a94;'}`}>
+          {!componentsReadOk
+            ? 'The salary component catalogue could not be read, so this page cannot say what a run would deduct. It is NOT saying that nothing is configured. Do not generate a run until this loads.'
+            : statutoryConfigured === 0
             ? 'No statutory component is configured, so a run generated now deducts no provident fund, state insurance, professional tax or withholding — the run assumes none of them. Those rates are jurisdiction-specific and this product makes no claim about what yours requires.'
             : statutoryConfigured + ' statutory component' + (statutoryConfigured === 1 ? '' : 's') + ' configured, plus ' + (activeComponents.length - statutoryConfigured) + ' other component' + ((activeComponents.length - statutoryConfigured) === 1 ? '' : 's') + '. Every rate is the one you entered; nothing here is advice on what your jurisdiction requires.'}
           <a href="/admin/hr/payroll/components" style="color:#FF7040;"> Open components</a>.
         </p>
       </div>
-      {runRows.length === 0 && (
+      {/* "No payroll runs yet" over a FAILED read is the worst sentence this page can print: the
+          only button next to it creates a run, and a duplicate run recovers loan instalments and
+          pays bonuses a second time. */}
+      {!runsRes.ok && (
+        <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;padding:16px;color:#fca5a5;font-size:13px;line-height:1.65;">
+          The payroll runs could not be read, so none is listed. There may be a run for this month
+          already — this page does not know. Do not press "+ Run Payroll" until this list loads.
+        </div>
+      )}
+      {runsRes.ok && runRows.length === 0 && (
         <div style="text-align:center;padding:48px;color:#6e6e78;">
           <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px;opacity:0.7;"><path d="M20 12V8H6a2 2 0 0 1-2-2c0-1.1.9-2 2-2h12v4"/><path d="M4 6v12c0 1.1.9 2 2 2h14v-4"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/></svg>
           <p style="font-size:13px;">No payroll runs yet</p>
+          <p style="font-size:12px;margin-top:4px;">This list was read successfully and is genuinely empty.</p>
           <p style="font-size:12px;margin-top:4px;">Click "+ Run Payroll" to create your first payroll run</p>
         </div>
       )}
@@ -460,7 +576,11 @@ function fmt(n: any) {
                   check is a prompt that gets dismissed. On a phone these two sit side by side and are
                   seven pixels apart. */}
               {run.status === 'draft' && (
-                <form method="POST" style="flex:1;min-width:120px;" onsubmit={`return confirm('Approve the ${MONTH_NAMES[(run.month || 1) - 1]} ${run.year} payroll run? This fixes ${run.total_employees} payslip${run.total_employees === 1 ? '' : 's'} totalling ${fmt(run.total_net)} net and is what Mark Paid then pays out.')`}>
+                <form method="POST" style="flex:1;min-width:120px;" onsubmit={confirmAttr(
+                  'Approve the ' + (MONTH_NAMES[(run.month || 1) - 1] || 'unknown month') + ' ' + run.year
+                  + ' payroll run? This fixes ' + (run.total_employees ?? 0) + ' payslip'
+                  + (Number(run.total_employees) === 1 ? '' : 's') + ' totalling ' + fmt(run.total_net)
+                  + ' net and is what Mark Paid then pays out.')}>
                   <input type="hidden" name="action" value="approve_run" />
                   <input type="hidden" name="runId" value={run.id} />
                   <button type="submit" style="width:100%;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.4);color:#c7d2fe;font-size:12px;font-weight:600;padding:7px;border-radius:6px;cursor:pointer;min-height:44px;">
@@ -469,7 +589,11 @@ function fmt(n: any) {
                 </form>
               )}
               {run.status === 'approved' && (
-                <form method="POST" style="flex:1;min-width:120px;" onsubmit={`return confirm('Mark the ${MONTH_NAMES[(run.month || 1) - 1]} ${run.year} payroll as paid? ${run.total_employees} employee${run.total_employees === 1 ? '' : 's'} will be credited ${fmt(run.total_net)} net in their wallets and told they have been paid. There is no undo.')`}>
+                <form method="POST" style="flex:1;min-width:120px;" onsubmit={confirmAttr(
+                  'Mark the ' + (MONTH_NAMES[(run.month || 1) - 1] || 'unknown month') + ' ' + run.year
+                  + ' payroll as paid? ' + (run.total_employees ?? 0) + ' employee'
+                  + (Number(run.total_employees) === 1 ? '' : 's') + ' will be credited ' + fmt(run.total_net)
+                  + ' net in their wallets and told they have been paid. There is no undo.')}>
                   <input type="hidden" name="action" value="mark_paid" />
                   <input type="hidden" name="runId" value={run.id} />
                   <button type="submit" style="width:100%;background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.4);color:#a7f3d0;font-size:12px;font-weight:600;padding:7px;border-radius:6px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;min-height:44px;">
@@ -496,16 +620,28 @@ function fmt(n: any) {
         <select id="runSelect" name="run" onchange="this.form.submit()" style="flex:1 1 180px;min-width:0;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;">
           <option value="">Select Payroll Run</option>
           {runRows.map(r => (
-            <option value={r.id} selected={selectedRunId === r.id}>{MONTH_NAMES[(r.month||1)-1]} {r.year} · {r.status}</option>
+            <option value={r.id} selected={selectedRunId === String(r.id)}>{MONTH_NAMES[(r.month||1)-1]} {r.year} · {r.status || 'no status'}</option>
           ))}
         </select>
         <button type="submit" style="flex:0 0 auto;background:#15151a;border:1px solid #26262e;color:#d8d8de;font-size:12.5px;font-weight:600;padding:0 16px;border-radius:8px;cursor:pointer;min-height:44px;">Show</button>
       </form>
+      {!runsRes.ok && (
+        <p style="font-size:12px;color:#fca5a5;margin:-4px 0 12px;line-height:1.6;">The run list could not be read, so this picker is empty. There may be runs; we could not fetch them.</p>
+      )}
 
       {selectedRun && (
         <div style="background:#0f0f14;border:1px solid #FF4F00;border-radius:10px;padding:10px 14px;margin-bottom:12px;">
-          <p style="font-size:12px;color:#FF7040;margin:0;font-weight:600;">{MONTH_NAMES[(selectedRun.month||1)-1]} {selectedRun.year} — {selectedRun.status?.toUpperCase()}</p>
-          <p style="font-size:11px;color:#6e6e78;margin:4px 0 0;">{selectedRun.total_employees} employees · Net: ₹{fmt(selectedRun.total_net)}</p>
+          <p style="font-size:12px;color:#FF7040;margin:0;font-weight:600;">{MONTH_NAMES[(selectedRun.month||1)-1]} {selectedRun.year} — {selectedRun.status ? String(selectedRun.status).toUpperCase() : 'NO STATUS'}</p>
+          <p style="font-size:11px;color:#6e6e78;margin:4px 0 0;">{selectedRun.total_employees ?? 0} employees · Net: ₹{fmt(selectedRun.total_net)}</p>
+        </div>
+      )}
+      {/* A RUN ID THAT IS NOT IN THE LIST. The list is the latest 24 runs, so this is reachable
+          without anything being wrong — and it used to render as though no run were selected while
+          the payslips below were still those of the run that IS being read. */}
+      {selectedRunMissing && (
+        <div style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.3);border-radius:10px;padding:12px 14px;margin-bottom:12px;color:#fde68a;font-size:12.5px;line-height:1.6;">
+          That run is not among the 24 most recent, so its month, status and totals are not shown here.
+          Any payslips listed below do belong to it.
         </div>
       )}
 
@@ -513,12 +649,28 @@ function fmt(n: any) {
         {!selectedRunId && <div style="text-align:center;padding:32px;color:#8a8a94;"><p style="font-size:13px;">Select a payroll run to view payslips</p></div>}
         {/* A RUN WITH NO PAYSLIPS USED TO RENDER NOTHING AT ALL — the same blank space as "you have
             not picked a run yet", which is the exact ambiguity that let four months of failed
-            messages go unnoticed on this project. Now it says which of the two it is. */}
-        {selectedRunId && payslipRows && payslipRows.length === 0 && (
+            messages go unnoticed on this project. Now it says which of the two it is.
+            AND a THIRD state that was folded into the second: the payslip read failing. "This run
+            carries no payslip — regenerate it before approving" is advice to re-run a month, which
+            recovers every loan instalment on it a second time. It must never be printed on a guess. */}
+        {selectedRunId && payslipsRes && !payslipsRes.ok && (
+          <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;padding:14px;color:#fca5a5;font-size:13px;line-height:1.6;">
+            The payslips on this run could not be read, so none is listed. This does NOT mean the run
+            is empty, and it is not a reason to regenerate the month — a second run for a period
+            recovers loan instalments and pays bonuses again.
+          </div>
+        )}
+        {selectedRunId && payslipsRes && payslipsRes.ok && payslipTotal === 0 && (
           <div style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.3);border-radius:10px;padding:14px;color:#fde68a;font-size:13px;line-height:1.6;">
             This run exists but carries no payslip. Either every employee was skipped when it was
             generated, or the payslips were removed afterwards. Nobody on this run has anything to be
             paid — regenerate it before approving.
+          </div>
+        )}
+        {selectedRunId && payslipsRes && payslipsRes.ok && payslipTotal > 0 && payslipRows && payslipRows.length === 0 && (
+          <div style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.3);border-radius:10px;padding:14px;color:#fde68a;font-size:13px;line-height:1.6;">
+            This run carries {payslipTotal} payslips, but none on this page.
+            <a href={`?tab=payslips&run=${encodeURIComponent(selectedRunId)}&p=1`} style="color:#FF7040;"> Go to the first page</a>.
           </div>
         )}
         {payslipRows && payslipRows.map(ps => (
@@ -526,8 +678,10 @@ function fmt(n: any) {
             <div style="padding:12px 14px;">
               <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
                 <div>
-                  <p style="font-size:13px;font-weight:600;color:#fff;margin:0;">{ps.full_name}</p>
-                  <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;font-family:'Geist Mono',monospace;">{ps.employee_code} · {ps.days_worked}d worked</p>
+                  <p style="font-size:13px;font-weight:600;color:#fff;margin:0;overflow-wrap:anywhere;" title={String(ps.full_name || '')}>{clip(ps.full_name || 'Unnamed employee', 60)}</p>
+                  {/* `{ps.days_worked}d worked` printed "nulld worked" for a payslip whose column
+                      was never written. A number that was not recorded is not a zero. */}
+                  <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;font-family:'Geist Mono',monospace;">{ps.employee_code || 'no code'} · {ps.days_worked != null ? ps.days_worked + 'd worked' : 'days worked not recorded'}</p>
                 </div>
                 <div style="text-align:right;">
                   <p style="font-size:15px;font-weight:700;color:#6ee7b7;margin:0;">{ps.currency} {fmt(ps.net_salary)}</p>
@@ -569,6 +723,20 @@ function fmt(n: any) {
           </div>
         ))}
       </div>
+
+      {/* THE PAYSLIP PAGER. This list had no LIMIT: a run for a large organisation rendered every
+          payslip card into one column on a phone. The count is the run's real total. */}
+      {selectedRunId && payslipsRes && payslipsRes.ok && payslipPages > 1 && (
+        <div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:16px 0 0;flex-wrap:wrap;">
+          {payslipPage > 1 && (
+            <a href={`?tab=payslips&run=${encodeURIComponent(selectedRunId)}&p=${payslipPage - 1}`} style="background:#15151a;border:1px solid #26262e;color:#d8d8de;text-decoration:none;padding:0 14px;border-radius:8px;font-size:12px;min-height:44px;display:inline-flex;align-items:center;">Previous</a>
+          )}
+          <span style="font-size:12px;color:#6e6e78;">Page {payslipPage} of {payslipPages} · {payslipTotal} payslips on this run</span>
+          {payslipPage < payslipPages && (
+            <a href={`?tab=payslips&run=${encodeURIComponent(selectedRunId)}&p=${payslipPage + 1}`} style="background:#15151a;border:1px solid #26262e;color:#d8d8de;text-decoration:none;padding:0 14px;border-radius:8px;font-size:12px;min-height:44px;display:inline-flex;align-items:center;">Next</a>
+          )}
+        </div>
+      )}
     </div>
   )}
 

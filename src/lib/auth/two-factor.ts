@@ -122,6 +122,80 @@ export async function clearAttempts(bucket: string): Promise<void> {
   await db.execute(sql`DELETE FROM auth_attempt_limit WHERE bucket = ${bucket}`).catch(() => {});
 }
 
+// ── password sign-in: the one path with no ceiling on it at all ─────────────
+//
+// EVERY OTHER GUESSABLE AUTH PATH ON THIS PROJECT IS COUNTED, AND THE PASSWORD FORM WAS NOT.
+// /api/auth/totp-login counts six-digit guesses per identifier and per IP; /portal/login counts face
+// descriptors and face lookups; recovery.ts counts date-of-birth and question-set attempts and fails
+// closed. The four password forms — /admin/login, /portal/login, /aquintutor/login, /hei/login —
+// called verifyPasswordForLogin() and nothing else, so an attacker could post passwords at an
+// administrator's address for as long as they liked, from as many invocations as they liked, and the
+// only cost was one scrypt per try. Nothing in front of those pages limits anything: middleware
+// exempts the sign-in surfaces by name.
+//
+// THIS COUNTS FAILURES ONLY, AND CLEARS ON SUCCESS. A person typing their own password correctly
+// never touches these buckets, so nobody's daily access changes. The ceilings are deliberately high
+// enough to sit far above a bad morning of typos and far below an online guessing run.
+//
+// THE TRADE-OFF, STATED. A per-identifier ceiling means somebody who knows an address can spend it
+// deliberately and make that person wait out the window. That is why the identifier ceiling is 20
+// rather than 5, why the window is fifteen minutes rather than an hour, and why nothing here writes
+// users.is_active or any other durable lock: the block evaporates on its own and the account is never
+// altered. Recovery by email stays open throughout, on its own separate allowance.
+export const PASSWORD_MAX_PER_IDENTIFIER = 20;
+export const PASSWORD_MAX_PER_IP = 60;
+export const PASSWORD_WINDOW_SECONDS = 900;
+
+/** The message every surface shows, so four sign-in pages cannot word this four ways. */
+export const PASSWORD_THROTTLED_MESSAGE =
+  'Too many sign-in attempts for that account. Please wait 15 minutes and try again, or use "Forgot password" to get a one-time link by email.';
+
+const pwIdBucket = (identifier: string) =>
+  'pw:id:' + createHash('sha256').update((identifier || '').trim().toLowerCase()).digest('hex').slice(0, 32);
+const pwIpBucket = (ip: string) =>
+  'pw:ip:' + createHash('sha256').update((ip || 'unknown').trim()).digest('hex').slice(0, 32);
+
+/**
+ * Has this identifier / source already spent its allowance of FAILED password attempts?
+ *
+ * Read-only: it peeks, it does not spend, so simply loading the form costs nothing.
+ *
+ * IT FAILS OPEN, DELIBERATELY, AND THAT IS THE OPPOSITE OF recovery.ts. The recovery limiter refuses
+ * when it cannot read its own counters because recovery is not a daily path and a few minutes of
+ * refusal costs a support email. This one guards the door every employee walks through every morning:
+ * if auth_attempt_limit becomes unreadable, refusing here would be a total sign-in outage across all
+ * four surfaces, which is the exact failure this codebase has already shipped twice. The password and
+ * scrypt are still required either way — this counter is depth, not the lock — so the safe direction
+ * when the counter is missing is to let the real check decide, loudly logged.
+ */
+export async function passwordAttemptsBlocked(identifier: string, ip: string): Promise<boolean> {
+  try {
+    if (await peekAttempts(pwIdBucket(identifier), PASSWORD_WINDOW_SECONDS) > PASSWORD_MAX_PER_IDENTIFIER) return true;
+    if (await peekAttempts(pwIpBucket(ip), PASSWORD_WINDOW_SECONDS) > PASSWORD_MAX_PER_IP) return true;
+    return false;
+  } catch (e: any) {
+    console.error('[auth/two-factor] password attempt counter unreadable; letting the password check decide:',
+      e?.cause?.message || e?.message);
+    return false;
+  }
+}
+
+/** Spend one failure. Never throws — a limiter that cannot count must not break the sign-in form. */
+export async function recordFailedPassword(identifier: string, ip: string): Promise<void> {
+  try {
+    await countAttempt(pwIdBucket(identifier), PASSWORD_WINDOW_SECONDS);
+    await countAttempt(pwIpBucket(ip), PASSWORD_WINDOW_SECONDS);
+  } catch (e: any) {
+    console.error('[auth/two-factor] could not record a failed password attempt:', e?.cause?.message || e?.message);
+  }
+}
+
+/** Give the allowance back the moment the right password arrives. */
+export async function clearPasswordAttempts(identifier: string, ip: string): Promise<void> {
+  await clearAttempts(pwIdBucket(identifier)).catch(() => {});
+  await clearAttempts(pwIpBucket(ip)).catch(() => {});
+}
+
 // ── per-account policy ──────────────────────────────────────────────────────
 /** True when this account has opted in to a mandatory second step. */
 export async function isSecondStepRequired(userId: string): Promise<boolean> {

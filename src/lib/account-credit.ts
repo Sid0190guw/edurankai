@@ -26,6 +26,23 @@ export function ensureCreditSchema(): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS acl_user_idx ON account_credit_ledger(user_id, created_at DESC)`);
+    // ONE TOP-UP PER ORDER, ENFORCED BY THE DATABASE AND NOT ONLY BY A LOOKUP.
+    //
+    // payment-effects.ts credits a wallet_recharge after checking `SELECT 1 ... WHERE ref_id = order`.
+    // That read-then-write is not atomic, and THREE paths run it for the same order — the browser
+    // /verify, the Razorpay webhook, and reconcile — so two arriving together both see no row and
+    // both credit the top-up. This index makes the second insert fail instead, and runEffect() there
+    // already reports a failure rather than swallowing it.
+    //
+    // ADDITIVE AND NON-FATAL: if a live ledger already holds a duplicated recharge ref the index
+    // cannot be built, and that must not take the whole credit module down. It is logged loudly —
+    // it means somebody was credited twice and a human has to net it off.
+    try {
+      await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS acl_recharge_ref_uniq
+        ON account_credit_ledger(ref_id) WHERE ref_type = 'recharge' AND ref_id IS NOT NULL`);
+    } catch (e: any) {
+      console.error('[credit] could not create the UNIQUE index on recharge ref_id — a duplicate top-up credit may already exist:', e?.cause?.message || e?.message);
+    }
   });
 }
 
@@ -80,24 +97,38 @@ export async function coverWithCredit(opts: {
   const { userId, amountPaise, purpose, referenceType, referenceId } = opts;
   if (!userId || !referenceId || !amountPaise) return { covered: false };
   await ensureCreditSchema();
-  const bal = await getCreditBalance(userId);
-  if (bal < amountPaise) return { covered: false };
+  const amt = Math.round(amountPaise);
+  if (!(amt > 0)) return { covered: false };
 
   // Synthetic order id so the existing payments + effects machinery works.
   const orderId = 'CREDIT-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 
   // STEP 1 — debit. If this fails nothing has happened yet, so the caller can safely fall back to a
   // card order.
+  //
+  // THE BALANCE IS TESTED INSIDE THE INSERT, not before it. This used to read the balance with
+  // getCreditBalance(), compare it in JavaScript, and then insert a negative row — so two checkouts
+  // submitted together (a double tap, a retried POST, two tabs) both saw the same balance and both
+  // spent it, and the ledger went negative for a wallet that is meant to be spendable only once.
+  // The sum below is computed in the same statement that writes the row; a second attempt sees the
+  // first row already in the sum and writes nothing at all.
+  //
+  // ZERO ROWS BACK IS NOT AN ERROR. It means the balance does not cover it, which is exactly the
+  // covered:false the caller falls back on.
+  let debited: any[] = [];
   try {
-    await db.execute(sql`
+    debited = rows(await db.execute(sql`
       INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id)
-      VALUES (${userId}, ${-Math.round(amountPaise)}, ${'Paid with credit: ' + (opts.label || purpose)}, ${referenceType}, ${referenceId})
-    `);
+      SELECT ${userId}::uuid, ${-amt}, ${'Paid with credit: ' + (opts.label || purpose)}, ${referenceType}, ${referenceId}
+       WHERE COALESCE((SELECT SUM(delta_paise) FROM account_credit_ledger WHERE user_id = ${userId}::uuid), 0) >= ${amt}
+      RETURNING id
+    `));
   } catch (e: any) {
     const real = e?.cause?.message || e?.message;
     console.error('[credit] wallet debit failed for user', userId, 'order', orderId, '-', real);
     return { covered: false, error: 'Your credit balance could not be used just now, so nothing was deducted. Please pay by card or try again.' };
   }
+  if (!debited.length) return { covered: false };
 
   // STEP 2 — the payments row, WHICH IS NOT OPTIONAL. It used to end in `.catch(() => {})`, and the
   // consequence was the worst shape available in this file: the wallet is already debited above, and

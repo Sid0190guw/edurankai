@@ -11,6 +11,8 @@ import {
   isSecondStepRequired, availableSecondFactors, startPendingChallenge,
   resolvePendingChallenge, verifySecondFactor, dropPendingChallenge,
   pendingCookieName, verifyFaceSecondFactor, canCompleteSecondStep,
+  passwordAttemptsBlocked, recordFailedPassword, clearPasswordAttempts,
+  PASSWORD_THROTTLED_MESSAGE,
   PENDING_TTL_SECONDS, PENDING_COOKIE_SECURE,
   type SecondFactorMethod,
 } from '@/lib/auth/two-factor';
@@ -18,6 +20,9 @@ import {
 // Every `const` this handler touches is declared BEFORE the handler — `const`
 // is not hoisted, and that has taken pages down here before.
 const SURFACE = 'admin' as const;
+/** The source address, in the shape every limiter on this project keys on. */
+const CLIENT_IP = (Astro.clientAddress || Astro.request.headers.get('x-forwarded-for') || 'unknown')
+  .toString().split(',')[0].trim().slice(0, 64);
 const PENDING_COOKIE = pendingCookieName(SURFACE);
 const LEGACY_FACE_COOKIE = 'face_pending_user';
 const LEGACY_TFA_COOKIE = 'admin_tfa_pending';
@@ -84,6 +89,12 @@ if (Astro.request.method === 'POST') {
 
     if (!identifier || !password) {
       errorMsg = 'Enter your email or internal handle, and your password.';
+    } else if (await passwordAttemptsBlocked(identifier, CLIENT_IP)) {
+      // This console is the highest-value password on the platform and, until this line, the only
+      // thing that cost an attacker anything per guess was one scrypt. Failures only are counted,
+      // the count is cleared the moment the right password arrives, and nothing durable is written
+      // to the account — so a person typing their own password never sees this.
+      errorMsg = PASSWORD_THROTTLED_MESSAGE;
     } else {
       try {
         const u = await findUserByLoginIdentifier(identifier);
@@ -91,10 +102,13 @@ if (Astro.request.method === 'POST') {
         // which. One message covers unknown identifier AND wrong password.
         const ok = await verifyPasswordForLogin(u, password);
         if (!ok || !u) {
+          await recordFailedPassword(identifier, CLIENT_IP);
           errorMsg = 'Invalid email or password.';
         } else if (!u.isActive) {
+          await recordFailedPassword(identifier, CLIENT_IP);
           errorMsg = 'Account is inactive. Contact admin.';
         } else {
+          await clearPasswordAttempts(identifier, CLIENT_IP);
           const methods = await availableSecondFactors(u.id);
           const optedIn = await isSecondStepRequired(u.id);
           // Staff with a face on file kept their existing face challenge before

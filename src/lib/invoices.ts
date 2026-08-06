@@ -77,6 +77,9 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logAudit } from '@/lib/audit';
+// The civil date in the company's zone. An invoice due date is a CALENDAR day, and comparing it to
+// the server's UTC day gets the answer wrong for the first five and a half hours of every IST day.
+import { civilDate } from '@/lib/page-safety';
 import {
   startWorkflow,
   instanceForRecord,
@@ -876,9 +879,14 @@ export function displayStatus(invoice: Invoice, paidTotal: number, today?: Date)
   if (total > 0 && paid >= total) return 'paid';
   if (paid > 0) return 'part_paid';
   if (invoice.dueDate) {
-    const now = today || new Date();
-    const iso = now.toISOString().slice(0, 10);
-    if (invoice.dueDate < iso) return 'overdue';
+    // THE DUE DATE IS A CIVIL DATE AND MUST BE COMPARED AGAINST ONE.
+    //
+    // This was `new Date().toISOString().slice(0,10)`, which is the UTC day. The server runs in UTC
+    // and the people reading this are in IST, five and a half hours ahead — so for the first five and
+    // a half hours of every IST day the comparison used YESTERDAY, and an invoice that fell due did
+    // not read as overdue on the morning it fell due. civilDate() asks Intl for the day in the zone.
+    const iso = civilDate(today || new Date());
+    if (iso && invoice.dueDate < iso) return 'overdue';
   }
   return invoice.status;
 }
@@ -2024,16 +2032,38 @@ export async function recordPayment(input: PaymentInput, actorUserId: string | n
   if (!(await schemaReady())) return { ok: false, error: SCHEMA_FAILED };
 
   try {
+    // THE OUTSTANDING TEST IS REPEATED INSIDE THE INSERT.
+    //
+    // The check against view.balance a few lines up is a READ, and two payments recorded together —
+    // two people on the same bill, one person double-submitting on a slow connection — both passed
+    // it and both were written, so an invoice could carry more paid against it than it is worth. For
+    // a payable settled into an employee wallet that is not just a wrong total: each row credits the
+    // wallet under its own ref, so the second one pays somebody a second time.
+    //
+    // The sum below is computed in the same statement that writes the row, so the second attempt
+    // sees the first payment already counted and inserts nothing.
     const ins = rows(await db.execute(sql`
       INSERT INTO invoice_payments (invoice_id, amount, currency, paid_on, method, reference, note, recorded_by)
-      VALUES (${invoiceId}::uuid, ${money(amount)}, ${invoice.currency},
-              ${isoDate(input?.paidOn) || new Date().toISOString().slice(0, 10)}::date,
-              ${method}, ${text(input?.reference, 120)}, ${text(input?.note, MAX_TEXT)},
-              ${isUuid(actorUserId) ? actorUserId : null}::uuid)
+      SELECT ${invoiceId}::uuid, ${money(amount)}, ${invoice.currency},
+             ${isoDate(input?.paidOn) || new Date().toISOString().slice(0, 10)}::date,
+             ${method}, ${text(input?.reference, 120)}, ${text(input?.note, MAX_TEXT)},
+             ${isUuid(actorUserId) ? actorUserId : null}::uuid
+        FROM invoices i
+       WHERE i.id = ${invoiceId}::uuid
+         AND i.status <> 'void'
+         AND ${money(amount)} <= i.total - COALESCE(
+               (SELECT SUM(p.amount) FROM invoice_payments p WHERE p.invoice_id = i.id), 0)
       RETURNING id`));
     if (!ins.length) {
-      logFail('recordPayment', new Error('insert returned no row for invoice ' + invoiceId));
-      return { ok: false, error: WRITE_FAILED };
+      // NOT a database failure. Somebody recorded a payment against this invoice between the read
+      // above and this write, and what is left no longer covers this amount.
+      const fresh = await viewInvoice(invoiceId);
+      return {
+        ok: false,
+        error: 'Nothing was recorded. Another payment was entered against this invoice a moment ago, '
+          + 'and only ' + formatAmount(fresh?.balance ?? 0, invoice.currency) + ' is still outstanding. '
+          + 'Reload the invoice and record what is actually left.',
+      };
     }
     const paymentId = String(ins[0].id);
 

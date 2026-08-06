@@ -161,33 +161,86 @@ export function ensureLifecycleSchema(): Promise<void> {
 
 // ============================== PROBATION ==============================
 
+// -------------------------------------------------------------------------------------------------
+// DATE ARITHMETIC FOR PROBATION TERMS. Declared ABOVE its first reader — `const` is not hoisted.
+//
+// UTC THROUGHOUT, AND NEVER A MIX. `new Date('2026-01-15')` is UTC midnight but `setMonth()` reads
+// and writes LOCAL fields, so the pair "parse an ISO date, setMonth, toISOString" is doing its
+// arithmetic in one zone and its formatting in another. On a UTC server the two agree and nothing
+// shows; anywhere else a probation term can land a day early or a day late, which is the day
+// somebody's employment status changes. These helpers stay in UTC from end to end.
+//
+// A DATE THAT WILL NOT PARSE RETURNS NULL rather than throwing: `Invalid Date.toISOString()` raises
+// a RangeError, which would take a probation screen down with a stack trace instead of a sentence.
+// -------------------------------------------------------------------------------------------------
+
+/** 'YYYY-MM-DD' out of anything Postgres or a form hands us. Null when it will not parse. */
+function isoDayOf(value: unknown): string | null {
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? null : value.toISOString().slice(0, 10);
+  }
+  const s = String(value ?? '').trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+}
+
+/**
+ * Add whole months to an ISO day, in UTC. Null in, null out.
+ *
+ * Clamps the day of month the way a person expects a term to end: 31 August plus six months is
+ * 28/29 February, not 2/3 March. setUTCMonth() on its own rolls that over into the next month.
+ */
+function addMonthsIso(dateIso: string | null, months: number): string | null {
+  if (!dateIso) return null;
+  const d = new Date(dateIso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return null;
+  const day = d.getUTCDate();
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() + Math.round(Number(months) || 0));
+  const lastOfMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(day, lastOfMonth));
+  return d.toISOString().slice(0, 10);
+}
+
+/** Add whole days to an ISO day, in UTC. Null in, null out. */
+function addDaysIso(dateIso: string | null, days: number): string | null {
+  if (!dateIso) return null;
+  const d = new Date(dateIso + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return null;
+  d.setUTCDate(d.getUTCDate() + Math.round(Number(days) || 0));
+  return d.toISOString().slice(0, 10);
+}
+
 export async function openProbation(opts: {
   employeeId: string;
   startDate: string;
   durationMonths?: number;
   noticeDaysDuringProbation?: number;
-}) {
+}): Promise<{ ok: boolean; error?: string; probationId?: string; scheduledEnd?: string }> {
   await ensureLifecycleSchema();
   const months = Math.max(1, Math.min(12, opts.durationMonths || 6));
-  const start = new Date(opts.startDate);
-  const scheduledEnd = new Date(start.getTime());
-  scheduledEnd.setMonth(scheduledEnd.getMonth() + months);
-  const endStr = scheduledEnd.toISOString().slice(0, 10);
+  const startIso = isoDayOf(opts.startDate);
+  // REFUSED, NOT GUESSED. This used to build a Date from whatever arrived and then call
+  // toISOString() on it, which throws a RangeError on an unparseable value and takes the page down
+  // with a stack trace. A probation with no readable start date is a form to fix, not a 500.
+  if (!startIso) return { ok: false, error: 'That start date could not be read, so no probation was opened.' };
+  const endStr = addMonthsIso(startIso, months) as string;
   const r = rows(await db.execute(sql`
     INSERT INTO hr_probation (employee_id, start_date, scheduled_end_date, duration_months, notice_days_during_probation)
-    VALUES (${opts.employeeId}, ${opts.startDate}, ${endStr}, ${months}, ${opts.noticeDaysDuringProbation || 30})
+    VALUES (${opts.employeeId}, ${startIso}, ${endStr}, ${months}, ${opts.noticeDaysDuringProbation || 30})
     RETURNING id, scheduled_end_date
   `));
   const probationId = r[0]?.id;
 
   // Auto-schedule 30 / 60 / 90 day reviews (capped at probation end).
   for (const day of [30, 60, 90]) {
-    const reviewDate = new Date(start.getTime());
-    reviewDate.setDate(reviewDate.getDate() + day);
-    if (reviewDate > scheduledEnd) continue;
+    const reviewDate = addDaysIso(startIso, day);
+    if (!reviewDate || reviewDate > endStr) continue;
     await db.execute(sql`
       INSERT INTO hr_probation_reviews (probation_id, review_day, scheduled_at)
-      VALUES (${probationId}, ${day}, ${reviewDate.toISOString().slice(0, 10)})
+      VALUES (${probationId}, ${day}, ${reviewDate})
     `);
   }
   return { ok: true, probationId, scheduledEnd: endStr };
@@ -246,20 +299,54 @@ export async function confirmEmployee(opts: { probationId: string; confirmedByUs
   await db.execute(sql`UPDATE hr_employees SET confirmation_date = CURRENT_DATE WHERE id IN (SELECT employee_id FROM hr_probation WHERE id = ${opts.probationId})`);
 }
 
-export async function extendProbation(opts: { probationId: string; months: number; reason: string }) {
+/**
+ * Push a probation's end date out by whole months.
+ *
+ * IT EXTENDS FROM THE DATE THE PROBATION ACTUALLY ENDS ON, WHICH IS NOT ALWAYS scheduled_end_date.
+ * This read `scheduled_end_date` alone, while every reader of the term answers with
+ * COALESCE(extended_to_date, scheduled_end_date) — the ordering query at line ~1397, the console row
+ * and /admin/hr/employees/[id]. So the FIRST extension worked and the SECOND one silently did not:
+ * it recomputed from the original scheduled end, wrote the same extended_to_date back, incremented
+ * extension_count and returned a newEnd the screen printed as "Probation extended to ...". Two
+ * three-month extensions moved the end date three months, and the only trace was a counter saying
+ * two. A probation end date is the date somebody's employment status changes, so a term that quietly
+ * refuses to move is a person confirmed or terminated on the wrong day.
+ *
+ * The base is now COALESCE(extended_to_date, scheduled_end_date), read in SQL so the expression
+ * matches the readers exactly rather than being reassembled in JavaScript.
+ */
+export async function extendProbation(
+  opts: { probationId: string; months: number; reason: string },
+): Promise<{ ok: boolean; error?: string; newEnd?: string }> {
   await ensureLifecycleSchema();
   const months = Math.max(1, Math.min(6, opts.months));
-  const cur = rows(await db.execute(sql`SELECT scheduled_end_date, extension_count FROM hr_probation WHERE id = ${opts.probationId}`))[0] as any;
-  if (!cur) return { ok: false, error: 'not found' };
-  const newEnd = new Date(cur.scheduled_end_date);
-  newEnd.setMonth(newEnd.getMonth() + months);
-  await db.execute(sql`
+  const cur = rows(await db.execute(sql`
+    SELECT COALESCE(extended_to_date, scheduled_end_date)::text AS ends_on, extension_count
+      FROM hr_probation WHERE id = ${opts.probationId}`))[0] as any;
+  if (!cur) return { ok: false, error: 'That probation record could not be found, so nothing was extended.' };
+
+  const base = isoDayOf(cur.ends_on);
+  const newEnd = addMonthsIso(base, months);
+  if (!newEnd) {
+    return { ok: false, error: 'That probation has no readable end date, so it could not be extended.' };
+  }
+
+  // The UPDATE re-states its own precondition, so two approvals racing each other cannot both extend
+  // from the same base: the second one matches no row and is reported rather than counted.
+  const wrote = rows(await db.execute(sql`
     UPDATE hr_probation
-    SET status = 'extended', extended_to_date = ${newEnd.toISOString().slice(0, 10)},
-      extension_count = extension_count + 1, extension_reason = ${opts.reason}, updated_at = NOW()
-    WHERE id = ${opts.probationId}
-  `);
-  return { ok: true, newEnd: newEnd.toISOString().slice(0, 10) };
+       SET status = 'extended', extended_to_date = ${newEnd}::date,
+           extension_count = extension_count + 1, extension_reason = ${opts.reason}, updated_at = NOW()
+     WHERE id = ${opts.probationId}
+       AND COALESCE(extended_to_date, scheduled_end_date)::text = ${base}::text
+    RETURNING id`));
+  if (!wrote.length) {
+    return {
+      ok: false,
+      error: 'That probation changed while this page was open, so nothing was extended. Reload and try again.',
+    };
+  }
+  return { ok: true, newEnd };
 }
 
 export async function terminateOnProbation(opts: { probationId: string; reason: string }) {

@@ -3,6 +3,13 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql as sqlExpr } from 'drizzle-orm';
 import { can, canAccessSection } from '@/lib/auth/permissions';
+// EVERY READ ON THIS PAGE NOW REPORTS WHETHER IT WORKED.
+// Six statements below used to be bare top-level `await db.execute(...)`. A malformed ?date= or
+// ?emp= in the URL, or an hr_time_logs table that has not been created on this database, took the
+// entire screen down with an unexplained 500 — and the two reads that WERE wrapped were wrapped in
+// `catch (_) {}`, which is the other half of the same fault: an empty face-check-in strip that
+// means "none today" and an empty one that means "we could not look" rendered identically.
+import { safeRows, jsString, confirmAttr, clip, firstWord, isoDate, uuidish, civilToday, pageParam } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -36,6 +43,16 @@ const attendanceDesk = await canAccessSection(user, 'attendance', 'edit');
 const mayManage = can(user as any, 'attendance.roster.manage') || attendanceDesk;
 if (!mayManage) return Astro.redirect('/admin');
 
+// DECLARED BEFORE THE POST HANDLER THAT READS IT — `const` is not hoisted, and a const declared
+// below the handler throws on its first use with a message that names the wrong thing entirely.
+//
+// The status column is free text in the database, so a hand-built POST could previously store
+// anything at all. Everything downstream reads it as an enum: computePay() in src/lib/payroll.ts
+// prices 'absent' as a loss-of-pay day, and STATUS_COLORS/STATUS_TEXT below fall back to grey for
+// anything they do not know. A value outside this set is not a new status; it is a row that no
+// screen and no payroll run can interpret.
+const VALID_STATUS = new Set(['present', 'absent', 'half_day', 'wfh', 'on_leave', 'holiday']);
+
 let errorMsg = '';
 let successMsg = '';
 
@@ -46,7 +63,10 @@ if (Astro.request.method === 'POST') {
   try {
     if (action === 'mark') {
       const employeeId = fd.get('employeeId') as string;
-      const date = fd.get('date') as string;
+      // A date the browser did not supply (scripting off, an old form, a hand-built POST) used to be
+      // bound straight into a DATE column and raised 22007, which the catch below then printed as a
+      // Postgres sentence. Refuse it in words the person can act on instead.
+      const date = isoDate(fd.get('date') as string) || '';
       const status = fd.get('status') as string;
       const clockIn = fd.get('clockIn') as string;
       const clockOut = fd.get('clockOut') as string;
@@ -71,47 +91,94 @@ if (Astro.request.method === 'POST') {
         workHours = Math.round(((outTime.getTime() - inTime.getTime()) / 3600000) * 100) / 100;
       }
 
-      await db.execute(sqlExpr`
-        INSERT INTO hr_attendance (employee_id, date, clock_in, clock_out, work_hours, status, work_mode, notes, ip_address)
-        VALUES (
-          ${employeeId}, ${date},
-          ${clockInTs},
-          ${clockOutTs},
-          ${workHours}, ${status}, ${workMode}, ${notes || null},
-          ${Astro.clientAddress || null}
-        )
-        ON CONFLICT (employee_id, date)
-        DO UPDATE SET
-          clock_in = EXCLUDED.clock_in,
-          clock_out = EXCLUDED.clock_out,
-          work_hours = EXCLUDED.work_hours,
-          status = EXCLUDED.status,
-          work_mode = EXCLUDED.work_mode,
-          notes = EXCLUDED.notes
-      `);
-      successMsg = 'Attendance saved.';
+      if (!date) {
+        errorMsg = 'That did not save: the date on the form was missing or not a real calendar date. Nothing was written.';
+      } else if (!uuidish(employeeId)) {
+        errorMsg = 'That did not save: no employee was chosen, or the value sent was not an employee id. Nothing was written.';
+      } else if (!VALID_STATUS.has(status)) {
+        errorMsg = 'That did not save: "' + clip(status, 40) + '" is not a status this page recognises. Nothing was written.';
+      } else {
+        await db.execute(sqlExpr`
+          INSERT INTO hr_attendance (employee_id, date, clock_in, clock_out, work_hours, status, work_mode, notes, ip_address)
+          VALUES (
+            ${employeeId}, ${date},
+            ${clockInTs},
+            ${clockOutTs},
+            ${workHours}, ${status}, ${workMode}, ${notes || null},
+            ${Astro.clientAddress || null}
+          )
+          ON CONFLICT (employee_id, date)
+          DO UPDATE SET
+            clock_in = EXCLUDED.clock_in,
+            clock_out = EXCLUDED.clock_out,
+            work_hours = EXCLUDED.work_hours,
+            status = EXCLUDED.status,
+            work_mode = EXCLUDED.work_mode,
+            notes = EXCLUDED.notes
+        `);
+        successMsg = 'Attendance saved for ' + date + ' as ' + status.replace('_', ' ') + '.';
+      }
     } else if (action === 'delete') {
       const employeeId = fd.get('employeeId') as string;
-      const date = fd.get('date') as string;
-      await db.execute(sqlExpr`DELETE FROM hr_attendance WHERE employee_id = ${employeeId} AND date = ${date}`);
-      successMsg = 'Attendance entry deleted.';
+      const date = isoDate(fd.get('date') as string) || '';
+      if (!date || !uuidish(employeeId)) {
+        errorMsg = 'Nothing was deleted: that form did not carry a valid employee and date.';
+      } else {
+        // RETURNING, so the page can tell "deleted" from "there was nothing there". Without it a
+        // second submit — a refresh of the POST response, which this page still does — reported a
+        // successful delete of a row that had already gone, and two admins each believed they were
+        // the one who removed it.
+        const gone = await db.execute(sqlExpr`
+          DELETE FROM hr_attendance WHERE employee_id = ${employeeId} AND date = ${date} RETURNING id`);
+        const goneRows = (Array.isArray(gone) ? gone : ((gone as any)?.rows || [])) as any[];
+        successMsg = goneRows.length
+          ? 'Attendance entry deleted for ' + date + '.'
+          : 'There was no attendance entry for that person on ' + date + ', so nothing was deleted. Somebody may have removed it already.';
+      }
     } else if (action === 'bulk_mark') {
-      const date = fd.get('date') as string;
+      const date = isoDate(fd.get('date') as string) || '';
       const status = fd.get('status') as string;
       const workMode = fd.get('workMode') as string || 'remote';
 
-      const emps = await db.execute(sqlExpr`SELECT id FROM hr_employees WHERE is_active = true`);
-      const _empRows = (Array.isArray(emps) ? emps : (emps?.rows || [])) as any[];
-      let count = 0;
-      for (const emp of _empRows) {
-        await db.execute(sqlExpr`
+      if (!date) {
+        errorMsg = 'Nothing was marked: the date on the form was missing or not a real calendar date.';
+      } else if (!VALID_STATUS.has(status)) {
+        errorMsg = 'Nothing was marked: "' + clip(status, 40) + '" is not a status this page recognises.';
+      } else {
+        // ONE STATEMENT, NOT ONE PER PERSON.
+        //
+        // This used to SELECT every active employee and then issue a separate INSERT for each of
+        // them, sequentially, inside the request. At a few dozen people that is merely slow; at a
+        // few thousand the serverless function times out PART WAY THROUGH — some people marked,
+        // some not, no success message, and nothing anywhere recording where it stopped. The set
+        // is chosen and written in a single round trip instead, so it either happened or it did not.
+        //
+        // RETURNING gives the number of rows this run actually created, which is not the number of
+        // active employees: anybody who already had a record for that day keeps it and is not
+        // counted. The old message said "Marked N employees" using the SELECT count, so it claimed
+        // to have marked people whose day it had deliberately left alone.
+        const ins = await db.execute(sqlExpr`
           INSERT INTO hr_attendance (employee_id, date, status, work_mode)
-          VALUES (${emp.id}, ${date}, ${status}, ${workMode})
+          SELECT e.id, ${date}::date, ${status}, ${workMode}
+          FROM hr_employees e WHERE e.is_active = true
           ON CONFLICT (employee_id, date) DO NOTHING
+          RETURNING employee_id
         `);
-        count++;
+        const insRows = (Array.isArray(ins) ? ins : ((ins as any)?.rows || [])) as any[];
+        const activeRes = await safeRows('[attendance] active headcount', () =>
+          db.execute(sqlExpr`SELECT COUNT(*)::int AS n FROM hr_employees WHERE is_active = true`));
+        const activeCount = activeRes.ok ? Number(activeRes.rows[0]?.n ?? 0) : null;
+        const kept = activeCount === null ? null : Math.max(0, activeCount - insRows.length);
+        successMsg = insRows.length === 0
+          ? (activeCount === 0
+              ? 'No active employee is on record, so there was nobody to mark for ' + date + '.'
+              : 'Nobody was marked for ' + date + ' — every active employee already has a record for that day, and none was overwritten.')
+          : 'Marked ' + insRows.length + ' employee' + (insRows.length === 1 ? '' : 's') + ' as '
+            + status.replace('_', ' ') + ' for ' + date + '.'
+            + (kept === null
+                ? ' The number who already had a record for that day could not be counted.'
+                : kept > 0 ? ' ' + kept + ' already had a record for that day and were left unchanged.' : '');
       }
-      successMsg = `Marked ${count} employees as ${status} for ${date}.`;
     }
   } catch (err: any) {
     // The real Postgres reason is on `.cause`; `.message` is only the failed SQL text, which is
@@ -123,12 +190,28 @@ if (Astro.request.method === 'POST') {
 
 const url = new URL(Astro.request.url);
 const tab = url.searchParams.get('tab') || 'today';
-const dateFilter = url.searchParams.get('date') || new Date().toISOString().split('T')[0];
-const empFilter = url.searchParams.get('emp') || '';
+
+// EVERY VALUE BELOW REACHES A TYPED POSTGRES COLUMN, SO EVERY ONE IS CHECKED BEFORE IT DOES.
+//
+// `?date=x` was bound straight into `a.date = ${dateFilter}` and `?emp=x` into an employee_id UUID
+// comparison. Postgres answers 22007 and 22P02, the statements were at the top level with no catch,
+// and the whole console 500d on a URL anybody can type or a stale bookmark can carry. The values are
+// now either valid or refused, and a refused one is SAID rather than silently replaced.
+const rawDate = url.searchParams.get('date');
+const rawEmp = url.searchParams.get('emp');
+// civilToday() asks for the civil date in IST rather than slicing a UTC ISO string. On a UTC server
+// — which is what this deploys onto — the UTC slice reads YESTERDAY between midnight and 05:30 IST,
+// so the console opened before dawn showed the previous day's roster while calling it today.
+const defaultDate = civilToday();
+const dateFilter = isoDate(rawDate) || defaultDate;
+const dateFilterRejected = rawDate !== null && isoDate(rawDate) === null;
+const empFilter = uuidish(rawEmp) || '';
+const empFilterRejected = !!rawEmp && !empFilter;
 
 // One-shot heal: fix rows where clock_out got stored on the same calendar day
 // as clock_in but is earlier (overnight shifts). Shift clock_out to next day
 // and recompute work_hours. Idempotent - matches zero rows once corrected.
+// Kept swallowed on purpose — it repairs history and nothing on the page depends on it having run.
 try {
   await db.execute(sqlExpr`
     UPDATE hr_attendance
@@ -138,8 +221,21 @@ try {
   `);
 } catch (_) {}
 
+// THE DAY ROSTER IS PAGED. It used to have no LIMIT at all: at a few thousand employees the server
+// rendered every row into a phone-first card list, and the page that HR opens every morning became
+// the slowest thing in the product. `?p=` is clamped to a positive integer whatever the URL says —
+// `?p=0` used to become OFFSET -N, which Postgres refuses outright.
+const ROSTER_PER_PAGE = 50;
+const rosterCountRes = await safeRows('[attendance] day roster count', () => db.execute(sqlExpr`
+  SELECT COUNT(*)::int AS n FROM hr_attendance a JOIN hr_employees e ON a.employee_id = e.id
+  WHERE a.date = ${dateFilter}`));
+const rosterTotal = rosterCountRes.ok ? Number(rosterCountRes.rows[0]?.n ?? 0) : 0;
+const rosterPages = Math.max(1, Math.ceil(rosterTotal / ROSTER_PER_PAGE));
+const rosterPage = pageParam(url.searchParams.get('p'), rosterPages);
+const rosterOffset = (rosterPage - 1) * ROSTER_PER_PAGE;
+
 // Today's attendance (with the employee's daily diary/progress report for the day)
-const todayAttendance = await db.execute(sqlExpr`
+const attendanceRes = await safeRows('[attendance] day roster', () => db.execute(sqlExpr`
   SELECT a.*, e.full_name, e.employee_code, e.designation,
     dr.work_done AS report_work, dr.progress AS report_progress, dr.blockers AS report_blockers,
     (SELECT COALESCE(SUM(hours),0) FROM hr_time_logs tl WHERE tl.employee_id = a.employee_id AND tl.log_date = a.date) AS logged_hours,
@@ -149,58 +245,73 @@ const todayAttendance = await db.execute(sqlExpr`
   LEFT JOIN hr_daily_reports dr ON dr.employee_id = a.employee_id AND dr.report_date = a.date
   WHERE a.date = ${dateFilter}
   ORDER BY e.full_name
-`);
+  LIMIT ${ROSTER_PER_PAGE} OFFSET ${rosterOffset}
+`));
+const attendanceRows = attendanceRes.rows;
 
 // Time-period logs for the day (per employee) to show under attendance.
-const dayTimeLogs = await db.execute(sqlExpr`SELECT employee_id, start_time, end_time, hours, task FROM hr_time_logs WHERE log_date = ${dateFilter} ORDER BY start_time ASC`);
-const _dtl = (Array.isArray(dayTimeLogs) ? dayTimeLogs : (dayTimeLogs?.rows || [])) as any[];
+const timeLogRes = await safeRows('[attendance] day time logs', () => db.execute(
+  sqlExpr`SELECT employee_id, start_time, end_time, hours, task FROM hr_time_logs WHERE log_date = ${dateFilter} ORDER BY start_time ASC LIMIT 2000`));
 const timeLogsByEmp: Record<string, any[]> = {};
-for (const t of _dtl) (timeLogsByEmp[t.employee_id] = timeLogsByEmp[t.employee_id] || []).push(t);
+for (const t of timeLogRes.rows) (timeLogsByEmp[t.employee_id] = timeLogsByEmp[t.employee_id] || []).push(t);
 
-// Face check-ins for the selected day (advisory attendance proof — a human
-// verifies these; they never auto-penalise). Guarded because face_photo
-// self-bootstraps on first clock event and may not exist on older DBs.
-let faceCheckins: any[] = [];
-try {
-  const fr = await db.execute(sqlExpr`
-    SELECT ce.id, ce.event_type, ce.event_time, ce.face_photo, ce.location_name,
-           e.full_name, e.employee_code
-    FROM hr_clock_events ce
-    JOIN hr_employees e ON ce.employee_id = e.id
-    WHERE DATE(ce.event_time) = ${dateFilter} AND ce.face_photo IS NOT NULL
-    ORDER BY ce.event_time DESC
-    LIMIT 60
-  `);
-  faceCheckins = (Array.isArray(fr) ? fr : (fr?.rows || [])) as any[];
-} catch (_) {}
+// Face check-ins for the selected day (advisory attendance proof — a human verifies these; they
+// never auto-penalise). This was `catch (_) {}`: on a database where hr_clock_events or its
+// face_photo column has not been created, the strip vanished and read as "nobody checked in with a
+// photo today", which is a claim about people rather than about the database.
+const faceRes = await safeRows('[attendance] face check-ins', () => db.execute(sqlExpr`
+  SELECT ce.id, ce.event_type, ce.event_time, ce.face_photo, ce.location_name,
+         e.full_name, e.employee_code
+  FROM hr_clock_events ce
+  JOIN hr_employees e ON ce.employee_id = e.id
+  WHERE DATE(ce.event_time) = ${dateFilter} AND ce.face_photo IS NOT NULL
+  ORDER BY ce.event_time DESC
+  LIMIT 60
+`));
+const faceCheckins = faceRes.rows;
 
-// Employees not marked today
-const unmarkedToday = await db.execute(sqlExpr`
+// Employees not marked today. Capped, and the count is read separately so the banner can say how
+// many there really are rather than how many fitted.
+const UNMARKED_SHOWN = 200;
+const unmarkedCountRes = await safeRows('[attendance] unmarked count', () => db.execute(sqlExpr`
+  SELECT COUNT(*)::int AS n FROM hr_employees e
+  WHERE e.is_active = true
+    AND NOT EXISTS (SELECT 1 FROM hr_attendance a WHERE a.employee_id = e.id AND a.date = ${dateFilter})`));
+const unmarkedTotal = unmarkedCountRes.ok ? Number(unmarkedCountRes.rows[0]?.n ?? 0) : 0;
+const unmarkedRes = await safeRows('[attendance] unmarked list', () => db.execute(sqlExpr`
   SELECT e.id, e.full_name, e.employee_code, e.designation
   FROM hr_employees e
   WHERE e.is_active = true
-  AND e.id NOT IN (SELECT employee_id FROM hr_attendance WHERE date = ${dateFilter})
+    AND NOT EXISTS (SELECT 1 FROM hr_attendance a WHERE a.employee_id = e.id AND a.date = ${dateFilter})
   ORDER BY e.full_name
-`);
+  LIMIT ${UNMARKED_SHOWN}
+`));
+const unmarkedRows = unmarkedRes.rows;
 
 // Monthly summary for an employee
-const monthlySummary = empFilter ? await db.execute(sqlExpr`
-  SELECT 
+const monthlyRes = empFilter ? await safeRows('[attendance] monthly summary', () => db.execute(sqlExpr`
+  SELECT
     COUNT(*) FILTER (WHERE status = 'present') as present_days,
     COUNT(*) FILTER (WHERE status = 'absent') as absent_days,
     COUNT(*) FILTER (WHERE status = 'half_day') as half_days,
     COUNT(*) FILTER (WHERE status = 'wfh') as wfh_days,
     COUNT(*) FILTER (WHERE status = 'on_leave') as leave_days,
     ROUND(AVG(work_hours)::numeric, 1) as avg_hours,
-    SUM(overtime_hours) as total_overtime
+    SUM(overtime_hours) as total_overtime,
+    COUNT(*)::int as rows_in_month
   FROM hr_attendance a
   WHERE a.employee_id = ${empFilter}
   AND DATE_TRUNC('month', a.date) = DATE_TRUNC('month', NOW())
-`) : null;
+`)) : null;
+const _monthlyRows = monthlyRes ? monthlyRes.rows : [];
+const ms = (_monthlyRows[0] || {}) as any;
+// An aggregate over zero rows still returns ONE row, of nulls — so `_monthlyRows.length > 0` was
+// never the test for "this person has attendance this month". COUNT(*) is.
+const monthlyHasRows = Number(ms.rows_in_month || 0) > 0;
 
-// Stats for today
-const todayStats = await db.execute(sqlExpr`
-  SELECT 
+// Stats for the selected date
+const statsRes = await safeRows('[attendance] day stats', () => db.execute(sqlExpr`
+  SELECT
     COUNT(*) FILTER (WHERE status = 'present') as present,
     COUNT(*) FILTER (WHERE status = 'absent') as absent,
     COUNT(*) FILTER (WHERE status = 'wfh') as wfh,
@@ -208,16 +319,26 @@ const todayStats = await db.execute(sqlExpr`
     COUNT(*) FILTER (WHERE status = 'on_leave') as on_leave,
     COUNT(*) as total
   FROM hr_attendance WHERE date = ${dateFilter}
-`);
-const _todayStatsRows = Array.isArray(todayStats) ? todayStats : (todayStats?.rows || []);
-const ts = (_todayStatsRows[0] || {}) as any;
-const _monthlyRows = monthlySummary ? (Array.isArray(monthlySummary) ? monthlySummary : (monthlySummary?.rows || [])) : [];
-const ms = (_monthlyRows[0] || {}) as any;
+`));
+const ts = (statsRes.rows[0] || {}) as any;
 
 const EMPLOYEE_PICKER_LIMIT = 200;
-const allEmployees = await db.execute(sqlExpr`SELECT id, full_name, employee_code FROM hr_employees WHERE is_active = true ORDER BY full_name LIMIT ${EMPLOYEE_PICKER_LIMIT}`);
-const employeeOptions = (Array.isArray(allEmployees) ? allEmployees : ((allEmployees as any)?.rows || [])) as any[];
-const attendanceRows = (Array.isArray(todayAttendance) ? todayAttendance : ((todayAttendance as any)?.rows || [])) as any[];
+const employeeRes = await safeRows('[attendance] employee picker', () => db.execute(
+  sqlExpr`SELECT id, full_name, employee_code FROM hr_employees WHERE is_active = true ORDER BY full_name LIMIT ${EMPLOYEE_PICKER_LIMIT}`));
+const employeeOptions = employeeRes.rows;
+
+// ONE BANNER FOR EVERYTHING THAT COULD NOT BE READ, naming each surface. Without it a failed read
+// is a blank region, and a blank region on this page reads as a statement about attendance.
+const readFailures: string[] = [];
+if (!rosterCountRes.ok || !attendanceRes.ok) readFailures.push('the attendance roster for this day');
+if (!timeLogRes.ok) readFailures.push('the hourly time logs');
+if (!faceRes.ok) readFailures.push('the face check-ins');
+if (!unmarkedRes.ok || !unmarkedCountRes.ok) readFailures.push('the list of people not yet marked');
+if (monthlyRes && !monthlyRes.ok) readFailures.push('the monthly summary');
+if (!statsRes.ok) readFailures.push('the counts in the header');
+if (!employeeRes.ok) readFailures.push('the employee picker');
+const firstReadError = attendanceRes.error || statsRes.error || employeeRes.error
+  || unmarkedRes.error || faceRes.error || timeLogRes.error || (monthlyRes && monthlyRes.error) || null;
 
 // THE MARK / EDIT SHEET IS OPENED BY A URL, NOT BY JAVASCRIPT.
 //
@@ -258,14 +379,29 @@ const STATUS_TEXT: Record<string, string> = {
   holiday: '#9ca3af',
 };
 
+// "—" MEANS NOT RECORDED. An unparseable timestamp is a different thing and used to render as the
+// literal text "Invalid Date" next to a person's name; it now says so in words.
 function formatTime(ts: any) {
   if (!ts) return '—';
-  return new Date(ts).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return 'unreadable';
+  return d.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
 }
+// THE EDIT FORM IS PREFILLED IN IST, NOT IN THE SERVER'S ZONE.
+// getHours()/getMinutes() read the PROCESS's local time. This deploys onto a UTC server, so opening
+// Edit on a 09:30 IST clock-in prefilled 04:00 — and saving without touching the field silently
+// moved the person's start time back five and a half hours.
 function timeInputValue(ts: any) {
   if (!ts) return '';
   const d = new Date(ts);
-  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  if (isNaN(d.getTime())) return '';
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(d);
+  } catch {
+    return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+  }
 }
 function dateValue(d: any) {
   if (!d) return '';
@@ -329,7 +465,10 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
         { label: 'Leave', value: ts.on_leave, color: '#d8b4fe' },
       ].map(stat => (
         <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:6px;text-align:center;">
-          <p style={`font-size:16px;font-weight:700;color:${stat.color};margin:0;line-height:1;`}>{stat.value || 0}</p>
+          {/* A ZERO IS A CLAIM. `stat.value || 0` printed 0 for "nobody was absent today" and 0 for
+              "the counting query failed", which are opposite facts about the same workforce. When
+              the read did not succeed these show a dash and the banner below says why. */}
+          <p style={`font-size:16px;font-weight:700;color:${statsRes.ok ? stat.color : '#6e6e78'};margin:0;line-height:1;`}>{statsRes.ok ? (stat.value || 0) : '—'}</p>
           <p style="font-size:8px;color:#6e6e78;margin:2px 0 0;text-transform:uppercase;">{stat.label}</p>
         </div>
       ))}
@@ -345,6 +484,34 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
 
   {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
+
+  {/* A URL PARAMETER THIS PAGE CANNOT USE IS SAID, NOT SWALLOWED. `?date=last-week` used to take
+      the whole console down with a Postgres 22007 and `?emp=me` with a 22P02. Falling back silently
+      would be the other failure: the reader would believe they were looking at what they asked for. */}
+  {dateFilterRejected && (
+    <div style="margin:12px 16px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);color:#fde68a;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.6;">
+      The date in the address bar was not a real calendar date, so this is showing {defaultDate} instead.
+      Everything below is for {defaultDate}, not for what was asked for.
+    </div>
+  )}
+  {empFilterRejected && (
+    <div style="margin:12px 16px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);color:#fde68a;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.6;">
+      The employee in the address bar was not an employee id, so no monthly summary is being shown for anybody.
+      Pick a person from the list on the Monthly tab.
+    </div>
+  )}
+
+  {/* "COULD NOT READ" IS NOT "NOTHING TO SHOW". Each region below renders empty when its read
+      fails, and an empty attendance list is a statement about the workforce. This names exactly
+      which reads failed and gives the real Postgres reason — the one on `.cause`. */}
+  {readFailures.length > 0 && (
+    <div style="margin:12px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.6;">
+      <strong style="color:#fecaca;">Some of this page could not be read, so parts of it are blank for a
+      reason that has nothing to do with attendance.</strong> Not read: {readFailures.join('; ')}.
+      Where a section below is empty and it is on that list, treat it as unknown rather than as none.
+      {firstReadError && <span style="display:block;margin-top:6px;color:#f87171;font-family:'Geist Mono',monospace;font-size:11px;overflow-wrap:anywhere;">{clip(firstReadError, 300)}</span>}
+    </div>
+  )}
 
   <!-- DAILY TAB -->
   {tab === 'today' && (
@@ -363,40 +530,76 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
                   <img src={f.face_photo} alt="" loading="lazy" style="width:100%;height:100%;object-fit:cover;transform:scaleX(-1);" />
                   <span style={`position:absolute;left:4px;bottom:4px;font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:1px 5px;border-radius:99px;color:#fff;background:${f.event_type==='clock_in'?'rgba(16,185,129,.9)':f.event_type==='clock_out'?'rgba(239,68,68,.9)':'rgba(251,191,36,.9)'};`}>{f.event_type==='clock_in'?'IN':f.event_type==='clock_out'?'OUT':f.event_type==='break_start'?'BRK':'RES'}</span>
                 </div>
-                <p style="font-size:10px;color:#d8d8de;margin:4px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{f.full_name?.split(' ')[0]}</p>
+                <p style="font-size:10px;color:#d8d8de;margin:4px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title={String(f.full_name || '')}>{firstWord(f.full_name)}</p>
                 <p style="font-size:9px;color:#6e6e78;margin:0;font-family:'Geist Mono',monospace;">{formatTime(f.event_time)}</p>
               </div>
             ))}
           </div>
         </div>
       )}
-      {(Array.isArray(unmarkedToday) ? unmarkedToday : (unmarkedToday?.rows || [])).length > 0 && (
-        <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.2);border-radius:10px;padding:10px 14px;margin-bottom:12px;">
-          <p style="font-size:12px;color:#fbbf24;font-weight:600;margin:0 0 4px;"><span set:html={ICON_ALERT}></span>{(Array.isArray(unmarkedToday) ? unmarkedToday : (unmarkedToday?.rows || [])).length} employees not yet marked for {dateFilter}</p>
-          <div style="display:flex;flex-wrap:wrap;gap:4px;">
-            {((Array.isArray(unmarkedToday) ? unmarkedToday : (unmarkedToday?.rows || [])) as any[]).slice(0, 8).map((e: any) => (
-              <span style="font-size:10px;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;padding:2px 8px;border-radius:100px;">{e.full_name.split(' ')[0]}</span>
-            ))}
-            {(Array.isArray(unmarkedToday) ? unmarkedToday : (unmarkedToday?.rows || [])).length > 8 && <span style="font-size:10px;color:#6e6e78;">+{(Array.isArray(unmarkedToday) ? unmarkedToday : (unmarkedToday?.rows || [])).length - 8} more</span>}
-          </div>
+      {/* THE ONE THAT MEANT "NOBODY IS MISSING" AND "WE DID NOT LOOK" WITH THE SAME BLANK SPACE.
+          The banner rendered only when the list was non-empty, so a failed read looked exactly like
+          a fully-marked day — the most reassuring possible rendering of not knowing. */}
+      {!unmarkedRes.ok || !unmarkedCountRes.ok ? (
+        <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;padding:10px 14px;margin-bottom:12px;">
+          <p style="font-size:12px;color:#fca5a5;margin:0;line-height:1.6;">
+            <span set:html={ICON_ALERT}></span>Who is not yet marked for {dateFilter} could not be worked out.
+            This is NOT a statement that everybody is marked — it is that the check did not run.
+          </p>
         </div>
-      )}
+      ) : unmarkedTotal > 0 ? (
+        <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.2);border-radius:10px;padding:10px 14px;margin-bottom:12px;">
+          <p style="font-size:12px;color:#fbbf24;font-weight:600;margin:0 0 4px;"><span set:html={ICON_ALERT}></span>{unmarkedTotal} employee{unmarkedTotal === 1 ? '' : 's'} not yet marked for {dateFilter}</p>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;">
+            {/* firstWord() rather than `full_name.split(' ')[0]`, which throws on a NULL name and
+                takes the whole page with it, and returns an empty chip for a name that is spaced
+                differently. A mononym is a name, not a defect. */}
+            {unmarkedRows.slice(0, 8).map((e: any) => (
+              <span style="font-size:10px;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;padding:2px 8px;border-radius:100px;" title={String(e.full_name || '')}>{firstWord(e.full_name)}</span>
+            ))}
+            {unmarkedTotal > 8 && <span style="font-size:10px;color:#6e6e78;">+{unmarkedTotal - 8} more</span>}
+          </div>
+          {unmarkedTotal > UNMARKED_SHOWN && (
+            <p style="font-size:10.5px;color:#6e6e78;margin:6px 0 0;line-height:1.5;">Names are listed for the first {UNMARKED_SHOWN} of them; the count above is the real total.</p>
+          )}
+        </div>
+      ) : null}
 
       <div style="display:flex;flex-direction:column;gap:6px;">
-        {(Array.isArray(todayAttendance) ? todayAttendance : (todayAttendance?.rows || [])).length === 0 && (
-          <div style="text-align:center;padding:48px;color:#6e6e78;">
-            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px;opacity:0.7;"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-            <p style="font-size:13px;">No attendance marked for {dateFilter}</p>
+        {/* THREE DIFFERENT BLANK STATES THAT USED TO BE ONE SENTENCE. "No attendance marked for
+            this date" was printed whether the day was genuinely unmarked, the roster query had
+            failed, or the reader had paged past the end of the list. */}
+        {!attendanceRes.ok && (
+          <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;padding:14px;color:#fca5a5;font-size:13px;line-height:1.6;">
+            The attendance roster for {dateFilter} could not be read, so nothing is listed below. This
+            does not mean nobody was marked — it means we could not find out. Try again; if it keeps
+            failing the reason is in the banner above.
           </div>
         )}
-        {((Array.isArray(todayAttendance) ? todayAttendance : (todayAttendance?.rows || [])) as any[]).map(a => (
+        {attendanceRes.ok && attendanceRows.length === 0 && rosterTotal === 0 && (
+          <div style="text-align:center;padding:48px;color:#6e6e78;">
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px;opacity:0.7;"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+            <p style="font-size:13px;">Nobody has been marked for {dateFilter} yet.</p>
+            <p style="font-size:12px;margin-top:4px;">This is a real reading of the day, not a failed one.</p>
+          </div>
+        )}
+        {attendanceRes.ok && attendanceRows.length === 0 && rosterTotal > 0 && (
+          <div style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.28);border-radius:10px;padding:14px;color:#fde68a;font-size:13px;line-height:1.6;">
+            There are {rosterTotal} records for {dateFilter}, but none on this page. Go back to <a href={sheetBack + '&p=1'} style="color:#FF7040;">the first page</a>.
+          </div>
+        )}
+        {attendanceRows.map(a => (
           <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 14px;">
             <div style="display:flex;align-items:center;gap:12px;">
               <div style={`width:36px;height:36px;border-radius:8px;background:${STATUS_COLORS[a.status] || 'rgba(107,114,128,0.15)'};display:flex;align-items:center;justify-content:center;flex-shrink:0;`}>
                 <span style={`color:${STATUS_TEXT[a.status] || '#9ca3af'};display:flex;`} set:html={statusIcon(a.status)}></span>
               </div>
               <div style="flex:1;min-width:0;">
-                <p style="font-size:13px;font-weight:600;color:#fff;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{a.full_name}</p>
+                {/* Clipped for the row, with the full value on the element itself. A 400-character
+                    "name" — which the add form accepts — used to push the badge and both buttons off
+                    the card. Non-Latin scripts are untouched: clip() counts characters and cuts on a
+                    character boundary, so a surrogate pair is never split into two replacement boxes. */}
+                <p style="font-size:13px;font-weight:600;color:#fff;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title={String(a.full_name || '')}>{clip(a.full_name || 'Unnamed employee', 60)}</p>
                 <p style="font-size:10px;color:#6e6e78;margin:2px 0 0;">
                   {formatTime(a.clock_in)} {crossesMidnight(a) ? '(prev) ' : ''}to {formatTime(a.clock_out)} {crossesMidnight(a) ? '(next day) ' : ''}
                   {a.work_hours != null ? ` · ${a.work_hours}h clocked` : ''}
@@ -405,36 +608,59 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
                 </p>
               </div>
               <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;">
+                {/* `a.status.replace(...)` threw on a NULL status and took the whole roster down.
+                    The column has no NOT NULL and no CHECK, so a row written by any other path can
+                    carry one. An unrecognised status is shown as itself, marked as unrecognised —
+                    payroll cannot price it either, and that is worth seeing. */}
                 <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;background:${STATUS_COLORS[a.status] || 'rgba(107,114,128,0.15)'};color:${STATUS_TEXT[a.status] || '#9ca3af'};`}>
-                  {a.status.replace('_', ' ')}
+                  {a.status ? String(a.status).replace(/_/g, ' ') : 'not recorded'}
                 </span>
+                {a.status && !VALID_STATUS.has(String(a.status)) && (
+                  <span style="font-size:9px;color:#fbbf24;">not a status payroll can price</span>
+                )}
                 {/* Edit is a LINK to the server-rendered sheet — it needs no script, and it was
                     10.5px inside a 20px-tall box, well under the 44px a thumb can reliably hit next
                     to a Delete that removes a pay-affecting record. Both are 44px now. */}
                 <div style="display:flex;gap:8px;">
-                  <a href={sheetBack + '&sheet=edit&sheetEmp=' + a.employee_id}
-                    aria-label={'Edit attendance for ' + a.full_name}
+                  <a href={sheetBack + '&p=' + rosterPage + '&sheet=edit&sheetEmp=' + encodeURIComponent(String(a.employee_id))}
+                    aria-label={'Edit attendance for ' + clip(a.full_name || 'this employee', 60)}
                     style="background:#15151a;border:1px solid #26262e;color:#FF7040;font-size:12px;font-weight:600;padding:0 14px;border-radius:6px;cursor:pointer;text-decoration:none;min-height:44px;display:inline-flex;align-items:center;">Edit</a>
-                  {/* "Delete this attendance entry?" named nothing. The same prompt appeared on every
-                      row, so on a phone — where the rows are 8px apart — there was no way to tell
-                      from the dialog whether you had hit the right person's. It says so now. */}
-                  <form method="POST" style="margin:0;display:inline;" onsubmit={`return confirm('Delete the attendance entry for ${String(a.full_name || 'this employee').replace(/'/g, '')} on ${dateValue(a.date)}? It is currently ${String(a.status || '').replace('_', ' ')}${a.work_hours != null ? ' with ' + a.work_hours + ' hours clocked' : ''}. Deleting it leaves the day unmarked, which counts as neither present nor absent until somebody marks it again.')`}>
+                  {/* THE PROMPT KEEPS THE APOSTROPHE.
+                      This was interpolated with `.replace(/'/g, '')`, which DELETES it — so the
+                      admin was asked to confirm deleting the record of "OBrien", a person who does
+                      not exist, which is the one thing a confirmation is for. Worse, a name carrying
+                      a newline (a paste into the HR form) ended the JS string literal outright: the
+                      onsubmit expression became a syntax error, confirm() never ran, and the
+                      destructive form submitted with NO confirmation at all.
+                      confirmAttr() escapes rather than strips, and covers the line terminators too. */}
+                  <form method="POST" style="margin:0;display:inline;" onsubmit={confirmAttr(
+                    'Delete the attendance entry for ' + (a.full_name || 'this employee')
+                    + ' on ' + dateValue(a.date) + '? It is currently '
+                    + (a.status ? String(a.status).replace(/_/g, ' ') : 'not recorded')
+                    + (a.work_hours != null ? ' with ' + a.work_hours + ' hours clocked' : '')
+                    + '. Deleting it leaves the day unmarked, which counts as neither present nor absent until somebody marks it again.')}>
                     <input type="hidden" name="action" value="delete" />
                     <input type="hidden" name="employeeId" value={a.employee_id} />
                     <input type="hidden" name="date" value={dateValue(a.date)} />
-                    <button type="submit" aria-label={'Delete attendance for ' + a.full_name} style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:12px;font-weight:600;padding:0 14px;border-radius:6px;cursor:pointer;min-height:44px;">Delete</button>
+                    <button type="submit" aria-label={'Delete attendance for ' + clip(a.full_name || 'this employee', 60)} style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:12px;font-weight:600;padding:0 14px;border-radius:6px;cursor:pointer;min-height:44px;">Delete</button>
                   </form>
                 </div>
               </div>
             </div>
-            {(timeLogsByEmp[a.employee_id] && timeLogsByEmp[a.employee_id].length > 0) && (
+            {!timeLogRes.ok && (
+              <p style="font-size:10.5px;color:#fca5a5;margin:8px 0 0;">The hourly time log could not be read for this day, so none is shown. That is not the same as none having been filed.</p>
+            )}
+            {timeLogRes.ok && timeLogsByEmp[a.employee_id] && timeLogsByEmp[a.employee_id].length > 0 && (
               <div style="margin-top:10px;padding-top:10px;border-top:1px solid #1a1a1f;">
                 <p style="font-size:10px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0 0 5px;">Hourly time log</p>
                 <div style="display:flex;flex-direction:column;gap:4px;">
                   {timeLogsByEmp[a.employee_id].map((t: any) => (
                     <div style="display:flex;gap:8px;font-size:11.5px;">
                       <span style="color:#FF7040;font-family:monospace;white-space:nowrap;">{t.start_time}-{t.end_time}</span>
-                      <span style="color:#d8d8de;flex:1;min-width:0;overflow-wrap:anywhere;">{t.task}</span>
+                      {/* A time-log task is free text with no length limit. Clipped here, whole value
+                          on the title, so one pasted paragraph cannot make the card taller than the
+                          phone it is being read on. */}
+                      <span style="color:#d8d8de;flex:1;min-width:0;overflow-wrap:anywhere;" title={String(t.task || '')}>{clip(t.task, 240)}</span>
                       <span style="color:#6e6e78;white-space:nowrap;">{t.hours}h</span>
                     </div>
                   ))}
@@ -454,6 +680,21 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
           </div>
         ))}
       </div>
+
+      {/* THE ROSTER PAGER. This list had no LIMIT and no pager at all — every marked employee for
+          the day was rendered into one phone-first column. The count is the real total, not the
+          number on this page, so the reader can tell the two apart. */}
+      {attendanceRes.ok && rosterPages > 1 && (
+        <div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:16px 0 0;flex-wrap:wrap;">
+          {rosterPage > 1 && (
+            <a href={sheetBack + '&p=' + (rosterPage - 1)} style="background:#15151a;border:1px solid #26262e;color:#d8d8de;text-decoration:none;padding:0 14px;border-radius:8px;font-size:12px;min-height:44px;display:inline-flex;align-items:center;">Previous</a>
+          )}
+          <span style="font-size:12px;color:#6e6e78;">Page {rosterPage} of {rosterPages} · {rosterTotal} marked on {dateFilter}</span>
+          {rosterPage < rosterPages && (
+            <a href={sheetBack + '&p=' + (rosterPage + 1)} style="background:#15151a;border:1px solid #26262e;color:#d8d8de;text-decoration:none;padding:0 14px;border-radius:8px;font-size:12px;min-height:44px;display:inline-flex;align-items:center;">Next</a>
+          )}
+        </div>
+      )}
     </div>
   )}
 
@@ -471,13 +712,36 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
         <select id="monthlyEmp" name="emp" onchange="this.form.submit()" style="flex:1 1 180px;min-width:0;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;">
           <option value="">Select Employee</option>
           {employeeOptions.map(e => (
-            <option value={e.id} selected={empFilter === e.id}>{e.full_name} ({e.employee_code})</option>
+            <option value={e.id} selected={empFilter === String(e.id)}>{clip(e.full_name || 'Unnamed employee', 70)} ({e.employee_code || 'no code'})</option>
           ))}
         </select>
         <button type="submit" style="flex:0 0 auto;background:#15151a;border:1px solid #26262e;color:#d8d8de;font-size:12.5px;font-weight:600;padding:0 16px;border-radius:8px;cursor:pointer;min-height:44px;">Show</button>
       </form>
+      {/* An empty picker with no explanation reads as "there are no employees". */}
+      {!employeeRes.ok && (
+        <p style="font-size:12px;color:#fca5a5;margin:-4px 0 12px;line-height:1.6;">The employee list could not be read, so this picker is empty. There may well be employees; we could not fetch them.</p>
+      )}
+      {employeeRes.ok && employeeOptions.length === 0 && (
+        <p style="font-size:12px;color:#8a8a94;margin:-4px 0 12px;line-height:1.6;">No active employee is on record, so there is nobody to summarise.</p>
+      )}
 
-      {monthlySummary && _monthlyRows.length > 0 && (
+      {/* AN AGGREGATE OVER NOTHING STILL RETURNS A ROW. `_monthlyRows.length > 0` was true for an
+          employee with no attendance at all this month, so six tiles of `null || 0` were rendered
+          as a confident "0 present, 0 absent" — the same picture as a person who was marked absent
+          for the whole month. rows_in_month is the count that actually distinguishes them. */}
+      {monthlyRes && !monthlyRes.ok && (
+        <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;padding:14px;color:#fca5a5;font-size:13px;line-height:1.6;">
+          That person's monthly summary could not be read, so no figures are shown. This is not a
+          month with nothing in it — it is a month we could not count.
+        </div>
+      )}
+      {monthlyRes && monthlyRes.ok && !monthlyHasRows && (
+        <div style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.28);border-radius:10px;padding:14px;color:#fde68a;font-size:13px;line-height:1.6;">
+          No attendance has been recorded for that person in this calendar month. Not absent, not
+          present — unmarked. A payroll run for this month prices unmarked days as neither.
+        </div>
+      )}
+      {monthlyRes && monthlyRes.ok && monthlyHasRows && (
         <div style="display:flex;flex-direction:column;gap:8px;">
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;">
             {[

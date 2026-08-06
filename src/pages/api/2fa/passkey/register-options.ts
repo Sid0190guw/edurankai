@@ -15,6 +15,8 @@ export const POST: APIRoute = async ({ request, locals, cookies }) => {
     const options = await registrationOptions({ userId: user.id, email: user.email, name: user.name, rpId, challenge });
     return json({ ok: true, options });
   } catch (e: any) {
-    return json({ ok: false, error: e?.cause?.message || e?.message || 'Could not start' }, 500);
+    // Never echoed: e.message is the failed SQL, e.cause is the database's own words.
+    console.error('[api/2fa/passkey/register-options]', e?.cause?.message || e?.message, e?.stack);
+    return json({ ok: false, error: 'Could not start passkey setup. Please try again.' }, 500);
   }
 };

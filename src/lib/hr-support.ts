@@ -3,13 +3,24 @@
 // Self-bootstrapping schema; paid via Razorpay (same gateway as test fees).
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-let ready: Promise<void> | null = null;
+/** The real Postgres reason is on `e.cause`; `e.message` is only the SQL that failed. */
+const logFail = (tag: string, e: any) =>
+  console.error('[hr-support] ' + tag, e?.cause?.message || e?.message);
+
+/**
+ * Create the support tables if they are absent. Idempotent.
+ *
+ * WAS a hand-rolled `let ready` memo with `catch (_) {}` inside it: nothing logged, and the resolved
+ * promise cached for the life of the process, so a transient DDL failure meant every paid support
+ * request thereafter hit a missing table and nobody could find out why. ensureOnce() drops a failed
+ * run from its cache so the next call retries; the catch names the reason and re-throws so it does.
+ */
 export function ensureHrSupportSchema(): Promise<void> {
-  if (ready) return ready;
-  ready = (async () => {
+  return ensureOnce('hr_support_v1', async () => {
     try {
       await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_application_support (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -63,9 +74,11 @@ export function ensureHrSupportSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hrsm_req_idx ON hr_support_messages(request_id, created_at ASC)`);
-    } catch (_) {}
-  })();
-  return ready;
+    } catch (e: any) {
+      logFail('ensureHrSupportSchema', e);
+      throw e;
+    }
+  });
 }
 
 export interface CreateHrSupportOpts {

@@ -99,6 +99,40 @@ export function verifyTotp(secretB32: string, token: string, window = 1): boolea
   return matchTotpStep(secretB32, token, window) !== null;
 }
 
+/**
+ * SPEND A STEP. Returns false when this step — or a later one — has already been spent, which means
+ * the caller is presenting a code that has already signed somebody in.
+ *
+ * WHY THIS EXISTS. RFC 6238 s.5.2 requires a verifier to refuse a code it has already accepted, and
+ * nothing here did. verifyTotp() accepts the current 30-second step plus one either side, so one
+ * six-digit code stayed good for about ninety seconds and could be used as often as it was sent. On
+ * the second-factor path that is contained, because the pending challenge is burned on first use —
+ * but /api/auth/totp-login signs somebody in on an authenticator code ALONE, and there a code read
+ * over a shoulder, left in a screen recording, or captured by a phishing page was a complete sign-in
+ * for whoever replayed it inside the window.
+ *
+ * WHY IT REUSES last_used_at RATHER THAN A NEW COLUMN. The high-water mark is written as the START
+ * INSTANT OF THE STEP (`to_timestamp(step * 30)`) instead of now(), which makes the column both the
+ * "last used" timestamp it always was — accurate to within one 30-second step — and the guard. No
+ * schema change, nothing dropped, and no live row is invalidated: a legacy value written by the old
+ * `now()` path is simply an earlier instant, so the next genuine code still compares greater. The
+ * column is read nowhere else in this codebase.
+ *
+ * The comparison lives in the WHERE clause on purpose. A read-then-write would let two concurrent
+ * replays both observe "not yet spent" and both succeed; exactly one UPDATE can match this one.
+ */
+async function claimTotpStep(userId: string, step: number): Promise<boolean> {
+  const marker = step * 30;
+  const rows = rowsOf(await db.execute(sql`
+    UPDATE user_totp
+       SET last_used_at = to_timestamp(${marker})
+     WHERE user_id = ${userId}
+       AND (last_used_at IS NULL OR last_used_at < to_timestamp(${marker}))
+     RETURNING user_id
+  `));
+  return rows.length > 0;
+}
+
 /** otpauth:// URI — tap it on a phone to add the account, or scan as a QR. */
 export function otpauthUri(secretB32: string, account: string, issuer = 'EduRankAI'): string {
   const label = encodeURIComponent(issuer) + ':' + encodeURIComponent(account);
@@ -136,8 +170,15 @@ export async function isTotpEnabled(userId: string): Promise<boolean> {
 export async function confirmTotp(userId: string, token: string): Promise<boolean> {
   const rec = await getTotpRecord(userId);
   if (!rec) return false;
-  if (!verifyTotp(rec.secret, token)) return false;
-  await db.execute(sql`UPDATE user_totp SET confirmed_at = COALESCE(confirmed_at, now()), last_used_at = now() WHERE user_id = ${userId}`);
+  const step = matchTotpStep(rec.secret, token);
+  if (step === null) return false;
+  // The confirming code is spent too, so it cannot be turned round and replayed at
+  // /api/auth/totp-login (which signs somebody in on a code alone) in the seconds after enrolment.
+  await db.execute(sql`
+    UPDATE user_totp
+       SET confirmed_at = COALESCE(confirmed_at, now()), last_used_at = to_timestamp(${step * 30})
+     WHERE user_id = ${userId}
+  `);
   return true;
 }
 
@@ -145,6 +186,22 @@ export async function disableTotp(userId: string): Promise<void> {
   await ensureTwoFactorSchema();
   await db.execute(sql`DELETE FROM user_totp WHERE user_id = ${userId}`);
   await db.execute(sql`DELETE FROM user_backup_codes WHERE user_id = ${userId}`);
+}
+
+/**
+ * Drop the authenticator SECRET only, leaving recovery codes intact.
+ *
+ * For abandoning an enrolment that was never confirmed. disableTotp() above also deletes every
+ * recovery code, which is correct when somebody has just PROVED a factor and asked to remove their
+ * second factor entirely — and wrong when nothing has been proved at all. /api/2fa/disable called the
+ * destructive one on its unproved branch, so any signed-in session could delete the ten single-use
+ * codes of an account whose second step is enforced through FACE (isTotpEnabled is false there), with
+ * no code, no confirmation, and no way to get them back: storeBackupCodes keeps only hashes. Those
+ * codes are the documented way back in when a phone is lost.
+ */
+export async function deleteTotpSecret(userId: string): Promise<void> {
+  await ensureTwoFactorSchema();
+  await db.execute(sql`DELETE FROM user_totp WHERE user_id = ${userId}`);
 }
 
 // ── backup recovery codes ──────────────────────────────────────────────────
@@ -192,9 +249,25 @@ export async function hasTotpOrBackup(userId: string): Promise<boolean> {
 /** Accept a live TOTP code OR an unused backup code. Used on the login challenge. */
 export async function verifyLoginCode(userId: string, code: string): Promise<boolean> {
   const rec = await getTotpRecord(userId);
-  if (rec && rec.confirmed && verifyTotp(rec.secret, code)) {
-    await db.execute(sql`UPDATE user_totp SET last_used_at = now() WHERE user_id = ${userId}`).catch(() => {});
-    return true;
+  if (rec && rec.confirmed) {
+    const step = matchTotpStep(rec.secret, code);
+    if (step !== null) {
+      // The claim is NOT swallowed with `.catch(() => {})` the way the old last_used_at touch was.
+      // That call was cosmetic and a failure cost nothing; this one is the single-use guard, and
+      // accepting a code whose spend could not be recorded is accepting an unlimited replay of it.
+      let claimed = false;
+      try {
+        claimed = await claimTotpStep(userId, step);
+      } catch (e: any) {
+        console.error('[auth/twofactor] could not record the authenticator code as spent; refusing it.',
+          e?.cause?.message || e?.message);
+        return false;
+      }
+      // A correctly-formed code that is already spent is a replay, not a backup code — six digits can
+      // never match the `xxxxx-xxxxx` shape generateBackupCodes() mints, so there is nothing to fall
+      // through to and falling through would only cost a wasted query.
+      return claimed;
+    }
   }
   return consumeBackupCode(userId, code);
 }

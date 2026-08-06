@@ -4,6 +4,11 @@ import { db } from '@/lib/db';
 import { sql as sqlExpr, eq, ilike, or, desc } from 'drizzle-orm';
 import { pgTable, uuid, varchar, boolean, date, text, decimal, timestamp } from 'drizzle-orm/pg-core';
 import { ensureOnce } from '@/lib/ensure-once';
+// employee_code is TEXT NOT NULL UNIQUE. This page used to mint it from COUNT(*) + 1 — as did the
+// auto-hire path — which reissues a number the moment any row is deleted and hands the same number
+// to two people adding at once. One shared minter, deriving from MAX and retrying the INSERT on a
+// unique violation, so the two paths cannot disagree about what the next code is.
+import { withEmployeeCode } from '@/lib/hr/employee-code';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -95,16 +100,15 @@ if (Astro.request.method === 'POST') {
         // record reads as assigned, which is harder to notice than an unassigned one.
         errorMsg = 'That department is not on the department register. Nothing was added — pick one from the list, or leave it unset.';
       } else {
-        // Generate employee code
-        const count = await db.execute(sqlExpr`SELECT COUNT(*) as n FROM hr_employees`);
-        const _countNRows = Array.isArray(count) ? count : (count?.rows || []);
-        const n = parseInt((_countNRows[0] as any)?.n || '0') + 1;
-        const code = 'ERA-EMP-' + String(n).padStart(4, '0');
-
-        await db.execute(sqlExpr`
-          INSERT INTO hr_employees (employee_code, full_name, email, phone, designation, department_id, employment_type, work_mode, joining_date, base_salary, currency, employment_status)
-          VALUES (${code}, ${fullName}, ${email}, ${phone || null}, ${designation || null}, ${departmentId || null}, ${employmentType}, ${workMode}, ${joiningDate || null}, ${baseSalary ? parseFloat(baseSalary) : null}, ${currency}, 'active')
-        `);
+        // The code is minted from the highest already issued, and the INSERT is retried if another
+        // writer took that number between the read and the write.
+        const code = await withEmployeeCode(async (candidate) => {
+          await db.execute(sqlExpr`
+            INSERT INTO hr_employees (employee_code, full_name, email, phone, designation, department_id, employment_type, work_mode, joining_date, base_salary, currency, employment_status)
+            VALUES (${candidate}, ${fullName}, ${email}, ${phone || null}, ${designation || null}, ${departmentId || null}, ${employmentType}, ${workMode}, ${joiningDate || null}, ${baseSalary ? parseFloat(baseSalary) : null}, ${currency}, 'active')
+          `);
+          return candidate;
+        });
         // The reporting manager is deliberately not on this form: it is a longer decision than an
         // add dialog should carry (the target must be an active employee with a sign-in, and the
         // chain has to be checked for loops), so it is set on the record itself. Say so, rather
@@ -114,13 +118,20 @@ if (Astro.request.method === 'POST') {
           + ' Open the record to set a reporting manager — until one is set, nobody can approve their leave or withdrawals.';
       }
     } else if (action === 'deactivate') {
+      // RETURNING, so "matched nothing" and "done" are different outcomes. Without it a stale id
+      // from an open tab reported "Employee deactivated" while the person kept every access that
+      // record grants — the reassuring blank this codebase has been bitten by before.
       const id = fd.get('id') as string;
-      await db.execute(sqlExpr`UPDATE hr_employees SET employment_status = 'inactive', is_active = false, updated_at = NOW() WHERE id = ${id}`);
-      successMsg = 'Employee deactivated.';
+      const r = await db.execute(sqlExpr`UPDATE hr_employees SET employment_status = 'inactive', is_active = false, updated_at = NOW() WHERE id = ${id} RETURNING employee_code`);
+      const hit = (Array.isArray(r) ? r : ((r as any)?.rows || []))[0] as any;
+      if (hit) successMsg = 'Employee deactivated (' + (hit.employee_code || id) + ').';
+      else errorMsg = 'No employee matched that record, so nothing was changed. Reload the list and try again.';
     } else if (action === 'activate') {
       const id = fd.get('id') as string;
-      await db.execute(sqlExpr`UPDATE hr_employees SET employment_status = 'active', is_active = true, updated_at = NOW() WHERE id = ${id}`);
-      successMsg = 'Employee activated.';
+      const r = await db.execute(sqlExpr`UPDATE hr_employees SET employment_status = 'active', is_active = true, updated_at = NOW() WHERE id = ${id} RETURNING employee_code`);
+      const hit = (Array.isArray(r) ? r : ((r as any)?.rows || []))[0] as any;
+      if (hit) successMsg = 'Employee activated (' + (hit.employee_code || id) + ').';
+      else errorMsg = 'No employee matched that record, so nothing was changed. Reload the list and try again.';
     }
   } catch (err: any) {
     // e.cause carries the real Postgres reason; err.message is only the failed SQL.

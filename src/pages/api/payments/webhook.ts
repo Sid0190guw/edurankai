@@ -28,13 +28,26 @@ export const POST: APIRoute = async ({ request }) => {
   const paymentEntity = event?.payload?.payment?.entity;
   const refundEntity = event?.payload?.refund?.entity;
 
-  // Find the order_id from the most relevant entity
-  const orderId = paymentEntity?.order_id || refundEntity?.payment_id || null;
+  // WHICH ROW THIS EVENT IS ABOUT.
+  //
+  // A refund entity carries no order id — it carries the PAYMENT id it refunded — and this used to
+  // put that payment id into `orderId` and then match `WHERE order_id = ...`. payments.order_id holds
+  // a Razorpay ORDER id (order_...), never a payment id (pay_...), so every refund.created and
+  // refund.processed webhook matched zero rows: the status was never written, refunded_at stayed
+  // null, and no screen in the product could ever say a payment had been refunded. The two entities
+  // are now matched on their own columns.
+  const orderId: string | null = paymentEntity?.order_id || null;
+  const refundedPaymentId: string | null = refundEntity?.payment_id || paymentEntity?.id || null;
+  const isRefund = eventType === 'refund.created' || eventType === 'refund.processed';
 
-  if (!orderId) {
+  if (!orderId && !(isRefund && refundedPaymentId)) {
     // Not all webhook types relate to a stored order - acknowledge anyway
     return new Response('ok', { status: 200 });
   }
+  /** The WHERE clause that names this event's row: by order for payments, by payment id for refunds. */
+  const match = isRefund && !orderId
+    ? sql`razorpay_payment_id = ${refundedPaymentId}`
+    : sql`order_id = ${orderId}`;
 
   // Compute the new status
   let nextStatus: string | null = null;
@@ -59,10 +72,21 @@ export const POST: APIRoute = async ({ request }) => {
       UPDATE payments SET
         webhook_events = webhook_events || ${sql.raw("'" + JSON.stringify([{ at: new Date().toISOString(), event: eventType, payment_id: paymentEntity?.id || null }]).replace(/'/g, "''") + "'::jsonb")},
         updated_at = NOW()
-      WHERE order_id = ${orderId}
+      WHERE ${match}
     `);
 
     if (nextStatus) {
+      // A FAILED ATTEMPT MUST NOT UNDO A CAPTURE.
+      //
+      // Razorpay allows several attempts against one order: a card declines, the payer retries, the
+      // second attempt is captured. Webhook deliveries are not ordered, so payment.failed for the
+      // first attempt can arrive AFTER payment.captured for the second — and this statement, which
+      // wrote `status = 'failed'` unconditionally, then turned a paid order into a failed one. The
+      // payer had paid; the product said they had not. 'paid' and 'refunded' are terminal here and
+      // only a refund event moves a payment off 'paid'.
+      const guard = nextStatus === 'failed'
+        ? sql`AND status NOT IN ('paid', 'refunded')`
+        : sql``;
       await db.execute(sql`
         UPDATE payments SET
           status = ${nextStatus},
@@ -71,18 +95,19 @@ export const POST: APIRoute = async ({ request }) => {
           refunded_at = COALESCE(${refundedAt}::timestamptz, refunded_at),
           refund_amount_paise = COALESCE(${refundAmount}, refund_amount_paise),
           updated_at = NOW()
-        WHERE order_id = ${orderId}
+        WHERE ${match} ${guard}
       `);
     }
 
     // On capture, apply the same downstream effects as the browser verify so
     // the payment completes even if the user never returned to the site.
-    if (eventType === 'payment.captured' || eventType === 'order.paid') {
+    if (orderId && (eventType === 'payment.captured' || eventType === 'order.paid')) {
       const { applyPaidEffects } = await import('@/lib/payment-effects');
       await applyPaidEffects(orderId, paymentEntity?.id || null);
     }
   } catch (e: any) {
-    console.error('[payments webhook] db update failed:', e?.message);
+    // The real Postgres reason is on `.cause`; `.message` is only the failed SQL text.
+    console.error('[payments webhook] db update failed:', e?.cause?.message || e?.message);
     // Still return 200 to prevent Razorpay retry storms - log + alert separately
   }
 

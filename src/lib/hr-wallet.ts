@@ -73,6 +73,13 @@ export function ensureWalletSchema(): Promise<void> {
         decided_by UUID, decided_by_role TEXT, decided_at TIMESTAMPTZ, decision_note TEXT,
         payout_ref TEXT, paid_at TIMESTAMPTZ)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_withdrawal_status ON hr_withdrawal (status, requested_at DESC)`);
+      // ADDITIVE. payWithdrawal() now CLAIMS a request into status 'paying' before it calls the payout
+      // provider, so a second press cannot reach the provider at all. These two columns say who holds
+      // the claim and since when, which is the only way to tell a payout in flight from one whose
+      // process died between the claim and the provider's answer. Nothing is dropped, and a database
+      // that already has the columns is unaffected.
+      await db.execute(sql`ALTER TABLE hr_withdrawal ADD COLUMN IF NOT EXISTS paying_at TIMESTAMPTZ`);
+      await db.execute(sql`ALTER TABLE hr_withdrawal ADD COLUMN IF NOT EXISTS paying_by UUID`);
       // IDEMPOTENCY FOR SALARY, ENFORCED BY THE DATABASE RATHER THAN BY A RACE.
       //
       // creditPayrollRun() skips a payslip whose ref already exists, but that read-then-write is not
@@ -473,14 +480,15 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
   // between the claim and the bank's answer the row STAYS 'paying' rather than being retried
   // automatically — an automatic retry there is how a payout gets sent a second time.
   const claimed = rows(await db.execute(sql`
-    UPDATE hr_withdrawal SET status = 'paying' WHERE id = ${id} AND status = 'approved' RETURNING id`));
+    UPDATE hr_withdrawal SET status = 'paying', paying_at = NOW(), paying_by = ${user.id}::uuid
+     WHERE id = ${id} AND status = 'approved' RETURNING id`));
   if (!claimed.length) {
     return { ok: false, error: 'That payout is already being released, or has been released. Reload the page before trying again.' };
   }
   /** Put the request back where it was, so a failed payout can be retried deliberately. */
   const releaseClaim = async (why: string) => {
     try {
-      await db.execute(sql`UPDATE hr_withdrawal SET status = 'approved' WHERE id = ${id} AND status = 'paying'`);
+      await db.execute(sql`UPDATE hr_withdrawal SET status = 'approved', paying_at = NULL, paying_by = NULL WHERE id = ${id} AND status = 'paying'`);
     } catch (e: any) {
       console.error('[hr-wallet] payout', id, 'failed (' + why + ') AND the request could not be put back to approved — it is stuck at "paying":', e?.cause?.message || e?.message);
     }

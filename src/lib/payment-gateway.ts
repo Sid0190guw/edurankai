@@ -60,12 +60,38 @@ function razorpayGateway(): PaymentGateway {
 // SANDBOX: no real gateway configured. Orders are clearly test; a test payment is verified against a
 // deterministic sandbox token so dev can exercise the unlock path — but it is NEVER a real charge.
 export const SANDBOX_TOKEN = 'sandbox-ok';
+
+/**
+ * IS THIS A DEPLOYED SERVER RATHER THAN SOMEBODY'S MACHINE?
+ *
+ * Read from NODE_ENV rather than import.meta.env so the unit test (run under tsx, where import.meta
+ * .env does not exist) and the built server both get an answer.
+ */
+function isDeployed(): boolean {
+  try { return String(process.env.NODE_ENV || '').toLowerCase() === 'production'; } catch { return false; }
+}
+
 function sandboxGateway(): PaymentGateway {
   return {
     mode: 'sandbox',
-    async createOrder(amount, receipt) { return { ok: true, order: { id: 'test_order_' + receipt + '_' + Date.now(), amount, currency: 'INR', keyId: null } }; },
-    verify(_orderId, _paymentId, signature) { return signature === SANDBOX_TOKEN; },   // test-only; not real money
-    async refund() { return { ok: true }; },
+    async createOrder(amount, receipt) {
+      // FAIL CLOSED ON A DEPLOYED SERVER. A checkout that cannot charge must say so, not hand back a
+      // test order that unlocks a paid course for nothing.
+      if (isDeployed()) {
+        return { ok: false, error: 'Payments are not configured on this server, so nothing can be charged. Nobody has been billed.' };
+      }
+      return { ok: true, order: { id: 'test_order_' + receipt + '_' + Date.now(), amount, currency: 'INR', keyId: null } };
+    },
+    // THE FAIL-OPEN THIS CLOSES. `signature === SANDBOX_TOKEN` is a constant anybody can type. On a
+    // deployed server with the Razorpay keys missing — a bad rotation, an env var dropped from a new
+    // project — getGateway() falls back here and every signed-in visitor could post the literal
+    // string 'sandbox-ok' and unlock a paid course for free. The token is a DEVELOPMENT affordance
+    // and is refused wherever NODE_ENV says this is production.
+    verify(_orderId, _paymentId, signature) { return !isDeployed() && signature === SANDBOX_TOKEN; },
+    async refund() {
+      if (isDeployed()) return { ok: false, error: 'Payments are not configured on this server, so no refund can be issued here.' };
+      return { ok: true };
+    },
     publicKey() { return null; },
   };
 }

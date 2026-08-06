@@ -355,18 +355,45 @@ export function punchRefusal(kind: PunchKind, totals: DayTotals): string {
 }
 
 // -------------------------------------------------------------------------------------------------
-// TODAY, AS POSTGRES COUNTS IT
+// TODAY, IN THE ZONE THE COMPANY ACTUALLY WORKS IN
 // -------------------------------------------------------------------------------------------------
 
 /**
- * CURRENT_DATE from the database. Null when the read did not happen.
+ * THE ZONE EVERY DAY BOUNDARY IN THIS MODULE IS CUT ON, named once.
+ *
+ * Attendance is the one module where a day is not a formatting choice: "did I clock in today" is a
+ * claim about a person's pay, and the header of this file says so. Declared here, above the only
+ * function that reads it — const is not hoisted.
+ */
+export const ATTENDANCE_TIME_ZONE = 'Asia/Kolkata';
+
+/**
+ * Today, as the working day is counted here. Null when the read did not happen.
+ *
+ * ASKING POSTGRES WAS ONLY HALF THE ANSWER, AND THE MISSING HALF COST FIVE AND A HALF HOURS A DAY.
+ * This used to be `SELECT CURRENT_DATE`, written deliberately so a render process in another region
+ * could not decide the date. But CURRENT_DATE is the DATABASE SESSION's zone, and nothing anywhere
+ * sets it: src/lib/db/index.ts opens postgres(connectionString, { prepare: false }) with no timezone
+ * option and no SET TIME ZONE, so the session inherits the server default, which is UTC. IST is
+ * UTC+05:30, so between 00:00 and 05:29 every night "today" was still YESTERDAY.
+ *
+ * What that produced, every night: an early-shift punch at 05:00 IST written onto the previous day's
+ * hr_attendance row over a day already closed out; a daily report filed at 00:30 IST refused as
+ * "that day has not happened yet"; an overtime claim refused the same way.
+ *
+ * `NOW() AT TIME ZONE '<zone>'` converts the transaction timestamp into local wall-clock time in that
+ * zone and the ::date then cuts the day where the people cutting it do. It is explicit, it does not
+ * depend on the session's configuration, and it does not require changing the connection — which on
+ * a pooled connection is not this module's decision to make.
  *
  * NULL IS NOT "GUESS". A caller that gets null must not render a day-partitioned claim; the pages
  * here say so rather than showing yesterday's punches under today's heading.
  */
 export async function today(): Promise<string | null> {
   try {
-    const r = await db.execute(sql`SELECT CURRENT_DATE::text AS d`);
+    const r = await db.execute(
+      sql`SELECT (NOW() AT TIME ZONE ${ATTENDANCE_TIME_ZONE})::date::text AS d`,
+    );
     const list = rows(r);
     const d = list.length ? String(list[0].d || '') : '';
     return isDateIso(d) ? d : null;
@@ -2114,11 +2141,29 @@ export async function requestOvertime(input: {
       RETURNING id`);
     const list = rows(r);
     if (!list.length) {
+      // Defensive only. An INSERT with no ON CONFLICT returns its row or throws; it cannot return
+      // zero. The real duplicate path is the catch below.
       return { ok: false, error: 'You already have a claim open for that day. Withdraw it before filing another.' };
     }
     claimId = String(list[0].id);
   } catch (e: any) {
     logFail('requestOvertime.insert', e);
+    // THE FRIENDLY SENTENCE ABOVE WAS UNREACHABLE, AND THIS IS WHERE IT ACTUALLY BELONGS.
+    //
+    // hr_overtime_one_live (src/lib/attendance-schema.ts) is a partial unique index on
+    // (employee_id, work_date) WHERE withdrawn_at IS NULL, so a second claim for the same day raises
+    // 23505 — it does not come back as zero rows. errText() then returned e.cause.message verbatim,
+    // so an employee who double-tapped a slow form was shown
+    // 'duplicate key value violates unique constraint "hr_overtime_one_live"'. The constraint is
+    // doing exactly its job; the only thing wrong was who the message was written for.
+    const real = String(e?.cause?.message || e?.message || '');
+    if (/duplicate key|unique constraint/i.test(real)) {
+      return {
+        ok: false,
+        error: 'You already have a claim on file for ' + workDate + '. Withdraw that one before filing '
+          + 'another — including a claim your manager has already turned down, which still holds the day.',
+      };
+    }
     return { ok: false, error: errText(e, 'The claim could not be saved.') };
   }
 

@@ -300,8 +300,16 @@ export async function settlementFacts(separationId: string): Promise<SettlementF
     }
   }
 
+  // MULTIPLY FIRST, ROUND ONCE. This was round2(gross / days) followed by a multiplication by the
+  // days worked, so the rounding error on the per-day figure was multiplied by up to 31: a 75,000
+  // gross over a 31-day month with all 31 days worked paid 74,999.85 — fifteen paise short of a month
+  // actually worked — and a 65,000 gross over 28 days paid 65,000.04, four paise more than the month
+  // is worth. perDayRate is still published because the statement PRINTS it, but it is now a display
+  // figure and no longer the thing the total is derived from.
   const perDayRate = finalMonthDays > 0 ? round2(regularGross / finalMonthDays) : 0;
-  const unpaidFinalSalary = finalMonthAlreadyPaid ? 0 : round2(perDayRate * finalMonthDaysWorked);
+  const unpaidFinalSalary = finalMonthAlreadyPaid || finalMonthDays <= 0
+    ? 0
+    : round2((regularGross * finalMonthDaysWorked) / finalMonthDays);
 
   let leaveBalances: LeaveBalance[] = [];
   if (isUuid(employeeId)) {
@@ -901,6 +909,30 @@ export async function finaliseSettlement(opts: {
     }
     if (blockers.length) return { ok: false, error: blockers[0], blockers };
 
+    // CLAIM THE SETTLEMENT BEFORE ANYTHING IRREVERSIBLE HAPPENS.
+    //
+    // The state check above is a READ, and the write that marked the settlement 'settled' used to sit
+    // at the very END of this function with no precondition on it. Two presses of Hand off landing
+    // together therefore both passed the read, both closed the loans (a second ledger row for a
+    // balance already recovered) and both recorded a handoff on the separation. This single
+    // conditional UPDATE lets exactly one of them through; the loser is told and does nothing.
+    //
+    // The reference and timestamp are written here rather than afterwards so the row never sits in a
+    // state that says settled without saying by what.
+    const claimed = rows(await db.execute(sql`
+      UPDATE hr_settlements
+         SET state = 'settled', settled_reference = ${reference}, settled_at = NOW(),
+             settled_by_user_id = ${by}::uuid, updated_at = NOW()
+       WHERE id = ${opts.settlementId}::uuid AND state = 'approved'
+      RETURNING id`));
+    if (!claimed.length) {
+      return {
+        ok: false,
+        error: 'This settlement was handed off by somebody else while this page was open. Reload it — '
+          + 'nothing was done twice.',
+      };
+    }
+
     // CLOSE THE LOANS THIS STATEMENT RECOVERED, through the module that owns them. Each failure is
     // collected and reported; none of them is swallowed, because a loan left open after its balance
     // was deducted from a settlement will keep showing as owed by somebody who has left.
@@ -922,18 +954,19 @@ export async function finaliseSettlement(opts: {
       actorUserId: by,
     });
     if (!handoff.ok) {
+      // The claim above already moved this settlement to 'settled', and the loans it recovered may
+      // already be closed, so putting it back to 'approved' would invite a second run over ledger
+      // rows that now exist. It stays settled and the failure is stated in full: what is missing is
+      // the handoff record on the separation, which is repaired on that console.
+      logFail('finaliseSettlement.handoff', new Error(handoff.error || 'unknown reason'));
       return {
         ok: false,
-        error: 'The settlement was not handed off: ' + (handoff.error || 'unknown reason')
-          + (loanErrors.length ? ' Some loan balances were already closed — check the loan register.' : ''),
+        error: 'The settlement is marked handed off here, but the record on the separation console was '
+          + 'NOT written: ' + (handoff.error || 'unknown reason')
+          + ' Record it there by hand.'
+          + (loanErrors.length ? ' Some loan balances could not be closed either — check the loan register.' : ''),
       };
     }
-
-    await db.execute(sql`
-      UPDATE hr_settlements
-         SET state = 'settled', settled_reference = ${reference}, settled_at = NOW(),
-             settled_by_user_id = ${by}::uuid, updated_at = NOW()
-       WHERE id = ${opts.settlementId}::uuid`);
 
     await logAudit({
       userId: by, action: 'settlement.handed_off', entity: 'hr_settlement',

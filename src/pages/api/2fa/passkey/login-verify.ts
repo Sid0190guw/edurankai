@@ -73,6 +73,13 @@ export const POST: APIRoute = async ({ request, cookies, clientAddress }) => {
     // The log gets the truth; the browser gets a sentence. Our own assertion
     // failures (challenge mismatch, bad signature) carry no cause and stay
     // readable, because "your passkey did not verify" is the answer in that case.
+    // THE CHALLENGE IS BURNED ON FAILURE TOO. It was only deleted on the success path, so a
+    // challenge that had already been presented and rejected stayed in the cookie for its full five
+    // minutes and could be re-presented as often as the caller liked. A WebAuthn challenge is
+    // single-use by definition — the freshness of the signed data is the whole reason it exists —
+    // and leaving a spent one live hands an attacker an unlimited window to work in. Nothing
+    // legitimate is lost: public/webauthn-client.js requests fresh options on every press.
+    try { cookies.delete('wa_chal', { path: '/' }); } catch (_) {}
     const cause = e?.cause?.message;
     console.error('[api/2fa/passkey/login-verify]', cause || e?.message, e?.stack);
     return json({ ok: false, error: cause ? 'Passkey sign-in is temporarily unavailable. Please try again.' : (e?.message || 'Verification failed') }, 400);

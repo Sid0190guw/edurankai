@@ -193,9 +193,20 @@ function formatTime(d: any) {
           </div>
         </header>
 
+        {threadError && (
+          <div style="margin:14px 18px 0;padding:10px 12px;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.28);border-radius:9px;color:#fbbf24;font-size:12px;line-height:1.5;overflow-wrap:anywhere;">
+            This conversation could not be read, so it is empty here for a reason that is not "no
+            messages": {threadError}
+          </div>
+        )}
         <div id="messageStream" style="flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px;">
-          {activeMessages.length === 0 && (
-            <p style="text-align:center;color:#6e6e78;font-size:12px;font-style:italic;padding:20px;">No messages in this conversation yet.</p>
+          {/* id="helpEmptyNote" so the poller can remove it before appending the FIRST live message.
+              The poller used to compare `stream.children.length` against the server's message count,
+              and this placeholder counts as a child — so on an empty thread the first visitor reply
+              made 1 > 1 false and never rendered, and the second appended only itself, dropping the
+              first message from the screen entirely until somebody reloaded. */}
+          {activeMessages.length === 0 && !threadError && (
+            <p id="helpEmptyNote" style="text-align:center;color:#6e6e78;font-size:12px;font-style:italic;padding:20px;">No messages in this conversation yet.</p>
           )}
           {activeMessages.map((msg: any) => {
             const isAdmin = msg.sender_role === 'admin';
@@ -238,7 +249,7 @@ function formatTime(d: any) {
 </style>
 
 {activeConv && (
-  <script is:inline define:vars={{ conversationId: activeConv.id, lastMessageTs: activeMessages.length > 0 ? activeMessages[activeMessages.length - 1].created_at : '1970-01-01T00:00:00Z' }}>
+  <script is:inline define:vars={{ conversationId: activeConv.id, renderedCount: activeMessages.length, lastMessageTs: activeMessages.length > 0 ? activeMessages[activeMessages.length - 1].created_at : '1970-01-01T00:00:00Z' }}>
     (function() {
       var stream = document.getElementById('messageStream');
       var form = document.getElementById('replyForm');
@@ -247,6 +258,9 @@ function formatTime(d: any) {
       var closeBtn = document.getElementById('closeBtn');
       var reopenBtn = document.getElementById('reopenBtn');
       var lastTs = lastMessageTs;
+      // How many MESSAGES are on screen — counted, not inferred from stream.children.length, which
+      // also counts the "no messages yet" placeholder. See the comment on that element.
+      var shown = renderedCount;
 
       function formatTime(iso) {
         try { return new Date(iso).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; }
@@ -255,6 +269,8 @@ function formatTime(d: any) {
         return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       }
       function appendMessage(m) {
+        var note = document.getElementById('helpEmptyNote');
+        if (note && note.parentNode) note.parentNode.removeChild(note);
         var isAdmin = m.sender_role === 'admin';
         var wrap = document.createElement('div');
         wrap.style.cssText = 'display:flex;flex-direction:column;align-items:' + (isAdmin ? 'flex-end' : 'flex-start') + ';';
@@ -267,6 +283,7 @@ function formatTime(d: any) {
             escapeHtml(m.body).replace(/\n/g, '<br/>') +
           '</div>';
         stream.appendChild(wrap);
+        shown += 1;
         stream.scrollTop = stream.scrollHeight;
       }
 
@@ -311,21 +328,39 @@ function formatTime(d: any) {
           .then(function(r) { return r.json(); })
           .then(function(d) {
             if (!d.ok || !d.messages) return;
-            var rendered = stream.children.length;
-            if (d.messages.length > rendered) {
-              for (var i = rendered; i < d.messages.length; i++) appendMessage(d.messages[i]);
+            if (d.messages.length > shown) {
+              for (var i = shown; i < d.messages.length; i++) appendMessage(d.messages[i]);
               lastTs = d.messages[d.messages.length - 1].created_at;
             }
           }).catch(function() {});
       }, 5000);
 
-      // Close / reopen
+      // Close / reopen.
+      //
+      // IT USED TO RELOAD WHICHEVER WAY THE REQUEST WENT. `.then(function() { location.reload(); })`
+      // ran on a refusal, a 500 and a success alike, so a close that the server rejected redrew the
+      // page with the conversation still open and nothing on screen saying why — the "reported
+      // success while nothing happened" shape. It only reloads on a confirmed change now.
+      //
+      // REOPEN IS ALSO REPORTED, NOT FIXED: /api/admin/help/reply only ever sets status='closed'
+      // (via closeAfter) and has no path back to 'open', so the Reopen button posts a system line and
+      // leaves the conversation closed. Adding a reopen verb is a change to that endpoint's contract
+      // and belongs with a human deciding whether reopening should be an admin power at all.
       function setStatus(s) {
+        var btn = s === 'closed' ? closeBtn : reopenBtn;
+        if (btn) btn.disabled = true;
         fetch('/api/admin/help/reply', {
           method: 'POST', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ conversationId: conversationId, body: s === 'closed' ? '(Conversation closed)' : '(Conversation reopened)', closeAfter: s === 'closed' })
-        }).then(function(r) { return r.json(); }).then(function() { location.reload(); });
+        }).then(function(r) { return r.json(); }).then(function(d) {
+          if (d && d.ok) { location.reload(); return; }
+          if (btn) btn.disabled = false;
+          alert('Nothing was changed: ' + ((d && d.error) || 'the server did not confirm it') + '. This conversation is still where it was.');
+        }).catch(function(err) {
+          if (btn) btn.disabled = false;
+          alert('Nothing was changed - the request never reached the server (' + ((err && err.message) || 'network error') + ').');
+        });
       }
       if (closeBtn) closeBtn.addEventListener('click', function() { if (confirm('Close this conversation?')) setStatus('closed'); });
       if (reopenBtn) reopenBtn.addEventListener('click', function() { setStatus('open'); });

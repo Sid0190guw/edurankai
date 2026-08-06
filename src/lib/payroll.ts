@@ -86,6 +86,7 @@ import { logAudit } from '@/lib/audit';
 // The dependency runs ONE WAY — payroll imports loans, loans never imports payroll.
 import { plannedRecoveries, recordRecovery, type LoanCharge } from '@/lib/loans';
 import { plannedBonuses, recordBonusPayout, type BonusCharge } from '@/lib/payroll-bonuses';
+import { round2, sumMoney } from '@/lib/money';
 
 // -------------------------------------------------------------------------------------------------
 // MODULE CONSTANTS — all above the functions that use them.
@@ -187,7 +188,14 @@ const LEGACY_PAYSLIP_COLUMN: Record<string, string> = {
 
 const CODE_RE = /^[a-z][a-z0-9_]{1,38}$/;
 
-const round2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
+// ROUNDING IS SHARED, NOT RE-DECLARED — see the import of round2/sumMoney at the top of this file.
+//
+// What stood here was a local copy of
+//   Math.round((Number(n) || 0) * 100) / 100
+// which rounds a half paisa the wrong way: 1.005 * 100 is 100.49999999999999 in IEEE754, so it
+// answered 1.00 where the decimal value says 1.01, and it did so consistently AGAINST the employee.
+// Five other modules carried the identical copy. src/lib/money.ts explains the arithmetic and is now
+// the only implementation of it.
 
 // -------------------------------------------------------------------------------------------------
 // SCHEMA — self-bootstrapping, and the guard resets on failure.
@@ -636,6 +644,17 @@ export interface PayComputation {
    * never had, and the shortfall would vanish. The screen must say this out loud when it happens.
    */
   loanRecoveryReduced: boolean;
+  /**
+   * True when ANY deduction had to be reduced because the month's pay could not carry it.
+   *
+   * The counterpart to loanRecoveryReduced for everything that is not a loan. A screen that shows a
+   * payslip must be able to say "tax was reduced from 5,000 to 0 because there was no pay to withhold
+   * it from" rather than printing a figure that silently disagrees with the salary structure behind
+   * it. See the deduction-order table above fitDeductionsToGross().
+   */
+  deductionsReduced: boolean;
+  /** Every line that was reduced, with what was planned and what the month could carry. */
+  deductionReductions: DeductionReduction[];
   /** The awards that produced the bonus lines, for the caller to write into the payout ledger. */
   bonusCharges: BonusCharge[];
   /** The loans that produced the recovery lines, at the amounts ACTUALLY applied. */
@@ -664,6 +683,98 @@ function applyCap(amount: number, cap: number | null): number {
   return round2(Math.min(amount, cap));
 }
 
+// -------------------------------------------------------------------------------------------------
+// THE ORDER DEDUCTIONS COME OFF PAY — written down here because a payslip has to be reconstructable.
+// -------------------------------------------------------------------------------------------------
+//
+// A month's pay can be smaller than the sum of everything somebody wants to take out of it. Full loss
+// of pay leaves nothing to withhold tax from; a big typed-in "other deduction" plus a loan instalment
+// can exceed what is left. SOMETHING has to give, and which thing gives is a policy decision, not an
+// accident of the order two `for` loops happen to run in.
+//
+// WHAT WENT WRONG BEFORE. Only loan recovery was fitted to the money available. Everything else was
+// summed unconditionally, and `net` was then clamped with Math.max(0, ...). So a payslip could be
+// written — and PRINTED by src/lib/hr-payslip.ts, which shows all three figures — reading:
+//
+//     gross 40,000    total deductions 45,000    net 0
+//
+// Three numbers on one document that do not make an equation. An employee cannot check it, an
+// accountant cannot reconcile it, and nothing in the product said the 5,000 had gone anywhere.
+//
+// THE ORDER, LEAST PROTECTED FIRST. Anything that must be reduced is reduced from the top of this
+// list downwards, and a line reduced to nothing is dropped rather than printed as a zero:
+//
+//   4  LOAN AND ADVANCE RECOVERY   — money owed to the employer. The employer can wait a month; the
+//                                    balance stays on the loan ledger and is recovered next run.
+//   3  VOLUNTARY DEDUCTIONS        — anything an administrator configured that is not marked
+//                                    statutory. Elective, so it yields before anything compulsory.
+//   2  TYPED-IN TAX AND OTHER      — the legacy hr_salary_structures.tds / other_deductions columns.
+//                                    A withholding figure typed against a full month's salary is not
+//                                    owed on a month that was not paid.
+//   1  STATUTORY COMPONENTS        — provident fund and the like, computed from the catalogue. Almost
+//                                    never reduced, and only when there is genuinely no pay left.
+//   0  LOSS OF PAY                 — NEVER reduced. It is not a deduction taken out of earnings; it is
+//                                    the absence of earnings, and it can never exceed regular gross by
+//                                    construction (lopDays is capped at the days in the month).
+//
+// AFTER THIS PASS, total deductions cannot exceed gross, so net is a subtraction rather than a clamp
+// and gross - deductions = net holds on the row, on the payslip and on every screen that adds them up.
+//
+// WHAT THE EMPLOYEE IS TOLD. Every reduction is returned in `deductionReductions` with the planned
+// and applied figures, so the screen can name the line that was cut and by how much instead of
+// showing a number that quietly disagrees with the instruction behind it.
+
+/** Lower is more protected. See the table above; this is the only place the ranking is expressed. */
+function deductionRank(line: PayLine): number {
+  if (line.code === 'loss_of_pay') return 0;
+  if (line.statutory) return 1;
+  if (line.code === 'tds' || line.code === 'other_deductions') return 2;
+  if (line.code.startsWith('loan:')) return 4;
+  return 3;
+}
+
+export interface DeductionReduction {
+  code: string;
+  label: string;
+  /** What the configuration or the typed column asked for. */
+  planned: number;
+  /** What the month could actually carry. Zero means the line was dropped entirely. */
+  applied: number;
+}
+
+/**
+ * Reduce deductions, least protected first, until they fit inside `gross`.
+ *
+ * MUTATES the lines it is given and returns what it changed. Called with the deductions assembled so
+ * far and the gross they are being taken from; loan recovery is fitted separately and afterwards,
+ * into the room this pass leaves behind, so the two mechanisms cannot disagree.
+ */
+function fitDeductionsToGross(lines: PayLine[], gross: number): DeductionReduction[] {
+  const reductions: DeductionReduction[] = [];
+  let over = round2(sumMoney(lines.map((l) => l.amount)) - gross);
+  if (over <= 0) return reductions;
+
+  // Highest rank first, and within a rank the largest line first — so one big elective deduction
+  // absorbs the shortfall before several small ones are each disturbed.
+  const order = lines
+    .map((l, i) => ({ l, i }))
+    .sort((a, b) => deductionRank(b.l) - deductionRank(a.l) || b.l.amount - a.l.amount);
+
+  for (const { l } of order) {
+    if (over <= 0) break;
+    if (deductionRank(l) === 0) continue; // loss of pay is never reduced
+    if (l.amount <= 0) continue;
+    const cut = round2(Math.min(l.amount, over));
+    const applied = round2(l.amount - cut);
+    reductions.push({ code: l.code, label: l.label, planned: l.amount, applied });
+    l.amount = applied;
+    l.rate = l.basis === 'fixed' ? applied : l.rate;
+    over = round2(over - cut);
+  }
+
+  return reductions;
+}
+
 /**
  * WHAT THIS PERSON IS PAID FOR THIS MONTH, and every component that made it up.
  *
@@ -683,6 +794,7 @@ export async function computePay(
     employeeId, currency: 'INR', basic: 0, earnings: [], deductions: [],
     grossEarnings: 0, totalDeductions: 0, net: 0, employerCost: 0,
     regularGross: 0, bonusTotal: 0, loanRecovery: 0, loanRecoveryReduced: false,
+    deductionsReduced: false, deductionReductions: [],
     bonusCharges: [], loanCharges: [],
     lopDays: 0, lopDeduction: 0, daysWorked: 0, daysLeave: 0, daysAbsent: 0,
     noStatutoryComponents: true, gaps,
@@ -760,7 +872,7 @@ export async function computePay(
   // REGULAR GROSS — basic plus the recurring earnings, and no bonus. See PayComputation.regularGross
   // for why the two are kept apart; every band test, every percentage and the loss-of-pay day rate
   // below are computed against THIS number, not against a month that happened to carry an award.
-  const regularGross = round2(basic + earnings.reduce((s, l) => s + l.amount, 0));
+  const regularGross = sumMoney([basic, ...earnings.map((l) => l.amount)]);
 
   // ---- attendance and loss of pay ------------------------------------------------------------------
   //
@@ -803,9 +915,56 @@ export async function computePay(
     gaps.push('approved unpaid leave for this month');
   }
 
-  const lopDays = Math.min(daysInMonth, Math.max(0, unpaidDays) + Math.max(0, daysAbsent));
-  const perDay = daysInMonth > 0 ? regularGross / daysInMonth : 0;
-  const lopDeduction = round2(perDay * lopDays);
+  // ---- ONE DAY IS ONE DEDUCTION -------------------------------------------------------------------
+  //
+  // THIS WAS `unpaidDays + daysAbsent`, AND IT CHARGED THE SAME DAY TWICE.
+  //
+  // The two figures are read from two different tables that describe the SAME calendar days from two
+  // directions: hr_leave_request says "this person had approved unpaid leave from the 3rd to the 7th",
+  // and hr_attendance says "this person did not clock in on the 3rd to the 7th". Marking an attendance
+  // row 'absent' for a day with no clock-in is exactly what an operator does — it is what the bulk-mark
+  // button on /admin/hr/attendance is for — so for approved unpaid leave BOTH rows normally exist.
+  // Adding them made five days of approved leave cost ten days of pay: on a gross of 62,000 in a
+  // 31-day month, 20,000 deducted where 10,000 was owed.
+  //
+  // The overlap has to be resolved on DATES, which means asking the database rather than adding two
+  // scalars. absentDaysNotOnUnpaidLeave counts attendance rows marked absent EXCEPT those falling
+  // inside an approved unpaid-leave range, so each calendar day contributes exactly one day of loss of
+  // pay however many tables record it.
+  //
+  // daysAbsent itself is NOT changed: it is the attendance fact and the attendance screens print it.
+  // Only the money is corrected.
+  let absentDaysNotOnUnpaidLeave = daysAbsent;
+  try {
+    const ab = rows(await db.execute(sql`
+      SELECT COUNT(*)::int AS d
+        FROM hr_attendance a
+       WHERE a.employee_id = ${employeeId}::uuid
+         AND a.date >= make_date(${year}, ${month}, 1)
+         AND a.date <= make_date(${year}, ${month}, ${daysInMonth})
+         AND a.status = 'absent'
+         AND NOT EXISTS (
+           SELECT 1 FROM hr_leave_request lr
+            WHERE lr.employee_id = a.employee_id
+              AND lr.status = 'approved'
+              AND lr.leave_type = 'unpaid'
+              AND a.date BETWEEN lr.start_date AND lr.end_date
+         )`))[0] || {};
+    absentDaysNotOnUnpaidLeave = Number(ab.d) || 0;
+  } catch (e: any) {
+    // A FAILED READ MUST NOT SILENTLY RESTORE THE DOUBLE CHARGE. Falling back to the raw daysAbsent
+    // is the old, wrong arithmetic, so it is said out loud on the payslip's gap list rather than
+    // applied quietly.
+    logFail('computePay.absentNotOnLeave', e);
+    gaps.push('which absences were already covered by approved unpaid leave, so a day may be counted twice in loss of pay');
+  }
+
+  const lopDays = Math.min(daysInMonth, Math.max(0, unpaidDays) + Math.max(0, absentDaysNotOnUnpaidLeave));
+  // MULTIPLY FIRST, ROUND ONCE. Rounding the per-day rate and then multiplying it by the day count
+  // multiplies the rounding error by that count as well: 62,000 over 31 days is 2000.00 exactly, but
+  // 75,000 over 31 days is 2419.354838..., and a rounded 2419.35 times 31 is 74,999.85 — a month of
+  // absence that does not cost a month of pay. The division stays inside the single round2.
+  const lopDeduction = daysInMonth > 0 ? round2((regularGross * lopDays) / daysInMonth) : 0;
 
   if (lopDeduction > 0) {
     deductions.push({
@@ -864,7 +1023,31 @@ export async function computePay(
     logFail('computePay.bonuses', e);
     gaps.push('approved bonuses for this month');
   }
+  // AN AWARD IN ANOTHER CURRENCY IS NOT ADDED TO THIS PAYSLIP.
+  //
+  // hr_bonus_awards records a currency and so does the salary structure, and until now neither was
+  // compared: BonusCharge dropped the field entirely, so an award of USD 2,000 arrived here as the
+  // number 2000 and was pushed onto a rupee payslip as a 2,000 rupee earning. The currency did not
+  // convert — it stopped existing.
+  //
+  // THIS MODULE IS NOT A CONVERTER, AND MUST NOT BECOME ONE. There is no exchange rate anywhere in
+  // this codebase, and a rate invented in a payroll file, applied to somebody's pay, on a date nobody
+  // recorded, is worse than the bug it would be fixing. So the mismatch is REFUSED and NAMED: the
+  // award is left unpaid and out of gross, and the reason goes on the gap list, which every payroll
+  // screen already prints. Somebody then either re-records the award in the payslip currency or pays
+  // it outside payroll — both of which are decisions a person makes, with a rate they can defend.
+  const payableBonuses: BonusCharge[] = [];
   for (const b of bonusCharges) {
+    const awardCurrency = String(b.currency || currency);
+    if (awardCurrency !== currency) {
+      gaps.push(
+        'the award "' + b.label + '" is recorded in ' + awardCurrency + ' and this payslip is in '
+        + currency + ', so it has NOT been added to this month. There is no exchange rate in this '
+        + 'system to convert it with — re-record it in ' + currency + ' or pay it outside payroll.',
+      );
+      continue;
+    }
+    payableBonuses.push(b);
     earnings.push({
       code: 'bonus:' + b.bonusId,
       label: b.label,
@@ -872,7 +1055,11 @@ export async function computePay(
       employerAmount: 0, statutory: false, sortOrder: 30,
     });
   }
-  const bonusTotal = round2(bonusCharges.reduce((s, b) => s + b.amount, 0));
+  // A REFUSED AWARD IS ALSO NOT RECORDED AS PAID. bonusCharges is what generateRun() writes into the
+  // bonus ledger through recordBonusPayout(), so it has to be the awards that actually reached the
+  // payslip — otherwise a one-off nobody was paid would be marked spent and never pay at all.
+  bonusCharges = payableBonuses;
+  const bonusTotal = sumMoney(bonusCharges.map((b) => b.amount));
   const grossEarnings = round2(regularGross + bonusTotal);
 
   // ---- LOAN AND SALARY-ADVANCE RECOVERY -------------------------------------------------------------
@@ -886,7 +1073,19 @@ export async function computePay(
   // A recovery reduced to zero produces no line at all rather than a zero line, and the caller is
   // told through loanRecoveryReduced so it can say so instead of showing a repayment that silently
   // did not happen.
-  const deductionsBeforeLoans = round2(deductions.reduce((s, l) => s + l.amount, 0));
+  // EVERYTHING EXCEPT LOAN RECOVERY IS FITTED TO THE MONTH FIRST, in the documented order above.
+  // Without this, `room` below was computed from a deduction total that could already exceed gross,
+  // so it clamped to zero, no loan was recovered — and the excess simply stayed in totalDeductions
+  // where the net clamp hid it.
+  const deductionReductions = fitDeductionsToGross(deductions, grossEarnings);
+  const deductionsReduced = deductionReductions.length > 0;
+  // A line reduced all the way to nothing is dropped, not printed as a zero: "Tax deducted at source
+  // 0.00" reads as a calculated figure rather than as a deduction that could not be taken.
+  for (let i = deductions.length - 1; i >= 0; i--) {
+    if (deductions[i].amount <= 0 && deductions[i].employerAmount <= 0) deductions.splice(i, 1);
+  }
+
+  const deductionsBeforeLoans = sumMoney(deductions.map((l) => l.amount));
   let room = round2(Math.max(0, grossEarnings - deductionsBeforeLoans));
 
   let plannedLoans: LoanCharge[] = [];
@@ -923,15 +1122,19 @@ export async function computePay(
       employerAmount: 0, statutory: false, sortOrder: 70,
     });
   }
-  const loanRecovery = round2(loanCharges.reduce((s, c) => s + c.amount, 0));
+  const loanRecovery = sumMoney(loanCharges.map((c) => c.amount));
 
   earnings.sort((a, b) => a.sortOrder - b.sortOrder || a.label.localeCompare(b.label));
   deductions.sort((a, b) => a.sortOrder - b.sortOrder || a.label.localeCompare(b.label));
 
-  const totalDeductions = round2(deductions.reduce((s, l) => s + l.amount, 0));
-  const employerShare = round2(
-    earnings.reduce((s, l) => s + l.employerAmount, 0) + deductions.reduce((s, l) => s + l.employerAmount, 0),
-  );
+  // TOTALS ARE SUMMED IN PAISE so the printed total equals the printed lines exactly. Adding doubles
+  // left to right accumulates error that a long payslip can carry into the second decimal; adding
+  // integers cannot. See sumMoney() in src/lib/money.ts.
+  const totalDeductions = sumMoney(deductions.map((l) => l.amount));
+  const employerShare = sumMoney([
+    ...earnings.map((l) => l.employerAmount),
+    ...deductions.map((l) => l.employerAmount),
+  ]);
 
   return {
     employeeId,
@@ -941,12 +1144,19 @@ export async function computePay(
     deductions,
     grossEarnings,
     totalDeductions,
-    net: round2(Math.max(0, grossEarnings - totalDeductions)),
+    // A SUBTRACTION, NOT A CLAMP. This was Math.max(0, gross - deductions), which produced a net of
+    // zero on a payslip whose own two other figures said otherwise and printed all three. After
+    // fitDeductionsToGross() above, totalDeductions cannot exceed grossEarnings, so this subtraction
+    // is non-negative by construction — and if that invariant is ever broken by a future change, the
+    // number goes negative and is VISIBLE instead of being quietly floored.
+    net: round2(grossEarnings - totalDeductions),
     employerCost: round2(grossEarnings + employerShare),
     regularGross,
     bonusTotal,
     loanRecovery,
     loanRecoveryReduced,
+    deductionsReduced,
+    deductionReductions,
     bonusCharges,
     loanCharges,
     lopDays,
@@ -1055,16 +1265,60 @@ export async function generateRun(
           const col = LEGACY_PAYSLIP_COLUMN[line.code];
           if (col) legacy[col] = round2((legacy[col] || 0) + line.amount);
         }
-        const otherAllowances = round2(
-          pay.earnings.filter((l) => !LEGACY_PAYSLIP_COLUMN[l.code]).reduce((s, l) => s + l.amount, 0)
-          + (legacy.other_allowances || 0),
-        );
-        const otherDeductions = round2(
-          pay.deductions
+        const otherAllowances = sumMoney([
+          ...pay.earnings.filter((l) => !LEGACY_PAYSLIP_COLUMN[l.code]).map((l) => l.amount),
+          legacy.other_allowances || 0,
+        ]);
+        const otherDeductions = sumMoney([
+          ...pay.deductions
             .filter((l) => !LEGACY_PAYSLIP_COLUMN[l.code] && l.code !== 'loss_of_pay')
-            .reduce((s, l) => s + l.amount, 0)
-          + (legacy.other_deductions || 0),
-        );
+            .map((l) => l.amount),
+          legacy.other_deductions || 0,
+        ]);
+
+        // ---- THE PAYSLIP MUST ADD UP, AND SOMEBODY MUST BE TOLD WHEN IT DOES NOT -----------------
+        //
+        // hr_payslips stores gross_salary, total_deductions and net_salary as three independent
+        // numbers, AND a lossy legacy projection of the component lines into fixed columns (hra, da,
+        // tds ...). Nothing anywhere asserted that either set reconciles, so a payslip whose columns
+        // did not sum back to its own totals printed exactly like one that did.
+        //
+        // Two identities are checked against the very figures being written on this row:
+        //
+        //   basic + every allowance column                 == gross_salary
+        //   pf + esic + pt + tds + other_deductions + lop  == total_deductions
+        //
+        // lop_deduction belongs in the second sum precisely because otherDeductions EXCLUDES
+        // loss_of_pay (it has its own column) — so the projection only balances when that column is
+        // added back, which is the kind of fact that stops being true the moment somebody edits one
+        // of the two places and not the other.
+        //
+        // NOT FATAL. The row is still the best record of the run, and refusing to write it would
+        // leave the employee with no payslip at all. But it is a number a human will query one day,
+        // so it is named now rather than discovered then.
+        const legacyGross = sumMoney([
+          pay.basic, legacy.hra || 0, legacy.da || 0, legacy.special_allowance || 0,
+          legacy.transport_allowance || 0, legacy.medical_allowance || 0, otherAllowances,
+        ]);
+        const legacyDeductions = sumMoney([
+          legacy.pf_employee || 0, legacy.esic_employee || 0, legacy.professional_tax || 0,
+          legacy.tds || 0, otherDeductions, pay.lopDeduction,
+        ]);
+        if (legacyGross !== pay.grossEarnings) {
+          const msg = 'The payslip for employee ' + empId + ' stores allowance columns adding to '
+            + legacyGross.toFixed(2) + ' against a gross of ' + pay.grossEarnings.toFixed(2)
+            + '. The component lines are the true detail; the fixed columns are a projection of them, '
+            + 'and this one does not reconcile.';
+          console.error('[payroll] payslip gross does not reconcile -', msg);
+          ledgerWarnings.push(msg);
+        }
+        if (legacyDeductions !== pay.totalDeductions) {
+          const msg = 'The payslip for employee ' + empId + ' stores deduction columns adding to '
+            + legacyDeductions.toFixed(2) + ' against total deductions of '
+            + pay.totalDeductions.toFixed(2) + '. The component lines are the true detail.';
+          console.error('[payroll] payslip deductions do not reconcile -', msg);
+          ledgerWarnings.push(msg);
+        }
 
         const slip = rows(await db.execute(sql`
           INSERT INTO hr_payslips (

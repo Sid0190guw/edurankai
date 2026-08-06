@@ -1100,7 +1100,7 @@ export async function routeWithdrawals(employeeId?: string | null): Promise<Rout
              e.full_name
         FROM hr_withdrawal w
         LEFT JOIN hr_employees e ON e.id = w.employee_id
-       WHERE w.status IN ('pending','approved','rejected','paid','failed') ${scopeFilter}
+       WHERE w.status IN ('pending','approved','paying','rejected','paid','failed') ${scopeFilter}
        ORDER BY (w.status = 'pending') DESC, w.requested_at DESC
        LIMIT 100`));
   } catch (e: any) {

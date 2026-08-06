@@ -49,6 +49,7 @@ import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logAudit } from '@/lib/audit';
 import { startWorkflow, getInstance } from '@/lib/workflow';
+import { round2 } from '@/lib/money';
 
 // -------------------------------------------------------------------------------------------------
 // CONSTANTS FIRST
@@ -63,7 +64,10 @@ const logFail = (tag: string, e: any) => console.error('[payroll-bonuses] ' + ta
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v: unknown): v is string => typeof v === 'string' && UUID_RE.test(v);
 
-const round2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
+// ROUNDING IS SHARED — round2 is imported above. What stood here was a local copy of
+// Math.round((Number(n) || 0) * 100) / 100, which rounds a half paisa the wrong way: 1.005 * 100 is
+// 100.49999999999999 in IEEE754, so it answered 1.00 where the decimal says 1.01. Five other modules
+// carried the identical copy; src/lib/money.ts is now the only implementation of it.
 
 const WRITE_FAILED = 'Something went wrong saving that. Nothing was changed. Try again in a moment.';
 
@@ -563,6 +567,21 @@ export interface BonusCharge {
   bonusId: string;
   label: string;
   amount: number;
+  /**
+   * THE CURRENCY THE AWARD WAS MADE IN, and the reason this field exists at all.
+   *
+   * hr_bonus_awards carries a currency column and every screen that creates an award records one —
+   * and then this interface dropped it, so the number crossed into src/lib/payroll.ts as a bare
+   * `amount`. computePay() pushed it straight onto the payslip's earnings, where the payslip currency
+   * came from the salary structure. An award of USD 2,000 was therefore paid as 2,000 rupees: the
+   * currency did not convert, it stopped existing at the module boundary.
+   *
+   * Carrying it does not make this module a converter — there is no exchange rate anywhere in this
+   * codebase and inventing one would be worse than the bug. It makes the MISMATCH VISIBLE, so
+   * computePay() can refuse to fold a foreign-currency award into a payslip silently and say so
+   * instead.
+   */
+  currency: string;
   /** Which payout of how many this is, for a recurring award. Both 1 for a one-off. */
   occurrence: number;
   occurrences: number;
@@ -604,6 +623,7 @@ export async function plannedBonuses(
         bonusId: b.id,
         label: b.title + (b.occurrences > 1 ? ' (' + occurrence + ' of ' + b.occurrences + ')' : ''),
         amount: round2(b.amount),
+        currency: String(b.currency || 'INR'),
         occurrence,
         occurrences: b.occurrences,
         finalPayout: occurrence >= b.occurrences,

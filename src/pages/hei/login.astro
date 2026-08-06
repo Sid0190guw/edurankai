@@ -10,6 +10,8 @@ import {
   isSecondStepRequired, availableSecondFactors, startPendingChallenge,
   resolvePendingChallenge, verifySecondFactor, dropPendingChallenge,
   pendingCookieName, verifyFaceSecondFactor, canCompleteSecondStep,
+  passwordAttemptsBlocked, recordFailedPassword, clearPasswordAttempts,
+  PASSWORD_THROTTLED_MESSAGE,
   PENDING_TTL_SECONDS, PENDING_COOKIE_SECURE,
   type SecondFactorMethod,
 } from '@/lib/auth/two-factor';
@@ -22,6 +24,9 @@ if (Astro.locals.user && Astro.locals.user.role === 'institution_admin') {
 const SURFACE = 'hei' as const;
 const PENDING_COOKIE = pendingCookieName(SURFACE);
 const LEGACY_FACE_COOKIE = 'hei_face_pending';
+/** The source address, in the shape every limiter on this project keys on. */
+const CLIENT_IP = (Astro.clientAddress || Astro.request.headers.get('x-forwarded-for') || 'unknown')
+  .toString().split(',')[0].trim().slice(0, 64);
 
 function setPendingCookie(cookies: any, token: string) {
   cookies.set(PENDING_COOKIE, token, {
@@ -97,6 +102,11 @@ if (Astro.request.method === 'POST') {
 
     if (!identifier || !password) {
       errorMsg = 'Enter your email or internal handle, and your password.';
+    } else if (await passwordAttemptsBlocked(identifier, CLIENT_IP)) {
+      // Failures only are counted, the count is cleared the moment the right password arrives, and
+      // nothing durable is written to the account — so a person typing their own password never sees
+      // this. Without it, the only cost of a guess was one scrypt.
+      errorMsg = PASSWORD_THROTTLED_MESSAGE;
     } else {
       try {
         const user = await findUserByLoginIdentifier(identifier);
@@ -104,10 +114,12 @@ if (Astro.request.method === 'POST') {
         // and a wrong password cost the same and answer the same.
         const ok = await verifyPasswordForLogin(user, password);
         if (!ok || !user || !user.isActive) {
+          await recordFailedPassword(identifier, CLIENT_IP);
           errorMsg = 'Invalid email or password.';
         } else if (user.role !== 'institution_admin') {
           errorMsg = 'This account does not have institution portal access. Visit /admin/login for admin or /portal/login for applicant.';
         } else {
+          await clearPasswordAttempts(identifier, CLIENT_IP);
           const methods = await availableSecondFactors(user.id);
           const optedIn = await isSecondStepRequired(user.id);
           // Pre-existing posture: a face on file meant a face challenge.

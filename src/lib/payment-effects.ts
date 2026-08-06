@@ -496,13 +496,38 @@ export async function applyPaidEffects(orderId: string, paymentId: string | null
     await runEffect(orderId, 'credit wallet top-up',
       'A user paid to top up their wallet and the balance was NOT credited.',
       async () => {
-        const dup = rows(await db.execute(sql`SELECT 1 FROM account_credit_ledger WHERE ref_id = ${orderId} LIMIT 1`));
-        if (dup.length) return; // already credited by verify/webhook/reconcile — idempotent
         const amt = Number(rows(await db.execute(sql`SELECT amount_paise FROM payments WHERE order_id = ${orderId} LIMIT 1`))[0]?.amount_paise) || 0;
         if (!(amt > 0)) throw new Error('the payment row carries no amount_paise, so there is nothing to credit');
         const { ensureCreditSchema } = await import('@/lib/account-credit');
         await ensureCreditSchema();
-        await db.execute(sql`INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id) VALUES (${pay.user_id || pay.reference_id}, ${amt}, 'Wallet top-up', 'recharge', ${orderId})`);
+
+        // TWO LAYERS, BECAUSE THE HEADING ABOVE CLAIMED SOMETHING THE CODE DID NOT DO.
+        //
+        // It was `SELECT 1 ... WHERE ref_id = order` and then, several round-trips later, a plain
+        // INSERT. That is a read-then-write with no constraint underneath it, and the two callers
+        // that reach this line — the browser /verify and the Razorpay webhook — routinely land
+        // milliseconds apart on the same order. Both saw no row; both credited. A 5,000 rupee top-up
+        // became 10,000 in a ledger whose balance is a SUM, so nothing anywhere disagreed with it.
+        //
+        //   1. NOT EXISTS inside the INSERT closes the ordinary sequential repeat (reconcile after a
+        //      webhook that already landed) in ONE statement rather than two.
+        //   2. acl_recharge_ref_uniq (src/lib/account-credit.ts) is what closes the actual RACE, and
+        //      losing that race means somebody else credited this exact order a moment ago — the
+        //      desired outcome, not a failure. It is read as success, exactly as the salary credit in
+        //      hr-wallet.ts reads its own duplicate-key.
+        //
+        // Anything else still throws, and runEffect() turns that into a loud, recorded failure: a
+        // top-up that was captured and not credited must never be silent.
+        try {
+          await db.execute(sql`
+            INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id)
+            SELECT ${pay.user_id || pay.reference_id}, ${amt}, 'Wallet top-up', 'recharge', ${orderId}
+             WHERE NOT EXISTS (SELECT 1 FROM account_credit_ledger WHERE ref_id = ${orderId})`);
+        } catch (e: any) {
+          const real = String(e?.cause?.message || e?.message || '');
+          if (/duplicate key|unique constraint/i.test(real)) return;
+          throw e;
+        }
       });
     return;
   }

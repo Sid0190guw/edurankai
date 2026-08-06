@@ -11,6 +11,8 @@ import {
   resolvePendingChallenge, verifySecondFactor, dropPendingChallenge,
   pendingCookieName, verifyFaceSecondFactor, canCompleteSecondStep,
   countAttempt, clearAttempts,
+  passwordAttemptsBlocked, recordFailedPassword, clearPasswordAttempts,
+  PASSWORD_THROTTLED_MESSAGE,
   PENDING_TTL_SECONDS, PENDING_COOKIE_SECURE,
   type SecondFactorMethod,
 } from '@/lib/auth/two-factor';
@@ -31,6 +33,9 @@ const FACE_LOOKUP_BUCKET = 'face-login:ip:';
 const FACE_WINDOW_SECONDS = 900;
 const FACE_MAX_ATTEMPTS = 8;
 const FACE_LOOKUP_MAX = 20;
+/** The source address, in the shape every limiter on this project keys on. */
+const CLIENT_IP = (Astro.clientAddress || Astro.request.headers.get('x-forwarded-for') || 'unknown')
+  .toString().split(',')[0].trim().slice(0, 64);
 
 function setPendingCookie(cookies: any, token: string) {
   cookies.set(PENDING_COOKIE, token, {
@@ -224,6 +229,11 @@ if (Astro.request.method === 'POST') {
       const password = fd2.get('password') as string || '';
       if (!identifier || !password) {
         errorMsg = 'Enter your email or internal handle, and your password.';
+      } else if (await passwordAttemptsBlocked(identifier, CLIENT_IP)) {
+        // The face paths on this page have been counted in shared Postgres state for a while; the
+        // password path was not, and it is the one that needs no camera. Failures only, cleared on
+        // success, nothing durable written to the account.
+        errorMsg = PASSWORD_THROTTLED_MESSAGE;
       } else {
         try {
           const u = await findUserByLoginIdentifier(identifier);
@@ -231,8 +241,10 @@ if (Astro.request.method === 'POST') {
           // cost the same and answer the same.
           const ok = await verifyPasswordForLogin(u, password);
           if (!ok || !u || !u.isActive) {
+            await recordFailedPassword(identifier, CLIENT_IP);
             errorMsg = 'Invalid email or password.';
           } else {
+            await clearPasswordAttempts(identifier, CLIENT_IP);
             const methods = await availableSecondFactors(u.id);
             const optedIn = await isSecondStepRequired(u.id);
             const isApplicant = u.role === 'applicant';
@@ -485,8 +497,18 @@ const showPasswordForm = !requireSecondStep && !requireFaceFirstFactor;
       var code = (document.getElementById('totpCode').value || '').trim();
       if (!email || !code) { if (te) te.textContent = 'Enter your email and code.'; return; }
       tb.disabled = true;
-      var rr = await fetch('/api/auth/totp-login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ email: email, code: code }) });
-      var d = {}; try { d = await rr.json(); } catch (_) {}
+      // NOT LEFT UNGUARDED IN A SIGN-IN PATH. A rejected fetch - offline, DNS, a dropped
+      // connection - used to reject this handler outright, which left the button disabled for
+      // good with an empty error line beneath it: a dead control that says nothing, on the one
+      // screen where a person most needs to be told what happened.
+      var d = {};
+      try {
+        var rr = await fetch('/api/auth/totp-login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ email: email, code: code }) });
+        try { d = await rr.json(); } catch (_) { d = {}; }
+        if (!d.ok && !d.error && !rr.ok) d = { error: 'Sign-in is temporarily unavailable. Please try again.' };
+      } catch (_) {
+        d = { error: 'We could not reach the server. Check your connection and try again.' };
+      }
       tb.disabled = false;
       if (d.ok) location.href = d.redirect || '/portal'; else if (te) te.textContent = d.error || 'Invalid email or code.';
     });

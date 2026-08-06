@@ -433,10 +433,27 @@ export function isAllowedTransition(from: string, to: string): boolean {
  *   minAmount the rule only applies when the instance's amount is at or above this. Below it the
  *             rung does not exist at all — it is not skipped, it was never part of this chain.
  */
+/**
+ * THE CURRENCY EVERY `minAmount` BELOW IS WRITTEN IN.
+ *
+ * It was never stated anywhere, and the comparison in resolveRoute() was a bare `amount >= minAmount`
+ * against instances that carry their own currency column — so a USD figure was measured against a
+ * rupee threshold and came out small. Naming the unit does not convert anything; it makes the
+ * mismatch DETECTABLE, which is what resolveRoute() needs in order to refuse to guess.
+ *
+ * If these thresholds are ever re-expressed in another currency, this constant moves with them and
+ * every comparison follows. Declared here, above the route table that uses it — const is not hoisted.
+ */
+const ROUTE_THRESHOLD_CURRENCY = 'INR';
+
 interface RouteRule {
   step: number;
   via: RouteVia;
-  optional?: boolean;
+  /**
+   * The rule applies at or above this figure, expressed in ROUTE_THRESHOLD_CURRENCY. An instance in
+   * another currency, or one with no amount at all, cannot be compared and KEEPS the rung — see
+   * resolveRoute().
+   */
   minAmount?: number;
 }
 
@@ -1118,7 +1135,7 @@ function missingRungReason(via: RouteVia, subjectName: string): string {
 export async function resolveRoute(
   domain: WorkflowDomain,
   subjectEmployeeId: string,
-  opts: { amount?: number | null; asOf?: Date | null } = {},
+  opts: { amount?: number | null; currency?: string | null; asOf?: Date | null } = {},
 ): Promise<RoutePlan> {
   const def = DOMAINS[domain];
   if (!def) {
@@ -1134,9 +1151,34 @@ export async function resolveRoute(
     return { ok: false, initialized: false, approvers: [], haltReason: HALT_NOT_INITIALIZED };
   }
 
-  const amount = typeof opts.amount === 'number' && isFinite(opts.amount) ? opts.amount : 0;
+  // ===============================================================================================
+  // WHICH RUNGS THIS AMOUNT ACTUALLY NEEDS — AND WHAT HAPPENS WHEN THE AMOUNT CANNOT BE COMPARED
+  // ===============================================================================================
+  //
+  // This was `def.route.filter((r) => !r.minAmount || amount >= r.minAmount)` with `amount` defaulted
+  // to 0, and it dropped approval rungs in two situations where nobody chose to drop them:
+  //
+  //   1. NO AMOUNT GIVEN. Every threshold rung silently vanished, so a caller that forgot the field
+  //      got a shorter chain than the same request with the figure filled in. A missing figure is not
+  //      evidence that a request is small.
+  //   2. A DIFFERENT CURRENCY. The thresholds below (100000, 200000, 500000) are RUPEE figures, and
+  //      the comparison was against a bare number. A USD 3,000 procurement request — roughly two and
+  //      a half lakh — failed `3000 >= 200000`, so the executive-sponsor rung was dropped and a
+  //      manager alone approved what a 200,001 rupee request could not have been.
+  //
+  // There is no exchange rate in this codebase and inventing one here would be a policy decision
+  // dressed up as arithmetic. So when the figure cannot be compared, the rung is KEPT. That is the
+  // safe direction and the only defensible one: the failure mode of keeping it is one more person
+  // being asked to approve, which is visible and correctable; the failure mode of dropping it is
+  // money leaving on fewer signatures than the organisation decided it needed, which nobody sees.
+  //
+  // A rung kept this way can still HALT if no executive sponsor is recorded. That is the documented
+  // behaviour of a required rung, and a halt that says so is better than a quiet short chain.
+  const amount = typeof opts.amount === 'number' && isFinite(opts.amount) ? opts.amount : null;
+  const currency = opts.currency ? String(opts.currency).trim().toUpperCase() : null;
+  const comparable = amount !== null && (!currency || currency === ROUTE_THRESHOLD_CURRENCY);
   const asOf = opts.asOf ?? null;
-  const applicable = def.route.filter((r) => !r.minAmount || amount >= r.minAmount);
+  const applicable = def.route.filter((r) => !r.minAmount || !comparable || (amount as number) >= r.minAmount);
 
   // How many rules share each step number — that is what makes a step parallel, and it is derived
   // from the rules rather than stored, so the two cannot disagree.
@@ -1678,7 +1720,7 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<Workflow
       };
     }
 
-    const plan = await resolveRoute(domain, subject, { amount });
+    const plan = await resolveRoute(domain, subject, { amount, currency });
     const state: WorkflowState = plan.ok ? 'pending' : 'halted';
 
     // draft -> pending / draft -> halted. Asked rather than assumed, so this file has exactly one
@@ -1938,10 +1980,22 @@ async function advanceInstance(instanceId: string, actorId: string | null): Prom
     await db.execute(sql`
       UPDATE workflow_steps SET decision = 'skipped'
        WHERE instance_id = ${instanceId}::uuid AND decision = 'pending'`);
-    await db.execute(sql`
+    // THE GUARD WAS ALREADY RIGHT. ITS ANSWER WAS BEING THROWN AWAY.
+    //
+    // `AND state = 'pending'` means at most ONE caller can perform this transition — but the result
+    // was never read, so every caller that raced here went on to audit, notify and settle anyway. Two
+    // approvers deciding within the same second wrote two 'rejected' audit rows naming two different
+    // actors and sent the requester the same notification twice. settleDomainRecord() happens to
+    // carry its own status guard for the one domain that needs it, which is luck of that domain and
+    // not a property of this function: any domain added there later without a guard would have the
+    // settlement applied twice. RETURNING makes the write itself say whether THIS call is the one
+    // that moved the state, and everything after it now depends on that answer.
+    const didReject = rows(await db.execute(sql`
       UPDATE workflow_instances
          SET state = 'rejected', settled_at = NOW(), updated_at = NOW()
-       WHERE id = ${instanceId}::uuid AND state = 'pending'`);
+       WHERE id = ${instanceId}::uuid AND state = 'pending'
+      RETURNING id`));
+    if (!didReject.length) return 'rejected';
     await auditWorkflow(actorId, 'rejected', instanceId, {
       domain: instance.domain,
       recordId: instance.recordId,
@@ -1956,10 +2010,14 @@ async function advanceInstance(instanceId: string, actorId: string | null): Prom
   if (stillPending.length === 0) {
     const gate = canTransition('pending', 'approved');
     if (!gate.ok) return current;
-    await db.execute(sql`
+    // Same shape, same reason as the rejection branch above: exactly one caller may settle this
+    // instance, and only that caller notifies the requester and applies the domain record.
+    const didApprove = rows(await db.execute(sql`
       UPDATE workflow_instances
          SET state = 'approved', settled_at = NOW(), updated_at = NOW()
-       WHERE id = ${instanceId}::uuid AND state = 'pending'`);
+       WHERE id = ${instanceId}::uuid AND state = 'pending'
+      RETURNING id`));
+    if (!didApprove.length) return 'approved';
     await auditWorkflow(actorId, 'approved', instanceId, {
       domain: instance.domain,
       recordId: instance.recordId,
@@ -2080,7 +2138,12 @@ export async function resumeWorkflow(
     }
     if (!isWorkflowDomain(instance.domain)) return { ok: false, error: NOT_AVAILABLE };
 
-    const plan = await resolveRoute(instance.domain, instance.subjectEmployeeId, { amount: instance.amount });
+    // currency travels with the amount. Without it the thresholds in DOMAINS are compared against a
+    // figure in an unknown unit, which is how a resumed foreign-currency request could come back with
+    // a SHORTER chain than the one it halted on.
+    const plan = await resolveRoute(instance.domain, instance.subjectEmployeeId, {
+      amount: instance.amount, currency: instance.currency,
+    });
     if (!plan.ok) {
       await db.execute(sql`
         UPDATE workflow_instances SET halt_reason = ${plan.haltReason}::text, updated_at = NOW()

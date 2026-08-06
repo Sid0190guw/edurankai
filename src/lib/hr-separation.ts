@@ -491,7 +491,22 @@ export async function setClearance(opts: {
   }
 }
 
-/** Record that final settlement has been handed to whoever pays it. A handoff, not a payment. */
+/**
+ * Record that final settlement has been handed to whoever pays it. A handoff, not a payment.
+ *
+ * WRITE-ONCE, AND THE DATABASE IS WHAT MAKES IT SO.
+ *
+ * This was a bare UPDATE with no precondition. A leaver handed off twice — two presses on the
+ * settlement console, or a retry after a POST that timed out with the write already landed — had the
+ * SECOND reference silently overwrite the first, so the payment that actually went out first existed
+ * nowhere in the product. That is precisely the shape of failure nobody can reconstruct in month
+ * three: two payments, one reference, and no row that says the other ever happened.
+ *
+ * `settlement_handoff_at IS NULL` in the WHERE makes the first handoff the only one. Zero rows back
+ * is NOT a database failure — it is the refusal, and it is reported as one, naming the reference
+ * already on file so the caller can see whether their handoff is the one recorded or a duplicate of
+ * somebody else's.
+ */
 export async function recordSettlementHandoff(opts: {
   separationId: string;
   amount?: number | null;
@@ -507,12 +522,38 @@ export async function recordSettlementHandoff(opts: {
   const by = isSepUuid(opts?.actorUserId) ? String(opts.actorUserId) : null;
   try {
     await ensureExitSchema();
-    await db.execute(sql`
+    const wrote = rows(await db.execute(sql`
       UPDATE hr_separations
          SET settlement_reference = ${reference},
              ff_amount = COALESCE(${amount}::numeric, ff_amount),
              settlement_handoff_at = NOW(), updated_at = NOW()
-       WHERE id = ${opts.separationId}::uuid`);
+       WHERE id = ${opts.separationId}::uuid AND settlement_handoff_at IS NULL
+      RETURNING id`));
+
+    if (!wrote.length) {
+      // Either the separation is gone, or it was already handed off. Those are different sentences,
+      // so the row is re-read rather than guessed at. This read is allowed to fail without changing
+      // the outcome — nothing was written either way.
+      let existing: any = null;
+      try {
+        existing = rows(await db.execute(sql`
+          SELECT settlement_reference, settlement_handoff_at FROM hr_separations
+           WHERE id = ${opts.separationId}::uuid LIMIT 1`))[0] || null;
+      } catch (e: any) {
+        logSepFail('recordSettlementHandoff.recheck', e);
+      }
+      if (existing && existing.settlement_handoff_at) {
+        return {
+          ok: false,
+          error: 'This settlement was already handed off'
+            + (existing.settlement_reference ? ' under reference ' + String(existing.settlement_reference) : '')
+            + '. Nothing was changed — a second reference would have replaced the first and hidden a '
+            + 'payment that really happened.',
+        };
+      }
+      return { ok: false, error: 'That separation could not be found, so no handoff was recorded.' };
+    }
+
     await logAudit({
       userId: by,
       action: 'separation.settlement_handoff',

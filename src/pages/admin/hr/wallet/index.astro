@@ -48,14 +48,23 @@ if (Astro.request.method === 'POST') {
     if (action === 'decide') { const r = await decideWithdrawal(fd.get('id') as string, user, (fd.get('decision') as string) === 'approved' ? 'approved' : 'rejected', (fd.get('note') as string) || ''); flash = r.ok ? 'Decision recorded.' : 'Error: ' + r.error; }
     else if (action === 'pay') { const r = await payWithdrawal(fd.get('id') as string, user, (fd.get('manual_ref') as string || '').trim() || undefined); flash = r.ok ? ('Paid. Ref ' + (r.ref || '—')) : 'Error: ' + r.error; }
     else if (action === 'disburse') { const amt = parseFloat(fd.get('amount') as string || '0'); const emp = fd.get('employee_id') as string; if (emp && amt > 0) { await credit(emp, amt, (fd.get('kind') as string) || 'salary', (fd.get('note') as string) || 'Salary credit', user.id); flash = 'Credited ₹' + amt.toLocaleString('en-IN') + ' to wallet.'; } else flash = 'Pick an employee and amount.'; }
-  } catch (e: any) { flash = 'Error: ' + (e?.message || 'failed'); }
+  } catch (e: any) {
+    // The real Postgres reason is on `.cause`; `.message` is only the failed SQL text, which tells
+    // an admin nothing about why a payout did not go out.
+    const real = e?.cause?.message || e?.message;
+    console.error('[hr/wallet] action failed -', real);
+    flash = 'Error: ' + (real || 'failed');
+  }
   return Astro.redirect('/admin/hr/wallet?msg=' + encodeURIComponent(flash));
 }
 
 const all = await listWithdrawals({});
 const pending = all.filter((w: any) => w.status === 'pending');
 const approved = all.filter((w: any) => w.status === 'approved');
-const settled = all.filter((w: any) => w.status === 'paid' || w.status === 'rejected' || w.status === 'failed').slice(0, 20);
+// 'paying' means the payout was handed to the channel and no confirmation has come back. It belongs
+// on a screen — a request in that state is neither waiting for a decision nor released, and leaving
+// it off every list is how it becomes invisible money.
+const settled = all.filter((w: any) => w.status === 'paid' || w.status === 'paying' || w.status === 'rejected' || w.status === 'failed').slice(0, 20);
 let employees: any[] = [];
 try { employees = rowsOf(await db.execute(sql`SELECT id, full_name, employee_code, designation FROM hr_employees WHERE is_active = true ORDER BY full_name ASC LIMIT 500`)); } catch (_) {}
 const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
@@ -70,7 +79,13 @@ const rzxReady = !!process.env.RAZORPAYX_ACCOUNT_NUMBER;
       <p class="admin-page-sub">Disburse salary into employee wallets, and approve &amp; release withdrawal requests. Withdrawals need approval from a reporting manager, HR head, admin or super-admin before payout.</p>
     </div></div>
 
-    {msg && <div style="margin:0 0 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{msg}</div>}
+    {/* A REFUSAL MUST NOT BE PAINTED GREEN. Every outcome of this page — including "Error: you are
+        not permitted to approve this withdrawal" and "the payout was released but the wallet was NOT
+        debited" — came back through this one banner styled as a success. On a money screen that is
+        the difference between somebody re-reading a sentence and somebody assuming it worked. */}
+    {msg && (msg.indexOf('Error') === 0
+      ? <div style="margin:0 0 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;line-height:1.6;">{msg}</div>
+      : <div style="margin:0 0 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;line-height:1.6;">{msg}</div>)}
 
     <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px 18px;margin-bottom:18px;font-size:12.5px;color:#cfd6da;line-height:1.7;">
       Payout channel: {rzxReady ? <span style="color:#86efac;font-weight:700;">RazorpayX Payouts — automatic on release</span> : <span style="color:#fbbf24;font-weight:700;">manual settlement</span>}. {rzxReady ? '' : 'Set RAZORPAYX_ACCOUNT_NUMBER to enable automatic bank payouts; until then, pay from your bank and record the UTR/reference on release.'}
@@ -126,8 +141,8 @@ const rzxReady = !!process.env.RAZORPAYX_ACCOUNT_NUMBER;
       <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#8a8a94;font-weight:700;margin:24px 0 10px;">Recent</h2>
       {settled.map((w: any) => (
         <div class="wrow" style="opacity:.7;">
-          <div style="flex:1;"><div style="color:#cfd6da;">{w.full_name} · {inr(w.amount)}</div><div style="color:#8a8a94;font-size:12px;">{w.status}{w.payout_ref ? ' · ' + w.payout_ref : ''}</div></div>
-          <span style={`font-family:'Geist Mono',monospace;font-size:10px;font-weight:700;text-transform:uppercase;color:${w.status==='paid'?'#86efac':'#fca5a5'};`}>{w.status}</span>
+          <div style="flex:1;"><div style="color:#cfd6da;">{w.full_name} · {inr(w.amount)}</div><div style="color:#8a8a94;font-size:12px;">{w.status === 'paying' ? 'being released — no confirmation back yet; check the payout channel before releasing again' : w.status}{w.payout_ref ? ' · ' + w.payout_ref : ''}</div></div>
+          <span style={`font-family:'Geist Mono',monospace;font-size:10px;font-weight:700;text-transform:uppercase;color:${w.status==='paid'?'#86efac':(w.status==='paying'?'#fbbf24':'#fca5a5')};`}>{w.status}</span>
         </div>
       ))}
     </div>)}
