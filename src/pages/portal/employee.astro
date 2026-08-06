@@ -171,7 +171,63 @@ const noEmployeeRecord = composed.ok && !composed.workspace;
 // Declared HERE, above the POST handler, for the same hoisting reason as everything else.
 const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done'];
 
-let okMsg = '', errorMsg = '';
+// =================================================================================================
+// THE FLASH CHANNEL. TWO OF THEM, AND THE PAGE NEVER ECHOES WHAT IT WAS SENT.
+//
+// This page used to redirect with `?msg=` + encodeURIComponent(okMsg || errorMsg) — ONE parameter
+// for both outcomes — and render whatever arrived in a green success panel. Three defects rode on
+// that one line, and all three are the shape this file's own comments say the page has been punished
+// for before:
+//
+//   1. A FAILED PUNCH WAS SHOWN IN GREEN. The failure message went down the success channel and came
+//      out in the affirmative colour, on the one screen where "did that land" is the entire question.
+//      That is the green flash over a write that never happened.
+//
+//   2. NEITHER PANEL WAS ANNOUNCED. No role, no live region. A screen-reader user performed the only
+//      action on the page and was told nothing at all.
+//
+//   3. ARBITRARY TEXT WAS REFLECTED INTO A TRUSTED BANNER. Anyone could hand somebody
+//      /portal/employee?msg=Your+salary+account+needs+reverification,+call+... and the authenticated
+//      HR workspace would render it inside its own success styling. Text only, so not XSS — a
+//      ready-made phishing surface all the same.
+//
+// THE FIX IS THAT THE URL CARRIES A CODE, NEVER A SENTENCE. The wording lives here; an unrecognised
+// code renders NOTHING rather than itself. There is no path by which a query string becomes copy.
+//
+// It also stops putting the failed SQL in the address bar: `catch(e:any){ errorMsg = e.message }`
+// leaked the statement into a shareable URL, and it was the wrong string anyway — the real Postgres
+// reason is on e.cause, which is what logFail() reads.
+const FLASH_OK = {
+  clocked_in: 'Clocked in. Your punch is recorded.',
+  clocked_out: 'Clocked out. Have a good evening.',
+  break_started: 'Break started.',
+  break_ended: 'Break ended. Welcome back.',
+  report_saved: 'Your report for today is saved.',
+  time_logged: 'That block of time is logged.',
+  time_deleted: 'That time entry has been removed.',
+  task_updated: 'Task updated.',
+};
+
+const FLASH_ERR = {
+  // Said in the negative and said twice, because the one thing somebody must not do here is walk
+  // away believing a punch landed when it did not.
+  clock_failed: 'Your punch was NOT recorded. Nothing has been saved. Please try again, and if it keeps failing tell your manager today rather than at the end of the month.',
+  report_short: 'Please describe what you did today — at least a sentence.',
+  report_failed: 'Your report could not be saved, so nothing has been recorded for today. Please try again.',
+  time_invalid: 'Enter a valid time period — the end time has to be after the start time.',
+  time_task_missing: 'Describe what you worked on in that period.',
+  time_failed: 'That block of time could not be logged. Nothing has been saved.',
+  task_unknown_status: 'That is not a status we track.',
+  task_failed: 'That task could not be updated. Nothing has changed.',
+};
+
+// Both lookups fail closed to an empty string, which renders no panel at all.
+const flashOkText = (code: string) => FLASH_OK[code as keyof typeof FLASH_OK] || '';
+const flashErrText = (code: string) => FLASH_ERR[code as keyof typeof FLASH_ERR] || '';
+
+/** Where a write lands. One code, one channel, and nothing from the request in either. */
+const backWithOk = (code: keyof typeof FLASH_OK) => '/portal/employee?ok=' + code;
+const backWithErr = (code: keyof typeof FLASH_ERR) => '/portal/employee?err=' + code;
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -190,6 +246,13 @@ if (Astro.request.method === 'POST') {
     const note = (fd.get('note') as string || '').trim() || null;
     const facePhoto = (fd.get('face_photo') as string || '').slice(0, 300000) || null;
 
+    // Which success sentence this punch earns, decided from the event type BEFORE anything is
+    // written, so the branch below has one job: record it, or say plainly that it did not.
+    let punchOk: keyof typeof FLASH_OK = 'clocked_in';
+    if (eventType === 'clock_out') punchOk = 'clocked_out';
+    else if (eventType === 'break_start') punchOk = 'break_started';
+    else if (eventType === 'break_end') punchOk = 'break_ended';
+
     try {
       await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_photo TEXT`).catch(() => {});
       await db.execute(sql`
@@ -206,7 +269,6 @@ if (Astro.request.method === 'POST') {
           VALUES (${employeeId}, ${today}, NOW(), 'present', ${workMode}, ${Astro.clientAddress})
           ON CONFLICT (employee_id, date) DO UPDATE SET clock_in = NOW(), status = 'present', work_mode = ${workMode}
         `).catch(() => {});
-        okMsg = 'Clocked in successfully!';
       } else if (eventType === 'clock_out') {
         await db.execute(sql`
           UPDATE hr_attendance SET clock_out = NOW(),
@@ -221,14 +283,15 @@ if (Astro.request.method === 'POST') {
             await db.execute(sql`INSERT INTO hr_task_log (employee_id, log_date, task, status, percent, details) VALUES (${employeeId}, ${today}, ${task.slice(0, 500)}, ${(fd.get('task_status') as string) || 'done'}, ${Math.max(0, Math.min(100, parseInt(fd.get('task_percent') as string || '100') || 100))}, ${(fd.get('task_details') as string || '').trim() || null})`);
           }
         } catch (_) {}
-        okMsg = 'Clocked out. Have a great day!';
-      } else if (eventType === 'break_start') {
-        okMsg = 'Break started.';
-      } else if (eventType === 'break_end') {
-        okMsg = 'Break ended. Welcome back!';
       }
-    } catch(e: any) { errorMsg = e.message; }
-    return Astro.redirect('/portal/employee?msg=' + encodeURIComponent(okMsg || errorMsg));
+    } catch (e: any) {
+      // NEVER SWALLOWED, AND NEVER DRESSED AS SUCCESS. The real Postgres reason is on e.cause;
+      // e.message is only the failed SQL, which is what used to be handed to the browser in the
+      // address bar. The person gets the negative sentence, the log gets the cause.
+      logFail('clock_event', e);
+      return Astro.redirect(backWithErr('clock_failed'));
+    }
+    return Astro.redirect(backWithOk(punchOk));
   }
 
   if (action === 'daily_report' && employeeId && has('dailyreport.today')) {
@@ -237,7 +300,7 @@ if (Astro.request.method === 'POST') {
     const blockers = (fd.get('blockers') as string || '').trim() || null;
     const today = new Date().toISOString().split('T')[0];
     if (!workDone || workDone.length < 10) {
-      return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Please describe what you did today (at least a sentence).'));
+      return Astro.redirect(backWithErr('report_short'));
     }
     try {
       await db.execute(sql`
@@ -245,8 +308,12 @@ if (Astro.request.method === 'POST') {
         VALUES (${employeeId}, ${today}, ${workDone}, ${progress}, ${blockers})
         ON CONFLICT (employee_id, report_date) DO UPDATE SET work_done = EXCLUDED.work_done, progress = EXCLUDED.progress, blockers = EXCLUDED.blockers, updated_at = NOW()
       `);
-    } catch (e: any) { return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Could not save report: ' + e.message)); }
-    return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Daily report submitted. Thank you!'));
+    } catch (e: any) {
+      // The cause, not the SQL, and to the log rather than to the address bar.
+      logFail('daily_report', e);
+      return Astro.redirect(backWithErr('report_failed'));
+    }
+    return Astro.redirect(backWithOk('report_saved'));
   }
 
   if (action === 'add_time_log' && employeeId && has('timelog.today')) {
@@ -257,21 +324,37 @@ if (Astro.request.method === 'POST') {
     const toMin = (t: string) => { const m = /^(\d{1,2}):(\d{2})$/.exec(t); return m ? (parseInt(m[1]) * 60 + parseInt(m[2])) : -1; };
     const s = toMin(startTime), e = toMin(endTime);
     if (s < 0 || e < 0 || e <= s) {
-      return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Enter a valid time period (end after start).'));
+      return Astro.redirect(backWithErr('time_invalid'));
     }
     if (!task || task.length < 3) {
-      return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Describe what you worked on in that period.'));
+      return Astro.redirect(backWithErr('time_task_missing'));
     }
     const hours = Math.round(((e - s) / 60) * 100) / 100;
     try {
       await db.execute(sql`INSERT INTO hr_time_logs (employee_id, log_date, start_time, end_time, hours, task) VALUES (${employeeId}, ${today}, ${startTime}, ${endTime}, ${hours}, ${task})`);
-    } catch (er: any) { return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Could not log: ' + er.message)); }
-    return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('Logged ' + hours + 'h.'));
+    } catch (er: any) {
+      logFail('add_time_log', er);
+      return Astro.redirect(backWithErr('time_failed'));
+    }
+    // The hours used to be interpolated into the URL. The card already prints the running total for
+    // the day, so the figure is on screen either way and nothing variable needs to travel in a query
+    // string that is rendered back into a banner.
+    return Astro.redirect(backWithOk('time_logged'));
   }
   if (action === 'delete_time_log' && employeeId && has('timelog.today')) {
     const logId = (fd.get('log_id') as string || '').trim();
-    if (logId) await db.execute(sql`DELETE FROM hr_time_logs WHERE id = ${logId} AND employee_id = ${employeeId}`).catch((e: any) => logFail('delete time log', e));
-    return Astro.redirect('/portal/employee');
+    // A deletion that says nothing at all is indistinguishable from a deletion that did not happen —
+    // and the row simply disappearing is not confirmation, because a mis-tap looks exactly the same.
+    let deleted = true;
+    if (logId) {
+      try {
+        await db.execute(sql`DELETE FROM hr_time_logs WHERE id = ${logId} AND employee_id = ${employeeId}`);
+      } catch (e: any) {
+        deleted = false;
+        logFail('delete time log', e);
+      }
+    }
+    return Astro.redirect(deleted ? backWithOk('time_deleted') : backWithErr('time_failed'));
   }
 
   // Move a task along.
@@ -293,21 +376,24 @@ if (Astro.request.method === 'POST') {
     // would be a control that always refuses.
     const blockedReason = (fd.get('blocked_reason') as string || '').trim();
     if (!taskId || !TASK_STATUSES.includes(nextStatus)) {
-      return Astro.redirect('/portal/employee?msg=' + encodeURIComponent('That is not a status we track.'));
+      return Astro.redirect(backWithErr('task_unknown_status'));
     }
-    let taskMsg = '';
+    // The library's own error text is LOGGED rather than forwarded. It is written for a developer
+    // ("That task is not available."), it varies, and forwarding it means an arbitrary string in the
+    // query parameter this page renders — which is the reflection this whole channel exists to close.
+    let taskUpdated = false;
     try {
       const { updateTaskStatus } = await import('@/lib/employee-tasks');
       const res = await updateTaskStatus(taskId, user.id, nextStatus as any, {
         blockedReason,
         ipAddress: Astro.clientAddress,
       });
-      taskMsg = res?.ok ? 'Task updated.' : (res?.error || 'Could not update that task.');
+      taskUpdated = res?.ok === true;
+      if (!taskUpdated) console.error('[portal/employee] task_status refused', res?.error || 'no reason given');
     } catch (e: any) {
       logFail('task_status', e);
-      taskMsg = 'Could not update that task.';
     }
-    return Astro.redirect('/portal/employee?msg=' + encodeURIComponent(taskMsg));
+    return Astro.redirect(taskUpdated ? backWithOk('task_updated') : backWithErr('task_failed'));
   }
 }
 
@@ -451,6 +537,40 @@ if (employeeId && has('clock.today')) {
     logFail('clock events', e);
   }
 }
+
+// HOW THIS PERSON LAST CLOCKED IN, so the form does not ask them the same question about themselves
+// twice a day forever.
+//
+// The work_mode select defaulted to 'remote' on every single render. For an office-based employee
+// that is the wrong answer, every morning, and the fastest path through the form is to leave the
+// default alone — so 'remote' silently over-reports in hr_attendance.work_mode and the attendance
+// data is quietly wrong for exactly the people who never touch the control. Adjacent in spirit to
+// WCAG 2.2 SC 3.3.7 Redundant Entry: information the system already holds about you should not be
+// asked for again.
+//
+// ONE ROW, AND ONLY WHEN THE CLOCK-IN FORM IS ABOUT TO RENDER. Somebody already clocked in is not
+// shown this control, so there is nothing to prefill and no reason to pay for the read. Scoped to
+// the caller's own employee id like every other read on this page, and a failure leaves the old
+// 'remote' default in place rather than breaking the form.
+let lastWorkMode = '';
+if (employeeId && has('clock.today') && currentStatus === 'clocked_out') {
+  try {
+    const r = await db.execute(sql`
+      SELECT work_mode FROM hr_clock_events
+       WHERE employee_id = ${employeeId} AND event_type = 'clock_in' AND work_mode IS NOT NULL
+       ORDER BY event_time DESC
+       LIMIT 1
+    `);
+    lastWorkMode = String(rowsOf(r)[0]?.work_mode || '');
+  } catch (e: any) {
+    logFail('last work mode', e);
+  }
+}
+// Only a value the select actually offers. Anything else — an old code, a null, a value written by a
+// surface that has since changed — falls back to the original default rather than rendering a
+// <select> with nothing selected.
+const WORK_MODES = ['remote', 'office', 'hybrid', 'field'];
+const workModeDefault = WORK_MODES.includes(lastWorkMode) ? lastWorkMode : 'remote';
 
 // Today's time logs (period tracking)
 let timeLogs: any[] = [];
@@ -1128,7 +1248,13 @@ const identitySub = composed.workspace
   : (user.email || '');
 const identityPhoto = composed.workspace?.photoUrl || '';
 
-const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+// THE FLASH, READ AS A CODE AND RESOLVED AGAINST A KNOWN SET. An unrecognised value — including
+// anything a stranger put in a link — resolves to '' and renders no panel at all. `?msg=` is gone
+// entirely and is deliberately NOT still honoured: a compatibility branch that renders arbitrary
+// text back to the reader IS the defect, whichever parameter it is spelled with.
+const flashParams = new URL(Astro.request.url).searchParams;
+const flashOk = flashOkText(flashParams.get('ok') || '');
+const flashErr = flashErrText(flashParams.get('err') || '');
 
 // THE ORDER OF THE PAGE.
 //
@@ -1164,10 +1290,36 @@ const slots = composed.widgets.map((w: any) => w.key);
        this is the only thing keeping the last card clear of it. */
     body{background:#f8f6f1;font-family:system-ui,sans-serif;min-height:100vh;padding-bottom:80px;}
     .topbar{background:#0f0f14;padding:0 16px;height:52px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:40;}
+    /* THE FLASH. Two tones, and the difference has to be readable without colour —
+       hence the glyph and the wording, not the background alone (SC 1.4.1). Both
+       clear 4.5:1 on their own wash. */
+    .flash{margin:12px 14px 0;border-radius:10px;padding:11px 13px;font-size:13px;
+      line-height:1.5;display:flex;align-items:flex-start;gap:9px;}
+    .flash svg{flex:0 0 auto;margin-top:1px;}
+    .flash--ok{background:#ecfdf5;border:1px solid #a7d9c2;color:#065f46;}
+    .flash--err{background:#fef2f2;border:1px solid #f0c0c0;color:#9b1c1c;}
+    @media (forced-colors: active){
+      .flash{border-color:CanvasText;}
+    }
     .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;margin:0 14px 12px;}
     .card-header{padding:14px 16px;border-bottom:1px solid #f0f0f0;}
     .card-body{padding:14px 16px;}
     .clock-btn{width:100%;border:none;font-size:15px;font-weight:700;padding:16px;border-radius:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;}
+    .clock-btn[disabled]{opacity:.7;cursor:progress;}
+    /* "Recording…" LIVES HERE, NOT IN THE BUTTON. It used to be written over
+       button.textContent, which destroys the button's own SVG icon mid-press and
+       leaves a bare word where a labelled control was. A sibling live region says
+       the same thing without touching the control, and a screen reader hears it.
+       Empty until the script has something to say, so it occupies nothing. */
+    .clock-say{margin:8px 0 0;font-size:12px;color:#4b5563;text-align:center;}
+    .clock-say:empty{display:none;}
+    /* A 24x24 box on a control that deletes a row of somebody's own timesheet with
+       no confirmation and no undo. It was 11x14 CSS px, which is both a WCAG 2.2
+       SC 2.5.8 failure and a mis-tap generator on a phone. */
+    .tl-del{background:none;border:none;color:#ef4444;font-size:15px;line-height:1;
+      cursor:pointer;padding:0;min-width:24px;min-height:24px;border-radius:6px;
+      display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;}
+    .tl-del:focus-visible{outline:2px solid #FF4F00;outline-offset:2px;}
     .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;}
     .payslip-row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid #f0f0f0;}
     .event-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
@@ -1366,17 +1518,40 @@ const slots = composed.widgets.map((w: any) => w.key);
   </style>
 </head>
 <body>
+{/* THE BACK CHEVRON IS GONE, and it is a removal rather than a relabelling.
+    It was `<a href="/portal">` wrapping a bare polyline: no accessible name (SC 2.4.4 / 4.1.2),
+    about 18x18 CSS px with no padding (SC 2.5.8 Target Size), in the most-tapped corner of the
+    phone — and for anyone with an employee record /portal resolves through resolveLanding() back to
+    /portal/employee, so its only observable effect was a server round trip to the same screen. On
+    Home, "back" has no meaning: this page IS the root for an employee. The space is now the app
+    name, which is what a topbar's left corner is for. */}
 <nav class="topbar">
-  <div style="display:flex;align-items:center;gap:10px;">
-    <a href="/portal" style="color:#6e6e78;text-decoration:none;">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
-    </a>
-    <span style="font-size:15px;font-weight:700;color:#fff;">My HR</span>
-  </div>
-  <span style="font-size:11px;color:#6e6e78;">{user.name}</span>
+  <span style="font-size:15px;font-weight:700;color:#fff;">My HR</span>
+  {/* --wf-nav-ink, not the #6e6e78 literal that was here. BottomNav.astro measured that exact pair
+      against this bar at 3.79:1 and the design system raised it to #7C7C88 (4.64:1) for this reason;
+      this was the one place still using the value that was rejected. 12px rather than 11px for the
+      same reason — it is the only place a person's own name appears on their home screen. */}
+  <span style="font-size:12px;color:var(--wf-nav-ink);">{user.name}</span>
 </nav>
 
-{msg && <div style="margin:12px 14px 0;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#065f46;border-radius:8px;padding:10px 14px;font-size:13px;">{msg}</div>}
+{/* TWO CHANNELS, TWO TONES, TWO ROLES.
+    One panel used to render both outcomes in green with no role at all, so a failed punch was
+    announced as a success and announced to nobody. role="status" is polite (the person just acted
+    and is looking at the screen); role="alert" is assertive, because a punch that did not land is
+    worth interrupting for. Both texts come from the known set in the frontmatter — never from the
+    query string. */}
+{flashOk && (
+  <div class="flash flash--ok" role="status">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+    <span>{flashOk}</span>
+  </div>
+)}
+{flashErr && (
+  <div class="flash flash--err" role="alert">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="7.5" x2="12" y2="13"/><line x1="12" y1="16.5" x2="12" y2="16.6"/></svg>
+    <span>{flashErr}</span>
+  </div>
+)}
 
 {/* =====================================================================
     THE FALLBACK, AND WHAT IT IS NOT.
@@ -1454,7 +1629,7 @@ const slots = composed.widgets.map((w: any) => w.key);
       <svg class="door__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
     </a>
 
-    <a class="door" href="/portal/security">
+    <a class="door" href="/portal/employee/security">
       <span class="door__mark" aria-hidden="true">
         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
       </span>
@@ -1806,7 +1981,8 @@ const slots = composed.widgets.map((w: any) => w.key);
 
         {/* THE CLOCK. One widget, two pieces of screen: the strip that STATES where the day stands,
             and the card that CHANGES it. They are not duplicated — the forms live in the card only,
-            because they are driven by ids (submitClock('clockForm')) and a second copy would give two
+            because the progressive-enhancement script is driven by ids (clockForm / outForm /
+            breakForm / resumeForm) and a second copy would give two
             elements the same id and break the punch that already works. The strip's link jumps to the
             card, which is now directly beneath it. */}
         {slot === 'clock.today' && (
@@ -1893,17 +2069,22 @@ const slots = composed.widgets.map((w: any) => w.key);
                       <input type="hidden" name="accuracy" id="acc_in"/>
                       <input type="hidden" name="location_name" id="loc_in"/>
                       <div style="display:flex;gap-8px;margin-bottom:8px;">
-                        <select name="work_mode" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;">
-                          <option value="remote">Remote</option>
-                          <option value="office">Office</option>
-                          <option value="hybrid">Hybrid</option>
-                          <option value="field">Field</option>
+                        {/* Pre-selected from this person's own last clock-in rather than pinned to
+                            'remote' on every render. An unlabelled <select> is also an unnamed
+                            control to a screen reader (SC 1.3.1 / 4.1.2), so it has a real label. */}
+                        <label for="workMode" style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:5px;">Where are you working today?</label>
+                        <select id="workMode" name="work_mode" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:8px;">
+                          <option value="remote" selected={workModeDefault === 'remote'}>Remote</option>
+                          <option value="office" selected={workModeDefault === 'office'}>Office</option>
+                          <option value="hybrid" selected={workModeDefault === 'hybrid'}>Hybrid</option>
+                          <option value="field" selected={workModeDefault === 'field'}>Field</option>
                         </select>
                       </div>
-                      <button type="button" class="clock-btn" style="background:#10b981;color:#fff;" onclick="submitClock('clockForm')">
+                      <button type="submit" class="clock-btn" style="background:#10b981;color:#fff;">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                         Clock In
                       </button>
+                      <p class="clock-say" data-clock-status role="status"></p>
                     </form>
                   )}
                   {currentStatus === 'clocked_in' && (
@@ -1925,20 +2106,22 @@ const slots = composed.widgets.map((w: any) => w.key);
                           </div>
                         </div>
                         <input name="task_details" placeholder="Details / handover (optional)" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-top:8px;"/>
-                        <button type="button" class="clock-btn" style="background:#ef4444;color:#fff;margin-top:10px;" onclick="submitClock('outForm')">
+                        <button type="submit" class="clock-btn" style="background:#ef4444;color:#fff;margin-top:10px;">
                           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
                           Clock Out
                         </button>
+                        <p class="clock-say" data-clock-status role="status"></p>
                       </form>
                       <form method="POST" id="breakForm">
                         <input type="hidden" name="action" value="clock_event"/>
                         <input type="hidden" name="event_type" value="break_start"/>
                         <input type="hidden" name="lat"/><input type="hidden" name="lon"/>
                         <input type="hidden" name="accuracy"/><input type="hidden" name="location_name"/>
-                        <button type="button" class="clock-btn" style="background:transparent;border:1px solid #e5e7eb;color:#374151;" onclick="submitClock('breakForm')">
+                        <button type="submit" class="clock-btn" style="background:transparent;border:1px solid #e5e7eb;color:#374151;">
                           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 8h1a4 4 0 0 1 0 8h-1"/><path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"/><line x1="6" y1="1" x2="6" y2="4"/><line x1="10" y1="1" x2="10" y2="4"/><line x1="14" y1="1" x2="14" y2="4"/></svg>
                           Take a break
                         </button>
+                        <p class="clock-say" data-clock-status role="status"></p>
                       </form>
                     </div>
                   )}
@@ -1948,10 +2131,11 @@ const slots = composed.widgets.map((w: any) => w.key);
                       <input type="hidden" name="event_type" value="break_end"/>
                       <input type="hidden" name="lat"/><input type="hidden" name="lon"/>
                       <input type="hidden" name="accuracy"/><input type="hidden" name="location_name"/>
-                      <button type="button" class="clock-btn" style="background:#10b981;color:#fff;" onclick="submitClock('resumeForm')">
+                      <button type="submit" class="clock-btn" style="background:#10b981;color:#fff;">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                         Resume Work
                       </button>
+                      <p class="clock-say" data-clock-status role="status"></p>
                     </form>
                   )}
                 </div>
@@ -2016,7 +2200,16 @@ const slots = composed.widgets.map((w: any) => w.key);
                       <span style="font-size:11px;font-weight:700;color:#FF4F00;font-family:monospace;white-space:nowrap;">{l.start_time}-{l.end_time}</span>
                       <span style="font-size:12.5px;color:#374151;flex:1;">{l.task}</span>
                       <span style="font-size:11px;color:#9ca3af;white-space:nowrap;">{l.hours}h</span>
-                      <form method="POST" style="margin:0;"><input type="hidden" name="action" value="delete_time_log"/><input type="hidden" name="log_id" value={l.id}/><button type="submit" style="background:none;border:none;color:#ef4444;font-size:11px;cursor:pointer;padding:0;">×</button></form>
+                      {/* "×" is not an accessible name — a screen reader announces "button" and
+                          nothing else. The label names the entry being destroyed, because this is
+                          the one control on the page with no confirmation and no undo behind it. */}
+                      <form method="POST" style="margin:0;">
+                        <input type="hidden" name="action" value="delete_time_log"/>
+                        <input type="hidden" name="log_id" value={l.id}/>
+                        <button type="submit" class="tl-del" aria-label={'Delete the time entry ' + l.start_time + ' to ' + l.end_time}>
+                          <span aria-hidden="true">&#215;</span>
+                        </button>
+                      </form>
                     </div>
                   ))}
                 </div>
@@ -2451,8 +2644,22 @@ const slots = composed.widgets.map((w: any) => w.key);
      cannot disagree about what this person may reach. `active` is left to resolve from the path —
      /portal/employee is Home for anyone with an employee record. On a degraded composition the bar
      collapses on its own to the destinations that need nothing but a session, because eligibility
-     here is expressed as "did the composer keep this widget". -->
-<WorkspaceNav composed={composed} />
+     here is expressed as "did the composer keep this widget".
+
+     THE COUNTS ARE A PROJECTION, NOT A QUERY. Both numbers were already resolved above for this
+     page's own cards - `pendingLeave` / `pendingWithdrawals` from the approver queue, and
+     `notifs.unread` from myNotifications() - so handing them to the bar costs nothing. This is the
+     mechanism that stops an approvals queue rotting: the entry is rank 4 and only three ranked
+     entries reach the bar, so a manager's pending decisions live behind More, and a count nobody
+     can see until they open a menu is a count nobody opens the menu for. WorkspaceNav sums whatever
+     did not take a bar slot onto the More tab itself.
+
+     buildWorkspaceNav discards any key whose destination this composition did not authorise, so a
+     figure passed here can never imply the existence of a surface somebody may not open. -->
+<WorkspaceNav
+  composed={composed}
+  badges={{ approvals: pendingLeave + pendingWithdrawals, notifications: Number(notifs?.unread) || 0 }}
+/>
 
 <script is:inline>
 // Local-time timestamps
@@ -2485,30 +2692,69 @@ function fill(form,p){ var c=p.coords; setF(form,'lat',c.latitude); setF(form,'l
 function setFace(form,data){ var el=form.querySelector('[name="face_photo"]');
   if(!el){ el=document.createElement('input'); el.type='hidden'; el.name='face_photo'; form.appendChild(el); } el.value=data; }
 
-// Face check-in: take a quick selfie with the front camera as attendance proof.
-// Advisory only — a human verifies it later; if the camera is denied or missing
-// the clock still proceeds (we never block someone from marking attendance).
+// Say what is happening, in the live region BESIDE the button rather than ON it.
+// Writing over button.textContent destroyed the button's own SVG icon mid-press and
+// left a bare word where a labelled control had been; role="status" also means a
+// screen reader hears it, which it never did before.
+function say(form, text){ var el=form.querySelector('[data-clock-status]'); if(el) el.textContent=text||''; }
+
+// ------------------------------------------------------------------------------
+// FACE CHECK-IN. Advisory only, and DECLINING IT IS A FIRST-CLASS CHOICE.
+//
+// This modal appears on every single punch and is the only thing standing between an
+// employee and marking their attendance, so what it was matters:
+//
+//   - no role="dialog", no aria-modal, no accessible name. A screen reader was told
+//     nothing had happened; focus stayed on the button behind a 0.85 scrim, and a
+//     keyboard user could tab straight into the page underneath.
+//   - no Escape, no scrim click, no focus restore on close.
+//   - "Skip camera" was #9ca3af on white, about 2.6:1 (fails SC 1.4.3), with 4px of
+//     padding on 12px text, about 20px tall (fails SC 2.5.8). The one control that
+//     lets a person decline the camera - which the capture being advisory-only
+//     entitles them to do - was the least visible and least tappable thing on the
+//     screen. That combination reads as a nudge whether or not it was meant as one.
+//
+// Both buttons are now real 44px controls in inks that clear 4.5:1, the panel is a
+// labelled dialog, focus moves in and comes back, and Escape and the scrim both mean
+// "continue without a photo". If the camera is denied or missing the punch still
+// proceeds: declining must never cost somebody their attendance record.
+// ------------------------------------------------------------------------------
 function captureFace(form, cb){
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ cb(); return; }
   var settled=false; function done(){ if(settled) return; settled=true; cb(); }
   navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user', width:{ideal:480}, height:{ideal:480} }, audio:false })
   .then(function(stream){
+    // Where focus must return when this closes. Dropping it on <body> leaves a
+    // keyboard user at the top of a long page with no idea where they were.
+    var opener = document.activeElement;
+
     var ov=document.createElement('div');
     ov.style.cssText='position:fixed;inset:0;z-index:100000;background:rgba(10,12,20,.85);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:20px;';
     ov.innerHTML=''+
-      '<div style="background:#fff;border-radius:18px;max-width:340px;width:100%;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.5);font-family:system-ui,sans-serif;">'+
-      '<div style="padding:14px 16px;border-bottom:1px solid #f0f0f0;"><p style="margin:0;font-size:14px;font-weight:700;color:#111;">Face check-in</p>'+
-      '<p style="margin:3px 0 0;font-size:11.5px;color:#6b7280;">Look at the camera and capture to confirm it’s you.</p></div>'+
+      '<div data-scrim style="position:absolute;inset:0;"></div>'+
+      '<div role="dialog" aria-modal="true" aria-labelledby="faceCapTitle" aria-describedby="faceCapNote" style="position:relative;background:#fff;border-radius:18px;max-width:340px;width:100%;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.5);font-family:system-ui,sans-serif;">'+
+      '<div style="padding:14px 16px;border-bottom:1px solid #f0f0f0;"><p id="faceCapTitle" style="margin:0;font-size:14px;font-weight:700;color:#111;">Face check-in</p>'+
+      '<p id="faceCapNote" style="margin:3px 0 0;font-size:12px;color:#4b5563;line-height:1.5;">Take a photo to go with this punch, or continue without one. A person checks it later; it never decides anything on its own.</p></div>'+
       '<div style="position:relative;background:#000;aspect-ratio:1;overflow:hidden;">'+
       '<video autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;transform:scaleX(-1);"></video>'+
       '<div style="position:absolute;inset:14%;border:2px dashed rgba(255,255,255,.55);border-radius:50%;pointer-events:none;"></div></div>'+
       '<div style="padding:12px 16px 16px;display:flex;flex-direction:column;gap:8px;">'+
-      '<button type="button" data-cap style="width:100%;background:#10b981;color:#fff;border:none;font-size:14px;font-weight:700;padding:13px;border-radius:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;">'+
-      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>Capture &amp; continue</button>'+
-      '<button type="button" data-skip style="width:100%;background:none;border:none;color:#9ca3af;font-size:12px;cursor:pointer;padding:4px;">Skip camera</button></div></div>';
+      '<button type="button" data-cap style="width:100%;min-height:44px;background:#10b981;color:#fff;border:none;font-size:14px;font-weight:700;padding:13px;border-radius:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;">'+
+      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>Capture and continue</button>'+
+      '<button type="button" data-skip style="width:100%;min-height:44px;background:#fff;border:1px solid #d1d5db;color:#1f2937;font-size:14px;font-weight:600;padding:12px;border-radius:11px;cursor:pointer;">Continue without a photo</button></div></div>';
     document.body.appendChild(ov);
     var video=ov.querySelector('video'); video.srcObject=stream;
-    function cleanup(){ try{ stream.getTracks().forEach(function(t){t.stop();}); }catch(_){} if(ov.parentNode) ov.parentNode.removeChild(ov); }
+
+    var onKey=function(ev){ if(ev.key==='Escape'||ev.key==='Esc'){ ev.preventDefault(); skip(); } };
+    function cleanup(){
+      document.removeEventListener('keydown', onKey, true);
+      try{ stream.getTracks().forEach(function(t){t.stop();}); }catch(_){}
+      if(ov.parentNode) ov.parentNode.removeChild(ov);
+      try{ if(opener && opener.focus) opener.focus(); }catch(_){}
+    }
+    function skip(){ cleanup(); done(); }
+    document.addEventListener('keydown', onKey, true);
+
     ov.querySelector('[data-cap]').onclick=function(){
       var vw=video.videoWidth||480, vh=video.videoHeight||480;
       var w=240, h=Math.max(1, Math.round(vh*(w/vw)));
@@ -2516,17 +2762,34 @@ function captureFace(form, cb){
       try{ cv.getContext('2d').drawImage(video,0,0,w,h); setFace(form, cv.toDataURL('image/jpeg',0.6)); }catch(_){}
       cleanup(); done();
     };
-    ov.querySelector('[data-skip]').onclick=function(){ cleanup(); done(); };
-    setTimeout(function(){ if(!settled){} }, 60000); // leave modal open until the user acts
+    ov.querySelector('[data-skip]').onclick=skip;
+    // The scrim means the same thing as the secondary button. It must never mean
+    // "capture", and on a modal it must never mean "nothing happens".
+    var scrim=ov.querySelector('[data-scrim]'); if(scrim) scrim.onclick=skip;
+
+    // Focus INTO the panel. Without this, focus stays on the button behind the scrim
+    // and a keyboard user walks a page they cannot see under a dialog they cannot leave.
+    try{ ov.querySelector('[data-cap]').focus(); }catch(_){}
   })
-  .catch(function(){ done(); }); // no permission / no camera -> clock in without a photo
+  .catch(function(){ done(); }); // no permission / no camera -> punch without a photo
 }
 
-// Robust submit — captures GPS, never hangs (hard fallback), no external calls.
+// Attach GPS, then let the form submit itself. Never hangs: a hard fallback fires the
+// submit if geolocation neither resolves nor rejects, which some Android WebViews do.
 function finishClock(form){
-  var btn=form.querySelector('button.clock-btn'); if(btn){ btn.disabled=true; btn.textContent='Recording…'; }
-  var done=false; function go(){ if(done) return; done=true; form.submit(); }
-  var fallback=setTimeout(go, 13000); // never leave the button stuck
+  var btn=form.querySelector('button.clock-btn');
+  // Disabled, but THE LABEL IS LEFT ALONE. The icon and the word stay put; the
+  // sentence goes in the live region beside the button.
+  if(btn){ btn.disabled=true; }
+  say(form, 'Recording your punch...');
+  var done=false;
+  function go(){
+    if(done) return; done=true;
+    // requestSubmit() where it exists, so the browser runs the same path a real press
+    // would. The listener below knows this is the re-submit and stands aside.
+    if(typeof form.requestSubmit==='function'){ form.requestSubmit(); } else { form.submit(); }
+  }
+  var fallback=setTimeout(go, 13000);
   if(lastPos){ fill(form,lastPos); }
   if(!navigator.geolocation){ clearTimeout(fallback); go(); return; }
   navigator.geolocation.getCurrentPosition(
@@ -2536,11 +2799,45 @@ function finishClock(form){
   );
 }
 
-// Clock in/out by face: take the selfie first, then record GPS and submit.
-function submitClock(formId){
-  var form=document.getElementById(formId); if(!form) return;
-  captureFace(form, function(){ finishClock(form); });
-}
+// ------------------------------------------------------------------------------
+// THE PUNCH IS A REAL FORM SUBMIT. THIS ONLY DECORATES IT.
+//
+// All four punch controls used to be type="button" with onclick="submitClock(...)",
+// and the forms contained NO submit button at all - outForm carries several fields,
+// so implicit submission on Enter could not rescue it either. On a mid-range Android
+// on a weak connection, which is the actual device profile here, a page renders and
+// is tappable before an inline script has executed, and stays tappable after one has
+// thrown. The button then did nothing, silently, and the person walked away believing
+// they had clocked in. Every other write on this page - daily report, time log,
+// delete - posts natively; only the act performed twice a day by every single
+// employee was JavaScript-only, and its failure mode was invisible to them AND to HR
+// until a missing punch became a payroll dispute.
+//
+// The buttons are type="submit" now. This listener intercepts the submit to add the
+// selfie and the coordinates and then re-submits. If it never runs, the browser posts
+// the form on its own: no photo, no coordinates, and a RECORDED PUNCH - which is the
+// correct degradation, because both of those are advisory and attendance is not.
+// ------------------------------------------------------------------------------
+['clockForm','outForm','breakForm','resumeForm'].forEach(function(id){
+  var form=document.getElementById(id);
+  if(!form) return;
+  form.addEventListener('submit', function(ev){
+    // Set by finishClock's go(): this is the re-submit, so let the browser have it.
+    if(form.getAttribute('data-enhanced')==='1') return;
+    ev.preventDefault();
+    form.setAttribute('data-enhanced','1');
+    try{
+      captureFace(form, function(){ finishClock(form); });
+    }catch(e){
+      // NEVER SWALLOWED INTO A DEAD BUTTON. If the enhancement throws, the punch
+      // still goes - without the photo and without the coordinates - because the
+      // alternative is the exact silent failure this change exists to remove.
+      console.error('[portal/employee] clock enhancement failed', e && e.message);
+      say(form, 'Recording your punch...');
+      if(typeof form.requestSubmit==='function'){ form.requestSubmit(); } else { form.submit(); }
+    }
+  });
+});
 </script>
 </body>
 </html>

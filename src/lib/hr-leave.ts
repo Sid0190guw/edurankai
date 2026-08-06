@@ -859,6 +859,21 @@ export async function pendingLeaveForApprover(user: any): Promise<any[]> {
   // function. The list and the enforcement cannot drift apart.
   const seesAll = decidesEveryRequest(user, 'leave.approve');
 
+  // ORDERED BY HOW LONG SOMEBODY HAS BEEN WAITING, NOT BY WHEN THEIR LEAVE STARTS.
+  //
+  // This was `ORDER BY l.start_date ASC`, and that sorted the queue by the wrong clock. A request
+  // filed this morning for March sorted BELOW every near-term request, so the row most likely to rot
+  // was the row hardest to see — and on a busy HR account, where the whole-org branch below is the
+  // one that runs, it could fall off the LIMIT 120 entirely and be invisible rather than merely low.
+  // Nobody chases a request they cannot see, and nothing tells them it exists.
+  //
+  // requested_at is NOT NULL DEFAULT NOW() on this table and is already indexed alongside status
+  // (hr_leave_status), so oldest-first costs nothing. start_date is kept as the tiebreak, so two
+  // requests filed in the same second still order sensibly, and it remains in the SELECT — the
+  // surface renders "started" urgency from it separately from queue position.
+  //
+  // The 120-row cap stays. It now truncates the NEWEST requests instead of the oldest, which is the
+  // right direction: the ones cut off are the ones that have waited least.
   try {
     if (seesAll) {
       return rows(await db.execute(sql`
@@ -866,7 +881,7 @@ export async function pendingLeaveForApprover(user: any): Promise<any[]> {
           FROM hr_leave_request l
           LEFT JOIN hr_employees e ON e.id = l.employee_id
          WHERE l.status = 'pending'
-         ORDER BY l.start_date ASC
+         ORDER BY l.requested_at ASC, l.start_date ASC
          LIMIT 120`));
     }
     // reporting_manager_id holds a USERS id, not an hr_employees id — the same column and the same
@@ -878,7 +893,7 @@ export async function pendingLeaveForApprover(user: any): Promise<any[]> {
         JOIN hr_employees e ON e.id = l.employee_id
        WHERE l.status = 'pending'
          AND e.reporting_manager_id::text = ${String(user.id)}
-       ORDER BY l.start_date ASC
+       ORDER BY l.requested_at ASC, l.start_date ASC
        LIMIT 120`));
   } catch (e: any) {
     // Fail closed: an approver seeing nothing is a missed notification; an approver seeing everyone

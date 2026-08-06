@@ -4,6 +4,10 @@ import { db } from '@/lib/db';
 import { markOfferOpened } from '@/lib/track';
 import { offerLetters, applications, applicationMessages } from '@/lib/db/schema';
 import { eq, and } from 'drizzle-orm';
+import {
+  decideOfferTemplate, renderOfferLetter, emphasize, summaryFieldLabel,
+  type AgreedFields
+} from '@/lib/offer-templates';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -46,6 +50,80 @@ if (!isOwner) {
   if (!isAdmin) return Astro.redirect('/portal');
 }
 const app: any = appList.length > 0 ? appList[0] : null;
+
+const content = offer.content || {};
+const c = content;
+
+function formatDate(d: any): string {
+  if (!d) return '';
+  const date = typeof d === 'string' ? new Date(d) : d;
+  if (isNaN(date.getTime())) return d;
+  return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
+}
+// India Standard Time stamp - the server runs in UTC, so we must pin the zone
+// or signed timestamps render ~5.5h off.
+function formatDateTimeIST(d: any): string {
+  if (!d) return '';
+  const date = typeof d === 'string' ? new Date(d) : d;
+  if (isNaN(date.getTime())) return '';
+  return date.toLocaleString('en-IN', {
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: true,
+    timeZone: 'Asia/Kolkata'
+  }) + ' IST';
+}
+
+// THE LEVEL THAT WAS ACTUALLY AGREED.
+//
+// The offer content blob has never carried a level, so the letter had nothing to read except the
+// role title and the template somebody happened to open. `applications.level` is the level the
+// candidate applied and was assessed at, and it is the field that should have decided this letter
+// all along. It is read for staff viewers too, so the admin preview and the candidate's copy are
+// the same document.
+let agreedLevel: string | null = (c.level as string) || null;
+if (!agreedLevel) {
+  if (app && app.level) {
+    agreedLevel = app.level;
+  } else {
+    try {
+      const lvlRows = await db.select({ level: applications.level }).from(applications)
+        .where(eq(applications.id, offer.applicationId)).limit(1);
+      if (lvlRows.length > 0 && lvlRows[0].level) agreedLevel = String(lvlRows[0].level);
+    } catch (e: any) {
+      // Not swallowed: a missing level downgrades the letter to the neutral template, which is
+      // safe but worth knowing about. The real Postgres reason lives on e.cause.
+      console.error('[offer] level lookup failed:', e?.cause?.message || e?.message);
+    }
+  }
+}
+
+// ONE SOURCE OF TRUTH FOR THE WORDS IN THIS LETTER.
+//
+// Every sentence below - the opening, the engagement terms, the review paragraph, the completion
+// paragraph, which summary fields are worth printing - comes from src/lib/offer-templates.ts, and
+// so does the PDF. The template is SELECTED from the agreed fields; `offer.templateType` is passed
+// as an override REQUEST, not as an instruction, and it is refused when it contradicts them. There
+// is no intern fallback anywhere in that path: an unmatched offer lands on the neutral template.
+//
+// Declared HERE, above the POST handler, because the signing audit entry records which template
+// governed the letter the person actually signed. A const is not hoisted; declaring it below the
+// handler would throw on the first line of every acceptance.
+const letterFields: AgreedFields = {
+  level: agreedLevel,
+  roleTitle: c.roleTitle || offer.roleTitle || '',
+  employmentType: c.employmentType || '',
+  department: c.department || offer.department || '',
+  workMode: c.workMode || '',
+  duration: c.duration || '',
+  hoursCommitment: c.hoursCommitment || '',
+  joiningDate: formatDate(c.joiningDate),
+  reportingTo: c.reportingTo || '',
+  compensation: c.compensation || '',
+  candidateName: c.candidateName || offer.candidateName || '',
+  org: 'EduRankAI'
+};
+const templateDecision = decideOfferTemplate(letterFields, offer.templateType);
+const letter = renderOfferLetter(letterFields, templateDecision);
 
 // Handle signing — recipient only.
 if (Astro.request.method === 'POST' && isOwner) {
@@ -195,6 +273,17 @@ if (Astro.request.method === 'POST' && isOwner) {
             entityId: String(offer.id), ipAddress: ipHeader.substring(0, 64),
             diff: { refNumber: offer.refNumber, roleTitle: offer.roleTitle,
               consent: true, consentText: 'read the offer, accepts all terms, typed name is legal e-signature',
+              // WHICH LETTER DID THIS PERSON ACTUALLY SIGN? Recorded once, at the binding moment,
+              // rather than inferred later from a template_type column that is only a request.
+              // If a hand-picked template was refused, the refusal is in `templateNotes`.
+              templateId: letter.templateId,
+              templateLevel: templateDecision.level || 'not recorded',
+              templateEngagement: templateDecision.engagement || 'not recorded',
+              templateOverrideRequested: templateDecision.overrideRequested || 'none',
+              templateOverrideAccepted: templateDecision.overrideAccepted,
+              templateNotes: templateDecision.notes,
+              unpaidClauseShown: letter.showsUnpaidClause,
+              completionCertificatePromised: letter.awardsCompletionCertificate,
               // The name the person actually typed, recorded alongside the claim that it IS the
               // signature. Without it the audit entry asserted evidence that was never captured.
               typedName, typedNameMatchesAccount: typedName.toLowerCase() === String(offer.candidateName || '').trim().toLowerCase(),
@@ -226,33 +315,11 @@ if (Astro.request.method === 'POST' && isOwner) {
   }
 }
 
-const content = offer.content || {};
-const c = content;
 const verifyUrl = 'https://edurankai.in/offer/verify/' + offer.token;
 // Rendered server-side so it is present in the printed/saved document, not dependent on a script
 // having run or a remote image still existing years later.
 const { qrSvg } = await import('@/lib/qr');
 const verifyQr = await qrSvg(verifyUrl, { size: 128 });
-const shortId = offer.id.substring(0, 8).toUpperCase();
-
-function formatDate(d: any): string {
-  if (!d) return '';
-  const date = typeof d === 'string' ? new Date(d) : d;
-  if (isNaN(date.getTime())) return d;
-  return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
-}
-// India Standard Time stamp - the server runs in UTC, so we must pin the zone
-// or signed timestamps render ~5.5h off.
-function formatDateTimeIST(d: any): string {
-  if (!d) return '';
-  const date = typeof d === 'string' ? new Date(d) : d;
-  if (isNaN(date.getTime())) return '';
-  return date.toLocaleString('en-IN', {
-    day: '2-digit', month: 'short', year: 'numeric',
-    hour: '2-digit', minute: '2-digit', hour12: true,
-    timeZone: 'Asia/Kolkata'
-  }) + ' IST';
-}
 
 // Load internal handle for the user account, if linked
 let internalHandle: string | null = null;
@@ -286,10 +353,36 @@ const TEMPLATE_INTROS: Record<string, string> = {
   leadership: 'We are honored to extend this leadership offer for the position of'
 };
 
-const intro = TEMPLATE_INTROS[offer.templateType] || TEMPLATE_INTROS.intern;
+// WHO THIS PERSON IS, decided ONCE and used everywhere below.
+//
+// This was `TEMPLATE_INTROS[templateType] || TEMPLATE_INTROS.intern`, so an offer whose template
+// was unset or unrecognised told the recipient we were pleased to offer them an internship --
+// including a full-time hire, including a C-level executive. The most junior possible reading is
+// the worst available default: it is the one that insults the person receiving it.
+//
+// The fallback now runs the other way. An engagement is an internship only when something
+// POSITIVELY says so, and anything senior is excluded outright. \bintern(?!al) is the same
+// word-boundary pattern src/lib/auth/admin-access.ts uses, so "Internal Auditor" is never read
+// as an intern.
+const SENIOR_LEVELS = /\b(c-level|chief|executive|director|vp|vice[- ]president|head|lead|principal|senior|manager)\b/i;
+const declaredIntern = offer.templateType === 'intern'
+  || /\bintern(?!al)/i.test(String(c.employmentType || ''))
+  || /\bintern(?!al)/i.test(String(c.roleTitle || ''));
+const seniorEngagement = offer.templateType === 'leadership'
+  || SENIOR_LEVELS.test(String(c.roleTitle || ''))
+  || SENIOR_LEVELS.test(String(c.level || ''));
+const isIntern = declaredIntern && !seniorEngagement;
 
-// Data for the one-click, dependency-free PDF generator (era-offer-pdf.js).
-const isIntern = (offer.templateType === 'intern') || /intern/i.test(c.employmentType || '');
+// THE TEMPLATE DOES NOT GET THE LAST WORD. A real offer went out reading "we are pleased to extend
+// this formal offer of an internship for the position of Chief AI Officer", and "This Full-Time is
+// offered on an unpaid basis in accordance with EduRankAI's Internship Policy" -- because somebody
+// started from the intern template and then filled in senior, full-time fields. The template is a
+// starting point; the FIELDS are what was actually agreed, so the fields win.
+const templateKey = TEMPLATE_INTROS[offer.templateType] ? offer.templateType : '';
+const introKey = seniorEngagement
+  ? (templateKey === 'contract' ? 'contract' : 'leadership')
+  : (isIntern ? 'intern' : (templateKey && templateKey !== 'intern' ? templateKey : 'fulltime'));
+const intro = TEMPLATE_INTROS[introKey];
 const joiningTxt = formatDate(c.joiningDate) || 'a mutually agreed date';
 const offerPdfData = {
   refNumber: offer.refNumber || '',
@@ -317,7 +410,12 @@ const offerPdfData = {
     isIntern
       ? ('This ' + (c.employmentType || 'internship') + ' is offered on an unpaid basis in accordance with EduRankAI\'s Internship Policy. You will work ' + (c.workMode || 'Remote') + ', committing ' + (c.hoursCommitment || 'the agreed hours') + ' of focused effort. The engagement runs for ' + (c.duration || 'the agreed term') + ', commencing ' + joiningTxt + '. Compensation: ' + (c.compensation || 'To be discussed') + '.')
       : ('This is a ' + (c.employmentType || 'role') + ' engagement, work mode ' + (c.workMode || 'Remote') + ', for ' + (c.duration || 'the agreed term') + ', commencing ' + joiningTxt + '. Compensation: ' + (c.compensation || 'as discussed') + '.'),
-    'You will receive a mid-point review and a final review, assessed via EduRankAI\'s rubric-based evaluation. Outstanding performers receive a Letter of Recommendation; all successful completers receive a Certificate of Completion.',
+    // WAS UNCONDITIONAL. Mid-point reviews, a Certificate of Completion and "successful completers"
+    // are internship language, and every offer carried them -- so a Chief Technology Officer was
+    // told they would receive a certificate for completing us.
+    isIntern
+      ? 'You will receive a mid-point review and a final review, assessed via EduRankAI\'s rubric-based evaluation. Outstanding performers receive a Letter of Recommendation; all successful completers receive a Certificate of Completion.'
+      : 'Your performance will be reviewed on the cycle that applies to your role, against objectives agreed with you after joining.',
     'By accepting, you confirm you have read and agree to EduRankAI\'s Recruitment and Work Policy and Code of Conduct.'
   ]
 };
@@ -451,7 +549,19 @@ const offerPdfData = {
         <p class="doc-kicker"><span class="doc-kicker__n">01</span></p>
         <h2 class="doc-h2" id="pnl-opening">Dear {(c.candidateName || '').split(' ')[0] || 'Candidate'},</h2>
         <div class="doc-prose">
+          {/* The letter opened straight into "we are pleased to extend" -- correct, and cold. This is
+              the moment somebody finds out they got the job, and the document said nothing about
+              that. Congratulations first, terms second. Inline SVG, never an emoji. */}
+          <p class="doc-congrats">
+            <svg class="doc-congrats__mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2.6l2.6 5.5 6 .9-4.3 4.3 1 6-5.3-2.9-5.3 2.9 1-6L3.4 9l6-.9z" />
+            </svg>
+            <span><strong>Congratulations{(c.candidateName || '').split(' ')[0] ? ', ' + (c.candidateName || '').split(' ')[0] : ''}.</strong> You have been selected, and we are genuinely glad it is you.</span>
+          </p>
           <p>{intro} <strong>{c.roleTitle}</strong>{c.department && (<span> within the <strong>{c.department}</strong></span>)} at <strong>EduRankAI</strong>. Following a thorough evaluation of your application and conversations, we are confident you demonstrate the capability, character, and commitment we look for.</p>
+          <p>{isIntern
+            ? 'Plenty of people applied. You are here because of how you thought about the problems we put in front of you, and we are looking forward to what you build while you are with us.'
+            : 'Plenty of capable people applied. You are here because of the judgement and the standard you brought to every conversation, and we are looking forward to the work you will lead here.'}</p>
         </div>
       </section>
 
@@ -480,10 +590,14 @@ const offerPdfData = {
         <p class="doc-kicker"><span class="doc-kicker__n">03</span></p>
         <h2 class="doc-h2" id="pnl-terms">Engagement terms</h2>
         <div class="doc-prose">
-          {(offer.templateType === 'intern') && (
+          {/* isIntern, NOT templateType. An offer started from the intern template and then filled
+              in with senior full-time terms told a Chief AI Officer their role was unpaid under the
+              Internship Policy. The agreed fields decide, never the template somebody happened to
+              open first. */}
+          {isIntern && (
             <p>This {c.employmentType} is offered on an <strong>unpaid basis</strong> in accordance with EduRankAI's Internship Policy. You will work <strong>{c.workMode}</strong>, committing <strong>{c.hoursCommitment}</strong> of focused effort. The engagement runs for <strong>{c.duration}</strong>, commencing <strong>{formatDate(c.joiningDate) || 'a mutually agreed date'}</strong>.</p>
           )}
-          {(offer.templateType !== 'intern') && (
+          {!isIntern && (
             <p>This offer is contingent on completion of pre-employment requirements. Your employment commences on <strong>{formatDate(c.joiningDate) || 'a mutually agreed date'}</strong> as a <strong>{c.employmentType}</strong> employee. Onboarding details will be confirmed within 7 days of acceptance.</p>
           )}
         </div>
@@ -874,6 +988,22 @@ const offerPdfData = {
       font-size: 1.0625rem; line-height: 1.78; color: var(--ink-2); margin: 0 0 14px;
     }
     .doc-prose p:last-child, .doc-prose__p:last-child { margin-bottom: 0; }
+
+    /* The congratulation line. Set apart from the body so the first thing read is the news, not
+       the terms. Prints with the document -- somebody keeps this letter. */
+    .doc-congrats {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 14px 16px; margin-bottom: 18px;
+      border-left: 3px solid currentColor;
+      background: rgba(255, 79, 0, 0.05);
+      border-radius: 0 10px 10px 0;
+      font-size: 1.02rem; line-height: 1.55;
+    }
+    .doc-congrats__mark { width: 22px; height: 22px; flex: 0 0 22px; margin-top: 2px; opacity: 0.85; }
+    @media (max-width: 480px) {
+      .doc-congrats { padding: 12px 13px; gap: 8px; font-size: 0.97rem; }
+      .doc-congrats__mark { width: 19px; height: 19px; flex-basis: 19px; }
+    }
     .doc-prose strong, .doc-prose__p strong { color: var(--ink); font-weight: 600; }
     .doc-prose__note { font-style: italic; }
     .doc-meta { font-size: 0.82rem; line-height: 1.65; color: var(--muted); }

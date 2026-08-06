@@ -1,114 +1,167 @@
 ---
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
+import { db } from '@/lib/db';
+import { users } from '@/lib/db/schema';
+import { eq, sql } from 'drizzle-orm';
+import { generateSessionToken, createSession } from '@/lib/auth/session';
+import { setSessionCookie } from '@/lib/auth/cookie';
+import { findUserByLoginIdentifier, verifyPasswordForLogin } from '@/lib/auth/handle';
+import {
+  isSecondStepRequired, availableSecondFactors, startPendingChallenge,
+  resolvePendingChallenge, verifySecondFactor, dropPendingChallenge,
+  pendingCookieName, verifyFaceSecondFactor, canCompleteSecondStep,
+  PENDING_TTL_SECONDS, PENDING_COOKIE_SECURE,
+  type SecondFactorMethod,
+} from '@/lib/auth/two-factor';
 
 if (Astro.locals.user) {
   return Astro.redirect('/aquintutor/dashboard');
 }
 
-let errorMsg = '';
-let requireFace = false;
-let pendingUserId = '';
-let pendingUserName = '';
-let faceDescriptor = '';
+// Declared before the handler that uses them - `const` is not hoisted.
+const SURFACE = 'aquintutor' as const;
+const PENDING_COOKIE = pendingCookieName(SURFACE);
+const LEGACY_FACE_COOKIE = 'aquintutor_face_pending';
 
-const pendingId = Astro.cookies.get('aquintutor_face_pending')?.value || '';
-
-if (pendingId) {
-  requireFace = true;
-  pendingUserId = pendingId;
-  try {
-    const { db } = await import('@/lib/db');
-    const { users } = await import('@/lib/db/schema');
-    const { eq } = await import('drizzle-orm');
-    const { sql } = await import('drizzle-orm');
-    const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pendingId)).limit(1);
-    pendingUserName = u[0]?.name || '';
-    const fd = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${pendingId} AND is_active = true LIMIT 1`);
-    const rows = Array.isArray(fd) ? fd : (fd?.rows || []);
-    faceDescriptor = rows.length > 0 ? JSON.stringify((rows[0] as any).face_descriptor) : '';
-  } catch (_) {}
+function setPendingCookie(cookies: any, token: string) {
+  cookies.set(PENDING_COOKIE, token, {
+    path: '/', httpOnly: true, sameSite: 'lax', secure: PENDING_COOKIE_SECURE, maxAge: PENDING_TTL_SECONDS,
+  });
 }
+function clearPendingCookies(cookies: any) {
+  cookies.delete(PENDING_COOKIE, { path: '/' });
+  cookies.delete(LEGACY_FACE_COOKIE, { path: '/' });
+}
+
+let errorMsg = '';
+let noticeMsg = '';
+let requireSecondStep = false;
+let pendingUserName = '';
+let offerFace = false;
+let offerCode = false;
+
+// The half-finished sign-in is named by an opaque server-minted token. It used
+// to be a raw user id in a cookie, which is client-settable - see the report.
+let pendingToken = Astro.cookies.get(PENDING_COOKIE)?.value || '';
 
 if (Astro.request.method === 'POST') {
   const fd2 = await Astro.request.formData();
   const action = (fd2.get('action') as string) || '';
 
-  if (action === 'face_verified') {
-    const userId = (fd2.get('user_id') as string) || '';
-    if (userId === pendingId) {
-      try {
-        const { db } = await import('@/lib/db');
-        const { users } = await import('@/lib/db/schema');
-        const { generateSessionToken, createSession } = await import('@/lib/auth/session');
-        const { setSessionCookie } = await import('@/lib/auth/cookie');
-        const { eq } = await import('drizzle-orm');
-        const { sql } = await import('drizzle-orm');
-        await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
+  if (action === 'second_factor') {
+    const method = ((fd2.get('method') as string) || 'totp') as SecondFactorMethod;
+    const payload = method === 'face'
+      ? ((fd2.get('live_descriptor') as string) || '')
+      : ((fd2.get('code') as string) || '').trim();
+    try {
+      if (method === 'face') {
+        const peek = await resolvePendingChallenge(pendingToken, SURFACE);
+        if (peek) {
+          const r = await verifyFaceSecondFactor(peek.userId, payload);
+          await db.execute(sql`
+            INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
+            VALUES (${peek.userId}, ${''}, ${''}, 'face_login', ${Number.isFinite(r.distance) ? r.distance : null}, ${r.matched}, ${r.matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
+          `).catch(() => {});
+        }
+      }
+      const result = await verifySecondFactor(pendingToken, SURFACE, method, payload);
+      if (!result.ok) {
+        errorMsg = result.error;
+        if (result.locked) { clearPendingCookies(Astro.cookies); pendingToken = ''; }
+      } else {
+        if (method === 'face') {
+          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${result.userId}`).catch(() => {});
+        }
         const token = generateSessionToken();
-        const session = await createSession(token, userId, {
+        const session = await createSession(token, result.userId, {
           userAgent: Astro.request.headers.get('user-agent') || undefined,
-          ipAddress: Astro.clientAddress
+          ipAddress: Astro.clientAddress,
         });
         setSessionCookie(Astro.cookies, token, session.expiresAt);
-        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, userId));
-        Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
+        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, result.userId)).catch(() => {});
+        clearPendingCookies(Astro.cookies);
         return Astro.redirect('/aquintutor/dashboard');
-      } catch (_) { errorMsg = 'Sign-in error. Please try again.'; }
-    } else {
-      errorMsg = 'Session mismatch. Please sign in again.';
-      Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
-      requireFace = false;
+      }
+    } catch (e: any) {
+      // Never swallowed - a bare catch in a login path hid an outage here once.
+      console.error('[aquintutor/login second_factor]', e?.cause?.message || e?.message, e?.stack);
+      errorMsg = 'Verification is temporarily unavailable. Please try again.';
     }
-  } else if (action === 'cancel_face') {
-    Astro.cookies.delete('aquintutor_face_pending', { path: '/' });
+  } else if (action === 'cancel_face' || action === 'cancel_second_step') {
+    await dropPendingChallenge(pendingToken).catch(() => {});
+    clearPendingCookies(Astro.cookies);
     return Astro.redirect('/aquintutor/login');
   } else {
-    const email = (fd2.get('email') as string || '').trim().toLowerCase();
+    const identifier = (fd2.get('email') as string || '').trim();
     const password = (fd2.get('password') as string) || '';
-    if (!email || !password) {
-      errorMsg = 'Email and password are required.';
+    if (!identifier || !password) {
+      errorMsg = 'Enter your email or internal handle, and your password.';
     } else {
       try {
-        const { db } = await import('@/lib/db');
-        const { users } = await import('@/lib/db/schema');
-        const { verifyPassword } = await import('@/lib/auth/password');
-        const { generateSessionToken, createSession } = await import('@/lib/auth/session');
-        const { setSessionCookie } = await import('@/lib/auth/cookie');
-        const { eq, or } = await import('drizzle-orm');
-        const { sql } = await import('drizzle-orm');
-
-        const found = await db.select().from(users).where(or(eq(users.email, email), eq(users.internalHandle, email))).limit(1);
-        const user = found[0];
-        if (!user || !user.isActive) {
+        const user = await findUserByLoginIdentifier(identifier);
+        // scrypt runs whether or not the account exists, so an unknown handle
+        // and a wrong password cost the same and answer the same.
+        const ok = await verifyPasswordForLogin(user, password);
+        if (!ok || !user || !user.isActive) {
           errorMsg = 'Invalid email or password.';
         } else {
-          const valid = await verifyPassword(user.passwordHash, password);
-          if (!valid) {
-            errorMsg = 'Invalid email or password.';
-          } else {
-            const faceCheck = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
-            const faceRows = Array.isArray(faceCheck) ? faceCheck : (faceCheck?.rows || []);
-            if (faceRows.length > 0) {
-              Astro.cookies.set('aquintutor_face_pending', user.id, { path: '/', httpOnly: true, maxAge: 300, sameSite: 'lax' });
-              return Astro.redirect('/aquintutor/login');
-            } else {
-              const token = generateSessionToken();
-              const session = await createSession(token, user.id, {
-                userAgent: Astro.request.headers.get('user-agent') || undefined,
-                ipAddress: Astro.clientAddress
-              });
-              setSessionCookie(Astro.cookies, token, session.expiresAt);
-              await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, user.id));
-              return Astro.redirect('/aquintutor/dashboard');
-            }
+          const methods = await availableSecondFactors(user.id);
+          const optedIn = await isSecondStepRequired(user.id);
+          // Pre-existing posture: a face on file meant a face challenge.
+          const legacyFaceRule = methods.indexOf('face') >= 0;
+          // A remaining recovery code is a completable second step too, so an
+          // account whose only enrolled factor was cleared is still challenged
+          // instead of being waved through on one factor. False only when nothing
+          // is left at all - the one case where challenging would be a lockout.
+          if ((optedIn || legacyFaceRule) && await canCompleteSecondStep(user.id)) {
+            const t = await startPendingChallenge(user.id, SURFACE, 'password');
+            setPendingCookie(Astro.cookies, t);
+            return Astro.redirect('/aquintutor/login');
           }
+          const token = generateSessionToken();
+          const session = await createSession(token, user.id, {
+            userAgent: Astro.request.headers.get('user-agent') || undefined,
+            ipAddress: Astro.clientAddress,
+          });
+          setSessionCookie(Astro.cookies, token, session.expiresAt);
+          await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, user.id)).catch(() => {});
+          clearPendingCookies(Astro.cookies);
+          return Astro.redirect('/aquintutor/dashboard');
         }
       } catch (e: any) {
-        errorMsg = 'Sign-in error. Please try again.';
+        console.error('[aquintutor/login password]', e?.cause?.message || e?.message, e?.stack);
+        errorMsg = 'Sign-in is temporarily unavailable. Please try again.';
       }
     }
   }
 }
+
+if (pendingToken) {
+  try {
+    const pending = await resolvePendingChallenge(pendingToken, SURFACE);
+    if (pending) {
+      requireSecondStep = true;
+      const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pending.userId)).limit(1);
+      pendingUserName = u[0]?.name || '';
+      const methods = await availableSecondFactors(pending.userId);
+      offerFace = methods.indexOf('face') >= 0;
+      offerCode = methods.indexOf('totp') >= 0;
+    } else {
+      clearPendingCookies(Astro.cookies);
+      pendingToken = '';
+      if (!errorMsg) noticeMsg = 'That sign-in step expired. Please sign in again.';
+    }
+  } catch (e: any) {
+    console.error('[aquintutor/login pending]', e?.cause?.message || e?.message, e?.stack);
+    clearPendingCookies(Astro.cookies);
+    pendingToken = '';
+    errorMsg = 'Sign-in is temporarily unavailable. Please try again.';
+  }
+}
+
+// The enrolled descriptor is never sent to the browser; the server compares.
+const showCamera = requireSecondStep && offerFace;
+const showPasswordForm = !requireSecondStep;
 ---
 <AquintutorLayout title="Sign in" description="Sign in to AquinTutor - the frontier research institution." noindex={true}>
 
@@ -121,10 +174,10 @@ if (Astro.request.method === 'POST') {
     </div>
     <div style="max-width:540px; margin:0 auto; padding:72px 28px 56px; position:relative; z-index:1;">
 
-      <p style="font-family:'Inter Tight',sans-serif; font-size:12px; color:var(--rust); font-weight:600; letter-spacing:0.16em; text-transform:uppercase; margin:0 0 14px;">{requireFace ? 'Verify your face' : 'Sign in'}</p>
+      <p style="font-family:'Inter Tight',sans-serif; font-size:12px; color:var(--rust); font-weight:600; letter-spacing:0.16em; text-transform:uppercase; margin:0 0 14px;">{requireSecondStep ? 'One more step' : 'Sign in'}</p>
 
       <h1 class="font-display" style="font-size:clamp(2rem, 5vw, 3.5rem); line-height:1.02; letter-spacing:-0.025em; font-weight:500; margin:0; color:var(--ink);">
-        {requireFace
+        {requireSecondStep
           ? <>Welcome back,<br/><span style="font-style:italic; font-weight:300; color:var(--ink-500);">{pendingUserName}.</span></>
           : <>Continue your<br/><span style="font-style:italic; font-weight:300; color:var(--ink-500);">studies.</span></>}
       </h1>
@@ -133,21 +186,25 @@ if (Astro.request.method === 'POST') {
         <div style="background:rgba(160,66,30,0.08); border:1px solid rgba(160,66,30,0.4); color:var(--rust); padding:12px 16px; border-radius:8px; margin-top:24px; font-family:'Inter Tight',sans-serif; font-size:13.5px;">{errorMsg}</div>
       )}
 
-      {!requireFace && (
+      {noticeMsg && (
+        <div style="background:rgba(160,66,30,0.05); border:1px solid rgba(160,66,30,0.25); color:var(--ink-500); padding:12px 16px; border-radius:8px; margin-top:24px; font-family:'Inter Tight',sans-serif; font-size:13.5px;">{noticeMsg}</div>
+      )}
+
+      {showPasswordForm && (
         <form method="POST" style="margin-top:32px; display:flex; flex-direction:column; gap:18px;">
           <div>
-            <label for="email" style="display:block; font-family:'Inter Tight',sans-serif; font-size:11px; letter-spacing:0.16em; text-transform:uppercase; color:var(--ink-500); margin-bottom:6px; font-weight:600;">Email</label>
-            <input id="email" name="email" type="email" autocomplete="email" required autofocus style="width:100%; padding:11px 14px; border:1px solid var(--rule); border-radius:8px; background:var(--paper); font-family:'Inter Tight',sans-serif; font-size:15px; color:var(--ink); outline:none;" />
+            <label for="email" style="display:block; font-family:'Inter Tight',sans-serif; font-size:11px; letter-spacing:0.16em; text-transform:uppercase; color:var(--ink-500); margin-bottom:6px; font-weight:600;">Email or internal handle</label>
+            <input id="email" name="email" type="text" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="username" required autofocus style="width:100%; padding:11px 14px; min-height:48px; border:1px solid var(--rule); border-radius:8px; background:var(--paper); font-family:'Inter Tight',sans-serif; font-size:15px; color:var(--ink); outline:none;" />
           </div>
           <div>
             <label for="password" style="display:block; font-family:'Inter Tight',sans-serif; font-size:11px; letter-spacing:0.16em; text-transform:uppercase; color:var(--ink-500); margin-bottom:6px; font-weight:600;">Password</label>
-            <input id="password" name="password" type="password" autocomplete="current-password" required style="width:100%; padding:11px 14px; border:1px solid var(--rule); border-radius:8px; background:var(--paper); font-family:'Inter Tight',sans-serif; font-size:15px; color:var(--ink); outline:none;" />
+            <input id="password" name="password" type="password" autocomplete="current-password" required style="width:100%; padding:11px 14px; min-height:48px; border:1px solid var(--rule); border-radius:8px; background:var(--paper); font-family:'Inter Tight',sans-serif; font-size:15px; color:var(--ink); outline:none;" />
           </div>
-          <button type="submit" style="margin-top:8px; background:var(--ink); color:var(--sand-50); padding:13px 24px; border:none; border-radius:6px; font-family:'Inter Tight',sans-serif; font-size:14px; font-weight:600; cursor:pointer; align-self:flex-start;">Sign in &rarr;</button>
+          <button type="submit" style="margin-top:8px; background:var(--ink); color:var(--sand-50); padding:13px 24px; min-height:48px; border:none; border-radius:6px; font-family:'Inter Tight',sans-serif; font-size:14px; font-weight:600; cursor:pointer; align-self:flex-start;">Sign in</button>
         </form>
       )}
 
-      {requireFace && faceDescriptor && (
+      {showCamera && (
         <div style="margin-top:32px; background:var(--paper); border:1px solid var(--rule); border-radius:14px; overflow:hidden;">
           <div style="background:#000; aspect-ratio:3/4; position:relative; max-height:380px;">
             <video id="videoEl" autoplay playsinline muted style="width:100%; height:100%; object-fit:cover; transform:scaleX(-1);"></video>
@@ -158,25 +215,36 @@ if (Astro.request.method === 'POST') {
               <span id="camStatus" style="background:rgba(0,0,0,0.75); color:#fff; font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:0.16em; text-transform:uppercase; padding:5px 14px; border-radius:100px;">Loading face model...</span>
             </div>
           </div>
-          <div style="height:3px; background:var(--rule);">
-            <div id="progFill" style="height:100%; background:var(--rust); width:0%; transition:width 0.4s;"></div>
-          </div>
-          <button id="verifyBtn" type="button" disabled style="width:100%; border:none; font-family:'Inter Tight',sans-serif; font-size:13px; font-weight:600; letter-spacing:0.16em; text-transform:uppercase; padding:16px; cursor:pointer; background:var(--ink); color:var(--sand-50); border-radius:0;">Scanning&hellip;</button>
+          <button id="verifyBtn" type="button" disabled style="width:100%; border:none; font-family:'Inter Tight',sans-serif; font-size:13px; font-weight:600; letter-spacing:0.16em; text-transform:uppercase; padding:16px; min-height:48px; cursor:pointer; background:var(--ink); color:var(--sand-50); border-radius:0;">Preparing camera</button>
         </div>
       )}
 
-      {requireFace && (
+      {showCamera && (
         <form id="faceSuccessForm" method="POST" style="display:none;">
-          <input type="hidden" name="action" value="face_verified"/>
-          <input type="hidden" name="user_id" value={pendingUserId}/>
+          <input type="hidden" name="action" value="second_factor"/>
+          <input type="hidden" name="method" value="face"/>
+          <input type="hidden" name="live_descriptor" id="liveDescriptorField" value=""/>
         </form>
       )}
 
-      {requireFace && (
-        <div style="text-align:center; margin-top:20px;">
+      {requireSecondStep && (
+        <form method="POST" style="margin-top:24px; display:flex; flex-direction:column; gap:14px;">
+          <input type="hidden" name="action" value="second_factor"/>
+          <input type="hidden" name="method" value="totp"/>
+          <div>
+            <label for="code" style="display:block; font-family:'Inter Tight',sans-serif; font-size:11px; letter-spacing:0.16em; text-transform:uppercase; color:var(--ink-500); margin-bottom:6px; font-weight:600;">{offerCode ? 'Authenticator code, or a recovery code' : 'Recovery code'}</label>
+            <input id="code" name="code" type="text" inputmode="text" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="one-time-code" maxlength="16" required style="width:100%; padding:11px 14px; min-height:48px; border:1px solid var(--rule); border-radius:8px; background:var(--paper); font-family:'JetBrains Mono',monospace; font-size:18px; letter-spacing:0.18em; text-align:center; color:var(--ink); outline:none;" />
+          </div>
+          <button type="submit" style="background:var(--ink); color:var(--sand-50); padding:13px 24px; min-height:48px; border:none; border-radius:6px; font-family:'Inter Tight',sans-serif; font-size:14px; font-weight:600; cursor:pointer;">Verify</button>
+        </form>
+      )}
+
+      {requireSecondStep && (
+        <div style="text-align:center; margin-top:16px;">
+          <p style="font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500); margin:0 0 8px; line-height:1.6;">Lost your phone? Use one of the recovery codes you saved. Each one works once.</p>
           <form method="POST" style="display:inline;">
-            <input type="hidden" name="action" value="cancel_face"/>
-            <button type="submit" style="background:transparent; border:none; font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500); cursor:pointer; text-decoration:underline; padding:8px;">Use password instead</button>
+            <input type="hidden" name="action" value="cancel_second_step"/>
+            <button type="submit" style="background:transparent; border:none; font-family:'Inter Tight',sans-serif; font-size:12.5px; color:var(--ink-500); cursor:pointer; text-decoration:underline; padding:12px; min-height:44px;">Use a different account</button>
           </form>
         </div>
       )}
@@ -193,144 +261,92 @@ if (Astro.request.method === 'POST') {
     </div>
   </section>
 
-  {requireFace && faceDescriptor && (
+  {showCamera && (
     <script slot="head" is:inline src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js"></script>
   )}
-  {requireFace && faceDescriptor && (
-    <script is:inline define:vars={{ storedDescriptor: faceDescriptor }}>
+  {showCamera && (
+    <script is:inline>
+    // The enrolled descriptor is NEVER sent to the browser. This captures a live
+    // descriptor and posts it; the comparison and verdict happen server-side.
+    (function () {
       var video = document.getElementById('videoEl');
       var verifyBtn = document.getElementById('verifyBtn');
-      var camStatus = document.getElementById('camStatus');
-      var progFill = document.getElementById('progFill');
-      var verified = false;
-      var attempts = 0;
-      var fvOptions;
-      // Strict match threshold: lower = stricter. 0.6 is face-api's default
-      // "same person" line. 0.6 is face-api's recommended match distance; the
-      // median + 60%-of-readings rule below keeps it from accepting a different
-      // person while not locking out the real user (0.45 was far too strict).
-      var MATCH_THRESHOLD = 0.6;
-      function setStatus(msg, color) { camStatus.style.color = color || '#fff'; camStatus.textContent = msg; }
-      async function init() {
+      var statusEl = document.getElementById('camStatus');
+      var form = document.getElementById('faceSuccessForm');
+      var field = document.getElementById('liveDescriptorField');
+      if (!video || !verifyBtn || !form || !field) return;
+      var submitted = false;
+      var stream = null;
+
+      function setStatus(msg) { if (statusEl) statusEl.textContent = msg; }
+
+      // THE CAMERA IS TURNED OFF EXPLICITLY, ON EVERY EXIT - before the descriptor
+      // is posted, and whenever this page is left. Leaving it to the navigation
+      // keeps the light on through the POST and the next render, and keeps it on
+      // indefinitely for anyone who abandons the face step and types a code
+      // instead. Nothing is stored either way; a camera still running after the
+      // moment it was granted for is its own trust failure.
+      function shutCamera() {
         try {
-          setStatus('Loading high-accuracy model...');
-          progFill.style.width = '20%';
-          var URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
-          await Promise.all([
-            faceapi.nets.ssdMobilenetv1.loadFromUri(URL),
-            faceapi.nets.faceLandmark68Net.loadFromUri(URL),
-            faceapi.nets.faceRecognitionNet.loadFromUri(URL),
-          ]);
-          fvOptions = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
-          progFill.style.width = '60%';
-          var stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 720 } });
-          video.srcObject = stream;
-          progFill.style.width = '100%';
-          setTimeout(function() {
-            progFill.style.display = 'none';
-            verifyBtn.disabled = false;
-            verifyBtn.textContent = 'Verify face';
-            verifyBtn.onclick = doVerify;
-            setStatus('Center face in the oval', '#7dd3a8');
-            autoVerifyLoop();
-          }, 300);
-        } catch (e) { setStatus('Camera error: ' + e.message, '#ef4444'); }
+          if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (_) {} }); }
+        } catch (_) {}
+        stream = null;
+        try { video.pause(); } catch (_) {}
+        try { video.srcObject = null; } catch (_) {}
+        try { video.removeAttribute('src'); } catch (_) {}
       }
-      function storedArr() {
-        var stored = JSON.parse(storedDescriptor);
-        return new Float32Array(Array.isArray(stored) ? stored : Object.values(stored));
+      window.addEventListener('pagehide', shutCamera);
+
+      async function init() {
+        setStatus('Loading face model...');
+        var MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+        ]);
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+        video.srcObject = stream;
+        verifyBtn.disabled = false;
+        verifyBtn.textContent = 'Verify my face';
+        verifyBtn.onclick = capture;
+        setStatus('Position your face in the oval');
       }
-      // ── Liveness: eye-aspect-ratio blink detection (defeats a static photo) ──
-      function eyeAspect(eye) {
-        function d(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
-        return (d(eye[1], eye[5]) + d(eye[2], eye[4])) / (2 * d(eye[0], eye[3]));
-      }
-      // Resolves true once a genuine blink (eyes close then re-open) is seen on a
-      // single face within the window. A photo can't blink, so it never passes.
-      async function requireBlink(timeoutMs) {
-        var start = Date.now();
-        var closed = false;
-        while (Date.now() - start < timeoutMs) {
-          if (verified) return false;
-          try {
-            var all = await faceapi.detectAllFaces(video, fvOptions).withFaceLandmarks();
-            if (all && all.length > 1) return { multi: true };
-            if (all && all.length === 1) {
-              var lm = all[0].landmarks;
-              var e = (eyeAspect(lm.getLeftEye()) + eyeAspect(lm.getRightEye())) / 2;
-              if (e < 0.19) closed = true;
-              else if (e > 0.27 && closed) return true;
-            }
-          } catch (_) {}
-          await new Promise(function(res){ setTimeout(res, 90); });
-        }
-        return false;
-      }
-      // One verification attempt = strict identity match. The blink liveness gate
-      // was removed (it locked real users out across cameras/lighting); the strict
-      // match below already rejects multiple faces and low-confidence frames.
-      async function runVerification(isAuto) {
-        setStatus('Verifying identity… hold still', '#fbbf24');
-        var v = await verifyStrict();
-        if (v.ok) { onVerified(); return; }
-        if (isAuto) { setStatus('Center face in the oval', '#7dd3a8'); setTimeout(autoVerifyLoop, 500); }
-        else { setStatus(v.msg || 'Face not recognised. Try again.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
-      }
-      // One strict reading: requires exactly one clear, close, confident face,
-      // and returns its distance to the enrolled signature (or null on reject).
-      async function measureOnce() {
-        var all = await faceapi.detectAllFaces(video, fvOptions).withFaceLandmarks().withFaceDescriptors();
-        if (!all || all.length === 0) return { reject: 'no_face' };
-        if (all.length > 1) return { reject: 'multiple' };
-        var d = all[0];
-        if ((d.detection.score || 0) < 0.6) return { reject: 'low_conf' };
-        var vw = video.videoWidth || 640;
-        if (d.detection.box.width < vw * 0.22) return { reject: 'too_small' };
-        return { dist: faceapi.euclideanDistance(d.descriptor, storedArr()) };
-      }
-      // Multi-frame decision: sample several readings, require the MEDIAN
-      // distance under threshold AND a majority of frames to agree. This stops
-      // a single lucky frame (or a different person) from passing.
-      async function verifyStrict() {
-        var dists = [];
-        var samples = 0;
-        var lastReject = '';
-        while (samples < 5) {
-          var r = await measureOnce();
-          if (r.reject) { lastReject = r.reject; if (r.reject === 'multiple') return { ok: false, msg: 'Only your face should be visible.' }; }
-          else { dists.push(r.dist); }
-          samples++;
-          await new Promise(function(res){ setTimeout(res, 140); });
-        }
-        if (dists.length < 3) {
-          var m = lastReject === 'too_small' ? 'Move closer to the camera.' : lastReject === 'low_conf' ? 'Face not clear - improve lighting.' : 'Center your face in the oval.';
-          return { ok: false, msg: m, soft: true };
-        }
-        dists.sort(function(a,b){ return a-b; });
-        var median = dists[Math.floor(dists.length / 2)];
-        var passing = dists.filter(function(x){ return x < MATCH_THRESHOLD; }).length;
-        // Median must clear the strict line AND most frames must agree.
-        return { ok: (median < MATCH_THRESHOLD && passing >= Math.ceil(dists.length * 0.6)) };
-      }
-      async function autoVerifyLoop() {
-        if (verified || attempts > 6) { if (attempts > 6) setStatus('Tap "Verify face" to try again.', '#fbbf24'); return; }
-        attempts++;
-        try { await runVerification(true); } catch(_) { setTimeout(autoVerifyLoop, 600); }
-      }
-      async function doVerify() {
+
+      async function capture() {
+        if (submitted) return;
         verifyBtn.disabled = true;
-        verifyBtn.textContent = 'Verifying...';
-        try { await runVerification(false); }
-        catch (e) { setStatus('Error: ' + e.message, '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try again'; }
+        verifyBtn.textContent = 'Checking';
+        setStatus('Scanning...');
+        try {
+          var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+            .withFaceLandmarks(true).withFaceDescriptor();
+          if (!det) {
+            setStatus('No face detected. Try again in better light.');
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = 'Try again';
+            return;
+          }
+          submitted = true;
+          field.value = JSON.stringify(Array.prototype.slice.call(det.descriptor));
+          // Camera off BEFORE anything is posted. The frame it came from is never
+          // drawn to a canvas, never uploaded, and does not outlive this line.
+          shutCamera();
+          setStatus('Sending for verification...');
+          form.submit();
+        } catch (e) {
+          setStatus('Camera error. Use a code instead.');
+          verifyBtn.disabled = false;
+          verifyBtn.textContent = 'Try again';
+        }
       }
-      function onVerified() {
-        verified = true;
-        setStatus('Verified. Signing you in...', '#7dd3a8');
-        verifyBtn.textContent = 'Verified';
-        verifyBtn.style.background = '#3f8a64';
-        setTimeout(function() { document.getElementById('faceSuccessForm').submit(); }, 600);
-      }
-      init();
+
+      init().catch(function () {
+        setStatus('Camera unavailable. Use a code instead.');
+        verifyBtn.textContent = 'Camera unavailable';
+      });
+    })();
     </script>
   )}
+
 </AquintutorLayout>

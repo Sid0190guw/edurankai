@@ -76,8 +76,16 @@ import {
   type DayTotals,
   type Timesheet,
 } from '@/lib/attendance';
+import {
+  hasFaceEnrolment,
+  declinedVerification,
+  verificationLine,
+  verificationBadge,
+  needsHumanLook,
+} from '@/lib/attendance-verify';
 
 const PATH = '/portal/employee/attendance';
+const PUNCH_API = '/api/portal/attendance/punch';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
@@ -114,6 +122,15 @@ function sourceWord(source: string | null): string {
   return '';
 }
 
+/** Which tone the verification badge takes. A function, not a JSX-indexed map. */
+function badgeClass(outcome: string | null): string {
+  if (outcome === 'match') return 'vbadge good';
+  // 'look' is amber, and it means SOMEBODY SHOULD GLANCE AT THIS - never red, because red on an
+  // employee's own attendance reads as an accusation, and a mismatch decides nothing.
+  if (needsHumanLook(outcome)) return 'vbadge look';
+  return 'vbadge';
+}
+
 const clockTime = (iso: string | null) => {
   if (!iso) return '';
   const d = new Date(iso);
@@ -138,6 +155,7 @@ const employeeId = workspace ? workspace.employeeId : '';
 let flash = '';
 let flashError = '';
 let advisory = '';
+let verifyNote = '';
 
 // ------------------------------------------------------------------------------------------------
 // THE WRITE. One action, and it is re-checked inside the engine on the posted value.
@@ -152,6 +170,16 @@ if (Astro.request.method === 'POST' && employeeId) {
       const latRaw = String(form.get('lat') || '');
       const lonRaw = String(form.get('lon') || '');
       const accRaw = String(form.get('acc') || '');
+      // THIS IS THE NO-JAVASCRIPT PATH, AND IT IS A REAL PATH, NOT A DEGRADED ONE.
+      //
+      // A plain form POST cannot run a camera, so it records an HONEST 'no_capture' — a punch that
+      // was not face-checked, labelled as one. It is deliberately NOT refused and deliberately not
+      // left blank: refusing would lock out anybody without JavaScript, a working camera or the
+      // patience for either, and leaving it blank would let an unverified punch pass for a verified
+      // one on the screens that read the column.
+      //
+      // declinedVerification() is the only shape this path can produce. There is no request field
+      // that could turn it into a pass, here or in /api/portal/attendance/punch.
       const res = await punch(employeeId, kind, {
         lat: latRaw ? Number(latRaw) : null,
         lon: lonRaw ? Number(lonRaw) : null,
@@ -160,10 +188,12 @@ if (Astro.request.method === 'POST' && employeeId) {
         workMode: String(form.get('mode') || 'remote'),
         ipAddress: Astro.request.headers.get('x-forwarded-for'),
         deviceInfo: Astro.request.headers.get('user-agent'),
+        verification: declinedVerification('no_capture'),
       });
       if (res.ok) {
         flash = punchLabel(kind) + ' recorded.';
         advisory = res.advisory || '';
+        verifyNote = verificationLine(res.verification ? res.verification.outcome : null);
       } else {
         // NEVER SWALLOWED. The engine's sentence is shown as it is, including the database's own
         // reason when the write itself failed. A punch that silently did nothing is how somebody
@@ -199,6 +229,11 @@ let upcomingHolidays: any[] = [];
 let breaks: any[] = [];
 let punctualityNote = '';
 let overtimeMinutes = 0;
+// Whether to OFFER the camera, and whether to invite an enrolment. A boolean and nothing else — this
+// page never needs the enrolled descriptor to draw a viewfinder, and shipping one to the browser is
+// the exact defect src/lib/auth/face.ts was written to close (read it out of the page source, replay
+// it, distance zero). Someone with no enrolment is never locked out; they are invited.
+let faceEnrolled = false;
 
 if (employeeId && now) {
   const events = await punchesOn(employeeId, now);
@@ -213,6 +248,7 @@ if (employeeId && now) {
   punctualityNote = punct.sentence || '';
   const against = await dayAgainstShift(employeeId, now);
   overtimeMinutes = against ? against.overtimeMinutes : 0;
+  faceEnrolled = await hasFaceEnrolment(String(user.id));
 }
 
 const prevWeek = sheet ? shiftDateIso(sheet.weekStart, -7) : '';
@@ -297,6 +333,32 @@ const balanceMinutes = sheet ? sheet.totalMinutes - sheet.expectedMinutes : 0;
       font-size:0.8125rem;font-weight:600;text-decoration:none;}
     .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;
       line-height:1.6;color:#70685C;}
+    /* THE FACE PANEL. Hidden until the script un-hides it, so a browser with no camera and no
+       JavaScript never sees a control that does nothing. 360px first: the viewfinder is fluid and
+       every control clears 44px. */
+    .facebox{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .facebox h3{margin:0 0 6px;font-size:0.875rem;font-weight:680;}
+    .facebox p{margin:0 0 8px;font-size:0.8125rem;line-height:1.55;color:#564E43;}
+    .privacy{margin:0 0 10px;padding:10px 12px;border:1px solid #D6D2EC;border-radius:10px;
+      background:#F5F3FD;font-size:0.8125rem;line-height:1.55;color:#312A5B;}
+    .privacy b{font-weight:680;}
+    .viewer{position:relative;width:100%;max-width:320px;margin:0 auto 10px;aspect-ratio:3/4;
+      border-radius:12px;overflow:hidden;background:#1B1813;}
+    .viewer video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block;}
+    .facebtns{display:flex;flex-wrap:wrap;gap:8px;}
+    .facebtns button{flex:1 1 100%;min-height:48px;padding:12px 14px;border-radius:10px;font:inherit;
+      font-size:0.9375rem;font-weight:650;cursor:pointer;border:1px solid #1B1813;
+      background:#1B1813;color:#FFFFFF;}
+    .facebtns button.soft{border-color:#DFDCD8;background:#FDFDFC;color:#1B1813;}
+    .facebtns button:focus-visible{outline:2px solid #6F52E5;outline-offset:2px;}
+    .facestate{margin:8px 0 0;font-size:0.8125rem;line-height:1.55;color:#564E43;}
+    .vbadge{display:inline-flex;align-items:center;gap:5px;margin-top:4px;padding:3px 8px;
+      border:1px solid #DFDCD8;border-radius:999px;background:#F4F3F0;
+      font-size:0.6875rem;font-weight:650;color:#564E43;}
+    .vbadge svg{width:12px;height:12px;flex:none;}
+    .vbadge.good{border-color:#CBE3D2;background:#F1F8F3;color:#1F5132;}
+    .vbadge.look{border-color:#EADECD;background:#FBF7F1;color:#6D470D;}
+    @media (min-width:480px){ .facebtns button{flex:1 1 45%;} }
     @media (min-width:640px){ .field{flex:1 1 240px;} }
   </style>
 </head>
@@ -336,6 +398,7 @@ const balanceMinutes = sheet ? sheet.totalMinutes - sheet.expectedMinutes : 0;
     )}
 
     {flash && <p class="ok">{flash}</p>}
+    {verifyNote && <p class="notice">{verifyNote}</p>}
     {advisory && <p class="notice">{advisory} This is a note kept with your punch. It changes nothing about your day and nobody is penalised by it.</p>}
     {flashError && <p class="bad">{flashError}</p>}
 
@@ -353,11 +416,15 @@ const balanceMinutes = sheet ? sheet.totalMinutes - sheet.expectedMinutes : 0;
           <div class="stat"><b>{todayShift ? shiftSummary(todayShift) : 'None'}</b><span>rostered shift</span></div>
         </div>
 
-        <form method="POST" action={PATH}>
+        <form method="POST" action={PATH} id="punch-form">
           <input type="hidden" name="action" value="punch" />
           <input type="hidden" name="lat" id="geo-lat" value="" />
           <input type="hidden" name="lon" id="geo-lon" value="" />
           <input type="hidden" name="acc" id="geo-acc" value="" />
+          {/* Carries the punch kind on the one path that has no submit button: the native fallback
+              the script uses when the API itself cannot be reached. DISABLED, so it is not
+              submitted on any ordinary press and the button's own name/value wins. */}
+          <input type="hidden" name="kind" id="fallback-kind" value="" disabled />
 
           <label class="lab" for="mode">Where are you working from</label>
           <select class="field" id="mode" name="mode">
@@ -384,6 +451,46 @@ const balanceMinutes = sheet ? sheet.totalMinutes - sheet.expectedMinutes : 0;
             ))}
           </div>
         </form>
+
+        {/* THE CAPTURE PANEL.
+            data-* attributes rather than define:vars, which cannot be combined with is:inline on
+            this project. Hidden until the script un-hides it: a browser with no camera API keeps the
+            plain buttons above and never sees a control that would do nothing. */}
+        <div class="facebox" id="face-panel" hidden data-api={PUNCH_API} data-enrolled={faceEnrolled ? '1' : '0'}>
+          <h3>Face check</h3>
+
+          {/* SAID AT THE MOMENT OF CAPTURE, NOT BURIED IN A POLICY. A person is entitled to know
+              what a camera pointed at their face is doing, while it is pointed at their face. */}
+          <p class="privacy">
+            <b>No photo is taken and none is kept.</b> The camera preview stays on this phone. What is
+            checked is a mathematical signature of your face - 128 numbers - which is compared on our
+            server against the one you enrolled, and then discarded. Nothing is uploaded, saved to
+            your record or shown to anybody, and there is no image of you stored anywhere from this.
+          </p>
+
+          <div class="viewer" id="face-viewer" hidden>
+            {/* playsinline AND muted: iOS Safari refuses to play an inline camera stream without
+                both, and takes the video full screen instead. autoplay for everyone else. */}
+            <video id="face-video" playsinline autoplay muted></video>
+          </div>
+
+          <p class="facestate" id="face-state"></p>
+
+          <div class="facebtns">
+            <button type="button" id="face-skip" class="soft" hidden>Record without the face check</button>
+            <button type="button" id="face-cancel" class="soft" hidden>Cancel and turn the camera off</button>
+          </div>
+
+          {!faceEnrolled && (
+            <p class="hint">
+              No face is enrolled on your account yet, so there is nothing to check against and your
+              punches are recorded without one. That is entirely fine and nothing is marked against
+              you. If you would like to use it, <a href="/portal/face-setup">enrol your face</a> -
+              it takes about a minute, and it is one of several ways to sign in, never an extra
+              hurdle on top of your password.
+            </p>
+          )}
+        </div>
       </section>
     )}
 
@@ -433,6 +540,19 @@ const balanceMinutes = sheet ? sheet.totalMinutes - sheet.expectedMinutes : 0;
                 {e.lat !== null && e.lon !== null ? 'A location reading was kept with this punch. ' : 'No location reading.'}
                 {e.accuracy !== null && e.accuracy > 200 ? 'The phone called it accurate to about ' + Math.round(e.accuracy) + ' m.' : ''}
               </small>
+              {/* AN UNVERIFIED PUNCH IS VISIBLY UNVERIFIED. Without this the feature means nothing:
+                  a check nobody can see the result of is a check nobody ran. Monochrome inline SVG,
+                  never an emoji. */}
+              <span class={badgeClass(e.faceOutcome)}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path>
+                  {e.faceVerified === true && <path d="M9 12l2 2 4-4"></path>}
+                  {e.faceVerified !== true && <path d="M12 9v3.5"></path>}
+                  {e.faceVerified !== true && <path d="M12 16h.01"></path>}
+                </svg>
+                {verificationBadge(e.faceOutcome)}
+              </span>
             </li>
           ))}
         </ul>
@@ -505,6 +625,16 @@ const balanceMinutes = sheet ? sheet.totalMinutes - sheet.expectedMinutes : 0;
     )}
 
     <p class="foot">
+      The face check never stores a photograph. Your camera stays on your own device, the frame is
+      discarded the moment a signature is read from it, and only that signature - 128 numbers - is
+      sent to be compared against the one you enrolled. It is compared and then dropped. What is kept
+      beside your punch is the answer: checked, or not checked. A check that does not match never
+      refuses your punch, never reduces your hours and never decides anything on its own; it is
+      marked for a person to look at, because cameras and lighting fail far more often than people
+      do. You can record every punch without a face check and nothing is held against you for it.
+    </p>
+
+    <p class="foot">
       Your punches are recorded against your own employee record and nobody else's. A location
       reading or a scanned station code is kept as evidence beside a punch and is never used to
       refuse one, mark one as suspicious or reduce anybody's hours: a person decides what a reading
@@ -540,6 +670,311 @@ const balanceMinutes = sheet ? sheet.totalMinutes - sheet.expectedMinutes : 0;
           },
           { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
         );
+      });
+    })();
+  </script>
+
+  <script is:inline>
+    // =============================================================================================
+    // FACE CHECK AT THE MOMENT OF PUNCHING. NO IMAGE LEAVES THIS DEVICE, AND NONE IS KEPT ON IT.
+    // =============================================================================================
+    //
+    // WHAT THIS SENDS: 128 numbers. That is the whole payload. The camera frame is never drawn to a
+    // canvas by this page, never turned into a data URI, never put in a FormData, never uploaded.
+    // The model reads the live <video> element directly and returns a descriptor; shutCamera() then
+    // stops every MediaStream track (so the camera light goes out), pauses the element, drops
+    // srcObject and hides the viewer. That happens BEFORE the descriptor is posted, on every exit
+    // path including cancel, failure and leaving the page.
+    //
+    // WHAT THIS DOES NOT SEND: a distance, a score, a verdict. The comparison is done on the server
+    // against a descriptor the server never hands out. Nothing this file could lie about would
+    // change the answer.
+    //
+    // PROGRESSIVE ENHANCEMENT, AND THE FALLBACKS ARE REAL PATHS.
+    //   - No JavaScript: the punch buttons above are an ordinary form POST. Recorded, unverified.
+    //   - No camera API, camera refused, camera broken, no face found, model would not download:
+    //     the punch is still recorded, unverified, and the screen says which of those happened.
+    //   - No face enrolled: no camera is opened at all - there would be nothing to compare against -
+    //     and the panel invites an enrolment instead of blocking a punch.
+    //   - The API itself unreachable: nativeFallback() submits the plain form, so the worst case is
+    //     still a recorded punch.
+    // NOTHING HERE CAN REFUSE A PUNCH. There is no branch in this file that ends without one.
+    //
+    // LAZY: the model script and its weights are requested on the FIRST TAP of a punch button and
+    // never before, so anybody who opens this page to read their timesheet downloads none of it.
+    // iOS: getUserMedia is called synchronously inside the click gesture (an await before it breaks
+    // the gesture chain and Safari refuses), and the element carries playsinline + muted or Safari
+    // takes it full screen.
+    (function () {
+      var panel = document.getElementById('face-panel');
+      var form = document.getElementById('punch-form');
+      if (!panel || !form) return;
+
+      var video = document.getElementById('face-video');
+      var viewer = document.getElementById('face-viewer');
+      var state = document.getElementById('face-state');
+      var skipBtn = document.getElementById('face-skip');
+      var cancelBtn = document.getElementById('face-cancel');
+      var fallbackKind = document.getElementById('fallback-kind');
+      var api = panel.getAttribute('data-api') || '';
+      var enrolled = panel.getAttribute('data-enrolled') === '1';
+      var hasCam = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.fetch);
+
+      // DELIBERATELY THE SAME TWO URLS AS /portal/enroll-face, CHARACTER FOR CHARACTER.
+      //
+      // A descriptor is only comparable to one produced by the same pipeline: the same recognition
+      // weights, aligned by the same landmark net. Verification that loaded a different build than
+      // enrolment would drift the distance for reasons that have nothing to do with whose face it
+      // is, and the person would be told their own face did not match. Matching the URLs also means
+      // anybody who has already enrolled has all of this in their HTTP cache.
+      //
+      // FOLLOW-UP, AND IT BELONGS TO ENROLMENT AS MUCH AS TO THIS PAGE: the model URL floats on
+      // @latest while the library is pinned. If the CDN's @latest ever moves, descriptors enrolled
+      // before the move stop matching descriptors captured after it - for everybody at once, with no
+      // error anywhere, looking exactly like every employee's face suddenly changed. Pinning it is a
+      // one-word change; it needs doing in the same commit in all three places (this page,
+      // /portal/enroll-face, /portal/face-setup) or it causes the very drift it prevents.
+      var LIB = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js';
+      var MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
+
+      var stream = null;
+      var busy = false;
+      var lastBtn = null;
+      var libP = null;
+
+      panel.hidden = false;
+
+      function say(t) { if (state) state.textContent = t; }
+
+      // EVERY TRACE OF THE CAMERA, GONE. Called on success, failure, cancel and page hide.
+      function shutCamera() {
+        try { if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (_) {} }); } } catch (_) {}
+        stream = null;
+        try { video.pause(); } catch (_) {}
+        try { video.srcObject = null; } catch (_) {}
+        try { video.removeAttribute('src'); } catch (_) {}
+        viewer.hidden = true;
+        cancelBtn.hidden = true;
+      }
+
+      function val(id) {
+        var el = document.getElementById(id);
+        return el && el.value ? el.value : null;
+      }
+
+      function reload() { window.location.href = window.location.pathname + window.location.search; }
+
+      // LAST RESORT: the API could not be reached at all. Submit the plain form so the person still
+      // gets their punch. form.submit() does not fire the submit listener, so this cannot loop.
+      function nativeFallback(kind) {
+        try {
+          fallbackKind.value = kind;
+          fallbackKind.disabled = false;
+          form.submit();
+        } catch (_) {
+          say('We could not reach the server to record that. Check your connection and try again - nothing has been recorded yet, and nothing is lost.');
+          busy = false;
+        }
+      }
+
+      function post(kind, descriptor, skip) {
+        var body = {
+          kind: kind,
+          lat: val('geo-lat'), lon: val('geo-lon'), acc: val('geo-acc'),
+          qr: val('qr'), mode: val('mode') || 'remote'
+        };
+        // Either a descriptor or an explicit skip. There is no third field, and no field that
+        // asserts a result - the server would not read one.
+        if (skip) { body.skipFace = true; } else { body.descriptor = descriptor; }
+        return fetch(api, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify(body)
+        }).then(function (r) {
+          return r.json().catch(function () {
+            return { ok: false, error: 'The server answered in a way we could not read. Reload the page to see whether your punch was recorded.' };
+          });
+        });
+      }
+
+      // Load the model only when somebody actually punches. Failure clears the cache so a second
+      // tap retries rather than the whole feature staying broken for the life of the page.
+      function loadLib() {
+        if (libP) return libP;
+        libP = new Promise(function (res, rej) {
+          if (window.faceapi) { res(); return; }
+          var s = document.createElement('script');
+          s.src = LIB;
+          s.async = true;
+          s.onload = function () { res(); };
+          s.onerror = function () { rej(new Error('face-model-script')); };
+          document.head.appendChild(s);
+        }).then(function () {
+          var f = window.faceapi;
+          if (!f) throw new Error('face-model-script');
+          var back = Promise.resolve();
+          if (f.tf) {
+            // The backend must be initialised before detection or detect() throws "backend not
+            // initialized". WebGL where it exists, wasm where it does not.
+            back = Promise.resolve()
+              .then(function () { return f.tf.setBackend('webgl'); })
+              .catch(function () { return f.tf.setBackend('wasm'); })
+              .catch(function () {})
+              .then(function () { return f.tf.ready ? f.tf.ready() : null; })
+              .catch(function () {});
+          }
+          return back.then(function () {
+            return Promise.all([
+              f.nets.tinyFaceDetector.loadFromUri(MODELS),
+              f.nets.faceLandmark68TinyNet.loadFromUri(MODELS),
+              f.nets.faceRecognitionNet.loadFromUri(MODELS)
+            ]);
+          });
+        }).catch(function (e) { libP = null; throw e; });
+        return libP;
+      }
+
+      // Read the LIVE ELEMENT. No canvas is created here and no frame object outlives this call.
+      function grab() {
+        var f = window.faceapi;
+        var opts = new f.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+        var deadline = Date.now() + 12000;
+        function tick() {
+          return f.detectSingleFace(video, opts).withFaceLandmarks(true).withFaceDescriptor()
+            .then(function (d) {
+              if (d && d.descriptor) return Array.prototype.slice.call(d.descriptor);
+              if (Date.now() > deadline) return null;
+              return new Promise(function (r) { setTimeout(r, 250); }).then(tick);
+            });
+        }
+        return tick();
+      }
+
+      function finish(res, kind) {
+        busy = false;
+        skipBtn.hidden = true;
+        if (!res || !res.ok) {
+          say((res && res.error) || 'That could not be recorded. Nothing is lost - try again.');
+          return;
+        }
+        // The outcome sentence comes from the server, so the screen cannot claim a pass the server
+        // did not measure. The badge on the punch below is the permanent record of it.
+        say(res.verificationLine || 'Recorded.');
+        setTimeout(reload, 4500);
+      }
+
+      function camFail(e, kind) {
+        shutCamera();
+        busy = false;
+        var name = (e && (e.name || e.message)) + '';
+        var why = /NotAllowed|Security|denied|permission/i.test(name)
+          ? 'The camera was not allowed, so there is no face check on this punch.'
+          : /NotFound|DevicesNotFound/i.test(name)
+          ? 'No camera was found on this device, so there is no face check on this punch.'
+          : /NotReadable|TrackStart/i.test(name)
+          ? 'The camera is being used by another app, so there is no face check on this punch.'
+          : /face-model-script/i.test(name)
+          ? 'The face model could not be downloaded, so there is no face check on this punch.'
+          : 'The face check could not run, so there is none on this punch.';
+        say(why + ' Your attendance is not affected: tap the button below and it is recorded without one. Nothing is marked against you for this.');
+        skipBtn.hidden = false;
+        skipBtn.setAttribute('data-kind', kind);
+      }
+
+      // Remember which button was pressed, for browsers without event.submitter.
+      var btns = form.querySelectorAll('button[type="submit"]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].addEventListener('click', function () { lastBtn = this; });
+      }
+
+      skipBtn.addEventListener('click', function () {
+        var kind = skipBtn.getAttribute('data-kind') || (lastBtn && lastBtn.value) || '';
+        if (!kind || busy) return;
+        busy = true;
+        shutCamera();
+        say('Recording without a face check.');
+        post(kind, null, true)
+          .then(function (r) { finish(r, kind); })
+          .catch(function () { nativeFallback(kind); });
+      });
+
+      cancelBtn.addEventListener('click', function () {
+        shutCamera();
+        busy = false;
+        say('Camera off. Nothing was captured or sent. You can punch again whenever you are ready.');
+        skipBtn.hidden = false;
+      });
+
+      // Leaving the page must never leave a camera running.
+      window.addEventListener('pagehide', shutCamera);
+
+      if (!hasCam) {
+        say('This browser cannot open a camera for us, so your punches are recorded without a face check. That is fine and nothing is marked against you.');
+        return;
+      }
+      if (!enrolled) {
+        // Nothing to compare against. Opening a camera would be intrusive and pointless, so the
+        // plain form POST is left to do its job and the panel above invites an enrolment.
+        return;
+      }
+
+      form.addEventListener('submit', function (ev) {
+        var btn = ev.submitter || lastBtn;
+        var kind = btn && btn.value ? btn.value : '';
+        if (!kind) return;              // nothing identifiable was pressed: let the form do its job
+        if (busy) { ev.preventDefault(); return; }
+
+        ev.preventDefault();
+        busy = true;
+        skipBtn.hidden = false;
+        skipBtn.setAttribute('data-kind', kind);
+        cancelBtn.hidden = false;
+        say('Starting the camera. No photo is taken and nothing is uploaded.');
+
+        // FIRST, INSIDE THE GESTURE. iOS Safari refuses a camera started after an await.
+        var camP;
+        try {
+          camP = navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 480 } },
+            audio: false
+          });
+        } catch (e) { camP = Promise.reject(e); }
+
+        camP.then(function (s) {
+          stream = s;
+          video.setAttribute('playsinline', '');
+          video.muted = true;
+          video.srcObject = s;
+          viewer.hidden = false;
+          var p = video.play();
+          if (p && p.catch) { p.catch(function () {}); }
+          say('Look at the camera. The picture stays on this phone and only a signature is checked.');
+          return loadLib();
+        }).then(function () {
+          say('Checking your face. No photo is being taken.');
+          return grab();
+        }).then(function (descriptor) {
+          // CAMERA OFF AND FRAME DROPPED BEFORE ANYTHING IS SENT.
+          shutCamera();
+          if (!descriptor) {
+            say('We could not find a face clearly enough in the time we allowed. Recording your punch without a face check - nothing is marked against you.');
+            return post(kind, null, true);
+          }
+          say('Checking with the server. Your punch is being recorded either way.');
+          return post(kind, descriptor, false);
+        }).then(function (res) {
+          finish(res, kind);
+        }).catch(function (e) {
+          // A fetch failure is the one case where the punch has not been recorded at all, so it
+          // falls back to the plain form rather than being reported as a face problem.
+          if (e && /fetch|network|Failed to fetch/i.test((e.message || '') + '')) {
+            shutCamera();
+            nativeFallback(kind);
+            return;
+          }
+          camFail(e, kind);
+        });
       });
     })();
   </script>

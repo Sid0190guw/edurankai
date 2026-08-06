@@ -51,6 +51,16 @@ import { db } from './db';
 import { sql } from 'drizzle-orm';
 import { ensureAttendanceSchema, ensureWorkingTimeSchema } from './attendance-schema';
 import { startWorkflow, resumeWorkflow, instanceForRecord, type WorkflowInstanceRow } from './workflow';
+// FACE VERIFICATION IS AN OUTCOME THIS FILE RECORDS, NOT A CHECK IT PERFORMS. The comparison lives
+// in src/lib/attendance-verify.ts (which owns the descriptor and drops it) and its result arrives
+// here already decided, by the server, in a shape no request body can produce. This file never sees
+// a descriptor and never sees an image. The import is one-directional — attendance-verify.ts
+// imports nothing from here — so there is no cycle.
+import {
+  ensureFaceVerifySchema,
+  dayVerification,
+  type PunchVerification,
+} from './attendance-verify';
 
 // -------------------------------------------------------------------------------------------------
 // MODULE CONSTANTS — all above their first use.
@@ -940,6 +950,17 @@ export interface PunchEvidence {
   note?: string | null;
   ipAddress?: string | null;
   deviceInfo?: string | null;
+  /**
+   * THE RESULT of a face check that the SERVER already ran, or null when none was attempted.
+   *
+   * NOT A DESCRIPTOR, NOT A DISTANCE, NOT AN IMAGE — there is no field on this interface that could
+   * carry any of those and no column to put them in. The caller obtains this by awaiting
+   * verifyPunchFace() or declinedVerification() in src/lib/attendance-verify.ts; it is never parsed
+   * out of a request body, so a browser cannot post `{ verified: true }` and be believed.
+   *
+   * A FAILED CHECK NEVER REFUSES THE PUNCH. It is recorded beside it, exactly as a poor GPS fix is.
+   */
+  verification?: PunchVerification | null;
 }
 
 export interface PunchResult extends WriteResult {
@@ -950,6 +971,14 @@ export interface PunchResult extends WriteResult {
    * must never be rendered as a warning about the employee. Null when there is nothing to say.
    */
   advisory?: string | null;
+  /**
+   * The face-check outcome that was written beside this punch, echoed back so the caller can say so
+   * on screen without a second read. Null when no check was attempted.
+   *
+   * A punch is `ok: true` whether this verified or not. That is the point: the outcome is a label on
+   * a recorded fact, never a gate in front of one.
+   */
+  verification?: PunchVerification | null;
 }
 
 /** Today's punches for one employee, oldest first. */
@@ -984,15 +1013,24 @@ export interface PunchRow extends PunchEvent {
   stationLabel: string | null;
   qrCodeRaw: string | null;
   source: string | null;
+  /**
+   * What the face check found, or null when none ran. THE OUTCOME ONLY — there is no descriptor and
+   * no image to select, because none was ever stored. Rendered by verificationBadge() in
+   * src/lib/attendance-verify.ts so an unverified punch is visibly unverified.
+   */
+  faceVerified: boolean | null;
+  faceOutcome: string | null;
 }
 
 export async function punchLog(employeeId: string, dateIso: string): Promise<PunchRow[]> {
   if (!isUuid(employeeId) || !isDateIso(dateIso)) return [];
   try {
     await ensureAttendanceSchema();
+    await ensureFaceVerifySchema();
     const r = await db.execute(sql`
       SELECT c.event_type, c.event_time, c.lat, c.lon, c.accuracy, c.location_name,
-             c.qr_code_raw, c.source, s.label AS station_label
+             c.qr_code_raw, c.source, c.face_verified, c.face_verify_outcome,
+             s.label AS station_label
         FROM hr_clock_events c
         LEFT JOIN hr_attendance_qr_stations s ON s.id = c.qr_station_id
        WHERE c.employee_id = ${employeeId}::uuid
@@ -1010,6 +1048,8 @@ export async function punchLog(employeeId: string, dateIso: string): Promise<Pun
       stationLabel: row?.station_label ? String(row.station_label) : null,
       qrCodeRaw: row?.qr_code_raw ? String(row.qr_code_raw) : null,
       source: row?.source ? String(row.source) : null,
+      faceVerified: row?.face_verified === null || row?.face_verified === undefined ? null : row.face_verified === true,
+      faceOutcome: row?.face_verify_outcome ? String(row.face_verify_outcome) : null,
     }));
   } catch (e: any) {
     logFail('punchLog', e);
@@ -1116,16 +1156,36 @@ export async function punch(
   const advisory = evidenceAdvisory(station, rawCode, goodLat, goodLon, goodAcc);
   const source = rawCode ? 'qr' : 'self';
 
+  // THE FACE-CHECK OUTCOME, AND NOTHING ELSE ABOUT IT.
+  //
+  // Four scalars are lifted out of the result the server already computed: a boolean, two short
+  // words and a timestamp. THERE IS NO DESCRIPTOR HERE AND NO IMAGE HERE, and the INSERT below has
+  // no column that could take one. Note what is NOT done with this value: it is not consulted by
+  // any branch between here and the write. There is deliberately no `if (!verified) return` — a
+  // failed face check records the punch exactly like a passed one and differs only in the label it
+  // carries, because a person who turned up must never lose the record of turning up to a camera.
+  const verification = evidence?.verification || null;
+  const faceVerified = verification ? verification.verified === true : null;
+  const faceMethod = verification ? String(verification.method).slice(0, 20) : null;
+  const faceOutcome = verification ? String(verification.outcome).slice(0, 30) : null;
+  const faceAt = verification && verification.at ? verification.at : null;
+
   try {
     await ensureAttendanceSchema();
+    // Its own ensureOnce key: ensureOnce memoises per key per PROCESS, so a server that has already
+    // resolved 'attendance_v1' would never run statements appended to it. ensureOnce swallows a
+    // failed run for the caller, so a DDL hiccup cannot cost anybody their punch.
+    await ensureFaceVerifySchema();
     await db.execute(sql`
       INSERT INTO hr_clock_events
         (employee_id, event_type, lat, lon, accuracy, location_name, work_mode, note,
-         ip_address, device_info, qr_station_id, qr_code_raw, source)
+         ip_address, device_info, qr_station_id, qr_code_raw, source,
+         face_verified, face_verify_method, face_verify_outcome, face_verified_at)
       VALUES
         (${employeeId}::uuid, ${kind}, ${goodLat}, ${goodLon}, ${goodAcc},
          ${station ? station.label : null}, ${workMode}, ${note},
-         ${ip}, ${device}, ${station ? station.id : null}::uuid, ${rawCode}, ${source})`);
+         ${ip}, ${device}, ${station ? station.id : null}::uuid, ${rawCode}, ${source},
+         ${faceVerified}, ${faceMethod}, ${faceOutcome}, ${faceAt}::timestamptz)`);
   } catch (e: any) {
     logFail('punch.insert', e);
     return { ok: false, error: errText(e, 'The punch could not be recorded.'), totals: before };
@@ -1133,9 +1193,9 @@ export async function punch(
 
   const after = computeDay(await punchesOn(employeeId, day));
   const written = await writeDayFromPunches(employeeId, day, after, workMode);
-  if (!written.ok) return { ...written, totals: after, advisory };
+  if (!written.ok) return { ...written, totals: after, advisory, verification };
 
-  return { ok: true, changed: true, totals: after, advisory };
+  return { ok: true, changed: true, totals: after, advisory, verification };
 }
 
 /**
@@ -1157,14 +1217,32 @@ async function writeDayFromPunches(
   const hours = minutesToHours(totals.workedMinutes);
   try {
     const shift = await shiftOn(employeeId, dateIso);
+
+    // THE DAY'S VERIFICATION IS RECOMPUTED FROM THE PUNCHES, never incremented — the same discipline
+    // work_hours already follows two lines below, and for the same reason: a double-fire cannot then
+    // double-count, and a repaired event log repairs the day the next time anybody punches.
+    //
+    // THREE STATES, and the third one matters. TRUE means every punch today passed a server-side
+    // check; FALSE means at least one did not; NULL means nothing about verification is recorded for
+    // this day at all (HR entered it, approved leave wrote it, or it predates this feature). NULL is
+    // NOT "unverified", and COALESCE below keeps a NULL from overwriting a real answer — otherwise a
+    // later HR edit to the same day would erase the fact that the person verified at 09:02.
+    //
+    // That COALESCE covers face_verified too, and it has to: dayVerification() fails CLOSED to a
+    // NULL summary, so without it one unreadable moment would rewrite a verified day as "nothing
+    // recorded". A real answer still replaces a real answer, true -> false included, because the
+    // summary is recomputed from the punches rather than incremented.
+    const dayFace = await dayVerification(employeeId, dateIso);
+
     await db.execute(sql`
       INSERT INTO hr_attendance
         (employee_id, date, clock_in, clock_out, work_hours, break_minutes, status, work_mode,
-         shift_id, source)
+         shift_id, source, face_verified, face_verify_method, face_verified_at)
       VALUES
         (${employeeId}::uuid, ${dateIso}::date, ${totals.clockIn}::timestamptz,
          ${totals.clockOut}::timestamptz, ${hours}, ${totals.breakMinutes},
-         ${status}, ${workMode}, ${shift ? shift.id : null}::uuid, 'self')
+         ${status}, ${workMode}, ${shift ? shift.id : null}::uuid, 'self',
+         ${dayFace.allVerified}, ${dayFace.method}, ${dayFace.at}::timestamptz)
       ON CONFLICT (employee_id, date) DO UPDATE
         SET clock_in      = EXCLUDED.clock_in,
             clock_out     = EXCLUDED.clock_out,
@@ -1173,6 +1251,9 @@ async function writeDayFromPunches(
             status        = EXCLUDED.status,
             work_mode     = EXCLUDED.work_mode,
             shift_id      = COALESCE(EXCLUDED.shift_id, hr_attendance.shift_id),
+            face_verified      = COALESCE(EXCLUDED.face_verified, hr_attendance.face_verified),
+            face_verify_method = COALESCE(EXCLUDED.face_verify_method, hr_attendance.face_verify_method),
+            face_verified_at   = COALESCE(EXCLUDED.face_verified_at, hr_attendance.face_verified_at),
             source        = 'self'`);
     return { ok: true, changed: true };
   } catch (e: any) {

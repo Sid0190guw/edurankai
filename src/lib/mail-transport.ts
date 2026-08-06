@@ -16,6 +16,17 @@ export interface SendExternalParams {
   messageId?: string;
   inReplyTo?: string;
   attachments?: { filename: string; path?: string; href?: string }[];
+  /**
+   * Write an email_logs row for this send. Default true, because most callers here (password
+   * resets, offer letters, reminders) have no other record of the attempt.
+   *
+   * /api/mail/send and /api/mail/scheduled-send set it FALSE: they log one row per recipient keyed
+   * by the mail_messages UUID, which is what the reading pane and /admin/mail/analytics read. A
+   * second row per send from here would double every status count on that page — and until now it
+   * silently never landed at all, because this function passed an RFC id into a uuid column and
+   * caught the error.
+   */
+  logToDb?: boolean;
 }
 
 export interface SendResult { ok: boolean; provider: 'smtp' | 'resend' | 'none'; id?: string; error?: string; }
@@ -72,9 +83,21 @@ export async function verifySmtp(p: VerifySmtpParams): Promise<{ ok: boolean; de
 export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
   const c = await getMailConfig();
   const toStr = Array.isArray(p.to) ? p.to.join(', ') : p.to;
+  const shouldLog = p.logToDb !== false;
+  // p.messageId is an RFC id ("<uuid@host>"), and email_logs.message_id is uuid-typed. Passing it
+  // there threw into a .catch(() => {}) on every single send, which is why a failed SMTP attempt
+  // could leave no trace anywhere. It has its own column now.
+  const logLine = async (status: string, error: string | null) => {
+    if (!shouldLog) return;
+    try {
+      await logOutbound({ messageId: '', rfcMessageId: p.messageId || null, to: toStr, from: p.from, subject: p.subject, status, provider: status === 'no_transport' ? 'none' : 'smtp', error });
+    } catch (e: any) {
+      console.error('[mail-transport] could not write email_logs:', e?.cause?.message || e?.message);
+    }
+  };
 
   if (!c.smtpHost) {
-    await logOutbound({ messageId: p.messageId || '', to: toStr, from: p.from, subject: p.subject, status: 'no_transport', provider: 'none', error: 'No SMTP configured' }).catch(() => {});
+    await logLine('no_transport', 'No SMTP configured');
     return { ok: false, provider: 'none', error: 'No SMTP transport configured (add your mail server in Mail Settings)' };
   }
 
@@ -129,7 +152,7 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
     if (delays[attempt]) await new Promise((r) => setTimeout(r, delays[attempt]));
     try {
       const info = await transport.sendMail(mail);
-      await logOutbound({ messageId: info.messageId || p.messageId || '', to: toStr, from: fromHeader, subject: p.subject, status: 'sent', provider: 'smtp', error: null }).catch(() => {});
+      await logLine('sent', null);
       try { transport.close(); } catch (_) {}
       return { ok: true, provider: 'smtp', id: info.messageId };
     } catch (e: any) {
@@ -140,6 +163,6 @@ export async function sendExternal(p: SendExternalParams): Promise<SendResult> {
   }
   try { transport.close(); } catch (_) {}
   console.error('[mail-transport] SMTP send failed after retries:', lastErr);
-  await logOutbound({ messageId: p.messageId || '', to: toStr, from: fromHeader, subject: p.subject, status: 'failed', provider: 'smtp', error: lastErr }).catch(() => {});
+  await logLine('failed', lastErr);
   return { ok: false, provider: 'smtp', error: lastErr };
 }

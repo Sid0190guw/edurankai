@@ -870,6 +870,14 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     render: 'list',
     href: null,
     hideWhenEmpty: true,
+    // PAY WAS THE DEEPEST HIGH-FREQUENCY THING IN THIS PORTAL, and there was no reason for it.
+    // The nav entry is drawer-only (correctly — the bar holds three ranked tabs and pay is not a
+    // twice-a-day act), so reaching a payslip meant More, scroll to the Record group, tap. Three
+    // interactions, on the one errand people arrive with a deadline attached to: a rent payment, a
+    // loan application, a visa file. `href` stays null because this widget LISTS payslips inline and
+    // a card that links to itself is a loop; the quick action is the verb form, which is what the
+    // action row is for, and it costs no query — the composer collects it from this definition.
+    quickAction: { label: 'Payslips', href: '/portal/employee/payslips', icon: 'doc' },
     notes:
       'LIVE LIABILITY on the download route, not on this list: src/lib/hr-payslip.ts:24 SELECTs ' +
       'e.work_email, a column NOTHING writes, created at runtime only by an unrelated page\'s bootstrap. ' +

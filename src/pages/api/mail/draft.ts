@@ -3,6 +3,7 @@ import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { deliverMessage, parseAddressList, getMailboxAddress } from '@/lib/mail';
+import { describeLinkList } from '@/lib/mail-links';
 import { denyMailApi } from '@/lib/auth/mail-access';
 
 function json(d: any, s = 200) {
@@ -11,6 +12,8 @@ function json(d: any, s = 200) {
 function escapeHtml(s: string) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+// e.message is only the failed SQL — the reason is on e.cause. Declared above the handler.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 export const POST: APIRoute = async ({ request, locals }) => {
   // Same surface, same gate as send.ts: the only callers are the composers on /admin/mail and

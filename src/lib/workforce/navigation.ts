@@ -38,7 +38,10 @@
 //      forget. What SURVIVES is Home, Profile, and the two entries whose audience is `anyone`:
 //      Learning and Settings. That is checked, not assumed, and it is correct — /portal/courses and
 //      /portal/security each gate on "signed in" and nothing more, which is exactly what a degraded
-//      composition still establishes. Four entries fit the bar, so no More tab appears.
+//      composition still establishes. Four entries survive; three of them take bar slots and the
+//      fourth moves into the drawer, because the More tab is no longer conditional — see `hasMore`.
+//      It carries the account block (who you are signed in as, and sign out), which must exist on a
+//      degraded render too: that is the render where somebody is most likely to want out.
 //      NOTE the ordering consequence: `worksHere` reads ctx.hasEmployeeRecord and ctx.holds(), both
 //      of which are false/empty on a degraded context, so Messages, Meet and Mail drop out too.
 //
@@ -60,10 +63,12 @@ import type { WorkspaceContext } from '@/lib/workforce/widgets';
  * know, and a fallback that renders silently is how two different destinations end up wearing the
  * same picture without anybody noticing.
  *
- * There is no 'menu' glyph over there today, so the More tab reuses 'grid'. Adding one is a one-line
- * change to an existing component and is recorded in the build report rather than made here.
+ * 'menu' EXISTS NOW, AND THE MORE TAB USES IT. It did not, and the More tab reused 'grid' — which is
+ * also Home's glyph, so two of the four tabs wore the same picture. On a 360px bar the labels are
+ * 10px, which makes the icon the primary scan target, and that made Home and More interchangeable at
+ * a glance. Both BottomNav.astro and WorkspaceNav.astro carry the glyph now.
  */
-export type NavIcon = 'grid' | 'message' | 'book' | 'user' | 'calendar' | 'checklist';
+export type NavIcon = 'grid' | 'message' | 'book' | 'user' | 'calendar' | 'checklist' | 'menu';
 
 /** The bands the drawer lays out in. Order here is the order they render in. */
 export type NavGroup = 'workspace' | 'work' | 'communicate' | 'time' | 'record' | 'account';
@@ -264,7 +269,13 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     href: '/portal/messages',
     icon: 'message',
     group: 'communicate',
-    bar: 2,
+    // MOVED OUT OF THE BAR, from rank 2. Three ranked entries reach the bar, so rank 2 was a thumb
+    // slot and this had it. An HRIS workspace is not a chat app: its DM volume is a fraction of its
+    // punch volume, and the daily-open set on a staff portal is attendance, leave, payslips and
+    // tasks. Rank 6 keeps it high in the More drawer, one tap away, and hands the slot to check-in.
+    // It ties with 'meet' at 6; the sort is stable by specification and this entry is declared first,
+    // so Messages wins the tie deterministically rather than by luck.
+    bar: 6,
     audience: worksHere,
     gate: 'Page: signed in (messages.astro:6). Threads are scoped by membership in the query. This entry NARROWS that to people who work here.',
   },
@@ -316,19 +327,25 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     href: '/portal/employee/attendance',
     icon: 'calendar',
     group: 'time',
-    // RANK 3, SHARED WITH 'team', AND THE TIE IS DELIBERATE RATHER THAN AN OVERSIGHT.
-    // buildWorkspaceNav sorts by rank with Array.prototype.sort, which is stable by specification,
-    // so equal ranks keep NAV_DESTINATIONS order — and the `time` group is declared above `record`.
-    // When a department lead is eligible for both, Attendance takes the bar slot and Team moves to
-    // the drawer. That is the right trade: checking in is a daily act performed with one thumb, and
-    // a team roster is a reference somebody opens occasionally. It is deterministic, not luck.
+    // RANK 2, AND THIS IS THE SLOT MESSAGES USED TO HOLD.
+    //
+    // The reasoning below was already written down and the number disagreed with it. Three ranked
+    // entries reach the bar (the fourth slot is always the More tab), so rank 3 was the drawer: an
+    // ordinary employee's bar read Home | Tasks | Messages | More, and clock-in — the one act
+    // performed twice a day by every single person with a record — was two taps behind More. That is
+    // the most repeated action in the product sitting deeper than a DM list.
+    //
+    // At rank 2 the bar reads Home | Tasks | Attendance | More. 'team' keeps rank 3 and moves to the
+    // drawer for a department lead, which is the same trade the old comment argued for and got
+    // wrong by one: checking in is a daily act performed with one thumb, a team roster is a
+    // reference somebody opens occasionally.
     //
     // NOT the same destination as the 'attendance' entry above it. That one opens /portal/workspace,
     // which SHOWS a month of recorded hours alongside credit hours, documents and reviews. This one
     // is the surface a person WRITES from: check in, check out, breaks, the week's timesheet, and
     // the way into a correction request. Two different acts, and merging them would mean the read
     // screen's other four sections sit between somebody and the check-in button.
-    bar: 3,
+    bar: 2,
     // EXACTLY the page's own gate, in the composition's vocabulary. index.astro runs requireEmployee
     // and renders its named denial without one; all three of these widgets carry withEmployeeRecord,
     // so they are true for precisely the accounts the page admits. Gating on the roster-management
@@ -678,17 +695,28 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   },
   {
     key: 'settings',
-    label: 'Settings',
-    href: '/portal/security',
+    label: 'Security',
+    href: '/portal/employee/security',
     icon: 'user',
     group: 'account',
     bar: 14,
     audience: anyone,
-    gate: 'Signed in (security.astro:7). Sign-in methods and 2FA for the signed-in account only.',
+    gate: 'Signed in (portal/employee/security.astro). Sign-in methods, the per-account second-step opt-in, and recovery codes — all scoped to the signed-in account and nobody else.',
   },
   {
     key: 'support',
-    label: 'Support',
+    // RENAMED FROM 'Support', WHICH WAS THE WRONG DOOR WEARING THE OBVIOUS WORD.
+    //
+    // The note below already said this entry must never be worded as a way to raise a workplace
+    // issue — and then it was labelled 'Support', filed under Account, which is the first place
+    // somebody looking for help goes. An employee with a payroll problem landed in a paid
+    // CANDIDATE-facing application-support queue, and the staff helpdesk one group away was called
+    // 'Helpdesk', a word that does not obviously beat 'Support'.
+    //
+    // The label now names the audience. WCAG 2.2 SC 3.2.6 Consistent Help (A) asks that help appear
+    // in a consistent relative order across pages; the deeper fix is that the two labels no longer
+    // invert the routing. Copy only — no gate, no query and no schema behind this change.
+    label: 'Application support (candidates)',
     href: '/portal/hr-support',
     icon: 'message',
     group: 'account',
@@ -704,7 +732,11 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   // ---------------------------------------------------------------- workplace services
   {
     key: 'helpdesk',
-    label: 'Helpdesk',
+    // RENAMED FROM 'Helpdesk'. This is the door a member of staff with a workplace problem wants,
+    // and it now says so in the words somebody in trouble actually reaches for. Its counterpart in
+    // the Account group is 'Application support (candidates)', so the two no longer compete for the
+    // same reader.
+    label: 'Get help (staff)',
     href: '/portal/employee/support',
     icon: 'message',
     group: 'work',
@@ -901,6 +933,18 @@ export interface NavEntry {
   href: string;
   icon: NavIcon;
   group: NavGroup;
+  /**
+   * HOW MANY THINGS ARE WAITING BEHIND THIS DOOR. Absent when the caller supplied nothing, and
+   * absent — never zero — when the number is zero: a bar covered in "0" pills teaches people to
+   * stop reading the pills.
+   *
+   * THIS DOES NOT BREAK RULE 1 OF THIS FILE. The number rides along with a destination the composer
+   * ALREADY authorised: an entry that is not in `entries` cannot carry a badge, because it does not
+   * exist. Nothing here decides who may see a count — the page that resolved the count decided that
+   * when it ran the query, and it passes the figure in through `opts.badges`. This module still
+   * performs no read and still cannot widen anything.
+   */
+  badge?: number;
 }
 
 export interface WorkspaceNavigation {
@@ -908,16 +952,40 @@ export interface WorkspaceNavigation {
   home: string;
   /** Every destination this composition authorises, in bar order then declaration order. */
   entries: readonly NavEntry[];
-  /** The bottom bar: at most BAR_CAPACITY, with the last slot given to More when anything is left over. */
+  /** The ranked destinations that reach the bar: BAR_CAPACITY - 1 of them, because the last slot is
+   *  always the More tab. See `hasMore` for why that is unconditional. */
   bar: readonly NavEntry[];
   /** The full list, grouped, for the drawer. Empty groups are absent, never rendered as a heading. */
   drawer: readonly { group: NavGroup; label: string; entries: readonly NavEntry[] }[];
-  /** Is a More tab needed at all? False when everything authorised already fits in the bar. */
+  /**
+   * Is a More tab needed at all?
+   *
+   * ALWAYS TRUE SINCE THE ACCOUNT CONTROL SHIPPED, and that is a fact about what the drawer holds
+   * rather than a shortcut. The drawer now carries "you are signed in as ..." and the sign-out
+   * button, and neither of those can ever take a bar slot: a tab bar is a row of links, and a
+   * sign-out has to be a POST. So there is always something behind the More tab, which is precisely
+   * what this field means — it did not change meaning, the contents changed.
+   *
+   * WHY IT MATTERS THAT IT IS UNCONDITIONAL. The old value was `ranked.length > BAR_CAPACITY`, so a
+   * DEGRADED composition — four surviving entries — produced no More tab and therefore no drawer at
+   * all. That is the exact moment a person most needs to end their session and hand the phone back,
+   * and it was the one render in which the control would not have existed.
+   */
   hasMore: boolean;
   /** The key of the entry the reader is currently on, resolved from the path when not passed. */
   active: string;
   /** True when the composition was degraded — the caller should say so rather than imply this is all there is. */
   degraded: boolean;
+  /**
+   * WHAT THE MORE TAB IS HIDING. The sum of every badge on an authorised entry that did NOT reach
+   * the bar, so a count behind the drawer is still visible from the outside. Zero when there is
+   * nothing, and the renderer must show nothing at zero.
+   *
+   * Without this the whole badge mechanism is decorative for the people it matters to: 'approvals'
+   * is rank 4 and three ranked entries reach the bar, so a manager's pending queue lives in the
+   * drawer, and a count you have to open a menu to discover is a count nobody discovers.
+   */
+  moreBadge: number;
 }
 
 export interface BuildNavOptions {
@@ -925,6 +993,19 @@ export interface BuildNavOptions {
   active?: string;
   /** Astro.url.pathname. Used only to light the tab the person is already on. */
   pathname?: string;
+  /**
+   * HOW MANY THINGS ARE WAITING, BY DESTINATION KEY — for example `{ approvals: 3, notifications: 7 }`.
+   *
+   * SUPPLIED BY THE PAGE, NEVER RESOLVED HERE. The caller has already run the query and already
+   * scoped it; this module only projects the figure onto a door it had independently decided to
+   * offer. A key naming a destination this composition does NOT authorise is DISCARDED rather than
+   * rendered, so a stale or over-generous badge map cannot leak the existence of a surface — that
+   * is the same fail-closed direction every other decision in this file takes.
+   *
+   * Anything that is not a finite number greater than zero is dropped. A NaN from a failed count
+   * would otherwise render as a pill reading "NaN" on the most-looked-at element on the phone.
+   */
+  badges?: Record<string, number>;
 }
 
 /**
@@ -959,12 +1040,17 @@ export function buildWorkspaceNav(
       allowed = false;
     }
     if (!allowed) continue;
+    // The badge is attached ONLY here, inside the branch that has already decided this person may be
+    // offered the destination. A key in `opts.badges` naming an entry that did not survive the
+    // audience test never reaches this line, so it is discarded rather than rendered.
+    const badge = badgeFor(opts.badges, d.key);
     entries.push({
       key: d.key,
       label: d.label,
       href: d.key === 'home' ? home : d.href,
       icon: d.icon,
       group: d.group,
+      ...(badge > 0 ? { badge } : {}),
     });
   }
 
@@ -976,14 +1062,35 @@ export function buildWorkspaceNav(
     .filter((e) => (rankOf.get(e.key) ?? Number.MAX_SAFE_INTEGER) < Number.MAX_SAFE_INTEGER)
     .sort((a, b) => (rankOf.get(a.key) as number) - (rankOf.get(b.key) as number));
 
-  const hasMore = ranked.length > BAR_CAPACITY;
-  const bar: NavEntry[] = hasMore ? ranked.slice(0, BAR_CAPACITY - 1) : ranked.slice(0, BAR_CAPACITY);
+  // THE DRAWER ALWAYS EXISTS, so the last bar slot is ALWAYS the More tab.
+  //
+  // This used to be `ranked.length > BAR_CAPACITY`, which gave a person with four or fewer
+  // destinations a full bar and no drawer. That was fine while the drawer held only overflow links.
+  // It stopped being fine the moment the drawer became the only place carrying "signed in as ..."
+  // and the sign-out button: on a degraded composition exactly four entries survive, so the bar
+  // filled, the More tab vanished, and there was no way to end the session on that render — the one
+  // render where somebody is most likely to want to.
+  //
+  // The cost is one ranked destination moving from the bar into the drawer for those people. That is
+  // one extra tap on a link. The thing it buys is a sign-out that is present on every single render,
+  // which is the whole point of this control existing.
+  const hasMore = true;
+  const bar: NavEntry[] = ranked.slice(0, BAR_CAPACITY - 1);
 
   const drawer: { group: NavGroup; label: string; entries: NavEntry[] }[] = [];
   for (const g of NAV_GROUP_LABELS) {
     const inGroup = entries.filter((e) => e.group === g.group);
     if (inGroup.length > 0) drawer.push({ group: g.group, label: g.label, entries: inGroup });
   }
+
+  // What the More tab is hiding: every badge on an authorised entry that did not take a bar slot.
+  // Summed over `entries` rather than over `opts.badges`, so an unauthorised key still cannot move
+  // the number — the count on the tab and the rows behind it are computed from one list.
+  const inBar = new Set<string>(bar.map((e) => e.key));
+  const moreBadge = entries.reduce(
+    (total, e) => (inBar.has(e.key) ? total : total + (e.badge || 0)),
+    0,
+  );
 
   return {
     home,
@@ -993,7 +1100,25 @@ export function buildWorkspaceNav(
     hasMore,
     active: resolveActive(entries, opts),
     degraded: composed.degraded === true || composed.ok !== true,
+    moreBadge,
   };
+}
+
+/**
+ * One badge, sanitised.
+ *
+ * Anything that is not a finite number above zero comes back as 0 and is then dropped by the caller.
+ * That covers the three shapes a count actually arrives in when something upstream went wrong — NaN
+ * from a `Number(undefined)`, a negative from a subtraction, and a string from a raw pg row — none of
+ * which should ever be painted onto the most-looked-at element on the phone. Capped at 99 for the
+ * same reason the renderer shows "99+": a four-digit pill widens a 90px tab and that is the one way
+ * a tab bar makes the page scroll sideways at 360px.
+ */
+function badgeFor(badges: Record<string, number> | undefined, key: string): number {
+  if (!badges) return 0;
+  const raw = Number(badges[key]);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(Math.floor(raw), 99);
 }
 
 /**

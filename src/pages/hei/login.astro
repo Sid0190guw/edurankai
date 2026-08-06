@@ -1,117 +1,170 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { users } from '@/lib/db/schema';
+import { eq, sql } from 'drizzle-orm';
+import { generateSessionToken, createSession } from '@/lib/auth/session';
+import { setSessionCookie } from '@/lib/auth/cookie';
+import { findUserByLoginIdentifier, verifyPasswordForLogin } from '@/lib/auth/handle';
+import {
+  isSecondStepRequired, availableSecondFactors, startPendingChallenge,
+  resolvePendingChallenge, verifySecondFactor, dropPendingChallenge,
+  pendingCookieName, verifyFaceSecondFactor, canCompleteSecondStep,
+  PENDING_TTL_SECONDS, PENDING_COOKIE_SECURE,
+  type SecondFactorMethod,
+} from '@/lib/auth/two-factor';
 
 if (Astro.locals.user && Astro.locals.user.role === 'institution_admin') {
   return Astro.redirect('/hei/portal');
 }
 
-let errorMsg = '';
-let requireFace = false;
-let pendingUserId = '';
-let pendingUserName = '';
-let faceDescriptor = '';
+// Declared before the handler that uses them - `const` is not hoisted.
+const SURFACE = 'hei' as const;
+const PENDING_COOKIE = pendingCookieName(SURFACE);
+const LEGACY_FACE_COOKIE = 'hei_face_pending';
 
-const pendingId = Astro.cookies.get('hei_face_pending')?.value || '';
-
-if (pendingId) {
-  requireFace = true;
-  pendingUserId = pendingId;
-  try {
-    const { db } = await import('@/lib/db');
-    const { users } = await import('@/lib/db/schema');
-    const { eq } = await import('drizzle-orm');
-    const { sql } = await import('drizzle-orm');
-    const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pendingId)).limit(1);
-    pendingUserName = u[0]?.name || '';
-    const fd = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${pendingId} AND is_active = true LIMIT 1`);
-    const rows = Array.isArray(fd) ? fd : (fd?.rows || []);
-    faceDescriptor = rows.length > 0 ? JSON.stringify((rows[0] as any).face_descriptor) : '';
-  } catch(e) {}
+function setPendingCookie(cookies: any, token: string) {
+  cookies.set(PENDING_COOKIE, token, {
+    path: '/', httpOnly: true, sameSite: 'lax', secure: PENDING_COOKIE_SECURE, maxAge: PENDING_TTL_SECONDS,
+  });
 }
+function clearPendingCookies(cookies: any) {
+  cookies.delete(PENDING_COOKIE, { path: '/' });
+  cookies.delete(LEGACY_FACE_COOKIE, { path: '/' });
+}
+
+let errorMsg = '';
+let noticeMsg = '';
+let requireSecondStep = false;
+let pendingUserName = '';
+let offerFace = false;
+let offerCode = false;
+
+// The half-finished sign-in is named by an opaque server-minted token, not by a
+// user id the client can set.
+let pendingToken = Astro.cookies.get(PENDING_COOKIE)?.value || '';
 
 if (Astro.request.method === 'POST') {
   const fd2 = await Astro.request.formData();
   const action = (fd2.get('action') as string) || '';
 
-  if (action === 'face_verified') {
-    const userId = (fd2.get('user_id') as string) || '';
-    if (userId === pendingId) {
-      try {
-        const { db } = await import('@/lib/db');
-        const { generateSessionToken, createSession } = await import('@/lib/auth/session');
-        const { setSessionCookie } = await import('@/lib/auth/cookie');
-        const { sql } = await import('drizzle-orm');
-        await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`);
+  if (action === 'second_factor') {
+    const method = ((fd2.get('method') as string) || 'totp') as SecondFactorMethod;
+    const payload = method === 'face'
+      ? ((fd2.get('live_descriptor') as string) || '')
+      : ((fd2.get('code') as string) || '').trim();
+    try {
+      if (method === 'face') {
+        const peek = await resolvePendingChallenge(pendingToken, SURFACE);
+        if (peek) {
+          const r = await verifyFaceSecondFactor(peek.userId, payload);
+          await db.execute(sql`
+            INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
+            VALUES (${peek.userId}, ${''}, ${''}, 'face_login', ${Number.isFinite(r.distance) ? r.distance : null}, ${r.matched}, ${r.matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
+          `).catch(() => {});
+        }
+      }
+      const result = await verifySecondFactor(pendingToken, SURFACE, method, payload);
+      if (!result.ok) {
+        errorMsg = result.error;
+        if (result.locked) { clearPendingCookies(Astro.cookies); pendingToken = ''; }
+      } else {
+        if (method === 'face') {
+          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${result.userId}`).catch(() => {});
+        }
         const token = generateSessionToken();
-        const session = await createSession(token, userId, {
+        const session = await createSession(token, result.userId, {
           userAgent: Astro.request.headers.get('user-agent') || undefined,
-          ipAddress: Astro.clientAddress
+          ipAddress: Astro.clientAddress,
         });
         setSessionCookie(Astro.cookies, token, session.expiresAt);
-        Astro.cookies.delete('hei_face_pending', { path: '/' });
+        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, result.userId)).catch(() => {});
+        clearPendingCookies(Astro.cookies);
         return Astro.redirect('/hei/portal');
-      } catch(e: any) {
-        console.error('[hei/login]', e?.cause?.message || e?.message, e?.stack);
-        errorMsg = 'Login error. Please try again.';
       }
-    } else {
-      errorMsg = 'Session mismatch. Please sign in again.';
-      Astro.cookies.delete('hei_face_pending', { path: '/' });
-      requireFace = false;
+    } catch (e: any) {
+      // Never swallowed - a bare catch in a login path hid an outage here once.
+      console.error('[hei/login second_factor]', e?.cause?.message || e?.message, e?.stack);
+      errorMsg = 'Verification is temporarily unavailable. Please try again.';
     }
-  } else if (action === 'cancel_face') {
-    Astro.cookies.delete('hei_face_pending', { path: '/' });
+  } else if (action === 'cancel_face' || action === 'cancel_second_step') {
+    await dropPendingChallenge(pendingToken).catch(() => {});
+    clearPendingCookies(Astro.cookies);
     return Astro.redirect('/hei/login');
   } else {
-    const email = (fd2.get('email') as string || '').trim().toLowerCase();
+    const identifier = (fd2.get('email') as string || '').trim();
     const password = fd2.get('password') as string || '';
 
-    if (!email || !password) {
-      errorMsg = 'Email and password are required.';
+    if (!identifier || !password) {
+      errorMsg = 'Enter your email or internal handle, and your password.';
     } else {
-      const { db } = await import('@/lib/db');
-      const { users } = await import('@/lib/db/schema');
-      const { verifyPassword } = await import('@/lib/auth/password');
-      const { generateSessionToken, createSession } = await import('@/lib/auth/session');
-      const { setSessionCookie } = await import('@/lib/auth/cookie');
-      const { eq } = await import('drizzle-orm');
-      const { sql } = await import('drizzle-orm');
-
-      const found = await db.select().from(users).where(eq(users.email, email)).limit(1);
-      const user = found[0];
-
-      if (!user || !user.isActive) {
-        errorMsg = 'Invalid email or password.';
-      } else {
-        const valid = await verifyPassword(user.passwordHash, password);
-        if (!valid) {
+      try {
+        const user = await findUserByLoginIdentifier(identifier);
+        // scrypt runs whether or not the account exists, so an unknown handle
+        // and a wrong password cost the same and answer the same.
+        const ok = await verifyPasswordForLogin(user, password);
+        if (!ok || !user || !user.isActive) {
           errorMsg = 'Invalid email or password.';
         } else if (user.role !== 'institution_admin') {
           errorMsg = 'This account does not have institution portal access. Visit /admin/login for admin or /portal/login for applicant.';
         } else {
-          // Face enrolled? Require face verification before session.
-          const faceCheck = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${user.id} AND is_active = true LIMIT 1`);
-          const faceRows = Array.isArray(faceCheck) ? faceCheck : (faceCheck?.rows || []);
-
-          if (faceRows.length > 0) {
-            Astro.cookies.set('hei_face_pending', user.id, {
-              path: '/', httpOnly: true, maxAge: 300, sameSite: 'lax'
-            });
+          const methods = await availableSecondFactors(user.id);
+          const optedIn = await isSecondStepRequired(user.id);
+          // Pre-existing posture: a face on file meant a face challenge.
+          const legacyFaceRule = methods.indexOf('face') >= 0;
+          // A remaining recovery code is a completable second step too, so an
+          // account whose only enrolled factor was cleared is still challenged
+          // instead of being waved through on one factor. False only when nothing
+          // is left at all - the one case where challenging would be a lockout.
+          if ((optedIn || legacyFaceRule) && await canCompleteSecondStep(user.id)) {
+            const t = await startPendingChallenge(user.id, SURFACE, 'password');
+            setPendingCookie(Astro.cookies, t);
             return Astro.redirect('/hei/login');
-          } else {
-            const token = generateSessionToken();
-            const session = await createSession(token, user.id, {
-              userAgent: Astro.request.headers.get('user-agent') || undefined,
-              ipAddress: Astro.clientAddress
-            });
-            setSessionCookie(Astro.cookies, token, session.expiresAt);
-            return Astro.redirect('/hei/portal');
           }
+          const token = generateSessionToken();
+          const session = await createSession(token, user.id, {
+            userAgent: Astro.request.headers.get('user-agent') || undefined,
+            ipAddress: Astro.clientAddress,
+          });
+          setSessionCookie(Astro.cookies, token, session.expiresAt);
+          await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, user.id)).catch(() => {});
+          clearPendingCookies(Astro.cookies);
+          return Astro.redirect('/hei/portal');
         }
+      } catch (e: any) {
+        console.error('[hei/login password]', e?.cause?.message || e?.message, e?.stack);
+        errorMsg = 'Sign-in is temporarily unavailable. Please try again.';
       }
     }
   }
 }
+
+if (pendingToken) {
+  try {
+    const pending = await resolvePendingChallenge(pendingToken, SURFACE);
+    if (pending) {
+      requireSecondStep = true;
+      const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pending.userId)).limit(1);
+      pendingUserName = u[0]?.name || '';
+      const methods = await availableSecondFactors(pending.userId);
+      offerFace = methods.indexOf('face') >= 0;
+      offerCode = methods.indexOf('totp') >= 0;
+    } else {
+      clearPendingCookies(Astro.cookies);
+      pendingToken = '';
+      if (!errorMsg) noticeMsg = 'That sign-in step expired. Please sign in again.';
+    }
+  } catch (e: any) {
+    console.error('[hei/login pending]', e?.cause?.message || e?.message, e?.stack);
+    clearPendingCookies(Astro.cookies);
+    pendingToken = '';
+    errorMsg = 'Sign-in is temporarily unavailable. Please try again.';
+  }
+}
+
+// The enrolled descriptor is never sent to the browser; the server compares.
+const showCamera = requireSecondStep && offerFace;
+const showPasswordForm = !requireSecondStep;
 ---
 <BaseLayout title="Institution Sign-in - EduRankAI HEI" description="Sign in to your institution portal">
   <style>
@@ -122,9 +175,7 @@ if (Astro.request.method === 'POST') {
     .oval-inner { width: 55%; aspect-ratio: 3/4; border: 2.5px solid rgba(220,80,0,0.7); border-radius: 50%; }
     .cam-status { position: absolute; bottom: 12px; left: 0; right: 0; text-align: center; }
     .cam-status span { background: rgba(0,0,0,0.75); color: #fff; font-size: 12px; padding: 4px 14px; border-radius: 100px; }
-    .prog-bar { height: 3px; background: #f0f0f0; }
-    .prog-fill { height: 100%; background: #DC5000; width: 0%; transition: width 0.4s; }
-    .face-btn { width: 100%; border: none; font-size: 15px; font-weight: 700; padding: 14px; cursor: pointer; border-radius: 0; }
+    .face-btn { width: 100%; border: none; font-size: 15px; font-weight: 700; padding: 14px; min-height: 48px; cursor: pointer; border-radius: 0; }
     .face-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   </style>
 
@@ -132,153 +183,160 @@ if (Astro.request.method === 'POST') {
 
     <div class="mb-7 text-center">
       <p class="eyebrow mb-3">Institution Portal</p>
-      <h1 class="font-display text-3xl font-semibold text-ink mb-2">{requireFace ? 'Verify your face' : 'Sign in'}</h1>
-      {!requireFace && <p class="text-[0.88rem] text-ink-soft">Don't have an account? <a href="/hei/register" class="text-burn font-semibold hover:underline">Register</a></p>}
-      {requireFace && <p class="text-[0.88rem] text-ink-soft">Welcome back, <strong>{pendingUserName}</strong></p>}
+      <h1 class="font-display text-3xl font-semibold text-ink mb-2">{requireSecondStep ? 'One more step' : 'Sign in'}</h1>
+      {showPasswordForm && <p class="text-[0.88rem] text-ink-soft">Don't have an account? <a href="/hei/register" class="text-burn font-semibold hover:underline">Register</a></p>}
+      {requireSecondStep && <p class="text-[0.88rem] text-ink-soft">Welcome back, <strong>{pendingUserName}</strong>. Confirm it is you to finish signing in.</p>}
     </div>
 
     {errorMsg && <div style="background:rgba(220,38,38,0.06);border:1px solid rgba(220,38,38,0.2);color:#b91c1c;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;">{errorMsg}</div>}
+    {noticeMsg && <div style="background:rgba(220,80,0,0.06);border:1px solid rgba(220,80,0,0.2);color:#9a3412;font-size:0.85rem;padding:11px 14px;border-radius:8px;margin-bottom:18px;">{noticeMsg}</div>}
 
-    {!requireFace && (
+    {showPasswordForm && (
       <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-7 flex flex-col gap-5">
         <div>
-          <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Official email</label>
-          <input type="email" name="email" required autofocus class="w-full px-4 py-3 border border-ink/15 rounded-lg text-[0.95rem] outline-none focus:border-burn bg-cream-2" />
+          <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Official email or internal handle</label>
+          <input type="text" name="email" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="username" required autofocus style="min-height:48px;" class="w-full px-4 py-3 border border-ink/15 rounded-lg text-[0.95rem] outline-none focus:border-burn bg-cream-2" />
         </div>
         <div>
           <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">Password</label>
-          <input type="password" name="password" required class="w-full px-4 py-3 border border-ink/15 rounded-lg text-[0.95rem] outline-none focus:border-burn bg-cream-2" />
+          <input type="password" name="password" autocomplete="current-password" required style="min-height:48px;" class="w-full px-4 py-3 border border-ink/15 rounded-lg text-[0.95rem] outline-none focus:border-burn bg-cream-2" />
         </div>
-        <button type="submit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">Sign in</button>
-        <p class="text-[0.75rem] text-ink-soft text-center mt-2">Face verification required after password if enrolled.</p>
+        <button type="submit" style="min-height:48px;" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">Sign in</button>
       </form>
     )}
 
-    {requireFace && faceDescriptor && (
+    {showCamera && (
       <div class="face-card">
         <div class="cam-wrap">
           <video id="videoEl" autoplay playsinline muted></video>
           <div class="oval-ring"><div class="oval-inner" id="ovalRing"></div></div>
           <div class="cam-status"><span id="camStatus">Loading face model...</span></div>
         </div>
-        <div class="prog-bar"><div class="prog-fill" id="progFill"></div></div>
-        <button id="verifyBtn" class="face-btn" disabled style="background:#DC5000;color:#fff;">Scanning...</button>
+        <button id="verifyBtn" class="face-btn" disabled style="background:#DC5000;color:#fff;">Preparing camera...</button>
       </div>
     )}
 
-    {requireFace && !faceDescriptor && (
-      <div style="text-align:center;padding:32px;background:#fff;border:1px solid rgba(0,0,0,0.1);border-radius:16px;">
-        <p style="font-size:14px;color:#6b7280;margin:0 0 16px;">Face data not found for this account. Use password sign-in.</p>
-        <form method="POST">
-          <input type="hidden" name="action" value="cancel_face"/>
-          <button type="submit" style="background:#DC5000;color:#fff;border:none;font-size:14px;font-weight:600;padding:10px 24px;border-radius:8px;cursor:pointer;">Use Password Instead</button>
-        </form>
+    {showCamera && (
+      <form id="faceSuccessForm" method="POST" style="display:none;">
+        <input type="hidden" name="action" value="second_factor"/>
+        <input type="hidden" name="method" value="face"/>
+        <input type="hidden" name="live_descriptor" id="liveDescriptorField" value=""/>
+      </form>
+    )}
+
+    {requireSecondStep && offerFace && offerCode && (
+      <div style="display:flex;align-items:center;gap:10px;color:#9ca3af;font-size:12px;margin:16px 0;">
+        <span style="flex:1;height:1px;background:rgba(0,0,0,0.1);"></span>OR<span style="flex:1;height:1px;background:rgba(0,0,0,0.1);"></span>
       </div>
     )}
 
-    {requireFace && (
+    {requireSecondStep && (
+      <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-7 flex flex-col gap-5" style="margin-top:16px;">
+        <input type="hidden" name="action" value="second_factor"/>
+        <input type="hidden" name="method" value="totp"/>
+        <div>
+          <label class="block text-[0.7rem] font-bold uppercase tracking-wider text-ink-soft mb-2">{offerCode ? 'Authenticator code, or a recovery code' : 'Recovery code'}</label>
+          <input type="text" name="code" inputmode="text" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="one-time-code" maxlength="16" required style="min-height:48px;text-align:center;letter-spacing:0.18em;font-size:18px;" class="w-full px-4 py-3 border border-ink/15 rounded-lg outline-none focus:border-burn bg-cream-2" />
+        </div>
+        <button type="submit" style="min-height:48px;" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 px-6 rounded-lg text-[0.95rem]">Verify</button>
+        <p class="text-[0.75rem] text-ink-soft text-center">Lost your phone? Use one of the recovery codes you saved. Each one works once.</p>
+      </form>
+    )}
+
+    {requireSecondStep && (
       <div style="text-align:center;margin-top:16px;">
         <form method="POST" style="display:inline;">
-          <input type="hidden" name="action" value="cancel_face"/>
-          <button type="submit" style="background:transparent;border:none;color:#6b7280;font-size:13px;cursor:pointer;text-decoration:underline;">Use password instead</button>
+          <input type="hidden" name="action" value="cancel_second_step"/>
+          <button type="submit" style="background:transparent;border:none;color:#6b7280;font-size:13px;cursor:pointer;text-decoration:underline;padding:12px;min-height:44px;">Use a different account</button>
         </form>
       </div>
     )}
 
   </section>
 
-  {requireFace && faceDescriptor && (
-    <form id="faceSuccessForm" method="POST" style="display:none;">
-      <input type="hidden" name="action" value="face_verified"/>
-      <input type="hidden" name="user_id" value={pendingUserId}/>
-    </form>
-  )}
-
-  {requireFace && faceDescriptor && (
+  {showCamera && (
     <script is:inline src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js"></script>
-    <script is:inline define:vars={{ storedDescriptor: faceDescriptor }}>
+    <script is:inline>
+    // The enrolled descriptor is NEVER sent to the browser. This captures a live
+    // descriptor and posts it; the comparison and verdict happen server-side.
+    (function () {
       var video = document.getElementById('videoEl');
       var verifyBtn = document.getElementById('verifyBtn');
-      var camStatus = document.getElementById('camStatus');
-      var progFill = document.getElementById('progFill');
-      var ovalRing = document.getElementById('ovalRing');
-      var verified = false;
-      var attempts = 0;
+      var statusEl = document.getElementById('camStatus');
+      var form = document.getElementById('faceSuccessForm');
+      var field = document.getElementById('liveDescriptorField');
+      if (!video || !verifyBtn || !form || !field) return;
+      var submitted = false;
+      var stream = null;
 
-      function setStatus(msg, color) {
-        camStatus.innerHTML = '<span style="background:rgba(0,0,0,0.75);color:' + (color||'#fff') + ';font-size:12px;padding:4px 14px;border-radius:100px;">' + msg + '</span>';
+      function setStatus(msg) { if (statusEl) statusEl.textContent = msg; }
+
+      // THE CAMERA IS TURNED OFF EXPLICITLY, ON EVERY EXIT - before the descriptor
+      // is posted, and whenever this page is left. Leaving it to the navigation
+      // keeps the light on through the POST and the next render, and keeps it on
+      // indefinitely for anyone who abandons the face step and types a code
+      // instead. Nothing is stored either way; a camera still running after the
+      // moment it was granted for is its own trust failure.
+      function shutCamera() {
+        try {
+          if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (_) {} }); }
+        } catch (_) {}
+        stream = null;
+        try { video.pause(); } catch (_) {}
+        try { video.srcObject = null; } catch (_) {}
+        try { video.removeAttribute('src'); } catch (_) {}
       }
+      window.addEventListener('pagehide', shutCamera);
 
       async function init() {
-        try {
-          setStatus('Loading face model...');
-          progFill.style.width = '20%';
-          var MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
-          await Promise.all([
-            faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-            faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL),
-            faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
-          ]);
-          progFill.style.width = '60%';
-          var stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 640 } });
-          video.srcObject = stream;
-          progFill.style.width = '100%';
-          setTimeout(function() {
-            progFill.style.display = 'none';
-            verifyBtn.disabled = false;
-            verifyBtn.textContent = 'Verify My Face';
-            verifyBtn.onclick = doVerify;
-            setStatus('Center face in the oval', '#10b981');
-            autoVerifyLoop();
-          }, 300);
-        } catch(e) {
-          setStatus('Camera error: ' + e.message, '#ef4444');
-        }
+        setStatus('Loading face model...');
+        var MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+        ]);
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+        video.srcObject = stream;
+        verifyBtn.disabled = false;
+        verifyBtn.textContent = 'Verify my face';
+        verifyBtn.onclick = capture;
+        setStatus('Position your face in the oval');
       }
 
-      async function tryMatch() {
-        var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
-          .withFaceLandmarks(true).withFaceDescriptor();
-        if (!det) return false;
-        var stored = JSON.parse(storedDescriptor);
-        var storedArr = Array.isArray(stored) ? stored : Object.values(stored);
-        var storedFloat = new Float32Array(storedArr);
-        var dist = faceapi.euclideanDistance(det.descriptor, storedFloat);
-        return dist < 0.5;
-      }
-
-      async function autoVerifyLoop() {
-        if (verified || attempts > 25) {
-          if (attempts > 25) setStatus('Auto-verify failed. Click button.', '#fbbf24');
-          return;
-        }
-        attempts++;
-        try { if (await tryMatch()) { onVerified(); return; } } catch(_) {}
-        setTimeout(autoVerifyLoop, 700);
-      }
-
-      async function doVerify() {
+      async function capture() {
+        if (submitted) return;
         verifyBtn.disabled = true;
-        verifyBtn.textContent = 'Verifying...';
-        setStatus('Scanning face...', '#fbbf24');
+        verifyBtn.textContent = 'Checking...';
+        setStatus('Scanning...');
         try {
-          if (await tryMatch()) { onVerified(); }
-          else { setStatus('Face not recognised. Try again.', '#ef4444'); verifyBtn.disabled = false; verifyBtn.textContent = 'Try Again'; }
-        } catch(e) {
-          setStatus('Error: ' + e.message, '#ef4444');
-          verifyBtn.disabled = false; verifyBtn.textContent = 'Try Again';
+          var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+            .withFaceLandmarks(true).withFaceDescriptor();
+          if (!det) {
+            setStatus('No face detected. Try again in better light.');
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = 'Try again';
+            return;
+          }
+          submitted = true;
+          field.value = JSON.stringify(Array.prototype.slice.call(det.descriptor));
+          // Camera off BEFORE anything is posted. The frame it came from is never
+          // drawn to a canvas, never uploaded, and does not outlive this line.
+          shutCamera();
+          setStatus('Sending for verification...');
+          form.submit();
+        } catch (e) {
+          setStatus('Camera error. Use a code instead.');
+          verifyBtn.disabled = false;
+          verifyBtn.textContent = 'Try again';
         }
       }
 
-      function onVerified() {
-        verified = true;
-        setStatus('Verified! Signing you in...', '#10b981');
-        verifyBtn.textContent = 'Verified!';
-        verifyBtn.style.background = '#10b981';
-        setTimeout(function() { document.getElementById('faceSuccessForm').submit(); }, 600);
-      }
-
-      init();
+      init().catch(function () {
+        setStatus('Camera unavailable. Use a code instead.');
+        verifyBtn.textContent = 'Camera unavailable';
+      });
+    })();
     </script>
   )}
 </BaseLayout>

@@ -26,6 +26,7 @@ async function run() {
         to, cc, bcc, subject: s.subject || '', bodyHtml: s.body_html || '', bodyText: s.body_text || '',
         threadId: s.thread_id || null, inReplyTo: s.in_reply_to || null, attachments: [],
       });
+      let externalError: string | null = null;
       if (result.external.length) {
         const cfg = await getMailConfig();
         const envFromAddr = cfg.fromAddress || cfg.smtpUser || fromEmail;
@@ -38,14 +39,27 @@ async function run() {
           cc: result.external.filter((e: any) => e.kind === 'cc').map((e: any) => e.email),
           bcc: result.external.filter((e: any) => e.kind === 'bcc').map((e: any) => e.email),
           subject: s.subject || '', html, text: s.body_text || '', replyTo: fromEmail, messageId: result.rfcMessageId,
+          logToDb: false, // one row per recipient below, keyed by the mail_messages UUID
         });
-        for (const e of result.external) await logOutbound({ messageId: result.messageId, to: e.email, from: fromEmail, subject: s.subject || '', status: send.ok ? 'sent' : 'failed', provider: send.provider, error: send.error }).catch(() => {});
+        const status = send.ok ? 'sent' : (send.provider === 'none' ? 'no_transport' : 'failed');
+        for (const e of result.external) await logOutbound({ messageId: result.messageId, rfcMessageId: result.rfcMessageId, to: e.email, from: fromEmail, subject: s.subject || '', status, provider: send.provider, error: send.error }).catch((le: any) => console.error('[scheduled-send] delivery log failed:', le?.cause?.message || le?.message));
         await db.execute(sql`UPDATE mail_messages SET direction = 'outbound' WHERE id = ${result.messageId}`).catch(() => {});
+        if (!send.ok) externalError = send.error || 'the mail server refused the message';
       }
-      await markScheduled(s.id, 'sent', result.messageId);
-      sent++;
+      // A scheduled message whose SMTP attempt was REFUSED used to be recorded as 'sent' — so the
+      // scheduled list told the sender their message had gone when the only thing that happened
+      // was a copy landing in their own Sent folder. It says what happened now.
+      if (externalError) {
+        await markScheduled(s.id, 'failed', result.messageId, ('Saved to Sent, but not delivered: ' + externalError).slice(0, 240)).catch(() => {});
+        failed++;
+      } else {
+        await markScheduled(s.id, 'sent', result.messageId);
+        sent++;
+      }
     } catch (e: any) {
-      await markScheduled(s.id, 'failed', undefined, String(e?.message || e).slice(0, 240)).catch(() => {});
+      const reason = String(e?.cause?.message || e?.message || e);
+      console.error('[scheduled-send] failed for', s.id, reason);
+      await markScheduled(s.id, 'failed', undefined, reason.slice(0, 240)).catch(() => {});
       failed++;
     }
   }

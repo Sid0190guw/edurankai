@@ -3,10 +3,24 @@ import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
-import { verifyPassword } from '@/lib/auth/password';
 import { sql } from 'drizzle-orm';
 import { generateSessionToken, createSession } from '@/lib/auth/session';
 import { setSessionCookie } from '@/lib/auth/cookie';
+import { findUserByLoginIdentifier, verifyPasswordForLogin } from '@/lib/auth/handle';
+import {
+  isSecondStepRequired, availableSecondFactors, startPendingChallenge,
+  resolvePendingChallenge, verifySecondFactor, dropPendingChallenge,
+  pendingCookieName, verifyFaceSecondFactor, canCompleteSecondStep,
+  PENDING_TTL_SECONDS, PENDING_COOKIE_SECURE,
+  type SecondFactorMethod,
+} from '@/lib/auth/two-factor';
+
+// Every `const` this handler touches is declared BEFORE the handler — `const`
+// is not hoisted, and that has taken pages down here before.
+const SURFACE = 'admin' as const;
+const PENDING_COOKIE = pendingCookieName(SURFACE);
+const LEGACY_FACE_COOKIE = 'face_pending_user';
+const LEGACY_TFA_COOKIE = 'admin_tfa_pending';
 
 async function startSession(userId: string, req: Request, ip: string | undefined, cookies: any) {
   const token = generateSessionToken();
@@ -17,19 +31,16 @@ async function startSession(userId: string, req: Request, ip: string | undefined
   setSessionCookie(cookies, token, session.expiresAt);
 }
 
-// Authoritative server-side face match — the browser result is never trusted.
-const FACE_2FA_THRESHOLD = 0.6;
-function euclid(a: number[], b: number[]): number {
-  let s = 0; const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) { const d = (a[i] || 0) - (b[i] || 0); s += d * d; }
-  return Math.sqrt(s);
+function setPendingCookie(cookies: any, token: string) {
+  cookies.set(PENDING_COOKIE, token, {
+    path: '/', httpOnly: true, sameSite: 'lax', secure: PENDING_COOKIE_SECURE, maxAge: PENDING_TTL_SECONDS,
+  });
 }
-function normDesc(d: any): number[] | null {
-  if (d == null) return null;
-  if (typeof d === 'string') { try { return normDesc(JSON.parse(d)); } catch { return null; } }
-  if (Array.isArray(d)) return d.map(Number);
-  if (typeof d === 'object') return Object.keys(d).sort((a, b) => Number(a) - Number(b)).map((k) => Number(d[k]));
-  return null;
+function clearPendingCookies(cookies: any) {
+  cookies.delete(PENDING_COOKIE, { path: '/' });
+  // Retire the old raw-user-id cookies if a browser still carries one.
+  cookies.delete(LEGACY_FACE_COOKIE, { path: '/' });
+  cookies.delete(LEGACY_TFA_COOKIE, { path: '/' });
 }
 
 // Already logged in?
@@ -38,36 +49,27 @@ if (Astro.locals.user) {
 }
 
 let errorMsg = '';
-let requireFace = false;
-let pendingUserId = '';
+let noticeMsg = '';
+let requireSecondStep = false;
 let pendingUserName = '';
-let faceDescriptor = '';
+let offerFace = false;
+let offerCode = false;
 
-// Check if we're in face verification phase
-const pendingId = Astro.cookies.get('face_pending_user')?.value || '';
+// The half-finished sign-in is named by an opaque token we minted, never by a
+// user id the client can type. Previously this cookie held a raw uuid, which
+// meant setting it by hand skipped the password outright.
+let pendingToken = Astro.cookies.get(PENDING_COOKIE)?.value || '';
 
-if (pendingId) {
-  requireFace = true;
-  pendingUserId = pendingId;
-  try {
-    const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pendingId)).limit(1);
-    pendingUserName = u[0]?.name || '';
-    const fd = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${pendingId} AND is_active = true LIMIT 1`);
-    const rows = Array.isArray(fd) ? fd : (fd?.rows || []);
-    faceDescriptor = rows.length > 0 ? JSON.stringify((rows[0] as any).face_descriptor) : '';
-  } catch(e) {}
-}
-
-// Authenticator (TOTP) verification phase — password OK, awaiting the code.
-const tfaPendingId = Astro.cookies.get('admin_tfa_pending')?.value || '';
-let requireTotp = false;
-let tfaPendingName = '';
-if (tfaPendingId && !pendingId) {
-  requireTotp = true;
-  try {
-    const u = await db.select({ name: users.name }).from(users).where(eq(users.id, tfaPendingId)).limit(1);
-    tfaPendingName = u[0]?.name || '';
-  } catch (e) {}
+async function loadPendingState(token: string) {
+  const pending = await resolvePendingChallenge(token, SURFACE);
+  if (!pending) return null;
+  const u = await db.select({ name: users.name }).from(users).where(eq(users.id, pending.userId)).limit(1);
+  pendingUserName = u[0]?.name || '';
+  const methods = await availableSecondFactors(pending.userId);
+  offerFace = methods.indexOf('face') >= 0;
+  offerCode = methods.indexOf('totp') >= 0;
+  requireSecondStep = true;
+  return pending;
 }
 
 if (Astro.request.method === 'POST') {
@@ -75,98 +77,107 @@ if (Astro.request.method === 'POST') {
   const action = fd2.get('action') as string;
 
   if (action === 'password_login') {
-    const email = (fd2.get('email') as string || '').trim().toLowerCase();
+    // Accept a personal email OR an internal handle. Trimmed and matched
+    // case-insensitively; a handle is an identifier, not a mailbox.
+    const identifier = (fd2.get('email') as string || '').trim();
     const password = (fd2.get('password') as string || '').trim();
 
-    if (!email || !password) {
-      errorMsg = 'Email and password required.';
+    if (!identifier || !password) {
+      errorMsg = 'Enter your email or internal handle, and your password.';
     } else {
       try {
-        const found = await db.select().from(users).where(eq(users.email, email)).limit(1);
-        if (!found.length || !(await verifyPassword(found[0].passwordHash || '', password))) {
+        const u = await findUserByLoginIdentifier(identifier);
+        // Always pays for scrypt, present or absent, so timing does not say
+        // which. One message covers unknown identifier AND wrong password.
+        const ok = await verifyPasswordForLogin(u, password);
+        if (!ok || !u) {
           errorMsg = 'Invalid email or password.';
-        } else if (!found[0].isActive) {
+        } else if (!u.isActive) {
           errorMsg = 'Account is inactive. Contact admin.';
         } else {
-          const u = found[0];
-          // Any one method signs you in — passkey / authenticator / face are
-          // offered as independent options; a correct password is enough here.
-          // Check if face enrolled
-          const faceCheck = await db.execute(sql`SELECT id FROM user_face_enrollments WHERE user_id = ${u.id} AND is_active = true LIMIT 1`);
-          const faceRows = Array.isArray(faceCheck) ? faceCheck : (faceCheck?.rows || []);
-
-          if (faceRows.length > 0 && u.role !== 'applicant') {
-            // Face enrolled - redirect to face verification
-            Astro.cookies.set('face_pending_user', u.id, { path: '/', httpOnly: true, maxAge: 300, sameSite: 'lax' });
+          const methods = await availableSecondFactors(u.id);
+          const optedIn = await isSecondStepRequired(u.id);
+          // Staff with a face on file kept their existing face challenge before
+          // the opt-in existed; that posture is preserved, not relaxed.
+          const legacyFaceRule = u.role !== 'applicant' && methods.indexOf('face') >= 0;
+          // A recovery code counts as a completable second step, so an account
+          // whose only enrolled factor was cleared is still challenged instead of
+          // being waved through on the password alone. It returns false only when
+          // there is nothing left at all, which is the one case where challenging
+          // would mean a lockout rather than a check.
+          if ((optedIn || legacyFaceRule) && await canCompleteSecondStep(u.id)) {
+            const token = await startPendingChallenge(u.id, SURFACE, 'password');
+            setPendingCookie(Astro.cookies, token);
             return Astro.redirect('/admin/login');
-          } else {
-            // No face - log in directly via proper session token
-            await startSession(u.id, Astro.request, Astro.clientAddress, Astro.cookies);
-            Astro.cookies.delete('face_pending_user', { path: '/' });
-            return Astro.redirect('/admin');
           }
-        }
-      } catch(e: any) {
-        errorMsg = 'Login error: ' + e.message;
-      }
-    }
-  } else if (action === 'face_verified') {
-    // The browser does a live face scan, but the AUTHORITATIVE comparison is here:
-    // we re-fetch the enrolled descriptor and match it server-side. A forged POST
-    // with no/!matching descriptor cannot grant an admin session.
-    const userId = fd2.get('user_id') as string;
-    const liveRaw = (fd2.get('live_descriptor') as string) || '';
-    if (userId === pendingId) {
-      try {
-        const fdRow = await db.execute(sql`SELECT face_descriptor FROM user_face_enrollments WHERE user_id = ${userId} AND is_active = true LIMIT 1`);
-        const fdr = Array.isArray(fdRow) ? fdRow : (fdRow?.rows || []);
-        const stored = normDesc((fdr[0] as any)?.face_descriptor);
-        let live: number[] | null = null;
-        try { live = normDesc(JSON.parse(liveRaw)); } catch { live = null; }
-        const dist = (stored && live && stored.length === 128 && live.length === 128) ? euclid(stored, live) : 99;
-        const matched = dist < FACE_2FA_THRESHOLD;
-        await db.execute(sql`
-          INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
-          VALUES (${userId}, ${''}, ${pendingUserName || ''}, 'face_login', ${Number.isFinite(dist) ? dist : null}, ${matched}, ${matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
-        `).catch(() => {});
-        if (!matched) {
-          errorMsg = 'Face not recognised (distance ' + (Number.isFinite(dist) ? dist.toFixed(3) : 'n/a') + '). Try again, or use your password.';
-        } else {
-          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${userId}`).catch(() => {});
-          await startSession(userId, Astro.request, Astro.clientAddress, Astro.cookies);
-          Astro.cookies.delete('face_pending_user', { path: '/' });
+          // No second step on this account: one method signs you in, unchanged.
+          await startSession(u.id, Astro.request, Astro.clientAddress, Astro.cookies);
+          clearPendingCookies(Astro.cookies);
           return Astro.redirect('/admin');
         }
-      } catch (e: any) { errorMsg = 'Login error. Please try again.'; }
-    } else {
-      errorMsg = 'Session mismatch. Please try again.';
-      Astro.cookies.delete('face_pending_user', { path: '/' });
-      requireFace = false;
-    }
-  } else if (action === 'tfa_verify') {
-    const userId = (fd2.get('user_id') as string) || '';
-    const code = ((fd2.get('code') as string) || '').trim();
-    if (!userId || userId !== tfaPendingId) {
-      errorMsg = 'Session expired. Please sign in again.';
-      Astro.cookies.delete('admin_tfa_pending', { path: '/' });
-      requireTotp = false;
-    } else {
-      const { verifyLoginCode } = await import('@/lib/auth/twofactor');
-      const ok = await verifyLoginCode(userId, code);
-      if (!ok) {
-        errorMsg = 'That code is not right. Use the current code from your authenticator app, or a backup code.';
-      } else {
-        await startSession(userId, Astro.request, Astro.clientAddress, Astro.cookies);
-        Astro.cookies.delete('admin_tfa_pending', { path: '/' });
-        return Astro.redirect('/admin');
+      } catch (e: any) {
+        // Never swallow this. A bare catch here once hid a total sign-in outage.
+        console.error('[admin/login password]', e?.cause?.message || e?.message, e?.stack);
+        errorMsg = 'Sign-in is temporarily unavailable. Please try again.';
       }
     }
-  } else if (action === 'cancel_tfa') {
-    Astro.cookies.delete('admin_tfa_pending', { path: '/' });
+  } else if (action === 'second_factor') {
+    const method = ((fd2.get('method') as string) || 'totp') as SecondFactorMethod;
+    const payload = method === 'face'
+      ? ((fd2.get('live_descriptor') as string) || '')
+      : ((fd2.get('code') as string) || '').trim();
+    try {
+      // Audit the face attempt with the distance the SERVER measured.
+      if (method === 'face') {
+        const peek = await resolvePendingChallenge(pendingToken, SURFACE);
+        if (peek) {
+          const r = await verifyFaceSecondFactor(peek.userId, payload);
+          await db.execute(sql`
+            INSERT INTO identity_verifications (user_id, email, claimed_name, method, face_match_distance, face_match_passed, verdict, ip_address, user_agent)
+            VALUES (${peek.userId}, ${''}, ${pendingUserName || ''}, 'face_login', ${Number.isFinite(r.distance) ? r.distance : null}, ${r.matched}, ${r.matched ? 'verified' : 'rejected'}, ${(Astro.clientAddress || '').toString().slice(0, 64) || null}, ${(Astro.request.headers.get('user-agent') || '').slice(0, 500)})
+          `).catch(() => {});
+        }
+      }
+      const result = await verifySecondFactor(pendingToken, SURFACE, method, payload);
+      if (!result.ok) {
+        errorMsg = result.error;
+        if (result.locked) { clearPendingCookies(Astro.cookies); pendingToken = ''; }
+      } else {
+        if (method === 'face') {
+          await db.execute(sql`UPDATE user_face_enrollments SET last_used_at = NOW() WHERE user_id = ${result.userId}`).catch(() => {});
+        }
+        await startSession(result.userId, Astro.request, Astro.clientAddress, Astro.cookies);
+        await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, result.userId)).catch(() => {});
+        clearPendingCookies(Astro.cookies);
+        return Astro.redirect('/admin');
+      }
+    } catch (e: any) {
+      console.error('[admin/login second_factor]', e?.cause?.message || e?.message, e?.stack);
+      errorMsg = 'Verification is temporarily unavailable. Please try again.';
+    }
+  } else if (action === 'cancel_second_step') {
+    await dropPendingChallenge(pendingToken).catch(() => {});
+    clearPendingCookies(Astro.cookies);
     return Astro.redirect('/admin/login');
-  } else if (action === 'cancel_face') {
-    Astro.cookies.delete('face_pending_user', { path: '/' });
-    return Astro.redirect('/admin/login');
+  }
+}
+
+// Render the challenge if one is still live (also after a failed attempt).
+if (pendingToken) {
+  try {
+    const pending = await loadPendingState(pendingToken);
+    if (!pending) {
+      clearPendingCookies(Astro.cookies);
+      pendingToken = '';
+      requireSecondStep = false;
+      if (!errorMsg) noticeMsg = 'That sign-in step expired. Please sign in again.';
+    }
+  } catch (e: any) {
+    console.error('[admin/login pending]', e?.cause?.message || e?.message, e?.stack);
+    clearPendingCookies(Astro.cookies);
+    pendingToken = '';
+    requireSecondStep = false;
+    errorMsg = 'Sign-in is temporarily unavailable. Please try again.';
   }
 }
 ---
@@ -191,6 +202,7 @@ if (Astro.request.method === 'POST') {
     .btn:hover { opacity: 0.9; }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .error { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); color: #fca5a5; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 16px; }
+    .notice { background: rgba(255,79,0,0.08); border: 1px solid rgba(255,79,0,0.28); color: #ffb694; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 16px; }
     .field { margin-bottom: 14px; }
     .face-oval { width: 200px; height: 240px; border: 3px solid rgba(255,79,0,0.5); border-radius: 50%; margin: 0 auto 16px; position: relative; overflow: hidden; }
   </style>
@@ -200,34 +212,62 @@ if (Astro.request.method === 'POST') {
     <div class="logo">EduRank<em>AI</em></div>
 
     {errorMsg && <div class="error">{errorMsg}</div>}
+    {noticeMsg && <div class="notice">{noticeMsg}</div>}
 
-    {requireTotp ? (
-      <!-- Authenticator (TOTP) code -->
+    {requireSecondStep ? (
+      <!-- Second step. The first factor already passed, but no session exists
+           yet and the pending token is not one. -->
       <div>
         <p style="text-align:center;font-size:13px;color:#8a8a94;margin-bottom:4px;">Welcome back,</p>
-        <p style="text-align:center;font-size:16px;font-weight:600;color:#fff;margin-bottom:18px;">{tfaPendingName}</p>
-        <form method="POST">
-          <input type="hidden" name="action" value="tfa_verify" />
-          <input type="hidden" name="user_id" value={tfaPendingId} />
-          <div class="field">
-            <label class="label">6-digit code from your authenticator app</label>
-            <input name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="12" class="input" placeholder="123456" required autofocus style="text-align:center;letter-spacing:0.18em;font-size:18px;" />
+        <p style="text-align:center;font-size:16px;font-weight:600;color:#fff;margin-bottom:6px;">{pendingUserName}</p>
+        <p style="text-align:center;font-size:12px;color:#6e6e78;margin-bottom:18px;">One more step to confirm it is you.</p>
+
+        {offerFace && (
+          <div style="margin-bottom:18px;">
+            <div style="position:relative;background:#000;border-radius:16px;overflow:hidden;margin-bottom:12px;aspect-ratio:3/4;max-width:240px;margin-left:auto;margin-right:auto;">
+              <video id="videoEl" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;transform:scaleX(-1);"></video>
+              <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;">
+                <div style="width:140px;height:180px;border:2px solid rgba(255,79,0,0.7);border-radius:50%;"></div>
+              </div>
+              <div id="faceStatus" style="position:absolute;bottom:10px;left:0;right:0;text-align:center;">
+                <span style="background:rgba(0,0,0,0.75);color:#fff;font-size:11px;padding:3px 10px;border-radius:100px;">Loading...</span>
+              </div>
+            </div>
+            <button id="verifyBtn" disabled class="btn" style="opacity:0.5;">Preparing camera...</button>
+            <form method="POST" style="display:none;" id="successForm">
+              <input type="hidden" name="action" value="second_factor" />
+              <input type="hidden" name="method" value="face" />
+              <input type="hidden" name="live_descriptor" id="liveDescriptorField" value="" />
+            </form>
           </div>
-          <button type="submit" class="btn">Verify</button>
-        </form>
-        <p style="text-align:center;margin-top:12px;font-size:12px;color:#6e6e78;">Lost your phone? Enter a <strong style="color:#8a8a94;">backup code</strong> instead.</p>
+        )}
+
+        {offerFace && offerCode && (
+          <div style="display:flex;align-items:center;gap:10px;color:#4a4a52;font-size:11px;margin:14px 0;"><span style="flex:1;height:1px;background:#1a1a1f;"></span>OR<span style="flex:1;height:1px;background:#1a1a1f;"></span></div>
+        )}
+
         <form method="POST">
-          <input type="hidden" name="action" value="cancel_tfa" />
-          <button type="submit" style="width:100%;background:none;border:none;color:#6e6e78;font-size:12px;cursor:pointer;padding:8px;">Use different account</button>
+          <input type="hidden" name="action" value="second_factor" />
+          <input type="hidden" name="method" value="totp" />
+          <div class="field">
+            <label class="label">{offerCode ? 'Authenticator code, or a recovery code' : 'Recovery code'}</label>
+            <input name="code" type="text" inputmode="text" autocomplete="one-time-code" maxlength="16" class="input" placeholder={offerCode ? '123456' : 'abcde-12345'} required style="text-align:center;letter-spacing:0.18em;font-size:18px;min-height:48px;" />
+          </div>
+          <button type="submit" class="btn" style="min-height:48px;">Verify</button>
+        </form>
+        <p style="text-align:center;margin-top:12px;font-size:12px;color:#6e6e78;line-height:1.5;">Lost your phone? Use one of the <strong style="color:#8a8a94;">recovery codes</strong> you saved when you turned this on. Each works once.</p>
+        <form method="POST">
+          <input type="hidden" name="action" value="cancel_second_step" />
+          <button type="submit" style="width:100%;background:none;border:none;color:#6e6e78;font-size:12px;cursor:pointer;padding:12px;min-height:44px;">Use a different account</button>
         </form>
       </div>
-    ) : !requireFace ? (
+    ) : (
       <!-- Password login -->
       <form method="POST">
         <input type="hidden" name="action" value="password_login" />
         <div class="field">
-          <label class="label">Email</label>
-          <input name="email" type="email" class="input" placeholder="you@edurankai.in" required autofocus />
+          <label class="label">Email or internal handle</label>
+          <input name="email" type="text" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="username" class="input" placeholder="you@edurankai.in" required autofocus style="min-height:48px;" />
         </div>
         <div class="field">
           <label class="label">Password</label>
@@ -252,155 +292,109 @@ if (Astro.request.method === 'POST') {
           <button type="button" id="totpToggle" style="background:transparent;border:none;color:#FF7040;font-size:12px;font-weight:600;cursor:pointer;text-decoration:underline;">Sign in with an authenticator code</button>
         </div>
         <div id="totpBox" style="display:none;margin-top:10px;">
-          <input id="totpEmail" type="email" placeholder="you@edurankai.in" class="input" style="margin-bottom:8px;" />
+          <input id="totpEmail" type="text" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Email or internal handle" class="input" style="margin-bottom:8px;" />
           <input id="totpCode" inputmode="numeric" maxlength="12" placeholder="6-digit code" class="input" style="margin-bottom:8px;text-align:center;letter-spacing:0.15em;" />
           <button type="button" id="totpBtn" class="btn" style="font-size:13px;padding:10px;">Verify code</button>
           <p id="totpErr" style="color:#ff6b6b;font-size:11px;text-align:center;margin:8px 0 0;min-height:1em;"></p>
         </div>
       </div>
-    ) : (
-      <!-- Face verification -->
-      <div>
-        <p style="text-align:center;font-size:13px;color:#8a8a94;margin-bottom:4px;">Welcome back,</p>
-        <p style="text-align:center;font-size:16px;font-weight:600;color:#fff;margin-bottom:20px;">{pendingUserName}</p>
-
-        <div style="position:relative;background:#000;border-radius:16px;overflow:hidden;margin-bottom:16px;aspect-ratio:3/4;max-width:240px;margin-left:auto;margin-right:auto;">
-          <video id="videoEl" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;transform:scaleX(-1);"></video>
-          <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;">
-            <div style="width:140px;height:180px;border:2px solid rgba(255,79,0,0.7);border-radius:50%;"></div>
-          </div>
-          <div id="faceStatus" style="position:absolute;bottom:10px;left:0;right:0;text-align:center;">
-            <span style="background:rgba(0,0,0,0.75);color:#fff;font-size:11px;padding:3px 10px;border-radius:100px;">Loading...</span>
-          </div>
-        </div>
-
-        <div id="loadingBar" style="background:#15151a;border-radius:100px;height:3px;margin-bottom:12px;">
-          <div id="loadingProg" style="background:#FF4F00;height:100%;width:0%;border-radius:100px;transition:width 0.5s;"></div>
-        </div>
-
-        <button id="verifyBtn" disabled class="btn" style="opacity:0.5;margin-bottom:10px;">Verifying face...</button>
-
-        <form method="POST" style="display:none;" id="successForm">
-          <input type="hidden" name="action" value="face_verified" />
-          <input type="hidden" name="user_id" value={pendingUserId} />
-          <input type="hidden" name="live_descriptor" id="liveDescriptorField" value="" />
-        </form>
-
-        <form method="POST">
-          <input type="hidden" name="action" value="cancel_face" />
-          <button type="submit" style="width:100%;background:none;border:none;color:#6e6e78;font-size:12px;cursor:pointer;padding:8px;">Use different account</button>
-        </form>
-      </div>
     )}
   </div>
 
-  {requireFace && faceDescriptor && (
+  {requireSecondStep && offerFace && (
     <script is:inline src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.min.js"></script>
-    <script is:inline define:vars={{ storedDescriptor: faceDescriptor }}>
-    var video = document.getElementById('videoEl');
-    var verifyBtn = document.getElementById('verifyBtn');
-    var statusEl = document.getElementById('faceStatus');
-    var loadingProg = document.getElementById('loadingProg');
-    var successForm = document.getElementById('successForm');
-    var verified = false;
-    var lastLiveDescriptor = null;
+    <script is:inline>
+    // The enrolled descriptor is NEVER sent to the browser. This script only
+    // captures a live descriptor and posts it; the comparison, the threshold
+    // and the verdict all happen on the server, which is the only place a
+    // forged POST cannot reach.
+    (function () {
+      var video = document.getElementById('videoEl');
+      var verifyBtn = document.getElementById('verifyBtn');
+      var statusEl = document.getElementById('faceStatus');
+      var successForm = document.getElementById('successForm');
+      var field = document.getElementById('liveDescriptorField');
+      if (!video || !verifyBtn || !successForm) return;
+      var submitted = false;
+      var stream = null;
 
-    function setStatus(msg, color) {
-      statusEl.innerHTML = '<span style="background:rgba(0,0,0,0.75);color:' + (color||'#fff') + ';font-size:11px;padding:3px 10px;border-radius:100px;">' + msg + '</span>';
-    }
+      // THE CAMERA IS TURNED OFF EXPLICITLY, ON EVERY EXIT.
+      //
+      // Leaving it to the page navigation was not good enough: the light stays on
+      // while the descriptor is posted and the next page renders, and it stays on
+      // indefinitely whenever somebody abandons the face step and types a code
+      // instead — the page is still open, so nothing ever tears the stream down.
+      // A camera that keeps running after the moment it was granted for is a
+      // trust failure even when, as here, no frame is ever stored or uploaded.
+      function shutCamera() {
+        try {
+          if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (_) {} }); }
+        } catch (_) {}
+        stream = null;
+        try { video.pause(); } catch (_) {}
+        try { video.srcObject = null; } catch (_) {}
+        try { video.removeAttribute('src'); } catch (_) {}
+      }
+      window.addEventListener('pagehide', shutCamera);
 
-    async function init() {
-      setStatus('Loading face model...', '#fff');
-      loadingProg.style.width = '20%';
+      function setStatus(msg, color) {
+        if (!statusEl) return;
+        statusEl.innerHTML = '<span style="background:rgba(0,0,0,0.75);color:' + (color || '#fff') + ';font-size:11px;padding:3px 10px;border-radius:100px;">' + msg + '</span>';
+      }
 
-      var MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
-      await Promise.all([
-        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-        faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL),
-        faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
-      ]);
-      loadingProg.style.width = '60%';
-
-      var stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
-      video.srcObject = stream;
-      loadingProg.style.width = '100%';
-
-      setTimeout(function() {
-        loadingProg.style.display = 'none';
+      async function init() {
+        setStatus('Loading face model...', '#fff');
+        var MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@latest/model';
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+        ]);
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+        video.srcObject = stream;
         verifyBtn.disabled = false;
         verifyBtn.style.opacity = '1';
-        verifyBtn.textContent = 'Verify My Face';
-        verifyBtn.onclick = doVerify;
-        setStatus('Position face in oval', '#10b981');
-        // Auto-verify loop
-        autoVerify();
-      }, 300);
-    }
-
-    var attempts = 0;
-    async function autoVerify() {
-      if (verified) return;
-      if (attempts > 20) {
-        setStatus('Auto-verify failed. Click verify.', '#fbbf24');
-        return;
+        verifyBtn.textContent = 'Verify my face';
+        verifyBtn.onclick = capture;
+        setStatus('Position your face in the oval', '#10b981');
       }
-      attempts++;
-      try {
-        var match = await tryMatch();
-        if (match) {
-          onVerified();
-          return;
-        }
-      } catch(e) {}
-      setTimeout(autoVerify, 800);
-    }
 
-    async function doVerify() {
-      verifyBtn.disabled = true;
-      verifyBtn.textContent = 'Verifying...';
-      setStatus('Scanning face...', '#fbbf24');
-      try {
-        var match = await tryMatch();
-        if (match) { onVerified(); }
-        else {
-          setStatus('Face not recognized. Try again.', '#ef4444');
-          verifyBtn.disabled = false;
-          verifyBtn.textContent = 'Try Again';
-        }
-      } catch(e) {
-        setStatus('Error: ' + e.message, '#ef4444');
-        verifyBtn.disabled = false;
-        verifyBtn.textContent = 'Try Again';
-      }
-    }
-
-    async function tryMatch() {
-      var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
-        .withFaceLandmarks(true).withFaceDescriptor();
-      if (!det) return false;
-      lastLiveDescriptor = det.descriptor;
-      var stored = JSON.parse(storedDescriptor);
-      var storedArr = Array.isArray(stored) ? stored : Object.values(stored);
-      var storedFloat = new Float32Array(storedArr);
-      var dist = faceapi.euclideanDistance(det.descriptor, storedFloat);
-      return dist < 0.5; // threshold ' lower = stricter
-    }
-
-    function onVerified() {
-      verified = true;
-      setStatus('Face verified! Logging in...', '#10b981');
-      verifyBtn.textContent = 'Verified!';
-      verifyBtn.style.background = '#10b981';
-      setTimeout(function() {
+      async function capture() {
+        if (submitted) return;
+        verifyBtn.disabled = true;
+        verifyBtn.textContent = 'Checking...';
+        setStatus('Scanning...', '#fbbf24');
         try {
-          var f = document.getElementById('liveDescriptorField');
-          if (f && lastLiveDescriptor) f.value = JSON.stringify(Array.prototype.slice.call(lastLiveDescriptor));
-        } catch (e) {}
-        successForm.submit();
-      }, 800);
-    }
+          var det = await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+            .withFaceLandmarks(true).withFaceDescriptor();
+          if (!det) {
+            setStatus('No face detected. Try again in better light.', '#ef4444');
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = 'Try again';
+            return;
+          }
+          submitted = true;
+          field.value = JSON.stringify(Array.prototype.slice.call(det.descriptor));
+          // Camera off BEFORE the descriptor is posted. The frame it came from is
+          // never drawn to a canvas, never uploaded and does not outlive this line.
+          shutCamera();
+          setStatus('Sending for verification...', '#10b981');
+          successForm.submit();
+        } catch (e) {
+          // The camera is left running here on purpose: this is a detection
+          // failure, "Try again" needs a live preview, and pagehide still stops
+          // every track the moment this page is left by any route.
+          setStatus('Camera error. Use a code instead.', '#ef4444');
+          verifyBtn.disabled = false;
+          verifyBtn.textContent = 'Try again';
+        }
+      }
 
-    init().catch(function(e) { setStatus('Camera error: ' + e.message, '#ef4444'); });
+      init().catch(function () {
+        setStatus('Camera unavailable. Use a code instead.', '#ef4444');
+        verifyBtn.textContent = 'Camera unavailable';
+      });
+    })();
     </script>
   )}
 
@@ -425,7 +419,10 @@ if (Astro.request.method === 'POST') {
         var code = (document.getElementById('totpCode').value || '').trim();
         if (!email || !code) { if (te) te.textContent = 'Enter your email and code.'; return; }
         tb.disabled = true;
-        var rr = await fetch('/api/auth/totp-login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ email: email, code: code }) });
+        // `surface` names the sign-in this code belongs to. Without it the route
+        // defaults to the portal, so an admin whose account owes a second step is
+        // handed a portal challenge cookie and redirected to /portal/login.
+        var rr = await fetch('/api/auth/totp-login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ email: email, code: code, surface: 'admin' }) });
         var d = {}; try { d = await rr.json(); } catch (_) {}
         tb.disabled = false;
         if (d.ok) location.href = d.redirect || '/admin'; else if (te) te.textContent = d.error || 'Invalid email or code.';
