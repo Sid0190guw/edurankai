@@ -15,6 +15,14 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { logEvent } from '@/lib/logger';
 import { withEmployeeCode } from '@/lib/hr/employee-code';
+// A JOINING DATE AND AN EXIT DATE ARE CIVIL DATES, NOT UTC INSTANTS.
+// Both were `new Date().toISOString().split('T')[0]`, which is the date in UTC. This process runs
+// in UTC and the people it records live in IST (UTC+05:30), so every hire confirmed between
+// 00:00 and 05:29 IST was written onto the register as having joined YESTERDAY — and every
+// offboarding in that window as having left yesterday. Those two columns are read by probation
+// end, notice period, leave accrual and the full-and-final settlement, so a day out is not
+// cosmetic. civilToday() asks Intl for the date in the zone the company works in.
+import { civilToday } from '@/lib/page-safety';
 
 export type HrSyncResult = {
   ok: boolean;
@@ -75,7 +83,7 @@ async function syncHiredToEmployee(applicationId: string, actorUserId: string): 
     }
 
     const fullName = ((a.first_name || '') + ' ' + (a.last_name || '')).trim();
-    const joinDate = new Date().toISOString().split('T')[0];
+    const joinDate = civilToday();
 
     // Create employee record. Column names must match the real hr_employees
     // schema: email (NOT NULL) + personal_email + joining_date (not work_email
@@ -126,7 +134,12 @@ async function syncHiredToEmployee(applicationId: string, actorUserId: string): 
 
 async function syncOffboardEmployee(applicationId: string, reason: string, actorUserId: string): Promise<HrSyncResult> {
   try {
-    const offboardDate = new Date().toISOString().split('T')[0];
+    // The header of this file says BOTH of these dates are civil dates in the company's zone. The
+    // joining date was moved to civilToday(); this one was left on `new Date().toISOString()`, the
+    // date in UTC, so every offboarding confirmed between 00:00 and 05:29 IST was written onto the
+    // register as having happened YESTERDAY. exit_date drives notice period and the full-and-final
+    // settlement, so a day out here is money, not formatting.
+    const offboardDate = civilToday();
     await db.execute(sql`
       UPDATE hr_employees SET
         is_active = false,

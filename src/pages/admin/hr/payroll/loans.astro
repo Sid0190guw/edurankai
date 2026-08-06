@@ -24,12 +24,20 @@ import { can } from '@/lib/auth/permissions';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { isInitialized } from '@/lib/org-graph';
-import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import { decideInstance, getInstance, resumeWorkflow, VIA_LABELS } from '@/lib/workflow';
 import {
   ensureLoanSchema, listLoans, requestLoan, cancelLoan, recordDisbursement,
   syncLoanApprovals, loanLedger, loanKindLabel, loanStateLabel, LOAN_KINDS,
   type LoanRow,
 } from '@/lib/loans';
+// CONFIRMATION PROMPTS ARE ESCAPED, NOT STRIPPED. These were built with `.replace(/'/g, '')`,
+// which DELETES the apostrophe — the admin was asked to confirm an action against "OBrien", a person
+// who does not exist, which is the one thing a confirmation exists to let them check. A value
+// carrying a newline ended the JS string literal outright, the handler became a syntax error,
+// confirm() never fired, and the destructive form submitted with no confirmation at all.
+import { confirmAttr, clip, civilToday } from '@/lib/page-safety';
+// sumMoney adds integer paise, so a summary tile equals the rows printed beneath it.
+import { sumMoney } from '@/lib/money';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -130,6 +138,33 @@ if (Astro.request.method === 'POST') {
       flash = r.ok
         ? 'Disbursement recorded. Recovery starts with the next payroll run at or after the start month.'
         : (r.error || 'The disbursement was not recorded.');
+    } else if (action === 'resume') {
+      // THE HALT WAS A DEAD END ON THIS PAGE.
+      //
+      // The banner told the operator to "record the missing relationship in the Organization Graph,
+      // then resume it from the approvals workflow" — and the only console that resumes anything is
+      // /admin/hr/leave/workflow, which is hard-scoped to the `leave` domain. A loan halted for a
+      // missing manager could therefore never be moved again from any surface in the product: the
+      // request sat halted forever with a sentence pointing at a screen that cannot list it.
+      //
+      // resumeWorkflow() carries NO entitlement check of its own and says so in its own doc comment
+      // — the caller must bring the gate. This page's gate is `payroll.manage`, tested at the top,
+      // and it is the same key that raises a loan here. Resuming cannot decide anything: it re-routes
+      // to whoever the graph names, and if the graph still names nobody the instance STAYS halted
+      // with the current reason. It is never nudged towards approved.
+      const r = await resumeWorkflow(String(fd.get('instance_id') || ''), user as any);
+      if (!r.ok) {
+        flash = r.error || 'The request was not resumed.';
+      } else if (r.state === 'halted') {
+        flash = 'Still halted: ' + (r.haltReason || 'the graph still names nobody for a required rung.')
+          + ' Nothing was approved and no money has moved.';
+      } else {
+        flash = 'Resumed. It carries on from the rung it stopped at; nothing earlier was re-decided.';
+      }
+      if (r.ok) {
+        const sync = await syncLoanApprovals(user.id);
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
     } else {
       flash = 'That is not something this page does.';
     }
@@ -173,8 +208,40 @@ for (const l of open) {
 const active = loans.filter((l) => l.state === 'active');
 const settled = loans.filter((l) => ['closed', 'rejected', 'cancelled'].indexOf(l.state) >= 0);
 const awaitingDisbursement = active.filter((l) => !l.disbursedAt);
-const outstandingTotal = active.reduce((s, l) => s + l.outstanding, 0);
-const currency = String(loans[0]?.currency || 'INR');
+// ===================================================================================================
+// A TOTAL OVER TWO CURRENCIES IS NOT A NUMBER, AND THE FIRST ROW'S SYMBOL IS NOT A LABEL FOR IT
+// ===================================================================================================
+//
+// This was `active.reduce((s, l) => s + l.outstanding, 0)` printed with `loans[0]?.currency`. Two
+// faults compounded on one tile:
+//
+//   * Every other figure on this page is rendered with its OWN loan's currency (`money(l.principal,
+//     l.currency)`), because hr_salary_loans carries one and src/lib/loans.ts reads it. This tile
+//     added them all together regardless and labelled the sum with whichever loan the ORDER BY
+//     happened to return first. A register holding a USD 4,000 advance and a rupee loan of 60,000
+//     reported "INR 64,000.00" — a figure that is not true in any currency, on the screen somebody
+//     uses to say what the company is owed. src/lib/payroll.ts and src/lib/settlement.ts both REFUSE
+//     to mix currencies at exactly this boundary; this page quietly did it anyway.
+//   * The addition was a left-to-right double sum. sumMoney() adds integer paise, so the total
+//     equals the balances printed beneath it to the paisa.
+//
+// One entry per currency held. Nothing is converted — there is no exchange rate in this codebase and
+// a summary tile is not the place to invent one.
+const outstandingBuckets = new Map<string, number[]>();
+for (const l of active) {
+  const cur = String(l.currency || 'INR').toUpperCase();
+  const bucket = outstandingBuckets.get(cur) || [];
+  bucket.push(l.outstanding);
+  outstandingBuckets.set(cur, bucket);
+}
+const outstandingByCurrency: Array<{ currency: string; total: number }> = [];
+outstandingBuckets.forEach((amounts, cur) => {
+  outstandingByCurrency.push({ currency: cur, total: sumMoney(amounts) });
+});
+outstandingByCurrency.sort((a, b) => a.currency.localeCompare(b.currency));
+const outstandingLabel = outstandingByCurrency.length === 0
+  ? money(0, 'INR')
+  : outstandingByCurrency.map((o) => money(o.total, o.currency)).join('  +  ');
 
 // The ledger for the live agreements only. Each is one query, and a long history must not turn one
 // page load on a phone into hundreds of round trips.
@@ -183,9 +250,16 @@ for (const l of active.slice(0, DETAIL_LIMIT)) {
   ledgers[l.id] = await loanLedger(l.id);
 }
 
-const now = new Date();
-const thisMonth = now.getMonth() + 1;
-const thisYear = now.getFullYear();
+// THE MONTH THIS FORM DEFAULTS TO, IN THE ZONE THE COMPANY WORKS IN.
+//
+// `new Date().getMonth()` reads the PROCESS clock, which is UTC on this deployment. Between 00:00 and
+// 05:29 IST on the 1st of a month it is still the previous month there, so the "recovery starts from"
+// selector defaulted to a month that has already been paid — and src/lib/loans.ts plannedRecoveries()
+// skips a loan whose start period is not yet reached, so the opposite error simply delays recovery by
+// a run. Neither is visible on the form: it shows a plausible month either way.
+const civilNow = civilToday();
+const thisMonth = Number(civilNow.slice(5, 7)) || 1;
+const thisYear = Number(civilNow.slice(0, 4)) || new Date().getUTCFullYear();
 const yearOptions = [thisYear, thisYear + 1];
 ---
 <AdminLayout title="Loans and salary advances" activeNav="hr">
@@ -214,7 +288,7 @@ const yearOptions = [thisYear, thisYear + 1];
     <div class="tile"><span class="tv">{detail.length}</span><span class="tl">Waiting on a decision</span></div>
     <div class="tile"><span class="tv">{active.length}</span><span class="tl">Live agreements</span></div>
     <div class="tile"><span class="tv">{awaitingDisbursement.length}</span><span class="tl">Approved, not paid out</span></div>
-    <div class="tile"><span class="tv">{money(outstandingTotal, currency)}</span><span class="tl">Outstanding in total</span></div>
+    <div class="tile"><span class="tv">{outstandingLabel}</span><span class="tl">{outstandingByCurrency.length > 1 ? 'Outstanding, per currency (not added together)' : 'Outstanding in total'}</span></div>
   </div>
 
   <details class="panel">
@@ -307,8 +381,30 @@ const yearOptions = [thisYear, thisYear + 1];
 
           {d.l.state === 'halted' && (
             <div class="halt">
-              <strong>Halted.</strong> {d.l.haltReason || 'No approver could be resolved.'}
-              <span class="hint">Nothing has been lent and nothing is being deducted. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+              <strong>Halted.</strong> {d.l.haltReason || (graphReady
+                ? 'No approver could be resolved.'
+                : 'The Organization Graph has not been initialized, so no approver could be resolved for anybody yet.')}
+              {/* THE INSTRUCTION USED TO POINT AT A SCREEN THAT CANNOT HELP. It read "resume it from
+                  the approvals workflow" — the only resume console is /admin/hr/leave/workflow and
+                  it is hard-scoped to the leave domain, so a halted LOAN never appears on it. The
+                  button is here now, on the request it concerns. */}
+              <span class="hint">
+                {graphReady
+                  ? 'Nothing has been lent and nothing is being deducted. Record the missing relationship in the Organization Graph, then press Resume below — the approval carries on from the rung it stopped at.'
+                  : 'Nothing has been lent and nothing is being deducted. This is NOT a claim that this person has no manager: the Organization Graph has not been initialized at all, so nothing can be routed yet. Initialize it, then press Resume below.'}
+              </span>
+              {/* No extra gate: the whole page is already refused to anybody without
+                  `payroll.manage`, which is the same key that raises a loan here. */}
+              {d.instance && (
+                <form method="POST" class="inline">
+                  <input type="hidden" name="action" value="resume" />
+                  <input type="hidden" name="instance_id" value={d.instance.id} />
+                  <button type="submit" class="btn ghost">Resume this approval</button>
+                </form>
+              )}
+              {!d.instance && (
+                <span class="hint">There is no approval instance on this request to resume — withdraw it and raise it again once the graph names an approver.</span>
+              )}
             </div>
           )}
 
@@ -335,7 +431,7 @@ const yearOptions = [thisYear, thisYear + 1];
           )}
 
           {/* Withdrawing ends an approval somebody may already have acted on. It named nothing. */}
-          <form method="POST" class="inline" onsubmit={`return confirm('Withdraw the ${money(d.l.principal, d.l.currency)} ${loanKindLabel(d.l.kind).toLowerCase()} for ${String(d.l.employeeName || 'this employee').replace(/'/g, '')}? The approval in progress ends, no money is lent, and raising it again starts a new approval from the beginning.')`}>
+          <form method="POST" class="inline" onsubmit={confirmAttr('Withdraw the ' + money(d.l.principal, d.l.currency) + ' ' + loanKindLabel(d.l.kind).toLowerCase() + ' for ' + clip(d.l.employeeName || 'this employee', 80) + '? The approval in progress ends, no money is lent, and raising it again starts a new approval from the beginning.')}>
             <input type="hidden" name="action" value="cancel" />
             <input type="hidden" name="loan_id" value={d.l.id} />
             <button type="submit" class="btn ghost">Withdraw this request</button>

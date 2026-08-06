@@ -19,7 +19,7 @@ import { canAccessSection, can } from '@/lib/auth/permissions';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { isInitialized } from '@/lib/org-graph';
-import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import { decideInstance, getInstance, resumeWorkflow, VIA_LABELS } from '@/lib/workflow';
 import {
   ensureMoveSchema,
   requestTransfer,
@@ -27,6 +27,12 @@ import {
   syncMoves,
   listTransfers,
 } from '@/lib/hr-lifecycle';
+// The withdraw prompt below was built with `.replace(/'/g, '')`, which DELETES the apostrophe: the
+// admin was asked to confirm withdrawing the transfer of "OBrien", a person who does not exist —
+// which is the one thing a confirmation exists to let them check. A name carrying a newline ended
+// the JS string literal outright, the handler became a syntax error, confirm() never fired, and the
+// form submitted with no confirmation at all. confirmAttr() escapes; it does not delete.
+import { confirmAttr, clip } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -97,6 +103,31 @@ if (Astro.request.method === 'POST') {
       if (r.ok) {
         const sync = await syncMoves(user.id);
         if (sync.applied) flash += ' ' + sync.applied + ' approved move applied to the Organization Graph.';
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else if (action === 'resume' && mayWrite) {
+      // THE `&& mayWrite` IS LOAD-BEARING. This branch sits ABOVE the chain's `!mayWrite` arm because
+      // it has to sit beside 'decide' — but 'decide' is safe there only because decideInstance()
+      // re-checks the actor itself, and resumeWorkflow() explicitly does NOT. Without this test a
+      // read-only account could re-route somebody else's approval. Falling through leaves the
+      // refusal sentence the chain already has.
+      //
+      // A HALTED REQUEST USED TO BE A DEAD END. The banner said "resume it from the approvals
+      // workflow" — the only resume console is /admin/hr/leave/workflow and it is hard-scoped to the
+      // `leave` domain, so this transfer never appeared on it and no surface could move it again.
+      // resumeWorkflow() carries no entitlement check of its own; the gate is the test on this line. It cannot decide anything — it re-routes to whoever the graph names, and
+      // leaves the instance halted with the current reason when the graph still names nobody.
+      const r = await resumeWorkflow(String(fd.get('instance_id') || ''), user as any);
+      if (!r.ok) {
+        flash = r.error || 'The transfer was not resumed.';
+      } else if (r.state === 'halted') {
+        flash = 'Still halted: ' + (r.haltReason || 'the graph still names nobody for a required rung.')
+          + ' Nobody has moved.';
+      } else {
+        flash = 'Resumed. It carries on from the rung it stopped at; nothing earlier was re-decided.';
+      }
+      if (r.ok) {
+        const sync = await syncMoves(user.id);
         if (sync.errors.length) flash += ' ' + sync.errors[0];
       }
     } else if (!mayWrite) {
@@ -271,8 +302,24 @@ const today = new Date().toISOString().slice(0, 10);
 
           {d.t.state === 'halted' && (
             <div class="halt">
-              <strong>Halted.</strong> {d.t.haltReason || 'No approver could be resolved.'}
-              <span class="hint">Nobody has moved and nothing has been written to the Organization Graph. Record the missing relationship, then resume it from the approvals workflow.</span>
+              <strong>Halted.</strong> {d.t.haltReason || (graphReady
+                ? 'No approver could be resolved.'
+                : 'The Organization Graph has not been initialized, so no approver could be resolved for anybody yet.')}
+              <span class="hint">
+                {graphReady
+                  ? 'Nobody has moved and nothing has been written to the Organization Graph. Record the missing relationship, then press Resume below — the approval carries on from the rung it stopped at.'
+                  : 'Nobody has moved and nothing has been written to the Organization Graph. This is NOT a claim that this person has no manager: the graph has not been initialized at all, so nothing can be routed yet. Initialize it, then press Resume below.'}
+              </span>
+              {mayWrite && d.instance && (
+                <form method="POST" class="inline">
+                  <input type="hidden" name="action" value="resume" />
+                  <input type="hidden" name="instance_id" value={d.instance.id} />
+                  <button type="submit" class="btn ghost">Resume this approval</button>
+                </form>
+              )}
+              {mayWrite && !d.instance && (
+                <span class="hint">There is no approval instance on this request to resume — withdraw it and raise it again once the graph names an approver.</span>
+              )}
             </div>
           )}
 
@@ -301,7 +348,7 @@ const today = new Date().toISOString().slice(0, 10);
           {/* Withdrawing ends an approval somebody may already have acted on, and the button carried
             no prompt at all. It names the person and what stops. */}
           {mayWrite && (d.t.state === 'pending' || d.t.state === 'halted') && (
-            <form method="POST" class="inline" onsubmit={`return confirm('Withdraw the transfer for ${String(d.t.employeeName || 'this employee').replace(/'/g, '')}? The approval in progress ends, nobody moves, and raising it again starts a new approval from the beginning.')`}>
+            <form method="POST" class="inline" onsubmit={confirmAttr('Withdraw the transfer for ' + clip(d.t.employeeName || 'this employee', 80) + '? The approval in progress ends, nobody moves, and raising it again starts a new approval from the beginning.')}>
               <input type="hidden" name="action" value="cancel" />
               <input type="hidden" name="transfer_id" value={d.t.id} />
               <button type="submit" class="btn ghost">Withdraw this request</button>

@@ -16,8 +16,32 @@ import {
   isInitialized as orgGraphInitialized,
 } from '@/lib/org-graph';
 import { startWorkflow, getInstance, type WorkflowInstanceView } from '@/lib/workflow';
+// THE CIVIL DATE IN THE COMPANY'S ZONE. `new Date()` in this process is UTC on this deployment, five
+// and a half hours behind the zone the working day actually turns over in, so every date this module
+// derived for itself between 00:00 and 05:29 local was the previous day. See src/lib/page-safety.ts.
+import { civilToday } from '@/lib/page-safety';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
+/**
+ * A CIVIL DATE, N DAYS ON — calendar arithmetic, never an instant.
+ *
+ * Anchored at UTC midnight of a date STRING that is already the company's civil day, so adding days
+ * cannot cross a zone boundary on the way back out. Declared ABOVE its readers; `const` is not
+ * hoisted and a helper placed under its first caller has taken pages down on this project.
+ */
+function civilDatePlusDays(days: number): string {
+  const d = new Date(civilToday() + 'T00:00:00Z');
+  if (isNaN(d.getTime())) return '';
+  d.setUTCDate(d.getUTCDate() + Math.round(Number(days) || 0));
+  return d.toISOString().slice(0, 10);
+}
+
+/** Today in the company's zone as a UTC-midnight instant, for whole-day differences. */
+function civilTodayInstant(): Date {
+  const d = new Date(civilToday() + 'T00:00:00Z');
+  return isNaN(d.getTime()) ? new Date(0) : d;
+}
 
 /**
  * THE PROBATION / KRA / PIP TABLES. Inside an ensureOnce guard, and NOT a hand-rolled module-level
@@ -204,6 +228,17 @@ function addMonthsIso(dateIso: string | null, months: number): string | null {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * THE ZONE A PROBATION DAY IS CUT ON. Declared above every reader — `const` is not hoisted.
+ *
+ * The date somebody's employment status changes is not a formatting choice. CURRENT_DATE is the
+ * database SESSION's zone and nothing in this codebase sets it, so it resolves to UTC — which puts
+ * every confirmation recorded between 00:00 and 05:29 IST on the PREVIOUS day. A confirmation date is
+ * read back as the start of somebody's confirmed service; being a day out is a real error in a record
+ * people rely on. `NOW() AT TIME ZONE '<zone>'` names the zone instead of inheriting one.
+ */
+const LIFECYCLE_TIME_ZONE = 'Asia/Kolkata';
+
 /** Add whole days to an ISO day, in UTC. Null in, null out. */
 function addDaysIso(dateIso: string | null, days: number): string | null {
   if (!dateIso) return null;
@@ -277,26 +312,82 @@ export async function recordReview(opts: {
   `);
 }
 
+/**
+ * Confirm somebody at the end of probation.
+ *
+ * =================================================================================================
+ * ONE STATEMENT, AND IT RESTATES ITS OWN PRECONDITION
+ * =================================================================================================
+ *
+ * This used to be two unconditional UPDATEs, and both halves of that were wrong:
+ *
+ *   1. NO STATE GUARD. terminateOnProbation() writes the same column with the same shape, so HR
+ *      confirming on /admin/hr/employees/[id] while the reporting manager terminates on the probation
+ *      console a second later left hr_probation.status = 'terminated' WITH a confirmation letter URL
+ *      stored on the same row and hr_employees.confirmation_date set. The employee record said
+ *      confirmed, the probation record said terminated on probation, and the letter had been issued.
+ *      Which one a reader believed depended on which page they opened, and nothing in the data said
+ *      which decision was real.
+ *
+ *   2. TWO SEPARATE COMMITS. The probation row could be written and the employee row not, leaving
+ *      "confirmed" on one record and no confirmation_date on the other.
+ *
+ * Both are answered by the same change: `AND status IN ('active','extended')` makes the transition a
+ * CLAIM that exactly one caller can win, and a data-modifying CTE carries the employee update in the
+ * same statement, so it commits with the probation row or not at all.
+ *
+ * IT STILL THROWS, DELIBERATELY, AND BOTH CALLERS DEPEND ON THAT. /admin/hr/employees/[id] renders
+ * `e.cause?.message` from its POST handler, and applyProbationDecision() leaves the decision
+ * approved-but-not-applied when this rejects — which is exactly right for a decision that did not take
+ * effect. Returning a quiet result object here would have applyProbationDecision() mark it applied.
+ */
 export async function confirmEmployee(opts: { probationId: string; confirmedByUserId: string; letterUrl?: string }) {
   await ensureLifecycleSchema();
-  await db.execute(sql`
-    UPDATE hr_probation SET status = 'confirmed', confirmation_letter_issued_at = NOW(),
-      confirmation_letter_url = ${opts.letterUrl || null}, confirmed_by_user_id = ${opts.confirmedByUserId},
-      updated_at = NOW()
-    WHERE id = ${opts.probationId}
-  `);
-  // THE EMPLOYEE RECORD, AND IT IS NOT OPTIONAL. This used to be wrapped in `catch (_) {}`, which
-  // meant confirmation could succeed on hr_probation and fail on hr_employees while the screen said
+  // The column has to exist before the CTE below can write it. Additive and idempotent.
+  await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS confirmation_date DATE`);
+
+  const done = rows(await db.execute(sql`
+    WITH claimed AS (
+      UPDATE hr_probation
+         SET status = 'confirmed', confirmation_letter_issued_at = NOW(),
+             confirmation_letter_url = ${opts.letterUrl || null},
+             confirmed_by_user_id = ${opts.confirmedByUserId}, updated_at = NOW()
+       WHERE id = ${opts.probationId}
+         AND status IN ('active', 'extended')
+      RETURNING id, employee_id
+    ), stamped AS (
+      UPDATE hr_employees e
+         SET confirmation_date = (NOW() AT TIME ZONE ${LIFECYCLE_TIME_ZONE})::date
+        FROM claimed c
+       WHERE e.id = c.employee_id
+      RETURNING e.id
+    )
+    SELECT c.id, c.employee_id, (SELECT COUNT(*) FROM stamped)::int AS employees_stamped
+      FROM claimed c`));
+
+  if (!done.length) {
+    // Nothing was claimed: the probation is already confirmed, already terminated, or gone. Re-read so
+    // the sentence names what actually happened rather than guessing at it.
+    const cur = rows(await db.execute(sql`
+      SELECT status FROM hr_probation WHERE id = ${opts.probationId} LIMIT 1`))[0] as any;
+    if (!cur) {
+      throw new Error('That probation record could not be found, so nobody was confirmed.');
+    }
+    throw new Error('That probation is already ' + String(cur.status)
+      + ', so it was not confirmed. Somebody decided it while this page was open — reload it.');
+  }
+
+  // THE EMPLOYEE RECORD, AND IT IS NOT OPTIONAL. This was once wrapped in `catch (_) {}`, so
+  // confirmation could succeed on hr_probation and fail on hr_employees while the screen said
   // "Employee confirmed. Written confirmation recorded." Two records disagreeing about whether
   // somebody is confirmed, with nothing written down anywhere, is the same fault class as the hire
-  // that failed silently for eleven days on this project.
-  //
-  // The exception now PROPAGATES. Every caller of this function reaches it from a POST handler with
-  // a try/catch that renders `e.cause?.message` on screen (/admin/hr/employees/[id] does exactly
-  // that), so the person who pressed the button is told the confirmation is half-written instead of
-  // being congratulated on a write that did not happen.
-  await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS confirmation_date DATE`);
-  await db.execute(sql`UPDATE hr_employees SET confirmation_date = CURRENT_DATE WHERE id IN (SELECT employee_id FROM hr_probation WHERE id = ${opts.probationId})`);
+  // that failed silently for eleven days on this project. It is now part of the statement above, so it
+  // cannot fail separately — but it CAN legitimately match no row if the probation points at an
+  // employee id that no longer exists, and that is worth saying out loud rather than reading as done.
+  if (!Number(done[0].employees_stamped)) {
+    throw new Error('The probation is marked confirmed, but no employee record matched it, so no '
+      + 'confirmation date was recorded. Check which employee this probation belongs to.');
+  }
 }
 
 /**
@@ -349,13 +440,38 @@ export async function extendProbation(
   return { ok: true, newEnd };
 }
 
+/**
+ * End somebody's employment during probation.
+ *
+ * THE SAME CLAIM AS confirmEmployee(), FOR THE SAME REASON. These two functions write the same column
+ * on the same row from two different consoles, and neither used to state a precondition — so a
+ * confirmation and a termination decided within the same minute both took effect, in whichever order
+ * they happened to land. The row ended up 'terminated' with a confirmation letter issued against it,
+ * or 'confirmed' with a termination reason recorded, and no way to tell which decision was the real
+ * one.
+ *
+ * THROWS ON REFUSAL, deliberately: applyProbationDecision() calls this without reading a result, so a
+ * quietly-returned failure would be marked applied. A thrown one leaves the decision approved-but-not-
+ * applied on the console, with the reason.
+ */
 export async function terminateOnProbation(opts: { probationId: string; reason: string }) {
   await ensureLifecycleSchema();
-  await db.execute(sql`
-    UPDATE hr_probation SET status = 'terminated', termination_reason = ${opts.reason},
-      terminated_at = NOW(), updated_at = NOW()
-    WHERE id = ${opts.probationId}
-  `);
+  const wrote = rows(await db.execute(sql`
+    UPDATE hr_probation
+       SET status = 'terminated', termination_reason = ${opts.reason},
+           terminated_at = NOW(), updated_at = NOW()
+     WHERE id = ${opts.probationId}
+       AND status IN ('active', 'extended')
+    RETURNING id`));
+  if (!wrote.length) {
+    const cur = rows(await db.execute(sql`
+      SELECT status FROM hr_probation WHERE id = ${opts.probationId} LIMIT 1`))[0] as any;
+    if (!cur) {
+      throw new Error('That probation record could not be found, so nothing was ended.');
+    }
+    throw new Error('That probation is already ' + String(cur.status)
+      + ', so it was not ended here. Somebody decided it while this page was open — reload it.');
+  }
 }
 
 // ============================== KRA / GOALS ==============================
@@ -409,12 +525,19 @@ export async function openPip(opts: {
 }) {
   await ensureLifecycleSchema();
   const weeks = Math.max(1, Math.min(12, opts.durationWeeks || 2));
-  const end = new Date(); end.setDate(end.getDate() + weeks * 7);
+  // THE DATE A PERFORMANCE PLAN ENDS ON, IN THE ZONE THE PERSON WORKS IN.
+  //
+  // This was `new Date()` + setDate(+N) + `.toISOString().slice(0,10)`, which mixes two calendars:
+  // the addition happens in the process's local time and the answer is read back as the UTC day. On
+  // this deployment the process is UTC, five and a half hours behind, so a plan opened at any time
+  // between 00:00 and 05:29 IST was dated from the PREVIOUS civil day and ended a day early. A PIP is
+  // the document an employment decision is taken against; its end date is not a display detail.
+  const endDate = civilDatePlusDays(weeks * 7);
   const r = rows(await db.execute(sql`
     INSERT INTO hr_pips (employee_id, manager_user_id, opened_by_user_id, duration_weeks, scheduled_end_date,
       reason, expectations, consequences)
     VALUES (${opts.employeeId}, ${opts.managerUserId || null}, ${opts.openedByUserId}, ${weeks},
-      ${end.toISOString().slice(0, 10)}, ${opts.reason}, ${opts.expectations}, ${opts.consequences || null})
+      ${endDate}, ${opts.reason}, ${opts.expectations}, ${opts.consequences || null})
     RETURNING id, scheduled_end_date
   `));
   return { ok: true, pipId: r[0]?.id, scheduledEnd: r[0]?.scheduled_end_date };
@@ -1483,15 +1606,25 @@ export async function listOpenProbations(limit = 200): Promise<ProbationRow[]> {
        WHERE p.status IN ('active', 'extended')
        ORDER BY COALESCE(p.extended_to_date, p.scheduled_end_date) ASC
        LIMIT ${lim}`);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // "DAYS REMAINING" AND "OVERDUE" ARE COUNTED FROM THE COMPANY'S CIVIL DAY.
+    //
+    // This was `new Date()` with setHours(0,0,0,0) — midnight in the PROCESS's zone, which is UTC on
+    // this deployment — compared against a date parsed as local midnight. Between 18:30 and 24:00 UTC
+    // it is already tomorrow in the zone the probation actually runs in, so a probation ending today
+    // read as one day remaining and one ending yesterday did not read as overdue. This screen is the
+    // only place anybody is told a confirmation decision is due, and a decision taken a day late is
+    // a person left on probation past the date their letter names.
+    //
+    // Both sides are now UTC-midnight anchors of CIVIL dates, so the difference is a whole number of
+    // calendar days with no zone in it at all.
+    const today = civilTodayInstant();
     return rows(r).map((x: any) => {
       const endsOn = x.extended_to_date
         ? String(x.extended_to_date).slice(0, 10)
         : (x.scheduled_end_date ? String(x.scheduled_end_date).slice(0, 10) : null);
       let daysRemaining: number | null = null;
       if (endsOn) {
-        const end = new Date(endsOn + 'T00:00:00');
+        const end = new Date(endsOn + 'T00:00:00Z');
         if (!isNaN(end.getTime())) {
           daysRemaining = Math.round((end.getTime() - today.getTime()) / 86400000);
         }

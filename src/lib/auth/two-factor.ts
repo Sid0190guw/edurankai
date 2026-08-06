@@ -266,6 +266,28 @@ export async function enableSecondStep(userId: string): Promise<{ ok: true; reco
   if (!methods.length) {
     return { ok: false, error: 'Set up an authenticator app or enrol your face first — otherwise turning this on locks you out.' };
   }
+  // TURNING ON WHAT IS ALREADY ON IS NOT A NO-OP — IT SILENTLY REPLACES THE RECOVERY CODES.
+  //
+  // storeBackupCodes() DELETEs every existing code before inserting the new ten, so calling this on
+  // an account whose second step is already required destroys whatever the person is still carrying
+  // and hands the caller ten fresh working ones. That is precisely what
+  // /api/auth/2fa/recovery-codes refuses to do without proof of a factor — its whole comment is "a
+  // hijacked session cannot mint itself a fresh set of permanent bypasses" — and this route reached
+  // the same place with no code at all, from any signed-in session, at both
+  // /api/auth/2fa/enforce {enabled:true} and the `enable` action on /portal/employee/security.
+  // The page hides that button once enforcement is on (an inline display:none), which is a hidden
+  // control, not a closed door.
+  //
+  // Refused only while unused codes still exist. With none left there is nothing to destroy and
+  // nothing to prove a factor with either, so this stays the escape hatch out of that corner rather
+  // than becoming a second way to strand somebody — the failure mode this module was written to
+  // avoid twice over.
+  if (await isSecondStepRequired(userId) && (await countUnusedBackupCodes(userId)) > 0) {
+    return {
+      ok: false,
+      error: 'The second step is already on for this account. To replace your recovery codes, use "Issue ten new codes" and confirm with a current code — turning it on again would silently invalidate the codes you are still carrying.',
+    };
+  }
   const codes = generateBackupCodes(10);
   await storeBackupCodes(userId, codes);
   await db.execute(sql`

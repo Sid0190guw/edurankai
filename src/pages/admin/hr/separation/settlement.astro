@@ -23,7 +23,8 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { flashFailed } from '@/lib/flash-tone';
 import { canAccessSection, can } from '@/lib/auth/permissions';
-import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import { decideInstance, getInstance, resumeWorkflow, VIA_LABELS } from '@/lib/workflow';
+import { isInitialized } from '@/lib/org-graph';
 import { listSeparations } from '@/lib/hr-separation';
 import {
   ensureSettlementSchema, settlementFacts, listSettlements, getSettlement,
@@ -31,6 +32,12 @@ import {
   removeSettlementLine, requestSettlementApproval, syncSettlementApprovals, finaliseSettlement,
   settlementStateLabel,
 } from '@/lib/settlement';
+// CONFIRMATION PROMPTS ARE ESCAPED, NOT STRIPPED. These were built with `.replace(/'/g, '')`,
+// which DELETES the apostrophe — the admin was asked to confirm an action against "OBrien", a person
+// who does not exist, which is the one thing a confirmation exists to let them check. A value
+// carrying a newline ended the JS string literal outright, the handler became a syntax error,
+// confirm() never fired, and the destructive form submitted with no confirmation at all.
+import { confirmAttr, clip } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -131,6 +138,29 @@ if (Astro.request.method === 'POST') {
     } else if (action === 'remove_line') {
       const r = await removeSettlementLine(String(fd.get('line_id') || ''), user.id);
       flash = r.ok ? 'Line removed.' : (r.error || 'The line was not removed.');
+    } else if (action === 'resume') {
+      // A HALTED FULL AND FINAL SETTLEMENT USED TO BE PERMANENTLY DEAD. The banner said "resume it
+      // from the approvals workflow"; the only resume console is /admin/hr/leave/workflow and it is
+      // hard-scoped to the `leave` domain, so a halted settlement never appeared on it — a person who
+      // has left could not be paid and no surface in the product could move the request again.
+      //
+      // resumeWorkflow() carries no entitlement check of its own and says so; the gate is the
+      // `mayWrite` (employee.manage) branch this sits inside, the same key that prepares the
+      // statement. Resuming decides nothing — it re-routes to whoever the graph names, and leaves
+      // the instance halted, with the current reason, when the graph still names nobody.
+      const r = await resumeWorkflow(String(fd.get('instance_id') || ''), user as any);
+      if (!r.ok) {
+        flash = r.error || 'The settlement was not resumed.';
+      } else if (r.state === 'halted') {
+        flash = 'Still halted: ' + (r.haltReason || 'the graph still names nobody for a required rung.')
+          + ' Nothing has been paid.';
+      } else {
+        flash = 'Resumed. It carries on from the rung it stopped at; nothing earlier was re-decided.';
+      }
+      if (r.ok) {
+        const sync = await syncSettlementApprovals();
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
     } else if (action === 'send') {
       const r = await requestSettlementApproval(focusId, user.id);
       if (r.ok && r.haltReason) flash = 'Sent, but it is halted: ' + r.haltReason;
@@ -162,6 +192,9 @@ const url = new URL(Astro.request.url);
 const msg = url.searchParams.get('msg') || '';
 const focusParam = url.searchParams.get('id') || '';
 
+// "No approver could be resolved" and "the graph holds nothing at all yet" are different claims, and
+// the first is a statement about a real person that should not be made when the second is true.
+const graphReady = await isInitialized();
 const synced = await syncSettlementApprovals();
 const settlements = await listSettlements(150);
 const focus = focusParam ? await getSettlement(focusParam) : null;
@@ -353,7 +386,7 @@ const encashable = (facts?.leaveBalances || []).filter((b) => b.allowance > 0);
                         what they are owed, and every Remove button on the statement was identical
                         with no prompt at all. */}
                     {mayWrite && focus.state === 'draft' && (
-                      <form method="POST" onsubmit={`return confirm('Remove "${String(l.label).replace(/'/g, '')}" (${l.kind === 'deduction' ? 'a deduction of ' : ''}${money(l.amount, focus.currency)}) from this final settlement? It changes what this person is paid when the statement is handed off.')`}>
+                      <form method="POST" onsubmit={confirmAttr('Remove "' + clip(l.label, 80) + '" (' + (l.kind === 'deduction' ? 'a deduction of ' : '') + money(l.amount, focus.currency) + ') from this final settlement? It changes what this person is paid when the statement is handed off.')}>
                         <input type="hidden" name="action" value="remove_line" />
                         <input type="hidden" name="settlement_id" value={focus.id} />
                         <input type="hidden" name="line_id" value={l.id} />
@@ -465,8 +498,28 @@ const encashable = (facts?.leaveBalances || []).filter((b) => b.allowance > 0);
       {focus.state === 'halted' && (
         <div class="card">
           <div class="halt">
-            <strong>Halted.</strong> {focus.haltReason || 'No approver could be resolved.'}
-            <span class="hint">Nothing has been paid. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+            <strong>Halted.</strong> {focus.haltReason || (graphReady
+              ? 'No approver could be resolved.'
+              : 'The Organization Graph has not been initialized, so no approver could be resolved for anybody yet.')}
+            {/* "Resume it from the approvals workflow" pointed at /admin/hr/leave/workflow, which
+                lists only the leave domain — so a halted settlement could never be moved from any
+                screen. The button is here now, on the statement it concerns. */}
+            <span class="hint">
+              {graphReady
+                ? 'Nothing has been paid. Record the missing relationship in the Organization Graph, then press Resume below — the approval carries on from the rung it stopped at.'
+                : 'Nothing has been paid. This is NOT a claim that this person has no manager: the Organization Graph has not been initialized at all, so nothing can be routed yet. Initialize it, then press Resume below.'}
+            </span>
+            {mayWrite && instance && (
+              <form method="POST" class="inline">
+                <input type="hidden" name="action" value="resume" />
+                <input type="hidden" name="settlement_id" value={focus.id} />
+                <input type="hidden" name="instance_id" value={instance.id} />
+                <button type="submit" class="btn ghost">Resume this approval</button>
+              </form>
+            )}
+            {mayWrite && !instance && (
+              <span class="hint">There is no approval instance on this statement to resume — send it for approval again once the graph names an approver.</span>
+            )}
           </div>
         </div>
       )}

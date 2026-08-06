@@ -56,6 +56,11 @@ import { computePay, MONTH_NAMES } from '@/lib/payroll';
 import { outstandingForEmployee, settleLoanOutsidePayroll, loanKindLabel, type LoanRow } from '@/lib/loans';
 import { getBalances, type LeaveBalance } from '@/lib/hr-leave';
 import { clearanceFor, recordSettlementHandoff, ensureExitSchema } from '@/lib/hr-separation';
+// ONE ROUNDING RULE, SHARED. The copy that lived in this file was
+// `Math.round((Number(n) || 0) * 100) / 100`, which rounds a half paisa DOWN whenever the product
+// lands just under .5 in IEEE754 (1.005 * 100 === 100.49999999999999) — always against the leaver.
+// sumMoney() adds in integer paise so a statement's total equals the lines it prints. src/lib/money.ts.
+import { round2, sumMoney } from '@/lib/money';
 
 // -------------------------------------------------------------------------------------------------
 // CONSTANTS FIRST
@@ -69,8 +74,6 @@ const logFail = (tag: string, e: any) => console.error('[settlement] ' + tag, re
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v: unknown): v is string => typeof v === 'string' && UUID_RE.test(v);
-
-const round2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
 
 const WRITE_FAILED = 'Something went wrong saving that. Nothing was changed. Try again in a moment.';
 
@@ -324,6 +327,33 @@ export async function settlementFacts(separationId: string): Promise<SettlementF
   let loans: LoanRow[] = [];
   try {
     loans = await outstandingForEmployee(employeeId);
+    // A LOAN IN ANOTHER CURRENCY IS NOT DEDUCTED FROM THIS STATEMENT.
+    //
+    // refreshComputedLines() writes one 'loan:<id>' deduction per row below, using l.outstanding as a
+    // bare number against a settlement denominated in `currency`. A loan of USD 4,000 outstanding was
+    // therefore deducted as 4,000 RUPEES from a rupee final settlement — the leaver kept most of a
+    // debt the statement says was recovered — and finaliseSettlement() then closed that loan in full
+    // through settleLoanOutsidePayroll(), so the balance disappeared from the register as well.
+    //
+    // No conversion, for the reason src/lib/payroll.ts gives at the same decision: there is no
+    // exchange rate in this codebase. The loan is left off the statement and still open, which is the
+    // recoverable state, and the reason is on the gap list every settlement screen prints.
+    const sameCurrency: LoanRow[] = [];
+    for (const l of loans) {
+      const loanCurrency = String(l.currency || currency).toUpperCase();
+      if (loanCurrency !== String(currency).toUpperCase()) {
+        gaps.push(
+          'a ' + loanKindLabel(l.kind).toLowerCase() + ' of ' + loanCurrency + ' '
+          + l.outstanding.toLocaleString('en-IN') + ' is still outstanding, but it is recorded in '
+          + loanCurrency + ' and this settlement is in ' + currency + '. It has NOT been deducted here '
+          + 'and the loan stays open — there is no exchange rate in this system to convert it with. '
+          + 'Recover it separately, or re-record the loan in ' + currency + '.',
+        );
+        continue;
+      }
+      sameCurrency.push(l);
+    }
+    loans = sameCurrency;
   } catch (e: any) {
     logFail('settlementFacts.loans', e);
     gaps.push('outstanding loan and advance balances');
@@ -355,7 +385,7 @@ export async function settlementFacts(separationId: string): Promise<SettlementF
     finalMonthAlreadyPaid,
     leaveBalances,
     loans,
-    loanOutstandingTotal: round2(loans.reduce((s, l) => s + l.outstanding, 0)),
+    loanOutstandingTotal: sumMoney(loans.map((l) => l.outstanding)),
     assetsCleared: assetsClearanceStatus === 'cleared',
     assetsClearanceStatus,
     gaps,
@@ -413,9 +443,18 @@ function mapLine(r: any): SettlementLine {
   };
 }
 
+/**
+ * THE TOTALS EQUAL THE LINES THAT ARE PRINTED BESIDE THEM.
+ *
+ * These were `reduce((s, l) => s + l.amount, 0)` — doubles added left to right, so the accumulated
+ * representation error can reach the second decimal on a statement with many lines and the printed
+ * total then differs from the printed lines by a paisa. A leaver querying their final statement is
+ * the last person who should be told the document does not add up. sumMoney() adds integer paise,
+ * where that failure mode does not exist.
+ */
 function totalsOf(lines: SettlementLine[]) {
-  const totalEarnings = round2(lines.filter((l) => l.kind === 'earning').reduce((s, l) => s + l.amount, 0));
-  const totalDeductions = round2(lines.filter((l) => l.kind === 'deduction').reduce((s, l) => s + l.amount, 0));
+  const totalEarnings = sumMoney(lines.filter((l) => l.kind === 'earning').map((l) => l.amount));
+  const totalDeductions = sumMoney(lines.filter((l) => l.kind === 'deduction').map((l) => l.amount));
   return { totalEarnings, totalDeductions, netPayable: round2(totalEarnings - totalDeductions) };
 }
 
@@ -907,6 +946,47 @@ export async function finaliseSettlement(opts: {
         + 'That is a recovery, not a payment, and it is not handed off from here.',
       );
     }
+
+    // ---- THE FINAL MONTH, RE-TESTED AT THE MOMENT OF THE HANDOFF ------------------------------------
+    //
+    // THIS IS THE ONE THAT PAYS A FULL MONTH'S SALARY TWICE.
+    //
+    // settlementFacts() asks whether payroll has already produced a payslip for the month of the last
+    // working day, and refreshComputedLines() writes the prorated final-month salary as an auto line
+    // ONLY when it has not. But that question is answered when the settlement is PREPARED, and
+    // refreshComputedLines() deliberately refuses to recompute once the settlement has left draft
+    // (an approved figure must not change under the people who approved it). So the answer on the
+    // statement is as old as the draft.
+    //
+    // The gap between those two moments is where the money goes:
+    //
+    //   3 March   last working day 12 March; settlement opened, final salary auto line 19,354.80
+    //   5 March   approved
+    //  31 March   the March payroll run includes the employee — generateRun() selects
+    //             `WHERE is_active = true`, and the record is not closed until the exit completes —
+    //             and pays the full 50,000
+    //   2 April   Hand off is pressed. The statement still carries its 19,354.80.
+    //
+    // Total paid for one month: 69,354.80. Nothing on any screen says the two overlap, because each
+    // one is individually correct about the moment it was written.
+    //
+    // `facts` above is a FRESH read, so finalMonthAlreadyPaid is the answer as of now. It was already
+    // being fetched and only assetsCleared was being read off it. Refusing here rather than silently
+    // adjusting the line is deliberate: an approved figure is not quietly rewritten at handoff time
+    // either. Somebody reopens the settlement, recomputes it against a month that is now paid, and
+    // has it approved again — which is a decision, made by a person, with both facts in front of them.
+    const finalSalaryLine = s.lines.find(
+      (l) => l.code === AUTO_FINAL_SALARY && l.kind === 'earning' && l.amount > 0,
+    );
+    if (finalSalaryLine && facts && facts.finalMonthAlreadyPaid) {
+      blockers.push(
+        'This statement pays ' + s.currency + ' ' + finalSalaryLine.amount.toLocaleString('en-IN')
+        + ' for ' + facts.finalMonthLabel + ', but payroll has since run for that month and already '
+        + 'paid it. Handing this off would pay the final month twice. Reopen the settlement so the '
+        + 'line is recomputed against a month that is now paid, and have the new figure approved.',
+      );
+    }
+
     if (blockers.length) return { ok: false, error: blockers[0], blockers };
 
     // CLAIM THE SETTLEMENT BEFORE ANYTHING IRREVERSIBLE HAPPENS.

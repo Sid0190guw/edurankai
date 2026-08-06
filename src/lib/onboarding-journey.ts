@@ -72,6 +72,8 @@ import { logAudit } from '@/lib/audit';
 import { notifyUser } from '@/lib/notify';
 import { isInitialized, getManager, getDepartmentHead, getApprovalOwner } from '@/lib/org-graph';
 import { listDocs, progress as docProgress, isDriveLink, linkProblem } from '@/lib/hr-onboarding';
+// AN OVERDUE FLAG IS A DAY BOUNDARY, AND THIS PROCESS IS NOT IN THE COMPANY'S ZONE.
+import { civilToday } from '@/lib/page-safety';
 
 // Declared BEFORE anything that uses them. `const` is not hoisted.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -437,8 +439,14 @@ function mapTemplateStep(r: any): TemplateStep {
   };
 }
 
+/**
+ * Today as the COMPANY counts it. Every due date on a journey is computed from a joining DATE — a
+ * civil date — so the thing it is compared against has to be one too. `new Date().toISOString()`
+ * is the date in UTC and this process runs in UTC, five and a half hours behind the joiners; a step
+ * that fell due yesterday did not turn red until 05:30 local, which is most of a working morning.
+ */
 function todayIso(): string {
-  return new Date().toISOString().slice(0, 10);
+  return civilToday();
 }
 
 function mapItem(r: any): JourneyItem {
@@ -869,6 +877,8 @@ export async function startJourney(employeeId: string, actorUserId: string | nul
     // Owners already notified on this run, so somebody who owns four steps gets one message rather
     // than four. A notification per step is how people learn to ignore notifications.
     const notified = new Set<string>();
+    // Steps added on this run that the JOINER themselves owns. See the block after the loop.
+    let joinerSteps = 0;
 
     for (const step of steps) {
       if (step.employmentType && String(step.employmentType).trim()) {
@@ -911,6 +921,33 @@ export async function startJourney(employeeId: string, actorUserId: string | nul
         } catch (e: any) {
           logFail('startJourney.notify', e);
         }
+      }
+
+      if (added.length && owner.userId && joiner.userId && owner.userId === joiner.userId) joinerSteps += 1;
+    }
+
+    // THE JOINER IS TOLD TOO — SEPARATELY, AND POINTING SOMEWHERE THEY CAN ACTUALLY GO.
+    //
+    // The guard above (`owner.userId !== joiner.userId`) correctly stops somebody who owns both an
+    // HR step and their own from getting two messages. What it also did was exclude the joiner
+    // ENTIRELY: four of the eight suggested steps are owned by 'the_joiner' — submit the documents,
+    // the first-week reading, acknowledge the policies — and the documents step is due on day zero.
+    // The one participant with same-day obligations was the only one who received no notification
+    // that they had any, and the owner message points at an admin console they cannot open.
+    if (joinerSteps > 0 && joiner.userId) {
+      try {
+        await notifyUser(joiner.userId, {
+          title: 'Your onboarding checklist is ready',
+          body: joinerSteps === 1
+            ? 'There is one step waiting for you, with a date on it.'
+            : 'There are ' + joinerSteps + ' steps waiting for you, each with a date on it.',
+          type: 'hire',
+          actionUrl: '/portal/employee/onboarding',
+          entityType: 'hr_onboarding_journey',
+          entityId: journeyId,
+        });
+      } catch (e: any) {
+        logFail('startJourney.notifyJoiner', e);
       }
     }
 

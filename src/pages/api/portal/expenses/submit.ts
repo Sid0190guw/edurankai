@@ -78,6 +78,14 @@ export const POST: APIRoute = async ({ request, locals, redirect }) => {
     travelEnd: s('travel_end'),
     neededBy: s('needed_by'),
     receiptUrl: s('receipt_url'),
+    // WHICH ADVANCE THIS CLAIM ACCOUNTS FOR, if the person picked one.
+    //
+    // Passed through raw and validated inside submitClaim() against THIS employee's own open
+    // advances — the same reason employeeId above is resolved from the session rather than read off
+    // the body. A posted advance id decides how much money actually moves, so trusting the form here
+    // would let somebody net their claim against a colleague's advance, or against one that has
+    // already been accounted for.
+    settlesAdvanceId: s('settles_advance_id'),
   });
 
   if (!result.ok) return back('err', result.error || 'That claim could not be raised.');

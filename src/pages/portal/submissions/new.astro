@@ -1,6 +1,8 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { createSubmission, SUBMISSION_KIND_LABELS } from '@/lib/submissions';
+import { activeAmbassadorFor } from '@/lib/campus-ambassadors';
+import { resolveWorkspace } from '@/lib/auth/workspace-access';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -8,9 +10,56 @@ if (!user) return Astro.redirect('/portal/login');
 let successMsg = '', errorMsg = '';
 let submittedId = '';
 
+// WHO IS SUBMITTING, RESOLVED FROM DATA — NOT FROM A ROLE STRING.
+//
+// This page used to read `user.role === 'campus_ambassador' ? ... : user.role === 'intern' ? ...`.
+// None of those three values exists in the User['role'] union (astro check reported all four
+// comparisons as ts(2367) "no overlap"), so isCA was permanently false and submitterRole was
+// permanently 'applicant': the CA reporting flow this page was written for did not exist, and every
+// submission on /admin/submissions carried the APPLICANT badge whoever sent it.
+//
+// The standing is now read from the two records that actually carry it — an approved row in
+// campus_ambassadors, and an hr_employees row resolved by src/lib/auth/workspace-access.ts, whose
+// isIntern flag is the same one every other workforce surface uses.
+type SubmitterRole = 'applicant' | 'campus_ambassador' | 'intern' | 'employee';
+let submitterRole: SubmitterRole = 'applicant';
+let standingSource = 'No ambassador or employee record is linked to this account.';
+let standingUnknown = '';
+
+try {
+  const amb = await activeAmbassadorFor({ userId: user.id, email: user.email });
+  if (amb) {
+    submitterRole = 'campus_ambassador';
+    standingSource = 'Approved Campus Ambassador' + (amb.institution ? ' — ' + amb.institution : '') + '.';
+  } else {
+    const ws = await resolveWorkspace(user as any);
+    if (ws && ws.isActive) {
+      submitterRole = ws.isIntern ? 'intern' : 'employee';
+      standingSource = (ws.isIntern ? 'Intern' : 'Employee') + ' record ' + (ws.employeeCode || ws.employeeId.slice(0, 8))
+        + (ws.designation ? ' — ' + ws.designation : '') + '.';
+    }
+  }
+} catch (e: any) {
+  // Refuse to guess. A failed lookup files the submission as 'applicant' — which is the safest
+  // value — but the person is told so on the page rather than finding out from a wrong badge on a
+  // reviewer's screen.
+  console.error('[portal/submissions/new] standing lookup failed:', e?.cause?.message || e?.message);
+  standingUnknown = 'We could not read your ambassador/employee record just now (' + (e?.cause?.message || e?.message || 'unknown error')
+    + '). This submission will be filed under your account as a general submission; tell a reviewer if it was meant to be a Campus Ambassador report.';
+  standingSource = 'Standing could not be determined.';
+}
+
+// Declared BEFORE the POST handler that fills it (const/let hoisting has broken this project's
+// apply flow before). Holds what the person typed so a failed save re-renders their words instead
+// of an empty form.
+let submitted: Record<string, string> = {};
+
 if (Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
+    for (const key of ['kind', 'title', 'description', 'drive_url', 'external_url', 'platform', 'target_role_slug', 'word_count']) {
+      submitted[key] = String(fd.get(key) ?? '');
+    }
     const kind = (fd.get('kind') as string || 'work_sample').toString();
     const title = (fd.get('title') as string || '').trim().slice(0, 300);
     const description = (fd.get('description') as string || '').trim().slice(0, 8000);
@@ -25,10 +74,6 @@ if (Astro.request.method === 'POST') {
     if (!title) errorMsg = 'Title is required.';
     else if (!description && !driveUrl && !externalUrl) errorMsg = 'Provide a description, drive link, or external URL — at least one must be present.';
     else {
-      const submitterRole: any = user.role === 'campus_ambassador' ? 'campus_ambassador'
-        : user.role === 'intern' ? 'intern'
-        : user.role === 'employee' ? 'employee'
-        : 'applicant';
       const r = await createSubmission({
         submitterUserId: user.id,
         submitterName: user.name || user.email,
@@ -36,13 +81,25 @@ if (Astro.request.method === 'POST') {
         submitterRole, kind, title, description,
         driveUrl, externalUrl, platform, wordCount, targetRoleSlug,
       });
-      if (r.ok) { submittedId = r.id!; successMsg = 'Submission received. Our reviewers will respond within 5 working days.'; }
-      else errorMsg = 'Submission failed.';
+      if (r.ok && r.id) {
+        submittedId = r.id;
+        submitted = {}; // saved — clear the retained draft so the form comes back blank
+        successMsg = 'Submission received. Our reviewers will respond within 5 working days.';
+      } else {
+        // createSubmission returning no id means the INSERT did not come back with a row.
+        errorMsg = 'The submission was not stored (the database returned no reference). Nothing was saved — please try again.';
+      }
     }
-  } catch (e: any) { errorMsg = String(e?.message || e).slice(0, 300); }
+  } catch (e: any) {
+    // A write path never swallows its exception, and the message a person reads is the reason, not
+    // the failed SQL.
+    console.error('[portal/submissions/new] createSubmission failed:', e?.cause?.message || e?.message);
+    errorMsg = 'Your submission was NOT saved: ' + String(e?.cause?.message || e?.message || 'unknown error').slice(0, 240)
+      + ' — nothing was stored. Your entries are still on this form; try again in a moment.';
+  }
 }
 
-const isCA = user.role === 'campus_ambassador';
+const isCA = submitterRole === 'campus_ambassador';
 const defaultKind = isCA ? 'ca_report' : 'work_sample';
 ---
 <BaseLayout title={isCA ? 'Submit your CA report' : 'Submit your work'} description="Submit original work for review by EduRankAI reviewers.">
@@ -69,6 +126,20 @@ const defaultKind = isCA ? 'ca_report' : 'work_sample';
     </div>
   )}
   {errorMsg && <div class="bg-burn-pale border border-burn-dim rounded-2xl px-6 py-4 mb-6 text-[0.92rem] text-burn font-semibold">{errorMsg}</div>}
+  {standingUnknown && <div class="bg-burn-pale border border-burn-dim rounded-2xl px-6 py-4 mb-6 text-[0.88rem] text-burn leading-relaxed">{standingUnknown}</div>}
+
+  {!successMsg && (
+    <div class="bg-cream-2/60 border border-ink/8 rounded-2xl px-6 py-4 mb-6">
+      <p class="eyebrow mb-1">Filed as</p>
+      <p class="text-[0.9rem] text-ink m-0 font-semibold">
+        {submitterRole === 'campus_ambassador' ? 'Campus Ambassador report'
+          : submitterRole === 'intern' ? 'Intern submission'
+          : submitterRole === 'employee' ? 'Employee submission'
+          : 'General submission'}
+      </p>
+      <p class="text-[0.8rem] text-ink-soft font-light m-0 mt-1">{standingSource} Reviewers see this label on your submission.</p>
+    </div>
+  )}
 
   <form method="POST" class="bg-white border border-ink/10 rounded-2xl p-8 md:p-10 space-y-6">
 
@@ -76,19 +147,19 @@ const defaultKind = isCA ? 'ca_report' : 'work_sample';
       <label class="eyebrow block mb-2">What are you submitting? <span class="text-burn">*</span></label>
       <select name="kind" required class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none">
         {Object.entries(SUBMISSION_KIND_LABELS).map(([k, v]) => (
-          <option value={k} selected={k === defaultKind}>{v.label} — {v.description}</option>
+          <option value={k} selected={k === (submitted.kind || defaultKind)}>{v.label} — {v.description}</option>
         ))}
       </select>
     </div>
 
     <div>
       <label class="eyebrow block mb-2">Title <span class="text-burn">*</span></label>
-      <input name="title" type="text" required maxlength="300" placeholder={isCA ? 'e.g. Campus Ambassador Report — Q2 2026' : 'e.g. Compliance assessment for Brahmacarya regulation, India 2026'} class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none" />
+      <input name="title" type="text" required maxlength="300" value={submitted.title || ''} placeholder={isCA ? 'e.g. Campus Ambassador Report — Q2 2026' : 'e.g. Compliance assessment for Brahmacarya regulation, India 2026'} class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none" />
     </div>
 
     <div>
       <label class="eyebrow block mb-2">Description / abstract</label>
-      <textarea name="description" rows="6" maxlength="8000" placeholder={isCA ? 'Summary of work in this period: events organised, signups, classroom visits, social outreach. Include numbers.' : 'A short summary of your submission. What is it, why should we read it, what is the headline finding or output?'} class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink font-body leading-relaxed focus:border-burn focus:outline-none resize-y"></textarea>
+      <textarea name="description" rows="6" maxlength="8000" placeholder={isCA ? 'Summary of work in this period: events organised, signups, classroom visits, social outreach. Include numbers.' : 'A short summary of your submission. What is it, why should we read it, what is the headline finding or output?'} class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink font-body leading-relaxed focus:border-burn focus:outline-none resize-y">{submitted.description || ''}</textarea>
     </div>
 
     <div class="bg-cream-2/50 border border-ink/8 rounded-2xl p-6">
@@ -96,28 +167,28 @@ const defaultKind = isCA ? 'ca_report' : 'work_sample';
       <p class="text-[0.85rem] text-ink-soft font-light leading-relaxed mb-5">Provide at least one. Drive link is recommended for documents. External URL for portfolio submissions.</p>
 
       <label class="eyebrow block mb-2">Google Drive link</label>
-      <input name="drive_url" type="url" maxlength="2000" placeholder="https://drive.google.com/..." class="w-full bg-white border border-ink/15 rounded-xl px-4 py-3 text-[0.9rem] text-ink mb-4 focus:border-burn focus:outline-none" />
+      <input name="drive_url" type="url" maxlength="2000" value={submitted.drive_url || ''} placeholder="https://drive.google.com/..." class="w-full bg-white border border-ink/15 rounded-xl px-4 py-3 text-[0.9rem] text-ink mb-4 focus:border-burn focus:outline-none" />
 
       <label class="eyebrow block mb-2">External / platform URL (GitHub, Figma, Behance, YouTube)</label>
-      <input name="external_url" type="url" maxlength="2000" placeholder="https://github.com/... or https://figma.com/..." class="w-full bg-white border border-ink/15 rounded-xl px-4 py-3 text-[0.9rem] text-ink mb-4 focus:border-burn focus:outline-none" />
+      <input name="external_url" type="url" maxlength="2000" value={submitted.external_url || ''} placeholder="https://github.com/... or https://figma.com/..." class="w-full bg-white border border-ink/15 rounded-xl px-4 py-3 text-[0.9rem] text-ink mb-4 focus:border-burn focus:outline-none" />
 
       <label class="eyebrow block mb-2">Platform</label>
       <select name="platform" class="w-full bg-white border border-ink/15 rounded-xl px-4 py-3 text-[0.9rem] text-ink focus:border-burn focus:outline-none">
-        <option value="direct">Direct (pasted in description)</option>
-        <option value="drive">Google Drive</option>
-        <option value="github">GitHub</option>
-        <option value="other">Other</option>
+        <option value="direct" selected={(submitted.platform || 'direct') === 'direct'}>Direct (pasted in description)</option>
+        <option value="drive" selected={submitted.platform === 'drive'}>Google Drive</option>
+        <option value="github" selected={submitted.platform === 'github'}>GitHub</option>
+        <option value="other" selected={submitted.platform === 'other'}>Other</option>
       </select>
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
       <div>
         <label class="eyebrow block mb-2">Word count (optional)</label>
-        <input name="word_count" type="number" min="0" max="500000" placeholder="e.g. 2400" class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none" />
+        <input name="word_count" type="number" min="0" max="500000" value={submitted.word_count || ''} placeholder="e.g. 2400" class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none" />
       </div>
       <div>
         <label class="eyebrow block mb-2">Targeting a role? (slug, optional)</label>
-        <input name="target_role_slug" type="text" maxlength="120" placeholder="e.g. compliance-analyst" class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none" />
+        <input name="target_role_slug" type="text" maxlength="120" value={submitted.target_role_slug || ''} placeholder="e.g. compliance-analyst" class="w-full bg-cream border border-ink/15 rounded-xl px-4 py-3 text-[0.95rem] text-ink focus:border-burn focus:outline-none" />
       </div>
     </div>
 

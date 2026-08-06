@@ -84,7 +84,13 @@ import { logAudit } from '@/lib/audit';
 // rupees with no way to say which is wrong.
 //
 // The dependency runs ONE WAY — payroll imports loans, loans never imports payroll.
-import { plannedRecoveries, recordRecovery, type LoanCharge } from '@/lib/loans';
+import {
+  plannedRecoveries,
+  recordRecovery,
+  syncLoanApprovals,
+  closeClearedLoans,
+  type LoanCharge,
+} from '@/lib/loans';
 import { plannedBonuses, recordBonusPayout, type BonusCharge } from '@/lib/payroll-bonuses';
 import { round2, sumMoney } from '@/lib/money';
 
@@ -263,6 +269,57 @@ export function ensurePayrollSchema(): Promise<void> {
       // share. Additive to the existing table so nothing that reads hr_payslips today changes.
       await db.execute(sql`ALTER TABLE hr_payslips
         ADD COLUMN IF NOT EXISTS employer_cost NUMERIC(14,2) NOT NULL DEFAULT 0`);
+
+      // ===========================================================================================
+      // THE TWO INVARIANTS generateRun() ALREADY CLAIMS, ASSERTED WHERE THEY CAN ACTUALLY HOLD
+      // ===========================================================================================
+      //
+      // The doc comment on generateRun() says "hr_payroll_runs carries a unique constraint on the
+      // period" and its payslip INSERT ends in ON CONFLICT (payroll_run_id, employee_id). Both of
+      // those are declared ONLY as inline CONSTRAINTs inside CREATE TABLE IF NOT EXISTS in
+      // db/hr-schema.sql — and hr_payroll_runs and hr_payslips PRE-DATE that file (the header of this
+      // module says so). On a table that already existed, CREATE TABLE IF NOT EXISTS does nothing at
+      // all, so neither constraint was ever created and nothing here added it.
+      //
+      // What that costs, if they are in fact absent on the live database:
+      //   * two Generate clicks landing together both pass the existence read below and both insert a
+      //     run. Loan recovery is idempotent on (loan_id, payroll_run_id) and bonus payout on
+      //     (bonus_id, payroll_run_id) — but the two run ids DIFFER, so every instalment is recovered
+      //     twice and every one-off bonus is paid twice, by the very keys that were supposed to stop it.
+      //   * the payslip ON CONFLICT raises 42P10 ("no unique or exclusion constraint matching") for
+      //     every employee, so the whole company lands in `failed[]` with a generic message.
+      //
+      // CREATE UNIQUE INDEX IF NOT EXISTS is the additive, idempotent form: it satisfies ON CONFLICT
+      // exactly as a table constraint does, it is a no-op when the constraint is already there, and it
+      // drops nothing. Same shape attendance-schema.ts:298 already uses for hr_attendance.
+      //
+      // EACH IN ITS OWN try/catch, AND NEITHER IS FATAL. If a live table already holds two runs for one
+      // month, or two payslips for one employee on one run, the index cannot be built — and a payroll
+      // module that refuses to load is worse than one that runs with the pre-existing sequential
+      // guards. The failure is logged in full because it means somebody has already been paid twice.
+      //
+      // TO CHECK BEFORE THIS CAN SUCCEED, if either line below keeps logging (run these yourself; this
+      // process never connects to production):
+      //   SELECT month, year, COUNT(*) FROM hr_payroll_runs GROUP BY 1,2 HAVING COUNT(*) > 1;
+      //   SELECT payroll_run_id, employee_id, COUNT(*) FROM hr_payslips GROUP BY 1,2 HAVING COUNT(*) > 1;
+      // Anything returned is a duplicate that has to be netted off by a human before the invariant can
+      // be enforced. Nothing here deletes it.
+      try {
+        await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS hr_payroll_runs_period_uniq
+          ON hr_payroll_runs (month, year)`);
+      } catch (e: any) {
+        console.error('[payroll] could not create the UNIQUE index on hr_payroll_runs (month, year) —'
+          + ' there may already be more than one run for a single month, which means loan instalments'
+          + ' and bonuses have been recovered or paid more than once:', e?.cause?.message || e?.message);
+      }
+      try {
+        await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS hr_payslips_run_emp_uniq
+          ON hr_payslips (payroll_run_id, employee_id)`);
+      } catch (e: any) {
+        console.error('[payroll] could not create the UNIQUE index on hr_payslips (payroll_run_id,'
+          + ' employee_id) — there may already be more than one payslip for an employee on one run:',
+          e?.cause?.message || e?.message);
+      }
     } catch (e: any) {
       logFail('ensurePayrollSchema', e);
       // RESET, so the next call retries. A guard that stays set after a failure means every later
@@ -804,7 +861,36 @@ export async function computePay(
     return empty;
   }
 
+  // The length of the month being paid. DECLARED HERE, above the structure read that now uses it —
+  // `const` is not hoisted and this value moved upwards when the structure query started asking about
+  // the payroll period instead of about today. Both the construction and the getDate() below are
+  // local-time, so the answer is the same in every zone.
+  const daysInMonth = new Date(year, month, 0).getDate();
+
   // ---- the structure: basic, currency, and the legacy fixed columns --------------------------------
+  //
+  // THE SALARY STRUCTURE OF THE MONTH BEING PAID, NOT THE ONE IN FORCE TODAY.
+  //
+  // This joined on `effective_from <= CURRENT_DATE AND (effective_to IS NULL OR effective_to >=
+  // CURRENT_DATE)` — the structure in force on the day somebody happened to press the button. Every
+  // caller that asks about a month which is not the current one therefore priced it wrongly:
+  //
+  //   * a run generated late, or regenerated, for an earlier month took today's basic. Somebody
+  //     raised in July had their March payslip computed at the July salary.
+  //   * src/lib/settlement.ts settlementFacts() calls computePay() for the month of the LAST WORKING
+  //     DAY to prorate a leaver's final salary. A structure superseded since the exit priced the
+  //     final month — the one number on a full-and-final statement — off a row that was not in force
+  //     for a single day of it.
+  //   * CURRENT_DATE is also the DATABASE SESSION's date, which is a second, different clock from
+  //     the `month`/`year` this function was asked about.
+  //
+  // The LATERAL below prefers the structure whose effective window OVERLAPS the payroll month, and
+  // orders the rest by effective_from DESC. That second arm is deliberate and it is why this is not a
+  // regression: when NO structure covers the month — a first structure recorded on the 1st of the
+  // following month with the default effective_from, which is an ordinary way to record one — the
+  // latest structure is used exactly as CURRENT_DATE used to choose it. Nothing that computed a
+  // figure before computes a smaller one now; only a run over a month with its own structure changes,
+  // and it changes to that month's own numbers.
   let structure: any = null;
   let baseSalary = 0;
   let currency = 'INR';
@@ -812,11 +898,18 @@ export async function computePay(
     const r = await db.execute(sql`
       SELECT ss.*, e.base_salary, e.currency AS emp_currency
         FROM hr_employees e
-        LEFT JOIN hr_salary_structures ss ON ss.employee_id = e.id
-             AND ss.effective_from <= CURRENT_DATE
-             AND (ss.effective_to IS NULL OR ss.effective_to >= CURRENT_DATE)
+        LEFT JOIN LATERAL (
+          SELECT s.*
+            FROM hr_salary_structures s
+           WHERE s.employee_id = e.id
+           ORDER BY (
+                   s.effective_from <= make_date(${year}, ${month}, ${daysInMonth})
+               AND (s.effective_to IS NULL OR s.effective_to >= make_date(${year}, ${month}, 1))
+                 ) DESC,
+                 s.effective_from DESC
+           LIMIT 1
+        ) ss ON TRUE
        WHERE e.id = ${employeeId}::uuid
-       ORDER BY ss.effective_from DESC NULLS LAST
        LIMIT 1`);
     structure = rows(r)[0] || null;
     baseSalary = Number(structure?.base_salary) || 0;
@@ -874,6 +967,28 @@ export async function computePay(
   // below are computed against THIS number, not against a month that happened to carry an award.
   const regularGross = sumMoney([basic, ...earnings.map((l) => l.amount)]);
 
+  // =================================================================================================
+  // A SALARY OF ZERO IS A MISSING RECORD, NOT A SALARY
+  // =================================================================================================
+  //
+  // gaps.push() only ever fired inside a catch, so a NULL base_salary — which is what the candidate
+  // signing path leaves behind, because nothing copies the offer's agreed compensation onto
+  // hr_employees — produced a complete payslip with basic 0, gross 0 and net 0. Both reconciliation
+  // identities balance at zero so no ledgerWarning fires, the run reports success, and Mark Paid then
+  // pushes the person "Salary credited ... 0". They are formally paid nothing for their first month
+  // and the only place the absence shows is an empty field on an admin screen nobody was told to open.
+  //
+  // A ZERO GROSS IS NOT REFUSED HERE. Refusing would abort the whole run for everybody else, and
+  // there are legitimate zero-gross rows (an unpaid intern engagement recorded deliberately). It is
+  // NAMED — on the payslip's gap list, in the run summary, and therefore on the screen of the person
+  // pressing the button, who is the one human able to fix it before the money moves.
+  if (regularGross <= 0) {
+    gaps.push(
+      'a salary on the employee record - basic and every recurring earning came to zero, so this '
+      + 'payslip pays nothing. Set the base salary on the employee before this run is marked paid',
+    );
+  }
+
   // ---- attendance and loss of pay ------------------------------------------------------------------
   //
   // Unchanged in substance from what /admin/hr/payroll already did, and moved here so the run and any
@@ -897,20 +1012,69 @@ export async function computePay(
     gaps.push('attendance for this month');
   }
 
-  const daysInMonth = new Date(year, month, 0).getDate();
+  // daysInMonth is declared above the salary-structure read, which now needs it too.
   let unpaidDays = 0;
   try {
+    // =============================================================================================
+    // UNPAID LEAVE IS PRICED AT WHAT IT COST, NOT AT THE CALENDAR SPAN IT OCCUPIED
+    // =============================================================================================
+    //
+    // This read `(LEAST(end,me) - GREATEST(start,ms)) + 1` off the raw dates and nothing else, and
+    // that is not what any of the three kinds of unpaid absence actually costs:
+    //
+    //   * A HALF DAY was deducted as a FULL day. An unpaid TWO-HOUR absence was deducted as a full
+    //     day. src/lib/hr-leave.ts has stored the true cost in day_units since part-days existed —
+    //     0.5 for a half day, hours/working-hours for an hourly one — and this arithmetic never read
+    //     the column, nor `unit`, nor `hours`.
+    //   * A HOLIDAY INSIDE THE SPAN was charged. applyLeave() removes observed holidays before it
+    //     charges the balance and markLeaveAttendance() skips the same dates, deliberately using the
+    //     same function so the two cannot disagree — and then payroll re-derived the span from the raw
+    //     dates with no holiday exclusion at all. Unpaid Monday to Friday across a Wednesday public
+    //     holiday was deducted as five days where four were charged to leave and four attendance rows
+    //     exist. The employee reads "Loss of pay (5 days)" on a document that is already approved and
+    //     paid, and the run cannot be regenerated.
+    //
+    // So: a PART-DAY request contributes its own day_units, counted in the month its single day falls
+    // in. A WHOLE-DAY request contributes the days of the overlap MINUS the observed holidays in that
+    // same overlap — non-optional only, and department-scoped, which is exactly what
+    // src/lib/holidays.ts isObserved() means. departments.id is varchar(50) in schema.ts and UUID in
+    // db/hr-schema.sql, so it is compared ::text and never cast.
+    //
+    // The result is NUMERIC now, not ::int — a half day of loss of pay is half a day of loss of pay.
     const up = rows(await db.execute(sql`
       SELECT COALESCE(SUM(
-        (LEAST(end_date, make_date(${year}, ${month}, ${daysInMonth}))
-         - GREATEST(start_date, make_date(${year}, ${month}, 1))) + 1
-      ), 0)::int AS d
-      FROM hr_leave_request
-      WHERE employee_id = ${employeeId}::uuid AND status = 'approved' AND leave_type = 'unpaid'
-        AND start_date <= make_date(${year}, ${month}, ${daysInMonth})
-        AND end_date   >= make_date(${year}, ${month}, 1)`))[0] || {};
-    unpaidDays = Number(up.d) || 0;
+        CASE
+          WHEN COALESCE(lr.unit, 'full') <> 'full' THEN
+            CASE
+              WHEN lr.start_date >= make_date(${year}, ${month}, 1)
+               AND lr.start_date <= make_date(${year}, ${month}, ${daysInMonth})
+              THEN COALESCE(lr.day_units, 1)
+              ELSE 0
+            END
+          ELSE GREATEST(0,
+            ((LEAST(lr.end_date, make_date(${year}, ${month}, ${daysInMonth}))
+              - GREATEST(lr.start_date, make_date(${year}, ${month}, 1))) + 1)
+            - COALESCE((
+                SELECT COUNT(DISTINCT h.holiday_date)
+                  FROM hr_holidays h
+                 WHERE h.is_optional = FALSE
+                   AND (h.department_id IS NULL OR h.department_id::text = emp.department_id::text)
+                   AND h.holiday_date >= GREATEST(lr.start_date, make_date(${year}, ${month}, 1))
+                   AND h.holiday_date <= LEAST(lr.end_date, make_date(${year}, ${month}, ${daysInMonth}))
+              ), 0)
+          )
+        END
+      ), 0)::numeric AS d
+      FROM hr_leave_request lr
+      JOIN hr_employees emp ON emp.id = lr.employee_id
+      WHERE lr.employee_id = ${employeeId}::uuid AND lr.status = 'approved' AND lr.leave_type = 'unpaid'
+        AND lr.start_date <= make_date(${year}, ${month}, ${daysInMonth})
+        AND lr.end_date   >= make_date(${year}, ${month}, 1)`))[0] || {};
+    unpaidDays = round2(Number(up.d) || 0);
   } catch (e: any) {
+    // NOT SILENT, AND NOT REPLACED BY THE OLD ARITHMETIC. A failed read here means the payslip cannot
+    // say how much unpaid leave this month carried, and that is written on the payslip's own gap list
+    // rather than quietly deducting a number nobody can check.
     logFail('computePay.unpaidLeave', e);
     gaps.push('approved unpaid leave for this month');
   }
@@ -959,7 +1123,9 @@ export async function computePay(
     gaps.push('which absences were already covered by approved unpaid leave, so a day may be counted twice in loss of pay');
   }
 
-  const lopDays = Math.min(daysInMonth, Math.max(0, unpaidDays) + Math.max(0, absentDaysNotOnUnpaidLeave));
+  // round2 because unpaidDays can now be fractional — a half day of unpaid leave is 0.5, and the
+  // binary sum of two fractions must not reach the payslip as 1.2000000000000002 days.
+  const lopDays = round2(Math.min(daysInMonth, Math.max(0, unpaidDays) + Math.max(0, absentDaysNotOnUnpaidLeave)));
   // MULTIPLY FIRST, ROUND ONCE. Rounding the per-day rate and then multiplying it by the day count
   // multiplies the rounding error by that count as well: 62,000 over 31 days is 2000.00 exactly, but
   // 75,000 over 31 days is 2419.354838..., and a rounded 2419.35 times 31 is 74,999.85 — a month of
@@ -1096,6 +1262,39 @@ export async function computePay(
     gaps.push('loan and advance balances');
   }
 
+  // A LOAN IN ANOTHER CURRENCY IS NOT RECOVERED FROM THIS PAYSLIP.
+  //
+  // The same fault the bonus loop above was fixed for, and worse in what follows from it.
+  // hr_salary_loans records a currency and mapLoan() reads it, but LoanCharge dropped the field — so
+  // an instalment of USD 500 arrived here as the bare number 500 and was deducted from a rupee
+  // payslip as 500 rupees. Then generateRun() writes that 500 into hr_loan_instalments through
+  // recordRecovery(), and closeCleared() closes a loan once SUM(amount) reaches total_payable. So a
+  // USD-denominated loan is marked fully repaid once the RUPEE ledger has summed to a USD total: the
+  // employee is under-deducted every month AND the outstanding balance disappears from the register
+  // while the debt is still owed. Nothing on any screen says either half of that.
+  //
+  // NO CONVERSION HERE, for the reason the bonus loop gives: there is no exchange rate anywhere in
+  // this codebase, and one invented in a payroll file and applied to somebody's debt is worse than
+  // the bug it would be fixing. The recovery is skipped, the balance stays on the loan ledger where
+  // it is still visible and still owed, and the reason goes on the gap list every payroll screen
+  // prints. Somebody re-records the loan in the payslip currency or recovers it outside payroll —
+  // both decisions a person makes, with a rate they can defend.
+  const recoverableLoans: LoanCharge[] = [];
+  for (const c of plannedLoans) {
+    const loanCurrency = String(c.currency || currency);
+    if (loanCurrency !== currency) {
+      gaps.push(
+        'the ' + c.label.toLowerCase() + ' is recorded in ' + loanCurrency + ' and this payslip is in '
+        + currency + ', so nothing has been recovered against it this month. There is no exchange rate '
+        + 'in this system to convert it with — re-record the loan in ' + currency + ', or recover it '
+        + 'outside payroll. The balance is unchanged and still owed.',
+      );
+      continue;
+    }
+    recoverableLoans.push(c);
+  }
+  plannedLoans = recoverableLoans;
+
   const loanCharges: LoanCharge[] = [];
   let loanRecoveryReduced = false;
   for (const c of plannedLoans) {
@@ -1224,30 +1423,93 @@ export async function generateRun(
   if (m < 1 || m > 12) return { ...blank, error: 'Pick a month between January and December.' };
   if (y < 2000 || y > 2100) return { ...blank, error: 'That is not a year this payroll covers.' };
 
+  // Things that went wrong BEFORE the first payslip was computed, and that change what the payslips
+  // say. Declared here, above the block that pushes to it — `const` is not hoisted and a helper under
+  // its first reader has taken pages down on this project. Merged into RunSummary.ledgerWarnings at
+  // the end, which is the list the payroll console already renders.
+  const preflightWarnings: string[] = [];
+
   try {
     await ensurePayrollSchema();
 
-    const existing = rows(await db.execute(sql`
-      SELECT id, status FROM hr_payroll_runs WHERE month = ${m} AND year = ${y} LIMIT 1`));
-    if (existing.length) {
-      return {
-        ...blank,
-        error: 'A payroll run for ' + MONTH_NAMES[m - 1] + ' ' + y + ' already exists ('
-          + String(existing[0].status) + '). Open it rather than creating a second one.',
-      };
-    }
-
+    // THE EXISTENCE TEST IS INSIDE THE INSERT, NOT IN FRONT OF IT.
+    //
+    // This was a SELECT, a refusal, and then an unconditional INSERT. Two Generate presses landing
+    // together — or one press retried after a POST that timed out with the write already committed —
+    // both read no run and both created one. Two runs for the same month is not merely an untidy list:
+    // loan recovery is keyed on (loan_id, payroll_run_id) and bonus payout on (bonus_id,
+    // payroll_run_id), so a SECOND run id defeats both of those keys and every instalment is recovered
+    // twice and every one-off bonus paid twice.
+    //
+    // NOT EXISTS in the same statement closes the ordinary repeat; hr_payroll_runs_period_uniq (created
+    // in ensurePayrollSchema above) is what closes the actual race. This form needs no ON CONFLICT
+    // clause, so it still behaves correctly on a database where that index could not be built.
     const ins = rows(await db.execute(sql`
       INSERT INTO hr_payroll_runs (month, year, status, notes, processed_by)
-      VALUES (${m}, ${y}, 'draft', ${String(notes || '').trim().slice(0, 500) || null}, ${actorUserId}::uuid)
+      SELECT ${m}, ${y}, 'draft', ${String(notes || '').trim().slice(0, 500) || null}, ${actorUserId}::uuid
+       WHERE NOT EXISTS (SELECT 1 FROM hr_payroll_runs WHERE month = ${m} AND year = ${y})
       RETURNING id`));
-    if (!ins.length) return { ...blank, error: WRITE_FAILED };
+
+    if (!ins.length) {
+      // ZERO ROWS IS THE REFUSAL, NOT A DATABASE FAILURE: a run for this period already exists. It is
+      // re-read so the sentence can name its state, which is what the caller shows.
+      const existing = rows(await db.execute(sql`
+        SELECT id, status FROM hr_payroll_runs WHERE month = ${m} AND year = ${y} LIMIT 1`));
+      if (existing.length) {
+        return {
+          ...blank,
+          error: 'A payroll run for ' + MONTH_NAMES[m - 1] + ' ' + y + ' already exists ('
+            + String(existing[0].status) + '). Open it rather than creating a second one.',
+        };
+      }
+      return { ...blank, error: WRITE_FAILED };
+    }
     const runId = String(ins[0].id);
+
+    // =============================================================================================
+    // BRING THE LOAN LEDGER UP TO DATE BEFORE ANYTHING IS DEDUCTED
+    // =============================================================================================
+    //
+    // plannedRecoveries() filters on state = 'active', and a loan only reaches 'active' when
+    // syncLoanApprovals() mirrors its settled workflow instance onto the row. That mirror ran from
+    // exactly one place: a page load of /admin/hr/payroll/loans. So a loan approved by the routed
+    // manager on Tuesday was still 'pending' on Friday unless somebody had happened to open that
+    // console, and a run generated in between DEDUCTED NOTHING — silently, with nothing on the
+    // payslip or in this summary saying a recovery had been skipped. The borrower's own page said
+    // "Waiting for approval" all the while.
+    //
+    // Idempotent (it only mirrors what the engine already decided) and non-fatal: a sync failure is
+    // named in the run summary rather than aborting payroll for everybody.
+    try {
+      const synced = await syncLoanApprovals(actorUserId);
+      for (const err of synced.errors) {
+        preflightWarnings.push('A loan approval could not be applied before this run: ' + err);
+      }
+    } catch (e: any) {
+      logFail('generateRun.syncLoanApprovals', e);
+      preflightWarnings.push(
+        'Approved loans could not be brought up to date before this run, so an instalment may be '
+        + 'missing from these payslips (' + (e?.cause?.message || e?.message || 'unknown reason') + ').',
+      );
+    }
 
     const employees = rows(await db.execute(sql`
       SELECT id, full_name FROM hr_employees WHERE is_active = true ORDER BY full_name`));
 
-    let totalGross = 0, totalDeductions = 0, totalNet = 0, totalEmployerCost = 0, count = 0;
+    // THE RUN TOTAL IS THE SUM OF THE PAYSLIPS, TO THE PAISA.
+    //
+    // These were four `+=` accumulators over doubles, rounded once at the end. On a company of any
+    // size that is the same left-to-right double addition sumMoney() exists to replace: the run
+    // header is written to hr_payroll_runs and printed beside the payslips it is made of, and
+    // "total_net does not equal the sum of the net_salary column" is a question somebody asks a
+    // month later with no way to answer it. Each payslip figure is already exact to two decimals, so
+    // adding them as integer paise makes the header equal its own rows by construction rather than
+    // by luck. The arrays are declared here, above the loop that pushes to them.
+    const grossAmounts: number[] = [];
+    const deductionAmounts: number[] = [];
+    const netAmounts: number[] = [];
+    const employerCostAmounts: number[] = [];
+    let count = 0;
     const failed: string[] = [];
     const ledgerWarnings: string[] = [];
     let noStatutory = true;
@@ -1257,6 +1519,18 @@ export async function generateRun(
       try {
         const pay = await computePay(empId, { month: m, year: y });
         if (!pay.noStatutoryComponents) noStatutory = false;
+
+        // WHAT THIS PAYSLIP COULD NOT SEE, SAID TO THE PERSON PRESSING THE BUTTON.
+        //
+        // computePay() has always collected `gaps` — the salary structure it could not read, the
+        // attendance it could not count, and now a gross that came to zero — and generateRun() threw
+        // the list away. So a payslip computed from a NULL base salary went out as a complete row of
+        // zeroes, both reconciliation identities balanced at zero, the run reported success, and the
+        // employee was pushed "Salary credited ... 0". The gap list is the one place that fact exists
+        // before the money moves, and it is now on the screen of the only human who can act on it.
+        for (const gap of pay.gaps) {
+          ledgerWarnings.push(String(emp.full_name || empId) + ': this payslip was computed without ' + gap + '.');
+        }
 
         // The legacy fixed columns, filled from whichever lines map onto them, so every existing
         // reader of hr_payslips keeps rendering exactly what it rendered before.
@@ -1320,6 +1594,17 @@ export async function generateRun(
           ledgerWarnings.push(msg);
         }
 
+        // ONE PAYSLIP PER EMPLOYEE PER RUN, WITHOUT DEPENDING ON A CONSTRAINT THAT MAY NOT EXIST.
+        //
+        // This was ON CONFLICT (payroll_run_id, employee_id) DO NOTHING, which requires a matching
+        // unique index — and the only declaration of that index lives inside a CREATE TABLE IF NOT
+        // EXISTS for a table that pre-dates it, so on the live database it may never have been created.
+        // When ON CONFLICT finds no matching index it does not degrade quietly: it raises 42P10, which
+        // the per-employee catch below turns into a name in `failed[]`. Every employee, every run.
+        //
+        // WHERE NOT EXISTS says the same thing in a form that works either way. hr_payslips_run_emp_uniq
+        // is now created in ensurePayrollSchema and remains the guard against a true race; this makes
+        // the sequential repeat harmless even if that index could not be built.
         const slip = rows(await db.execute(sql`
           INSERT INTO hr_payslips (
             payroll_run_id, employee_id, month, year,
@@ -1328,7 +1613,8 @@ export async function generateRun(
             other_allowances, gross_salary,
             pf_employee, esic_employee, professional_tax, tds, other_deductions,
             total_deductions, net_salary, employer_cost, currency, status
-          ) VALUES (
+          )
+          SELECT
             ${runId}::uuid, ${empId}::uuid, ${m}, ${y},
             ${pay.daysWorked}, ${pay.daysLeave}, ${pay.daysAbsent}, ${pay.lopDays}, ${pay.lopDeduction},
             ${pay.basic}, ${legacy.hra || 0}, ${legacy.da || 0}, ${legacy.special_allowance || 0},
@@ -1337,8 +1623,10 @@ export async function generateRun(
             ${legacy.pf_employee || 0}, ${legacy.esic_employee || 0}, ${legacy.professional_tax || 0},
             ${legacy.tds || 0}, ${otherDeductions},
             ${pay.totalDeductions}, ${pay.net}, ${pay.employerCost}, ${pay.currency}, 'pending'
+          WHERE NOT EXISTS (
+            SELECT 1 FROM hr_payslips
+             WHERE payroll_run_id = ${runId}::uuid AND employee_id = ${empId}::uuid
           )
-          ON CONFLICT (payroll_run_id, employee_id) DO NOTHING
           RETURNING id`));
 
         if (!slip.length) continue; // already generated for this employee — not a failure.
@@ -1396,10 +1684,10 @@ export async function generateRun(
           );
         }
 
-        totalGross += pay.grossEarnings;
-        totalDeductions += pay.totalDeductions;
-        totalNet += pay.net;
-        totalEmployerCost += pay.employerCost;
+        grossAmounts.push(pay.grossEarnings);
+        deductionAmounts.push(pay.totalDeductions);
+        netAmounts.push(pay.net);
+        employerCostAmounts.push(pay.employerCost);
         count++;
       } catch (e: any) {
         logFail('generateRun employee ' + empId, e);
@@ -1407,30 +1695,60 @@ export async function generateRun(
       }
     }
 
+    // =============================================================================================
+    // A LOAN THAT IS PAID OFF STOPS BEING OWED
+    // =============================================================================================
+    //
+    // closeClearedLoans() was written as the safety net for "a loan whose final instalment was
+    // written by a run that then failed part-way", it is documented as exactly that, and it was
+    // imported by NOTHING in src/ — the same class as the intern-hours library no page ever loaded.
+    // The stated failure mode was therefore entirely uncovered: a loan left 'active' with a fully
+    // covered ledger kept reading as owed on the register, on the borrower's portal page and in the
+    // settlement facts a leaver's final money is computed from.
+    //
+    // AFTER the recoveries, so this run's own final instalments are included, and non-fatal.
+    try {
+      await closeClearedLoans();
+    } catch (e: any) {
+      logFail('generateRun.closeClearedLoans', e);
+      ledgerWarnings.push(
+        'Loans that are now fully repaid could not be closed automatically, so a cleared loan may '
+        + 'still read as owed (' + (e?.cause?.message || e?.message || 'unknown reason') + ').',
+      );
+    }
+
+    const totalGross = sumMoney(grossAmounts);
+    const totalDeductions = sumMoney(deductionAmounts);
+    const totalNet = sumMoney(netAmounts);
+    const totalEmployerCost = sumMoney(employerCostAmounts);
+
     await db.execute(sql`
       UPDATE hr_payroll_runs
-         SET total_employees = ${count}, total_gross = ${round2(totalGross)},
-             total_deductions = ${round2(totalDeductions)}, total_net = ${round2(totalNet)}
+         SET total_employees = ${count}, total_gross = ${totalGross},
+             total_deductions = ${totalDeductions}, total_net = ${totalNet}
        WHERE id = ${runId}::uuid`);
 
     await logAudit({
       userId: actorUserId, action: 'payroll.run.generated', entity: 'hr_payroll_run', entityId: runId,
       diff: {
-        month: m, year: y, employees: count, totalGross: round2(totalGross),
-        totalNet: round2(totalNet), failed, noStatutoryComponents: noStatutory,
+        month: m, year: y, employees: count, totalGross,
+        totalNet, failed, noStatutoryComponents: noStatutory,
         ledgerWarnings: ledgerWarnings.length,
       },
     });
 
     return {
       ok: true, runId, employees: count,
-      totalGross: round2(totalGross), totalDeductions: round2(totalDeductions),
-      totalNet: round2(totalNet), totalEmployerCost: round2(totalEmployerCost),
-      failed, noStatutoryComponents: noStatutory, ledgerWarnings,
+      totalGross, totalDeductions,
+      totalNet, totalEmployerCost,
+      failed, noStatutoryComponents: noStatutory,
+      // The preflight list first: it says why the payslips below may be missing something, so it
+      // belongs above the per-employee consequences rather than under them.
+      ledgerWarnings: [...preflightWarnings, ...ledgerWarnings],
     };
   } catch (e: any) {
     logFail('generateRun', e);
-    return { ...blank, error: WRITE_FAILED };
+    return { ...blank, error: WRITE_FAILED, ledgerWarnings: [...preflightWarnings] };
   }
 }
 

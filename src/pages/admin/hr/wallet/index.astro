@@ -2,8 +2,12 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { listWithdrawals, decideWithdrawal, payWithdrawal, credit } from '@/lib/hr-wallet';
+import { listWithdrawals, decideWithdrawal, payWithdrawal, credit, getBalance, resolvePaying } from '@/lib/hr-wallet';
 import { canAccessSection } from '@/lib/auth/permissions';
+// safeRows keeps "no withdrawal is waiting" apart from "we could not read the withdrawals" — on a
+// payouts console those two sentences differ by somebody not being paid. clip keeps a long name or
+// note inside its row.
+import { safeRows, clip } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -47,7 +51,55 @@ if (Astro.request.method === 'POST') {
   try {
     if (action === 'decide') { const r = await decideWithdrawal(fd.get('id') as string, user, (fd.get('decision') as string) === 'approved' ? 'approved' : 'rejected', (fd.get('note') as string) || ''); flash = r.ok ? 'Decision recorded.' : 'Error: ' + r.error; }
     else if (action === 'pay') { const r = await payWithdrawal(fd.get('id') as string, user, (fd.get('manual_ref') as string || '').trim() || undefined); flash = r.ok ? ('Paid. Ref ' + (r.ref || '—')) : 'Error: ' + r.error; }
-    else if (action === 'disburse') { const amt = parseFloat(fd.get('amount') as string || '0'); const emp = fd.get('employee_id') as string; if (emp && amt > 0) { await credit(emp, amt, (fd.get('kind') as string) || 'salary', (fd.get('note') as string) || 'Salary credit', user.id); flash = 'Credited ₹' + amt.toLocaleString('en-IN') + ' to wallet.'; } else flash = 'Pick an employee and amount.'; }
+    // THE WAY OUT OF 'paying'. This state had none: payWithdrawal() accepts only 'approved', so a
+    // payout whose gateway call timed out could not be paid, could not be released, and could not be
+    // abandoned — while getBalance() counts it as pending, so the employee could neither receive the
+    // money nor request it again. The only exit was an UPDATE on the production database.
+    //
+    // A HUMAN CHECKS THE PAYOUT CHANNEL AND SAYS WHICH IT WAS. Nothing here calls a gateway or guesses.
+    else if (action === 'resolve_paying') {
+      const outcome = String(fd.get('outcome') || '') === 'paid' ? 'paid' : 'approved';
+      const r = await resolvePaying(fd.get('id') as string, user, outcome, (fd.get('channel_ref') as string) || '');
+      flash = r.ok
+        ? (outcome === 'paid'
+            ? 'Confirmed as paid. The wallet has been debited and the employee has been told.'
+            : 'Released. The request is back with the approved ones and can be paid again.')
+        : 'Error: ' + r.error;
+    }
+    else if (action === 'disburse') {
+      const amt = parseFloat(fd.get('amount') as string || '0');
+      const emp = fd.get('employee_id') as string;
+      if (emp && amt > 0) {
+        // THE EMPLOYEE'S OWN CURRENCY, AND AN IDEMPOTENCY KEY.
+        //
+        // credit() defaults to INR when no currency is given, so disbursing to somebody on a non-INR
+        // salary structure wrote a rupee row into a wallet whose balance is denominated in something
+        // else — money that then sits outside the balance the employee is shown.
+        //
+        // The ref is what makes a double-submitted form (or a refresh of this POST) a no-op instead
+        // of a second disbursement: it is unique per employee, amount and minute, and hr_wallet_txn
+        // carries a UNIQUE index on ref. Two presses inside the same minute collide and the second
+        // writes nothing; a genuine second disbursement a minute later is unaffected.
+        const bal = await getBalance(emp);
+        const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
+        const ref = 'disburse:' + emp + ':' + Math.round(amt * 100) + ':' + stamp;
+        try {
+          // credit() now REPORTS the collision rather than throwing it — a duplicate ref is the
+          // idempotency working, not a failure, and a repair path that treats it as an error retries
+          // it. The catch below stays as a second line of defence for a database where the partial
+          // unique index could not be built and the collision surfaces some other way.
+          const res = await credit(emp, amt, (fd.get('kind') as string) || 'salary', (fd.get('note') as string) || 'Salary credit', user.id, ref, bal.currency);
+          flash = res.duplicate
+            ? 'That disbursement is already recorded — nothing was credited a second time.'
+            : 'Credited ' + (bal.currency === 'INR' ? '₹' : bal.currency + ' ') + amt.toLocaleString('en-IN') + ' to wallet.';
+        } catch (e: any) {
+          const real = String(e?.cause?.message || e?.message || '');
+          if (/duplicate key|unique constraint/i.test(real)) {
+            flash = 'That disbursement is already recorded — nothing was credited a second time.';
+          } else throw e;
+        }
+      } else flash = 'Pick an employee and amount.';
+    }
   } catch (e: any) {
     // The real Postgres reason is on `.cause`; `.message` is only the failed SQL text, which tells
     // an admin nothing about why a payout did not go out.
@@ -58,17 +110,74 @@ if (Astro.request.method === 'POST') {
   return Astro.redirect('/admin/hr/wallet?msg=' + encodeURIComponent(flash));
 }
 
-const all = await listWithdrawals({});
+// =================================================================================================
+// "NO WITHDRAWALS WAITING" IS A CLAIM ABOUT PEOPLE'S MONEY, AND THIS PAGE COULD NOT MAKE IT.
+//
+// listWithdrawals() runs its query through safe(), which returns [] when the read fails — so a
+// database where hr_withdrawal is unreachable, or where the wallet schema has not been provisioned,
+// rendered as "No withdrawals waiting." and "Nothing to release." on the one console where an
+// unanswered request means somebody is not being paid and nobody is looking. It was also a bare
+// top-level await: if ensureWalletSchema() threw, the whole payouts console answered with a 500.
+//
+// Both halves are fixed here, in the page, without changing what the module returns:
+//   * the call is wrapped, so a throw is a sentence rather than a blank 500, and
+//   * an independent probe asks the table directly, so an EMPTY list can be told apart from a
+//     FAILED one. An empty list under a successful probe is genuinely empty; an empty list under a
+//     failed probe is unknown, and the page says so instead of reassuring anybody.
+// =================================================================================================
+let all: any[] = [];
+let withdrawalsOk = true;
+let withdrawalsError: string | null = null;
+try {
+  all = await listWithdrawals({});
+} catch (e: any) {
+  withdrawalsOk = false;
+  withdrawalsError = e?.cause?.message || e?.message || 'unknown database error';
+  console.error('[hr/wallet] withdrawal list failed -', withdrawalsError);
+}
+if (withdrawalsOk && all.length === 0) {
+  const probe = await safeRows('[hr/wallet] withdrawal probe', () =>
+    db.execute(sql`SELECT 1 FROM hr_withdrawal LIMIT 1`));
+  if (!probe.ok) {
+    withdrawalsOk = false;
+    withdrawalsError = probe.error;
+  }
+}
 const pending = all.filter((w: any) => w.status === 'pending');
 const approved = all.filter((w: any) => w.status === 'approved');
 // 'paying' means the payout was handed to the channel and no confirmation has come back. It belongs
 // on a screen — a request in that state is neither waiting for a decision nor released, and leaving
 // it off every list is how it becomes invisible money.
-const settled = all.filter((w: any) => w.status === 'paid' || w.status === 'paying' || w.status === 'rejected' || w.status === 'failed').slice(0, 20);
-let employees: any[] = [];
-try { employees = rowsOf(await db.execute(sql`SELECT id, full_name, employee_code, designation FROM hr_employees WHERE is_active = true ORDER BY full_name ASC LIMIT 500`)); } catch (_) {}
+// 'paying' now has its OWN section with the two buttons that resolve it, so it is no longer folded
+// into the read-only Recent list where it had nowhere to go. Declared above the render that reads it.
+const beingReleased = all.filter((w: any) => w.status === 'paying');
+const settled = all.filter((w: any) => w.status === 'paid' || w.status === 'rejected' || w.status === 'failed').slice(0, 20);
+// WAS `catch (_) {}`. An empty picker on the "Credit a wallet" form looks like an organisation with
+// no active employees, which is not something this page should ever assert without having asked.
+const employeesRes = await safeRows('[hr/wallet] employee picker', () => db.execute(
+  sql`SELECT id, full_name, employee_code, designation FROM hr_employees WHERE is_active = true ORDER BY full_name ASC LIMIT 500`));
+const employees: any[] = employeesRes.rows;
 const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
-const inr = (n: any) => '₹' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// EVERY WITHDRAWAL CARRIES ITS OWN CURRENCY, AND THIS PAGE PRINTED THEM ALL AS RUPEES.
+//
+// `inr()` hard-coded ₹ onto four figures: the amount waiting for a decision, the amount waiting to be
+// released, the amount being released, and the settled history. hr_withdrawal has had a `currency`
+// column since the table was created, listWithdrawals() returns `w.*` so the value is already on
+// every row here, requestWithdrawal() writes the employee's OWN wallet currency into it, and
+// src/lib/hr-wallet.ts getBalance() sums strictly within one currency for exactly this reason. The
+// employee's own screen (src/pages/portal/employee/wallet.astro) was already fixed to print the
+// wallet's currency; the console where the money is APPROVED AND RELEASED was still asserting rupees.
+//
+// A payout of USD 1,200 read as "₹1,200.00" — roughly a hundredth of what was being released — to the
+// one person deciding whether to release it.
+const sym = (cur: any) => {
+  const c = String(cur || 'INR').toUpperCase();
+  return c === 'INR' ? '₹' : c + ' ';
+};
+const amountOf = (n: any, cur: any) =>
+  sym(cur) + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+/** Kept as the name every render below already uses; it now reads the row's own currency. */
+const inr = (n: any, cur?: any) => amountOf(n, cur);
 const rzxReady = !!process.env.RAZORPAYX_ACCOUNT_NUMBER;
 ---
 <AdminLayout title="Wallet & payouts" activeNav="">
@@ -91,12 +200,26 @@ const rzxReady = !!process.env.RAZORPAYX_ACCOUNT_NUMBER;
       Payout channel: {rzxReady ? <span style="color:#86efac;font-weight:700;">RazorpayX Payouts — automatic on release</span> : <span style="color:#fbbf24;font-weight:700;">manual settlement</span>}. {rzxReady ? '' : 'Set RAZORPAYX_ACCOUNT_NUMBER to enable automatic bank payouts; until then, pay from your bank and record the UTR/reference on release.'}
     </div>
 
+    {/* SAID ONCE, ABOVE EVERY LIST IT AFFECTS. Without it a payouts console with an unreadable
+        withdrawal table renders as a calm, empty, fully-settled screen. */}
+    {!withdrawalsOk && (
+      <div style="margin:0 0 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.7;">
+        <strong style="color:#fecaca;">The withdrawal requests could not be read, so every list below is empty for that reason.</strong>
+        Nothing here is a statement that nobody is waiting to be paid, and nothing here is a count.
+        Crediting a wallet still works; approving and releasing do not, because there is nothing to act on.
+        {withdrawalsError && <span style="display:block;margin-top:6px;color:#f87171;font-family:'Geist Mono',monospace;font-size:11px;overflow-wrap:anywhere;">{clip(withdrawalsError, 300)}</span>}
+      </div>
+    )}
+
     <!-- Disburse salary -->
     <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:18px;margin-bottom:18px;">
       <div style="font-weight:700;color:#fff;font-size:14px;margin-bottom:12px;">Credit a wallet</div>
       <form method="POST" style="display:grid;grid-template-columns:1.6fr 1fr 1fr 2fr auto;gap:10px;align-items:end;">
         <input type="hidden" name="action" value="disburse"/>
-        <div><label class="fl">Employee</label><select name="employee_id" class="fi" required><option value="">Select…</option>{employees.map((e: any) => (<option value={e.id}>{e.full_name} · {e.employee_code}</option>))}</select></div>
+        <div><label class="fl">Employee</label><select name="employee_id" class="fi" required><option value="">Select…</option>{employees.map((e: any) => (<option value={e.id}>{clip(e.full_name || 'Unnamed employee', 60)} · {e.employee_code || 'no code'}</option>))}</select>
+          {!employeesRes.ok && <p style="color:#fca5a5;font-size:11.5px;line-height:1.6;margin:5px 0 0;">The employee list could not be read, so this picker is empty. There may be employees; we could not fetch them.</p>}
+          {employeesRes.ok && employees.length === 0 && <p style="color:#fbbf24;font-size:11.5px;line-height:1.6;margin:5px 0 0;">There is no active employee to credit. This list was read successfully.</p>}
+        </div>
         <div><label class="fl">Amount ₹</label><input name="amount" type="number" step="0.01" min="1" class="fi" required/></div>
         <div><label class="fl">Kind</label><select name="kind" class="fi"><option value="salary">Salary</option><option value="bonus">Bonus</option><option value="reimbursement">Reimbursement</option><option value="adjustment">Adjustment</option></select></div>
         <div><label class="fl">Note</label><input name="note" class="fi" placeholder="e.g. June 2026 net salary"/></div>
@@ -106,12 +229,16 @@ const rzxReady = !!process.env.RAZORPAYX_ACCOUNT_NUMBER;
 
     <!-- Pending approvals -->
     <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#c2410c;font-weight:700;margin:0 0 10px;">Pending approval · {pending.length}</h2>
-    {pending.length === 0 && <p style="color:#8a8a94;font-size:13px;margin-bottom:20px;">No withdrawals waiting.</p>}
+    {!withdrawalsOk && <p style="color:#fca5a5;font-size:13px;margin-bottom:20px;line-height:1.7;">The withdrawal requests could not be read, so none is listed here or below. This page is NOT saying nobody is waiting to be paid — check before you close it.</p>}
+    {withdrawalsOk && pending.length === 0 && <p style="color:#8a8a94;font-size:13px;margin-bottom:20px;">No withdrawal is waiting for a decision. This list was read successfully.</p>}
     {pending.map((w: any) => (
       <div class="wrow">
         <div style="flex:1;">
-          <div style="color:#fff;font-weight:700;">{w.full_name || 'Employee'} · {inr(w.amount)}</div>
-          <div style="color:#8a8a94;font-size:12px;">{w.employee_code} · {w.designation} · to {w.bank_holder || w.upi_id || '—'} {w.bank_acc ? '(' + ('••••' + String(w.bank_acc).slice(-4)) + (w.ifsc ? ', ' + w.ifsc : '') + ')' : ''}{w.note ? ' · ' + w.note : ''}</div>
+          {/* The employee join is a LEFT JOIN, so a withdrawal whose employee row has been removed
+              renders with every one of these fields null. "Employee · undefined · undefined" is not
+              a row anybody can act on; each field now says what it is when it is not there. */}
+          <div style="color:#fff;font-weight:700;overflow-wrap:anywhere;" title={String(w.full_name || '')}>{clip(w.full_name || 'No employee record for this request', 60)} · {inr(w.amount, w.currency)}</div>
+          <div style="color:#8a8a94;font-size:12px;overflow-wrap:anywhere;">{w.employee_code || 'no code'} · {w.designation || 'no designation'} · to {clip(w.bank_holder || w.upi_id || 'no payee on file', 60)} {w.bank_acc ? '(' + ('••••' + String(w.bank_acc).slice(-4)) + (w.ifsc ? ', ' + w.ifsc : '') + ')' : ''}{w.note ? ' · ' + clip(w.note, 120) : ''}</div>
         </div>
         <form method="POST" style="display:flex;gap:6px;align-items:center;">
           <input type="hidden" name="action" value="decide"/><input type="hidden" name="id" value={w.id}/>
@@ -124,10 +251,10 @@ const rzxReady = !!process.env.RAZORPAYX_ACCOUNT_NUMBER;
 
     <!-- Approved: ready to pay -->
     <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#2563eb;font-weight:700;margin:24px 0 10px;">Approved · ready to pay · {approved.length}</h2>
-    {approved.length === 0 && <p style="color:#8a8a94;font-size:13px;margin-bottom:20px;">Nothing to release.</p>}
+    {withdrawalsOk && approved.length === 0 && <p style="color:#8a8a94;font-size:13px;margin-bottom:20px;">Nothing is approved and waiting to be released. This list was read successfully.</p>}
     {approved.map((w: any) => (
       <div class="wrow">
-        <div style="flex:1;"><div style="color:#fff;font-weight:700;">{w.full_name} · {inr(w.amount)}</div><div style="color:#8a8a94;font-size:12px;">approved by {w.decided_by_role} · to {w.bank_holder || w.upi_id || '—'}</div></div>
+        <div style="flex:1;"><div style="color:#fff;font-weight:700;overflow-wrap:anywhere;" title={String(w.full_name || '')}>{clip(w.full_name || 'No employee record for this request', 60)} · {inr(w.amount, w.currency)}</div><div style="color:#8a8a94;font-size:12px;overflow-wrap:anywhere;">approved by {w.decided_by_role || 'somebody whose role was not recorded'} · to {clip(w.bank_holder || w.upi_id || 'no payee on file', 60)}</div></div>
         <form method="POST" style="display:flex;gap:6px;align-items:center;">
           <input type="hidden" name="action" value="pay"/><input type="hidden" name="id" value={w.id}/>
           {!rzxReady && <input name="manual_ref" class="fi" style="width:150px;" placeholder="UTR / reference"/>}
@@ -136,12 +263,45 @@ const rzxReady = !!process.env.RAZORPAYX_ACCOUNT_NUMBER;
       </div>
     ))}
 
+    {/* BEING RELEASED — THE ONE STATE WITH NO WAY OUT, NOW GIVEN TWO.
+        These rows were rendered in the Recent list with an explanatory sentence and NO button of any
+        kind: no confirm-paid, no release, no mark-failed. payWithdrawal() accepts only 'approved', so
+        the request could not be paid; getBalance() counts 'paying' as pending, so the employee could
+        not ask again. The money was invisible to them and unavailable to everybody, indefinitely, and
+        the only exit was a manual UPDATE on the production database.
+        Nothing here calls a gateway. A human reads the payout channel and says which of the two it is. */}
+    {beingReleased.length > 0 && (<div>
+      <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#fbbf24;font-weight:700;margin:24px 0 10px;">Being released · needs a human · {beingReleased.length}</h2>
+      <p style="color:#cfd6da;font-size:12.5px;line-height:1.7;margin:0 0 10px;max-width:70ch;">
+        The payout instruction was sent and no confirmation came back, so these are held rather than
+        retried — pressing again could pay twice. Check the payout channel for each one, then say what
+        you found. Until then the amount counts against the employee's balance and they can neither
+        receive it nor request it again.
+      </p>
+      {beingReleased.map((w: any) => (
+        <div class="wrow" style="border-color:#4d3d10;">
+          <div style="flex:1;">
+            <div style="color:#fff;font-weight:700;">{w.full_name || 'Employee'} · {inr(w.amount, w.currency)}</div>
+            <div style="color:#8a8a94;font-size:12px;">{w.employee_code} · held since {w.paying_at ? new Date(w.paying_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'unknown'}</div>
+          </div>
+          <form method="POST" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            <input type="hidden" name="action" value="resolve_paying"/>
+            <input type="hidden" name="id" value={w.id}/>
+            <label class="fl" style="width:100%;margin:0;">Reference from the payout channel — required to confirm</label>
+            <input name="channel_ref" class="fi" style="width:180px;" placeholder="UTR / payout id"/>
+            <button name="outcome" value="paid" class="wbtn" style="background:#22c07e;">It went out</button>
+            <button name="outcome" value="approved" class="wbtn" style="background:transparent;border:1px solid #444;color:#fbbf24;">It did not — release</button>
+          </form>
+        </div>
+      ))}
+    </div>)}
+
     <!-- Settled -->
     {settled.length > 0 && (<div>
       <h2 style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#8a8a94;font-weight:700;margin:24px 0 10px;">Recent</h2>
       {settled.map((w: any) => (
         <div class="wrow" style="opacity:.7;">
-          <div style="flex:1;"><div style="color:#cfd6da;">{w.full_name} · {inr(w.amount)}</div><div style="color:#8a8a94;font-size:12px;">{w.status === 'paying' ? 'being released — no confirmation back yet; check the payout channel before releasing again' : w.status}{w.payout_ref ? ' · ' + w.payout_ref : ''}</div></div>
+          <div style="flex:1;"><div style="color:#cfd6da;">{w.full_name} · {inr(w.amount, w.currency)}</div><div style="color:#8a8a94;font-size:12px;">{w.status === 'paying' ? 'being released — no confirmation back yet; check the payout channel before releasing again' : w.status}{w.payout_ref ? ' · ' + w.payout_ref : ''}</div></div>
           <span style={`font-family:'Geist Mono',monospace;font-size:10px;font-weight:700;text-transform:uppercase;color:${w.status==='paid'?'#86efac':(w.status==='paying'?'#fbbf24':'#fca5a5')};`}>{w.status}</span>
         </div>
       ))}

@@ -6,16 +6,21 @@ import {
   institutionSubmissionScores,
   heiInstitutions,
   heiDimensions,
-  heiInstitutionScores,
-  users
+  heiInstitutionScores
 } from '@/lib/db/schema';
 import { eq, desc, asc, and } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
 
 const user = Astro.locals.user!;
-if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+// Authorization from permissions.ts, never a users.role literal. admin.access is the population
+// src/middleware.ts already admits to every /admin path, so this narrows nobody.
+if (!user || !can(user as any, 'admin.access')) return Astro.redirect('/portal');
 
 let errorMsg = '';
 let okMsg = '';
+// Set when a read below fails, so the page can say WHICH read failed instead of rendering an
+// empty queue that looks exactly like "no submissions".
+let loadError = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -61,24 +66,40 @@ if (Astro.request.method === 'POST') {
         if (accepted.length === 0) {
           errorMsg = 'No accepted scores in this submission — nothing to publish.';
         } else {
-          // Flow accepted scores to hei_institution_scores (upsert)
+          // Flow accepted scores to hei_institution_scores (upsert).
+          //
+          // hei_institution_scores has FIVE columns — institution_id, dimension_id, score, notes,
+          // updated_at (src/lib/db/schema.ts, scripts/setup-hei-scores.mjs). It has no `id`, no
+          // `evidence_url` and no `source`. Writing those three is what made this button throw on
+          // its first accepted score every single time it was pressed, so nothing below it ever ran:
+          // no Truth Score was recomputed and no submission ever left 'submitted'. The evidence URL
+          // and the reviewer's note are preserved in `notes`, which does exist.
+          //
+          // The UPDATE is keyed on BOTH columns. The primary key is (institution_id, dimension_id),
+          // so a one-column WHERE would overwrite every dimension of that institution with this
+          // dimension's score.
           for (const a of accepted) {
+            const provenance = 'From institution submission ' + submissionId.slice(0, 8)
+              + ' — evidence: ' + (a.evidenceUrl || 'none recorded')
+              + (a.adminNotes ? ' — reviewer note: ' + a.adminNotes : '');
             const existing = await db.select().from(heiInstitutionScores).where(
               and(eq(heiInstitutionScores.institutionId, sub.institutionId), eq(heiInstitutionScores.dimensionId, a.dimensionId))
             ).limit(1);
             if (existing.length > 0) {
               await db.update(heiInstitutionScores).set({
                 score: a.adminAcceptedScore || '0',
-                evidenceUrl: a.evidenceUrl,
+                notes: provenance,
                 updatedAt: new Date()
-              }).where(eq(heiInstitutionScores.id, existing[0].id));
+              }).where(and(
+                eq(heiInstitutionScores.institutionId, sub.institutionId),
+                eq(heiInstitutionScores.dimensionId, a.dimensionId)
+              ));
             } else {
               await db.insert(heiInstitutionScores).values({
                 institutionId: sub.institutionId,
                 dimensionId: a.dimensionId,
                 score: a.adminAcceptedScore || '0',
-                evidenceUrl: a.evidenceUrl,
-                source: 'institution_submission'
+                notes: provenance
               });
             }
           }
@@ -101,13 +122,19 @@ if (Astro.request.method === 'POST') {
             updatedAt: new Date()
           }).where(eq(heiInstitutions.id, sub.institutionId));
 
+          // A submission with dimensions still sitting on 'pending' is not fully accepted, and
+          // saying so is the difference between a queue you can trust and one you cannot.
+          const allEntries = await db.select().from(institutionSubmissionScores)
+            .where(eq(institutionSubmissionScores.submissionId, submissionId));
+          const stillPending = allEntries.filter(e => e.adminDecision === 'pending').length;
           await db.update(institutionSubmissions).set({
-            submissionStatus: 'accepted',
+            submissionStatus: stillPending > 0 ? 'partially_accepted' : 'accepted',
             reviewedByUserId: user.id,
             reviewedAt: new Date()
           }).where(eq(institutionSubmissions.id, submissionId));
 
-          okMsg = 'Published ' + accepted.length + ' accepted score(s). Truth Score recomputed: ' + (finalScore || 'n/a');
+          okMsg = 'Published ' + accepted.length + ' accepted score(s). Truth Score recomputed: ' + (finalScore || 'n/a')
+            + (stillPending > 0 ? '. ' + stillPending + ' dimension(s) still pending — submission marked partially accepted.' : '');
         }
       }
     } else if (action === 'reject_submission') {
@@ -122,36 +149,47 @@ if (Astro.request.method === 'POST') {
       okMsg = 'Submission rejected.';
     }
   } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+    // postgres-js puts the failed SQL on .message and the REASON on .cause.message. Reporting
+    // .message alone is why a failed publish used to show an admin a page of SQL.
+    console.error('[hei/submissions] ' + action + ' failed:', err?.cause?.message || err?.message, err?.cause?.detail || '');
+    errorMsg = 'Failed: ' + (err?.cause?.message || err?.message || 'Unknown error');
   }
 }
 
 const url = new URL(Astro.request.url);
 const filterStatus = url.searchParams.get('status') || 'submitted';
 
-let allSubmissions = await db.select().from(institutionSubmissions).orderBy(desc(institutionSubmissions.submittedAt));
-if (filterStatus !== 'all') allSubmissions = allSubmissions.filter(s => s.submissionStatus === filterStatus);
+let allSubmissions: any[] = [];
+let institutionsList: any[] = [];
+let dimensions: any[] = [];
+let allScoreEntries: any[] = [];
+const counts: Record<string, number> = { all: 0, submitted: 0, accepted: 0, rejected: 0, partially_accepted: 0 };
 
-// Get related data
-const subIds = allSubmissions.map(s => s.id);
-const instIds = Array.from(new Set(allSubmissions.map(s => s.institutionId)));
-const institutionsList = instIds.length > 0 ? await db.select().from(heiInstitutions) : [];
+try {
+  allSubmissions = await db.select().from(institutionSubmissions).orderBy(desc(institutionSubmissions.submittedAt));
+  for (const c of allSubmissions) {
+    counts.all++;
+    counts[c.submissionStatus] = (counts[c.submissionStatus] || 0) + 1;
+  }
+  if (filterStatus !== 'all') allSubmissions = allSubmissions.filter(s => s.submissionStatus === filterStatus);
+
+  institutionsList = allSubmissions.length > 0 ? await db.select().from(heiInstitutions) : [];
+  dimensions = await db.select().from(heiDimensions).orderBy(asc(heiDimensions.sortOrder));
+  allScoreEntries = allSubmissions.length > 0 ? await db.select().from(institutionSubmissionScores) : [];
+} catch (e: any) {
+  // A read failure and an empty queue used to render identically. They must not.
+  console.error('[hei/submissions] queue read failed:', e?.cause?.message || e?.message);
+  loadError = 'The submission queue could not be read: ' + (e?.cause?.message || e?.message || 'unknown error');
+  allSubmissions = [];
+}
+
 const instMap = Object.fromEntries(institutionsList.map(i => [i.id, i]));
-const dimensions = await db.select().from(heiDimensions).orderBy(asc(heiDimensions.sortOrder));
 const dimMap = Object.fromEntries(dimensions.map(d => [d.id, d]));
 
-const allScoreEntries = subIds.length > 0 ? await db.select().from(institutionSubmissionScores) : [];
 const scoresBySubId: Record<string, any[]> = {};
 for (const s of allScoreEntries) {
   if (!scoresBySubId[s.submissionId]) scoresBySubId[s.submissionId] = [];
   scoresBySubId[s.submissionId].push(s);
-}
-
-const counts: Record<string, number> = { all: 0, submitted: 0, accepted: 0, rejected: 0, partially_accepted: 0 };
-const allFresh = await db.select({ submissionStatus: institutionSubmissions.submissionStatus }).from(institutionSubmissions);
-for (const c of allFresh) {
-  counts.all++;
-  counts[c.submissionStatus] = (counts[c.submissionStatus] || 0) + 1;
 }
 
 function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '-'; }
@@ -162,7 +200,9 @@ function categoryColor(s: string): string {
   return 'background:rgba(255,79,0,0.15);color:#FF7040;';
 }
 ---
-<HeiAdminLayout title="HEI Submissions" activeNav="hei-submissions">
+{/* The layout's prop is `active` and its value is a nav item ID (see HeiAdminLayout NAV).
+    `activeNav="hei-submissions"` was silently dropped, so the sidebar highlighted nothing here. */}
+<HeiAdminLayout title="HEI Submissions" active="submissions">
 <div style="padding-bottom:80px;">
   <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;position:sticky;top:0;z-index:10;">
     <div style="margin-bottom:10px;">
@@ -183,7 +223,14 @@ function categoryColor(s: string): string {
   {errorMsg && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:13px;padding:10px 14px;border-radius:8px;margin-bottom:12px;">{errorMsg}</div>}
   {okMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:13px;padding:10px 14px;border-radius:8px;margin-bottom:12px;">{okMsg}</div>}
 
-    {allSubmissions.length === 0 && <div class="admin-card" style="padding:30px;text-align:center;color:#6e6e78;font-size:13px;">No submissions with this filter.</div>}
+    {loadError && (
+      <div class="admin-card" style="padding:20px;border-color:rgba(239,68,68,0.35);">
+        <p style="color:#fca5a5;font-size:13px;font-weight:600;margin:0 0 6px;">The queue below is NOT empty — it could not be read.</p>
+        <p style="color:#a0a0ab;font-size:11.5px;margin:0;line-height:1.6;">{loadError}</p>
+        <p style="color:#6e6e78;font-size:11px;margin:8px 0 0;">Reload after the database recovers. Do not treat this screen as "no submissions pending".</p>
+      </div>
+    )}
+    {!loadError && allSubmissions.length === 0 && <div class="admin-card" style="padding:30px;text-align:center;color:#6e6e78;font-size:13px;">No submissions with this filter. (The queue was read successfully; there is nothing in this status.)</div>}
 
     <div style="display:flex;flex-direction:column;gap:16px;">
       {allSubmissions.map((sub) => {

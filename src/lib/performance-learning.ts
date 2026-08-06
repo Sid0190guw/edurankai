@@ -51,6 +51,8 @@ import {
   uuidList,
   type PerfViewer,
 } from '@/lib/performance-scope';
+// AN OVERDUE FLAG IS A DAY BOUNDARY, AND THIS PROCESS IS NOT IN THE COMPANY'S ZONE.
+import { civilToday } from '@/lib/page-safety';
 
 const MOD = 'performance-learning';
 const WRITE_FAILED = 'We could not save that just now. Nothing was changed.';
@@ -144,9 +146,17 @@ function iso(v: any): string | null {
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-/** Today as the SERVER counts it, in UTC, for the overdue comparison. */
+/**
+ * Today as the COMPANY counts it, for the overdue comparison.
+ *
+ * This was `new Date().toISOString().slice(0,10)` — the date in UTC, described in its own comment
+ * as "as the SERVER counts it", which is the bug stated out loud. The process runs in UTC and the
+ * people whose training is being chased work in IST (UTC+05:30), so between 00:00 and 05:29 local
+ * an assignment that fell due yesterday still read as on time: the compliance list a manager opens
+ * first thing in the morning was a day behind itself, in the direction that under-reports.
+ */
 function todayIso(): string {
-  return new Date().toISOString().slice(0, 10);
+  return civilToday();
 }
 
 function mapItem(r: any): LearningItem {

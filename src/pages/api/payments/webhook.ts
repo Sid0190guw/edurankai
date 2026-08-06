@@ -84,9 +84,21 @@ export const POST: APIRoute = async ({ request }) => {
       // wrote `status = 'failed'` unconditionally, then turned a paid order into a failed one. The
       // payer had paid; the product said they had not. 'paid' and 'refunded' are terminal here and
       // only a refund event moves a payment off 'paid'.
+      //
+      // AND A REFUND MUST NOT BE UNDONE BY A REDELIVERY. The `failed` arm was guarded and the `paid`
+      // arm was not, but Razorpay redelivers webhooks — up to 24 hours, and again whenever a
+      // dashboard operator resends one. A payment.captured redelivered AFTER the refund it was
+      // refunded by wrote 'refunded' back to 'paid', cleared nothing, and then fell through to
+      // applyPaidEffects() below, which re-approved the account or re-marked the fee paid. The
+      // refund had actually left the company; only the record of it was reversed.
+      //
+      // 'partially_refunded' is in the guard for the same reason: a partial refund is money already
+      // returned, and a redelivery that relabels it a clean capture hides the part that went back.
       const guard = nextStatus === 'failed'
-        ? sql`AND status NOT IN ('paid', 'refunded')`
-        : sql``;
+        ? sql`AND status NOT IN ('paid', 'refunded', 'partially_refunded')`
+        : nextStatus === 'paid'
+          ? sql`AND status NOT IN ('refunded', 'partially_refunded')`
+          : sql``;
       await db.execute(sql`
         UPDATE payments SET
           status = ${nextStatus},
@@ -101,9 +113,21 @@ export const POST: APIRoute = async ({ request }) => {
 
     // On capture, apply the same downstream effects as the browser verify so
     // the payment completes even if the user never returned to the site.
+    //
+    // NOT FOR A REFUNDED ORDER. The status guard above stops the ROW being relabelled, but the
+    // effects are what actually give somebody the thing they paid for, and they were applied from
+    // the event alone. A redelivered payment.captured on a refunded order re-approved the account
+    // and re-marked the fee paid without the row ever changing — the guard has to cover both.
     if (orderId && (eventType === 'payment.captured' || eventType === 'order.paid')) {
-      const { applyPaidEffects } = await import('@/lib/payment-effects');
-      await applyPaidEffects(orderId, paymentEntity?.id || null);
+      const cur = await db.execute(sql`SELECT status FROM payments WHERE order_id = ${orderId} LIMIT 1`);
+      const curRows = Array.isArray(cur) ? cur : ((cur as any)?.rows || []);
+      const curStatus = String(curRows[0]?.status || '');
+      if (curStatus === 'refunded' || curStatus === 'partially_refunded') {
+        console.error('[payments webhook]', eventType, 'redelivered for REFUNDED order', orderId, '- no effect was applied');
+      } else {
+        const { applyPaidEffects } = await import('@/lib/payment-effects');
+        await applyPaidEffects(orderId, paymentEntity?.id || null);
+      }
     }
   } catch (e: any) {
     // The real Postgres reason is on `.cause`; `.message` is only the failed SQL text.

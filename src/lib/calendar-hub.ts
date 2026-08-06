@@ -821,10 +821,16 @@ export async function buildCalendar(
     }
   } else if (view === 'meeting') {
     sources.push(await meetingSource(viewer.userId, from, lastDate));
-    explanation = 'Meetings you are hosting.';
-    emptyTitle = 'No meetings you host in this period';
+    // THESE THREE SENTENCES WERE STALE, AND THEY DENIED A CAPABILITY THE PRODUCT HAS. They said
+    // meetings you were invited to are not listed, and that the store cannot record invitations in a
+    // shape this calendar can read. meetingSource() above has matched the invitee list since one
+    // module took ownership of the meet_* DDL — it reads host OR invitee, and the WHERE clause forty
+    // lines up says so. A screen that denies something it can do sends somebody to a colleague to
+    // ask what time their own meeting is. What is still true is narrower, and it is what these say now.
+    explanation = 'Meetings you are hosting, and meetings you were invited to.';
+    emptyTitle = 'No meetings in this period';
     emptyBody =
-      'Meetings you were invited to are not listed. The meeting store records who hosts a room and does not record invitations in a shape this calendar can read honestly, so it does not pretend to.';
+      'Nothing you host or were invited to falls in these dates. Invitations are matched on the address you sign in with, and an invitation is not an acceptance — nothing records one — so a meeting invited to another of your addresses does not appear here.';
   } else if (view === 'holiday') {
     // Whole-organization holidays plus this person's department. A holder of employee.manage sees
     // every department's, because they administer them.

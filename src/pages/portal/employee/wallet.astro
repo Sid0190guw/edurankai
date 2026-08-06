@@ -7,12 +7,42 @@ const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// =================================================================================================
+// "NO EMPLOYEE PROFILE LINKED" IS A CLAIM, AND THIS PAGE COULD NOT MAKE IT
+// =================================================================================================
+//
+// The lookup below sat inside `catch (_) {}`. Any failure of either SELECT — an unreachable pooler, a
+// table not yet provisioned, a permission error — left `employee` null, and the render then told the
+// person "No employee profile linked. Ask HR to link your account." That is a definite statement of
+// fact about somebody's own pay, produced by a read that never completed. They go and ask HR about a
+// link that already exists, HR sees it, and neither of them can see the actual reason.
+//
+// The two states are now distinct: null WITH lookupError is UNKNOWN and says so; null WITHOUT one is
+// genuinely not linked. Nothing else about the page changes — a failed read still shows no balance,
+// because there is no balance to show, but it no longer blames the employee's record for it.
+//
+// Declared ABOVE the POST handler that reads them; `const`/`let` are not hoisted.
 let employee: any = null;
+let lookupError: string | null = null;
 try {
   employee = rowsOf(await db.execute(sql`SELECT * FROM hr_employees WHERE user_id = ${user.id} AND is_active = true LIMIT 1`))[0]
     || rowsOf(await db.execute(sql`SELECT * FROM hr_employees WHERE (work_email = ${user.email} OR personal_email = ${user.email} OR email = ${user.email}) AND is_active = true LIMIT 1`))[0] || null;
-  if (employee && !employee.user_id) await db.execute(sql`UPDATE hr_employees SET user_id = ${user.id} WHERE id = ${employee.id}`).catch(() => {});
-} catch (_) {}
+  // THE SELF-HEAL WRITE IS NOT SWALLOWED. This linked the employee row to the signed-in account and
+  // threw the failure away with `.catch(() => {})`; when it fails the account is matched by e-mail on
+  // every single load instead, and nothing anywhere says the link was never written. The page still
+  // proceeds — the person can see their wallet either way — but the reason reaches the log.
+  if (employee && !employee.user_id) {
+    await db.execute(sql`UPDATE hr_employees SET user_id = ${user.id} WHERE id = ${employee.id}`)
+      .catch((e: any) => {
+        console.error('[portal/employee/wallet] could not link employee', String(employee.id),
+          'to user', String(user.id), '-', e?.cause?.message || e?.message);
+      });
+  }
+} catch (e: any) {
+  // The real Postgres reason is on `.cause`; `.message` is only the SQL that failed.
+  lookupError = e?.cause?.message || e?.message || 'unknown database error';
+  console.error('[portal/employee/wallet] employee lookup failed -', lookupError);
+}
 
 let flash = '';
 if (Astro.request.method === 'POST' && employee) {
@@ -28,17 +58,37 @@ if (Astro.request.method === 'POST' && employee) {
     const amount = parseFloat(fd.get('amount') as string || '0');
     const bankId = (fd.get('bank_account_id') as string || '') || null;
     const r = await requestWithdrawal(employee.id, amount, bankId, (fd.get('note') as string || ''));
-    flash = r.ok ? 'Withdrawal requested — pending approval.' : (r.error || 'Could not request.');
+    // "PENDING APPROVAL" IS ONLY TRUE IF SOMEBODY WAS ASKED.
+    //
+    // This line said it unconditionally, and requestWithdrawal() used to write the row and return —
+    // the function that creates the approval instance and notifies the approver ran only when
+    // somebody later happened to load a DIFFERENT page. So the screen asserted a chain that did not
+    // exist. The request now enters the chain here, and when the Organization Graph cannot name an
+    // approver it HALTS with a readable sentence rather than vanishing; this says which happened.
+    flash = r.ok
+      ? (r.halted
+          ? 'Withdrawal requested. It is NOT yet with an approver: ' + (r.haltReason || 'no approver could be resolved.')
+            + ' The amount is held against your balance until it is decided.'
+          : 'Withdrawal requested and sent to your approver.')
+      : (r.error || 'Could not request.');
   }
   return Astro.redirect('/portal/employee/wallet?msg=' + encodeURIComponent(flash));
 }
 
-const bal = employee ? await getBalance(employee.id) : { balance: 0, currency: 'INR', pending: 0, available: 0 };
+const bal = employee
+  ? await getBalance(employee.id)
+  : { balance: 0, currency: 'INR', pending: 0, available: 0, otherCurrencies: [] };
 const txns = employee ? await listTxns(employee.id, 20) : [];
 const banks = employee ? await listBankAccounts(employee.id) : [];
 const withdrawals = employee ? await listWithdrawals({ employeeId: employee.id }) : [];
 const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
-const inr = (n: any) => '₹' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// The wallet's OWN currency, not an assumed rupee sign. getBalance() resolves it from the salary
+// structure and sums only rows denominated in it; printing every figure with a hard-coded ₹ is how a
+// USD salary credit came to be read as rupees on this very screen.
+const sym = (cur: string) => (cur === 'INR' ? '₹' : cur + ' ');
+const amt = (n: any, cur: string = bal.currency) =>
+  sym(cur) + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const inr = (n: any) => amt(n);
 // Darkened: #d97706 and #059669 were 3.2:1 and 3.8:1 on the near-white pill, under the
 // 4.5:1 floor, on 10px uppercase text that is the only thing saying whether the money
 // is on its way.
@@ -89,7 +139,9 @@ const statusColor: Record<string, string> = { pending: '#b45309', approved: '#25
       for, and it arrived silently for anyone not looking at the top of the page. */}
   {msg && <div role="status" style="background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:11px 14px;font-size:13px;margin-bottom:14px;">{msg}</div>}
 
-  {!employee && (<div class="card" style="text-align:center;padding:34px;"><p style="font-weight:600;">No employee profile linked</p><p style="font-size:13px;color:#6b6255;margin-top:6px;">Ask HR to link your account.</p></div>)}
+  {!employee && lookupError && (<div class="card" role="alert" style="text-align:center;padding:34px;"><p style="font-weight:600;">Your wallet could not be loaded</p><p style="font-size:13px;color:#6b6255;margin-top:6px;">Your employee record could not be read just now, so this page cannot say whether you have a wallet or what is in it. Nothing has changed and nothing has been lost. Try again in a few minutes; if it keeps happening, tell HR that the wallet page reported: {lookupError}</p></div>)}
+
+  {!employee && !lookupError && (<div class="card" style="text-align:center;padding:34px;"><p style="font-weight:600;">No employee profile linked</p><p style="font-size:13px;color:#6b6255;margin-top:6px;">Ask HR to link your account.</p></div>)}
 
   {employee && (<div>
     <div class="card" style="background:linear-gradient(160deg,#1a1510,#2b241b);color:#faf6ef;border:none;">
@@ -99,6 +151,16 @@ const statusColor: Record<string, string> = { pending: '#b45309', approved: '#25
         <div><div style="color:rgba(250,246,239,.55);font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;">In wallet</div><div style="font-weight:700;margin-top:2px;">{inr(bal.balance)}</div></div>
         <div><div style="color:rgba(250,246,239,.55);font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;">Pending withdrawal</div><div style="font-weight:700;margin-top:2px;color:#fbbf24;">{inr(bal.pending)}</div></div>
       </div>
+      {/* Money held in another currency is never added into the balance above — there is no exchange
+          rate in this system — but it must not be invisible either, or an employee is simply not
+          shown money that is theirs. */}
+      {bal.otherCurrencies.length > 0 && (
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid rgba(250,246,239,.15);font-size:12px;color:rgba(250,246,239,.75);">
+          You also hold {bal.otherCurrencies.map((o) => amt(o.balance, o.currency)).join(', ')}. That is a
+          different currency, so it is not part of the balance above and cannot be withdrawn from this
+          form. Ask HR to settle it.
+        </div>
+      )}
     </div>
 
     <div class="card">
@@ -150,7 +212,7 @@ const statusColor: Record<string, string> = { pending: '#b45309', approved: '#25
       {txns.map((t: any) => (
         <div class="ledger">
           <div><div style="font-weight:600;text-transform:capitalize;">{t.kind}{t.note ? ' · ' + t.note : ''}</div><div style="font-size:11px;color:#6b6255;">{new Date(t.created_at).toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'numeric'})}</div></div>
-          <div style={`font-weight:700;font-family:'JetBrains Mono',monospace;color:${t.direction==='credit'?'#059669':'#dc2626'};`}>{t.direction === 'credit' ? '+' : '−'}{inr(t.amount)}</div>
+          <div style={`font-weight:700;font-family:'JetBrains Mono',monospace;color:${t.direction==='credit'?'#059669':'#dc2626'};`}>{t.direction === 'credit' ? '+' : '−'}{amt(t.amount, String(t.currency || bal.currency))}</div>
         </div>
       ))}
     </div>

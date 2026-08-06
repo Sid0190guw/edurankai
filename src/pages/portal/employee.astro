@@ -169,7 +169,11 @@ const employeeId: string | null = composed.workspace?.employeeId ?? null;
 const noEmployeeRecord = composed.ok && !composed.workspace;
 
 // Declared HERE, above the POST handler, for the same hoisting reason as everything else.
-const TASK_STATUSES = ['open', 'in_progress', 'blocked', 'done'];
+// TASK_STATUSES USED TO BE DECLARED HERE, as ['open','in_progress','blocked','done'] — the four
+// LEGACY names — and the POST handler validated against it. src/lib/employee-tasks.ts has ten
+// canonical statuses and a transition graph between them, so this page's copy silently refused every
+// canonical value before the library could answer for it. The handler asks canonicalStatus() now and
+// the control is drawn from allowedTransitionsFor(); neither list lives on this page any more.
 
 // =================================================================================================
 // THE FLASH CHANNEL. TWO OF THEM, AND THE PAGE NEVER ECHOES WHAT IT WAS SENT.
@@ -202,7 +206,6 @@ const FLASH_OK = {
   clocked_out: 'Clocked out. Have a good evening.',
   break_started: 'Break started.',
   break_ended: 'Break ended. Welcome back.',
-  report_saved: 'Your report for today is saved.',
   time_logged: 'That block of time is logged.',
   time_deleted: 'That time entry has been removed.',
   task_updated: 'Task updated.',
@@ -212,8 +215,33 @@ const FLASH_ERR = {
   // Said in the negative and said twice, because the one thing somebody must not do here is walk
   // away believing a punch landed when it did not.
   clock_failed: 'Your punch was NOT recorded. Nothing has been saved. Please try again, and if it keeps failing tell your manager today rather than at the end of the month.',
-  report_short: 'Please describe what you did today — at least a sentence.',
-  report_failed: 'Your report could not be saved, so nothing has been recorded for today. Please try again.',
+  // A CLOCK-OUT THAT LANDED IN THE PUNCH LOG BUT CLOSED NO DAY. Reachable without anything being
+  // broken: an overnight shift clocking out after the date has rolled over, or a clock-out with no
+  // clock-in. Both used to render "Clocked out. Have a good evening." over an unclosed day.
+  clock_out_no_day: 'Your clock-out was recorded as a punch, but there is no attendance row for today to close — so today still shows no clock-out and no hours. This happens if your shift started on the previous date, or if you never clocked in. Raise an attendance correction so the day is counted.',
+  clock_out_no_clock_in: 'Your clock-out was recorded, but today has no clock-in, so the hours worked could not be worked out and have been left as they were rather than set to zero. Raise an attendance correction with your start time.',
+  // A punch that is in the raw log but not on the day roster. The roster is what payroll reads.
+  clock_in_not_on_roster: 'Your clock-in was recorded as a punch, but today could not be marked present on the attendance roster — which is what payroll and your manager read. Tell HR today; do not assume it will correct itself.',
+  // THE FOUR REFUSALS punchRefusal() CAN GIVE, as codes rather than as forwarded text.
+  //
+  // punch() returns the refusal as a SENTENCE, and this page's whole flash channel exists because a
+  // sentence travelling in a query string is a phishing surface. So the sentence is not forwarded:
+  // the code is chosen from the posted kind and the day totals punch() hands back with the refusal,
+  // using allowedPunches() — the same pure function the buttons are drawn from. The wording below is
+  // punchRefusal()'s, restated here, and the two are checked against each other by nothing but a
+  // reader; that is the cost of not reflecting arbitrary text and it is worth paying.
+  //
+  // Reaching one of these at all means the screen and the day disagreed — a second tab, a back
+  // button, or two phones. NOTHING WAS WRITTEN in any of them.
+  punch_already_in: 'You are already checked in for today, so that clock-in was not recorded. Reload this page to see where your day actually stands.',
+  punch_not_checked_in: 'You are not checked in, so there was nothing to check out of and nothing has been recorded. Reload this page — another tab or another device may have closed your day already.',
+  punch_already_on_break: 'You are already on a break, so that was not recorded twice. Reload this page and use Resume work.',
+  punch_no_break_running: 'No break is running, so there was nothing to end and nothing has been recorded. Reload this page to see where your day stands.',
+  // THE PUNCH LANDED AND THE DAY DID NOT. punch() writes hr_clock_events first and then recomputes
+  // hr_attendance from the whole day's events; this is the state where the first succeeded and the
+  // second did not. hr_attendance is what payroll, the timesheet and the intern hours ledger read,
+  // so it is emphatically not a success — and it is not "nothing was saved" either.
+  punch_day_not_written: 'Your punch was recorded, but today\'s attendance row could not be updated from it — so your hours for today are not yet counted, and that row is what payroll and your timesheet read. Nothing you did is lost. Reload in a moment; if this line comes back, tell HR today rather than at the end of the month.',
   time_invalid: 'Enter a valid time period — the end time has to be after the start time.',
   time_task_missing: 'Describe what you worked on in that period.',
   time_failed: 'That block of time could not be logged. Nothing has been saved.',
@@ -236,14 +264,43 @@ if (Astro.request.method === 'POST') {
   // EVERY WRITE IS GATED ON THE SAME WIDGET THE FORM CAME FROM. A form that was never rendered must
   // not be postable, and the eligibility answer is already resolved above — so the control and the
   // write agree by construction instead of by two people remembering to keep them in step.
+  //
+  // =================================================================================================
+  // THE PUNCH GOES THROUGH punch(). THIS PAGE NO LONGER WRITES ATTENDANCE ITSELF.
+  //
+  // WHAT WAS HERE, AND WHY IT WAS THE WORST KIND OF BUG. There were TWO writers of hr_attendance, one
+  // tap apart on the same navigation bar, and they did different arithmetic:
+  //
+  //   /portal/employee/attendance  -> punch() (src/lib/attendance.ts:1146). Validates the kind against
+  //      the day so far, inserts the raw event, then RECOMPUTES the whole day from the event log:
+  //      first clock_in to last clock_out, minus closed breaks, floored at zero and capped at
+  //      MAX_DAY_MINUTES. break_minutes lands in its own column and is excluded from worked time.
+  //
+  //   this page (the Home card)   -> a hand-written INSERT plus an UPDATE that set
+  //      work_hours = NOW() - clock_in. WALL CLOCK. break_start and break_end were recorded as events
+  //      and subtracted from NOTHING, so an hour of lunch was paid time. It also validated no event
+  //      type at all, had no refusal rule, and overwrote clock_in on a second clock_in.
+  //
+  // hr_attendance.work_hours is what weeklyTimesheet() renders, what computePay() counts and what
+  // credit-ledger.ts turns into an intern's recorded hours. So which of two buttons somebody pressed
+  // decided whether their lunch break was paid, and nothing on any screen said so.
+  //
+  // Now there is ONE writer. This handler collects evidence off the form and hands it to the engine;
+  // every rule — what may be punched next, what the day adds up to, what the failure was — is
+  // answered in one place, by the same function the attendance page calls.
+  // =================================================================================================
   if (action === 'clock_event' && employeeId && has('clock.today')) {
-    const eventType = fd.get('event_type') as string;
+    const eventType = String(fd.get('event_type') || '');
     const lat = parseFloat(fd.get('lat') as string || '0') || null;
     const lon = parseFloat(fd.get('lon') as string || '0') || null;
     const accuracy = parseFloat(fd.get('accuracy') as string || '0') || null;
-    const locationName = (fd.get('location_name') as string || '').trim() || null;
-    const workMode = fd.get('work_mode') as string || 'remote';
+    const workMode = String(fd.get('work_mode') || 'remote');
     const note = (fd.get('note') as string || '').trim() || null;
+    // The selfie the capture modal attaches. NOT handed to punch(): PunchEvidence has no field for an
+    // image and no column takes one — it carries a face-check OUTCOME the server computed, never a
+    // picture. Kept here so the existing behaviour is not silently deleted (the strip on
+    // /admin/hr/attendance renders these), and written AFTER the punch as a separate, non-fatal
+    // update. The honest follow-up is recorded below.
     const facePhoto = (fd.get('face_photo') as string || '').slice(0, 300000) || null;
 
     // Which success sentence this punch earns, decided from the event type BEFORE anything is
@@ -253,37 +310,18 @@ if (Astro.request.method === 'POST') {
     else if (eventType === 'break_start') punchOk = 'break_started';
     else if (eventType === 'break_end') punchOk = 'break_ended';
 
+    let res: any = null;
     try {
-      await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_photo TEXT`).catch(() => {});
-      await db.execute(sql`
-        INSERT INTO hr_clock_events (employee_id, event_type, lat, lon, accuracy, location_name, work_mode, note, face_photo, ip_address, device_info)
-        VALUES (${employeeId}, ${eventType}, ${lat}, ${lon}, ${accuracy}, ${locationName}, ${workMode}, ${note}, ${facePhoto},
-          ${Astro.clientAddress}, ${Astro.request.headers.get('user-agent')?.substring(0,200) || null})
-      `);
-
-      // Update attendance record
-      const today = new Date().toISOString().split('T')[0];
-      if (eventType === 'clock_in') {
-        await db.execute(sql`
-          INSERT INTO hr_attendance (employee_id, date, clock_in, status, work_mode, ip_address)
-          VALUES (${employeeId}, ${today}, NOW(), 'present', ${workMode}, ${Astro.clientAddress})
-          ON CONFLICT (employee_id, date) DO UPDATE SET clock_in = NOW(), status = 'present', work_mode = ${workMode}
-        `).catch(() => {});
-      } else if (eventType === 'clock_out') {
-        await db.execute(sql`
-          UPDATE hr_attendance SET clock_out = NOW(),
-            work_hours = EXTRACT(EPOCH FROM (NOW() - clock_in))/3600
-          WHERE employee_id = ${employeeId} AND date = ${today}
-        `).catch(() => {});
-        // Capture the wrap-up task summary (what was completed, status, %).
-        try {
-          const task = (fd.get('task') as string || '').trim();
-          if (task) {
-            await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_task_log (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), employee_id UUID NOT NULL, log_date DATE NOT NULL, task TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'done', percent INT NOT NULL DEFAULT 100, details TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-            await db.execute(sql`INSERT INTO hr_task_log (employee_id, log_date, task, status, percent, details) VALUES (${employeeId}, ${today}, ${task.slice(0, 500)}, ${(fd.get('task_status') as string) || 'done'}, ${Math.max(0, Math.min(100, parseInt(fd.get('task_percent') as string || '100') || 100))}, ${(fd.get('task_details') as string || '').trim() || null})`);
-          }
-        } catch (_) {}
-      }
+      const { punch } = await import('@/lib/attendance');
+      res = await punch(employeeId, eventType, {
+        lat,
+        lon,
+        accuracy,
+        workMode,
+        note,
+        ipAddress: Astro.clientAddress,
+        deviceInfo: Astro.request.headers.get('user-agent') || null,
+      });
     } catch (e: any) {
       // NEVER SWALLOWED, AND NEVER DRESSED AS SUCCESS. The real Postgres reason is on e.cause;
       // e.message is only the failed SQL, which is what used to be handed to the browser in the
@@ -291,36 +329,121 @@ if (Astro.request.method === 'POST') {
       logFail('clock_event', e);
       return Astro.redirect(backWithErr('clock_failed'));
     }
+
+    if (!res?.ok) {
+      // WHICH FAILURE, ANSWERED FROM THE ENGINE'S OWN PURE FUNCTION rather than from its prose.
+      //
+      //   totals present, and this kind is not one the day allows  -> a refusal. Nothing was written.
+      //   totals present, and it WAS allowed                       -> the event landed, the day did
+      //                                                               not. A different sentence.
+      //   no totals                                                -> refused before the insert (an
+      //                                                               unreadable date, a bad kind).
+      //                                                               Nothing was written.
+      let code: keyof typeof FLASH_ERR = 'clock_failed';
+      if (res?.totals) {
+        let allowed: string[] = [];
+        try {
+          const { allowedPunches } = await import('@/lib/attendance');
+          allowed = allowedPunches(res.totals) as string[];
+        } catch (e: any) {
+          logFail('allowedPunches', e);
+        }
+        if (allowed.length > 0 && allowed.indexOf(eventType) < 0) {
+          if (eventType === 'clock_in') code = 'punch_already_in';
+          else if (eventType === 'clock_out') code = 'punch_not_checked_in';
+          else if (eventType === 'break_start') {
+            code = res.totals.onBreak ? 'punch_already_on_break' : 'punch_not_checked_in';
+          } else code = res.totals.open ? 'punch_no_break_running' : 'punch_not_checked_in';
+        } else {
+          code = 'punch_day_not_written';
+        }
+      }
+      // The engine's sentence goes to the LOG, where a developer reads it, and never into the query
+      // string this page renders back.
+      console.error('[portal/employee] punch refused', eventType, res?.error || 'no reason given');
+      return Astro.redirect(backWithErr(code));
+    }
+
+    // THE SELFIE, ATTACHED AFTER THE FACT AND NEVER ALLOWED TO FAIL THE PUNCH.
+    //
+    // Scoped to this employee's newest event and to a row that has no photo yet, so a retry cannot
+    // overwrite an earlier punch's picture. It is a compromise and it is written down as one: the
+    // rest of the product has moved to a server-computed face-check OUTCOME (src/lib/attendance-verify.ts,
+    // which stores a verdict and never an image, and whose own header calls hr_clock_events.face_photo
+    // a pre-existing problem it did not fix), and /api/portal/attendance/punch.ts refuses image
+    // fields outright. This form still captures a picture, and deleting that quietly would remove a
+    // strip an admin screen renders — so it is preserved exactly, and the follow-up is to replace the
+    // capture with a descriptor check like every other surface.
+    if (facePhoto) {
+      try {
+        await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS face_photo TEXT`);
+        await db.execute(sql`
+          UPDATE hr_clock_events SET face_photo = ${facePhoto}
+           WHERE id = (SELECT id FROM hr_clock_events
+                        WHERE employee_id = ${employeeId}::uuid AND event_type = ${eventType}
+                        ORDER BY event_time DESC LIMIT 1)
+             AND face_photo IS NULL`);
+      } catch (e: any) {
+        // Not fatal and not silent. The punch is recorded and counted; only the picture is missing,
+        // and a picture is evidence beside a fact rather than the fact.
+        logFail('punch face photo', e);
+      }
+    }
+
+    // The wrap-up note typed on the clock-out form. Secondary to the punch — it must never fail one —
+    // but a bare catch meant a note somebody typed vanished with no trace anywhere.
+    if (eventType === 'clock_out') {
+      try {
+        const task = (fd.get('task') as string || '').trim();
+        if (task) {
+          const logDay = composed.context.today || todayIso;
+          await db.execute(sql`INSERT INTO hr_task_log (employee_id, log_date, task, status, percent, details) VALUES (${employeeId}, ${logDay}, ${task.slice(0, 500)}, ${(fd.get('task_status') as string) || 'done'}, ${Math.max(0, Math.min(100, parseInt(fd.get('task_percent') as string || '100') || 100))}, ${(fd.get('task_details') as string || '').trim() || null})`);
+        }
+      } catch (e: any) {
+        logFail('clock_out task log', e);
+      }
+    }
+
     return Astro.redirect(backWithOk(punchOk));
   }
 
-  if (action === 'daily_report' && employeeId && has('dailyreport.today')) {
-    const workDone = (fd.get('work_done') as string || '').trim();
-    const progress = (fd.get('progress') as string || '').trim() || null;
-    const blockers = (fd.get('blockers') as string || '').trim() || null;
-    const today = new Date().toISOString().split('T')[0];
-    if (!workDone || workDone.length < 10) {
-      return Astro.redirect(backWithErr('report_short'));
-    }
-    try {
-      await db.execute(sql`
-        INSERT INTO hr_daily_reports (employee_id, report_date, work_done, progress, blockers)
-        VALUES (${employeeId}, ${today}, ${workDone}, ${progress}, ${blockers})
-        ON CONFLICT (employee_id, report_date) DO UPDATE SET work_done = EXCLUDED.work_done, progress = EXCLUDED.progress, blockers = EXCLUDED.blockers, updated_at = NOW()
-      `);
-    } catch (e: any) {
-      // The cause, not the SQL, and to the log rather than to the address bar.
-      logFail('daily_report', e);
-      return Astro.redirect(backWithErr('report_failed'));
-    }
-    return Astro.redirect(backWithOk('report_saved'));
-  }
+  // =================================================================================================
+  // THE DAILY REPORT IS NOT WRITTEN HERE ANY MORE. THIS PAGE HAD THE SECOND WRITER, AND IT WAS SILENT.
+  //
+  // WHAT WAS HERE: `INSERT INTO hr_daily_reports ... ON CONFLICT DO UPDATE SET work_done, progress,
+  // blockers`. Three things were wrong with it, and every one of them is a promise the screen made
+  // and did not keep:
+  //
+  //   1. IT TOLD NOBODY. src/lib/daily-report.ts submitReport() resolves the reviewer from the
+  //      Organization Graph and notifies them (daily-report.ts:972). This handler notified no one, so
+  //      a report filed from Home reached a reviewer only if they happened to open the team screen.
+  //      The person had written up their day and believed it had been sent.
+  //
+  //   2. IT DESTROYED THE REVISION TRAIL. submitReport() snapshots the live row into
+  //      hr_daily_report_revisions inside a transaction, under a row lock, BEFORE overwriting it —
+  //      the module's header (daily-report.ts:36) says plainly why: without it, "we shipped the
+  //      parser" becomes unfalsifiable, because the text a reviewer read is gone. This upsert
+  //      overwrote work_done with no snapshot and without incrementing revision_count, so an edit
+  //      made from Home existed in no revision and in no live copy of what came before.
+  //
+  //   3. IT WROTE A COLUMN NOBODY READS. `progress` is written by this form and by nothing else, and
+  //      it is not in REPORT_COLS (daily-report.ts:536) — no reviewer screen, no export and no reader
+  //      anywhere in src/ ever selects it. What somebody typed into "Progress and what is next" went
+  //      nowhere at all.
+  //
+  // So the card below is a STATUS AND A DOOR. Filing and revising happen on /portal/employee/reports,
+  // which is the one writer, requires the link a reviewer can actually open, records the revision and
+  // tells the person who reads it — and which says, correctly, that nobody is named as a reviewer
+  // until the Organization Graph is initialized rather than naming somebody plausible.
+  // =================================================================================================
 
   if (action === 'add_time_log' && employeeId && has('timelog.today')) {
     const startTime = (fd.get('start_time') as string || '').trim();
     const endTime = (fd.get('end_time') as string || '').trim();
     const task = (fd.get('task') as string || '').trim();
-    const today = new Date().toISOString().split('T')[0];
+    // The database's day, for the same reason the report above uses it: a block of time logged before
+    // dawn was landing on the previous date and disappearing from a card that reads today.
+    const today = composed.context.today || todayIso;
     const toMin = (t: string) => { const m = /^(\d{1,2}):(\d{2})$/.exec(t); return m ? (parseInt(m[1]) * 60 + parseInt(m[2])) : -1; };
     const s = toMin(startTime), e = toMin(endTime);
     if (s < 0 || e < 0 || e <= s) {
@@ -375,16 +498,23 @@ if (Astro.request.method === 'POST') {
     // The field is carried through from the form rather than dropped, otherwise choosing Blocked
     // would be a control that always refuses.
     const blockedReason = (fd.get('blocked_reason') as string || '').trim();
-    if (!taskId || !TASK_STATUSES.includes(nextStatus)) {
+    if (!taskId) {
       return Astro.redirect(backWithErr('task_unknown_status'));
     }
-    // The library's own error text is LOGGED rather than forwarded. It is written for a developer
-    // ("That task is not available."), it varies, and forwarding it means an arbitrary string in the
-    // query parameter this page renders — which is the reflection this whole channel exists to close.
+    // WHAT WE ACCEPT IS WHAT THE ENGINE RECOGNISES, not a list written out on this page.
+    //
+    // This used to test the posted value against a four-name array declared at the top of this file
+    // — the LEGACY statuses — so 'under_review', 'accepted', 'approved' and every other canonical
+    // value the control now offers would have been rejected here as "not a status we track" before
+    // the library ever saw them. canonicalStatus() is the library's own reader and accepts both
+    // vocabularies; whether the MOVE is permitted is still decided by updateTaskStatus(), which
+    // re-derives the right inside its own UPDATE.
     let taskUpdated = false;
     try {
-      const { updateTaskStatus } = await import('@/lib/employee-tasks');
-      const res = await updateTaskStatus(taskId, user.id, nextStatus as any, {
+      const { updateTaskStatus, canonicalStatus } = await import('@/lib/employee-tasks');
+      const canonical = canonicalStatus(nextStatus);
+      if (!canonical) return Astro.redirect(backWithErr('task_unknown_status'));
+      const res = await updateTaskStatus(taskId, user.id, canonical as any, {
         blockedReason,
         ipAddress: Astro.clientAddress,
       });
@@ -421,6 +551,9 @@ const wantDueToday = wantAttention && has('tasks.dueToday');
 const wantBoard = wantAttention && (has('tasks.signoff') || has('tasks.review'));
 const wantLeaveQueue = wantAttention && has('approvals.leave');
 const wantWithdrawalQueue = wantAttention && has('approvals.withdrawal');
+// Everything the workflow engine routed to this person, in every domain that is not leave or a
+// wallet withdrawal. See the loader below for what was wrong before it existed.
+const wantRoutedQueue = wantAttention && has('approvals.routed');
 const wantMyDocs = wantAttention && has('onboarding.docs');
 const wantDocReview = wantAttention && has('onboarding.review');
 
@@ -437,14 +570,40 @@ let myTasks: any[] = [];
 let taskTally: any = null;
 let tasksReady = false;
 let tasksFailed = false;
+// THE MOVES THIS PERSON MAY ACTUALLY MAKE, per task, from the engine's own transition graph.
+//
+// WHAT WAS WRONG. The status control offered a fixed four — Not started, In progress, Blocked, Done
+// — which are the LEGACY names, and employee-tasks.ts has ten canonical statuses with a real graph
+// between them (TRANSITIONS, :250). So an assignee whose task had reached 'under_review' was shown
+// "Done", chose it, and was refused with a flat "That task could not be updated. Nothing has
+// changed." — no reason, because the library's sentence is deliberately logged rather than
+// forwarded into a query string. The control existed only to be refused, which teaches people the
+// system is broken. allowedTransitionsFor() is exported precisely so a screen does not have to
+// guess; its docblock says "render the buttons from THIS".
+//
+// ROLE 'assignee', because this list IS the person's own assigned work — myTasksView() is scoped to
+// their employee id. Anything they hold a different role on (approver, lead, reviewer) is on the
+// board at /portal/tasks, which resolves viewerRoles per row in SQL. A narrower role here can only
+// offer fewer moves, never more, and the write re-derives the right inside its own UPDATE anyway.
+let taskMoves: Record<string, { value: string; label: string }[]> = {};
 if (wantTaskView) {
   try {
-    const { myTasksView } = await import('@/lib/employee-tasks');
+    const {
+      myTasksView, allowedTransitionsFor, STATUS_LABELS, canonicalStatus,
+    } = await import('@/lib/employee-tasks');
     const view = await myTasksView(employeeId as string);
     myTasks = Array.isArray(view?.tasks) ? view.tasks : [];
     taskTally = view?.counts ?? null;
     tasksReady = true;
     tasksFailed = !view?.ok;
+    for (const t of myTasks as any[]) {
+      if (!t?.id) continue;
+      const from = canonicalStatus(t.state || t.status) || 'assigned';
+      taskMoves[String(t.id)] = allowedTransitionsFor(from, 'assignee').map((s: any) => ({
+        value: String(s),
+        label: (STATUS_LABELS as any)[s] || String(s),
+      }));
+    }
   } catch (e: any) {
     logFail('tasks', e);
   }
@@ -468,6 +627,11 @@ const openTasks = myTasks
     detail: t.description || '',
     blockedReason: t.blockedReason || '',
     from: t.selfAssigned ? '' : (t.assignedByName || ''),
+    /** The canonical status, which is what the transition graph speaks. `status` above is the
+     *  four-value legacy window this page's older markup reads. */
+    state: String(t.state || t.status || 'assigned').toLowerCase(),
+    /** Only the moves this person may make from where the task actually is. Never a fixed list. */
+    moves: taskMoves[String(t.id)] || [],
   }));
 const overdueCount = Number(taskTally?.overdue ?? NaN);
 const doneCount = Number(taskTally?.done ?? NaN);
@@ -494,45 +658,67 @@ const taskMeta = [
 // ALL rather than guessed at from the clock in this process.
 const dbToday = composed.context.today || '';
 
-// TODAY'S CLOCK. hr_clock_events for this person only — it stores GPS, IP, device and a selfie per
-// punch, and no surface may read it for anybody else.
+// TODAY'S CLOCK — READ BY THE SAME ENGINE THAT WRITES IT.
+//
+// hr_clock_events for this person only: it stores GPS, IP, device and a selfie per punch, and no
+// surface may read it for anybody else.
+//
+// THE ARITHMETIC IS NO LONGER DONE HERE, and that is the point. This block used to derive the day
+// itself — status from the LAST event, hours as wall clock from the first clock_in — which disagreed
+// with punch() in three ways at once: it read the day in the SERVER's timezone rather than the one
+// attendance is counted in (DATE(event_time) = CURRENT_DATE against the session zone, which is UTC),
+// it treated a stray second clock_in as a fresh start, and it subtracted no break time at all. So
+// the figure on this card was not the figure on the timesheet, and neither the person nor their
+// manager had any way to see which one payroll would use.
+//
+// computeDay() is pure and is the ONLY expression of that arithmetic; allowedPunches() draws the
+// buttons from the same totals the write path re-checks. Same day boundary (attendance today()),
+// same fold, same answer.
 let todayEvents: any[] = [];
 let currentStatus: 'clocked_out' | 'clocked_in' | 'on_break' = 'clocked_out';
 let todayHours = 0;
+let todayBreakMinutes = 0;
+/** Which punches the day allows next. The buttons are drawn from THIS and from nothing else. */
+let punchOptions: string[] = [];
 // Whether the PUNCH READ happened. currentStatus and todayHours both default to "clocked out, zero
 // hours", which is indistinguishable from a failed read — and the strip at the top of the page
 // states today's clock position as a fact.
 let clockReadFailed = false;
 if (employeeId && has('clock.today')) {
   try {
-    const r = await db.execute(sql`
-      SELECT * FROM hr_clock_events
-      WHERE employee_id = ${employeeId} AND DATE(event_time) = CURRENT_DATE
-      ORDER BY event_time ASC
-    `);
-    todayEvents = rowsOf(r);
-
-    // Determine current status
-    if (todayEvents.length > 0) {
-      const last = todayEvents[todayEvents.length - 1] as any;
-      if (last.event_type === 'clock_in') currentStatus = 'clocked_in';
-      else if (last.event_type === 'clock_out') currentStatus = 'clocked_out';
-      else if (last.event_type === 'break_start') currentStatus = 'on_break';
-      else if (last.event_type === 'break_end') currentStatus = 'clocked_in';
-    }
-
-    // Calculate today's hours
-    const clockIn = (todayEvents as any[]).find((e: any) => e.event_type === 'clock_in');
-    const clockOut = (todayEvents as any[]).find((e: any) => e.event_type === 'clock_out');
-    if (clockIn) {
-      const end = clockOut ? new Date(clockOut.event_time) : new Date();
-      todayHours = Math.round(((end.getTime() - new Date(clockIn.event_time).getTime()) / 3600000) * 10) / 10;
+    const {
+      today: attendanceToday, punchesOn, punchLog, computeDay, allowedPunches,
+    } = await import('@/lib/attendance');
+    // The day the ATTENDANCE module cuts, not the one this process would. Null means the read did
+    // not happen, and a day-partitioned claim must not be made on a guess.
+    const day = await attendanceToday();
+    if (!day) {
+      clockReadFailed = true;
+    } else {
+      // punchLog() for the visible list (it carries the location and the verification badge the rows
+      // render), computeDay() over the kinds and times for the totals. One extra read against the
+      // same table, and it buys a page that cannot disagree with the timesheet.
+      const log = await punchLog(employeeId, day);
+      const totals = computeDay(await punchesOn(employeeId, day));
+      // A positional id, not the timestamp: the markup builds an element id from it, and an ISO
+      // string carries colons. The live-time script selects on [data-ts] rather than by id, so this
+      // is about the markup being well formed rather than about anything working.
+      todayEvents = log.map((e: any, i: number) => ({
+        id: 'p' + i,
+        event_type: e.kind,
+        event_time: e.at,
+        location_name: e.locationName || e.stationLabel || null,
+      }));
+      currentStatus = totals.onBreak ? 'on_break' : (totals.open ? 'clocked_in' : 'clocked_out');
+      todayHours = Math.round((totals.workedMinutes / 60) * 10) / 10;
+      todayBreakMinutes = totals.breakMinutes;
+      punchOptions = allowedPunches(totals) as string[];
     }
   } catch (e: any) {
     // Logging only — no control flow changed here. This catch is worth a line because of what its
     // silence looks like: if the punch READ fails, currentStatus stays 'clocked_out' and the page
-    // offers "Clock In" to somebody who is already clocked in. The clock-in/out WRITE path above is
-    // untouched.
+    // offers "Clock In" to somebody who is already clocked in. The WRITE path above is untouched and
+    // re-checks the same rule anyway, so a stale button cannot produce a wrong punch.
     clockReadFailed = true;
     logFail('clock events', e);
   }
@@ -577,7 +763,9 @@ let timeLogs: any[] = [];
 let loggedHours = 0;
 if (employeeId && has('timelog.today')) {
   try {
-    const r = await db.execute(sql`SELECT * FROM hr_time_logs WHERE employee_id = ${employeeId} AND log_date = ${todayIso} ORDER BY start_time ASC`);
+    // The same day the write above used. These two must never be resolved from different clocks:
+    // the read decides what the card shows, and the write decides what exists.
+    const r = await db.execute(sql`SELECT id, log_date, start_time, end_time, hours, task FROM hr_time_logs WHERE employee_id = ${employeeId} AND log_date = ${dbToday || todayIso} ORDER BY start_time ASC`);
     timeLogs = rowsOf(r);
     loggedHours = Math.round(timeLogs.reduce((a: number, l: any) => a + Number(l.hours || 0), 0) * 100) / 100;
   } catch (e: any) {
@@ -597,13 +785,26 @@ if (employeeId && has('worklog.today')) {
   }
 }
 
-// Today's daily report (if already submitted)
+// TODAY'S REPORT — READ HERE, WRITTEN NOWHERE ON THIS PAGE ANY MORE. See the long note beside the
+// card for what the write used to do and why it had to stop.
+//
+// A DIRECT READ RATHER THAN getReport(), and the reason is rule 2 of the loaders file: getReport()
+// returns null both when there is genuinely no report and when its own query threw, and this card
+// states "no report filed yet" as a fact about somebody's day. The column list is the same set the
+// module maps, narrowed to what this card renders — no SELECT *, which used to drag every review
+// column onto a page that shows none of them.
 let todayReport: any = null;
+let reportReadFailed = false;
 if (employeeId && has('dailyreport.today')) {
   try {
-    const r = await db.execute(sql`SELECT * FROM hr_daily_reports WHERE employee_id = ${employeeId} AND report_date = ${todayIso} LIMIT 1`);
+    const r = await db.execute(sql`
+      SELECT report_url, work_done, blockers, revision_count, reviewed_at
+        FROM hr_daily_reports
+       WHERE employee_id = ${employeeId} AND report_date = ${dbToday || todayIso}
+       LIMIT 1`);
     todayReport = rowsOf(r)[0] || null;
   } catch (e: any) {
+    reportReadFailed = true;
     logFail('daily report', e);
   }
 }
@@ -641,19 +842,61 @@ if (employeeId && has('payslips.mine')) {
 // This is the only row belonging to somebody else that this page reads, and it is narrowed to two
 // display columns — no email, no identifier, no employment detail — reached solely through a
 // pointer stored on the viewer's own record.
+//
+// ASKED OF THE ORGANIZATION GRAPH FIRST, AND "NOBODY" IS NO LONGER ONE SENTENCE.
+//
+// The card used to read the column alone and render every empty answer as "Not assigned yet — ask HR
+// to set your reporting manager". The Organization Graph ships EMPTY until the founder runs
+// db/org-graph-backfill.sql, and until then getManager() answers null for every person in the
+// company — so a card built on the graph would have told the entire workforce that they report to
+// nobody. That is a claim about a real person, made on the strength of a table nobody has filled in
+// yet, and it is a different fact from "the graph is not initialized".
+//
+// reportingManagerCard() keeps the four answers apart (loaders.ts). This page renders a different
+// sentence for each, and only ONE of them is allowed to say that no manager is recorded.
 let manager: any = null;
 let managerReadFailed = false;
+let managerSource: string = 'none';
 if (employeeId && has('manager.card')) {
   try {
-    const { managerNameFor } = await import('@/lib/workforce/loaders');
-    const found = await managerNameFor(composed.context.reportingManagerUserId);
+    const { reportingManagerCard } = await import('@/lib/workforce/loaders');
+    const found = await reportingManagerCard(employeeId, composed.context.reportingManagerUserId);
+    managerSource = found.source;
     managerReadFailed = !found.ok;
     manager = found.person;
   } catch (e: any) {
     managerReadFailed = true;
+    managerSource = 'failed';
     logFail('manager', e);
   }
 }
+
+// THE SENTENCES, BUILT HERE RATHER THAN AS NESTED TERNARIES INSIDE JSX.
+//
+// Exactly one of these says that no reporting manager is recorded, and it is reachable only when the
+// Organization Graph is initialized, holds no edge for this person, and their employee record
+// carries no pointer either. Everything else names what is actually unknown.
+const managerEmptyTitle =
+  managerSource === 'failed' || managerReadFailed
+    ? 'We could not read this just now'
+    : managerSource === 'graph-empty'
+      ? 'The Organization Graph is not set up yet'
+      : 'Not assigned yet';
+const managerEmptyBody =
+  managerSource === 'failed' || managerReadFailed
+    ? 'This is not a statement that you have no reporting manager — the read itself failed. Reload in a moment.'
+    : managerSource === 'graph-empty'
+      ? 'Reporting lines are held in the Organization Graph, and it has not been filled in yet — so this is a gap in the company\'s records rather than anything about you. Nobody has a manager on it. Ask HR when it is being loaded.'
+      : 'Ask HR to set your reporting manager on your employee record. Until it is set there is no named approver for your leave or wallet requests.';
+// When somebody IS shown, where the answer came from — because a name resolved from the graph and a
+// name resolved from a column that the graph does not agree with are different facts, and the second
+// one is worth somebody knowing about.
+const managerProvenance =
+  managerSource === 'graph-empty'
+    ? 'Taken from your employee record. The Organization Graph is not set up yet, so this has not been confirmed against it.'
+    : managerSource === 'column-only'
+      ? 'Taken from your employee record. The Organization Graph does not hold a reporting line for you, so the two do not agree — worth mentioning to HR.'
+      : '';
 
 // WAITING ON MY SIGN-OFF, AND WAITING ON MY REVIEW.
 //
@@ -719,6 +962,77 @@ if (wantLeaveQueue || wantWithdrawalQueue) {
   } catch (e: any) {
     hrQueueFailed = true;
     logFail('approver queue', e);
+  }
+}
+
+// EVERYTHING ELSE ROUTED TO THIS PERSON — the queue this page could not see.
+//
+// THE HOLE THIS CLOSES. The two counts above are leave and wallet withdrawals: two of the nineteen
+// domains in src/lib/workflow.ts. Everything else the org graph routes to somebody — a submitted
+// weekly timesheet, an overtime claim, an attendance correction, an expense claim, a procurement
+// request, a loan, a document, a helpdesk ticket, an appraisal, a benefits election, a separation —
+// reaches them through pendingForApprover(), which seven pages call one domain at a time and no
+// aggregate surface called at all. So the headline on this card was a count of two domains presented
+// as the count of everything waiting, the bar badge was the same two, and a manager who cleared this
+// screen to zero had decided nothing about any of the rest. Nobody was told, because
+// notifyApprover() sends them to /admin/hr/leave/workflow — a page most managers cannot open and
+// which lists only leave.
+//
+// COUNTS AND DOMAIN NAMES ONLY on this card. The full rows, with the decision buttons, are on
+// /portal/approvals; a triage row is a pointer to work, never the work itself.
+let routedCount = 0;
+let routedRows: any[] = [];
+let routedFailed = false;
+if (wantRoutedQueue && user?.id) {
+  try {
+    const { routedApprovals } = await import('@/lib/workforce/loaders');
+    const routed = await routedApprovals(String(user.id));
+    routedFailed = !routed.ok;
+    routedCount = routed.count;
+    routedRows = routed.rows;
+  } catch (e: any) {
+    routedFailed = true;
+    logFail('routed approvals', e);
+  }
+}
+// How many DISTINCT kinds of thing are waiting, so one row can say "3 requests — expense claim,
+// timesheet" instead of listing three rows that all lead to the same queue.
+const routedKinds = Array.from(new Set((routedRows as any[]).map((r: any) => r.domainLabel).filter(Boolean)));
+
+// MEETINGS TODAY — and this page used to deny they could be shown at all.
+//
+// WHAT WAS WRONG. The "Today" section carried the flat sentence "Scheduled meetings are not shown:
+// this workspace has no meeting calendar to read from yet." That stopped being true. meetingSource()
+// in src/lib/calendar-hub.ts:515 reads meet_rooms for anything this person HOSTS or is named on the
+// invitee list of, and /portal/employee/calendar has been rendering exactly that one route away. So
+// the workspace was telling people a capability did not exist while the product had it — the same
+// class of fault as a screen promising something it cannot show, pointed the other way, and it sends
+// somebody to a colleague to ask what time a meeting is that their own workspace could have told
+// them.
+//
+// THE LIMIT IS CARRIED, NOT HIDDEN. `invitees` is a jsonb list of email strings with no membership
+// row and no accepted/declined state, so an invitation appears as an invitation and never as an
+// acceptance, and somebody invited at an address they do not sign in with is not matched. The card
+// says so rather than implying a complete calendar.
+let meetingsToday: any[] = [];
+let meetingsOk = false;
+if (has('meetings.today') && user?.id && dbToday) {
+  try {
+    const { buildCalendar } = await import('@/lib/calendar-hub');
+    const model = await buildCalendar(
+      'meeting',
+      {
+        userId: String(user.id),
+        employeeId,
+        departmentId: composed.context.departmentId,
+        holds: composed.context.holds,
+      },
+      { from: dbToday, to: dbToday },
+    );
+    meetingsOk = !model.degraded;
+    meetingsToday = (model.days as any[]).flatMap((d: any) => d.events || []);
+  } catch (e: any) {
+    logFail('meetings today', e);
   }
 }
 
@@ -890,16 +1204,38 @@ if (has('notifications.unread') && user?.id) {
 // DIRECT REPORTS. ctx.managesPeople has been true for reporting managers all along and
 // reports.direct has been registered all along, but NOTHING ANYWHERE LOADED IT — a manager with
 // direct reports had no way to see who they were. Names and designations only.
-let reports: any = { ok: true, people: [], more: 0 };
+//
+// ASKED OF THE ORGANIZATION GRAPH FIRST, exactly as the manager card above is, and for the mirror
+// image of the same reason. The graph ships EMPTY until db/org-graph-backfill.sql is run, so an
+// empty answer from it says nothing whatsoever about whether people report to this person — and
+// "nobody is recorded as reporting to you" is a claim about a real team. directReportsView() keeps
+// the four answers apart and this page renders a different sentence for each; only ONE of them is
+// allowed to say that nobody reports to them.
+let reports: any = { ok: true, people: [], more: 0, source: 'none' };
 if (has('reports.direct') && user?.id) {
   try {
-    const { directReportsFor } = await import('@/lib/workforce/loaders');
-    reports = await directReportsFor(String(user.id), 6);
+    const { directReportsView } = await import('@/lib/workforce/loaders');
+    reports = await directReportsView(String(user.id), employeeId, 6);
   } catch (e: any) {
     logFail('direct reports', e);
-    reports = { ok: false, people: [], more: 0 };
+    reports = { ok: false, people: [], more: 0, source: 'failed' };
   }
 }
+// Exactly one of these says that nobody reports to this person, and it is reachable only when the
+// Organization Graph is initialized, holds no edge for them, and no colleague's employee record
+// points at them either.
+const reportsEmptyMessage =
+  reports.source === 'graph-empty'
+    ? 'Reporting lines are held in the Organization Graph, and it has not been filled in yet — so this is a gap in the company\'s records rather than a statement about your team. Nobody has reports recorded on it. Ask HR when it is being loaded.'
+    : 'Nobody is currently recorded as reporting to you. If that is not right, ask HR to set the reporting manager on their records.';
+// Where the names came from, when there are names. A team resolved from the graph and a team
+// resolved from a column the graph does not agree with are different facts.
+const reportsProvenance =
+  reports.source === 'graph-empty'
+    ? 'Taken from employee records. The Organization Graph is not set up yet, so this has not been confirmed against it.'
+    : reports.source === 'column-only'
+      ? 'Taken from employee records. The Organization Graph holds no reporting line for you, so the two do not agree — worth mentioning to HR.'
+      : '';
 
 // THE DEPARTMENT A LEAD MAY QUERY. Narrowed by departmentFilter() inside the loader, from
 // ctx.scopeDepartmentId — which comes from the session (users.assigned_department_id) and never from
@@ -1076,6 +1412,20 @@ if (pendingWithdrawals > 0) attentionRows.push({
   priority: '',
 });
 
+// ONE ROW FOR EVERY OTHER DOMAIN, naming the kinds so it is not a mystery number. These were routed
+// to this person by the org graph and were invisible on every aggregate surface in the product.
+if (routedCount > 0) attentionRows.push({
+  key: 'routed-queue',
+  href: '/portal/approvals',
+  title: routedCount === 1 ? 'One request needs your decision' : routedCount + ' requests need your decision',
+  note: routedKinds.length > 0
+    ? routedKinds.slice(0, 3).join(', ') + (routedKinds.length > 3 ? ' and more' : '') + ' — routed to you, and waiting'
+    : 'Routed to you by the Organization Graph, and waiting',
+  tone: 'info',
+  glyph: GLYPH_INBOX,
+  priority: '',
+});
+
 // The headline counts THINGS, not rows: four late tasks are four things even though three are shown.
 // The overflow link is computed over tasks only, because the two queue rows are already a count of
 // everything in them.
@@ -1086,7 +1436,7 @@ const attentionTaskShown =
   + Math.min(ROW_CAP, signOffTasks.length) + Math.min(ROW_CAP, reviewTasks.length);
 const attentionMore = attentionTaskTotal - attentionTaskShown;
 const attentionCount =
-  attentionTaskTotal + pendingLeave + pendingWithdrawals + rejectedDocs + docsToReview;
+  attentionTaskTotal + pendingLeave + pendingWithdrawals + routedCount + rejectedDocs + docsToReview;
 
 // WHAT THE SECTION IS NOT ALLOWED TO SAY. If a source that WAS asked for did not run, "nothing is
 // waiting on you" is not a fact this page is in a position to state, so the all-clear is withheld and
@@ -1097,6 +1447,7 @@ if (wantTaskView && !attentionTasksOk) attentionGaps.push('your own task list');
 else if (wantDueToday && !dbToday) attentionGaps.push('what is due today');
 if (wantBoard && !boardOk) attentionGaps.push('anything waiting on your sign-off or review');
 if (hrQueueFailed) attentionGaps.push('the leave and withdrawal queues');
+if (routedFailed) attentionGaps.push('the requests routed to you for a decision');
 if (docsFailed) attentionGaps.push('your joining documents');
 if (docReviewFailed) attentionGaps.push('the joining-document review queue');
 // The composer reports its OWN unanswered sources the same way — "who reports to you" decides whether
@@ -1156,10 +1507,30 @@ const clockCta = clockReadFailed
       ? 'Clock out or take a break'
       : 'Clock in';
 // Hours are withheld, not zeroed, when the punch read failed: 0h is a statement about someone's day.
-// The label says "on the clock" and not "worked" on purpose — break_start/break_end are recorded in
-// hr_clock_events but do NOT adjust this span, so it is wall-clock from the first punch and includes
-// every break taken.
+//
+// IT IS WORKED TIME NOW, AND THE OLD CAVEAT IS GONE. This used to say "on the clock" rather than
+// "worked", because break_start and break_end were recorded in hr_clock_events and subtracted from
+// nothing — the figure was wall clock from the first punch and included every break taken. Both the
+// write and the read go through src/lib/attendance.ts computeDay() now, which closes each break at
+// its break_end (or at clock_out, if somebody went home without ending one) and excludes it. This
+// figure and the one on /portal/employee/timesheet are the same number from the same fold.
 const showTodayHours = !clockReadFailed && todayHours > 0;
+
+// WHICH PUNCH CONTROLS TO DRAW.
+//
+// From allowedPunches() — the engine's own pure rule — so the screen can no longer offer "End break"
+// when no break is running, and somebody on a break can now clock out (they always could; this page
+// simply never drew the button, so a person who forgot to end a break had to end one they were no
+// longer on before they could go home).
+//
+// WHEN THE READ FAILED, EVERY CONTROL IS OFFERED. punchOptions is empty on a failed read, and an
+// attendance card with no buttons at all strands somebody who genuinely needs to clock in. The write
+// path re-checks the rule and now refuses honestly and in words, so the worst case is a refusal
+// sentence rather than a wrong punch — which is the right direction when the alternative is being
+// unable to record your day.
+const ALL_PUNCHES = ['clock_in', 'clock_out', 'break_start', 'break_end'];
+const punchChoices: string[] = clockReadFailed ? ALL_PUNCHES : punchOptions;
+const canPunch = (kind: string) => punchChoices.indexOf(kind) >= 0;
 
 // =================================================================================================
 // "TODAY" — ASSEMBLED FROM ROWS ALREADY READ, AND HONEST ABOUT WHAT IT IS NOT.
@@ -1202,7 +1573,20 @@ const scheduleGapText = scheduleGaps.length === 0
     : scheduleGaps.slice(0, -1).join(', ') + ' and ' + scheduleGaps[scheduleGaps.length - 1];
 const scheduleEmpty =
   scheduleDueTasks.length === 0 && scheduleOverdue === 0 && scheduleLeave.length === 0
+  && meetingsToday.length === 0
   && !(showTodayHours || todayEvents.length > 0);
+
+// THE SENTENCE UNDER THE DAY, AND IT NO LONGER DENIES A CAPABILITY THE PRODUCT HAS.
+//
+// It used to read "Scheduled meetings are not shown: this workspace has no meeting calendar to read
+// from yet." That was written when meet_rooms.scheduled_at had no writer, and it survived two
+// rounds of that becoming false. Meetings are read now — hosted, and invited by the address on the
+// account — so what is left to say is the honest LIMIT of that read rather than a denial of it.
+const meetingsNote = !has('meetings.today')
+  ? 'Live huddles are at Meet.'
+  : !meetingsOk
+    ? 'Your meetings could not be read just now, so any that are scheduled are missing from this list. The full window is on your calendar. Live huddles are at Meet.'
+    : 'Meetings show if you are hosting or were invited at the address you sign in with; an invitation is not an acceptance, because nothing records one. The full window is on your calendar. Live huddles are at Meet.';
 
 // THE ATTENDANCE SUMMARY LINE. Days recorded, never a percentage: there is no holiday table, so an
 // absence figure would count every weekend against the person. What is not written down is not
@@ -1231,7 +1615,7 @@ const bannerStanding = clockReadFailed
   : !has('clock.today')
     ? null
     : currentStatus === 'clocked_in'
-      ? (showTodayHours ? 'You are clocked in, ' + todayHours + 'h on the clock so far today.' : 'You are clocked in.')
+      ? (showTodayHours ? 'You are clocked in, ' + todayHours + 'h worked so far today.' : 'You are clocked in.')
       : currentStatus === 'on_break'
         ? 'You are on a break.'
         : todayEvents.length > 0
@@ -1813,7 +2197,7 @@ const slots = composed.widgets.map((w: any) => w.key);
             hrefLabel="Task board"
             failed={scheduleGaps.length > 0 && scheduleEmpty}
             failedMessage={'We could not read ' + scheduleGapText + ' just now, so this is not a picture of your day. Reload in a moment.'}
-            note="Scheduled meetings are not shown: this workspace has no meeting calendar to read from yet. Live huddles are at Meet."
+            note={meetingsNote}
           >
             <ul class="rows">
               {bannerStanding && (
@@ -1840,6 +2224,16 @@ const slots = composed.widgets.map((w: any) => w.key);
                   <a class="row__main wf-focusable" href="/portal/employee/leave">
                     <span class="row__title">Approved leave today</span>
                     <span class="row__note wf-num">{l.type}{l.start && l.end && l.start !== l.end ? ' · ' + l.start + ' to ' + l.end : ''}</span>
+                  </a>
+                </li>
+              ))}
+              {/* MEETINGS. Read for real now — hosted or invited — rather than denied in a footnote.
+                  The link is the calendar, which is the surface that can show the whole window. */}
+              {(meetingsToday as any[]).map((m: any) => (
+                <li class="row">
+                  <a class="row__main wf-focusable" href={m.href || '/portal/employee/calendar'}>
+                    <span class="row__title">{m.title}</span>
+                    <span class="row__note">{m.timeLabel ? m.timeLabel : 'Today'}{m.detail ? ' · ' + m.detail : ''}</span>
                   </a>
                 </li>
               ))}
@@ -1915,20 +2309,34 @@ const slots = composed.widgets.map((w: any) => w.key);
                             than revealed on change, because revealing it would need a script and,
                             without one, choosing Blocked would be a control that refuses every time —
                             the library requires a stated cause before it will accept that status. */}
+                        {t.moves.length > 0 && (
                         <form method="POST" style="margin-top:8px;">
                           <input type="hidden" name="action" value="task_status"/>
                           <input type="hidden" name="task_id" value={t.id}/>
                           <div style="display:flex;gap:6px;align-items:center;">
-                            <select name="status" aria-label="Status of this task" style="flex:1;min-width:0;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 10px;font-size:12.5px;outline:none;">
-                              <option value="open" selected={t.status === 'open'}>Not started</option>
-                              <option value="in_progress" selected={t.status === 'in_progress'}>In progress</option>
-                              <option value="blocked" selected={t.status === 'blocked'}>Blocked</option>
-                              <option value="done" selected={t.status === 'done'}>Done</option>
+                            {/* Every option here is a move allowedTransitionsFor() says this person
+                                can make FROM WHERE THIS TASK ACTUALLY IS. The old fixed four offered
+                                "Done" on a task under review and the write refused it with no stated
+                                reason, every time. */}
+                            <select name="status" aria-label="Move this task to" style="flex:1;min-width:0;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:9px 10px;font-size:12.5px;outline:none;">
+                              {(t.moves as any[]).map((m: any) => (
+                                <option value={m.value}>{m.label}</option>
+                              ))}
                             </select>
                             <button type="submit" style="background:#111;color:#fff;border:none;font-size:12.5px;font-weight:600;padding:10px 14px;border-radius:8px;cursor:pointer;flex-shrink:0;">Update</button>
                           </div>
                           <input name="blocked_reason" aria-label="If blocked, what is blocking it" placeholder="If blocked, what is blocking it?" value={t.blockedReason} maxlength="2000" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:8px 10px;font-size:12px;outline:none;margin-top:6px;"/>
                         </form>
+                        )}
+                        {t.moves.length === 0 && tasksReady && !tasksFailed && (
+                          /* NOT a broken control and not silence. There is genuinely no move an
+                             assignee can make from here — it is with somebody else — and saying so
+                             is the difference between a screen that is finished and one that is
+                             stuck. The task page carries the full picture of who holds it. */
+                          <p style="font-size:11.5px;color:#6b7280;margin:8px 0 0;line-height:1.5;">
+                            Nothing for you to move from here. <a href={'/portal/tasks/' + t.id} style="color:#b93c00;">Open the task</a> to see who it is with.
+                          </p>
+                        )}
                       </div>
                     );
                   })}
@@ -1982,6 +2390,31 @@ const slots = composed.widgets.map((w: any) => w.key);
             failedMessage="We could not read the approval queue just now, so this is not a statement that nothing is waiting on you."
           >
             <p class="plain">{pendingLeave === 1 ? 'One person is waiting to know whether they can take the days.' : pendingLeave + ' people are waiting to know whether they can take the days.'}</p>
+          </WorkspaceCard>
+        )}
+
+        {/* EVERYTHING ELSE ROUTED TO THIS PERSON. Counts and the KINDS of thing, never the requests
+            themselves: an expense claim carries an amount and a reason, a separation carries a
+            leaver's name, and none of that belongs on a workspace card that a colleague can read
+            over a shoulder. The decisions are on /portal/approvals, which re-checks authority at the
+            write through the engine's own mayAct(). Shown when the read FAILED too, because "nothing
+            is waiting on you" printed over a query that threw is the lie this page has been punished
+            for twice. */}
+        {slot === 'approvals.routed' && (routedCount > 0 || routedFailed) && (
+          <WorkspaceCard
+            title="Requests routed to you"
+            href={routedFailed ? null : '/portal/approvals'}
+            hrefLabel="Decide"
+            meta={routedFailed ? null : String(routedCount)}
+            failed={routedFailed}
+            failedMessage="We could not read the requests routed to you just now, so this is not a statement that nothing is waiting on you."
+          >
+            <p class="plain">{routedCount === 1
+              ? 'One request has been routed to you and is waiting on your decision.'
+              : routedCount + ' requests have been routed to you and are waiting on your decision.'}</p>
+            {routedKinds.length > 0 && (
+              <p class="plain plain--quiet">{routedKinds.join(', ')}.</p>
+            )}
           </WorkspaceCard>
         )}
 
@@ -2046,10 +2479,19 @@ const slots = composed.widgets.map((w: any) => w.key);
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
                   <span id="locText">Locating you…</span>
                 </div>
-                {todayHours > 0 && (
+                {showTodayHours && (
                   <div style="text-align:center;margin-bottom:14px;">
                     <p style="font-size:36px;font-weight:800;color:#111;font-family:monospace;margin:0;">{todayHours}h</p>
+                    {/* "Worked" is now literally true: computeDay() closes each break and excludes
+                        it, so this figure and the one on the timesheet are the same fold of the same
+                        events. The break line is stated rather than left to be inferred from a gap
+                        between two numbers on different screens. */}
                     <p style="font-size:12px;color:#6b7280;margin:2px 0 0;">worked today</p>
+                    {todayBreakMinutes > 0 && (
+                      <p style="font-size:11.5px;color:#6b7280;margin:3px 0 0;">
+                        {todayBreakMinutes} min of breaks recorded and not counted as worked time
+                      </p>
+                    )}
                   </div>
                 )}
 
@@ -2076,7 +2518,19 @@ const slots = composed.widgets.map((w: any) => w.key);
                 )}
 
                 <div style="display:flex;flex-direction:column;gap:8px;">
-                  {currentStatus === 'clocked_out' && (
+                  {/* EVERY CONTROL IS DRAWN FROM allowedPunches(), never from a status word this page
+                      inferred for itself. A button that exists only to be refused teaches people the
+                      system is broken; a button that is MISSING when it should be there strands them.
+                      When the punch read failed, all four are offered and the engine refuses in
+                      words — see punchChoices above. */}
+                  {clockReadFailed && (
+                    <p style="font-size:12.5px;color:#7c2d12;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:10px 12px;margin:0 0 4px;line-height:1.5;" role="status">
+                      Today's punches could not be read, so this card cannot say where your day stands.
+                      Every control is shown; whichever one does not apply will be refused and nothing
+                      will be recorded for it.
+                    </p>
+                  )}
+                  {canPunch('clock_in') && (
                     <form method="POST" id="clockForm">
                       <input type="hidden" name="action" value="clock_event"/>
                       <input type="hidden" name="event_type" value="clock_in"/>
@@ -2103,7 +2557,7 @@ const slots = composed.widgets.map((w: any) => w.key);
                       <p class="clock-say" data-clock-status="1" role="status"></p>
                     </form>
                   )}
-                  {currentStatus === 'clocked_in' && (
+                  {canPunch('clock_out') && (
                     <div style="display:flex;flex-direction:column;gap:10px;">
                       <form method="POST" id="outForm">
                         <input type="hidden" name="action" value="clock_event"/>
@@ -2140,6 +2594,7 @@ const slots = composed.widgets.map((w: any) => w.key);
                         </button>
                         <p class="clock-say" data-clock-status="1" role="status"></p>
                       </form>
+                      {canPunch('break_start') && (
                       <form method="POST" id="breakForm">
                         <input type="hidden" name="action" value="clock_event"/>
                         <input type="hidden" name="event_type" value="break_start"/>
@@ -2151,9 +2606,10 @@ const slots = composed.widgets.map((w: any) => w.key);
                         </button>
                         <p class="clock-say" data-clock-status="1" role="status"></p>
                       </form>
+                      )}
                     </div>
                   )}
-                  {currentStatus === 'on_break' && (
+                  {canPunch('break_end') && (
                     <form method="POST" id="resumeForm">
                       <input type="hidden" name="action" value="clock_event"/>
                       <input type="hidden" name="event_type" value="break_end"/>
@@ -2268,25 +2724,48 @@ const slots = composed.widgets.map((w: any) => w.key);
 
         {/* Daily work report */}
         {slot === 'dailyreport.today' && (
+          {/* TODAY'S REPORT — STATE, AND THE DOOR TO THE ONE PLACE IT IS WRITTEN.
+              The form that used to live here is gone; the block above the POST handler says exactly
+              what it did and why it could not stay. Three states, and they are three different
+              sentences: filed, not filed yet, and "we could not read it" — which is emphatically not
+              the same as "you have not filed one", and used to render as it. */}
           <div class="card" id="daily-report">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
               <p style="font-size:13px;font-weight:700;color:#111;margin:0;">Today's work report</p>
-              {todayReport && <span style="font-size:11px;font-weight:600;color:#0f7a4a;">submitted</span>}
+              {!reportReadFailed && todayReport && (
+                <span style="font-size:11px;font-weight:600;color:#0f7a4a;">
+                  {todayReport.reviewed_at ? 'reviewed' : 'filed'}
+                </span>
+              )}
             </div>
             <div class="card-body">
-              <p style="font-size:12px;color:#6b7280;margin:0 0 10px;line-height:1.5;">A short written report of what you did today is part of your attendance. {todayReport ? 'You can edit and resubmit.' : ''}</p>
-              <form method="POST">
-                <input type="hidden" name="action" value="daily_report" />
-                {/* Associated, and "required" said out loud rather than left to an
-                    asterisk a screen reader reads as "star". */}
-                <label for="drWorkDone" style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">What did you do today? (required)</label>
-                <textarea id="drWorkDone" name="work_done" required rows="3" placeholder="Tasks completed, work done" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:11px 12px;font-size:16px;margin-bottom:8px;resize:vertical;">{todayReport ? todayReport.work_done : ''}</textarea>
-                <label for="drProgress" style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Progress and what is next</label>
-                <textarea id="drProgress" name="progress" rows="2" placeholder="Progress on ongoing work, plan for tomorrow" style="width:100%;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:11px 12px;font-size:16px;margin-bottom:8px;resize:vertical;">{todayReport && todayReport.progress ? todayReport.progress : ''}</textarea>
-                <label for="drBlockers" style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Blockers (optional)</label>
-                <input id="drBlockers" name="blockers" placeholder="Anything blocking you?" value={todayReport && todayReport.blockers ? todayReport.blockers : ''} style="width:100%;min-height:44px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:11px 12px;font-size:16px;margin-bottom:10px;" />
-                <button type="submit" style="width:100%;background:#FF4F00;color:#fff;border:none;font-size:14px;font-weight:700;padding:12px;border-radius:10px;cursor:pointer;">{todayReport ? 'Update report' : 'Submit report'}</button>
-              </form>
+              {reportReadFailed ? (
+                <p style="font-size:12.5px;color:#6b7280;margin:0 0 10px;line-height:1.55;">
+                  We could not read today's report just now, so this is not a statement that you have
+                  not filed one. Open Reports to see where it stands.
+                </p>
+              ) : todayReport ? (
+                <>
+                  <p style="font-size:12.5px;color:#374151;margin:0 0 6px;line-height:1.55;">{todayReport.work_done}</p>
+                  {todayReport.blockers && (
+                    <p style="font-size:12px;color:#9a3412;margin:0 0 6px;line-height:1.55;">Blocked: {todayReport.blockers}</p>
+                  )}
+                  <p style="font-size:11.5px;color:#6b7280;margin:0 0 10px;line-height:1.5;">
+                    {Number(todayReport.revision_count) > 0
+                      ? 'Revision ' + Number(todayReport.revision_count) + '. The earlier versions are kept.'
+                      : 'Filed once.'}
+                    {todayReport.report_url ? '' : ' No link is attached — a reviewer has only this text to go on.'}
+                  </p>
+                </>
+              ) : (
+                <p style="font-size:12.5px;color:#6b7280;margin:0 0 10px;line-height:1.55;">
+                  No report filed for today yet. A report is a link to the work plus a sentence or two,
+                  so whoever reads it can tell what to open.
+                </p>
+              )}
+              <a href="/portal/employee/reports" style="display:block;text-align:center;background:#FF4F00;color:#fff;font-size:14px;font-weight:700;padding:12px;border-radius:10px;text-decoration:none;min-height:44px;">
+                {todayReport && !reportReadFailed ? 'Open or revise the report' : 'File today\'s report'}
+              </a>
             </div>
           </div>
         )}
@@ -2467,13 +2946,14 @@ const slots = composed.widgets.map((w: any) => w.key);
                     </div>
                   </div>
                   <p style="font-size:11.5px;color:#6b7280;margin:10px 0 0;line-height:1.5;">Your leave and wallet requests go to them for approval.</p>
+                  {managerProvenance && (
+                    <p style="font-size:11.5px;color:#6b7280;margin:6px 0 0;line-height:1.5;">{managerProvenance}</p>
+                  )}
                 </div>
               ) : (
                 <div>
-                  <p style="font-size:13px;font-weight:600;color:#374151;margin:0 0 4px;">{managerReadFailed ? 'We could not read this just now' : 'Not assigned yet'}</p>
-                  <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">{managerReadFailed
-                    ? 'This is not a statement that you have no reporting manager — the read itself failed. Reload in a moment.'
-                    : 'Ask HR to set your reporting manager on your employee record. Until it is set there is no named approver for your leave or wallet requests.'}</p>
+                  <p style="font-size:13px;font-weight:600;color:#374151;margin:0 0 4px;">{managerEmptyTitle}</p>
+                  <p style="font-size:12.5px;color:#6b7280;margin:0;line-height:1.55;">{managerEmptyBody}</p>
                 </div>
               )}
             </div>
@@ -2509,8 +2989,11 @@ const slots = composed.widgets.map((w: any) => w.key);
             failed={!reports.ok}
             failedMessage="We could not read who reports to you just now, so this is not a statement that nobody does."
             empty={reports.ok && reportPeople.length === 0}
-            emptyMessage="Nobody is currently recorded as reporting to you. If that is not right, ask HR to set the reporting manager on their records."
-            note={reports.more > 0 ? 'And ' + reports.more + ' more.' : null}
+            emptyMessage={reportsEmptyMessage}
+            note={[
+              reports.more > 0 ? 'And ' + reports.more + ' more.' : '',
+              reportPeople.length > 0 ? reportsProvenance : '',
+            ].filter(Boolean).join(' ') || null}
           >
             <AvatarStack people={reportPeople} max={4} size="md" label="People who report to you" />
             <ul class="rows rows--tight">
@@ -2619,6 +3102,28 @@ const slots = composed.widgets.map((w: any) => w.key);
             breach — so the one thing that must not happen is that read running and its answer being
             thrown away, which is what a missing renderer meant: the cost and the row were real and
             the person got nothing for either. A door is the whole widget. */}
+        {/* THE WAY BACK TO THE CONSOLE, and it did not exist in either direction.
+            src/lib/admin-nav.ts has no link to this workspace and AdminLayout has none either, so a
+            department head, an HR account, a recruiter or an editor who is also on the payroll had a
+            console with no door to their own working day — and /portal used to bounce them straight
+            back to it. landing.ts answers an explicit /portal request with the workspace now, and
+            this is the return leg. A DOOR AND NOTHING ELSE: no count, no queue, no fragment of admin
+            data belongs on a personal workspace. The composer only keeps this widget for an account
+            holding admin.access whose engagement is not an internship, which is exactly who the
+            console admits — so it can never open onto a redirect. */}
+        {slot === 'console.admin' && (
+          <a class="door door--ink" href="/admin">
+            <span class="door__mark" aria-hidden="true">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+            </span>
+            <span class="door__body">
+              <span class="door__title">Admin console</span>
+              <span class="door__note">Your administrative work. This workspace stays here at /portal/employee.</span>
+            </span>
+            <svg class="door__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+          </a>
+        )}
+
         {slot === 'wellness.entry' && (
           <a class="door" href="/portal/wellness">
             <span class="door__mark" aria-hidden="true">
@@ -2689,9 +3194,12 @@ const slots = composed.widgets.map((w: any) => w.key);
      collapses on its own to the destinations that need nothing but a session, because eligibility
      here is expressed as "did the composer keep this widget".
 
-     THE COUNTS ARE A PROJECTION, NOT A QUERY. Both numbers were already resolved above for this
-     page's own cards - `pendingLeave` / `pendingWithdrawals` from the approver queue, and
-     `notifs.unread` from myNotifications() - so handing them to the bar costs nothing. This is the
+     THE COUNTS ARE A PROJECTION, NOT A QUERY. Every number was already resolved above for this
+     page's own cards - `pendingLeave` / `pendingWithdrawals` from the approver queue, `routedCount`
+     from the workflow engine's own routed queue, and `notifs.unread` from myNotifications() - so
+     handing them to the bar costs nothing. The approvals badge counted only leave and withdrawals
+     until now, which meant a badge reading 0 over a routed timesheet, expense claim or attendance
+     correction that had been sitting for a week. This is the
      mechanism that stops an approvals queue rotting: the entry is rank 4 and only three ranked
      entries reach the bar, so a manager's pending decisions live behind More, and a count nobody
      can see until they open a menu is a count nobody opens the menu for. WorkspaceNav sums whatever
@@ -2701,7 +3209,7 @@ const slots = composed.widgets.map((w: any) => w.key);
      figure passed here can never imply the existence of a surface somebody may not open. -->
 <WorkspaceNav
   composed={composed}
-  badges={{ approvals: pendingLeave + pendingWithdrawals, notifications: Number(notifs?.unread) || 0 }}
+  badges={{ approvals: pendingLeave + pendingWithdrawals + routedCount, notifications: Number(notifs?.unread) || 0 }}
 />
 
 <script is:inline>

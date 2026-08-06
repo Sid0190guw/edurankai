@@ -145,7 +145,26 @@ export async function issueRecoveryToken(
   return token;
 }
 
-export interface RecoveryHolder { userId: string; email: string | null; name: string | null; }
+export interface RecoveryHolder {
+  userId: string;
+  email: string | null;
+  name: string | null;
+  /**
+   * users.is_active for the account this token belongs to.
+   *
+   * A RECOVERY FLOW MUST NOT BE A WAY BACK INTO A REVOKED ACCOUNT. Offboarding
+   * (src/pages/admin/hr/employees/[id].astro, action `mark_relieved`) sets users.is_active = false
+   * and tells the operator "The account is deactivated, so no sign-in method works." The person it
+   * was just taken from still knows their own date of birth and still holds the personal mailbox on
+   * users.email, so nothing in /api/auth/forgot-password stops them from being mailed a valid reset
+   * link — the deactivation is the only thing standing between them and the account, and the reset
+   * surface is where that has to be respected.
+   *
+   * Reported rather than inferred: `false` only when the row says so, so a column that cannot be
+   * read does not turn every reset into a refusal.
+   */
+  isActive: boolean;
+}
 
 /**
  * Look at a token WITHOUT burning it, so the reset page can render a form and tell an expired link
@@ -155,7 +174,7 @@ export async function peekRecoveryToken(raw: string, purpose: RecoveryPurpose): 
   if (!raw) return null;
   await ensureRecoverySchema();
   const rows = rowsOf(await db.execute(sql`
-    SELECT t.user_id, u.email, u.name
+    SELECT t.user_id, u.email, u.name, u.is_active
     FROM auth_recovery_token t
     LEFT JOIN users u ON u.id = t.user_id
     WHERE t.token_hash = ${hashToken(raw)}
@@ -166,7 +185,12 @@ export async function peekRecoveryToken(raw: string, purpose: RecoveryPurpose): 
   `));
   const r = rows[0];
   if (!r) return null;
-  return { userId: String(r.user_id), email: r.email ? String(r.email) : null, name: r.name ? String(r.name) : null };
+  return {
+    userId: String(r.user_id),
+    email: r.email ? String(r.email) : null,
+    name: r.name ? String(r.name) : null,
+    isActive: r.is_active !== false,
+  };
 }
 
 /**
@@ -187,9 +211,14 @@ export async function consumeRecoveryToken(raw: string, purpose: RecoveryPurpose
   `));
   const r = rows[0];
   if (!r) return null;
-  const who = rowsOf(await db.execute(sql`SELECT id, email, name FROM users WHERE id = ${String(r.user_id)} LIMIT 1`))[0];
+  const who = rowsOf(await db.execute(sql`SELECT id, email, name, is_active FROM users WHERE id = ${String(r.user_id)} LIMIT 1`))[0];
   if (!who) return null;
-  return { userId: String(who.id), email: who.email ? String(who.email) : null, name: who.name ? String(who.name) : null };
+  return {
+    userId: String(who.id),
+    email: who.email ? String(who.email) : null,
+    name: who.name ? String(who.name) : null,
+    isActive: who.is_active !== false,
+  };
 }
 
 /** Build the absolute link a recovery mail carries. */

@@ -7,8 +7,43 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { holdsCapability, decidesEveryRequest, type ApprovalCapability } from '@/lib/auth/capability';
+// Money arithmetic. numeric() reads the NUMERIC that postgres-js hands back as a STRING without the
+// precision loss a ::float cast in SQL causes; toMinor/fromMinor compare and subtract in integer
+// paise, which is why an employee is no longer refused a withdrawal of the exact balance they hold.
+import { numeric, toMinor, fromMinor } from '@/lib/money';
+import { sendPushToUser } from '@/lib/push';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+/** Where a wallet notification sends somebody. The page exists (src/pages/portal/employee/wallet.astro). */
+const WALLET_PORTAL_URL = '/portal/employee/wallet';
+
+/**
+ * TELL AN EMPLOYEE WHAT HAPPENED TO THEIR OWN MONEY.
+ *
+ * NOTHING IN THIS MODULE DID THIS. decideWithdrawal() ended at hrAudit(); payWithdrawal() ended at
+ * hrAudit(); the workflow mirror in expenses.routeWithdrawals() ends at logAudit(); and
+ * workflow.notifyRequester() could not fire because that mirror starts the instance without a
+ * requestedByUserId. So a person asked for their own money and was never told what happened to it —
+ * not when it was approved, not when it left. The withdrawal simply changed colour on a page they had
+ * to go and look at. That is the payroll mark-paid fault repeating in the withdrawal path, except
+ * here it was never wired at all rather than broken by a wrong column.
+ *
+ * Declared ABOVE its readers; `const` is not hoisted. Never blocks the decision it announces.
+ */
+async function notifyEmployeeOfMoney(
+  employeeId: string,
+  payload: { type: string; title: string; body: string; tag: string },
+): Promise<void> {
+  try {
+    const r = await safe(sql`SELECT user_id::text AS user_id FROM hr_employees WHERE id = ${employeeId}::uuid LIMIT 1`);
+    const userId = r.length ? String(r[0].user_id || '') : '';
+    if (!userId) return;
+    await sendPushToUser(userId, { ...payload, url: WALLET_PORTAL_URL });
+  } catch (e: any) {
+    console.error('[hr-wallet] could not notify employee', employeeId, '-', e?.cause?.message || e?.message);
+  }
+}
 /**
  * A read that answers "nothing" rather than throwing.
  *
@@ -108,27 +143,156 @@ export function ensureWalletSchema(): Promise<void> {
   return ready;
 }
 
-export interface Balance { balance: number; currency: string; pending: number; available: number; }
-export async function getBalance(employeeId: string): Promise<Balance> {
+export interface Balance {
+  balance: number;
+  currency: string;
+  pending: number;
+  available: number;
+  /**
+   * Money this employee holds in a currency OTHER than the one `balance` is denominated in.
+   *
+   * Normally empty. It is never folded into `balance`, and a screen that shows a wallet MUST show
+   * this too — see the comment on getBalance() for what happens when it is not.
+   */
+  otherCurrencies: Array<{ currency: string; balance: number }>;
+}
+
+/**
+ * THE WALLET BALANCE, IN ONE CURRENCY, WITHOUT ADDING TWO OF THEM TOGETHER.
+ *
+ * WHAT THIS USED TO DO. It summed EVERY hr_wallet_txn row for an employee regardless of the
+ * `currency` column that has existed on that table since it was created, cast the exact NUMERIC to
+ * ::float, and then returned the result hard-coded as `currency: 'INR'`. A wallet holding one salary
+ * credit of USD 1,000 and one reimbursement of INR 5,000 reported a balance of ₹6,000 — a number that
+ * is not true in any currency, printed with a rupee sign, and withdrawable.
+ *
+ * That was not a hypothetical. creditPayrollRun() writes the PAYSLIP's currency into the ledger
+ * (`${s.currency || 'INR'}`), and computePay() reads that currency from the salary structure, so any
+ * employee on a non-INR structure produced exactly these rows.
+ *
+ * WHAT IT DOES NOW. The employee's own currency is resolved once — the caller's argument, else the
+ * salary structure, else hr_employees.currency, else INR — and only rows in THAT currency are summed.
+ * Anything held in another currency is returned separately in `otherCurrencies` rather than being
+ * dropped, because money that is invisible is worse than money that is inconvenient. There is no
+ * exchange rate anywhere in this codebase and this function does not invent one.
+ *
+ * THE ::float CASTS ARE GONE. postgres-js returns NUMERIC as a STRING precisely so no precision is
+ * lost; casting to float in SQL threw that away before JavaScript ever saw it, and the arithmetic
+ * `balance - pending` on the results produced values like 7225.199999999999. Comparisons now happen
+ * in integer paise (see requestWithdrawal), and these figures are for display.
+ */
+export async function getBalance(employeeId: string, currencyHint?: string): Promise<Balance> {
   await ensureWalletSchema();
-  const r = (await safe(sql`SELECT
-      COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0)::float AS bal
-    FROM hr_wallet_txn WHERE employee_id = ${employeeId}`))[0] || {};
+
+  let currency = String(currencyHint || '').trim().toUpperCase();
+  if (!currency) {
+    const emp = (await safe(sql`
+      SELECT COALESCE(ss.currency, e.currency, 'INR') AS cur
+        FROM hr_employees e
+        LEFT JOIN hr_salary_structures ss ON ss.employee_id = e.id
+             AND ss.effective_from <= CURRENT_DATE
+             AND (ss.effective_to IS NULL OR ss.effective_to >= CURRENT_DATE)
+       WHERE e.id = ${employeeId}::uuid
+       ORDER BY ss.effective_from DESC NULLS LAST
+       LIMIT 1`))[0] || {};
+    currency = String(emp.cur || 'INR').toUpperCase();
+  }
+
+  // One row per currency held, so nothing an employee owns can fall out of the answer unseen.
+  const byCurrency = await safe(sql`
+    SELECT COALESCE(NULLIF(UPPER(currency), ''), 'INR') AS cur,
+           COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END), 0) AS bal
+      FROM hr_wallet_txn
+     WHERE employee_id = ${employeeId}::uuid
+     GROUP BY 1`);
+
+  let balance = 0;
+  const otherCurrencies: Array<{ currency: string; balance: number }> = [];
+  for (const row of byCurrency) {
+    const cur = String(row.cur || 'INR').toUpperCase();
+    const amount = numeric(row.bal);
+    if (cur === currency) balance = amount;
+    else if (amount !== 0) otherCurrencies.push({ currency: cur, balance: amount });
+  }
+
   // 'paying' is money already handed to the payout channel and not yet confirmed. It is NOT available
-  // to request again, so it counts as pending exactly like 'pending' and 'approved' do.
-  const pend = (await safe(sql`SELECT COALESCE(SUM(amount),0)::float AS p FROM hr_withdrawal WHERE employee_id = ${employeeId} AND status IN ('pending','approved','paying')`))[0] || {};
-  const balance = Number(r.bal || 0), pending = Number(pend.p || 0);
-  return { balance, currency: 'INR', pending, available: Math.max(0, balance - pending) };
+  // to request again, so it counts as pending exactly like 'pending' and 'approved' do. Withdrawals
+  // are matched on currency for the same reason the ledger is.
+  const pend = (await safe(sql`
+    SELECT COALESCE(SUM(amount), 0) AS p
+      FROM hr_withdrawal
+     WHERE employee_id = ${employeeId}::uuid
+       AND status IN ('pending', 'approved', 'paying')
+       AND COALESCE(NULLIF(UPPER(currency), ''), 'INR') = ${currency}`))[0] || {};
+  const pending = numeric(pend.p);
+
+  return {
+    balance,
+    currency,
+    pending,
+    // Subtracted in integer paise so the figure quoted back to an employee is the figure compared.
+    available: Math.max(0, fromMinor(toMinor(balance) - toMinor(pending))),
+    otherCurrencies,
+  };
 }
 export async function listTxns(employeeId: string, limit = 30): Promise<any[]> {
   await ensureWalletSchema();
   return safe(sql`SELECT direction, amount, currency, kind, note, created_at FROM hr_wallet_txn WHERE employee_id = ${employeeId} ORDER BY created_at DESC LIMIT ${limit}`);
 }
-export async function credit(employeeId: string, amount: number, kind: string, note: string, createdBy: string | null, ref?: string): Promise<void> {
+/**
+ * Put money into an employee's wallet.
+ *
+ * `currency` IS NOT OPTIONAL IN MEANING, only in position — it is last so no existing call site
+ * changes shape, and it defaults to INR exactly as the column already did.
+ *
+ * WHY IT HAD TO EXIST. This function took no currency and its INSERT omitted the column, so every
+ * row it wrote defaulted to 'INR'. Two callers hand it money that carries its own currency:
+ * src/lib/expenses.ts credits `claim.amount` for a claim with a currency column, and
+ * src/lib/invoices.ts credits an invoice payment whose invoice carries one. An approved travel claim
+ * of USD 1,200 therefore landed as a credit of 1,200 RUPEES — roughly a hundredth of what was
+ * approved — and nothing anywhere recorded that a conversion had been assumed, because none had:
+ * the currency was simply dropped on the way in.
+ *
+ * NEGATIVES ARE REFUSED AT THE WRITE. `!(amount > 0)` also catches NaN, so a credit is either a
+ * positive amount or it is not written. A negative "credit" is a debit and belongs on the debit path
+ * where the balance is checked.
+ */
+export async function credit(
+  employeeId: string,
+  amount: number,
+  kind: string,
+  note: string,
+  createdBy: string | null,
+  ref?: string,
+  currency?: string | null,
+): Promise<{ ok: boolean; duplicate?: boolean; error?: string }> {
   await ensureWalletSchema();
-  if (!(amount > 0)) return;
-  await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, kind, note, ref, created_by)
-    VALUES (${employeeId}, 'credit', ${amount}, ${kind}, ${note || null}, ${ref || null}, ${createdBy})`);
+  if (!(amount > 0)) return { ok: false, error: 'A credit is a positive amount.' };
+  const cur = String(currency || 'INR').trim().toUpperCase().slice(0, 8) || 'INR';
+  // =================================================================================================
+  // A DUPLICATE REF IS NOT A FAILURE — IT IS THE IDEMPOTENCY WORKING
+  // =================================================================================================
+  //
+  // hr_wallet_txn_ref_uniq is a PARTIAL unique index (WHERE ref IS NOT NULL). A caller that supplies
+  // a ref gets exactly-once crediting from the database rather than from a read-then-write race, and
+  // the second attempt lands here as a duplicate-key error. Reporting that as an error would make the
+  // repair paths retry it; reporting it as `duplicate` lets a screen say "already credited", which is
+  // the truth. Anything else still throws, because a credit that did not happen must never read as
+  // one that did.
+  //
+  // The return value is additive: every existing caller ignored the void this used to return.
+  try {
+    await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, currency, kind, note, ref, created_by)
+      VALUES (${employeeId}, 'credit', ${amount}, ${cur}, ${kind}, ${note || null}, ${ref || null}, ${createdBy})`);
+    return { ok: true };
+  } catch (e: any) {
+    const real = String(e?.cause?.message || e?.message || '');
+    if (ref && /duplicate key|unique constraint/i.test(real)) {
+      return { ok: true, duplicate: true };
+    }
+    console.error('[hr-wallet] credit failed for employee', employeeId, '-', real);
+    throw e;
+  }
 }
 
 // ---- bank accounts ----
@@ -271,29 +435,107 @@ export async function addBankAccount(employeeId: string, f: { holder: string; ac
  * Zero rows back is therefore NOT a database failure: it is the refusal, and it is reported as one
  * with the balance re-read so the sentence names a real number.
  */
-export async function requestWithdrawal(employeeId: string, amount: number, bankAccountId: string | null, note: string): Promise<{ ok: boolean; error?: string }> {
+export async function requestWithdrawal(
+  employeeId: string,
+  amount: number,
+  bankAccountId: string | null,
+  note: string,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  /** The request exists but nobody has been asked yet. NEVER auto-approved — see the routing below. */
+  halted?: boolean;
+  haltReason?: string;
+}> {
   await ensureWalletSchema();
   if (!(amount > 0)) return { ok: false, error: 'Enter an amount.' };
   try {
+    // THE CURRENCY IS PART OF THE TEST, not an assumption.
+    //
+    // The sums below used to run across EVERY row for the employee, so a wallet holding USD 1,000 and
+    // INR 5,000 authorised a withdrawal of 6,000 in whichever currency the request happened to be
+    // stamped with. Both the ledger sum and the pending sum are now confined to one currency, and the
+    // row is written carrying that currency, so a request can only ever be measured against money of
+    // the same kind.
+    const bal = await getBalance(employeeId);
+    const cur = bal.currency;
     const wrote = rows(await db.execute(sql`
-      INSERT INTO hr_withdrawal (employee_id, amount, bank_account_id, note)
-      SELECT ${employeeId}::uuid, ${amount}, ${bankAccountId}, ${note || null}
+      INSERT INTO hr_withdrawal (employee_id, amount, currency, bank_account_id, note)
+      SELECT ${employeeId}::uuid, ${amount}, ${cur}, ${bankAccountId}, ${note || null}
        WHERE ${amount} <= (
          COALESCE((SELECT SUM(CASE WHEN direction = 'credit' THEN amount ELSE -amount END)
-                     FROM hr_wallet_txn WHERE employee_id = ${employeeId}::uuid), 0)
+                     FROM hr_wallet_txn
+                    WHERE employee_id = ${employeeId}::uuid
+                      AND COALESCE(NULLIF(UPPER(currency), ''), 'INR') = ${cur}), 0)
          - COALESCE((SELECT SUM(amount) FROM hr_withdrawal
-                      WHERE employee_id = ${employeeId}::uuid AND status IN ('pending', 'approved', 'paying')), 0)
+                      WHERE employee_id = ${employeeId}::uuid
+                        AND status IN ('pending', 'approved', 'paying')
+                        AND COALESCE(NULLIF(UPPER(currency), ''), 'INR') = ${cur}), 0)
        )
       RETURNING id`));
-    if (!wrote.length) {
-      const bal = await getBalance(employeeId);
+    if (wrote.length) {
+      // =============================================================================================
+      // NOBODY WAS ASKED FOR ANYTHING
+      // =============================================================================================
+      //
+      // This function wrote the row and returned, and the screen told the employee "pending approval".
+      // routeWithdrawals() — the function that creates the workflow instance and therefore fires
+      // notifyApprover — was called only from a page load of /portal/employee/expenses or of
+      // /admin/hr/payroll/claims. So the approver's inbox stayed empty, no push was sent, and the
+      // request entered the chain only if the employee later happened to open a DIFFERENT page. Same
+      // shape as the scheduler that POSTed to a route nobody had built.
+      //
+      // The sweep is idempotent (startWorkflow is unique on (domain, record_id)), so calling it here
+      // costs one no-op for requests already routed. Imported dynamically: src/lib/expenses.ts
+      // imports this module, and a static import back would be a load-time cycle.
+      //
+      // NEVER FAILS THE REQUEST. The row is written and the money is reserved against the balance
+      // either way; a routing failure means an unrouted request that is still visible, not a lost one.
+      const newId = String(wrote[0].id);
+      try {
+        const { routeWithdrawals } = await import('@/lib/expenses');
+        // SCOPED TO THIS EMPLOYEE. The unscoped sweep reads up to a hundred rows across the company
+        // on a page an employee just posted from; the request that needs routing is theirs.
+        const results = await routeWithdrawals(employeeId);
+        const mine = results.find((r) => r.id === newId);
+        if (mine && mine.workflowState === 'halted') {
+          // HALTED, NOT LOST. The request exists, nothing is auto-approved, and the reason is handed
+          // back so the screen can say it rather than printing "pending approval" over the top of it.
+          return { ok: true, halted: true, haltReason: mine.haltReason || 'No approver could be resolved from the organization graph.' };
+        }
+        if (!mine || !mine.workflowState) {
+          return {
+            ok: true,
+            halted: true,
+            haltReason: 'The approval chain could not be started, so nobody has been asked yet. '
+              + 'Your request is recorded and HR can route it.',
+          };
+        }
+      } catch (e: any) {
+        console.error('[hr-wallet] withdrawal', newId, 'was filed but could not be sent for approval -', e?.cause?.message || e?.message);
+        return {
+          ok: true,
+          halted: true,
+          haltReason: 'Your request is recorded, but it could not be sent for approval just now. '
+            + 'Tell HR if it is still waiting tomorrow.',
+        };
+      }
+      return { ok: true };
+    }
+
+    {
+      const fresh = await getBalance(employeeId);
+      const money = (n: number) => (fresh.currency === 'INR' ? '₹' : fresh.currency + ' ') + n.toFixed(2);
       return {
         ok: false,
-        error: 'Amount exceeds your available balance (₹' + bal.available.toFixed(2) + ').'
-          + (bal.pending > 0 ? ' ₹' + bal.pending.toFixed(2) + ' is already requested and not yet paid.' : ''),
+        error: 'Amount exceeds your available balance (' + money(fresh.available) + ').'
+          + (fresh.pending > 0 ? ' ' + money(fresh.pending) + ' is already requested and not yet paid.' : '')
+          + (fresh.otherCurrencies.length
+            ? ' You also hold ' + fresh.otherCurrencies.map((o) => o.currency + ' ' + o.balance.toFixed(2)).join(', ')
+              + ', which is a different currency and is not part of this balance.'
+            : ''),
       };
     }
-    return { ok: true };
   } catch (e: any) {
     // NOT SWALLOWED. A request that was not written must never read as one that was.
     console.error('[hr-wallet] requestWithdrawal failed for employee', employeeId, '-', e?.cause?.message || e?.message);
@@ -436,7 +678,117 @@ export async function decideWithdrawal(id: string, user: any, decision: 'approve
   if (!decided.length) return { ok: false, error: 'That request was decided by somebody else while this page was open. Reload it.' };
   await hrAudit(user.id, 'hr.withdrawal.' + decision, String(id),
     { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, byRole: role, note: note || null });
+  // THE PERSON WHOSE MONEY IT IS, TOLD.
+  await notifyEmployeeOfMoney(String(w.employee_id), {
+    type: 'withdrawal_decision',
+    title: decision === 'approved' ? 'Withdrawal approved' : 'Withdrawal declined',
+    body: (String(w.currency || 'INR') + ' ' + Number(w.amount).toLocaleString('en-IN'))
+      + (decision === 'approved'
+        ? ' is approved and waiting to be released.'
+        : ' was not approved.')
+      + (note ? ' ' + String(note).slice(0, 140) : ''),
+    tag: 'withdrawal-' + String(id),
+  });
   return { ok: true };
+}
+
+/**
+ * RESOLVE A PAYOUT STUCK AT 'paying'.
+ *
+ * payWithdrawal() deliberately leaves a request at 'paying' when the gateway call throws without an
+ * answer — a network error is not proof the payout did not happen, and an automatic retry there is
+ * how somebody gets paid twice. That reasoning is right, and it had no exit. The request could not be
+ * paid (payWithdrawal accepts only 'approved'), the admin console drew no button for it, and
+ * getBalance() counts 'paying' as pending — so the employee could neither receive the money nor ask
+ * for it again, indefinitely, and the only way out was a manual UPDATE on the production database.
+ *
+ * A HUMAN DECIDES, HAVING CHECKED THE PAYOUT CHANNEL. That is the whole point: this function does not
+ * guess and does not call the gateway.
+ *
+ *   'paid'     the payout IS in the channel. The wallet debit is written idempotently (ref
+ *              'withdrawal:<id>', which carries a UNIQUE index) so this can never double-debit, and
+ *              the reference the operator read off the channel is recorded.
+ *   'approved' the payout is NOT in the channel. The claim is released and it can be paid again
+ *              deliberately.
+ *
+ * Same capability as releasing money in the first place — confirming a payout is a statement that
+ * money left the company, so it is not a lesser act than sending it.
+ */
+export async function resolvePaying(
+  id: string,
+  user: any,
+  outcome: 'paid' | 'approved',
+  channelRef: string = '',
+): Promise<{ ok: boolean; error?: string }> {
+  await ensureWalletSchema();
+  if (outcome !== 'paid' && outcome !== 'approved') return { ok: false, error: 'That is not an outcome we record.' };
+  if (!holdsCapability(user, 'payouts.pay')) return { ok: false, error: 'Only HR/admin can settle a payout that is being released.' };
+
+  const w = (await safe(sql`SELECT * FROM hr_withdrawal WHERE id = ${id} LIMIT 1`))[0];
+  if (!w) return { ok: false, error: 'Not found.' };
+  if (String(w.status) !== 'paying') {
+    return { ok: false, error: 'That request is ' + String(w.status) + ', not being released. Nothing was changed.' };
+  }
+  const ref = String(channelRef || '').trim().slice(0, 200);
+  if (outcome === 'paid' && !ref) {
+    return {
+      ok: false,
+      error: 'Confirming a payout needs the reference you read off the payout channel. Nothing was '
+        + 'changed — without it there is no way to tell later which instruction this was.',
+    };
+  }
+
+  try {
+    if (outcome === 'approved') {
+      const back = rows(await db.execute(sql`
+        UPDATE hr_withdrawal SET status = 'approved', paying_at = NULL, paying_by = NULL
+         WHERE id = ${id} AND status = 'paying' RETURNING id`));
+      if (!back.length) return { ok: false, error: 'That request changed while this page was open. Reload it.' };
+      await hrAudit(user.id, 'hr.withdrawal.payout_not_found', String(id),
+        { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, note: ref || null });
+      return { ok: true };
+    }
+
+    // THE DEBIT FIRST, AND IDEMPOTENTLY. The unique index on hr_wallet_txn.ref means a repeat can only
+    // ever collide with its own earlier row, so a confirmation that races payWithdrawal's own debit
+    // cannot remove the money twice.
+    const debitRef = 'withdrawal:' + String(id);
+    try {
+      await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, currency, kind, note, ref, created_by)
+        VALUES (${w.employee_id}, 'debit', ${w.amount}, ${String(w.currency || 'INR').toUpperCase()}, 'withdrawal',
+                ${'Withdrawal confirmed against the payout channel (' + ref + ')'}, ${debitRef}, ${user.id})`);
+    } catch (e: any) {
+      const real = String(e?.cause?.message || e?.message || '');
+      if (!/duplicate key|unique constraint/i.test(real)) {
+        // NOT SWALLOWED. The money has left and the ledger does not know.
+        console.error('[hr-wallet] confirming payout', id, 'could not write the wallet debit -', real);
+        return {
+          ok: false,
+          error: 'The wallet could not be debited, so nothing was confirmed and the request is still '
+            + 'being released. (' + (real || 'database error') + ')',
+        };
+      }
+    }
+
+    const done = rows(await db.execute(sql`
+      UPDATE hr_withdrawal SET status = 'paid', payout_ref = ${ref}, paid_at = NOW()
+       WHERE id = ${id} AND status = 'paying' RETURNING id`));
+    if (!done.length) return { ok: false, error: 'That request changed while this page was open. Reload it.' };
+
+    await hrAudit(user.id, 'hr.withdrawal.payout_confirmed', String(id),
+      { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, payoutRef: ref });
+    await notifyEmployeeOfMoney(String(w.employee_id), {
+      type: 'withdrawal_paid',
+      title: 'Withdrawal paid',
+      body: String(w.currency || 'INR') + ' ' + Number(w.amount).toLocaleString('en-IN')
+        + ' has left for your bank account. Reference ' + ref + '.',
+      tag: 'withdrawal-' + String(id),
+    });
+    return { ok: true };
+  } catch (e: any) {
+    console.error('[hr-wallet] resolvePaying failed for withdrawal', id, '-', e?.cause?.message || e?.message);
+    return { ok: false, error: 'That could not be recorded just now. Nothing was changed.' };
+  }
 }
 
 /** Money decisions leave a trail. Nothing under /admin/hr wrote to audit_log before this. */
@@ -532,8 +884,11 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
   // debit is LOST while the request still says paid) nor present at all when none is given.
   const debitRef = 'withdrawal:' + String(id);
   try {
-    await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, kind, note, ref, created_by)
-      VALUES (${w.employee_id}, 'debit', ${w.amount}, 'withdrawal', ${'Withdrawal via ' + paidVia + (ref ? ' (' + ref + ')' : '')}, ${debitRef}, ${user.id})`);
+    // THE DEBIT CARRIES THE REQUEST'S CURRENCY. It omitted the column before, so every debit defaulted
+    // to INR — and a USD withdrawal removed USD from the bank while subtracting rupees from the
+    // ledger, leaving the USD balance untouched and withdrawable a second time.
+    await db.execute(sql`INSERT INTO hr_wallet_txn (employee_id, direction, amount, currency, kind, note, ref, created_by)
+      VALUES (${w.employee_id}, 'debit', ${w.amount}, ${String(w.currency || 'INR').toUpperCase()}, 'withdrawal', ${'Withdrawal via ' + paidVia + (ref ? ' (' + ref + ')' : '')}, ${debitRef}, ${user.id})`);
   } catch (e: any) {
     const real = String(e?.cause?.message || e?.message || '');
     if (!/duplicate key|unique constraint/i.test(real)) {
@@ -554,5 +909,13 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
   await db.execute(sql`UPDATE hr_withdrawal SET status = 'paid', payout_ref = ${ref}, paid_at = NOW() WHERE id = ${id} AND status = 'paying'`);
   await hrAudit(user.id, 'hr.withdrawal.paid', String(id),
     { employeeId: w.employee_id, amount: Number(w.amount), currency: w.currency, paidVia, payoutRef: ref });
+  // THE MONEY LEFT AND THE PERSON IS TOLD. Nothing announced this before, in any path.
+  await notifyEmployeeOfMoney(String(w.employee_id), {
+    type: 'withdrawal_paid',
+    title: 'Withdrawal paid',
+    body: String(w.currency || 'INR') + ' ' + Number(w.amount).toLocaleString('en-IN')
+      + ' has left for your bank account.' + (ref ? ' Reference ' + ref + '.' : ''),
+    tag: 'withdrawal-' + String(id),
+  });
   return { ok: true, ref: ref || undefined };
 }

@@ -44,7 +44,7 @@ import {
   DAY_PARTS,
 } from '@/lib/hr-leave';
 import { upcomingHolidays } from '@/lib/holidays';
-import { today as attendanceToday } from '@/lib/attendance';
+import { today as attendanceToday, applyApprovedOvertimeClaims } from '@/lib/attendance';
 
 const PATH = '/portal/employee/leave';
 
@@ -55,6 +55,37 @@ const gate = await requireEmployee(user as any, PATH);
 if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
 const workspace = gate.ok ? gate.workspace : null;
 const employeeId = workspace ? workspace.employeeId : '';
+
+// =================================================================================================
+// AN APPROVED OVERTIME CLAIM HAS TO REACH THE BALANCE THIS PAGE SPENDS
+// =================================================================================================
+//
+// THE BREAK THIS CLOSES. Comp off is not earned by working late — it is earned when an overtime or
+// worked-holiday claim is APPROVED through the engine, and the credit is written by a SECOND step,
+// applyApprovedOvertimeClaims(), which re-reads the workflow instance and refuses anything that is
+// not 'approved'. That step ran on exactly two screens: /portal/employee/attendance/overtime and
+// .../attendance/approvals. It did NOT run here — on the one page whose comp-off balance depends
+// entirely on it, and which is where somebody actually spends the day.
+//
+// So: the manager approves the overtime on Monday. On Tuesday the person opens this page, reads
+// "Comp off available: 0", asks for a comp-off day and is refused with "There is only 0 day(s) of
+// comp off left". The credit was sitting unapplied behind a page they had no reason to open, and
+// nothing on this screen hinted at it. An approval that reaches nothing is the same fault as an
+// approval nobody was ever asked for.
+//
+// IT RUNS BEFORE THE POST HANDLER, NOT ONLY BEFORE THE READS. Sweeping on render alone would correct
+// the number on the screen and still refuse the request: applyLeave() calls consumeCompOff(), which
+// asks the ledger at the moment of filing. The credit has to land before the spend, or the person
+// reads an accurate balance and is told they do not have it anyway.
+//
+// THIS PAGE DECIDES NOTHING. applyApprovedOvertimeClaims() re-reads each claim's workflow instance
+// and credits only what the engine has genuinely approved, so this is a reconciliation and not a
+// second approval path — the same reasoning the two attendance screens already carry.
+//
+// FAILURE IS TOLERATED, AND IT IS NOT SILENT: the function logs the real cause and returns 0 rather
+// than throwing, because a ledger that cannot be swept must not take the leave screen down. The
+// balance below is then the balance as it stands, which is exactly what this page showed before.
+if (employeeId) await applyApprovedOvertimeClaims(employeeId, 20);
 
 const fmt = (d: any) => {
   const dt = new Date(String(d).slice(0, 10) + 'T00:00:00Z');
@@ -130,19 +161,40 @@ if (Astro.request.method === 'POST' && employeeId) {
         unit: unit as any,
         dayPart: String(fd.get('day_part') || 'first_half') as any,
         hours: Number(fd.get('hours') || 0),
+        // WHO FILED IT. Carried into the approval instance so the engine can tell this person when it
+        // settles — workflow.notifyRequester() returns on its first line without it.
+        requestedByUserId: String(user.id || ''),
       },
     );
     if (res.ok) {
       const skipped = (res.excluded || []).filter((x) => x && x.reason);
       flash = 'Requested: ' + describeUnits(unit, Number(res.dayUnits) || 0, Number(fd.get('hours')) || null)
-        + '. Waiting for approval.'
+        + '.'
         + (skipped.length ? ' ' + skipped.length + ' day(s) were not charged (' + [...new Set(skipped.map((x) => x.reason))].join(', ') + ').' : '');
+      // "WAITING FOR APPROVAL" IS ONLY TRUE IF SOMEBODY WAS ASKED.
+      //
+      // This screen said it unconditionally, and until now nothing on the employee path ever started
+      // an approval: the row was written 'pending' with no approver, nobody was notified, and it sat
+      // there until an HR account happened to open a list. Now the request enters the engine, and
+      // when the Organization Graph cannot name an approver the engine HALTS with a readable sentence
+      // instead of vanishing — so this says which of the two happened, in the person's own words.
+      if (res.routing && res.routing.halted) {
+        flash += ' It is NOT yet with an approver: ' + (res.routing.haltReason || 'no approver could be resolved.')
+          + ' Your request is recorded and is visible to HR, who can route it once that is fixed.';
+      } else {
+        flash += ' Sent to your approver.';
+      }
     } else {
       flash = res.error || 'Could not file that request.';
     }
   } else if (action === 'cancel') {
-    await cancelLeave(String(fd.get('id') || ''), employeeId);
-    flash = 'Request cancelled. Any comp off it used has been returned.';
+    // ITS ANSWER IS READ. cancelLeave() used to return void and swallow everything while this line
+    // printed success whatever happened — so somebody whose cancellation matched no rows believed
+    // they were working that day, while the approver still saw a live request.
+    const cancelled = await cancelLeave(String(fd.get('id') || ''), employeeId);
+    flash = cancelled.ok
+      ? 'Request cancelled. Any comp off it used has been returned, and it has been withdrawn from your approver.'
+      : (cancelled.error || 'That request could not be cancelled. Nothing was changed.');
   } else {
     flash = 'That is not something this page does.';
   }
@@ -338,6 +390,22 @@ const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
                 {l.day_part ? ' · ' + (l.day_part === 'first_half' ? 'first half' : 'second half') : ''}
                 {l.reason ? ' · ' + l.reason : ''}
               </div>
+              {/* THE HALT, SAID TO THE PERSON IT IS ABOUT.
+                  The engine writes a readable sentence when the Organization Graph cannot name an
+                  approver, and it was rendered only on an admin console — so the employee saw
+                  "pending" and waited, while the record actually said nobody had been asked. The
+                  request is never auto-approved and never discarded; it waits, visibly, with a cause
+                  somebody can act on. */}
+              {l.status === 'pending' && l.halt_reason && (
+                <div style="margin-top:6px;font-size:11.5px;line-height:1.5;color:#8a4b06;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:7px 9px;">
+                  Not with an approver yet: {l.halt_reason}
+                </div>
+              )}
+              {l.status === 'rejected' && l.decision_note && (
+                <div style="margin-top:6px;font-size:11.5px;line-height:1.5;color:#7f1d1d;">
+                  {l.decision_note}
+                </div>
+              )}
             </div>
             <div style="display:flex;align-items:center;gap:8px;flex:0 0 auto;">
               <span class="pill" style={'color:' + statusColour(String(l.status)) + ';background:' + statusColour(String(l.status)) + '18;'}>{l.status}</span>

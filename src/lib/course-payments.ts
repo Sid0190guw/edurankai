@@ -38,7 +38,18 @@ export async function markPaid(orderId: string, paymentId: string): Promise<{ ok
   const { db, sql } = await ctx();
   const row = await paymentByOrder(orderId); if (!row) return { ok: false, courseObjId: null, userId: null };
   if (row.needs_guardian && !row.authorized_by) return { ok: false, courseObjId: null, userId: null, error: 'awaiting guardian authorization' };   // child-safety gate
-  await db.execute(sql`UPDATE edu_course_payments SET status = 'paid', payment_id = ${paymentId}, updated_at = now() WHERE order_id = ${orderId}`);
+  // A REFUND IS TERMINAL. markRefunded() sets status='refunded' and re-locks the enrolment, and this
+  // UPDATE had no guard — so the payer, who still holds the order id / payment id / signature their
+  // own browser was handed at checkout, could post them to /api/aquintutor/checkout again after the
+  // refund cleared and get the course back. The signature never expires (it is an HMAC over
+  // `order|payment` and nothing else), so "already verified once" is not a defence: the state has to
+  // be. unlockedByPayment() reads the latest status, so leaving it 'refunded' is what keeps the
+  // course locked.
+  if (row.status === 'refunded') {
+    console.error('[course-payments] confirm replayed against REFUNDED order', orderId, '- nothing was changed');
+    return { ok: false, courseObjId: null, userId: null, error: 'This payment was refunded, so it cannot be completed. Nothing was changed.' };
+  }
+  await db.execute(sql`UPDATE edu_course_payments SET status = 'paid', payment_id = ${paymentId}, updated_at = now() WHERE order_id = ${orderId} AND status <> 'refunded'`);
   // THE ENROLMENT FAILURE WAS `catch {}` — the one shape this file must not have. The payment is
   // recorded as paid by the line above, so a swallowed failure here is somebody who paid for a course
   // and is not in it, with nothing on any screen and nothing in any log. courseAccess() still unlocks

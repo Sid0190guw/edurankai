@@ -87,6 +87,41 @@ let flash = '';
 let flashError = '';
 let notice = '';
 
+/**
+ * WHAT AN EMPLOYEE IS SHOWN WHEN A CLAIM DOES NOT SAVE.
+ *
+ * requestOvertime() reports failure through errText(), which returns the Postgres message verbatim.
+ * There is a partial unique index `hr_overtime_one_live (employee_id, work_date) WHERE withdrawn_at
+ * IS NULL`, and the INSERT behind it carries no ON CONFLICT — so a second claim for the same day
+ * (a double tap on a slow phone, or a retry after a POST that timed out with the write landed)
+ * raises 23505 and what reached this screen was:
+ *
+ *     duplicate key value violates unique constraint "hr_overtime_one_live"
+ *
+ * The friendly sentence the module has for that case sits behind an `if (!list.length)` test that an
+ * INSERT without ON CONFLICT can never satisfy — it returns a row or it throws, never zero rows — so
+ * that sentence is unreachable and the raw text is what people actually got.
+ *
+ * This page cannot change the index or the INSERT, but it owns what is rendered. A recognised
+ * constraint becomes the sentence it was always meant to be. Anything else becomes a plain statement
+ * that nothing was saved; the real reason goes to the log, which is where a statement belongs.
+ *
+ * The second half of the sentence is not phrasing, it is a fact about the index: the predicate is
+ * `withdrawn_at IS NULL`, so a claim a manager REJECTED still holds that day. Somebody told to
+ * re-file for two hours instead of three is blocked until they withdraw the rejected one, and
+ * nothing said so.
+ */
+function claimFailureText(raw: string | null | undefined): string {
+  const s = String(raw ?? '');
+  if (/hr_overtime_one_live/i.test(s) || /duplicate key/i.test(s)) {
+    return 'You already have a claim on file for that day, so a second one was not saved. '
+      + 'Withdraw the existing one below and file again. A claim your manager rejected still holds the day, '
+      + 'so withdraw that one too if you are re-filing for different hours.';
+  }
+  if (!s) return 'That claim could not be filed. Nothing was saved.';
+  return 'That claim could not be filed and nothing was saved. Please try again, and tell HR today if it keeps failing.';
+}
+
 // ------------------------------------------------------------------------------------------------
 // THE WRITE
 // ------------------------------------------------------------------------------------------------
@@ -112,18 +147,25 @@ if (Astro.request.method === 'POST' && employeeId) {
             '. It is saved and nobody has approved it. Once that relationship is recorded it carries on from here.';
         }
       } else {
-        flashError = res.error || 'That claim could not be filed.';
+        // The raw constraint text never reaches the screen; it does reach the log.
+        if (res.error) console.error('[portal/overtime] claim refused -', res.error);
+        flashError = claimFailureText(res.error);
       }
     } else if (action === 'withdraw') {
       const res = await withdrawOvertime(String(form.get('id') || ''), employeeId);
       if (res.ok) flash = res.changed === false ? 'That claim was already withdrawn or applied.' : 'Claim withdrawn.';
-      else flashError = res.error || 'That could not be withdrawn.';
+      else {
+        if (res.error) console.error('[portal/overtime] withdraw refused -', res.error);
+        flashError = 'That claim could not be withdrawn and nothing has changed. Reload the page — it may already have been withdrawn or approved.';
+      }
     } else {
       flashError = 'That is not something this page does.';
     }
   } catch (e: any) {
-    flashError = 'We could not record that: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    // The failed SQL used to be printed to the employee. The reason belongs in the log; what they
+    // need to know is that nothing was saved and that it is worth telling somebody.
     console.error('[portal/overtime] post', e?.cause?.message || e?.message);
+    flashError = claimFailureText(e?.cause?.message || e?.message);
   }
 }
 

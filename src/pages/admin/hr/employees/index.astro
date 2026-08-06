@@ -9,6 +9,11 @@ import { ensureOnce } from '@/lib/ensure-once';
 // to two people adding at once. One shared minter, deriving from MAX and retrying the INSERT on a
 // unique violation, so the two paths cannot disagree about what the next code is.
 import { withEmployeeCode } from '@/lib/hr/employee-code';
+// "No employees found" and "the employee register could not be read" used to render as the same
+// sentence over the same illustration — on the screen whose only other control ADDS a person.
+// safeRows carries both facts; pageParam stops `?page=abc` and `?page=0` reaching OFFSET; clip and
+// firstWord stop a null or 4,000-character name breaking a card; confirmAttr keeps the apostrophe.
+import { safeRows, clip, firstWord, confirmAttr, pageParam } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -37,9 +42,17 @@ const hrEmployees = pgTable('hr_employees', {
 // Self-bootstrap the reporting line (idempotent). Repeated from the employee detail page because
 // this list reads the column and has no other ensure step of its own — without it, a database
 // predating the column would 500 the whole list instead of showing a blank manager.
+// The catch was bare. A failed ALTER left the "Reports To" tile below reading "Not set. Nobody can
+// approve their leave or withdrawals." for EVERY person on the register — a claim about real people,
+// made because a column could not be added — with nothing in the log to say why. It still must not
+// take the page down, so it is caught; it is no longer silent.
+let reportingColumnOk = true;
 try {
   await db.execute(sqlExpr`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
-} catch (_) {}
+} catch (e: any) {
+  reportingColumnOk = false;
+  console.error('[hr-employees] reporting_manager_id ALTER -', e?.cause?.message || e?.message);
+}
 
 // Same for the department column, which the add form below now writes and the cards below now read.
 // The ensureOnce key is shared with src/pages/admin/hr/employees/[id].astro on purpose: the DDL is
@@ -52,19 +65,26 @@ await ensureOnce('hr_employees_department_id_v1', async () => {
 // The department register, read BEFORE the POST handler because the handler validates the submitted
 // department against it. `const` is not hoisted — below the handler, its first line would throw.
 // `id::text` keeps the comparison text-on-text; the ids are slugs like 'engineering'.
+//
+// AND THE HANDLER MUST KNOW WHETHER THE REGISTER WAS READ. Both reads failing left
+// departmentOptions empty, and the validation below then REFUSED every department as "not on the
+// register" — a page that cannot read the register telling the operator their department does not
+// exist. `departmentsOk` keeps "there are no departments" apart from "we could not ask".
 let departmentOptions: any[] = [];
-try {
-  const deptRes = await db.execute(sqlExpr`
-    SELECT id::text AS id, name, is_visible FROM departments ORDER BY sort_order ASC, name ASC LIMIT 300`);
-  departmentOptions = (Array.isArray(deptRes) ? deptRes : ((deptRes as any)?.rows || [])) as any[];
-} catch (e: any) {
-  console.error('[hr-employees] department list:', e?.cause?.message || e?.message);
-  try {
-    const deptAlt = await db.execute(sqlExpr`SELECT id::text AS id, name FROM departments ORDER BY name ASC LIMIT 300`);
-    departmentOptions = (Array.isArray(deptAlt) ? deptAlt : ((deptAlt as any)?.rows || [])) as any[];
-  } catch (e2: any) {
-    console.error('[hr-employees] department list fallback:', e2?.cause?.message || e2?.message);
-    departmentOptions = [];
+let departmentsOk = true;
+let departmentsError: string | null = null;
+{
+  const primary = await safeRows('[hr-employees] department list', () => db.execute(sqlExpr`
+    SELECT id::text AS id, name, is_visible FROM departments ORDER BY sort_order ASC, name ASC LIMIT 300`));
+  if (primary.ok) {
+    departmentOptions = primary.rows;
+  } else {
+    // is_visible / sort_order may not exist on an older departments table; the names still can.
+    const fallback = await safeRows('[hr-employees] department list fallback', () => db.execute(
+      sqlExpr`SELECT id::text AS id, name FROM departments ORDER BY name ASC LIMIT 300`));
+    departmentOptions = fallback.rows;
+    departmentsOk = fallback.ok;
+    departmentsError = fallback.ok ? null : (fallback.error || primary.error);
   }
 }
 const departmentIds = new Set(departmentOptions.map((d: any) => String(d.id)));
@@ -95,6 +115,10 @@ if (Astro.request.method === 'POST') {
 
       if (!fullName || !email) {
         errorMsg = 'Full name and email are required.';
+      } else if (departmentId && !departmentsOk) {
+        // Refusing on the strength of a list that could not be read would be a claim this page is
+        // not entitled to make. Say which it is, and do not write a department nobody verified.
+        errorMsg = 'The department register could not be read, so the department you picked could not be checked and nothing was added. Try again in a moment, or add the person with no department and set it on their record.';
       } else if (departmentId && !departmentIds.has(departmentId)) {
         // Not merely dropped: a department id matching nothing puts the person in no list while the
         // record reads as assigned, which is harder to notice than an unassigned one.
@@ -144,18 +168,27 @@ if (Astro.request.method === 'POST') {
 const url = new URL(Astro.request.url);
 const q = url.searchParams.get('q') || '';
 const statusFilter = url.searchParams.get('status') || 'active';
-const page = parseInt(url.searchParams.get('page') || '1');
 const perPage = 20;
-const offset = (page - 1) * perPage;
 
-const countResult = await db.execute(sqlExpr`
+// THE PAGE NUMBER IS NOT WHATEVER THE URL SAYS.
+//
+// This was `parseInt(url.searchParams.get('page') || '1')` bound straight into OFFSET. `?page=abc`
+// gives NaN and `?page=0` gives OFFSET -20; Postgres refuses both, so the whole employee register
+// answered with a bare 500 on a URL anybody can type or a stale bookmark can hold. pageParam()
+// always returns a positive integer, and clamps to the last real page once the count is known.
+const countRes = await safeRows('[hr-employees] register count', () => db.execute(sqlExpr`
   SELECT COUNT(*) as n FROM hr_employees
   WHERE (${statusFilter === 'all'} OR employment_status = ${statusFilter})
   AND (${!q} OR full_name ILIKE ${'%' + q + '%'} OR email ILIKE ${'%' + q + '%'} OR employee_code ILIKE ${'%' + q + '%'} OR designation ILIKE ${'%' + q + '%'})
-`);
-const _countRows = Array.isArray(countResult) ? countResult : (countResult?.rows || []);
-const totalCount = parseInt((_countRows[0] as any)?.n || '0');
-const totalPages = Math.ceil(totalCount / perPage);
+`));
+const totalCount = countRes.ok ? parseInt(String((countRes.rows[0] as any)?.n ?? '0')) || 0 : 0;
+// Math.ceil(0/20) is 0, and the pager rendered that as "1 / 0" on an empty database. A page count is
+// never below one — there is always the page you are looking at, even when it holds nothing.
+const totalPages = Math.max(1, Math.ceil(totalCount / perPage));
+const page = pageParam(url.searchParams.get('page'), countRes.ok ? totalPages : undefined);
+const offset = (page - 1) * perPage;
+/** Kept so links preserve the search without corrupting it — a name with & or # broke every pager link. */
+const pagerQs = (n: number) => '?q=' + encodeURIComponent(q) + '&status=' + encodeURIComponent(statusFilter) + '&page=' + n;
 
 // The reporting manager comes back as a correlated scalar subquery, not a join: reporting_manager_id
 // holds a USERS id, and a join on m.user_id would duplicate an employee card if two employee rows
@@ -166,7 +199,7 @@ const totalPages = Math.ceil(totalCount / perPage);
 // against a UUID departments table that does not exist in that form; casting either side ::uuid
 // throws "invalid input syntax for type uuid" on a value like 'engineering' and takes the whole
 // list down. Text on both sides is correct under either shape.
-const employees = await db.execute(sqlExpr`
+const employeesRes = await safeRows('[hr-employees] register page', () => db.execute(sqlExpr`
   SELECT e.id, e.employee_code, e.full_name, e.email, e.phone, e.designation, e.employment_type, e.work_mode, e.employment_status, e.joining_date, e.base_salary, e.currency, e.is_active,
     e.reporting_manager_id,
     e.department_id,
@@ -177,18 +210,28 @@ const employees = await db.execute(sqlExpr`
   AND (${!q} OR e.full_name ILIKE ${'%' + q + '%'} OR e.email ILIKE ${'%' + q + '%'} OR e.employee_code ILIKE ${'%' + q + '%'} OR e.designation ILIKE ${'%' + q + '%'})
   ORDER BY e.created_at DESC
   LIMIT ${perPage} OFFSET ${offset}
-`);
+`));
+const employeeRows = employeesRes.rows;
 
-const stats = await db.execute(sqlExpr`
-  SELECT 
+const statsRes = await safeRows('[hr-employees] header counts', () => db.execute(sqlExpr`
+  SELECT
     COUNT(*) FILTER (WHERE employment_status = 'active') as active,
     COUNT(*) FILTER (WHERE employment_status = 'inactive') as inactive,
     COUNT(*) FILTER (WHERE joining_date >= NOW() - INTERVAL '30 days') as new_this_month,
     COUNT(*) as total
   FROM hr_employees
-`);
-const _statsRows = Array.isArray(stats) ? stats : (stats?.rows || []);
-const s = (_statsRows[0] || {}) as any;
+`));
+const s = (statsRes.rows[0] || {}) as any;
+/** A count that was not read is not a zero. The tiles print a dash rather than inventing one. */
+const statValue = (v: any) => (statsRes.ok && v != null ? String(v) : '—');
+
+// One banner naming every read that did not answer, so nothing blank below is mistaken for empty.
+const readFailures: string[] = [];
+if (!employeesRes.ok) readFailures.push('the employee register');
+if (!countRes.ok) readFailures.push('how many employees match this filter');
+if (!statsRes.ok) readFailures.push('the counts in the header');
+if (!departmentsOk) readFailures.push('the department register');
+const firstReadError = employeesRes.error || countRes.error || statsRes.error || departmentsError;
 ---
 <AdminLayout title="Employees — HRMS" activeNav="hr">
 <div class="admin-page" style="padding: 0 0 80px;">
@@ -217,7 +260,7 @@ const s = (_statsRows[0] || {}) as any;
         { label: 'New (30d)', value: s.new_this_month, color: '#FF7040' },
       ].map(stat => (
         <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:8px;padding:8px;text-align:center;">
-          <p style={`font-size:18px;font-weight:700;color:${stat.color};margin:0;line-height:1;`}>{stat.value}</p>
+          <p style={`font-size:18px;font-weight:700;color:${stat.color};margin:0;line-height:1;`}>{statValue(stat.value)}</p>
           <p style="font-size:9px;color:#6e6e78;margin:2px 0 0;text-transform:uppercase;letter-spacing:0.08em;">{stat.label}</p>
         </div>
       ))}
@@ -239,31 +282,59 @@ const s = (_statsRows[0] || {}) as any;
   {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
 
+  {/* WHAT COULD NOT BE READ, SAID BEFORE ANYTHING BLANK IS SHOWN. Every read on this page used to be
+      a bare top-level await: on a database where hr_employees or departments has not been created —
+      the state of every fresh deployment, and the state this page is most likely to be opened in
+      first — the whole register answered with an unexplained 500. Failing soft alone would be worse:
+      an empty list under "Add your first employee" invites a duplicate of somebody who is already
+      on the register. */}
+  {readFailures.length > 0 && (
+    <div style="margin:12px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.6;">
+      <strong style="color:#fecaca;">Part of this page could not be read, so what is blank below is unknown rather than empty.</strong>
+      Not read: {readFailures.join('; ')}. Do not add somebody on the strength of an empty list here —
+      they may already be on the register.
+      {firstReadError && <span style="display:block;margin-top:6px;color:#f87171;font-family:'Geist Mono',monospace;font-size:11px;overflow-wrap:anywhere;">{clip(firstReadError, 300)}</span>}
+    </div>
+  )}
+
   <!-- Employee Cards (mobile-first) -->
   <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
-    {(Array.isArray(employees) ? employees : (employees?.rows || [])).length === 0 && (
-      <div style="text-align:center;padding:48px 16px;color:#6e6e78;">
-        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px;opacity:0.7;"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-        <p style="font-size:14px;font-weight:500;color:#a0a0ab;">No employees found</p>
-        <p style="font-size:12px;margin-top:4px;">Add your first employee to get started</p>
+    {!employeesRes.ok && (
+      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;padding:16px;color:#fca5a5;font-size:13px;line-height:1.65;">
+        The employee register could not be read, so nobody is listed. This page is NOT saying the
+        register is empty. Reload before adding anyone.
       </div>
     )}
-    {(Array.isArray(employees) ? employees : (employees?.rows || [])).map((emp: any) => (
+    {employeesRes.ok && employeeRows.length === 0 && (
+      <div style="text-align:center;padding:48px 16px;color:#6e6e78;">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px;opacity:0.7;"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <p style="font-size:14px;font-weight:500;color:#a0a0ab;">{q || statusFilter !== 'all' ? 'No employee matches this search and filter' : 'No employees on the register'}</p>
+        <p style="font-size:12px;margin-top:4px;">This list was read successfully and is genuinely empty.</p>
+        {!q && <p style="font-size:12px;margin-top:4px;">Add your first employee to get started</p>}
+      </div>
+    )}
+    {employeeRows.map((emp: any) => (
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
         <!-- Card header -->
         <div style="padding:12px 14px;display:flex;align-items:flex-start;gap:12px;">
           <div style={`width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,${emp.employment_status === 'active' ? '#FF4F00,#FF7040' : '#2a2a32,#1a1a1f'});display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;color:#fff;flex-shrink:0;`}>
-            {emp.full_name.substring(0, 1).toUpperCase()}
+            {/* `emp.full_name.substring(0,1)` throws on a NULL name and takes the whole register
+                down with it — full_name is NOT NULL in db/hr-schema.sql but this page also renders
+                rows written by importers and by hand. firstWord() answers for a null, a mononym and
+                a script that does not space its words alike. */}
+            {firstWord(emp.full_name, '?').substring(0, 1).toUpperCase()}
           </div>
           <div style="flex:1;min-width:0;">
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-              <p style="font-size:14px;font-weight:600;color:#fff;margin:0;">{emp.full_name}</p>
+              {/* Clipped for the card, complete in the title attribute — a display cap, never a data
+                  cap. A pasted 4,000-character "name" used to push the status chip off the card. */}
+              <p style="font-size:14px;font-weight:600;color:#fff;margin:0;overflow-wrap:anywhere;" title={String(emp.full_name || '')}>{clip(emp.full_name || 'Unnamed employee', 70)}</p>
               <span style={`font-size:9px;font-weight:700;padding:2px 7px;border-radius:100px;text-transform:uppercase;letter-spacing:0.06em;${emp.employment_status === 'active' ? 'background:rgba(16,185,129,0.15);color:#6ee7b7;' : 'background:rgba(239,68,68,0.15);color:#fca5a5;'}`}>
-                {emp.employment_status}
+                {emp.employment_status || 'status not recorded'}
               </span>
             </div>
             <p style="font-size:11px;color:#6e6e78;margin:2px 0 0;">{emp.designation || 'No designation'} · {emp.employment_type || 'Full-Time'}</p>
-            <p style="font-size:11px;color:#8a8a94;margin:1px 0 0;font-family:'Geist Mono',monospace;">{emp.employee_code}</p>
+            <p style="font-size:11px;color:#8a8a94;margin:1px 0 0;font-family:'Geist Mono',monospace;">{emp.employee_code || 'no employee code'}</p>
           </div>
           <a href={`/admin/hr/employees/${emp.id}`} style="display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:8px;background:#1a1a1f;color:#8a8a94;text-decoration:none;flex-shrink:0;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
@@ -273,7 +344,7 @@ const s = (_statsRows[0] || {}) as any;
         <div style="padding:0 14px 12px;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
           <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
             <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Email</p>
-            <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{emp.email}</p>
+            <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title={String(emp.email || '')}>{emp.email || 'no email on file'}</p>
           </div>
           <div style="background:#15151a;border-radius:6px;padding:6px 8px;">
             <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Work Mode</p>
@@ -295,9 +366,9 @@ const s = (_statsRows[0] || {}) as any;
           <div style={`border-radius:6px;padding:6px 8px;grid-column:1/-1;${emp.department_name ? 'background:#15151a;' : 'background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.22);'}`}>
             <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Department</p>
             {emp.department_name
-              ? <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{emp.department_name}</p>
+              ? <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title={String(emp.department_name)}>{clip(emp.department_name, 60)}</p>
               : emp.department_id
-                ? <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Set to "{emp.department_id}", which is not on the register</p>
+                ? <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;overflow-wrap:anywhere;">{departmentsOk ? 'Set to "' + clip(emp.department_id, 60) + '", which is not on the register' : 'Set to "' + clip(emp.department_id, 60) + '". The department register could not be read, so whether that is on it is unknown.'}</p>
                 : <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Not set. They appear in no department list.</p>}
           </div>
           {/* A missing reporting manager is not a cosmetic gap: approverRole() in src/lib/hr-wallet.ts
@@ -307,10 +378,12 @@ const s = (_statsRows[0] || {}) as any;
           <div style={`border-radius:6px;padding:6px 8px;grid-column:1/-1;${emp.manager_name ? 'background:#15151a;' : 'background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.22);'}`}>
             <p style="font-size:9px;color:#6e6e78;text-transform:uppercase;letter-spacing:0.08em;margin:0;">Reports To</p>
             {emp.manager_name
-              ? <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{emp.manager_name}</p>
+              ? <p style="font-size:11px;color:#d8d8de;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title={String(emp.manager_name)}>{clip(emp.manager_name, 60)}</p>
               : emp.reporting_manager_id
                 ? <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Set, but that login is not on the employee register</p>
-                : <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Not set. Nobody can approve their leave or withdrawals.</p>}
+                : reportingColumnOk
+                  ? <p style="font-size:11px;color:#fbbf24;margin:2px 0 0;">Not set. Nobody can approve their leave or withdrawals.</p>
+                  : <p style="font-size:11px;color:#fca5a5;margin:2px 0 0;">Unknown — the reporting line column could not be provisioned, so this page cannot say whether one is set.</p>}
           </div>
         </div>
         <!-- Actions -->
@@ -324,7 +397,16 @@ const s = (_statsRows[0] || {}) as any;
           <a href={`/admin/hr/completion/${emp.id}`} style="flex:1;text-align:center;background:#1a1a1f;color:#d8d8de;text-decoration:none;font-size:12px;font-weight:500;padding:7px;border-radius:6px;border:1px solid #2a2a32;">
             Completion
           </a>
-          <form method="POST" style="flex:1;">
+          {/* DEACTIVATE HAD NO CONFIRMATION AT ALL, and it sits a thumb's width from "View Profile"
+              on a phone. It ends every access the employee record grants, so the prompt names the
+              person and the code — with the apostrophe INTACT: escaping it, not deleting it, is what
+              lets somebody check they are ending the right person's access. */}
+          <form method="POST" style="flex:1;" onsubmit={emp.employment_status === 'active' ? confirmAttr(
+              'Deactivate ' + (emp.full_name || 'this employee') + ' (' + (emp.employee_code || 'no code') + ')? '
+              + 'They stop counting as an active employee: no payroll run includes them, and nothing they have raised can be approved through their record.')
+            : confirmAttr(
+              'Reactivate ' + (emp.full_name || 'this employee') + ' (' + (emp.employee_code || 'no code') + ')? '
+              + 'They count as active again and the next payroll run will include them.')}>
             <input type="hidden" name="action" value={emp.employment_status === 'active' ? 'deactivate' : 'activate'} />
             <input type="hidden" name="id" value={emp.id} />
             <button type="submit" style={`width:100%;font-size:12px;font-weight:500;padding:7px;border-radius:6px;border:none;cursor:pointer;${emp.employment_status === 'active' ? 'background:rgba(239,68,68,0.15);color:#fca5a5;' : 'background:rgba(16,185,129,0.15);color:#6ee7b7;'}`}>
@@ -336,13 +418,23 @@ const s = (_statsRows[0] || {}) as any;
     ))}
   </div>
 
-  <!-- Pagination -->
-  {totalPages > 1 && (
-    <div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:16px;">
-      {page > 1 && <a href={`?q=${q}&status=${statusFilter}&page=${page-1}`} style="background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;padding:7px 14px;border-radius:8px;font-size:12px;">← Prev</a>}
-      <span style="font-size:12px;color:#6e6e78;">{page} / {totalPages}</span>
-      {page < totalPages && <a href={`?q=${q}&status=${statusFilter}&page=${page+1}`} style="background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;padding:7px 14px;border-radius:8px;font-size:12px;">Next →</a>}
+  {/* PAGINATION. The search term is encoded into the link: a name carrying & or # used to truncate
+      the query and silently page through a DIFFERENT search than the one on screen. The count is
+      only quoted when it was actually read — "1 / 0" on an empty database, and a confident total
+      over a failed count, are the same lie in two shapes. Targets are 44px so a thumb lands on the
+      link rather than between the two. */}
+  {countRes.ok && totalPages > 1 && (
+    <div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:16px;flex-wrap:wrap;">
+      {page > 1 && <a href={pagerQs(page - 1)} style="background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;padding:0 16px;border-radius:8px;font-size:12px;min-height:44px;display:inline-flex;align-items:center;">Previous</a>}
+      <span style="font-size:12px;color:#6e6e78;">Page {page} of {totalPages} · {totalCount} employee{totalCount === 1 ? '' : 's'} match</span>
+      {page < totalPages && <a href={pagerQs(page + 1)} style="background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;padding:0 16px;border-radius:8px;font-size:12px;min-height:44px;display:inline-flex;align-items:center;">Next</a>}
     </div>
+  )}
+  {!countRes.ok && employeesRes.ok && employeeRows.length > 0 && (
+    <p style="text-align:center;font-size:12px;color:#fbbf24;padding:12px 16px;line-height:1.6;">
+      How many employees match could not be counted, so there is no page count and no Next link.
+      What is listed above is page {page}; there may be more.
+    </p>
   )}
 </div>
 
@@ -377,15 +469,23 @@ const s = (_statsRows[0] || {}) as any;
           <select name="departmentId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
             <option value="" selected>No department set</option>
             {departmentOptions.map((d: any) => (
-              <option value={String(d.id)}>{d.name}{d.is_visible === false ? ' (not listed publicly)' : ''}</option>
+              <option value={String(d.id)}>{clip(d.name || d.id, 70)}{d.is_visible === false ? ' (not listed publicly)' : ''}</option>
             ))}
           </select>
           <p style="font-size:10.5px;color:#6e6e78;margin:5px 0 0;line-height:1.5;">
             Sets which team and department lists this person appears in. Optional for now, so existing records can still be added and corrected — but a record added without one is in no list until it is set on the record itself.
           </p>
-          {departmentOptions.length === 0 && (
+          {/* "No departments could be read" was printed for BOTH an empty register and a failed
+              read, and the two want opposite actions: create one, or wait and reload. */}
+          {departmentOptions.length === 0 && departmentsOk && (
             <p style="font-size:10.5px;color:#fbbf24;margin:4px 0 0;line-height:1.5;">
-              No departments could be read, so there is nothing to choose. Create them under Departments first.
+              There are no departments on the register yet, so there is nothing to choose. Create them under Departments first.
+            </p>
+          )}
+          {!departmentsOk && (
+            <p style="font-size:10.5px;color:#fca5a5;margin:4px 0 0;line-height:1.5;">
+              The department register could not be read, so this list is not empty — it is unknown. Adding
+              somebody with a department will be refused until it loads; adding them without one still works.
             </p>
           )}
         </div>

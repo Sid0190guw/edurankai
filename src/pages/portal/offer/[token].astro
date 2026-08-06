@@ -54,6 +54,25 @@ if (!isOwner) {
 }
 const app: any = appList.length > 0 ? appList[0] : null;
 
+// "OFFER OPENED" IS NOW ACTUALLY RECORDED.
+//
+// markOfferOpened() was imported at the top of this file and never called, anywhere in src/. So
+// offer_letters.opened_at and open_count were written by nothing and read by nothing, and a named
+// step of the hiring journey did not exist: HR could not tell a candidate who has read their offer
+// and is thinking about it from one who never received the push and does not know an offer exists.
+// The thread-open equivalent for applications (track.ts markThreadOpened) IS wired and IS read on the
+// application activity route — the capability was built and only this half was left unconnected.
+//
+// Recipient only, and reads only. A staff viewer opening the letter must not stamp the candidate's
+// record with a read they did not make, and a POST is a signature rather than an opening.
+if (isOwner && Astro.request.method !== 'POST') {
+  const _openIp = Astro.request.headers.get('x-forwarded-for')
+    || Astro.request.headers.get('cf-connecting-ip') || '';
+  // Best effort by design: markOfferOpened() already contains its own catch, and a tracking write
+  // must never stop somebody reading the offer they were sent.
+  await markOfferOpened(String(offer.id), String(user.id), _openIp.substring(0, 64));
+}
+
 const content = offer.content || {};
 const c = content;
 
@@ -291,29 +310,71 @@ if (Astro.request.method === 'POST' && isOwner) {
           updatedAt: new Date()
         }).where(eq(offerLetters.id, offer.id));
 
-        // Update application status to hired
-        if (app) {
-          await db.update(applications).set({
-            status: 'hired',
-            updatedAt: new Date()
-          }).where(eq(applications.id, app.id));
+        // -----------------------------------------------------------------------------------------
+        // THE WHOLE HANDOFF, IN ONE CALL THAT LEAVES A TRACE.
+        // -----------------------------------------------------------------------------------------
+        //
+        // WHAT THIS REPLACED. Six writes and nothing downstream. This handler flipped the offer to
+        // 'signed', flipped applications.status to 'hired' with a bare db.update, posted a thread
+        // message, called transferApplicantToEmployee() inside `catch (_) {}` AND discarded its
+        // return value, and pushed the admins. It did not start an onboarding journey — startJourney()
+        // had exactly one caller in the entire repo, a manual button on an admin page. It did not move
+        // the candidate's own six-step tracker, which rested on "05 Decision" after they had started
+        // work. It did not tell the person anything except the sentence on this screen. And because
+        // the status was written by hand rather than through onApplicationStatusChange(), the BETTER
+        // of the two employee-creation engines — the one that sets a department and mints a safe
+        // employee code — never ran for a hire the candidate initiated. The normal path was the worse
+        // path.
+        //
+        // Worst of all: the failure was invisible twice over. hire-transfer.ts had been fixed to
+        // return its reason, and this caller threw the reason away and printed "You are officially
+        // part of EduRankAI" regardless. Somebody signed on 23 July and was not an employee until
+        // 3 August, and no screen in the product could list a signed offer with no employee record.
+        //
+        // src/lib/hire-completion.ts does all of it in one place, records every step's outcome in
+        // hr_hire_handoffs whether or not it worked, pushes the people desk when a step did not
+        // complete, and is listed by /admin/hr/reconciliation. Every handoff now either happens or is
+        // VISIBLE as not having happened.
+        //
+        // IT MUST NOT BREAK THE SIGNATURE. Somebody who has just accepted a job must not be shown a
+        // red error because a downstream write failed — the signature above is already committed and
+        // is what legally matters. So the call is guarded, but the guard LOGS and TRACKS rather than
+        // discarding, and the sentence shown below changes to match what actually happened.
+        let handoff: import('@/lib/hire-completion').HireCompletion | null = null;
+        try {
+          const { completeHire } = await import('@/lib/hire-completion');
+          handoff = await completeHire({
+            offer,
+            actorUserId: String(user.id),
+            source: 'candidate_signature',
+          });
+        } catch (e: any) {
+          console.error('[offer] hire handoff threw:', e?.cause?.message || e?.message);
+          try {
+            const { trackError } = await import('@/lib/logger');
+            await trackError('hire.handoff_threw', e, { offerId: String(offer.id), applicationId: offer.applicationId });
+          } catch (_) { /* the log must never be the reason a signature fails */ }
+        }
 
-          // Post system message to thread
+        // The thread message states what actually happened, not what was hoped for. It used to say
+        // "Status updated to: Hired." unconditionally, including on the days no employee record was
+        // created — so the one durable, human-readable record of this moment asserted something that
+        // was not true.
+        if (app) {
           await db.insert(applicationMessages).values({
             applicationId: app.id,
             senderUserId: user.id,
             senderRole: 'system',
             senderName: 'System',
-            body: 'Offer accepted and signed by the applicant. Status updated to: Hired.',
+            body: 'Offer accepted and signed by the applicant. Status updated to: Hired.'
+              + (handoff && handoff.ok
+                ? ' Employee record created' + (handoff.employeeCode ? ' (' + handoff.employeeCode + ')' : '') + '.'
+                : ' NO employee record was created: '
+                  + ((handoff && handoff.error) || 'the handoff could not be run')
+                  + ' — this hire is listed on /admin/hr/reconciliation until it is.'),
             isSystem: true
           });
         }
-
-        // Transfer the applicant into an employee record (pending onboarding).
-        try {
-          const { transferApplicantToEmployee } = await import('@/lib/hire-transfer');
-          await transferApplicantToEmployee(offer);
-        } catch (_) {}
 
         // PRIVILEGE ESCALATION, REMOVED.
         //
@@ -365,12 +426,29 @@ if (Astro.request.method === 'POST' && isOwner) {
           await promoteEnrolmentPhoto(String(user.id));
         } catch (_) {}
 
-        // Push notification to admins
+        // Push notification to admins. The application id falls back to the offer's own column: it
+        // was `app?.id || ''`, and `app` is null whenever the applicant record could not be matched
+        // to this account — which produced a notification whose URL was literally
+        // '/admin/applications/', landing the reader on the list with no indication which hire it was
+        // about. offer.applicationId is NOT NULL on the table, so this always has an answer.
         try {
           const { pushNotify } = await import('@/lib/push');
-          await pushNotify.offerSigned(offer.candidateName || 'Candidate', offer.roleTitle || 'a role', app?.id || '');
+          await pushNotify.offerSigned(
+            offer.candidateName || 'Candidate',
+            offer.roleTitle || 'a role',
+            String(app?.id || offer.applicationId || ''),
+          );
         } catch (_) {}
-        successMsg = 'Offer accepted. You are officially part of EduRankAI. Next: share your educational and professional certificates so HR can verify them.';
+
+        // THE SENTENCE MATCHES WHAT HAPPENED. It read "Offer accepted. You are officially part of
+        // EduRankAI." on every path, including the ones where no employee record existed — a person
+        // was told they had joined a company that had no record of them. The signature is real either
+        // way and is never downplayed; what changes is what they are told to expect next.
+        successMsg = handoff && handoff.ok
+          ? 'Offer accepted. You are officially part of EduRankAI. Next: share your educational and professional certificates so HR can verify them.'
+          : 'Offer accepted, and your signature is recorded. The people desk is still finishing your '
+            + 'employee record — they have been notified and will be in touch. Nothing further is '
+            + 'needed from you right now.';
         acceptedNow = true;
         offer.status = 'signed';
         offer.signedAt = new Date();
@@ -830,9 +908,17 @@ const offerPdfData = {
         <h2 class="doc-h2" id="pnl-access">Access Credentials</h2>
         {offer.createdUserId ? (
           <div class="doc-access">
+            {/* THE DOOR THIS SENDS THEM TO HAS TO BE ONE THAT OPENS.
+                This read "Sign in at edurankai.in/admin/login". Signing an offer deliberately no
+                longer promotes the account (that was the escalation which handed every intern the
+                admin panel and edit rights over live content), so the account stays an ordinary one
+                and the middleware bounces it straight off /admin/*. The permanent, printed,
+                PDF-archived copy of somebody's offer was instructing them to sign in somewhere that
+                would throw them out on their first day. /portal/login is their actual workspace door
+                and it opens for every kind of account. */}
             <p class="doc-prose__p">
               Your institutional account is active. Sign in at
-              <a href="https://edurankai.in/admin/login" class="doc-link">edurankai.in/admin/login</a>
+              <a href="https://edurankai.in/portal/login" class="doc-link">edurankai.in/portal/login</a>
               using <strong>either</strong> your personal email OR your internal handle &mdash; both work.
             </p>
             <div class="doc-grid">

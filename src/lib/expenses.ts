@@ -58,6 +58,10 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { logAudit } from '@/lib/audit';
+// THE ONE ROUNDING RULE. src/lib/money.ts, shared with payroll, loans, settlement, invoices and
+// leave — see the header there for why the six local copies of `Math.round(n * 100) / 100` were all
+// wrong in the same direction, and always against the person being paid.
+import { round2 } from '@/lib/money';
 import {
   startWorkflow,
   cancelWorkflow,
@@ -218,6 +222,35 @@ export function ensureExpenseSchema(): Promise<void> {
         ON expense_claims (employee_id, created_at DESC)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS expense_claims_status
         ON expense_claims (status, created_at DESC)`);
+
+      // ===========================================================================================
+      // AN ADVANCE AND THE CLAIM THAT ACCOUNTS FOR IT — THE LINK THAT DID NOT EXIST
+      // ===========================================================================================
+      //
+      // CLAIM_KIND_HINTS.advance promises, in the product's own words: "Money you need BEFORE you
+      // spend it. You will still submit a claim afterwards for what you actually spent." Nothing kept
+      // that promise. There was no column joining a later claim to the advance it accounts for,
+      // creditApprovedClaim() treated an advance exactly like a reimbursement, and no screen or query
+      // anywhere paired them. So the company credited the advance, then credited the reimbursement
+      // for the SAME spend, and nothing subtracted one from the other. Money left twice against one
+      // expense, and the only person who could notice was the employee.
+      //
+      // ADDITIVE, NEVER DESTRUCTIVE. Three nullable/defaulted columns and one partial unique index.
+      // Every row already in the table keeps counting exactly as it did — settles_advance_id is NULL
+      // on all of them, which is "this claim accounts for no advance", which is what they all were.
+      await db.execute(sql`ALTER TABLE expense_claims ADD COLUMN IF NOT EXISTS settles_advance_id UUID`);
+      // What was WITHHELD from this claim's credit because the advance had already paid it, and what
+      // the person is still holding when the advance was larger than the spend. Both are money and
+      // both are written down, because a netting nobody can see is indistinguishable from a
+      // short payment.
+      await db.execute(sql`ALTER TABLE expense_claims ADD COLUMN IF NOT EXISTS advance_offset NUMERIC(14,2) NOT NULL DEFAULT 0`);
+      await db.execute(sql`ALTER TABLE expense_claims ADD COLUMN IF NOT EXISTS advance_returnable NUMERIC(14,2) NOT NULL DEFAULT 0`);
+      // ONE ADVANCE IS ACCOUNTED FOR ONCE. This is the idempotency guard for the netting: without it
+      // two claims could each declare themselves the settlement of the same advance, each would net
+      // against the full advance, and the company would recover the same money twice from the person.
+      // PARTIAL, so the NULL on every ordinary claim does not collide.
+      await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS expense_claims_advance_uniq
+        ON expense_claims (settles_advance_id) WHERE settles_advance_id IS NOT NULL`);
     } catch (e: any) {
       logFail('ensureExpenseSchema', e);
       ready = null; // RESET — a transient failure must not mark the schema provisioned forever.
@@ -268,6 +301,23 @@ export interface Claim {
   createdAt: string | null;
   settledAt: string | null;
   reimbursedAt: string | null;
+  /**
+   * THE ADVANCE THIS CLAIM ACCOUNTS FOR, if the person named one when they filed it. Null on an
+   * ordinary claim and on every claim written before this existed.
+   */
+  settlesAdvanceId: string | null;
+  /**
+   * How much of this claim's approved amount was NOT credited, because the advance had already paid
+   * it. Zero on every claim that settles nothing. This is the number that stops one spend being paid
+   * twice, and it is on the record rather than implied by a smaller credit.
+   */
+  advanceOffset: number;
+  /**
+   * How much of the advance the person is STILL HOLDING, because they spent less than they were
+   * given. Nothing is taken back automatically — see creditApprovedClaim() for why — so this is the
+   * figure a human acts on.
+   */
+  advanceReturnable: number;
 }
 
 function categoryLabelFor(kind: ClaimKind, value: string): string {
@@ -311,6 +361,9 @@ function mapClaim(r: any): Claim {
     createdAt: r?.created_at ? new Date(r.created_at).toISOString() : null,
     settledAt: r?.settled_at ? new Date(r.settled_at).toISOString() : null,
     reimbursedAt: r?.reimbursed_at ? new Date(r.reimbursed_at).toISOString() : null,
+    settlesAdvanceId: r?.settles_advance_id ? String(r.settles_advance_id) : null,
+    advanceOffset: Number(r?.advance_offset) || 0,
+    advanceReturnable: Number(r?.advance_returnable) || 0,
   };
 }
 
@@ -321,6 +374,48 @@ export interface ClaimResult {
   status?: ClaimState;
   /** Present exactly when the claim halted. Rendered verbatim — it names the missing relationship. */
   haltReason?: string | null;
+}
+
+/**
+ * ADVANCES THIS PERSON HAS BEEN PAID AND HAS NOT YET ACCOUNTED FOR.
+ *
+ * "Paid" is deliberately `status = 'reimbursed'` and nothing weaker. An advance that is merely
+ * approved has not left the company: creditApprovedClaim() may still be failing against the wallet,
+ * and netting a later claim against money that never arrived would take a real amount off somebody's
+ * reimbursement to repay an advance they never received. Only money actually in the ledger is money
+ * that can be recovered from a later claim.
+ *
+ * "Not accounted for" is simply that no claim points at it. A settling claim that is rejected or
+ * withdrawn RELEASES its pointer (see writeClaimState), so a refused claim does not lock an advance
+ * out of ever being settled — that would be a dead end created by the very repair meant to remove
+ * one.
+ *
+ * Declared above submitClaim() and creditApprovedClaim(), both of which read it. `const` is not
+ * hoisted on this project and a helper under its first reader has taken pages down here.
+ */
+export async function openAdvances(employeeId: string, limit = 20): Promise<Claim[]> {
+  if (!isUuid(employeeId)) return [];
+  if (!(await safeEnsure())) return [];
+  const lim = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  try {
+    const r = await db.execute(sql`
+      SELECT a.*, e.full_name, e.employee_code
+        FROM expense_claims a
+        LEFT JOIN hr_employees e ON e.id = a.employee_id
+       WHERE a.employee_id = ${employeeId}::uuid
+         AND a.kind = 'advance'
+         AND a.status = 'reimbursed'
+         AND NOT EXISTS (
+           SELECT 1 FROM expense_claims s WHERE s.settles_advance_id = a.id)
+       ORDER BY a.created_at ASC
+       LIMIT ${lim}`);
+    return rows(r).map(mapClaim);
+  } catch (e: any) {
+    // A read that degrades to "none" — but never silently. The submit path treats an unreadable
+    // advance list as "no advance named", which files an ordinary claim rather than refusing one.
+    logFail('openAdvances', e);
+    return [];
+  }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -354,7 +449,11 @@ function validAmount(raw: any): { ok: boolean; amount: number; error?: string } 
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return { ok: false, amount: 0, error: 'Enter the amount.' };
   if (n > MAX_AMOUNT) return { ok: false, amount: 0, error: 'That amount looks like a typo. Check it and try again.' };
-  return { ok: true, amount: Math.round(n * 100) / 100 };
+  // round2() from src/lib/money.ts, not `Math.round(n * 100) / 100`. That expression rounds on the
+  // BINARY double: 1.005 * 100 is 100.49999999999999, so a claim typed as 1.005 was stored as 1.00.
+  // The bias is always downward and always against the claimant. Six modules carried that copy and
+  // five have already been moved onto the shared one — this was the sixth.
+  return { ok: true, amount: round2(n) };
 }
 
 function validDate(raw: any): string | null {
@@ -384,6 +483,12 @@ export interface SubmitClaimInput {
   travelEnd?: string;
   neededBy?: string;
   receiptUrl?: string;
+  /**
+   * The advance this claim accounts for, if any. Only meaningful on a reimbursement or travel claim —
+   * an advance cannot settle an advance. Validated against THIS employee's own open advances before
+   * it is written; a posted id for somebody else's advance is refused, not trusted.
+   */
+  settlesAdvanceId?: string | null;
 }
 
 /**
@@ -447,23 +552,73 @@ export async function submitClaim(input: SubmitClaimInput): Promise<ClaimResult>
     return { ok: false, error: 'The return date is before the departure date.' };
   }
 
+  // ---- WHICH ADVANCE, IF ANY, THIS CLAIM ACCOUNTS FOR ---------------------------------------------
+  //
+  // VALIDATED AGAINST THE PERSON'S OWN OPEN ADVANCES, never trusted from the form. openAdvances()
+  // already restricts to this employee, to kind 'advance', to money genuinely in the wallet, and to
+  // advances nothing else has claimed — so membership of that list IS the whole check, and a posted
+  // id for a colleague's advance, an unpaid one, or one already accounted for simply is not in it.
+  //
+  // AN ADVANCE CANNOT SETTLE AN ADVANCE. Asking for more money up front is not accounting for the
+  // money you were given.
+  let settlesAdvanceId: string | null = null;
+  const requestedAdvance = String(input?.settlesAdvanceId || '').trim();
+  if (requestedAdvance) {
+    if (kind === 'advance') {
+      return { ok: false, error: 'An advance request cannot account for another advance. Raise an expense or travel claim for what you actually spent.' };
+    }
+    const open = await openAdvances(employeeId, 50);
+    const match = open.find((a) => a.id === requestedAdvance);
+    if (!match) {
+      return {
+        ok: false,
+        error: 'That advance is not one of yours to account for. It may already have been settled by '
+          + 'another claim, or the money may not have reached your wallet yet. Reload the page and pick from the list.',
+      };
+    }
+    if (match.currency !== currency) {
+      // Netting across currencies would need a rate, and a rate invented here is a number nobody
+      // agreed to. Refuse rather than guess with somebody's money.
+      return {
+        ok: false,
+        error: 'That advance was paid in ' + match.currency + ' and this claim is in ' + currency
+          + '. Raise the claim in the same currency as the advance, or ask HR to settle it by hand.',
+      };
+    }
+    settlesAdvanceId = match.id;
+  }
+
   let claimId = '';
   try {
     await ensureExpenseSchema();
     const ins = rows(await db.execute(sql`
       INSERT INTO expense_claims
         (employee_id, submitted_by_user_id, kind, category, title, description, amount, currency,
-         incurred_on, travel_from, travel_to, travel_start, travel_end, needed_by, receipt_url, status)
+         incurred_on, travel_from, travel_to, travel_start, travel_end, needed_by, receipt_url, status,
+         settles_advance_id)
       VALUES
         (${employeeId}::uuid, ${userId}::uuid, ${kind}, ${category}, ${title}, ${description},
          ${amt.amount}, ${currency}, ${incurredOn}::date, ${travelFrom}, ${travelTo},
-         ${travelStart}::date, ${travelEnd}::date, ${neededBy}::date, ${receipt.url}, 'draft')
+         ${travelStart}::date, ${travelEnd}::date, ${neededBy}::date, ${receipt.url}, 'draft',
+         ${settlesAdvanceId}::uuid)
       RETURNING id`));
     if (!ins.length) return { ok: false, error: WRITE_FAILED };
     claimId = String(ins[0].id);
   } catch (e: any) {
     // NOT SWALLOWED. Cause to the log, sentence to the person, ok:false to the caller.
     logFail('submitClaim.insert', e);
+    // THE ONE REFUSAL THE DATABASE MAKES THAT A PERSON CAN ACT ON. expense_claims_advance_uniq is
+    // what stops two claims netting against the same advance — the check above loses that race by
+    // design, because a unique index is the only thing that can win it. Saying "something went
+    // wrong" here would send somebody back to raise the same claim again.
+    const cause = String(e?.cause?.message || e?.message || '');
+    if (cause.indexOf('expense_claims_advance_uniq') >= 0) {
+      return {
+        ok: false,
+        error: 'Another claim is already accounting for that advance, so this one was not raised. '
+          + 'Reload your claims and check which one — an advance is settled once.',
+      };
+    }
     return { ok: false, error: WRITE_FAILED };
   }
 
@@ -516,6 +671,10 @@ export async function submitClaim(input: SubmitClaimInput): Promise<ClaimResult>
     diff: {
       kind, category, amount: amt.amount, currency, domain,
       workflowInstanceId: wf.instanceId || null, state: status, haltReason: wf.haltReason || null,
+      // ON THE RECORD FROM THE START. Which advance this claim was raised against is what decides how
+      // much money actually moves when it is approved, so it belongs in the trail at the moment the
+      // person chose it, not only in the credit that follows.
+      settlesAdvanceId,
     },
   });
 
@@ -631,6 +790,19 @@ async function writeClaimState(
   next: ClaimState,
   opts: { haltReason: string | null; settled: boolean; reimbursed: boolean; instanceId: string | null },
 ): Promise<Claim | null> {
+  // A REFUSED CLAIM LETS GO OF THE ADVANCE IT WAS ACCOUNTING FOR.
+  //
+  // expense_claims_advance_uniq allows ONE claim per advance, which is what stops the same advance
+  // being netted twice. Without this release a claim that was rejected or withdrawn would hold that
+  // single slot forever: the advance could never be accounted for by any later claim, openAdvances()
+  // would stop offering it, and the person would be left holding company money with no route in the
+  // product to settle it. That is a dead end created by the guard, so the guard releases.
+  //
+  // Only on the two states that mean "this claim is not happening". An approved or reimbursed claim
+  // keeps its pointer, because it IS the settlement. Both consts are declared above the write that
+  // reads them.
+  const releasesAdvance = next === 'rejected' || next === 'cancelled';
+  const advanceWrite = releasesAdvance ? sql`NULL` : sql`settles_advance_id`;
   try {
     const wrote = rows(await db.execute(sql`
       UPDATE expense_claims
@@ -639,11 +811,14 @@ async function writeClaimState(
              workflow_instance_id = COALESCE(${opts.instanceId}::uuid, workflow_instance_id),
              settled_at = ${opts.settled ? sql`COALESCE(settled_at, NOW())` : sql`settled_at`},
              reimbursed_at = ${opts.reimbursed ? sql`COALESCE(reimbursed_at, NOW())` : sql`reimbursed_at`},
+             settles_advance_id = ${advanceWrite},
              updated_at = NOW()
        WHERE id = ${claim.id}::uuid
          AND status = ${claim.status}
       RETURNING *`));
     if (!wrote.length) return null;
+
+    const updated = mapClaim({ ...wrote[0], full_name: claim.employeeName, employee_code: claim.employeeCode });
 
     if (next !== claim.status) {
       await logAudit({
@@ -651,11 +826,19 @@ async function writeClaimState(
         action: 'expenses.claim.' + next,
         entity: 'expense_claim',
         entityId: claim.id,
-        diff: { from: claim.status, to: next, amount: claim.amount, currency: claim.currency },
+        diff: {
+          from: claim.status, to: next, amount: claim.amount, currency: claim.currency,
+          advanceOffset: updated.advanceOffset, advanceReturnable: updated.advanceReturnable,
+          advanceReleased: releasesAdvance && !!claim.settlesAdvanceId,
+        },
       });
-      await notifyClaimant(claim, next);
+      // THE ROW AS IT NOW STANDS, not the one read before the write. creditApprovedClaim() has just
+      // written advance_offset and advance_returnable, and notifying from the stale object would tell
+      // somebody "Paid into your wallet" for a claim where nothing reached the wallet at all, because
+      // an advance had already covered it.
+      await notifyClaimant(updated, next);
     }
-    return mapClaim({ ...wrote[0], full_name: claim.employeeName, employee_code: claim.employeeCode });
+    return updated;
   } catch (e: any) {
     logFail('writeClaimState', e);
     return null;
@@ -682,22 +865,122 @@ async function creditApprovedClaim(claim: Claim): Promise<boolean> {
     logFail('creditApprovedClaim.check', e);
   }
 
+  // ===============================================================================================
+  // THE ADVANCE IS SUBTRACTED HERE, AND THIS IS THE LINE THAT STOPS ONE SPEND BEING PAID TWICE
+  // ===============================================================================================
+  //
+  // The company already put `advance` in this person's wallet before they spent anything. If the
+  // claim that accounts for it is then credited in full, the same expense has been paid twice and
+  // nothing anywhere subtracts one from the other — which is exactly what happened, silently, to
+  // every advance ever raised on this product.
+  //
+  // THREE CASES, AND ONLY ONE OF THEM MOVES MONEY:
+  //   spent MORE than the advance   credit the difference. The company still owes that much.
+  //   spent EXACTLY the advance     credit nothing. The account is square, and the claim is still
+  //                                 marked reimbursed, because it HAS been paid — in advance.
+  //   spent LESS than the advance   credit nothing, and record what the person is still holding.
+  //
+  // WHY THE SHORTFALL IS NOT TAKEN BACK AUTOMATICALLY. Debiting a wallet to recover an advance would
+  // be this module moving somebody's money without them doing anything, and it can drive a balance
+  // below zero or swallow a withdrawal they had already asked for. It is written down, said to the
+  // person in plain words, and left for a human — the same reasoning payWithdrawal() uses when the
+  // gateway does not answer: an unresolved amount that is VISIBLE is recoverable, one that a machine
+  // has quietly acted on is not.
+  //
+  // THE ADVANCE ITSELF IS NEVER RE-READ FOR ITS STATUS HERE. openAdvances() already established, at
+  // the moment the person chose it, that the money was in the ledger; re-deciding that now would let
+  // a claim's credit change size depending on when a page happened to load.
+  let advanceAmount = 0;
+  if (claim.settlesAdvanceId) {
+    try {
+      const adv = rows(await db.execute(sql`
+        SELECT amount, currency FROM expense_claims
+         WHERE id = ${claim.settlesAdvanceId}::uuid AND kind = 'advance' LIMIT 1`))[0];
+      // A CURRENCY MISMATCH NETS NOTHING. submitClaim() refuses one, so reaching this means the data
+      // changed underneath; inventing a rate to net across it would be a number nobody agreed to.
+      if (adv && String(adv.currency || 'INR') === claim.currency) {
+        advanceAmount = Math.max(0, round2(Number(adv.amount) || 0));
+      } else if (adv) {
+        logFail('creditApprovedClaim.advanceCurrency', new Error(
+          'claim ' + claim.id + ' is in ' + claim.currency + ' and its advance is in ' + String(adv.currency)));
+      }
+    } catch (e: any) {
+      // NOT SWALLOWED INTO A FULL CREDIT. If the advance cannot be read we do not know what was
+      // already paid, and crediting the whole claim on that ignorance is the double payment this
+      // exists to stop. Refuse: the claim stays 'approved' and is retried on the next read, which is
+      // the module's existing behaviour for a credit that could not be completed.
+      logFail('creditApprovedClaim.readAdvance', e);
+      return false;
+    }
+  }
+
+  // round2() from src/lib/money.ts. Netting an advance off a claim is a subtraction of two decimals,
+  // which is exactly where the binary-double copy of this helper loses a paisa — and here it loses it
+  // out of what the claimant is still owed.
+  const payable = Math.max(0, round2(claim.amount - advanceAmount));
+  const offset = round2(Math.min(advanceAmount, claim.amount));
+  const returnable = Math.max(0, round2(advanceAmount - claim.amount));
+
   try {
-    const { credit } = await import('@/lib/hr-wallet');
-    await credit(
-      claim.employeeId,
-      claim.amount,
-      'reimbursement',
-      CLAIM_KIND_LABELS[claim.kind] + ': ' + claim.title,
-      // created_by is a USERS id. No human causes this write — an approved chain does — so it is
-      // null rather than the workflow instance id, which would put a workflow uuid in a users column
-      // and read as a person who does not exist.
-      null,
-      ref,
-    );
+    if (payable > 0) {
+      const { credit } = await import('@/lib/hr-wallet');
+      const res = await credit(
+        claim.employeeId,
+        payable,
+        'reimbursement',
+        CLAIM_KIND_LABELS[claim.kind] + ': ' + claim.title
+          + (offset > 0 ? ' (less ' + claim.currency + ' ' + offset.toLocaleString('en-IN') + ' already paid as an advance)' : ''),
+        // created_by is a USERS id. No human causes this write — an approved chain does — so it is
+        // null rather than the workflow instance id, which would put a workflow uuid in a users column
+        // and read as a person who does not exist.
+        null,
+        ref,
+        // THE CLAIM'S OWN CURRENCY. It was not passed before, so hr_wallet_txn.currency defaulted to
+        // INR and an approved claim of USD 1,200 was credited as 1,200 rupees — a hundredth of what
+        // was approved, with nothing recording that a currency had been assumed.
+        claim.currency,
+      );
+      // credit() REFUSES WITHOUT THROWING, and this line ignored its answer. It returns
+      // `{ ok: false, error: 'A credit is a positive amount.' }` — not an exception — for anything
+      // that is not a positive finite number, so a claim whose amount had come through as NaN (a
+      // hand-edited row, a currency-mismatched advance netting) was marked 'reimbursed', stamped
+      // reimbursed_at, and pushed to the claimant as "Paid into your wallet" with NOTHING in the
+      // ledger behind it. The claimant then has no claim to chase: their own screen says they were
+      // paid. src/lib/invoices.ts checks the same return for the same reason; this was the copy that
+      // did not. Returning false leaves the claim 'approved', which is the state the next sync retries.
+      if (!res?.ok) {
+        logFail('creditApprovedClaim.refused', new Error(
+          'the wallet refused the credit for claim ' + claim.id + ': ' + (res?.error || 'no reason given')));
+        return false;
+      }
+    }
+
+    // WHAT WAS WITHHELD IS WRITTEN ON THE CLAIM. Without this the person sees a credit smaller than
+    // the amount that was approved and has nothing on the record explaining the difference, which is
+    // indistinguishable from being short-paid. It is written whether or not any money moved, because
+    // "nothing was credited, and here is why" is the case that most needs a reason attached.
+    if (claim.settlesAdvanceId) {
+      try {
+        await db.execute(sql`
+          UPDATE expense_claims
+             SET advance_offset = ${offset}, advance_returnable = ${returnable}, updated_at = NOW()
+           WHERE id = ${claim.id}::uuid`);
+      } catch (e: any) {
+        // The money is right; the explanation did not save. Logged, and NOT a reason to refuse a
+        // credit that has already landed — retrying would re-enter this function, and the wallet ref
+        // guard would correctly refuse to pay again, leaving the claim stuck instead.
+        logFail('creditApprovedClaim.writeOffset', e);
+      }
+    }
+
     await logAudit({
       userId: null, action: 'expenses.claim.credited', entity: 'expense_claim', entityId: claim.id,
-      diff: { employeeId: claim.employeeId, amount: claim.amount, currency: claim.currency, ref },
+      diff: {
+        employeeId: claim.employeeId, approved: claim.amount, credited: payable,
+        currency: claim.currency, ref,
+        settlesAdvanceId: claim.settlesAdvanceId, advanceAmount, advanceOffset: offset,
+        advanceReturnable: returnable,
+      },
     });
     return true;
   } catch (e: any) {
@@ -709,18 +992,46 @@ async function creditApprovedClaim(claim: Claim): Promise<boolean> {
   }
 }
 
-/** Tell the claimant their own claim settled. The existing notifier; never blocks the state change. */
+/**
+ * Tell the claimant their own claim settled. The existing notifier; never blocks the state change.
+ *
+ * THE MESSAGE SAYS WHAT ACTUALLY MOVED, NOT JUST WHAT WAS APPROVED.
+ *
+ * CLAIM_STATE_LABELS.reimbursed reads "Paid into your wallet", and for a claim that accounts for an
+ * advance that sentence can be false in two different ways: nothing was credited at all because the
+ * advance already covered the spend, or the person is still holding company money because they spent
+ * less than they were given. Sending the bare label in either case tells somebody to go and look for
+ * a credit that is not there, or lets them keep money nobody has told them to return.
+ *
+ * The netting is stated in the notification because that is the only surface that reaches a person
+ * who is not looking at the page.
+ */
 async function notifyClaimant(claim: Claim, next: ClaimState): Promise<void> {
   try {
     const who = rows(await db.execute(sql`
       SELECT user_id FROM hr_employees WHERE id = ${claim.employeeId}::uuid LIMIT 1`))[0];
     const userId = who?.user_id ? String(who.user_id) : '';
     if (!userId) return;
+
+    const money = (n: number) => claim.currency + ' ' + Number(n).toLocaleString('en-IN');
+    let body = claim.title;
+    if (next === 'reimbursed' && claim.settlesAdvanceId && claim.advanceOffset > 0) {
+      const credited = Math.max(0, Math.round((claim.amount - claim.advanceOffset) * 100) / 100);
+      body = claim.title + ' - approved ' + money(claim.amount) + ', of which '
+        + money(claim.advanceOffset) + ' was already paid to you as an advance. '
+        + (credited > 0
+          ? money(credited) + ' has been credited to your wallet.'
+          : 'Nothing further has been credited.')
+        + (claim.advanceReturnable > 0
+          ? ' You are still holding ' + money(claim.advanceReturnable) + ' of that advance - return it to HR.'
+          : '');
+    }
+
     const { sendPushToUser } = await import('@/lib/push');
     await sendPushToUser(userId, {
       type: 'expense_claim',
       title: CLAIM_KIND_LABELS[claim.kind] + ' ' + CLAIM_STATE_LABELS[next].toLowerCase(),
-      body: claim.title,
+      body,
       url: '/portal/employee/expenses',
       tag: 'claim-' + claim.id,
     });
@@ -1097,7 +1408,7 @@ export async function routeWithdrawals(employeeId?: string | null): Promise<Rout
     const scopeFilter = scoped ? sql`AND w.employee_id = ${scoped}::uuid` : sql``;
     list = rows(await db.execute(sql`
       SELECT w.id, w.employee_id, w.amount, w.currency, w.status, w.note, w.requested_at,
-             e.full_name
+             e.full_name, e.user_id::text AS user_id
         FROM hr_withdrawal w
         LEFT JOIN hr_employees e ON e.id = w.employee_id
        WHERE w.status IN ('pending','approved','paying','rejected','paid','failed') ${scopeFilter}
@@ -1126,6 +1437,11 @@ export async function routeWithdrawals(employeeId?: string | null): Promise<Rout
           domain: 'expenses',
           recordId,
           subjectEmployeeId: String(w.employee_id),
+          // THE REQUESTER, CARRIED. This was omitted, so instance.requestedByUserId was always null
+          // and workflow.notifyRequester() returned on its first line — every withdrawal decided
+          // through the chain settled in total silence, forever. It is also what lets the person
+          // withdraw their own request through cancelWorkflow(), which admits the requester.
+          requestedByUserId: w.user_id ? String(w.user_id) : null,
           summary: 'Wallet withdrawal of ' + String(w.currency || 'INR') + ' ' + Number(w.amount || 0).toFixed(2),
           amount: Number(w.amount) || 0,
           currency: String(w.currency || 'INR'),
@@ -1152,6 +1468,27 @@ export async function routeWithdrawals(employeeId?: string | null): Promise<Rout
               entityId: id,
               diff: { amount: Number(w.amount) || 0, currency: String(w.currency || 'INR'), workflowInstanceId: instance.id },
             });
+            // AND THE PERSON IS TOLD. This mirror ended at logAudit(), so a withdrawal decided
+            // through the chain changed colour on a page nobody had a reason to reopen. Instances
+            // started before this repair carry no requestedByUserId, so notifyRequester cannot fire
+            // for them either — this notification does not depend on that column and covers both.
+            if (w.user_id) {
+              try {
+                // Dynamic import, exactly as notifyClaimant() does a few hundred lines up — this
+                // module must not take a load-time dependency on the push stack.
+                const { sendPushToUser } = await import('@/lib/push');
+                await sendPushToUser(String(w.user_id), {
+                  type: 'withdrawal_decision',
+                  title: decision === 'approved' ? 'Withdrawal approved' : 'Withdrawal declined',
+                  body: String(w.currency || 'INR') + ' ' + Number(w.amount || 0).toLocaleString('en-IN')
+                    + (decision === 'approved' ? ' is approved and waiting to be released.' : ' was not approved.'),
+                  url: '/portal/employee/wallet',
+                  tag: 'withdrawal-' + id,
+                });
+              } catch (e: any) {
+                logFail('routeWithdrawals.notify ' + id, e);
+              }
+            }
           }
         }
       }

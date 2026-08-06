@@ -121,7 +121,28 @@ export async function holidaysBetween(
   to: string,
   scope: HolidayScope = {},
 ): Promise<Holiday[]> {
-  if (!isDateIso(from) || !isDateIso(to) || to < from) return [];
+  return (await readHolidays(from, to, scope)).list;
+}
+
+/**
+ * THE SAME READ, SAYING WHETHER IT WORKED.
+ *
+ * holidaysBetween() catches its own errors and returns [], so a FAILED read and a company with no
+ * holidays are the same observable fact. That tolerance is right for a calendar — a broken read must
+ * not blank a screen — and wrong for money: applyLeave() then charges the public holiday to somebody's
+ * allowance and hands back an EMPTY `excluded` list, so the confirmation says nothing was skipped and
+ * neither the person nor HR can tell it from correct behaviour without reading the server log.
+ * src/lib/payroll.ts, faced with the same class of failure, pushes to `gaps` and says so on the
+ * payslip. This is how a caller that is about to charge somebody can do the same.
+ *
+ * `ok: false` means UNKNOWN, never "none".
+ */
+export async function readHolidays(
+  from: string,
+  to: string,
+  scope: HolidayScope = {},
+): Promise<{ ok: boolean; list: Holiday[]; error?: string }> {
+  if (!isDateIso(from) || !isDateIso(to) || to < from) return { ok: true, list: [] };
   const dept = scope.departmentId ? String(scope.departmentId).trim() : '';
   try {
     await ensureAttendanceSchema();
@@ -141,10 +162,10 @@ export async function holidaysBetween(
          ${optionalScope}
        ORDER BY h.holiday_date ASC, h.name ASC
        LIMIT ${LIST_LIMIT}`);
-    return rows(r).map(mapRow);
+    return { ok: true, list: rows(r).map(mapRow) };
   } catch (e: any) {
     logFail('holidaysBetween', e);
-    return [];
+    return { ok: false, list: [], error: String(e?.cause?.message || e?.message || 'the holiday calendar could not be read') };
   }
 }
 
@@ -184,13 +205,26 @@ export async function observedDates(
   to: string,
   scope: HolidayScope = {},
 ): Promise<Map<string, Holiday>> {
+  return (await observedDatesResult(from, to, scope)).map;
+}
+
+/**
+ * The same answer, carrying whether the calendar could actually be read. See readHolidays() for why
+ * "no holidays" and "we could not tell" must not be the same value to a caller about to charge
+ * somebody a day of their allowance.
+ */
+export async function observedDatesResult(
+  from: string,
+  to: string,
+  scope: HolidayScope = {},
+): Promise<{ ok: boolean; map: Map<string, Holiday>; error?: string }> {
   const out = new Map<string, Holiday>();
-  const list = await holidaysBetween(from, to, scope);
-  for (const h of list) {
+  const read = await readHolidays(from, to, scope);
+  for (const h of read.list) {
     if (!h.dateIso || out.has(h.dateIso)) continue;
     if (isObserved(h, scope)) out.set(h.dateIso, h);
   }
-  return out;
+  return { ok: read.ok, map: out, error: read.error };
 }
 
 /** Is one specific day a holiday for this caller? Null when the date will not parse. */
@@ -214,6 +248,17 @@ export interface LeaveSpan {
   chargeableDays: number;
   /** The dates that were removed, and why — for a sentence on screen. */
   excluded: Array<{ dateIso: string; reason: string }>;
+  /**
+   * THE HOLIDAY CALENDAR COULD NOT BE READ, so `holidayDays` is 0 because nothing is KNOWN and not
+   * because nothing is there.
+   *
+   * A caller that merely displays this can ignore it. A caller about to CHARGE somebody must not:
+   * charging the full span here takes a public holiday out of a person's allowance and reports an
+   * empty `excluded` list, which reads exactly like correct behaviour. src/lib/hr-leave.ts
+   * applyLeave() refuses on this rather than guessing, the same way it refuses when the balance
+   * itself could not be read.
+   */
+  holidayReadFailed: boolean;
 }
 
 /**
@@ -244,6 +289,7 @@ export async function leaveSpan(
     weeklyOffDays: 0,
     chargeableDays: 0,
     excluded: [],
+    holidayReadFailed: false,
   };
   if (!isDateIso(from) || !isDateIso(to) || to < from) return empty;
 
@@ -253,7 +299,8 @@ export async function leaveSpan(
   const offs = new Set(
     (weeklyOffDays || []).filter((n) => Number.isInteger(n) && n >= 1 && n <= 7),
   );
-  const holidays = await observedDates(from, to, scope);
+  const read = await observedDatesResult(from, to, scope);
+  const holidays = read.map;
 
   const excluded: Array<{ dateIso: string; reason: string }> = [];
   let holidayDays = 0;
@@ -281,6 +328,7 @@ export async function leaveSpan(
     weeklyOffDays: offDays,
     chargeableDays: Math.max(0, dates.length - holidayDays - offDays),
     excluded,
+    holidayReadFailed: !read.ok,
   };
 }
 

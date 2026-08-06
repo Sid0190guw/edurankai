@@ -450,6 +450,19 @@ interface RouteRule {
   step: number;
   via: RouteVia;
   /**
+   * When this rule resolves NOBODY, skip the rung instead of halting the request.
+   *
+   * DECLARED AT LAST. The doc block above this interface documents `optional`, twenty-odd route
+   * literals below set it, and resolveRoute() reads `rule.optional` to decide between skipping a rung
+   * and halting with "nobody is named" — but the interface never declared it, so the one property that
+   * decides whether an unstaffed rung stops a request existed only by convention. Any reader outside
+   * this file had to reach it through a structural cast, and a typo in a route literal would have been
+   * silently ignored rather than refused at compile time.
+   *
+   * Additive: it is optional, every existing literal already conforms, and no behaviour changes.
+   */
+  optional?: boolean;
+  /**
    * The rule applies at or above this figure, expressed in ROUTE_THRESHOLD_CURRENCY. An instance in
    * another currency, or one with no amount at all, cannot be compared and KEEPS the rung — see
    * resolveRoute().
@@ -485,6 +498,18 @@ interface DomainDefinition {
   escalateAfterHours: number;
   /** Where a notification about this domain should send somebody. */
   approvalUrl: string;
+  /**
+   * Where the notification about a SETTLED request sends the person who raised it.
+   *
+   * notifyRequester() sent everybody to '/portal/approvals' — an APPROVER's queue. Somebody told
+   * "Expense claim approved" or "Loan or salary advance rejected" tapped it and landed on a list of
+   * other people's pending requests, which cannot show the decision they were just told about. Their
+   * own request lives on their own page, and this is where that is named.
+   *
+   * Optional: a domain that does not set one keeps the previous destination, so nothing that has not
+   * been checked is moved.
+   */
+  requesterUrl?: string;
 }
 
 /**
@@ -511,7 +536,15 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 2, via: 'approval_owner', optional: true },
     ],
     escalateAfterHours: 48,
-    approvalUrl: '/admin/hr/leave/workflow',
+    // WHERE THE ROUTED APPROVER CAN ACTUALLY DECIDE IT.
+    //
+    // This pointed at /admin/hr/leave/workflow, which is gated by the `leave` admin section. The
+    // person the graph routes a leave request to is that employee's REPORTING MANAGER — an ordinary
+    // employee who almost never holds an admin section — so the one person authorised to decide was
+    // sent to a page that redirects them. /portal/approvals now carries every routed request the
+    // reader may act on, whatever the domain, and decideStep() re-checks authority at the write.
+    approvalUrl: '/portal/approvals',
+    requesterUrl: '/portal/employee/leave',
   },
   // A single rung on purpose. An attendance correction is a small factual claim about one day; a
   // three-rung chain for it would mean nobody ever corrects anything.
@@ -521,7 +554,8 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     capability: null,
     route: [{ step: 1, via: 'reporting_manager' }],
     escalateAfterHours: 72,
-    approvalUrl: '/admin/hr/leave/workflow',
+    approvalUrl: '/portal/employee/attendance/approvals',
+    requesterUrl: '/portal/employee/attendance',
   },
   // Money the company pays back. Manager, then the finance owner, then an executive above a
   // threshold. The threshold rung is NOT optional: if the amount is large enough to need an
@@ -536,7 +570,11 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 100000 },
     ],
     escalateAfterHours: 72,
-    approvalUrl: '/admin/hr/leave/workflow',
+    // The claim is decided at /portal/employee/expenses — src/lib/expenses.ts put the decision there
+    // deliberately, precisely so the routed manager could reach it. The notification pointed at an
+    // admin page that lists ONLY leave instances, so it named the one place the claim is not.
+    approvalUrl: '/portal/employee/expenses',
+    requesterUrl: '/portal/employee/expenses',
   },
   // Money the company spends. The only chain with a genuinely PARALLEL rung: the department head and
   // the procurement owner both sit at step 2 and both must approve, because one is answering "does
@@ -577,7 +615,8 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 200000 },
     ],
     escalateAfterHours: 48,
-    approvalUrl: '/admin/hr/leave/workflow',
+    approvalUrl: '/portal/employee/expenses',
+    requesterUrl: '/portal/employee/expenses',
   },
 
   // ===============================================================================================
@@ -764,7 +803,15 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 200000 },
     ],
     escalateAfterHours: 72,
-    approvalUrl: '/admin/hr/payroll/loans',
+    // THE APPROVER COULD NOT OPEN THE ONLY SCREEN THAT OFFERED THE BUTTON.
+    //
+    // /admin/hr/payroll/loans is gated by `payroll.manage`, and `capability: null` above exists
+    // precisely so that ONLY the person the graph routed to may decide — an ordinary employee who
+    // almost never holds payroll.manage. So the loan sat 'pending' forever while the one authorised
+    // person was pointed at a locked door. /portal/approvals now shows them the step and decides it
+    // through the same decideStep() the admin console uses.
+    approvalUrl: '/portal/approvals',
+    requesterUrl: '/portal/employee/loans',
   },
 
   // A BONUS OR INCENTIVE.
@@ -789,7 +836,10 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 200000 },
     ],
     escalateAfterHours: 96,
-    approvalUrl: '/admin/hr/payroll/bonuses',
+    // Same inversion as `loan` above: the department head the graph routes to is not a payroll.manage
+    // holder. The bonus console stays where it is; the DECISION is reachable from the portal queue.
+    approvalUrl: '/portal/approvals',
+    requesterUrl: '/portal/employee',
   },
 
   // THE END OF A PROBATION — confirm, extend, or terminate.
@@ -1625,12 +1675,14 @@ async function notifyApprover(
 async function notifyRequester(instance: WorkflowInstanceRow, state: WorkflowState): Promise<void> {
   if (!instance.requestedByUserId) return;
   const label = domainLabel(instance.domain);
+  // THE REQUESTER'S OWN PAGE, not the approver queue. See DomainDefinition.requesterUrl.
+  const def = isWorkflowDomain(instance.domain) ? DOMAINS[instance.domain] : null;
   try {
     await sendPushToUser(instance.requestedByUserId, {
       type: 'workflow_settled',
       title: label + ' ' + STATE_LABELS[state].toLowerCase(),
       body: instance.summary || 'Your request has been decided.',
-      url: '/portal/approvals',
+      url: def?.requesterUrl || '/portal/approvals',
       tag: 'workflow-' + instance.id,
     });
   } catch (e: any) {
@@ -2334,31 +2386,27 @@ async function settleDomainRecord(
   if (instance.domain !== 'leave') return;
   if (!instance.recordId) return;
   try {
-    const wrote = rows(await db.execute(sql`
-      UPDATE hr_leave_request
-         SET status = ${state},
-             decided_by = ${actorId}::uuid,
-             decided_by_role = 'workflow',
-             decided_at = NOW(),
-             decision_note = ${'Decided through the approval workflow (' + instance.id + ')'}
-       WHERE id::text = ${instance.recordId}
-         AND status = 'pending'
-      RETURNING id, employee_id, leave_type, start_date, end_date`));
-
-    if (!wrote.length) return; // already decided the ordinary way — leave it alone.
-
-    if (state === 'approved') {
-      // Approving leave has to reach attendance, or the two modules disagree about the same day:
-      // payroll counts attendance, so an approved leave day with no attendance row is counted as
-      // nothing at all. Same function the ordinary path calls, imported dynamically so this module
-      // does not take a load-time dependency on the HR leave service.
-      const { markLeaveAttendance } = await import('@/lib/hr-leave');
-      await markLeaveAttendance(wrote[0]);
-    }
+    // THE SETTLEMENT ITSELF BELONGS TO THE LEAVE MODULE, AND IT IS ONE FUNCTION RATHER THAN TWO.
+    //
+    // This used to write the status and stamp attendance inline, and it did neither of the two other
+    // things a leave decision has to do. A comp-off request rejected HERE never got its credits back —
+    // they are spent the moment the request is filed — so days somebody earned from approved overtime
+    // were consumed against a request that was refused, with no reversal row and nothing on any screen
+    // saying where they went. And nobody was told the outcome at all. The SAME rejection through
+    // decideLeave() refunded correctly, so what happened to a person's comp off depended on which of
+    // two doors the decision came through.
+    //
+    // src/lib/hr-leave.ts settleLeaveFromWorkflow() is now the single settlement: same 'pending'
+    // guard, so a request already decided the ordinary way is still left exactly as it was left.
+    // Imported dynamically so this module keeps no load-time dependency on the HR leave service.
+    const { settleLeaveFromWorkflow } = await import('@/lib/hr-leave');
+    const settled = await settleLeaveFromWorkflow(instance.recordId, state, actorId, instance.id);
+    if (!settled.settled) return; // already decided the ordinary way — leave it alone.
 
     await auditWorkflow(actorId, 'settle.leave', instance.id, {
       recordId: instance.recordId,
       state,
+      warning: settled.warning || null,
     });
   } catch (e: any) {
     logFail('settleDomainRecord', e);

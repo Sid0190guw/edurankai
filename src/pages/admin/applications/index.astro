@@ -3,6 +3,8 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { applications, users } from '@/lib/db/schema';
 import { eq, desc, sql, and, or, ilike, inArray, gte } from 'drizzle-orm';
+// pageParam so a query-string page number can never reach OFFSET as NaN or a negative.
+import { pageParam } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -108,7 +110,11 @@ const url = new URL(Astro.request.url);
 const statusFilter = url.searchParams.get('status') || 'all';
 const search = url.searchParams.get('q') || '';
 const archivedFilter = url.searchParams.get('archived') || 'active';
-const page = parseInt(url.searchParams.get('page') || '1');
+// `parseInt(url.searchParams.get('page') || '1')` bound straight into OFFSET: `?page=abc` gives NaN
+// and `?page=0` gives OFFSET -20, both of which Postgres refuses — so the applications register 500d
+// on a URL anybody can type or a stale bookmark can hold. pageParam() always returns a positive
+// integer; it is clamped to the last real page below, once the count is known.
+const rawPage = pageParam(url.searchParams.get('page'));
 const perPage = 20;
 
 // Export CSV
@@ -161,8 +167,19 @@ if (search.trim()) {
 
 const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
 const totalResult = await db.select({ n: sql<number>`count(*)::int` }).from(applications).where(whereClause);
-const total = totalResult[0].n;
-const totalPages = Math.ceil(total / perPage);
+// WAS `totalResult[0].n`, unguarded. A count query returns exactly one row when it succeeds, so the
+// bare index is right on the happy path and a TypeError on the only path that is not: a driver that
+// hands back an empty result — the shape an unprovisioned `applications` table produces on a fresh
+// install — took the whole applications console to a blank 500. Zero applications and an unreadable
+// table both render as an empty list here, which is what a list screen should do; a 500 tells the
+// person looking at it nothing at all. The pager below already clamps a zero total correctly.
+const total = Number(totalResult?.[0]?.n) || 0;
+// Math.ceil(0/20) is 0, and the pager rendered that as "Page 1 of 0" on an empty filter. A page
+// count is never below one: there is always the page you are looking at, even when it holds nothing.
+const totalPages = Math.max(1, Math.ceil(total / perPage));
+// Asking for page 900 of a 3-page list used to return an empty table that looked exactly like a
+// filter matching nothing. Clamping means the last page is shown instead.
+const page = Math.min(rawPage, totalPages);
 
 const apps = await db.select({
   id: applications.id, applicationNumber: applications.applicationNumber,

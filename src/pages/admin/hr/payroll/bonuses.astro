@@ -25,11 +25,20 @@ import { can } from '@/lib/auth/permissions';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { isInitialized } from '@/lib/org-graph';
-import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import { decideInstance, getInstance, resumeWorkflow, VIA_LABELS } from '@/lib/workflow';
 import {
   ensureBonusSchema, listBonuses, requestBonus, cancelBonus, syncBonusApprovals,
   bonusKindLabel, bonusStateLabel, BONUS_KINDS, type BonusRow,
 } from '@/lib/payroll-bonuses';
+// CONFIRMATION PROMPTS ARE ESCAPED, NOT STRIPPED. These were built with `.replace(/'/g, '')`,
+// which DELETES the apostrophe — the admin was asked to confirm an action against "OBrien", a person
+// who does not exist, which is the one thing a confirmation exists to let them check. A value
+// carrying a newline ended the JS string literal outright, the handler became a syntax error,
+// confirm() never fired, and the destructive form submitted with no confirmation at all.
+import { confirmAttr, clip, civilToday } from '@/lib/page-safety';
+// sumMoney adds integer paise and round2 rounds the decimal value, so a summary tile equals the
+// awards printed beneath it.
+import { sumMoney, round2 } from '@/lib/money';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -146,6 +155,26 @@ if (Astro.request.method === 'POST') {
           flash = parts.join(' ');
         }
       }
+    } else if (action === 'resume') {
+      // A HALTED AWARD USED TO BE PERMANENTLY DEAD. The banner said "resume it from the approvals
+      // workflow"; the only resume console is /admin/hr/leave/workflow and it is hard-scoped to the
+      // `leave` domain, so a halted bonus never appeared on it and no surface in the product could
+      // move it again. resumeWorkflow() brings no gate of its own — this page's is `payroll.manage`,
+      // tested at the top, the same key that raises an award here. It cannot decide anything: it
+      // re-routes to whoever the graph names and leaves the instance halted when it names nobody.
+      const r = await resumeWorkflow(String(fd.get('instance_id') || ''), user as any);
+      if (!r.ok) {
+        flash = r.error || 'The award was not resumed.';
+      } else if (r.state === 'halted') {
+        flash = 'Still halted: ' + (r.haltReason || 'the graph still names nobody for a required rung.')
+          + ' Nothing has been paid.';
+      } else {
+        flash = 'Resumed. It carries on from the rung it stopped at; nothing earlier was re-decided.';
+      }
+      if (r.ok) {
+        const sync = await syncBonusApprovals(user.id);
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
     } else if (action === 'cancel') {
       const r = await cancelBonus(String(fd.get('bonus_id') || ''), user.id);
       flash = r.ok ? 'Award withdrawn.' : (r.error || 'The award was not withdrawn.');
@@ -199,12 +228,47 @@ const openCount = awards.filter((b) => b.state === 'pending' || b.state === 'hal
 const approved = awards.filter((b) => b.state === 'approved');
 const settled = awards.filter((b) => ['spent', 'rejected', 'cancelled'].indexOf(b.state) >= 0);
 const haltedCount = awards.filter((b) => b.state === 'halted').length;
-const committed = approved.reduce((s, b) => s + b.amount * b.remainingOccurrences, 0);
-const currency = String(awards[0]?.currency || 'INR');
+// ===================================================================================================
+// WHAT IS STILL COMMITTED, PER CURRENCY, AND EQUAL TO THE AWARDS BENEATH IT
+// ===================================================================================================
+//
+// This was `approved.reduce((s, b) => s + b.amount * b.remainingOccurrences, 0)` labelled with
+// `awards[0]?.currency`. Three things were wrong with one tile:
+//
+//   * hr_bonus_awards carries a currency and every other figure on this page prints its own
+//     (`money(b.amount, b.currency)`). src/lib/payroll.ts REFUSES to add an award in another currency
+//     to a payslip and says so on the gap list — and this tile added them anyway and labelled the sum
+//     with whichever award sorted first. "Approved and still to pay" is the forward commitment
+//     number; it must not be a sum of two different moneys.
+//   * `amount * remainingOccurrences` is an unrounded product added into a running double. Each term
+//     is rounded to the paisa before it enters the sum, and the sum is integer paise.
+//   * remainingOccurrences is clamped at zero, so a stale negative on a row cannot subtract from what
+//     the company still owes everybody else.
+const committedBuckets = new Map<string, number[]>();
+for (const b of approved) {
+  const cur = String(b.currency || 'INR').toUpperCase();
+  const occurrences = Math.max(0, Number(b.remainingOccurrences) || 0);
+  const bucket = committedBuckets.get(cur) || [];
+  bucket.push(round2(Number(b.amount) * occurrences));
+  committedBuckets.set(cur, bucket);
+}
+const committedByCurrency: Array<{ currency: string; total: number }> = [];
+committedBuckets.forEach((amounts, cur) => {
+  committedByCurrency.push({ currency: cur, total: sumMoney(amounts) });
+});
+committedByCurrency.sort((a, b) => a.currency.localeCompare(b.currency));
+const committedLabel = committedByCurrency.length === 0
+  ? money(0, 'INR')
+  : committedByCurrency.map((c) => money(c.total, c.currency)).join('  +  ');
 
-const now = new Date();
-const thisMonth = now.getMonth() + 1;
-const thisYear = now.getFullYear();
+// THE MONTH THIS FORM DEFAULTS TO, IN THE ZONE THE COMPANY WORKS IN.
+//
+// `new Date().getMonth()` reads the PROCESS clock, which is UTC here. Between 00:00 and 05:29 IST on
+// the 1st it is still the previous month there, so "pay from" defaulted to a month that may already
+// have been run — and an award dated into a closed month is an award that never appears on a payslip.
+const civilNow = civilToday();
+const thisMonth = Number(civilNow.slice(5, 7)) || 1;
+const thisYear = Number(civilNow.slice(0, 4)) || new Date().getUTCFullYear();
 const yearOptions = [thisYear, thisYear + 1];
 ---
 <AdminLayout title="Bonuses and incentives" activeNav="hr">
@@ -233,7 +297,7 @@ const yearOptions = [thisYear, thisYear + 1];
     <div class="tile"><span class="tv">{openCount}</span><span class="tl">Waiting on a decision</span></div>
     <div class="tile"><span class="tv">{approved.length}</span><span class="tl">Approved, awaiting a run</span></div>
     <div class="tile"><span class="tv">{haltedCount}</span><span class="tl">Halted</span></div>
-    <div class="tile"><span class="tv">{money(committed, currency)}</span><span class="tl">Approved and still to pay</span></div>
+    <div class="tile"><span class="tv">{committedLabel}</span><span class="tl">{committedByCurrency.length > 1 ? 'Approved and still to pay, per currency (not added together)' : 'Approved and still to pay'}</span></div>
   </div>
 
   <details class="panel">
@@ -322,8 +386,26 @@ const yearOptions = [thisYear, thisYear + 1];
 
           {d.b.state === 'halted' && (
             <div class="halt">
-              <strong>Halted.</strong> {d.b.haltReason || 'No approver could be resolved.'}
-              <span class="hint">Nothing has been paid. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+              <strong>Halted.</strong> {d.b.haltReason || (graphReady
+                ? 'No approver could be resolved.'
+                : 'The Organization Graph has not been initialized, so no approver could be resolved for anybody yet.')}
+              {/* "Resume it from the approvals workflow" pointed at /admin/hr/leave/workflow, which
+                  lists only the leave domain. The button is here now, on the award it concerns. */}
+              <span class="hint">
+                {graphReady
+                  ? 'Nothing has been paid. Record the missing relationship in the Organization Graph, then press Resume below — the approval carries on from the rung it stopped at.'
+                  : 'Nothing has been paid. This is NOT a claim that this person has no manager: the Organization Graph has not been initialized at all, so nothing can be routed yet. Initialize it, then press Resume below.'}
+              </span>
+              {d.instance && (
+                <form method="POST" class="inline">
+                  <input type="hidden" name="action" value="resume" />
+                  <input type="hidden" name="instance_id" value={d.instance.id} />
+                  <button type="submit" class="btn ghost">Resume this approval</button>
+                </form>
+              )}
+              {!d.instance && (
+                <span class="hint">There is no approval instance on this award to resume — withdraw it and raise it again once the graph names an approver.</span>
+              )}
             </div>
           )}
 
@@ -350,7 +432,7 @@ const yearOptions = [thisYear, thisYear + 1];
           )}
 
           {/* Withdrawing ends an approval somebody may already have acted on. It named nothing. */}
-          <form method="POST" class="inline" onsubmit={`return confirm('Withdraw the ${String(d.b.title).replace(/'/g, '')} award of ${money(d.b.amount, d.b.currency)} for ${String(d.b.employeeName || 'this employee').replace(/'/g, '')}? The approval in progress ends, nothing is paid, and raising it again starts a new approval from the beginning.')`}>
+          <form method="POST" class="inline" onsubmit={confirmAttr('Withdraw the ' + clip(d.b.title, 60) + ' award of ' + money(d.b.amount, d.b.currency) + ' for ' + clip(d.b.employeeName || 'this employee', 80) + '? The approval in progress ends, nothing is paid, and raising it again starts a new approval from the beginning.')}>
             <input type="hidden" name="action" value="cancel" />
             <input type="hidden" name="bonus_id" value={d.b.id} />
             <button type="submit" class="btn ghost">Withdraw this award</button>
@@ -379,7 +461,7 @@ const yearOptions = [thisYear, thisYear + 1];
               <td>{MONTH_OPTIONS[b.effectiveMonth - 1]?.l} {b.effectiveYear}</td>
               <td>
                 {b.timesPaid === 0 && (
-                  <form method="POST" onsubmit={`return confirm('Withdraw the approved ${String(b.title).replace(/'/g, '')} award of ${money(b.amount, b.currency)} for ${String(b.employeeName || 'this employee').replace(/'/g, '')}? It is approved and waiting on a payroll run; withdrawing it means it is never paid.')`}>
+                  <form method="POST" onsubmit={confirmAttr('Withdraw the approved ' + clip(b.title, 60) + ' award of ' + money(b.amount, b.currency) + ' for ' + clip(b.employeeName || 'this employee', 80) + '? It is approved and waiting on a payroll run; withdrawing it means it is never paid.')}>
                     <input type="hidden" name="action" value="cancel" />
                     <input type="hidden" name="bonus_id" value={b.id} />
                     <button type="submit" class="btn ghost small">Withdraw</button>

@@ -20,7 +20,7 @@
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import {
-  claimsForEmployee, routeWithdrawals, claimApprovalTrail, decisionsAwaiting,
+  claimsForEmployee, routeWithdrawals, claimApprovalTrail, decisionsAwaiting, openAdvances,
   CLAIM_KINDS, CLAIM_KIND_LABELS, CLAIM_KIND_HINTS, CLAIM_CATEGORIES,
   type ClaimKind, type Claim,
 } from '@/lib/expenses';
@@ -71,9 +71,31 @@ for (const c of claims) {
   }
 }
 
+// =================================================================================================
+// ADVANCES THIS PERSON HAS BEEN PAID AND HAS NOT YET ACCOUNTED FOR
+// =================================================================================================
+//
+// CLAIM_KIND_HINTS.advance tells everybody who raises one: "You will still submit a claim afterwards
+// for what you actually spent." Nothing kept that promise. There was no link between an advance and
+// the claim that follows it, so the company credited the advance, then credited the reimbursement for
+// the SAME spend, and no screen or query anywhere paired them. Money left twice against one expense.
+//
+// This is the surface half of the repair. The claim form now offers these, and creditApprovedClaim()
+// subtracts whichever one is chosen from what reaches the wallet.
+//
+// IT IS SHOWN EVEN WHEN THE LIST IS EMPTY OF CHOICES — see the panel below. An outstanding advance is
+// money of the company's that a person is holding, and the one place they will see it is the page
+// where they raise the claim that clears it.
+const advances = employee ? await openAdvances(String(employee.id), 20) : [];
+
 const today = new Date().toISOString().slice(0, 10);
 const currency = String(employee?.currency || 'INR');
 const categories = CLAIM_CATEGORIES[kind];
+
+// An advance can only be accounted for by a claim for money already spent, and only in the currency
+// it was paid in — submitClaim() refuses both, and offering a choice it will refuse is a form that
+// wastes somebody's typing. An advance cannot settle an advance.
+const settleable = kind === 'advance' ? [] : advances.filter((a) => a.currency === currency);
 
 const money = (n: any, cur: string) =>
   (cur || 'INR') + ' ' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -290,6 +312,24 @@ const inbox = await decisionsAwaiting(String(user.id));
             </div>
           )}
 
+          {settleable.length > 0 && (
+            <div>
+              <label for="settles_advance_id">Is this accounting for an advance</label>
+              <select id="settles_advance_id" name="settles_advance_id">
+                <option value="">No - this is a separate expense</option>
+                {settleable.map((a) => (
+                  <option value={a.id}>{a.title + ' - ' + money(a.amount, a.currency)}</option>
+                ))}
+              </select>
+              <div class="note">
+                Pick the advance this spend was paid out of. Whatever the advance already covered is
+                subtracted from this claim, so only the difference is credited to your wallet - the
+                company does not pay for the same thing twice. If you spent less than the advance, the
+                balance is yours to return and the claim will say how much.
+              </div>
+            </div>
+          )}
+
           <label for="description">Details</label>
           <textarea id="description" name="description" required maxlength="4000" placeholder="What this was for, and anything an approver would otherwise have to ask you."></textarea>
 
@@ -379,8 +419,29 @@ const inbox = await decisionsAwaiting(String(user.id));
                 <span class="pill" style={`margin-top:5px;color:${stateColour[c.status]};background:${stateColour[c.status]}18;`}>{c.statusLabel}</span>
               </div>
             </div>
-            {c.status === 'reimbursed' && (
+            {c.status === 'reimbursed' && c.advanceOffset <= 0 && (
               <div class="trail">Credited to your wallet. <a class="inline" href="/portal/employee/wallet">Open your wallet</a> to withdraw it to a bank account.</div>
+            )}
+
+            {/*
+              A CLAIM THAT WAS NETTED AGAINST AN ADVANCE SAYS SO, HERE, IN FULL.
+
+              Without this the person sees "Paid into your wallet" over an amount and finds a smaller
+              credit, or none at all, and has nothing on the record explaining the difference — which
+              is indistinguishable from being short-paid. The three numbers are the ones that decide
+              whether they are owed anything or still holding something.
+            */}
+            {c.status === 'reimbursed' && c.advanceOffset > 0 && (
+              <div class="trail">
+                Approved {money(c.amount, c.currency)}, of which {money(c.advanceOffset, c.currency)} had
+                already been paid to you as an advance.
+                {c.amount - c.advanceOffset > 0
+                  ? ' ' + money(c.amount - c.advanceOffset, c.currency) + ' was credited to your wallet.'
+                  : ' Nothing further was credited, because the advance already covered it.'}
+                {c.advanceReturnable > 0 && (
+                  <span> You are still holding {money(c.advanceReturnable, c.currency)} of that advance. Return it to HR - nothing has been taken back from your wallet automatically.</span>
+                )}
+              </div>
             )}
             {c.status === 'approved' && (
               <div class="trail" style="color:#8a4b06;">Approved, but the credit to your wallet has not gone through yet. Tell HR if it stays like this.</div>
