@@ -30,5 +30,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
       VALUES (${user.id}, ${(user.email || '').toString()}, ${(user.name || '').toString()}, ${idType || null}, ${url}, 'pending', 'self_upload', NOW())
     `).catch(() => {});
     return json({ ok: true });
-  } catch (e: any) { return json({ ok: false, error: String(e?.message || e).slice(0, 160) }, 500); }
+  } catch (e: any) {
+    // NEITHER SWALLOWED NOR ECHOED. This was the one endpoint in the folder still returning
+    // `e.message` to the caller, and on postgres-js e.message is the SQL STATEMENT THAT FAILED —
+    // table and column names handed to whoever posted — while the database's own reason sits
+    // unread on e.cause and nothing was written to the log at all. So a document that never saved
+    // reported a fragment of the schema to the user and left no trace for anyone looking into it.
+    console.error('[api/auth/save-id-doc]', e?.cause?.message || e?.message, e?.stack);
+    return json({ ok: false, error: 'We could not save that document. Please try again.' }, 500);
+  }
 };

@@ -20,11 +20,12 @@
 // somebody who has gone, whose leave routes to nobody and whose approvals halt with no trace back
 // to this exit.
 import AdminLayout from '@/layouts/AdminLayout.astro';
+import { flashFailed } from '@/lib/flash-tone';
 import { canAccessSection, can } from '@/lib/auth/permissions';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { isInitialized } from '@/lib/org-graph';
-import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import { decideInstance, getInstance, resumeWorkflow, VIA_LABELS } from '@/lib/workflow';
 import {
   ensureExitSchema,
   openSeparation,
@@ -132,6 +133,30 @@ if (Astro.request.method === 'POST') {
       );
       flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
       if (r.ok) await syncSeparationApprovals();
+    } else if (action === 'resume' && mayWrite) {
+      // THE `&& mayWrite` IS LOAD-BEARING. This branch sits ABOVE the chain's `!mayWrite` arm because
+      // it has to sit beside 'decide' — but 'decide' is safe there only because decideInstance()
+      // re-checks the actor itself, and resumeWorkflow() explicitly does NOT. Without this test a
+      // read-only account could re-route somebody else's approval. Falling through leaves the
+      // refusal sentence the chain already has.
+      //
+      // A HALTED REQUEST USED TO BE A DEAD END. The banner said "resume it from the approvals
+      // workflow" — the only resume console is /admin/hr/leave/workflow and it is hard-scoped to the
+      // `leave` domain, so this separation never appeared on it and no surface could move it again.
+      // resumeWorkflow() carries no entitlement check of its own; the gate is the test on this line. It cannot decide anything — it re-routes to whoever the graph names, and
+      // leaves the instance halted with the current reason when the graph still names nobody.
+      const r = await resumeWorkflow(String(fd.get('instance_id') || ''), user as any);
+      if (!r.ok) {
+        flash = r.error || 'The separation was not resumed.';
+      } else if (r.state === 'halted') {
+        flash = 'Still halted: ' + (r.haltReason || 'the graph still names nobody for a required rung.')
+          + ' Nothing has been approved.';
+      } else {
+        flash = 'Resumed. It carries on from the rung it stopped at; nothing earlier was re-decided.';
+      }
+      if (r.ok) {
+        await syncSeparationApprovals();
+      }
     } else if (!mayWrite) {
       flash = 'You can read separations, but changing one needs the employee-records permission.';
     } else if (action === 'open') {
@@ -269,8 +294,17 @@ const haltedCount = separations.filter((s: any) => String(s.approval_state || ''
     the Organization Graph with the date they left — their record of who they managed and who approved
     what survives, which it would not if the edges were deleted.
   </p>
+  {/* An exit that was never opened here cannot appear here. A record closed by hand, or closed before
+      the Organization Graph existed, leaves edges nothing on this page will ever reach — and a person
+      whose last working day has passed while their record is still active holds live access that no
+      list here counts. Those joins are on /admin/hr/reconciliation. */}
+  <p class="lede">
+    Exits that were never opened on this page &mdash; a record closed by hand, or closed before the
+    graph existed &mdash; leave open edges and live access that nothing here counts.
+    <a class="link" href="/admin/hr/reconciliation"> Joining and leaving: reconciliation</a> finds them.
+  </p>
 
-  {msg && <div class="flash">{msg}</div>}
+  {msg && <div class={flashFailed(msg) ? 'flash warn' : 'flash'} role={flashFailed(msg) ? 'alert' : 'status'}>{msg}</div>}
   {syncedApprovals.errors.length > 0 && <div class="flash warn">{syncedApprovals.errors[0]}</div>}
   {!mayWrite && (
     <div class="flash warn">You can read separations. Opening or closing one needs the employee-records permission.</div>
@@ -362,8 +396,24 @@ const haltedCount = separations.filter((s: any) => String(s.approval_state || ''
             )}
             {String(d.s.approval_state || '') === 'halted' && (
               <div class="halt">
-                <strong>Halted.</strong> {d.s.halt_reason || 'No approver could be resolved.'}
-                <span class="hint">Nothing has been approved. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+                <strong>Halted.</strong> {d.s.halt_reason || (graphReady
+                  ? 'No approver could be resolved.'
+                  : 'The Organization Graph has not been initialized, so no approver could be resolved for anybody yet.')}
+                <span class="hint">
+                  {graphReady
+                    ? 'Nothing has been approved. Record the missing relationship in the Organization Graph, then press Resume below — the approval carries on from the rung it stopped at.'
+                    : 'Nothing has been approved. This is NOT a claim that this person has no manager: the Organization Graph has not been initialized at all, so nothing can be routed yet. Initialize it, then press Resume below.'}
+                </span>
+                {mayWrite && d.instance && (
+                  <form method="POST" class="inline">
+                    <input type="hidden" name="action" value="resume" />
+                    <input type="hidden" name="instance_id" value={d.instance.id} />
+                    <button type="submit" class="btn ghost">Resume this approval</button>
+                  </form>
+                )}
+                {mayWrite && !d.instance && (
+                  <span class="hint">There is no approval instance on this separation to resume — raise the approval again once the graph names an approver.</span>
+                )}
               </div>
             )}
             {d.instance && d.instance.state === 'pending' && d.waiting.length > 0 && (
@@ -596,6 +646,7 @@ const haltedCount = separations.filter((s: any) => String(s.approval_state || ''
   h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
   h3 { font-size: 10.5px; color: #FF7040; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 20px 0 8px; }
   .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .link { color: #9bd1ff; }
   .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
   .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 18px; }

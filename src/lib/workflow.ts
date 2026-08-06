@@ -246,6 +246,21 @@ export const WORKFLOW_DOMAINS = [
   // ---------------------------------------------------------------------------------------------
   'overtime',
   'timesheet',
+  // ---------------------------------------------------------------------------------------------
+  // BENEFITS. One domain, for ELECTING a benefit that has to be chosen — a cover level, an
+  // allowance somebody opts into (src/lib/benefits.ts).
+  //
+  // ADDED HERE RATHER THAN GIVEN A PATH OF ITS OWN INSIDE THE BENEFITS MODULE, for the reason this
+  // array's own header states: an election decided by a rule inside src/lib/benefits.ts would be a
+  // second approval engine, and within a month the two would disagree about who signs off an
+  // employee opting into cover.
+  //
+  // WHAT IS NOT HERE. Most benefits need no election at all — they apply to whoever the eligibility
+  // rules cover, and the catalogue simply says how to claim them. Only a benefit HR marked as
+  // needing an election starts one of these. Wrapping every entitlement in an approval would mean
+  // nobody ever receives anything they are already owed.
+  // ---------------------------------------------------------------------------------------------
+  'benefits',
 ] as const;
 
 export type WorkflowDomain = (typeof WORKFLOW_DOMAINS)[number];
@@ -418,10 +433,40 @@ export function isAllowedTransition(from: string, to: string): boolean {
  *   minAmount the rule only applies when the instance's amount is at or above this. Below it the
  *             rung does not exist at all — it is not skipped, it was never part of this chain.
  */
+/**
+ * THE CURRENCY EVERY `minAmount` BELOW IS WRITTEN IN.
+ *
+ * It was never stated anywhere, and the comparison in resolveRoute() was a bare `amount >= minAmount`
+ * against instances that carry their own currency column — so a USD figure was measured against a
+ * rupee threshold and came out small. Naming the unit does not convert anything; it makes the
+ * mismatch DETECTABLE, which is what resolveRoute() needs in order to refuse to guess.
+ *
+ * If these thresholds are ever re-expressed in another currency, this constant moves with them and
+ * every comparison follows. Declared here, above the route table that uses it — const is not hoisted.
+ */
+const ROUTE_THRESHOLD_CURRENCY = 'INR';
+
 interface RouteRule {
   step: number;
   via: RouteVia;
+  /**
+   * When this rule resolves NOBODY, skip the rung instead of halting the request.
+   *
+   * DECLARED AT LAST. The doc block above this interface documents `optional`, twenty-odd route
+   * literals below set it, and resolveRoute() reads `rule.optional` to decide between skipping a rung
+   * and halting with "nobody is named" — but the interface never declared it, so the one property that
+   * decides whether an unstaffed rung stops a request existed only by convention. Any reader outside
+   * this file had to reach it through a structural cast, and a typo in a route literal would have been
+   * silently ignored rather than refused at compile time.
+   *
+   * Additive: it is optional, every existing literal already conforms, and no behaviour changes.
+   */
   optional?: boolean;
+  /**
+   * The rule applies at or above this figure, expressed in ROUTE_THRESHOLD_CURRENCY. An instance in
+   * another currency, or one with no amount at all, cannot be compared and KEEPS the rung — see
+   * resolveRoute().
+   */
   minAmount?: number;
 }
 
@@ -453,6 +498,18 @@ interface DomainDefinition {
   escalateAfterHours: number;
   /** Where a notification about this domain should send somebody. */
   approvalUrl: string;
+  /**
+   * Where the notification about a SETTLED request sends the person who raised it.
+   *
+   * notifyRequester() sent everybody to '/portal/approvals' — an APPROVER's queue. Somebody told
+   * "Expense claim approved" or "Loan or salary advance rejected" tapped it and landed on a list of
+   * other people's pending requests, which cannot show the decision they were just told about. Their
+   * own request lives on their own page, and this is where that is named.
+   *
+   * Optional: a domain that does not set one keeps the previous destination, so nothing that has not
+   * been checked is moved.
+   */
+  requesterUrl?: string;
 }
 
 /**
@@ -479,7 +536,15 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 2, via: 'approval_owner', optional: true },
     ],
     escalateAfterHours: 48,
-    approvalUrl: '/admin/hr/leave/workflow',
+    // WHERE THE ROUTED APPROVER CAN ACTUALLY DECIDE IT.
+    //
+    // This pointed at /admin/hr/leave/workflow, which is gated by the `leave` admin section. The
+    // person the graph routes a leave request to is that employee's REPORTING MANAGER — an ordinary
+    // employee who almost never holds an admin section — so the one person authorised to decide was
+    // sent to a page that redirects them. /portal/approvals now carries every routed request the
+    // reader may act on, whatever the domain, and decideStep() re-checks authority at the write.
+    approvalUrl: '/portal/approvals',
+    requesterUrl: '/portal/employee/leave',
   },
   // A single rung on purpose. An attendance correction is a small factual claim about one day; a
   // three-rung chain for it would mean nobody ever corrects anything.
@@ -489,7 +554,8 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     capability: null,
     route: [{ step: 1, via: 'reporting_manager' }],
     escalateAfterHours: 72,
-    approvalUrl: '/admin/hr/leave/workflow',
+    approvalUrl: '/portal/employee/attendance/approvals',
+    requesterUrl: '/portal/employee/attendance',
   },
   // Money the company pays back. Manager, then the finance owner, then an executive above a
   // threshold. The threshold rung is NOT optional: if the amount is large enough to need an
@@ -504,7 +570,11 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 100000 },
     ],
     escalateAfterHours: 72,
-    approvalUrl: '/admin/hr/leave/workflow',
+    // The claim is decided at /portal/employee/expenses — src/lib/expenses.ts put the decision there
+    // deliberately, precisely so the routed manager could reach it. The notification pointed at an
+    // admin page that lists ONLY leave instances, so it named the one place the claim is not.
+    approvalUrl: '/portal/employee/expenses',
+    requesterUrl: '/portal/employee/expenses',
   },
   // Money the company spends. The only chain with a genuinely PARALLEL rung: the department head and
   // the procurement owner both sit at step 2 and both must approve, because one is answering "does
@@ -545,7 +615,8 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 200000 },
     ],
     escalateAfterHours: 48,
-    approvalUrl: '/admin/hr/leave/workflow',
+    approvalUrl: '/portal/employee/expenses',
+    requesterUrl: '/portal/employee/expenses',
   },
 
   // ===============================================================================================
@@ -732,7 +803,15 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 200000 },
     ],
     escalateAfterHours: 72,
-    approvalUrl: '/admin/hr/payroll/loans',
+    // THE APPROVER COULD NOT OPEN THE ONLY SCREEN THAT OFFERED THE BUTTON.
+    //
+    // /admin/hr/payroll/loans is gated by `payroll.manage`, and `capability: null` above exists
+    // precisely so that ONLY the person the graph routed to may decide — an ordinary employee who
+    // almost never holds payroll.manage. So the loan sat 'pending' forever while the one authorised
+    // person was pointed at a locked door. /portal/approvals now shows them the step and decides it
+    // through the same decideStep() the admin console uses.
+    approvalUrl: '/portal/approvals',
+    requesterUrl: '/portal/employee/loans',
   },
 
   // A BONUS OR INCENTIVE.
@@ -757,7 +836,10 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 200000 },
     ],
     escalateAfterHours: 96,
-    approvalUrl: '/admin/hr/payroll/bonuses',
+    // Same inversion as `loan` above: the department head the graph routes to is not a payroll.manage
+    // holder. The bonus console stays where it is; the DECISION is reachable from the portal queue.
+    approvalUrl: '/portal/approvals',
+    requesterUrl: '/portal/employee',
   },
 
   // THE END OF A PROBATION — confirm, extend, or terminate.
@@ -815,6 +897,40 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     route: [{ step: 1, via: 'reporting_manager' }],
     escalateAfterHours: 96,
     approvalUrl: '/portal/employee/attendance/approvals',
+  },
+
+  // ===============================================================================================
+  // ELECTING A BENEFIT.
+  //
+  // ONE RUNG, AND IT IS DELIBERATELY NOT THE REPORTING MANAGER. Read this before changing it.
+  //
+  // What somebody elects says things about them that are not their line manager's business: which
+  // cover level they need says something about their health, and adding a dependant says something
+  // about their family. Routing an election through the manager would make every one of those a
+  // disclosure to the person who writes their appraisal, in exchange for a sign-off the manager has
+  // no basis to give — they do not know what the policy costs or who it covers. So the rung is the
+  // BENEFITS APPROVAL OWNER: an `approval_owner` edge scoped to the domain 'benefits', which is the
+  // desk that actually administers the scheme.
+  //
+  // THE RUNG IS REQUIRED, NOT OPTIONAL, and that is the whole safety property. Where an organisation
+  // has named nobody, every election HALTS with "no approval owner is recorded for this kind of
+  // request" and waits on the queue until the founder records that one edge. The alternative — an
+  // optional rung — would leave the chain empty, and resolveRoute() would then halt anyway rather
+  // than settle it approved. Making it required simply says WHICH relationship is missing, which is
+  // the sentence somebody can act on.
+  //
+  // `capability: null`, like every domain but `leave`. There is no key in permissions.ts whose
+  // holders mean "may approve anybody's benefit election"; the key that opens the benefits console
+  // is about CONFIGURING what the company offers, and mapping it here would let the desk that wrote
+  // the policy approve people into it unilaterally.
+  // ===============================================================================================
+  benefits: {
+    key: 'benefits',
+    label: 'Benefit election',
+    capability: null,
+    route: [{ step: 1, via: 'approval_owner' }],
+    escalateAfterHours: 96,
+    approvalUrl: '/admin/hr/benefits/enrolments',
   },
 };
 
@@ -1069,7 +1185,7 @@ function missingRungReason(via: RouteVia, subjectName: string): string {
 export async function resolveRoute(
   domain: WorkflowDomain,
   subjectEmployeeId: string,
-  opts: { amount?: number | null; asOf?: Date | null } = {},
+  opts: { amount?: number | null; currency?: string | null; asOf?: Date | null } = {},
 ): Promise<RoutePlan> {
   const def = DOMAINS[domain];
   if (!def) {
@@ -1085,9 +1201,34 @@ export async function resolveRoute(
     return { ok: false, initialized: false, approvers: [], haltReason: HALT_NOT_INITIALIZED };
   }
 
-  const amount = typeof opts.amount === 'number' && isFinite(opts.amount) ? opts.amount : 0;
+  // ===============================================================================================
+  // WHICH RUNGS THIS AMOUNT ACTUALLY NEEDS — AND WHAT HAPPENS WHEN THE AMOUNT CANNOT BE COMPARED
+  // ===============================================================================================
+  //
+  // This was `def.route.filter((r) => !r.minAmount || amount >= r.minAmount)` with `amount` defaulted
+  // to 0, and it dropped approval rungs in two situations where nobody chose to drop them:
+  //
+  //   1. NO AMOUNT GIVEN. Every threshold rung silently vanished, so a caller that forgot the field
+  //      got a shorter chain than the same request with the figure filled in. A missing figure is not
+  //      evidence that a request is small.
+  //   2. A DIFFERENT CURRENCY. The thresholds below (100000, 200000, 500000) are RUPEE figures, and
+  //      the comparison was against a bare number. A USD 3,000 procurement request — roughly two and
+  //      a half lakh — failed `3000 >= 200000`, so the executive-sponsor rung was dropped and a
+  //      manager alone approved what a 200,001 rupee request could not have been.
+  //
+  // There is no exchange rate in this codebase and inventing one here would be a policy decision
+  // dressed up as arithmetic. So when the figure cannot be compared, the rung is KEPT. That is the
+  // safe direction and the only defensible one: the failure mode of keeping it is one more person
+  // being asked to approve, which is visible and correctable; the failure mode of dropping it is
+  // money leaving on fewer signatures than the organisation decided it needed, which nobody sees.
+  //
+  // A rung kept this way can still HALT if no executive sponsor is recorded. That is the documented
+  // behaviour of a required rung, and a halt that says so is better than a quiet short chain.
+  const amount = typeof opts.amount === 'number' && isFinite(opts.amount) ? opts.amount : null;
+  const currency = opts.currency ? String(opts.currency).trim().toUpperCase() : null;
+  const comparable = amount !== null && (!currency || currency === ROUTE_THRESHOLD_CURRENCY);
   const asOf = opts.asOf ?? null;
-  const applicable = def.route.filter((r) => !r.minAmount || amount >= r.minAmount);
+  const applicable = def.route.filter((r) => !r.minAmount || !comparable || (amount as number) >= r.minAmount);
 
   // How many rules share each step number — that is what makes a step parallel, and it is derived
   // from the rules rather than stored, so the two cannot disagree.
@@ -1534,12 +1675,14 @@ async function notifyApprover(
 async function notifyRequester(instance: WorkflowInstanceRow, state: WorkflowState): Promise<void> {
   if (!instance.requestedByUserId) return;
   const label = domainLabel(instance.domain);
+  // THE REQUESTER'S OWN PAGE, not the approver queue. See DomainDefinition.requesterUrl.
+  const def = isWorkflowDomain(instance.domain) ? DOMAINS[instance.domain] : null;
   try {
     await sendPushToUser(instance.requestedByUserId, {
       type: 'workflow_settled',
       title: label + ' ' + STATE_LABELS[state].toLowerCase(),
       body: instance.summary || 'Your request has been decided.',
-      url: '/portal/approvals',
+      url: def?.requesterUrl || '/portal/approvals',
       tag: 'workflow-' + instance.id,
     });
   } catch (e: any) {
@@ -1629,7 +1772,7 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<Workflow
       };
     }
 
-    const plan = await resolveRoute(domain, subject, { amount });
+    const plan = await resolveRoute(domain, subject, { amount, currency });
     const state: WorkflowState = plan.ok ? 'pending' : 'halted';
 
     // draft -> pending / draft -> halted. Asked rather than assumed, so this file has exactly one
@@ -1889,10 +2032,22 @@ async function advanceInstance(instanceId: string, actorId: string | null): Prom
     await db.execute(sql`
       UPDATE workflow_steps SET decision = 'skipped'
        WHERE instance_id = ${instanceId}::uuid AND decision = 'pending'`);
-    await db.execute(sql`
+    // THE GUARD WAS ALREADY RIGHT. ITS ANSWER WAS BEING THROWN AWAY.
+    //
+    // `AND state = 'pending'` means at most ONE caller can perform this transition — but the result
+    // was never read, so every caller that raced here went on to audit, notify and settle anyway. Two
+    // approvers deciding within the same second wrote two 'rejected' audit rows naming two different
+    // actors and sent the requester the same notification twice. settleDomainRecord() happens to
+    // carry its own status guard for the one domain that needs it, which is luck of that domain and
+    // not a property of this function: any domain added there later without a guard would have the
+    // settlement applied twice. RETURNING makes the write itself say whether THIS call is the one
+    // that moved the state, and everything after it now depends on that answer.
+    const didReject = rows(await db.execute(sql`
       UPDATE workflow_instances
          SET state = 'rejected', settled_at = NOW(), updated_at = NOW()
-       WHERE id = ${instanceId}::uuid AND state = 'pending'`);
+       WHERE id = ${instanceId}::uuid AND state = 'pending'
+      RETURNING id`));
+    if (!didReject.length) return 'rejected';
     await auditWorkflow(actorId, 'rejected', instanceId, {
       domain: instance.domain,
       recordId: instance.recordId,
@@ -1907,10 +2062,14 @@ async function advanceInstance(instanceId: string, actorId: string | null): Prom
   if (stillPending.length === 0) {
     const gate = canTransition('pending', 'approved');
     if (!gate.ok) return current;
-    await db.execute(sql`
+    // Same shape, same reason as the rejection branch above: exactly one caller may settle this
+    // instance, and only that caller notifies the requester and applies the domain record.
+    const didApprove = rows(await db.execute(sql`
       UPDATE workflow_instances
          SET state = 'approved', settled_at = NOW(), updated_at = NOW()
-       WHERE id = ${instanceId}::uuid AND state = 'pending'`);
+       WHERE id = ${instanceId}::uuid AND state = 'pending'
+      RETURNING id`));
+    if (!didApprove.length) return 'approved';
     await auditWorkflow(actorId, 'approved', instanceId, {
       domain: instance.domain,
       recordId: instance.recordId,
@@ -2031,7 +2190,12 @@ export async function resumeWorkflow(
     }
     if (!isWorkflowDomain(instance.domain)) return { ok: false, error: NOT_AVAILABLE };
 
-    const plan = await resolveRoute(instance.domain, instance.subjectEmployeeId, { amount: instance.amount });
+    // currency travels with the amount. Without it the thresholds in DOMAINS are compared against a
+    // figure in an unknown unit, which is how a resumed foreign-currency request could come back with
+    // a SHORTER chain than the one it halted on.
+    const plan = await resolveRoute(instance.domain, instance.subjectEmployeeId, {
+      amount: instance.amount, currency: instance.currency,
+    });
     if (!plan.ok) {
       await db.execute(sql`
         UPDATE workflow_instances SET halt_reason = ${plan.haltReason}::text, updated_at = NOW()
@@ -2222,31 +2386,27 @@ async function settleDomainRecord(
   if (instance.domain !== 'leave') return;
   if (!instance.recordId) return;
   try {
-    const wrote = rows(await db.execute(sql`
-      UPDATE hr_leave_request
-         SET status = ${state},
-             decided_by = ${actorId}::uuid,
-             decided_by_role = 'workflow',
-             decided_at = NOW(),
-             decision_note = ${'Decided through the approval workflow (' + instance.id + ')'}
-       WHERE id::text = ${instance.recordId}
-         AND status = 'pending'
-      RETURNING id, employee_id, leave_type, start_date, end_date`));
-
-    if (!wrote.length) return; // already decided the ordinary way — leave it alone.
-
-    if (state === 'approved') {
-      // Approving leave has to reach attendance, or the two modules disagree about the same day:
-      // payroll counts attendance, so an approved leave day with no attendance row is counted as
-      // nothing at all. Same function the ordinary path calls, imported dynamically so this module
-      // does not take a load-time dependency on the HR leave service.
-      const { markLeaveAttendance } = await import('@/lib/hr-leave');
-      await markLeaveAttendance(wrote[0]);
-    }
+    // THE SETTLEMENT ITSELF BELONGS TO THE LEAVE MODULE, AND IT IS ONE FUNCTION RATHER THAN TWO.
+    //
+    // This used to write the status and stamp attendance inline, and it did neither of the two other
+    // things a leave decision has to do. A comp-off request rejected HERE never got its credits back —
+    // they are spent the moment the request is filed — so days somebody earned from approved overtime
+    // were consumed against a request that was refused, with no reversal row and nothing on any screen
+    // saying where they went. And nobody was told the outcome at all. The SAME rejection through
+    // decideLeave() refunded correctly, so what happened to a person's comp off depended on which of
+    // two doors the decision came through.
+    //
+    // src/lib/hr-leave.ts settleLeaveFromWorkflow() is now the single settlement: same 'pending'
+    // guard, so a request already decided the ordinary way is still left exactly as it was left.
+    // Imported dynamically so this module keeps no load-time dependency on the HR leave service.
+    const { settleLeaveFromWorkflow } = await import('@/lib/hr-leave');
+    const settled = await settleLeaveFromWorkflow(instance.recordId, state, actorId, instance.id);
+    if (!settled.settled) return; // already decided the ordinary way — leave it alone.
 
     await auditWorkflow(actorId, 'settle.leave', instance.id, {
       recordId: instance.recordId,
       state,
+      warning: settled.warning || null,
     });
   } catch (e: any) {
     logFail('settleDomainRecord', e);

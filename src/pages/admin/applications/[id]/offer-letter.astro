@@ -5,6 +5,7 @@ import { db } from '@/lib/db';
 import { applications, offerLetters, users, applicationMessages } from '@/lib/db/schema';
 import { generateInternalHandle } from '@/lib/auth/handle';
 import { eq } from 'drizzle-orm';
+import { resolveEngagementPolicy, shortCommitment } from '@/lib/engagement-policy';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -15,6 +16,10 @@ if (!id) return Astro.redirect('/admin/applications');
 
 let errorMsg = '';
 let successMsg = '';
+// Declared before the POST handler that assigns it. There is NO EMAIL FALLBACK on this page, so the
+// push is the only thing that tells a candidate an offer exists — and it sat inside a bare catch
+// while the page printed "Offer sent." A candidate who is never told has not been sent anything.
+let candidateNotTold = '';
 
 const found = await db.select().from(applications).where(eq(applications.id, id)).limit(1);
 if (found.length === 0) return Astro.redirect('/admin/applications');
@@ -108,7 +113,12 @@ if (Astro.request.method === 'POST') {
           body: 'Offer extended to the candidate. A formal offer letter will follow.',
           isSystem: true
         });
-      } catch (_) {}
+      } catch (e: any) {
+        // The thread entry is what the candidate reads on their application page. The stage change
+        // above has committed, so this cannot abort — but it must not vanish either.
+        console.error('[offer-letter] the "offer extended" thread message was not written for', id, '-', e?.cause?.message || e?.message);
+        candidateNotTold = 'The offer stage was recorded, but the note explaining it was NOT added to the candidate\'s thread.';
+      }
       // Nothing on this page notified anyone: this branch bypasses [id].astro entirely, so
       // neither pushNotify.applicationStatus nor pushApplicant.offerExtended ran, and this file
       // sends no email either. The candidate learned about their offer only if an admin told them
@@ -128,7 +138,12 @@ if (Astro.request.method === 'POST') {
             url: '/portal/applications/' + id,
             tag: 'offer-extended-' + id,
           });
-        } catch (_) {}
+        } catch (e: any) {
+          console.error('[offer-letter] "offer extended" notification failed for', id, '-', e?.cause?.message || e?.message);
+          candidateNotTold = 'The candidate was NOT notified that an offer has been extended — tell them yourself.';
+        }
+      } else {
+        candidateNotTold = 'This application has no portal account attached, so the candidate could not be notified that an offer has been extended.';
       }
       try {
         const { sendPushToAdmins } = await import('@/lib/push');
@@ -139,7 +154,10 @@ if (Astro.request.method === 'POST') {
           url: '/admin/applications/' + id,
           tag: 'offer-extended-admin-' + id,
         }, user.id);
-      } catch (_) {}
+      } catch (e: any) {
+        // Admin-side notice only — never blocks the offer, but never silent either.
+        console.error('[offer-letter] admin notification failed -', e?.cause?.message || e?.message);
+      }
       app.status = 'offer';
       successMsg = 'Offer extension confirmed. Application stage is now "Offer". Send the formal letter below when ready.';
     } else if (action === 'generate') {
@@ -147,7 +165,18 @@ if (Astro.request.method === 'POST') {
       const candidateEmail = ((fd.get('candidateEmail') as string) || '').trim();
       const roleTitle = ((fd.get('roleTitle') as string) || '').trim();
       const department = ((fd.get('department') as string) || '').trim();
-      const templateType = ((fd.get('templateType') as string) || 'intern').trim();
+      // THE LAST INTERN FALLBACK IN A WRITE PATH.
+      //
+      // This form has no templateType input. `fd.get('templateType')` is therefore ALWAYS null, and
+      // this line was writing template_type = 'intern' onto every single offer letter this page has
+      // ever generated — Chief Officers included. The letter page treats that column as an override
+      // REQUEST and refuses it wherever the agreed fields contradict it, which is why the leak was
+      // no longer visible; but with no level recorded and no employment type typed, 'intern' was
+      // still enough to supply the engagement and select the internship template on its own.
+      //
+      // The default is now "no request". A human who wants a specific template asks for one; nobody
+      // asks for one by omission.
+      const templateType = ((fd.get('templateType') as string) || '').trim();
       const employmentType = ((fd.get('employmentType') as string) || '').trim();
       const workMode = ((fd.get('workMode') as string) || 'Remote').trim();
       const duration = ((fd.get('duration') as string) || '').trim();
@@ -174,6 +203,12 @@ if (Astro.request.method === 'POST') {
       } else {
         const integrityHash = integrityHmac([refNumber, candidateName, roleTitle, department, offerDate, employmentType]);
         const contentBlob = {
+          // THE AGREED LEVEL TRAVELS WITH THE LETTER. It was never stored, so the letter had to go
+          // back to the application row to find out who it was describing — and if that row was
+          // later edited, or the level had never been set on it, the document silently changed
+          // meaning. It is the field the candidate was assessed at; it belongs in the record of
+          // what was offered.
+          level: app.level || '',
           candidateName, candidateEmail, candidatePhone, candidateCity,
           roleTitle, department, employmentType, workMode, duration,
           hoursCommitment, compensation, reportingTo,
@@ -225,7 +260,12 @@ if (Astro.request.method === 'POST') {
                   url: '/portal/offer/' + existingOffer.token,   // straight to the signable document
                   tag: 'offer-letter-' + id,
                 });
-              } catch (_) {}
+              } catch (e: any) {
+                console.error('[offer-letter] candidate notification failed for application', id, '-', e?.cause?.message || e?.message);
+                candidateNotTold = 'The candidate was NOT notified that their offer letter is ready — send them the link yourself.';
+              }
+            } else {
+              candidateNotTold = 'This offer has no portal account attached, so nobody could be notified — send the candidate the link yourself.';
             }
             try {
               const { sendPushToAdmins } = await import('@/lib/push');
@@ -236,7 +276,10 @@ if (Astro.request.method === 'POST') {
                 url: '/admin/applications/' + id,
                 tag: 'offer-letter-admin-' + id,
               }, user.id);
-            } catch (_) {}
+            } catch (e: any) {
+              // Admin-side notice only — never blocks the offer, but never silent either.
+              console.error('[offer-letter] admin notification failed -', e?.cause?.message || e?.message);
+            }
             successMsg = acct?.isNew
               ? 'Offer sent. TEMPORARY PASSWORD (copy now, shown once): ' + tempPw + ' — email ' + candidateEmail + (acct.handle ? ' OR handle ' + acct.handle : '') + '. Token: ' + existingOffer.token + '.'
               : 'Offer sent. Token: ' + existingOffer.token + '.';
@@ -300,7 +343,12 @@ if (Astro.request.method === 'POST') {
                   url: '/portal/offer/' + token,   // straight to the signable document
                   tag: 'offer-letter-' + id,
                 });
-              } catch (_) {}
+              } catch (e: any) {
+                console.error('[offer-letter] candidate notification failed for application', id, '-', e?.cause?.message || e?.message);
+                candidateNotTold = 'The candidate was NOT notified that their offer letter is ready — send them the link yourself.';
+              }
+            } else {
+              candidateNotTold = 'No portal account was created for this candidate, so nobody could be notified — send them the offer link yourself.';
             }
             try {
               const { sendPushToAdmins } = await import('@/lib/push');
@@ -311,7 +359,10 @@ if (Astro.request.method === 'POST') {
                 url: '/admin/applications/' + id,
                 tag: 'offer-letter-admin-' + id,
               }, user.id);
-            } catch (_) {}
+            } catch (e: any) {
+              // Admin-side notice only — never blocks the offer, but never silent either.
+              console.error('[offer-letter] admin notification failed -', e?.cause?.message || e?.message);
+            }
             if (accountIsNew) {
               successMsg = 'Offer letter sent. Login at edurankai.in/admin/login with email ' + candidateEmail + (internalHandle ? ' OR handle ' + internalHandle : '') + '. TEMPORARY PASSWORD (shown once, copy now and send to the candidate): ' + plaintextPw + ' — they should change it after first sign-in. Offer token: ' + token + '.';
             } else {
@@ -328,11 +379,58 @@ if (Astro.request.method === 'POST') {
         withdrawnReason: reason || null,
         updatedAt: new Date()
       }).where(eq(offerLetters.id, existingOffer.id));
+
+      // THE PERSON WHOSE JOB IT WAS IS TOLD.
+      //
+      // Every other branch of this handler pushes the candidate and reports separately when it could
+      // not. This one updated the row and printed "Offer withdrawn." — so somebody who had been told
+      // they had a job found out only if they happened to re-open the token, which is the one link
+      // they had no reason to open again. The withdrawal is already committed by this point; a failed
+      // notification is reported to the person who pressed the button rather than swallowed.
+      // `roleTitle` IS DECLARED IN THE `generate` BRANCH, NOT THIS ONE.
+      //
+      // The two push bodies below read a `const` that is block-scoped to a sibling branch, so every
+      // withdrawal raised a ReferenceError — AFTER the UPDATE above had already committed. The offer
+      // was withdrawn, the candidate was never told, the notification code never ran, and the whole
+      // handler fell into the outer catch, which printed a failure for something that had in fact
+      // happened. The operator's reasonable next move is to press Withdraw again.
+      //
+      // The title is taken from the OFFER ROW — the document actually being withdrawn — falling back
+      // to the application snapshot, so the sentence names the role the candidate was told about.
+      const _wRole = String((existingOffer as any).roleTitle || app.roleTitleSnapshot || '').trim();
+      const _wTo = existingOffer.createdUserId || app.applicantUserId;
+      if (_wTo) {
+        try {
+          const { sendPushToUser } = await import('@/lib/push');
+          await sendPushToUser(_wTo, {
+            type: 'applicant_offer',
+            title: 'Your offer has been withdrawn',
+            body: reason
+              ? 'The offer for ' + (_wRole || 'this role') + ' has been withdrawn: ' + reason
+              : 'The offer for ' + (_wRole || 'this role') + ' has been withdrawn. Open it for the details.',
+            url: '/portal/offer/' + existingOffer.token,
+            tag: 'offer-withdrawn-' + id,
+          });
+        } catch (e: any) {
+          console.error('[offer-letter] withdrawal notification failed for application', id, '-', e?.cause?.message || e?.message);
+          candidateNotTold = 'The offer is withdrawn, but the candidate was NOT notified - tell them yourself.';
+        }
+      } else {
+        candidateNotTold = 'The offer is withdrawn, but no portal account is attached, so the candidate could not be notified - tell them yourself.';
+      }
       successMsg = 'Offer withdrawn.';
     }
   } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown');
+    // `.message` on a drizzle error is only the failed SQL; the reason lives on `.cause`.
+    const real = err?.cause?.message || err?.message;
+    console.error('[offer-letter] action failed for application', id, '-', real);
+    errorMsg = 'Failed: ' + (real || 'Unknown');
   }
+
+  // "Offer sent." was printed whatever happened to the notification. It is still printed — the
+  // letter IS sent and the token IS valid — but the one thing that reaches the candidate is now
+  // reported separately when it did not happen.
+  if (candidateNotTold) errorMsg = (errorMsg ? errorMsg + ' ' : '') + candidateNotTold;
 
   const refresh = await db.select().from(offerLetters).where(eq(offerLetters.applicationId, id)).limit(1);
   existingOffer = refresh.length > 0 ? refresh[0] : null;
@@ -353,7 +451,15 @@ const fallbackDefaults = {
   employmentType: app.engagementType || 'Internship',
   workMode: 'Remote',
   duration: app.level === 'Intern' ? '3 Months' : '12 Months',
-  hoursCommitment: app.level === 'Intern' ? '2.5 hrs/day, 5 days/week' : 'Full-time',
+  // From src/lib/engagement-policy.ts, resolved per level. This box used to default every intern
+  // to "2.5 hrs/day, 5 days/week" — a figure that appears nowhere in the published internship
+  // policy, which is six days and about 40 hours of TOTAL ENGAGEMENT — and every non-intern to the
+  // bare word "Full-time", which tells a Chief Officer nothing at all about what they owe.
+  hoursCommitment: shortCommitment(resolveEngagementPolicy({
+    level: app.level,
+    engagementType: app.engagementType,
+    roleTitle: app.roleTitleSnapshot,
+  })),
   compensation: (app.level === 'Intern' || app.level === 'Apprentice') ? 'Unpaid' : (app.compensation || 'To be discussed'),
   reportingTo: '',
   offerDate: new Date().toISOString().split('T')[0],
@@ -363,7 +469,9 @@ const fallbackDefaults = {
   signatoryName: user.name || 'Siddharth Prasad',
   signatoryTitle: 'Founder & CEO',
   customNote: '',
-  templateType: (app.level === 'Intern' || app.level === 'Apprentice') ? 'intern' : 'fulltime',
+  // No template is requested by default. The letter is written from the agreed fields
+  // (src/lib/offer-templates.ts decides); nothing here pre-selects a seniority for anyone.
+  templateType: '',
   includeFounderRemark: false
 };
 
@@ -389,7 +497,7 @@ const letterStatusLabel = !currentOffer ? 'Not sent'
   : isDeclined ? 'Declined'
   : 'Sent - awaiting signature';
 ---
-<AdminLayout title="Offer Letter" description="Generate and manage offer letter">
+<AdminLayout title="Offer Letter">
 
   <div class="mb-4">
     <a href={'/admin/applications/' + id} class="text-[0.78rem] text-white/50 hover:text-white">&larr; Back to application</a>
@@ -485,11 +593,16 @@ const letterStatusLabel = !currentOffer ? 'Not sent'
             <label class="ofl">Compensation</label>
             <input type="text" id="compInput" name="compensation" value={defaults.compensation} class="ofi" />
             <div class="flex flex-wrap gap-1.5 mt-2">
-              <button type="button" class="comp-preset" data-comp="Unpaid during the internship (2.5 hrs/day, 5 days/week). USD 1,000 on conversion to full-time upon successful completion of the project and meeting the eligibility criteria.">Product intern</button>
-              <button type="button" class="comp-preset" data-comp="Unpaid during the internship (2.5 hrs/day, 5 days/week). A one-time reward of USD 550 on successful completion of the internship and meeting the eligibility criteria.">Other intern (unpaid)</button>
+              {/* THESE PRESETS NO LONGER STATE HOURS. They carried "(2.5 hrs/day, 5 days/week)"
+                  inside the COMPENSATION sentence, which put a third working-time figure into the
+                  candidate's letter — one that disagreed with the Hours field beside it and with
+                  the published internship policy. Compensation states money; hours come from the
+                  Hours field, which is filled from src/lib/engagement-policy.ts. */}
+              <button type="button" class="comp-preset" data-comp="Unpaid during the internship. USD 1,000 on conversion to full-time upon successful completion of the project and meeting the eligibility criteria.">Product intern</button>
+              <button type="button" class="comp-preset" data-comp="Unpaid during the internship. A one-time reward of USD 550 on successful completion of the internship and meeting the eligibility criteria.">Other intern (unpaid)</button>
               <button type="button" class="comp-preset" data-comp="Market-leading, top-competitive compensation (finalised at offer).">Full-time / contract / freelance</button>
             </div>
-            <p class="text-[0.68rem] text-white/40 mt-1.5">Quick-fill the standard compensation language, then edit if needed.</p>
+            <p class="text-[0.68rem] text-white/40 mt-1.5">Quick-fill the standard compensation language, then edit if needed. Working hours are a separate field &mdash; do not restate them here.</p>
           </div>
           <div><label class="ofl">Reporting To</label><input type="text" name="reportingTo" value={defaults.reportingTo} placeholder="Head of AI / Founder" class="ofi" /></div>
         </div>

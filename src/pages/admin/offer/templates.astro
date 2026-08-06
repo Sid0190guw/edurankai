@@ -1,0 +1,366 @@
+---
+/**
+ * OFFER TEMPLATES — the catalogue, the self-audit, and every issued letter checked against it.
+ *
+ * The failure this page exists to make impossible to repeat: a Chief AI Officer received a letter
+ * offering "an internship", "on an unpaid basis in accordance with EduRankAI's Internship Policy",
+ * with a Certificate of Completion. Nobody could see it, because the template was a hidden column
+ * on the offer record that somebody had set by hand and everybody afterwards trusted.
+ *
+ * So: the templates are listed here as data, the structural guarantees are re-checked live rather
+ * than asserted in a comment, and every offer letter ever issued is re-run through the real
+ * selector so a hand-picked template that contradicts the agreed fields shows up as a refusal you
+ * can read. Nothing on this page writes anything; it reads the same code path the letter renders.
+ */
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { offerLetters, applications } from '@/lib/db/schema';
+import { desc, eq } from 'drizzle-orm';
+import {
+  OFFER_TEMPLATES, auditTemplateCopy, decideOfferTemplate, renderOfferLetter,
+  type AgreedFields
+} from '@/lib/offer-templates';
+
+const currentUser = Astro.locals.user;
+if (!currentUser) return Astro.redirect('/admin/login');
+if (currentUser.role === 'applicant') return Astro.redirect('/portal');
+
+// Same permission that gates the rest of the offers section. /admin/offer is mapped to 'offers'
+// in src/middleware.ts, and the check is repeated here so the page does not depend on the map.
+const { canAccessSection } = await import('@/lib/auth/permissions');
+const mayView = await canAccessSection(currentUser as any, 'offers', 'view').catch(() => false);
+if (!mayView) return Astro.redirect('/admin');
+
+const audit = auditTemplateCopy();
+const auditFailures = audit.filter((a) => !a.ok);
+
+// Every issued letter, re-decided from its own agreed fields. The level comes from the application
+// the offer belongs to, exactly as the letter page reads it.
+interface ReviewRow {
+  id: string;
+  token: string;
+  refNumber: string;
+  candidateName: string;
+  roleTitle: string;
+  status: string;
+  storedTemplateType: string;
+  templateLabel: string;
+  level: string;
+  engagement: string;
+  unpaidShown: boolean;
+  certificatePromised: boolean;
+  overrideRequested: string;
+  overrideAccepted: boolean;
+  notes: string[];
+}
+
+let rows: ReviewRow[] = [];
+let loadError = '';
+try {
+  const issued = await db.select({
+    id: offerLetters.id,
+    token: offerLetters.token,
+    refNumber: offerLetters.refNumber,
+    candidateName: offerLetters.candidateName,
+    roleTitle: offerLetters.roleTitle,
+    department: offerLetters.department,
+    status: offerLetters.status,
+    templateType: offerLetters.templateType,
+    content: offerLetters.content,
+    level: applications.level,
+  })
+    .from(offerLetters)
+    .leftJoin(applications, eq(applications.id, offerLetters.applicationId))
+    .orderBy(desc(offerLetters.createdAt))
+    .limit(300);
+
+  // postgres-js returns plain arrays; drizzle's select already gives us one, but normalise anyway
+  // so a driver change cannot turn this page into a blank screen.
+  const list: any[] = Array.isArray(issued) ? issued : ((issued as any)?.rows || []);
+
+  rows = list.map((o: any) => {
+    const c: any = o.content || {};
+    const fields: AgreedFields = {
+      level: c.level || o.level || null,
+      roleTitle: c.roleTitle || o.roleTitle || '',
+      employmentType: c.employmentType || '',
+      department: c.department || o.department || '',
+      workMode: c.workMode || '',
+      duration: c.duration || '',
+      hoursCommitment: c.hoursCommitment || '',
+      joiningDate: c.joiningDate || '',
+      reportingTo: c.reportingTo || '',
+      compensation: c.compensation || '',
+      candidateName: o.candidateName || '',
+      org: 'EduRankAI',
+    };
+    const decision = decideOfferTemplate(fields, o.templateType);
+    const letter = renderOfferLetter(fields, decision);
+    return {
+      id: String(o.id),
+      token: String(o.token || ''),
+      refNumber: String(o.refNumber || ''),
+      candidateName: String(o.candidateName || ''),
+      roleTitle: String(o.roleTitle || ''),
+      status: String(o.status || ''),
+      storedTemplateType: String(o.templateType || ''),
+      templateLabel: letter.templateLabel,
+      level: decision.level || 'not recorded',
+      engagement: decision.engagement || 'not recorded',
+      unpaidShown: letter.showsUnpaidClause,
+      certificatePromised: letter.awardsCompletionCertificate,
+      overrideRequested: decision.overrideRequested || '',
+      overrideAccepted: decision.overrideAccepted,
+      notes: decision.notes.slice(),
+    };
+  });
+} catch (e: any) {
+  // Not swallowed. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+  loadError = e?.cause?.message || e?.message || 'Unknown error';
+  console.error('[admin/offer/templates] load failed:', loadError);
+}
+
+const needsAttention = rows.filter((r) => r.notes.length > 0);
+const templateCount = OFFER_TEMPLATES.length;
+---
+<AdminLayout title="Offer Templates" activeNav="offer-templates">
+  <div class="otp">
+
+    <header class="otp-head">
+      <p class="otp-eyebrow">Offer letters</p>
+      <h1 class="otp-h1">Templates</h1>
+      <p class="otp-lead">
+        One template per engagement level, held as data in <code>src/lib/offer-templates.ts</code> and read by
+        both renderers of an offer letter &mdash; the web letter and the PDF. The template is selected from the
+        agreed fields (level, engagement type, role title). A person may request a different one; the request is
+        recorded, and it is refused when it contradicts those fields.
+      </p>
+      <p class="otp-lead otp-lead--rule">
+        There is no intern fallback. When nothing matches, the letter is written from the most neutral template,
+        never the most junior. The junior default is what put an internship offer in front of a Chief AI Officer.
+      </p>
+    </header>
+
+    {loadError && (
+      <div class="otp-alert otp-alert--bad" role="alert">
+        <p class="otp-alert__t">Issued offers could not be loaded</p>
+        <p class="otp-alert__b">{loadError}</p>
+        <p class="otp-alert__b">The template catalogue and the structural checks below do not touch the database and are still accurate.</p>
+      </div>
+    )}
+
+    {/* ------------------------------------------------------------------ STRUCTURAL CHECKS */}
+    <section class="otp-sec">
+      <h2 class="otp-h2">Structural checks</h2>
+      <p class="otp-note">
+        Re-run on every page load against the live template data. Two invariants: no template outside the unpaid
+        programmes contains trainee-only language anywhere in its copy, and no template that does contain such
+        language declares a level above trainee. This is the guarantee that an intern letter cannot describe a
+        senior engagement &mdash; not a convention, a property of the data.
+      </p>
+      <div class={'otp-verdict ' + (auditFailures.length === 0 ? 'otp-verdict--ok' : 'otp-verdict--bad')}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          {auditFailures.length === 0
+            ? <path d="M20 6 9 17l-5-5" />
+            : <Fragment><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></Fragment>}
+        </svg>
+        <span>
+          {auditFailures.length === 0
+            ? templateCount + ' templates checked, all pass.'
+            : auditFailures.length + ' of ' + templateCount + ' templates FAIL. Fix src/lib/offer-templates.ts before any further offer is sent.'}
+        </span>
+      </div>
+      {auditFailures.length > 0 && (
+        <ul class="otp-fails">
+          {auditFailures.map((f) => (
+            <li>
+              <strong>{f.label}</strong>
+              <ul>{f.violations.map((v) => (<li>{v}</li>))}</ul>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+
+    {/* ------------------------------------------------------------------ CATALOGUE */}
+    <section class="otp-sec">
+      <h2 class="otp-h2">The catalogue</h2>
+      <p class="otp-note">
+        Levels mirror the platform role levels. A template can only ever describe the levels and engagement kinds
+        it declares here; anything else falls to the neutral template.
+      </p>
+      <div class="otp-cards">
+        {OFFER_TEMPLATES.map((t) => (
+          <article class={'otp-card' + (t.isNeutralFallback ? ' otp-card--neutral' : '')}>
+            <div class="otp-card__top">
+              <h3 class="otp-card__h">{t.label}</h3>
+              <code class="otp-card__id">{t.id}</code>
+            </div>
+            <p class="otp-card__d">{t.description}</p>
+            <dl class="otp-card__meta">
+              <div><dt>Levels</dt><dd>{t.levels.join(', ')}</dd></div>
+              <div><dt>Engagements</dt><dd>{t.engagements.join(', ')}</dd></div>
+              <div><dt>Unpaid unless a stipend is recorded</dt><dd>{t.unpaidUnlessStipend ? 'yes' : 'no'}</dd></div>
+              <div><dt>Completion certificate</dt><dd>{t.awardsCompletionCertificate ? 'yes' : 'no'}</dd></div>
+              <div><dt>Summary fields</dt><dd>{t.summaryFields.join(', ')}</dd></div>
+            </dl>
+            <details class="otp-card__copy">
+              <summary>Read the copy</summary>
+              <p class="otp-para"><span class="otp-para__k">Opening</span>{t.opening}</p>
+              <p class="otp-para"><span class="otp-para__k">Engagement terms</span>{t.engagementTerms}</p>
+              {t.engagementTermsWithStipend && (
+                <p class="otp-para"><span class="otp-para__k">Engagement terms (stipend recorded)</span>{t.engagementTermsWithStipend}</p>
+              )}
+              <p class="otp-para"><span class="otp-para__k">Review / progression</span>{t.progression}</p>
+              {t.completion && (<p class="otp-para"><span class="otp-para__k">On completion</span>{t.completion}</p>)}
+              <p class="otp-para"><span class="otp-para__k">Closing</span>{t.closing}</p>
+            </details>
+          </article>
+        ))}
+      </div>
+    </section>
+
+    {/* ------------------------------------------------------------------ ISSUED LETTERS */}
+    <section class="otp-sec">
+      <h2 class="otp-h2">Issued letters, re-checked</h2>
+      <p class="otp-note">
+        Every offer letter on record, re-run through the real selector using its own agreed fields. The stored
+        template type is treated as a request, exactly as the letter page treats it. Rows with a note are the ones
+        where a hand-picked template was refused, or where the level and the role title disagree.
+      </p>
+
+      {needsAttention.length > 0 && (
+        <div class="otp-alert otp-alert--warn">
+          <p class="otp-alert__t">{needsAttention.length} letter{needsAttention.length === 1 ? '' : 's'} need a human decision</p>
+          <p class="otp-alert__b">These still render safely &mdash; the neutral template carries them &mdash; but the fields disagree with each other and only a person can say which is right.</p>
+        </div>
+      )}
+
+      {rows.length === 0 && !loadError && (<p class="otp-empty">No offer letters on record yet.</p>)}
+
+      <div class="otp-tablewrap">
+        <table class="otp-table">
+          <thead>
+            <tr>
+              <th scope="col">Candidate</th>
+              <th scope="col">Role</th>
+              <th scope="col">Level</th>
+              <th scope="col">Engagement</th>
+              <th scope="col">Template used</th>
+              <th scope="col">Requested</th>
+              <th scope="col">Unpaid</th>
+              <th scope="col">Certificate</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <Fragment>
+                <tr class={r.notes.length > 0 ? 'otp-row otp-row--flag' : 'otp-row'}>
+                  <th scope="row">
+                    <a href={'/portal/offer/' + r.token} class="otp-link">{r.candidateName || 'Unnamed'}</a>
+                    <span class="otp-sub">{r.refNumber}</span>
+                  </th>
+                  <td>{r.roleTitle}</td>
+                  <td>{r.level}</td>
+                  <td>{r.engagement}</td>
+                  <td><strong>{r.templateLabel}</strong></td>
+                  <td>
+                    {r.overrideRequested
+                      ? <span class={r.overrideAccepted ? 'otp-tag otp-tag--ok' : 'otp-tag otp-tag--bad'}>{r.overrideRequested}{r.overrideAccepted ? '' : ' (refused)'}</span>
+                      : <span class="otp-sub">none</span>}
+                  </td>
+                  <td>{r.unpaidShown ? 'shown' : '—'}</td>
+                  <td>{r.certificatePromised ? 'promised' : '—'}</td>
+                  <td>{r.status}</td>
+                </tr>
+                {r.notes.length > 0 && (
+                  <tr class="otp-noterow">
+                    <td colspan="9">
+                      {r.notes.map((n) => (<p class="otp-notetext">{n}</p>))}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <p class="otp-foot">
+      <a href="/admin/offers" class="otp-link">All offer letters</a>
+      &nbsp;&middot;&nbsp;
+      <a href="/admin/offer/blank" class="otp-link">Offer letter builder</a>
+    </p>
+
+  </div>
+
+  <style>
+    .otp { max-width: 78rem; margin: 0 auto; padding: 4px 0 56px; color: #e9e9ee; }
+    .otp code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.86em; }
+
+    .otp-head { margin-bottom: 26px; }
+    .otp-eyebrow { font-size: 0.66rem; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; color: #FF4F00; margin: 0 0 6px; }
+    .otp-h1 { font-size: clamp(1.5rem, 5vw, 2rem); font-weight: 600; letter-spacing: -0.02em; margin: 0 0 12px; color: #fff; }
+    .otp-lead { font-size: 0.9rem; line-height: 1.75; color: #b9b9c4; max-width: 66ch; margin: 0 0 10px; }
+    .otp-lead--rule { border-left: 2px solid rgba(255, 79, 0, 0.5); padding-left: 12px; color: #d5d5de; }
+
+    .otp-sec { margin-bottom: 34px; }
+    .otp-h2 { font-size: 1.05rem; font-weight: 600; color: #fff; margin: 0 0 8px; }
+    .otp-note { font-size: 0.82rem; line-height: 1.7; color: #9a9aa6; max-width: 74ch; margin: 0 0 14px; }
+
+    .otp-verdict { display: flex; align-items: flex-start; gap: 10px; padding: 13px 15px; border-radius: 10px; font-size: 0.86rem; line-height: 1.6; border: 1px solid; }
+    .otp-verdict svg { width: 18px; height: 18px; flex: 0 0 18px; margin-top: 1px; }
+    .otp-verdict--ok { background: rgba(34, 197, 94, 0.08); border-color: rgba(34, 197, 94, 0.32); color: #b8f0cd; }
+    .otp-verdict--bad { background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.4); color: #ffc9c9; }
+    .otp-fails { margin: 12px 0 0; padding-left: 18px; font-size: 0.82rem; line-height: 1.7; color: #ffc9c9; }
+
+    .otp-alert { border-radius: 10px; padding: 13px 15px; margin-bottom: 16px; border: 1px solid; }
+    .otp-alert--bad { background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.4); }
+    .otp-alert--warn { background: rgba(255, 79, 0, 0.08); border-color: rgba(255, 79, 0, 0.34); }
+    .otp-alert__t { font-size: 0.86rem; font-weight: 600; color: #fff; margin: 0 0 4px; }
+    .otp-alert__b { font-size: 0.8rem; line-height: 1.65; color: #c4c4ce; margin: 0 0 4px; }
+
+    .otp-cards { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 780px) { .otp-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .otp-card { background: rgba(255, 255, 255, 0.035); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; padding: 15px; }
+    .otp-card--neutral { border-color: rgba(255, 79, 0, 0.35); }
+    .otp-card__top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    .otp-card__h { font-size: 0.95rem; font-weight: 600; color: #fff; margin: 0; }
+    .otp-card__id { color: #FF4F00; }
+    .otp-card__d { font-size: 0.8rem; line-height: 1.65; color: #a4a4b0; margin: 7px 0 12px; }
+    .otp-card__meta { margin: 0; font-size: 0.76rem; line-height: 1.6; }
+    .otp-card__meta > div { display: flex; gap: 8px; padding: 4px 0; border-top: 1px solid rgba(255, 255, 255, 0.06); }
+    .otp-card__meta dt { color: #8b8b97; flex: 0 0 46%; }
+    .otp-card__meta dd { color: #dcdce4; margin: 0; overflow-wrap: anywhere; }
+    .otp-card__copy { margin-top: 12px; }
+    .otp-card__copy summary { font-size: 0.78rem; color: #FF4F00; cursor: pointer; padding: 10px 0; min-height: 44px; display: flex; align-items: center; }
+    .otp-para { font-size: 0.78rem; line-height: 1.7; color: #c8c8d2; margin: 0 0 10px; }
+    .otp-para__k { display: block; font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.12em; color: #8b8b97; margin-bottom: 3px; }
+
+    .otp-empty { font-size: 0.84rem; color: #8b8b97; padding: 20px 0; }
+    .otp-tablewrap { overflow-x: auto; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; }
+    .otp-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; min-width: 60rem; }
+    .otp-table th, .otp-table td { text-align: left; padding: 10px 12px; vertical-align: top; }
+    .otp-table thead th { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.12em; color: #8b8b97; font-weight: 600; border-bottom: 1px solid rgba(255, 255, 255, 0.12); white-space: nowrap; }
+    .otp-row { border-bottom: 1px solid rgba(255, 255, 255, 0.06); color: #d0d0da; }
+    .otp-row th { font-weight: 500; color: #fff; }
+    .otp-row--flag { background: rgba(255, 79, 0, 0.07); }
+    .otp-sub { display: block; font-size: 0.68rem; color: #85858f; margin-top: 2px; }
+    .otp-tag { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 0.68rem; border: 1px solid; }
+    .otp-tag--ok { color: #b8f0cd; border-color: rgba(34, 197, 94, 0.4); }
+    .otp-tag--bad { color: #ffc9c9; border-color: rgba(239, 68, 68, 0.45); }
+    .otp-noterow td { background: rgba(255, 79, 0, 0.05); border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
+    .otp-notetext { font-size: 0.75rem; line-height: 1.65; color: #f0d5c6; margin: 0 0 5px; max-width: 92ch; }
+
+    .otp-link { color: #FF4F00; text-decoration: underline; text-underline-offset: 2px; }
+    .otp-link:hover { color: #fff; }
+    .otp-foot { margin-top: 26px; font-size: 0.8rem; color: #8b8b97; }
+
+    @media (max-width: 480px) {
+      .otp-card__meta > div { flex-direction: column; gap: 2px; }
+      .otp-card__meta dt { flex: none; }
+    }
+  </style>
+</AdminLayout>

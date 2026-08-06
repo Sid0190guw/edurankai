@@ -445,8 +445,15 @@ export async function errorGroups(opts: { hours?: number; limit?: number } = {})
   }
 }
 
-/** Error volume over three windows — the shape of an incident (spiking, or steady background noise). */
-export async function errorRate(): Promise<{ lastHour: number; last24h: number; last7d: number; distinct24h: number }> {
+/**
+ * Error volume over three windows — the shape of an incident (spiking, or steady background noise).
+ *
+ * `readable` IS PART OF THE ANSWER. This used to return four zeros when the read failed, and four
+ * zeros is what a perfectly healthy deployment also returns — so an unreadable edu_error_log made
+ * the incident board say HEALTHY, which is the single most dangerous thing this page can say. The
+ * caller now has a value that separates "nothing has gone wrong" from "I could not find out".
+ */
+export async function errorRate(): Promise<{ lastHour: number; last24h: number; last7d: number; distinct24h: number; readable: boolean; unreadableReason?: string }> {
   try {
     const { db, sql } = await ctx();
     const r = rows(await db.execute(sql`SELECT
@@ -455,9 +462,16 @@ export async function errorRate(): Promise<{ lastHour: number; last24h: number; 
         COUNT(*)::int AS d7,
         COUNT(DISTINCT COALESCE(fingerprint, event)) FILTER (WHERE created_at > now() - INTERVAL '24 hours')::int AS distinct24
       FROM edu_error_log WHERE created_at > now() - INTERVAL '7 days'`))[0];
-    return { lastHour: Number(r?.h1 || 0), last24h: Number(r?.h24 || 0), last7d: Number(r?.d7 || 0), distinct24h: Number(r?.distinct24 || 0) };
-  } catch {
-    return { lastHour: 0, last24h: 0, last7d: 0, distinct24h: 0 };
+    return { lastHour: Number(r?.h1 || 0), last24h: Number(r?.h24 || 0), last7d: Number(r?.d7 || 0), distinct24h: Number(r?.distinct24 || 0), readable: true };
+  } catch (e: any) {
+    // Never throws — blanking the console an operator is depending on is worse than a partial one.
+    // But it says so, on stdout and in the return value, instead of returning a healthy-looking zero.
+    const reason = e?.cause?.message || e?.message || 'unknown';
+    // Imported here, like every other logger use in this module, so nothing in the logging path is
+    // pulled into a bundle that only wants the pure helpers at the top of this file.
+    const { logEvent } = await import('@/lib/logger');
+    logEvent('warn', 'ops.error_rate_unreadable', { reason });
+    return { lastHour: 0, last24h: 0, last7d: 0, distinct24h: 0, readable: false, unreadableReason: reason };
   }
 }
 

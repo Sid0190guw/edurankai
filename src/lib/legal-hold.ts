@@ -169,14 +169,39 @@ export async function closeMatter(id: string, byUserId: string): Promise<void> {
     WHERE id = ${id} AND status = 'open'`);
 }
 
-export async function listMatters(status?: MatterStatus): Promise<Matter[]> {
+/**
+ * THE EMPTY-LIST LIE, AND WHY EVERY READ IN THIS MODULE IS NOW DISCRIMINATED.
+ *
+ * These three reads (listMatters, accessHistoryFor, accessLogForMatter) each ended in
+ * `catch { return []; }`. An empty legal access log is not a UI state — it is a statement, made to
+ * the person whose messages may have been read, that nobody read them. `[]` was returned both when
+ * that statement was true and when the query had failed, and the two are indistinguishable on
+ * screen: a subject asking "has anyone opened my records?" was answered "nobody has" by a database
+ * error.
+ *
+ * Every read now returns { ok:true, rows } or { ok:false, reason }; the reason is logged with
+ * e.cause (the real Postgres message — e.message is only the failed SQL) and the surfaces render
+ * "the log could not be read" instead of "no accesses recorded".
+ *
+ * hasAcknowledged() above is deliberately left returning false on error: that one fails CLOSED —
+ * it re-shows the disclosure — so a failure there over-protects rather than under-reports.
+ */
+export type ListResult<T> = { ok: true; rows: T[] } | { ok: false; reason: string };
+
+function readFailed(where: string, e: any): { ok: false; reason: string } {
+  const reason = e?.cause?.message || e?.message || 'unknown';
+  console.error('[legal-hold] ' + where, reason);
+  return { ok: false, reason };
+}
+
+export async function listMatters(status?: MatterStatus): Promise<ListResult<Matter>> {
   try {
     await ensureLegalHoldSchema();
     const r = status
       ? await db.execute(sql`SELECT * FROM legal_matters WHERE status = ${status} ORDER BY opened_at DESC LIMIT 200`)
       : await db.execute(sql`SELECT * FROM legal_matters ORDER BY opened_at DESC LIMIT 200`);
-    return rows(r).map(map);
-  } catch { return []; }
+    return { ok: true, rows: rows(r).map(map) };
+  } catch (e: any) { return readFailed('listMatters', e); }
 }
 
 /**
@@ -327,11 +352,11 @@ export interface AccessRecord {
  * Deliberately available to the SUBJECT, not only to the founder. A log that only the people doing
  * the looking can see does not hold anyone to account, and the disclosure notice promises this.
  */
-export async function accessHistoryFor(subjectUserId: string): Promise<AccessRecord[]> {
-  if (!subjectUserId) return [];
+export async function accessHistoryFor(subjectUserId: string): Promise<ListResult<AccessRecord>> {
+  if (!subjectUserId) return { ok: false, reason: 'missing-subject' };
   try {
     await ensureLegalHoldSchema();
-    return rows(await db.execute(sql`
+    const out = rows(await db.execute(sql`
       SELECT a.id, m.reference AS matter_reference, m.title AS matter_title,
              a.accessed_by, u.name AS accessed_by_name,
              a.source_kind, a.item_count, a.justification, a.created_at
@@ -345,14 +370,15 @@ export async function accessHistoryFor(subjectUserId: string): Promise<AccessRec
         sourceKind: r.source_kind, itemCount: Number(r.item_count) || 0,
         justification: r.justification, createdAt: String(r.created_at),
       }));
-  } catch { return []; }
+    return { ok: true, rows: out };
+  } catch (e: any) { return readFailed('accessHistoryFor', e); }
 }
 
 /** Full access log for a matter, for the founder console and for producing a disclosure bundle. */
-export async function accessLogForMatter(matterId: string): Promise<AccessRecord[]> {
+export async function accessLogForMatter(matterId: string): Promise<ListResult<AccessRecord>> {
   try {
     await ensureLegalHoldSchema();
-    return rows(await db.execute(sql`
+    const out = rows(await db.execute(sql`
       SELECT a.id, m.reference AS matter_reference, m.title AS matter_title,
              a.accessed_by, u.name AS accessed_by_name,
              a.source_kind, a.item_count, a.justification, a.created_at
@@ -366,7 +392,8 @@ export async function accessLogForMatter(matterId: string): Promise<AccessRecord
         sourceKind: r.source_kind, itemCount: Number(r.item_count) || 0,
         justification: r.justification, createdAt: String(r.created_at),
       }));
-  } catch { return []; }
+    return { ok: true, rows: out };
+  } catch (e: any) { return readFailed('accessLogForMatter', e); }
 }
 
 /**

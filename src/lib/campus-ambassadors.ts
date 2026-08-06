@@ -80,6 +80,42 @@ export async function decideAmbassador(opts: { id: string; status: 'approved' | 
   return { ok: true };
 }
 
+/**
+ * IS THIS ACCOUNT A LIVE CAMPUS AMBASSADOR? Answered from the campus_ambassadors table.
+ *
+ * /portal/submissions/new decided this with `user.role === 'campus_ambassador'`, a comparison
+ * against a union that has no such member — TypeScript reported it as "no overlap" and it was
+ * permanently false, so no approved ambassador ever saw the CA form and EVERY submission in the
+ * product was filed as 'applicant'.
+ *
+ * Matched on user_id first (written when the application was made from a signed-in session) and
+ * then on the application email, because decideAmbassador() only promotes the role `WHERE role =
+ * 'applicant'` — an ambassador who is also an intern keeps their other role and would otherwise be
+ * invisible here.
+ *
+ * Returns null when there is no record. THROWS if the query fails: the caller must be able to tell
+ * "not an ambassador" from "we could not find out", and a swallowed error here silently downgrades
+ * a real ambassador's report to an applicant submission.
+ */
+export async function activeAmbassadorFor(opts: { userId?: string | null; email?: string | null }) {
+  await ensureCaSchema();
+  const userId = (opts.userId || '').trim();
+  const email = (opts.email || '').trim().toLowerCase();
+  if (!userId && !email) return null;
+  const r = rows(await db.execute(sql`
+    SELECT id, applicant_name, institution, status, approved_at
+      FROM campus_ambassadors
+     WHERE status IN ('approved', 'active')
+       AND (
+         ${userId ? sql`user_id = ${userId}` : sql`FALSE`}
+         OR ${email ? sql`lower(applicant_email) = ${email}` : sql`FALSE`}
+       )
+     ORDER BY approved_at DESC NULLS LAST
+     LIMIT 1
+  `));
+  return r[0] || null;
+}
+
 export async function listAmbassadors(filterStatus?: string) {
   await ensureCaSchema();
   return rows(await db.execute(sql`

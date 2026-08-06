@@ -44,7 +44,7 @@ import {
   DAY_PARTS,
 } from '@/lib/hr-leave';
 import { upcomingHolidays } from '@/lib/holidays';
-import { today as attendanceToday } from '@/lib/attendance';
+import { today as attendanceToday, applyApprovedOvertimeClaims } from '@/lib/attendance';
 
 const PATH = '/portal/employee/leave';
 
@@ -56,16 +56,76 @@ if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
 const workspace = gate.ok ? gate.workspace : null;
 const employeeId = workspace ? workspace.employeeId : '';
 
+// =================================================================================================
+// AN APPROVED OVERTIME CLAIM HAS TO REACH THE BALANCE THIS PAGE SPENDS
+// =================================================================================================
+//
+// THE BREAK THIS CLOSES. Comp off is not earned by working late — it is earned when an overtime or
+// worked-holiday claim is APPROVED through the engine, and the credit is written by a SECOND step,
+// applyApprovedOvertimeClaims(), which re-reads the workflow instance and refuses anything that is
+// not 'approved'. That step ran on exactly two screens: /portal/employee/attendance/overtime and
+// .../attendance/approvals. It did NOT run here — on the one page whose comp-off balance depends
+// entirely on it, and which is where somebody actually spends the day.
+//
+// So: the manager approves the overtime on Monday. On Tuesday the person opens this page, reads
+// "Comp off available: 0", asks for a comp-off day and is refused with "There is only 0 day(s) of
+// comp off left". The credit was sitting unapplied behind a page they had no reason to open, and
+// nothing on this screen hinted at it. An approval that reaches nothing is the same fault as an
+// approval nobody was ever asked for.
+//
+// IT RUNS BEFORE THE POST HANDLER, NOT ONLY BEFORE THE READS. Sweeping on render alone would correct
+// the number on the screen and still refuse the request: applyLeave() calls consumeCompOff(), which
+// asks the ledger at the moment of filing. The credit has to land before the spend, or the person
+// reads an accurate balance and is told they do not have it anyway.
+//
+// THIS PAGE DECIDES NOTHING. applyApprovedOvertimeClaims() re-reads each claim's workflow instance
+// and credits only what the engine has genuinely approved, so this is a reconciliation and not a
+// second approval path — the same reasoning the two attendance screens already carry.
+//
+// FAILURE IS TOLERATED, AND IT IS NOT SILENT: the function logs the real cause and returns 0 rather
+// than throwing, because a ledger that cannot be swept must not take the leave screen down. The
+// balance below is then the balance as it stands, which is exactly what this page showed before.
+if (employeeId) await applyApprovedOvertimeClaims(employeeId, 20);
+
 const fmt = (d: any) => {
   const dt = new Date(String(d).slice(0, 10) + 'T00:00:00Z');
   if (isNaN(dt.getTime())) return String(d || '');
   return dt.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
 };
 
+/**
+ * The sentence the Cancel button asks before it withdraws a request, BUILT HERE rather than inside
+ * the JSX attribute.
+ *
+ * Two reasons, and the second is a hard constraint of this file type. It is easier to read a
+ * sentence assembled on its own lines than one assembled inside an attribute value. And a regex
+ * literal next to a ternary inside an `.astro` attribute expression does not survive the template
+ * parser — it desynchronises brace matching and the compiler starts reporting missing closing tags
+ * hundreds of lines further down, which is the least helpful error this toolchain produces. This is
+ * the same family as the "no Record<string,string> typed maps inside JSX" rule in CLAUDE.md.
+ *
+ * `scrub` strips anything that could close the JavaScript string or the HTML attribute around it.
+ * Leave reasons are typed by people and go through here untrusted.
+ *
+ * NAMES WHAT IS LOST: the type of leave and the dates. The list repeats, each row carries the same
+ * Cancel control 8px from a status pill, and on a phone the row above and the row below are within
+ * a thumb of it. Cancelling is not a pause — the request leaves the approver's queue and has to be
+ * raised again from the start, which restarts the approval clock.
+ */
+function cancelLeaveConfirm(l: any): string {
+  const scrub = (s: any) => String(s === null || s === undefined ? '' : s).replace(/[^\w \-.,]/g, '');
+  const oneDay = String(l.start_date).slice(0, 10) === String(l.end_date).slice(0, 10);
+  const span = oneDay ? scrub(fmt(l.start_date)) : scrub(fmt(l.start_date)) + ' to ' + scrub(fmt(l.end_date));
+  return 'return confirm("Cancel your ' + scrub(leaveTypeName(l.leave_type)) + ' request for ' + span +
+    '?\\n\\nIt is withdrawn from your approver and has to be raised again from the start.")';
+}
+
+// Darkened: #059669 and #d97706 were 3.8:1 and 3.2:1 on the pale pill, under the 4.5:1
+// floor, on 10px uppercase text that is the whole answer to "was it approved".
 function statusColour(status: string): string {
-  if (status === 'approved') return '#059669';
-  if (status === 'rejected') return '#dc2626';
-  if (status === 'pending') return '#d97706';
+  if (status === 'approved') return '#046c4e';
+  if (status === 'rejected') return '#b91c1c';
+  if (status === 'pending') return '#b45309';
   return '#6b6255';
 }
 
@@ -101,19 +161,40 @@ if (Astro.request.method === 'POST' && employeeId) {
         unit: unit as any,
         dayPart: String(fd.get('day_part') || 'first_half') as any,
         hours: Number(fd.get('hours') || 0),
+        // WHO FILED IT. Carried into the approval instance so the engine can tell this person when it
+        // settles — workflow.notifyRequester() returns on its first line without it.
+        requestedByUserId: String(user.id || ''),
       },
     );
     if (res.ok) {
       const skipped = (res.excluded || []).filter((x) => x && x.reason);
       flash = 'Requested: ' + describeUnits(unit, Number(res.dayUnits) || 0, Number(fd.get('hours')) || null)
-        + '. Waiting for approval.'
+        + '.'
         + (skipped.length ? ' ' + skipped.length + ' day(s) were not charged (' + [...new Set(skipped.map((x) => x.reason))].join(', ') + ').' : '');
+      // "WAITING FOR APPROVAL" IS ONLY TRUE IF SOMEBODY WAS ASKED.
+      //
+      // This screen said it unconditionally, and until now nothing on the employee path ever started
+      // an approval: the row was written 'pending' with no approver, nobody was notified, and it sat
+      // there until an HR account happened to open a list. Now the request enters the engine, and
+      // when the Organization Graph cannot name an approver the engine HALTS with a readable sentence
+      // instead of vanishing — so this says which of the two happened, in the person's own words.
+      if (res.routing && res.routing.halted) {
+        flash += ' It is NOT yet with an approver: ' + (res.routing.haltReason || 'no approver could be resolved.')
+          + ' Your request is recorded and is visible to HR, who can route it once that is fixed.';
+      } else {
+        flash += ' Sent to your approver.';
+      }
     } else {
       flash = res.error || 'Could not file that request.';
     }
   } else if (action === 'cancel') {
-    await cancelLeave(String(fd.get('id') || ''), employeeId);
-    flash = 'Request cancelled. Any comp off it used has been returned.';
+    // ITS ANSWER IS READ. cancelLeave() used to return void and swallow everything while this line
+    // printed success whatever happened — so somebody whose cancellation matched no rows believed
+    // they were working that day, while the approver still saw a live request.
+    const cancelled = await cancelLeave(String(fd.get('id') || ''), employeeId);
+    flash = cancelled.ok
+      ? 'Request cancelled. Any comp off it used has been returned, and it has been withdrawn from your approver.'
+      : (cancelled.error || 'That request could not be cancelled. Nothing was changed.');
   } else {
     flash = 'That is not something this page does.';
   }
@@ -158,11 +239,14 @@ const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
     .tabs{display:flex;gap:6px;overflow-x:auto;padding:0 0 12px;}
     .tabs a{flex:none;min-height:38px;display:inline-flex;align-items:center;padding:8px 12px;border:1px solid #e6ddcd;border-radius:99px;background:#fff;color:#6b6255;font-size:12.5px;font-weight:600;text-decoration:none;white-space:nowrap;}
     .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
-    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px;}
-    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;margin:8px 0 4px;}
-    input,select,textarea{width:100%;min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:14px;font-family:inherit;color:#1a1510;outline:none;}
+    /* #9a8f7d was 3.2:1 on white — under the 4.5:1 floor, and it named every field. */
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6255;font-weight:700;margin:0 0 12px;}
+    label,legend{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#6b6255;font-weight:700;display:block;margin:8px 0 4px;padding:0;}
+    input,select,textarea{width:100%;min-height:44px;background:#faf7f1;border:1px solid #e6ddcd;border-radius:9px;padding:10px 12px;font-size:16px;font-family:inherit;color:#1a1510;}
     textarea{min-height:60px;}
     input:focus,select:focus,textarea:focus{border-color:#c2410c;}
+    /* `outline:none` was set with nothing put in its place. */
+    input:focus-visible,select:focus-visible,textarea:focus-visible,.btn:focus-visible,.kill:focus-visible,a:focus-visible{outline:3px solid #7c2d12;outline-offset:2px;}
     .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;min-height:46px;padding:11px 18px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;width:100%;}
     .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
     .balgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
@@ -173,12 +257,13 @@ const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
     .ledger:last-child{border-bottom:none;}
     .ledger .who{flex:1 1 auto;min-width:0;overflow-wrap:anywhere;}
     .pill{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:3px 9px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;}
-    .note{font-size:11.5px;color:#9a8f7d;margin-top:8px;line-height:1.55;overflow-wrap:anywhere;}
+    .note{font-size:11.5px;color:#6b6255;margin-top:8px;line-height:1.55;overflow-wrap:anywhere;}
     .flash{background:rgba(5,150,105,.1);border:1px solid rgba(5,150,105,.3);color:#065f46;border-radius:10px;padding:11px 14px;font-size:13px;margin-bottom:14px;line-height:1.55;overflow-wrap:anywhere;}
     .warn{background:#fdf6ec;border:1px solid #f0dcc0;color:#6d470d;border-radius:10px;padding:11px 14px;font-size:12.5px;margin-bottom:14px;line-height:1.55;}
     .kill{background:none;border:none;color:#dc2626;cursor:pointer;font-size:12px;font-weight:700;min-height:44px;padding:0 6px;}
     fieldset{border:none;}
     .units{display:flex;gap:6px;flex-wrap:wrap;}
+    .units legend{flex:1 1 100%;float:left;width:100%;}
     .units label{flex:1 1 30%;min-width:96px;display:flex;align-items:center;gap:6px;margin:0;padding:10px;border:1px solid #e6ddcd;border-radius:9px;background:#faf7f1;text-transform:none;letter-spacing:0;font-size:13px;color:#1a1510;font-family:inherit;font-weight:600;min-height:44px;}
     .units input{width:auto;min-height:0;}
   </style>
@@ -248,8 +333,11 @@ const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
             ))}
           </select>
 
-          <label>How much</label>
+          {/* Was a bare <label> pointing at nothing, sitting outside the fieldset. A
+              <legend> is what names a group of radios, and it is what a screen reader
+              repeats before each option. */}
           <fieldset class="units">
+            <legend>How much</legend>
             <label for="u_full"><input id="u_full" type="radio" name="unit" value="full" checked/> Whole days</label>
             <label for="u_half"><input id="u_half" type="radio" name="unit" value="half"/> Half a day</label>
             <label for="u_hours"><input id="u_hours" type="radio" name="unit" value="hours"/> A few hours</label>
@@ -297,16 +385,39 @@ const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
           <div class="ledger">
             <div class="who">
               <div style="font-weight:600;">{leaveTypeName(l.leave_type)} · {unitWords(l)}</div>
-              <div style="font-size:11px;color:#9a8f7d;">
+              <div style="font-size:11px;color:#6b6255;">
                 {fmt(l.start_date)}{String(l.start_date).slice(0, 10) === String(l.end_date).slice(0, 10) ? '' : ' to ' + fmt(l.end_date)}
                 {l.day_part ? ' · ' + (l.day_part === 'first_half' ? 'first half' : 'second half') : ''}
                 {l.reason ? ' · ' + l.reason : ''}
               </div>
+              {/* THE HALT, SAID TO THE PERSON IT IS ABOUT.
+                  The engine writes a readable sentence when the Organization Graph cannot name an
+                  approver, and it was rendered only on an admin console — so the employee saw
+                  "pending" and waited, while the record actually said nobody had been asked. The
+                  request is never auto-approved and never discarded; it waits, visibly, with a cause
+                  somebody can act on. */}
+              {l.status === 'pending' && l.halt_reason && (
+                <div style="margin-top:6px;font-size:11.5px;line-height:1.5;color:#8a4b06;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:7px 9px;">
+                  Not with an approver yet: {l.halt_reason}
+                </div>
+              )}
+              {l.status === 'rejected' && l.decision_note && (
+                <div style="margin-top:6px;font-size:11.5px;line-height:1.5;color:#7f1d1d;">
+                  {l.decision_note}
+                </div>
+              )}
             </div>
             <div style="display:flex;align-items:center;gap:8px;flex:0 0 auto;">
               <span class="pill" style={'color:' + statusColour(String(l.status)) + ';background:' + statusColour(String(l.status)) + '18;'}>{l.status}</span>
+              {/* NAMES THE REQUEST BEING WITHDRAWN, not "this request" — see cancelLeaveConfirm in
+                  the frontmatter for the sentence and why it is built there.
+
+                  OUTSIDE THE `&&` ON PURPOSE. As the first child inside the parentheses,
+                  `{/* ... *​/}` is not a comment: it parses as an object literal beside an adjacent
+                  element, and the compiler reports missing closing tags a hundred lines lower. The
+                  ".astro specifics" trap in CLAUDE.md. */}
               {l.status === 'pending' && (
-                <form method="POST" action={PATH} style="margin:0;">
+                <form method="POST" action={PATH} style="margin:0;" onsubmit={cancelLeaveConfirm(l)}>
                   <input type="hidden" name="action" value="cancel"/>
                   <input type="hidden" name="id" value={l.id}/>
                   <button class="kill" type="submit" aria-label="Cancel this request">Cancel</button>
@@ -324,7 +435,7 @@ const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
             <div class="ledger">
               <div class="who">
                 <div style="font-weight:600;">{c.remaining} of {c.units} day(s) left</div>
-                <div style="font-size:11px;color:#9a8f7d;">
+                <div style="font-size:11px;color:#6b6255;">
                   Earned {fmt(c.earnedOn)} from {c.source === 'holiday_work' ? 'a worked holiday' : 'approved overtime'} · expires {fmt(c.expiresOn)}
                 </div>
               </div>
@@ -347,7 +458,7 @@ const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
           <div class="ledger">
             <div class="who">
               <div style="font-weight:600;">{h.name}</div>
-              <div style="font-size:11px;color:#9a8f7d;">
+              <div style="font-size:11px;color:#6b6255;">
                 {fmt(h.dateIso)}
                 {h.location ? ' · at ' + h.location : ''}
                 {h.departmentName ? ' · ' + h.departmentName : ''}

@@ -10,8 +10,25 @@ const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 const gate = await can(user, 'administer', { type: 'platform' });
 if (!gate.allow) return Astro.redirect('/admin');
-const health = await queueHealth().catch(() => ({ pending: 0, processing: 0, failed: 0, done: 0 }));
-const errors = await recentErrors(40).catch(() => []);
+// "NOTHING IS WRONG" AND "THE QUERY THREW" MUST NOT RENDER THE SAME, AND ON THIS PAGE ABOVE ALL.
+//
+// Both reads were `.catch(() => <empty>)`. So when the logger table was unreadable this screen — the
+// one whose entire purpose is to surface failures — printed "No errors logged — clean." and a queue
+// of four zeros. A monitoring view that reports health when it cannot see is worse than one that is
+// down, because somebody stops looking. The reason is captured and shown instead.
+const ERROR_TAIL = 40;
+let healthError = '';
+let errorsError = '';
+const health = await queueHealth().catch((e: any) => {
+  healthError = String(e?.cause?.message || e?.message || 'unknown error');
+  console.error('[hardening] queueHealth failed -', healthError);
+  return { pending: 0, processing: 0, failed: 0, done: 0 };
+});
+const errors = await recentErrors(ERROR_TAIL).catch((e: any) => {
+  errorsError = String(e?.cause?.message || e?.message || 'unknown error');
+  console.error('[hardening] recentErrors failed -', errorsError);
+  return [] as any[];
+});
 const headers = ['Strict-Transport-Security', 'X-Content-Type-Options: nosniff', 'X-Frame-Options: SAMEORIGIN', 'Referrer-Policy', 'Permissions-Policy', 'admin: no-store + noindex'];
 const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;margin-bottom:16px;';
 const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;";
@@ -23,7 +40,9 @@ const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'G
     <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;">Live reliability + the security posture. The authz + secret audits run in CI (security-audit.test.ts); this view shows the runtime signals.</p>
     <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;">The table at the bottom of this page is the raw error tail. For the incident view — the same errors <b style="color:#d6d6de;">grouped</b> so one fault recurring 400 times is one row, plus database latency, cron last-run, connection-pool pressure and which commit is serving — open <a href="/admin/ops" style="color:#9bd1ff;">/admin/ops</a>.</p>
 
-    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:16px;">
+    {/* Two fixed tracks with no breakpoint scrolled the page sideways on a phone. auto-fit keeps the
+        pair side by side wherever both still fit and stacks them when they do not. */}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:16px;">
       <div style={CARD + 'margin:0;'}>
         <p style={HD}>Security posture</p>
         <ul style="font-size:13px;color:#d6d6de;line-height:1.7;margin:0;padding-left:16px;">
@@ -41,26 +60,49 @@ const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'G
           <span style="color:#fca5a5;">failed {health.failed}</span>
           <span style="color:#6ee7b7;">done {health.done}</span>
         </div>
+        {healthError && (
+          <p style="font-size:12px;color:#fca5a5;margin:10px 0 0;line-height:1.6;">
+            Those four numbers are NOT the queue. The health query failed, so they are zeros standing
+            in for an answer nobody has: {healthError}
+          </p>
+        )}
         <p style="font-size:12px;color:#8a8a94;margin:10px 0 0;">Worker + retries at <a href="/admin/jobs" style="color:#9bd1ff;">/admin/jobs</a>.</p>
       </div>
     </div>
 
     <div style={CARD}>
-      <p style={HD}>Recent errors (redacted, {errors.length})</p>
-      {errors.length ? (
-        <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
-          <thead><tr style="text-align:left;color:#8a8a94;font-size:11px;text-transform:uppercase;"><th style="padding:6px 8px;">When</th><th style="padding:6px 8px;">Event</th><th style="padding:6px 8px;">Message</th></tr></thead>
-          <tbody>
-            {errors.map((e: any) => (
-              <tr style="border-top:1px solid #1a1a1f;color:#d6d6de;">
-                <td style="padding:6px 8px;font-family:'Geist Mono',monospace;font-size:11px;color:#8a8a94;">{new Date(e.created_at).toLocaleString()}</td>
-                <td style="padding:6px 8px;color:#fca5a5;">{e.event}</td>
-                <td style="padding:6px 8px;color:#8a8a94;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{e.message}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      ) : <p style="font-size:12.5px;color:#8a8a94;margin:0;">No errors logged — clean.</p>}
+      <p style={HD}>Recent errors (redacted, {errorsError ? 'unavailable' : errors.length})</p>
+      {errorsError ? (
+        /* THE LINE THAT USED TO PRINT HERE WHEN THIS QUERY THREW WAS "No errors logged — clean." */
+        <p style="font-size:12.5px;color:#fca5a5;margin:0;line-height:1.6;">
+          The error log could not be read, so this is not a report that there are no errors — it is a
+          report that nobody can currently see whether there are. Postgres said: {errorsError}
+        </p>
+      ) : errors.length ? (
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+          {/* The table has three columns and a message cell capped at 360px, so it needed roughly
+              560px and pushed the PAGE sideways on a phone. It scrolls inside this box instead. */}
+          <table style="width:100%;border-collapse:collapse;font-size:12.5px;min-width:560px;">
+            <thead><tr style="text-align:left;color:#8a8a94;font-size:11px;text-transform:uppercase;"><th style="padding:6px 8px;">When</th><th style="padding:6px 8px;">Event</th><th style="padding:6px 8px;">Message</th></tr></thead>
+            <tbody>
+              {errors.map((e: any) => (
+                <tr style="border-top:1px solid #1a1a1f;color:#d6d6de;">
+                  <td style="padding:6px 8px;font-family:'Geist Mono',monospace;font-size:11px;color:#8a8a94;white-space:nowrap;">{new Date(e.created_at).toLocaleString()}</td>
+                  <td style="padding:6px 8px;color:#fca5a5;">{e.event}</td>
+                  <td style="padding:6px 8px;color:#a8a8b2;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{e.message}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : <p style="font-size:12.5px;color:#8a8a94;margin:0;">The log was read and holds no errors.</p>}
+      {!errorsError && errors.length >= ERROR_TAIL && (
+        <p style="font-size:12px;color:#8a8a94;margin:10px 0 0;line-height:1.6;">
+          This is the last {ERROR_TAIL} only — there are older ones this tail does not reach. The
+          grouped view at <a href="/admin/ops" style="color:#9bd1ff;">/admin/ops</a> is the one to read
+          when the tail is full.
+        </p>
+      )}
     </div>
   </div>
 </AdminLayout>

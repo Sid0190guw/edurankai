@@ -22,6 +22,15 @@ export const GET: APIRoute = async ({ params, locals }) => {
       headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' },
     });
   } catch (e: any) {
-    return new Response('Error: ' + e.message, { status: 500 });
+    // WAS `'Error: ' + e.message`, which on a drizzle/postgres-js error is the FAILED SQL TEXT and
+    // not the reason — so the HR user was shown a statement in the browser while the log got
+    // nothing at all. The reason is on `.cause`; it goes to the log, and the browser gets a sentence
+    // that says what did and did not happen. The statement is never echoed to the page.
+    console.error('[admin/hr/payslip] could not render payslip', id, '-', e?.cause?.message || e?.message);
+    return new Response(
+      'This payslip could not be rendered, so nothing is shown. Nothing has been changed and no payslip has been altered. '
+      + 'The reason has been written to the server log; ask whoever runs the deployment to read it before reissuing anything.',
+      { status: 500, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } },
+    );
   }
 };

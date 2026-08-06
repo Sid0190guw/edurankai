@@ -18,6 +18,13 @@ export const POST: APIRoute = async ({ request, locals, cookies }) => {
     cookies.delete('wa_chal', { path: '/' });
     return json({ ok: true, id: r.credentialId });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'Could not register this device' }, 400);
+    // Same rule as login-verify: the challenge is spent whatever the outcome, and a database
+    // failure's text (e.message is the SQL that failed, e.cause is Postgres) never reaches the
+    // caller — while our own assertion failures, challenge mismatch and origin mismatch, stay
+    // readable, because in those cases that IS the answer.
+    try { cookies.delete('wa_chal', { path: '/' }); } catch (_) {}
+    const cause = e?.cause?.message;
+    console.error('[api/2fa/passkey/register-verify]', cause || e?.message, e?.stack);
+    return json({ ok: false, error: cause ? 'Passkey setup is temporarily unavailable. Please try again.' : (e?.message || 'Could not register this device') }, 400);
   }
 };

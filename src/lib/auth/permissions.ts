@@ -512,7 +512,61 @@ export type Permission =
   // Create a project, change its name, code, description, department, dates and status, set its
   // PLANNED budget, retire it, and record who runs it. Recording a project manager writes an
   // effective-dated edge into the Organization Graph; it does not make the holder that manager.
-  | 'projects.manage';
+  | 'projects.manage'
+  // =============================================================================================
+  // ANNOUNCEMENTS AND RECOGNITION (src/lib/announcements.ts, src/lib/recognition.ts).
+  //
+  // TWO KEYS, AND NEITHER OF THEM APPROVES ANYTHING. There is no approval anywhere in either module
+  // — publishing a notice is a standing authority, not a per-row routing question, so
+  // src/lib/workflow.ts is deliberately not involved and holding either key puts nobody on an
+  // approval route.
+  //
+  // WHAT IS NOT GATED, AND MUST NEVER BE:
+  //
+  //   READING AN ANNOUNCEMENT. Who sees a notice is decided by its AUDIENCE — company, one
+  //   department, one project, one location — applied in the WHERE clause of every read against the
+  //   reader's own employee record and project membership. There is deliberately no
+  //   `announcements.view`: minting one would create a second way to answer "may I see this" and the
+  //   two would disagree within a release. It would also lock out exactly the people notices are
+  //   for, since an employee's account frequently carries the `applicant` role, which holds nothing.
+  //
+  //   SENDING RECOGNITION. Thanking a colleague requires no capability at all and none is checked.
+  //   Gating it would make it a management instrument, and recognition that only flows downward is
+  //   not recognition. An intern may thank the founder. The only rules are enforced in the write:
+  //   not to yourself, and say what they actually did.
+  //
+  // NO PRIOR POPULATION TO PRESERVE, and that is a fact about this codebase rather than an
+  // assumption: there was no announcements table anywhere in src, db or scripts before
+  // src/lib/announcements.ts — src/lib/search-global.ts, src/lib/workforce/widgets.ts and
+  // src/pages/portal/notifications.astro each said so in as many words — and no recognition table
+  // either (cr_recognitions in src/lib/credential-store.ts records one INSTITUTION recognising
+  // another's credentials: different domain, different columns). So the rule that applies is the one
+  // requisitions.approve, community.moderate and the workplace-services keys were settled by: GRANT
+  // TO THE NARROWEST DEFENSIBLE HOLDER AND WRITE DOWN WHY. That is super_admin + hr, the same two
+  // who hold `knowledge.manage` — the adjacent key that already decides what the whole company is
+  // asked to read — and both are ENFORCED at every call site from the day they ship.
+  // =============================================================================================
+
+  // WRITING AND PUBLISHING A COMPANY ANNOUNCEMENT: compose it, choose its audience, mark it urgent,
+  // pin it, set the date it stops being shown, publish it, revise it, and take it down with a reason.
+  //
+  // IT ALSO OPENS THE ACKNOWLEDGEMENT RECORD, which is why this key matters more than "may post a
+  // notice" suggests. An announcement can require acknowledgement, the acknowledgement is recorded
+  // against a VERSION, and REVISING a published announcement re-opens it for everybody — so this key
+  // decides what the whole company is asked to read and confirm. The record it opens NAMES the people
+  // who have acknowledged (an act each of them deliberately performed) and reports the people who
+  // have not as a COUNT. No query behind this key lists the names of people who have not read
+  // something; that screen is a shame list and it does not exist.
+  | 'announcements.publish'
+  // TAKING DOWN SOMEBODY ELSE'S RECOGNITION, with a reason kept on the row. It is not a delete and
+  // there is no delete: "somebody removed a thank-you about me" is a thing the person it was about is
+  // entitled to have a record of.
+  //
+  // IT BUYS NO WIDER READ. A recognition sent to one team stays visible to that team only, including
+  // to a holder of this key — the aggregate console shows counts and lists only the ones the sender
+  // already made company-wide, because reading a team-scoped one on an HR screen would quietly widen
+  // the audience the sender chose after the fact. A moderator acts on what they can already see.
+  | 'recognition.moderate';
 
 // Exported so a read-only console can SHOW the matrix instead of a second, hand-typed copy of it
 // drifting away from the real one (/admin/access-preview). Nothing outside this file may decide
@@ -770,7 +824,13 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // PROJECTS. The portfolio read and the project register. NEITHER makes the founder the manager
     // of any project — that is a `project_manager` edge in the Organization Graph, scoped to one
     // project, and /admin/projects resolves it per row exactly like every other surface here.
-    'projects.view', 'projects.manage'
+    'projects.view', 'projects.manage',
+    // ANNOUNCEMENTS AND RECOGNITION. No prior authority to preserve — there was no announcements
+    // table and no recognition table anywhere in this codebase. Narrowest defensible holders,
+    // matching `knowledge.manage`: the key that already decides what the whole company is asked to
+    // read. Neither approves anything, neither widens a read: an announcement's audience is applied
+    // in the WHERE clause, and a team-scoped recognition stays team-scoped for the holder too.
+    'announcements.publish', 'recognition.moderate'
   ],
   hr: [
     'admin.access',
@@ -854,7 +914,14 @@ export const PERMS_BY_ROLE: Record<User['role'], Permission[]> = {
     // REFERRALS. `hr` holds payouts.approve, so it holds referrals.reward: putting a number on a
     // referral bonus is the same class of act as approving a withdrawal, and the same two accounts
     // already do it. It still approves nothing — the reward routes through the workflow engine.
-    'referrals.view', 'referrals.reward'
+    'referrals.view', 'referrals.reward',
+    // ANNOUNCEMENTS AND RECOGNITION. `hr` already holds `knowledge.manage`, which decides what the
+    // whole company is asked to READ and CONFIRM through the staff handbook; a company notice is the
+    // same act with a shorter shelf life, and the people desk is who writes both today by hand. It
+    // confers no approval and no wider sight of anything: a notice's audience is applied in the
+    // query, and a recognition sent to one team is not readable on this desk because it was not sent
+    // to it. Sending recognition needs no key at all and this is not one — it only takes one down.
+    'announcements.publish', 'recognition.moderate'
   ],
   recruiter: [
     'admin.access',

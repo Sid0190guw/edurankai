@@ -4,6 +4,13 @@ import { db } from '@/lib/db';
 import { markOfferOpened } from '@/lib/track';
 import { offerLetters, applications, applicationMessages } from '@/lib/db/schema';
 import { eq, and } from 'drizzle-orm';
+import { decideOfferTemplate, renderOfferLetter, emphasize, plain, type AgreedFields } from '@/lib/offer-templates';
+// Working time, per level, from one module. See src/lib/engagement-policy.ts.
+import {
+  ENGAGEMENT_POLICIES, resolveEngagementPolicy, isInternshipPolicy, INTERN_WORD,
+  shortCommitment, describeCommitment, describeProgrammeTotal, formatMinutes, formatMinutesShort,
+  WELLBEING_ASSESSED_AS,
+} from '@/lib/engagement-policy';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
@@ -46,6 +53,163 @@ if (!isOwner) {
   if (!isAdmin) return Astro.redirect('/portal');
 }
 const app: any = appList.length > 0 ? appList[0] : null;
+
+// "OFFER OPENED" IS NOW ACTUALLY RECORDED.
+//
+// markOfferOpened() was imported at the top of this file and never called, anywhere in src/. So
+// offer_letters.opened_at and open_count were written by nothing and read by nothing, and a named
+// step of the hiring journey did not exist: HR could not tell a candidate who has read their offer
+// and is thinking about it from one who never received the push and does not know an offer exists.
+// The thread-open equivalent for applications (track.ts markThreadOpened) IS wired and IS read on the
+// application activity route — the capability was built and only this half was left unconnected.
+//
+// Recipient only, and reads only. A staff viewer opening the letter must not stamp the candidate's
+// record with a read they did not make, and a POST is a signature rather than an opening.
+if (isOwner && Astro.request.method !== 'POST') {
+  const _openIp = Astro.request.headers.get('x-forwarded-for')
+    || Astro.request.headers.get('cf-connecting-ip') || '';
+  // Best effort by design: markOfferOpened() already contains its own catch, and a tracking write
+  // must never stop somebody reading the offer they were sent.
+  await markOfferOpened(String(offer.id), String(user.id), _openIp.substring(0, 64));
+}
+
+const content = offer.content || {};
+const c = content;
+
+function formatDate(d: any): string {
+  if (!d) return '';
+  const date = typeof d === 'string' ? new Date(d) : d;
+  if (isNaN(date.getTime())) return d;
+  return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
+}
+// India Standard Time stamp - the server runs in UTC, so we must pin the zone
+// or signed timestamps render ~5.5h off.
+function formatDateTimeIST(d: any): string {
+  if (!d) return '';
+  const date = typeof d === 'string' ? new Date(d) : d;
+  if (isNaN(date.getTime())) return '';
+  return date.toLocaleString('en-IN', {
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: true,
+    timeZone: 'Asia/Kolkata'
+  }) + ' IST';
+}
+
+// THE LEVEL THAT WAS ACTUALLY AGREED.
+//
+// The offer content blob has never carried a level, so the letter had nothing to read except the
+// role title and the template somebody happened to open. `applications.level` is the level the
+// candidate applied and was assessed at, and it is the field that should have decided this letter
+// all along. It is read for staff viewers too, so the admin preview and the candidate's copy are
+// the same document.
+let agreedLevel: string | null = (c.level as string) || null;
+if (!agreedLevel) {
+  if (app && app.level) {
+    agreedLevel = app.level;
+  } else {
+    try {
+      const lvlRows = await db.select({ level: applications.level }).from(applications)
+        .where(eq(applications.id, offer.applicationId)).limit(1);
+      if (lvlRows.length > 0 && lvlRows[0].level) agreedLevel = String(lvlRows[0].level);
+    } catch (e: any) {
+      // Not swallowed: a missing level downgrades the letter to the neutral template, which is
+      // safe but worth knowing about. The real Postgres reason lives on e.cause.
+      console.error('[offer] level lookup failed:', e?.cause?.message || e?.message);
+    }
+  }
+}
+
+// ONE SOURCE OF TRUTH FOR THE WORDS IN THIS LETTER.
+//
+// Every sentence below - the opening, the engagement terms, the review paragraph, the completion
+// paragraph, which summary fields are worth printing - comes from src/lib/offer-templates.ts, and
+// so does the PDF. The template is SELECTED from the agreed fields; `offer.templateType` is passed
+// as an override REQUEST, not as an instruction, and it is refused when it contradicts them. There
+// is no intern fallback anywhere in that path: an unmatched offer lands on the neutral template.
+//
+// Declared HERE, above the POST handler, because the signing audit entry records which template
+// governed the letter the person actually signed. A const is not hoisted; declaring it below the
+// handler would throw on the first line of every acceptance.
+// WORKING TIME COMES FROM THE POLICY MODULE, NOT FROM A FREE-TEXT BOX.
+//
+// `hoursCommitment` is typed by hand into an admin form. It has been arriving as a bare "40 hours"
+// -- which is the TOTAL ENGAGEMENT for an internship, of which only five hours a day is project
+// work -- and as literally nothing, in which case the letter read "the agreed hours". Both leave
+// the recipient to guess what they owe. src/lib/engagement-policy.ts answers it per level, and it
+// cannot state a counted total without its split.
+//
+// Declared HERE, above the POST handler and above `letterFields`, because a const is not hoisted
+// and the signing path renders this letter.
+const resolvedPolicy = resolveEngagementPolicy({
+  level: agreedLevel,
+  engagementType: c.employmentType,
+  roleTitle: c.roleTitle || offer.roleTitle || '',
+});
+// A letter that is not a trainee programme must never inherit trainee hours, whatever the level
+// field happens to say. That is the same failure that put "unpaid internship" into a Chief AI
+// Officer's offer, arriving through a different door.
+//
+// THE GUARD READS EVERY FIELD THE RESOLVER READ, and that matters. It previously looked only at
+// employmentType and level, so it demoted two engagements that are genuinely counted:
+//   - an APPRENTICESHIP (nothing in the word "Apprentice" contains "intern"), and
+//   - an internship recorded only in the ROLE TITLE, with the level column empty.
+// Both then rendered the apprenticeship or internship template — unpaid clause, completion
+// certificate — with a mid-level employee's "5 days/week, 8h/day" printed underneath as their
+// working time. The letter contradicted itself about what the person had agreed to.
+//
+// It stays written as a last line rather than a decision: resolveEngagementPolicy() already refuses
+// to read a senior title as a trainee, so with all three fields in view this can now only fire if
+// that function regresses. That is what a guard is for.
+const traineeDeclaration = [
+  c.employmentType, agreedLevel, c.roleTitle || offer.roleTitle || '',
+].map((v) => String(v || '')).join(' ');
+const declaresTrainee = INTERN_WORD.test(traineeDeclaration) || /\bapprentice/i.test(traineeDeclaration);
+const engagementPolicy = (isInternshipPolicy(resolvedPolicy) && !declaresTrainee)
+  ? ENGAGEMENT_POLICIES['Mid']
+  : resolvedPolicy;
+const policyHours = shortCommitment(engagementPolicy);
+const hoursExplainer = describeCommitment(engagementPolicy);
+const programmeTotal = describeProgrammeTotal(engagementPolicy);
+const recordedHours = String(c.hoursCommitment || '').trim();
+const hoursWereAgreed = !!recordedHours;
+
+// A COUNTED TOTAL MAY NOT BE PUBLISHED WITHOUT ITS SPLIT — including when it was typed by hand.
+//
+// engagement-policy.ts is structurally incapable of emitting a bare total, but `hoursCommitment` is
+// a free-text box and bypasses it entirely: "40 hours" typed there printed as "Working Hours: 40
+// hours" in the summary of an internship letter, which is the exact sentence the founder objected
+// to. The recorded figure still GOVERNS — it is what was negotiated, and it is left first and
+// untouched — but where the engagement is hour-counted and the text carries no split, the split is
+// appended to it rather than left for the reader to assume.
+const hoursForLetter = (() => {
+  if (!recordedHours) return policyHours;
+  if (engagementPolicy.timeModel !== 'counted') return recordedHours;
+  if (/project|well-?being|per day|\/day|a day/i.test(recordedHours)) return recordedHours;
+  const proj = formatMinutesShort(engagementPolicy.projectMinutesPerDay);
+  const well = formatMinutesShort(engagementPolicy.wellbeingMinutesPerDay);
+  if (!proj || !well) return recordedHours;
+  return recordedHours + ' of total engagement (' + proj + ' project work + ' + well
+    + ' well-being per day)';
+})();
+
+const letterFields: AgreedFields = {
+  level: agreedLevel,
+  roleTitle: c.roleTitle || offer.roleTitle || '',
+  employmentType: c.employmentType || '',
+  department: c.department || offer.department || '',
+  workMode: c.workMode || '',
+  duration: c.duration || '',
+  // The agreed field still wins wherever one exists — it is what was actually negotiated. The
+  // policy only fills the silence, so no letter goes out saying "the agreed hours" again.
+  hoursCommitment: hoursForLetter,
+  joiningDate: formatDate(c.joiningDate),
+  reportingTo: c.reportingTo || '',
+  compensation: c.compensation || '',
+  candidateName: c.candidateName || offer.candidateName || '',
+  org: 'EduRankAI'
+};
+const templateDecision = decideOfferTemplate(letterFields, offer.templateType);
+const letter = renderOfferLetter(letterFields, templateDecision);
 
 // Handle signing — recipient only.
 if (Astro.request.method === 'POST' && isOwner) {
@@ -146,29 +310,71 @@ if (Astro.request.method === 'POST' && isOwner) {
           updatedAt: new Date()
         }).where(eq(offerLetters.id, offer.id));
 
-        // Update application status to hired
-        if (app) {
-          await db.update(applications).set({
-            status: 'hired',
-            updatedAt: new Date()
-          }).where(eq(applications.id, app.id));
+        // -----------------------------------------------------------------------------------------
+        // THE WHOLE HANDOFF, IN ONE CALL THAT LEAVES A TRACE.
+        // -----------------------------------------------------------------------------------------
+        //
+        // WHAT THIS REPLACED. Six writes and nothing downstream. This handler flipped the offer to
+        // 'signed', flipped applications.status to 'hired' with a bare db.update, posted a thread
+        // message, called transferApplicantToEmployee() inside `catch (_) {}` AND discarded its
+        // return value, and pushed the admins. It did not start an onboarding journey — startJourney()
+        // had exactly one caller in the entire repo, a manual button on an admin page. It did not move
+        // the candidate's own six-step tracker, which rested on "05 Decision" after they had started
+        // work. It did not tell the person anything except the sentence on this screen. And because
+        // the status was written by hand rather than through onApplicationStatusChange(), the BETTER
+        // of the two employee-creation engines — the one that sets a department and mints a safe
+        // employee code — never ran for a hire the candidate initiated. The normal path was the worse
+        // path.
+        //
+        // Worst of all: the failure was invisible twice over. hire-transfer.ts had been fixed to
+        // return its reason, and this caller threw the reason away and printed "You are officially
+        // part of EduRankAI" regardless. Somebody signed on 23 July and was not an employee until
+        // 3 August, and no screen in the product could list a signed offer with no employee record.
+        //
+        // src/lib/hire-completion.ts does all of it in one place, records every step's outcome in
+        // hr_hire_handoffs whether or not it worked, pushes the people desk when a step did not
+        // complete, and is listed by /admin/hr/reconciliation. Every handoff now either happens or is
+        // VISIBLE as not having happened.
+        //
+        // IT MUST NOT BREAK THE SIGNATURE. Somebody who has just accepted a job must not be shown a
+        // red error because a downstream write failed — the signature above is already committed and
+        // is what legally matters. So the call is guarded, but the guard LOGS and TRACKS rather than
+        // discarding, and the sentence shown below changes to match what actually happened.
+        let handoff: import('@/lib/hire-completion').HireCompletion | null = null;
+        try {
+          const { completeHire } = await import('@/lib/hire-completion');
+          handoff = await completeHire({
+            offer,
+            actorUserId: String(user.id),
+            source: 'candidate_signature',
+          });
+        } catch (e: any) {
+          console.error('[offer] hire handoff threw:', e?.cause?.message || e?.message);
+          try {
+            const { trackError } = await import('@/lib/logger');
+            await trackError('hire.handoff_threw', e, { offerId: String(offer.id), applicationId: offer.applicationId });
+          } catch (_) { /* the log must never be the reason a signature fails */ }
+        }
 
-          // Post system message to thread
+        // The thread message states what actually happened, not what was hoped for. It used to say
+        // "Status updated to: Hired." unconditionally, including on the days no employee record was
+        // created — so the one durable, human-readable record of this moment asserted something that
+        // was not true.
+        if (app) {
           await db.insert(applicationMessages).values({
             applicationId: app.id,
             senderUserId: user.id,
             senderRole: 'system',
             senderName: 'System',
-            body: 'Offer accepted and signed by the applicant. Status updated to: Hired.',
+            body: 'Offer accepted and signed by the applicant. Status updated to: Hired.'
+              + (handoff && handoff.ok
+                ? ' Employee record created' + (handoff.employeeCode ? ' (' + handoff.employeeCode + ')' : '') + '.'
+                : ' NO employee record was created: '
+                  + ((handoff && handoff.error) || 'the handoff could not be run')
+                  + ' — this hire is listed on /admin/hr/reconciliation until it is.'),
             isSystem: true
           });
         }
-
-        // Transfer the applicant into an employee record (pending onboarding).
-        try {
-          const { transferApplicantToEmployee } = await import('@/lib/hire-transfer');
-          await transferApplicantToEmployee(offer);
-        } catch (_) {}
 
         // PRIVILEGE ESCALATION, REMOVED.
         //
@@ -195,6 +401,17 @@ if (Astro.request.method === 'POST' && isOwner) {
             entityId: String(offer.id), ipAddress: ipHeader.substring(0, 64),
             diff: { refNumber: offer.refNumber, roleTitle: offer.roleTitle,
               consent: true, consentText: 'read the offer, accepts all terms, typed name is legal e-signature',
+              // WHICH LETTER DID THIS PERSON ACTUALLY SIGN? Recorded once, at the binding moment,
+              // rather than inferred later from a template_type column that is only a request.
+              // If a hand-picked template was refused, the refusal is in `templateNotes`.
+              templateId: letter.templateId,
+              templateLevel: templateDecision.level || 'not recorded',
+              templateEngagement: templateDecision.engagement || 'not recorded',
+              templateOverrideRequested: templateDecision.overrideRequested || 'none',
+              templateOverrideAccepted: templateDecision.overrideAccepted,
+              templateNotes: templateDecision.notes,
+              unpaidClauseShown: letter.showsUnpaidClause,
+              completionCertificatePromised: letter.awardsCompletionCertificate,
               // The name the person actually typed, recorded alongside the claim that it IS the
               // signature. Without it the audit entry asserted evidence that was never captured.
               typedName, typedNameMatchesAccount: typedName.toLowerCase() === String(offer.candidateName || '').trim().toLowerCase(),
@@ -209,12 +426,29 @@ if (Astro.request.method === 'POST' && isOwner) {
           await promoteEnrolmentPhoto(String(user.id));
         } catch (_) {}
 
-        // Push notification to admins
+        // Push notification to admins. The application id falls back to the offer's own column: it
+        // was `app?.id || ''`, and `app` is null whenever the applicant record could not be matched
+        // to this account — which produced a notification whose URL was literally
+        // '/admin/applications/', landing the reader on the list with no indication which hire it was
+        // about. offer.applicationId is NOT NULL on the table, so this always has an answer.
         try {
           const { pushNotify } = await import('@/lib/push');
-          await pushNotify.offerSigned(offer.candidateName || 'Candidate', offer.roleTitle || 'a role', app?.id || '');
+          await pushNotify.offerSigned(
+            offer.candidateName || 'Candidate',
+            offer.roleTitle || 'a role',
+            String(app?.id || offer.applicationId || ''),
+          );
         } catch (_) {}
-        successMsg = 'Offer accepted. You are officially part of EduRankAI. Next: share your educational and professional certificates so HR can verify them.';
+
+        // THE SENTENCE MATCHES WHAT HAPPENED. It read "Offer accepted. You are officially part of
+        // EduRankAI." on every path, including the ones where no employee record existed — a person
+        // was told they had joined a company that had no record of them. The signature is real either
+        // way and is never downplayed; what changes is what they are told to expect next.
+        successMsg = handoff && handoff.ok
+          ? 'Offer accepted. You are officially part of EduRankAI. Next: share your educational and professional certificates so HR can verify them.'
+          : 'Offer accepted, and your signature is recorded. The people desk is still finishing your '
+            + 'employee record — they have been notified and will be in touch. Nothing further is '
+            + 'needed from you right now.';
         acceptedNow = true;
         offer.status = 'signed';
         offer.signedAt = new Date();
@@ -226,33 +460,11 @@ if (Astro.request.method === 'POST' && isOwner) {
   }
 }
 
-const content = offer.content || {};
-const c = content;
 const verifyUrl = 'https://edurankai.in/offer/verify/' + offer.token;
 // Rendered server-side so it is present in the printed/saved document, not dependent on a script
 // having run or a remote image still existing years later.
 const { qrSvg } = await import('@/lib/qr');
 const verifyQr = await qrSvg(verifyUrl, { size: 128 });
-const shortId = offer.id.substring(0, 8).toUpperCase();
-
-function formatDate(d: any): string {
-  if (!d) return '';
-  const date = typeof d === 'string' ? new Date(d) : d;
-  if (isNaN(date.getTime())) return d;
-  return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
-}
-// India Standard Time stamp - the server runs in UTC, so we must pin the zone
-// or signed timestamps render ~5.5h off.
-function formatDateTimeIST(d: any): string {
-  if (!d) return '';
-  const date = typeof d === 'string' ? new Date(d) : d;
-  if (isNaN(date.getTime())) return '';
-  return date.toLocaleString('en-IN', {
-    day: '2-digit', month: 'short', year: 'numeric',
-    hour: '2-digit', minute: '2-digit', hour12: true,
-    timeZone: 'Asia/Kolkata'
-  }) + ' IST';
-}
 
 // Load internal handle for the user account, if linked
 let internalHandle: string | null = null;
@@ -279,18 +491,51 @@ if (offer.expiryDate && !isSigned) {
   else if (daysLeft <= 3) expiryStatus = 'warning';
 }
 
-const TEMPLATE_INTROS: Record<string, string> = {
-  intern: 'We are pleased to extend this formal offer of an internship for the position of',
-  fulltime: 'We are pleased to extend this formal full-time employment offer for the position of',
-  contract: 'We are pleased to extend this contract engagement offer for the position of',
-  leadership: 'We are honored to extend this leadership offer for the position of'
-};
+// THE LETTER, AS PARTS. Emphasis is carried as data ({ text, bold }) rather than as markup, so a
+// field value typed by an admin is rendered through normal JSX escaping and can never become HTML.
+// Nothing in this document is passed to set:html except the QR we generated ourselves.
+const openingParts = emphasize(letter.opening);
+const welcomeParts = emphasize(letter.welcome);
+const termsParts = emphasize(letter.engagementTerms);
+const progressionParts = emphasize(letter.progression);
+const completionParts = letter.completion ? emphasize(letter.completion) : [];
+const closingParts = emphasize(letter.closing);
 
-const intro = TEMPLATE_INTROS[offer.templateType] || TEMPLATE_INTROS.intern;
+// WHICH SUMMARY FIELDS ARE RELEVANT is part of the template, not a fixed list. A permanent
+// appointment has no "Duration", and a contract has no "Working Hours"; printing "TBD" against
+// either one is the document admitting it does not know what it is describing.
+const showsDuration = letter.summaryKeys.indexOf('duration') !== -1;
+const showsHours = letter.summaryKeys.indexOf('hoursCommitment') !== -1;
 
-// Data for the one-click, dependency-free PDF generator (era-offer-pdf.js).
-const isIntern = (offer.templateType === 'intern') || /intern/i.test(c.employmentType || '');
-const joiningTxt = formatDate(c.joiningDate) || 'a mutually agreed date';
+// THE WORKING-TIME PARAGRAPHS ARE PART OF THE LETTER, SO THEY ARE PART OF THE PRINTED LETTER.
+//
+// They were rendered in section 03 of the web page and nowhere else, so the PDF — the copy people
+// actually keep — carried a "Working Hours" row and not one word explaining it. The saved document
+// therefore did state a bare total with no split, which is precisely the thing this whole module
+// exists to prevent, surviving in the one artefact that outlives the web page.
+//
+// Built from the same consts the JSX below renders, in the same order, so the two cannot drift.
+const workingTimeParas: string[] = ['Working time. ' + hoursExplainer];
+if (programmeTotal) workingTimeParas.push(programmeTotal + ' The total is your engagement, not your task output.');
+if (hoursWereAgreed) workingTimeParas.push('Where the hours recorded in your summary below differ from the standard structure, the recorded figure is the one that governs your engagement.');
+workingTimeParas.push(engagementPolicy.statutoryNote);
+workingTimeParas.push('How this is measured. ' + engagementPolicy.measuredBy);
+
+// The PDF reads the SAME sentences. `bodyParas` is what the generator prints when supplied, and
+// the irrelevant summary fields are blanked here because the generator skips empty values - that
+// is how a template's field relevance reaches the printed copy without a second copy of the rules.
+// Assembled part by part rather than from `letter.paragraphs` so the working-time block lands where
+// the reader meets it on the page: immediately after the engagement terms it qualifies.
+const pdfBodyParas: string[] = [
+  plain(letter.opening),
+  plain(letter.welcome),
+  plain(letter.engagementTerms),
+  ...workingTimeParas,
+  plain(letter.progression),
+  plain(letter.completion),
+  plain(letter.closing),
+].filter((p) => p && p.trim().length > 0);
+
 const offerPdfData = {
   refNumber: offer.refNumber || '',
   offerDate: formatDate(offer.offerDate),
@@ -300,11 +545,15 @@ const offerPdfData = {
   candidateCity: c.candidateCity || '',
   roleTitle: c.roleTitle || offer.roleTitle || '',
   department: c.department || offer.department || '',
-  employmentType: c.employmentType || '',
+  employmentType: letter.engagementLabel,
   workMode: c.workMode || '',
-  duration: c.duration || '',
-  hoursCommitment: c.hoursCommitment || '',
-  compensation: c.compensation || 'To be discussed',
+  duration: showsDuration ? (c.duration || '') : '',
+  // The SAME string the web summary prints. This read `c.hoursCommitment || ''` — the raw box,
+  // without the policy fallback — so an offer with an empty hours field showed the resolved policy
+  // commitment on screen and an absent Working Hours row in the PDF. Two documents, one signature,
+  // different terms. `letterFields.hoursCommitment` is the single value both now render.
+  hoursCommitment: showsHours ? (letterFields.hoursCommitment || '') : '',
+  compensation: c.compensation || '',
   integrityHash: offer.integrityHash || '',
   internalHandle: internalHandle || '',
   verifyUrl: verifyUrl,
@@ -312,14 +561,7 @@ const offerPdfData = {
   signedAt: offer.signedAt ? formatDateTimeIST(offer.signedAt) : '',
   signatoryName: (c.signatoryName || 'Siddharth Prasad'),
   signatoryTitle: (c.signatoryTitle || 'Founder & CEO'),
-  bodyParas: [
-    intro + ' ' + (c.roleTitle || '') + ' within ' + (c.department ? c.department : 'the team') + ' at EduRankAI. Following a thorough evaluation of your application and conversations, we are confident you demonstrate the capability, character, and commitment we look for.',
-    isIntern
-      ? ('This ' + (c.employmentType || 'internship') + ' is offered on an unpaid basis in accordance with EduRankAI\'s Internship Policy. You will work ' + (c.workMode || 'Remote') + ', committing ' + (c.hoursCommitment || 'the agreed hours') + ' of focused effort. The engagement runs for ' + (c.duration || 'the agreed term') + ', commencing ' + joiningTxt + '. Compensation: ' + (c.compensation || 'To be discussed') + '.')
-      : ('This is a ' + (c.employmentType || 'role') + ' engagement, work mode ' + (c.workMode || 'Remote') + ', for ' + (c.duration || 'the agreed term') + ', commencing ' + joiningTxt + '. Compensation: ' + (c.compensation || 'as discussed') + '.'),
-    'You will receive a mid-point review and a final review, assessed via EduRankAI\'s rubric-based evaluation. Outstanding performers receive a Letter of Recommendation; all successful completers receive a Certificate of Completion.',
-    'By accepting, you confirm you have read and agree to EduRankAI\'s Recruitment and Work Policy and Code of Conduct.'
-  ]
+  bodyParas: pdfBodyParas
 };
 ---
 <BaseLayout title={'Offer Letter - ' + c.candidateName} description="Your EduRankAI offer letter">
@@ -348,6 +590,28 @@ const offerPdfData = {
         </button>
       </div>
     </div>
+
+    {/* WHY THIS LETTER READS THE WAY IT DOES — staff only, never printed, never shown to the
+        candidate. The template used to be a hidden column somebody set by hand on a form, and
+        nobody could see afterwards which one had governed the letter. It is now decided from the
+        agreed fields, and this is where a human checks that decision against what they meant to
+        send, BEFORE anything is signed. */}
+    {isAdmin && (
+      <div class={'doc-note no-print ' + (templateDecision.notes.length > 0 ? 'doc-note--warn' : 'doc-note--time')}>
+        <svg class="doc-note__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M9 13h6" /><path d="M9 17h4" /></svg>
+        <div>
+          <p class="doc-note__eyebrow">Viewing as staff &nbsp;|&nbsp; template provenance</p>
+          <p class="doc-note__sm">
+            Written from <strong>{letter.templateLabel}</strong>. Level read as <strong>{templateDecision.level || 'not recorded'}</strong> (source: {templateDecision.levelSource}), engagement read as <strong>{templateDecision.engagement || 'not recorded'}</strong> (source: {templateDecision.engagementSource}). Unpaid clause <strong>{letter.showsUnpaidClause ? 'shown' : 'not shown'}</strong>; completion certificate <strong>{letter.awardsCompletionCertificate ? 'promised' : 'not promised'}</strong>.
+          </p>
+          {templateDecision.overrideRequested && (
+            <p class="doc-note__sm">Template requested by hand: <strong>{templateDecision.overrideRequested}</strong> &mdash; {templateDecision.overrideAccepted ? 'accepted' : 'refused'}.</p>
+          )}
+          {templateDecision.notes.map((n) => (<p class="doc-note__quote">{n}</p>))}
+          <p class="doc-note__sm"><a href="/admin/offer/templates" class="doc-link">Review every issued offer against its template</a></p>
+        </div>
+      </div>
+    )}
 
     {errorMsg && (
       <div class="doc-note doc-note--warn no-print" role="alert">
@@ -441,8 +705,10 @@ const offerPdfData = {
             </div>
           )}
           <span class="doc-cover__rule" aria-hidden="true"></span>
-          <h1 class="doc-h1"><span class="doc-h1__re">Re: </span>Offer of {c.employmentType} &nbsp;|&nbsp; {c.roleTitle}{c.department && (<span>, {c.department}</span>)}</h1>
-          <p class="doc-badge">{c.employmentType} &nbsp;|&nbsp; {c.department || c.roleTitle}</p>
+          {/* The engagement name comes from the resolved template, so a letter with an empty
+              employmentType field reads "Offer of Full-Time" rather than "Offer of". */}
+          <h1 class="doc-h1"><span class="doc-h1__re">Re: </span>Offer of {letter.engagementLabel} &nbsp;|&nbsp; {c.roleTitle}{c.department && (<span>, {c.department}</span>)}</h1>
+          <p class="doc-badge">{letter.engagementLabel} &nbsp;|&nbsp; {c.department || c.roleTitle}</p>
         </div>
       </header>
 
@@ -451,68 +717,94 @@ const offerPdfData = {
         <p class="doc-kicker"><span class="doc-kicker__n">01</span></p>
         <h2 class="doc-h2" id="pnl-opening">Dear {(c.candidateName || '').split(' ')[0] || 'Candidate'},</h2>
         <div class="doc-prose">
-          <p>{intro} <strong>{c.roleTitle}</strong>{c.department && (<span> within the <strong>{c.department}</strong></span>)} at <strong>EduRankAI</strong>. Following a thorough evaluation of your application and conversations, we are confident you demonstrate the capability, character, and commitment we look for.</p>
+          {/* The letter opened straight into "we are pleased to extend" -- correct, and cold. This is
+              the moment somebody finds out they got the job, and the document said nothing about
+              that. Congratulations first, terms second. Inline SVG, never an emoji. */}
+          <p class="doc-congrats">
+            <svg class="doc-congrats__mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2.6l2.6 5.5 6 .9-4.3 4.3 1 6-5.3-2.9-5.3 2.9 1-6L3.4 9l6-.9z" />
+            </svg>
+            <span><strong>Congratulations{(c.candidateName || '').split(' ')[0] ? ', ' + (c.candidateName || '').split(' ')[0] : ''}.</strong> You have been selected, and we are genuinely glad it is you.</span>
+          </p>
+          <p>{openingParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
+          <p>{welcomeParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
         </div>
       </section>
 
-      {/* ---------------------------------------------------------------- 02 THE OFFER */}
-      <section class="doc-panel" data-reveal aria-labelledby="pnl-offer">
-        <p class="doc-kicker"><span class="doc-kicker__n">02</span></p>
-        <h2 class="doc-h2" id="pnl-offer">The offer at a glance</h2>
-        <div class="doc-grid">
-          <div class="fact">
-            <p class="fact__k">Duration</p>
-            <p class="fact__v">{c.duration || 'TBD'}</p>
+      {/* ---------------------------------------------------------------- 02 THE OFFER
+          WHICH FACTS ARE WORTH PULLING OUT depends on the engagement. A permanent appointment led
+          with "Duration: TBD", which told the reader nothing except that the letter had been filled
+          in on a form built for internships. The template names its own facts; a fact with no value
+          is left out rather than printed as TBD, and if none were recorded the panel does not
+          render an empty box under a heading. */}
+      {letter.glance.length > 0 && (
+        <section class="doc-panel" data-reveal aria-labelledby="pnl-offer">
+          <p class="doc-kicker"><span class="doc-kicker__n">02</span></p>
+          <h2 class="doc-h2" id="pnl-offer">The offer at a glance</h2>
+          <div class="doc-grid">
+            {letter.glance.map((f) => (
+              <div class="fact">
+                <p class="fact__k">{f.label}</p>
+                <p class="fact__v">{f.value}</p>
+              </div>
+            ))}
           </div>
-          <div class="fact">
-            <p class="fact__k">Work Mode</p>
-            <p class="fact__v">{c.workMode || 'Remote'}</p>
-          </div>
-          <div class="fact doc-grid__wide">
-            <p class="fact__k">Compensation</p>
-            <p class="fact__v">{c.compensation || 'TBD'}</p>
-          </div>
-        </div>
-      </section>
+        </section>
+      )}
 
       {/* ---------------------------------------------------------------- 03 ENGAGEMENT TERMS */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-terms">
         <p class="doc-kicker"><span class="doc-kicker__n">03</span></p>
         <h2 class="doc-h2" id="pnl-terms">Engagement terms</h2>
         <div class="doc-prose">
-          {(offer.templateType === 'intern') && (
-            <p>This {c.employmentType} is offered on an <strong>unpaid basis</strong> in accordance with EduRankAI's Internship Policy. You will work <strong>{c.workMode}</strong>, committing <strong>{c.hoursCommitment}</strong> of focused effort. The engagement runs for <strong>{c.duration}</strong>, commencing <strong>{formatDate(c.joiningDate) || 'a mutually agreed date'}</strong>.</p>
+          {/* The unpaid clause is not a branch here. It is a property of the internship and
+              apprenticeship templates in src/lib/offer-templates.ts, and no other template holds
+              the sentence at all - which is why a senior letter cannot render it however the form
+              was filled in. */}
+          <p>{termsParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
+
+          {/* WORKING TIME, STATED RATHER THAN IMPLIED.
+              A bare hours figure is the thing the founder objected to, and he was right: for an
+              internship "40 hours" is the TOTAL ENGAGEMENT, and only five hours a day of it is
+              project work. Someone reading 40 on its own concludes they owe forty hours of task
+              output. Everything below comes from src/lib/engagement-policy.ts, which is incapable
+              of printing a counted total without its split -- and which, for a director or a chief
+              officer, prints no hour count at all, because a position of management sits outside
+              the working-hours provisions of the statute and a daily figure there would be
+              inaccurate rather than strict. */}
+          <p class="doc-prose__note"><strong>Working time.</strong> {hoursExplainer}</p>
+          {programmeTotal && (<p class="doc-prose__note">{programmeTotal} The total is your engagement, not your task output.</p>)}
+          {hoursWereAgreed && (
+            <p class="doc-prose__note">Where the hours recorded in your summary below differ from the standard structure, the recorded figure is the one that governs your engagement.</p>
           )}
-          {(offer.templateType !== 'intern') && (
-            <p>This offer is contingent on completion of pre-employment requirements. Your employment commences on <strong>{formatDate(c.joiningDate) || 'a mutually agreed date'}</strong> as a <strong>{c.employmentType}</strong> employee. Onboarding details will be confirmed within 7 days of acceptance.</p>
-          )}
+          <p class="doc-prose__note">{engagementPolicy.statutoryNote}</p>
+          <p class="doc-prose__note"><strong>How this is measured.</strong> {engagementPolicy.measuredBy}</p>
         </div>
       </section>
 
       {/* ---------------------------------------------------------------- 04 REVIEW */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-review">
         <p class="doc-kicker"><span class="doc-kicker__n">04</span></p>
-        <h2 class="doc-h2" id="pnl-review">Review and assessment</h2>
+        <h2 class="doc-h2" id="pnl-review">{letter.awardsCompletionCertificate ? 'Review, and what you leave with' : 'Review and progression'}</h2>
         <div class="doc-prose">
-          <p>You will receive a mid-point review and final review, assessed via EduRankAI's rubric-based evaluation.</p>
+          <p>{progressionParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
+          {/* MID-POINT REVIEWS, A CERTIFICATE OF COMPLETION AND "SUCCESSFUL COMPLETERS" WERE
+              UNCONDITIONAL SECTIONS OF THIS LETTER. Every offer carried them, so a Chief Technology
+              Officer was told in writing that they would receive a certificate for completing us.
+              Completion copy now exists only on the two templates that award one, and this block
+              renders only when the governing template is one of them. */}
+          {completionParts.length > 0 && (
+            <p>{completionParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
+          )}
         </div>
       </section>
 
-      {/* ---------------------------------------------------------------- 05 ON COMPLETION */}
-      <section class="doc-panel" data-reveal aria-labelledby="pnl-completion">
-        <p class="doc-kicker"><span class="doc-kicker__n">05</span></p>
-        <h2 class="doc-h2" id="pnl-completion">On completion</h2>
-        <div class="doc-prose">
-          <p>Outstanding performers receive a Letter of Recommendation; all successful completers receive a Certificate of Completion.</p>
-        </div>
-      </section>
-
-      {/* ---------------------------------------------------------------- 06 POLICIES */}
+      {/* ---------------------------------------------------------------- 05 POLICIES */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-policy">
-        <p class="doc-kicker"><span class="doc-kicker__n">06</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">05</span></p>
         <h2 class="doc-h2" id="pnl-policy">Terms you are agreeing to</h2>
         <div class="doc-prose">
-          <p>By accepting, you confirm you have read and agree to EduRankAI's Recruitment and Work Policy and Code of Conduct.</p>
+          <p>{closingParts.map((p) => (p.bold ? <strong>{p.text}</strong> : p.text))}</p>
           {c.customNote && (<p class="doc-prose__note">{c.customNote}</p>)}
         </div>
       </section>
@@ -523,42 +815,61 @@ const offerPdfData = {
       {(c.includeFounderRemark !== false) && (
       <section class="doc-panel doc-panel--quote" data-reveal aria-labelledby="pnl-founder">
         <h2 class="doc-h2" id="pnl-founder">A remark from the Founder</h2>
+        {/* THE FOUNDER'S INVITATION IS KEPT. Two things about it were changed, and both were
+            changes of standing rather than of sentiment.
+            (1) It said the well-being practice "is regarded as part of your eligibility criteria
+                and is assessed accordingly", and then illustrated that practice with the chanting
+                of the Hare Krishna Mahamantra and thirty minutes with the Srimad Bhagavad Gita.
+                Read together, a named devotional observance became a stated condition of
+                eligibility inside a hiring document. India's private sector has no statutory bar
+                on that, but EduRankAI hires into jurisdictions that do -- and quite apart from any
+                statute, a candidate of another faith reading that paragraph learns something
+                untrue about whether this role is open to them. The founder's own practice is now
+                offered explicitly as HIS example, and what is assessed is stated without reference
+                to anyone's beliefs (WELLBEING_ASSESSED_AS).
+            (2) It asked for "a further 2.5 hours each day" ON TOP of contribution hours. The
+                published policy puts 1 hour 40 minutes of well-being INSIDE the engagement, and
+                the founder's own four-item rhythm added up to about 1 hour 45. The figure now
+                comes from the policy module and the rhythm sums to it exactly. */}
         <div class="doc-prose">
-          <p>Your active contribution hours are fixed in accordance with our policies. Beyond them, we warmly encourage you to devote a further <strong>2.5 hours</strong> each day to staying holistically fit. A sound body and a steady mind are the quiet foundation of exceptional work, and so this practice is regarded as part of your eligibility criteria and is assessed accordingly.</p>
-          <p>A gentle rhythm you might follow for that time:</p>
+          {engagementPolicy.wellbeingMinutesPerDay != null && (
+            <p>Your engagement already sets aside <strong>{formatMinutes(engagementPolicy.wellbeingMinutesPerDay)}</strong> of each working day for holistic well-being and personal development. It sits inside your hours, not on top of them, and I would like you to genuinely take it. A sound body and a steady mind are the quiet foundation of exceptional work.</p>
+          )}
+          {engagementPolicy.wellbeingMinutesPerDay == null && (
+            <p>Your role carries no counted hours, and this is not an hour I intend to count either. I would still ask you to keep a daily practice that looks after your body and steadies your mind. A sound body and a steady mind are the quiet foundation of exceptional work, and they are harder to protect the more senior you become.</p>
+          )}
+          <p>{WELLBEING_ASSESSED_AS}</p>
+          <p>Here is the rhythm I keep myself. It is my example, not your requirement &mdash; yours may look nothing like it, and that is entirely fine:</p>
           <ul class="doc-list">
-            <li><svg class="doc-list__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>15 to 30 minutes of meditation: the chanting of Aum, the Hare Krishna Mahamantra, or any practice true to your own faith.</span></li>
+            <li><svg class="doc-list__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>20 minutes of stillness. For me that is the chanting of Aum and the Hare Krishna Mahamantra. For you it might be prayer, breathwork, silence, or nothing of the kind.</span></li>
             <li><svg class="doc-list__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>45 minutes of intensive physical exercise.</span></li>
-            <li><svg class="doc-list__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>15 minutes of focused rest.</span></li>
-            <li><svg class="doc-list__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>30 minutes with the Srimad Bhagavad Gita, or any scripture that speaks to you.</span></li>
+            <li><svg class="doc-list__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>15 minutes of genuine rest, away from a screen.</span></li>
+            <li><svg class="doc-list__i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg><span>20 minutes of reading that steadies you. For me that is the Srimad Bhagavad Gita. Choose whatever does that for you, sacred or secular.</span></li>
           </ul>
           <p>Why ask for something so personal in a professional letter? Because good health shapes character, and character is what upholds true professional excellence. Consider this an invitation, offered with care. Thank you for your precious time and your kind efforts.</p>
         </div>
       </section>
       )}
 
-      {/* ---------------------------------------------------------------- 07 OFFER SUMMARY */}
+      {/* ---------------------------------------------------------------- 06 OFFER SUMMARY */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-summary">
-        <p class="doc-kicker"><span class="doc-kicker__n">07</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">06</span></p>
         <h2 class="doc-h2" id="pnl-summary">Offer Summary</h2>
+        {/* Rows come from the template's own list of relevant fields, in its own order, and an
+            empty value drops the row instead of printing a blank one. A permanent appointment no
+            longer carries an empty "Duration"; a contract no longer carries "Working Hours". */}
         <div class="doc-grid">
-          <div class="sum"><p class="sum__k">Position</p><p class="sum__v">{c.roleTitle}</p></div>
-          {c.department && (<div class="sum"><p class="sum__k">Department</p><p class="sum__v">{c.department}</p></div>)}
-          <div class="sum"><p class="sum__k">Employment Type</p><p class="sum__v">{c.employmentType}</p></div>
-          <div class="sum"><p class="sum__k">Work Mode</p><p class="sum__v">{c.workMode}</p></div>
-          <div class="sum"><p class="sum__k">Duration</p><p class="sum__v">{c.duration}</p></div>
-          {c.joiningDate && (<div class="sum"><p class="sum__k">Joining Date</p><p class="sum__v">{formatDate(c.joiningDate)}</p></div>)}
-          {c.reportingTo && (<div class="sum"><p class="sum__k">Reporting To</p><p class="sum__v">{c.reportingTo}</p></div>)}
-          {c.hoursCommitment && (<div class="sum"><p class="sum__k">Working Hours</p><p class="sum__v">{c.hoursCommitment}</p></div>)}
-          <div class="sum"><p class="sum__k">Compensation</p><p class="sum__v">{c.compensation}</p></div>
+          {letter.summary.map((row) => (
+            <div class="sum"><p class="sum__k">{row.label}</p><p class="sum__v">{row.value}</p></div>
+          ))}
           {offer.expiryDate && (<div class="sum"><p class="sum__k">Offer Expires</p><p class="sum__v">{formatDate(offer.expiryDate)}</p></div>)}
           <div class="sum doc-grid__wide"><p class="sum__k">Integrity Hash</p><p class="sum__v sum__v--hash">{offer.integrityHash}</p></div>
         </div>
       </section>
 
-      {/* ---------------------------------------------------------------- 08 AUTHORISATION */}
+      {/* ---------------------------------------------------------------- 07 AUTHORISATION */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-auth">
-        <p class="doc-kicker"><span class="doc-kicker__n">08</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">07</span></p>
         <h2 class="doc-h2" id="pnl-auth">Authorisation</h2>
         <div class="doc-sign">
           <div>
@@ -591,15 +902,23 @@ const offerPdfData = {
         </section>
       )}
 
-      {/* ---------------------------------------------------------------- 09 ACCESS */}
+      {/* ---------------------------------------------------------------- 08 ACCESS */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-access">
-        <p class="doc-kicker"><span class="doc-kicker__n">09</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">08</span></p>
         <h2 class="doc-h2" id="pnl-access">Access Credentials</h2>
         {offer.createdUserId ? (
           <div class="doc-access">
+            {/* THE DOOR THIS SENDS THEM TO HAS TO BE ONE THAT OPENS.
+                This read "Sign in at edurankai.in/admin/login". Signing an offer deliberately no
+                longer promotes the account (that was the escalation which handed every intern the
+                admin panel and edit rights over live content), so the account stays an ordinary one
+                and the middleware bounces it straight off /admin/*. The permanent, printed,
+                PDF-archived copy of somebody's offer was instructing them to sign in somewhere that
+                would throw them out on their first day. /portal/login is their actual workspace door
+                and it opens for every kind of account. */}
             <p class="doc-prose__p">
               Your institutional account is active. Sign in at
-              <a href="https://edurankai.in/admin/login" class="doc-link">edurankai.in/admin/login</a>
+              <a href="https://edurankai.in/portal/login" class="doc-link">edurankai.in/portal/login</a>
               using <strong>either</strong> your personal email OR your internal handle &mdash; both work.
             </p>
             <div class="doc-grid">
@@ -629,9 +948,9 @@ const offerPdfData = {
         )}
       </section>
 
-      {/* ---------------------------------------------------------------- 10 VERIFICATION */}
+      {/* ---------------------------------------------------------------- 09 VERIFICATION */}
       <section class="doc-panel" data-reveal aria-labelledby="pnl-verify">
-        <p class="doc-kicker"><span class="doc-kicker__n">10</span></p>
+        <p class="doc-kicker"><span class="doc-kicker__n">09</span></p>
         <h2 class="doc-h2" id="pnl-verify">Verification</h2>
         <div class="verify">
           <div class="verify__top">
@@ -874,6 +1193,22 @@ const offerPdfData = {
       font-size: 1.0625rem; line-height: 1.78; color: var(--ink-2); margin: 0 0 14px;
     }
     .doc-prose p:last-child, .doc-prose__p:last-child { margin-bottom: 0; }
+
+    /* The congratulation line. Set apart from the body so the first thing read is the news, not
+       the terms. Prints with the document -- somebody keeps this letter. */
+    .doc-congrats {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 14px 16px; margin-bottom: 18px;
+      border-left: 3px solid currentColor;
+      background: rgba(255, 79, 0, 0.05);
+      border-radius: 0 10px 10px 0;
+      font-size: 1.02rem; line-height: 1.55;
+    }
+    .doc-congrats__mark { width: 22px; height: 22px; flex: 0 0 22px; margin-top: 2px; opacity: 0.85; }
+    @media (max-width: 480px) {
+      .doc-congrats { padding: 12px 13px; gap: 8px; font-size: 0.97rem; }
+      .doc-congrats__mark { width: 19px; height: 19px; flex-basis: 19px; }
+    }
     .doc-prose strong, .doc-prose__p strong { color: var(--ink); font-weight: 600; }
     .doc-prose__note { font-style: italic; }
     .doc-meta { font-size: 0.82rem; line-height: 1.65; color: var(--muted); }

@@ -273,6 +273,32 @@ async function createAttendanceTables(): Promise<void> {
   await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS qr_station_id UUID`);
   await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS qr_code_raw TEXT`);
   await db.execute(sql`ALTER TABLE hr_clock_events ADD COLUMN IF NOT EXISTS source TEXT`);
+
+  // -----------------------------------------------------------------------------------------
+  // THE UNIQUENESS EIGHT UPSERTS DEPEND ON, WHICH ONLY A BRAND-NEW DATABASE HAD.
+  //
+  // `UNIQUE (employee_id, date)` is declared ONLY inside the CREATE TABLE body at
+  // db/hr-schema.sql:140, and that file's own comment two lines below says the production table
+  // pre-dates it and the CREATE "only fills a brand-new one" — which is exactly why overtime_hours
+  // was given an explicit ALTER and this constraint was not. No module CREATEs hr_attendance (this
+  // file only ALTERs columns onto it) and there is no ADD CONSTRAINT anywhere in the repository.
+  //
+  // Without it every `ON CONFLICT (employee_id, date)` fails with "there is no unique or exclusion
+  // constraint matching the ON CONFLICT specification" — clock-in, clock-out, the HR bulk-mark grid
+  // and approved-leave propagation all die together (src/lib/attendance.ts:1246/1721/2237,
+  // src/lib/hr-leave.ts:1047/1055/1063, /admin/hr/attendance/index.astro:83/110,
+  // /portal/employee.astro:270). ON CONFLICT infers from a unique INDEX just as it does from a
+  // table constraint, and CREATE UNIQUE INDEX IF NOT EXISTS is the only additive, idempotent form.
+  //
+  // ITS OWN try/catch, DELIBERATELY. If a live table already holds two rows for one employee-day
+  // the index cannot be built, and that must not abort the rest of this ensure (which re-throws) or
+  // take the module down. It is logged as the data-repair job it is; the day's rows must be merged
+  // by hand before the guarantee can be restored.
+  try {
+    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS hr_attendance_emp_date_uniq ON hr_attendance (employee_id, date)`);
+  } catch (e: any) {
+    console.error('[attendance-schema] could not create the UNIQUE index on hr_attendance (employee_id, date) — duplicate rows for one employee-day probably exist and must be merged by hand; until then every attendance upsert will fail:', e?.cause?.message || e?.message);
+  }
 }
 
 // =================================================================================================

@@ -3,6 +3,8 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { applications, users } from '@/lib/db/schema';
 import { eq, desc, sql, and, or, ilike, inArray, gte } from 'drizzle-orm';
+// pageParam so a query-string page number can never reach OFFSET as NaN or a negative.
+import { pageParam } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -32,16 +34,23 @@ if (Astro.request.method === 'POST') {
       const id = (fd.get('id') as string || '').trim();
       if (id) { await db.delete(applications).where(eq(applications.id, id)); okMsg = 'Application permanently deleted.'; }
     } else if (action === 'bulk_delete' || action === 'bulk_archive' || action === 'bulk_status') {
-      const ids = ((fd.get('selected_ids') as string) || '').split(',').map(s => s.trim());
+      // ''.split(',') is [''], never [], so the old ids.length === 0 guard could never fire and an
+      // empty selection reached the query as a blank id. Filter the blanks and test what is left.
+      const ids = ((fd.get('selected_ids') as string) || '').split(',').map(s => s.trim()).filter(Boolean);
       if (ids.length === 0) { errorMsg = 'No applications selected.'; }
       else if (action === 'bulk_delete') {
         // Soft delete → Trash (recoverable), matching the single-row Delete.
+        // deleted_at is what puts a row in the Trash tab (the list query filters on it), so this
+        // is the PRIMARY write, not a nicety. It used to be .catch(() => {}), which meant a failure
+        // left the rows merely archived while the page still said they were in Trash. Any failure
+        // now reaches the catch below and is shown.
         await db.update(applications).set({ isArchived: true }).where(inArray(applications.id, ids));
-        await db.execute(sql`UPDATE applications SET deleted_at = NOW(), updated_at = NOW() WHERE id::text = ANY(${ids})`).catch(() => {});
+        await db.execute(sql`UPDATE applications SET deleted_at = NOW(), updated_at = NOW() WHERE id::text = ANY(${ids})`);
         okMsg = `Moved ${ids.length} application(s) to Trash.`;
       } else if (action === 'bulk_archive') {
+        // Clearing deleted_at is what keeps these out of Trash, so the same reasoning applies.
         await db.update(applications).set({ isArchived: true }).where(inArray(applications.id, ids));
-        await db.execute(sql`UPDATE applications SET deleted_at = NULL WHERE id::text = ANY(${ids})`).catch(() => {});
+        await db.execute(sql`UPDATE applications SET deleted_at = NULL WHERE id::text = ANY(${ids})`);
         okMsg = `Archived ${ids.length} application(s).`;
       } else if (action === 'bulk_status') {
         const newStatus = fd.get('new_status') as string;
@@ -70,7 +79,8 @@ if (Astro.request.method === 'POST') {
         okMsg = 'Marked paid + promoted to submitted.';
       }
     }
-  } catch (err: any) { errorMsg = 'Failed: ' + (err.message || 'Unknown'); }
+    // A partial bulk write must not be reported as a success, so clear any message set before the throw.
+  } catch (err: any) { okMsg = ''; errorMsg = 'Failed: ' + (err?.cause?.message || err?.message || 'Unknown'); }
 }
 
 // Ensure the 'pending_payment' enum value exists before any query uses it.
@@ -100,7 +110,11 @@ const url = new URL(Astro.request.url);
 const statusFilter = url.searchParams.get('status') || 'all';
 const search = url.searchParams.get('q') || '';
 const archivedFilter = url.searchParams.get('archived') || 'active';
-const page = parseInt(url.searchParams.get('page') || '1');
+// `parseInt(url.searchParams.get('page') || '1')` bound straight into OFFSET: `?page=abc` gives NaN
+// and `?page=0` gives OFFSET -20, both of which Postgres refuses — so the applications register 500d
+// on a URL anybody can type or a stale bookmark can hold. pageParam() always returns a positive
+// integer; it is clamped to the last real page below, once the count is known.
+const rawPage = pageParam(url.searchParams.get('page'));
 const perPage = 20;
 
 // Export CSV
@@ -153,8 +167,19 @@ if (search.trim()) {
 
 const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
 const totalResult = await db.select({ n: sql<number>`count(*)::int` }).from(applications).where(whereClause);
-const total = totalResult[0].n;
-const totalPages = Math.ceil(total / perPage);
+// WAS `totalResult[0].n`, unguarded. A count query returns exactly one row when it succeeds, so the
+// bare index is right on the happy path and a TypeError on the only path that is not: a driver that
+// hands back an empty result — the shape an unprovisioned `applications` table produces on a fresh
+// install — took the whole applications console to a blank 500. Zero applications and an unreadable
+// table both render as an empty list here, which is what a list screen should do; a 500 tells the
+// person looking at it nothing at all. The pager below already clamps a zero total correctly.
+const total = Number(totalResult?.[0]?.n) || 0;
+// Math.ceil(0/20) is 0, and the pager rendered that as "Page 1 of 0" on an empty filter. A page
+// count is never below one: there is always the page you are looking at, even when it holds nothing.
+const totalPages = Math.max(1, Math.ceil(total / perPage));
+// Asking for page 900 of a 3-page list used to return an empty table that looked exactly like a
+// filter matching nothing. Clamping means the last page is shown instead.
+const page = Math.min(rawPage, totalPages);
 
 const apps = await db.select({
   id: applications.id, applicationNumber: applications.applicationNumber,
@@ -315,7 +340,15 @@ const ALL_STATUSES = ['pending_payment','submitted','reviewing','shortlisted','i
               <a href={`/admin/applications/${a.id}`} data-preview={`/admin/applications/${a.id}`} data-preview-title={`Application: ${a.id}`} style="flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;font-size:12px;font-weight:500;padding:7px;border-radius:6px;">
                 View Details
               </a>
-              {a.status === 'pending_payment' && (
+              {/* String() on purpose: `pending_payment` is a live application_status value —
+                  it is added by the ALTER TYPE at the top of this file and filtered on at line 136 —
+                  but it is absent from applicationStatusEnum in src/lib/db/schema.ts, so Drizzle
+                  narrows a.status to a union without it and TypeScript calls this comparison
+                  unintentional. Comparing the string keeps the Mark-paid button reachable (it is the
+                  only way to rescue an application whose payment landed out of band) without editing
+                  a shared enum while other work is in flight. The enum in schema.ts should gain the
+                  value; that is reported rather than done here. */}
+              {String(a.status) === 'pending_payment' && (
                 <form method="POST" style="flex:1;" onsubmit="return confirm('Mark this application as paid and move it to Submitted? Use only if you have confirmed payment another way.');">
                   <input type="hidden" name="_action" value="mark_paid" />
                   <input type="hidden" name="id" value={a.id} />

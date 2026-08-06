@@ -4,13 +4,25 @@
 // Only after final approval can the role be marked is_open=true on roles.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-let ready: Promise<void> | null = null;
 
+/** The real Postgres reason is on `e.cause`; `e.message` is only the SQL that failed. */
+const logFail = (tag: string, e: any) =>
+  console.error('[hr-requisition] ' + tag, e?.cause?.message || e?.message);
+
+/**
+ * Create the requisition table if it is absent. Idempotent.
+ *
+ * WAS a hand-rolled `let ready` memo with `catch (_) {}` inside it: nothing logged, and the resolved
+ * promise cached for the lifetime of the process, so a single transient DDL failure meant the
+ * requisitions console showed an empty list and every raise died against a missing table for as long
+ * as the server ran. ensureOnce() drops a failed run from its cache so the next request retries; the
+ * catch names the reason and re-throws so that drop actually happens.
+ */
 export function ensureRequisitionSchema(): Promise<void> {
-  if (ready) return ready;
-  ready = (async () => {
+  return ensureOnce('hr_requisition_v1', async () => {
     try {
       await db.execute(sql`CREATE TABLE IF NOT EXISTS hiring_requisitions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -51,9 +63,11 @@ export function ensureRequisitionSchema(): Promise<void> {
       )`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_req_status_idx ON hiring_requisitions(status, created_at DESC)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_req_dept_idx ON hiring_requisitions(department, status)`);
-    } catch (_) {}
-  })();
-  return ready;
+    } catch (e: any) {
+      logFail('ensureRequisitionSchema', e);
+      throw e;
+    }
+  });
 }
 
 export const ENGAGEMENT_TYPES = {
@@ -83,18 +97,83 @@ export async function createRequisition(opts: any) {
   return { ok: true, id: r[0]?.id };
 }
 
-export async function decideRequisition(opts: { id: string; level: 'finance' | 'leadership'; userId: string; approve: boolean; notes?: string; rejectReason?: string }) {
+/**
+ * Record one stage of a requisition decision.
+ *
+ * =================================================================================================
+ * THE STAGE IS NOT WHATEVER THE FORM SAID — IT IS WHATEVER THE ROW IS WAITING FOR
+ * =================================================================================================
+ *
+ * `level` arrives from a hidden field on the console, and neither UPDATE used to constrain the row's
+ * CURRENT status. So one POST carrying level='leadership' took a requisition straight from
+ * pending_finance to 'approved' and the finance stage this module exists to enforce never happened —
+ * a budget and a headcount signed off by half the people the file's own header names. Each UPDATE
+ * now states the status it is allowed to advance FROM, so a stage can only be recorded when it is
+ * the stage the row is actually at, and a skipped or repeated one matches no row and is reported.
+ *
+ * =================================================================================================
+ * THIS STILL CHECKS NOBODY, AND THAT IS A DECISION SOMEBODY HAS TO MAKE, NOT ONE TO MAKE HERE
+ * =================================================================================================
+ *
+ * There is no capability test in this function. `requisitions.approve` exists in
+ * src/lib/auth/registry.ts and is deliberately unenforced: which holder signs the FINANCE stage and
+ * which signs the LEADERSHIP stage is a policy question nobody has answered, and inventing an answer
+ * inside a bug fix would quietly change who can authorise a hire. Until it is answered, any account
+ * that can open the console can record either stage. That is a reported hole, not an accepted one —
+ * see src/lib/workforce/widgets.ts 'requisitions.mine'.
+ *
+ * Returns { ok: false } with a reason when nothing was written, rather than a bare ok the console
+ * printed as "Decision recorded." over an UPDATE that matched no row at all.
+ */
+export async function decideRequisition(
+  opts: { id: string; level: 'finance' | 'leadership'; userId: string; approve: boolean; notes?: string; rejectReason?: string },
+): Promise<{ ok: boolean; error?: string }> {
   await ensureRequisitionSchema();
-  if (!opts.approve) {
-    await db.execute(sql`UPDATE hiring_requisitions SET status='rejected', rejection_reason=${opts.rejectReason || opts.notes || 'No reason given'}, rejected_at=NOW(), updated_at=NOW() WHERE id=${opts.id}`);
-    return { ok: true };
+  const id = String(opts?.id || '').trim();
+  if (!id) return { ok: false, error: 'No requisition was named, so nothing was decided.' };
+
+  // OPEN STAGES ONLY. A requisition that is already approved, rejected or withdrawn is settled;
+  // re-deciding it from a stale tab must not reopen it.
+  const OPEN = sql`status IN ('pending_finance', 'pending_leadership')`;
+
+  try {
+    if (!opts.approve) {
+      const wrote = rows(await db.execute(sql`
+        UPDATE hiring_requisitions
+           SET status='rejected', rejection_reason=${opts.rejectReason || opts.notes || 'No reason given'},
+               rejected_at=NOW(), updated_at=NOW()
+         WHERE id=${id} AND ${OPEN}
+        RETURNING id`));
+      return wrote.length
+        ? { ok: true }
+        : { ok: false, error: 'That requisition is no longer open, so nothing was rejected. Reload the list.' };
+    }
+
+    if (opts.level === 'finance') {
+      const wrote = rows(await db.execute(sql`
+        UPDATE hiring_requisitions
+           SET status='pending_leadership', finance_approved_by=${opts.userId}, finance_approved_at=NOW(),
+               finance_notes=${opts.notes || null}, updated_at=NOW()
+         WHERE id=${id} AND status='pending_finance'
+        RETURNING id`));
+      return wrote.length
+        ? { ok: true }
+        : { ok: false, error: 'That requisition is not waiting on finance, so nothing was recorded. Reload the list.' };
+    }
+
+    const wrote = rows(await db.execute(sql`
+      UPDATE hiring_requisitions
+         SET status='approved', leadership_approved_by=${opts.userId}, leadership_approved_at=NOW(),
+             leadership_notes=${opts.notes || null}, updated_at=NOW()
+       WHERE id=${id} AND status='pending_leadership'
+      RETURNING id`));
+    return wrote.length
+      ? { ok: true }
+      : { ok: false, error: 'That requisition has not cleared finance yet, so leadership sign-off was not recorded.' };
+  } catch (e: any) {
+    logFail('decideRequisition', e);
+    return { ok: false, error: String(e?.cause?.message || e?.message || 'The decision could not be saved.').slice(0, 300) };
   }
-  if (opts.level === 'finance') {
-    await db.execute(sql`UPDATE hiring_requisitions SET status='pending_leadership', finance_approved_by=${opts.userId}, finance_approved_at=NOW(), finance_notes=${opts.notes || null}, updated_at=NOW() WHERE id=${opts.id}`);
-  } else {
-    await db.execute(sql`UPDATE hiring_requisitions SET status='approved', leadership_approved_by=${opts.userId}, leadership_approved_at=NOW(), leadership_notes=${opts.notes || null}, updated_at=NOW() WHERE id=${opts.id}`);
-  }
-  return { ok: true };
 }
 
 export async function listRequisitions(filterStatus?: string) {

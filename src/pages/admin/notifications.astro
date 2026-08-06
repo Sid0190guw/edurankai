@@ -33,6 +33,13 @@ for (const t of NOTIFICATION_TYPES) {
 const VAPID_PUBLIC = import.meta.env.VAPID_PUBLIC_KEY || 'PASTE_YOUR_PUBLIC_KEY_HERE';
 
 let okMsg = '';
+// EVERY WRITE ON THIS PAGE USED TO END IN `catch(e: any) {}`, and every read in `catch(e) {}`. A
+// failed "Mark all read" redrew the page with the same unread badge and said nothing; a failed
+// SELECT drew "No notifications yet." over an unreadable table. Both are now stated.
+// e.cause carries the real Postgres reason; e.message is only the failed SQL.
+let errMsg = '';
+let loadError = '';
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -60,7 +67,11 @@ if (Astro.request.method === 'POST') {
       await db.execute(sql`DELETE FROM notifications WHERE user_id = ${user.id} AND is_read = true`);
       okMsg = 'Cleared all read notifications.';
     }
-  } catch(e: any) {}
+  } catch(e: any) {
+    okMsg = '';
+    errMsg = 'Nothing was changed: ' + reasonOf(e);
+    console.error('[admin/notifications] ' + action + ' failed:', reasonOf(e));
+  }
 }
 
 const url = new URL(Astro.request.url);
@@ -90,7 +101,10 @@ try {
   const uc = await db.execute(sql`SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = ${user.id} AND is_read = false AND COALESCE(is_archived, false) = false`);
   const ucRows = Array.isArray(uc) ? uc : (uc?.rows || []);
   unreadCount = Number((ucRows[0] as any)?.n) || 0;
-} catch(e) {}
+} catch(e: any) {
+  loadError = reasonOf(e);
+  console.error('[admin/notifications] history read failed:', loadError);
+}
 
 // Category icon glyphs (no emoji — inline SVG injected into <svg> via set:html).
 const ICONS: Record<string, string> = {
@@ -172,6 +186,8 @@ function timeAgo(d: any) {
   </div>
 
   {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+  {errMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.32);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;line-height:1.5;overflow-wrap:anywhere;">{errMsg}</div>}
+  {loadError && <div style="margin:10px 16px;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.28);color:#fbbf24;border-radius:8px;padding:10px 14px;font-size:13px;line-height:1.5;overflow-wrap:anywhere;">Your notifications could not be read, so this list is empty for a reason that is not "no notifications": {loadError}</div>}
 
   <!-- INBOX TAB (Notification Center) -->
   {tab === 'inbox' && (
@@ -224,7 +240,7 @@ function timeAgo(d: any) {
         ))}
       </div>
 
-      {notifications.length === 0 && (
+      {notifications.length === 0 && !loadError && (
         <div style="text-align:center;padding:48px;color:#6e6e78;">
           <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#3a3a42" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin:0 auto 10px;display:block;"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
           <p style="font-size:13px;">{view === 'archived' ? 'Nothing archived.' : (q || category !== 'all' || filter === 'unread') ? 'No notifications match this filter.' : 'No notifications yet.'}</p>
@@ -384,11 +400,25 @@ document.addEventListener('DOMContentLoaded', function() {
           userVisibleOnly: true,
           applicationServerKey: urlBase64ToUint8Array(vapidKey)
         }).then(function(sub) {
+          // THE ANSWER USED TO BE IGNORED. The browser subscription is created locally; it is the
+          // POST below that makes the SERVER able to push to it. A 500 here left the page saying
+          // "Notifications enabled" over an account the server has no endpoint for, so no
+          // notification would ever arrive and nothing said why. A refused save is now a refusal,
+          // and the local subscription is undone so the two sides cannot disagree.
           return fetch('/admin/api/push/subscribe', {
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(sub)
+          }).then(function(r) {
+            return r.json().catch(function() {
+              throw new Error('the server answered ' + r.status + ' with a response this page could not read');
+            });
+          }).then(function(d) {
+            if (!d || d.ok !== true) throw new Error((d && d.error) || 'the server did not confirm it');
+            return d;
+          }).catch(function(err) {
+            return sub.unsubscribe().catch(function(){}).then(function() { throw err; });
           });
         }).then(function() {
           if (statusText) statusText.textContent = 'Notifications enabled';
@@ -403,15 +433,37 @@ document.addEventListener('DOMContentLoaded', function() {
         });
       });
 
+      // DISABLE USED TO TELL THE SERVER NOTHING. It unsubscribed the browser and reported
+      // "You will no longer receive push notifications on this device" while the row in
+      // push_subscriptions stayed exactly where it was — so the platform went on sending to a dead
+      // endpoint for every event, and /api/push/test went on counting the device as subscribed.
+      // The DELETE verb this needs has existed in /admin/api/push/subscribe.ts all along and had no
+      // caller anywhere in the repository. The endpoint is deleted server-side FIRST (it is
+      // unreadable from the subscription once unsubscribe() has run) and only then locally.
       if (disableBtn) disableBtn.addEventListener('click', function() {
         disableBtn.disabled = true;
         reg.pushManager.getSubscription().then(function(sub) {
-          if (sub) return sub.unsubscribe();
+          if (!sub) return null;
+          var endpoint = sub.endpoint;
+          return fetch('/admin/api/push/subscribe', {
+            method: 'DELETE',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ endpoint: endpoint })
+          }).then(function(r) { return r.json().catch(function() { return { ok: false }; }); })
+            .then(function(d) {
+              if (!d || d.ok !== true) throw new Error((d && d.error) || 'the server did not confirm it');
+              return sub.unsubscribe();
+            });
         }).then(function() {
           if (statusText) statusText.textContent = 'Notifications disabled';
           if (statusSub) statusSub.textContent = 'You will no longer receive push notifications on this device.';
           disableBtn.style.display = 'none';
           if (enableBtn) { enableBtn.style.display = 'block'; enableBtn.disabled = false; }
+        }).catch(function(err) {
+          disableBtn.disabled = false;
+          if (statusText) statusText.textContent = 'Notifications are still enabled';
+          if (statusSub) statusSub.textContent = 'Nothing was changed: ' + ((err && err.message) || 'the request did not complete') + '. This device is still subscribed.';
         });
       });
     });

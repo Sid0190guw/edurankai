@@ -479,6 +479,29 @@ async function compose(
   // day-partitioned rows on its own when ctx.today is null. It is still logged, above.
   const directReports = day.reports ?? 0;
 
+  // ---- 4b. THE SAME QUESTION, ASKED OF THE LAYER THAT OWNS IT ---------------------------------
+  //
+  // directReports above is hr_employees.reporting_manager_id — a COLUMN. The Organization Graph is
+  // the layer that answers who reports to whom, and a manager whose team exists only as graph edges
+  // counted as ZERO here: no direct-reports card, and nothing anywhere on their workspace admitted
+  // that people report to them. That is the reverse of the fault manager.card was fixed for.
+  //
+  // ASKED ONLY WHEN THE COLUMN SAID NOTHING, so this costs one indexed query for the people it can
+  // change the answer for and none at all for a manager the column already names. getDirectReports()
+  // is the sanctioned reader (relationships come from src/lib/org-graph.ts and from nowhere else) and
+  // it fails closed to an empty array, so a graph that will not answer leaves the column's answer
+  // standing rather than replacing it with a worse one.
+  let graphReports = 0;
+  if (trustworthy && directReports === 0 && workspace?.employeeId) {
+    try {
+      const { getDirectReports } = await import('@/lib/org-graph');
+      const list = await getDirectReports(String(workspace.employeeId));
+      graphReports = Array.isArray(list) ? list.length : 0;
+    } catch (e: any) {
+      logFail('org-graph direct reports', e);
+    }
+  }
+
   // Can decide a leave request or a withdrawal. This is EXACTLY what pendingLeaveForApprover() and
   // pendingWithdrawalsForApprover() will return rows for, so a widget shown here always has a queue
   // behind it and an approver is never told about work they cannot reach.
@@ -507,6 +530,15 @@ async function compose(
   // The reporting line, kept as the row-level fact it is. It is a RELATIONSHIP to particular
   // employees, not a role grant, and no capability may stand in for it: granting a key to "cover
   // managers" would hand every manager authority over every employee.
+  //
+  // THE GRAPH COUNT IS DELIBERATELY NOT IN THIS EXPRESSION, and the asymmetry is the whole point.
+  // approvesRequests gates approvals.leave and approvals.withdrawal, whose queues —
+  // pendingLeaveForApprover() and pendingWithdrawalsForApprover() — resolve the approver from
+  // hr_employees.reporting_manager_id. Widening the CARD on a graph edge those two readers do not
+  // consult would offer somebody a queue that is empty by construction. So eligibility for an
+  // approvals card tracks exactly the authority that fills it, and the graph count widens only
+  // managesPeople, which decides whether a person is shown who reports to them — a display question,
+  // answered by the layer that owns the relationship.
   const approvesRequests = seesEveryRequest || directReports > 0;
 
   // ---- 5. The context ---------------------------------------------------------------------------
@@ -526,7 +558,9 @@ async function compose(
     departmentName: workspace?.department?.name ?? null,
     scopeDepartmentId,
     directReports,
-    managesPeople: directReports > 0 || !!scopeDepartmentId,
+    // The column, the graph, or a department to lead. Any one of the three means this person is
+    // responsible for somebody else's work and should be shown who.
+    managesPeople: directReports > 0 || graphReports > 0 || !!scopeDepartmentId,
     approvesRequests,
     holds,
     permissions,

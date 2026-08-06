@@ -9,7 +9,46 @@ export function isEnabled(flags: Flag[], key: string, defaultOn = true): boolean
   const f = flags.find((x) => x.key === key);
   return f ? f.enabled : defaultOn;
 }
-export const KNOWN_FEATURES = ['community', 'ai_tutor', 'gamification', 'offline', 'admissions', 'proctoring'] as const;
+/**
+ * The feature kill-switches, and WHAT EACH ONE ACTUALLY TURNS OFF.
+ *
+ * This used to be a bare list of six strings rendered as six identical checkboxes under the heading
+ * "Feature flags (disable a subsystem's routes safely)". Only TWO of the six are asked about
+ * anywhere: featureEnabled('ai_tutor') in /api/aquintutor/ask-aquin.ts and
+ * featureEnabled('community') in /api/aquintutor/discussion.ts. `gamification`, `offline`,
+ * `admissions` and `proctoring` gate NOTHING — unchecking `proctoring` wrote the row, reported
+ * "Flag proctoring disabled", and proctoring carried on running exactly as before.
+ *
+ * A kill-switch that does not kill anything is the most dangerous kind of dead control on this
+ * console, because the person flipping it is usually flipping it in a hurry. So each flag now
+ * carries the call sites it governs; an empty `enforcedAt` is a flag that enforces nothing, and
+ * /admin/observability renders it as inert instead of as a switch.
+ *
+ * TO MAKE ONE REAL: add `if (!(await featureEnabled('<key>'))) return ...` at the entry point, then
+ * list that file here. The two lists must move together.
+ */
+export interface FeatureFlagDef {
+  key: string;
+  label: string;
+  /** Files that actually ask featureEnabled() for this key. Empty means the switch enforces nothing. */
+  enforcedAt: string[];
+}
+
+export const FEATURE_CATALOG: FeatureFlagDef[] = [
+  { key: 'community',    label: 'Community discussions', enforcedAt: ['src/pages/api/aquintutor/discussion.ts'] },
+  { key: 'ai_tutor',     label: 'AI tutor',              enforcedAt: ['src/pages/api/aquintutor/ask-aquin.ts'] },
+  { key: 'gamification', label: 'Gamification',          enforcedAt: [] },
+  { key: 'offline',      label: 'Offline packages',      enforcedAt: [] },
+  { key: 'admissions',   label: 'Admissions',            enforcedAt: [] },
+  { key: 'proctoring',   label: 'Proctoring',            enforcedAt: [] },
+];
+
+/** True when flipping this switch changes what some route does. */
+export function isFeatureEnforced(key: string): boolean {
+  return (FEATURE_CATALOG.find((f) => f.key === key)?.enforcedAt.length || 0) > 0;
+}
+
+export const KNOWN_FEATURES = FEATURE_CATALOG.map((f) => f.key);
 
 // ============================ DB (self-bootstrapping; audit reads existing rbac_audit) ============
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
@@ -32,8 +71,19 @@ export async function featureEnabled(key: string, defaultOn = true): Promise<boo
   try { return isEnabled(await getFlags(), key, defaultOn); } catch { return defaultOn; }
 }
 
-/** Consolidated audit across subsystems (rbac_audit), filterable + paginated. */
-export async function consolidatedAudit(opts: { actor?: string; capability?: string; resource?: string; decision?: string; from?: string; to?: string; limit?: number; offset?: number }): Promise<{ rows: any[]; total: number }> {
+/**
+ * Consolidated audit across subsystems (rbac_audit), filterable + paginated.
+ *
+ * `error` IS THE POINT OF THE THIRD FIELD. This used to end `catch { return { rows: [], total: 0 } }`,
+ * and /admin/observability renders exactly that as "Consolidated audit · 0 rows" above the words
+ * "No audit rows match." So when rbac_audit was unreadable, the one screen whose job is to show
+ * every allow/deny decision on the platform reported that there had been none — the same shape as
+ * /admin/hardening printing "No errors logged — clean." while its query was throwing. An empty
+ * result and an unanswerable question must not render the same, least of all on a security console.
+ *
+ * Still non-fatal (the page keeps rendering its other panels); the caller is expected to SAY so.
+ */
+export async function consolidatedAudit(opts: { actor?: string; capability?: string; resource?: string; decision?: string; from?: string; to?: string; limit?: number; offset?: number }): Promise<{ rows: any[]; total: number; error?: string }> {
   const { db, sql } = await ctx();
   const conds: any[] = [];
   if (opts.actor) conds.push(sql`u.name ILIKE ${'%' + opts.actor + '%'}`);
@@ -48,16 +98,41 @@ export async function consolidatedAudit(opts: { actor?: string; capability?: str
     const total = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id ${where}`))[0]?.c || 0;
     const r = rows(await db.execute(sql`SELECT a.*, u.name AS user_name FROM rbac_audit a LEFT JOIN users u ON u.id = a.user_id ${where} ORDER BY a.at DESC LIMIT ${opts.limit || 50} OFFSET ${opts.offset || 0}`));
     return { rows: r, total };
-  } catch { return { rows: [], total: 0 }; }
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    const reason = String(e?.cause?.message || e?.message || 'unknown error');
+    console.error('[observability] consolidated audit read failed -', reason);
+    return { rows: [], total: 0, error: reason };
+  }
 }
 
 /** Real system health: DB reachability, configured integration providers, background-queue depth. */
 export async function healthCheck(): Promise<any> {
   const { db, sql } = await ctx();
-  let dbOk = false; try { await db.execute(sql`SELECT 1`); dbOk = true; } catch { dbOk = false; }
-  let llm = false; try { const { getConfig, isReady } = await import('@/lib/llm/gateway'); llm = isReady(await getConfig()); } catch {}
+  // Every arm below reports its own reason. The two queue depths in particular were `catch {}` and
+  // therefore rendered as a confident "0" on /admin/observability whenever the count threw — a
+  // health panel that shows a healthy number because it could not read is the failure mode this
+  // whole module exists to prevent. `queuesRead` says whether those numbers are answers or defaults.
+  let dbOk = false;
+  try { await db.execute(sql`SELECT 1`); dbOk = true; } catch (e: any) {
+    dbOk = false;
+    console.error('[observability] health: database unreachable -', e?.cause?.message || e?.message);
+  }
+  let llm = false;
+  try { const { getConfig, isReady } = await import('@/lib/llm/gateway'); llm = isReady(await getConfig()); } catch (e: any) {
+    console.error('[observability] health: AI provider config unreadable -', e?.cause?.message || e?.message);
+  }
   const credSecret = !!(process.env.CREDENTIAL_SIGNING_SECRET || process.env.SESSION_SECRET);
-  let syncQueue = 0; try { syncQueue = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM edu_sync_queue WHERE resolved = false`))[0]?.c || 0; } catch {}
-  let offlinePkgs = 0; try { offlinePkgs = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM edu_offline_packages`))[0]?.c || 0; } catch {}
-  return { db: dbOk, providers: { llm, credentialSigning: credSecret }, queues: { syncPending: syncQueue, offlinePackages: offlinePkgs } };
+  let queuesRead = true;
+  let syncQueue = 0;
+  try { syncQueue = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM edu_sync_queue WHERE resolved = false`))[0]?.c || 0; } catch (e: any) {
+    queuesRead = false;
+    console.error('[observability] health: sync-queue depth unreadable -', e?.cause?.message || e?.message);
+  }
+  let offlinePkgs = 0;
+  try { offlinePkgs = rows(await db.execute(sql`SELECT COUNT(*)::int AS c FROM edu_offline_packages`))[0]?.c || 0; } catch (e: any) {
+    queuesRead = false;
+    console.error('[observability] health: offline-package count unreadable -', e?.cause?.message || e?.message);
+  }
+  return { db: dbOk, providers: { llm, credentialSigning: credSecret }, queues: { syncPending: syncQueue, offlinePackages: offlinePkgs, read: queuesRead } };
 }

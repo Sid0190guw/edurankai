@@ -1,0 +1,601 @@
+---
+// /portal/employee/reports — FILE TODAY'S REPORT, AND SEE THE WEEK IT SITS IN.
+//
+// This is the surface an intern opens on a phone at the end of the day, so it is built for 360px
+// first: one column, 44px targets, no horizontal scroll, and the form above the history because
+// filing is why they came.
+//
+// A REPORT IS A LINK, NEVER A FILE. There is no upload control on this page and there will not be
+// one — documents of every kind on this platform are Drive links, and the only stored upload
+// anywhere is a small profile photo. The reason is storage cost, and a daily report from every
+// intern every working day is the highest-volume document in the product.
+//
+// THE SHARING WARNING IS RENDERED BEFORE THE FIELD IS TOUCHED, not after submission. A restricted
+// link is invisible to the person who pasted it — their own link always opens for them, because they
+// own it — and lands on the reviewer as an access-denied page they cannot tell apart from a report
+// nobody filed. So the warning is static text under the field AND a live check as they paste, both
+// answered by the same pure function through /api/portal/reports/check-link.
+//
+// EVERY FIGURE ON THIS PAGE IS MEASURED, AND SAYS WHAT IT COUNTS. The week's worked time comes from
+// clock-in and clock-out, net of breaks, and a day with a check-in and no check-out is shown as
+// INCOMPLETE rather than as a zero or as a full day. Both of those would be lies, and the second is
+// the more flattering one, which is why it is the more dangerous.
+//
+// SCOPE. requireEmployee() resolves the employee id from the SESSION. Nothing on this page reads an
+// employee id from the URL, so there is no id to change in the address bar.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  ensureDailyReportSchema,
+  submitReport,
+  weekView,
+  reviewerFor,
+  getReport,
+  attendanceFacts,
+  workedBasis,
+  dayStateSentence,
+  SHARING_WARNING,
+  BACKFILL_DAYS,
+  MIN_SUMMARY_CHARS,
+  type WeekView,
+  type ReviewerResolution,
+  type DailyReport,
+  type AttendanceFact,
+} from '@/lib/daily-report';
+import {
+  internHoursFor,
+  comparisonSentence,
+  hoursLabel,
+  type InternHours,
+} from '@/lib/intern-hours';
+import { today as attendanceToday, weekStartIso, shiftDateIso, formatMinutes } from '@/lib/attendance';
+
+const PAGE = '/portal/employee/reports';
+
+// THE GATE FIRST, before any query.
+const gate = await requireEmployee(Astro.locals.user, PAGE);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+
+const ws = gate.ok ? gate.workspace : null;
+const denial = gate.ok ? null : gate;
+const userId = (Astro.locals.user as any)?.id || null;
+
+// ------------------------------------------------------------------------------------------------
+// EVERY const BEFORE THE POST HANDLER THAT READS IT. `const` is not hoisted, and a const declared
+// under its first use has taken pages down on this project.
+// ------------------------------------------------------------------------------------------------
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 300);
+const msgKind = String(params.get('kind') || '');
+
+// Today comes from Postgres, not from this process — a serverless region an hour ahead must not
+// decide which day an intern is filing for. Null means the read did not happen, and nothing
+// day-partitioned is asserted on a guess.
+const todayIso = ws ? await attendanceToday() : null;
+const earliestIso = todayIso ? shiftDateIso(todayIso, -BACKFILL_DAYS) : null;
+
+const fmtDay = (d: string) => {
+  if (!DATE_RE.test(d)) return d;
+  const dt = new Date(d + 'T00:00:00Z');
+  return isNaN(dt.getTime())
+    ? d
+    : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+};
+const clockTime = (isoStr: string | null) => {
+  if (!isoStr) return '';
+  const dt = new Date(isoStr);
+  if (isNaN(dt.getTime())) return '';
+  return String(dt.getUTCHours()).padStart(2, '0') + ':' + String(dt.getUTCMinutes()).padStart(2, '0');
+};
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE. Post-redirect-get, so a refresh never files the same report twice.
+// ------------------------------------------------------------------------------------------------
+if (ws && Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+
+  if (action === 'submit') {
+    const result = await submitReport({
+      employeeId: ws.employeeId,
+      userId,
+      dateIso: String(fd.get('report_date') || ''),
+      url: String(fd.get('report_url') || ''),
+      summary: String(fd.get('summary') || ''),
+      blockers: String(fd.get('blockers') || ''),
+      sharingAck: String(fd.get('sharing_ack') || '') === 'yes',
+    });
+    // The failure text is the library's own words, never a generic one — a write path that hides why
+    // it refused is the pattern that hid a sign-in outage here for hours.
+    const note = result.ok
+      ? (result.created
+          ? 'Report filed. Your reviewer can see it.'
+          : 'Report updated. This is revision ' + result.revision + '; the previous version is kept.')
+      : result.error;
+    const day = String(fd.get('report_date') || '');
+    return Astro.redirect(
+      PAGE + '?d=' + encodeURIComponent(day)
+      + '&kind=' + (result.ok ? 'ok' : 'bad')
+      + '&msg=' + encodeURIComponent(note),
+    );
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// THE READ.
+// ------------------------------------------------------------------------------------------------
+const wantedDay = String(params.get('d') || '');
+const formDay = DATE_RE.test(wantedDay) ? wantedDay : (todayIso || '');
+const wantedWeek = String(params.get('w') || '');
+const weekAnchor = DATE_RE.test(wantedWeek) ? wantedWeek : (formDay || todayIso || '');
+
+let week: WeekView | null = null;
+let reviewer: ReviewerResolution | null = null;
+// THE HOURS THE PERSON ACTUALLY WORKED, beside the commitment their offer records — never instead
+// of it, and never the other way round. internHoursFor() reads hr_attendance, approved leave and the
+// holiday calendar; the commitment is read as the free text it is and labelled as a commitment.
+let hours: InternHours | null = null;
+if (ws) {
+  await ensureDailyReportSchema();
+  week = await weekView(ws.employeeId, weekAnchor);
+  reviewer = await reviewerFor(ws.employeeId);
+  try {
+    hours = await internHoursFor(ws.employeeId);
+  } catch (e: any) {
+    // A read that failed must not become a zero on screen. Null renders as "could not be read".
+    console.error('[portal/employee/reports] internHoursFor', e?.cause?.message || e?.message);
+    hours = null;
+  }
+}
+const weekSentence = hours ? comparisonSentence(hours.week, hours.commitment) : '';
+const totalSentence = hours ? comparisonSentence(hours.total, hours.commitment) : '';
+
+// THE FORM'S DAY IS RESOLVED SEPARATELY FROM THE WEEK ON PURPOSE. Paging back to an earlier week
+// leaves the form on today, and reading `existing` out of the displayed week would then show a blank
+// form for a day that already has a report — inviting somebody to overwrite work they had forgotten
+// filing. So when the day is not in the week on screen, it is read directly.
+const inWeek = !!(week && formDay && week.days.some((d) => d.dateIso === formDay));
+let existing: DailyReport | null = null;
+let dayFact: AttendanceFact | null = null;
+if (ws && formDay) {
+  if (inWeek && week) {
+    const row = week.days.find((d) => d.dateIso === formDay) || null;
+    existing = row?.report || null;
+    dayFact = row?.attendance || null;
+  } else {
+    existing = await getReport(ws.employeeId, formDay);
+    dayFact = (await attendanceFacts([ws.employeeId], formDay, formDay)).get(ws.employeeId)?.get(formDay) || null;
+  }
+}
+
+const prevWeek = week ? shiftDateIso(week.weekStart, -7) : '';
+const nextWeek = week ? shiftDateIso(week.weekStart, 7) : '';
+const nextWeekIsFuture = !!(week && todayIso && week.weekEnd >= todayIso);
+const basis = week ? workedBasis(week) : '';
+const title = 'Daily report';
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>{title}</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #f6f4ef; font-family: 'Inter Tight', system-ui, sans-serif; min-height: 100vh; padding-bottom: 56px; color: #1a1510; -webkit-text-size-adjust: 100%; }
+    .top { background: #12100c; min-height: 54px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; position: sticky; top: 0; z-index: 40; gap: 10px; }
+    .top a { color: #f6f4ef; text-decoration: none; font-size: 13px; display: inline-flex; align-items: center; min-height: 44px; }
+    .top span { color: #d8cdb8; font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; }
+    .wrap { max-width: 620px; margin: 0 auto; padding: 14px 12px; }
+    h1 { font-size: 21px; font-weight: 700; margin: 0 0 4px; letter-spacing: -.01em; }
+    .lede { font-size: 13.5px; color: #6b6255; line-height: 1.6; margin: 0 0 14px; }
+    .card { background: #fff; border: 1px solid #ece4d6; border-radius: 16px; padding: 16px; margin-bottom: 12px; box-shadow: 0 10px 30px rgba(26,21,16,.05); }
+    .card h3 { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #9a8f7d; font-weight: 700; margin: 0 0 10px; }
+    label { display: block; font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #6b6255; font-weight: 700; margin: 0 0 6px; }
+    input[type=date], input[type=url], textarea { width: 100%; min-height: 44px; padding: 11px 12px; border: 1px solid #e0d5c0; border-radius: 11px; font-size: 16px; font-family: inherit; background: #fdfcf9; color: #1a1510; }
+    textarea { min-height: 92px; resize: vertical; line-height: 1.5; }
+    input:focus, textarea:focus { outline: 2px solid #c2410c; outline-offset: 1px; border-color: #c2410c; }
+    .field { margin-bottom: 14px; }
+    .hint { font-size: 12.5px; color: #6b6255; line-height: 1.55; margin: 6px 0 0; }
+    .warn { border-left: 3px solid #b45309; background: #fffbeb; border-radius: 0 10px 10px 0; padding: 11px 12px; margin: 8px 0 0; font-size: 12.5px; color: #7c4a06; line-height: 1.6; }
+    .bad { border-left: 3px solid #b91c1c; background: #fef2f2; border-radius: 0 10px 10px 0; padding: 11px 12px; margin: 8px 0 0; font-size: 12.5px; color: #991b1b; line-height: 1.6; }
+    .good { border-left: 3px solid #15803d; background: #f0fdf4; border-radius: 0 10px 10px 0; padding: 11px 12px; margin: 8px 0 0; font-size: 12.5px; color: #166534; line-height: 1.6; }
+    .ack { display: flex; gap: 10px; align-items: flex-start; padding: 10px; border: 1px solid #e0d5c0; border-radius: 11px; background: #fdfcf9; min-height: 44px; }
+    .ack input { width: 22px; height: 22px; margin-top: 2px; flex: 0 0 auto; accent-color: #c2410c; }
+    .ack span { font-size: 13px; color: #4a4235; line-height: 1.5; }
+    button.primary { width: 100%; min-height: 48px; border: none; border-radius: 12px; background: #c2410c; color: #fff; font-size: 15px; font-weight: 700; font-family: inherit; cursor: pointer; }
+    button.primary:active { background: #9a3412; }
+    .banner { border-radius: 12px; padding: 12px 14px; font-size: 13.5px; line-height: 1.55; margin-bottom: 12px; }
+    .banner.ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; }
+    .banner.bad { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
+    .row { display: flex; gap: 10px; align-items: flex-start; padding: 11px 0; border-bottom: 1px dashed #ece4d6; }
+    .row:last-child { border-bottom: none; }
+    .rowday { flex: 0 0 62px; }
+    .rowday b { display: block; font-size: 13.5px; }
+    .rowday i { display: block; font-style: normal; font-size: 11px; color: #9a8f7d; }
+    .rowbody { flex: 1 1 auto; min-width: 0; }
+    .rowbody p { font-size: 12.8px; color: #4a4235; line-height: 1.5; margin: 0; overflow-wrap: anywhere; }
+    .rowbody a { color: #c2410c; display: inline-flex; align-items: center; min-height: 44px; font-size: 13px; overflow-wrap: anywhere; }
+    .chip { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; font-weight: 700; padding: 3px 7px; border-radius: 100px; border: 1px solid #e6ddcd; color: #6b6255; margin: 0 0 4px; }
+    .chip.filed { color: #15803d; border-color: #bbf7d0; background: #f0fdf4; }
+    .chip.out { color: #b45309; border-color: #fde68a; background: #fffbeb; }
+    .chip.inc { color: #9a3412; border-color: #fed7aa; background: #fff7ed; }
+    .stat { display: flex; gap: 14px; flex-wrap: wrap; margin: 0 0 8px; }
+    .stat div { min-width: 96px; }
+    .stat b { display: block; font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
+    .stat i { display: block; font-style: normal; font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: #9a8f7d; font-weight: 700; margin-top: 2px; }
+    .nav { display: flex; gap: 8px; justify-content: space-between; margin-top: 10px; }
+    .nav a, .nav span { flex: 1 1 0; text-align: center; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #e0d5c0; border-radius: 11px; font-size: 13px; text-decoration: none; color: #4a4235; }
+    .nav span { color: #b8ae9c; }
+    .empty { background: #fff; border: 1px dashed #e0d5c0; border-radius: 16px; padding: 26px 16px; text-align: center; color: #8a7f6d; font-size: 13.5px; line-height: 1.6; }
+    .deny { background: #fff; border: 1px solid #ece4d6; border-radius: 16px; padding: 22px 18px; }
+    .deny h2 { font-size: 17px; margin: 0 0 8px; }
+    .ico { width: 15px; height: 15px; vertical-align: -2px; margin-right: 5px; }
+    .foot { font-size: 12px; color: #8a7f6d; line-height: 1.6; margin: 14px 2px 0; }
+    @media (min-width: 560px) { .wrap { padding: 20px 16px; } h1 { font-size: 24px; } }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <a href="/portal/employee">Back to my workspace</a>
+    <span>Daily report</span>
+  </div>
+
+  <div class="wrap">
+    {denial ? (
+      <div class="deny">
+        <h2>{denial.title}</h2>
+        <p class="lede">{denial.reason}</p>
+      </div>
+    ) : (
+      <div>
+        <h1>Daily report</h1>
+        <p class="lede">
+          One report per working day: a link to what you produced, and a sentence about it. Nothing is
+          uploaded here — the file stays in your own Drive and you share it by link.
+        </p>
+
+        {msg && (
+          <div class={'banner ' + (msgKind === 'bad' ? 'bad' : 'ok')}>{msg}</div>
+        )}
+
+        <div class="card">
+          <h3>Your hours, measured</h3>
+          {hours ? (
+            <div>
+              <div class="stat">
+                <div>
+                  <b>{hoursLabel(hours.week.workedMinutes)}</b>
+                  <i>Worked this week</i>
+                </div>
+                <div>
+                  <b>{hoursLabel(hours.total.workedMinutes)}</b>
+                  <i>Worked in total</i>
+                </div>
+              </div>
+              <p class="hint">{hours.week.label}: {hours.week.fromIso} to {hours.week.toIso}. {hours.week.counts}</p>
+              <p class="hint">{weekSentence}</p>
+              <p class="hint">{hours.total.label}: {hours.total.fromIso} to {hours.total.toIso}. {hours.total.counts}</p>
+              <p class="hint">{totalSentence}</p>
+
+              <p class="hint" style="margin-top:10px;border-top:1px dashed #ece4d6;padding-top:10px;">
+                <b style="font-weight:700;">What you committed to</b> — this is what your offer records,
+                not something you have done.
+                {' '}{hours.commitment.weeklyHours !== null
+                  ? hours.commitment.weeklyHours + ' hours a week'
+                    + (hours.commitment.dailyHours !== null ? ' (about ' + hours.commitment.dailyHours + ' a day)' : '')
+                    + '.'
+                  : 'No number of hours is recorded.'}
+                {' '}{hours.commitment.basis}
+              </p>
+
+              {hours.week.incompleteDays > 0 && (
+                <p class="warn">
+                  {hours.week.incompleteDays === 1 ? 'One day' : hours.week.incompleteDays + ' days'} this
+                  week {hours.week.incompleteDays === 1 ? 'has' : 'have'} a check-in and no check-out
+                  ({hours.week.incompleteDates.join(', ')}). No time could be measured for
+                  {hours.week.incompleteDays === 1 ? ' it' : ' them'}, so
+                  {hours.week.incompleteDays === 1 ? ' it is' : ' they are'} not counted as zero and not
+                  counted as a full day. Fix the check-out on your attendance page.
+                </p>
+              )}
+
+              {hours.readFailed && (
+                <p class="bad">
+                  Part of this could not be read just now ({hours.failed.join(', ')}), so the figures
+                  above are incomplete. They are not a statement that you did less.
+                </p>
+              )}
+
+              <p class="hint">
+                Leave that was approved, and holidays, come out of what was expected of you rather than
+                counting against you. Nothing here is a score and nothing acts on it.
+              </p>
+            </div>
+          ) : (
+            <p class="hint">
+              We could not read your hours just now. That is a failed read, not a zero — nothing you
+              have clocked is affected.
+            </p>
+          )}
+        </div>
+
+        <div class="card">
+          <h3>Who reads this</h3>
+          <p class="hint">{reviewer ? reviewer.sentence : 'Could not resolve a reviewer just now.'}</p>
+          {reviewer && !reviewer.graphReady && (
+            <p class="hint">
+              Your report is still filed and kept. Nobody is named as its reviewer until the
+              Organization Graph is initialized, and we will not guess one from a job title.
+            </p>
+          )}
+        </div>
+
+        <form method="POST" class="card">
+          <h3>{existing ? 'Update the report for this day' : 'File a report'}</h3>
+          <input type="hidden" name="_action" value="submit" />
+
+          <div class="field">
+            <label for="report_date">Day this covers</label>
+            <input
+              type="date"
+              id="report_date"
+              name="report_date"
+              value={formDay}
+              max={todayIso || undefined}
+              min={earliestIso || undefined}
+              required
+            />
+            <p class="hint" id="dayhint">
+              {dayFact ? dayStateSentence(dayFact.state) : 'Pick the day.'}
+              {dayFact && dayFact.state === 'worked' && dayFact.workedMinutes !== null
+                ? ' Worked ' + formatMinutes(dayFact.workedMinutes) + ', net of breaks.'
+                : ''}
+            </p>
+            {existing && (
+              <p class="warn">
+                You already filed a report for {fmtDay(existing.dateIso)}. Submitting again replaces
+                what is shown to your reviewer and records this as revision {existing.revision + 1}.
+                The previous version is kept, not deleted.
+              </p>
+            )}
+          </div>
+
+          <div class="field">
+            <label for="report_url">Link to the work</label>
+            <input
+              type="url"
+              id="report_url"
+              name="report_url"
+              inputmode="url"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="https://docs.google.com/document/d/..."
+              value={existing?.url || ''}
+              required
+            />
+            <div class="warn" id="sharewarn">
+              <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+              {SHARING_WARNING}
+            </div>
+            <div id="linkcheck" hidden></div>
+            <p class="hint">
+              Accepted addresses are drive.google.com and docs.google.com. Nothing else can be stored,
+              because nothing else is a link your reviewer can be given.
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="summary">What you did</label>
+            <textarea
+              id="summary"
+              name="summary"
+              required
+              minlength={MIN_SUMMARY_CHARS}
+              placeholder="A sentence or two. Your reviewer reads this before deciding whether to open the link."
+            >{existing?.summary || ''}</textarea>
+          </div>
+
+          <div class="field">
+            <label for="blockers">Anything blocking you (optional)</label>
+            <textarea
+              id="blockers"
+              name="blockers"
+              placeholder="Waiting on access, stuck on something, or leave this empty."
+            >{existing?.blockers || ''}</textarea>
+          </div>
+
+          <div class="field">
+            <div class="ack">
+              <input type="checkbox" id="sharing_ack" name="sharing_ack" value="yes" checked={existing?.sharingAck || false} />
+              <label for="sharing_ack" style="text-transform:none;letter-spacing:0;font-family:inherit;font-size:13px;font-weight:400;color:#4a4235;line-height:1.5;margin:0;">
+                I have set this file to "Anyone with the link". I understand this is my word for it —
+                the platform cannot check who can open the link, and neither can I.
+              </label>
+            </div>
+          </div>
+
+          <button type="submit" class="primary">{existing ? 'Update this report' : 'File this report'}</button>
+          <p class="hint">
+            You can file for a day up to {BACKFILL_DAYS} days back. Older than that, ask HR, so an old
+            entry is a decision somebody made rather than a form somebody found.
+          </p>
+        </form>
+
+        {week ? (
+          <div class="card">
+            <h3>Week of {fmtDay(week.weekStart)}</h3>
+            <div class="stat">
+              <div>
+                <b>{formatMinutes(week.workedMinutes)}</b>
+                <i>Worked this week</i>
+              </div>
+              <div>
+                <b>{week.reportsFiled}</b>
+                <i>Reports filed</i>
+              </div>
+              <div>
+                <b>{week.outstandingDays}</b>
+                <i>Days outstanding</i>
+              </div>
+            </div>
+            <p class="hint">{basis}</p>
+            {week.incompleteDays > 0 && (
+              <p class="warn">
+                {week.incompleteDays === 1 ? 'One day this week has' : week.incompleteDays + ' days this week have'}
+                {' '}a check-in and no check-out. That time is not known, so it is not in the figure
+                above — it is not zero either. Fix it from your attendance page.
+              </p>
+            )}
+
+            <div style="margin-top:10px;">
+              {week.days.map((d) => (
+                <div class="row">
+                  <div class="rowday">
+                    <b>{fmtDay(d.dateIso)}</b>
+                    <i>{d.weekday.slice(0, 3)}</i>
+                  </div>
+                  <div class="rowbody">
+                    {d.report ? <span class="chip filed">Filed</span> : null}
+                    {d.outstanding ? <span class="chip out">Outstanding</span> : null}
+                    {d.attendance.state === 'incomplete' ? <span class="chip inc">Incomplete</span> : null}
+                    <p>{d.sentence}</p>
+                    {d.attendance.clockIn && (
+                      <p style="color:#8a7f6d;">
+                        In {clockTime(d.attendance.clockIn)}
+                        {d.attendance.clockOut ? ', out ' + clockTime(d.attendance.clockOut) : ', no check-out recorded'}
+                      </p>
+                    )}
+                    {d.report && d.report.url && (
+                      <a href={d.report.url} target="_blank" rel="noopener noreferrer">Open the report</a>
+                    )}
+                    {d.report && !d.report.url && (
+                      <p style="color:#8a7f6d;">Filed before links were required, so there is text but no link.</p>
+                    )}
+                    {d.report && d.report.reviewedAt && (
+                      <p style="color:#166534;">
+                        Read by your reviewer{d.report.revisedSinceReview ? ', before you revised it' : ''}
+                        {d.report.reviewComment ? '. Comment: ' + d.report.reviewComment : ''}
+                      </p>
+                    )}
+                    {!d.isFuture && !d.report && (
+                      <a href={PAGE + '?d=' + d.dateIso}>File for this day</a>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div class="nav">
+              <a href={PAGE + '?w=' + prevWeek}>Earlier week</a>
+              {nextWeekIsFuture
+                ? <span>Later week</span>
+                : <a href={PAGE + '?w=' + nextWeek}>Later week</a>}
+            </div>
+          </div>
+        ) : (
+          <div class="empty">
+            We could not read your week just now. Nothing you have filed is lost. Try again in a moment.
+          </div>
+        )}
+
+        <p class="foot">
+          A day counts as outstanding only when the clock says you worked it and no report exists.
+          Nothing here penalises a gap and nothing is scored — it is shown to a person, who decides.
+        </p>
+        <p class="foot">
+          <a href="/portal/employee/reports/team" style="color:#c2410c;">Reports from people you are
+          responsible for</a> — that page reads the Organization Graph, and tells you plainly when the
+          graph names nobody rather than showing you an empty list.
+        </p>
+      </div>
+    )}
+  </div>
+
+  <script>
+    // The live link check. It calls the SAME pure function the write path uses, through
+    // /api/portal/reports/check-link, so the hint under the field can never disagree with what
+    // happens on submit. There is no regex in this file for exactly that reason.
+    (function () {
+      // Narrowed through `const` + instanceof so the checks below hold inside every callback —
+      // a `var` re-read in a closure is exactly what astro check refuses, and rightly.
+      const inputEl = document.getElementById('report_url');
+      const boxEl = document.getElementById('linkcheck');
+      const dayEl = document.getElementById('report_date');
+      const hintEl = document.getElementById('dayhint');
+      if (!(inputEl instanceof HTMLInputElement)) return;
+      if (!(boxEl instanceof HTMLElement)) return;
+      const input = inputEl;
+      const box = boxEl;
+      const dayInput = dayEl instanceof HTMLInputElement ? dayEl : null;
+      const dayHint = hintEl instanceof HTMLElement ? hintEl : null;
+
+      let timer = 0;
+      let seq = 0;
+
+      function show(cls: string, text: string) {
+        box.className = cls;
+        box.textContent = text;
+        box.hidden = false;
+      }
+
+      function check() {
+        var value = input.value.trim();
+        if (!value) { box.hidden = true; return; }
+        var mine = ++seq;
+        fetch('/api/portal/reports/check-link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: value })
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (mine !== seq) return;
+          if (!d || d.ok !== true) {
+            show('bad', (d && d.problem) || 'That link could not be checked.');
+            return;
+          }
+          var notes = (d.notes || []).join(' ');
+          show('good', 'That is a Drive link. It still has to be shared as "Anyone with the link" — '
+            + 'we cannot check that for you.' + (notes ? ' ' + notes : ''));
+        }).catch(function () {
+          if (mine !== seq) return;
+          // Never claim a link is fine when the check did not run.
+          show('warn', 'We could not check that link just now. It will be checked again when you submit.');
+        });
+      }
+
+      input.addEventListener('input', function () {
+        if (timer) clearTimeout(timer);
+        timer = window.setTimeout(check, 400);
+      });
+      input.addEventListener('blur', check);
+      if (input.value) check();
+
+      // Changing the day re-reads what that day already holds, so nobody overwrites a report they
+      // forgot they filed.
+      if (dayInput && dayHint) {
+        dayInput.addEventListener('change', function () {
+          var d = dayInput.value;
+          if (!d) return;
+          fetch('/api/portal/reports/day?d=' + encodeURIComponent(d))
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+              if (!data || data.ok !== true) return;
+              var parts = [];
+              if (data.attendance) {
+                parts.push(data.attendance.sentence);
+                if (data.attendance.worked) parts.push('Worked ' + data.attendance.worked + ', net of breaks.');
+              }
+              if (data.existing) {
+                parts.push('You already filed for this day. Submitting replaces it and records revision '
+                  + (data.existing.revision + 1) + '; the previous version is kept.');
+              }
+              dayHint.textContent = parts.join(' ');
+            })
+            .catch(function () { /* the page still works; the server re-checks on submit */ });
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

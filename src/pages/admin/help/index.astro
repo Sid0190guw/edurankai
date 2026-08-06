@@ -15,6 +15,14 @@ let conversations: any[] = [];
 let activeConv: any = null;
 let activeMessages: any[] = [];
 let unreadCount = 0;
+// WHY THESE EXIST. Every read below used to end in `catch (_) {}`, so a failed query and an empty
+// inbox rendered the SAME screen: "No open conversations yet." An unreachable database therefore
+// looked exactly like a quiet afternoon, on the one screen where a missed message is a person
+// waiting. The reason is kept and said out loud instead. e.cause carries the real Postgres reason;
+// e.message is only the failed SQL.
+let listError = '';
+let threadError = '';
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 try {
   const r = await db.execute(sql`
@@ -28,13 +36,18 @@ try {
     ORDER BY c.last_message_at DESC NULLS LAST, c.created_at DESC LIMIT 200
   `);
   conversations = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+} catch (e: any) {
+  listError = reasonOf(e);
+  console.error('[admin/help] conversation list failed:', listError);
+}
 
 try {
   const r = await db.execute(sql`SELECT COUNT(*)::int as n FROM help_conversations WHERE status = 'open' AND unread_admin > 0`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   unreadCount = (rows[0] as any)?.n || 0;
-} catch (_) {}
+} catch (e: any) {
+  console.error('[admin/help] unread count failed:', reasonOf(e));
+}
 
 if (activeId) {
   try {
@@ -45,7 +58,10 @@ if (activeId) {
     `);
     const rows = Array.isArray(r) ? r : (r?.rows || []);
     activeConv = rows[0] || null;
-  } catch (_) {}
+  } catch (e: any) {
+    threadError = reasonOf(e);
+    console.error('[admin/help] conversation load failed:', threadError);
+  }
   if (activeConv) {
     try {
       const r = await db.execute(sql`
@@ -54,9 +70,19 @@ if (activeId) {
         ORDER BY created_at ASC LIMIT 500
       `);
       activeMessages = Array.isArray(r) ? r : (r?.rows || []);
-    } catch (_) {}
-    // Mark as read
-    await db.execute(sql`UPDATE help_conversations SET unread_admin = 0 WHERE id = ${activeId}`);
+    } catch (e: any) {
+      // An unreadable thread used to render as an EMPTY one: the admin was shown a conversation
+      // with no messages in it, next to a preview line proving there were some.
+      threadError = reasonOf(e);
+      console.error('[admin/help] thread load failed:', threadError);
+    }
+    // Mark as read. Wrapped: this was the one unguarded statement on the page, so a hiccup here
+    // took the whole inbox to a 500 rather than showing the conversation it had already read.
+    try {
+      await db.execute(sql`UPDATE help_conversations SET unread_admin = 0 WHERE id = ${activeId}`);
+    } catch (e: any) {
+      console.error('[admin/help] mark-read failed:', reasonOf(e));
+    }
   }
 }
 
@@ -96,7 +122,13 @@ function formatTime(d: any) {
       </div>
     </div>
     <div style="flex:1;overflow-y:auto;">
-      {conversations.length === 0 && (
+      {conversations.length === 0 && listError && (
+        <div style="padding:20px 16px;color:#fbbf24;font-size:12px;line-height:1.55;overflow-wrap:anywhere;">
+          The inbox could not be read, so this list is empty for a reason that is not "no
+          conversations": {listError}
+        </div>
+      )}
+      {conversations.length === 0 && !listError && (
         <div style="padding:40px 16px;text-align:center;color:#6e6e78;font-size:12px;">
           No {statusFilter === 'all' ? '' : statusFilter} conversations yet.
         </div>
@@ -161,9 +193,20 @@ function formatTime(d: any) {
           </div>
         </header>
 
+        {threadError && (
+          <div style="margin:14px 18px 0;padding:10px 12px;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.28);border-radius:9px;color:#fbbf24;font-size:12px;line-height:1.5;overflow-wrap:anywhere;">
+            This conversation could not be read, so it is empty here for a reason that is not "no
+            messages": {threadError}
+          </div>
+        )}
         <div id="messageStream" style="flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px;">
-          {activeMessages.length === 0 && (
-            <p style="text-align:center;color:#6e6e78;font-size:12px;font-style:italic;padding:20px;">No messages in this conversation yet.</p>
+          {/* id="helpEmptyNote" so the poller can remove it before appending the FIRST live message.
+              The poller used to compare `stream.children.length` against the server's message count,
+              and this placeholder counts as a child — so on an empty thread the first visitor reply
+              made 1 > 1 false and never rendered, and the second appended only itself, dropping the
+              first message from the screen entirely until somebody reloaded. */}
+          {activeMessages.length === 0 && !threadError && (
+            <p id="helpEmptyNote" style="text-align:center;color:#6e6e78;font-size:12px;font-style:italic;padding:20px;">No messages in this conversation yet.</p>
           )}
           {activeMessages.map((msg: any) => {
             const isAdmin = msg.sender_role === 'admin';
@@ -206,7 +249,7 @@ function formatTime(d: any) {
 </style>
 
 {activeConv && (
-  <script is:inline define:vars={{ conversationId: activeConv.id, lastMessageTs: activeMessages.length > 0 ? activeMessages[activeMessages.length - 1].created_at : '1970-01-01T00:00:00Z' }}>
+  <script is:inline define:vars={{ conversationId: activeConv.id, renderedCount: activeMessages.length, lastMessageTs: activeMessages.length > 0 ? activeMessages[activeMessages.length - 1].created_at : '1970-01-01T00:00:00Z' }}>
     (function() {
       var stream = document.getElementById('messageStream');
       var form = document.getElementById('replyForm');
@@ -215,6 +258,9 @@ function formatTime(d: any) {
       var closeBtn = document.getElementById('closeBtn');
       var reopenBtn = document.getElementById('reopenBtn');
       var lastTs = lastMessageTs;
+      // How many MESSAGES are on screen — counted, not inferred from stream.children.length, which
+      // also counts the "no messages yet" placeholder. See the comment on that element.
+      var shown = renderedCount;
 
       function formatTime(iso) {
         try { return new Date(iso).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; }
@@ -223,6 +269,8 @@ function formatTime(d: any) {
         return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       }
       function appendMessage(m) {
+        var note = document.getElementById('helpEmptyNote');
+        if (note && note.parentNode) note.parentNode.removeChild(note);
         var isAdmin = m.sender_role === 'admin';
         var wrap = document.createElement('div');
         wrap.style.cssText = 'display:flex;flex-direction:column;align-items:' + (isAdmin ? 'flex-end' : 'flex-start') + ';';
@@ -235,6 +283,7 @@ function formatTime(d: any) {
             escapeHtml(m.body).replace(/\n/g, '<br/>') +
           '</div>';
         stream.appendChild(wrap);
+        shown += 1;
         stream.scrollTop = stream.scrollHeight;
       }
 
@@ -279,21 +328,55 @@ function formatTime(d: any) {
           .then(function(r) { return r.json(); })
           .then(function(d) {
             if (!d.ok || !d.messages) return;
-            var rendered = stream.children.length;
-            if (d.messages.length > rendered) {
-              for (var i = rendered; i < d.messages.length; i++) appendMessage(d.messages[i]);
+            if (d.messages.length > shown) {
+              for (var i = shown; i < d.messages.length; i++) appendMessage(d.messages[i]);
               lastTs = d.messages[d.messages.length - 1].created_at;
             }
           }).catch(function() {});
       }, 5000);
 
-      // Close / reopen
+      // Close / reopen.
+      //
+      // IT USED TO RELOAD WHICHEVER WAY THE REQUEST WENT. `.then(function() { location.reload(); })`
+      // ran on a refusal, a 500 and a success alike, so a close that the server rejected redrew the
+      // page with the conversation still open and nothing on screen saying why — the "reported
+      // success while nothing happened" shape. It only reloads on a confirmed change now.
+      //
+      // REOPEN NOW ACTUALLY REOPENS. It used to send only `closeAfter: false`, which asked the server
+      // for nothing at all: the reply endpoint had no path back to status='open', so the button
+      // posted "(Conversation reopened)" into the transcript, got ok:true for the REPLY, reloaded on
+      // that success and redrew the conversation still closed — while the visitor stayed locked out,
+      // because /api/help/send matches on status='open'. `reopen: true` is the verb that was missing;
+      // it is the same endpoint under the same `messages` edit gate that already permitted closing.
+      //
+      // The reload is still conditional on a confirmed change, and the confirmation is now the
+      // returned status rather than the bare ok — a reply that saved while the status change did not
+      // is reported as what it is.
       function setStatus(s) {
+        var btn = s === 'closed' ? closeBtn : reopenBtn;
+        if (btn) btn.disabled = true;
         fetch('/api/admin/help/reply', {
           method: 'POST', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ conversationId: conversationId, body: s === 'closed' ? '(Conversation closed)' : '(Conversation reopened)', closeAfter: s === 'closed' })
-        }).then(function(r) { return r.json(); }).then(function() { location.reload(); });
+          body: JSON.stringify({
+            conversationId: conversationId,
+            body: s === 'closed' ? '(Conversation closed)' : '(Conversation reopened)',
+            closeAfter: s === 'closed',
+            reopen: s === 'open'
+          })
+        }).then(function(r) { return r.json(); }).then(function(d) {
+          if (d && d.ok && d.status === s) { location.reload(); return; }
+          if (d && d.ok) {
+            if (btn) btn.disabled = false;
+            alert('The message was posted, but this conversation is still "' + (d.status || 'unchanged') + '". Nothing else was changed.');
+            return;
+          }
+          if (btn) btn.disabled = false;
+          alert('Nothing was changed: ' + ((d && d.error) || 'the server did not confirm it') + '. This conversation is still where it was.');
+        }).catch(function(err) {
+          if (btn) btn.disabled = false;
+          alert('Nothing was changed - the request never reached the server (' + ((err && err.message) || 'network error') + ').');
+        });
       }
       if (closeBtn) closeBtn.addEventListener('click', function() { if (confirm('Close this conversation?')) setStatus('closed'); });
       if (reopenBtn) reopenBtn.addEventListener('click', function() { setStatus('open'); });

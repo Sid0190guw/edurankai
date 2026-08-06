@@ -58,6 +58,11 @@ import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logAudit } from '@/lib/audit';
 import { startWorkflow, getInstance } from '@/lib/workflow';
+// The civil date in the company's zone. new Date() on this deployment is UTC, which is five and a
+// half hours behind IST — see src/lib/page-safety.ts for why every derived "today" has to say so.
+import { civilToday } from '@/lib/page-safety';
+import { round2 } from '@/lib/money';
+import { sendPushToUser } from '@/lib/push';
 
 // -------------------------------------------------------------------------------------------------
 // CONSTANTS. All of them above the functions that read them.
@@ -69,10 +74,44 @@ const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || '
 
 const logFail = (tag: string, e: any) => console.error('[loans] ' + tag, reasonOf(e));
 
+/** Where a loan notification sends the borrower. The page exists (src/pages/portal/employee/loans.astro). */
+const LOANS_PORTAL_URL = '/portal/employee/loans';
+
+/**
+ * TELL THE BORROWER.
+ *
+ * NOTHING IN THIS MODULE DID. A loan being approved, disbursed or cleared sent nobody anything, in
+ * any path — the borrower's own screen simply changed if they happened to open it, and until this
+ * repair it did not even change then, because the approval mirror only ran on an admin page load. So
+ * the company decided about somebody's money and the somebody found out by checking.
+ *
+ * Declared above every reader; `const` is not hoisted. Never blocks the write it announces — a loan
+ * that was approved and not announced is a page somebody has to open; an approval refused because a
+ * push endpoint was stale is money that does not move.
+ */
+async function notifyBorrower(
+  employeeId: string,
+  payload: { type: string; title: string; body: string; tag: string },
+): Promise<void> {
+  try {
+    if (!isUuid(employeeId)) return;
+    const r = rows(await db.execute(sql`
+      SELECT user_id::text AS user_id FROM hr_employees WHERE id = ${employeeId}::uuid LIMIT 1`));
+    const userId = r.length ? String(r[0].user_id || '') : '';
+    if (!userId) return;
+    await sendPushToUser(userId, { ...payload, url: LOANS_PORTAL_URL });
+  } catch (e: any) {
+    logFail('notifyBorrower', e);
+  }
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v: unknown): v is string => typeof v === 'string' && UUID_RE.test(v);
 
-const round2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
+// ONE ROUNDING RULE, SHARED. The copy that lived here was
+// `Math.round((Number(n) || 0) * 100) / 100`, which rounds a half paisa DOWN whenever the product
+// lands just under .5 in IEEE754 (1.005 * 100 === 100.49999999999999) — and the bias always ran
+// against the borrower, on every EMI split and every interest apportionment. See src/lib/money.ts.
 
 /** The two words for one act. See the header for why they share a table. */
 export const LOAN_KINDS = [
@@ -196,6 +235,27 @@ export function ensureLoanSchema(): Promise<void> {
       // payroll run therefore cannot deduct the same instalment a second time.
       await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS hr_loan_instalments_run_uniq
         ON hr_loan_instalments(loan_id, payroll_run_id)`);
+      // AND ONE SETTLEMENT PER LOAN OUTSIDE PAYROLL. The index above does NOT cover
+      // settleLoanOutsidePayroll(), because that path writes payroll_run_id = NULL and Postgres treats
+      // NULLs as DISTINCT in a unique index — so N calls wrote N rows, each for the whole outstanding
+      // balance, and mapLoan()'s Math.max(0, ...) clamp then reported the over-recovery as a clean
+      // zero. A partial unique index over the NULL rows is the constraint that was missing.
+      //
+      // ADDITIVE AND NON-FATAL. If a live database already carries two out-of-payroll rows for one
+      // loan, this index cannot be built — and that must not take the loan module down. The failure is
+      // logged with the query a human should run first. settleLoanOutsidePayroll's own atomic state
+      // claim covers the ordinary case with or without this index.
+      try {
+        await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS hr_loan_instalments_offpayroll_uniq
+          ON hr_loan_instalments(loan_id) WHERE payroll_run_id IS NULL`);
+      } catch (e: any) {
+        console.error(
+          '[loans] could not create hr_loan_instalments_offpayroll_uniq. A loan may already have been '
+          + 'settled outside payroll more than once, which means it was over-recovered. Check with: '
+          + 'SELECT loan_id, count(*), sum(amount) FROM hr_loan_instalments WHERE payroll_run_id IS NULL '
+          + 'GROUP BY loan_id HAVING count(*) > 1; -- reason: ' + reasonOf(e),
+        );
+      }
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_loan_instalments_loan_idx
         ON hr_loan_instalments(loan_id, year DESC, month DESC)`);
     } catch (e: any) {
@@ -640,7 +700,8 @@ export async function syncLoanApprovals(actorUserId?: string | null): Promise<{
   try {
     await ensureLoanSchema();
     const open = rows(await db.execute(sql`
-      SELECT id, workflow_instance_id, state FROM hr_salary_loans
+      SELECT id, workflow_instance_id, state, employee_id::text AS employee_id, kind, principal, currency
+        FROM hr_salary_loans
        WHERE state IN ('pending', 'halted') AND workflow_instance_id IS NOT NULL
        ORDER BY created_at ASC LIMIT 100`));
 
@@ -669,15 +730,41 @@ export async function syncLoanApprovals(actorUserId?: string | null): Promise<{
       if (!next || next === String((raw as any).state)) continue;
 
       try {
-        await db.execute(sql`
+        // THE READ IS RE-STATED IN THE WRITE. This UPDATE was `WHERE id = ${id}` alone, and the loop
+        // makes a getInstance() round-trip per row, so the window between the SELECT above and this
+        // write is many round-trips wide. An employee who withdrew their request in that window had
+        // 'cancelled' overwritten with 'active' and an audit row that says the loan was approved,
+        // with nothing anywhere recording that a cancellation ever happened.
+        //
+        // The state this row was READ in is now part of the WHERE, so a row that moved on since is
+        // left exactly as it is and this pass simply does not count it. `state` is a plain varchar,
+        // so no cast is needed on either side.
+        const wrote = rows(await db.execute(sql`
           UPDATE hr_salary_loans
              SET state = ${next}, halt_reason = ${instance.haltReason}::text, updated_at = NOW()
-           WHERE id = ${id}::uuid`);
+           WHERE id = ${id}::uuid AND state = ${String((raw as any).state)}
+          RETURNING id`));
+        if (!wrote.length) continue;
         out.settled += 1;
         if (next === 'active') {
           await logAudit({
             userId: actor, action: 'loan.approved', entity: 'hr_salary_loan', entityId: id,
             diff: { workflowInstanceId: instanceId },
+          });
+        }
+        // THE BORROWER IS TOLD. A settled decision about somebody's money reached them only if they
+        // happened to reopen the page — and, before this sync started running from the payroll run
+        // too, only after an admin had opened the loans console first.
+        if (next === 'active' || next === 'rejected') {
+          const money = String((raw as any).currency || 'INR') + ' '
+            + Number((raw as any).principal || 0).toLocaleString('en-IN');
+          await notifyBorrower(String((raw as any).employee_id || ''), {
+            type: 'loan_decision',
+            title: next === 'active' ? 'Loan or advance approved' : 'Loan or advance declined',
+            body: next === 'active'
+              ? money + ' is approved. It is recovered from your pay once the disbursement is recorded.'
+              : money + ' was not approved.',
+            tag: 'loan-' + id,
           });
         }
       } catch (e: any) {
@@ -702,6 +789,20 @@ export interface LoanCharge {
   kind: string;
   label: string;
   amount: number;
+  /**
+   * THE CURRENCY THE LOAN IS DENOMINATED IN, carried so payroll can refuse to mix.
+   *
+   * hr_salary_loans has had a `currency` column since the table was created (see the DDL above) and
+   * mapLoan() reads it, but this interface dropped the field — so a loan of USD 500 arrived in
+   * src/lib/payroll.ts as the bare number 500 and was deducted from a rupee payslip as 500 rupees.
+   * The currency did not convert; it stopped existing at the boundary between these two modules.
+   *
+   * The consequence compounds: recordRecovery() writes that 500 into hr_loan_instalments, and
+   * closeCleared() closes the loan once SUM(amount) reaches total_payable — so a USD 500-a-month
+   * loan is marked fully repaid after the rupee ledger has summed to a USD figure, and the balance
+   * disappears from the register while the debt is still owed.
+   */
+  currency: string;
   principalPart: number;
   interestPart: number;
   /** What will still be owed AFTER this deduction. Printed so a payslip can say where it stands. */
@@ -759,6 +860,7 @@ export async function plannedRecoveries(
         label: loanKindLabel(l.kind) + ' repayment'
           + (l.instalments > 1 ? ' (' + Math.min(l.instalmentsPaid + 1, l.instalments) + ' of ' + l.instalments + ')' : ''),
         amount,
+        currency: l.currency,
         principalPart: round2(amount - interestPart),
         interestPart,
         remainingAfter,
@@ -842,7 +944,18 @@ export async function closeClearedLoans(): Promise<{ closed: number; error?: str
          AND l.total_payable <= (
            SELECT COALESCE(SUM(i.amount), 0) FROM hr_loan_instalments i WHERE i.loan_id = l.id
          )
-      RETURNING l.id`));
+      RETURNING l.id, l.employee_id::text AS employee_id`));
+    // CLEARED IS WORTH SAYING. The last instalment is the one a borrower actually wants to hear
+    // about, and a deduction silently stopping appearing on a payslip is not the same as being told
+    // the debt is settled. Each notification is independent of the write, which is already committed.
+    for (const row of wrote) {
+      await notifyBorrower(String((row as any).employee_id || ''), {
+        type: 'loan_cleared',
+        title: 'Loan repaid in full',
+        body: 'Your loan or advance is fully repaid. Nothing further will be deducted from your pay.',
+        tag: 'loan-' + String((row as any).id),
+      });
+    }
     return { closed: wrote.length };
   } catch (e: any) {
     logFail('closeClearedLoans', e);
@@ -860,6 +973,28 @@ export async function closeClearedLoans(): Promise<{ closed: number; error?: str
  * which is why the payslip_id column is nullable.
  *
  * It refuses to over-recover: the amount is capped at what is actually outstanding.
+ *
+ * =================================================================================================
+ * WHY THIS IS A CLAIM AND A TRANSACTION, AND NOT A READ FOLLOWED BY TWO WRITES
+ * =================================================================================================
+ *
+ * It used to be: getLoan() -> refuse unless state='active' -> INSERT the whole outstanding balance
+ * with payroll_run_id NULL -> UPDATE state='closed' with NO state guard. Three problems compounded:
+ *
+ *   1. hr_loan_instalments_run_uniq is on (loan_id, payroll_run_id) and Postgres treats NULLs as
+ *      DISTINCT, so the ONE constraint that looked like it covered this path covered nothing.
+ *   2. Nothing was atomic. Two 'Hand off' presses on a settlement carrying a loan line — or one
+ *      press retried after a timeout — both read 'active' and both inserted, so a 100,000 loan with
+ *      40,000 outstanding took two 40,000 rows and the ledger summed to 140,000.
+ *   3. mapLoan() clamps outstanding with Math.max(0, ...), so the over-recovery read as a clean zero
+ *      on the loan register, the employee's screen and the settlement statement alike.
+ *
+ * Now the state transition IS the claim: 'active' -> 'closed' in one conditional UPDATE, so exactly
+ * one caller can proceed, whatever the index situation is. The amount is derived FROM THE LEDGER
+ * inside the same statement rather than from a number read earlier, so a payroll recovery that
+ * landed in between cannot be double-counted. Both statements run in one transaction: if the
+ * instalment cannot be written the closure rolls back and the loan is still open and still owed —
+ * which is the only safe half-state for a debt.
  */
 export async function settleLoanOutsidePayroll(opts: {
   loanId: string;
@@ -870,6 +1005,15 @@ export async function settleLoanOutsidePayroll(opts: {
   const reference = String(opts?.reference || '').trim().slice(0, 300);
   if (!reference) return { ok: false, error: 'Record where this balance was settled — a reference somebody can follow.' };
   const by = isUuid(opts?.actorUserId) ? String(opts.actorUserId) : null;
+
+  // The period this recovery is filed under, in the zone the company actually works in. It was
+  // new Date().getMonth() from the process clock — UTC on this deployment — so a settlement handed
+  // off on the 1st before 05:30 IST was filed to the PREVIOUS month, and a monthly reconciliation
+  // then showed a recovery in a closed period and a hole in the open one.
+  const period = civilToday();
+  const settleYear = Number(period.slice(0, 4));
+  const settleMonth = Number(period.slice(5, 7));
+
   try {
     await ensureLoanSchema();
     const loan = await getLoan(opts.loanId);
@@ -880,21 +1024,44 @@ export async function settleLoanOutsidePayroll(opts: {
     if (loan.outstanding <= 0) {
       return { ok: false, error: 'That loan is already clear.' };
     }
-    const now = new Date();
-    await db.execute(sql`
-      INSERT INTO hr_loan_instalments
-        (loan_id, payroll_run_id, payslip_id, month, year, amount, principal_part, interest_part)
-      VALUES
-        (${opts.loanId}::uuid, NULL, NULL, ${now.getMonth() + 1}, ${now.getFullYear()},
-         ${loan.outstanding}, ${loan.outstanding}, 0)`);
-    await db.execute(sql`
-      UPDATE hr_salary_loans SET state = 'closed', closed_at = NOW(), updated_at = NOW()
-       WHERE id = ${opts.loanId}::uuid`);
+
+    let settled = 0;
+    let lost = false;
+    await db.transaction(async (tx: any) => {
+      // THE CLAIM. Zero rows back means somebody else closed this loan between the read above and
+      // here, so this call must write nothing at all.
+      const claimed = rows(await tx.execute(sql`
+        UPDATE hr_salary_loans SET state = 'closed', closed_at = NOW(), updated_at = NOW()
+         WHERE id = ${opts.loanId}::uuid AND state = 'active'
+        RETURNING id`));
+      if (!claimed.length) { lost = true; return; }
+
+      // THE AMOUNT IS DERIVED HERE, not carried in. total_payable is frozen on the row and the
+      // recovered total is the ledger sum as it stands inside this transaction, so nothing that
+      // landed in the meantime is charged twice. GREATEST(...,0) keeps a already-over-recovered
+      // loan from writing a negative row; the WHERE below then writes nothing at all for it.
+      const wrote = rows(await tx.execute(sql`
+        INSERT INTO hr_loan_instalments
+          (loan_id, payroll_run_id, payslip_id, month, year, amount, principal_part, interest_part)
+        SELECT l.id, NULL, NULL, ${settleMonth}, ${settleYear}, d.due, d.due, 0
+          FROM hr_salary_loans l
+          CROSS JOIN LATERAL (
+            SELECT GREATEST(l.total_payable - COALESCE((
+              SELECT SUM(i.amount) FROM hr_loan_instalments i WHERE i.loan_id = l.id), 0), 0) AS due
+          ) d
+         WHERE l.id = ${opts.loanId}::uuid AND d.due > 0
+        RETURNING amount`));
+      settled = wrote.length ? Number((wrote[0] as any).amount || 0) : 0;
+    });
+
+    if (lost) {
+      return { ok: false, error: 'That loan was closed a moment ago by someone else, so nothing was recovered twice.' };
+    }
     await logAudit({
       userId: by, action: 'loan.settled_on_exit', entity: 'hr_salary_loan', entityId: opts.loanId,
-      diff: { amount: loan.outstanding, reference },
+      diff: { amount: settled, reference, month: settleMonth, year: settleYear },
     });
-    return { ok: true, amount: loan.outstanding };
+    return { ok: true, amount: settled };
   } catch (e: any) {
     logFail('settleLoanOutsidePayroll', e);
     return { ok: false, error: 'The balance was not settled: ' + reasonOf(e) };

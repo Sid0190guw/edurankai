@@ -19,21 +19,59 @@
 // but wiring it here means a third decision path with its own transition rules, and it belongs with
 // the task engine rather than bolted on. Recorded in KNOWN_GAPS.md rather than shown as an empty
 // section — a section that is always empty teaches people to stop looking at the page.
-import BottomNav from '@/components/workforce/BottomNav.astro';
+import WorkspaceNav from '@/components/workforce/WorkspaceNav.astro';
 import EmptyState from '@/components/workforce/EmptyState.astro';
-import { pendingLeaveForApprover, decideLeave } from '@/lib/hr-leave';
+import { composeWorkspace } from '@/lib/workforce/composer';
+import { pendingLeaveForApprover, decideLeave, describeUnits } from '@/lib/hr-leave';
 import { pendingWithdrawalsForApprover, decideWithdrawal } from '@/lib/hr-wallet';
+// EVERY OTHER ROUTED APPROVAL. See the ROUTED WORKFLOW STEPS note below.
+import { pendingForApprover, decideStep, domainLabel, type PendingApproval } from '@/lib/workflow';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/approvals'));
 
 // Declared BEFORE the POST handler that uses them. `const` is not hoisted, and that has taken this
 // site down twice — apply step 5 and the /admin/roles Repair button both threw on their first line.
-const KINDS = ['leave', 'withdrawal'];
+//
+// =================================================================================================
+// ROUTED WORKFLOW STEPS — THE THIRD KIND, AND THE REASON THIS PAGE EXISTS AT ALL
+// =================================================================================================
+//
+// This page counted leave and wallet withdrawals and nothing else, while src/lib/workflow.ts routed
+// timesheets, overtime, attendance corrections, expense claims, travel, procurement, loans, bonuses,
+// documents, helpdesk asset requests and appraisals to the SAME people — per row, from the org graph.
+// Those steps were readable through pendingForApprover() by seven separate pages, each filtering to
+// one domain, and by no aggregate surface at all. So the queue a manager actually opens showed a
+// fraction of what was waiting on them, and the notification for the rest pointed at admin pages that
+// are gated against the very person the graph had routed to. A loan approved by nobody sat 'pending'
+// forever with its one authorised decider standing outside a locked door.
+//
+// THE PAGE IS STILL NOT THE PERMISSION. pendingForApprover() shows only steps routed or delegated to
+// this reader, and decideStep() re-derives authority at the write through mayAct() — a posted step id
+// for somebody else's request is refused by the engine, exactly as a posted leave id is.
+const KINDS = ['leave', 'withdrawal', 'step'];
 const DECISIONS = ['approved', 'rejected'];
+
+// A DECLINE NEEDS A SENTENCE. An approval does not.
+//
+// Asymmetric friction, and the asymmetry is the point: approving is the expected, reversible-ish
+// outcome and stays one tap. Declining costs somebody their plans or their money, and a decline with
+// no stated reason is the single most reliable generator of an HR conversation — the person on the
+// receiving end has no route to understand it, contest it, or fix the request and try again.
+//
+// Enforced HERE, on the server, not with a `required` attribute: the note field is shared by both
+// buttons, so a client-side `required` would block Approve too, and an attribute is not a rule
+// anyway. Three characters rather than one, so a lone "." does not satisfy it while still being far
+// short of asking anyone to write an essay on a phone.
+const MIN_DECLINE_REASON = 3;
 
 let errorMsg = '';
 let okMsg = '';
+// WHICH ROW WAS REFUSED, AND WHAT THEY HAD ALREADY TYPED. This page re-renders rather than
+// redirecting, so the text comes back with it — WCAG 2.2 SC 3.3.7 Redundant Entry, and more simply:
+// throwing away a manager's typed sentence and asking for it again is how a queue stops being worked.
+let needsReasonFor = '';
+let keptNote = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -44,15 +82,34 @@ if (Astro.request.method === 'POST') {
 
   if (!KINDS.includes(kind) || !DECISIONS.includes(decision) || !id) {
     errorMsg = 'That decision could not be read. Please try again.';
+  } else if (decision === 'rejected' && note.length < MIN_DECLINE_REASON) {
+    // NOTHING WAS WRITTEN. The request is untouched and still pending — said plainly, because a
+    // half-completed decision that reads like a failure is how somebody decides the same request
+    // twice.
+    needsReasonFor = id;
+    keptNote = note;
+    errorMsg = 'Declining needs a reason. Nothing has been recorded yet — add a short note saying why, and the person will see it with the decision.';
   } else {
     try {
       // The engine re-checks authority. A posted id for someone else's report is refused here, not
       // by the fact that this page did not draw a button for it.
       const res = kind === 'leave'
         ? await decideLeave(id, user, decision as any, note)
-        : await decideWithdrawal(id, user, decision as any, note);
-      if (res.ok) okMsg = decision === 'approved' ? 'Approved.' : 'Declined.';
-      else errorMsg = res.error || 'That decision could not be recorded.';
+        : kind === 'step'
+          ? await decideStep(id, user as any, decision as any, note)
+          : await decideWithdrawal(id, user, decision as any, note);
+      if (res.ok) {
+        okMsg = decision === 'approved' ? 'Approved.' : 'Declined.';
+        // THE LIBRARY'S WARNING IS NOT DROPPED. decideLeave() returns one when the decision COMMITTED
+        // but something that should have accompanied it did not — the audit row, or the attendance
+        // days payroll reads. Its own docblock says callers must append it, and both callers used to
+        // print a flat "Decision recorded." over the top of it. An approved leave with no attendance
+        // row is a month of wrong pay that nobody was told about.
+        const warning = (res as any).warning;
+        if (warning) okMsg = okMsg + ' ' + String(warning);
+      } else {
+        errorMsg = res.error || 'That decision could not be recorded.';
+      }
     } catch (e: any) {
       console.error('[portal/approvals] decide', e?.cause?.message || e?.message);
       errorMsg = 'That decision could not be recorded.';
@@ -60,23 +117,114 @@ if (Astro.request.method === 'POST') {
   }
 }
 
-let leave: any[] = [];
-let withdrawals: any[] = [];
-try {
-  [leave, withdrawals] = await Promise.all([
-    pendingLeaveForApprover(user),
-    pendingWithdrawalsForApprover(user),
-  ]);
-} catch (e: any) {
-  console.error('[portal/approvals] load', e?.cause?.message || e?.message);
-}
+// THREE QUEUES, THREE SEPARATE ANSWERS — AND AN UNREADABLE QUEUE IS NOT AN EMPTY ONE.
+//
+// This was one Promise.all inside one try/catch. Promise.all rejects as soon as ANY of the three
+// rejects, so a single failing reader left all three arrays at [] — and `total` at 0, and the page
+// printed "Nothing is waiting on you" to a manager with a fortnight of leave requests behind it. That
+// is the exact failure this whole page was built to end: everybody assuming somebody else was looking.
+// The all-clear on an approvals queue is the most expensive empty state in the product, because
+// nobody re-checks a screen that told them there was nothing there.
+//
+// allSettled, so one failure costs one section. Each source records whether it RAN, and the notice
+// below names the ones that did not.
+const settled = await Promise.allSettled([
+  pendingLeaveForApprover(user),
+  pendingWithdrawalsForApprover(user),
+  pendingForApprover(String(user.id || '')),
+]);
 
-const total = leave.length + withdrawals.length;
+const sourceNames = ['leave requests', 'wallet withdrawals', 'everything else routed to you'];
+const unreadSources: string[] = [];
+settled.forEach((s, i) => {
+  if (s.status === 'rejected') {
+    const e: any = s.reason;
+    console.error('[portal/approvals] load ' + sourceNames[i], e?.cause?.message || e?.message);
+    unreadSources.push(sourceNames[i]);
+  }
+});
+
+const leave: any[] = settled[0].status === 'fulfilled' && Array.isArray(settled[0].value) ? settled[0].value : [];
+const withdrawals: any[] = settled[1].status === 'fulfilled' && Array.isArray(settled[1].value) ? settled[1].value : [];
+const routed: PendingApproval[] = settled[2].status === 'fulfilled' && Array.isArray(settled[2].value) ? settled[2].value : [];
+
+// Any queue that did not answer. The empty state is suppressed while this is true: "nothing is
+// waiting on you" is a claim, and it may only be made when all three readers actually reported.
+const someQueueUnread = unreadSources.length > 0;
+const unreadSentence = unreadSources.length === 1
+  ? unreadSources[0]
+  : unreadSources.slice(0, -1).join(', ') + ' and ' + unreadSources[unreadSources.length - 1];
+
+// A LEAVE REQUEST ROUTED THROUGH THE ENGINE WOULD OTHERWISE APPEAR TWICE — once as an hr_leave_request
+// row in the leave queue and once as a workflow step — with two buttons that write the same decision
+// through two different paths. The engine's copy is dropped: the leave card carries the request's own
+// detail (type, dates, units, reason) and the step card cannot.
+const routedOther = routed.filter((p) => p.instance.domain !== 'leave');
+
+const total = leave.length + withdrawals.length + routedOther.length;
+
+// WHAT THE APPROVER IS ACTUALLY BEING ASKED FOR.
+//
+// This queue printed `{l.days} day(s)`, and days is the CALENDAR SPAN — a two-hour hospital
+// appointment and a half day both read "casual · 1 day" to the one person deciding about them. The
+// manager approved believing somebody was gone all day and arranged cover for a day, while the
+// attendance record and the balance both said half. /admin/hr/leave was corrected for this and uses
+// describeUnits(); the queue a reporting manager actually opens was not.
+const leaveCost = (l: any) => describeUnits(
+  String(l?.unit || 'full'),
+  Number(l?.day_units ?? l?.days) || 0,
+  l?.hours === null || l?.hours === undefined ? null : Number(l.hours),
+);
+const money = (a: any, c: any) => (a === null || a === undefined ? '' : (c || 'INR') + ' ' + Number(a).toLocaleString('en-IN'));
+
+// THE NAV IS DERIVED FROM THE COMPOSITION, like every other workspace surface.
+//
+// This page used to render `<BottomNav variant="hr" active="hr" />`: a hardcoded Home | Tasks |
+// Community | My HR with no capability test, whose Home pointed at /portal rather than at the
+// reader's actual home — and `active="hr"` put aria-current="page" on the My HR tab while the person
+// was standing on Approvals, telling a screen-reader user they were somewhere they were not.
+//
+// The bar now physically matches the one on Home and on every other composed surface (WCAG 2.2 SC
+// 3.2.3 Consistent Navigation), and the lit tab is resolved from the path, so it is Approvals.
+// composeWorkspace memoises on Astro.locals; this page did not compose before, so it is one
+// composition — two reads — and it buys a bar that cannot disagree with the one next door.
+let composed: any = null;
+try {
+  composed = await composeWorkspace(user as any, { locals: Astro.locals, next: '/portal/approvals' });
+} catch (e: any) {
+  console.error('[portal/approvals] compose', e?.cause?.message || e?.message);
+}
 
 const fmtDate = (d: any) => (d ? new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '');
 const fmtMoney = (a: any, c: any) => (a == null ? '' : (c || 'INR') + ' ' + Number(a).toLocaleString('en-IN'));
 // A request that started before today is already biting: the person is off, or waiting on money.
 const isUrgent = (d: any) => !!d && new Date(d).getTime() <= Date.now();
+
+// HOW LONG SOMEBODY HAS BEEN WAITING ON THIS. Whole days, floor, from requested_at — which
+// hr_leave_request has had all along (NOT NULL DEFAULT NOW()) and this page simply never rendered.
+// The queue is now ordered oldest-first by that same column, so the number and the position agree.
+//
+// Null when there is no timestamp to read, and the caller then prints nothing at all rather than
+// "waiting 20265 days" from an epoch-zero fallback. A number that is obviously wrong makes a reader
+// distrust the numbers that are right.
+const daysWaiting = (d: any) => {
+  if (!d) return null;
+  const t = new Date(d).getTime();
+  if (!Number.isFinite(t)) return null;
+  const days = Math.floor((Date.now() - t) / 86400000);
+  return days >= 0 ? days : 0;
+};
+const waitedLabel = (d: any) => {
+  const n = daysWaiting(d);
+  if (n === null) return '';
+  if (n === 0) return 'waiting since today';
+  return 'waiting ' + n + (n === 1 ? ' day' : ' days');
+};
+// AGE IS URGENCY TOO, not just a start date that has passed. Three working days is the point at
+// which a person has almost certainly chased it by other means; the same left rule the page already
+// uses for leave that has begun now also marks anything that has sat this long, on both queues.
+const AGE_ALERT_DAYS = 3;
+const isStale = (d: any) => (daysWaiting(d) ?? 0) >= AGE_ALERT_DAYS;
 ---
 
 <!doctype html>
@@ -108,6 +256,14 @@ const isUrgent = (d: any) => !!d && new Date(d).getTime() <= Date.now();
     .meta{font-size:12.5px;color:#5c5349;margin:0 0 4px;line-height:1.55;}
     .reason{font-size:13px;color:#1a1510;background:#faf6ef;border-radius:9px;
       padding:9px 11px;margin:8px 0 0;line-height:1.55;}
+    /* How long this has been sat on. Meta tone until it crosses the age threshold,
+       then the same rust the "Started" flag and the urgent left rule already use —
+       one urgency colour on this page, not two competing ones. */
+    .waited{font-size:12px;color:#8a7f70;margin:4px 0 0;
+      font-family:'Geist Mono',ui-monospace,monospace;}
+    .waited.is-stale{color:#c2410c;font-weight:700;}
+    /* Why a decline was not recorded. Sits under the note field it belongs to. */
+    .why{flex:1 1 100%;margin:0;font-size:12.5px;line-height:1.5;color:#a33;}
     .flag{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.06em;
       text-transform:uppercase;color:#8a4b12;background:#fdf3e7;border:1px solid #f0d9bd;
       border-radius:999px;padding:3px 8px;margin-left:6px;
@@ -135,10 +291,22 @@ const isUrgent = (d: any) => !!d && new Date(d).getTime() <= Date.now();
     {okMsg && <div class="flash ok" role="status">{okMsg}</div>}
     {errorMsg && <div class="flash err" role="alert">{errorMsg}</div>}
 
-    {total === 0 && (
+    {/* A queue that did not answer is said out loud, above everything else on the page. Whatever IS
+        below it is still shown and still decidable — one unreadable source must not hide two working
+        ones — but nothing on this screen may be read as a complete picture while this is here. */}
+    {someQueueUnread && (
+      <div class="flash err" role="alert">
+        We could not read {unreadSentence} just now, so this list is incomplete. Nothing has been
+        decided or lost. Reload in a moment, and tell us if it keeps happening.
+      </div>
+    )}
+
+    {/* THE ALL-CLEAR IS A CLAIM, AND IT NEEDS ALL THREE READERS TO HAVE REPORTED. Zero rows out of a
+        query that never ran is not "nothing is waiting on you". */}
+    {total === 0 && !someQueueUnread && (
       <EmptyState
         title="Nothing is waiting on you"
-        body="When someone on your team requests leave or a withdrawal, it appears here for your decision."
+        body="When something is routed to you for a decision — leave, a wallet withdrawal, an expense claim, a loan, a timesheet — it appears here."
         illustration="check"
         actionLabel="Back to My HR"
         actionHref="/portal/employee"
@@ -149,24 +317,46 @@ const isUrgent = (d: any) => !!d && new Date(d).getTime() <= Date.now();
       <>
         <p class="sec">Leave &middot; {leave.length}</p>
         {leave.map((l: any) => (
-          <div class={isUrgent(l.start_date) ? 'card urgent' : 'card'}>
+          <div class={isUrgent(l.start_date) || isStale(l.requested_at) ? 'card urgent' : 'card'}>
             <p class="who">
               {l.full_name || 'Employee'}
               {isUrgent(l.start_date) && <span class="flag">Started</span>}
             </p>
             <p class="meta">
-              {l.leave_type} &middot; <span class="tnum">{l.days}</span> day{Number(l.days) === 1 ? '' : 's'}
+              {l.leave_type} &middot; <span class="tnum">{leaveCost(l)}</span>
               &middot; {fmtDate(l.start_date)} to {fmtDate(l.end_date)}
             </p>
             <p class="meta">{l.employee_code}{l.designation ? ' · ' + l.designation : ''}</p>
+            {/* HOW LONG THEY HAVE BEEN WAITING. requested_at was already selected and never shown,
+                so an approver could not tell a request filed this morning from one filed a
+                fortnight ago. The queue is ordered by this, so the oldest is at the top. */}
+            {waitedLabel(l.requested_at) && (
+              <p class={isStale(l.requested_at) ? 'waited is-stale' : 'waited'}>
+                {waitedLabel(l.requested_at)} &middot; asked {fmtDate(l.requested_at)}
+              </p>
+            )}
             {l.reason && <p class="reason">{l.reason}</p>}
             <form method="POST" class="act">
               <input type="hidden" name="kind" value="leave" />
               <input type="hidden" name="id" value={l.id} />
               <label class="tnum" style="flex:1 1 100%;">
-                <span style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);">Note for {l.full_name}</span>
-                <input class="note" type="text" name="note" maxlength="500" placeholder="Add a note (optional)" />
+                <span style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);">Note for {l.full_name} — required if you decline</span>
+                <input
+                  class="note"
+                  type="text"
+                  name="note"
+                  maxlength="500"
+                  placeholder="Note — required if you decline"
+                  value={needsReasonFor === l.id ? keptNote : ''}
+                  aria-invalid={needsReasonFor === l.id ? 'true' : undefined}
+                  aria-describedby={needsReasonFor === l.id ? 'why-' + l.id : undefined}
+                />
               </label>
+              {needsReasonFor === l.id && (
+                <p class="why" id={'why-' + l.id} role="alert">
+                  Say why, and this decline will be recorded. Nothing has changed yet.
+                </p>
+              )}
               <button class="btn yes" type="submit" name="decision" value="approved">Approve</button>
               <button class="btn no" type="submit" name="decision" value="rejected">Decline</button>
             </form>
@@ -179,18 +369,84 @@ const isUrgent = (d: any) => !!d && new Date(d).getTime() <= Date.now();
       <>
         <p class="sec">Withdrawals &middot; {withdrawals.length}</p>
         {withdrawals.map((w: any) => (
-          <div class="card">
+          <div class={isStale(w.requested_at) ? 'card urgent' : 'card'}>
             <p class="who">{w.full_name || 'Employee'}</p>
             <p class="meta tnum">{fmtMoney(w.amount, w.currency)}{w.method ? ' · ' + w.method : ''}</p>
             <p class="meta">{w.employee_code} &middot; requested {fmtDate(w.requested_at)}</p>
+            {/* Money somebody has asked for and not received. The age is the whole story here. */}
+            {waitedLabel(w.requested_at) && (
+              <p class={isStale(w.requested_at) ? 'waited is-stale' : 'waited'}>{waitedLabel(w.requested_at)}</p>
+            )}
             {w.note && <p class="reason">{w.note}</p>}
             <form method="POST" class="act">
               <input type="hidden" name="kind" value="withdrawal" />
               <input type="hidden" name="id" value={w.id} />
               <label style="flex:1 1 100%;">
-                <span style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);">Note for {w.full_name}</span>
-                <input class="note" type="text" name="note" maxlength="500" placeholder="Add a note (optional)" />
+                <span style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);">Note for {w.full_name} — required if you decline</span>
+                <input
+                  class="note"
+                  type="text"
+                  name="note"
+                  maxlength="500"
+                  placeholder="Note — required if you decline"
+                  value={needsReasonFor === w.id ? keptNote : ''}
+                  aria-invalid={needsReasonFor === w.id ? 'true' : undefined}
+                  aria-describedby={needsReasonFor === w.id ? 'why-' + w.id : undefined}
+                />
               </label>
+              {needsReasonFor === w.id && (
+                <p class="why" id={'why-' + w.id} role="alert">
+                  Say why, and this decline will be recorded. Nothing has changed yet.
+                </p>
+              )}
+              <button class="btn yes" type="submit" name="decision" value="approved">Approve</button>
+              <button class="btn no" type="submit" name="decision" value="rejected">Decline</button>
+            </form>
+          </div>
+        ))}
+      </>
+    )}
+
+    {routedOther.length > 0 && (
+      <>
+        <p class="sec">Routed to you &middot; {routedOther.length}</p>
+        {routedOther.map((p: PendingApproval) => (
+          <div class={isStale(p.instance.createdAt) ? 'card urgent' : 'card'}>
+            <p class="who">{p.instance.subjectName || 'A colleague'}</p>
+            <p class="meta">
+              {domainLabel(p.instance.domain)}
+              {p.instance.amount !== null && p.instance.amount !== undefined
+                ? ' · ' + money(p.instance.amount, p.instance.currency)
+                : ''}
+              {p.step.stepNo > 1 ? ' · step ' + p.step.stepNo : ''}
+            </p>
+            {waitedLabel(p.instance.createdAt) && (
+              <p class={isStale(p.instance.createdAt) ? 'waited is-stale' : 'waited'}>
+                {waitedLabel(p.instance.createdAt)}
+              </p>
+            )}
+            {p.instance.summary && <p class="reason">{p.instance.summary}</p>}
+            <form method="POST" class="act">
+              <input type="hidden" name="kind" value="step" />
+              <input type="hidden" name="id" value={p.step.id} />
+              <label style="flex:1 1 100%;">
+                <span style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);">Note — required if you decline</span>
+                <input
+                  class="note"
+                  type="text"
+                  name="note"
+                  maxlength="500"
+                  placeholder="Note — required if you decline"
+                  value={needsReasonFor === p.step.id ? keptNote : ''}
+                  aria-invalid={needsReasonFor === p.step.id ? 'true' : undefined}
+                  aria-describedby={needsReasonFor === p.step.id ? 'why-' + p.step.id : undefined}
+                />
+              </label>
+              {needsReasonFor === p.step.id && (
+                <p class="why" id={'why-' + p.step.id} role="alert">
+                  Say why, and this decline will be recorded. Nothing has changed yet.
+                </p>
+              )}
               <button class="btn yes" type="submit" name="decision" value="approved">Approve</button>
               <button class="btn no" type="submit" name="decision" value="rejected">Decline</button>
             </form>
@@ -200,6 +456,10 @@ const isUrgent = (d: any) => !!d && new Date(d).getTime() <= Date.now();
     )}
   </div>
 
-  <BottomNav variant="hr" active="hr" />
+  {/* The composed bar, carrying the count of what is still waiting here. `leave.length +
+      withdrawals.length` is already on this page — no extra read — and buildWorkspaceNav drops the
+      key outright for anybody whose composition did not authorise the approvals door. If the
+      composition itself failed, no nav renders rather than a wrong one. */}
+  {composed && <WorkspaceNav composed={composed} badges={{ approvals: total }} />}
 </body>
 </html>

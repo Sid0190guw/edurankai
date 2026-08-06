@@ -2,60 +2,79 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
+import {
+  CRM_STAGES, ensureCrmSchema, dbReason, listDeals, dealStats,
+  listContacts, listActivities, listOpenTasks, listContactOptions, closeTask,
+} from '@/lib/crm';
+// toRows because postgres-js hands back a plain array and drizzle's own driver wraps it in `.rows`;
+// uuidish because a non-UUID id bound against a uuid column raises 22P02 and the user is then shown
+// a Postgres complaint about their own click; clip/pageParam for the same reasons as everywhere else.
+import { toRows, uuidish, clip, pageParam } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=/portal/crm');
 
-function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-
-// Self-bootstrap schema
-try {
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_contacts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    owner_user_id UUID,
-    full_name VARCHAR(200) NOT NULL,
-    email VARCHAR(200), phone VARCHAR(40), company VARCHAR(200),
-    role VARCHAR(120), location VARCHAR(120),
-    source VARCHAR(80),
-    pipeline_stage VARCHAR(40) NOT NULL DEFAULT 'lead',
-    lifetime_value_chf NUMERIC(12,2),
-    tags JSONB DEFAULT '[]'::jsonb,
-    notes TEXT,
-    last_contacted_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_activities (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    contact_id UUID REFERENCES crm_contacts(id) ON DELETE CASCADE,
-    user_id UUID, kind VARCHAR(20),
-    summary TEXT, payload JSONB DEFAULT '{}'::jsonb,
-    due_at TIMESTAMPTZ, completed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS crm_deals (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    contact_id UUID REFERENCES crm_contacts(id) ON DELETE CASCADE,
-    owner_user_id UUID, title TEXT NOT NULL,
-    amount_chf NUMERIC(12,2), stage VARCHAR(40) DEFAULT 'qualified',
-    close_date DATE, probability_pct INT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  )`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_contacts_stage ON crm_contacts(pipeline_stage)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_contacts_owner ON crm_contacts(owner_user_id)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_activities_contact ON crm_activities(contact_id)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_activities_due ON crm_activities(due_at)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_deals_stage ON crm_deals(stage)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_crm_deals_contact ON crm_deals(contact_id)`);
-} catch (e) { console.error('crm bootstrap', e); }
+// AUTHORISATION. THIS PAGE HAD NONE.
+//
+// The only gate was `if (!user)`, and src/middleware.ts protects /portal/* by sign-in alone. So any
+// signed-in account at all — an applicant who registered five minutes ago, a parent, a student —
+// could open /portal/crm and read every contact's name, email, phone, company and lifetime value,
+// and INSERT contacts and deals into the company pipeline. Customer contact details are exactly the
+// class of data that must not be readable by whoever happens to hold a portal session.
+//
+// The capability is asked of src/lib/auth/permissions.ts (never users.role), and `admin.access` is
+// the key whose holders are the seven console roles — the same population src/middleware.ts admits
+// to /admin, where every other internal business tool on this codebase lives. The refusal below
+// says what is missing rather than bouncing the person to /portal with no explanation.
+const mayUseCrm = can(user as any, 'admin.access');
+if (!mayUseCrm) {
+  return new Response(
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>CRM — not available for this account</title></head>' +
+    '<body style="margin:0;background:#FAF8F5;color:#0E0B08;font-family:Georgia,serif;">' +
+    '<main style="max-width:640px;margin:0 auto;padding:80px 24px;">' +
+    '<p style="font-family:ui-monospace,monospace;font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:#FF4F00;margin:0 0 16px;">Portal &middot; CRM</p>' +
+    '<h1 style="font-size:34px;font-weight:500;margin:0 0 16px;">This console is not open to your account.</h1>' +
+    '<p style="font-size:17px;line-height:1.6;color:#5d4a3a;margin:0 0 12px;">The CRM holds customer contact details — names, addresses, phone numbers and account values. Reading it requires the <strong>admin.access</strong> capability, which your account does not hold.</p>' +
+    '<p style="font-size:15px;line-height:1.6;color:#5d4a3a;margin:0 0 28px;">If you need it for your work, ask an administrator to grant it; nothing about this page changes until they do.</p>' +
+    '<p style="margin:0;"><a href="/portal" style="font-family:ui-monospace,monospace;font-size:12px;letter-spacing:0.06em;text-transform:uppercase;color:#0E0B08;border:1px solid #1d160f33;border-radius:8px;padding:10px 16px;text-decoration:none;">Back to the portal</a></p>' +
+    '</main></body></html>',
+    { status: 403, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } },
+  );
+}
 
 let okMsg = '', errMsg = '';
 
+// THE STAGE VOCABULARY, DECLARED BEFORE THE HANDLER THAT USES IT.
+//
+// `const stages` sits further down this file, below the POST block, and `const` is not hoisted —
+// referencing it from inside the handler would throw on the first line of every POST rather than
+// validating anything. This is the same shape that broke apply step 5 and the roles Repair button
+// on this project, and it is why the list is derived from the one vocabulary in src/lib/crm.ts
+// rather than written out twice.
+const STAGES = CRM_STAGES;
+
+// The six CREATE TABLE + six CREATE INDEX statements that used to run on EVERY page load now live
+// behind a once-per-process guard in src/lib/crm.ts, and they report failure instead of being
+// swallowed: if the schema is not there, every panel below says so rather than rendering empty.
+const schemaBoot = await ensureCrmSchema();
+
 // POST handlers
 if (Astro.request.method === 'POST') {
+  // DECLARED OUTSIDE THE `try`, WHICH IS THE WHOLE POINT.
+  //
+  // `action` used to be a `const` INSIDE the try block, and the catch at the bottom logged
+  // `String(action)`. A `const` is block-scoped, so the catch referenced a name that is not in
+  // scope: the moment any write failed, the error handler itself threw a ReferenceError, the
+  // failure it was written to report was replaced by a different one, and the page answered with a
+  // bare 500 instead of the sentence it had ready. The one path that must never fail is the path
+  // that explains a failure.
+  let action = '';
   try {
     const form = await Astro.request.formData();
-    const action = String(form.get('action') || '');
+    action = String(form.get('action') || '');
 
     if (action === 'create_contact') {
       const fullName = String(form.get('full_name') || '').trim();
@@ -93,19 +112,51 @@ if (Astro.request.method === 'POST') {
     } else if (action === 'move_deal_stage') {
       const dealId = String(form.get('deal_id') || '');
       const newStage = String(form.get('new_stage') || '');
-      if (dealId && newStage) {
-        const prev = rows(await db.execute(sql`SELECT stage, contact_id FROM crm_deals WHERE id = ${dealId}::uuid`));
-        await db.execute(sql`UPDATE crm_deals SET stage = ${newStage} WHERE id = ${dealId}::uuid`);
-        if (prev.length > 0) {
-          const oldStage = prev[0].stage;
-          const cid = prev[0].contact_id;
-          await db.execute(sql`INSERT INTO crm_activities(contact_id, user_id, kind, summary, payload)
-            VALUES (${cid}::uuid, ${user.id}, 'stage_change', ${'Deal moved: ' + oldStage + ' to ' + newStage}, ${JSON.stringify({from: oldStage, to: newStage, deal_id: dealId})}::jsonb)`);
-          if (newStage === 'won' || newStage === 'lost') {
-            await db.execute(sql`UPDATE crm_contacts SET pipeline_stage = ${newStage}, updated_at = NOW() WHERE id = ${cid}::uuid`);
+      // CHECKED AGAINST THE VOCABULARY, NOT AGAINST THE FORM THAT WAS RENDERED. The stage used to be
+      // written straight through, which was survivable while the only writer was a drag handler that
+      // could only ever produce a column that exists. There is a native <select> on every card now,
+      // so the value arrives from the request like any other posted field and has to be treated as
+      // one — an unrecognised stage would put a deal in a column no view renders, where it is
+      // invisible rather than wrong.
+      if (dealId && newStage && !(STAGES as readonly string[]).includes(newStage)) {
+        errMsg = 'That is not a stage on this pipeline. Nothing was moved.';
+      } else if (!uuidish(dealId)) {
+        // A deal id that is not a UUID reaches Postgres as an invalid literal and raises 22P02,
+        // which the catch below then shows the user as a database complaint about their own click.
+        errMsg = 'That is not a deal this page can move. Nothing was moved.';
+      } else if (dealId && newStage) {
+        // MOVING A DEAL HAS NEVER WORKED. This block called `rows(...)`, and there is no `rows` in
+        // this file — the ReferenceError fired BEFORE the UPDATE, so the deal never moved, and the
+        // catch below reported "rows is not defined" to whoever dragged the card.
+        //
+        // The read and the write are now one statement with RETURNING, which also fixes the second
+        // half of it: the UPDATE was unguarded and its result never looked at, so a stale card in an
+        // open tab printed "Deal moved." over a deal that no longer exists. `AND stage <> newStage`
+        // makes a repeat press a no-op rather than a second identical stage_change entry in the
+        // timeline, which is the only record of how a deal actually travelled.
+        const moved = toRows(await db.execute(sql`
+          UPDATE crm_deals d SET stage = ${newStage}
+          FROM crm_deals prev
+          WHERE d.id = ${dealId}::uuid AND prev.id = d.id AND d.stage <> ${newStage}
+          RETURNING prev.stage AS old_stage, d.contact_id AS contact_id`));
+        if (moved.length === 0) {
+          const still = toRows(await db.execute(sql`SELECT stage FROM crm_deals WHERE id = ${dealId}::uuid`));
+          errMsg = still.length
+            ? 'Nothing was moved: that deal is already at ' + String(still[0].stage) + '.'
+            : 'Nothing was moved: there is no deal with that id any more. Reload the board.';
+        } else {
+          const oldStage = moved[0].old_stage;
+          const cid = moved[0].contact_id;
+          if (cid) {
+            await db.execute(sql`INSERT INTO crm_activities(contact_id, user_id, kind, summary, payload)
+              VALUES (${cid}::uuid, ${user.id}, 'stage_change', ${'Deal moved: ' + oldStage + ' to ' + newStage}, ${JSON.stringify({from: oldStage, to: newStage, deal_id: dealId})}::jsonb)`);
+            if (newStage === 'won' || newStage === 'lost') {
+              await db.execute(sql`UPDATE crm_contacts SET pipeline_stage = ${newStage}, updated_at = NOW() WHERE id = ${cid}::uuid`);
+            }
           }
+          okMsg = 'Deal moved from ' + String(oldStage) + ' to ' + newStage + '.'
+            + (cid ? '' : ' It is not linked to a contact, so nothing was added to any timeline.');
         }
-        okMsg = 'Deal moved.';
       }
     } else if (action === 'create_deal') {
       const contactId = String(form.get('contact_id') || '');
@@ -121,9 +172,25 @@ if (Astro.request.method === 'POST') {
           VALUES (${contactId}::uuid, ${user.id}, ${title}, ${amount}, ${stage}, ${closeDate ? sql`${closeDate}::date` : sql`NULL`}, ${prob})`);
         okMsg = 'Deal created.';
       }
+    } else if (action === 'close_task') {
+      // THE TASKS PANEL LISTED WORK AND OFFERED NO WAY TO FINISH IT. crm_activities.completed_at was
+      // written only by log_activity (which sets it for non-task kinds), so an open task could never
+      // leave the "due in the next 7 days" list — the panel could only grow. This is the write that
+      // closes one, and it appends a note so the timeline records who closed it and when.
+      const taskId = String(form.get('task_id') || '');
+      if (!taskId) {
+        errMsg = 'No task was named. Nothing was closed.';
+      } else {
+        const done = await closeTask(taskId, user.id);
+        okMsg = done ? 'Task closed.' : '';
+        if (!done) errMsg = 'That task is already closed, or it no longer exists.';
+      }
     }
   } catch (e: any) {
-    errMsg = e?.message || 'Action failed.';
+    // postgres-js puts the failed SQL in e.message and the actual Postgres complaint on e.cause.
+    // Reporting e.message alone showed the operator their own statement and never the reason.
+    errMsg = dbReason(e);
+    console.error('[crm] POST ' + String(action) + ' failed:', errMsg);
   }
 }
 
@@ -131,7 +198,7 @@ if (Astro.request.method === 'POST') {
 const sortKey = String(Astro.url.searchParams.get('sort') || 'updated_at');
 const stageFilter = String(Astro.url.searchParams.get('stage') || '');
 const tagFilter = String(Astro.url.searchParams.get('tag') || '').toLowerCase();
-const page = Math.max(1, parseInt(String(Astro.url.searchParams.get('p') || '1')) || 1);
+const page = pageParam(Astro.url.searchParams.get('p'));
 const perPage = 25;
 const offset = (page - 1) * perPage;
 
@@ -146,114 +213,70 @@ const allowedSort: Record<string, string> = {
 const orderBy = allowedSort[sortKey] || allowedSort.updated_at;
 
 // Stage counts for kanban
-const stages = ['lead', 'qualified', 'proposal', 'negotiation', 'won', 'lost'];
+// Derived from STAGES above rather than restated, so the list the handler validates against and the
+// list the columns are drawn from can never drift apart.
+const stages: string[] = [...STAGES];
 
-let kanbanDeals: any[] = [];
-try {
-  kanbanDeals = rows(await db.execute(sql`
-    SELECT d.id, d.title, d.amount_chf, d.stage, d.probability_pct, d.close_date,
-           c.full_name AS contact_name, c.company AS contact_company, c.id AS contact_id
-    FROM crm_deals d
-    LEFT JOIN crm_contacts c ON c.id = d.contact_id
-    ORDER BY d.created_at DESC
-    LIMIT 200
-  `));
-} catch (_) {}
+// =================================================================================================
+// EVERY PANEL ON THIS PAGE WAS READING THROUGH A FUNCTION THAT DOES NOT EXIST.
+//
+// Six blocks below used to call `rows(await db.execute(...))`. There is no `rows` in this file and
+// none is imported — src/lib/crm.ts has one, but it is not exported and was never brought in. So at
+// runtime every one of those lines raised `rows is not defined`, and every one of them sat inside a
+// `catch (_) {}`. The consequence is not a crash, which is what makes it survivable for months: the
+// kanban rendered as six empty columns, the stat strip as five zeros, the contact table as "no
+// contacts", the timeline and the task panel as empty — a complete, confident, entirely fictional
+// picture of an empty CRM, with nothing in the log and nothing on the screen to say otherwise.
+//
+// The reads now go through src/lib/crm.ts, which already owns these queries and returns
+// `{ ok, rows } | { ok: false, error }`. Every panel below can therefore say which of the two it is,
+// and the `catch (_) {}` swallowing is gone from all six.
+// =================================================================================================
+const dealsRead = await listDeals();
+const kanbanDeals: any[] = dealsRead.ok ? dealsRead.rows : [];
 
-// Stats
-let stats = { open_deals: 0, pipeline_value: 0, won_month: 0, total_deals: 0, won_total: 0 };
-try {
-  const r = rows(await db.execute(sql`
-    SELECT
-      COUNT(*) FILTER (WHERE stage NOT IN ('won', 'lost')) AS open_deals,
-      COALESCE(SUM(amount_chf) FILTER (WHERE stage NOT IN ('won', 'lost')), 0) AS pipeline_value,
-      COUNT(*) FILTER (WHERE stage = 'won' AND date_trunc('month', created_at) = date_trunc('month', NOW())) AS won_month,
-      COUNT(*) AS total_deals,
-      COUNT(*) FILTER (WHERE stage = 'won') AS won_total
-    FROM crm_deals
-  `));
-  if (r.length > 0) {
-    stats.open_deals = Number(r[0].open_deals) || 0;
-    stats.pipeline_value = Number(r[0].pipeline_value) || 0;
-    stats.won_month = Number(r[0].won_month) || 0;
-    stats.total_deals = Number(r[0].total_deals) || 0;
-    stats.won_total = Number(r[0].won_total) || 0;
-  }
-} catch (_) {}
-const conversionRate = stats.total_deals > 0 ? Math.round((stats.won_total / stats.total_deals) * 100) : 0;
+const statsRead = await dealStats();
+const stats = statsRead.ok ? statsRead.rows : { open_deals: 0, pipeline_value: 0, won_month: 0, total_deals: 0, won_total: 0 };
+// A conversion rate over a failed read is a made-up number, so it is only computed from a real one.
+const conversionRate = statsRead.ok && stats.total_deals > 0
+  ? Math.round((stats.won_total / stats.total_deals) * 100)
+  : 0;
 
-// Contacts table
-let contacts: any[] = [];
-let totalContacts = 0;
-try {
-  const whereParts: any[] = [];
-  if (stageFilter && stages.includes(stageFilter)) {
-    whereParts.push(sql`pipeline_stage = ${stageFilter}`);
-  }
-  if (tagFilter) {
-    whereParts.push(sql`tags::text ILIKE ${'%' + tagFilter + '%'}`);
-  }
-  const whereSql = whereParts.length > 0
-    ? sql`WHERE ${sql.join(whereParts, sql` AND `)}`
-    : sql``;
-
-  const countR = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM crm_contacts ${whereSql}`));
-  totalContacts = countR[0]?.n || 0;
-
-  // Build full sort segment
-  let orderSegment: any;
-  if (sortKey === 'name') orderSegment = sql`full_name ASC`;
-  else if (sortKey === 'company') orderSegment = sql`company ASC NULLS LAST`;
-  else if (sortKey === 'last_contacted') orderSegment = sql`last_contacted_at DESC NULLS LAST`;
-  else if (sortKey === 'ltv') orderSegment = sql`lifetime_value_chf DESC NULLS LAST`;
-  else if (sortKey === 'stage') orderSegment = sql`pipeline_stage ASC`;
-  else orderSegment = sql`updated_at DESC`;
-
-  contacts = rows(await db.execute(sql`
-    SELECT id, full_name, email, phone, company, role, location, source, pipeline_stage,
-           lifetime_value_chf, tags, last_contacted_at, updated_at
-    FROM crm_contacts
-    ${whereSql}
-    ORDER BY ${orderSegment}
-    LIMIT ${perPage} OFFSET ${offset}
-  `));
-} catch (e) { console.error('contacts query', e); }
+const contactsRead = await listContacts({
+  stage: stageFilter && stages.includes(stageFilter) ? stageFilter : undefined,
+  tag: tagFilter || undefined,
+  limit: perPage,
+  offset,
+  sortKey,
+});
+const contacts: any[] = contactsRead.ok ? contactsRead.rows.contacts : [];
+const totalContacts = contactsRead.ok ? contactsRead.rows.total : 0;
 const totalPages = Math.max(1, Math.ceil(totalContacts / perPage));
 
-// Activity timeline (last 20)
-let activities: any[] = [];
-try {
-  activities = rows(await db.execute(sql`
-    SELECT a.id, a.kind, a.summary, a.created_at, a.due_at, a.completed_at,
-           c.full_name AS contact_name, c.id AS contact_id
-    FROM crm_activities a
-    LEFT JOIN crm_contacts c ON c.id = a.contact_id
-    ORDER BY a.created_at DESC
-    LIMIT 20
-  `));
-} catch (_) {}
+const activitiesRead = await listActivities({ limit: 20 });
+const activities: any[] = activitiesRead.ok ? activitiesRead.rows : [];
 
-// Tasks panel — due in next 7 days
-let tasks: any[] = [];
-try {
-  tasks = rows(await db.execute(sql`
-    SELECT a.id, a.summary, a.due_at, a.completed_at,
-           c.full_name AS contact_name, c.id AS contact_id
-    FROM crm_activities a
-    LEFT JOIN crm_contacts c ON c.id = a.contact_id
-    WHERE a.kind = 'task' AND a.completed_at IS NULL
-      AND a.due_at IS NOT NULL
-      AND a.due_at <= NOW() + INTERVAL '7 days'
-    ORDER BY a.due_at ASC
-    LIMIT 30
-  `));
-} catch (_) {}
+const tasksRead = await listOpenTasks();
+const tasks: any[] = tasksRead.ok ? tasksRead.rows : [];
 
-// All contacts for selectors
-let allContacts: any[] = [];
-try {
-  allContacts = rows(await db.execute(sql`SELECT id, full_name, company FROM crm_contacts ORDER BY full_name ASC LIMIT 500`));
-} catch (_) {}
+const contactOptionsRead = await listContactOptions();
+const allContacts: any[] = contactOptionsRead.ok ? contactOptionsRead.rows : [];
+
+/** One banner naming every panel that did not answer, so no blank below reads as "none". */
+const readFailures: string[] = [];
+if (!dealsRead.ok) readFailures.push('the deals on the pipeline board');
+if (!statsRead.ok) readFailures.push('the pipeline figures at the top');
+if (!contactsRead.ok) readFailures.push('the contact table');
+if (!activitiesRead.ok) readFailures.push('the activity timeline');
+if (!tasksRead.ok) readFailures.push('the task panel');
+if (!contactOptionsRead.ok) readFailures.push('the contact picker in the forms');
+const firstReadError = (!dealsRead.ok && dealsRead.error)
+  || (!statsRead.ok && statsRead.error)
+  || (!contactsRead.ok && contactsRead.error)
+  || (!activitiesRead.ok && activitiesRead.error)
+  || (!tasksRead.ok && tasksRead.error)
+  || (!contactOptionsRead.ok && contactOptionsRead.error)
+  || null;
 
 // Group deals by stage for kanban
 const dealsByStage: Record<string, any[]> = {};
@@ -267,7 +290,10 @@ function fmtChf(n: any): string {
   if (n === null || n === undefined) return '—';
   const v = Number(n);
   if (isNaN(v)) return '—';
-  return 'CHF ' + v.toLocaleString('en-CH', { timeZone: 'Asia/Kolkata', minimumFractionDigits: 0, maximumFractionDigits: 0 });
+  // `timeZone` is a DATE option and was being passed to a NUMBER formatter, which is what the type
+  // checker was reporting here. It never did anything to the output — a money figure has no time
+  // zone — so removing it changes no rendered character and takes the error with it.
+  return 'CHF ' + v.toLocaleString('en-CH', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 }
 function fmtDate(d: any): string {
   if (!d) return '—';
@@ -374,6 +400,19 @@ const stageColors: Record<string, string> = {
   .kcard-amount { font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 600; }
   .kcard-prob { font-family: 'Geist Mono', monospace; font-size: 10px; color: var(--mute); }
 
+  /* The touch path for moving a deal. Existing tokens only — same hairline, same mono label
+     treatment, same 8px radius as everything else on the card; nothing new is being introduced to
+     the visual language. Both controls clear 44px so they can be hit with a thumb, and the label is
+     visible rather than hidden, because a bare dropdown on a card of numbers reads as another
+     figure. min-width:0 on the select stops a long stage name forcing the card wider than its
+     column, which is the one way this row could push the page sideways. */
+  .kmove { display: flex; align-items: center; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hair); flex-wrap: wrap; }
+  .kmove-lab { font-family: 'Geist Mono', monospace; font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--mute); }
+  .kmove select { flex: 1 1 90px; min-width: 0; min-height: 44px; font-family: 'Geist Mono', monospace; font-size: 12px; padding: 6px 8px; border: 1px solid var(--hair-strong); border-radius: 8px; background: var(--paper); color: var(--ink); }
+  .kmove-go { min-height: 44px; padding: 6px 12px; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; border: 1px solid var(--ink); border-radius: 8px; background: var(--ink); color: var(--cream); cursor: pointer; }
+  .kmove-go:hover { background: var(--burn); border-color: var(--burn); }
+  .kmove select:focus-visible, .kmove-go:focus-visible { outline: 3px solid var(--burn); outline-offset: 2px; }
+
   /* Contacts table */
   .filters { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
   .filters select, .filters input { font-family: 'Geist Mono', monospace; font-size: 12px; padding: 8px 12px; border: 1px solid var(--hair-strong); border-radius: 8px; background: var(--paper); color: var(--ink); }
@@ -383,8 +422,15 @@ const stageColors: Record<string, string> = {
   .btn-ghost:hover { background: var(--ink); color: var(--cream); }
   .btn-sm { padding: 6px 10px; font-size: 10px; }
 
-  .table-wrap { background: var(--paper); border: 1px solid var(--hair-strong); border-radius: 14px; overflow: hidden; }
-  table.ct { width: 100%; border-collapse: collapse; }
+  /* THE SIX-COLUMN TABLE WAS BEING CLIPPED, NOT SCROLLED. `overflow: hidden` was here to make the
+     14px radius cut the table corners, and it did — it also cut off everything past the viewport
+     edge. Six columns of 18px-padded cells do not fit 360px, so on a phone LTV and Last contact
+     simply were not reachable, and nothing on screen said they existed. Scrolling the box, not the
+     page, is the fix: overflow-x on its own would compute overflow-y as `auto` and clip the sort
+     dropdown, so the two axes are stated separately. -webkit-overflow-scrolling keeps the momentum
+     flick that Android and iOS users expect from a sideways region. */
+  .table-wrap { background: var(--paper); border: 1px solid var(--hair-strong); border-radius: 14px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
+  table.ct { width: 100%; border-collapse: collapse; min-width: 560px; }
   table.ct thead th { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--mute); text-align: left; padding: 14px 18px; background: var(--cream); border-bottom: 1px solid var(--hair-strong); }
   table.ct thead a { color: var(--mute); text-decoration: none; }
   table.ct thead a:hover { color: var(--burn); }
@@ -480,33 +526,81 @@ const stageColors: Record<string, string> = {
   {okMsg && <div class="msg msg-ok">{okMsg}</div>}
   {errMsg && <div class="msg msg-err">{errMsg}</div>}
 
+  {/* THE SCHEMA BOOT RESULT WAS COMPUTED AND NEVER SHOWN. `ensureCrmSchema()` returns
+      { ok, error } precisely so this page can say the tables are not there — and the value was
+      assigned to a const nothing rendered, so a CRM with no tables at all looked exactly like a CRM
+      nobody had used yet. */}
+  {!schemaBoot.ok && (
+    <div class="msg msg-err">
+      <strong>The CRM tables could not be provisioned, so nothing below is real.</strong>
+      Every panel on this page will be empty, and that emptiness means "we could not ask", not "there
+      is nothing". Do not re-enter contacts on the strength of it.
+      {schemaBoot.error && <span style="display:block;margin-top:6px;font-family:'Geist Mono',monospace;font-size:11px;overflow-wrap:anywhere;">{clip(schemaBoot.error, 300)}</span>}
+    </div>
+  )}
+  {schemaBoot.ok && readFailures.length > 0 && (
+    <div class="msg msg-err">
+      <strong>Part of this page could not be read, so what is blank below is unknown rather than empty.</strong>
+      Not read: {readFailures.join('; ')}. Do not add a contact or a deal on the strength of an empty
+      panel here — it may already exist.
+      {firstReadError && <span style="display:block;margin-top:6px;font-family:'Geist Mono',monospace;font-size:11px;overflow-wrap:anywhere;">{clip(firstReadError, 300)}</span>}
+    </div>
+  )}
+
+  {/* FOUR ZEROS ARE A CLAIM. When dealStats() did not answer, this strip printed 0 open deals, CHF 0
+      of pipeline, 0 won and 0% conversion — the most confident possible statement of a fact nobody
+      had. A figure that was not read shows a dash. */}
   <section class="stats-strip">
     <div class="stat">
       <div class="stat-lbl">Open deals</div>
-      <div class="stat-val">{stats.open_deals}</div>
-      <div class="stat-sub">across pipeline</div>
+      <div class="stat-val">{statsRead.ok ? stats.open_deals : '—'}</div>
+      <div class="stat-sub">{statsRead.ok ? 'across pipeline' : 'not read'}</div>
     </div>
     <div class="stat">
       <div class="stat-lbl">Pipeline value</div>
-      <div class="stat-val">{fmtChf(stats.pipeline_value)}</div>
-      <div class="stat-sub">weighted by stage</div>
+      <div class="stat-val">{statsRead.ok ? fmtChf(stats.pipeline_value) : '—'}</div>
+      <div class="stat-sub">{statsRead.ok ? 'weighted by stage' : 'not read'}</div>
     </div>
     <div class="stat">
       <div class="stat-lbl">Won this month</div>
-      <div class="stat-val">{stats.won_month}</div>
-      <div class="stat-sub">closed deals</div>
+      <div class="stat-val">{statsRead.ok ? stats.won_month : '—'}</div>
+      <div class="stat-sub">{statsRead.ok ? 'closed deals' : 'not read'}</div>
     </div>
     <div class="stat">
       <div class="stat-lbl">Conversion rate</div>
-      <div class="stat-val">{conversionRate}%</div>
-      <div class="stat-sub">all-time won / total</div>
+      <div class="stat-val">{statsRead.ok ? conversionRate + '%' : '—'}</div>
+      <div class="stat-sub">{statsRead.ok ? 'all-time won / total' : 'not read'}</div>
     </div>
   </section>
 
+  {/* "DRAG DEALS BETWEEN COLUMNS" WAS THE ONLY WAY TO MOVE ONE, AND IT IS NOT A WAY ON A PHONE.
+      The whole mechanism was HTML5 dragstart/dragover/drop, which mobile browsers do not fire from
+      touch at all — no polyfill, no long-press fallback, nothing. So on the device most of these
+      people are holding, the pipeline was a read-only picture and the instruction above it was an
+      instruction to do something impossible. It also required a mouse AND scripting: with either
+      missing, on any device, the stage could not be changed.
+
+      Each card now carries a native select and a submit button posting the same move_deal_stage
+      action the drag handler posts. The drag path is untouched and still works with a mouse. */}
   <div class="sec-head">
     <h2>Pipeline</h2>
-    <div class="sec-sub">Drag deals between columns to update stage</div>
+    <div class="sec-sub">Drag a deal between columns, or use the stage picker on the card</div>
   </div>
+
+  {/* SIX EMPTY COLUMNS ARE A PICTURE OF A PIPELINE WITH NOTHING IN IT. Said once, above the board,
+      rather than six times inside it. */}
+  {!dealsRead.ok && (
+    <div class="msg msg-err">
+      The deals could not be read, so the board below is empty for that reason and not because the
+      pipeline is. Nothing here is a count of anything.
+    </div>
+  )}
+  {dealsRead.ok && kanbanDeals.length === 0 && (
+    <div class="msg" style="border:1px solid #1d160f22;color:#5d4a3a;">
+      The board was read successfully and there are no deals on it yet. Add a contact, then create a
+      deal against them.
+    </div>
+  )}
 
   <section class="kanban">
     {stages.map((s) => (
@@ -516,18 +610,33 @@ const stageColors: Record<string, string> = {
             <span class="kdot" style={`background: ${stageColors[s]}`}></span>
             <span>{s}</span>
           </div>
-          <div class="kcount">{dealsByStage[s].length}</div>
+          {/* A zero on a column whose read failed is a claim; a dash is not. */}
+          <div class="kcount">{dealsRead.ok ? dealsByStage[s].length : '—'}</div>
         </div>
         <div class="kbody" data-stage={s}>
           {dealsByStage[s].map((d) => (
             <div class="kcard" draggable="true" data-deal-id={d.id}>
-              <div class="kcard-name">{d.contact_name || 'No contact'}</div>
-              <div class="kcard-co">{d.contact_company || ''}</div>
-              <div class="kcard-title">{d.title}</div>
+              {/* Clipped for the card, complete in the title attribute. A kanban column is 1/6th of
+                  the page and these three values are all free text somebody typed. */}
+              <div class="kcard-name" title={String(d.contact_name || '')}>{d.contact_name ? clip(d.contact_name, 40) : 'No contact linked'}</div>
+              <div class="kcard-co" title={String(d.contact_company || '')}>{d.contact_company ? clip(d.contact_company, 40) : ''}</div>
+              <div class="kcard-title" title={String(d.title || '')}>{clip(d.title || 'Untitled deal', 80)}</div>
               <div class="kcard-foot">
                 <span class="kcard-amount">{fmtChf(d.amount_chf)}</span>
                 <span class="kcard-prob">{d.probability_pct || 0}%</span>
               </div>
+              {/* The select is named for the deal, not "Stage" — there are as many of these on the
+                  page as there are deals, and a screen reader reading six identical "Stage" combo
+                  boxes tells somebody nothing about which one they are in. */}
+              <form method="post" class="kmove" draggable="false">
+                <input type="hidden" name="action" value="move_deal_stage" />
+                <input type="hidden" name="deal_id" value={d.id} />
+                <label class="kmove-lab" for={'kmv-' + d.id}>Stage</label>
+                <select id={'kmv-' + d.id} name="new_stage" aria-label={'Stage for ' + (d.title || 'this deal')}>
+                  {stages.map((opt) => (<option value={opt} selected={opt === s}>{opt}</option>))}
+                </select>
+                <button type="submit" class="kmove-go">Move</button>
+              </form>
             </div>
           ))}
         </div>
@@ -596,25 +705,32 @@ const stageColors: Record<string, string> = {
         </tr>
       </thead>
       <tbody>
-        {contacts.length === 0 && (
-          <tr><td colspan="6" style="text-align:center; padding: 40px 18px; color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px;">No contacts yet. Click "Add contact" to begin.</td></tr>
+        {/* "No contacts yet. Click Add contact to begin." over a FAILED read is an invitation to
+            re-enter a customer who is already on file, as a second row nobody will ever merge. */}
+        {!contactsRead.ok && (
+          <tr><td colspan="6" style="text-align:center; padding: 40px 18px; color: #b3261e; font-family: 'Geist Mono', monospace; font-size: 12px; line-height:1.7;">The contact table could not be read, so none is listed. This is NOT a statement that there are no contacts. Do not add one until this loads.</td></tr>
+        )}
+        {contactsRead.ok && contacts.length === 0 && (
+          <tr><td colspan="6" style="text-align:center; padding: 40px 18px; color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px; line-height:1.7;">{stageFilter || tagFilter ? 'No contact matches this filter. The table was read successfully.' : 'No contacts yet. This table was read successfully and is genuinely empty. Click "Add contact" to begin.'}</td></tr>
         )}
         {contacts.map((c) => {
           const tagList = parseTags(c.tags);
           return (
             <tr>
               <td>
-                <div class="name-cell">{c.full_name}</div>
-                <div class="email-cell">{c.email}</div>
+                {/* Clipped for the cell, complete in the title attribute — a display cap, never a
+                    data cap. A pasted 4,000-character value stretched the table past the page. */}
+                <div class="name-cell" title={String(c.full_name || '')}>{clip(c.full_name || 'Unnamed contact', 60)}</div>
+                <div class="email-cell" title={String(c.email || '')}>{clip(c.email || 'no email on file', 60)}</div>
               </td>
               <td>
-                <div>{c.company || '—'}</div>
-                <div class="email-cell">{c.role || ''}</div>
+                <div title={String(c.company || '')}>{c.company ? clip(c.company, 40) : '—'}</div>
+                <div class="email-cell" title={String(c.role || '')}>{c.role ? clip(c.role, 40) : ''}</div>
               </td>
               <td><span class={stagePillClass(c.pipeline_stage)}>{c.pipeline_stage}</span></td>
               <td>
                 <div class="tags">
-                  {tagList.slice(0, 3).map((t: string) => (<span class="tag">{t}</span>))}
+                  {tagList.slice(0, 3).map((t: string) => (<span class="tag" title={t}>{clip(t, 24)}</span>))}
                   {tagList.length > 3 && (<span class="tag">+{tagList.length - 3}</span>)}
                 </div>
               </td>
@@ -627,9 +743,11 @@ const stageColors: Record<string, string> = {
     </table>
   </div>
 
-  {totalPages > 1 && (
+  {/* Only paged when the count is a real one. A page count derived from a failed read is a number
+      nobody measured, and "Page 1 of 1" over an unreadable table reads as a complete list. */}
+  {contactsRead.ok && totalPages > 1 && (
     <div class="pager">
-      <span>Page {page} of {totalPages}</span>
+      <span>Page {page} of {totalPages} · {totalContacts} contact{totalContacts === 1 ? '' : 's'}</span>
       <div style="display:flex; gap: 8px;">
         {page > 1 && <a href={`?p=${page - 1}&sort=${sortKey}${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`}>Prev</a>}
         {page < totalPages && <a href={`?p=${page + 1}&sort=${sortKey}${stageFilter ? '&stage=' + stageFilter : ''}${tagFilter ? '&tag=' + tagFilter : ''}`}>Next</a>}
@@ -641,7 +759,8 @@ const stageColors: Record<string, string> = {
     <div class="panel">
       <h3>Activity timeline</h3>
       <ul class="tl">
-        {activities.length === 0 && (<li><div class="tl-body"><div class="tl-text" style="color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px;">No activity yet. Use quick actions above.</div></div></li>)}
+        {!activitiesRead.ok && (<li><div class="tl-body"><div class="tl-text" style="color: #b3261e; font-family: 'Geist Mono', monospace; font-size: 12px; line-height:1.7;">The activity timeline could not be read, so none is shown. There may be activity; we could not fetch it.</div></div></li>)}
+        {activitiesRead.ok && activities.length === 0 && (<li><div class="tl-body"><div class="tl-text" style="color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px;">No activity yet. This timeline was read successfully and is genuinely empty — use quick actions above.</div></div></li>)}
         {activities.map((a) => (
           <li>
             <div class="tl-icon">
@@ -649,7 +768,7 @@ const stageColors: Record<string, string> = {
             </div>
             <div class="tl-body">
               <div class="tl-meta">{a.kind} · {a.contact_name || 'unknown'} · {timeAgo(a.created_at)}</div>
-              <div class="tl-text">{a.summary}</div>
+              <div class="tl-text" title={String(a.summary || '')}>{clip(a.summary, 400)}</div>
             </div>
           </li>
         ))}
@@ -658,7 +777,9 @@ const stageColors: Record<string, string> = {
 
     <div class="panel">
       <h3>Tasks · next 7 days</h3>
-      {tasks.length === 0 && (<div style="color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px;">No upcoming tasks.</div>)}
+      {/* "No upcoming tasks." over a failed read is the sentence that lets a due task be missed. */}
+      {!tasksRead.ok && (<div style="color: #b3261e; font-family: 'Geist Mono', monospace; font-size: 12px; line-height:1.7;">The task panel could not be read, so none is listed. This is NOT a statement that nothing is due — check before you close the page.</div>)}
+      {tasksRead.ok && tasks.length === 0 && (<div style="color: var(--mute); font-family: 'Geist Mono', monospace; font-size: 12px;">No task is due in the next seven days. This panel was read successfully.</div>)}
       {tasks.map((t) => {
         const due = t.due_at ? new Date(t.due_at).getTime() : 0;
         const now = Date.now();
@@ -687,38 +808,41 @@ const stageColors: Record<string, string> = {
 </main>
 
 <!-- Add Contact Modal -->
+{/* Both panels were plain divs: no role, no aria-modal, no accessible name, focus left
+    on the button behind the scrim, and Tab walked into the page underneath. Every label
+    also floated free of its field, so a screen reader met eleven unnamed boxes. */}
 <div class="modal-bg" id="contactModal">
-  <div class="modal">
-    <h3>Add contact</h3>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="contactModalTitle" tabindex="-1">
+    <h3 id="contactModalTitle">Add contact</h3>
     <p class="sub">Required: name and email. Everything else can be filled in later.</p>
     <form method="post">
       <input type="hidden" name="action" value="create_contact" />
       <div class="form-grid">
-        <div class="field full"><label>Full name *</label><input type="text" name="full_name" required maxlength="200" /></div>
-        <div class="field"><label>Email *</label><input type="email" name="email" required maxlength="200" /></div>
-        <div class="field"><label>Phone</label><input type="tel" name="phone" maxlength="40" /></div>
-        <div class="field"><label>Company</label><input type="text" name="company" maxlength="200" /></div>
-        <div class="field"><label>Role</label><input type="text" name="role" maxlength="120" /></div>
-        <div class="field"><label>Location</label><input type="text" name="location" maxlength="120" /></div>
+        <div class="field full"><label for="cmName">Full name (required)</label><input id="cmName" type="text" name="full_name" required maxlength="200" /></div>
+        <div class="field"><label for="cmEmail">Email (required)</label><input id="cmEmail" type="email" name="email" required maxlength="200" /></div>
+        <div class="field"><label for="cmPhone">Phone</label><input id="cmPhone" type="tel" name="phone" maxlength="40" /></div>
+        <div class="field"><label for="cmCompany">Company</label><input id="cmCompany" type="text" name="company" maxlength="200" /></div>
+        <div class="field"><label for="cmRole">Role</label><input id="cmRole" type="text" name="role" maxlength="120" /></div>
+        <div class="field"><label for="cmLocation">Location</label><input id="cmLocation" type="text" name="location" maxlength="120" /></div>
         <div class="field">
-          <label>Source</label>
-          <select name="source">
-            <option value="manual">manual</option>
-            <option value="inbound-form">inbound-form</option>
-            <option value="warm-intro">warm-intro</option>
-            <option value="event">event</option>
-            <option value="linkedin">linkedin</option>
+          <label for="cmSource">Source</label>
+          <select id="cmSource" name="source">
+            <option value="manual">Added by hand</option>
+            <option value="inbound-form">Inbound form</option>
+            <option value="warm-intro">Warm introduction</option>
+            <option value="event">Event</option>
+            <option value="professional-network">Professional network</option>
           </select>
         </div>
         <div class="field">
-          <label>Stage</label>
-          <select name="pipeline_stage">
+          <label for="cmStage">Stage</label>
+          <select id="cmStage" name="pipeline_stage">
             {stages.map((s) => (<option value={s}>{s}</option>))}
           </select>
         </div>
-        <div class="field"><label>LTV (CHF)</label><input type="number" name="lifetime_value_chf" min="0" step="100" /></div>
-        <div class="field"><label>Tags (comma)</label><input type="text" name="tags" placeholder="vip, education, swiss" /></div>
-        <div class="field full"><label>Notes</label><textarea name="notes" rows="3"></textarea></div>
+        <div class="field"><label for="cmLtv">Lifetime value (CHF)</label><input id="cmLtv" type="number" name="lifetime_value_chf" min="0" step="100" /></div>
+        <div class="field"><label for="cmTags">Tags, separated by commas</label><input id="cmTags" type="text" name="tags" placeholder="vip, education, swiss" /></div>
+        <div class="field full"><label for="cmNotes">Notes</label><textarea id="cmNotes" name="notes" rows="3"></textarea></div>
       </div>
       <div class="modal-actions">
         <button type="button" class="btn btn-ghost" data-close-modal>Cancel</button>
@@ -730,7 +854,7 @@ const stageColors: Record<string, string> = {
 
 <!-- Quick activity modal -->
 <div class="modal-bg" id="activityModal">
-  <div class="modal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="actTitle" tabindex="-1">
     <h3 id="actTitle">Log activity</h3>
     <p class="sub">Pick a contact, write what happened.</p>
     <form method="post">
@@ -738,14 +862,22 @@ const stageColors: Record<string, string> = {
       <input type="hidden" name="kind" id="actKind" value="note" />
       <div class="form-grid">
         <div class="field full">
-          <label>Contact *</label>
-          <select name="contact_id" required>
-            <option value="">— select contact —</option>
-            {allContacts.map((c) => (<option value={c.id}>{c.full_name}{c.company ? ' · ' + c.company : ''}</option>))}
+          <label for="amContact">Contact (required)</label>
+          <select id="amContact" name="contact_id" required>
+            <option value="">Select a contact</option>
+            {allContacts.map((c) => (<option value={c.id}>{clip(c.full_name || 'Unnamed contact', 60)}{c.company ? ' · ' + clip(c.company, 40) : ''}</option>))}
           </select>
+          {/* An empty picker with no explanation reads as "there is nobody to log this against",
+              which is a reason to give up on recording the call. */}
+          {!contactOptionsRead.ok && (
+            <p style="color:#b3261e;font-family:'Geist Mono',monospace;font-size:11px;line-height:1.7;margin:6px 0 0;">The contact list could not be read, so this picker is empty. There may be contacts; we could not fetch them.</p>
+          )}
+          {contactOptionsRead.ok && allContacts.length === 0 && (
+            <p style="color:var(--mute);font-family:'Geist Mono',monospace;font-size:11px;line-height:1.7;margin:6px 0 0;">There are no contacts yet, so there is nothing to log an activity against. Add a contact first.</p>
+          )}
         </div>
-        <div class="field full"><label>Summary *</label><textarea name="summary" rows="4" required></textarea></div>
-        <div class="field full" id="dueWrap" style="display:none;"><label>Due at</label><input type="datetime-local" name="due_at" /></div>
+        <div class="field full"><label for="amSummary">Summary (required)</label><textarea id="amSummary" name="summary" rows="4" required></textarea></div>
+        <div class="field full" id="dueWrap" style="display:none;"><label for="amDue">Due at</label><input id="amDue" type="datetime-local" name="due_at" /></div>
       </div>
       <div class="modal-actions">
         <button type="button" class="btn btn-ghost" data-close-modal>Cancel</button>
@@ -764,9 +896,75 @@ const stageColors: Record<string, string> = {
 
 <script is:inline>
 (function(){
-  // Modal helpers
-  function show(id){ var m = document.getElementById(id); if (m) m.classList.add('show'); }
-  function hide(id){ var m = document.getElementById(id); if (m) m.classList.remove('show'); }
+  // ------------------------------------------------------------------------
+  // MODAL HELPERS. Declared before every handler that calls them.
+  //
+  // Opening a panel used to do one thing: add a class. Focus stayed on the button
+  // behind the scrim, Tab walked into the page underneath, and closing dropped
+  // focus on <body>. aria-modal="true" is now backed by inert on everything else,
+  // Tab cycles inside the panel, and focus goes back where it came from.
+  // ------------------------------------------------------------------------
+  var lastFocus = null;
+
+  function siblingsOf(el) {
+    var out = [], kids = document.body.children;
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i] !== el && kids[i].tagName !== 'SCRIPT') out.push(kids[i]);
+    }
+    return out;
+  }
+  function setBehindInert(el, on) {
+    var sibs = siblingsOf(el);
+    for (var i = 0; i < sibs.length; i++) {
+      if (on) { sibs[i].setAttribute('inert', ''); sibs[i].setAttribute('aria-hidden', 'true'); }
+      else { sibs[i].removeAttribute('inert'); sibs[i].removeAttribute('aria-hidden'); }
+    }
+  }
+  function stopsIn(panel) {
+    var all = panel.querySelectorAll('input,select,textarea,button,a[href],[tabindex]:not([tabindex="-1"])');
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      if (!all[i].disabled && all[i].type !== 'hidden' && all[i].offsetParent !== null) out.push(all[i]);
+    }
+    return out;
+  }
+  function onModalKey(e) {
+    var open = document.querySelector('.modal-bg.show');
+    if (!open) return;
+    if (e.key === 'Escape' || e.key === 'Esc') { e.preventDefault(); hideAll(); return; }
+    if (e.key !== 'Tab') return;
+    var panel = open.querySelector('.modal') || open;
+    var stops = stopsIn(panel);
+    if (!stops.length) return;
+    var first = stops[0], last = stops[stops.length - 1], here = document.activeElement;
+    if (!panel.contains(here)) { e.preventDefault(); (e.shiftKey ? last : first).focus(); return; }
+    if (e.shiftKey && here === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && here === last) { e.preventDefault(); first.focus(); }
+  }
+
+  function show(id){
+    var m = document.getElementById(id);
+    if (!m) return;
+    lastFocus = document.activeElement;
+    m.classList.add('show');
+    setBehindInert(m, true);
+    document.addEventListener('keydown', onModalKey, true);
+    var stops = stopsIn(m.querySelector('.modal') || m);
+    try { if (stops.length) stops[0].focus(); } catch (err) {}
+  }
+  function hide(id){
+    var m = document.getElementById(id);
+    if (!m) return;
+    m.classList.remove('show');
+    setBehindInert(m, false);
+    document.removeEventListener('keydown', onModalKey, true);
+    try { if (lastFocus && lastFocus.focus) lastFocus.focus(); } catch (err) {}
+    lastFocus = null;
+  }
+  function hideAll(){
+    var open = document.querySelectorAll('.modal-bg.show');
+    for (var i = 0; i < open.length; i++) hide(open[i].id);
+  }
 
   var openBtn = document.getElementById('openContactBtn');
   if (openBtn) openBtn.addEventListener('click', function(){ show('contactModal'); });
@@ -774,12 +972,12 @@ const stageColors: Record<string, string> = {
   document.querySelectorAll('[data-close-modal]').forEach(function(b){
     b.addEventListener('click', function(){
       var p = b.closest('.modal-bg');
-      if (p) p.classList.remove('show');
+      if (p) hide(p.id);
     });
   });
   document.querySelectorAll('.modal-bg').forEach(function(bg){
     bg.addEventListener('click', function(e){
-      if (e.target === bg) bg.classList.remove('show');
+      if (e.target === bg) hide(bg.id);
     });
   });
 
@@ -841,12 +1039,8 @@ const stageColors: Record<string, string> = {
     });
   });
 
-  // ESC closes modal
-  document.addEventListener('keydown', function(e){
-    if (e.key === 'Escape') {
-      document.querySelectorAll('.modal-bg.show').forEach(function(m){ m.classList.remove('show'); });
-    }
-  });
+  // Escape is handled by onModalKey while a panel is open, so focus is restored and the
+  // page behind is un-inerted rather than merely re-shown.
 })();
 </script>
 </BaseLayout>

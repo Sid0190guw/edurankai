@@ -10,13 +10,31 @@
 //
 // WHY IT CANNOT LOOP — the proof, written out, because "it looked fine" is what took the site down.
 //
-//   1. /portal -> /admin fires if and only if canOpenAdmin(user).allowed === true.
+//   1. /portal -> /admin fires only for somebody canOpenAdmin(user).allowed === true admits AND who
+//      has no employee record of their own (see the ORDERING note below).
 //      /admin -> /portal fires (middleware.ts:353-369) if and only if canOpenAdmin(user).allowed === false.
-//      One function, one user object (Astro.locals.user, set by that same middleware run), so the two
-//      conditions are exact complements. At most one of them can be true. There is no input on which
-//      both fire, therefore there is no cycle. This is the ONLY safe shape: two guards that each
-//      decide with their own rule will eventually disagree, and disagreement between redirects is a
-//      loop by definition.
+//      One function, one user object (Astro.locals.user, set by that same middleware run), so the
+//      admin arm here is a strict SUBSET of the complement of the /admin guard. At most one of them
+//      can be true. There is no input on which both fire, therefore there is no cycle. This is the
+//      ONLY safe shape: two guards that each decide with their own rule will eventually disagree, and
+//      disagreement between redirects is a loop by definition.
+//
+// THE ORDERING, AND THE DAY IT COST. The employee arm used to sit BELOW the admin arm, so anybody
+// canOpenAdmin() admitted — a department head, an HR account, a recruiter, an editor — was sent to
+// /admin from /portal no matter what else was true about them. src/lib/admin-nav.ts carries no link
+// to /portal/employee and src/layouts/AdminLayout.astro carries none either, so for the exact
+// population that both approves things and is on the payroll there was NO ROUTE AT ALL to clock in,
+// take a break, clock out, file a daily report, look at a payslip or work their own approvals queue:
+// the console has no door to the workspace, and typing /portal by hand bounced them straight back to
+// the console. A manager could not have an ordinary working day.
+//
+// So the employee arm is FIRST now. Somebody with an hr_employees row who asks for /portal gets the
+// workspace they asked for; somebody with no employee record — a founder, an HR account with no HR
+// row of their own — still lands in the console, which genuinely is their workspace. Nothing about
+// the admin console's own door changes: /admin still admits exactly who it admitted, and the sign-in
+// screen still sends staff accounts there. This decides only where an explicit /portal request goes.
+// The way BACK is the `console.admin` widget in src/lib/workforce/widgets.ts, which the composer
+// keeps for admin.access holders and the workspace renders as a door.
 //
 //   2. /portal -> /portal/employee is terminal. employee.astro redirects on exactly one condition —
 //      no signed-in user, to /portal/login — and never to /portal. Verified by reading it.
@@ -146,27 +164,13 @@ export async function resolveLanding(
 
   const role = String(user.role || '').trim().toLowerCase();
 
-  // ---- 1. The admin console ------------------------------------------------------------------
+  // ---- 1. The employee workspace ---------------------------------------------------------------
   //
-  // Asked with canOpenAdmin(), which is the function src/middleware.ts:354 asks for every /admin path
-  // except the login screen. See the loop proof, point 1.
-  //
-  // The applicant skip is a COST guard and not a decision: middleware.ts:311 bounces every applicant
-  // off /admin unconditionally, before canOpenAdmin is even consulted, so skipping the call cannot
-  // land anybody anywhere they would have been admitted. It saves the registry lookup canOpenAdmin
-  // pays for a role that is not on the allow list, on the busiest page in the product.
-  if (role && role !== 'applicant') {
-    try {
-      const { canOpenAdmin } = await import('@/lib/auth/admin-access');
-      const verdict = await canOpenAdmin(user as any);
-      if (verdict.allowed) return { href: '/admin', reason: 'admin-console', degraded: false };
-    } catch (e: any) {
-      // Never loop on an error. If the check cannot run, they stay here.
-      console.error('[workforce/landing] admin check failed', e?.cause?.message || e?.message);
-    }
-  }
-
-  // ---- 2. The employee workspace ---------------------------------------------------------------
+  // FIRST, and the header explains what it cost to have it second. A person with an hr_employees row
+  // has a working day — a clock, a break, a report, leave, a payslip, a queue of decisions routed to
+  // them — and every one of those surfaces lives under /portal. Asking for /portal is asking for
+  // that, and answering it with a redirect to a console that has no link back is how the manager
+  // population lost their whole day.
   //
   // composeWorkspace() is the single authority on whether this person has a workspace, and it is
   // imported dynamically so /portal does not pull the composer's module graph on a request that never
@@ -190,17 +194,46 @@ export async function resolveLanding(
     return { href: '/portal/employee', reason: 'ambiguous-record', degraded: composed.degraded };
   }
 
-  // A LOOKUP THAT DID NOT RUN IS NOT AN ANSWER. Stay put and let the page render what it can.
-  if (composed.reason === 'lookup-failed') {
-    return { href: null, reason: 'undecided', degraded: true };
-  }
-
   if (composed.workspace) {
     const pending = String(composed.workspace.onboardingStatus || '').trim().toLowerCase() === 'pending';
     if (pending && !opts.hop) {
       return { href: '/portal/employee/onboarding', reason: 'employee-onboarding', degraded: composed.degraded };
     }
     return { href: '/portal/employee', reason: 'employee-workspace', degraded: composed.degraded };
+  }
+
+  // ---- 2. The admin console ----------------------------------------------------------------------
+  //
+  // Asked with canOpenAdmin(), which is the function src/middleware.ts:354 asks for every /admin path
+  // except the login screen. See the loop proof, point 1.
+  //
+  // Reached only by somebody with NO employee record — a founder, an HR or finance account that is
+  // not itself on the payroll — for whom the console genuinely is the workspace. Everybody else was
+  // answered above with the surface they asked for.
+  //
+  // The applicant skip is a COST guard and not a decision: middleware.ts:311 bounces every applicant
+  // off /admin unconditionally, before canOpenAdmin is even consulted, so skipping the call cannot
+  // land anybody anywhere they would have been admitted. It saves the registry lookup canOpenAdmin
+  // pays for a role that is not on the allow list, on the busiest page in the product.
+  if (role && role !== 'applicant') {
+    try {
+      const { canOpenAdmin } = await import('@/lib/auth/admin-access');
+      const verdict = await canOpenAdmin(user as any);
+      if (verdict.allowed) return { href: '/admin', reason: 'admin-console', degraded: composed.degraded };
+    } catch (e: any) {
+      // Never loop on an error. If the check cannot run, they stay here.
+      console.error('[workforce/landing] admin check failed', e?.cause?.message || e?.message);
+    }
+  }
+
+  // A LOOKUP THAT DID NOT RUN IS NOT AN ANSWER. Stay put and let the page render what it can.
+  //
+  // BELOW the admin arm deliberately. `lookup-failed` means the EMPLOYEE lookup did not run; it says
+  // nothing about the console, and canOpenAdmin() answers from a different table. Testing it earlier
+  // would strand a founder on the applicant portal every time the hr_employees read blinked, which is
+  // a worse answer than the one the console can still give.
+  if (composed.reason === 'lookup-failed') {
+    return { href: null, reason: 'undecided', degraded: true };
   }
 
   // ---- 3. The AquinTutor scopes ------------------------------------------------------------------

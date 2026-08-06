@@ -18,6 +18,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
     await storeBackupCodes(user.id, codes);
     return json({ ok: true, backupCodes: codes });
   } catch (e: any) {
-    return json({ ok: false, error: e?.cause?.message || e?.message || 'Could not confirm' }, 500);
+    // NEVER RETURNED VERBATIM — e.message is the failed SQL, e.cause is the database's own words.
+    // Logged here, and the caller gets a sentence.
+    console.error('[api/2fa/confirm]', e?.cause?.message || e?.message, e?.stack);
+    return json({ ok: false, error: 'Could not confirm that code. Please try again.' }, 500);
   }
 };

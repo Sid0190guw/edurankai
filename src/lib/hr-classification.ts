@@ -5,12 +5,24 @@
 // and exposes a structured matrix.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
-let ready: Promise<void> | null = null;
+/** The real Postgres reason is on `e.cause`; `e.message` is only the SQL that failed. */
+const logFail = (tag: string, e: any) =>
+  console.error('[hr-classification] ' + tag, e?.cause?.message || e?.message);
 
+/**
+ * Add the classification columns to hr_employees if they are absent. Idempotent.
+ *
+ * WAS a hand-rolled `let ready` memo with `catch (_) {}` inside it: the failure was never logged AND
+ * the resolved promise was cached for the life of the process, so one transient error left every
+ * classification read selecting a column that does not exist — for as long as the server ran, with
+ * nothing in the log. Wrong worker classification is described at the top of this file as the single
+ * biggest compliance risk in the lifecycle, which is not a thing to fail silently about. ensureOnce()
+ * drops a failed run so the next request retries; the catch names the reason and re-throws so it does.
+ */
 export function ensureClassificationSchema(): Promise<void> {
-  if (ready) return ready;
-  ready = (async () => {
+  return ensureOnce('hr_classification_v1', async () => {
     try {
       await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS classification VARCHAR(40) DEFAULT 'permanent'`);
       await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS country_of_work VARCHAR(80) DEFAULT 'IN'`);
@@ -18,9 +30,11 @@ export function ensureClassificationSchema(): Promise<void> {
       await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS classification_reviewed_at TIMESTAMPTZ`);
       await db.execute(sql`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS classification_reviewed_by UUID`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hre_classification_idx ON hr_employees(classification, country_of_work)`);
-    } catch (_) {}
-  })();
-  return ready;
+    } catch (e: any) {
+      logFail('ensureClassificationSchema', e);
+      throw e;
+    }
+  });
 }
 
 export const CLASSIFICATIONS = {

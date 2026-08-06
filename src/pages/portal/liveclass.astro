@@ -2,11 +2,28 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+
+// NOTHING IN THIS REPOSITORY EVER CREATED A LIVE CLASS.
+//
+// live_classes is bootstrapped here and SELECTed four times on this page. The only other writes
+// anywhere are an UPDATE of `status` on the AquinTutor command centre and the enrolled_count bump
+// below. There was no INSERT — so all three tabs were permanently empty, and the capacity meter,
+// the seat reservation, the capacity check and the "Host a class" button (which linked to this
+// same page and did nothing) were all unreachable code. A board that can only ever be empty must
+// either gain its writer or say so. This one gains its writer.
+//
+// AUTHORISATION FAILS CLOSED. Scheduling asks `content.edit` — the capability that already governs
+// who may publish teaching material — resolved through src/lib/auth/permissions.ts and nowhere
+// else; never from a role string. A reader without it does not get a hidden button, they get a
+// disabled control that names the capability, because a control that quietly vanishes teaches
+// nobody what to ask for.
+const canHost = can(user, 'content.edit');
 
 let okMsg = '';
 let errMsg = '';
@@ -78,9 +95,42 @@ if (Astro.request.method === 'POST') {
         `);
       }
       okMsg = 'Cancelled.';
+    } else if (action === 'create_class') {
+      // The gate is re-tested on the write. A hidden form is not a permission check.
+      if (!canHost) {
+        errMsg = 'Scheduling a class needs the content.edit capability, which this account does not hold.';
+      } else {
+        const title = String(fd.get('title') || '').trim().slice(0, 300);
+        const subject = String(fd.get('subject') || '').trim().slice(0, 120);
+        const scheduledAt = String(fd.get('scheduled_at') || '').trim();
+        const durationRaw = parseInt(String(fd.get('duration_minutes') || '60'), 10);
+        const capacityRaw = parseInt(String(fd.get('capacity') || '50'), 10);
+        const meetUrl = String(fd.get('meet_url') || '').trim().slice(0, 500);
+        const duration = Number.isFinite(durationRaw) ? Math.min(600, Math.max(10, durationRaw)) : 60;
+        const capacity = Number.isFinite(capacityRaw) ? Math.min(2000, Math.max(1, capacityRaw)) : 50;
+
+        if (!title) errMsg = 'A title is required.';
+        else if (!scheduledAt) errMsg = 'A start time is required.';
+        else if (Number.isNaN(new Date(scheduledAt).getTime())) errMsg = 'That start time could not be read.';
+        else if (meetUrl && !/^https?:\/\//i.test(meetUrl)) errMsg = 'The join link must be a full https:// address.';
+        else {
+          await db.execute(sql`
+            INSERT INTO live_classes (host_user_id, title, subject, scheduled_at, duration_minutes, meet_url, capacity, status)
+            VALUES (
+              ${user.id}, ${title}, ${subject || null}, ${new Date(scheduledAt).toISOString()},
+              ${duration}, ${meetUrl || null}, ${capacity}, 'scheduled'
+            )
+          `);
+          okMsg = meetUrl
+            ? 'Class scheduled. Learners can reserve a seat now.'
+            : 'Class scheduled. It has no join link yet, so the Join button stays disabled until one is added.';
+        }
+      }
     }
   } catch (e: any) {
-    errMsg = 'Could not complete the request.';
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL. Reporting a bare
+    // "could not complete" here is what let a broken write look like a user mistake.
+    errMsg = 'Could not complete the request: ' + String(e?.cause?.message || e?.message || 'unknown error').slice(0, 160);
   }
   return Astro.redirect('/portal/liveclass?msg=' + encodeURIComponent(okMsg || errMsg));
 }
@@ -206,6 +256,16 @@ const listForTab = tab === 'live' ? liveNow : tab === 'past' ? past : upcoming;
   .lc-empty strong { display: block; font-family: 'Cormorant Garamond', serif; font-size: 22px; color: #0E0B08; font-weight: 600; font-style: italic; margin-bottom: 6px; }
   .lc-flash { background: #fff; border: 1px solid rgba(255,79,0,0.30); border-left: 3px solid #FF4F00; padding: 12px 16px; border-radius: 8px; margin-bottom: 18px; font-size: 13px; color: #0E0B08; }
   form.lc-inline { display: contents; }
+  .lc-host-cta-off { background: rgba(14,11,8,0.06); color: #5b5650; cursor: not-allowed; }
+  .lc-host-cta-off svg { width: 15px; height: 15px; }
+  button.lc-host-cta { border: none; cursor: pointer; font-family: 'Geist Mono', monospace; }
+  .lc-host-form { background: #fff; border: 1px solid rgba(14,11,8,0.12); border-radius: 14px; padding: 18px; margin-bottom: 20px; }
+  .lc-host-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .lc-host-grid label { display: flex; flex-direction: column; gap: 5px; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #5b5650; font-weight: 700; }
+  .lc-host-grid input { background: #FAF8F5; border: 1px solid rgba(14,11,8,0.16); border-radius: 6px; padding: 9px 11px; font-size: 14px; font-family: inherit; color: #0E0B08; }
+  .lc-host-grid input:focus { outline: none; border-color: #FF4F00; }
+  .lc-host-wide { grid-column: 1 / -1; }
+  .lc-host-hint { font-family: inherit; font-size: 11px; letter-spacing: 0; text-transform: none; color: #8a847a; font-weight: 400; }
   @media (max-width: 600px) {
     .lc-wrap { padding: 22px 14px 80px; }
     .lc-grid { grid-template-columns: 1fr; }
@@ -219,11 +279,46 @@ const listForTab = tab === 'live' ? liveNow : tab === 'past' ? past : upcoming;
       <h1 class="lc-title">Live <em>classes</em></h1>
       <div class="lc-sub">Scheduled lectures, doubt sessions, and faculty office hours. Enroll to reserve a seat and receive a join link 15 minutes before start.</div>
     </div>
-    <a class="lc-host-cta" href="/portal/liveclass">
-      <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 5v14M5 12h14"/></svg>
-      Host a class
-    </a>
+    {canHost ? (
+      <button class="lc-host-cta" type="button" id="lcHostToggle">
+        <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 5v14M5 12h14"/></svg>
+        Host a class
+      </button>
+    ) : (
+      <span class="lc-host-cta lc-host-cta-off" title="Scheduling needs the content.edit capability.">
+        <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>
+        Hosting needs content.edit
+      </span>
+    )}
   </div>
+
+  {canHost && (
+    <form method="POST" class="lc-host-form" id="lcHostForm" style="display:none;">
+      <input type="hidden" name="action" value="create_class" />
+      <div class="lc-host-grid">
+        <label>Title
+          <input name="title" required maxlength="300" placeholder="Doubt session: rotational dynamics" />
+        </label>
+        <label>Subject
+          <input name="subject" maxlength="120" placeholder="Physics" />
+        </label>
+        <label>Starts at
+          <input name="scheduled_at" type="datetime-local" required />
+        </label>
+        <label>Minutes
+          <input name="duration_minutes" type="number" min="10" max="600" value="60" />
+        </label>
+        <label>Seats
+          <input name="capacity" type="number" min="1" max="2000" value="50" />
+        </label>
+        <label class="lc-host-wide">Join link
+          <input name="meet_url" type="url" placeholder="https://..." />
+          <span class="lc-host-hint">Where the class actually happens. Without it the Join button on this card stays disabled and says why.</span>
+        </label>
+      </div>
+      <button class="lc-btn lc-btn-primary" type="submit" style="max-width:220px;">Schedule the class</button>
+    </form>
+  )}
 
   {flash && <div class="lc-flash">{flash}</div>}
 
@@ -242,9 +337,11 @@ const listForTab = tab === 'live' ? liveNow : tab === 'past' ? past : upcoming;
   {listForTab.length === 0 ? (
     <div class="lc-empty">
       <strong>No classes here yet</strong>
-      {tab === 'upcoming' && 'New sessions are added every week. Check back soon or host your own.'}
-      {tab === 'live' && 'Nothing streaming right now. Upcoming classes will appear here when they begin.'}
-      {tab === 'past' && 'Past sessions and recordings will be listed here.'}
+      {tab === 'upcoming' && (canHost
+        ? 'Nothing is scheduled. Use "Host a class" above — a class appears here the moment you schedule it.'
+        : 'Nothing is scheduled. This board fills only when someone holding the content.edit capability schedules a class; it is not populated automatically.')}
+      {tab === 'live' && 'Nothing is streaming right now. A scheduled class appears here between its start time and its end time.'}
+      {tab === 'past' && 'A class moves here once its scheduled end time has passed. Its recording appears only if a host records one against it.'}
     </div>
   ) : (
     <div class="lc-grid">
@@ -292,11 +389,23 @@ const listForTab = tab === 'live' ? liveNow : tab === 'past' ? past : upcoming;
               </div>
             </div>
             <div class="lc-actions">
-              {isLive && (
-                <a class="lc-btn lc-btn-primary" href={`/portal/liveclass/${c.id}`}>
+              {/*
+                "Join now" pointed at /portal/liveclass/{id}. There is no [id] route under
+                /portal/liveclass and there never was, so the one button on a class that is actually
+                streaming led to a 404. The class row already carries the place the class happens —
+                meet_url — and that is what the button opens. When the host did not record one there
+                is nothing to open, and the control says so rather than leading somewhere empty.
+              */}
+              {isLive && c.meet_url && (
+                <a class="lc-btn lc-btn-primary" href={c.meet_url} rel="noopener noreferrer" target="_blank">
                   <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><polygon points="6 4 20 12 6 20 6 4"/></svg>
                   Join now
                 </a>
+              )}
+              {isLive && !c.meet_url && (
+                <button class="lc-btn lc-btn-disabled" disabled title="The host has not recorded a join link for this class.">
+                  No join link yet
+                </button>
               )}
               {isPast && c.recording_url && (
                 <a class="lc-btn lc-btn-ghost" href={c.recording_url}>
@@ -334,4 +443,19 @@ const listForTab = tab === 'live' ? liveNow : tab === 'past' ? past : upcoming;
     </div>
   )}
 </main>
+<script is:inline>
+  (function () {
+    var toggle = document.getElementById('lcHostToggle');
+    var form = document.getElementById('lcHostForm');
+    if (!toggle || !form) return;
+    toggle.addEventListener('click', function () {
+      var open = form.style.display !== 'none';
+      form.style.display = open ? 'none' : 'block';
+      if (!open) {
+        var first = form.querySelector('input[name="title"]');
+        if (first) first.focus();
+      }
+    });
+  })();
+</script>
 </BaseLayout>

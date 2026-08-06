@@ -5,6 +5,19 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 
 let ready: Promise<void> | null = null;
+
+/**
+ * THE GUARD NO LONGER SWALLOWS ITS OWN FAILURE.
+ *
+ * This was `try { ...DDL... } catch (_) {}` inside a memoised promise. If the ALTER for `stage` or the
+ * CREATE for application_stage_events failed once — a permissions blip, a lock timeout — the promise
+ * still resolved, was cached for the life of the process, and was never retried. Every stage read and
+ * write afterwards then failed against a column that did not exist, with nothing recorded anywhere
+ * saying why. That is precisely the shape the house rules forbid in a write path.
+ *
+ * Now: the real Postgres reason is logged, the memo is CLEARED so the next call tries again, and the
+ * error is re-thrown for the caller to decide about.
+ */
 export function ensureStageSchema(): Promise<void> {
   if (ready) return ready;
   ready = (async () => {
@@ -24,7 +37,11 @@ export function ensureStageSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS ase_app_idx ON application_stage_events(application_id, created_at ASC)`);
-    } catch (_) {}
+    } catch (e: any) {
+      ready = null;
+      console.error('[application-stages] schema:', e?.cause?.message || e?.message);
+      throw e;
+    }
   })();
   return ready;
 }
@@ -47,16 +64,48 @@ export function stageIndex(key: string): number {
   return i >= 0 ? i : 0;
 }
 
-export async function advanceStage(opts: { applicationId: string; toStage: string; actorUserId: string; actorName: string; note?: string }) {
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function advanceStage(opts: { applicationId: string; toStage: string; actorUserId: string | null; actorName: string; note?: string }) {
   await ensureStageSchema();
+  // actor_user_id is a UUID column. It used to take whatever the caller passed, and an empty string
+  // (which is what a system-driven advance has for an actor) fails the cast and takes the whole
+  // stage advance down with it.
+  const actor = UUID_RE.test(String(opts.actorUserId || '')) ? String(opts.actorUserId) : null;
   const cur = await db.execute(sql`SELECT stage FROM applications WHERE id = ${opts.applicationId} LIMIT 1`);
   const r = Array.isArray(cur) ? cur : ((cur as any)?.rows || []);
   const fromStage = r[0]?.stage || 'submitted';
+  if (fromStage === opts.toStage) return;
   await db.execute(sql`UPDATE applications SET stage = ${opts.toStage}, stage_updated_at = NOW(), updated_at = NOW() WHERE id = ${opts.applicationId}`);
   await db.execute(sql`
     INSERT INTO application_stage_events (application_id, from_stage, to_stage, actor_user_id, actor_name, note)
-    VALUES (${opts.applicationId}, ${fromStage}, ${opts.toStage}, ${opts.actorUserId}, ${opts.actorName}, ${opts.note || null})
+    VALUES (${opts.applicationId}, ${fromStage}, ${opts.toStage}, ${actor}, ${opts.actorName}, ${opts.note || null})
   `);
+
+  // THE CANDIDATE IS TOLD. Their tracker page states "every status change appears in this thread",
+  // and a stage advance used to put nothing in the thread and send no notification — so the six-step
+  // tracker moved silently and only somebody who happened to re-open the page ever saw it. The stage
+  // is already committed above; a notification failure must not report the advance as having failed,
+  // but it is logged with the real Postgres reason rather than dropped.
+  try {
+    const stage = STAGES.find((s) => s.key === opts.toStage);
+    const who = await db.execute(sql`SELECT applicant_user_id FROM applications WHERE id = ${opts.applicationId} LIMIT 1`);
+    const wRows = Array.isArray(who) ? who : ((who as any)?.rows || []);
+    const applicantUserId = wRows[0]?.applicant_user_id;
+    if (applicantUserId && stage) {
+      const { notifyUser } = await import('@/lib/notify');
+      await notifyUser(String(applicantUserId), {
+        title: 'Your application: ' + stage.label,
+        body: stage.blurb,
+        type: 'application',
+        actionUrl: '/portal/applications/' + opts.applicationId,
+        entityType: 'application',
+        entityId: opts.applicationId,
+      });
+    }
+  } catch (e: any) {
+    console.error('[application-stages] the candidate was NOT told about stage', opts.toStage, '-', e?.cause?.message || e?.message);
+  }
 }
 
 export async function getStageEvents(applicationId: string) {

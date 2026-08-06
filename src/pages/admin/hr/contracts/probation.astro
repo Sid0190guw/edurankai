@@ -20,9 +20,10 @@
 // and separation consoles already require for their writes. Opening a register is not deciding
 // somebody's employment.
 import AdminLayout from '@/layouts/AdminLayout.astro';
+import { flashFailed } from '@/lib/flash-tone';
 import { canAccessSection, can } from '@/lib/auth/permissions';
 import { isInitialized } from '@/lib/org-graph';
-import { decideInstance, getInstance, VIA_LABELS } from '@/lib/workflow';
+import { decideInstance, getInstance, resumeWorkflow, VIA_LABELS } from '@/lib/workflow';
 import {
   ensureLifecycleSchema, ensureProbationDecisionSchema,
   listOpenProbations, listProbationDecisions, requestProbationDecision,
@@ -30,6 +31,12 @@ import {
   probationOutcomeLabel, PROBATION_OUTCOMES,
   type ProbationRow, type ProbationDecisionRow,
 } from '@/lib/hr-lifecycle';
+// CONFIRMATION PROMPTS ARE ESCAPED, NOT STRIPPED. These were built with `.replace(/'/g, '')`,
+// which DELETES the apostrophe — the admin was asked to confirm an action against "OBrien", a person
+// who does not exist, which is the one thing a confirmation exists to let them check. A value
+// carrying a newline ended the JS string literal outright, the handler became a syntax error,
+// confirm() never fired, and the destructive form submitted with no confirmation at all.
+import { confirmAttr, clip } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -83,8 +90,13 @@ function dueWords(p: ProbationRow): string {
   return p.daysRemaining + ' day' + (p.daysRemaining === 1 ? '' : 's') + ' left';
 }
 
-await ensureLifecycleSchema().catch(() => {});
-await ensureProbationDecisionSchema().catch(() => {});
+// Both ensure functions log the Postgres cause and re-throw on purpose. Swallowing them made "the
+// probation tables are not there" render identically to "no probation is running" — and this page
+// is the one that decides whether somebody is confirmed or let go, so the two must never look the
+// same. The reason is kept and shown.
+let schemaError = '';
+try { await ensureLifecycleSchema(); await ensureProbationDecisionSchema(); }
+catch (e: any) { schemaError = e?.cause?.message || e?.message || 'unknown error'; }
 
 if (Astro.request.method === 'POST') {
   let flash = '';
@@ -105,6 +117,31 @@ if (Astro.request.method === 'POST') {
       if (r.ok) {
         const sync = await syncProbationDecisions(user.id);
         if (sync.applied) flash += ' ' + sync.applied + ' approved decision applied to the employee record.';
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else if (action === 'resume' && mayWrite) {
+      // THE `&& mayWrite` IS LOAD-BEARING. This branch sits ABOVE the chain's `!mayWrite` arm because
+      // it has to sit beside 'decide' — but 'decide' is safe there only because decideInstance()
+      // re-checks the actor itself, and resumeWorkflow() explicitly does NOT. Without this test a
+      // read-only account could re-route somebody else's approval. Falling through leaves the
+      // refusal sentence the chain already has.
+      //
+      // A HALTED REQUEST USED TO BE A DEAD END. The banner said "resume it from the approvals
+      // workflow" — the only resume console is /admin/hr/leave/workflow and it is hard-scoped to the
+      // `leave` domain, so this probation decision never appeared on it and no surface could move it again.
+      // resumeWorkflow() carries no entitlement check of its own; the gate is the test on this line. It cannot decide anything — it re-routes to whoever the graph names, and
+      // leaves the instance halted with the current reason when the graph still names nobody.
+      const r = await resumeWorkflow(String(fd.get('instance_id') || ''), user as any);
+      if (!r.ok) {
+        flash = r.error || 'The probation decision was not resumed.';
+      } else if (r.state === 'halted') {
+        flash = 'Still halted: ' + (r.haltReason || 'the graph still names nobody for a required rung.')
+          + ' Nothing on the employee record has changed.';
+      } else {
+        flash = 'Resumed. It carries on from the rung it stopped at; nothing earlier was re-decided.';
+      }
+      if (r.ok) {
+        const sync = await syncProbationDecisions(user.id);
         if (sync.errors.length) flash += ' ' + sync.errors[0];
       }
     } else if (!mayWrite) {
@@ -172,7 +209,8 @@ const today = new Date().toISOString().slice(0, 10);
     date passed.
   </p>
 
-  {msg && <div class="flash">{msg}</div>}
+  {msg && <div class={flashFailed(msg) ? 'flash warn' : 'flash'} role={flashFailed(msg) ? 'alert' : 'status'}>{msg}</div>}
+  {schemaError && <div class="flash warn">The probation tables could not be prepared, so any list below is incomplete and no decision here can be saved. Postgres said: {schemaError}</div>}
   {synced.errors.length > 0 && <div class="flash warn">{synced.errors[0]}</div>}
   {!mayWrite && (
     <div class="flash warn">You can read this register. Raising a probation decision needs the employee-records permission.</div>
@@ -295,8 +333,24 @@ const today = new Date().toISOString().slice(0, 10);
 
           {x.d.state === 'halted' && (
             <div class="halt">
-              <strong>Halted.</strong> {x.d.haltReason || 'No approver could be resolved.'}
-              <span class="hint">Nothing on the employee record has changed. Record the missing relationship in the Organization Graph, then resume it from the approvals workflow.</span>
+              <strong>Halted.</strong> {x.d.haltReason || (graphReady
+                ? 'No approver could be resolved.'
+                : 'The Organization Graph has not been initialized, so no approver could be resolved for anybody yet.')}
+              <span class="hint">
+                {graphReady
+                  ? 'Nothing on the employee record has changed. Record the missing relationship in the Organization Graph, then press Resume below — the approval carries on from the rung it stopped at.'
+                  : 'Nothing on the employee record has changed. This is NOT a claim that this person has no manager: the Organization Graph has not been initialized at all, so nothing can be routed yet. Initialize it, then press Resume below.'}
+              </span>
+              {mayWrite && x.instance && (
+                <form method="POST" class="inline">
+                  <input type="hidden" name="action" value="resume" />
+                  <input type="hidden" name="instance_id" value={x.instance.id} />
+                  <button type="submit" class="btn ghost">Resume this approval</button>
+                </form>
+              )}
+              {mayWrite && !x.instance && (
+                <span class="hint">There is no approval instance on this decision to resume — withdraw it and raise it again once the graph names an approver.</span>
+              )}
             </div>
           )}
 
@@ -322,8 +376,10 @@ const today = new Date().toISOString().slice(0, 10);
             </form>
           )}
 
+          {/* Withdrawing ends an approval somebody may already have acted on, and the button carried
+            no prompt at all. It names the person and what stops. */}
           {mayWrite && (
-            <form method="POST" class="inline">
+            <form method="POST" class="inline" onsubmit={confirmAttr('Withdraw the probation decision for ' + clip(x.d.employeeName || 'this employee', 80) + '? The approval in progress ends, nothing changes on their employee record, and raising it again starts a new approval from the beginning.')}>
               <input type="hidden" name="action" value="cancel" />
               <input type="hidden" name="decision_id" value={x.d.id} />
               <button type="submit" class="btn ghost">Withdraw this request</button>

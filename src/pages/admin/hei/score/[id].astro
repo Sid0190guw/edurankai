@@ -2,10 +2,12 @@
 import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
 import { heiInstitutions, heiDimensions, heiInstitutionScores } from '@/lib/db/schema';
-import { asc, eq } from 'drizzle-orm';
+import { and, asc, eq } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
 
 const user = Astro.locals.user!;
-if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+// Authorization from permissions.ts, never a users.role literal.
+if (!user || !can(user as any, 'admin.access')) return Astro.redirect('/portal');
 
 let errorMsg = '';
 let okMsg = '';
@@ -28,6 +30,12 @@ if (Astro.request.method === 'POST') {
       let weightedSum = 0;
       let totalWeight = 0;
 
+      // Read the institution's stored rows ONCE, before the loop, instead of re-selecting them on
+      // every dimension.
+      const existingRows = await db.select().from(heiInstitutionScores)
+        .where(eq(heiInstitutionScores.institutionId, id));
+      const existingDims = new Set(existingRows.map(s => s.dimensionId));
+
       for (const dim of allDims) {
         const scoreVal = (fd.get('score_' + dim.id) as string || '').trim();
         const notesVal = (fd.get('notes_' + dim.id) as string || '').trim() || null;
@@ -43,17 +51,19 @@ if (Astro.request.method === 'POST') {
           break;
         }
 
-        // Upsert: try update, if no rows insert
-        const existing = await db.select().from(heiInstitutionScores)
-          .where(eq(heiInstitutionScores.institutionId, id))
-          .limit(50);
-        const matched = existing.find(s => s.dimensionId === dim.id);
-
-        if (matched) {
+        // Upsert on the FULL primary key (institution_id, dimension_id).
+        //
+        // This UPDATE used to filter on institution_id alone — with a comment saying a composite
+        // WHERE was still needed — so saving one dimension overwrote EVERY stored dimension of that
+        // institution with that one score, and the Truth Score on /hei was computed from the
+        // wreckage. Both columns are matched now.
+        if (existingDims.has(dim.id)) {
           await db.update(heiInstitutionScores)
             .set({ score: scoreVal, notes: notesVal, updatedAt: new Date() })
-            .where(eq(heiInstitutionScores.institutionId, id));
-          // Actually we need a composite where - let me do it via raw
+            .where(and(
+              eq(heiInstitutionScores.institutionId, id),
+              eq(heiInstitutionScores.dimensionId, dim.id)
+            ));
         } else {
           await db.insert(heiInstitutionScores).values({
             institutionId: id,
@@ -79,7 +89,9 @@ if (Astro.request.method === 'POST') {
       }
     }
   } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+    // The real Postgres reason is on .cause; .message is only the failed SQL.
+    console.error('[hei/score] save_scores failed:', err?.cause?.message || err?.message);
+    errorMsg = 'Failed: ' + (err?.cause?.message || err?.message || 'Unknown error');
   }
 }
 
@@ -96,7 +108,8 @@ for (const s of existingScores) {
 
 const dimensionsCovered = allDims.filter(d => scoresByDim[d.id]).length;
 ---
-<HeiAdminLayout title="HEI Scores" activeNav="hei">
+{/* The layout's prop is `active`, and its value is a nav item ID. `activeNav` was silently dropped. */}
+<HeiAdminLayout title="HEI Scores" active="institutions">
   <div class="admin-page" style="max-width:1100px;">
 
     <div class="admin-page-header" style="margin-bottom:24px;display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">

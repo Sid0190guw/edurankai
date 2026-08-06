@@ -1,150 +1,135 @@
 ---
+// /admin/settings — SITE SETTINGS, AND WHY THEY ARE NO LONGER EDITABLE HERE.
+//
+// WHAT WAS WRONG. This screen read `site_settings` and UPDATEd it category by category, audited the
+// change, and reported "Settings saved for: <category>". Grep for `site_settings` across src/ and
+// db/ and this file is the ONLY match: no CREATE TABLE, no pgTable, and — the part that matters —
+// NO CONSUMER. Nothing on the public site, in the admin console, or in any library ever read a
+// value back. Every field an admin edited here was written, audited and then ignored by the entire
+// product. A settings screen that silently changes nothing is worse than no settings screen,
+// because someone eventually configures something important on it and believes it took effect.
+//
+// It also opened its OWN postgres pool (`postgres(databaseUrl, { max: 1 })`) instead of the shared
+// db, and the list query sat outside any try — so on any environment where the table does not
+// exist, this page did not render an error, it returned a 500.
+//
+// WHAT IT DOES NOW. It shows whatever `site_settings` holds, READ-ONLY, and states plainly that
+// nothing reads these values, so an admin cannot leave believing a change landed. The controls that
+// DO take effect are linked at the top. When a consumer is written for one of these keys, wire it
+// and restore editing for that key in the same change — not before.
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { can } from '@/lib/auth/permissions';
-import postgres from 'postgres';
-import { logAudit } from '@/lib/audit';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const reason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 const user = Astro.locals.user!;
 if (!can(user, 'settings.view')) return Astro.redirect('/admin');
-const canEdit = can(user, 'settings.edit');
 
-const databaseUrl = import.meta.env.DATABASE_URL || process.env.DATABASE_URL;
-const sql = postgres(databaseUrl, { max: 1 });
-
-let errorMsg = '';
-let okMsg = '';
-
-if (Astro.request.method === 'POST' && canEdit) {
-  const fd = await Astro.request.formData();
-  const action = fd.get('_action') as string;
-
-  try {
-    if (action === 'save_section') {
-      const category = fd.get('_category') as string;
-      const updates: { key: string; value: string }[] = [];
-
-      // Get all settings in this category to know which keys to expect
-      const inCategory = await sql`SELECT key, input_type FROM site_settings WHERE category = ${category}`;
-
-      for (const row of inCategory) {
-        const key = row.key as string;
-        const inputType = row.input_type as string;
-        let value: string;
-        if (inputType === 'bool') {
-          value = fd.get(key) === 'on' ? 'true' : 'false';
-        } else {
-          value = (fd.get(key) as string || '').trim();
-        }
-        updates.push({ key, value });
-      }
-
-      for (const u of updates) {
-        await sql`
-          UPDATE site_settings
-          SET value = ${u.value}, updated_at = NOW(), updated_by_user_id = ${user.id}
-          WHERE key = ${u.key}
-        `;
-      }
-
-      await logAudit({
-        userId: user.id,
-        action: 'settings.update',
-        entity: 'site_settings',
-        entityId: category,
-        diff: Object.fromEntries(updates.map(u => [u.key, u.value])),
-        ipAddress: Astro.clientAddress
-      });
-
-      okMsg = 'Settings saved for: ' + category;
-    }
-  } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
-  }
+let readError = '';
+let allSettings: any[] = [];
+try {
+  allSettings = rows(await db.execute(sql`
+    SELECT key, value, category, label, description, input_type, updated_at
+    FROM site_settings
+    ORDER BY category, key
+  `));
+} catch (e: any) {
+  // A missing table and an empty table are different facts. This page used to 500 on the first and
+  // could not tell you about either.
+  readError = reason(e).slice(0, 200);
 }
-
-const allSettings = await sql`
-  SELECT key, value, category, label, description, input_type, updated_at
-  FROM site_settings
-  ORDER BY category, key
-`;
-
-await sql.end();
 
 // Group by category
 const grouped: Record<string, any[]> = {};
 for (const s of allSettings) {
-  const cat = s.category as string;
+  const cat = String(s.category || 'other');
   if (!grouped[cat]) grouped[cat] = [];
   grouped[cat].push(s);
 }
 
-const CATEGORY_META: Record<string, { title: string; icon: string; description: string }> = {
-  site: { title: 'Site basics', icon: 'globe', description: 'Name, tagline, URLs - used in meta tags and footer' },
-  email: { title: 'Contact emails', icon: 'mail', description: 'Email addresses shown across forms and pages' },
-  hiring: { title: 'Hiring config', icon: 'briefcase', description: 'Defaults for new roles and applicant SLAs' },
-  features: { title: 'Feature flags', icon: 'flag', description: 'Enable or disable parts of the public site' }
+const CATEGORY_META: Record<string, { title: string; description: string }> = {
+  site: { title: 'Site basics', description: 'Name, tagline, URLs. Stored here; not read by any page.' },
+  email: { title: 'Contact emails', description: 'Addresses shown across forms and pages. Stored here; the addresses in use are the ones written into those pages.' },
+  hiring: { title: 'Hiring config', description: 'Defaults for new roles and applicant SLAs. Stored here; the hiring surfaces do not consult them.' },
+  features: { title: 'Feature flags', description: 'Superseded by /admin/feature-flags and /admin/observability, which are read at real call sites.' }
 };
 
 const orderedCategories = ['site', 'email', 'hiring', 'features'];
+const categoriesPresent = orderedCategories.filter((c) => (grouped[c] || []).length > 0);
+const otherCategories = Object.keys(grouped).filter((c) => orderedCategories.indexOf(c) === -1);
 ---
 <AdminLayout title="Settings" activeNav="settings">
   <div class="admin-page" style="max-width:100%;">
 
-    <div class="admin-page-header" style="margin-bottom:24px;">
+    <div class="admin-page-header" style="margin-bottom:20px;">
       <div class="admin-page-title-block">
         <div class="admin-page-eyebrow">System</div>
         <h1 class="admin-page-title">Settings</h1>
-        <p class="admin-page-sub">Site-wide configuration. {allSettings.length} settings across {orderedCategories.length} sections.</p>
+        <p class="admin-page-sub">{allSettings.length} stored values. None of them is read by any surface in this product.</p>
       </div>
     </div>
 
-    {errorMsg && <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{errorMsg}</div>}
-    {okMsg && <div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.25);color:#6ee7b7;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">{okMsg}</div>}
+    <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.30);color:#fcd34d;font-size:12.5px;line-height:1.6;padding:13px 15px;border-radius:8px;margin-bottom:18px;">
+      <strong style="display:block;margin-bottom:4px;color:#fde68a;">These values are stored, and nothing reads them.</strong>
+      This screen used to accept edits and report "Settings saved". The write worked; the effect did
+      not, because no page, route or library in this codebase ever reads <code>site_settings</code>
+      back. Editing is therefore off rather than misleading. The settings that do take effect live on
+      <a href="/admin/feature-flags" style="color:#fcd34d;">/admin/feature-flags</a> and
+      <a href="/admin/observability" style="color:#fcd34d;">/admin/observability</a>.
+    </div>
 
-    {orderedCategories.map((cat) => {
+    {readError && (
+      <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">
+        The settings table could not be read, so this page is not showing what is actually stored: {readError}
+      </div>
+    )}
+
+    {!readError && allSettings.length === 0 && (
+      <div class="admin-card" style="padding:22px;">
+        <div class="admin-card-title" style="margin:0 0 6px;font-size:14px;">Nothing stored</div>
+        <p style="font-size:12px;color:#6e6e78;line-height:1.6;margin:0;">
+          <code>site_settings</code> is empty, and this repository contains no code that creates it or
+          fills it. Nothing is missing from your installation.
+        </p>
+      </div>
+    )}
+
+    {categoriesPresent.concat(otherCategories).map((cat) => {
       const items = grouped[cat] || [];
-      if (items.length === 0) return null;
-      const meta = CATEGORY_META[cat] || { title: cat, description: '' };
+      const meta = CATEGORY_META[cat] || { title: cat, description: 'Stored values with no consumer.' };
       return (
-        <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:14px;margin-bottom:18px;">
-          <input type="hidden" name="_action" value="save_section" />
-          <input type="hidden" name="_category" value={cat} />
-
+        <div class="admin-card" style="display:flex;flex-direction:column;gap:14px;margin-bottom:18px;">
           <div style="border-bottom:1px solid #1f1f26;padding-bottom:12px;margin-bottom:4px;">
             <div class="admin-card-title" style="margin:0 0 3px;font-size:14px;">{meta.title}</div>
             <p style="font-size:11.5px;color:#6e6e78;line-height:1.5;">{meta.description}</p>
           </div>
 
           {items.map((s) => {
-            const key = s.key as string;
-            const inputType = s.input_type as string;
-            const value = s.value as string;
-            const label = s.label as string;
-            const description = s.description as string;
+            const key = String(s.key);
+            const inputType = String(s.input_type || 'text');
+            const value = s.value === null || s.value === undefined ? '' : String(s.value);
             const isChecked = value === 'true';
             return (
               <div>
                 <label class="rolefield-label" style="display:flex;align-items:center;gap:8px;">
-                  {inputType === 'bool' && canEdit && <input type="checkbox" name={key} checked={isChecked} style="accent-color:#FF4F00;margin-bottom:6px;" />}
-                  {inputType === 'bool' && !canEdit && <span style={'width:8px;height:8px;border-radius:50%;background:' + (isChecked ? '#10b981' : '#6e6e78') + ';display:inline-block;'}></span>}
-                  <span>{label}</span>
+                  {inputType === 'bool' && <span style={'width:8px;height:8px;border-radius:50%;background:' + (isChecked ? '#10b981' : '#6e6e78') + ';display:inline-block;'}></span>}
+                  <span>{s.label || key}</span>
                 </label>
                 {inputType !== 'bool' && inputType !== 'textarea' && (
-                  <input type={inputType === 'email' ? 'email' : (inputType === 'number' ? 'number' : 'text')} name={key} value={value} class="rolefield-input" readonly={!canEdit} />
+                  <input type="text" value={value} class="rolefield-input" readonly />
                 )}
                 {inputType === 'textarea' && (
-                  <textarea name={key} rows="3" class="rolefield-input" readonly={!canEdit}>{value}</textarea>
+                  <textarea rows="3" class="rolefield-input" readonly>{value}</textarea>
                 )}
-                {description && <p style="font-size:10.5px;color:#6e6e78;margin-top:4px;line-height:1.5;">{description}</p>}
-                <p style="font-size:9.5px;color:#6e6e78;margin-top:3px;font-family:'Geist Mono',monospace;opacity:0.6;">key: {key}</p>
+                {s.description && <p style="font-size:10.5px;color:#6e6e78;margin-top:4px;line-height:1.5;">{s.description}</p>}
+                <p style="font-size:9.5px;color:#6e6e78;margin-top:3px;font-family:'Geist Mono',monospace;opacity:0.6;">key: {key} &middot; read by nothing</p>
               </div>
             );
           })}
-
-          {canEdit && (
-            <button type="submit" class="admin-btn admin-btn-primary" style="align-self:flex-start;padding:7px 16px;font-size:12px;">Save {meta.title}</button>
-          )}
-        </form>
+        </div>
       );
     })}
 
@@ -153,7 +138,6 @@ const orderedCategories = ['site', 'email', 'hiring', 'features'];
   <style>
     .rolefield-label { display:block;font-size:10.5px;font-weight:600;color:#8a8a94;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:6px; }
     .rolefield-input { width:100%;padding:8px 11px;background:#08080a;border:1px solid #1f1f26;border-radius:6px;color:#fff;font-size:12.5px;font-family:inherit;outline:none; }
-    .rolefield-input:focus { border-color:#FF4F00; }
     .rolefield-input[readonly] { opacity:0.6;cursor:not-allowed; }
     textarea.rolefield-input { resize:vertical;min-height:60px;line-height:1.6; }
   </style>

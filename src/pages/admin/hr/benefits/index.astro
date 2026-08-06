@@ -1,0 +1,449 @@
+---
+// /admin/hr/benefits — THE BENEFITS CATALOGUE, AS THE COMPANY ACTUALLY OFFERS IT.
+//
+// WHAT THIS SCREEN IS FOR. Recording what employees are entitled to, who it applies to, how they
+// claim it, and where the policy document lives. Everything an employee reads on
+// /portal/employee/benefits comes from here and from nowhere else — there is no second list in a
+// component and no hardcoded entitlement anywhere in this product.
+//
+// THE CATALOGUE STARTS EMPTY AND STAYS EMPTY UNTIL SOMEBODY RECORDS A REAL BENEFIT. Nothing is
+// seeded. A plausible-looking insurance policy written into a live HR system is an entitlement the
+// company never agreed to, and the first anybody hears of it is when a person claims against it.
+//
+// ELIGIBILITY IS DATA. Each benefit carries conditions as ROWS (employment type, work mode,
+// department, minimum service), evaluated by evaluateEligibility() in src/lib/benefits.ts. Nothing on
+// this page or on the employee page tests employment type itself: a rule written in a component is a
+// second policy nobody can change without a deploy.
+//
+// THE GATE. `employee.manage` through can(). That is the people-desk capability this product already
+// grants to exactly the accounts that decide what the company offers its staff (super_admin and hr
+// today), so nobody gains or loses anything by this screen existing. A narrower `benefits.manage` key
+// would be better and is reported as a follow-up; it is not minted here, because adding a key to the
+// Permission union is an edit to src/lib/auth, which another workstream owns.
+//
+// NO CLIENT JAVASCRIPT. Every action is a plain form POST, which is what makes this usable on the
+// phone most of this company reads it on.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  ensureBenefitsSchema, listBenefits, createBenefit, updateBenefit, setBenefitActive,
+  addRule, removeRule, enrolmentCounts, describeRules, ruleTypeLabel,
+  benefitCategoryLabel, BENEFIT_CATEGORIES, RULE_TYPES, type Benefit,
+} from '@/lib/benefits';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'employee.manage')) return Astro.redirect('/admin?denied=benefits');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted, and a declaration below
+// its first use throws on the handler's first line while the page still reports success.
+const PAGE = '/admin/hr/benefits';
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+await ensureBenefitsSchema().catch(() => {});
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (action === 'create') {
+      const r = await createBenefit({
+        name: String(fd.get('name') || ''),
+        category: String(fd.get('category') || 'other'),
+        summary: String(fd.get('summary') || ''),
+        details: String(fd.get('details') || ''),
+        provider: String(fd.get('provider') || ''),
+        policyDriveUrl: String(fd.get('policy_drive_url') || ''),
+        claimHow: String(fd.get('claim_how') || ''),
+        claimContact: String(fd.get('claim_contact') || ''),
+        enrolmentRequired: String(fd.get('enrolment_required') || '') === 'on',
+        enrolmentOptions: String(fd.get('enrolment_options') || ''),
+        enrolmentNote: String(fd.get('enrolment_note') || ''),
+        sortOrder: Number(fd.get('sort_order') || 100),
+        actorUserId: user.id,
+      });
+      flash = r.ok
+        ? 'Benefit recorded. It is on the employee catalogue now; add conditions below if it is not open to everyone.'
+        : (r.error || 'The benefit was not saved.');
+    } else if (action === 'update') {
+      const r = await updateBenefit(String(fd.get('benefit_id') || ''), {
+        name: String(fd.get('name') || ''),
+        category: String(fd.get('category') || 'other'),
+        summary: String(fd.get('summary') || ''),
+        details: String(fd.get('details') || ''),
+        provider: String(fd.get('provider') || ''),
+        policyDriveUrl: String(fd.get('policy_drive_url') || ''),
+        claimHow: String(fd.get('claim_how') || ''),
+        claimContact: String(fd.get('claim_contact') || ''),
+        enrolmentRequired: String(fd.get('enrolment_required') || '') === 'on',
+        enrolmentOptions: String(fd.get('enrolment_options') || ''),
+        enrolmentNote: String(fd.get('enrolment_note') || ''),
+        sortOrder: Number(fd.get('sort_order') || 100),
+        actorUserId: user.id,
+      });
+      flash = r.ok ? 'Saved.' : (r.error || 'The change was not saved.');
+    } else if (action === 'retire' || action === 'restore') {
+      const r = await setBenefitActive(String(fd.get('benefit_id') || ''), action === 'restore', user.id);
+      flash = r.ok
+        ? (action === 'restore'
+          ? 'Back on the catalogue.'
+          : 'Retired. It is off the employee catalogue; everybody enrolled in it keeps their record.')
+        : (r.error || 'That was not changed.');
+    } else if (action === 'add_rule') {
+      const r = await addRule(
+        String(fd.get('benefit_id') || ''),
+        String(fd.get('rule_type') || ''),
+        String(fd.get('rule_value') || ''),
+        user.id,
+      );
+      if (r.ok && r.changed === false) flash = 'That condition was already recorded.';
+      else flash = r.ok ? 'Condition added.' : (r.error || 'The condition was not saved.');
+    } else if (action === 'remove_rule') {
+      const r = await removeRule(String(fd.get('rule_id') || ''), user.id);
+      flash = r.ok
+        ? 'Condition removed. A benefit with no conditions is offered to everyone.'
+        : (r.error || 'The condition was not removed.');
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[admin/hr/benefits] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const benefits = await listBenefits({ includeInactive: true });
+const counts = await enrolmentCounts();
+
+// The department list, so a department condition is picked rather than typed. ::text on both sides —
+// departments.id is a varchar slug in one schema file and a UUID in the other, and a cast throws.
+let departments: any[] = [];
+try {
+  departments = rowsOf(await db.execute(sql`
+    SELECT id::text AS id, name FROM departments WHERE is_active = true ORDER BY name ASC LIMIT 200`));
+} catch (e: any) {
+  console.error('[admin/hr/benefits] departments', e?.cause?.message || e?.message);
+}
+
+// The employment types actually recorded on employee records, so a condition is written against the
+// values this database really holds rather than against a list somebody guessed at.
+let employmentTypes: string[] = [];
+try {
+  employmentTypes = rowsOf(await db.execute(sql`
+    SELECT DISTINCT employment_type FROM hr_employees
+     WHERE employment_type IS NOT NULL AND btrim(employment_type) <> ''
+     ORDER BY employment_type ASC LIMIT 40`)).map((r: any) => String(r.employment_type));
+} catch (e: any) {
+  console.error('[admin/hr/benefits] employment types', e?.cause?.message || e?.message);
+}
+
+const WORK_MODES = ['Remote', 'Hybrid', 'On-Site'];
+const active = benefits.filter((b) => b.isActive);
+const retired = benefits.filter((b) => !b.isActive);
+const needingElection = active.filter((b) => b.enrolmentRequired).length;
+const enrolledTotal = Object.keys(counts).reduce((s, k) => s + (counts[k] || 0), 0);
+---
+<AdminLayout title="Benefits catalogue" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR &middot; Benefits</p>
+  <h1>Benefits catalogue</h1>
+  <p class="lede">
+    What this company offers its employees, in the words they will read. Everything recorded here
+    appears on each person's own benefits page, evaluated against their employee record, together with
+    how to claim it and a link to the policy document. Nothing is invented and nothing is pre-filled:
+    an empty catalogue means nobody has recorded a benefit yet.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{active.length}</span><span class="tl">On the catalogue</span></div>
+    <div class="tile"><span class="tv">{needingElection}</span><span class="tl">Need electing</span></div>
+    <div class="tile"><span class="tv">{enrolledTotal}</span><span class="tl">Live enrolments</span></div>
+    <div class="tile"><span class="tv">{retired.length}</span><span class="tl">Retired</span></div>
+  </div>
+
+  <p class="lede">
+    <a class="link" href="/admin/hr/benefits/enrolments">Open the elections queue</a> to see who has
+    asked to join what, and where each election has got to.
+  </p>
+
+  <details class="panel">
+    <summary>Record a benefit</summary>
+    <form method="POST" class="form">
+      <input type="hidden" name="action" value="create" />
+      <label>Name
+        <input name="name" required maxlength="200" placeholder="What an employee would call it" />
+      </label>
+      <div class="pair">
+        <label>Category
+          <select name="category">
+            {BENEFIT_CATEGORIES.map((c) => <option value={c.key}>{c.label}</option>)}
+          </select>
+        </label>
+        <label>Order on the page
+          <input type="number" name="sort_order" value="100" min="1" max="9999" />
+          <span class="hint">Lower shows first.</span>
+        </label>
+      </div>
+      <label>One line an employee reads first
+        <input name="summary" required maxlength="500" placeholder="What this actually is, in plain words" />
+      </label>
+      <label>The detail
+        <textarea name="details" rows="3" maxlength="4000" placeholder="Cover levels, limits, anything a person needs to understand it. Optional."></textarea>
+      </label>
+      <div class="pair">
+        <label>Provider or scheme name
+          <input name="provider" maxlength="200" placeholder="Optional" />
+        </label>
+        <label>Who to ask
+          <input name="claim_contact" maxlength="200" placeholder="A mailbox or a desk. Optional." />
+        </label>
+      </div>
+      <label>How somebody claims it
+        <textarea name="claim_how" rows="3" required maxlength="2000" placeholder="The actual steps. A benefit nobody knows how to claim is a benefit nobody claims."></textarea>
+      </label>
+      <label>Policy document
+        <input name="policy_drive_url" maxlength="500" placeholder="https://drive.google.com/..." />
+        <span class="hint">
+          A Google Drive link shared as &ldquo;Anyone with the link - Viewer&rdquo;. Documents of any
+          kind are links here and are never uploaded.
+        </span>
+      </label>
+      <label class="check">
+        <input type="checkbox" name="enrolment_required" />
+        <span>This one has to be elected &mdash; the employee chooses it and somebody approves</span>
+      </label>
+      <label>The choices offered, one per line
+        <textarea name="enrolment_options" rows="3" maxlength="2000" placeholder="Leave empty when electing is a plain yes."></textarea>
+        <span class="hint">An employee can only elect a value written here, so a cover level that does not exist cannot be approved.</span>
+      </label>
+      <label>Anything to say at the point of electing
+        <input name="enrolment_note" maxlength="1000" placeholder="Windows, deadlines, what happens next. Optional." />
+      </label>
+      <button type="submit" class="btn">Record this benefit</button>
+    </form>
+  </details>
+
+  <h2>On the catalogue</h2>
+  {active.length === 0 ? (
+    <div class="empty">
+      <p class="ec">No benefits have been configured yet.</p>
+      <p class="es">
+        Employees see an honest empty page saying the same thing, rather than a list of things this
+        company has not agreed to offer. Record the first real one above.
+      </p>
+    </div>
+  ) : (
+    <div class="stack">
+      {active.map((b: Benefit) => (
+        <div class="card">
+          <div class="cardhead">
+            <div class="grow">
+              <p class="name">{b.name}</p>
+              <p class="sub">
+                {benefitCategoryLabel(b.category)}
+                {b.provider ? ' · ' + b.provider : ''}
+                {' · '}{counts[b.id] || 0} enrolled
+                {b.createdAt ? ' · added ' + fmtDate(b.createdAt) : ''}
+              </p>
+            </div>
+            {b.enrolmentRequired && <span class="chip">Needs electing</span>}
+          </div>
+
+          <p class="reason">{b.summary}</p>
+
+          <div class="rules">
+            <p class="rl">Who it applies to</p>
+            {describeRules(b.rules).map((line) => <p class="rline">{line}</p>)}
+          </div>
+
+          {b.rules.length > 0 && (
+            <div class="chiprow">
+              {b.rules.map((r) => (
+                <form method="POST" class="chipform">
+                  <input type="hidden" name="action" value="remove_rule" />
+                  <input type="hidden" name="rule_id" value={r.id} />
+                  <button type="submit" class="chipbtn" title="Remove this condition">
+                    {ruleTypeLabel(r.ruleType)}: {r.ruleValue}
+                    <span class="x">remove</span>
+                  </button>
+                </form>
+              ))}
+            </div>
+          )}
+
+          <details class="sub-panel">
+            <summary>Add a condition</summary>
+            <form method="POST" class="form tight">
+              <input type="hidden" name="action" value="add_rule" />
+              <input type="hidden" name="benefit_id" value={b.id} />
+              <label>Condition
+                <select name="rule_type">
+                  {RULE_TYPES.map((t) => <option value={t.key}>{t.label}</option>)}
+                </select>
+                <span class="hint">
+                  Conditions of DIFFERENT kinds must all be met. Two of the SAME kind means either one
+                  will do &mdash; so two employment types reads as &ldquo;Full-Time or Part-Time&rdquo;.
+                </span>
+              </label>
+              <label>Value
+                <input name="rule_value" required maxlength="200" list={'vals-' + b.id}
+                  placeholder="Full-Time, Remote, a department id, or a number of days" />
+              </label>
+              <button type="submit" class="btn small">Add condition</button>
+            </form>
+          </details>
+
+          <datalist id={'vals-' + b.id}>
+            {employmentTypes.map((t) => <option value={t}></option>)}
+            {WORK_MODES.map((m) => <option value={m}></option>)}
+            {departments.map((d: any) => <option value={String(d.id)}>{String(d.name)}</option>)}
+          </datalist>
+
+          <details class="sub-panel">
+            <summary>Edit or retire</summary>
+            <form method="POST" class="form tight">
+              <input type="hidden" name="action" value="update" />
+              <input type="hidden" name="benefit_id" value={b.id} />
+              <label>Name<input name="name" required maxlength="200" value={b.name} /></label>
+              <div class="pair">
+                <label>Category
+                  <select name="category">
+                    {BENEFIT_CATEGORIES.map((c) => (
+                      <option value={c.key} selected={c.key === b.category}>{c.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>Order<input type="number" name="sort_order" value={b.sortOrder} min="1" max="9999" /></label>
+              </div>
+              <label>Summary<input name="summary" required maxlength="500" value={b.summary} /></label>
+              <label>Detail<textarea name="details" rows="3" maxlength="4000">{b.details || ''}</textarea></label>
+              <div class="pair">
+                <label>Provider<input name="provider" maxlength="200" value={b.provider || ''} /></label>
+                <label>Who to ask<input name="claim_contact" maxlength="200" value={b.claimContact || ''} /></label>
+              </div>
+              <label>How to claim<textarea name="claim_how" rows="3" required maxlength="2000">{b.claimHow}</textarea></label>
+              <label>Policy document
+                <input name="policy_drive_url" maxlength="500" value={b.policyDriveUrl || ''} placeholder="https://drive.google.com/..." />
+              </label>
+              <label class="check">
+                <input type="checkbox" name="enrolment_required" checked={b.enrolmentRequired} />
+                <span>Has to be elected</span>
+              </label>
+              <label>Choices, one per line
+                <textarea name="enrolment_options" rows="3" maxlength="2000">{b.enrolmentOptions.join('\n')}</textarea>
+              </label>
+              <label>Note at the point of electing
+                <input name="enrolment_note" maxlength="1000" value={b.enrolmentNote || ''} />
+              </label>
+              <button type="submit" class="btn small">Save changes</button>
+            </form>
+            <form method="POST" class="form tight">
+              <input type="hidden" name="action" value="retire" />
+              <input type="hidden" name="benefit_id" value={b.id} />
+              <p class="hint">
+                Retiring takes it off the employee catalogue. Nobody's enrolment record is deleted
+                &mdash; what the company offered somebody is part of their history.
+              </p>
+              <button type="submit" class="btn ghost small">Retire this benefit</button>
+            </form>
+          </details>
+
+          {b.policyDriveUrl && (
+            <p class="docline">
+              <a class="link" href={b.policyDriveUrl} target="_blank" rel="noopener noreferrer">Open the policy document</a>
+            </p>
+          )}
+        </div>
+      ))}
+    </div>
+  )}
+
+  {retired.length > 0 && (
+    <div>
+      <h2>Retired</h2>
+      <div class="stack">
+        {retired.map((b: Benefit) => (
+          <div class="card dim">
+            <div class="cardhead">
+              <div class="grow">
+                <p class="name">{b.name}</p>
+                <p class="sub">{benefitCategoryLabel(b.category)} &middot; {counts[b.id] || 0} still recorded as enrolled</p>
+              </div>
+              <form method="POST">
+                <input type="hidden" name="action" value="restore" />
+                <input type="hidden" name="benefit_id" value={b.id} />
+                <button type="submit" class="btn ghost small">Put back</button>
+              </form>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.5; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 19px; color: #fff; font-weight: 700; overflow-wrap: anywhere; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .panel { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 14px; margin-bottom: 16px; }
+  .panel > summary { cursor: pointer; padding: 14px 18px; font-size: 12.5px; color: #FF7040; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; list-style: none; min-height: 44px; display: flex; align-items: center; }
+  .form { padding: 0 16px 16px; display: grid; gap: 12px; }
+  .form.tight { padding: 12px 0 0; }
+  .form label { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  .form label.check { display: flex; align-items: flex-start; gap: 9px; text-transform: none; letter-spacing: normal; font-size: 13px; color: #d8d8de; font-weight: 400; line-height: 1.5; }
+  .form label.check input { width: 20px; height: 20px; min-height: 20px; flex: 0 0 auto; margin-top: 1px; }
+  .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  input, select, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 66px; resize: vertical; }
+  .hint { font-size: 11px; color: #6e6e78; text-transform: none; letter-spacing: normal; font-weight: 400; line-height: 1.5; display: block; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.small { padding: 10px 16px; font-size: 12.5px; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .card.dim { opacity: 0.62; }
+  .cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .grow { min-width: 0; flex: 1 1 220px; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; overflow-wrap: anywhere; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid rgba(103,232,249,0.35); color: #67e8f9; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; }
+  .rules { margin-top: 12px; padding: 10px 12px; background: rgba(103,232,249,0.05); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .rl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .rline { font-size: 12.5px; color: #e8e8ee; margin: 2px 0 0; line-height: 1.5; }
+  .chiprow { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .chipform { margin: 0; }
+  .chipbtn { background: #15151a; border: 1px solid #2a2a2f; color: #d8d8de; border-radius: 100px; padding: 7px 12px; font-size: 11.5px; cursor: pointer; min-height: 34px; font-family: inherit; }
+  .chipbtn .x { color: #fca5a5; margin-left: 7px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .sub-panel { margin-top: 12px; border-top: 1px solid #1a1a1f; }
+  .sub-panel > summary { cursor: pointer; font-size: 12px; color: #9aa6b6; min-height: 44px; display: flex; align-items: center; }
+  .docline { margin: 12px 0 0; font-size: 12.5px; }
+  .link { color: #9bd1ff; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 28px 18px; text-align: center; }
+  .ec { color: #d8d8de; font-size: 14px; font-weight: 700; margin: 0; }
+  .es { color: #6e6e78; font-size: 12.5px; margin: 8px auto 0; line-height: 1.6; max-width: 56ch; }
+</style>
+</AdminLayout>

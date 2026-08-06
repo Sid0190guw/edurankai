@@ -1,0 +1,219 @@
+---
+// /surveys/[slug] — the public form that /admin/hei/surveys has been building questions for since
+// it shipped, and which nothing ever rendered.
+//
+// WHY THIS FILE EXISTS. The survey builder writes hei_survey_forms (title, slug, questions JSON)
+// and every form card carries a "Preview" link to `/surveys/{slug}`. There is no /surveys/* route
+// anywhere in src/pages, so that link 404'd — which meant NO SURFACE IN THIS CODEBASE COULD EVER
+// WRITE hei_survey_responses. The admin console counts responses, the HEI dashboard counts them and
+// the sidebar counts them; all three were counting a table with no writer. An editor could spend an
+// afternoon building a twenty-question instrument that no student could ever answer.
+//
+// WHAT IT COLLECTS, AND WHAT IT DELIBERATELY DOES NOT. Answers and a typed institution name. No
+// account id, no email, no name, no IP. hei_survey_responses has no column for any of them (see
+// src/lib/hei-editorial.ts). A student describing their institution honestly must not be
+// identifiable from the record of having done so, and the cheapest way to guarantee that is to
+// never write it down.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureHeiEditorialSchema, heiRows, heiReason } from '@/lib/hei-editorial';
+
+const slug = String(Astro.params.slug || '').slice(0, 200);
+
+await ensureHeiEditorialSchema();
+
+type Question = { id?: string; type?: string; label?: string; required?: boolean; options?: string[] };
+
+function parseQuestions(raw: any): Question[] {
+  let value = raw;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch (_) { return []; }
+  }
+  return Array.isArray(value) ? (value as Question[]) : [];
+}
+
+let form: any = null;
+let loadFailed = false;
+try {
+  form = heiRows(await db.execute(sql`
+    SELECT id, title, slug, description, questions, is_active
+      FROM hei_survey_forms
+     WHERE slug = ${slug}
+     LIMIT 1
+  `))[0] || null;
+} catch (e: any) {
+  loadFailed = true;
+}
+
+const questions: Question[] = form ? parseQuestions(form.questions) : [];
+const answerable = questions.filter((q) => (q.type || 'text') !== 'section');
+
+let okMsg = '';
+let errMsg = '';
+
+if (Astro.request.method === 'POST' && form) {
+  const fd = await Astro.request.formData();
+  try {
+    if (!form.is_active) {
+      errMsg = 'This survey is closed. Nothing was recorded.';
+    } else if (String(fd.get('website') || '')) {
+      // Honeypot: a real person never fills a field they cannot see. Refuse quietly and record
+      // nothing, rather than pretend to have accepted it.
+      errMsg = 'That submission could not be accepted.';
+    } else {
+      const institution = String(fd.get('_institution') || '').trim().slice(0, 300);
+      const answers: Record<string, any> = {};
+      const missing: string[] = [];
+
+      for (const q of answerable) {
+        const key = String(q.id || '');
+        if (!key) continue;
+        const type = q.type || 'text';
+        if (type === 'checkbox') {
+          const picked = fd.getAll(key).map((v) => String(v).slice(0, 300)).slice(0, 40);
+          if (picked.length) answers[key] = picked;
+          else if (q.required) missing.push(String(q.label || key));
+        } else {
+          const value = String(fd.get(key) || '').trim().slice(0, 4000);
+          if (value) answers[key] = value;
+          else if (q.required) missing.push(String(q.label || key));
+        }
+      }
+
+      if (missing.length > 0) {
+        errMsg = 'These answers are required and were left blank: ' + missing.slice(0, 6).join('; ') + '.';
+      } else if (Object.keys(answers).length === 0) {
+        errMsg = 'Nothing was answered, so nothing was recorded.';
+      } else {
+        // No swallowed catch. If this INSERT fails the respondent is told, because a survey that
+        // thanks you for an answer it did not keep is worse than one that admits it broke.
+        await db.execute(sql`
+          INSERT INTO hei_survey_responses (form_id, institution_name, answers)
+          VALUES (${form.id}::uuid, ${institution || null}, ${JSON.stringify(answers)}::jsonb)
+        `);
+        okMsg = 'Recorded. Thank you — your answers are stored without your name, email or account.';
+      }
+    }
+  } catch (e: any) {
+    errMsg = 'Your answers could not be recorded: ' + heiReason(e).slice(0, 160) + '. Nothing was saved.';
+  }
+}
+
+const pageTitle = form ? String(form.title || 'Survey') : 'Survey not found';
+---
+<BaseLayout title={pageTitle} description="An anonymous survey about higher-education institutions.">
+<style>
+  .sv-wrap { max-width: 720px; margin: 0 auto; padding: 44px 22px 96px; }
+  .sv-eyebrow { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #FF4F00; font-weight: 700; }
+  .sv-title { font-family: 'Cormorant Garamond', Georgia, serif; font-size: clamp(28px, 4vw, 40px); font-weight: 600; letter-spacing: -0.02em; margin: 8px 0 10px; color: #0E0B08; }
+  .sv-desc { color: #4a4239; line-height: 1.6; font-size: 15px; margin-bottom: 8px; }
+  .sv-privacy { background: #FFF4EE; border: 1px solid rgba(255,79,0,0.35); color: #7a2c00; padding: 12px 14px; border-radius: 10px; font-size: 12.5px; line-height: 1.55; margin: 18px 0 24px; }
+  .sv-card { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 22px 24px; }
+  .sv-q { margin-bottom: 20px; }
+  .sv-q > label.q { display: block; font-size: 15px; color: #0E0B08; margin-bottom: 8px; line-height: 1.45; }
+  .sv-req { color: #DC2626; margin-left: 3px; }
+  .sv-section { font-family: 'Cormorant Garamond', serif; font-size: 21px; font-weight: 600; color: #0E0B08; margin: 26px 0 10px; padding-top: 14px; border-top: 1px solid rgba(14,11,8,0.10); }
+  .sv-input, .sv-card textarea, .sv-card select { width: 100%; background: #FAF8F5; border: 1px solid rgba(14,11,8,0.16); border-radius: 7px; padding: 10px 12px; font-size: 14px; font-family: inherit; color: #0E0B08; }
+  .sv-input:focus, .sv-card textarea:focus, .sv-card select:focus { outline: none; border-color: #FF4F00; }
+  .sv-opt { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; font-size: 14px; color: #2c2620; }
+  .sv-opt input { margin-top: 3px; accent-color: #FF4F00; }
+  .sv-btn { background: #FF4F00; color: #fff; padding: 12px 22px; border-radius: 8px; border: none; cursor: pointer; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+  .sv-msg { padding: 12px 15px; border-radius: 10px; font-size: 13.5px; line-height: 1.55; margin-bottom: 20px; }
+  .sv-msg.ok { background: #ECFDF5; border: 1px solid #10B981; color: #065F46; }
+  .sv-msg.err { background: #FEF2F2; border: 1px solid #DC2626; color: #7F1D1D; }
+  .sv-hp { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+</style>
+
+<main class="sv-wrap">
+  <div class="sv-eyebrow">independent survey</div>
+
+  {loadFailed && (
+    <>
+      <h1 class="sv-title">This survey could not be loaded</h1>
+      <div class="sv-msg err">The survey store could not be reached. This is a fault on our side, not a wrong link.</div>
+    </>
+  )}
+
+  {!loadFailed && !form && (
+    <>
+      <h1 class="sv-title">No survey here</h1>
+      <div class="sv-msg err">There is no survey at this address. It may have been removed.</div>
+    </>
+  )}
+
+  {form && (
+    <>
+      <h1 class="sv-title">{form.title}</h1>
+      {form.description && <p class="sv-desc">{form.description}</p>}
+
+      <div class="sv-privacy">
+        Answers are stored WITHOUT your name, email address, account or IP address. There is nowhere
+        in this record to put them. Name an institution only if you are willing for that institution
+        to be named; never name an individual.
+      </div>
+
+      {okMsg && <div class="sv-msg ok">{okMsg}</div>}
+      {errMsg && <div class="sv-msg err">{errMsg}</div>}
+
+      {!form.is_active && (
+        <div class="sv-msg err">This survey is closed and is not accepting answers.</div>
+      )}
+
+      {form.is_active && answerable.length === 0 && (
+        <div class="sv-msg err">
+          This survey has no questions on it yet, so there is nothing to answer. It was published
+          before any question was added.
+        </div>
+      )}
+
+      {form.is_active && answerable.length > 0 && !okMsg && (
+        <form method="POST" class="sv-card">
+          <div class="sv-hp"><label>Leave this empty<input name="website" tabindex="-1" autocomplete="off" /></label></div>
+
+          <div class="sv-q">
+            <label class="q" for="_institution">Which institution is this about?</label>
+            <input class="sv-input" id="_institution" name="_institution" maxlength="300" placeholder="The institution's name, if you wish to give it" />
+          </div>
+
+          {questions.map((q: Question) => {
+            const type = q.type || 'text';
+            const key = String(q.id || '');
+            const opts = Array.isArray(q.options) ? q.options : [];
+            if (type === 'section') {
+              return <div class="sv-section">{q.label || 'Section'}</div>;
+            }
+            if (!key) return null;
+            return (
+              <div class="sv-q">
+                <label class="q" for={key}>{q.label || 'Question'}{q.required && <span class="sv-req">*</span>}</label>
+                {type === 'textarea' && <textarea class="sv-input" id={key} name={key} rows="4" maxlength="4000"></textarea>}
+                {type === 'number' && <input class="sv-input" id={key} name={key} type="number" />}
+                {type === 'date' && <input class="sv-input" id={key} name={key} type="date" />}
+                {type === 'select' && (
+                  <select class="sv-input" id={key} name={key}>
+                    <option value="">Not answered</option>
+                    {opts.map((o: string) => <option value={o}>{o}</option>)}
+                  </select>
+                )}
+                {(type === 'radio' || type === 'scale' || type === 'rating') && opts.map((o: string) => (
+                  <label class="sv-opt"><input type="radio" name={key} value={o} />{o}</label>
+                ))}
+                {type === 'checkbox' && opts.map((o: string) => (
+                  <label class="sv-opt"><input type="checkbox" name={key} value={o} />{o}</label>
+                ))}
+                {['text', 'textarea', 'number', 'date', 'select', 'radio', 'scale', 'rating', 'checkbox'].indexOf(type) === -1 && (
+                  <input class="sv-input" id={key} name={key} maxlength="4000" />
+                )}
+                {type === 'text' && <input class="sv-input" id={key} name={key} maxlength="4000" />}
+              </div>
+            );
+          })}
+
+          <button class="sv-btn" type="submit">Submit answers</button>
+        </form>
+      )}
+    </>
+  )}
+</main>
+</BaseLayout>

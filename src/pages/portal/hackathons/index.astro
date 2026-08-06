@@ -1,11 +1,79 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
-import { ensureCommunitySchema, listHackathons } from '@/lib/community';
+import { ensureCommunitySchema, listHackathons, createHackathon } from '@/lib/community';
+import { can } from '@/lib/auth/permissions';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
 
 await ensureCommunitySchema();
+
+// NOTHING EVER CREATED A HACKATHON. The table is bootstrapped by ensureCommunitySchema() and there
+// was no INSERT anywhere in the repository — no createHackathon in src/lib/community.ts, no admin
+// form, nothing. Every one of the five tabs below therefore filtered the same empty list, the card
+// grid never rendered, /portal/hackathons/[slug] could never find a row, and the team-registration
+// and submission form on the detail page was unreachable code.
+//
+// AUTHORISATION FAILS CLOSED. Announcing a hackathon is `content.edit`, resolved through
+// src/lib/auth/permissions.ts — the same capability that governs publishing anything else learners
+// see. A reader without it sees a disabled control that names the capability, not a vanished one.
+const canAnnounce = can(user, 'content.edit');
+
+let okMsg = '';
+let errMsg = '';
+
+if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  try {
+    if (action !== 'announce') {
+      errMsg = 'Unknown action.';
+    } else if (!canAnnounce) {
+      // Re-tested on the write. A form that is not rendered is not a permission check.
+      errMsg = 'Announcing a hackathon needs the content.edit capability, which this account does not hold.';
+    } else {
+      const title = String(fd.get('title') || '').trim().slice(0, 300);
+      const tagline = String(fd.get('tagline') || '').trim().slice(0, 400);
+      const description = String(fd.get('description') || '').trim().slice(0, 8000);
+      const startsAt = String(fd.get('starts_at') || '').trim();
+      const endsAt = String(fd.get('ends_at') || '').trim();
+      const prizeRaw = String(fd.get('prize_pool_chf') || '').trim();
+      const teamRaw = String(fd.get('max_team_size') || '4').trim();
+      const status = String(fd.get('status') || 'announced');
+
+      if (!title) {
+        errMsg = 'A title is required.';
+      } else if (startsAt && Number.isNaN(new Date(startsAt).getTime())) {
+        errMsg = 'That start date could not be read.';
+      } else if (endsAt && Number.isNaN(new Date(endsAt).getTime())) {
+        errMsg = 'That end date could not be read.';
+      } else {
+        const base = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120);
+        const slug = (base || 'hackathon') + '-' + Math.random().toString(36).slice(2, 8);
+        const prize = prizeRaw ? Math.max(0, parseInt(prizeRaw, 10) || 0) : null;
+        const teamSize = Math.min(20, Math.max(1, parseInt(teamRaw, 10) || 4));
+        const created = await createHackathon({
+          slug,
+          title,
+          tagline: tagline || null,
+          description: description || null,
+          startsAt: startsAt ? new Date(startsAt).toISOString() : null,
+          endsAt: endsAt ? new Date(endsAt).toISOString() : null,
+          prizePoolChf: prize,
+          maxTeamSize: teamSize,
+          status,
+        });
+        okMsg = created.ok
+          ? 'Announced. It is on the board now at /portal/hackathons/' + created.slug
+          : 'The hackathon was not created. Nothing was saved.';
+        if (!created.ok) { errMsg = okMsg; okMsg = ''; }
+      }
+    }
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    errMsg = 'Could not announce it: ' + String(e?.cause?.message || e?.message || 'unknown error').slice(0, 160);
+  }
+}
 
 const url = new URL(Astro.request.url);
 const tab = url.searchParams.get('tab') || 'all';
@@ -59,6 +127,9 @@ const TABS = [
       <p class="hk-sub">Form a team. Ship in a weekend. Compete for a prize pool, a portfolio piece, and a place on the public leaderboard. Format: open theme, real judges, transparent rubric.</p>
     </section>
 
+    {okMsg && <div class="hk-flash hk-flash-ok">{okMsg}</div>}
+    {errMsg && <div class="hk-flash hk-flash-err">{errMsg}</div>}
+
     <section class="hk-tabs">
       {TABS.map(t => (
         <a href={t.key === 'all' ? '/portal/hackathons' : `/portal/hackathons?tab=${t.key}`}
@@ -68,11 +139,44 @@ const TABS = [
       ))}
     </section>
 
+    {canAnnounce ? (
+      <section class="hk-announce">
+        <details>
+          <summary>Announce a hackathon</summary>
+          <form method="POST" class="hk-form">
+            <input type="hidden" name="action" value="announce" />
+            <label>Title<input name="title" required maxlength="300" /></label>
+            <label>Tagline<input name="tagline" maxlength="400" /></label>
+            <label class="hk-wide">Brief<textarea name="description" rows="4" maxlength="8000"></textarea></label>
+            <label>Starts<input name="starts_at" type="datetime-local" /></label>
+            <label>Ends<input name="ends_at" type="datetime-local" /></label>
+            <label>Prize pool (CHF)<input name="prize_pool_chf" type="number" min="0" /></label>
+            <label>Max team size<input name="max_team_size" type="number" min="1" max="20" value="4" /></label>
+            <label>Status
+              <select name="status">
+                <option value="announced">Announced</option>
+                <option value="registration_open">Registration open</option>
+                <option value="in_progress">In progress</option>
+                <option value="completed">Completed</option>
+              </select>
+            </label>
+            <button type="submit" class="hk-submit">Put it on the board</button>
+          </form>
+        </details>
+      </section>
+    ) : null}
+
     {filtered.length === 0 ? (
       <section class="hk-empty">
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-        <div class="hk-empty-title">Nothing here yet.</div>
-        <div class="hk-empty-sub">Hackathons in this state will show up when scheduled. Check back, or browse all events.</div>
+        <div class="hk-empty-title">{all.length === 0 ? 'No hackathon has been announced yet.' : 'Nothing in this state.'}</div>
+        <div class="hk-empty-sub">
+          {all.length === 0
+            ? (canAnnounce
+                ? 'The board fills only when someone announces one. Use "Announce a hackathon" above.'
+                : 'Nothing populates this board automatically. It fills when someone holding the content.edit capability announces a hackathon.')
+            : 'Other tabs have entries. Try "All".'}
+        </div>
       </section>
     ) : (
       <section class="hk-grid">
@@ -143,6 +247,19 @@ const TABS = [
   .hk-meta-val { font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; color: #2E2520; text-align: right; }
 
   .hk-card-cta { display: flex; align-items: center; gap: 6px; font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #FF4F00; }
+
+  .hk-flash { font-family: 'DM Sans', system-ui, sans-serif; font-size: 14px; line-height: 1.55; padding: 12px 16px; border-radius: 12px; margin-top: 24px; }
+  .hk-flash-ok { background: #ECFDF5; border: 1px solid #10B981; color: #065F46; }
+  .hk-flash-err { background: #FEF2F2; border: 1px solid #DC2626; color: #7F1D1D; }
+
+  .hk-announce { margin-bottom: 28px; }
+  .hk-announce summary { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #FF4F00; cursor: pointer; padding: 10px 0; }
+  .hk-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 16px; padding: 20px; margin-top: 10px; }
+  .hk-form label { display: flex; flex-direction: column; gap: 6px; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #7A6F68; }
+  .hk-form input, .hk-form textarea, .hk-form select { background: #FAF8F5; border: 1px solid rgba(14,11,8,0.16); border-radius: 8px; padding: 9px 11px; font-family: 'DM Sans', system-ui, sans-serif; font-size: 14px; color: #0E0B08; }
+  .hk-form input:focus, .hk-form textarea:focus, .hk-form select:focus { outline: none; border-color: #FF4F00; }
+  .hk-wide { grid-column: 1 / -1; }
+  .hk-submit { grid-column: 1 / -1; justify-self: start; background: #FF4F00; color: #fff; border: none; border-radius: 10px; padding: 11px 20px; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer; }
 
   .hk-empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 80px 24px; text-align: center; border: 1px dashed rgba(14,11,8,0.20); border-radius: 16px; color: #7A6F68; }
   .hk-empty-title { font-family: 'Fraunces', serif; font-size: 22px; color: #0E0B08; }

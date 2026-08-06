@@ -124,7 +124,13 @@ export async function logUsage(userId: string | null, feature: string, c: LlmCon
     await ensureLlmSchema();
     await db.execute(sql`INSERT INTO ai_usage_log (user_id, feature, provider, model, prompt_chars, completion_chars, prompt_tokens, completion_tokens, latency_ms, status)
       VALUES (${userId}, ${feature}, ${c.provider}, ${activeModel(c)}, ${promptChars}, ${completionChars}, ${pt ?? null}, ${ct ?? null}, ${latencyMs}, ${status})`);
-  } catch (_) {}
+  } catch (e: any) {
+    // This table is BOTH the cost record and the input to underRateLimit(). A row lost here makes
+    // spend attribution drift and slackens the rate limit by exactly one request, and a bare catch
+    // meant nothing anywhere showed that it was happening. Still non-fatal: a lost log line must
+    // never fail the user's actual request.
+    console.error('[llm] ai_usage_log write failed for feature', feature, '-', e?.cause?.message || e?.message);
+  }
 }
 
 export async function logTrainingExample(userId: string | null, feature: string, c: LlmConfig, system: string, messages: ChatMessage[], completion: string): Promise<void> {
@@ -133,15 +139,33 @@ export async function logTrainingExample(userId: string | null, feature: string,
     await ensureLlmSchema();
     await db.execute(sql`INSERT INTO ai_training_example (user_id, feature, provider, model, system, messages, completion)
       VALUES (${userId}, ${feature}, ${c.provider}, ${activeModel(c)}, ${system.slice(0, 8000)}, ${JSON.stringify(messages).slice(0, 60000)}::jsonb, ${completion.slice(0, 20000)})`);
-  } catch (_) {}
+  } catch (e: any) {
+    // An administrator switched training capture ON. If the corpus is silently losing rows, the
+    // setting is telling them something that is not happening.
+    console.error('[llm] ai_training_example write failed for feature', feature, '-', e?.cause?.message || e?.message);
+  }
 }
 
+/**
+ * FAILS CLOSED. This used to end `catch { return true }`, so ANY failure of the usage-log read — a
+ * cold database, a missing table, a pool timeout — answered "under the limit" and removed the AI
+ * spend cap entirely, for every user, for as long as the fault lasted. Wrong direction for a limiter
+ * whose whole job is to bound a bill: a refused prompt is an inconvenience the caller sees and can
+ * retry; an unbounded one is a charge nobody sees until the invoice arrives.
+ *
+ * Callers already show a "you are going too fast" message on false, so the degraded behaviour is a
+ * message rather than a crash.
+ */
 export async function underRateLimit(userId: string, max = 20, windowSec = 60): Promise<boolean> {
   try {
     await ensureLlmSchema();
     const r = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM ai_usage_log WHERE user_id = ${userId} AND created_at > NOW() - (${windowSec} || ' seconds')::interval`))[0];
     return Number(r?.n || 0) < max;
-  } catch { return true; }
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[llm/gateway] rate-limit read failed, refusing:', e?.cause?.message || e?.message);
+    return false;
+  }
 }
 
 // ---- HTTP plumbing ----

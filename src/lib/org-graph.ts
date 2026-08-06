@@ -1438,6 +1438,27 @@ export async function supersedeReportingManager(
       return { ok: true };
     }
 
+    // ONE EXTRA LINE IN THE CTE — `AND subject_employee_id <> mgr` — AND IT IS THE WHOLE FIX.
+    //
+    // Postgres runs a data-modifying CTE ALWAYS and to completion, while the main query's NOT EXISTS
+    // reads the snapshot taken at the START of the statement. So when the new manager was ALREADY the
+    // open one, the CTE closed that edge and the NOT EXISTS then still saw it open, returned false,
+    // and inserted nothing. The employee was left reporting to NOBODY and the function returned
+    // { ok: true } — the comment below read the empty result as "already exactly this, nothing needed
+    // to change", which is the precise opposite of what had just happened.
+    //
+    // It is not an exotic race. `at` defaults to now(), so re-saving the SAME manager a second later
+    // is enough: the first call opens B, the second closes B and inserts nothing. A double-submitted
+    // org-chart form, or an HR user pressing Save twice, silently disconnects a person from the
+    // approval graph — after which getManager() answers null, pendingLeaveForApprover() shows their
+    // leave to no one, and workflow.ts halts every future request they raise with "nobody is named".
+    //
+    // With the exclusion, the two arms finally agree about what "already this" means:
+    //   - open edge is already `mgr`  -> the CTE skips it, NOT EXISTS sees it, nothing is written.
+    //     Zero rows back now genuinely means nothing needed to change.
+    //   - open edge is somebody else  -> the CTE closes it, NOT EXISTS finds no open `mgr` edge, the
+    //     new edge is inserted at the same instant. No gap, no overlap.
+    // It also makes the operation idempotent, which is what a retried POST needs.
     const r = await db.execute(sql`
       WITH closed AS (
         UPDATE org_relationships
@@ -1447,6 +1468,7 @@ export async function supersedeReportingManager(
            AND status = 'active'
            AND effective_to IS NULL
            AND effective_from < ${at}::timestamptz
+           AND subject_employee_id <> ${mgr}::uuid
         RETURNING id
       )
       INSERT INTO org_relationships
@@ -1464,7 +1486,9 @@ export async function supersedeReportingManager(
       RETURNING id`);
     const list = rows(r);
     // No returned row means the edge was already exactly this, so nothing needed to change. That is
-    // a success, not a failure — re-running a correction must not be an error.
+    // a success, not a failure — re-running a correction must not be an error. It is only TRUE of
+    // this statement because of the exclusion in the CTE above; without it, zero rows also covered
+    // the case where the only open edge had just been closed and not replaced.
     return list.length ? { ok: true, id: String(list[0].id) } : { ok: true };
   } catch (e: any) {
     logFail('supersedeReportingManager', e);

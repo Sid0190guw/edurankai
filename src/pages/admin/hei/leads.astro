@@ -2,9 +2,17 @@
 import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureHeiEditorialSchema } from '@/lib/hei-editorial';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
+
+// hei_leads is created NOWHERE in this repository — no CREATE TABLE, no pgTable, no file in db/.
+// The list query below is wrapped in catch(e){}, so this desk rendered as a clean empty queue on
+// any environment that does not already carry the table out of band, and every write threw a raw
+// Postgres string at the editor. src/lib/hei-editorial.ts creates it (and the five other HEI
+// editorial tables) once per process. If the table already exists this is a no-op.
+await ensureHeiEditorialSchema();
 
 let okMsg = '', errorMsg = '';
 
@@ -13,15 +21,14 @@ if (Astro.request.method === 'POST') {
   const action = fd.get('action') as string;
   try {
     if (action === 'promote') {
-      const id = fd.get('id') as string;
-      const lead = await db.execute(sql`SELECT * FROM hei_leads WHERE id = ${id} LIMIT 1`);
-      const rows = Array.isArray(lead) ? lead : (lead?.rows || []);
-      if (rows.length > 0) {
-        const l = rows[0] as any;
-        await db.execute(sql`UPDATE hei_leads SET status = 'promoted', updated_at = NOW() WHERE id = ${id}`);
-        await db.execute(sql`INSERT INTO hei_findings (title, description, status, institution_id, created_by) VALUES (${l.title}, ${l.summary || ''}, 'draft', ${l.institution_id || null}, ${user.id})`);
-        okMsg = 'Lead promoted to draft finding.';
-      }
+      // ONE EXPRESSION OF PROMOTION, NOT TWO. This page and /admin/hei both carried their own copy
+      // of the same broken INSERT (wrong column names, lead marked promoted before the finding was
+      // written, so the lead was lost on every use). promoteLeadToFinding() in src/lib/hei-editorial.ts
+      // is now the only place that knows how a lead becomes a finding, and it reports what happened
+      // instead of throwing a raw SQL string at the editor.
+      const { promoteLeadToFinding } = await import('@/lib/hei-editorial');
+      const res = await promoteLeadToFinding(fd.get('id') as string, user.id);
+      if (res.ok) okMsg = res.message; else errorMsg = res.message;
     } else if (action === 'dismiss') {
       await db.execute(sql`UPDATE hei_leads SET status = 'dismissed', updated_at = NOW() WHERE id = ${fd.get('id') as string}`);
       okMsg = 'Lead dismissed.';
@@ -44,7 +51,13 @@ if (Astro.request.method === 'POST') {
       await db.execute(sql`UPDATE hei_leads SET assigned_to = ${assignTo||null}, updated_at = NOW() WHERE id = ${id}`);
       okMsg = 'Assigned.';
     }
-  } catch(e: any) { errorMsg = e.message; }
+  } catch(e: any) {
+    // `.message` from drizzle is only the failed SQL text; the reason lives on `.cause`. Printing
+    // the query to an operator and dropping the reason is how the promote bug above survived.
+    const real = e?.cause?.message || e?.message;
+    console.error('[hei/leads]', action, 'failed -', real);
+    errorMsg = 'That could not be completed: ' + (real || 'unknown database error');
+  }
 }
 
 const url = new URL(Astro.request.url);
@@ -67,7 +80,11 @@ try {
     LIMIT 100
   `);
   leads = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+} catch(e: any) {
+  // An empty desk and an unreadable table looked identical here. They are different problems.
+  console.error('[hei/leads] lead list could not be read -', e?.cause?.message || e?.message);
+  errorMsg = errorMsg || 'The lead queue could not be read, so this list is not showing what is actually there.';
+}
 
 let admins: any[] = [];
 try {
@@ -88,7 +105,10 @@ function timeAgo(d: any) {
   return Math.floor(hrs/24) + 'd ago';
 }
 ---
-<HeiAdminLayout title="Lead Queue" activeNav="hei">
+{/* HeiAdminLayout's prop is `active`, and its value is a NAV ITEM ID ('leads', 'legal', ...), not
+    "hei". `activeNav` was never read, so the sidebar highlight has always come from the URL
+    fallback in the layout — which is correct on every page. Passing the right id explicitly. */}
+<HeiAdminLayout title="Lead Queue" active="leads">
 <div style="padding-bottom:80px;">
   <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;position:sticky;top:0;z-index:10;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">

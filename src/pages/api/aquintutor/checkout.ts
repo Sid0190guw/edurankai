@@ -36,7 +36,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
       const gw = getGateway();
       if (!gw.verify(orderId, paymentId, signature)) { await markFailed(orderId).catch(() => {}); return j({ ok: false, error: 'payment could not be verified', unlocked: false }); }
       const r = await markPaid(orderId, paymentId);
-      return j({ ok: r.ok, unlocked: r.ok, error: r.error });
+      // `warning` is carried through so a paid-but-not-enrolled outcome is visible to the payer
+      // instead of reading as an ordinary success.
+      return j({ ok: r.ok, unlocked: r.ok, error: r.error, warning: r.warning });
     }
     if (b.action === 'authorize') {
       // a guardian authorizes a linked minor's pending order

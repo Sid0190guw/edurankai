@@ -34,13 +34,48 @@ export async function paymentByOrder(orderId: string): Promise<any | null> {
   return rows(await db.execute(sql`SELECT * FROM edu_course_payments WHERE order_id = ${orderId} ORDER BY id DESC LIMIT 1`))[0] || null;
 }
 /** Mark a payment captured and UNLOCK the course enrolment. */
-export async function markPaid(orderId: string, paymentId: string): Promise<{ ok: boolean; courseObjId: string | null; userId: string | null; error?: string }> {
+export async function markPaid(orderId: string, paymentId: string): Promise<{ ok: boolean; courseObjId: string | null; userId: string | null; error?: string; enrolled?: boolean; warning?: string }> {
   const { db, sql } = await ctx();
   const row = await paymentByOrder(orderId); if (!row) return { ok: false, courseObjId: null, userId: null };
   if (row.needs_guardian && !row.authorized_by) return { ok: false, courseObjId: null, userId: null, error: 'awaiting guardian authorization' };   // child-safety gate
-  await db.execute(sql`UPDATE edu_course_payments SET status = 'paid', payment_id = ${paymentId}, updated_at = now() WHERE order_id = ${orderId}`);
-  if (row.course_obj_id) { try { const { enrolInCourse } = await import('@/lib/enrolment'); await enrolInCourse(String(row.user_id), String(row.course_obj_id), null); } catch {} }
-  return { ok: true, courseObjId: row.course_obj_id ? String(row.course_obj_id) : null, userId: String(row.user_id) };
+  // A REFUND IS TERMINAL. markRefunded() sets status='refunded' and re-locks the enrolment, and this
+  // UPDATE had no guard — so the payer, who still holds the order id / payment id / signature their
+  // own browser was handed at checkout, could post them to /api/aquintutor/checkout again after the
+  // refund cleared and get the course back. The signature never expires (it is an HMAC over
+  // `order|payment` and nothing else), so "already verified once" is not a defence: the state has to
+  // be. unlockedByPayment() reads the latest status, so leaving it 'refunded' is what keeps the
+  // course locked.
+  if (row.status === 'refunded') {
+    console.error('[course-payments] confirm replayed against REFUNDED order', orderId, '- nothing was changed');
+    return { ok: false, courseObjId: null, userId: null, error: 'This payment was refunded, so it cannot be completed. Nothing was changed.' };
+  }
+  await db.execute(sql`UPDATE edu_course_payments SET status = 'paid', payment_id = ${paymentId}, updated_at = now() WHERE order_id = ${orderId} AND status <> 'refunded'`);
+  // THE ENROLMENT FAILURE WAS `catch {}` — the one shape this file must not have. The payment is
+  // recorded as paid by the line above, so a swallowed failure here is somebody who paid for a course
+  // and is not in it, with nothing on any screen and nothing in any log. courseAccess() still unlocks
+  // the course from the payment record, so this is not a lockout — but the enrolment row that carries
+  // progress is missing, and that has to be visible.
+  let enrolled = true;
+  let enrolError: string | undefined;
+  if (row.course_obj_id) {
+    try {
+      const { enrolInCourse } = await import('@/lib/enrolment');
+      await enrolInCourse(String(row.user_id), String(row.course_obj_id), null);
+    } catch (e: any) {
+      enrolled = false;
+      enrolError = String(e?.cause?.message || e?.message || 'unknown error');
+      console.error('[course-payments] PAID BUT NOT ENROLLED - order', orderId, 'user', String(row.user_id), 'course', String(row.course_obj_id), '-', enrolError);
+    }
+  }
+  return {
+    ok: true,
+    courseObjId: row.course_obj_id ? String(row.course_obj_id) : null,
+    userId: String(row.user_id),
+    enrolled,
+    // A WARNING, NEVER AN ERROR: the payment IS recorded and the course IS unlocked, so reporting
+    // this as a failed payment would be its own lie and would invite a second charge.
+    warning: enrolled ? undefined : 'Your payment is recorded and the course is unlocked, but setting up your enrolment did not finish. Our team has been alerted.',
+  };
 }
 export async function markFailed(orderId: string): Promise<void> {
   const { db, sql } = await ctx(); await db.execute(sql`UPDATE edu_course_payments SET status = 'failed', updated_at = now() WHERE order_id = ${orderId}`);
@@ -58,7 +93,10 @@ export async function grantComp(userId: string, courseObjId: string, planId: str
   const { db, sql } = await ctx();
   await db.execute(sql`INSERT INTO edu_course_payments (user_id, course_obj_id, plan, order_id, amount_paise, mode, authorized_by, status, payment_id)
     VALUES (${userId}, ${courseObjId}, ${planId}, ${'comp_' + Date.now()}, 0, 'comp', ${by}, 'paid', ${'comp'})`);
-  try { const { enrolInCourse } = await import('@/lib/enrolment'); await enrolInCourse(userId, courseObjId, by); } catch {}
+  // Same reason as markPaid: a comp grant that records a payment row and then fails to enrol leaves
+  // somebody with access on paper and no course. Never silent.
+  try { const { enrolInCourse } = await import('@/lib/enrolment'); await enrolInCourse(userId, courseObjId, by); }
+  catch (e: any) { console.error('[course-payments] comp granted but enrolment failed - user', userId, 'course', courseObjId, '-', e?.cause?.message || e?.message); }
 }
 
 /** Is this course unlocked for the user? Latest payment status (or a free plan) decides. */

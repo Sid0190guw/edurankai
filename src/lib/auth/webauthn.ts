@@ -13,13 +13,69 @@ import { publicOrigin } from '@/lib/public-url';
 
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-/** Effective origin + RP ID for this request. The authenticator signs over the
- *  page origin, so we trust the Origin header (falling back to the canonical
- *  domain), and derive the RP ID as that origin's hostname. */
+/**
+ * The domain this product's passkeys belong to. Anything at or under it is a legitimate place for a
+ * credential to live; anything else is not. Declared before the function that reads it — `const` is
+ * not hoisted.
+ */
+const CREDENTIAL_DOMAIN = 'edurankai.in';
+
+/** Extra hosts a deployment is willing to serve passkeys for (preview URLs), comma-separated. */
+function extraAllowedHosts(): string[] {
+  const raw = process.env.WEBAUTHN_ORIGINS || (import.meta as any)?.env?.WEBAUTHN_ORIGINS || '';
+  return String(raw)
+    .split(',')
+    .map((s) => { const t = s.trim(); try { return new URL(t).hostname.toLowerCase(); } catch { return t.toLowerCase(); } })
+    .filter(Boolean);
+}
+
+/**
+ * Effective origin + RP ID for this request.
+ *
+ * WHAT WAS WRONG. Both values were derived from the CALLER'S Origin header, and verifyRegistration /
+ * verifyAuthentication then checked the assertion against those same caller-supplied values. The
+ * check was therefore self-consistent rather than pinned: a page under an attacker's control could
+ * register a credential under an RP ID of its choosing and later assert it from that same forged
+ * origin, and every comparison would agree. The ECDSA signature still binds, so this is a weakened
+ * binding rather than an outright bypass — but tying a credential to an origin is the entire reason
+ * WebAuthn resists phishing, and that tie was not being enforced.
+ *
+ * WHAT IT DOES NOW. The Origin header is still used — it must be, because the authenticator signs
+ * over the exact page origin and this product is reachable at both the apex and www — but only after
+ * the host is checked against what this deployment legitimately serves: edurankai.in or a subdomain
+ * of it, the host the proxy says the request actually arrived on, anything named in
+ * WEBAUTHN_ORIGINS, and localhost outside production. An origin passing none of those is DISCARDED
+ * and the canonical origin used instead, so a forged Origin can no longer choose its own RP ID.
+ *
+ * Deliberately NOT pinned to one hard-coded host: existing credentials were registered under
+ * whichever hostname the person used, and rewriting the RP ID would make every one of them fail to
+ * match its stored rpIdHash — a silent lockout of everybody who signs in with a fingerprint.
+ */
 export function rpFromRequest(request: Request): { origin: string; rpId: string } {
-  let origin = request.headers.get('origin') || '';
-  if (!origin || /localhost|127\.|0\.0\.0\.0/i.test(origin)) origin = publicOrigin(request);
-  let rpId = 'edurankai.in';
+  const served = publicOrigin(request);
+  const claimed = request.headers.get('origin') || '';
+
+  let origin = served;
+  if (claimed) {
+    let host = '';
+    try { host = new URL(claimed).hostname.toLowerCase(); } catch { host = ''; }
+    let servedHost = '';
+    try { servedHost = new URL(served).hostname.toLowerCase(); } catch { servedHost = ''; }
+
+    const isLocal = /^(localhost|127\.|0\.0\.0\.0|\[::1\])/i.test(host);
+    const allowed = !!host && (
+      host === CREDENTIAL_DOMAIN ||
+      host.endsWith('.' + CREDENTIAL_DOMAIN) ||
+      (!!servedHost && host === servedHost) ||
+      extraAllowedHosts().indexOf(host) !== -1 ||
+      (isLocal && !import.meta.env.PROD)
+    );
+
+    if (allowed) origin = claimed;
+    else console.error('[webauthn] refusing caller-supplied origin', claimed, '- using', served);
+  }
+
+  let rpId = CREDENTIAL_DOMAIN;
   try { rpId = new URL(origin).hostname; } catch (_) {}
   return { origin, rpId };
 }

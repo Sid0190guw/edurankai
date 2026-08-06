@@ -119,13 +119,52 @@ export async function removeDoc(userId: string, id: number): Promise<boolean> {
 /** HR review. Verified documents are locked from further edits by the hire. */
 export async function reviewDoc(id: number, status: DocStatus, by: string, note?: string): Promise<void> {
   const { db, sql } = await ctx();
-  await db.execute(sql`UPDATE hr_onboarding_documents SET status = ${status}, review_note = ${note || null}, reviewed_by = ${by}, reviewed_at = now() WHERE id = ${id}`);
+  const changed = rows(await db.execute(sql`UPDATE hr_onboarding_documents SET status = ${status}, review_note = ${note || null}, reviewed_by = ${by}, reviewed_at = now() WHERE id = ${id} RETURNING user_id, doc_type, title`));
+
+  // THE PERSON WHOSE DOCUMENT IT IS GETS TOLD.
+  //
+  // This wrote the status and an audit entry and sent nothing. addDoc() in this same file
+  // deliberately records an activity event when a hire submits, precisely so the hire is not blocked
+  // by silence — and the reverse direction, HR back to the hire, was left silent. So a joiner who had
+  // done their part had their credential bounced with a note, and learned about it only if they
+  // happened to revisit /portal/onboarding and read an amber chip. Meanwhile progress() reads
+  // complete only when EVERY document is verified, so one quietly rejected credential held the whole
+  // step open indefinitely, waiting on somebody who had not been told anything was wrong.
+  //
+  // Best-effort: the decision above is already committed, and a notification failure must never
+  // report the review as having failed. It is logged with the real Postgres reason rather than
+  // dropped.
+  const reviewed = changed[0];
+  if (reviewed?.user_id && (status === 'rejected' || status === 'verified')) {
+    try {
+      const { notifyUser } = await import('@/lib/notify');
+      const what = String(reviewed.title || docTypeLabel(String(reviewed.doc_type || 'other')));
+      await notifyUser(String(reviewed.user_id), {
+        title: status === 'rejected' ? 'A joining document needs re-sending' : 'Joining document verified',
+        body: status === 'rejected'
+          ? what + ' was not accepted' + (note ? ': ' + note : '.') + ' Share it again from your onboarding page.'
+          : what + ' has been verified. Nothing further is needed for it.',
+        type: 'hire',
+        actionUrl: '/portal/onboarding',
+        entityType: 'hr_onboarding_document',
+        entityId: String(id),
+      });
+    } catch (e: any) {
+      console.error('[hr-onboarding] the hire was NOT told about document', id, '-', e?.cause?.message || e?.message);
+    }
+  }
+
   // Verifying a credential is a hiring decision — it needs a record of who decided and why.
   try {
     const { logAudit } = await import('@/lib/audit');
     await logAudit({ userId: by, action: 'hr.onboarding_doc.' + status, entity: 'hr_onboarding_document',
       entityId: String(id), diff: { status, note: note || null } });
-  } catch (_) {}
+  } catch (e: any) {
+    // The decision itself is already committed above, so this cannot abort — but audit_log is the
+    // ONLY record of who verified a new hire's credential and why, and a bare catch here meant that
+    // record could vanish with nothing anywhere noting that it had.
+    console.error('[hr-onboarding] the audit record for document', id, 'review by', by, 'was NOT written -', e?.cause?.message || e?.message);
+  }
 }
 /** Everything awaiting HR, newest first, with who submitted it. */
 export async function pendingForReview(limit = 100): Promise<any[]> {

@@ -58,69 +58,123 @@ function sm2(prevEF: number, prevInterval: number, prevRep: number, quality: num
   return { ef: Math.round(ef * 100) / 100, interval, rep };
 }
 
+// The real Postgres reason is on e.cause; e.message is only the failed SQL. Declared above the
+// handler that reads it - `const` is not hoisted.
+const logFail = (tag: string, e: any) => console.error('[portal/flashcards] ' + tag, e?.cause?.message || e?.message);
+
+/**
+ * THE ONLY SENTENCES THIS PAGE SAYS ABOUT A WRITE, keyed by a fixed code.
+ *
+ * `flashMsg` was assigned inside the handler and then discarded by the redirect three lines later,
+ * so not one of these messages had ever reached a screen - and the handler's catch was empty, so a
+ * deck or a card that failed to save vanished with no message and no log entry either. The code
+ * travels in the query string; nothing variable from the request does.
+ */
+const FLASH: Record<string, { ok: boolean; text: string }> = {
+  deck_made: { ok: true, text: 'Deck created.' },
+  card_added: { ok: true, text: 'Card added.' },
+  card_saved: { ok: true, text: 'Card updated.' },
+  card_gone: { ok: true, text: 'Card deleted.' },
+  deck_gone: { ok: true, text: 'Deck deleted.' },
+  reviewed: { ok: true, text: 'Review recorded.' },
+  need_title: { ok: false, text: 'Give the deck a title of at least two characters.' },
+  need_sides: { ok: false, text: 'A card needs both a front and a back.' },
+  failed: { ok: false, text: 'That did not save. Nothing you typed is lost - try again in a moment.' },
+};
+
 let flashMsg = '';
+let flashOk = true;
 
 // --- Handle POST ---
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = String(fd.get('action') || '');
+  let code = '';
   try {
     if (action === 'create_deck') {
       const title = String(fd.get('title') || '').trim().slice(0, 200);
       const subject = String(fd.get('subject') || '').trim().slice(0, 120);
       const isPublic = fd.get('is_public') === 'on';
-      if (title.length >= 2) {
+      if (title.length < 2) {
+        code = 'need_title';
+      } else {
         await db.execute(sql`
           INSERT INTO flashcard_decks (user_id, title, subject, is_public)
           VALUES (${user.id}, ${title}, ${subject || null}, ${isPublic})
         `);
-        flashMsg = 'Deck created.';
+        code = 'deck_made';
       }
     } else if (action === 'add_card') {
       const deckId = String(fd.get('deck_id') || '');
       const front = String(fd.get('front') || '').trim();
       const back = String(fd.get('back') || '').trim();
       const hint = String(fd.get('hint') || '').trim();
-      if (deckId && front && back) {
-        const today = new Date().toISOString().slice(0, 10);
-        await db.execute(sql`
+      if (!deckId || !front || !back) {
+        code = 'need_sides';
+      } else {
+        // THE CARD ONLY LANDS IN A DECK THIS PERSON OWNS. The INSERT used to take deck_id
+        // straight from the form, so a posted id belonging to somebody else's deck would have
+        // been accepted; the ownership test was only on the counter update beside it.
+        // due_date comes from the database, not the render process - the two disagree by a day
+        // whenever their timezones do, and "due today" is exactly the claim that must not slip.
+        const ins = rows(await db.execute(sql`
           INSERT INTO flashcards (deck_id, front, back, hint, due_date)
-          VALUES (${deckId}, ${front}, ${back}, ${hint || null}, ${today}::date)
-        `);
-        await db.execute(sql`
-          UPDATE flashcard_decks SET card_count = card_count + 1 WHERE id = ${deckId} AND user_id = ${user.id}
-        `);
-        flashMsg = 'Card added.';
+          SELECT id, ${front}, ${back}, ${hint || null}, CURRENT_DATE
+            FROM flashcard_decks WHERE id = ${deckId}::uuid AND user_id = ${user.id}
+          RETURNING id
+        `));
+        if (ins.length === 0) {
+          code = 'failed';
+        } else {
+          await db.execute(sql`
+            UPDATE flashcard_decks SET card_count = card_count + 1 WHERE id = ${deckId}::uuid AND user_id = ${user.id}
+          `);
+          code = 'card_added';
+        }
       }
     } else if (action === 'edit_card') {
       const cardId = String(fd.get('card_id') || '');
       const front = String(fd.get('front') || '').trim();
       const back = String(fd.get('back') || '').trim();
       const hint = String(fd.get('hint') || '').trim();
-      if (cardId && front && back) {
-        await db.execute(sql`
+      if (!cardId || !front || !back) {
+        code = 'need_sides';
+      } else {
+        const upd = rows(await db.execute(sql`
           UPDATE flashcards SET front = ${front}, back = ${back}, hint = ${hint || null}
-          WHERE id = ${cardId} AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})
-        `);
-        flashMsg = 'Card updated.';
+          WHERE id = ${cardId}::uuid AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})
+          RETURNING id
+        `));
+        code = upd.length > 0 ? 'card_saved' : 'failed';
       }
     } else if (action === 'delete_card') {
       const cardId = String(fd.get('card_id') || '');
       const deckId = String(fd.get('deck_id') || '');
       if (cardId && deckId) {
-        await db.execute(sql`
-          DELETE FROM flashcards WHERE id = ${cardId}
+        // THE COUNTER FOLLOWS THE DELETE, IT DOES NOT ANTICIPATE IT. The decrement used to run
+        // whenever a card id and a deck id were posted at all - so a card id that matched nothing
+        // (a stale form, a double submit, a made-up id) took one off the count anyway, and the
+        // deck's card total drifted away from the cards actually in it with nothing to correct it.
+        const del = rows(await db.execute(sql`
+          DELETE FROM flashcards WHERE id = ${cardId}::uuid
           AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})
-        `);
-        await db.execute(sql`
-          UPDATE flashcard_decks SET card_count = GREATEST(0, card_count - 1) WHERE id = ${deckId} AND user_id = ${user.id}
-        `);
+          RETURNING id
+        `));
+        if (del.length > 0) {
+          await db.execute(sql`
+            UPDATE flashcard_decks SET card_count = GREATEST(0, card_count - 1) WHERE id = ${deckId}::uuid AND user_id = ${user.id}
+          `);
+          code = 'card_gone';
+        } else {
+          code = 'failed';
+        }
       }
     } else if (action === 'delete_deck') {
       const deckId = String(fd.get('deck_id') || '');
       if (deckId) {
-        await db.execute(sql`DELETE FROM flashcards WHERE deck_id = ${deckId} AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})`);
-        await db.execute(sql`DELETE FROM flashcard_decks WHERE id = ${deckId} AND user_id = ${user.id}`);
+        await db.execute(sql`DELETE FROM flashcards WHERE deck_id = ${deckId}::uuid AND deck_id IN (SELECT id FROM flashcard_decks WHERE user_id = ${user.id})`);
+        const del = rows(await db.execute(sql`DELETE FROM flashcard_decks WHERE id = ${deckId}::uuid AND user_id = ${user.id} RETURNING id`));
+        code = del.length > 0 ? 'deck_gone' : 'failed';
       }
     } else if (action === 'review') {
       const cardId = String(fd.get('card_id') || '');
@@ -137,23 +191,32 @@ if (Astro.request.method === 'POST') {
         if (cArr.length) {
           const c = cArr[0];
           const next = sm2(parseFloat(c.ease_factor), parseInt(c.interval_days, 10), parseInt(c.repetition_count, 10), quality);
-          const due = new Date();
-          due.setDate(due.getDate() + next.interval);
-          const dueStr = due.toISOString().slice(0, 10);
+          // The next due date is counted forward from the DATABASE's today, not from the render
+          // process's. Both the due list above and this write then agree about which day it is.
           await db.execute(sql`
             UPDATE flashcards
             SET ease_factor = ${next.ef},
                 interval_days = ${next.interval},
                 repetition_count = ${next.rep},
-                due_date = ${dueStr}::date,
+                due_date = CURRENT_DATE + ${next.interval}::int,
                 last_reviewed_at = NOW()
-            WHERE id = ${cardId}
+            WHERE id = ${cardId}::uuid
           `);
+          code = 'reviewed';
+        } else {
+          code = 'failed';
         }
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    // NEVER SWALLOWED. This catch was empty, so every failed write above redirected exactly like a
+    // successful one and the reason reached nobody at all.
+    logFail(action || 'post', e);
+    code = 'failed';
+  }
   const url = new URL(Astro.request.url);
+  url.searchParams.delete('msg');
+  if (code) url.searchParams.set('msg', code);
   const back = url.searchParams.toString();
   return Astro.redirect('/portal/flashcards' + (back ? ('?' + back) : ''));
 }
@@ -162,6 +225,10 @@ if (Astro.request.method === 'POST') {
 const url = new URL(Astro.request.url);
 const activeDeckId = url.searchParams.get('deck') || '';
 const view = url.searchParams.get('view') || 'study';
+// The banner is looked up from a fixed table by code. Nothing typed into the address bar can
+// reach the markup through it.
+const flashed = FLASH[url.searchParams.get('msg') || ''] || null;
+if (flashed) { flashMsg = flashed.text; flashOk = flashed.ok; }
 
 const decksRes = await db.execute(sql`
   SELECT d.id, d.title, d.subject, d.card_count, d.is_public, d.created_at,
@@ -315,6 +382,7 @@ const totalCards = decks.reduce((s: number, d: any) => s + parseInt(d.card_count
   .card-list-row .actions button:hover { color: #FF4F00; }
 
   .flash-msg { background: #e9f7e9; border: 1px solid #98c498; color: #2e5d2e; padding: 10px 14px; border-radius: 8px; margin-bottom: 18px; font-family: 'Geist Mono', monospace; font-size: 11px; }
+  .flash-msg.bad { background: #fbeaea; border-color: #d99a9a; color: #8a2b2b; }
 
   .legend { background: #FBF9F6; border: 1px solid rgba(14,11,8,0.08); border-radius: 8px; padding: 12px 14px; margin-top: 16px; font-size: 12px; color: #5b524a; line-height: 1.5; }
   .legend strong { color: #0E0B08; font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.10em; text-transform: uppercase; }
@@ -328,7 +396,7 @@ const totalCards = decks.reduce((s: number, d: any) => s + parseInt(d.card_count
   <h1>Spaced-repetition <em>flashcards</em></h1>
   <p class="sub">Active recall with the SM-2 algorithm. Each review adjusts the card's ease factor and pushes the next due date out exponentially as you master it.</p>
 
-  {flashMsg && <div class="flash-msg">{flashMsg}</div>}
+  {flashMsg && <div class={flashOk ? 'flash-msg' : 'flash-msg bad'}>{flashMsg}</div>}
 
   <div class="stats">
     <div class="stat"><div class="k">Decks</div><div class="v">{decks.length}</div></div>

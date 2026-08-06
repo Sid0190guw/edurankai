@@ -29,7 +29,21 @@ export function ensureApiKeysSchema(): Promise<void> {
   return ready;
 }
 
-const EMBED_SECRET = process.env.API_EMBED_SECRET || process.env.SESSION_SECRET || 'edurankai-embed-secret-v1';
+/**
+ * Signing key for lab-embed tokens.
+ *
+ * It used to end `|| 'edurankai-embed-secret-v1'`. A secret written into the repository is not a
+ * secret: with neither environment variable set, anyone who could read this file could mint a valid
+ * embed token, and src/middleware.ts accepts one as a reason to serve a gated lab WITHOUT A LOGIN.
+ * The literal is gone, and the two functions below fail CLOSED when nothing is configured rather
+ * than falling back to a key everybody has.
+ *
+ * OPERATIONAL CONSEQUENCE, stated plainly: if neither API_EMBED_SECRET nor SESSION_SECRET is set on
+ * the deployment, partner LMS lab embedding stops working until one of them is. That is the correct
+ * direction — an embed gate keyed on a public string is not a gate — but it is a real behaviour
+ * change and it is in the report.
+ */
+const EMBED_SECRET = String(process.env.API_EMBED_SECRET || process.env.SESSION_SECRET || '').trim();
 
 function sha256(s: string): string { return crypto.createHash('sha256').update(s).digest('hex'); }
 function b64url(buf: Buffer): string { return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
@@ -73,13 +87,28 @@ export async function validateApiKey(request: Request): Promise<{ id: string; or
 }
 
 // ---- signed lab-embed tokens (HMAC, no DB lookup so middleware stays fast) ----
+
+/** True when a real signing key is configured. Never assume; ask. */
+export function embedTokensConfigured(): boolean { return !!EMBED_SECRET; }
+
+/** Returns '' when no key is configured, so nothing can be minted against a public fallback. */
 export function signEmbedToken(slug: string): string {
+  if (!EMBED_SECRET) {
+    console.error('[api-keys] API_EMBED_SECRET (or SESSION_SECRET) is not set; refusing to mint a lab embed token.');
+    return '';
+  }
   return b64url(crypto.createHmac('sha256', EMBED_SECRET).update('lab:' + slug).digest());
 }
+
+/** FAILS CLOSED: no key configured means no token verifies, so the login gate stands. */
 export function verifyEmbedToken(slug: string, token: string): boolean {
   if (!slug || !token) return false;
+  if (!EMBED_SECRET) {
+    console.error('[api-keys] embed token presented but no signing key is configured; refusing.');
+    return false;
+  }
   const expected = signEmbedToken(slug);
-  if (expected.length !== token.length) return false;
+  if (!expected || expected.length !== token.length) return false;
   try { return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(token)); } catch (_) { return false; }
 }
 

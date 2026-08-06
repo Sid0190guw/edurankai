@@ -61,6 +61,13 @@ async function bootstrapSchema(): Promise<void> {
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), message_id UUID, to_email VARCHAR(255),
     from_email VARCHAR(255), subject TEXT, status VARCHAR(20) NOT NULL DEFAULT 'queued',
     provider VARCHAR(20), error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  // THE RFC ID GETS ITS OWN COLUMN. email_logs.message_id is uuid-typed here, and every transport
+  // caller was passing an RFC id ("<uuid@host>") or an empty string into it. Those INSERTs threw
+  // `invalid input syntax for type uuid` into a `.catch(() => {})` — so a send that FAILED at the
+  // SMTP layer left no trace at all, which is half of why the reading pane could claim delivery.
+  // Additive, never destructive: live rows exist under two historical shapes of this table.
+  try { await db.execute(sql`ALTER TABLE email_logs ADD COLUMN IF NOT EXISTS rfc_message_id TEXT`); } catch (e) {}
+  try { await db.execute(sql`CREATE INDEX IF NOT EXISTS email_logs_msg_idx ON email_logs(message_id)`); } catch (e) {}
   // Per-open read-receipt log. One row per read event (so multiple opens are
   // visible). Recipient_email is for external reads (pixel tracker), user_id
   // is for internal reads.
@@ -367,11 +374,120 @@ export async function clearMailField(field: 'smtp_host' | 'smtp_user' | 'smtp_pa
   await db.execute(sql.raw(`UPDATE mail_config SET ${field} = NULL, updated_at = NOW() WHERE id = 1`));
 }
 
-export async function logOutbound(p: { messageId: string; to: string; from: string; subject: string; status: string; provider: string; error?: string | null }) {
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function logOutbound(p: { messageId: string; to: string; from: string; subject: string; status: string; provider: string; error?: string | null; rfcMessageId?: string | null }) {
+  // message_id is uuid-typed; anything that is not a uuid (an RFC id, an empty string) goes to
+  // rfc_message_id instead of poisoning the whole INSERT. See the note in bootstrapSchema.
+  const mailMessageId = UUID_RE.test(String(p.messageId || '')) ? String(p.messageId) : null;
+  const rfc = (p.rfcMessageId || (mailMessageId ? null : (p.messageId || null))) || null;
   await db.execute(sql`
-    INSERT INTO email_logs (message_id, to_email, from_email, subject, status, provider, error)
-    VALUES (${p.messageId}, ${p.to}, ${p.from}, ${p.subject}, ${p.status}, ${p.provider}, ${p.error || null})
+    INSERT INTO email_logs (message_id, rfc_message_id, to_email, from_email, subject, status, provider, error)
+    VALUES (${mailMessageId}, ${rfc}, ${p.to}, ${p.from}, ${p.subject}, ${p.status}, ${p.provider}, ${p.error || null})
   `);
+}
+
+// ---- Delivery truth ----------------------------------------------------------------
+//
+// WHAT THE READING PANE USED TO DO. It looked up email_logs by rfc_message_id, while
+// /api/mail/send wrote those rows keyed by the mail_messages UUID. Nothing ever matched, so
+// `m.delivery` was always undefined and the template's ternary fell through to a green
+// "Delivered" badge on EVERY sent message — including one whose SMTP attempt had hard-failed.
+// (The same query also bound `::text[]` against a uuid column, which threw and blanked the whole
+// thread.) This is the exact failure mode this project keeps producing: a surface reporting
+// success while nothing happened.
+//
+// The rule now: a message is only called delivered when something says so. Internal-only mail is
+// "delivered" because we wrote the recipient's mailbox row ourselves and can see it. External mail
+// is delivered only when a transport logged 'sent'. Anything else says what it is, and an unknown
+// state says "unknown" — never "Delivered".
+
+export type DeliveryState = 'internal' | 'sent' | 'partial' | 'failed' | 'no_transport' | 'unknown';
+
+export interface DeliveryStatus {
+  state: DeliveryState;
+  /** External recipients on the message. 0 means the mail never needed to leave. */
+  externalCount: number;
+  sent: number;
+  failed: number;
+  provider: string | null;
+  error: string | null;
+}
+
+/**
+ * Roll up email_logs per message. Cast BOTH sides to text: email_logs exists in production under
+ * two historical shapes (uuid and text message_id) and this read must work against either.
+ */
+export async function getDeliveryStatuses(
+  messageIds: string[],
+  externalCounts: Record<string, number> = {},
+): Promise<Record<string, DeliveryStatus>> {
+  const out: Record<string, DeliveryStatus> = {};
+  const ids = (messageIds || []).filter((x) => typeof x === 'string' && x.length > 0);
+  if (!ids.length) return out;
+
+  let logRows: any[] = [];
+  try {
+    const r = await db.execute(sql`
+      SELECT message_id::text AS mid, status, provider, error, created_at
+      FROM email_logs
+      WHERE message_id::text = ANY(${ids}::text[])
+      ORDER BY created_at DESC
+    `);
+    logRows = rows(r);
+  } catch (e: any) {
+    // Not swallowed: a delivery read that did not run must not be reported as a delivery.
+    console.error('[mail] delivery status read failed:', (e as any)?.cause?.message || (e as any)?.message);
+    for (const id of ids) {
+      out[id] = { state: 'unknown', externalCount: externalCounts[id] || 0, sent: 0, failed: 0, provider: null, error: null };
+    }
+    return out;
+  }
+
+  for (const id of ids) {
+    const mine = logRows.filter((l) => String(l.mid) === id);
+    const externalCount = externalCounts[id] || 0;
+    const sent = mine.filter((l) => l.status === 'sent').length;
+    const failed = mine.filter((l) => l.status === 'failed' || l.status === 'bounced').length;
+    const noTransport = mine.filter((l) => l.status === 'no_transport').length;
+    const firstBad = mine.find((l) => l.error);
+
+    let state: DeliveryState;
+    if (externalCount === 0 && !mine.length) state = 'internal';
+    else if (noTransport && !sent) state = 'no_transport';
+    else if (failed && sent) state = 'partial';
+    else if (failed) state = 'failed';
+    else if (sent) state = 'sent';
+    else state = 'unknown';
+
+    out[id] = {
+      state,
+      externalCount,
+      sent,
+      failed: failed + noTransport,
+      provider: mine[0]?.provider || null,
+      error: firstBad?.error || null,
+    };
+  }
+  return out;
+}
+
+/** One sentence per state. Kept here so the composer's toast and the thread badge cannot disagree. */
+export function deliveryWording(d: DeliveryStatus): { label: string; tone: 'ok' | 'warn' | 'bad' | 'muted'; detail: string } {
+  switch (d.state) {
+    case 'internal':
+      return { label: 'Delivered in app', tone: 'ok', detail: 'Everyone on this message has a mailbox here, so it was placed in their inbox directly. It never needed a mail server.' };
+    case 'sent':
+      return { label: 'Sent', tone: 'ok', detail: 'Handed to the mail server for ' + d.externalCount + ' address' + (d.externalCount === 1 ? '' : 'es') + ' outside the organisation. Acceptance by their server is not something we can see from here.' };
+    case 'partial':
+      return { label: 'Partly delivered', tone: 'warn', detail: d.sent + ' address' + (d.sent === 1 ? '' : 'es') + ' accepted, ' + d.failed + ' not. ' + (d.error || '') };
+    case 'failed':
+      return { label: 'Not delivered', tone: 'bad', detail: 'The mail server refused this message. ' + (d.error || 'No reason was recorded.') };
+    case 'no_transport':
+      return { label: 'Not sent', tone: 'bad', detail: 'This message has recipients outside the organisation and no mail server is connected, so it went nowhere. It is saved in Sent.' };
+    default:
+      return { label: 'Delivery unknown', tone: 'muted', detail: 'No delivery record was found for this message. It has not been confirmed as delivered.' };
+  }
 }
 
 // ---- Read-side helpers for the mail client ----
@@ -401,22 +517,240 @@ export async function getFolderCounts(userId: string): Promise<Record<string, nu
 
 export interface ThreadRow {
   thread_id: string; message_id: string; subject: string; snippet: string;
-  from_name: string; from_email: string; created_at: string;
+  from_name: string; from_email: string; from_user_id: string | null; created_at: string;
   is_read: boolean; is_starred: boolean; has_attachments: boolean;
   folder: string; labels: string[]; thread_count: number; direction: string;
+  is_draft: boolean; participants?: string;
 }
 
-// List the latest message per thread within a folder for a user, with optional search.
-export async function listFolder(userId: string, folder: Folder, q?: string, starred?: boolean): Promise<ThreadRow[]> {
+// ---- Search ------------------------------------------------------------------------
+//
+// WHAT PEOPLE ACTUALLY SEARCH. The old query matched subject, snippet, from_name and from_email —
+// so "the paragraph I wrote about the Kerala site visit" was unfindable, because the BODY was never
+// looked at, and "everything from Anita in July" was unexpressible, because there was no notion of
+// a sender filter or a date. Both are the ordinary way a person looks for mail they remember
+// having rather than mail they can name.
+//
+// The grammar is the one people already have in their fingers, and every operator is optional:
+//   from:anita  to:accounts  subject:invoice  label:payroll
+//   has:attachment  is:unread  is:starred  is:read
+//   after:2026-07-01  before:2026-08-01  after:7d  after:today  after:yesterday
+//   in:anywhere        (search every folder except Trash and Spam)
+//   "exact phrase"     (quoted terms are kept whole)
+// Anything not recognised as an operator is free text and is matched against subject, body,
+// snippet, sender AND recipients — so a plain search still behaves like a plain search.
+//
+// The parse result is ECHOED ON SCREEN (describe). If a search finds nothing, the person can see
+// what was actually searched for rather than guessing whether the operator was understood.
+
+export interface MailQuery {
+  text: string[];
+  from: string[];
+  to: string[];
+  subject: string[];
+  label: string | null;
+  hasAttachment: boolean;
+  unreadOnly: boolean;
+  readOnly: boolean;
+  starredOnly: boolean;
+  after: Date | null;
+  before: Date | null;
+  everywhere: boolean;
+  raw: string;
+  active: boolean;
+  describe: string;
+}
+
+const EMPTY_QUERY: MailQuery = {
+  text: [], from: [], to: [], subject: [], label: null,
+  hasAttachment: false, unreadOnly: false, readOnly: false, starredOnly: false,
+  after: null, before: null, everywhere: false, raw: '', active: false, describe: '',
+};
+
+function parseWhen(v: string): Date | null {
+  const s = (v || '').trim().toLowerCase();
+  if (!s) return null;
+  const now = new Date();
+  if (s === 'today') return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (s === 'yesterday') return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const rel = /^(\d{1,4})\s*(d|day|days|w|week|weeks|m|month|months|y|year|years)$/.exec(s);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unit = rel[2][0];
+    const d = new Date(now);
+    if (unit === 'd') d.setDate(d.getDate() - n);
+    else if (unit === 'w') d.setDate(d.getDate() - n * 7);
+    else if (unit === 'm') d.setMonth(d.getMonth() - n);
+    else d.setFullYear(d.getFullYear() - n);
+    return d;
+  }
+  const iso = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/.exec(s);
+  if (iso) return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+  const dmy = /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/.exec(s);
+  if (dmy) return new Date(Number(dmy[3]), Number(dmy[2]) - 1, Number(dmy[1]));
+  const t = Date.parse(s);
+  return isNaN(t) ? null : new Date(t);
+}
+
+function fmtDay(d: Date): string {
+  return d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+export function parseMailQuery(raw: string): MailQuery {
+  const q: MailQuery = { ...EMPTY_QUERY, text: [], from: [], to: [], subject: [], raw: String(raw || '') };
+  const src = q.raw.trim();
+  if (!src) return q;
+
+  // Split on whitespace but keep "quoted phrases" and field:"quoted values" whole.
+  const tokens = src.match(/[a-zA-Z]+:"[^"]*"|"[^"]*"|\S+/g) || [];
+  for (const tokRaw of tokens) {
+    const tok = tokRaw.trim();
+    if (!tok) continue;
+    const m = /^([a-zA-Z]+):(.*)$/.exec(tok);
+    const unquote = (s: string) => s.replace(/^"(.*)"$/, '$1').trim();
+    if (m) {
+      const field = m[1].toLowerCase();
+      const value = unquote(m[2]);
+      if (!value && field !== 'is' && field !== 'has') continue;
+      if (field === 'from') { q.from.push(value.toLowerCase()); continue; }
+      if (field === 'to' || field === 'cc' || field === 'bcc') { q.to.push(value.toLowerCase()); continue; }
+      if (field === 'subject' || field === 'title') { q.subject.push(value.toLowerCase()); continue; }
+      if (field === 'label' || field === 'tag') { q.label = value; continue; }
+      if (field === 'has') {
+        if (/attach|file|link|doc/.test(value.toLowerCase())) q.hasAttachment = true;
+        continue;
+      }
+      if (field === 'is') {
+        const v = value.toLowerCase();
+        if (v === 'unread') q.unreadOnly = true;
+        else if (v === 'read') q.readOnly = true;
+        else if (v === 'starred' || v === 'star') q.starredOnly = true;
+        continue;
+      }
+      if (field === 'after' || field === 'since' || field === 'newer') { q.after = parseWhen(value); continue; }
+      if (field === 'before' || field === 'until' || field === 'older') {
+        const d = parseWhen(value);
+        // `before:` is inclusive of the named day — nobody means "up to midnight that morning".
+        if (d) { d.setDate(d.getDate() + 1); q.before = d; }
+        continue;
+      }
+      if (field === 'in') {
+        const v = value.toLowerCase();
+        if (v === 'anywhere' || v === 'all' || v === 'everywhere') q.everywhere = true;
+        continue;
+      }
+      // An unknown field: treat the whole token as free text rather than dropping it silently.
+      q.text.push(tok.toLowerCase());
+      continue;
+    }
+    const plain = unquote(tok).toLowerCase();
+    if (plain) q.text.push(plain);
+  }
+
+  const bits: string[] = [];
+  if (q.text.length) bits.push('“' + q.text.join(' ') + '”');
+  if (q.from.length) bits.push('from ' + q.from.join(', '));
+  if (q.to.length) bits.push('to ' + q.to.join(', '));
+  if (q.subject.length) bits.push('subject containing ' + q.subject.join(', '));
+  if (q.label) bits.push('labelled ' + q.label);
+  if (q.hasAttachment) bits.push('with an attachment');
+  if (q.unreadOnly) bits.push('unread only');
+  if (q.readOnly) bits.push('read only');
+  if (q.starredOnly) bits.push('starred only');
+  if (q.after) bits.push('on or after ' + fmtDay(q.after));
+  if (q.before) { const b = new Date(q.before); b.setDate(b.getDate() - 1); bits.push('on or before ' + fmtDay(b)); }
+  q.describe = bits.join(' · ');
+  q.active = bits.length > 0;
+  return q;
+}
+
+export interface ListFolderOptions {
+  folder: Folder;
+  /** The Starred pseudo-folder in the rail. */
+  starred?: boolean;
+  /** A label pseudo-folder in the rail; searches every folder except Trash and Spam. */
+  label?: string | null;
+  query?: string;
+  limit?: number;
+}
+
+export interface FolderListing {
+  rows: ThreadRow[];
+  query: MailQuery;
+  /** True when the listing is narrowed by anything other than the folder itself. */
+  filtered: boolean;
+  scopeLabel: string;
+}
+
+// List the latest message per thread, with search. One statement for the threads, one for the
+// participant names (a window function cannot do DISTINCT, and N+1 per row is what made the old
+// reading pane slow).
+export async function listFolder(userId: string, opts: ListFolderOptions): Promise<FolderListing> {
   await ensureMailSchema();
-  const search = q && q.trim() ? `%${q.trim().toLowerCase()}%` : null;
+  const q = parseMailQuery(opts.query || '');
+  const limit = Math.min(Math.max(opts.limit || 100, 1), 200);
+  const wide = q.everywhere || !!opts.label;
+
+  let where = sql`b.user_id = ${userId}`;
+  let scopeLabel: string;
+  if (opts.label) {
+    where = sql`${where} AND b.labels @> ARRAY[${opts.label}]::text[] AND b.folder NOT IN ('trash','spam')`;
+    scopeLabel = 'Label: ' + opts.label;
+  } else if (opts.starred) {
+    where = sql`${where} AND b.is_starred = true AND b.folder <> 'trash'`;
+    scopeLabel = 'Starred';
+  } else if (q.everywhere) {
+    where = sql`${where} AND b.folder NOT IN ('trash','spam')`;
+    scopeLabel = 'All mail';
+  } else {
+    where = sql`${where} AND b.folder = ${opts.folder}`;
+    scopeLabel = (FOLDERS.find((f) => f.key === opts.folder)?.label) || opts.folder;
+  }
+
+  if (q.label && !opts.label) where = sql`${where} AND b.labels @> ARRAY[${q.label}]::text[]`;
+  if (q.unreadOnly) where = sql`${where} AND b.is_read = false`;
+  if (q.readOnly) where = sql`${where} AND b.is_read = true`;
+  if (q.starredOnly) where = sql`${where} AND b.is_starred = true`;
+  if (q.hasAttachment) where = sql`${where} AND m.has_attachments = true`;
+  if (q.after) where = sql`${where} AND m.created_at >= ${q.after.toISOString()}::timestamptz`;
+  if (q.before) where = sql`${where} AND m.created_at < ${q.before.toISOString()}::timestamptz`;
+
+  for (const term of q.from) {
+    const like = '%' + term + '%';
+    where = sql`${where} AND (lower(coalesce(m.from_email,'')) LIKE ${like} OR lower(coalesce(m.from_name,'')) LIKE ${like})`;
+  }
+  for (const term of q.to) {
+    const like = '%' + term + '%';
+    where = sql`${where} AND EXISTS (SELECT 1 FROM mail_recipients r WHERE r.message_id = m.id
+      AND (lower(coalesce(r.email,'')) LIKE ${like} OR lower(coalesce(r.name,'')) LIKE ${like}))`;
+  }
+  for (const term of q.subject) {
+    const like = '%' + term + '%';
+    where = sql`${where} AND lower(coalesce(m.subject,'')) LIKE ${like}`;
+  }
+  // Free text: every term must appear SOMEWHERE on the message — subject, body, snippet, sender or
+  // any recipient. Body included, which is the whole point.
+  for (const term of q.text) {
+    const like = '%' + term + '%';
+    where = sql`${where} AND (
+      lower(coalesce(m.subject,'')) LIKE ${like}
+      OR lower(coalesce(m.snippet,'')) LIKE ${like}
+      OR lower(coalesce(m.body_text,'')) LIKE ${like}
+      OR lower(coalesce(m.body_html,'')) LIKE ${like}
+      OR lower(coalesce(m.from_name,'')) LIKE ${like}
+      OR lower(coalesce(m.from_email,'')) LIKE ${like}
+      OR EXISTS (SELECT 1 FROM mail_recipients r WHERE r.message_id = m.id
+                 AND (lower(coalesce(r.email,'')) LIKE ${like} OR lower(coalesce(r.name,'')) LIKE ${like}))
+    )`;
+  }
+
   const r = await db.execute(sql`
     WITH box AS (
-      SELECT b.*, m.subject, m.snippet, m.from_name, m.from_email, m.has_attachments, m.direction, m.created_at AS msg_created
+      SELECT b.thread_id, b.message_id, b.folder, b.is_read, b.is_starred, b.labels,
+             m.subject, m.snippet, m.from_name, m.from_email, m.from_user_id,
+             m.has_attachments, m.direction, m.is_draft, m.created_at AS msg_created
       FROM mail_box b JOIN mail_messages m ON m.id = b.message_id
-      WHERE b.user_id = ${userId}
-        AND ${starred ? sql`b.is_starred = true` : sql`b.folder = ${folder}`}
-        AND (${search}::text IS NULL OR lower(m.subject) LIKE ${search} OR lower(m.snippet) LIKE ${search} OR lower(m.from_name) LIKE ${search} OR lower(m.from_email) LIKE ${search})
+      WHERE ${where}
     ),
     ranked AS (
       SELECT *, ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY msg_created DESC) AS rn,
@@ -425,33 +759,192 @@ export async function listFolder(userId: string, folder: Folder, q?: string, sta
              bool_or(is_starred) OVER (PARTITION BY thread_id) AS any_star
       FROM box
     )
-    SELECT thread_id, message_id, subject, snippet, from_name, from_email, msg_created AS created_at,
-           all_read AS is_read, any_star AS is_starred, has_attachments, folder, labels, thread_count, direction
+    SELECT thread_id, message_id, subject, snippet, from_name, from_email, from_user_id,
+           msg_created AS created_at, all_read AS is_read, any_star AS is_starred,
+           has_attachments, folder, labels, thread_count, direction, is_draft
     FROM ranked WHERE rn = 1
-    ORDER BY created_at DESC LIMIT 100
+    ORDER BY created_at DESC LIMIT ${limit}
   `);
-  return rows(r) as ThreadRow[];
+  const list = rows(r) as ThreadRow[];
+
+  // Participants, so a thread reads like a conversation instead of repeating the last sender.
+  if (list.length) {
+    try {
+      const ids = list.map((t) => t.thread_id);
+      const p = await db.execute(sql`
+        SELECT b.thread_id, string_agg(DISTINCT coalesce(nullif(m.from_name,''), m.from_email), ', ') AS names
+        FROM mail_box b JOIN mail_messages m ON m.id = b.message_id
+        WHERE b.user_id = ${userId} AND b.thread_id = ANY(${ids}::uuid[])
+        GROUP BY b.thread_id
+      `);
+      const byThread: Record<string, string> = {};
+      for (const row of rows(p)) byThread[String(row.thread_id)] = row.names || '';
+      for (const t of list) t.participants = byThread[t.thread_id] || t.from_name || t.from_email;
+    } catch (e: any) {
+      console.error('[mail] participants read failed:', e?.cause?.message || e?.message);
+    }
+  }
+
+  return { rows: list, query: q, filtered: q.active || wide, scopeLabel };
 }
 
-export async function getThreadMessages(userId: string, threadId: string) {
+/** Every label this person has actually put on something — the rail and the label picker agree
+ *  because they read the same list. */
+export async function getUserLabels(userId: string): Promise<string[]> {
+  await ensureMailSchema();
+  try {
+    const r = await db.execute(sql`
+      SELECT DISTINCT unnest(labels) AS label FROM mail_box WHERE user_id = ${userId} ORDER BY 1 ASC
+    `);
+    return rows(r).map((x: any) => String(x.label)).filter(Boolean).slice(0, 60);
+  } catch (e: any) {
+    console.error('[mail] label read failed:', e?.cause?.message || e?.message);
+    return [];
+  }
+}
+
+export interface ThreadMessage {
+  id: string; subject: string; from_name: string; from_email: string; from_user_id: string | null;
+  body_html: string | null; body_text: string | null; created_at: string; direction: string;
+  has_attachments: boolean; folder: string; is_read: boolean; is_starred: boolean;
+  is_draft: boolean; rfc_message_id: string | null; in_reply_to: string | null; labels: string[];
+  recipients: { kind: string; email: string; name: string | null }[];
+  attachments: { filename: string; url: string; mime: string | null; size_bytes: number | null }[];
+  reads: any[];
+  delivery: DeliveryStatus | null;
+}
+
+/**
+ * Every message in a thread that this user has a mailbox row for, with its recipients,
+ * attachments, read receipts and DELIVERY TRUTH already resolved.
+ *
+ * This used to be N+1 (two statements per message) plus a block of raw SQL inside the .astro
+ * component, one line of which compared a uuid column to a text array and threw — and the
+ * component's catch turned that into an EMPTY THREAD. Four statements now, whatever the length of
+ * the conversation, and the component renders what it is given.
+ */
+export async function getThreadMessages(userId: string, threadId: string): Promise<ThreadMessage[]> {
   await ensureMailSchema();
   const r = await db.execute(sql`
     SELECT m.id, m.subject, m.from_name, m.from_email, m.from_user_id, m.body_html, m.body_text,
-           m.created_at, m.direction, m.has_attachments, b.folder, b.is_read, b.is_starred
+           m.created_at, m.direction, m.has_attachments, m.is_draft, m.rfc_message_id, m.in_reply_to,
+           b.folder, b.is_read, b.is_starred, b.labels
     FROM mail_box b JOIN mail_messages m ON m.id = b.message_id
     WHERE b.user_id = ${userId} AND b.thread_id = ${threadId}
     ORDER BY m.created_at ASC
   `);
-  const msgs = rows(r);
-  for (const m of msgs) {
-    const rec = await db.execute(sql`SELECT kind, email, name FROM mail_recipients WHERE message_id = ${m.id}`);
-    m.recipients = rows(rec);
-    if (m.has_attachments) {
-      const at = await db.execute(sql`SELECT filename, url, mime, size_bytes FROM mail_attachments WHERE message_id = ${m.id}`);
-      m.attachments = rows(at);
-    } else m.attachments = [];
+  const msgs = rows(r) as ThreadMessage[];
+  if (!msgs.length) return msgs;
+
+  const ids = msgs.map((m) => m.id);
+  const byId: Record<string, ThreadMessage> = {};
+  for (const m of msgs) { m.recipients = []; m.attachments = []; m.reads = []; m.delivery = null; byId[m.id] = m; }
+
+  const rec = await db.execute(sql`
+    SELECT message_id, kind, email, name, user_id FROM mail_recipients WHERE message_id = ANY(${ids}::uuid[])
+  `);
+  const externalCounts: Record<string, number> = {};
+  for (const x of rows(rec)) {
+    byId[String(x.message_id)]?.recipients.push({ kind: x.kind, email: x.email, name: x.name });
+    if (!x.user_id) externalCounts[String(x.message_id)] = (externalCounts[String(x.message_id)] || 0) + 1;
   }
+
+  const at = await db.execute(sql`
+    SELECT message_id, filename, url, mime, size_bytes FROM mail_attachments WHERE message_id = ANY(${ids}::uuid[])
+  `);
+  for (const x of rows(at)) {
+    byId[String(x.message_id)]?.attachments.push({ filename: x.filename, url: x.url, mime: x.mime, size_bytes: x.size_bytes });
+  }
+
+  // Read receipts and delivery are the sender's business only.
+  const mine = msgs.filter((m) => m.from_user_id === userId).map((m) => m.id);
+  if (mine.length) {
+    try {
+      const rr = await db.execute(sql`
+        SELECT message_id, kind, country, region, city, ip_address, read_at, user_id
+        FROM mail_reads WHERE message_id = ANY(${mine}::uuid[]) ORDER BY read_at DESC
+      `);
+      for (const x of rows(rr)) byId[String(x.message_id)]?.reads.push(x);
+    } catch (e: any) {
+      console.error('[mail] read-receipt read failed:', e?.cause?.message || e?.message);
+    }
+    const delivery = await getDeliveryStatuses(mine, externalCounts);
+    for (const id of mine) if (byId[id]) byId[id].delivery = delivery[id] || null;
+  }
+
   return msgs;
+}
+
+/**
+ * A draft, in the shape the composer needs to reopen it. Drafts are ordinary rows in
+ * mail_messages with is_draft = true, so this is scoped to the owner's own mailbox row.
+ */
+export async function getDraft(userId: string, draftId: string): Promise<any | null> {
+  await ensureMailSchema();
+  if (!UUID_RE.test(String(draftId || ''))) return null;
+  const r = await db.execute(sql`
+    SELECT m.id, m.subject, m.body_text, m.body_html, m.thread_id, m.in_reply_to, m.created_at
+    FROM mail_box b JOIN mail_messages m ON m.id = b.message_id
+    WHERE b.user_id = ${userId} AND b.message_id = ${draftId} AND b.folder = 'drafts' AND m.is_draft = true
+    LIMIT 1
+  `);
+  const d = rows(r)[0];
+  if (!d) return null;
+  const rec = rows(await db.execute(sql`SELECT kind, email FROM mail_recipients WHERE message_id = ${draftId}`));
+  const at = rows(await db.execute(sql`SELECT filename, url, mime FROM mail_attachments WHERE message_id = ${draftId}`));
+  const pick = (k: string) => rec.filter((x: any) => x.kind === k).map((x: any) => x.email).join(', ');
+  return {
+    draftId: d.id,
+    threadId: d.thread_id,
+    inReplyTo: d.in_reply_to,
+    subject: d.subject || '',
+    body: d.body_text || '',
+    to: pick('to'), cc: pick('cc'), bcc: pick('bcc'),
+    attachments: at.map((a: any) => ({ url: a.url, filename: a.filename, mime: a.mime })),
+    savedAt: d.created_at,
+  };
+}
+
+/**
+ * WHICH CONVERSATION DOES AN ARRIVING MESSAGE BELONG TO?
+ *
+ * In-Reply-To against rfc_message_id is the correct answer and is tried first. It fails often in
+ * practice: plenty of clients drop the header on a forward, and a reply typed into a webmail that
+ * lost the reference arrives as an orphan. When that happens the message used to start a brand new
+ * thread with the same subject, which is how a conversation ends up scattered down the list.
+ *
+ * The fallback is deliberately narrow — same normalised subject, same counterpart address, inside
+ * 30 days, in this user's own mailbox. Merging on subject alone would staple every "Hello" in the
+ * building into one thread, so it is not done.
+ */
+export async function findThreadForInbound(p: {
+  userId: string; inReplyTo?: string | null; subject?: string | null; fromEmail?: string | null;
+}): Promise<string | null> {
+  try {
+    if (p.inReplyTo) {
+      const t = rows(await db.execute(sql`SELECT thread_id FROM mail_messages WHERE rfc_message_id = ${p.inReplyTo} LIMIT 1`));
+      if (t[0]) return String(t[0].thread_id);
+    }
+    const base = normalizeSubject(p.subject || '');
+    if (!base || !p.fromEmail) return null;
+    const t = rows(await db.execute(sql`
+      SELECT b.thread_id FROM mail_box b JOIN mail_messages m ON m.id = b.message_id
+      WHERE b.user_id = ${p.userId}
+        AND m.created_at > NOW() - INTERVAL '30 days'
+        AND lower(regexp_replace(coalesce(m.subject,''), '^((re|fw|fwd)\\s*:\\s*)+', '', 'i')) = ${base}
+        AND (lower(coalesce(m.from_email,'')) = ${normalizeEmail(p.fromEmail)}
+             OR EXISTS (SELECT 1 FROM mail_recipients r WHERE r.message_id = m.id AND lower(coalesce(r.email,'')) = ${normalizeEmail(p.fromEmail)}))
+      ORDER BY m.created_at DESC LIMIT 1
+    `));
+    return t[0] ? String(t[0].thread_id) : null;
+  } catch (e: any) {
+    console.error('[mail] thread match failed:', e?.cause?.message || e?.message);
+    return null;
+  }
+}
+
+export function normalizeSubject(s: string): string {
+  return String(s || '').replace(/^((re|fw|fwd)\s*:\s*)+/i, '').trim().toLowerCase();
 }
 
 export async function markThreadRead(userId: string, threadId: string) {

@@ -13,11 +13,12 @@
 //    safe (see /api/admin/hei/mine).
 //  - Mined rows stay is_published = false. The pipeline never publishes on its own.
 //
-// Protected by CRON_SECRET when set (Vercel sends it as a Bearer token).
+// Protected by CRON_SECRET. Vercel sends it as a Bearer token.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { mineUniversities, countUniversities, slugify } from '@/lib/hei-miner';
+import { isCronAuthorized } from '@/lib/auth/cron-auth';
 
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
@@ -47,21 +48,15 @@ async function ensureState() {
   await db.execute(sql`INSERT INTO hei_miner_state (id, country, next_offset) VALUES ('default', ${COUNTRY}, 0) ON CONFLICT (id) DO NOTHING`);
 }
 
-// EXAMINED AND NOT CHANGED — NO CAPABILITY APPLIES (a shared secret is not a role), BUT THE GUARD
-// BELOW FAILS OPEN in a fourth spelling: the whole check sits inside `if (secret) { ... }`, so when
-// CRON_SECRET is absent or empty there is no check at all and anyone can trigger the HEI mining
-// pipeline. Blast radius is limited — mined rows stay is_published = false, as the header says — but
-// the gate shape is identical to the other three, and the shape is what gets copied into the next
-// cron route somebody writes.
+// THE GUARD USED TO FAIL OPEN in a spelling easy to read past: the whole check sat inside
+// `if (secret) { ... }`, so when CRON_SECRET was absent or empty there was NO check at all and
+// anyone could drive the HEI mining pipeline. Blast radius was limited (mined rows stay
+// is_published = false, as the header says), but the shape is what gets copied into the next cron
+// route somebody writes.
 //
-// See the fuller note in src/pages/api/cron/activity-digest.ts: one decision, four files, made by a
-// human against the deployed environment (this copy may not read .env*).
+// One shared, fail-closed helper now: src/lib/auth/cron-auth.ts.
 export const GET: APIRoute = async ({ request }) => {
-  const secret = import.meta.env.CRON_SECRET || process.env.CRON_SECRET;
-  if (secret) {
-    const auth = request.headers.get('authorization') || '';
-    if (auth !== 'Bearer ' + secret) return j({ ok: false, error: 'unauthorized' }, 401);
-  }
+  if (!isCronAuthorized(request, new URL(request.url))) return j({ ok: false, error: 'unauthorized' }, 401);
   const started = Date.now();
   try {
     await ensureState();

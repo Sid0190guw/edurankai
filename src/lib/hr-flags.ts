@@ -3,13 +3,26 @@
 // All flags written are immutable (no edits, no deletes) — only superseded.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-let ready: Promise<void> | null = null;
+/** The real Postgres reason is on `e.cause`; `e.message` is only the SQL that failed. */
+const logFail = (tag: string, e: any) =>
+  console.error('[hr-flags] ' + tag, e?.cause?.message || e?.message);
+
+/**
+ * Create the flag table if it is absent. Idempotent, safe on every call.
+ *
+ * WAS a hand-rolled `let ready` memo with `catch (_) {}` inside it. That combination is worse than
+ * either half: the failure was never logged, AND the resolved promise was cached for the lifetime of
+ * the process, so one transient DDL error meant every flag screen showed an empty list and every
+ * raiseFlag() failed for as long as the server ran, with nothing anywhere saying why. ensureOnce()
+ * drops a failed run from its cache so the next request retries; the catch below names the reason
+ * and re-throws so that drop actually happens.
+ */
 export function ensureFlagsSchema(): Promise<void> {
-  if (ready) return ready;
-  ready = (async () => {
+  return ensureOnce('hr_flags_v1', async () => {
     try {
       await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_employee_flags (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -28,9 +41,11 @@ export function ensureFlagsSchema(): Promise<void> {
       )`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_flags_emp_idx ON hr_employee_flags(employee_id, created_at DESC)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_flags_level_idx ON hr_employee_flags(level, created_at DESC)`);
-    } catch (_) {}
-  })();
-  return ready;
+    } catch (e: any) {
+      logFail('ensureFlagsSchema', e);
+      throw e;
+    }
+  });
 }
 
 // Breach catalogue — exact strings from policy v2.0.
@@ -90,7 +105,11 @@ export async function raiseFlag(opts: {
 
     return { ok: true, flagId, autoEscalated };
   } catch (e: any) {
-    return { ok: false, error: e?.message || 'db error' };
+    // e.message for a drizzle/postgres-js failure is only the SQL that was attempted; the actual
+    // reason ("null value in column ... violates not-null constraint") lives on e.cause. Returning
+    // the SQL told whoever raised the flag nothing at all about why it did not save.
+    logFail('raiseFlag', e);
+    return { ok: false, error: String(e?.cause?.message || e?.message || 'db error').slice(0, 400) };
   }
 }
 

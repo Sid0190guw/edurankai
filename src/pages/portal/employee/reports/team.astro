@@ -1,0 +1,398 @@
+---
+// /portal/employee/reports/team — WHAT THE PEOPLE YOU ARE RESPONSIBLE FOR FILED, AND WHAT IS MISSING.
+//
+// THE ROSTER COMES FROM THE ORGANIZATION GRAPH, NEVER FROM users.role. A role name cannot answer
+// "whose report is this to read" — it would make every department_head the reviewer of everybody at
+// once. reviewerRoster() resolves reporting_manager and reviewer edges per ROW through
+// src/lib/org-graph.ts, and the right to mark a report read is asked AGAIN at the write, against the
+// report's own employee_id, because a rendered list is not an authorisation.
+//
+// THE GRAPH IS EMPTY UNTIL THE FOUNDER RUNS THE BACKFILL. This page therefore has to distinguish
+// three states that look identical if you are careless:
+//    - the graph is not initialized               -> say so, name the backfill, show nothing
+//    - the graph is initialized and names nobody  -> say THAT, which is a fact, not a loading state
+//    - the graph names people who filed nothing   -> show the days, outstanding and all
+// Rendering an empty table for the first case would read as "your team filed nothing", which is a
+// different and defamatory claim.
+//
+// A MISSING REPORT IS SHOWN, AND NOTHING HAPPENS TO ANYBODY. Outstanding means the clock says the
+// day was worked and no report exists. There is no score, no streak, no flag and no consequence —
+// automated signals on this platform are ADVISORY, and a human decides what a gap means.
+//
+// EVERY FIGURE SAYS WHAT IT COUNTS. Worked time is net of breaks, measured between check-in and
+// check-out, and a day with a check-in and no check-out is INCOMPLETE — never folded into a total as
+// a zero and never assumed to be a full day.
+//
+// MOBILE FIRST: a reviewer reads this on a phone. One column at 360px, 44px targets, no table that
+// scrolls sideways.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import {
+  ensureDailyReportSchema,
+  reviewerRoster,
+  teamWeek,
+  markReviewed,
+  ROSTER_CAP,
+  type ReviewerRoster,
+  type PersonWeek,
+} from '@/lib/daily-report';
+import { internHoursForMany, hoursLabel, type InternHoursRow } from '@/lib/intern-hours';
+import { today as attendanceToday, shiftDateIso, formatMinutes } from '@/lib/attendance';
+
+const PAGE = '/portal/employee/reports/team';
+
+// The gate first, before any query.
+const gate = await requireEmployee(Astro.locals.user, PAGE);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+
+const ws = gate.ok ? gate.workspace : null;
+const denial = gate.ok ? null : gate;
+const userId = (Astro.locals.user as any)?.id || null;
+
+// ------------------------------------------------------------------------------------------------
+// EVERY const BEFORE THE POST HANDLER THAT READS IT. `const` is not hoisted, and a const declared
+// below its first use has taken pages down on this project.
+// ------------------------------------------------------------------------------------------------
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 300);
+const msgKind = String(params.get('kind') || '');
+
+const fmtDay = (d: string) => {
+  if (!DATE_RE.test(d)) return d;
+  const dt = new Date(d + 'T00:00:00Z');
+  return isNaN(dt.getTime())
+    ? d
+    : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+};
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE. Post-redirect-get, so a refresh never re-marks anything.
+//
+// markReviewed() re-resolves the reviewer from the graph against the report's OWN employee id and
+// refuses when it does not name this user. Nothing here trusts the fact that the list rendered.
+// ------------------------------------------------------------------------------------------------
+if (ws && Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('_action') || '');
+  const backTo = String(fd.get('w') || '');
+
+  if (action === 'review') {
+    const result = await markReviewed({
+      reportId: String(fd.get('report_id') || ''),
+      reviewerUserId: String(userId || ''),
+      comment: String(fd.get('comment') || ''),
+    });
+    // The library's own words on failure. A write path that hides why it refused is the pattern
+    // that hid a sign-in outage on this project for hours.
+    const note = result.ok
+      ? 'Marked as read. The person who filed it has been told.'
+      : result.error;
+    return Astro.redirect(
+      PAGE + (DATE_RE.test(backTo) ? '?w=' + backTo + '&' : '?')
+      + 'kind=' + (result.ok ? 'ok' : 'bad')
+      + '&msg=' + encodeURIComponent(note),
+    );
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// THE READ.
+// ------------------------------------------------------------------------------------------------
+const todayIso = ws ? await attendanceToday() : null;
+// `w` is the week anchor a link on this page passes. `d` is the DAY the push notification carries
+// (notifyReviewer in src/lib/daily-report.ts sends ?d=<report date>), and it is accepted here so
+// that following a notification lands on the week the report belongs to rather than on this week —
+// a notification about last Friday that opens on Monday's empty grid reads as a missing report.
+const wantedWeek = String(params.get('w') || '');
+const wantedDay = String(params.get('d') || '');
+const weekAnchor = DATE_RE.test(wantedWeek)
+  ? wantedWeek
+  : (DATE_RE.test(wantedDay) ? wantedDay : (todayIso || ''));
+
+let roster: ReviewerRoster | null = null;
+let teamRows: PersonWeek[] = [];
+let weekStart = '';
+let weekEnd = '';
+let hoursByPerson = new Map<string, InternHoursRow>();
+
+if (ws) {
+  await ensureDailyReportSchema();
+  roster = await reviewerRoster(String(userId || ''));
+
+  if (roster.graphReady && roster.people.length) {
+    const week = await teamWeek(roster.people, weekAnchor);
+    teamRows = week.rows;
+    weekStart = week.weekStart;
+    weekEnd = week.weekEnd;
+
+    // The measured hours for the same people, from the same module the intern's own page reads, so
+    // the figure a reviewer quotes is the figure the intern was shown.
+    const ids: string[] = [];
+    for (const p of roster.people) if (p.employeeId) ids.push(String(p.employeeId));
+    try {
+      hoursByPerson = await internHoursForMany(ids);
+    } catch (e: any) {
+      console.error('[portal/employee/reports/team] internHoursForMany', e?.cause?.message || e?.message);
+      hoursByPerson = new Map<string, InternHoursRow>();
+    }
+  }
+}
+
+const prevWeek = weekStart ? shiftDateIso(weekStart, -7) : '';
+const nextWeek = weekStart ? shiftDateIso(weekStart, 7) : '';
+const nextIsFuture = !!(weekEnd && todayIso && weekEnd >= todayIso);
+const title = 'Reports from your team';
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>{title}</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #f6f4ef; font-family: 'Inter Tight', system-ui, sans-serif; min-height: 100vh; padding-bottom: 56px; color: #1a1510; -webkit-text-size-adjust: 100%; }
+    .top { background: #12100c; min-height: 54px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; position: sticky; top: 0; z-index: 40; gap: 10px; }
+    .top a { color: #f6f4ef; text-decoration: none; font-size: 13px; display: inline-flex; align-items: center; min-height: 44px; }
+    .top span { color: #d8cdb8; font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; }
+    .wrap { max-width: 680px; margin: 0 auto; padding: 14px 12px; }
+    h1 { font-size: 21px; font-weight: 700; margin: 0 0 4px; letter-spacing: -.01em; }
+    .lede { font-size: 13.5px; color: #6b6255; line-height: 1.6; margin: 0 0 14px; }
+    .card { background: #fff; border: 1px solid #ece4d6; border-radius: 16px; padding: 16px; margin-bottom: 12px; box-shadow: 0 10px 30px rgba(26,21,16,.05); }
+    .card h3 { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #6b6255; font-weight: 700; margin: 0 0 10px; }
+    .card h2 { font-size: 16px; font-weight: 700; margin: 0 0 2px; }
+    .hint { font-size: 12.5px; color: #6b6255; line-height: 1.55; margin: 6px 0 0; }
+    .warn { border-left: 3px solid #b45309; background: #fffbeb; border-radius: 0 10px 10px 0; padding: 11px 12px; margin: 8px 0 0; font-size: 12.5px; color: #7c4a06; line-height: 1.6; }
+    .bad { border-left: 3px solid #b91c1c; background: #fef2f2; border-radius: 0 10px 10px 0; padding: 11px 12px; margin: 8px 0 0; font-size: 12.5px; color: #991b1b; line-height: 1.6; }
+    .banner { border-radius: 12px; padding: 12px 14px; font-size: 13.5px; line-height: 1.55; margin-bottom: 12px; }
+    .banner.ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; }
+    .banner.bad { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
+    .row { display: flex; gap: 10px; align-items: flex-start; padding: 11px 0; border-bottom: 1px dashed #ece4d6; }
+    .row:last-child { border-bottom: none; }
+    .rowday { flex: 0 0 60px; }
+    .rowday b { display: block; font-size: 13px; }
+    .rowday i { display: block; font-style: normal; font-size: 11px; color: #6b6255; }
+    .rowbody { flex: 1 1 auto; min-width: 0; }
+    .rowbody p { font-size: 12.8px; color: #4a4235; line-height: 1.5; margin: 0; overflow-wrap: anywhere; }
+    .rowbody a { color: #c2410c; display: inline-flex; align-items: center; min-height: 44px; font-size: 13px; overflow-wrap: anywhere; }
+    .chip { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; font-weight: 700; padding: 3px 7px; border-radius: 100px; border: 1px solid #e6ddcd; color: #6b6255; margin: 0 4px 4px 0; }
+    .chip.filed { color: #15803d; border-color: #bbf7d0; background: #f0fdf4; }
+    .chip.out { color: #b45309; border-color: #fde68a; background: #fffbeb; }
+    .chip.inc { color: #9a3412; border-color: #fed7aa; background: #fff7ed; }
+    .stat { display: flex; gap: 14px; flex-wrap: wrap; margin: 6px 0 0; }
+    .stat div { min-width: 92px; }
+    .stat b { display: block; font-size: 18px; font-weight: 700; letter-spacing: -.02em; }
+    .stat i { display: block; font-style: normal; font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: #6b6255; font-weight: 700; margin-top: 2px; }
+    .nav { display: flex; gap: 8px; justify-content: space-between; margin-top: 10px; }
+    .nav a, .nav span { flex: 1 1 0; text-align: center; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #e0d5c0; border-radius: 11px; font-size: 13px; text-decoration: none; color: #4a4235; }
+    .nav span { color: #6b6255; }
+    .empty { background: #fff; border: 1px dashed #e0d5c0; border-radius: 16px; padding: 26px 16px; text-align: center; color: #5f5749; font-size: 13.5px; line-height: 1.6; }
+    .deny { background: #fff; border: 1px solid #ece4d6; border-radius: 16px; padding: 22px 18px; }
+    .deny h2 { font-size: 17px; margin: 0 0 8px; }
+    .foot { font-size: 12px; color: #5f5749; line-height: 1.6; margin: 14px 2px 0; }
+    .revlab { display: block; font-size: 12px; color: #4a4235; font-weight: 600; margin: 8px 0 4px; line-height: 1.4; }
+    textarea { width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid #e0d5c0; border-radius: 11px; font-size: 16px; font-family: inherit; background: #fdfcf9; color: #1a1510; }
+    /* Nothing on this page showed focus at all. */
+    a:focus-visible, textarea:focus-visible, button:focus-visible { outline: 3px solid #7c2d12; outline-offset: 2px; }
+    button.mark { min-height: 44px; padding: 0 16px; border: none; border-radius: 11px; background: #12100c; color: #fff; font-size: 13.5px; font-weight: 700; font-family: inherit; cursor: pointer; margin-top: 8px; }
+    button.mark:active { background: #3a332a; }
+    .ico { width: 15px; height: 15px; vertical-align: -2px; margin-right: 5px; }
+    @media (min-width: 560px) { .wrap { padding: 20px 16px; } h1 { font-size: 24px; } }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <a href="/portal/employee/reports">My daily report</a>
+    <span>Team reports</span>
+  </div>
+
+  <div class="wrap">
+    {denial ? (
+      <div class="deny">
+        <h2>{denial.title}</h2>
+        <p class="lede">{denial.reason}</p>
+      </div>
+    ) : (
+      <div>
+        <h1>Reports from your team</h1>
+        <p class="lede">
+          Who you are responsible for is read from the Organization Graph, per relationship. Nothing
+          on this page is decided by a job title, and nothing here penalises anybody.
+        </p>
+
+        {msg && (
+          <div class={'banner ' + (msgKind === 'bad' ? 'bad' : 'ok')}>{msg}</div>
+        )}
+
+        {roster && !roster.graphReady && (
+          <div class="card">
+            <h3>Nothing can be shown yet</h3>
+            <p class="hint">{roster.sentence}</p>
+            <p class="hint">
+              This is not an empty team and it is not a loading state: the graph holds no
+              relationships at all until the backfill is run, so there is nobody it can name. Ask the
+              founder to run the Organization Graph backfill. Reports filed in the meantime are kept
+              and will appear here the moment the graph knows who reads them.
+            </p>
+          </div>
+        )}
+
+        {roster && roster.graphReady && !roster.people.length && (
+          <div class="card">
+            <h3>The graph names nobody</h3>
+            <p class="hint">{roster.sentence}</p>
+            <p class="hint">
+              If people do report to you, ask HR to record the relationship. We will not infer it
+              from a department or a job title.
+            </p>
+          </div>
+        )}
+
+        {roster && roster.graphReady && roster.truncated && (
+          <div class="card">
+            <p class="warn">
+              The graph names more than {ROSTER_CAP} people. The first {ROSTER_CAP} are shown; the
+              rest are not missing, they are simply not on this page.
+            </p>
+          </div>
+        )}
+
+        {teamRows.map((entry) => (
+          <div class="card">
+            <h2>{entry.person.fullName || 'Unnamed record'}</h2>
+            <p class="hint">
+              {entry.person.designation || 'No designation recorded'}
+              {entry.person.via === 'reporting_manager'
+                ? ' — reports to you (Organization Graph).'
+                : ' — you are recorded as reviewing their work (Organization Graph).'}
+            </p>
+
+            {entry.week ? (
+              <div>
+                <div class="stat">
+                  <div>
+                    <b>{formatMinutes(entry.week.workedMinutes)}</b>
+                    <i>Worked this week</i>
+                  </div>
+                  <div>
+                    <b>{entry.week.reportsFiled}</b>
+                    <i>Reports filed</i>
+                  </div>
+                  <div>
+                    <b>{entry.week.outstandingDays}</b>
+                    <i>Days outstanding</i>
+                  </div>
+                </div>
+                <p class="hint">
+                  Worked time is measured between check-in and check-out, net of breaks, across
+                  {' '}{entry.week.completeDays} complete {entry.week.completeDays === 1 ? 'day' : 'days'}
+                  {' '}from {entry.week.weekStart} to {entry.week.weekEnd}.
+                  {entry.week.incompleteDays > 0
+                    ? ' ' + entry.week.incompleteDays + (entry.week.incompleteDays === 1 ? ' day has' : ' days have')
+                      + ' a check-in and no check-out, so that time is not known and is not in the figure.'
+                    : ''}
+                </p>
+
+                {entry.person.employeeId && hoursByPerson.get(String(entry.person.employeeId)) && (
+                  <p class="hint">
+                    Since {hoursByPerson.get(String(entry.person.employeeId))!.total.fromIso}:
+                    {' '}{hoursLabel(hoursByPerson.get(String(entry.person.employeeId))!.total.workedMinutes)}
+                    {' '}measured. Recorded commitment:
+                    {' '}{hoursByPerson.get(String(entry.person.employeeId))!.commitment.weeklyHours !== null
+                      ? hoursByPerson.get(String(entry.person.employeeId))!.commitment.weeklyHours + ' hours a week, which is what was agreed and not what was done.'
+                      : 'none recorded, so there is nothing to compare against.'}
+                  </p>
+                )}
+
+                <div style="margin-top:10px;">
+                  {entry.week.days.map((d) => (
+                    <div class="row">
+                      <div class="rowday">
+                        <b>{fmtDay(d.dateIso)}</b>
+                        <i>{d.weekday.slice(0, 3)}</i>
+                      </div>
+                      <div class="rowbody">
+                        {d.report ? <span class="chip filed">Filed</span> : null}
+                        {d.outstanding ? <span class="chip out">Outstanding</span> : null}
+                        {d.attendance.state === 'incomplete' ? <span class="chip inc">Incomplete</span> : null}
+                        <p>{d.sentence}</p>
+                        {d.report && d.report.summary && (
+                          <p style="margin-top:4px;">{d.report.summary}</p>
+                        )}
+                        {d.report && d.report.blockers && (
+                          <p style="margin-top:4px;color:#9a3412;">Blocked: {d.report.blockers}</p>
+                        )}
+                        {d.report && d.report.url && (
+                          <a href={d.report.url} target="_blank" rel="noopener noreferrer">
+                            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14 21 3"/></svg>
+                            Open the linked report
+                          </a>
+                        )}
+                        {d.report && !d.report.sharingAck && d.report.url && (
+                          <p class="warn">
+                            They did not confirm this file is shared as "anyone with the link". If it
+                            opens as access-denied, that is why — tell them rather than assuming
+                            nothing was filed.
+                          </p>
+                        )}
+                        {d.report && !d.report.url && (
+                          <p style="color:#5f5749;">Filed before a link was required, so there is text but no link.</p>
+                        )}
+                        {d.report && d.report.revisedSinceReview && (
+                          <p class="warn">
+                            Revised after you read it. You read revision {d.report.reviewedRevision};
+                            it is now at revision {d.report.revision}. The earlier versions are kept.
+                          </p>
+                        )}
+                        {d.report && d.report.reviewedAt && !d.report.revisedSinceReview && (
+                          <p style="color:#166534;">
+                            You marked this read{d.report.reviewComment ? '. Comment: ' + d.report.reviewComment : ''}.
+                          </p>
+                        )}
+                        {d.report && !d.report.reviewedAt && (
+                          <form method="POST">
+                            <input type="hidden" name="_action" value="review" />
+                            <input type="hidden" name="report_id" value={d.report.id} />
+                            <input type="hidden" name="w" value={weekStart} />
+                            {/* Was a placeholder standing in for a label. There is one of
+                                these boxes per person per day, so the label is tied to the
+                                report id rather than to a name that would repeat. */}
+                            <label class="revlab" for={'rev-' + d.report.id}>
+                              Comment for {entry.person.fullName || 'this person'} on {fmtDay(d.dateIso)} (optional)
+                            </label>
+                            <textarea id={'rev-' + d.report.id} name="comment" placeholder="A comment, if you have one."></textarea>
+                            <button type="submit" class="mark">Mark as read</button>
+                          </form>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <p class="hint">We could not read this person's week just now. Nothing they filed is lost.</p>
+            )}
+          </div>
+        ))}
+
+        {teamRows.length > 0 && (
+          <div class="nav">
+            <a href={PAGE + '?w=' + prevWeek}>Earlier week</a>
+            {nextIsFuture
+              ? <span>Later week</span>
+              : <a href={PAGE + '?w=' + nextWeek}>Later week</a>}
+          </div>
+        )}
+
+        <p class="foot">
+          A day is outstanding when the clock says it was worked and no report exists. It is a
+          prompt for a conversation, not a finding: nothing is scored, nothing is flagged on anyone's
+          record, and no consequence follows from it automatically. Approved leave and holidays are
+          never outstanding.
+        </p>
+      </div>
+    )}
+  </div>
+</body>
+</html>

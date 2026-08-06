@@ -600,6 +600,48 @@ export const WIDGETS: readonly WidgetDefinition[] = [
       'render context of a workspace card.',
   },
   {
+    key: 'approvals.routed',
+    title: 'Requests routed to you',
+    group: 'approvals',
+    dataSource:
+      'pendingForApprover(users.id) -> workflow_steps JOIN workflow_instances (src/lib/workflow.ts:1430). ' +
+      'Routed and delegated steps only, never capability holders.',
+    requires: [],
+    audience: withEmployeeRecord,
+    priority: 205,
+    size: 'md',
+    render: 'list',
+    href: '/portal/approvals',
+    // NO QUICK ACTION, deliberately, and it is the audience that makes it necessary. The audience is
+    // withEmployeeRecord rather than decidesApprovals because routing comes from the Organization
+    // Graph and decidesApprovals is derived from hr_employees.reporting_manager_id — gating on the
+    // column would hide this queue from exactly the graph-routed manager whose column was never
+    // filled in, which is the invisibility this widget exists to end. The cost of the wider audience
+    // is that an intern with nothing routed to them is also eligible; hideWhenEmpty keeps the CARD
+    // off their screen, but a quick action is not a card and would sit in the action row offering a
+    // verb they have nothing to do. So the door is the card, and only when there is something behind
+    // it. approvals.leave keeps its quick action because its audience is the narrow one.
+    hideWhenEmpty: true,
+    notes:
+      'THE QUEUE THE WORKSPACE COULD NOT SEE. approvals.leave and approvals.withdrawal cover exactly two ' +
+      'of the nineteen domains in src/lib/workflow.ts; everything else routed to a person — a submitted ' +
+      'timesheet, an overtime claim, an attendance correction, an expense claim, a procurement request, a ' +
+      'loan, a document, a helpdesk ticket, an appraisal, a benefits election, a separation — reached ' +
+      'them only through pendingForApprover(), which no aggregate surface called. So the count on Home ' +
+      'was a count of two domains presented as a count of everything waiting, and a manager who worked ' +
+      'it to zero had still decided nothing. ' +
+      'AUDIENCE IS withEmployeeRecord because routing resolves through the Organization Graph into ' +
+      'hr_employees ids: a step is addressed to approver_employee_id, or to approver_user_id for a ' +
+      'user-space rung, and both are resolved from an employee. An account with no employee record has ' +
+      'nothing routed to it and would be shown a card that is empty by construction. ' +
+      'pendingForApprover() fails CLOSED to an empty list, so an unreadable queue and an empty queue ' +
+      'arrive identically — the loader must report whether the read HAPPENED and the card must say so. ' +
+      'LEAVE IS EXCLUDED from this widget\'s count: a leave request routed through the engine exists ' +
+      'twice, as an hr_leave_request row and as a workflow step, and approvals.leave already counts ' +
+      'the first. src/pages/portal/approvals.astro drops the engine\'s copy for the same reason, so ' +
+      'the number on the card and the length of the queue behind it are the same number.',
+  },
+  {
     key: 'onboarding.review',
     title: 'Joining documents to review',
     group: 'approvals',
@@ -649,6 +691,34 @@ export const WIDGETS: readonly WidgetDefinition[] = [
       'are wall-clock from the first punch: breaks are recorded and subtracted from nothing.',
   },
   {
+    key: 'meetings.today',
+    title: 'Meetings today',
+    group: 'time',
+    dataSource:
+      "buildCalendar('meeting', viewer, { from: today, to: today }) -> meetingSource() -> meet_rooms " +
+      'WHERE host_user_id = self OR invitees::text ILIKE the signed-in address (src/lib/calendar-hub.ts:515).',
+    requires: [],
+    audience: anyone,
+    priority: 305,
+    size: 'md',
+    render: 'list',
+    href: '/portal/employee/calendar',
+    hideWhenEmpty: true,
+    notes:
+      'REGISTERED NOW, AND THE OLD REASON FOR NOT REGISTERING IT IS STALE — do not restore it from ' +
+      'UNREGISTERED. It said meet_rooms could answer what somebody HOSTS and not what they were asked to ' +
+      'attend; meetingSource() has read the invitee list since calendar-hub.ts:519 and matches on the ' +
+      'stored address, the same test the scheduler itself writes with. Meanwhile /portal/employee ' +
+      "printed 'this workspace has no meeting calendar to read from yet' at people whose meetings were " +
+      'already rendering one page away at /portal/employee/calendar — a screen denying a capability the ' +
+      'product has. ' +
+      'THE HONEST LIMIT, which the card must carry rather than hide: `invitees` is a jsonb list of email ' +
+      'strings with no membership row and no accepted/declined state, so an invitation shows as an ' +
+      'invitation and never as an acceptance, and somebody invited at an address they do not sign in ' +
+      'with is not matched. hideWhenEmpty: an empty meeting list must not be rendered as "no meetings ' +
+      'today", because that is a claim about a calendar this one cannot fully see.',
+  },
+  {
     key: 'timelog.today',
     title: 'Hours logged today',
     group: 'time',
@@ -669,20 +739,27 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     key: 'dailyreport.today',
     title: 'Today\'s report',
     group: 'time',
-    dataSource: 'hr_daily_reports WHERE employee_id = self AND report_date = today.',
+    dataSource: 'hr_daily_reports WHERE employee_id = self AND report_date = ctx.today.',
     requires: [],
     audience: withEmployeeRecord,
     priority: 320,
     size: 'md',
-    render: 'form',
-    href: null,
-    quickAction: { label: "Write today's report", href: '#daily-report', icon: 'note' },
+    // A STATUS AND A DOOR, NOT A FORM, and the change of render is the point rather than a detail.
+    render: 'stat',
+    href: '/portal/employee/reports',
+    quickAction: { label: "Today's report", href: '/portal/employee/reports', icon: 'note' },
     notes:
-      'One writer, five readers including three admin surfaces — so what is typed here genuinely reaches ' +
-      'someone, unlike worklog.today. The table has no runtime DDL anywhere in src/ ' +
-      '(docs/workforce-os-architecture.md §3.1, which also names the unguarded top-level await at ' +
-      'admin/hr/attendance/index.astro:117); it ' +
-      'exists only because db/hr-schema.sql was applied by hand. Read it inside a try/catch.',
+      'THERE IS ONE WRITER AND IT IS src/lib/daily-report.ts submitReport(), reached at ' +
+      '/portal/employee/reports. /portal/employee carried a SECOND writer — a bare upsert of ' +
+      'work_done/progress/blockers — and it was silent in three ways at once: it never notified the ' +
+      'reviewer the Organization Graph names (submitReport does, daily-report.ts:972), it overwrote ' +
+      'work_done with no snapshot into hr_daily_report_revisions and no revision_count increment, so ' +
+      'the text a reviewer had already read was gone with no copy anywhere, and it wrote `progress`, ' +
+      'a column no reader in src/ selects at all. The card on Home is now the day\'s STATE plus a ' +
+      'door. A surface that renders this must keep "not filed yet" and "we could not read it" as ' +
+      'different sentences: the table has no runtime DDL anywhere in src/ ' +
+      '(docs/workforce-os-architecture.md §3.1), it exists only because db/hr-schema.sql was applied ' +
+      'by hand, and a failed read must never print as an unfiled day.',
   },
   {
     key: 'worklog.today',
@@ -870,6 +947,14 @@ export const WIDGETS: readonly WidgetDefinition[] = [
     render: 'list',
     href: null,
     hideWhenEmpty: true,
+    // PAY WAS THE DEEPEST HIGH-FREQUENCY THING IN THIS PORTAL, and there was no reason for it.
+    // The nav entry is drawer-only (correctly — the bar holds three ranked tabs and pay is not a
+    // twice-a-day act), so reaching a payslip meant More, scroll to the Record group, tap. Three
+    // interactions, on the one errand people arrive with a deadline attached to: a rent payment, a
+    // loan application, a visa file. `href` stays null because this widget LISTS payslips inline and
+    // a card that links to itself is a loop; the quick action is the verb form, which is what the
+    // action row is for, and it costs no query — the composer collects it from this definition.
+    quickAction: { label: 'Payslips', href: '/portal/employee/payslips', icon: 'doc' },
     notes:
       'LIVE LIABILITY on the download route, not on this list: src/lib/hr-payslip.ts:24 SELECTs ' +
       'e.work_email, a column NOTHING writes, created at runtime only by an unrelated page\'s bootstrap. ' +
@@ -1284,6 +1369,34 @@ export const WIDGETS: readonly WidgetDefinition[] = [
       'engagement only: no gender, no government ids, no bank details, no salary.',
   },
   {
+    key: 'console.admin',
+    title: 'Admin console',
+    group: 'account',
+    dataSource: 'None. A DOOR — the composed permission set and nothing else. No query.',
+    requires: ['admin.access'],
+    // An intern never reaches the console whatever else the account holds: AdminLayout.astro:32
+    // refuses a current internship record outright, and canOpenAdmin() carries the same refusal. The
+    // predicate mirrors that rather than widening past it, so this door never opens onto a redirect.
+    audience: (c) => c.engagement !== 'internship',
+    priority: 955,
+    size: 'sm',
+    render: 'link',
+    href: '/admin',
+    quickAction: { label: 'Admin console', href: '/admin', icon: 'doc' },
+    notes:
+      'THE WAY BACK, and it did not exist. src/lib/admin-nav.ts carries no link to /portal/employee and ' +
+      'src/layouts/AdminLayout.astro carries none either, so a department head, an HR account, a ' +
+      'recruiter or an editor who is ALSO on the payroll had a console with no door to their own working ' +
+      'day — no clock, no break, no daily report, no payslip, no approvals queue — and /portal bounced ' +
+      'them back to the console. src/lib/workforce/landing.ts now answers an explicit /portal request ' +
+      'with the workspace, and this is the return leg, so the round trip closes from the side this run ' +
+      'owns. The other half — a link INTO the workspace from the admin nav — is reported, not edited: ' +
+      'admin-nav.ts belongs to another run. ' +
+      'A DOOR AND NOTHING ELSE. render is \'link\': no count, no queue, no fragment of admin data may ' +
+      'appear on a personal workspace card, and requiring admin.access means the composer only ever ' +
+      'offers it to somebody the door will actually admit.',
+  },
+  {
     key: 'permissions.mine',
     title: 'What you can do here',
     group: 'account',
@@ -1412,21 +1525,11 @@ export const WIDGETS: readonly WidgetDefinition[] = [
 // ---------------------------------------------------------------------------------------------
 
 export const UNREGISTERED: readonly { key: string; reason: string }[] = [
-  {
-    key: 'meetings.today',
-    reason:
-      'THE ORIGINAL REASON IS NO LONGER TRUE AND IS RECORDED HERE ONLY SO IT IS NOT RE-DISCOVERED: ' +
-      'scheduled_at / duration_min / invitees / recurrence were written by nothing, the sole INSERT made an ' +
-      'ad-hoc untitled huddle, host_user_id was declared INTEGER in one CREATE and UUID in another, and the ' +
-      'scheduler POSTed to /api/meet/rooms, which did not exist. All four are fixed: src/lib/meet-schema.ts ' +
-      'is now the single owner of the meet_* DDL and reconciles the two shapes additively, and ' +
-      'src/pages/api/meet/rooms/{index,[id]}.ts write and update every one of those columns. ' +
-      'WHY IT IS STILL UNREGISTERED, on the narrower ground that survives: a meeting recorded in meet_rooms ' +
-      'belongs to its HOST (every read in ./[id].ts is narrowed by host_user_id), and `invitees` is a jsonb ' +
-      'list of email strings with no membership row and no accepted/declined state — so "what is on MY day" ' +
-      'cannot be answered for an invitee, only for a host. That needs the staff_meeting_invitees half of the ' +
-      'pair (architecture doc §3.8). huddle.active is what CAN be answered for everyone today.',
-  },
+  // meetings.today IS REGISTERED NOW. It sat here through two rounds of a reason that had already
+  // stopped being true: the DDL, the scheduler route and all four columns were fixed, and then
+  // calendar-hub.ts:519 started reading the invitee list as well as the host. What remained was a
+  // real but much smaller caveat — an invitation is not an acceptance — which is a sentence for the
+  // card to carry, not a reason to withhold a person's own day from them. See the widget's notes.
   {
     key: 'announcements.latest',
     reason:

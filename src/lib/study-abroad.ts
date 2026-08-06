@@ -61,12 +61,78 @@ export function ensureStudyAbroadSchema(): Promise<void> {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
+      await reconcileStudyAbroadRequestColumns();
       await db.execute(sql`CREATE INDEX IF NOT EXISTS sa_req_applicant_idx ON study_abroad_requests(applicant_user_id, created_at DESC)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS sa_req_consultant_idx ON study_abroad_requests(consultant_id, status)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS sa_req_status_idx ON study_abroad_requests(status, created_at DESC)`);
-    } catch (_) {}
+    } catch (e: any) {
+      // WAS `catch (_) {}` WITH NO RESET — the worst combination available: a single transient
+      // failure both hid its reason and cached a resolved promise, so every later caller believed
+      // the schema was ready and every INSERT threw against a table that had never been finished.
+      console.error('[study-abroad] ensureStudyAbroadSchema failed, will retry on next call:', e?.cause?.message || e?.message);
+      ready = null;
+    }
   })();
   return ready;
+}
+
+// study_abroad_requests was created by TWO features with incompatible shapes. This module owns the
+// consultant case system (applicant_user_id / consultant_id / countries[] / programme_level), and
+// src/pages/aquintutor/careerflow/study-abroad.astro created the SAME table for a public enquiry
+// form (user_id / name / email / target_level / target_countries / budget_inr / profile_summary).
+// CREATE TABLE IF NOT EXISTS means only whichever ran first on a given database exists, and the
+// other feature's every INSERT then throws on columns that are not there: either the consultant
+// console cannot record a case, or the public enquiry form rejects every visitor. Which one broke
+// depended on nothing more than deploy order.
+//
+// The two column sets are reconciled onto one table instead, and applicant_user_id loses its NOT
+// NULL because a public enquiry legitimately has no account behind it. The consultant console
+// INNER JOINs users on applicant_user_id, so account-less enquiries stay out of the case list
+// rather than appearing there as cases with no applicant.
+async function reconcileStudyAbroadRequestColumns(): Promise<void> {
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS applicant_user_id UUID`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS consultant_id UUID`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS countries TEXT[] NOT NULL DEFAULT '{}'`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS programme_level VARCHAR(40)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS intake_term VARCHAR(40)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS intake_year INT`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS budget_band VARCHAR(40)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS current_stage VARCHAR(60)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS notes TEXT`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'pending'`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS last_message_by VARCHAR(12)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS unread_applicant INT NOT NULL DEFAULT 0`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS unread_consultant INT NOT NULL DEFAULT 0`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS unread_admin INT NOT NULL DEFAULT 0`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS assigned_by_user_id UUID`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  // The public CareerFlow enquiry form's columns, so its INSERT cannot throw either.
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS user_id UUID`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS name VARCHAR(200)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS email VARCHAR(200)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS target_level VARCHAR(20)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS target_countries TEXT`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS target_intake VARCHAR(40)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS target_field VARCHAR(200)`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS budget_inr INT`);
+  await db.execute(sql`ALTER TABLE study_abroad_requests ADD COLUMN IF NOT EXISTS profile_summary TEXT`);
+  // Last, and only once the column is certain to exist: a public enquiry has no account behind it,
+  // so applicant_user_id cannot stay NOT NULL. Ordered after the ADD above because ALTER COLUMN on
+  // a column that does not exist is an error, and it would abort the rest of this reconciliation.
+  await db.execute(sql`ALTER TABLE study_abroad_requests ALTER COLUMN applicant_user_id DROP NOT NULL`);
+}
+
+/**
+ * The ONE place study_abroad_requests is brought into existence. The public CareerFlow enquiry form
+ * calls this instead of issuing its own CREATE TABLE, so a second incompatible shape can never win
+ * the race again.
+ */
+export async function ensureStudyAbroadRequestsTable(): Promise<void> {
+  await ensureStudyAbroadSchema();
 }
 
 export const PROGRAMME_LEVELS = [

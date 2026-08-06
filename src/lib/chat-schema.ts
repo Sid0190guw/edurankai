@@ -44,6 +44,13 @@
 // missing thread_id, ciphertext or iv before it reaches SQL. A future migration that has taken the
 // channel rows somewhere else can put the constraints back.
 //
+// GROUPS LIVE ON THE THREAD TABLES. Archiving /admin/chat retired the CHANNEL — a named group
+// conversation with a membership — and nobody asked to lose group chat. So a thread carries a KIND:
+// 'direct' (two people) or 'group' (a name, a description, and rows in chat_thread_members). There
+// is no second membership table and no second messenger; send, edit, delete, receipts, unread and
+// notifications are the same code for both. The only thing a group needed that a DM did not is a key
+// every member can open — see the GROUP KEYS block in run() below.
+//
 // AFTER THIS, ONE SYSTEM WRITES. The canonical messenger is /portal/messages (threads, E2EE). The
 // /admin/chat channels are an archive: readable, not writable — see the endpoints under
 // src/pages/admin/api/chat/. This module still creates chat_channels / chat_memberships because the
@@ -139,15 +146,25 @@ async function run(): Promise<void> {
       )`);
 
     // ---- thread side of the house (the canonical messenger).
+    //
+    // `kind` is the only distinction between a direct message and a group: 'direct' | 'group'.
+    // There is no second thread table and no second membership table — a group is a thread with a
+    // name and more than two rows in chat_thread_members. See GROUP KEYS below for what the extra
+    // columns on the membership table carry.
     await db.execute(sql`
       CREATE TABLE IF NOT EXISTS chat_threads (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         kind VARCHAR(20) NOT NULL DEFAULT 'direct',
         title VARCHAR(200),
+        description TEXT,
         cover_url TEXT,
         last_message_preview TEXT,
         last_message_at TIMESTAMPTZ,
         disappearing_seconds INT,
+        created_by_user_id UUID,
+        source_kind VARCHAR(20),
+        source_group_id UUID,
+        key_epoch INT NOT NULL DEFAULT 1,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
     await db.execute(sql`
@@ -159,8 +176,61 @@ async function run(): Promise<void> {
         last_read_at TIMESTAMPTZ,
         notifications_muted BOOLEAN NOT NULL DEFAULT false,
         public_key_pem TEXT,
+        wrapped_key TEXT,
+        wrapped_key_iv TEXT,
+        wrapped_by_user_id UUID,
+        wrapped_by_public_key_pem TEXT,
+        wrapped_key_epoch INT NOT NULL DEFAULT 1,
         PRIMARY KEY (thread_id, user_id)
       )`);
+
+    // CREATE TABLE IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE, INCLUDING ONE MISSING COLUMNS —
+    // and both tables above already exist on the live database (portal/messages.astro created them
+    // inline from 2026-06-09; only chat_messages collided with the channel shape). So every column
+    // added after that date is asserted again here, or the queries that name it throw. Same reason
+    // the same block exists in work-groups.ts. On a fresh database these are no-ops.
+    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS description TEXT`);
+    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS created_by_user_id UUID`);
+    // Where a group's membership came from, so a department channel derives from the work group
+    // instead of being a second, immediately-stale copy of it. No FOREIGN KEY to work_groups: that
+    // table is ensured by a different module (work-groups.ts) and may not exist yet when this runs,
+    // and a constraint that can fail the whole ensure would take the messenger down to gain nothing
+    // chat-groups.ts does not already check.
+    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS source_kind VARCHAR(20)`);
+    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS source_group_id UUID`);
+    await db.execute(sql`ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS key_epoch INT NOT NULL DEFAULT 1`);
+
+    // ---- GROUP KEYS. WHY THESE COLUMNS EXIST, AND WHAT THEY DO NOT CONTAIN.
+    //
+    // A direct thread needs no stored key: both ends derive the same AES-GCM key from ECDH between
+    // their two published public keys. That construction does NOT extend to three people — with
+    // members A, B, C, A derives ECDH(A,B) and C derives ECDH(C,A), which are different keys, and a
+    // group built on it would simply not decrypt. So a group has ONE random AES-GCM-256 key,
+    // generated in the creator's browser, and each member gets their own copy of it WRAPPED:
+    //
+    //   wrapped_key                = the 32-byte group key, AES-GCM encrypted under a key-encryption
+    //                                key derived by ECDH between the wrapper's private key and this
+    //                                member's published public key
+    //   wrapped_key_iv             = the IV for that wrap
+    //   wrapped_by_user_id         = who wrapped it (for display and audit)
+    //   wrapped_by_public_key_pem  = the wrapper's public key AT THE TIME OF WRAPPING. Stored rather
+    //                                than looked up, because the wrapper may later leave the group
+    //                                or regenerate their device key, and either would otherwise make
+    //                                every copy they wrapped permanently unopenable.
+    //   wrapped_key_epoch          = which generation of the group key this copy holds. Nothing
+    //                                rotates keys today; the column is what lets a client say "your
+    //                                copy is stale" later instead of silently decrypting to noise.
+    //
+    // THE SERVER STILL CANNOT READ ANYTHING. Every value here is ciphertext or a PUBLIC key. Opening
+    // a wrapped_key needs an ECDH private key, and private keys are generated in the browser and
+    // live only in that browser's localStorage — there is no column for one anywhere in this file,
+    // and there must never be. This is what keeps src/lib/legal-hold.ts truthful for group threads
+    // as well as direct ones.
+    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key TEXT`);
+    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key_iv TEXT`);
+    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_by_user_id UUID`);
+    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_by_public_key_pem TEXT`);
+    await db.execute(sql`ALTER TABLE chat_thread_members ADD COLUMN IF NOT EXISTS wrapped_key_epoch INT NOT NULL DEFAULT 1`);
 
     // ---- the table both systems collided on. Created UNIFIED when it is absent, so a fresh
     // database can never reproduce the split; reconciled additively when it is present.
@@ -240,6 +310,10 @@ async function run(): Promise<void> {
     await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_messages_thread_idx ON chat_messages (thread_id, created_at DESC)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_messages_channel_idx ON chat_messages (channel_id, created_at DESC)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_members_user_idx ON chat_thread_members (user_id)`);
+    // The group list is "my threads WHERE kind = 'group'", and the department-channel top-up asks
+    // "which thread was seeded from this work group".
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_threads_kind_idx ON chat_threads (kind)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS chat_threads_source_group_idx ON chat_threads (source_group_id)`);
   } catch (e: any) {
     // Logged before it is rethrown. ensureOnce drops a failed run from its cache so the next request
     // retries; without this line that retry would be the only trace that anything went wrong.
@@ -256,5 +330,8 @@ async function run(): Promise<void> {
  * defect this file was written to remove.
  */
 export function ensureChatSchema(): Promise<void> {
-  return ensureOnce('chat.schema.unified.v1', run);
+  // v2 and not v1: ensureOnce memoises per PROCESS, so a process that already ran the v1 ensure
+  // would never run the group-key ALTERs added in this revision. A deploy restarts every process
+  // and would have covered it, but a cache key that changes with the DDL does not depend on that.
+  return ensureOnce('chat.schema.unified.v2', run);
 }

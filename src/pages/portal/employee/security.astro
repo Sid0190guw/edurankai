@@ -1,0 +1,304 @@
+---
+// /portal/employee/security — where an employee turns the second step on or
+// off for their own account, and manages the recovery codes that keep a lost
+// phone from becoming a support ticket nobody can resolve.
+//
+// Mobile first: roughly nine in ten of these people are on a phone.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import TwoFactorPanel from '@/components/security/TwoFactorPanel.astro';
+import { isTotpEnabled, countUnusedBackupCodes } from '@/lib/auth/twofactor';
+import {
+  isSecondStepRequired, availableSecondFactors, enableSecondStep, disableSecondStep,
+  regenerateRecoveryCodes, verifyLoginCode, countAttempt,
+} from '@/lib/auth/two-factor';
+import { listPasskeys } from '@/lib/auth/webauthn';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login');
+
+// -----------------------------------------------------------------------------
+// THE THREE WRITES ON THIS PAGE POST NATIVELY.
+//
+// Turning the second step on, turning it off, and re-issuing recovery codes were
+// all `type="button"` + fetch(). On a mid-range Android on a weak connection the
+// page is tappable before the inline script has run, and stays tappable after one
+// has thrown — so the button did nothing and said nothing. On a security screen
+// that silence is worse than elsewhere: the person walks away believing their
+// account is protected, or believing they hold ten fresh recovery codes.
+//
+// These are real <form method="post"> submits handled here. The script below only
+// decorates them. Recovery codes are rendered straight into THIS response rather
+// than after a redirect, because the server stores only their hashes and cannot
+// show them twice — a redirect would lose them.
+//
+// `const` is not hoisted, so the limits are declared before the handler.
+// -----------------------------------------------------------------------------
+const MAX_PER_WINDOW = 10;
+const WINDOW_SECONDS = 900;
+
+let formError = '';
+let formOk = '';
+let regenError = '';
+let regenOk = '';
+let issuedCodes: string[] = [];
+let issuedNote = '';
+
+if (Astro.request.method === 'POST') {
+  let action = '';
+  let code = '';
+  try {
+    const fd = await Astro.request.formData();
+    action = String(fd.get('action') || '');
+    code = String(fd.get('code') || '').trim();
+  } catch { action = ''; }
+
+  try {
+    if (action === 'enable') {
+      const result = await enableSecondStep(user.id);
+      if (!result.ok) formError = result.error;
+      else {
+        issuedCodes = result.recoveryCodes;
+        issuedNote = 'Save these ten codes now. Each works once, and they cannot be shown again.';
+        formOk = 'The second step is on. Save your recovery codes below.';
+      }
+    } else if (action === 'disable') {
+      if (!(await isSecondStepRequired(user.id))) {
+        await disableSecondStep(user.id);
+        formOk = 'The second step is off. One method signs you in again.';
+      } else {
+        const attempts = await countAttempt('2fa:disable:' + user.id, WINDOW_SECONDS);
+        const nowMethods = await availableSecondFactors(user.id);
+        if (attempts > MAX_PER_WINDOW) {
+          formError = 'Too many attempts. Please wait 15 minutes.';
+        } else if (!code) {
+          formError = nowMethods.indexOf('totp') >= 0
+            ? 'Enter a current authenticator code, or a recovery code, to turn this off.'
+            : 'Enter a recovery code to turn this off.';
+        } else if (!(await verifyLoginCode(user.id, code))) {
+          formError = 'That code is not right. Try again, or use a recovery code.';
+        } else {
+          await disableSecondStep(user.id);
+          formOk = 'The second step is off. One method signs you in again.';
+        }
+      }
+    } else if (action === 'regenerate') {
+      const attempts = await countAttempt('2fa:recovery:' + user.id, WINDOW_SECONDS);
+      const nowMethods = await availableSecondFactors(user.id);
+      if (attempts > MAX_PER_WINDOW) {
+        regenError = 'Too many attempts. Please wait 15 minutes.';
+      } else if (!nowMethods.length) {
+        regenError = 'Set up an authenticator app or enrol your face first.';
+      } else if (!code || !(await verifyLoginCode(user.id, code))) {
+        regenError = nowMethods.indexOf('totp') >= 0
+          ? 'Enter a current authenticator code, or one of your remaining recovery codes.'
+          : 'Enter one of your remaining recovery codes.';
+      } else {
+        issuedCodes = await regenerateRecoveryCodes(user.id);
+        issuedNote = 'Your previous codes no longer work. Save these ten now.';
+        regenOk = 'Ten new codes issued. Your previous ones no longer work.';
+      }
+    }
+  } catch (e: any) {
+    // The real Postgres reason lives on e.cause, not e.message.
+    console.error('[portal/employee/security POST]', e?.cause?.message || e?.message, e?.stack);
+    const msg = 'Could not save that change. Please try again.';
+    if (action === 'regenerate') regenError = msg; else formError = msg;
+  }
+}
+
+let totpOn = false;
+let required = false;
+let backupRemaining = 0;
+let methods: string[] = [];
+let passkeys: any[] = [];
+let loadError = '';
+try {
+  totpOn = await isTotpEnabled(user.id);
+  required = await isSecondStepRequired(user.id);
+  backupRemaining = await countUnusedBackupCodes(user.id);
+  methods = await availableSecondFactors(user.id);
+  passkeys = await listPasskeys(user.id);
+} catch (e: any) {
+  // Do not fail silently — a blank page here looks like "2FA is off".
+  console.error('[portal/employee/security]', e?.cause?.message || e?.message, e?.stack);
+  loadError = 'Could not load your security settings. Refresh to try again.';
+}
+
+const hasFace = methods.indexOf('face') >= 0;
+const accountLabel = user.email || (user as any).internalHandle || user.name || '';
+const handle = (user as any).internalHandle || '';
+const canEnable = methods.length > 0;
+---
+<BaseLayout title="Security - EduRankAI" description="Two-factor authentication and recovery codes for your staff account.">
+  <style>
+    .sec-wrap { padding: 32px 16px 64px; max-width: 640px; margin: 0 auto; }
+    .sec-card { background: #fff; border: 1px solid rgba(0,0,0,0.1); border-radius: 16px; padding: 20px; margin-bottom: 18px; }
+    .sec-h2 { font-size: 17px; font-weight: 700; color: #111; margin: 0 0 6px; }
+    .sec-p { font-size: 14px; color: #6b7280; line-height: 1.65; margin: 0 0 14px; }
+    .sec-btn { width: 100%; min-height: 48px; border: none; border-radius: 10px; font-size: 15px; font-weight: 700; cursor: pointer; padding: 13px 18px; }
+    .sec-btn-primary { background: #DC5000; color: #fff; }
+    .sec-btn-quiet { background: #fff; color: #111; border: 1px solid rgba(0,0,0,0.18); }
+    .sec-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .sec-input { width: 100%; min-height: 48px; padding: 12px 14px; border: 1px solid rgba(0,0,0,0.15); border-radius: 8px; font-size: 16px; background: #fafaf9; }
+    /* A visible focus ring on every control. Without one, a keyboard or switch user
+       cannot tell which field they are in. */
+    .sec-input:focus-visible, .sec-btn:focus-visible, .sec-wrap a:focus-visible {
+      outline: 3px solid #7c2d12; outline-offset: 2px;
+    }
+    .sec-lab { display: block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #57534e; margin-bottom: 6px; }
+    .sec-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; padding: 5px 11px; border-radius: 100px; }
+    .sec-on { background: rgba(16,129,80,0.1); color: #0f7a4a; }
+    .sec-off { background: rgba(107,114,128,0.1); color: #4b5563; }
+    .sec-warn { background: rgba(180,83,9,0.08); border: 1px solid rgba(180,83,9,0.25); color: #92400e; font-size: 13.5px; line-height: 1.6; padding: 12px 14px; border-radius: 10px; margin: 0 0 14px; }
+    .sec-err { background: rgba(220,38,38,0.06); border: 1px solid rgba(220,38,38,0.2); color: #b91c1c; font-size: 13.5px; padding: 11px 14px; border-radius: 8px; margin: 0 0 14px; }
+    .sec-codes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 14px 0; }
+    .sec-code { font-family: ui-monospace, Menlo, monospace; font-size: 15px; letter-spacing: 0.06em; background: #f6f5f3; border: 1px solid rgba(0,0,0,0.08); border-radius: 8px; padding: 10px; text-align: center; }
+    @media (max-width: 380px) { .sec-codes { grid-template-columns: 1fr; } }
+  </style>
+
+  <section class="sec-wrap">
+    <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.15em;color:#DC5000;margin:0 0 8px;">Account security</p>
+    <h1 style="font-size:26px;font-weight:700;color:#111;margin:0 0 8px;">Sign-in and two-factor</h1>
+    <p class="sec-p">Any one of your password, passkey, face or authenticator normally signs you in. You can require a second step for your own account below.</p>
+
+    {loadError && <div class="sec-err">{loadError}</div>}
+
+    <div class="sec-card">
+      <h2 class="sec-h2">How you sign in</h2>
+      <p class="sec-p">You can use your personal email or your internal handle. Both work everywhere, and they are matched without regard to capitalisation.</p>
+      {handle
+        ? <p style="font-family:ui-monospace,Menlo,monospace;font-size:15px;color:#111;background:#f6f5f3;border:1px solid rgba(0,0,0,0.08);border-radius:8px;padding:11px 13px;margin:0;word-break:break-all;">{handle}</p>
+        : <div class="sec-warn">No internal handle is set on your account yet, so only your email works for now. Your HR admin assigns one from the user record.</div>}
+    </div>
+
+    <div class="sec-card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+        <h2 class="sec-h2" style="margin:0;">Require a second step</h2>
+        <span id="secStatePill" class={required ? 'sec-pill sec-on' : 'sec-pill sec-off'}>
+          {required ? 'On' : 'Off'}
+        </span>
+      </div>
+      <p class="sec-p">When this is on, your password (or passkey, or authenticator code) is no longer enough on its own. You will be asked to confirm with {hasFace ? 'your face or a code' : 'a code'} before you are signed in.</p>
+
+      {/* A PREREQUISITE WITH NO WAY TO REACH IT IS A DEAD END, AND THIS ONE NAMED TWO. The sentence
+          told somebody to enrol their face and gave them nowhere to do it — on a phone, that means
+          reading a warning, leaving the page, and guessing at an address. The authenticator lives
+          further down THIS page (the panel below), so that half is an anchor; face enrolment is at
+          /portal/face-setup, which is exempt from the face gate in src/middleware.ts and therefore
+          openable by exactly the person this warning is addressed to. */}
+      {!canEnable && (
+        <div class="sec-warn">
+          Set up an authenticator app or enrol your face first. Turning this on with no second factor
+          available would lock you out.
+          <span> </span>
+          <a href="#sec-methods">Set up an authenticator app</a>
+          <span> &middot; </span>
+          <a href="/portal/face-setup">Enrol your face</a>
+        </div>
+      )}
+
+      <div id="secDisableBox" style={required ? '' : 'display:none;'}>
+        {/* THE CODE FIELD IS FRICTION, NOT A DESCRIPTION. Typing six digits proves it is you; it
+            does not tell you what stops happening afterwards. This sentence does, and it names the
+            two things that actually change: the second step is no longer asked for, and one method
+            alone signs the account in from then on — which matters most on a shared handset, where
+            "one method" may be a password somebody else has watched being typed.
+            onsubmit only: with scripting off the form posts exactly as it does today. */}
+        <form method="post" action="/portal/employee/security" onsubmit="return confirm('Turn off the second step for this account?\n\nFrom then on any ONE of your password, passkey, face or authenticator signs you in on its own. Your recovery codes stay as they are.')">
+          <input type="hidden" name="action" value="disable" />
+          <label class="sec-lab" for="secOffCode">Confirm with a code to turn it off</label>
+          <input id="secOffCode" name="code" class="sec-input" type="text" inputmode="text" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="16" placeholder={totpOn ? 'For example 123456' : 'For example abcde-12345'} aria-describedby="secMsg" style="margin-bottom:10px;" />
+          <button id="secDisableBtn" class="sec-btn sec-btn-quiet" type="submit">Turn off the second step</button>
+        </form>
+      </div>
+
+      <div id="secEnableBox" style={required ? 'display:none;' : ''}>
+        <form method="post" action="/portal/employee/security">
+          <input type="hidden" name="action" value="enable" />
+          <button id="secEnableBtn" class="sec-btn sec-btn-primary" type="submit" disabled={!canEnable}>Turn on the second step</button>
+        </form>
+      </div>
+
+      {/* The state of this switch changes without the page moving when the script is
+          running. role="status" is what tells a screen-reader user it changed at all. */}
+      <p id="secMsg" role="status" style={'font-size:13px;margin:12px 0 0;min-height:1em;line-height:1.6;color:' + (formError ? '#b91c1c' : '#0f7a4a') + ';'}>{formError || formOk}</p>
+    </div>
+
+    <div class="sec-card">
+      <h2 class="sec-h2">Recovery codes</h2>
+      <p class="sec-p">Ten single-use codes. They are the way back in when your phone is lost, broken or wiped — without them that is a support ticket that cannot be resolved. We store only their hashes, so they can be shown exactly once.</p>
+      <p style="font-size:13.5px;color:#374151;margin:0 0 14px;"><strong id="secRemaining">{backupRemaining}</strong> unused code{backupRemaining === 1 ? '' : 's'} remaining.</p>
+
+      {/* Rendered into the SAME response that issued them. Only hashes are stored, so a
+          redirect here would throw the codes away and leave the person with nothing. */}
+      <div id="secCodesBox" style={issuedCodes.length ? '' : 'display:none;'}>
+        <div class="sec-warn" id="secCodesNote">{issuedNote || 'Save these now. They will not be shown again.'}</div>
+        <div class="sec-codes" id="secCodesList">
+          {issuedCodes.map((c) => <div class="sec-code">{c}</div>)}
+        </div>
+        <button id="secCopyBtn" class="sec-btn sec-btn-quiet" type="button" style="margin-bottom:10px;">Copy all codes</button>
+        <p id="secCopyMsg" role="status" style="font-size:13px;margin:0 0 10px;min-height:1em;color:#0f7a4a;"></p>
+      </div>
+
+      {/* NAMES THE COUNT THAT IS DESTROYED. Re-issuing does not add codes, it replaces them: every
+          unused code the person is carrying — on paper, in a password manager, written in a
+          notebook — stops working the instant this posts, and the replacements are shown exactly
+          once, in this response, because only hashes are stored. Somebody who taps this on a phone,
+          loses signal on the redirect and never sees the new list has just destroyed their way back
+          into the account. The number is read out because "your codes" is abstract and "the 7 codes
+          you are still carrying" is not. */}
+      <form method="post" action="/portal/employee/security" onsubmit={'return confirm("Replace your recovery codes?\\n\\nThe ' + String(backupRemaining) + ' unused code' + (backupRemaining === 1 ? '' : 's') + ' you are still carrying stop working immediately. Ten new ones are shown once, on the next screen, and cannot be shown again \\u2014 save them before you close it.")'}>
+        <input type="hidden" name="action" value="regenerate" />
+        <label class="sec-lab" for="secRegenCode">Confirm with a code to replace them</label>
+        <input id="secRegenCode" name="code" class="sec-input" type="text" inputmode="text" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="16" placeholder={totpOn ? 'For example 123456' : 'For example abcde-12345'} aria-describedby="secRegenMsg" style="margin-bottom:10px;" />
+        <button id="secRegenBtn" class="sec-btn sec-btn-quiet" type="submit">Issue ten new codes</button>
+      </form>
+      <p id="secRegenMsg" role="status" style={'font-size:13px;margin:12px 0 0;min-height:1em;line-height:1.6;color:' + (regenError ? '#b91c1c' : '#0f7a4a') + ';'}>{regenError || regenOk}</p>
+    </div>
+
+    {/* id="sec-methods" is the target of the warning above. Without it that anchor is a link to
+        nowhere, which is the defect it was written to fix. */}
+    <div class="sec-card" id="sec-methods">
+      <h2 class="sec-h2">Your sign-in methods</h2>
+      <p class="sec-p">Set up an authenticator app or a passkey here. Each of these also works as a second step.</p>
+      <TwoFactorPanel enabled={totpOn} backupRemaining={backupRemaining} accountLabel={accountLabel} passkeys={passkeys} />
+    </div>
+
+    <p style="font-size:13px;"><a href="/portal/employee" style="color:#DC5000;font-weight:600;">Back to your workspace</a></p>
+  </section>
+
+  <script is:inline>
+    (function () {
+      // Everything that writes on this page is a native form submit handled by the page
+      // itself. This script only does the two things a form cannot: bring the freshly
+      // issued codes into view, and copy them.
+      var codesBox = document.getElementById('secCodesBox');
+      var codesList = document.getElementById('secCodesList');
+      var copyBtn = document.getElementById('secCopyBtn');
+      var copyMsg = document.getElementById('secCopyMsg');
+
+      if (codesBox && codesList && codesList.children.length) {
+        try { codesBox.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) {}
+      }
+
+      if (copyBtn) copyBtn.addEventListener('click', function () {
+        var out = [];
+        var nodes = codesList ? codesList.children : [];
+        for (var i = 0; i < nodes.length; i++) out.push(nodes[i].textContent);
+        var text = out.join('\n');
+        function said(t) { if (copyMsg) copyMsg.textContent = t; }
+        // The result goes in a live region, NOT into the button's own label: rewriting
+        // a button mid-press leaves a screen-reader user on a control whose name just
+        // changed under them, and it announces nothing.
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(
+            function () { said('Ten codes copied to the clipboard.'); },
+            function () { said('Could not copy. Select the codes above and copy them by hand.'); }
+          );
+        } else {
+          said('Copying is not available in this browser. Select the codes above and copy them by hand.');
+        }
+      });
+    })();
+  </script>
+</BaseLayout>

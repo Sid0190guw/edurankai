@@ -26,13 +26,34 @@ export function ensureCreditSchema(): Promise<void> {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS acl_user_idx ON account_credit_ledger(user_id, created_at DESC)`);
+    // ONE TOP-UP PER ORDER, ENFORCED BY THE DATABASE AND NOT ONLY BY A LOOKUP.
+    //
+    // payment-effects.ts credits a wallet_recharge after checking `SELECT 1 ... WHERE ref_id = order`.
+    // That read-then-write is not atomic, and THREE paths run it for the same order — the browser
+    // /verify, the Razorpay webhook, and reconcile — so two arriving together both see no row and
+    // both credit the top-up. This index makes the second insert fail instead, and runEffect() there
+    // already reports a failure rather than swallowing it.
+    //
+    // ADDITIVE AND NON-FATAL: if a live ledger already holds a duplicated recharge ref the index
+    // cannot be built, and that must not take the whole credit module down. It is logged loudly —
+    // it means somebody was credited twice and a human has to net it off.
+    try {
+      await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS acl_recharge_ref_uniq
+        ON account_credit_ledger(ref_id) WHERE ref_type = 'recharge' AND ref_id IS NOT NULL`);
+    } catch (e: any) {
+      console.error('[credit] could not create the UNIQUE index on recharge ref_id — a duplicate top-up credit may already exist:', e?.cause?.message || e?.message);
+    }
   });
 }
 
 export async function getCreditBalance(userId: string): Promise<number> {
   if (!userId) return 0;
   await ensureCreditSchema();
-  const r = rows(await db.execute(sql`SELECT COALESCE(SUM(delta_paise), 0)::bigint AS bal FROM account_credit_ledger WHERE user_id = ${userId}`).catch(() => [] as any))[0] as any;
+  // A failed read reports a zero balance, which is the SAFE direction (the caller falls back to a
+  // card order rather than spending credit that may not exist) but it is indistinguishable from a
+  // genuinely empty wallet to anyone reading a support ticket. Log the reason.
+  const r = rows(await db.execute(sql`SELECT COALESCE(SUM(delta_paise), 0)::bigint AS bal FROM account_credit_ledger WHERE user_id = ${userId}`)
+    .catch((e: any) => { console.error('[credit] balance read failed for user', userId, '-', e?.cause?.message || e?.message); return [] as any; }))[0] as any;
   return Number(r?.bal) || 0;
 }
 
@@ -41,7 +62,7 @@ export async function getCreditLedger(userId: string, limit = 100): Promise<any[
   return rows(await db.execute(sql`
     SELECT delta_paise, reason, ref_type, ref_id, created_at
     FROM account_credit_ledger WHERE user_id = ${userId} ORDER BY created_at DESC LIMIT ${limit}
-  `).catch(() => [] as any));
+  `).catch((e: any) => { console.error('[credit] ledger read failed for user', userId, '-', e?.cause?.message || e?.message); return [] as any; }));
 }
 
 export async function grantCredit(userId: string, amountPaise: number, reason: string, byUserId?: string): Promise<{ ok: boolean; error?: string; balance?: number }> {
@@ -54,7 +75,12 @@ export async function grantCredit(userId: string, amountPaise: number, reason: s
       VALUES (${userId}, ${amt}, ${(reason || 'admin grant').slice(0, 300)}, 'grant', ${byUserId || null})
     `);
     return { ok: true, balance: await getCreditBalance(userId) };
-  } catch (e: any) { return { ok: false, error: String(e?.message || e).slice(0, 160) }; }
+  } catch (e: any) {
+    // `.message` is only the failed SQL; the reason is on `.cause`.
+    const real = e?.cause?.message || e?.message || e;
+    console.error('[credit] grantCredit failed for user', userId, '-', real);
+    return { ok: false, error: String(real).slice(0, 160) };
+  }
 }
 
 // Try to pay for something entirely from wallet credit. Returns covered:false
@@ -71,28 +97,93 @@ export async function coverWithCredit(opts: {
   const { userId, amountPaise, purpose, referenceType, referenceId } = opts;
   if (!userId || !referenceId || !amountPaise) return { covered: false };
   await ensureCreditSchema();
-  const bal = await getCreditBalance(userId);
-  if (bal < amountPaise) return { covered: false };
+  const amt = Math.round(amountPaise);
+  if (!(amt > 0)) return { covered: false };
 
   // Synthetic order id so the existing payments + effects machinery works.
   const orderId = 'CREDIT-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+
+  // STEP 1 — debit. If this fails nothing has happened yet, so the caller can safely fall back to a
+  // card order.
+  //
+  // THE BALANCE IS TESTED INSIDE THE INSERT, not before it. This used to read the balance with
+  // getCreditBalance(), compare it in JavaScript, and then insert a negative row — so two checkouts
+  // submitted together (a double tap, a retried POST, two tabs) both saw the same balance and both
+  // spent it, and the ledger went negative for a wallet that is meant to be spendable only once.
+  // The sum below is computed in the same statement that writes the row; a second attempt sees the
+  // first row already in the sum and writes nothing at all.
+  //
+  // ZERO ROWS BACK IS NOT AN ERROR. It means the balance does not cover it, which is exactly the
+  // covered:false the caller falls back on.
+  let debited: any[] = [];
   try {
-    // Debit the wallet first.
-    await db.execute(sql`
+    debited = rows(await db.execute(sql`
       INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id)
-      VALUES (${userId}, ${-Math.round(amountPaise)}, ${'Paid with credit: ' + (opts.label || purpose)}, ${referenceType}, ${referenceId})
-    `);
-    // Record a paid payments row.
+      SELECT ${userId}::uuid, ${-amt}, ${'Paid with credit: ' + (opts.label || purpose)}, ${referenceType}, ${referenceId}
+       WHERE COALESCE((SELECT SUM(delta_paise) FROM account_credit_ledger WHERE user_id = ${userId}::uuid), 0) >= ${amt}
+      RETURNING id
+    `));
+  } catch (e: any) {
+    const real = e?.cause?.message || e?.message;
+    console.error('[credit] wallet debit failed for user', userId, 'order', orderId, '-', real);
+    return { covered: false, error: 'Your credit balance could not be used just now, so nothing was deducted. Please pay by card or try again.' };
+  }
+  if (!debited.length) return { covered: false };
+
+  // STEP 2 — the payments row, WHICH IS NOT OPTIONAL. It used to end in `.catch(() => {})`, and the
+  // consequence was the worst shape available in this file: the wallet is already debited above, and
+  // applyPaidEffects() looks the order up in `payments` and returns immediately when there is no row
+  // (payment-effects.ts:103). So a failure here charged the user, delivered nothing, wrote no record
+  // that could ever be reconciled, and still returned covered:true. The debit is now REVERSED and the
+  // caller is told to use another method.
+  try {
     await db.execute(sql`
       INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
       VALUES (${orderId}, ${Math.round(amountPaise)}, 'INR', 'paid', ${purpose}, ${referenceType}, ${referenceId}, ${userId},
         ${opts.email || 'credit@edurankai.in'}, ${sql.raw("'" + JSON.stringify({ credit: true }).replace(/'/g, "''") + "'::jsonb")})
-    `).catch(() => {});
-    // Run the same downstream effects as a real capture (materialise app, mark fee paid, etc.).
+    `);
+  } catch (e: any) {
+    const real = e?.cause?.message || e?.message;
+    console.error('[credit] payments row could not be written for order', orderId, 'user', userId, '- reversing the debit -', real);
+    let reversed = false;
+    try {
+      await db.execute(sql`
+        INSERT INTO account_credit_ledger (user_id, delta_paise, reason, ref_type, ref_id)
+        VALUES (${userId}, ${Math.round(amountPaise)}, ${'Reversed (payment could not be recorded): ' + (opts.label || purpose)}, ${referenceType}, ${referenceId})
+      `);
+      reversed = true;
+    } catch (e2: any) {
+      console.error('[credit] REVERSAL ALSO FAILED — user', userId, 'is short', Math.round(amountPaise), 'paise with nothing delivered -', e2?.cause?.message || e2?.message);
+      try {
+        const { sendPushToAdmins } = await import('@/lib/push');
+        await sendPushToAdmins({
+          type: 'credit_debit_stranded',
+          title: 'Wallet credit taken, nothing delivered',
+          body: 'Rs ' + Math.round(amountPaise / 100) + ' was deducted from a user\'s credit balance, the payment could not be recorded, and the reversal failed. This needs a manual refund. Order ' + orderId + '.',
+          url: '/admin/finance',
+          tag: 'credit-stranded-' + orderId,
+        });
+      } catch (e3: any) {
+        console.error('[credit] could not even alert admins about the stranded debit:', e3?.cause?.message || e3?.message);
+      }
+    }
+    return {
+      covered: false,
+      error: reversed
+        ? 'That could not be paid from your credit balance. Nothing was deducted — please pay by card or try again.'
+        : 'That could not be paid from your credit balance and the deduction could not be undone automatically. Our team has been alerted; please contact support before paying again.',
+    };
+  }
+
+  // STEP 3 — downstream effects. The payment is real and recorded by this point, so a failure here
+  // must NOT be reported as "your credit was not used": it was. applyPaidEffects records and alerts
+  // its own failures; this only makes sure a thrown one is not mistaken for a failed payment.
+  try {
     const { applyPaidEffects } = await import('@/lib/payment-effects');
     const r = await applyPaidEffects(orderId, 'credit');
     return { covered: true, applicationId: (r && (r as any).applicationId) || undefined };
   } catch (e: any) {
-    return { covered: false, error: String(e?.message || e).slice(0, 160) };
+    console.error('[credit] paid from credit but the downstream effects failed for order', orderId, '-', e?.cause?.message || e?.message);
+    return { covered: true, error: 'Your credit was used and the payment is recorded, but setting up what you paid for did not finish. Our team has been alerted.' };
   }
 }

@@ -19,14 +19,35 @@ async function ensureSchema() {
       body TEXT NOT NULL,
       attachment_url TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-  } catch (_) {}
+  } catch (e: any) {
+    console.error('[request-threads] request_messages could not be created:', e?.cause?.message || e?.message);
+  }
   // Bookkeeping columns the thread relies on — self-heal so the request list
   // never errors (and silently hides) on a DB missing them.
+  //
+  // THE VISVAMBHARA HALF WAS MISSING. Only the three fee-waiver columns were self-healed here, yet
+  // postMessage() writes last_message_at, last_message_by, unread_applicant and unread_admin on
+  // visvambhara_access_requests too — and that table is created nowhere in this repository, so
+  // nothing declared them. Every one of those updates threw into a swallowing catch, which is why a
+  // reply could land in a thread and no unread badge ever appeared for the other party: the message
+  // was there, and nobody was told it was there. Additive; a live table already carrying them is
+  // untouched.
   for (const q of [
     sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ`,
+    sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS last_message_by VARCHAR(12)`,
     sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS unread_applicant INT NOT NULL DEFAULT 0`,
     sql`ALTER TABLE application_fee_waivers ADD COLUMN IF NOT EXISTS unread_admin INT NOT NULL DEFAULT 0`,
-  ]) { try { await db.execute(q); } catch (_) {} }
+    sql`ALTER TABLE visvambhara_access_requests ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ`,
+    sql`ALTER TABLE visvambhara_access_requests ADD COLUMN IF NOT EXISTS last_message_by VARCHAR(12)`,
+    sql`ALTER TABLE visvambhara_access_requests ADD COLUMN IF NOT EXISTS unread_applicant INT NOT NULL DEFAULT 0`,
+    sql`ALTER TABLE visvambhara_access_requests ADD COLUMN IF NOT EXISTS unread_admin INT NOT NULL DEFAULT 0`,
+  ]) {
+    try { await db.execute(q); } catch (e: any) {
+      // A missing TABLE (rather than column) is the expected failure on a deployment that never
+      // shipped that feature; either way the reason belongs on the log and not in a black hole.
+      console.error('[request-threads] thread bookkeeping column could not be added:', e?.cause?.message || e?.message);
+    }
+  }
 }
 
 // EXTENDED, NOT FORKED. `request_messages` is already keyed by (request_type, request_id) and is
@@ -77,7 +98,12 @@ export async function postMessage(opts: {
   senderName: string;
   body: string;
   attachmentUrl?: string | null;
-}): Promise<{ ok: boolean; id?: string; error?: string }> {
+  /**
+   * `warning` is set when the message WAS posted but the other side was not alerted — the unread
+   * counter or the push failed. Callers that report "reply sent" should append it, because a reply
+   * nobody is told about is a reply nobody reads.
+   */
+}): Promise<{ ok: boolean; id?: string; error?: string; warning?: string }> {
   await ensureSchema();
   const txt = (opts.body || '').toString().trim();
   if (!txt) return { ok: false, error: 'empty body' };
@@ -90,6 +116,7 @@ export async function postMessage(opts: {
       RETURNING id
     `));
     const id = ins[0]?.id;
+    let warning: string | undefined;
 
     // Bump bookkeeping on the source request row + bell the OTHER side
     if (opts.requestType === 'visvambhara_access') {
@@ -117,11 +144,16 @@ export async function postMessage(opts: {
             tag: 'visv-admin-' + opts.requestId,
           });
         }
-      } catch (_) {}
+      } catch (e: any) {
+        // The message IS stored, so this must not fail the post — but the other side has not been
+        // told, and that is the whole point of a thread.
+        console.error('[request-threads] visvambhara notify/bookkeeping failed for', opts.requestId, '-', e?.cause?.message || e?.message);
+        warning = 'The message was saved, but the other party was not alerted to it.';
+      }
     } else if (opts.requestType === 'fee_waiver') {
       try {
         if (opts.senderRole === 'admin') {
-          await db.execute(sql`UPDATE application_fee_waivers SET last_message_at = NOW(), unread_applicant = unread_applicant + 1, unread_admin = 0 WHERE id = ${opts.requestId}`).catch(() => {});
+          await db.execute(sql`UPDATE application_fee_waivers SET last_message_at = NOW(), unread_applicant = unread_applicant + 1, unread_admin = 0 WHERE id = ${opts.requestId}`);
           if (opts.applicantUserId) {
             const { sendPushToUser } = await import('@/lib/push');
             await sendPushToUser(opts.applicantUserId, {
@@ -133,7 +165,7 @@ export async function postMessage(opts: {
             });
           }
         } else {
-          await db.execute(sql`UPDATE application_fee_waivers SET last_message_at = NOW(), unread_admin = unread_admin + 1, unread_applicant = 0 WHERE id = ${opts.requestId}`).catch(() => {});
+          await db.execute(sql`UPDATE application_fee_waivers SET last_message_at = NOW(), unread_admin = unread_admin + 1, unread_applicant = 0 WHERE id = ${opts.requestId}`);
           const { sendPushToAdmins } = await import('@/lib/push');
           await sendPushToAdmins({
             type: 'fee_waiver_applicant_reply',
@@ -143,19 +175,25 @@ export async function postMessage(opts: {
             tag: 'fw-admin-' + opts.requestId,
           });
         }
-      } catch (_) {}
+      } catch (e: any) {
+        console.error('[request-threads] fee-waiver notify/bookkeeping failed for', opts.requestId, '-', e?.cause?.message || e?.message);
+        warning = 'The message was saved, but the other party was not alerted to it.';
+      }
     }
-    return { ok: true, id };
+    return { ok: true, id, warning };
   } catch (e: any) {
-    return { ok: false, error: e?.message || 'db error' };
+    const real = e?.cause?.message || e?.message;
+    console.error('[request-threads] postMessage failed for', opts.requestType, opts.requestId, '-', real);
+    return { ok: false, error: real || 'db error' };
   }
 }
 
 export async function markApplicantRead(requestType: RequestType, requestId: string) {
+  const fail = (e: any) => console.error('[request-threads] could not clear the applicant unread counter for', requestType, requestId, '-', e?.cause?.message || e?.message);
   if (requestType === 'visvambhara_access') {
-    await db.execute(sql`UPDATE visvambhara_access_requests SET unread_applicant = 0 WHERE id = ${requestId}`).catch(() => {});
+    await db.execute(sql`UPDATE visvambhara_access_requests SET unread_applicant = 0 WHERE id = ${requestId}`).catch(fail);
   } else if (requestType === 'fee_waiver') {
-    await db.execute(sql`UPDATE application_fee_waivers SET unread_applicant = 0 WHERE id = ${requestId}`).catch(() => {});
+    await db.execute(sql`UPDATE application_fee_waivers SET unread_applicant = 0 WHERE id = ${requestId}`).catch(fail);
   }
 }
 

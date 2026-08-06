@@ -1,0 +1,407 @@
+---
+// /portal/employee/benefits — WHAT THIS COMPANY OFFERS YOU, AND WHETHER IT APPLIES TO YOU.
+//
+// AUTHORISATION IS OWNERSHIP, NOT A ROLE. Every read here is narrowed to the signed-in person's own
+// employee record. There is no id in the URL, so there is nothing to change in the address bar, and
+// no capability is involved: what you are entitled to is yours to read. Gating this on a permission
+// would hide a person's own benefits from them, because an employee's account very often carries the
+// `applicant` role, which holds nothing at all.
+//
+// ELIGIBILITY IS EVALUATED, NOT HARDCODED. Every line saying whether something applies comes from
+// evaluateEligibility() in src/lib/benefits.ts, reading the conditions HR recorded against the
+// benefit and the facts on this person's own employee record. There is not one `if` in this file
+// testing employment type, and there must never be — a rule written into a page is a second policy
+// that nobody can change without a deploy.
+//
+// BENEFITS SOMEBODY DOES NOT QUALIFY FOR ARE STILL SHOWN, greyed, with the reason. Hiding them would
+// mean a person three weeks short of qualifying never learns the benefit exists and never asks.
+//
+// ELECTING ONE IS A REQUEST. The button sends it to whoever this organisation recorded as the
+// benefits approval owner. It enrols nobody by itself, and the page says so in those words rather
+// than leaving somebody to wonder why nothing changed.
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  catalogueFor, requestEnrolment, cancelEnrolment, describeRules, benefitCategoryLabel,
+  enrolmentStateLabel, type CatalogueEntry,
+} from '@/lib/benefits';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=/portal/employee/benefits');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted.
+const PAGE = '/portal/employee/benefits';
+
+// The signed-in account, captured after the guard. TypeScript's narrowing of `user` does not survive
+// into the closure below, and a non-null assertion there would be the same claim with the checking
+// switched off.
+const account = user;
+
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+const stateColour: Record<string, string> = {
+  active: '#047857', pending: '#d97706', halted: '#b45309',
+  rejected: '#b91c1c', cancelled: '#6b6255', ended: '#6b6255',
+};
+
+// The same resolution /portal/employee/loans and /portal/employee/payslips use: the linked account
+// first, then the three email columns, because the users-to-employees link is not guaranteed to have
+// been filled in.
+async function resolveEmployee(): Promise<{ employee: any | null; failed: boolean }> {
+  try {
+    const employee = rowsOf(await db.execute(sql`
+      SELECT id, full_name, employee_code
+        FROM hr_employees WHERE user_id = ${account.id} AND is_active = true LIMIT 1`))[0]
+      || rowsOf(await db.execute(sql`
+      SELECT id, full_name, employee_code
+        FROM hr_employees
+       WHERE (work_email = ${account.email} OR personal_email = ${account.email} OR email = ${account.email})
+         AND is_active = true LIMIT 1`))[0]
+      || null;
+    return { employee, failed: false };
+  } catch (e: any) {
+    // A FAILED READ AND AN EMPTY RESULT ARE DIFFERENT SENTENCES, and this page must not print the
+    // second when the first happened.
+    console.error('[portal/benefits] employee lookup', e?.cause?.message || e?.message);
+    return { employee: null, failed: true };
+  }
+}
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const resolved = await resolveEmployee();
+    if (!resolved.employee) {
+      flash = 'This account is not linked to an employee record, so nothing could be requested.';
+    } else {
+      const fd = await Astro.request.formData();
+      const action = String(fd.get('action') || '');
+      // THE EMPLOYEE ID COMES FROM THE SESSION, NEVER FROM THE FORM. A hidden field here would let
+      // somebody elect a benefit on a colleague's behalf by editing the page.
+      const myEmployeeId = String(resolved.employee.id);
+
+      if (action === 'elect') {
+        const r = await requestEnrolment({
+          benefitId: String(fd.get('benefit_id') || ''),
+          employeeId: myEmployeeId,
+          option: String(fd.get('option') || ''),
+          reason: String(fd.get('reason') || ''),
+          requestedByUserId: account.id,
+        });
+        if (r.ok && r.haltReason) {
+          flash = 'Recorded, but it could not be sent to anybody yet: ' + r.haltReason
+            + ' HR can see it and nothing is lost.';
+        } else if (r.ok) {
+          flash = 'Sent for approval. You are not enrolled until somebody approves it.';
+        } else {
+          flash = r.error || 'The election was not saved.';
+        }
+      } else if (action === 'withdraw') {
+        // Scoped to this person's own rows: the id was rendered from a catalogue already narrowed by
+        // employee_id, and it is re-checked here before anything is written.
+        const enrolmentId = String(fd.get('enrolment_id') || '');
+        const mine = (await catalogueFor(myEmployeeId)).entries
+          .some((e) => e.enrolment && e.enrolment.id === enrolmentId);
+        if (!mine) {
+          flash = 'That election is not yours, so nothing was changed.';
+        } else {
+          const r = await cancelEnrolment(enrolmentId, account.id);
+          flash = r.ok ? 'Election withdrawn.' : (r.error || 'The election was not withdrawn.');
+        }
+      } else {
+        flash = 'That is not something this page does.';
+      }
+    }
+  } catch (e: any) {
+    console.error('[portal/benefits] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const { employee, failed: lookupFailed } = await resolveEmployee();
+const { entries, subject } = await catalogueFor(employee ? String(employee.id) : null);
+
+const yours = entries.filter((e) => e.eligibility.eligible);
+const notYet = entries.filter((e) => !e.eligibility.eligible);
+const enrolled = entries.filter((e) => e.enrolment && e.enrolment.state === 'active');
+const waiting = entries.filter((e) => e.enrolment && (e.enrolment.state === 'pending' || e.enrolment.state === 'halted'));
+---
+<!doctype html>
+<html lang="en" style="background:#f6f4ef;">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>My benefits</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f6f4ef;font-family:'Inter Tight',system-ui,sans-serif;min-height:100vh;padding-bottom:48px;color:#1a1510;overflow-x:hidden;}
+    .top{background:#12100c;min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 14px;position:sticky;top:0;z-index:40;}
+    .top a{color:#9a8f7d;text-decoration:none;display:flex;align-items:center;gap:6px;font-size:14px;min-height:44px;}
+    .wrap{max-width:600px;margin:0 auto;padding:16px 14px;}
+    .card{background:#fff;border:1px solid #ece4d6;border-radius:16px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(26,21,16,.05);}
+    .card.dim{background:#fbf9f5;box-shadow:none;}
+    .card h3{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#6b6255;font-weight:700;margin:0 0 12px;}
+    .btitle{font-size:16px;font-weight:700;line-height:1.35;overflow-wrap:anywhere;}
+    .bmeta{font-size:11.5px;color:#8b8172;margin-top:4px;line-height:1.5;}
+    .bsum{font-size:14px;line-height:1.65;color:#3a332a;margin-top:10px;}
+    .bdet{font-size:13px;line-height:1.65;color:#4a4238;margin-top:8px;white-space:pre-wrap;}
+    .head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;}
+    .pill{font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap;}
+    .block{background:#faf7f1;border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;margin-top:12px;}
+    .bl{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#6b6255;font-weight:700;margin-bottom:5px;}
+    .bt{font-size:13px;color:#4a4238;line-height:1.6;white-space:pre-wrap;}
+    .good{background:rgba(4,120,87,.06);border-color:rgba(4,120,87,.2);}
+    .good .bl{color:#047857;}
+    .bad{background:rgba(180,83,9,.06);border-color:rgba(180,83,9,.2);}
+    .bad .bl{color:#b45309;}
+    .bad .bt{color:#7c4a12;}
+    .empty{text-align:center;padding:34px 12px;color:#6b6255;font-size:13.5px;line-height:1.7;}
+    .empty strong{display:block;font-size:15px;color:#1a1510;margin-bottom:8px;}
+    .note{background:#faf7f1;border:1px solid #f0e9dc;border-radius:10px;padding:11px 13px;font-size:12px;color:#6b6255;line-height:1.6;margin-top:12px;}
+    .warn{background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.28);color:#92400e;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;margin-bottom:14px;}
+    .flash{background:rgba(4,120,87,.08);border:1px solid rgba(4,120,87,.25);color:#065f46;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.6;margin-bottom:14px;}
+    form.ask{display:grid;gap:12px;margin-top:12px;}
+    label{font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#6b6255;font-weight:700;display:grid;gap:5px;}
+    input,select,textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcc;color:#1a1510;padding:11px 12px;border-radius:10px;font-size:15px;font-family:inherit;min-height:44px;letter-spacing:normal;text-transform:none;}
+    textarea{min-height:64px;resize:vertical;}
+    .hint{font-family:'Inter Tight',system-ui,sans-serif;font-size:11.5px;color:#8b8172;text-transform:none;letter-spacing:normal;font-weight:400;line-height:1.55;}
+    button.go{min-height:44px;padding:0 18px;border:none;border-radius:10px;background:#12100c;color:#fff;font-size:14px;font-weight:700;cursor:pointer;justify-self:start;}
+    button.ghost{min-height:44px;padding:0 14px;border:1px solid #e6ddcc;border-radius:10px;background:transparent;color:#6b6255;font-size:13px;font-weight:600;cursor:pointer;margin-top:10px;}
+    a.inline{color:#c2410c;}
+    details > summary{cursor:pointer;font-size:12.5px;color:#8b8172;min-height:44px;display:flex;align-items:center;}
+  </style>
+</head>
+<body>
+<nav class="top">
+  <a href="/portal/employee">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>My HR</a>
+  <span style="font-size:15px;font-weight:700;color:#fff;font-family:'Fraunces',serif;">Benefits</span>
+  <span style="font-size:11px;color:#9a8f7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:34vw;">{employee?.full_name || user.name}</span>
+</nav>
+
+<div class="wrap">
+  {msg && <div class="flash">{msg}</div>}
+
+  {lookupFailed && (
+    <div class="warn">
+      Your employee record could not be read just now, so nothing below has been checked against it.
+      This is a fault on our side, not a statement about what you are entitled to. Try again shortly.
+    </div>
+  )}
+
+  {!lookupFailed && !employee && (
+    <div class="card">
+      <div class="empty">
+        <strong>This account is not linked to an employee record</strong>
+        Benefits are worked out from your employee record, and this sign-in is not connected to one
+        yet. Ask HR to link it; nothing about your entitlement changes in the meantime.
+      </div>
+    </div>
+  )}
+
+  {employee && entries.length === 0 && (
+    <div class="card">
+      <div class="empty">
+        <strong>No benefits have been published yet</strong>
+        HR has not recorded any benefits in this system. That is exactly what this page says rather
+        than showing a list of things nobody has agreed to. When something is added it will appear
+        here, with what it is, whether it applies to you, and how to claim it.
+      </div>
+    </div>
+  )}
+
+  {employee && entries.length > 0 && (
+    <div>
+      {waiting.length > 0 && (
+        <div class="card">
+          <h3>Waiting on a decision</h3>
+          {waiting.map((e: CatalogueEntry) => (
+            <div class="block">
+              <div class="head">
+                <span class="btitle" style="font-size:14px;">{e.benefit.name}</span>
+                <span class="pill" style={`color:${stateColour[e.enrolment?.state || 'pending'] || '#6b6255'};background:${(stateColour[e.enrolment?.state || 'pending'] || '#6b6255')}18;`}>
+                  {enrolmentStateLabel(e.enrolment?.state || 'pending')}
+                </span>
+              </div>
+              <p class="bmeta">
+                Asked {fmtDate(e.enrolment?.createdAt)}
+                {e.enrolment?.optionChosen ? ' · ' + e.enrolment.optionChosen : ''}
+              </p>
+              {e.enrolment?.state === 'halted' && (
+                <p class="bt" style="margin-top:8px;color:#7c4a12;">
+                  This has not reached anybody yet: {e.enrolment?.haltReason || 'no approver could be resolved.'}
+                  {' '}HR can see it on their queue. Nothing is lost and you do not need to ask again.
+                </p>
+              )}
+              {/* "Withdraw" on its own does not say which benefit, and this is a stack of blocks
+                  with the same one-word button at the bottom of each. The confirmation names the
+                  benefit and the option chosen, because those are the two things a person picked
+                  and would have to pick again — an enrolment cannot be resumed, only re-requested,
+                  and some of these have enrolment windows that do not reopen. */}
+              <form method="POST" onsubmit={'return confirm("Withdraw your request to join ' + String(e.benefit.name || 'this benefit').replace(/[^\w \-.,]/g, '').slice(0, 60) + (e.enrolment?.optionChosen ? ' on ' + String(e.enrolment.optionChosen).replace(/[^\w \-.,]/g, '') : '') + '?\\n\\nThe request ends and you would have to ask to join again from the start.")'}>
+                <input type="hidden" name="action" value="withdraw" />
+                <input type="hidden" name="enrolment_id" value={e.enrolment?.id || ''} />
+                <button type="submit" class="ghost">Withdraw</button>
+              </form>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {enrolled.length > 0 && (
+        <div class="card">
+          <h3>You are enrolled in</h3>
+          {enrolled.map((e: CatalogueEntry) => (
+            <div class="block good">
+              <p class="bl">Enrolled</p>
+              <p class="bt">
+                {e.benefit.name}
+                {e.enrolment?.optionChosen ? ' - ' + e.enrolment.optionChosen : ''}
+                {e.enrolment?.decidedAt ? ' · approved ' + fmtDate(e.enrolment.decidedAt) : ''}
+              </p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div class="card">
+        <h3>Available to you</h3>
+        {yours.length === 0 ? (
+          <p class="hint">
+            Nothing on the catalogue applies to you yet. Everything that exists is listed further down
+            with the reason, so you can see what changes it.
+          </p>
+        ) : (
+          <p class="hint">
+            {yours.length} of {entries.length} benefit{entries.length === 1 ? '' : 's'} apply to you,
+            worked out from your own employee record.
+          </p>
+        )}
+      </div>
+
+      {yours.map((e: CatalogueEntry) => (
+        <div class="card">
+          <div class="head">
+            <span class="btitle">{e.benefit.name}</span>
+            {e.benefit.enrolmentRequired && !e.enrolment && (
+              <span class="pill" style="color:#c2410c;background:rgba(194,65,12,.1);">Choose to join</span>
+            )}
+          </div>
+          <p class="bmeta">
+            {benefitCategoryLabel(e.benefit.category)}
+            {e.benefit.provider ? ' · ' + e.benefit.provider : ''}
+          </p>
+          <p class="bsum">{e.benefit.summary}</p>
+          {e.benefit.details && <p class="bdet">{e.benefit.details}</p>}
+
+          <div class="block good">
+            <p class="bl">Why this applies to you</p>
+            {e.eligibility.met.map((line) => <p class="bt">{line}</p>)}
+          </div>
+
+          <div class="block">
+            <p class="bl">How to claim it</p>
+            <p class="bt">{e.benefit.claimHow}</p>
+            {e.benefit.claimContact && <p class="bt" style="margin-top:6px;">Ask: {e.benefit.claimContact}</p>}
+          </div>
+
+          {e.benefit.policyDriveUrl && (
+            <p class="bmeta" style="margin-top:12px;">
+              <a class="inline" href={e.benefit.policyDriveUrl} target="_blank" rel="noopener noreferrer">Read the policy document</a>
+            </p>
+          )}
+
+          {e.benefit.enrolmentRequired && !e.enrolment && (
+            <form method="POST" class="ask">
+              <input type="hidden" name="action" value="elect" />
+              <input type="hidden" name="benefit_id" value={e.benefit.id} />
+              {e.benefit.enrolmentOptions.length > 0 && (
+                <label>Choose
+                  <select name="option" required>
+                    <option value="">Choose one</option>
+                    {e.benefit.enrolmentOptions.map((o) => <option value={o}>{o}</option>)}
+                  </select>
+                </label>
+              )}
+              <label>Anything to add
+                <textarea name="reason" rows="2" maxlength="1000" placeholder="Optional. Whoever decides this reads it."></textarea>
+              </label>
+              {e.benefit.enrolmentNote && <p class="hint">{e.benefit.enrolmentNote}</p>}
+              <button type="submit" class="go">Ask to join this</button>
+              <p class="hint">
+                This enrols you in nothing on its own. It asks whoever this company has put in charge
+                of benefits to decide, and you will see the answer here.
+              </p>
+            </form>
+          )}
+
+          {e.benefit.enrolmentRequired && e.enrolment && e.enrolment.state !== 'active'
+            && e.enrolment.state !== 'pending' && e.enrolment.state !== 'halted' && (
+            <div class="block">
+              <p class="bl">Your last election</p>
+              <p class="bt">
+                {enrolmentStateLabel(e.enrolment.state)} &middot; {fmtDate(e.enrolment.createdAt)}
+              </p>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {notYet.length > 0 && (
+        <div class="card dim">
+          <h3>Not available to you yet</h3>
+          <p class="hint" style="margin-bottom:12px;">
+            These exist, and this is exactly why each one does not apply to you today. They are shown
+            rather than hidden so you know what changes it.
+          </p>
+          {notYet.map((e: CatalogueEntry) => (
+            <details>
+              <summary>{e.benefit.name}</summary>
+              <p class="bsum" style="font-size:13px;">{e.benefit.summary}</p>
+              <div class="block bad">
+                <p class="bl">Why not yet</p>
+                {e.eligibility.unmet.map((line) => <p class="bt">{line}</p>)}
+              </div>
+              <div class="block">
+                <p class="bl">Who it is for</p>
+                {describeRules(e.benefit.rules).map((line) => <p class="bt">{line}</p>)}
+              </div>
+            </details>
+          ))}
+        </div>
+      )}
+
+      <div class="card">
+        <h3>How this is worked out</h3>
+        <p class="bsum" style="font-size:13.5px;">
+          Eligibility comes from your own employee record
+          {subject ? ' - ' : ''}
+          {subject && [
+            subject.employmentType ? subject.employmentType : '',
+            subject.workMode ? subject.workMode : '',
+            subject.departmentName ? subject.departmentName : '',
+            subject.tenureDays !== null ? subject.tenureDays + ' days of service' : '',
+          ].filter((x) => x).join(', ')}
+          {subject ? '.' : '.'}
+          {' '}If something above looks wrong, the record is what to correct, not the benefit.
+        </p>
+        <div class="note">
+          <a class="inline" href="/portal/employee/onboarding">Your onboarding checklist</a>
+          <span> &middot; </span>
+          <a class="inline" href="/portal/employee/profile">Your employee record</a>
+        </div>
+      </div>
+    </div>
+  )}
+</div>
+</body>
+</html>

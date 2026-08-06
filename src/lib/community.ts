@@ -170,6 +170,51 @@ export async function listHackathons(opts: { status?: string } = {}) {
   `));
 }
 
+/**
+ * Create a hackathon.
+ *
+ * WHY THIS DID NOT EXIST. `hackathons` has been CREATEd by ensureCommunitySchema() since this
+ * module shipped and INSERTed into by NOTHING — the file exported createStudyGroup and
+ * createCollabPost, and no createHackathon; there is no INSERT INTO hackathons anywhere in the
+ * repository. So /portal/hackathons was permanently empty, its five status tabs all filtered the
+ * same empty list, /portal/hackathons/[slug] could never resolve a slug, and the team-registration
+ * and submission form on that page (INSERT INTO hackathon_submissions) was unreachable code. The
+ * AquinTutor command centre meanwhile counted hackathons and offered a status control for rows that
+ * could not exist.
+ *
+ * The AUTHORISATION DECISION BELONGS TO THE CALLER; this function does not make one and must not be
+ * reached from an ungated surface.
+ */
+export async function createHackathon(opts: {
+  slug: string;
+  title: string;
+  tagline?: string | null;
+  description?: string | null;
+  startsAt?: string | null;
+  endsAt?: string | null;
+  registrationDeadline?: string | null;
+  prizePoolChf?: number | null;
+  maxTeamSize?: number | null;
+  status?: string | null;
+  rulesUrl?: string | null;
+  judgesBlurb?: string | null;
+}): Promise<{ ok: boolean; id?: string; slug?: string }> {
+  await ensureCommunitySchema();
+  const status = ['announced', 'registration_open', 'in_progress', 'completed'].includes(String(opts.status || ''))
+    ? String(opts.status)
+    : 'announced';
+  const r = rows(await db.execute(sql`
+    INSERT INTO hackathons (slug, title, tagline, description, starts_at, ends_at, registration_deadline,
+                            prize_pool_chf, max_team_size, status, rules_url, judges_blurb)
+    VALUES (${opts.slug}, ${opts.title}, ${opts.tagline || null}, ${opts.description || null},
+            ${opts.startsAt || null}, ${opts.endsAt || null}, ${opts.registrationDeadline || null},
+            ${opts.prizePoolChf ?? null}, ${opts.maxTeamSize || 4}, ${status},
+            ${opts.rulesUrl || null}, ${opts.judgesBlurb || null})
+    RETURNING id, slug
+  `));
+  return { ok: r.length > 0, id: r[0]?.id, slug: r[0]?.slug };
+}
+
 // ============ Collab posts ============
 export async function listCollabPosts(opts: { field?: string } = {}) {
   await ensureCommunitySchema();

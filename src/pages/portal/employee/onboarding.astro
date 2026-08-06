@@ -2,6 +2,13 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// ADDITIVE — the tracked onboarding checklist (src/lib/onboarding-journey.ts). The form below is
+// unchanged; this adds the sequence around it, so a joiner can see what is still outstanding, who
+// each step is waiting on, and acknowledge the policies they are required to read.
+import {
+  journeyForEmployee, setItemState, acknowledgeItem, stepCategoryLabel, itemStateLabel,
+  type JourneyItem,
+} from '@/lib/onboarding-journey';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/employee/onboarding'));
@@ -10,9 +17,52 @@ function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 const emp: any = rows(await db.execute(sql`SELECT * FROM hr_employees WHERE user_id = ${user.id} OR lower(personal_email) = ${(user.email || '').toLowerCase()} OR lower(email) = ${(user.email || '').toLowerCase()} LIMIT 1`))[0];
 if (!emp) return Astro.redirect('/portal');
 
+// ADDITIVE. Declared BEFORE the POST handler that reads them — `const` is not hoisted, and a
+// declaration below its first use throws on the handler's first line while the page reports success.
+const ONB_PAGE = '/portal/employee/onboarding';
+const itemDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
 let msg = '';
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
+
+  // ADDITIVE BRANCH, AND IT RUNS FIRST. The original form carries no `action` field, so nothing below
+  // this point changes behaviour for it: a submission of that form falls straight through. Only the
+  // checklist buttons added by this section reach here, and each returns before the credential
+  // handler is touched.
+  const journeyAction = String(fd.get('action') || '');
+  if (journeyAction === 'journey_item' || journeyAction === 'journey_ack') {
+    let jflash = '';
+    try {
+      if (journeyAction === 'journey_ack') {
+        const r = await acknowledgeItem(String(fd.get('item_id') || ''), user.id);
+        jflash = r.ok
+          ? 'Acknowledged. That is recorded against your record with today, and only you could do it.'
+          : (r.error || 'The acknowledgement was not recorded.');
+      } else {
+        const r = await setItemState({
+          itemId: String(fd.get('item_id') || ''),
+          state: String(fd.get('state') || 'done') as any,
+          note: String(fd.get('note') || ''),
+          actorUserId: user.id,
+          // NOT the people desk. This is the joiner's own page, and setItemState() decides on
+          // ownership: they may move their own steps and nobody else's.
+          isHrDesk: false,
+        });
+        jflash = r.ok ? 'Saved.' : (r.error || 'That step was not updated.');
+      }
+    } catch (e: any) {
+      // NEVER SWALLOWED. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+      console.error('[portal/employee/onboarding] journey POST', e?.cause?.message || e?.message);
+      jflash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+    }
+    return Astro.redirect(ONB_PAGE + '?jmsg=' + encodeURIComponent(jflash.slice(0, 300)));
+  }
+
   const bankName = (fd.get('bank_name') as string || '').trim() || null;
   const bankAcc = (fd.get('bank_account_number') as string || '').trim() || null;
   const bankIfsc = (fd.get('bank_ifsc') as string || '').trim().toUpperCase() || null;
@@ -48,9 +98,62 @@ if (Astro.request.method === 'POST') {
   `);
   emp.onboarding_status = 'submitted';
   msg = 'submitted';
+
+  // A WRITE OF BANK AND IDENTITY DETAILS LEAVES A RECORD, AND SOMEBODY IS TOLD IT ARRIVED.
+  //
+  // This wrote an account number, an IFSC, a PAN and an emergency contact into hr_employees with no
+  // audit entry and no notification of any kind. Financial and identity data landed and nobody was
+  // told, so nothing prompted anyone to check it before the first payroll run — while reviewDoc(),
+  // three files away, explicitly protects the same class of record. The VALUES are never written into
+  // the audit diff: what is recorded is which kinds of detail arrived, not the numbers themselves.
+  try {
+    const { logAudit } = await import('@/lib/audit');
+    await logAudit({
+      userId: String(user.id), action: 'hr.joining_details_submitted', entity: 'hr_employee',
+      entityId: String(emp.id),
+      diff: {
+        fieldsProvided: [
+          bankAcc ? 'bank account' : null, bankIfsc ? 'IFSC' : null, pan ? 'PAN' : null,
+          govtIdNumber ? 'government ID' : null,
+          (emergencyName || emergencyPhone) ? 'emergency contact' : null,
+        ].filter(Boolean),
+        onboardingStatus: 'submitted',
+      },
+    });
+  } catch (e: any) {
+    console.error('[portal/employee/onboarding] the audit record for joining details was NOT written -', e?.cause?.message || e?.message);
+  }
+
+  try {
+    const { notifyAllAdmins } = await import('@/lib/notify');
+    await notifyAllAdmins({
+      title: 'Joining details submitted: ' + String(emp.full_name || 'a new joiner'),
+      body: 'Bank, identity and emergency contact details are waiting to be checked before their first payroll run.',
+      type: 'hire',
+      actionUrl: '/admin/hr/employees/' + String(emp.id),
+      entityType: 'hr_employee',
+      entityId: String(emp.id),
+    });
+  } catch (e: any) {
+    console.error('[portal/employee/onboarding] the people desk was NOT told the joining details arrived -', e?.cause?.message || e?.message);
+  }
 }
 
 const done = emp.onboarding_status === 'submitted' || emp.onboarding_status === 'verified';
+
+// ADDITIVE. The tracked checklist for this joiner, or null when HR has not started one — an honest
+// absence, rendered as a sentence rather than as an empty list that looks like a bug.
+const jmsg = new URL(Astro.request.url).searchParams.get('jmsg') || '';
+const journey = await journeyForEmployee(String(emp.id)).catch((e: any) => {
+  console.error('[portal/employee/onboarding] journey', e?.cause?.message || e?.message);
+  return null;
+});
+const myItems: JourneyItem[] = journey
+  ? journey.items.filter((i) => i.ownerVia === 'the_joiner' || (i.ownerUserId && i.ownerUserId === user.id))
+  : [];
+const otherItems: JourneyItem[] = journey
+  ? journey.items.filter((i) => myItems.indexOf(i) < 0)
+  : [];
 ---
 <BaseLayout title="Employee onboarding - EduRankAI" description="Complete your employee onboarding.">
   <section class="px-[5vw] py-10 md:py-14 max-w-2xl mx-auto">
@@ -125,6 +228,146 @@ const done = emp.onboarding_status === 'submitted' || emp.onboarding_status === 
         <button type="submit" id="onbSubmit" class="bg-burn hover:bg-burn/90 text-white font-semibold py-3 rounded-lg text-[0.92rem]">Submit onboarding</button>
       </form>
     )}
+
+    {/* ================================================================================
+        ADDITIVE — YOUR FIRST FORTNIGHT.
+        The form above collects your details. This is everything else that has to happen,
+        who each part is waiting on, and when it is due. Steps owned by somebody else are
+        shown read-only so you can see what is coming rather than wondering.
+        ================================================================================ */}
+    <div class="mt-10">
+      <h2 class="font-display text-[1.15rem] font-semibold text-ink mb-1">Your first fortnight</h2>
+
+      {jmsg && (
+        <div class="bg-leaf-bg/40 border border-leaf-border rounded-lg p-3 text-[0.85rem] text-ink-2 mb-4">{jmsg}</div>
+      )}
+
+      {!journey ? (
+        <div class="bg-white border border-ink/10 rounded-2xl p-5">
+          <p class="text-[0.9rem] text-ink-2 leading-relaxed">
+            No onboarding checklist has been started for you yet. That is a genuine "not yet", not an
+            empty screen: HR starts one and it appears here with every step, who owns it and when it is
+            due. Nothing is waiting on you in the meantime beyond the form above.
+          </p>
+        </div>
+      ) : (
+        <div class="flex flex-col gap-4">
+          <div class="bg-white border border-ink/10 rounded-2xl p-5">
+            <div class="flex items-baseline justify-between gap-3 flex-wrap">
+              <p class="text-[0.9rem] text-ink-2">
+                <strong class="text-ink">{journey.progress.done} of {journey.progress.total}</strong> done
+                {journey.progress.overdue > 0 ? ' · ' + journey.progress.overdue + ' past its date' : ''}
+              </p>
+              <p class="text-[0.8rem] text-ink-soft">{journey.progress.percent}%</p>
+            </div>
+            <div class="mt-3 h-1.5 rounded-full bg-ink/10 overflow-hidden">
+              <div class="h-full bg-leaf" style={'width:' + journey.progress.percent + '%;'}></div>
+            </div>
+            {journey.progress.unowned > 0 && (
+              <p class="text-[0.8rem] text-ink-soft mt-3 leading-relaxed">
+                {journey.progress.unowned} step{journey.progress.unowned === 1 ? ' has' : 's have'} no
+                owner recorded yet. Each one says why below. HR can see the same thing, so it is not
+                something you need to chase.
+              </p>
+            )}
+          </div>
+
+          {myItems.length > 0 && (
+            <div class="bg-white border border-ink/10 rounded-2xl p-5">
+              <p class="text-[0.7rem] font-bold uppercase tracking-wider text-burn mb-3">Yours to do</p>
+              <div class="flex flex-col gap-4">
+                {myItems.map((i: JourneyItem) => (
+                  <div class="border-b border-ink/8 pb-4 last:border-0 last:pb-0">
+                    <p class="text-[0.95rem] font-semibold text-ink leading-snug">{i.title}</p>
+                    <p class="text-[0.75rem] text-ink-soft mt-1">
+                      {stepCategoryLabel(i.category)}
+                      {i.dueOn ? ' · due ' + itemDate(i.dueOn) : ''}
+                      {i.overdue ? ' · past its date' : ''}
+                      {' · '}{itemStateLabel(i.state)}
+                    </p>
+                    {i.description && <p class="text-[0.85rem] text-ink-2 mt-2 leading-relaxed">{i.description}</p>}
+                    {i.readingUrl && (
+                      <p class="text-[0.85rem] mt-2">
+                        <a href={i.readingUrl} target="_blank" rel="noopener noreferrer" class="text-burn hover:underline">Open the document</a>
+                      </p>
+                    )}
+                    {i.note && <p class="text-[0.8rem] text-ink-soft mt-2">{i.note}</p>}
+
+                    {i.state !== 'done' && i.requiresAcknowledgement && (
+                      <form method="POST" class="mt-3">
+                        <input type="hidden" name="action" value="journey_ack" />
+                        <input type="hidden" name="item_id" value={i.id} />
+                        <button type="submit" class="bg-ink text-white font-semibold py-2.5 px-4 rounded-lg text-[0.85rem] min-h-[44px]">
+                          I have read and I acknowledge this
+                        </button>
+                        <p class="text-[0.75rem] text-ink-soft mt-2 leading-relaxed">
+                          Only you can press this. It records that you, on today's date, read that
+                          document, so nobody can record it on your behalf.
+                        </p>
+                      </form>
+                    )}
+
+                    {i.state !== 'done' && !i.requiresAcknowledgement && (
+                      <form method="POST" class="mt-3 flex flex-wrap gap-2 items-center">
+                        <input type="hidden" name="action" value="journey_item" />
+                        <input type="hidden" name="item_id" value={i.id} />
+                        <button type="submit" name="state" value="done" class="bg-ink text-white font-semibold py-2.5 px-4 rounded-lg text-[0.85rem] min-h-[44px]">
+                          Mark done
+                        </button>
+                      </form>
+                    )}
+
+                    {i.acknowledgedAt && (
+                      <p class="text-[0.78rem] text-leaf mt-2">Acknowledged {itemDate(i.acknowledgedAt)}.</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {otherItems.length > 0 && (
+            <div class="bg-white border border-ink/10 rounded-2xl p-5">
+              <p class="text-[0.7rem] font-bold uppercase tracking-wider text-burn mb-1">Waiting on somebody else</p>
+              <p class="text-[0.8rem] text-ink-soft mb-3 leading-relaxed">
+                Nothing here is yours to do. It is listed so you know what is coming and who has it.
+              </p>
+              <div class="flex flex-col gap-3">
+                {otherItems.map((i: JourneyItem) => (
+                  <div class="flex items-start justify-between gap-3 flex-wrap">
+                    <div class="min-w-0">
+                      <p class="text-[0.9rem] text-ink font-medium leading-snug">{i.title}</p>
+                      <p class="text-[0.75rem] text-ink-soft mt-1">
+                        {i.ownerName ? i.ownerName : 'No owner recorded yet'}
+                        {i.dueOn ? ' · due ' + itemDate(i.dueOn) : ''}
+                      </p>
+                      {i.ownerUnresolvedReason && (
+                        <p class="text-[0.75rem] text-ink-soft mt-1 leading-relaxed">{i.ownerUnresolvedReason}</p>
+                      )}
+                    </div>
+                    <span class="text-[0.7rem] font-semibold uppercase tracking-wide text-ink-soft whitespace-nowrap">
+                      {itemStateLabel(i.state)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div class="bg-white border border-ink/10 rounded-2xl p-5">
+            <p class="text-[0.85rem] text-ink-2 leading-relaxed">
+              Your joining documents are submitted separately, as Google Drive links that stay in your
+              own Drive.
+            </p>
+            <p class="text-[0.85rem] mt-2">
+              <a href="/portal/employee/documents" class="text-burn hover:underline">Joining documents</a>
+              <span class="text-ink-soft"> &middot; </span>
+              <a href="/portal/employee/benefits" class="text-burn hover:underline">Your benefits</a>
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
   </section>
 
   <style>.onbi { width:100%;padding:9px 12px;background:var(--cream-2,#f6f3ec);border:1px solid rgba(0,0,0,0.12);border-radius:8px;font-size:0.9rem;outline:none; } .onbi:focus { border-color:#FF4F00; }</style>

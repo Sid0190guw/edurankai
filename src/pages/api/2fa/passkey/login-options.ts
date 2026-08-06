@@ -13,6 +13,8 @@ export const POST: APIRoute = async ({ request, cookies }) => {
     cookies.set('wa_chal', challenge, { path: '/', httpOnly: true, maxAge: 300, sameSite: 'lax', secure: import.meta.env.PROD });
     return json({ ok: true, options: { challenge, rpId, allowCredentials: [], userVerification: 'preferred', timeout: 60000 } });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'Could not start' }, 500);
+    // Unauthenticated endpoint: an error string from here is free reconnaissance. Logged, not echoed.
+    console.error('[api/2fa/passkey/login-options]', e?.cause?.message || e?.message, e?.stack);
+    return json({ ok: false, error: 'Could not start passkey sign-in. Please try again.' }, 500);
   }
 };

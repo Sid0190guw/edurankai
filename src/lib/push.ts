@@ -366,13 +366,19 @@ export const pushNotify = {
       tag: `app-status-${appId}`
     }),
 
+  // '/admin/hei/claims', NOT '/admin/hei/submissions/<claimId>'. THERE IS NO PER-ITEM ROUTE UNDER
+  // EITHER PAGE — src/pages/admin/hei/ holds submissions.astro and claims.astro and no [id] child of
+  // either — so the tapped notification landed on a 404 every time. The one caller
+  // (src/pages/hei/claim.astro:84) passes a CLAIM TOKEN, and the queue that lists claims is
+  // /admin/hei/claims, which is where somebody acting on this notification needs to be. The id is
+  // kept in `tag` so two claims still produce two notifications rather than collapsing into one.
   newHeiSubmission: (institutionName: string, claimId: string) =>
     sendPushToAdmins({
       type: 'new_hei_submission',
       title: 'New HEI Submission',
       body: institutionName,
-      url: `/admin/hei/submissions/${claimId}`,
-      tag: 'new-hei-submission'
+      url: '/admin/hei/claims',
+      tag: `new-hei-submission-${claimId}`
     }),
 
   newUser: (userName: string, userId: string) =>
@@ -412,7 +418,12 @@ export const pushNotify = {
       tag: `app-msg-${appId}`
     }),
 
-  leaveRequest: (employeeName: string, detail: string, url = '/admin/leave') =>
+  // '/admin/hr/leave', NOT '/admin/leave'. There is no page at /admin/leave and there never has been
+  // — the leave console has always lived at /admin/hr/leave, and 'leave' is the SECTION KEY, not the
+  // path. So every leave-request push that reached an administrator's phone opened a 404: the
+  // notification arrived, they tapped it, and the app told them the page did not exist. A default
+  // argument is the worst possible place for a wrong path, because every call site reads as correct.
+  leaveRequest: (employeeName: string, detail: string, url = '/admin/hr/leave') =>
     sendPushToAdmins({
       type: 'leave_request',
       title: 'Leave Request',
@@ -430,7 +441,10 @@ export const pushNotify = {
       tag: 'test-submitted'
     }),
 
-  lmsEnrolment: (learnerName: string, courseTitle: string, url = '/admin/training') =>
+  // '/admin/hr/training', NOT '/admin/training' — same defect as leaveRequest above, same cause.
+  // 'training' is a section key; the console is at /admin/hr/training and is the entry the sidebar
+  // has always pointed at.
+  lmsEnrolment: (learnerName: string, courseTitle: string, url = '/admin/hr/training') =>
     sendPushToAdmins({
       type: 'lms_enrolment',
       title: 'New Enrolment',
@@ -444,7 +458,8 @@ export const pushNotify = {
       type: 'course_completed',
       title: 'Course completed',
       body: `${learnerName} finished ${courseTitle} (${certNumber})`,
-      url: '/admin/training',
+      // '/admin/hr/training' — see lmsEnrolment above. /admin/training does not exist.
+      url: '/admin/hr/training',
       tag: `course-complete-${certNumber}`,
     }),
 

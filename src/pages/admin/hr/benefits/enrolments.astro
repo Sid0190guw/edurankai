@@ -1,0 +1,357 @@
+---
+// /admin/hr/benefits/enrolments — WHO HAS ASKED TO JOIN WHAT, AND WHERE IT HAS GOT TO.
+//
+// THREE THINGS THIS SCREEN DELIBERATELY CANNOT DO:
+//   1. It cannot approve anything by being open. The Approve button acts on the WORKFLOW INSTANCE,
+//      and decideInstance() re-checks that the pressing account is the person the Organization Graph
+//      routed to, or their in-force delegate. Reaching this page proves nothing about that, and the
+//      `benefits` domain carries no standing capability at all — see src/lib/workflow.ts.
+//   2. It cannot enrol anybody directly. There is no button here that writes 'active'; that state is
+//      only ever mirrored from a decision the approval engine already made.
+//   3. It cannot un-halt an election by force. Resume re-routes and, if the graph still names nobody,
+//      the election stays halted with the reason. Nothing nudges it into approved to get it moving.
+//
+// WHY ELECTIONS HALT HERE MORE OFTEN THAN ELSEWHERE, and why that is correct. The `benefits` chain
+// has ONE rung and it is the benefits approval owner, not the reporting manager — what somebody
+// elects can say things about their health or their family that are not their line manager's
+// business. Until this organisation records one approval-owner relationship scoped to the domain
+// 'benefits', every election halts and says exactly that. The alternative was routing a person's
+// cover level through their appraiser.
+//
+// THE GATE. `employee.manage`, the same people-desk key as the catalogue screen. It opens the queue;
+// it decides nothing.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { isInitialized } from '@/lib/org-graph';
+import { decideInstance, resumeWorkflow, getInstance, VIA_LABELS } from '@/lib/workflow';
+import {
+  ensureBenefitsSchema, listEnrolments, syncEnrolmentApprovals, endEnrolment, cancelEnrolment,
+  enrolmentStateLabel, type Enrolment,
+} from '@/lib/benefits';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (!can(user as any, 'employee.manage')) return Astro.redirect('/admin?denied=benefits');
+
+// EVERY const BEFORE the POST handler that reads it. `const` is not hoisted.
+const PAGE = '/admin/hr/benefits/enrolments';
+const DETAIL_LIMIT = 20;
+
+const fmtDate = (d: any) => {
+  if (!d) return '';
+  const dt = new Date(d);
+  return isNaN(dt.getTime()) ? '' : dt.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+function stateTone(s: string): string {
+  const k = String(s || '');
+  if (k === 'active') return '#6ee7b7';
+  if (k === 'rejected') return '#fca5a5';
+  if (k === 'halted') return '#fbbf24';
+  if (k === 'cancelled' || k === 'ended') return '#9aa6b6';
+  return '#67e8f9';
+}
+
+function viaLabel(v: string): string {
+  const k = String(v || '');
+  if (k === 'reporting_manager') return VIA_LABELS.reporting_manager;
+  if (k === 'department_head') return VIA_LABELS.department_head;
+  if (k === 'approval_owner') return VIA_LABELS.approval_owner;
+  if (k === 'executive_sponsor') return VIA_LABELS.executive_sponsor;
+  return 'Approver';
+}
+
+await ensureBenefitsSchema().catch(() => {});
+
+if (Astro.request.method === 'POST') {
+  let flash = '';
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('action') || '');
+
+    if (action === 'decide') {
+      // THE WORKFLOW INSTANCE, not the enrolment row. decideInstance() re-checks entitlement.
+      const r = await decideInstance(
+        String(fd.get('instance_id') || ''),
+        user as any,
+        String(fd.get('decision') || '') === 'approved' ? 'approved' : 'rejected',
+        String(fd.get('note') || ''),
+      );
+      flash = r.ok ? 'Decision recorded.' : (r.error || 'The decision was not recorded.');
+      if (r.ok) {
+        const sync = await syncEnrolmentApprovals(user.id);
+        if (sync.errors.length) flash += ' ' + sync.errors[0];
+      }
+    } else if (action === 'resume') {
+      const r = await resumeWorkflow(String(fd.get('instance_id') || ''), user as any);
+      if (r.ok) {
+        const sync = await syncEnrolmentApprovals(user.id);
+        flash = 'Re-routed. It is with an approver now.' + (sync.errors.length ? ' ' + sync.errors[0] : '');
+      } else {
+        flash = r.error || 'It could not be re-routed, so it is still halted.';
+      }
+    } else if (action === 'end') {
+      const r = await endEnrolment(String(fd.get('enrolment_id') || ''), user.id, String(fd.get('note') || ''));
+      flash = r.ok ? 'Enrolment ended. The record of it stays.' : (r.error || 'The enrolment was not ended.');
+    } else if (action === 'withdraw') {
+      const r = await cancelEnrolment(String(fd.get('enrolment_id') || ''), user.id);
+      flash = r.ok ? 'Election withdrawn.' : (r.error || 'The election was not withdrawn.');
+    } else {
+      flash = 'That is not something this page does.';
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[admin/hr/benefits/enrolments] POST', e?.cause?.message || e?.message);
+    flash = 'Nothing was saved: ' + String(e?.cause?.message || e?.message || 'unknown error');
+  }
+  return Astro.redirect(PAGE + '?msg=' + encodeURIComponent(flash.slice(0, 300)));
+}
+
+const msg = new URL(Astro.request.url).searchParams.get('msg') || '';
+const synced = await syncEnrolmentApprovals(user.id);
+const graphReady = await isInitialized();
+const all = await listEnrolments({ limit: 300 });
+
+const open = all.filter((e) => e.state === 'pending' || e.state === 'halted');
+const live = all.filter((e) => e.state === 'active');
+const settled = all.filter((e) => ['rejected', 'cancelled', 'ended'].indexOf(e.state) >= 0);
+
+// The routing detail for the open ones only. A long history must not turn one page load on a phone
+// into hundreds of round trips.
+const detail: any[] = [];
+for (const en of open.slice(0, DETAIL_LIMIT)) {
+  let instance: any = null;
+  try {
+    if (en.workflowInstanceId) instance = await getInstance(en.workflowInstanceId);
+  } catch (e: any) {
+    console.error('[admin/hr/benefits/enrolments] instance', e?.cause?.message || e?.message);
+  }
+  const waiting = instance
+    ? (instance.steps || []).filter((s: any) => s.stepNo === instance.currentStep && s.decision === 'pending')
+    : [];
+  detail.push({ en, instance, waiting });
+}
+const haltedCount = open.filter((e) => e.state === 'halted').length;
+---
+<AdminLayout title="Benefit elections" activeNav="hr">
+<div class="wrap">
+  <p class="eyebrow">HR &middot; Benefits &middot; Elections</p>
+  <h1>Benefit elections</h1>
+  <p class="lede">
+    Employees who have asked to join a benefit that has to be elected. Each one is routed by the
+    approval engine to whoever this organisation has recorded as the benefits approval owner. Opening
+    this page approves nothing: the buttons act on the approval itself, and only the person the
+    Organization Graph named can make one count.
+  </p>
+
+  {msg && <div class="flash">{msg}</div>}
+  {synced.errors.length > 0 && <div class="flash warn">{synced.errors[0]}</div>}
+
+  {!graphReady && (
+    <div class="flash warn">
+      The Organization Graph has not been built yet, so no approver can be resolved for anybody. Every
+      election raised now is recorded and HALTED with that reason, and none of them is lost: once the
+      founder runs the backfill, press Resume on each and it carries on from where it stopped.
+    </div>
+  )}
+
+  {graphReady && haltedCount > 0 && (
+    <div class="flash warn">
+      {haltedCount} election{haltedCount === 1 ? ' is' : 's are'} halted. The benefits chain has one
+      rung &mdash; the approval owner for the domain &ldquo;benefits&rdquo; &mdash; and it is
+      deliberately not the reporting manager, because what somebody elects can say things about their
+      health or their family that their line manager has no business reading. Record one approval-owner
+      relationship scoped to &ldquo;benefits&rdquo; in the Organization Graph and press Resume.
+    </div>
+  )}
+
+  <div class="tiles">
+    <div class="tile"><span class="tv">{open.length}</span><span class="tl">Waiting</span></div>
+    <div class="tile"><span class="tv">{haltedCount}</span><span class="tl">Halted</span></div>
+    <div class="tile"><span class="tv">{live.length}</span><span class="tl">Enrolled</span></div>
+    <div class="tile"><span class="tv">{settled.length}</span><span class="tl">Settled</span></div>
+  </div>
+
+  <h2>Waiting on a decision</h2>
+  {open.length === 0 ? (
+    <div class="empty">Nothing is waiting. Elections appear here as employees make them.</div>
+  ) : (
+    <div class="stack">
+      {detail.map((d: any) => (
+        <div class="card">
+          <div class="cardhead">
+            <div class="grow">
+              <p class="name">{d.en.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {d.en.benefitName || 'A benefit'}
+                {d.en.optionChosen ? ' · ' + d.en.optionChosen : ''}
+                {d.en.employeeCode ? ' · ' + d.en.employeeCode : ''}
+                {' · asked ' + fmtDate(d.en.createdAt)}
+              </p>
+            </div>
+            <span class="chip" style={'color:' + stateTone(d.en.state) + ';border-color:' + stateTone(d.en.state) + '55;'}>
+              {enrolmentStateLabel(d.en.state)}
+            </span>
+          </div>
+
+          {d.en.reason && <p class="reason">{d.en.reason}</p>}
+
+          {d.en.state === 'halted' && (
+            <div class="halt">
+              <p class="hl">Halted</p>
+              <p class="hn">{d.en.haltReason || 'No approver could be resolved for this election.'}</p>
+              <form method="POST" class="inline">
+                <input type="hidden" name="action" value="resume" />
+                <input type="hidden" name="instance_id" value={d.en.workflowInstanceId || ''} />
+                <button type="submit" class="btn ghost small">Resume once the relationship is recorded</button>
+              </form>
+            </div>
+          )}
+
+          {d.waiting.length > 0 && (
+            <div class="waiting">
+              <p class="wl">Waiting on</p>
+              {d.waiting.map((s: any) => (
+                <p class="wn">{s.approverName || 'the named approver'} &middot; {viaLabel(s.via)}</p>
+              ))}
+            </div>
+          )}
+
+          {d.en.state === 'pending' && d.en.workflowInstanceId && (
+            <form method="POST" class="decide">
+              <input type="hidden" name="action" value="decide" />
+              <input type="hidden" name="instance_id" value={d.en.workflowInstanceId} />
+              <label class="lbl">A note the employee will read
+                <textarea name="note" rows="2" maxlength="2000" placeholder="Optional, and worth writing when the answer is no."></textarea>
+              </label>
+              {/* The DECISION is the button's own value. Two submit buttons sharing one hidden
+                  decision field would send the same answer whichever was pressed - a reject that
+                  silently approves is the worst possible shape for this particular bug. */}
+              <div class="btnrow">
+                <button type="submit" name="decision" value="approved" class="btn ok">Approve</button>
+                <button type="submit" name="decision" value="rejected" class="btn no">Reject</button>
+              </div>
+              <p class="hint">
+                Only the person the Organization Graph routed this to, or somebody standing in for
+                them, can make either button count. Anybody else is refused with a sentence.
+              </p>
+            </form>
+          )}
+
+          <form method="POST" class="inline">
+            <input type="hidden" name="action" value="withdraw" />
+            <input type="hidden" name="enrolment_id" value={d.en.id} />
+            <button type="submit" class="btn ghost small">Withdraw this election</button>
+          </form>
+        </div>
+      ))}
+      {open.length > DETAIL_LIMIT && (
+        <p class="hint">
+          Showing the first {DETAIL_LIMIT} of {open.length}. The rest are still queued and nothing is lost.
+        </p>
+      )}
+    </div>
+  )}
+
+  <h2>Enrolled</h2>
+  {live.length === 0 ? (
+    <div class="empty">Nobody is enrolled in an elected benefit yet.</div>
+  ) : (
+    <div class="stack">
+      {live.map((en: Enrolment) => (
+        <div class="card">
+          <div class="cardhead">
+            <div class="grow">
+              <p class="name">{en.employeeName || 'Employee'}</p>
+              <p class="sub">
+                {en.benefitName || 'A benefit'}
+                {en.optionChosen ? ' · ' + en.optionChosen : ''}
+                {en.decidedAt ? ' · approved ' + fmtDate(en.decidedAt) : ''}
+              </p>
+            </div>
+            <span class="chip" style="color:#6ee7b7;border-color:#6ee7b755;">Enrolled</span>
+          </div>
+          <details class="sub-panel">
+            <summary>End this enrolment</summary>
+            <form method="POST" class="form">
+              <input type="hidden" name="action" value="end" />
+              <input type="hidden" name="enrolment_id" value={en.id} />
+              <label class="lbl">Why it is ending
+                <input name="note" maxlength="1000" placeholder="Opted out, cover finished, scheme changed" />
+              </label>
+              <button type="submit" class="btn ghost small">End it</button>
+              <p class="hint">The record stays. What the company offered somebody is part of their history.</p>
+            </form>
+          </details>
+        </div>
+      ))}
+    </div>
+  )}
+
+  {settled.length > 0 && (
+    <div>
+      <h2>Settled</h2>
+      <div class="stack">
+        {settled.map((en: Enrolment) => (
+          <div class="card dim">
+            <div class="cardhead">
+              <div class="grow">
+                <p class="name">{en.employeeName || 'Employee'}</p>
+                <p class="sub">{en.benefitName || 'A benefit'} &middot; {fmtDate(en.createdAt)}</p>
+              </div>
+              <span class="chip" style={'color:' + stateTone(en.state) + ';border-color:' + stateTone(en.state) + '55;'}>
+                {enrolmentStateLabel(en.state)}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+</div>
+
+<style>
+  .wrap { padding: 14px 16px 90px; max-width: 1100px; margin: 0 auto; }
+  .eyebrow { font-size: 10.5px; color: #FF7040; letter-spacing: 0.12em; text-transform: uppercase; margin: 0; font-weight: 700; }
+  h1 { font-size: 23px; color: #fff; margin: 6px 0 4px; font-weight: 700; }
+  h2 { font-size: 14px; color: #fff; margin: 26px 0 10px; font-weight: 700; }
+  .lede { font-size: 13px; color: #9aa6b6; margin: 0 0 16px; line-height: 1.6; max-width: 70ch; }
+  .flash { background: rgba(103,232,249,0.08); border: 1px solid rgba(103,232,249,0.3); color: #a5f3fc; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; line-height: 1.55; }
+  .flash.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.32); color: #fde68a; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 18px; }
+  .tile { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .tv { font-size: 19px; color: #fff; font-weight: 700; }
+  .tl { font-size: 11px; color: #9aa6b6; }
+  .stack { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 14px 16px; }
+  .card.dim { opacity: 0.62; }
+  .cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+  .grow { min-width: 0; flex: 1 1 220px; }
+  .name { font-size: 14px; color: #fff; font-weight: 700; margin: 0; overflow-wrap: anywhere; }
+  .sub { font-size: 11.5px; color: #9aa6b6; margin: 3px 0 0; line-height: 1.5; }
+  .chip { font-size: 10px; font-weight: 700; padding: 4px 9px; border-radius: 100px; border: 1px solid #2a2a2f; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .reason { font-size: 13px; color: #d8d8de; margin: 10px 0 0; line-height: 1.6; white-space: pre-wrap; }
+  .halt { margin: 12px 0 0; padding: 10px 12px; background: rgba(251,191,36,0.07); border-left: 3px solid #fbbf24; border-radius: 0 8px 8px 0; }
+  .hl { font-size: 10px; color: #fbbf24; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .hn { font-size: 12.5px; color: #fde68a; margin: 0; line-height: 1.55; }
+  .waiting { margin: 12px 0 0; padding: 10px 12px; background: rgba(103,232,249,0.06); border-left: 3px solid #67e8f9; border-radius: 0 8px 8px 0; }
+  .wl { font-size: 10px; color: #67e8f9; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700; margin: 0 0 4px; }
+  .wn { font-size: 12.5px; color: #e8e8ee; margin: 0; }
+  .decide { display: grid; gap: 8px; margin-top: 12px; }
+  .inline { margin-top: 10px; }
+  .form { display: grid; gap: 10px; padding-top: 10px; }
+  .lbl { font-size: 11px; color: #9aa6b6; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; display: grid; gap: 5px; }
+  input, textarea { width: 100%; background: #08080a; border: 1px solid #2a2a2f; color: #fff; padding: 11px 12px; border-radius: 8px; font-size: 14px; font-family: inherit; min-height: 44px; text-transform: none; letter-spacing: normal; }
+  textarea { min-height: 60px; resize: vertical; }
+  .btn { background: #FF4F00; color: #fff; border: none; padding: 12px 20px; border-radius: 9px; font-size: 13px; font-weight: 700; cursor: pointer; min-height: 44px; justify-self: start; }
+  .btn.small { padding: 10px 16px; font-size: 12.5px; }
+  .btn.ok { background: #15803d; }
+  .btn.no { background: #b91c1c; }
+  .btn.ghost { background: transparent; border: 1px solid #2a2a2f; color: #9aa6b6; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hint { font-size: 11px; color: #6e6e78; line-height: 1.55; margin: 0; }
+  .sub-panel { margin-top: 12px; border-top: 1px solid #1a1a1f; }
+  .sub-panel > summary { cursor: pointer; font-size: 12px; color: #9aa6b6; min-height: 44px; display: flex; align-items: center; }
+  .empty { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 12px; padding: 30px 18px; text-align: center; color: #6e6e78; font-size: 13px; }
+</style>
+</AdminLayout>

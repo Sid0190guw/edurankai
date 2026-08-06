@@ -5,10 +5,11 @@
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { deliverMessage, parseAddressList, getMailboxAddress, logOutbound, getMailConfig } from '@/lib/mail';
+import { deliverMessage, parseAddressList, getMailboxAddress, logOutbound, getMailConfig, deliveryWording, type DeliveryStatus } from '@/lib/mail';
 import { sendExternal } from '@/lib/mail-transport';
 import { expandGroupTokens } from '@/lib/mail-groups';
 import { getSignature, scheduleMessage, rewriteLinksForTracking } from '@/lib/mail-advanced';
+import { describeLinkList } from '@/lib/mail-links';
 import { denyMailApi } from '@/lib/auth/mail-access';
 
 function json(d: any, s = 200) {
@@ -17,6 +18,9 @@ function json(d: any, s = 200) {
 function escapeHtml(s: string) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+// The real Postgres reason lives on e.cause; e.message is only the SQL that failed. Declared above
+// the handler on purpose — `const` is not hoisted and that has taken pages down here before.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 export const POST: APIRoute = async ({ request, locals }) => {
   // `if (!user) return 401` was the ENTIRE gate on sending mail from the company mailbox to
@@ -68,9 +72,19 @@ export const POST: APIRoute = async ({ request, locals }) => {
   if (!bodyHtml) bodyHtml = '<div>' + escapeHtml(bodyText).replace(/\n/g, '<br/>') + '</div>';
   if (!bodyText) bodyText = bodyHtml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
-  const attachments = Array.isArray(body.attachments)
-    ? body.attachments.filter((a: any) => a && a.url).map((a: any) => ({ filename: a.filename || 'attachment', url: a.url, mime: a.mime, size: a.size }))
-    : [];
+  // ATTACHMENTS ARE LINKS — there is no upload path in mail and there never was one (no
+  // multipart parse, no blob write, nothing in mail_attachments but a URL). describeLink() is the
+  // authority on the name and the type, so a hand-crafted POST cannot label a link as something it
+  // is not, and a link we refuse is REPORTED rather than quietly dropped from the message.
+  const linkList = describeLinkList(body.attachments);
+  if (linkList.rejected.length) {
+    return json({
+      ok: false,
+      error: 'That attachment is not a link: ' + linkList.rejected[0].reason,
+      rejectedAttachments: linkList.rejected,
+    }, 400);
+  }
+  const attachments = linkList.attachments.map((a) => ({ filename: a.filename, url: a.url, mime: a.mime }));
 
   // Append the composer's signature (unless this is a no-signature send).
   if (body.signature !== false) {
@@ -93,7 +107,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
     try {
       const sid = await scheduleMessage({ userId: user.id, to, cc, bcc, subject, bodyHtml, bodyText, threadId: body.threadId || null, inReplyTo: body.inReplyTo || null, scheduledAt: schedRaw });
       return json({ ok: true, scheduled: true, scheduledId: sid, scheduledAt: schedRaw.toISOString() });
-    } catch (e: any) { return json({ ok: false, error: 'could not schedule: ' + (e?.message || e) }, 500); }
+    } catch (e: any) {
+      console.error('[api/mail/send] schedule failed:', reasonOf(e));
+      return json({ ok: false, error: 'This message was NOT scheduled and has not been saved: ' + reasonOf(e) }, 500);
+    }
   }
 
   try {
@@ -108,10 +125,22 @@ export const POST: APIRoute = async ({ request, locals }) => {
       attachments,
     });
 
-    // Delete the draft this was sent from, if any
+    // Delete the draft this was sent from. The composer now SENDS draftId (it never used to), so
+    // "save draft, then send" stops leaving a permanent twin of the message sitting in Drafts.
+    //
+    // BOTH statements name the owner. The second one did not: `WHERE id = <draftId> AND is_draft`
+    // matched any account's draft, and mail_box cascades off mail_messages, so posting somebody
+    // else's draft id as `draftId` on a send of your own deleted THEIR unsent message. Same defect,
+    // same fix, as /api/mail/draft.ts — kept identical on purpose so the two cannot drift.
     if (body.draftId) {
-      await db.execute(sql`DELETE FROM mail_box WHERE user_id = ${user.id} AND message_id = ${body.draftId} AND folder = 'drafts'`);
-      await db.execute(sql`DELETE FROM mail_messages WHERE id = ${body.draftId} AND is_draft = true`);
+      try {
+        await db.execute(sql`DELETE FROM mail_box WHERE user_id = ${user.id} AND message_id = ${body.draftId} AND folder = 'drafts'`);
+        await db.execute(sql`DELETE FROM mail_messages WHERE id = ${body.draftId} AND is_draft = true AND from_user_id = ${user.id}`);
+      } catch (e: any) {
+        // The message HAS been sent by this point; a stranded draft is a nuisance, not a loss, and
+        // must not turn a successful send into a failure. Logged, never silent.
+        console.error('[api/mail/send] draft cleanup failed:', reasonOf(e));
+      }
     }
 
     // External delivery
@@ -140,21 +169,61 @@ export const POST: APIRoute = async ({ request, locals }) => {
         replyTo: fromEmail,
         messageId: result.rfcMessageId,
         inReplyTo: body.inReplyTo || undefined,
-        attachments: attachments.map((a: any) => ({ filename: a.filename, href: a.url })),
+        // Link attachments travel as links in the body; nodemailer must not try to fetch and
+        // embed them, which is what `path` did — a private document link fetched by the server
+        // becomes a 0-byte "attachment" named after a query string.
+        attachments: [],
+        // We log one row PER RECIPIENT below, which is the granularity the thread badge and
+        // /admin/mail/analytics both read. Letting the transport log a second row per send would
+        // double every status count on that page.
+        logToDb: false,
       });
+      // ONE ROW PER EXTERNAL RECIPIENT, keyed by the mail_messages UUID — which is what the
+      // reading pane looks the delivery state up by. The rfc id goes in its own column.
       for (const e of result.external) {
-        await logOutbound({
-          messageId: result.messageId, to: e.email, from: fromEmail, subject,
-          status: send.ok ? 'sent' : 'failed', provider: send.provider, error: send.error,
-        });
+        try {
+          await logOutbound({
+            messageId: result.messageId, rfcMessageId: result.rfcMessageId,
+            to: e.email, from: fromEmail, subject,
+            status: send.ok ? 'sent' : (send.provider === 'none' ? 'no_transport' : 'failed'),
+            provider: send.provider, error: send.error,
+          });
+        } catch (le: any) {
+          // A lost log line means the thread will say "Delivery unknown" — which is the honest
+          // answer when we cannot prove delivery. It must never say "Delivered" instead.
+          console.error('[api/mail/send] delivery log failed:', reasonOf(le));
+        }
       }
       // mark message as outbound when it left the platform
-      await db.execute(sql`UPDATE mail_messages SET direction = 'outbound' WHERE id = ${result.messageId}`);
-      return json({ ok: true, threadId: result.threadId, messageId: result.messageId, external: { attempted: result.external.length, delivered: send.ok, provider: send.provider, error: send.error } });
+      await db.execute(sql`UPDATE mail_messages SET direction = 'outbound' WHERE id = ${result.messageId}`).catch(() => {});
+
+      const status: DeliveryStatus = {
+        state: send.ok ? 'sent' : (send.provider === 'none' ? 'no_transport' : 'failed'),
+        externalCount: result.external.length,
+        sent: send.ok ? result.external.length : 0,
+        failed: send.ok ? 0 : result.external.length,
+        provider: send.provider,
+        error: send.error || null,
+      };
+      return json({
+        ok: true,
+        threadId: result.threadId,
+        messageId: result.messageId,
+        delivery: { ...status, ...deliveryWording(status) },
+        // kept for any older caller reading this shape
+        external: { attempted: result.external.length, delivered: send.ok, provider: send.provider, error: send.error },
+      });
     }
 
-    return json({ ok: true, threadId: result.threadId, messageId: result.messageId });
+    const internal: DeliveryStatus = { state: 'internal', externalCount: 0, sent: 0, failed: 0, provider: null, error: null };
+    return json({
+      ok: true, threadId: result.threadId, messageId: result.messageId,
+      delivery: { ...internal, ...deliveryWording(internal) },
+    });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'send failed' }, 500);
+    // NEVER SWALLOWED, AND NEVER SOFTENED. If this throws, the message did not go: say so in the
+    // words the composer will show, and log the real Postgres reason rather than the failed SQL.
+    console.error('[api/mail/send] send failed:', reasonOf(e));
+    return json({ ok: false, error: 'This message was NOT sent: ' + reasonOf(e) }, 500);
   }
 };

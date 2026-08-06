@@ -77,6 +77,13 @@ import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
 import { logAudit } from '@/lib/audit';
+// The civil date in the company's zone. An invoice due date is a CALENDAR day, and comparing it to
+// the server's UTC day gets the answer wrong for the first five and a half hours of every IST day.
+import { civilDate } from '@/lib/page-safety';
+// Money arithmetic. round2() rounds the DECIMAL value rather than the binary double; numeric() reads
+// the NUMERIC postgres-js hands back as a string without the precision a ::float cast destroys;
+// sumMoney() adds in integer paise so a total equals the lines printed beside it.
+import { round2, numeric, sumMoney, toMinor, fromMinor } from '@/lib/money';
 import {
   startWorkflow,
   instanceForRecord,
@@ -535,6 +542,27 @@ async function createInvoiceTables(): Promise<void> {
   await db.execute(sql`ALTER TABLE invoice_tax_lines ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
   await db.execute(sql`CREATE INDEX IF NOT EXISTS invoice_tax_lines_invoice_idx
     ON invoice_tax_lines (invoice_id, position)`);
+  // ONE LINE PER COMPONENT PER INVOICE, said by the database rather than only by applyTaxComponents.
+  //
+  // The only index on this table was the non-unique one above, so nothing prevented an invoice from
+  // carrying the same tax component twice — and recalcTotals() sums every row it finds, which is how a
+  // client invoice comes to charge 36% GST where the components say 18%. applyTaxComponents now does
+  // its DELETE and its INSERTs in one transaction, which is the real fix; this is the constraint that
+  // makes the invariant true regardless of who else ever writes this table.
+  //
+  // ADDITIVE AND NON-FATAL. An invoice that ALREADY carries a duplicated component would reject the
+  // index, and a finance module that refuses to load is worse than one running with the transaction
+  // guard alone. It is logged, because a duplicate here means a document overstated its own tax.
+  // TO FIND ANY BEFORE THIS CAN SUCCEED (run it yourself — this process never connects):
+  //   SELECT invoice_id, code, COUNT(*) FROM invoice_tax_lines GROUP BY 1,2 HAVING COUNT(*) > 1;
+  // Nothing here deletes a row; a duplicate has to be removed by a human who can see which invoice it
+  // is on and whether that invoice has already been issued.
+  try {
+    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS invoice_tax_lines_code_uq
+      ON invoice_tax_lines (invoice_id, code)`);
+  } catch (e: any) {
+    logFail('invoice_tax_lines_code_uq', e);
+  }
 
   // -----------------------------------------------------------------------------------------
   // invoice_payments — MONEY THAT ACTUALLY MOVED, one row per movement, so a part payment is a
@@ -569,6 +597,36 @@ async function createInvoiceTables(): Promise<void> {
   await db.execute(sql`ALTER TABLE invoice_payments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
   await db.execute(sql`CREATE INDEX IF NOT EXISTS invoice_payments_invoice_idx
     ON invoice_payments (invoice_id, paid_on DESC)`);
+
+  // ---- THE IDEMPOTENCY KEY -----------------------------------------------------------------------
+  //
+  // recordPayment() computes the outstanding balance inside the INSERT, so an OVERPAYMENT cannot be
+  // written. That closes one failure and leaves the other one wide open: a PART payment repeated.
+  //
+  // On a payable of 400,000 with 400,000 outstanding, two submissions of "100,000 by bank transfer,
+  // reference NEFT-88213" both pass the balance test, because 100,000 twice is still inside 400,000.
+  // Two rows land, the bill reads 200,000 paid, and nothing distinguishes the pair from two genuine
+  // part payments that happen to share a reference — which is precisely what a vendor's remittance
+  // advice looks like. When the payable is settled `method = 'wallet'`, each row credits the employee
+  // wallet under its OWN payment id, so the second one pays somebody a second time.
+  //
+  // The key is what the person recording the payment already knows: the invoice, the day the money
+  // moved, the method, the amount and the reference they typed. Two submissions of one form produce
+  // the same key; two genuinely different payments (a different day, a different amount, a different
+  // reference) do not. It is derived rather than supplied so no caller can forget to bring one.
+  //
+  // ADDITIVE, AND THE INDEX IS PARTIAL so rows written before this column existed — which all carry
+  // NULL — cannot collide with each other or with anything new.
+  await db.execute(sql`ALTER TABLE invoice_payments ADD COLUMN IF NOT EXISTS idempotency_key TEXT`);
+  try {
+    await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS invoice_payments_idem_uniq
+      ON invoice_payments (idempotency_key) WHERE idempotency_key IS NOT NULL`);
+  } catch (e: any) {
+    // NON-FATAL AND LOUD. If the index cannot be built there is already a duplicated key in the
+    // table, which means a payment has been recorded twice and a human has to net it off. A finance
+    // module that refuses to load is worse than one that runs with the balance guard alone.
+    logFail('createInvoiceTables.idempotency', e);
+  }
 
   // TWO SERIES SO THE MODULE WORKS THE MOMENT IT IS OPENED, and neither carries a rate, a tax or a
   // claim — a prefix and a counter are the whole of it. An administrator who renames, re-prefixes or
@@ -730,9 +788,17 @@ function num(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function money(n: number): number {
-  return Math.round((Number(n) || 0) * 100) / 100;
-}
+/**
+ * ONE ROUNDING RULE, SHARED WITH THE REST OF THE MONEY MODULES.
+ *
+ * This was `Math.round((Number(n) || 0) * 100) / 100`, the same copy five other modules carried. It
+ * rounds a half paisa DOWN whenever the product lands just under .5 in IEEE754 — 1.005 * 100 is
+ * 100.49999999999999 — so a tax line, a quantity times a rate, or a percentage of a subtotal could
+ * each be a paisa short of what the document's own figures say. round2() in src/lib/money.ts takes
+ * the decimal value back before rounding. Kept under the name `money` because it is used ~40 times
+ * in this file and the name reads correctly at each of them.
+ */
+const money = round2;
 
 /** A shared document link, or null. http(s) only, and nothing is ever uploaded on this platform. */
 export function normaliseLink(v: unknown): string | null {
@@ -876,9 +942,14 @@ export function displayStatus(invoice: Invoice, paidTotal: number, today?: Date)
   if (total > 0 && paid >= total) return 'paid';
   if (paid > 0) return 'part_paid';
   if (invoice.dueDate) {
-    const now = today || new Date();
-    const iso = now.toISOString().slice(0, 10);
-    if (invoice.dueDate < iso) return 'overdue';
+    // THE DUE DATE IS A CIVIL DATE AND MUST BE COMPARED AGAINST ONE.
+    //
+    // This was `new Date().toISOString().slice(0,10)`, which is the UTC day. The server runs in UTC
+    // and the people reading this are in IST, five and a half hours ahead — so for the first five and
+    // a half hours of every IST day the comparison used YESTERDAY, and an invoice that fell due did
+    // not read as overdue on the morning it fell due. civilDate() asks Intl for the day in the zone.
+    const iso = civilDate(today || new Date());
+    if (iso && invoice.dueDate < iso) return 'overdue';
   }
   return invoice.status;
 }
@@ -1204,7 +1275,16 @@ export async function viewInvoice(id: string): Promise<InvoiceView | null> {
     invoiceTaxLines(invoice.id),
     invoicePayments(invoice.id),
   ]);
-  const paidTotal = money(payments.reduce((s, p) => s + (Number(p.amount) || 0), 0));
+  // THE AMOUNT PAID EQUALS THE PAYMENT ROWS PRINTED BENEATH IT.
+  //
+  // This was `money(payments.reduce((s, p) => s + amount, 0))` — doubles added left to right and
+  // rounded once at the end. Every consumer of this figure is a comparison, not a display: `balance`
+  // below is derived from it, recordPayment() refuses an amount above that balance, and
+  // displayStatus() decides whether a bill reads as PAID from it. A total that is a paisa away from
+  // the sum of its own rows leaves an invoice whose payments visibly cover it still showing a
+  // balance nobody can clear, or the reverse. sumMoney() adds integer paise, where that cannot
+  // happen. See src/lib/money.ts.
+  const paidTotal = sumMoney(payments.map((p) => p.amount));
   const instance = await payApprovalFor(invoice);
   return {
     invoice,
@@ -1242,12 +1322,15 @@ export async function withTotals(list: Invoice[]): Promise<InvoiceListRow[]> {
       // BOUND, one fragment per id, never pasted — the same shape src/lib/calendar-hub.ts uses. An
       // id is data even when it came from a row this process just read.
       const idList = sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `);
+      // NO ::float. invoice_payments.amount is NUMERIC(14,2); the cast converted an exact decimal to
+      // a double before this process saw it, and the result is subtracted from the invoice total to
+      // produce the balance every list screen prints.
       const r = await db.execute(sql`
-        SELECT invoice_id, COALESCE(SUM(amount), 0)::float AS paid
+        SELECT invoice_id, COALESCE(SUM(amount), 0) AS paid
           FROM invoice_payments
          WHERE invoice_id IN (${idList})
          GROUP BY invoice_id`);
-      for (const row of rows(r)) paidById.set(String(row.invoice_id), Number(row.paid) || 0);
+      for (const row of rows(r)) paidById.set(String(row.invoice_id), numeric(row.paid));
     }
   } catch (e: any) {
     // The totals could not be read. Every invoice is reported with zero paid AND the caller sees the
@@ -1290,39 +1373,98 @@ export async function billedPurchaseRequestIds(): Promise<Set<string>> {
 
 export interface InvoiceSummary {
   receivableOpen: number;
+  /** Outstanding in DEFAULT_CURRENCY only. See `outstandingOtherCurrencies`. */
   receivableOutstanding: number;
   receivableOverdue: number;
   payableOpen: number;
+  /** Outstanding in DEFAULT_CURRENCY only. See `outstandingOtherCurrencies`. */
   payableOutstanding: number;
   awaitingPayApproval: number;
+  /**
+   * Outstanding money held in any OTHER currency, one entry per currency and never added in.
+   *
+   * A screen showing the two scalars above MUST show this too when it is non-empty, or the number it
+   * prints is smaller than what is actually owed and nothing says so.
+   */
+  outstandingOtherCurrencies: Array<{ currency: string; receivable: number; payable: number }>;
   /** True when a count could not be read. A screen must say so rather than render a confident 0. */
   degraded: boolean;
 }
 
+/**
+ * THE FINANCE CONSOLE'S HEADLINE FIGURES — one currency at a time.
+ *
+ * WHAT THIS USED TO DO. `SUM(total - paid)` ran across EVERY live invoice regardless of
+ * invoices.currency, and the console printed the result with formatAmount(..., DEFAULT_CURRENCY). So
+ * a receivable of USD 40,000 and one of INR 40,000 were reported as "₹80,000 outstanding" — a sum of
+ * dollars and rupees, labelled rupees, on the screen a founder reads to decide whether the company
+ * can make payroll. There is no exchange rate anywhere in this codebase, so there was no arithmetic
+ * that could have made that number mean anything.
+ *
+ * The scalars are now DEFAULT_CURRENCY only, and anything else is returned beside them rather than
+ * folded in or dropped.
+ */
 export async function invoiceSummary(): Promise<InvoiceSummary> {
   const empty: InvoiceSummary = {
     receivableOpen: 0, receivableOutstanding: 0, receivableOverdue: 0,
-    payableOpen: 0, payableOutstanding: 0, awaitingPayApproval: 0, degraded: true,
+    payableOpen: 0, payableOutstanding: 0, awaitingPayApproval: 0,
+    outstandingOtherCurrencies: [], degraded: true,
   };
   try {
     await ensureInvoiceSchema();
-    const r = rows(await db.execute(sql`
+    // OVERDUE IS DECIDED IN THE SAME ZONE ON THIS TILE AS IT IS ON THE INVOICE ITSELF.
+    //
+    // This filter was `due_date < CURRENT_DATE`, which is the DATABASE session's date — UTC. Every
+    // other overdue judgement in this module goes through displayStatus(), which compares against
+    // civilDate() in Asia/Kolkata precisely because the server is UTC and the readers are IST. For
+    // the first five and a half hours of every IST day the two disagreed: the list showed an invoice
+    // badged "overdue" that the summary tile above it did not count, and the count on the dashboard
+    // was one or more short of the rows a reader could see for themselves. A number that contradicts
+    // the list beside it is worse than no number, because it is the one somebody quotes.
+    const todayCivil = civilDate(new Date());
+    // Counts stay across all currencies — "how many bills are open" is a count of documents and does
+    // not depend on what they are denominated in. Only the MONEY is separated.
+    const byCurrency = rows(await db.execute(sql`
       WITH paid AS (
         SELECT invoice_id, COALESCE(SUM(amount), 0) AS p
           FROM invoice_payments GROUP BY invoice_id
       ), live AS (
-        SELECT i.id, i.direction, i.total, i.due_date, COALESCE(paid.p, 0) AS paid
+        SELECT i.id, i.direction, i.total, i.due_date,
+               COALESCE(NULLIF(UPPER(i.currency), ''), ${DEFAULT_CURRENCY}) AS cur,
+               COALESCE(paid.p, 0) AS paid
           FROM invoices i
           LEFT JOIN paid ON paid.invoice_id = i.id
          WHERE i.status <> 'void' AND i.status <> 'draft'
       )
       SELECT
+        cur,
         COUNT(*) FILTER (WHERE direction = 'receivable' AND paid < total)::int AS r_open,
-        COALESCE(SUM(total - paid) FILTER (WHERE direction = 'receivable' AND paid < total), 0)::float AS r_out,
-        COUNT(*) FILTER (WHERE direction = 'receivable' AND paid < total AND due_date IS NOT NULL AND due_date < CURRENT_DATE)::int AS r_over,
+        COALESCE(SUM(total - paid) FILTER (WHERE direction = 'receivable' AND paid < total), 0) AS r_out,
+        COUNT(*) FILTER (WHERE direction = 'receivable' AND paid < total AND due_date IS NOT NULL AND due_date < ${todayCivil}::date)::int AS r_over,
         COUNT(*) FILTER (WHERE direction = 'payable' AND paid < total)::int AS p_open,
-        COALESCE(SUM(total - paid) FILTER (WHERE direction = 'payable' AND paid < total), 0)::float AS p_out
-      FROM live`))[0] || {};
+        COALESCE(SUM(total - paid) FILTER (WHERE direction = 'payable' AND paid < total), 0) AS p_out
+      FROM live
+      GROUP BY cur`));
+
+    const r: Record<string, number> = {
+      r_open: 0, r_out: 0, r_over: 0, p_open: 0, p_out: 0,
+    };
+    const outstandingOtherCurrencies: Array<{ currency: string; receivable: number; payable: number }> = [];
+    for (const row of byCurrency) {
+      const cur = String(row.cur || DEFAULT_CURRENCY).toUpperCase();
+      // Counts are currency-independent and are added up across all of them.
+      r.r_open += Number(row.r_open) || 0;
+      r.r_over += Number(row.r_over) || 0;
+      r.p_open += Number(row.p_open) || 0;
+      const receivable = numeric(row.r_out);
+      const payable = numeric(row.p_out);
+      if (cur === DEFAULT_CURRENCY) {
+        r.r_out = receivable;
+        r.p_out = payable;
+      } else if (receivable !== 0 || payable !== 0) {
+        outstandingOtherCurrencies.push({ currency: cur, receivable, payable });
+      }
+    }
 
     let awaiting = 0;
     try {
@@ -1345,6 +1487,7 @@ export async function invoiceSummary(): Promise<InvoiceSummary> {
       payableOpen: Number(r.p_open || 0),
       payableOutstanding: Number(r.p_out || 0),
       awaitingPayApproval: awaiting,
+      outstandingOtherCurrencies,
       degraded: false,
     };
   } catch (e: any) {
@@ -1423,7 +1566,11 @@ async function createInvoice(
   }
 
   const currency = String(columns.currency || DEFAULT_CURRENCY).slice(0, 8);
-  const issueDate = isoDate(columns.issueDate) || new Date().toISOString().slice(0, 10);
+  // THE ISSUE DATE IS A CIVIL DATE, in the same zone displayStatus() compares the due date against.
+  // This was `new Date().toISOString().slice(0,10)` — the UTC day — so an invoice raised between 00:00
+  // and 05:29 IST was dated YESTERDAY: on the wrong side of a month end for the first five and a half
+  // hours of the 1st, and one day out of step with the overdue derivation for the rest of the year.
+  const issueDate = isoDate(columns.issueDate) || civilDate(new Date());
   const dueDate = isoDate(columns.dueDate);
 
   try {
@@ -1611,21 +1758,39 @@ export async function createPayable(input: PayableInput, actorUserId: string | n
  */
 async function recalcTotals(invoiceId: string): Promise<{ subtotal: number; taxTotal: number; total: number } | null> {
   try {
+    // THE ::float CAST IS GONE. invoice_lines.amount is NUMERIC(14,2) and postgres-js hands NUMERIC
+    // back as a STRING precisely so no precision is lost; casting to float in SQL threw that away
+    // before JavaScript saw it, and this figure is then WRITTEN BACK to invoices.subtotal.
     const sub = rows(await db.execute(sql`
-      SELECT COALESCE(SUM(amount), 0)::float AS s FROM invoice_lines WHERE invoice_id = ${invoiceId}::uuid`))[0];
-    const subtotal = money(Number(sub?.s || 0));
+      SELECT COALESCE(SUM(amount), 0) AS s FROM invoice_lines WHERE invoice_id = ${invoiceId}::uuid`))[0];
+    const subtotal = numeric(sub?.s);
 
+    // ---- THE TAX TOTAL EQUALS THE TAX LINES THE DOCUMENT PRINTS -----------------------------------
+    //
+    // Each component's amount is still rounded — it has to be, because it is PRINTED as its own line
+    // on the invoice and stored in a NUMERIC(14,2) column. What changed is the summing: it was
+    // `taxTotal = money(taxTotal + amount)` folded through a rounding step on every iteration, and
+    // the total is now added in integer paise from the rounded line amounts.
+    //
+    // The identity that must hold on an issued document is TAX TOTAL == SUM OF THE PRINTED TAX LINES,
+    // and it now does by construction. Note what this deliberately does NOT do: on a subtotal of
+    // 1,000.05 with CGST 9% and SGST 9%, each line rounds to 90.00 and the total is 180.00, where
+    // 18% of 1,000.05 is 180.009. The document is internally consistent — 90.00 + 90.00 = 180.00 —
+    // which is the property a counterparty can actually check, and it is the same answer any invoice
+    // that prints its components separately has to give. Making the total 180.01 instead would leave
+    // a document whose own two lines do not add up to it.
     const taxes = rows(await db.execute(sql`
       SELECT id, basis, value FROM invoice_tax_lines WHERE invoice_id = ${invoiceId}::uuid`));
-    let taxTotal = 0;
+    const taxAmounts: number[] = [];
     for (const t of taxes) {
       const value = Number(t.value) || 0;
       const amount = String(t.basis) === 'fixed' ? money(value) : money((subtotal * value) / 100);
-      taxTotal = money(taxTotal + amount);
+      taxAmounts.push(amount);
       await db.execute(sql`UPDATE invoice_tax_lines SET amount = ${amount} WHERE id = ${String(t.id)}::uuid`);
     }
+    const taxTotal = sumMoney(taxAmounts);
 
-    const total = money(subtotal + taxTotal);
+    const total = sumMoney([subtotal, taxTotal]);
     await db.execute(sql`
       UPDATE invoices SET subtotal = ${subtotal}, tax_total = ${taxTotal}, total = ${total}, updated_at = NOW()
        WHERE id = ${invoiceId}::uuid`);
@@ -1748,20 +1913,49 @@ export async function applyTaxComponents(
     if (wanted.length && !chosen.length) {
       return { ok: false, error: 'None of those tax components exist or are active any more.' };
     }
-    await db.execute(sql`DELETE FROM invoice_tax_lines WHERE invoice_id = ${invoiceId}::uuid`);
-    let position = 1;
-    for (const c of chosen) {
-      await db.execute(sql`
-        INSERT INTO invoice_tax_lines (invoice_id, component_id, code, label, basis, value, amount, position)
-        VALUES (${invoiceId}::uuid, ${c.id}::uuid, ${c.code}, ${c.label}, ${c.basis}, ${c.value}, 0, ${position})`);
-      position += 1;
-    }
+    // THE OLD LINES AND THE NEW ONES ARE ONE TRANSACTION. Replacing a set with DELETE followed by a
+    // loop of INSERTs is only safe if the two cannot be separated, and they were separated by nothing
+    // at all: a connection drop or a function timeout between them left the invoice with ZERO or with
+    // PARTIAL tax lines while invoices.tax_total and invoices.total still carried the tax the deleted
+    // lines had produced. The error returned was the generic WRITE_FAILED, which does not mention that
+    // the previous tax lines no longer exist — so finance reopened the draft, saw an empty tax section
+    // beside a total that still included GST, and had nothing telling them which was right.
+    //
+    // Two people applying components at once had the matching problem: both deleted, both inserted,
+    // recalcTotals summed every row it found, and the client invoice charged 36% where the components
+    // said 18%. Inside one transaction the second writer waits for the first to commit and then
+    // replaces its rows wholesale, so the last edit wins entirely and never merges with the other.
+    await db.transaction(async (tx: any) => {
+      await tx.execute(sql`DELETE FROM invoice_tax_lines WHERE invoice_id = ${invoiceId}::uuid`);
+      let position = 1;
+      for (const c of chosen) {
+        await tx.execute(sql`
+          INSERT INTO invoice_tax_lines (invoice_id, component_id, code, label, basis, value, amount, position)
+          VALUES (${invoiceId}::uuid, ${c.id}::uuid, ${c.code}, ${c.label}, ${c.basis}, ${c.value}, 0, ${position})`);
+        position += 1;
+      }
+    });
+
+    // recalcTotals() runs after the commit and owns its own error handling — it returns null rather
+    // than throwing. That null was previously folded into the audit diff and reported as a plain
+    // success, so an invoice whose tax lines were replaced but whose stored total was NOT recomputed
+    // read exactly like one that was. The lines are right and the total is stale; the draft is
+    // recoverable by pressing Apply again, and the person is told that rather than left to find it
+    // when the invoice is issued.
     const totals = await recalcTotals(invoiceId);
     await logAudit({
       userId: isUuid(actorUserId) ? actorUserId : null,
       action: 'invoice.tax.apply', entity: 'invoice', entityId: invoiceId,
       diff: { codes: chosen.map((c) => c.code), taxTotal: totals?.taxTotal ?? null, total: totals?.total ?? null },
     });
+    if (!totals) {
+      return {
+        ok: true, id: invoiceId, changed: true,
+        warning: 'The tax components were applied, but the invoice total could not be recalculated, so '
+          + 'the total shown is the one from before this change. Apply them again before issuing this '
+          + 'invoice.',
+      };
+    }
     return { ok: true, id: invoiceId, changed: true };
   } catch (e: any) {
     logFail('applyTaxComponents', e);
@@ -2024,16 +2218,73 @@ export async function recordPayment(input: PaymentInput, actorUserId: string | n
   if (!(await schemaReady())) return { ok: false, error: SCHEMA_FAILED };
 
   try {
-    const ins = rows(await db.execute(sql`
-      INSERT INTO invoice_payments (invoice_id, amount, currency, paid_on, method, reference, note, recorded_by)
-      VALUES (${invoiceId}::uuid, ${money(amount)}, ${invoice.currency},
-              ${isoDate(input?.paidOn) || new Date().toISOString().slice(0, 10)}::date,
-              ${method}, ${text(input?.reference, 120)}, ${text(input?.note, MAX_TEXT)},
-              ${isUuid(actorUserId) ? actorUserId : null}::uuid)
-      RETURNING id`));
+    // THE OUTSTANDING TEST IS REPEATED INSIDE THE INSERT.
+    //
+    // The check against view.balance a few lines up is a READ, and two payments recorded together —
+    // two people on the same bill, one person double-submitting on a slow connection — both passed
+    // it and both were written, so an invoice could carry more paid against it than it is worth. For
+    // a payable settled into an employee wallet that is not just a wrong total: each row credits the
+    // wallet under its own ref, so the second one pays somebody a second time.
+    //
+    // The sum below is computed in the same statement that writes the row, so the second attempt
+    // sees the first payment already counted and inserts nothing.
+    // THE SAME PAYMENT, RECORDED TWICE, IS RECORDED ONCE.
+    //
+    // The balance test below stops an OVERpayment. It does not stop a part payment being written
+    // twice: 100,000 against a 400,000 balance passes on both submissions. The key is derived from
+    // what the person entered — invoice, day, method, amount, reference — so a double-submitted form,
+    // a retried POST and a browser refresh all produce the same key and the second write is refused
+    // by the unique index rather than becoming a second payment. Two genuinely separate part payments
+    // differ in at least one of those fields and are unaffected.
+    // The civil day in the company's zone, not the server's UTC day — a payment entered at 00:30 IST
+    // on the 1st was being dated the last day of the previous month, landing in the wrong month's
+    // receipts and, for a receivable, on the wrong side of a period close.
+    const paidOn = isoDate(input?.paidOn) || civilDate(new Date());
+    const reference = text(input?.reference, 120);
+    const idempotencyKey = [
+      invoiceId, paidOn, method, money(amount).toFixed(2), reference || '',
+    ].join('|').slice(0, 400);
+
+    let ins: any[];
+    try {
+      ins = rows(await db.execute(sql`
+        INSERT INTO invoice_payments (invoice_id, amount, currency, paid_on, method, reference, note, recorded_by, idempotency_key)
+        SELECT ${invoiceId}::uuid, ${money(amount)}, ${invoice.currency},
+               ${paidOn}::date,
+               ${method}, ${reference}, ${text(input?.note, MAX_TEXT)},
+               ${isUuid(actorUserId) ? actorUserId : null}::uuid, ${idempotencyKey}
+          FROM invoices i
+         WHERE i.id = ${invoiceId}::uuid
+           AND i.status <> 'void'
+           AND ${money(amount)} <= i.total - COALESCE(
+                 (SELECT SUM(p.amount) FROM invoice_payments p WHERE p.invoice_id = i.id), 0)
+        RETURNING id`));
+    } catch (e: any) {
+      const real = String(e?.cause?.message || e?.message || '');
+      if (/duplicate key|unique constraint/i.test(real)) {
+        // A RETRY IS A NO-OP, AND IT IS REPORTED AS ONE. The first submission landed; this one did
+        // not write a second payment. Saying "already recorded" rather than "failed" is the whole
+        // point — a user told the write failed records it again by hand.
+        return {
+          ok: false,
+          error: 'That payment is already recorded — ' + formatAmount(money(amount), invoice.currency)
+            + ' on ' + paidOn + (reference ? ' (' + reference + ')' : '')
+            + '. Nothing was recorded a second time. Reload the invoice to see it. If this really is a '
+            + 'separate payment of the same amount on the same day, give it its own reference.',
+        };
+      }
+      throw e;
+    }
     if (!ins.length) {
-      logFail('recordPayment', new Error('insert returned no row for invoice ' + invoiceId));
-      return { ok: false, error: WRITE_FAILED };
+      // NOT a database failure. Somebody recorded a payment against this invoice between the read
+      // above and this write, and what is left no longer covers this amount.
+      const fresh = await viewInvoice(invoiceId);
+      return {
+        ok: false,
+        error: 'Nothing was recorded. Another payment was entered against this invoice a moment ago, '
+          + 'and only ' + formatAmount(fresh?.balance ?? 0, invoice.currency) + ' is still outstanding. '
+          + 'Reload the invoice and record what is actually left.',
+      };
     }
     const paymentId = String(ins[0].id);
 
@@ -2092,14 +2343,27 @@ async function creditEmployeeWallet(paymentId: string, invoice: Invoice, amount:
   }
   try {
     const { credit } = await import('@/lib/hr-wallet');
-    await credit(
+    const res = await credit(
       employeeId,
       amount,
       'reimbursement',
       'Invoice ' + invoice.invoiceNumber + (invoice.vendorInvoiceRef ? ' (' + invoice.vendorInvoiceRef + ')' : ''),
       null,
       ref,
+      // THE INVOICE'S OWN CURRENCY. It was not passed before, so the wallet row defaulted to INR and
+      // a bill of USD 1,200 credited the employee 1,200 rupees.
+      invoice.currency,
     );
+    // credit() REFUSES WITHOUT THROWING, and this line ignored it. It answers `{ ok: false }` — not an
+    // exception — for an amount that is not positive, so a payment row whose amount had come through
+    // as zero or NaN was marked wallet_credited = TRUE with nothing in the ledger behind it. The
+    // invoice then reads as settled into a wallet that was never credited, and "Retry wallet credit"
+    // is switched off by the same flag, so there is no path back. A refusal is a failure here.
+    if (!res?.ok) {
+      console.error('[invoices] the wallet was NOT credited for payment', paymentId,
+        '- employee', employeeId, '-', res?.error || 'the credit was refused');
+      return false;
+    }
     await db.execute(sql`
       UPDATE invoice_payments SET wallet_credited = TRUE, wallet_ref = ${ref} WHERE id = ${paymentId}::uuid`);
     await logAudit({
@@ -2176,13 +2440,38 @@ export async function voidInvoice(invoiceId: string, actorUserId: string | null,
   if (!(await schemaReady())) return { ok: false, error: SCHEMA_FAILED };
 
   try {
+    // "NO MONEY AGAINST IT" IS TESTED IN THE WRITE, NOT ONLY IN FRONT OF IT.
+    //
+    // The payments read above and this UPDATE are two separate statements, and recordPayment() tests
+    // `status === 'void'` from ITS OWN read. Interleave the two and each guard checked the other's
+    // precondition before the other's write landed: void reads zero payments, recordPayment reads
+    // status 'sent' and inserts a payment, and this UPDATE still succeeds because the status has not
+    // changed. What is left is exactly the state the refusal above exists to prevent — a void invoice
+    // with money recorded against it — and where that payment was a payable settled with method
+    // 'wallet', an employee has been credited against a bill the organisation now says never counted.
+    // Nothing reconciles that afterwards: the invoice is excluded from every receivable and payable
+    // figure, and the wallet credit is real.
+    //
+    // NOT EXISTS in the same statement closes it. The status guard stays — the two refuse different
+    // things, and the caller is told which one happened.
     const wrote = rows(await db.execute(sql`
       UPDATE invoices
          SET status = 'void', void_reason = ${why}, voided_at = NOW(),
              voided_by = ${isUuid(actorUserId) ? actorUserId : null}::uuid, updated_at = NOW()
        WHERE id = ${invoiceId}::uuid AND status = ${invoice.status}
+         AND NOT EXISTS (SELECT 1 FROM invoice_payments p WHERE p.invoice_id = invoices.id)
       RETURNING id`));
     if (!wrote.length) {
+      // Two different refusals share this branch, so the reason is re-read rather than assumed.
+      const since = await invoicePayments(invoiceId);
+      if (since.length) {
+        return {
+          ok: false,
+          error: 'A payment was recorded against this invoice while this page was open, so it was NOT '
+            + 'voided. Voiding it now would leave that payment pointing at a document saying it never '
+            + 'counted. Raise a credit note as its own invoice instead.',
+        };
+      }
       return { ok: false, error: 'That invoice changed while this page was open. Reload it and try again.' };
     }
 
@@ -2273,7 +2562,12 @@ export function payApprovalChain(): ChainRung[] {
   return def.route.map((r) => ({
     step: r.step,
     via: String(r.via),
-    optional: r.optional === true,
+    // READ STRUCTURALLY, ON PURPOSE. Every route literal in src/lib/workflow.ts carries `optional`
+    // and resolveRoute() reads it, but the RouteRule interface there does not yet declare it. This
+    // module does not own that file, so the property is read through a structural type rather than by
+    // editing a declaration another change is in the middle of. It compiles the same either way once
+    // RouteRule declares it.
+    optional: (r as { optional?: boolean }).optional === true,
     minAmount: typeof r.minAmount === 'number' ? r.minAmount : null,
     parallel: (perStep.get(r.step) || 1) > 1,
   }));

@@ -36,6 +36,63 @@ try {
 
 let flashMsg = '';
 
+// AUTOSAVE. The editor has always debounced a 1s save and painted "Saved" from the response — at
+// POST /api/notes/save, a route that does not exist in this repository. Every keystroke 404'd, the
+// chip read "Error" forever, and a note created by the form below (body = '') could never be given
+// any content. The page's own POST handler implemented create/delete/share/add_collab and no save.
+//
+// The handler is here rather than under src/pages/api/ because this page already owns the note
+// vocabulary and the ownership test; a second surface would be a second place for the two to drift.
+// The client contract is unchanged — JSON { id, title, body } — only the URL moves to this page.
+//
+// AUTHORISATION FAILS CLOSED: the UPDATE itself carries the ownership test, so a note the caller
+// neither owns nor collaborates on matches zero rows and is reported as a refusal. Nothing is
+// inferred from the id the browser sent.
+async function readJsonBody(): Promise<any> {
+  try { return await Astro.request.json(); } catch (_) { return null; }
+}
+
+if (
+  Astro.request.method === 'POST' &&
+  (Astro.request.headers.get('content-type') || '').includes('application/json')
+) {
+  const body = await readJsonBody();
+  const noteId = String(body?.id || '');
+  const title = String(body?.title ?? 'Untitled note').trim().slice(0, 240) || 'Untitled note';
+  const noteBody = String(body?.body ?? '');
+  const json = (payload: any, status: number) =>
+    new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } });
+
+  if (!noteId || !/^[0-9a-fA-F-]{36}$/.test(noteId)) {
+    return json({ ok: false, error: 'A note id is required.' }, 400);
+  }
+  try {
+    const saved = rows(await db.execute(sql`
+      UPDATE notes
+         SET title = ${title}, body = ${noteBody}, updated_at = NOW()
+       WHERE id = ${noteId}::uuid
+         AND (
+           owner_user_id = ${user.id}
+           OR id IN (
+             SELECT note_id FROM note_collaborators
+              WHERE user_id = ${user.id} AND permission = 'edit'
+           )
+         )
+       RETURNING id, updated_at
+    `));
+    if (saved.length === 0) {
+      // Either the note is gone or this account may not edit it. Both are refusals, and the editor
+      // is told so instead of being shown a green "Saved".
+      return json({ ok: false, error: 'You do not have edit access to this note.' }, 403);
+    }
+    return json({ ok: true, updated_at: saved[0].updated_at }, 200);
+  } catch (e: any) {
+    // The real Postgres reason lives on e.cause; e.message is only the failed SQL.
+    const reason = String(e?.cause?.message || e?.message || 'save failed');
+    return json({ ok: false, error: 'Could not save: ' + reason.slice(0, 160) }, 500);
+  }
+}
+
 // --- Handle POST ---
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -299,6 +356,11 @@ const notesPayload = myNotes.map((n: any) => ({
       </div>
     </section>
   </div>
+
+  <form method="post" id="actionForm" style="display:none;">
+    <input type="hidden" name="action" value="" />
+    <input type="hidden" name="id" value="" />
+  </form>
 </main>
 
 <script is:inline define:vars={{ notesPayload }}>
@@ -461,29 +523,39 @@ const notesPayload = myNotes.map((n: any) => ({
     const body = ed.innerHTML;
     const title = titleEl.value || 'Untitled note';
     try {
-      const r = await fetch('/api/notes/save', {
+      // Posts to this page, which answers JSON for an application/json body. Same request shape the
+      // editor has always sent; only the URL changed, because the route it used never existed.
+      const r = await fetch(window.location.pathname, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id, title, body }),
       });
-      if (r.ok) {
+      let payload = null;
+      try { payload = await r.json(); } catch (e) { payload = null; }
+      if (r.ok && payload && payload.ok) {
         saveState.className = 'save-state saved';
         saveState.textContent = 'Saved';
+        saveState.title = '';
         const n = state.notes.find((x) => x.id === id);
         if (n) {
           n.title = title;
           n.body = body;
-          n.updated_at = new Date().toISOString();
-          updatedAt.textContent = 'Updated ' + new Date().toLocaleString();
+          n.updated_at = payload.updated_at || new Date().toISOString();
+          updatedAt.textContent = 'Updated ' + new Date(n.updated_at).toLocaleString();
           renderList();
         }
       } else {
+        // Name the refusal instead of a bare "Error" the writer cannot act on.
         saveState.className = 'save-state';
-        saveState.textContent = 'Error';
+        saveState.textContent = 'Not saved';
+        saveState.title = (payload && payload.error) || ('Server responded ' + r.status);
+        updatedAt.textContent = saveState.title;
       }
     } catch (e) {
       saveState.className = 'save-state';
       saveState.textContent = 'Offline';
+      saveState.title = 'This device is offline. The note is still in the editor; it has not reached the server.';
+      updatedAt.textContent = saveState.title;
     }
   }
 
@@ -498,13 +570,19 @@ const notesPayload = myNotes.map((n: any) => ({
   });
 
   // ---------- share ----------
-  document.getElementById('btnShare').addEventListener('click', async () => {
+  // Share and delete used to fire a fetch, ignore the response and reload. A refusal and a success
+  // reloaded to the same page with no message. They now submit the page's own form, so what comes
+  // back is the server's rendering of what actually happened, including its flash message.
+  function submitPageAction(action) {
+    const f = document.getElementById('actionForm');
+    f.querySelector('input[name="action"]').value = action;
+    f.querySelector('input[name="id"]').value = state.activeId;
+    f.submit();
+  }
+
+  document.getElementById('btnShare').addEventListener('click', () => {
     if (!state.activeId) return;
-    const fd = new FormData();
-    fd.set('action', 'share_note');
-    fd.set('id', state.activeId);
-    await fetch(window.location.pathname, { method: 'POST', body: fd });
-    window.location.reload();
+    submitPageAction('share_note');
   });
 
   document.getElementById('btnCopyShare').addEventListener('click', () => {
@@ -519,10 +597,7 @@ const notesPayload = myNotes.map((n: any) => ({
   document.getElementById('btnDelete').addEventListener('click', () => {
     if (!state.activeId) return;
     if (!confirm('Delete this note? This cannot be undone.')) return;
-    const fd = new FormData();
-    fd.set('action', 'delete_note');
-    fd.set('id', state.activeId);
-    fetch(window.location.pathname, { method: 'POST', body: fd }).then(() => window.location.reload());
+    submitPageAction('delete_note');
   });
 
   // ---------- markdown export ----------
