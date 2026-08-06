@@ -31,6 +31,12 @@ function ensureSchema(): Promise<void> {
       week_xp INTEGER NOT NULL DEFAULT 0, final_rank INTEGER,
       placement_result VARCHAR(20), joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE(league_id, user_id))`);
+    // processed_at is written by the weekly settlement (/api/aquintutor/league-settle.ts) and was
+    // created by NOTHING, so every settlement UPDATE threw, the failure was swallowed by a
+    // `.catch(() => {})`, the counter was incremented anyway, and each learner was emailed a real
+    // promotion or demotion notice while no placement was ever recorded. Created here because this
+    // module owns league_memberships.
+    await db.execute(sql`ALTER TABLE league_memberships ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ`);
     await db.execute(sql`ALTER TABLE user_xp ADD COLUMN IF NOT EXISTS league_tier INTEGER NOT NULL DEFAULT 1`);
     await db.execute(sql`ALTER TABLE user_xp ADD COLUMN IF NOT EXISTS current_league_id UUID`);
   });

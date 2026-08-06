@@ -290,6 +290,30 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'Page: signed in (meet/index.astro:6). Narrowed here to people who work here.',
   },
   {
+    // THE COMPANY FEED — announcements, recognition and milestones, on one page.
+    //
+    // IT WAS REACHABLE ONLY BY NOTIFICATION, WHICH IS NOT REACHABLE. The only two links to
+    // /portal/feed/company anywhere in this codebase are actionUrl strings inside
+    // src/lib/announcements.ts and src/lib/recognition.ts — so a person could open the wall the day
+    // somebody recognised them and never find it again, and a person nobody had recognised yet could
+    // not find it at all. An announcement nobody can go and read is a notice board in a locked room.
+    //
+    // `worksHere` — an employee record, or admin.access — is STRICTLY NARROWER than the page's own
+    // gate, which is "signed in" followed by buildFeedViewer(). Same treatment as Messages, Meet and
+    // Mail above and for the same reason: an applicant does not belong on the staff notice board even
+    // though the page would give them an honest empty view. Rule 2 of this file.
+    //
+    // DRAWER ONLY. The four bar slots are daily acts; a notice board is read when something lands.
+    key: 'company-feed',
+    label: 'Company feed',
+    href: '/portal/feed/company',
+    icon: 'message',
+    group: 'communicate',
+    bar: null,
+    audience: worksHere,
+    gate: 'Page: signed in, then buildFeedViewer(). Audience scoping for every announcement is applied in the WHERE clause; recognition is public by design and carries no leaderboard. Narrowed here to people who work here.',
+  },
+  {
     key: 'mail',
     label: 'Mail',
     href: '/portal/mail',
@@ -433,6 +457,32 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     gate: 'Page: signed in. Every source is scoped in the query — people through the Organization Graph, departments through employee.manage or a headed department, tasks to your own and ones you assigned, documents to your own account, drafts through content.view. A result you may not open is never selected, so it cannot appear as a hidden row or move a count.',
   },
 
+  {
+    // FOCUS AND WELLBEING — a browser-side companion: a focus timer, a breathing pacer, desk
+    // exercises, hydration and meal reminders, and a focus streak. It was orphaned: nothing in
+    // src/ linked /portal/wellbeing at all.
+    //
+    // READ THE LABEL CAREFULLY, BECAUSE THE NEAR-MISS MATTERS. This is NOT the wellness programme at
+    // /portal/wellness, which is women-only, gated server-side, and whose individual data no admin
+    // and no founder may see. Nothing behind this entry reads or writes a health record: everything
+    // it does happens in the browser, and the page stores nothing about a person's body. The label
+    // says "focus" first for exactly that reason — one word meaning two rooms is the navigation
+    // defect this file already fixed once for "Documents".
+    //
+    // `anyone`, and that is EXACTLY the page's own gate: it redirects a signed-out visitor to the
+    // login screen and asks for nothing else. There is no capability to narrow to and nothing a
+    // narrower audience would protect.
+    key: 'wellbeing',
+    label: 'Focus and wellbeing',
+    href: '/portal/wellbeing',
+    icon: 'grid',
+    group: 'workspace',
+    // DRAWER ONLY. The bar slots belong to the acts people repeat every day.
+    bar: null,
+    audience: anyone,
+    gate: 'Signed in (wellbeing.astro). Everything on it runs in the browser; there is no query on the page and no row written anywhere. NOT the wellness programme — that is /portal/wellness and it is gated separately in src/lib/wellness.ts.',
+  },
+
   // ---------------------------------------------------------------- record
   {
     key: 'documents',
@@ -490,6 +540,28 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
     // person's own borrowing and their own repayments from them.
     audience: (v) => v.ctx.hasEmployeeRecord,
     gate: 'Signed in, then its own hr_employees lookup. Every read is narrowed by employee_id; requesting and withdrawing both resolve the employee from the session, never from the form.',
+  },
+  {
+    // THE WALLET — where net pay lands, and where a withdrawal to a bank account is raised from.
+    //
+    // THREE PAGES ALREADY POINT AT IT (payslips, expenses, loans) AND NOTHING OPENED IT DIRECTLY.
+    // NAV_BACKLOG `wallet` said this was "a one-line addition when money is wanted in the bar" and
+    // left it out rather than adding it silently. It is wanted: the money surfaces around it all end
+    // sentences with "open your wallet", so a person who arrived at any of them from the drawer had a
+    // door and a person who came looking for their balance first had none.
+    //
+    // hasEmployeeRecord, and NOT `worksHere` — the narrower of the two, for the same reason 'assets'
+    // and 'projects' use it. A wallet is resolved from hr_employees, so an admin account with no
+    // employee row would open a page that can only say there is nothing here.
+    key: 'wallet',
+    label: 'Wallet',
+    href: '/portal/employee/wallet',
+    icon: 'book',
+    group: 'record',
+    // DRAWER ONLY. Pay lands monthly; this is not a thumb destination.
+    bar: null,
+    audience: (v) => v.ctx.hasEmployeeRecord,
+    gate: 'Page: signed in, then its own hr_employees lookup (linked account first, then the three email columns). Every balance and every withdrawal row is narrowed by that employee id; a withdrawal is routed through src/lib/workflow.ts and the page approves nothing.',
   },
   {
     key: 'contract',
@@ -861,9 +933,46 @@ export const NAV_BACKLOG: readonly { key: string; reason: string }[] = [
   {
     key: 'wallet',
     reason:
-      'REACHABLE BUT NOT IN THE REQUESTED SET. /portal/employee/wallet exists and wallet.balance is ' +
-      'registered, so an entry is a one-line addition when money is wanted in the bar. Left out here ' +
-      'rather than added silently.',
+      'ANSWERED. This said an entry was "a one-line addition when money is wanted in the bar" and was ' +
+      'left out rather than added silently. It is in the list above now, drawer-only, gated on the ' +
+      'employee record — because /portal/employee/{payslips,expenses,loans} all end sentences with ' +
+      '"open your wallet" while nothing opened it directly, so the balance was reachable only by ' +
+      'arriving somewhere else first.',
+  },
+  {
+    key: 'totp-setup.duplicate',
+    reason:
+      'A SECOND DOOR INTO ONE ROOM, AND IT IS THE ONE NOBODY LINKS. /portal/totp-setup exists and ' +
+      'NOTHING in src/ points at it — the only mention anywhere is a sentence inside an AI chat ' +
+      'prompt. Authenticator enrolment is done INLINE on /portal/employee/security through ' +
+      'TwoFactorPanel, which is the entry the Security destination above already opens. So the fix ' +
+      'is a DELETION or a redirect, not a nav entry: two doors into one room teaches people the two ' +
+      'behave differently. Left in place and reported rather than removed, because a page that may ' +
+      'still be linked from an old email is not something to delete inside a navigation pass.',
+  },
+  {
+    key: 'learner.surfaces',
+    reason:
+      'NOT A WORKSPACE GAP, AND DELIBERATELY NOT SOLVED HERE. /portal/{achievements, crm, doubts, ' +
+      'feed, flashcards, groups, hackathons, jobs, library, notes, parent, resume-builder} are ' +
+      'LEARNER surfaces, every one gated on "signed in" and nothing more, and every one of them was ' +
+      'orphaned — no nav entry and no link from any reachable page. They are now linked from the ' +
+      'footer of /portal/index.astro, which is the learner home, rather than added to this list: an ' +
+      'HRIS drawer that already holds ~30 destinations does not need twelve more that an employee ' +
+      'will never open, and rule 1 of this file is about what is OFFERED, not only about what is ' +
+      'permitted. If a learner navigation module is ever written, it belongs beside this one and not ' +
+      'inside it.',
+  },
+  {
+    key: 'visvambhara.loop',
+    reason:
+      'AN ORPHAN THAT MUST STAY ONE UNTIL A PAGE IS FIXED. /portal/visvambhara:12 carries ' +
+      '`if (user.role !== \'applicant\') return Astro.redirect(\'/admin\')` — the same loop shape ' +
+      'profile.edit records below, where middleware bounces anyone without admin.access straight ' +
+      'back. It is unreachable today, and linking it before that line goes would hand every employee ' +
+      'a redirect loop. Same for /portal/requests/index:7 and /portal/wallet:11 (the LEARNER wallet ' +
+      'at /portal/wallet, which is not /portal/employee/wallet in the list above). Each is a ' +
+      'one-line page fix in a file this pass does not own.',
   },
   {
     key: 'reports.direct',

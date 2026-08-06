@@ -33,6 +33,27 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
       await ex(sql`ALTER TABLE training_modules ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
       await ex(sql`CREATE INDEX IF NOT EXISTS tm_course_idx ON training_modules(course_id, order_in_course)`);
 
+      // THE OTHER HALF OF THE CODEBASE ORDERS BY sort_order AND WRITES description, AND NOTHING
+      // CREATED EITHER COLUMN. The comment above notes an older shape "may already" use sort_order
+      // and adds order_in_course for this module's helpers — but never did the reverse, so on any
+      // database built from this file seven live call sites failed:
+      //   src/pages/admin/courses/[id]/edit.astro:64   INSERT (description, sort_order)
+      //   src/pages/admin/courses/[id]/edit.astro:111  ORDER BY sort_order
+      //   src/pages/admin/hr/training.astro:52, :96    INSERT sort_order / ORDER BY sort_order
+      //   src/pages/api/aquintutor/tutor.ts:41         SELECT description ORDER BY sort_order
+      //   src/pages/aquintutor/courses/[slug].astro:29, src/pages/portal/courses/[slug].astro:43
+      // Each one threw, which took out the module list on the learner AND admin course pages and
+      // turned "ORDER BY sort_order" into an ordering control that cannot order.
+      //
+      // Both spellings now exist, and sort_order is BACKFILLED from order_in_course so a module
+      // created through createModule() (which sets only order_in_course) sorts the same way on the
+      // pages that read the other name. Deliberately additive: nothing is renamed or dropped, so
+      // neither half changes behaviour beyond starting to work.
+      await ex(sql`ALTER TABLE training_modules ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0`);
+      await ex(sql`ALTER TABLE training_modules ADD COLUMN IF NOT EXISTS description TEXT`);
+      await ex(sql`UPDATE training_modules SET sort_order = order_in_course WHERE sort_order IS NULL OR (sort_order = 0 AND order_in_course <> 0)`);
+      await ex(sql`UPDATE training_modules SET order_in_course = sort_order WHERE order_in_course = 0 AND sort_order <> 0`);
+
       // Per-lesson additions (idempotent ALTER).
       await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS module_id UUID`);
       await ex(sql`ALTER TABLE training_lessons ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'draft'`);
@@ -284,13 +305,22 @@ export async function createModule(opts: { courseId: string; title: string; summ
     catch { order = 0; }
   }
   // Try full insert; fall back to the minimal columns if order_in_course/summary are absent.
+  // sort_order is written alongside order_in_course because half the course surfaces order by that
+  // name (see the bootstrap note above); a module created here used to sort last on all of them.
   try {
     const r = rows(await db.execute(sql`
-      INSERT INTO training_modules (course_id, title, summary, order_in_course)
-      VALUES (${opts.courseId}, ${opts.title}, ${opts.summary || null}, ${order})
+      INSERT INTO training_modules (course_id, title, summary, order_in_course, sort_order)
+      VALUES (${opts.courseId}, ${opts.title}, ${opts.summary || null}, ${order}, ${order})
       RETURNING id`));
     return r[0]?.id;
   } catch {
+    try {
+      const r = rows(await db.execute(sql`
+        INSERT INTO training_modules (course_id, title, summary, order_in_course)
+        VALUES (${opts.courseId}, ${opts.title}, ${opts.summary || null}, ${order})
+        RETURNING id`));
+      return r[0]?.id;
+    } catch (_) { /* fall through to the minimal insert below */ }
     try {
       const r = rows(await db.execute(sql`INSERT INTO training_modules (course_id, title) VALUES (${opts.courseId}, ${opts.title}) RETURNING id`));
       return r[0]?.id;

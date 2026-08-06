@@ -1,0 +1,256 @@
+// src/lib/auth/recovery.ts — THE ONE PLACE A PASSWORD RECOVERY IS AUTHORISED.
+//
+// WHY THIS FILE EXISTS.
+// Two unauthenticated endpoints could reset ANY account's password — including a super_admin — and
+// hand the new password straight back in the HTTP response:
+//
+//   /api/auth/forgot-password        knowledge of a date of birth was the whole gate, and the
+//                                    response body carried the new password. ~36,500 candidate
+//                                    dates, no rate limit anywhere (a 600 ms sleep inside one
+//                                    serverless invocation limits nothing — the next request runs
+//                                    in a different container), and two distinguishable 404 texts
+//                                    told an attacker whether the account existed at all.
+//   /api/auth/verify-by-questions    returned a per-attempt `score`, so each fact could be probed
+//                                    on its own (answer one field, leave the rest blank, read the
+//                                    score) until the aggregate cleared the threshold. The question
+//                                    token was an HMAC that fell back to a hard-coded literal and
+//                                    was reusable for ten minutes.
+//
+// THE RULE THIS MODULE ENFORCES: knowledge alone never returns a credential. A knowledge check can
+// only cause a SINGLE-USE, HASHED, EXPIRING, PURPOSE-BOUND token to be MAILED to the address already
+// on the account. Proving you know a birthday is not proof you are the person; also holding their
+// mailbox is the second condition that makes the reset meaningful.
+//
+// The raw token never touches the database (only its SHA-256), never appears in a response body,
+// never appears in a log line, and is consumed atomically so two concurrent replays cannot both win.
+//
+// Attempt limiting deliberately REUSES countAttempt()/peekAttempts() from ./two-factor.ts rather
+// than adding a second limiter with its own table. One limiter, one place to raise a threshold.
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { createHash, randomBytes } from 'node:crypto';
+import { countAttempt, peekAttempts, clearAttempts } from '@/lib/auth/two-factor';
+
+// Declared before every function that reads them — `const` is not hoisted, and a handler reaching a
+// later declaration has taken pages down on this project.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+/** The real Postgres reason is on e.cause; e.message is only the SQL that failed. */
+export const causeOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
+/** A recovery link is short-lived: long enough to reach an inbox, short enough to matter. */
+export const RECOVERY_TTL_MINUTES = 30;
+
+/**
+ * Purpose binding. A token minted by the DOB flow must not be redeemable by anything else, and vice
+ * versa; the purpose is stored with the row and compared on consumption.
+ */
+export type RecoveryPurpose = 'password-reset';
+
+// ── attempt limits ──────────────────────────────────────────────────────────
+// Both windows are enforced. The per-account window stops a targeted date-of-birth sweep; the per-IP
+// window stops a broad sweep across many accounts from one source. Neither is a lockout of the
+// ACCOUNT — a recovery attempt limit must never become a way to lock a colleague out of signing in,
+// so these buckets gate recovery only and are cleared on success.
+export const RECOVERY_MAX_PER_ACCOUNT = 5;
+export const RECOVERY_MAX_PER_IP = 20;
+export const RECOVERY_WINDOW_SECONDS = 3600;
+
+const accountBucket = (key: string, purpose: string) => 'recover:acct:' + purpose + ':' + createHash('sha256').update(key.toLowerCase()).digest('hex').slice(0, 32);
+const ipBucket = (ip: string, purpose: string) => 'recover:ip:' + purpose + ':' + createHash('sha256').update(ip || 'unknown').digest('hex').slice(0, 32);
+
+export interface LimitVerdict {
+  /** True when the caller has spent their allowance and must be refused. */
+  blocked: boolean;
+  /** Which window tripped — for the server log only, never for the response body. */
+  scope: 'account' | 'ip' | null;
+}
+
+/**
+ * Count this attempt and say whether the caller has run out of allowance.
+ *
+ * FAILS CLOSED. If the counter cannot be read or written the answer is "blocked": a recovery flow
+ * whose rate limiter is down must refuse, not wave everyone through. Recovery is not a daily path,
+ * so refusing for the minutes a database hiccup lasts costs a support email; the other direction
+ * costs an account.
+ */
+export async function overRecoveryLimit(identityKey: string, ip: string, purpose: RecoveryPurpose): Promise<LimitVerdict> {
+  try {
+    const perIp = await countAttempt(ipBucket(ip, purpose), RECOVERY_WINDOW_SECONDS);
+    if (perIp > RECOVERY_MAX_PER_IP) return { blocked: true, scope: 'ip' };
+    const perAccount = await countAttempt(accountBucket(identityKey, purpose), RECOVERY_WINDOW_SECONDS);
+    if (perAccount > RECOVERY_MAX_PER_ACCOUNT) return { blocked: true, scope: 'account' };
+    return { blocked: false, scope: null };
+  } catch (e: any) {
+    console.error('[auth/recovery] limiter unavailable, refusing:', causeOf(e));
+    return { blocked: true, scope: null };
+  }
+}
+
+/** Give the allowance back after a genuine success, so one bad week is not a month of refusals. */
+export async function clearRecoveryLimit(identityKey: string, ip: string, purpose: RecoveryPurpose): Promise<void> {
+  await clearAttempts(accountBucket(identityKey, purpose)).catch(() => {});
+  await clearAttempts(ipBucket(ip, purpose)).catch(() => {});
+}
+
+/** Read a bucket without spending from it. Used by surfaces that want to warn before the last try. */
+export async function recoveryAttemptsUsed(identityKey: string, purpose: RecoveryPurpose): Promise<number> {
+  try { return await peekAttempts(accountBucket(identityKey, purpose), RECOVERY_WINDOW_SECONDS); }
+  catch { return RECOVERY_MAX_PER_ACCOUNT; }
+}
+
+// ── schema ──────────────────────────────────────────────────────────────────
+let ensured = false;
+export async function ensureRecoverySchema(): Promise<void> {
+  if (ensured) return;
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS auth_recovery_token (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    token_hash text NOT NULL UNIQUE,
+    user_id uuid NOT NULL,
+    purpose text NOT NULL,
+    method text,
+    created_ip text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    consumed_at timestamptz
+  )`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS auth_recovery_token_user_idx ON auth_recovery_token(user_id, purpose)`);
+  await db.execute(sql`CREATE INDEX IF NOT EXISTS auth_recovery_token_expiry_idx ON auth_recovery_token(expires_at)`);
+  ensured = true;
+}
+
+const hashToken = (t: string): string => createHash('sha256').update(t).digest('hex');
+
+/**
+ * Mint a recovery token for `userId`. Returns the RAW token — the only copy that will ever exist
+ * outside the mail that carries it. Callers must put it in a link and must never put it in a
+ * response body, a redirect the browser can read back, or a log line.
+ *
+ * Any earlier unconsumed token for the same user and purpose is dropped, so a second "email me a
+ * link" click invalidates the first link rather than leaving two live doors.
+ */
+export async function issueRecoveryToken(
+  userId: string, purpose: RecoveryPurpose, opts: { ip?: string; method?: string } = {},
+): Promise<string> {
+  await ensureRecoverySchema();
+  const token = randomBytes(32).toString('base64url');
+  await db.execute(sql`
+    DELETE FROM auth_recovery_token
+    WHERE (user_id = ${userId} AND purpose = ${purpose} AND consumed_at IS NULL) OR expires_at < now()
+  `).catch(() => {});
+  await db.execute(sql`
+    INSERT INTO auth_recovery_token (token_hash, user_id, purpose, method, created_ip, expires_at)
+    VALUES (${hashToken(token)}, ${userId}, ${purpose}, ${opts.method || null}, ${opts.ip || null},
+            now() + make_interval(mins => ${RECOVERY_TTL_MINUTES}))
+  `);
+  return token;
+}
+
+export interface RecoveryHolder { userId: string; email: string | null; name: string | null; }
+
+/**
+ * Look at a token WITHOUT burning it, so the reset page can render a form and tell an expired link
+ * apart from a wrong one. Returns null for unknown, expired, already-used, or wrong-purpose.
+ */
+export async function peekRecoveryToken(raw: string, purpose: RecoveryPurpose): Promise<RecoveryHolder | null> {
+  if (!raw) return null;
+  await ensureRecoverySchema();
+  const rows = rowsOf(await db.execute(sql`
+    SELECT t.user_id, u.email, u.name
+    FROM auth_recovery_token t
+    LEFT JOIN users u ON u.id = t.user_id
+    WHERE t.token_hash = ${hashToken(raw)}
+      AND t.purpose = ${purpose}
+      AND t.consumed_at IS NULL
+      AND t.expires_at > now()
+    LIMIT 1
+  `));
+  const r = rows[0];
+  if (!r) return null;
+  return { userId: String(r.user_id), email: r.email ? String(r.email) : null, name: r.name ? String(r.name) : null };
+}
+
+/**
+ * Burn the token and return whose it was. Single-use: the UPDATE matches only while consumed_at IS
+ * NULL, so two concurrent redemptions cannot both succeed. Call this BEFORE writing the new
+ * password, never after.
+ */
+export async function consumeRecoveryToken(raw: string, purpose: RecoveryPurpose): Promise<RecoveryHolder | null> {
+  if (!raw) return null;
+  await ensureRecoverySchema();
+  const rows = rowsOf(await db.execute(sql`
+    UPDATE auth_recovery_token SET consumed_at = now()
+    WHERE token_hash = ${hashToken(raw)}
+      AND purpose = ${purpose}
+      AND consumed_at IS NULL
+      AND expires_at > now()
+    RETURNING user_id
+  `));
+  const r = rows[0];
+  if (!r) return null;
+  const who = rowsOf(await db.execute(sql`SELECT id, email, name FROM users WHERE id = ${String(r.user_id)} LIMIT 1`))[0];
+  if (!who) return null;
+  return { userId: String(who.id), email: who.email ? String(who.email) : null, name: who.name ? String(who.name) : null };
+}
+
+/** Build the absolute link a recovery mail carries. */
+export function recoveryLink(origin: string, token: string): string {
+  return origin.replace(/\/+$/, '') + '/reset-password?token=' + encodeURIComponent(token);
+}
+
+export type DeliveryOutcome = 'sent' | 'no-transport' | 'no-address';
+
+/**
+ * Mail the link. Returns what actually happened rather than a boolean dressed as success — a
+ * recovery flow that reports "check your inbox" when no SMTP transport exists is the false-success
+ * shape this codebase keeps paying for.
+ *
+ * The mail module is imported dynamically so that a build without a transport configured still
+ * type-checks and still loads this file.
+ */
+export async function sendRecoveryMail(
+  to: string | null, name: string | null, link: string,
+): Promise<DeliveryOutcome> {
+  if (!to || !to.includes('@')) return 'no-address';
+  const greeting = name ? 'Hello ' + name + ',' : 'Hello,';
+  const text = [
+    greeting,
+    '',
+    'Someone asked to reset the password on your EduRankAI account.',
+    'If that was you, open this link within ' + RECOVERY_TTL_MINUTES + ' minutes and choose a new password:',
+    '',
+    link,
+    '',
+    'The link can be used once and then stops working.',
+    'If this was not you, no action is needed — your password has not changed. Tell hr@edurankai.in so we can look at it.',
+  ].join('\n');
+  try {
+    const mod: any = await import('@/lib/mail-transport');
+    const res = await mod.sendExternal({
+      to,
+      subject: 'Reset your EduRankAI password',
+      text,
+    });
+    if (res?.ok) return 'sent';
+    console.error('[auth/recovery] reset mail not delivered:', String(res?.error || 'unknown'));
+    return 'no-transport';
+  } catch (e: any) {
+    // NEVER swallowed. A recovery mail that silently fails is an account nobody can get back into.
+    console.error('[auth/recovery] reset mail threw:', causeOf(e));
+    return 'no-transport';
+  }
+}
+
+/**
+ * The whole tail of every recovery flow: mint, mail, report honestly.
+ *
+ * `method` is recorded on the token row so an audit can say which check produced it (dob /
+ * question_set), which the identity_verifications audit alone cannot express.
+ */
+export async function issueAndMailReset(
+  user: { id: string; email?: string | null; name?: string | null },
+  origin: string,
+  opts: { ip?: string; method?: string } = {},
+): Promise<DeliveryOutcome> {
+  const token = await issueRecoveryToken(user.id, 'password-reset', opts);
+  return await sendRecoveryMail(user.email || null, user.name || null, recoveryLink(origin, token));
+}

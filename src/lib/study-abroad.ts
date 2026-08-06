@@ -65,7 +65,13 @@ export function ensureStudyAbroadSchema(): Promise<void> {
       await db.execute(sql`CREATE INDEX IF NOT EXISTS sa_req_applicant_idx ON study_abroad_requests(applicant_user_id, created_at DESC)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS sa_req_consultant_idx ON study_abroad_requests(consultant_id, status)`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS sa_req_status_idx ON study_abroad_requests(status, created_at DESC)`);
-    } catch (_) {}
+    } catch (e: any) {
+      // WAS `catch (_) {}` WITH NO RESET — the worst combination available: a single transient
+      // failure both hid its reason and cached a resolved promise, so every later caller believed
+      // the schema was ready and every INSERT threw against a table that had never been finished.
+      console.error('[study-abroad] ensureStudyAbroadSchema failed, will retry on next call:', e?.cause?.message || e?.message);
+      ready = null;
+    }
   })();
   return ready;
 }

@@ -143,6 +143,10 @@ function isExempt(path: string): boolean {
   if (path === '/identity-setup') return true;
   if (path === '/verify-by-questions') return true;
   if (path === '/forgot-password') return true;
+  // The redemption surface for the emailed one-time reset link. It must be reachable by someone who
+  // is signed out and, by definition, has no face enrolment — the gate below would otherwise bounce
+  // the one page that gets them back in. It reads nothing but the token and grants no access.
+  if (path === '/reset-password') return true;
   if (path === '/admin/login' || path === '/portal/login' || path === '/hei/login') return true;
   if (path === '/aquintutor/login' || path === '/aquintutor/signup') return true;
   if (path === '/portal/signup' || path === '/portal/forgot') return true;

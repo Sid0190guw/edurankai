@@ -2,10 +2,35 @@
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { canOpenAdmin } from '@/lib/auth/admin-access';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login?next=/aquintutor/admin/moderator');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+
+/* ══ THE GATE ══════════════════════════════════════════════════════════════
+   This page WAS gated by `user.role !== 'applicant'` alone. That test is the one
+   src/lib/auth/permissions.ts explicitly warns against: every internal role passes it, including
+   `editor` (the role a signed offer letter used to hand every intern), and including the partner /
+   teacher scopes that src/middleware.ts bounces off /admin entirely. What sat behind it:
+
+     * the identity-verification queue — government-ID document URLs, selfies, claimed names,
+       candidate email addresses and the account's verified state;
+     * AI-interview risk scores;
+     * every discussion author's email and role;
+     * and a POST that ran `UPDATE users SET identity_verified = true, photo_verified = true`.
+
+   The gate is now the same question /admin asks — canOpenAdmin(), which is deny-by-default, refuses
+   an internship record whatever the role, and FAILS CLOSED when the employee lookup throws — plus
+   one explicit arm for `technical_moderator`, the role this console is named for and which is not
+   admin-capable in the permission matrix. That arm still requires an active account.
+
+   NARROWING, AND IT IS DELIBERATE: partner, teacher, applicant and any intern-flagged account lose
+   this page. They have their own consoles (partner.astro, teacher.astro) and no reason to hold a
+   stranger's passport image. Reported for confirmation rather than assumed.
+   ══════════════════════════════════════════════════════════════════════════ */
+const adminVerdict = await canOpenAdmin(user);
+const isModerator = user.isActive !== false && String(user.role || '') === 'technical_moderator';
+if (!adminVerdict.allowed && !isModerator) return Astro.redirect('/portal?denied=moderation');
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 async function safeRows(q: any): Promise<any[]> { try { return rows(await db.execute(q)); } catch { return []; } }
@@ -23,15 +48,36 @@ if (Astro.request.method === 'POST') {
     const entity = String(fd.get('entity') || '');
     const action = String(fd.get('action') || '');
     const id = String(fd.get('id') || '');
-    const userId = String(fd.get('user_id') || '');
     if (!id) throw new Error('missing id');
 
     if (entity === 'identity' && action === 'approve') {
-      await db.execute(sql`UPDATE identity_verifications SET verdict = 'verified' WHERE id = ${id}`);
-      if (userId) await db.execute(sql`UPDATE users SET identity_verified = true, photo_verified = true WHERE id = ${userId}`);
+      // THE SUBJECT COMES FROM THE ROW, NEVER FROM THE FORM.
+      //
+      // This handler used to take `user_id` out of the posted form and run
+      // `UPDATE users SET identity_verified = true, photo_verified = true WHERE id = <that value>`
+      // with nothing tying it to the verification being approved. Approving any pending row while
+      // typing a different account's id into the hidden field marked THAT account verified — which
+      // is the assertion face sign-in and attendance face checks are later trusted to have made.
+      //
+      // The UPDATE now consumes the row and RETURNS its user_id, so the account marked verified is
+      // by construction the account the reviewer was looking at. A row already decided matches
+      // nothing (verdict = 'pending' in the WHERE), so a replay approves nothing twice.
+      const decided = rows(await db.execute(sql`
+        UPDATE identity_verifications SET verdict = 'verified'
+        WHERE id = ${id} AND verdict = 'pending'
+        RETURNING user_id
+      `));
+      if (decided.length === 0) throw new Error('that verification is no longer pending');
+      const subjectId = decided[0]?.user_id ? String(decided[0].user_id) : '';
+      if (subjectId) await db.execute(sql`UPDATE users SET identity_verified = true, photo_verified = true WHERE id = ${subjectId}`);
       okMsg = 'Identity verification approved. Candidate marked verified.';
     } else if (entity === 'identity' && action === 'reject') {
-      await db.execute(sql`UPDATE identity_verifications SET verdict = 'rejected' WHERE id = ${id}`);
+      const decided = rows(await db.execute(sql`
+        UPDATE identity_verifications SET verdict = 'rejected'
+        WHERE id = ${id} AND verdict = 'pending'
+        RETURNING id
+      `));
+      if (decided.length === 0) throw new Error('that verification is no longer pending');
       okMsg = 'Identity verification rejected. The candidate may re-attempt.';
     } else if (entity === 'discussion' && action === 'hide') {
       // Guarded: the column may not exist yet on older DBs — add it if missing,
@@ -208,7 +254,9 @@ function statusPill(s: string) { return s === 'completed' ? 'green' : s === 'in_
                   <input type="hidden" name="entity" value="identity" />
                   <input type="hidden" name="action" value="approve" />
                   <input type="hidden" name="id" value={v.id} />
-                  <input type="hidden" name="user_id" value={v.user_id || ''} />
+                  <!-- The user_id field that used to ride along here has been removed. The handler
+                       derives the subject from the verification row it decides; a value posted from
+                       the browser could name any account at all. -->
                   <button class="md-btn go" type="submit">Approve</button>
                 </form>
                 <form class="inline" method="POST" onsubmit="return confirm('Reject this identity verification? The candidate can re-attempt.')">

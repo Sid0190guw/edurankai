@@ -1299,6 +1299,13 @@ body.era-has-fab { padding-bottom: 0; }
   // ---------------------------------------------------------------------------
   var KEYS = {};
 
+  // The OUTCOME of the last group-key hand-over, so the screen can say what happened instead of what
+  // was intended. The hand-over below used to report a failure to console.error and nowhere else,
+  // while "Added, and this browser sealed a copy of the group key to them." was printed regardless —
+  // a person who could not read one word of the group was described as fully set up.
+  // null = no hand-over was attempted; { ok, count, error } = one was.
+  var keyHandover = null;
+
   async function deriveEcdh(peerPem) {
     var pub = await importPub(peerPem);
     var priv = await importPriv();
@@ -1364,6 +1371,7 @@ body.era-has-fab { padding-bottom: 0; }
     // ---- group
     var gtag = 'g:' + (thread.key_epoch || 1);
     if (cached && cached.tag === gtag) return { key: cached.key, problem: '' };
+    keyHandover = null;
 
     var info = await api({ action: 'thread_keys', thread_id: thread.id });
     if (!info.ok) return { key: null, readOnly: true, problem: 'The keys for this group could not be read: ' + info.error };
@@ -1439,8 +1447,14 @@ body.era-has-fab { padding-bottom: 0; }
           action: 'wrap_keys', thread_id: thread.id, epoch: info.epoch || 1,
           wrapped_by_public_key_pem: localStorage.getItem(LS_PUB), entries: give
         });
-        if (!handed.ok) console.error('[messages] group key not handed to new members:', handed.error);
+        if (!handed.ok) {
+          keyHandover = { ok: false, count: need.length, error: handed.error };
+          console.error('[messages] group key not handed to new members:', handed.error);
+        } else {
+          keyHandover = { ok: true, count: need.length };
+        }
       } catch (e) {
+        keyHandover = { ok: false, count: need.length, error: (e && e.message) || 'this browser could not seal the key' };
         console.error('[messages] group key not handed to new members:', (e && e.message) || e);
       }
     }
@@ -1554,6 +1568,33 @@ body.era-has-fab { padding-bottom: 0; }
   // here — the previous client render dropped both, so the accurate badges the server had already
   // put in the HTML were wiped the moment the script rendered over them.
   // ---------------------------------------------------------------------------
+  // ONE place that turns server thread rows into this page's THREADS — the poll, the new-chat
+  // handler and openThread all read the same shape, and three hand-written copies of this mapping is
+  // how one of them ends up dropping a field nobody notices for a month.
+  //
+  // Members are carried over from what the last fetch_messages established: a thread ROW does not
+  // include membership, and overwriting members with an empty list is what sent key derivation down
+  // the encrypt-to-yourself path.
+  function mergeThreadRows(incoming) {
+    var prev = {};
+    for (var p = 0; p < THREADS.length; p++) prev[THREADS[p].id] = THREADS[p].members;
+    var merged = [];
+    for (var i = 0; i < (incoming || []).length; i++) {
+      var row = incoming[i];
+      merged.push({
+        id: row.id, kind: row.kind, title: row.title || 'Untitled',
+        last_message_at: row.last_message_at,
+        unread: Number(row.unread) || 0,
+        muted: !!row.notifications_muted,
+        disappearing_seconds: row.disappearing_seconds,
+        role: row.role,
+        key_epoch: Number(row.key_epoch) || 1,
+        members: prev[row.id] || []
+      });
+    }
+    return merged;
+  }
+
   function renderThreadList(filter) {
     var list = $('threadList');
     list.innerHTML = '';
@@ -1621,7 +1662,24 @@ body.era-has-fab { padding-bottom: 0; }
     renderThreadList($('threadSearch').value);
 
     var t = activeThread();
-    if (!t) return;
+    if (!t) {
+      // A HIT THAT OPENED NOTHING, IN SILENCE. This page loads the hundred most recent conversations,
+      // but the metadata search runs against every conversation this reader is in — so a result from
+      // further back was not in THREADS, `activeThread()` returned null, and the click cleared the
+      // search box and did absolutely nothing else. The list is re-read once, and if the thread is
+      // still not there it is said out loud rather than shrugged off.
+      var listed = await api({ action: 'threads' });
+      if (listed.ok) {
+        var merged = mergeThreadRows(listed.threads || []);
+        if (merged.length) THREADS = merged;
+        renderThreadList($('threadSearch').value);
+      }
+      t = activeThread();
+    }
+    if (!t) {
+      setStatus('That conversation could not be opened: it is not among the conversations this account is a member of, or the list could not be re-read.', true);
+      return;
+    }
 
     if (navigate) {
       var url = '/portal/messages?thread=' + encodeURIComponent(tid);
@@ -1672,6 +1730,15 @@ body.era-has-fab { padding-bottom: 0; }
       var without = others.filter(function (m) { return !m.public_key_pem; }).length;
       n.textContent = 'You hold this group\'s key in this browser. It is stored sealed to each member and the server cannot open any copy.'
         + (without ? ' ' + without + ' member(s) have not published a key yet and cannot read the group until they open Messages.' : '');
+      // A hand-over that failed is a member who reads nothing, permanently, and it belongs on screen
+      // rather than in the console where it used to go alone.
+      if (keyHandover && keyHandover.ok === false) {
+        n.className = 'panel-note warn';
+        stamp(n);
+        n.textContent = n.textContent + ' A copy of the key was NOT sealed to ' + keyHandover.count
+          + ' member(s) just now: ' + keyHandover.error
+          + ' Until that succeeds they see this group as unreadable.';
+      }
     } else if (!others.length) {
       n.textContent = 'These are your private notes. They are encrypted with your own key, in this browser.';
     } else {
@@ -2061,26 +2128,10 @@ body.era-has-fab { padding-bottom: 0; }
     // next heartbeat five seconds later.
     if (connectionBad) { connectionBad = false; setStatus(''); }
 
-    var incoming = res.threads || [];
-    var merged = [];
-    for (var i = 0; i < incoming.length; i++) {
-      var row = incoming[i];
-      var prev = null;
-      for (var p = 0; p < THREADS.length; p++) if (THREADS[p].id === row.id) prev = THREADS[p];
-      merged.push({
-        id: row.id, kind: row.kind, title: row.title || 'Untitled',
-        last_message_at: row.last_message_at,
-        unread: Number(row.unread) || 0,
-        muted: !!row.notifications_muted,
-        disappearing_seconds: row.disappearing_seconds,
-        role: row.role,
-        key_epoch: Number(row.key_epoch) || 1,
-        // The poll returns thread rows, not membership; members are whatever the last
-        // fetch_messages established. Overwriting them with nothing is what would empty the member
-        // list and send key derivation down the encrypt-to-yourself path.
-        members: (prev && prev.members) || []
-      });
-    }
+    // The poll returns thread rows, not membership — mergeThreadRows() keeps the members the last
+    // fetch_messages established, because an empty member list is what sends key derivation down
+    // the encrypt-to-yourself path.
+    var merged = mergeThreadRows(res.threads || []);
     if (merged.length) THREADS = merged;
     renderThreadList($('threadSearch').value);
     syncTitle();
@@ -2157,21 +2208,27 @@ body.era-has-fab { padding-bottom: 0; }
     showResults(true);
 
     var out = $('searchResults');
+    // CLEARED FIRST. The metadata search that runs while you type draws its hits into this same
+    // panel, and appending to them produced a header counting one set of results above a list
+    // showing two — a count that does not describe what is on screen.
+    out.innerHTML = '';
     var header = el('div', { class: 'panel-note', style: 'padding:10px 14px' });
     var lower = q.toLowerCase();
-    var scanned = 0, hits = 0, locked = 0;
+    var scanned = 0, hits = 0, locked = 0, unreadable = 0;
     var targets = THREADS.slice(0, 60);
 
+    try {
     for (var i = 0; i < targets.length; i++) {
       var t = targets[i];
       prog.textContent = 'Decrypting and searching in this browser: conversation ' + (i + 1) + ' of ' + targets.length + '.';
-      var before = null, pages = 0, threadHits = 0, threadLocked = 0;
+      var before = null, pages = 0, threadHits = 0, threadLocked = 0, threadFailed = false;
       var kres = null;
       while (pages < MAX_SEARCH_PAGES) {
         var body = { action: 'fetch_messages', thread_id: t.id };
         if (before) body.before = before;
         var res = await api(body);
-        if (!res.ok) break;
+        // A conversation the server would not return is NOT a conversation with no match in it.
+        if (!res.ok) { threadFailed = true; break; }
         if (!kres) {
           t.members = (res.members || []).map(function (m) {
             return { user_id: m.user_id, name: m.full_name || m.email || 'Unknown', email: m.email || '', role: m.role, public_key_pem: m.public_key_pem || null, has_wrapped_key: !!m.has_wrapped_key };
@@ -2201,17 +2258,32 @@ body.era-has-fab { padding-bottom: 0; }
         pages++;
       }
       if (threadLocked) locked++;
-      scanned++;
+      if (threadFailed) unreadable++; else scanned++;
     }
 
     prog.style.display = 'none';
     header.textContent = 'Searched ' + scanned + ' conversation(s) in this browser, up to the most recent '
       + (MAX_SEARCH_PAGES * 60) + ' messages in each. ' + hits + ' match(es).'
-      + (locked ? ' ' + locked + ' conversation(s) contained messages this browser holds no key for and could not be searched.' : '');
+      + (locked ? ' ' + locked + ' conversation(s) contained messages this browser holds no key for and could not be searched.' : '')
+      + (unreadable ? ' ' + unreadable + ' conversation(s) could not be read from the server at all and were not searched.' : '');
     out.insertBefore(header, out.firstChild);
     if (!hits) out.appendChild(el('div', { class: 'media-empty', text: 'No message text this browser can read contains that.', style: 'margin:14px' }));
-    btn.disabled = false;
-    contentSearchRunning = false;
+    } catch (e) {
+      // A search that stopped early must SAY it stopped early. Left as it was, this threw out of an
+      // event handler, the button stayed disabled for the life of the page, the progress line sat
+      // frozen mid-count, and whatever had been found so far read as the complete answer.
+      console.error('[messages] content search', (e && e.message) || e);
+      prog.style.display = 'none';
+      out.insertBefore(el('div', {
+        class: 'panel-note warn', style: 'padding:10px 14px',
+        text: 'This search stopped after ' + scanned + ' conversation(s): ' + ((e && e.message) || 'unknown error')
+          + ' Anything listed below is only what had been searched by then, not the whole answer.'
+      }), out.firstChild);
+    } finally {
+      // Runs whichever way the search went, so the button is never left dead.
+      btn.disabled = false;
+      contentSearchRunning = false;
+    }
   }
 
   function renderSearchInThread() {
@@ -2343,11 +2415,24 @@ body.era-has-fab { padding-bottom: 0; }
     var res = await api({ action: 'add_member', thread_id: t.id, email: email });
     if (!res.ok) { note.textContent = res.error; return; }
     $('addMemberEmail').value = '';
-    note.textContent = 'Added. Their copy of the group key is being sealed to them now.';
+    note.textContent = 'Added. Sealing a copy of the group key to them...';
     delete KEYS[t.id];               // force a re-read so the hand-over below actually runs
+    keyHandover = null;              // and so this line reports THIS hand-over, not an earlier one
     lastSignature = '';
     await loadMessages();
-    note.textContent = 'Added, and this browser sealed a copy of the group key to them.';
+    // WHAT HAPPENED, NOT WHAT WAS INTENDED. This used to print "Added, and this browser sealed a
+    // copy of the group key to them." unconditionally — including when the wrap_keys call had been
+    // refused, which was logged to the console and nowhere a person would ever see it.
+    if (keyHandover && keyHandover.ok) {
+      note.textContent = 'Added, and this browser sealed a copy of the group key to them.';
+    } else if (keyHandover) {
+      note.textContent = 'Added, but their copy of the group key was NOT sealed: ' + keyHandover.error
+        + ' They cannot read this group until a member who holds the key opens it again.';
+    } else {
+      note.textContent = 'Added, but no key was sealed to them just now - either they have not '
+        + 'published an encryption key yet (they must open Messages in a browser once), or this '
+        + 'browser does not hold the group key itself. The Keys panel above says which.';
+    }
   });
 
   // --- New conversation
@@ -2375,18 +2460,11 @@ body.era-has-fab { padding-bottom: 0; }
     // pushed a made-up row even when the server had answered "you already have this conversation",
     // which put the same conversation in the list twice.
     var listed = await api({ action: 'threads' });
-    if (listed.ok) {
-      var prevMembers = {};
-      for (var p = 0; p < THREADS.length; p++) prevMembers[THREADS[p].id] = THREADS[p].members;
-      THREADS = (listed.threads || []).map(function (row) {
-        return {
-          id: row.id, kind: row.kind, title: row.title || 'Untitled', last_message_at: row.last_message_at,
-          unread: Number(row.unread) || 0, muted: !!row.notifications_muted,
-          disappearing_seconds: row.disappearing_seconds, role: row.role,
-          key_epoch: Number(row.key_epoch) || 1, members: prevMembers[row.id] || []
-        };
-      });
-    }
+    // If this re-read fails the conversation still exists, and openThread() below re-reads the list
+    // itself and says so if the thread still cannot be found. Nothing is invented locally either
+    // way: the previous version pushed a made-up row even when the server had answered "you already
+    // have this conversation", which put the same conversation in the list twice.
+    if (listed.ok) THREADS = mergeThreadRows(listed.threads || []);
     hideNewChat();
     $('newPeer').value = '';
     renderThreadList('');

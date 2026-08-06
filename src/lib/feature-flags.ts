@@ -8,10 +8,21 @@ import { sql } from 'drizzle-orm';
 export interface FlagDef { key: string; env: string; label: string; desc: string; def: boolean; group: string; }
 
 // Catalog — add a row here to expose a new flag in the admin panel.
+//
+// A ROW HERE IS A PROMISE THAT SOMETHING ASKS isFeatureEnabled() FOR IT. `storyReading` was in this
+// list, so /admin/feature-flags rendered it with a working toggle and a source badge — and
+// isFeatureEnabled('storyReading') is called NOWHERE in the repository. Toggling it wrote a row to
+// feature_flags, reported success, and changed nothing on any surface. Its two siblings are read for
+// real (aiTutor at /aquintutor/converse and /aquintutor/dashboard; dailyChallenge at
+// /aquintutor/daily and the same dashboard), which is exactly why the dead one was invisible: it sat
+// in a list of working switches.
+//
+// Removed rather than left disabled: an admin who flips a switch labelled "Story reading" is
+// entitled to assume a story-reading surface stopped serving. When that mode ships, add the row back
+// in the same commit as the isFeatureEnabled() call that reads it.
 export const FLAG_CATALOG: FlagDef[] = [
   { key: 'aiTutor',        env: 'AI_TUTOR',        label: 'AI conversation tutor', desc: 'Conversational AI tutor (/aquintutor/converse). Needs the LLM key + a verified flow.', def: false, group: 'AquinTutor' },
   { key: 'dailyChallenge', env: 'DAILY_CHALLENGE', label: 'Daily challenge',        desc: 'Daily challenge surface (/aquintutor/daily).', def: false, group: 'AquinTutor' },
-  { key: 'storyReading',   env: 'STORY_READING',   label: 'Story reading',          desc: 'Story-reading practice mode.', def: false, group: 'AquinTutor' },
 ];
 
 function envOverride(envName: string): boolean | null {

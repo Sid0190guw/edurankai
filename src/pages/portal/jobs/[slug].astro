@@ -1,0 +1,293 @@
+---
+// /portal/jobs/[slug] — the listing page every card on /portal/jobs already links to.
+//
+// WHY THIS FILE EXISTS. /portal/jobs renders each row as `<a href={'/portal/jobs/' + j.slug}>`.
+// No route answered that. Every card on the board 404'd, which meant the four fields the posting
+// form collects and stores — description, requirements, apply_url, apply_email — were written on
+// every post and rendered on no surface at all. Posting worked; applying was impossible.
+//
+// It also gives job_applications its first writer. That table has been CREATEd by the board since
+// it shipped and INSERTed into by nothing, so "did I already apply to this?" had no answer.
+//
+// DOCUMENTS ARE LINKS. The resume field takes a shared Drive URL. Nothing is uploaded here.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const reason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
+const user = Astro.locals.user;
+const slug = String(Astro.params.slug || '');
+if (!user) {
+  return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/jobs/' + slug));
+}
+
+let okMsg = '';
+let errMsg = '';
+
+// The listing is loaded BEFORE the POST handler so the handler can test the row it is about to act
+// on. `const` is not hoisted; a handler that reaches a later declaration throws on its first line.
+let job: any = null;
+let loadFailed = false;
+try {
+  job = rows(await db.execute(sql`
+    SELECT j.*, u.name AS poster_name
+      FROM jobs_board j
+      LEFT JOIN users u ON u.id = j.posted_by_user_id
+     WHERE j.slug = ${slug}
+     LIMIT 1
+  `))[0] || null;
+} catch (e: any) {
+  loadFailed = true;
+  errMsg = 'Could not read this listing: ' + reason(e).slice(0, 160);
+}
+
+if (Astro.request.method === 'POST' && job) {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  try {
+    if (action === 'apply') {
+      if (job.is_active === false) {
+        errMsg = 'This listing has been closed and is no longer accepting applications.';
+      } else {
+        const resumeUrl = String(fd.get('resume_url') || '').trim().slice(0, 500);
+        const coverLetter = String(fd.get('cover_letter') || '').trim().slice(0, 4000);
+        if (resumeUrl && !/^https?:\/\//i.test(resumeUrl)) {
+          errMsg = 'The resume link must be a full https:// address to a document anyone with the link can open.';
+        } else {
+          const already = rows(await db.execute(sql`
+            SELECT id FROM job_applications WHERE job_id = ${job.id}::uuid AND user_id = ${user.id} LIMIT 1
+          `));
+          if (already.length > 0) {
+            errMsg = 'You have already registered an application for this role.';
+          } else {
+            // No swallowed catch here: if this INSERT fails the message below says so, and the
+            // page does not claim an application exists.
+            await db.execute(sql`
+              INSERT INTO job_applications (job_id, user_id, resume_url, cover_letter, status)
+              VALUES (${job.id}::uuid, ${user.id}, ${resumeUrl || null}, ${coverLetter || null}, 'submitted')
+            `);
+            okMsg = 'Application recorded. The poster still needs you to apply through the link below — this only records it on your portal.';
+          }
+        }
+      }
+    } else if (action === 'withdraw') {
+      const del = rows(await db.execute(sql`
+        DELETE FROM job_applications WHERE job_id = ${job.id}::uuid AND user_id = ${user.id} RETURNING id
+      `));
+      okMsg = del.length > 0 ? 'Application withdrawn.' : 'There was no application to withdraw.';
+    }
+  } catch (e: any) {
+    errMsg = 'Could not complete that: ' + reason(e).slice(0, 160);
+  }
+}
+
+let myApplication: any = null;
+if (job) {
+  try {
+    myApplication = rows(await db.execute(sql`
+      SELECT id, status, applied_at, resume_url FROM job_applications
+       WHERE job_id = ${job.id}::uuid AND user_id = ${user.id} LIMIT 1
+    `))[0] || null;
+  } catch (_) { myApplication = null; }
+}
+
+function parseRequirements(raw: any): string[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.map((s) => String(s)).filter(Boolean);
+  try {
+    const parsed = JSON.parse(String(raw));
+    return Array.isArray(parsed) ? parsed.map((s) => String(s)).filter(Boolean) : [];
+  } catch (_) { return []; }
+}
+
+const requirements = job ? parseRequirements(job.requirements) : [];
+
+function fmtKind(k: string): string {
+  if (k === 'internship') return 'Internship';
+  if (k === 'full_time') return 'Full-time';
+  if (k === 'part_time') return 'Part-time';
+  if (k === 'contract') return 'Contract';
+  return k || 'Role';
+}
+
+function fmtPay(j: any): string {
+  if (j?.stipend_inr_per_month && j.stipend_inr_per_month > 0) {
+    return 'INR ' + Number(j.stipend_inr_per_month).toLocaleString() + ' per month';
+  }
+  if (j?.salary_range) return String(j.salary_range);
+  return 'Compensation on request';
+}
+
+function fmtDate(d: any): string {
+  if (!d) return '';
+  try { return new Date(d).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }); }
+  catch (_) { return ''; }
+}
+
+const applyHref = job?.apply_url
+  ? String(job.apply_url)
+  : (job?.apply_email ? 'mailto:' + String(job.apply_email) + '?subject=' + encodeURIComponent('Application: ' + (job.title || '')) : '');
+
+const pageTitle = job ? (job.title + ' at ' + job.company) : 'Listing not found';
+---
+<BaseLayout title={pageTitle} description="A role posted on the EduRankAI portal jobs board.">
+<style>
+  .jd-shell { max-width: 880px; margin: 0 auto; padding: 40px 22px 96px; }
+  .jd-back { font-family: 'Geist Mono', monospace; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #FF4F00; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+  .jd-back svg { width: 13px; height: 13px; }
+  .jd-head { margin: 18px 0 22px; }
+  .jd-company { font-family: 'Geist Mono', monospace; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: #6e655c; font-weight: 700; }
+  .jd-title { font-family: 'Cormorant Garamond', serif; font-size: clamp(26px, 4vw, 38px); font-weight: 600; letter-spacing: -0.02em; color: #0E0B08; margin: 8px 0 12px; line-height: 1.12; }
+  .jd-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .jd-chip { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; padding: 4px 10px; border-radius: 999px; background: #F1F1EE; color: #4a4239; }
+  .jd-chip.accent { background: #FFF4EE; color: #7a2c00; border: 1px solid rgba(255,79,0,0.3); }
+  .jd-card { background: #fff; border: 1px solid rgba(14,11,8,0.10); border-radius: 14px; padding: 22px 24px; margin-bottom: 16px; }
+  .jd-card h2 { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin: 0 0 12px; }
+  .jd-body { white-space: pre-wrap; line-height: 1.65; color: #2c2620; font-size: 15px; }
+  .jd-req { margin: 0; padding-left: 20px; line-height: 1.7; color: #2c2620; font-size: 15px; }
+  .jd-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
+  .jd-fact-k { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #8a847a; }
+  .jd-fact-v { font-size: 14px; color: #0E0B08; margin-top: 3px; }
+  .jd-btn { display: inline-flex; align-items: center; gap: 8px; background: #FF4F00; color: #fff; padding: 11px 18px; border-radius: 8px; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; border: none; cursor: pointer; }
+  .jd-btn.ghost { background: transparent; color: #0E0B08; border: 1px solid rgba(14,11,8,0.2); }
+  .jd-btn[disabled] { background: #E7E3DC; color: #8a847a; cursor: not-allowed; }
+  .jd-field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+  .jd-field label { font-family: 'Geist Mono', monospace; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #6e655c; font-weight: 700; }
+  .jd-field input, .jd-field textarea { background: #FAF8F5; border: 1px solid rgba(14,11,8,0.16); border-radius: 6px; padding: 9px 11px; font-size: 14px; font-family: inherit; color: #0E0B08; }
+  .jd-field input:focus, .jd-field textarea:focus { outline: none; border-color: #FF4F00; }
+  .jd-msg { padding: 11px 14px; border-radius: 10px; font-size: 13px; line-height: 1.55; margin-bottom: 16px; }
+  .jd-msg.ok { background: #ECFDF5; border: 1px solid #10B981; color: #065F46; }
+  .jd-msg.err { background: #FEF2F2; border: 1px solid #DC2626; color: #7F1D1D; }
+  .jd-missing { background: #FFF4EE; border: 1px solid #FF4F00; color: #7a2c00; padding: 14px 16px; border-radius: 10px; font-size: 13px; line-height: 1.6; }
+</style>
+
+<main class="jd-shell">
+  <a class="jd-back" href="/portal/jobs">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+    All roles
+  </a>
+
+  {okMsg && <div class="jd-msg ok" style="margin-top:16px;">{okMsg}</div>}
+  {errMsg && <div class="jd-msg err" style="margin-top:16px;">{errMsg}</div>}
+
+  {!job && !loadFailed && (
+    <div class="jd-card" style="margin-top:20px;">
+      <h2>Not found</h2>
+      <p class="jd-body">This listing does not exist, or it was removed by the person who posted it. The board is at <a href="/portal/jobs" style="color:#FF4F00;">/portal/jobs</a>.</p>
+    </div>
+  )}
+
+  {job && (
+    <>
+      <div class="jd-head">
+        <div class="jd-company">{job.company}</div>
+        <h1 class="jd-title">{job.title}</h1>
+        <div class="jd-chips">
+          <span class="jd-chip accent">{fmtKind(job.kind)}</span>
+          {job.location && <span class="jd-chip">{job.location}</span>}
+          {job.remote_ok && <span class="jd-chip">Remote OK</span>}
+          {job.is_active === false && <span class="jd-chip">Closed</span>}
+        </div>
+      </div>
+
+      <div class="jd-card">
+        <h2>The role</h2>
+        {job.description && String(job.description).trim()
+          ? <div class="jd-body">{job.description}</div>
+          : <div class="jd-missing">No description was written for this listing. Everything known about it is in the facts below.</div>}
+      </div>
+
+      {requirements.length > 0 && (
+        <div class="jd-card">
+          <h2>What they ask for</h2>
+          <ul class="jd-req">
+            {requirements.map((r: string) => <li>{r}</li>)}
+          </ul>
+        </div>
+      )}
+
+      <div class="jd-card">
+        <h2>Facts</h2>
+        <div class="jd-facts">
+          <div>
+            <div class="jd-fact-k">Compensation</div>
+            <div class="jd-fact-v">{fmtPay(job)}</div>
+          </div>
+          <div>
+            <div class="jd-fact-k">Engagement</div>
+            <div class="jd-fact-v">{fmtKind(job.kind)}</div>
+          </div>
+          <div>
+            <div class="jd-fact-k">Posted</div>
+            <div class="jd-fact-v">{fmtDate(job.posted_at) || 'Not recorded'}</div>
+          </div>
+          {job.expires_at && (
+            <div>
+              <div class="jd-fact-k">Closes</div>
+              <div class="jd-fact-v">{fmtDate(job.expires_at)}</div>
+            </div>
+          )}
+          <div>
+            <div class="jd-fact-k">Posted by</div>
+            <div class="jd-fact-v">{job.poster_name || 'A portal member'}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="jd-card">
+        <h2>Apply</h2>
+        {applyHref ? (
+          <p style="margin:0 0 14px;font-size:14px;color:#2c2620;line-height:1.6;">
+            Applications for this role are handled by the poster, not by this portal.
+            {job.apply_url ? ' Use their link.' : ' Write to the address they gave.'}
+          </p>
+        ) : (
+          <div class="jd-missing" style="margin-bottom:14px;">
+            This listing carries no apply link and no apply address, so there is no way to reach the
+            poster from here. Nothing on this page can send an application on your behalf.
+          </div>
+        )}
+
+        {applyHref && (
+          <p style="margin:0 0 18px;">
+            <a class="jd-btn" href={applyHref} rel="noopener noreferrer" target="_blank">
+              {job.apply_url ? 'Open the application' : 'Email the poster'}
+            </a>
+          </p>
+        )}
+
+        {myApplication ? (
+          <div>
+            <p style="font-size:14px;color:#2c2620;margin:0 0 10px;">
+              You marked this as applied on {fmtDate(myApplication.applied_at)}. That record is yours
+              alone — it is not sent to the poster.
+            </p>
+            <form method="POST">
+              <input type="hidden" name="action" value="withdraw" />
+              <button class="jd-btn ghost" type="submit">Remove that record</button>
+            </form>
+          </div>
+        ) : job.is_active === false ? (
+          <button class="jd-btn" disabled>Closed to applications</button>
+        ) : (
+          <form method="POST">
+            <input type="hidden" name="action" value="apply" />
+            <div class="jd-field">
+              <label for="resume_url">Resume link (optional)</label>
+              <input id="resume_url" name="resume_url" type="url" placeholder="https://drive.google.com/..." />
+              <span style="font-size:11px;color:#8a847a;">A shared document link that anyone with the link can open. Nothing is uploaded.</span>
+            </div>
+            <div class="jd-field">
+              <label for="cover_letter">Note to yourself (optional)</label>
+              <textarea id="cover_letter" name="cover_letter" rows="3" placeholder="Where you applied from, who you spoke to, what to follow up on."></textarea>
+            </div>
+            <button class="jd-btn" type="submit">Mark as applied</button>
+          </form>
+        )}
+      </div>
+    </>
+  )}
+</main>
+</BaseLayout>

@@ -66,6 +66,45 @@ export async function setEnabledTypes(types: string[]): Promise<void> {
   const clean = types.filter((t) => (EVENT_TYPES as readonly string[]).includes(t));
   await db.execute(sql`INSERT INTO edu_proctor_policy (id, enabled_types) VALUES (1, ${clean}) ON CONFLICT (id) DO UPDATE SET enabled_types = ${clean}, updated_at = NOW()`);
 }
+/**
+ * May `userId` write events into `sessionId`?
+ *
+ * WHY THIS EXISTS. /api/aquintutor/proctor took `sessionId` out of the request body and passed it to
+ * recordEvents() verbatim, with nothing checking that the session belonged to the caller. Any
+ * signed-in user could therefore inject fabricated events into ANOTHER candidate's session, and
+ * riskSummary()/proctoredAttempts() compute that candidate's advisory risk purely from session_id —
+ * so the human reviewer at /admin/proctoring would be weighing evidence anyone could plant. Advisory
+ * or not, a flag a stranger can forge is worse than no flag at all.
+ *
+ * The rule is FIRST CLAIM WINS, checked two ways:
+ *   - if an edu_attempts row already carries this proctor_session_id, it must be the caller's;
+ *   - if events already exist under it, they must be the caller's.
+ * An unclaimed session id stays writable, which is what lets a candidate's own browser open one.
+ *
+ * FAILS CLOSED: a lookup that throws returns false. A proctoring event lost during a database hiccup
+ * costs one advisory signal; accepting a forged one costs somebody their exam result.
+ */
+export async function canWriteProctorSession(sessionId: string, userId: string): Promise<boolean> {
+  if (!sessionId || !userId) return false;
+  try {
+    await ensureProctorSchema(); const { db, sql } = await ctx();
+    try {
+      const owner = rows(await db.execute(sql`SELECT user_id FROM edu_attempts WHERE proctor_session_id = ${sessionId} LIMIT 1`))[0];
+      if (owner && String(owner.user_id || '') !== String(userId)) return false;
+    } catch (e: any) {
+      // edu_attempts may not exist on a fresh environment. That is not evidence of a conflict, so it
+      // does not deny on its own — the event-owner check below still runs and is authoritative.
+      console.error('[proctor] attempt-owner lookup', e?.cause?.message || e?.message);
+    }
+    const prior = rows(await db.execute(sql`SELECT user_id FROM edu_proctor_events WHERE session_id = ${sessionId} AND user_id IS NOT NULL LIMIT 1`))[0];
+    if (prior && String(prior.user_id || '') !== String(userId)) return false;
+    return true;
+  } catch (e: any) {
+    console.error('[proctor] session-owner lookup', e?.cause?.message || e?.message);
+    return false;
+  }
+}
+
 /** Record sanitized (media-free) events for a proctor session, filtered to enabled types. */
 export async function recordEvents(sessionId: string, userId: string | null, raw: any[]): Promise<number> {
   await ensureProctorSchema(); const { db, sql } = await ctx();

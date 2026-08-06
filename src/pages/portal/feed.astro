@@ -180,6 +180,67 @@ try {
   }
 } catch (e) {}
 
+// ---------------- View + AR-filter-use logging (JSON) ----------------
+//
+// THE WRITER THAT WAS NEVER BUILT. An IntersectionObserver at the bottom of this page has always
+// POSTed each reel view to /api/feed-view — a route that does not exist in this repository — with
+// `.catch(() => {})` hiding the 404. feed_view_events is CREATEd above and was INSERTed into by
+// nothing, and TWO things read it:
+//   * minutesToday / capReached, the daily watch-time cap. It could never fire. The wellbeing meter
+//     read "0m / 90m today" for every reader forever and the "take a walk" banner was unreachable.
+//   * seenSet, the de-ranking term in scorePost(). Always empty, so the recommender silently lost
+//     one of its inputs and could keep resurfacing the same reel.
+// A stated wellbeing control that cannot fire is worse than no control, because the number beside
+// it looks measured.
+//
+// The handler lives on this page rather than under src/pages/api/ because the page already owns
+// every other write in this feature (like, create_post, save_interests), and a second surface is a
+// second place for the shapes to drift. The client contract is unchanged — the same JSON body it
+// has always sent — only the URL moves here.
+//
+// ONE ROW PER USER, PER POST, PER DAY. Without that guard a reader reloading the page inflates
+// their own watch total until the cap trips; with it, the cap counts distinct posts seen today.
+if (
+  Astro.request.method === 'POST' &&
+  (Astro.request.headers.get('content-type') || '').includes('application/json')
+) {
+  const jsonOut = (payload: any, status: number) =>
+    new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } });
+  let body: any = null;
+  try { body = await Astro.request.json(); } catch (_) { body = null; }
+
+  const postId = String(body?.post_id || '');
+  const filterSlug = String(body?.filter_slug || '');
+
+  try {
+    if (postId) {
+      if (!/^[0-9a-fA-F-]{36}$/.test(postId)) return jsonOut({ ok: false, error: 'bad post id' }, 400);
+      const pct = Math.max(0, Math.min(100, Math.round(Number(body?.watched_pct) || 0)));
+      const device = String(body?.device || 'web').slice(0, 20);
+      await db.execute(sql`
+        INSERT INTO feed_view_events (user_id, post_id, watched_pct, device)
+        SELECT ${user.id}, ${postId}::uuid, ${pct}, ${device}
+         WHERE NOT EXISTS (
+           SELECT 1 FROM feed_view_events
+            WHERE user_id = ${user.id} AND post_id = ${postId}::uuid AND created_at >= CURRENT_DATE
+         )
+      `);
+      return jsonOut({ ok: true }, 200);
+    }
+    if (filterSlug) {
+      // The AR tray orders by use_count and nothing ever incremented it, so a tray presenting itself
+      // as usage-ranked was permanently alphabetical. This is that increment.
+      await db.execute(sql`
+        UPDATE ar_filters SET use_count = COALESCE(use_count, 0) + 1 WHERE slug = ${filterSlug.slice(0, 120)}
+      `);
+      return jsonOut({ ok: true }, 200);
+    }
+    return jsonOut({ ok: false, error: 'nothing to record' }, 400);
+  } catch (e: any) {
+    return jsonOut({ ok: false, error: String(e?.cause?.message || e?.message || 'failed').slice(0, 160) }, 500);
+  }
+}
+
 // ---------------- Handle POST ----------------
 let okMsg = '', errMsg = '';
 if (Astro.request.method === 'POST') {
@@ -974,7 +1035,9 @@ const safeInterests = JSON.stringify(interests);
         const postId = e.target.dataset.postId;
         if (postId && !sentViews.has(postId)) {
           sentViews.add(postId);
-          fetch('/api/feed-view', {
+          // Posts to this page, which answers JSON. Same body as before; the route it used to call
+          // (/api/feed-view) never existed, so every view was a 404 swallowed by the catch below.
+          fetch(window.location.pathname, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ post_id: postId, watched_pct: 100, device: 'web' })
@@ -1066,7 +1129,17 @@ const safeInterests = JSON.stringify(interests);
   });
 
   document.querySelectorAll('button[data-try-slug]').forEach(b => {
-    b.addEventListener('click', () => openAr(b.dataset.trySlug));
+    b.addEventListener('click', () => {
+      const slug = b.dataset.trySlug;
+      openAr(slug);
+      // The tray is ordered by use_count. This is the only thing that has ever written it, so the
+      // ordering finally means what the panel says it means.
+      fetch(window.location.pathname, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filter_slug: slug })
+      }).catch(() => {});
+    });
   });
 
   // -------- REAL AR EFFECTS --------

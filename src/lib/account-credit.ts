@@ -32,7 +32,11 @@ export function ensureCreditSchema(): Promise<void> {
 export async function getCreditBalance(userId: string): Promise<number> {
   if (!userId) return 0;
   await ensureCreditSchema();
-  const r = rows(await db.execute(sql`SELECT COALESCE(SUM(delta_paise), 0)::bigint AS bal FROM account_credit_ledger WHERE user_id = ${userId}`).catch(() => [] as any))[0] as any;
+  // A failed read reports a zero balance, which is the SAFE direction (the caller falls back to a
+  // card order rather than spending credit that may not exist) but it is indistinguishable from a
+  // genuinely empty wallet to anyone reading a support ticket. Log the reason.
+  const r = rows(await db.execute(sql`SELECT COALESCE(SUM(delta_paise), 0)::bigint AS bal FROM account_credit_ledger WHERE user_id = ${userId}`)
+    .catch((e: any) => { console.error('[credit] balance read failed for user', userId, '-', e?.cause?.message || e?.message); return [] as any; }))[0] as any;
   return Number(r?.bal) || 0;
 }
 
@@ -41,7 +45,7 @@ export async function getCreditLedger(userId: string, limit = 100): Promise<any[
   return rows(await db.execute(sql`
     SELECT delta_paise, reason, ref_type, ref_id, created_at
     FROM account_credit_ledger WHERE user_id = ${userId} ORDER BY created_at DESC LIMIT ${limit}
-  `).catch(() => [] as any));
+  `).catch((e: any) => { console.error('[credit] ledger read failed for user', userId, '-', e?.cause?.message || e?.message); return [] as any; }));
 }
 
 export async function grantCredit(userId: string, amountPaise: number, reason: string, byUserId?: string): Promise<{ ok: boolean; error?: string; balance?: number }> {
@@ -54,7 +58,12 @@ export async function grantCredit(userId: string, amountPaise: number, reason: s
       VALUES (${userId}, ${amt}, ${(reason || 'admin grant').slice(0, 300)}, 'grant', ${byUserId || null})
     `);
     return { ok: true, balance: await getCreditBalance(userId) };
-  } catch (e: any) { return { ok: false, error: String(e?.message || e).slice(0, 160) }; }
+  } catch (e: any) {
+    // `.message` is only the failed SQL; the reason is on `.cause`.
+    const real = e?.cause?.message || e?.message || e;
+    console.error('[credit] grantCredit failed for user', userId, '-', real);
+    return { ok: false, error: String(real).slice(0, 160) };
+  }
 }
 
 // Try to pay for something entirely from wallet credit. Returns covered:false

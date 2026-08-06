@@ -2,15 +2,28 @@
 // Self-bootstrapping schema. All helpers idempotent and safe to call from any page/API.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { logEvent } from '@/lib/logger';
+import { ensureOnce } from '@/lib/ensure-once';
 
 import { reconcileXpEventsColumns } from '@/lib/xp';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
-let ready: Promise<void> | null = null;
 
+/**
+ * THIS USED TO BE `catch (_) {}` AROUND A MEMOIZED PROMISE, which is the worst combination of the
+ * two: a DDL failure was swallowed with nothing written anywhere, AND the failed run was cached for
+ * the life of the process, so every later caller got the same silent success. If the xp_events
+ * reconcile at the end of this block threw, gamification.awardXp()'s INSERT then failed on a missing
+ * column for every learner until the process restarted, and the only symptom was an achievements
+ * page that never moved.
+ *
+ * Now on ensureOnce(), which drops a failed run from the cache so the next call retries, and the
+ * cause is LOGGED before it is re-thrown into that guard. ensureOnce() absorbs the throw at the
+ * caller boundary, so /portal/achievements keeps its existing tolerate-missing-schema behaviour —
+ * what changes is that the reason is now on the record instead of nowhere.
+ */
 export function ensureGamificationSchema(): Promise<void> {
-  if (ready) return ready;
-  ready = (async () => {
+  return ensureOnce('gamification', async () => {
     try {
       // Per-learner streak + XP rollup. One row per user.
       await db.execute(sql`CREATE TABLE IF NOT EXISTS learner_streaks (
@@ -51,9 +64,14 @@ export function ensureGamificationSchema(): Promise<void> {
       // every INSERT then throws on a missing column. Reconcile to the union of both shapes so
       // neither module's XP log can be silently lost. See the twin in src/lib/xp.ts.
       await reconcileXpEventsColumns();
-    } catch (_) {}
-  })();
-  return ready;
+    } catch (e: any) {
+      // The real Postgres reason is on e.cause; e.message is only the failed statement.
+      logEvent('error', 'gamification.schema_ensure_failed', {
+        reason: e?.cause?.message || e?.message || 'unknown',
+      });
+      throw e;
+    }
+  });
 }
 
 // level = floor(sqrt(xp / 100)) + 1

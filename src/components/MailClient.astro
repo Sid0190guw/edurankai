@@ -57,6 +57,10 @@ const queryNote = listing && listing.query && listing.query.active ? listing.que
 let thread: any[] = [];
 let threadSubject = '';
 let threadOtherParty = '';
+// The reason a conversation would not open. It used to be thrown away by `catch (e) { thread = []; }`
+// and an unreadable thread rendered as an EMPTY one — the reader was shown a conversation with no
+// messages in it and told nothing had gone wrong.
+let threadError = '';
 if (threadId && dbReady) {
   try {
     thread = await getThreadMessages(user.id, threadId);
@@ -88,7 +92,12 @@ if (threadId && dbReady) {
         for (const m of thread as any[]) if (m.rfc_message_id && byRfc[m.rfc_message_id]) m.delivery = byRfc[m.rfc_message_id];
       }
     }
-  } catch (e) { thread = []; }
+  } catch (e: any) {
+    // NOT SWALLOWED. e.cause carries the real Postgres reason; e.message is only the failed SQL.
+    thread = [];
+    threadError = String(e?.cause?.message || e?.message || 'unknown error');
+    console.error('[MailClient] thread failed:', threadError);
+  }
   const first = thread[0];
   threadSubject = first?.subject || '(no subject)';
   const last = thread[thread.length - 1] || {};
@@ -133,6 +142,11 @@ const folderLinks = [
       {' '}{mailError}
     </div>
   )}
+  {/* Where a FAILED star, archive, delete, mark-unread or spam report is said out loud. Those five
+      buttons used to fire and then reload or navigate whichever way the request went, so a refused
+      action left you on a fresh inbox with the mail exactly as it was and nothing on screen to say
+      so — the same "reported success while nothing happened" this client was repaired for. */}
+  <div class="mc-alert" id="mcAlert" role="alert" hidden></div>
   <!-- Header -->
   <div class="mc-head">
     <div class="mc-head-id">
@@ -239,6 +253,12 @@ const folderLinks = [
             </div>
           </div>
 
+          {threadError && (
+            <div class="mc-thread-error">
+              This conversation could not be read, so it is empty here for a reason that is not "no
+              messages": {threadError}
+            </div>
+          )}
           <div class="mc-msgs">
             {thread.map((m: any) => (
               <div class="mc-msg">
@@ -253,9 +273,15 @@ const folderLinks = [
                 <div class="mc-msg-body">{bodyToText(m)}</div>
                 {m.from_user_id === user.id && (
                   <div class="mc-status">
+                    {/* "Delivered" USED TO BE THE DEFAULT. Anything without a `failed` row in
+                        email_logs was labelled delivered — including a message with NO log row at
+                        all, which is what an external send that never reached a transport looks
+                        like. Three states now, and the third one does not claim anything. */}
                     {m.delivery?.status === 'failed'
                       ? <span class="mc-st fail" title={m.delivery?.error || ''}>Failed to send</span>
-                      : <span class="mc-st ok">Delivered</span>}
+                      : (m.delivery
+                        ? <span class="mc-st ok">Delivered</span>
+                        : <span class="mc-st none" title="This message is stored in the mailbox. No external delivery was recorded for it, which is normal for mail that never left this system.">Stored, no delivery record</span>)}
                     {(m.reads || []).length > 0
                       ? <span class="mc-st open">Opened{(m.reads as any[]).length > 1 ? ' · ' + (m.reads as any[]).length + ' opens' : ''}</span>
                       : <span class="mc-st none">Not opened yet</span>}
@@ -354,6 +380,9 @@ const folderLinks = [
   color: var(--mc-text); display:flex; flex-direction:column; height:calc(100vh - 0px); min-height:560px;
   font-family: var(--o-font-body, inherit);
 }
+.mc-alert{ padding:10px 16px; background:rgba(239,68,68,0.12); border-bottom:1px solid rgba(239,68,68,0.32); color:#fca5a5; font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
+.mc-alert[hidden]{ display:none !important; }
+.mc-thread-error{ margin:14px 18px 0; padding:10px 12px; background:rgba(251,191,36,0.12); border:1px solid rgba(251,191,36,0.28); border-radius:9px; color:#fbbf24; font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
 .mc-head{ display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--mc-border); background:var(--mc-bg); position:sticky; top:0; z-index:8; flex-wrap:wrap; }
 .mc-head-id{ display:flex; align-items:center; gap:9px; min-width:0; }
 .mc-dot{ width:32px; height:32px; border-radius:9px; background:linear-gradient(135deg,var(--mc-accent),var(--mc-accent-bright)); flex-shrink:0; box-shadow:0 0 16px var(--o-brand-glow, rgba(255,79,0,0.35)); }
@@ -474,8 +503,14 @@ const folderLinks = [
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messageIds: openMessageIds }),
-      }).catch(function () {});
-    } catch (_) {}
+      }).catch(function (err) {
+        // Not silent. When this does not land, the SENDER is shown "Not opened yet" about a message
+        // that was opened, and nothing anywhere would have said why.
+        console.error('[MailClient] open receipt not logged:', (err && err.message) || err);
+      });
+    } catch (err) {
+      console.error('[MailClient] open receipt not logged:', (err && err.message) || err);
+    }
   }
   const modal = document.getElementById('mcModal');
   const $ = function(id){ return document.getElementById(id); };
@@ -536,13 +571,28 @@ const folderLinks = [
   // A 500 that returns an HTML error page used to make r.json() throw, and every caller caught that
   // as "Network error" — so a server fault and an unplugged cable read identically, and neither
   // said which. The status is reported when the body cannot be read.
+  // It also never THROWS any more. A dropped connection used to reject out of here into whichever
+  // caller was awaiting it, and the two action handlers below awaited it without a try at all — so a
+  // failed archive or star threw an unhandled rejection and the page reloaded as if it had worked.
   async function post(url, data){
-    const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    var r;
+    try {
+      r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    } catch (e) {
+      return { ok:false, error: 'the request never reached the server (' + ((e && e.message) || 'network error') + ')' };
+    }
     try {
       return await r.json();
     } catch (e) {
       return { ok:false, error: 'the server answered ' + r.status + ' with a response this page could not read' };
     }
+  }
+  function showAlert(msg){
+    const a = $('mcAlert');
+    if (!a) { console.error('[MailClient]', msg); return; }
+    a.textContent = msg;
+    a.hidden = false;
+    a.scrollIntoView({ block: 'nearest' });
   }
   const sendBtn = $('mcSend');
   if (sendBtn) sendBtn.addEventListener('click', async function(){
@@ -561,29 +611,48 @@ const folderLinks = [
           setTimeout(function(){ location.href = basePath + '?folder=sent'; }, 500);
         }
       }
-      else { $('mcStatus').textContent = res.error || 'Failed'; sendBtn.disabled=false; }
-    }catch(e){ $('mcStatus').textContent='Network error'; sendBtn.disabled=false; }
+      else { $('mcStatus').textContent = 'Not sent - ' + (res.error || 'the server refused it without saying why') + '. Your message is still here.'; sendBtn.disabled=false; }
+    }catch(e){ $('mcStatus').textContent='Not sent - ' + ((e && e.message) || 'this page could not complete the request') + '. Your message is still here.'; sendBtn.disabled=false; }
   });
   const draftBtn = $('mcSaveDraft');
   if (draftBtn) draftBtn.addEventListener('click', async function(){
     $('mcStatus').textContent='Saving...';
-    try{ const res = await post('/api/mail/draft', payload()); $('mcStatus').textContent = res.ok ? 'Draft saved' : (res.error||'Failed'); if(res.ok) setTimeout(closeModal, 500); }
-    catch(e){ $('mcStatus').textContent='Network error'; }
+    try{ const res = await post('/api/mail/draft', payload()); $('mcStatus').textContent = res.ok ? 'Draft saved' : ('Not saved - ' + (res.error||'the server refused it without saying why')); if(res.ok) setTimeout(closeModal, 500); }
+    catch(e){ $('mcStatus').textContent='Not saved - ' + ((e && e.message) || 'this page could not complete the request'); }
   });
 
-  // Star toggles + thread actions
+  // Star toggles + thread actions.
+  //
+  // BOTH OF THESE USED TO IGNORE THE ANSWER. They awaited the POST and then reloaded (star) or
+  // navigated to the inbox (archive / delete / mark-unread / spam) whichever way it went. A refused
+  // action therefore looked identical to a completed one: you landed on a freshly-drawn inbox with
+  // the mail exactly as it had been, and nothing said why. Neither navigates now unless the server
+  // confirmed the change, and a refusal is printed at the top of the client.
   document.querySelectorAll('.mc-star').forEach(function(btn){
     btn.addEventListener('click', async function(e){
       e.preventDefault(); e.stopPropagation();
       const thread = btn.getAttribute('data-thread'); const action = btn.getAttribute('data-action');
-      await post('/api/mail/action', { action: action, threadId: thread });
+      btn.disabled = true;
+      const res = await post('/api/mail/action', { action: action, threadId: thread });
+      if (!res || res.ok !== true) {
+        btn.disabled = false;
+        showAlert('This conversation was not ' + (action === 'star' ? 'starred' : 'unstarred') + ', and nothing was changed: ' + ((res && res.error) || 'the server did not confirm it') + '.');
+        return;
+      }
       location.reload();
     });
   });
+  const ACTION_DONE = { archive: 'archived', trash: 'deleted', unread: 'marked unread', spam: 'reported as spam' };
   document.querySelectorAll('.mc-act').forEach(function(btn){
     btn.addEventListener('click', async function(){
       const thread = btn.getAttribute('data-thread'); const action = btn.getAttribute('data-action');
-      await post('/api/mail/action', { action: action, threadId: thread });
+      btn.disabled = true;
+      const res = await post('/api/mail/action', { action: action, threadId: thread });
+      if (!res || res.ok !== true) {
+        btn.disabled = false;
+        showAlert('This conversation was not ' + (ACTION_DONE[action] || action) + ', and nothing was changed: ' + ((res && res.error) || 'the server did not confirm it') + '. It is still where it was.');
+        return;
+      }
       location.href = basePath + '?folder=inbox';
     });
   });

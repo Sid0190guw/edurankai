@@ -9,7 +9,46 @@ export function isEnabled(flags: Flag[], key: string, defaultOn = true): boolean
   const f = flags.find((x) => x.key === key);
   return f ? f.enabled : defaultOn;
 }
-export const KNOWN_FEATURES = ['community', 'ai_tutor', 'gamification', 'offline', 'admissions', 'proctoring'] as const;
+/**
+ * The feature kill-switches, and WHAT EACH ONE ACTUALLY TURNS OFF.
+ *
+ * This used to be a bare list of six strings rendered as six identical checkboxes under the heading
+ * "Feature flags (disable a subsystem's routes safely)". Only TWO of the six are asked about
+ * anywhere: featureEnabled('ai_tutor') in /api/aquintutor/ask-aquin.ts and
+ * featureEnabled('community') in /api/aquintutor/discussion.ts. `gamification`, `offline`,
+ * `admissions` and `proctoring` gate NOTHING — unchecking `proctoring` wrote the row, reported
+ * "Flag proctoring disabled", and proctoring carried on running exactly as before.
+ *
+ * A kill-switch that does not kill anything is the most dangerous kind of dead control on this
+ * console, because the person flipping it is usually flipping it in a hurry. So each flag now
+ * carries the call sites it governs; an empty `enforcedAt` is a flag that enforces nothing, and
+ * /admin/observability renders it as inert instead of as a switch.
+ *
+ * TO MAKE ONE REAL: add `if (!(await featureEnabled('<key>'))) return ...` at the entry point, then
+ * list that file here. The two lists must move together.
+ */
+export interface FeatureFlagDef {
+  key: string;
+  label: string;
+  /** Files that actually ask featureEnabled() for this key. Empty means the switch enforces nothing. */
+  enforcedAt: string[];
+}
+
+export const FEATURE_CATALOG: FeatureFlagDef[] = [
+  { key: 'community',    label: 'Community discussions', enforcedAt: ['src/pages/api/aquintutor/discussion.ts'] },
+  { key: 'ai_tutor',     label: 'AI tutor',              enforcedAt: ['src/pages/api/aquintutor/ask-aquin.ts'] },
+  { key: 'gamification', label: 'Gamification',          enforcedAt: [] },
+  { key: 'offline',      label: 'Offline packages',      enforcedAt: [] },
+  { key: 'admissions',   label: 'Admissions',            enforcedAt: [] },
+  { key: 'proctoring',   label: 'Proctoring',            enforcedAt: [] },
+];
+
+/** True when flipping this switch changes what some route does. */
+export function isFeatureEnforced(key: string): boolean {
+  return (FEATURE_CATALOG.find((f) => f.key === key)?.enforcedAt.length || 0) > 0;
+}
+
+export const KNOWN_FEATURES = FEATURE_CATALOG.map((f) => f.key);
 
 // ============================ DB (self-bootstrapping; audit reads existing rbac_audit) ============
 const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));

@@ -114,7 +114,10 @@ if (Astro.request.method === 'POST') {
       successMsg = `Marked ${count} employees as ${status} for ${date}.`;
     }
   } catch (err: any) {
-    errorMsg = 'Error: ' + (err.message || 'Unknown');
+    // The real Postgres reason is on `.cause`; `.message` is only the failed SQL text, which is
+    // what an administrator was being shown instead of what actually went wrong.
+    console.error('[attendance] action failed -', err?.cause?.message || err?.message);
+    errorMsg = 'That did not save: ' + (err?.cause?.message || err?.message || 'unknown database error');
   }
 }
 
@@ -211,7 +214,32 @@ const ts = (_todayStatsRows[0] || {}) as any;
 const _monthlyRows = monthlySummary ? (Array.isArray(monthlySummary) ? monthlySummary : (monthlySummary?.rows || [])) : [];
 const ms = (_monthlyRows[0] || {}) as any;
 
-const allEmployees = await db.execute(sqlExpr`SELECT id, full_name, employee_code FROM hr_employees WHERE is_active = true ORDER BY full_name LIMIT 200`);
+const EMPLOYEE_PICKER_LIMIT = 200;
+const allEmployees = await db.execute(sqlExpr`SELECT id, full_name, employee_code FROM hr_employees WHERE is_active = true ORDER BY full_name LIMIT ${EMPLOYEE_PICKER_LIMIT}`);
+const employeeOptions = (Array.isArray(allEmployees) ? allEmployees : ((allEmployees as any)?.rows || [])) as any[];
+const attendanceRows = (Array.isArray(todayAttendance) ? todayAttendance : ((todayAttendance as any)?.rows || [])) as any[];
+
+// THE MARK / EDIT SHEET IS OPENED BY A URL, NOT BY JAVASCRIPT.
+//
+// "+ Mark" was a <button onclick="...style.display='flex'"> and every row's Edit called
+// editAttendance(this) from an inline script at the foot of the page. Until that script had parsed —
+// which on a mid-range phone on a weak connection is well after the page is readable — both controls
+// were dead on tap, with no error and nothing to retry. Marking somebody absent prices a
+// loss-of-pay day against their salary, so this is not a cosmetic surface.
+//
+// The sheet is now rendered by the server from ?sheet=new or ?sheet=edit&sheetEmp=<id>. It needs no
+// script at all, it survives the back button, and an Edit link can be reopened or shared.
+const sheetMode = url.searchParams.get('sheet') || '';
+const sheetEmpId = url.searchParams.get('sheetEmp') || '';
+const sheetRow = sheetMode === 'edit'
+  ? (attendanceRows.find((a: any) => String(a.employee_id) === sheetEmpId) || null)
+  : null;
+const sheetOpen = sheetMode === 'new' || sheetMode === 'edit';
+/** An edit whose row is no longer on this date falls back to a blank entry rather than lying. */
+const isEditSheet = sheetMode === 'edit' && sheetRow !== null;
+const sheetBack = '?tab=' + encodeURIComponent(tab) + '&date=' + encodeURIComponent(dateFilter)
+  + (empFilter ? '&emp=' + encodeURIComponent(empFilter) : '');
+const sheetNewHref = sheetBack + '&sheet=new';
 
 const STATUS_COLORS: Record<string, string> = {
   present: 'rgba(16,185,129,0.15)',
@@ -277,7 +305,7 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
           <a href="/admin/hr/leave" style="color:#f97316;">Leave approvals</a>
         </p>
       </div>
-      <button onclick="document.getElementById('markModal').style.display='flex'" style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:12px;padding:8px 14px;border-radius:8px;cursor:pointer;">+ Mark</button>
+      <a href={sheetNewHref} style="background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:12px;padding:0 14px;border-radius:8px;cursor:pointer;text-decoration:none;min-height:44px;display:inline-flex;align-items:center;white-space:nowrap;flex:0 0 auto;">+ Mark</a>
     </div>
 
     <!-- Date picker -->
@@ -380,22 +408,21 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
                 <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;text-transform:uppercase;background:${STATUS_COLORS[a.status] || 'rgba(107,114,128,0.15)'};color:${STATUS_TEXT[a.status] || '#9ca3af'};`}>
                   {a.status.replace('_', ' ')}
                 </span>
-                <div style="display:flex;gap:4px;">
-                  <button type="button"
-                    data-emp-id={a.employee_id}
-                    data-date={dateValue(a.date)}
-                    data-status={a.status}
-                    data-work-mode={a.work_mode || 'remote'}
-                    data-clock-in={timeInputValue(a.clock_in)}
-                    data-clock-out={timeInputValue(a.clock_out)}
-                    data-notes={a.notes || ''}
-                    onclick="editAttendance(this)"
-                    style="background:#15151a;border:1px solid #1a1a1f;color:#FF7040;font-size:10.5px;padding:3px 9px;border-radius:6px;cursor:pointer;">Edit</button>
-                  <form method="POST" style="margin:0;display:inline;" onsubmit="return confirm('Delete this attendance entry?');">
+                {/* Edit is a LINK to the server-rendered sheet — it needs no script, and it was
+                    10.5px inside a 20px-tall box, well under the 44px a thumb can reliably hit next
+                    to a Delete that removes a pay-affecting record. Both are 44px now. */}
+                <div style="display:flex;gap:8px;">
+                  <a href={sheetBack + '&sheet=edit&sheetEmp=' + a.employee_id}
+                    aria-label={'Edit attendance for ' + a.full_name}
+                    style="background:#15151a;border:1px solid #26262e;color:#FF7040;font-size:12px;font-weight:600;padding:0 14px;border-radius:6px;cursor:pointer;text-decoration:none;min-height:44px;display:inline-flex;align-items:center;">Edit</a>
+                  {/* "Delete this attendance entry?" named nothing. The same prompt appeared on every
+                      row, so on a phone — where the rows are 8px apart — there was no way to tell
+                      from the dialog whether you had hit the right person's. It says so now. */}
+                  <form method="POST" style="margin:0;display:inline;" onsubmit={`return confirm('Delete the attendance entry for ${String(a.full_name || 'this employee').replace(/'/g, '')} on ${dateValue(a.date)}? It is currently ${String(a.status || '').replace('_', ' ')}${a.work_hours != null ? ' with ' + a.work_hours + ' hours clocked' : ''}. Deleting it leaves the day unmarked, which counts as neither present nor absent until somebody marks it again.')`}>
                     <input type="hidden" name="action" value="delete" />
                     <input type="hidden" name="employeeId" value={a.employee_id} />
                     <input type="hidden" name="date" value={dateValue(a.date)} />
-                    <button type="submit" style="background:#15151a;border:1px solid rgba(239,68,68,0.3);color:#fca5a5;font-size:10.5px;padding:3px 9px;border-radius:6px;cursor:pointer;">Delete</button>
+                    <button type="submit" aria-label={'Delete attendance for ' + a.full_name} style="background:#15151a;border:1px solid rgba(239,68,68,0.4);color:#fca5a5;font-size:12px;font-weight:600;padding:0 14px;border-radius:6px;cursor:pointer;min-height:44px;">Delete</button>
                   </form>
                 </div>
               </div>
@@ -476,123 +503,143 @@ const ICON_ALERT = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" 
     <div style="padding:12px 16px;">
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
         <p style="font-size:14px;font-weight:600;color:#fff;margin:0 0 4px;">Bulk Mark Attendance</p>
-        <p style="font-size:12px;color:#6e6e78;margin:0 0 16px;">Marks all active employees at once. Won't overwrite existing records.</p>
-        <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
+        <p style="font-size:12.5px;color:#8a8a94;margin:0 0 16px;line-height:1.6;">
+          Writes one attendance row for every active employee on the chosen date. It will not overwrite
+          a day somebody already has a record for. Marking the company absent prices a loss-of-pay day
+          against each of their salaries in that month's payroll run.
+        </p>
+        {/* THE WIDEST WRITE ON THIS SCREEN AND IT HAD NO CONFIRMATION AT ALL — one tap wrote a row
+            for every active employee, and "absent" sits directly under "present" in the same list.
+            The prompt reads back the status and date actually chosen rather than asking whether you
+            are sure about something it will not name. */}
+        <form method="POST" style="display:flex;flex-direction:column;gap:12px;"
+          onsubmit="return confirm('Mark EVERY active employee as ' + this.status.value.replace('_', ' ') + ' on ' + this.date.value + '? Anyone who already has a record for that day keeps it. A day recorded as absent is priced as a loss-of-pay day against that person’s salary in the payroll run for that month.')">
           <input type="hidden" name="action" value="bulk_mark" />
-          <div>
-            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Date</label>
-            <input type="date" name="date" value={dateFilter} style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-          </div>
-          <div>
-            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Status</label>
-            <select name="status" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+          <label style="display:block;">
+            <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Date</span>
+            <input type="date" name="date" value={dateFilter} required style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;" />
+          </label>
+          <label style="display:block;">
+            <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Status</span>
+            <select name="status" style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;">
               <option value="present">Present</option>
               <option value="absent">Absent</option>
               <option value="wfh">Work From Home</option>
               <option value="holiday">Holiday</option>
               <option value="on_leave">On Leave</option>
             </select>
-          </div>
-          <div>
-            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Work Mode</label>
-            <select name="workMode" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
+          </label>
+          <label style="display:block;">
+            <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Work Mode</span>
+            <select name="workMode" style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;">
               <option value="remote">Remote</option>
               <option value="office">Office</option>
               <option value="hybrid">Hybrid</option>
             </select>
-          </div>
-          <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Mark All Active Employees</button>
+          </label>
+          <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;min-height:44px;">Mark All Active Employees</button>
         </form>
       </div>
     </div>
   )}
 </div>
 
-<script is:inline>
-function editAttendance(btn) {
-  var m = document.getElementById('markModal');
-  var f = m.querySelector('form');
-  function set(name, v) { var el = f.querySelector('[name="' + name + '"]'); if (el) el.value = v || ''; }
-  set('employeeId', btn.dataset.empId);
-  set('date',       btn.dataset.date);
-  set('status',     btn.dataset.status);
-  set('workMode',   btn.dataset.workMode);
-  set('clockIn',    btn.dataset.clockIn);
-  set('clockOut',   btn.dataset.clockOut);
-  set('notes',      btn.dataset.notes);
-  m.querySelector('h2').textContent = 'Edit Attendance';
-  m.style.display = 'flex';
-}
-// Reset the modal title when the "+ Mark" button opens it fresh.
-document.addEventListener('click', function(e) {
-  var t = e.target;
-  if (t && t.tagName === 'BUTTON' && t.textContent && t.textContent.trim() === '+ Mark') {
-    var m = document.getElementById('markModal');
-    if (m) {
-      var f = m.querySelector('form'); if (f) f.reset();
-      m.querySelector('h2').textContent = 'Mark Attendance';
-    }
-  }
-});
-</script>
-
-<!-- Mark Individual Modal -->
-<div id="markModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:100;align-items:flex-end;justify-content:center;">
+{/* MARK / EDIT SHEET — rendered by the server when ?sheet= is set. The inline editAttendance()
+    script and the "+ Mark" click listener that used to live here are gone: they were the only way
+    to open this form, and until they parsed the two controls that reach it were dead. */}
+{sheetOpen && (
+<div id="markModal" role="dialog" aria-modal="true" aria-labelledby="markModalTitle" style="display:flex;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:100;align-items:flex-end;justify-content:center;">
   <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:16px 16px 0 0;width:100%;max-width:600px;max-height:90vh;overflow-y:auto;padding:20px;">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
-      <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">Mark Attendance</h2>
-      <button onclick="document.getElementById('markModal').style.display='none'" style="background:#1a1a1f;border:none;color:#8a8a94;width:30px;height:30px;border-radius:6px;font-size:18px;cursor:pointer;">&times;</button>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;gap:10px;">
+      <h2 id="markModalTitle" style="font-size:15px;font-weight:700;color:#fff;margin:0;">
+        {isEditSheet ? 'Edit attendance for ' + sheetRow.full_name : 'Mark Attendance'}
+      </h2>
+      <a href={sheetBack} aria-label="Close without saving" style="background:#1a1a1f;border:none;color:#d8d8de;min-width:44px;min-height:44px;border-radius:8px;font-size:20px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;">&times;</a>
     </div>
+    {sheetMode === 'edit' && !isEditSheet && (
+      <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:8px;padding:10px 12px;margin-bottom:12px;">
+        <p style="font-size:12px;color:#fde68a;margin:0;line-height:1.55;">
+          That entry is no longer on {dateFilter} — somebody may have deleted it since this page was
+          drawn. The form below is blank rather than showing you stale values.
+        </p>
+      </div>
+    )}
     <form method="POST" style="display:flex;flex-direction:column;gap:12px;">
       <input type="hidden" name="action" value="mark" />
-      <div>
-        <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Employee</label>
-        <select name="employeeId" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
-          {((Array.isArray(allEmployees) ? allEmployees : (allEmployees?.rows || [])) as any[]).map(e => (
-            <option value={e.id}>{e.full_name} ({e.employee_code})</option>
+      {/* Every label WRAPS its control. They were loose <label> elements with no `for`, so a screen
+          reader announced seven unlabelled fields and tapping a word focused nothing. */}
+      <label style="display:block;">
+        <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Employee</span>
+        <select name="employeeId" required style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;">
+          {employeeOptions.map(e => (
+            <option value={e.id} selected={isEditSheet && String(e.id) === String(sheetRow.employee_id)}>{e.full_name} ({e.employee_code})</option>
           ))}
         </select>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div style="grid-column:1/-1;">
-          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Date</label>
-          <input type="date" name="date" value={dateFilter} style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-        </div>
-        <div>
-          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Status</label>
-          <select name="status" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
-            <option value="present">Present</option>
-            <option value="absent">Absent</option>
-            <option value="wfh">WFH</option>
-            <option value="half_day">Half Day</option>
-            <option value="on_leave">On Leave</option>
-            <option value="holiday">Holiday</option>
+      </label>
+      {employeeOptions.length >= EMPLOYEE_PICKER_LIMIT && (
+        <p style="font-size:11.5px;color:#fbbf24;margin:-4px 0 0;line-height:1.5;">
+          This picker lists the first {EMPLOYEE_PICKER_LIMIT} active employees by name. If somebody is
+          missing they are past that cut, not inactive.
+        </p>
+      )}
+      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">
+        <label style="grid-column:1/-1;display:block;">
+          <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Date</span>
+          <input type="date" name="date" value={isEditSheet ? dateValue(sheetRow.date) : dateFilter} required style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;" />
+        </label>
+        <label style="display:block;">
+          <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Status</span>
+          <select name="status" style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;">
+            {[['present','Present'],['absent','Absent'],['wfh','WFH'],['half_day','Half Day'],['on_leave','On Leave'],['holiday','Holiday']].map(([v, label]) => (
+              <option value={v} selected={isEditSheet && sheetRow.status === v}>{label}</option>
+            ))}
           </select>
-        </div>
-        <div>
-          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Work Mode</label>
-          <select name="workMode" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;">
-            <option value="remote">Remote</option>
-            <option value="office">Office</option>
-            <option value="hybrid">Hybrid</option>
+        </label>
+        <label style="display:block;">
+          <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Work Mode</span>
+          <select name="workMode" style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;">
+            {[['remote','Remote'],['office','Office'],['hybrid','Hybrid']].map(([v, label]) => (
+              <option value={v} selected={isEditSheet && (sheetRow.work_mode || 'remote') === v}>{label}</option>
+            ))}
           </select>
-        </div>
-        <div>
-          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Clock In</label>
-          <input type="time" name="clockIn" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-        </div>
-        <div>
-          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Clock Out</label>
-          <input type="time" name="clockOut" style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-        </div>
-        <div style="grid-column:1/-1;">
-          <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Notes</label>
-          <input type="text" name="notes" placeholder="Optional note..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
-        </div>
+        </label>
+        <label style="display:block;">
+          <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Clock In</span>
+          <input type="time" name="clockIn" value={isEditSheet ? timeInputValue(sheetRow.clock_in) : ''} style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;" />
+        </label>
+        <label style="display:block;">
+          <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Clock Out</span>
+          <input type="time" name="clockOut" value={isEditSheet ? timeInputValue(sheetRow.clock_out) : ''} style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;" />
+        </label>
+        <label style="grid-column:1/-1;display:block;">
+          <span style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#9a9aa4;margin-bottom:5px;">Notes</span>
+          <input type="text" name="notes" value={isEditSheet ? (sheetRow.notes || '') : ''} placeholder="Optional note" style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;" />
+        </label>
       </div>
-      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;">Save Attendance</button>
+      <p style="font-size:11.5px;color:#8a8a94;margin:0;line-height:1.55;">
+        A day saved as absent is counted by the payroll run as a loss-of-pay day and priced against
+        that month's gross.
+      </p>
+      <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;min-height:44px;">Save Attendance</button>
+      <a href={sheetBack} style="text-align:center;color:#8a8a94;font-size:12.5px;text-decoration:underline;min-height:44px;display:flex;align-items:center;justify-content:center;">Cancel</a>
     </form>
   </div>
 </div>
+)}
+
+{/* PROGRESSIVE ENHANCEMENT ONLY — focus and Escape. Deliberately NOT inside a JSX conditional: a
+    <script> in one breaks .astro parsing. It guards on the element instead. */}
+<script is:inline>
+(function () {
+  var sheet = document.getElementById('markModal');
+  if (!sheet) return;
+  var back = sheet.querySelector('a[aria-label]');
+  var first = sheet.querySelector('select, input');
+  if (first && first.focus) { try { first.focus(); } catch (e) {} }
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape' && back) { window.location.href = back.getAttribute('href'); }
+  });
+})();
+</script>
 
 </AdminLayout>

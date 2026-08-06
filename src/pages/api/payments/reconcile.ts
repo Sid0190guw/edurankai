@@ -5,21 +5,21 @@
 // Protected by CRON_SECRET (Authorization: Bearer <secret> or ?secret=).
 import type { APIRoute } from 'astro';
 import { reconcilePending } from '@/lib/payment-effects';
+import { isCronAuthorized } from '@/lib/auth/cron-auth';
 
 function json(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
 
-function authed(request: Request, url: URL): boolean {
-  const secret = process.env.CRON_SECRET;
-  if (!secret) return true; // cron-only path when no secret configured
-  const auth = request.headers.get('authorization') || '';
-  if (auth === 'Bearer ' + secret) return true;
-  if (url.searchParams.get('secret') === secret) return true;
-  return false;
-}
-
+// THE GUARD USED TO FAIL OPEN: `if (!secret) return true`. An absent or empty CRON_SECRET admitted
+// every caller to a route that walks pending payments and settles them against the gateway.
+// Replaced by the one shared, fail-closed helper (src/lib/auth/cron-auth.ts), which still accepts
+// the same Bearer header and ?secret= query this endpoint already took.
 export const GET: APIRoute = async ({ request, url }) => {
-  if (!authed(request, url)) return json({ ok: false, error: 'unauthorized' }, 401);
+  if (!isCronAuthorized(request, url)) return json({ ok: false, error: 'unauthorized' }, 401);
   try { return json({ ok: true, ...(await reconcilePending(200)) }); }
-  catch (e: any) { return json({ ok: false, error: String(e?.message || e) }, 500); }
+  catch (e: any) {
+    // The real Postgres/gateway reason is on e.cause; e.message is only the failed SQL.
+    console.error('[payments/reconcile]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'reconcile failed' }, 500);
+  }
 };
 export const POST = GET;

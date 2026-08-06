@@ -4,11 +4,11 @@ import { db } from '@/lib/db';
 import { markOfferOpened } from '@/lib/track';
 import { offerLetters, applications, applicationMessages } from '@/lib/db/schema';
 import { eq, and } from 'drizzle-orm';
-import { decideOfferTemplate, renderOfferLetter, emphasize, type AgreedFields } from '@/lib/offer-templates';
+import { decideOfferTemplate, renderOfferLetter, emphasize, plain, type AgreedFields } from '@/lib/offer-templates';
 // Working time, per level, from one module. See src/lib/engagement-policy.ts.
 import {
   ENGAGEMENT_POLICIES, resolveEngagementPolicy, isInternshipPolicy, INTERN_WORD,
-  shortCommitment, describeCommitment, describeProgrammeTotal, formatMinutes,
+  shortCommitment, describeCommitment, describeProgrammeTotal, formatMinutes, formatMinutesShort,
   WELLBEING_ASSESSED_AS,
 } from '@/lib/engagement-policy';
 
@@ -126,18 +126,52 @@ const resolvedPolicy = resolveEngagementPolicy({
   engagementType: c.employmentType,
   roleTitle: c.roleTitle || offer.roleTitle || '',
 });
-// A letter that is not an internship must never inherit internship hours, whatever the level field
-// happens to say. That is the same failure that put "unpaid internship" into a Chief AI Officer's
-// offer, arriving through a different door.
-const engagementPolicy = (isInternshipPolicy(resolvedPolicy)
-  && !INTERN_WORD.test(String(c.employmentType || ''))
-  && !INTERN_WORD.test(String(agreedLevel || '')))
+// A letter that is not a trainee programme must never inherit trainee hours, whatever the level
+// field happens to say. That is the same failure that put "unpaid internship" into a Chief AI
+// Officer's offer, arriving through a different door.
+//
+// THE GUARD READS EVERY FIELD THE RESOLVER READ, and that matters. It previously looked only at
+// employmentType and level, so it demoted two engagements that are genuinely counted:
+//   - an APPRENTICESHIP (nothing in the word "Apprentice" contains "intern"), and
+//   - an internship recorded only in the ROLE TITLE, with the level column empty.
+// Both then rendered the apprenticeship or internship template — unpaid clause, completion
+// certificate — with a mid-level employee's "5 days/week, 8h/day" printed underneath as their
+// working time. The letter contradicted itself about what the person had agreed to.
+//
+// It stays written as a last line rather than a decision: resolveEngagementPolicy() already refuses
+// to read a senior title as a trainee, so with all three fields in view this can now only fire if
+// that function regresses. That is what a guard is for.
+const traineeDeclaration = [
+  c.employmentType, agreedLevel, c.roleTitle || offer.roleTitle || '',
+].map((v) => String(v || '')).join(' ');
+const declaresTrainee = INTERN_WORD.test(traineeDeclaration) || /\bapprentice/i.test(traineeDeclaration);
+const engagementPolicy = (isInternshipPolicy(resolvedPolicy) && !declaresTrainee)
   ? ENGAGEMENT_POLICIES['Mid']
   : resolvedPolicy;
 const policyHours = shortCommitment(engagementPolicy);
 const hoursExplainer = describeCommitment(engagementPolicy);
 const programmeTotal = describeProgrammeTotal(engagementPolicy);
-const hoursWereAgreed = !!String(c.hoursCommitment || '').trim();
+const recordedHours = String(c.hoursCommitment || '').trim();
+const hoursWereAgreed = !!recordedHours;
+
+// A COUNTED TOTAL MAY NOT BE PUBLISHED WITHOUT ITS SPLIT — including when it was typed by hand.
+//
+// engagement-policy.ts is structurally incapable of emitting a bare total, but `hoursCommitment` is
+// a free-text box and bypasses it entirely: "40 hours" typed there printed as "Working Hours: 40
+// hours" in the summary of an internship letter, which is the exact sentence the founder objected
+// to. The recorded figure still GOVERNS — it is what was negotiated, and it is left first and
+// untouched — but where the engagement is hour-counted and the text carries no split, the split is
+// appended to it rather than left for the reader to assume.
+const hoursForLetter = (() => {
+  if (!recordedHours) return policyHours;
+  if (engagementPolicy.timeModel !== 'counted') return recordedHours;
+  if (/project|well-?being|per day|\/day|a day/i.test(recordedHours)) return recordedHours;
+  const proj = formatMinutesShort(engagementPolicy.projectMinutesPerDay);
+  const well = formatMinutesShort(engagementPolicy.wellbeingMinutesPerDay);
+  if (!proj || !well) return recordedHours;
+  return recordedHours + ' of total engagement (' + proj + ' project work + ' + well
+    + ' well-being per day)';
+})();
 
 const letterFields: AgreedFields = {
   level: agreedLevel,
@@ -148,7 +182,7 @@ const letterFields: AgreedFields = {
   duration: c.duration || '',
   // The agreed field still wins wherever one exists — it is what was actually negotiated. The
   // policy only fills the silence, so no letter goes out saying "the agreed hours" again.
-  hoursCommitment: c.hoursCommitment || policyHours,
+  hoursCommitment: hoursForLetter,
   joiningDate: formatDate(c.joiningDate),
   reportingTo: c.reportingTo || '',
   compensation: c.compensation || '',
@@ -395,9 +429,35 @@ const closingParts = emphasize(letter.closing);
 const showsDuration = letter.summaryKeys.indexOf('duration') !== -1;
 const showsHours = letter.summaryKeys.indexOf('hoursCommitment') !== -1;
 
+// THE WORKING-TIME PARAGRAPHS ARE PART OF THE LETTER, SO THEY ARE PART OF THE PRINTED LETTER.
+//
+// They were rendered in section 03 of the web page and nowhere else, so the PDF — the copy people
+// actually keep — carried a "Working Hours" row and not one word explaining it. The saved document
+// therefore did state a bare total with no split, which is precisely the thing this whole module
+// exists to prevent, surviving in the one artefact that outlives the web page.
+//
+// Built from the same consts the JSX below renders, in the same order, so the two cannot drift.
+const workingTimeParas: string[] = ['Working time. ' + hoursExplainer];
+if (programmeTotal) workingTimeParas.push(programmeTotal + ' The total is your engagement, not your task output.');
+if (hoursWereAgreed) workingTimeParas.push('Where the hours recorded in your summary below differ from the standard structure, the recorded figure is the one that governs your engagement.');
+workingTimeParas.push(engagementPolicy.statutoryNote);
+workingTimeParas.push('How this is measured. ' + engagementPolicy.measuredBy);
+
 // The PDF reads the SAME sentences. `bodyParas` is what the generator prints when supplied, and
 // the irrelevant summary fields are blanked here because the generator skips empty values - that
 // is how a template's field relevance reaches the printed copy without a second copy of the rules.
+// Assembled part by part rather than from `letter.paragraphs` so the working-time block lands where
+// the reader meets it on the page: immediately after the engagement terms it qualifies.
+const pdfBodyParas: string[] = [
+  plain(letter.opening),
+  plain(letter.welcome),
+  plain(letter.engagementTerms),
+  ...workingTimeParas,
+  plain(letter.progression),
+  plain(letter.completion),
+  plain(letter.closing),
+].filter((p) => p && p.trim().length > 0);
+
 const offerPdfData = {
   refNumber: offer.refNumber || '',
   offerDate: formatDate(offer.offerDate),
@@ -410,7 +470,11 @@ const offerPdfData = {
   employmentType: letter.engagementLabel,
   workMode: c.workMode || '',
   duration: showsDuration ? (c.duration || '') : '',
-  hoursCommitment: showsHours ? (c.hoursCommitment || '') : '',
+  // The SAME string the web summary prints. This read `c.hoursCommitment || ''` — the raw box,
+  // without the policy fallback — so an offer with an empty hours field showed the resolved policy
+  // commitment on screen and an absent Working Hours row in the PDF. Two documents, one signature,
+  // different terms. `letterFields.hoursCommitment` is the single value both now render.
+  hoursCommitment: showsHours ? (letterFields.hoursCommitment || '') : '',
   compensation: c.compensation || '',
   integrityHash: offer.integrityHash || '',
   internalHandle: internalHandle || '',
@@ -419,7 +483,7 @@ const offerPdfData = {
   signedAt: offer.signedAt ? formatDateTimeIST(offer.signedAt) : '',
   signatoryName: (c.signatoryName || 'Siddharth Prasad'),
   signatoryTitle: (c.signatoryTitle || 'Founder & CEO'),
-  bodyParas: letter.paragraphs
+  bodyParas: pdfBodyParas
 };
 ---
 <BaseLayout title={'Offer Letter - ' + c.candidateName} description="Your EduRankAI offer letter">

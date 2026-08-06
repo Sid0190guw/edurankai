@@ -136,12 +136,26 @@ export async function logTrainingExample(userId: string | null, feature: string,
   } catch (_) {}
 }
 
+/**
+ * FAILS CLOSED. This used to end `catch { return true }`, so ANY failure of the usage-log read — a
+ * cold database, a missing table, a pool timeout — answered "under the limit" and removed the AI
+ * spend cap entirely, for every user, for as long as the fault lasted. Wrong direction for a limiter
+ * whose whole job is to bound a bill: a refused prompt is an inconvenience the caller sees and can
+ * retry; an unbounded one is a charge nobody sees until the invoice arrives.
+ *
+ * Callers already show a "you are going too fast" message on false, so the degraded behaviour is a
+ * message rather than a crash.
+ */
 export async function underRateLimit(userId: string, max = 20, windowSec = 60): Promise<boolean> {
   try {
     await ensureLlmSchema();
     const r = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM ai_usage_log WHERE user_id = ${userId} AND created_at > NOW() - (${windowSec} || ' seconds')::interval`))[0];
     return Number(r?.n || 0) < max;
-  } catch { return true; }
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    console.error('[llm/gateway] rate-limit read failed, refusing:', e?.cause?.message || e?.message);
+    return false;
+  }
 }
 
 // ---- HTTP plumbing ----

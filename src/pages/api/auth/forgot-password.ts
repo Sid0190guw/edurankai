@@ -1,57 +1,66 @@
 // POST /api/auth/forgot-password
 // Body: { emailOrName: string, dob: string }
-// Verifies user identity via DOB (from applications.dob or hr_employees.date_of_birth)
-// and resets the password to a freshly generated temp password.
-// Returns the temp password in the response so the user can immediately sign in.
 //
-// Security notes:
-// - DOB comparison is normalised to digits-only so YYYY-MM-DD == DD/MM/YYYY etc.
-// - Rate-limited per IP would be ideal; for now we cap to 1 reset / 30s by inserting
-//   a small artificial delay.
-// - Users with no DOB on file (some legacy admin accounts) cannot use this flow;
-//   they must use the admin reset script or ask another admin.
+// WHAT THIS USED TO DO, AND WHY IT COULD NOT STAY.
+// It compared the submitted date of birth to the one on file and, on a match, generated a new
+// password, wrote it to users.password_hash and RETURNED IT IN THE RESPONSE BODY. Unauthenticated.
+// So the entire gate on every account on this platform — super_admin included — was a birthday:
+// about 36,500 candidates, tried at whatever rate the attacker liked, because the only "limit" was
+// `await new Promise(r => setTimeout(r, 600))` inside a single serverless invocation, which delays
+// the caller who is already inside and limits nothing at all across requests. Two different 404
+// texts ("no account found" vs "no date of birth on file") also told an attacker whether an address
+// existed before they started guessing.
+//
+// WHAT IT DOES NOW.
+//   1. Rate limits, in Postgres, per account AND per IP — the only kind of limit that survives a
+//      stateless runtime. Fails CLOSED if the limiter itself cannot be read.
+//   2. Never returns a credential. A correct date of birth causes a single-use, hashed, expiring,
+//      purpose-bound token to be MAILED to the address already on the account (src/lib/auth/
+//      recovery.ts). Knowing a birthday is not proof of identity; also holding the mailbox is the
+//      second condition that makes a reset mean something.
+//   3. Answers IDENTICALLY whether the account is unknown, has no DOB on file, or the DOB is wrong.
+//      One message, one status code, one shape — no enumeration oracle.
+//   4. Does not touch users.password_hash at all. Nothing here changes a credential; only
+//      /reset-password does, and only against a token it burns first.
+//
+// The one honest exception to the uniform response is delivery: if the platform has no working mail
+// transport the caller is told so plainly, because "check your inbox" for a mail that was never sent
+// is the false-success shape this codebase keeps paying for. That branch reveals nothing about
+// whether the account existed — it is reached only after a match, and it names an operational fault.
 
 import type { APIRoute } from 'astro';
-import crypto from 'node:crypto';
-import { promisify } from 'node:util';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { overRecoveryLimit, clearRecoveryLimit, issueAndMailReset, RECOVERY_TTL_MINUTES, causeOf } from '@/lib/auth/recovery';
 
-const scrypt = promisify(crypto.scrypt) as (pw: string, salt: Buffer, len: number) => Promise<Buffer>;
-const KEY_LEN = 64;
+export const prerender = false;
 
-function json(d: any, s = 200) {
-  return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
-}
+// Declared before the handler that uses them — `const` is not hoisted.
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
-async function hashPassword(password: string): Promise<string> {
-  const salt = crypto.randomBytes(16);
-  const derived = await scrypt(password, salt, KEY_LEN);
-  return salt.toString('hex') + ':' + derived.toString('hex');
-}
+const json = (d: any, s = 200) =>
+  new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json', 'cache-control': 'no-store' } });
+
+/** The SAME answer for unknown account, no DOB on file, and wrong DOB. */
+const UNIFORM = 'If those details match an account, a one-time reset link is on its way to the email address on that account. It expires in ' + RECOVERY_TTL_MINUTES + ' minutes.';
 
 function digitsOnly(s: string): string {
-  return (s || '').replace(/[^0-9]/g, '');
+  return (s || '').toString().replace(/[^0-9]/g, '');
 }
 
-function genTempPassword(): string {
-  // 10 chars, no ambiguous characters
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  const bytes = crypto.randomBytes(10);
-  let out = '';
-  for (let i = 0; i < 10; i++) out += alphabet[bytes[i] % alphabet.length];
-  return out;
+function toIsoDay(d: any): string | null {
+  if (!d) return null;
+  if (typeof d === 'string') return d.substring(0, 10);
+  try { return new Date(d).toISOString().split('T')[0]; } catch { return null; }
 }
 
-export const POST: APIRoute = async ({ request }) => {
-  // Small artificial delay against bursts
-  await new Promise(r => setTimeout(r, 600));
-
+export const POST: APIRoute = async ({ request, clientAddress }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
   const emailOrName = (body?.emailOrName || '').toString().trim().toLowerCase();
   const dob = (body?.dob || '').toString().trim();
+  const ip = (clientAddress || request.headers.get('x-forwarded-for') || '').toString().split(',')[0].trim().slice(0, 64);
 
   if (!emailOrName) return json({ ok: false, error: 'Email or name required' }, 400);
   if (!dob) return json({ ok: false, error: 'Date of birth required' }, 400);
@@ -61,73 +70,74 @@ export const POST: APIRoute = async ({ request }) => {
     return json({ ok: false, error: 'Invalid date of birth format' }, 400);
   }
 
+  // Spend from the allowance BEFORE any lookup, so a sweep is throttled whether or not the account
+  // it is guessing at exists.
+  const limit = await overRecoveryLimit(emailOrName, ip, 'password-reset');
+  if (limit.blocked) {
+    return json({
+      ok: false,
+      error: 'Too many recovery attempts. Wait an hour and try again, or email hr@edurankai.in to recover manually.',
+    }, 429);
+  }
+
   try {
-    // Find user by email or name (case-insensitive). Pull users.dob too -
-    // identity-setup writes there, and that should be checked first.
     const u = await db.execute(sql`
-      SELECT id, email, name, role, dob FROM users
+      SELECT id, email, name, dob FROM users
       WHERE LOWER(email) = ${emailOrName} OR LOWER(name) = ${emailOrName}
       LIMIT 1
     `);
-    const uRows = Array.isArray(u) ? u : (u?.rows || []);
-    if (uRows.length === 0) {
-      return json({ ok: false, error: 'No account found with that email/name + date of birth' }, 404);
-    }
+    const uRows = rowsOf(u);
+    // Unknown account: the uniform answer, and nothing else happens.
+    if (uRows.length === 0) return json({ ok: true, message: UNIFORM });
     const user = uRows[0] as any;
 
-    // 1) Prefer users.dob (set by /identity-setup)
-    let foundDob: string | null = null;
-    if (user.dob) {
-      foundDob = typeof user.dob === 'string' ? user.dob.substring(0, 10) : new Date(user.dob).toISOString().split('T')[0];
-    }
+    // The DOB on file. users.dob first (written by identity setup), then the application, then the
+    // HR record. Each fallback is guarded because the table may not exist on every environment.
+    let foundDob: string | null = toIsoDay(user.dob);
 
-    // 2) Fall back to applications.dob
     if (!foundDob) {
       try {
         const a = await db.execute(sql`SELECT dob FROM applications WHERE applicant_user_id = ${user.id} AND dob IS NOT NULL ORDER BY created_at DESC LIMIT 1`);
-        const aRows = Array.isArray(a) ? a : (a?.rows || []);
-        if (aRows.length > 0) {
-          const d = (aRows[0] as any).dob;
-          foundDob = typeof d === 'string' ? d.substring(0, 10) : new Date(d).toISOString().split('T')[0];
-        }
-      } catch (_) {}
+        foundDob = toIsoDay(rowsOf(a)[0]?.dob);
+      } catch (e: any) { console.error('[api/auth/forgot-password] applications lookup', causeOf(e)); }
     }
 
-    // 3) Fall back to hr_employees.date_of_birth (linked by user_id)
     if (!foundDob) {
       try {
-        const e = await db.execute(sql`SELECT date_of_birth FROM hr_employees WHERE user_id = ${user.id} AND date_of_birth IS NOT NULL LIMIT 1`);
-        const eRows = Array.isArray(e) ? e : (e?.rows || []);
-        if (eRows.length > 0) {
-          const d = (eRows[0] as any).date_of_birth;
-          foundDob = d ? new Date(d).toISOString().split('T')[0] : null;
-        }
-      } catch (_) {}
+        const e2 = await db.execute(sql`SELECT date_of_birth FROM hr_employees WHERE user_id = ${user.id} AND date_of_birth IS NOT NULL LIMIT 1`);
+        foundDob = toIsoDay(rowsOf(e2)[0]?.date_of_birth);
+      } catch (e: any) { console.error('[api/auth/forgot-password] hr_employees lookup', causeOf(e)); }
     }
 
-    if (!foundDob) {
-      return json({ ok: false, error: 'No date of birth on file for this account. Contact hr@edurankai.in to recover.' }, 404);
+    // No DOB on file, or it does not match: the SAME answer as an unknown account.
+    if (!foundDob || digitsOnly(foundDob) !== dobDigits) {
+      return json({ ok: true, message: UNIFORM });
     }
 
-    if (digitsOnly(foundDob) !== dobDigits) {
-      return json({ ok: false, error: 'No account found with that email/name + date of birth' }, 404);
+    // Matched. Nothing about the credential changes here — a link goes to the address on file.
+    const origin = new URL(request.url).origin;
+    const outcome = await issueAndMailReset(user, origin, { ip, method: 'dob' });
+
+    if (outcome === 'no-address') {
+      return json({
+        ok: false,
+        error: 'That account has no email address on file, so a reset link cannot be delivered. Email hr@edurankai.in to recover it manually.',
+      }, 409);
+    }
+    if (outcome === 'no-transport') {
+      // Honest, and it names an operational fault rather than the account.
+      return json({
+        ok: false,
+        error: 'We could not send the reset email just now. Nothing has changed on your account. Try again shortly, or email hr@edurankai.in.',
+      }, 503);
     }
 
-    // Match! Generate + set new password
-    const tempPassword = genTempPassword();
-    const hash = await hashPassword(tempPassword);
-    await db.execute(sql`
-      UPDATE users SET password_hash = ${hash}, is_active = true, updated_at = NOW() WHERE id = ${user.id}
-    `);
-
-    return json({
-      ok: true,
-      tempPassword,
-      email: user.email,
-      name: user.name,
-      message: 'Password reset. Use this temporary password to sign in, then change it from your account settings.',
-    });
+    await clearRecoveryLimit(emailOrName, ip, 'password-reset');
+    return json({ ok: true, message: UNIFORM });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'server error' }, 500);
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL. Logged here and NOT
+    // returned — an error string from an auth path is free reconnaissance.
+    console.error('[api/auth/forgot-password]', causeOf(e));
+    return json({ ok: false, error: 'We could not process that request. Try again shortly.' }, 500);
   }
 };

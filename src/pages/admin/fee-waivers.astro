@@ -11,6 +11,11 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 await ensureFeeWaiverSchema();
 
 let okMsg = '', errMsg = '';
+// Declared before the handler that fills it. Each entry is one side effect of a decision that did
+// NOT happen — the thread post, the notification, the fallback application link. Every one of these
+// was swallowed by a bare catch while the page printed three confident claims, so an admin closed
+// the case believing the applicant had been told the outcome and the reason.
+const missedEffects: string[] = [];
 if (Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
@@ -34,7 +39,11 @@ if (Astro.request.method === 'POST') {
         const ex = rows(await db.execute(sql`SELECT id FROM applications WHERE applicant_user_id = ${applicantUid} ORDER BY created_at DESC LIMIT 1`).catch(() => []))[0];
         if (ex?.id) {
           appId = ex.id as string;
-          await db.execute(sql`UPDATE applications SET fee_waiver_granted = true, fee_waiver_reason = COALESCE(fee_waiver_reason, ${'Fee waiver approved by ' + (user.name || user.email)}), fee_paid_at = COALESCE(fee_paid_at, NOW()) WHERE id = ${ex.id}`).catch(() => {});
+          await db.execute(sql`UPDATE applications SET fee_waiver_granted = true, fee_waiver_reason = COALESCE(fee_waiver_reason, ${'Fee waiver approved by ' + (user.name || user.email)}), fee_paid_at = COALESCE(fee_paid_at, NOW()) WHERE id = ${ex.id}`)
+            .catch((e: any) => {
+              console.error('[fee-waivers] could not mark the existing application as waived -', e?.cause?.message || e?.message);
+              missedEffects.push('the applicant\'s existing application was NOT marked fee-waived, so it may still be treated as unpaid');
+            });
         }
       }
       await db.execute(sql`UPDATE application_fee_waivers SET status='approved', reviewed_by_user_id=${user.id}, reviewed_at=NOW(), reject_reason=NULL, application_id=${appId} WHERE id=${id}`);
@@ -44,7 +53,7 @@ if (Astro.request.method === 'POST') {
       // to read except a push notification.
       try {
         const { postMessage } = await import('@/lib/request-threads');
-        await postMessage({
+        const posted = await postMessage({
           requestType: 'fee_waiver',
           requestId: id,
           applicantUserId: applicantUid || null,
@@ -53,15 +62,34 @@ if (Astro.request.method === 'POST') {
           senderName: user.name || 'Admissions team',
           body: 'Your fee waiver has been approved.\n\nYour application has been moved into review. You can track it from your portal home.\n\n' + (appId ? 'Open your application: /portal/applications/' + appId : 'Open your portal: /portal'),
         });
-      } catch (_) {}
+        if (!posted.ok) missedEffects.push('the decision was NOT posted into the applicant\'s thread (' + (posted.error || 'unknown reason') + ')');
+        else if (posted.warning) missedEffects.push('the decision is in the thread but no unread badge was raised for the applicant');
+      } catch (e: any) {
+        console.error('[fee-waivers] approval thread post failed for', id, '-', e?.cause?.message || e?.message);
+        missedEffects.push('the decision was NOT posted into the applicant\'s thread');
+      }
       // Notify applicant
       try {
         if (applicantUid) {
           const { sendPushToUser } = await import('@/lib/push');
           await sendPushToUser(applicantUid, { type: 'fee_waiver_approved', title: 'Fee waiver approved', body: 'Your application is now in review.', url: appId ? '/portal/applications/' + appId : '/portal/requests/fee-waiver/' + id, tag: 'waiver-' + id });
+        } else {
+          missedEffects.push('this waiver has no portal account attached, so the applicant could not be notified');
         }
-      } catch (_) {}
-      okMsg = 'Waiver approved. Application created, decision posted into thread, applicant notified.';
+      } catch (e: any) {
+        console.error('[fee-waivers] approval notification failed for', id, '-', e?.cause?.message || e?.message);
+        missedEffects.push('the applicant was NOT notified');
+      }
+      // WAS: 'Waiver approved. Application created, decision posted into thread, applicant notified.'
+      // — three claims printed unconditionally after three separately-swallowed operations. The
+      // decision itself is committed above, so it is still reported as done; what is now honest is
+      // everything the applicant was supposed to receive.
+      okMsg = 'Waiver approved.' + (appId ? ' Application ' + appId + ' is linked.' : ' No application could be linked to it — check this one by hand.');
+      if (missedEffects.length) {
+        errMsg = 'The waiver is approved, but ' + missedEffects.join('; ') + '. Contact the applicant directly.';
+      } else {
+        okMsg += ' Decision posted into the thread and the applicant notified.';
+      }
     } else if (action === 'reject') {
       const r0 = await db.execute(sql`SELECT user_id, intent_id FROM application_fee_waivers WHERE id=${id}`);
       const w0 = ((Array.isArray(r0) ? r0 : (r0 as any)?.rows || []) as any[])[0];
@@ -77,7 +105,7 @@ if (Astro.request.method === 'POST') {
           + (reasonText ? '\n\nReason from the reviewer:\n' + reasonText : '')
           + '\n\nYou are welcome to update the situation / expertise notes and re-submit, or pay the application fee'
           + (intentId ? ' on /apply/pay?intent=' + intentId : '') + '. Replies to this thread reach the admissions team directly.';
-        await postMessage({
+        const posted = await postMessage({
           requestType: 'fee_waiver',
           requestId: id,
           applicantUserId: applicantUid || null,
@@ -86,16 +114,38 @@ if (Astro.request.method === 'POST') {
           senderName: user.name || 'Admissions team',
           body,
         });
-      } catch (_) {}
+        if (!posted.ok) missedEffects.push('the reason was NOT posted into the applicant\'s thread (' + (posted.error || 'unknown reason') + ')');
+        else if (posted.warning) missedEffects.push('the reason is in the thread but no unread badge was raised for the applicant');
+      } catch (e: any) {
+        console.error('[fee-waivers] rejection thread post failed for', id, '-', e?.cause?.message || e?.message);
+        missedEffects.push('the reason was NOT posted into the applicant\'s thread');
+      }
       try {
         if (applicantUid) {
           const { sendPushToUser } = await import('@/lib/push');
           await sendPushToUser(applicantUid, { type: 'fee_waiver_rejected', title: 'Fee waiver decision', body: 'Your waiver was not granted. Open your portal thread to read the reason and reply.', url: '/portal/requests/fee-waiver/' + id, tag: 'waiver-' + id });
+        } else {
+          missedEffects.push('this waiver has no portal account attached, so the applicant could not be notified');
         }
-      } catch (_) {}
-      okMsg = 'Waiver rejected. Decision posted into thread, applicant notified.';
+      } catch (e: any) {
+        console.error('[fee-waivers] rejection notification failed for', id, '-', e?.cause?.message || e?.message);
+        missedEffects.push('the applicant was NOT notified');
+      }
+      // The reason for refusal is the only thing the applicant can act on, and it was the thing most
+      // likely to vanish silently under the old bare catches.
+      okMsg = 'Waiver rejected.';
+      if (missedEffects.length) {
+        errMsg = 'The rejection is recorded, but ' + missedEffects.join('; ') + '. The applicant does not know why they were refused — contact them directly.';
+      } else {
+        okMsg += ' Decision posted into the thread and the applicant notified.';
+      }
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+  } catch (e: any) {
+    // `.message` on a drizzle error is only the failed SQL; the reason is on `.cause`.
+    const real = e?.cause?.message || e?.message;
+    console.error('[fee-waivers] decision failed -', real);
+    errMsg = 'Failed: ' + (real || 'unknown');
+  }
 }
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }

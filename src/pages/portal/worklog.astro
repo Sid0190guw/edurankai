@@ -1,52 +1,119 @@
 ---
 import BaseLayout from '@/layouts/BaseLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { ensureOfflineSchema } from '@/pages/api/offline/sync';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login');
+
+// -----------------------------------------------------------------------------
+// SAVING AN ENTRY NO LONGER DEPENDS ON JAVASCRIPT.
+//
+// The form carried no method and no action. When offline-sync.js had loaded it was
+// captured and stored in IndexedDB; when it had NOT — script blocked, cache miss on
+// a weak connection, or an exception on an older Android WebView — pressing "Save
+// entry" did a GET of this same page. The typed entry vanished, the page looked
+// like it had reloaded on purpose, and nothing said a word. That is the worst shape
+// a failure can take: it is indistinguishable from success.
+//
+// It is a real POST now, landing in the same offline_work table the sync endpoint
+// writes to and keyed the same way, so a native save and a later background sync of
+// the same entry cannot produce two rows. The script still intercepts first when it
+// is alive, so the offline path is unchanged.
+//
+// `const` is not hoisted — PATH is declared above the handler that uses it.
+// -----------------------------------------------------------------------------
+const PATH = '/portal/worklog';
+
+let errorFlash = '';
+
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const title = String(fd.get('title') || '').trim();
+    if (!title) {
+      errorFlash = 'Say what you worked on. Nothing was saved.';
+    } else {
+      const payload = {
+        title: title.slice(0, 300),
+        hours: String(fd.get('hours') || '').trim().slice(0, 20),
+        date: String(fd.get('date') || '').trim().slice(0, 20),
+        notes: String(fd.get('notes') || '').trim().slice(0, 4000),
+      };
+      const clientId = (String(fd.get('clientId') || '').trim() || ('srv-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10))).slice(0, 120);
+      await ensureOfflineSchema();
+      await db.execute(sql`INSERT INTO offline_work (client_id, user_id, kind, payload, created_at)
+        VALUES (${clientId}, ${user.id}, 'worklog', ${JSON.stringify(payload)}::jsonb, now())
+        ON CONFLICT (client_id) DO NOTHING`);
+      return Astro.redirect(PATH + '?saved=1');
+    }
+  } catch (e: any) {
+    // Never swallowed into a dead button. The real Postgres reason is on e.cause.
+    console.error('[portal/worklog]', e?.cause?.message || e?.message, e?.stack);
+    errorFlash = 'Could not save that entry. Nothing was recorded — please try again.';
+  }
+}
+
+const savedFlash = new URL(Astro.request.url).searchParams.get('saved') === '1';
 ---
 <BaseLayout title="Work log (offline) - EduRankAI" description="Log your work even without a connection; it syncs automatically.">
   <section style="padding:40px 20px; max-width:640px; margin:0 auto;">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px;">
       <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.15em;color:#DC5000;margin:0;">Works offline</p>
-      <span id="netBadge" class="net off" style="font-size:11px;font-weight:700;padding:4px 10px;border-radius:100px;">…</span>
+      {/* The connection badge changes on its own. role="status" is what makes it reach
+          somebody who is not watching this corner of the screen. */}
+      <span id="netBadge" class="net off" role="status" style="font-size:11px;font-weight:700;padding:4px 10px;border-radius:100px;">Checking your connection</span>
     </div>
     <h1 style="font-size:26px;font-weight:700;color:#111;margin:0 0 6px;">Work log</h1>
-    <p style="font-size:14px;color:#6b7280;margin:0 0 22px;line-height:1.6;">Record what you did — it saves to this device instantly, even with no signal, and syncs to the team automatically when you are back online.</p>
+    <p style="font-size:14px;color:#57534e;margin:0 0 22px;line-height:1.6;">Record what you did — it saves to this device instantly, even with no signal, and syncs to the team automatically when you are back online.</p>
 
-    <form data-offline="worklog" class="wl-card" style="margin-bottom:20px;">
-      <label class="wl-l">What did you work on?</label>
-      <input name="title" class="wl-i" placeholder="e.g. Visited 3 schools in the district" required />
+    {savedFlash && <p class="wl-flash wl-flash--ok" role="status">Entry saved.</p>}
+    {errorFlash && <p class="wl-flash wl-flash--bad" role="alert">{errorFlash}</p>}
+
+    <form method="post" action={PATH} data-offline="worklog" class="wl-card" style="margin-bottom:20px;">
+      <label class="wl-l" for="wlTitle">What did you work on?</label>
+      <input id="wlTitle" name="title" class="wl-i" placeholder="For example, visited 3 schools in the district" required />
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <div><label class="wl-l">Hours</label><input name="hours" class="wl-i" inputmode="decimal" placeholder="2.5" /></div>
-        <div><label class="wl-l">Date</label><input name="date" class="wl-i" type="date" /></div>
+        <div><label class="wl-l" for="wlHours">Hours</label><input id="wlHours" name="hours" class="wl-i" inputmode="decimal" placeholder="2.5" /></div>
+        <div><label class="wl-l" for="wlDate">Date</label><input id="wlDate" name="date" class="wl-i" type="date" /></div>
       </div>
-      <label class="wl-l">Notes</label>
-      <textarea name="notes" class="wl-i" rows="3" placeholder="Anything worth recording…"></textarea>
+      <label class="wl-l" for="wlNotes">Notes</label>
+      <textarea id="wlNotes" name="notes" class="wl-i" rows="3" placeholder="Anything worth recording"></textarea>
       <button type="submit" class="wl-btn">Save entry</button>
-      <p id="wlSaved" class="wl-ok"></p>
+      <p id="wlSaved" class="wl-ok" role="status"></p>
     </form>
 
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
       <h2 style="font-size:1rem;font-weight:700;color:#111;margin:0;">Your entries</h2>
-      <span id="wlPending" style="font-size:12px;color:#9ca3af;"></span>
+      <span id="wlPending" role="status" style="font-size:12px;color:#57534e;"></span>
     </div>
     <div id="wlList"></div>
+    <noscript>
+      <p style="font-size:13.5px;color:#57534e;line-height:1.6;">Entries you save are recorded straight away. The list of your past entries is kept on this device and needs JavaScript to show, so it is empty here.</p>
+    </noscript>
   </section>
 
   <style>
     .wl-card { background:#fff; border:1px solid rgba(0,0,0,0.1); border-radius:16px; padding:18px; }
-    .wl-l { display:block; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:#6b7280; margin:10px 0 5px; }
-    .wl-i { width:100%; border:1px solid rgba(0,0,0,0.15); border-radius:9px; padding:10px 12px; font-size:15px; outline:none; background:#fafaf9; }
-    .wl-btn { margin-top:14px; width:100%; background:#DC5000; color:#fff; border:none; font-size:15px; font-weight:700; padding:12px; border-radius:9px; cursor:pointer; }
-    .wl-ok { color:#1a7f43; font-size:13px; margin:8px 0 0; min-height:1em; }
-    .net.on { background:#e7f6ec; color:#1a7f43; }
+    .wl-l { display:block; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:#57534e; margin:10px 0 5px; }
+    /* min-height 44px, and the focus ring is back: `outline:none` was set with nothing
+       put in its place, so a keyboard or switch user had no idea which field they were in. */
+    .wl-i { width:100%; min-height:44px; border:1px solid rgba(0,0,0,0.15); border-radius:9px; padding:11px 12px; font-size:16px; background:#fafaf9; font-family:inherit; }
+    .wl-i:focus-visible, .wl-btn:focus-visible { outline:3px solid #7c2d12; outline-offset:2px; }
+    .wl-btn { margin-top:14px; width:100%; min-height:48px; background:#DC5000; color:#fff; border:none; font-size:15px; font-weight:700; padding:13px; border-radius:9px; cursor:pointer; }
+    .wl-ok { color:#15803d; font-size:13px; margin:8px 0 0; min-height:1em; }
+    .wl-flash { font-size:13.5px; line-height:1.6; border-radius:10px; padding:11px 14px; margin:0 0 16px; }
+    .wl-flash--ok { background:rgba(21,128,61,0.08); border:1px solid rgba(21,128,61,0.28); color:#15803d; }
+    .wl-flash--bad { background:rgba(185,28,28,0.06); border:1px solid rgba(185,28,28,0.25); color:#b91c1c; }
+    .net.on { background:#e7f6ec; color:#15803d; }
     .net.off { background:#fef2f2; color:#b91c1c; }
     .wl-entry { background:#fff; border:1px solid rgba(0,0,0,0.1); border-radius:12px; padding:12px 14px; margin-bottom:10px; }
     .wl-entry h3 { font-size:14px; font-weight:700; color:#111; margin:0 0 3px; }
-    .wl-entry p { font-size:13px; color:#6b7280; margin:0; }
+    .wl-entry p { font-size:13px; color:#57534e; margin:0; }
     .wl-tag { font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:0.06em; padding:2px 8px; border-radius:100px; }
-    .wl-tag.synced { background:#e7f6ec; color:#1a7f43; }
-    .wl-tag.pending { background:#fff7ed; color:#c2410c; }
+    .wl-tag.synced { background:#e7f6ec; color:#15803d; }
+    .wl-tag.pending { background:#fff7ed; color:#9a3412; }
   </style>
 
   <script src="/offline-sync.js" is:inline></script>
@@ -65,7 +132,7 @@ if (!user) return Astro.redirect('/portal/login');
         var recs = await window.eraOffline.records();
         var pending = recs.filter(function (r) { return !r.synced; }).length;
         pendEl.textContent = pending ? (pending + ' waiting to sync') : (recs.length ? 'All synced' : '');
-        if (!recs.length) { listEl.innerHTML = '<p style="color:#9ca3af;font-size:14px;">No entries yet.</p>'; return; }
+        if (!recs.length) { listEl.innerHTML = '<p style="color:#57534e;font-size:14px;">No entries yet.</p>'; return; }
         listEl.innerHTML = recs.map(function (r) {
           var d = r.data || {};
           var meta = [d.date, d.hours ? (d.hours + ' h') : ''].filter(Boolean).join(' · ');
@@ -80,7 +147,7 @@ if (!user) return Astro.redirect('/portal/login');
       setNet(); render();
       window.addEventListener('online', function () { setNet(); if (window.eraOffline) window.eraOffline.flush(); });
       window.addEventListener('offline', setNet);
-      document.addEventListener('era-offline-saved', function () { saved.textContent = 'Saved to this device.'; setTimeout(function () { saved.textContent = ''; }, 2000); render(); });
+      document.addEventListener('era-offline-saved', function () { saved.textContent = 'Saved to this device.'; setTimeout(function () { saved.textContent = ''; }, 4000); render(); });
       document.addEventListener('era-offline-synced', render);
     })();
   </script>

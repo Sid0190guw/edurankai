@@ -155,9 +155,27 @@ export const ADMIN_NAV: AdminNavEntry[] = [
       // BGV already existed at this URL and is one of the entries this module's header describes as
       // missing from the layout's hand-maintained list — reachable only by typing the URL.
       { id: 'recruitment-bgv', label: 'Background verification', href: '/admin/hr/bgv', icon: 'shield', section: 'hr' },
+      // WHERE CANDIDATES CAME FROM. /admin/application-sources was orphaned — no sidebar entry and no
+      // link from any reachable page, so the only way in was to type the URL.
+      //
+      // 'hr' AND NOT 'applications', WHICH IS THE OBVIOUS-LOOKING CHOICE AND WOULD BE WIDER THAN THE
+      // LOCK. The page's own gate is can(user, 'roles.edit'), held by super_admin, hr and
+      // department_head. The 'applications' section is held by hr, recruiter, reviewer AND
+      // department_head, and the 'roles' section by hr, recruiter and department_head — either would
+      // put this link in a recruiter's sidebar and bounce them to /admin on click. 'hr' is held below
+      // super_admin by `hr` alone, and `hr` holds roles.edit, so every account offered this entry can
+      // open it. It UNDER-shows to department_head, which costs one message; the alternative hands a
+      // recruiter a link the door refuses, which is the defect this module exists to remove.
+      { id: 'application-sources', label: 'Application sources', href: '/admin/application-sources', icon: 'chart', section: 'hr' },
     ],
   },
   { id: 'help', label: 'Help Inbox', href: '/admin/help', icon: 'chat', section: 'messages' },
+  // WHAT THE PUBLIC CONTACT FORM COLLECTS. /admin/contact was orphaned: the page exists, writes
+  // `handled_by_user_id` and `handled_at` back to contact_submissions, and nothing anywhere linked
+  // it — so messages arrived and were marked handled by nobody. Filed on 'messages' beside the Help
+  // Inbox, which is the same desk answering the same kind of thing; the page's own gate is "signed
+  // in and not an applicant", so the section is strictly NARROWER than the door.
+  { id: 'contact', label: 'Contact Inbox', href: '/admin/contact', icon: 'inbox', section: 'messages' },
   { id: 'messages', label: 'DMs', href: '/admin/messages', icon: 'chat', section: 'dms' },
   { id: 'chat', label: 'Discussion', href: '/admin/chat', icon: 'message-circle', section: 'discussion' },
   { id: 'offers', label: 'Offer Letters', href: '/admin/offers', icon: 'document', section: 'offers' },
@@ -450,6 +468,13 @@ export const ADMIN_NAV: AdminNavEntry[] = [
     icon: 'book',
     children: [
       { id: 'aquintutor-overview', label: 'Overview', href: '/admin/aquintutor', icon: 'grid', section: 'lms' },
+      // THE COURSE AUTHORING CONSOLE. Orphaned: /admin/aquintutor/courses creates a course, writes
+      // the caller into training_course_authors and redirects into the lesson editor, and nothing
+      // linked it — so an author could edit a course only by already holding its URL. Distinct from
+      // 'courses' below, which is the older /admin/courses catalogue over a different console.
+      // src/middleware.ts maps the whole /admin/aquintutor subtree to 'lms', so this entry names the
+      // gate the door already applies.
+      { id: 'aquintutor-courses', label: 'Course authoring', href: '/admin/aquintutor/courses', icon: 'book', section: 'lms' },
       { id: 'schools', label: 'Schools & Departments', href: '/admin/schools', icon: 'book', section: 'lms' },
       { id: 'courses', label: 'Courses', href: '/admin/courses', icon: 'book', section: 'lms' },
       { id: 'paths', label: 'Learning Paths', href: '/admin/paths', icon: 'grid', section: 'lms' },
@@ -498,6 +523,11 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   { id: 'billing', label: 'Payments & refunds', href: '/admin/billing', icon: 'chart', section: 'finance' },
   { id: 'schedule', label: 'Schedule & deadlines', href: '/admin/schedule', icon: 'document', section: 'lms' },
   { id: 'credentials', label: 'Credentials', href: '/admin/credentials', icon: 'shield', section: 'audit' },
+  // CREDENTIAL RECOGNITION AND TRANSFER — prior learning brought in from elsewhere. Orphaned, and the
+  // page still declares `activeNav="credential-transfer"`, so the sidebar entry it was written for
+  // existed once and went missing. 'audit' beside Credentials, which no built-in role but super_admin
+  // holds; the page's own gate is "signed in and not an applicant", so the section only narrows it.
+  { id: 'credential-transfer', label: 'Credential transfer', href: '/admin/credential-transfer', icon: 'shield', section: 'audit' },
   { id: 'proctoring', label: 'Proctoring (ATLAS)', href: '/admin/proctoring', icon: 'shield', section: 'tests_proctoring' },
   { id: 'search', label: 'Search index', href: '/admin/search', icon: 'grid', section: 'audit' },
   { id: 'learning-analytics', label: 'Learning analytics', href: '/admin/learning-analytics', icon: 'chart', section: 'audit' },
@@ -506,6 +536,12 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   { id: 'notification-log', label: 'Notifications log', href: '/admin/notification-log', icon: 'bell', section: 'audit' },
   { id: 'community-moderation', label: 'Discussion moderation', href: '/admin/community-moderation', icon: 'message-circle', section: 'discussion' },
   { id: 'moderation-live', label: 'Live safety', href: '/admin/moderation-live', icon: 'shield', section: 'discussion' },
+  // FLAGGED CONTENT AND BLOCKED DOMAINS — the queue where a reported post is resolved or dismissed
+  // and a domain is blocked. The page already declares `activeNav="moderation"`, which is the fossil
+  // of a sidebar entry that was lost: the layout was highlighting a tab that no longer existed. Third
+  // of the three moderation surfaces and gated identically to the other two, on 'discussion' —
+  // strictly narrower than the page's own gate, which is "signed in and not an applicant".
+  { id: 'moderation', label: 'Flagged content', href: '/admin/moderation', icon: 'shield', section: 'discussion' },
   { id: 'campus', label: 'Campus content', href: '/admin/campus', icon: 'globe', section: 'settings' },
   { id: 'animations', label: 'Teaching board', href: '/admin/animations', icon: 'grid', section: 'lms' },
   { id: 'vod', label: 'Recordings & VOD', href: '/admin/vod', icon: 'document', section: 'lms' },
@@ -531,12 +567,63 @@ export const ADMIN_NAV: AdminNavEntry[] = [
   // existed but nothing linked to it, so the feed was written and never read.
   { id: 'activity', label: 'Activity', href: '/admin/activity', icon: 'inbox', section: 'audit' },
   { id: 'audit', label: 'Audit Log', href: '/admin/audit', icon: 'shield', section: 'audit' },
+  // FORENSIC ACCESS TO PRIVATE CHAT, AND EVERY VIEW OF IT IS LOGGED. Orphaned until now, which is
+  // the wrong kind of quiet for a surface like this: an unlinked forensic console is not safer, it is
+  // merely undiscovered, and the people who should be able to audit it did not know it existed.
+  // /admin/audit is mapped to the 'audit' section in src/middleware.ts by longest-prefix match and
+  // the page then asks can(user, 'audit.view') for itself, so the menu, the door and the page all ask
+  // one question. The entry is NOT what protects the contents; the logged read is.
+  { id: 'audit-chat', label: 'Chat audit (logged)', href: '/admin/audit/chat', icon: 'shield', section: 'audit' },
+  // PROGRAMME OVERSIGHT FOR THE WELLNESS PROGRAMME — AGGREGATE ONLY, AND THAT IS THE WHOLE PAGE.
+  // There is no query behind this link that returns a row per person: no name, no user id, no cycle,
+  // no symptom, no message, no drill-down and no "view as user". Every figure comes from the four
+  // oversight functions in src/lib/wellness.ts, which withhold anything covering fewer than MIN_GROUP
+  // distinct people AND drop the surviving categories with it, so a total cannot be differenced back
+  // into the ones held back. Gated on 'audit' — super_admin alone among built-in roles — which is
+  // narrower than the page's own can(user, 'audit.view'). Linking it changes nobody's access.
+  { id: 'wellness', label: 'Wellness oversight (aggregate)', href: '/admin/wellness', icon: 'chart', section: 'audit' },
   // Universal (see UNIVERSAL_NAV_IDS), so the section is only a fallback — but it is deliberately
   // 'dashboard' and not 'audit'. This is the person's OWN notification inbox, not the admin log at
   // /admin/notification-log; gating it on 'audit' would hide everybody's inbox from everybody the day
   // the universal set is trimmed.
   { id: 'notifications', label: 'Notifications', href: '/admin/notifications', icon: 'bell', section: 'dashboard' },
   { id: 'settings', label: 'Settings', href: '/admin/settings', icon: 'cog', section: 'settings' },
+  // THE PERMISSION EDITOR AND THE FACE-SIGN-IN SETTINGS. Both live UNDER /admin/settings, which
+  // src/middleware.ts already maps to the 'settings' section by longest-prefix match, so these two
+  // entries name the gate the door applies rather than inventing a second one. /admin/settings/
+  // permissions additionally asks can(user, 'settings.edit') in its own frontmatter — strictly
+  // narrower — and /admin/settings/face asks nothing beyond a session, so the section is the lock.
+  // Neither was linked from anywhere: the screen that decides who may do what was reachable only by
+  // typing its address.
+  { id: 'settings-permissions', label: 'Permission editor', href: '/admin/settings/permissions', icon: 'shield', section: 'settings' },
+  { id: 'settings-face', label: 'Face sign-in', href: '/admin/settings/face', icon: 'shield', section: 'settings' },
+  // CUSTOM SECTIONS. Orphaned, and the page declares `activeNav="sections"` — another entry the
+  // hand-maintained list lost. 'settings' is the narrowest honest home: the page's own gate is
+  // "signed in and not an applicant", which is far wider than anything that should be offered a
+  // structural editor, and no built-in role but super_admin holds 'settings'.
+  { id: 'sections', label: 'Custom sections', href: '/admin/sections', icon: 'grid', section: 'settings' },
+  // LTI 1.1 INTEGRATIONS. The page asks can(user, 'settings.edit') on its own first lines, so this
+  // entry mirrors that exactly; there is no PATH_SECTION entry for /admin/lti in src/middleware.ts,
+  // which is why the page carries its own gate and why the menu must agree with the page rather than
+  // with the door.
+  { id: 'lti', label: 'LTI integrations', href: '/admin/lti', icon: 'package', section: 'settings' },
+  // SOS AND PROXIMITY — emergency events raised from the app, and the last recorded location of the
+  // people who raised them. Orphaned, and the page declares `activeNav="sos"`.
+  //
+  // 'settings' — super_admin alone among built-in roles — and NOT anything wider, DELIBERATELY. The
+  // page itself gates on "signed in and not an applicant", which would show live staff locations to
+  // every recruiter, reviewer, editor and marketing account with a console login. That is a real
+  // finding about the PAGE and it is reported rather than fixed here, because a nav module must not
+  // become the lock: this entry narrows who is OFFERED the door and changes nothing about who can
+  // open it by typing the address. The page needs `locations.view` (super_admin only today) as its
+  // own first await.
+  { id: 'sos', label: 'SOS and safety', href: '/admin/sos', icon: 'shield', section: 'settings' },
+  // PAYMENTS THAT TOOK MONEY AND STUCK. The page asks can(user, 'payments.retry'), which is held by
+  // super_admin ALONE — hr holds payments.view and payments.refund and NOT retry. So the section here
+  // is 'settings' and not 'finance': 'finance' would put this link in the hr sidebar and bounce them
+  // to /admin on click, which is precisely the menu-disagrees-with-the-lock defect this module
+  // exists to remove. Somebody paid and got nothing; an unlinked console meant nobody went looking.
+  { id: 'paid-stuck', label: 'Stuck payments', href: '/admin/paid-stuck', icon: 'package', section: 'settings' },
   { id: 'diagnostics', label: 'Diagnostics', href: '/admin/diagnostics', icon: 'shield', section: 'settings' },
 ];
 
