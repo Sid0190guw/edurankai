@@ -267,10 +267,34 @@ const assignLeadClause: SQL = scopeDepartmentId
   ? sql`OR e.department_id::text = ${scopeDepartmentId}`
   : sql``;
 
+// THE PEOPLE-WIDE ROUTE, and the reason the dropdown was empty for the founder.
+//
+// The three clauses below are all RELATIONSHIP routes: yourself, whoever HR recorded as reporting
+// to you, and the department you lead. Every one of them resolves through data that is mostly not
+// there yet — hr_employees.reporting_manager_id is written by a single admin form, and
+// scopeDepartmentId is populated only when the SESSION carries role 'department_head'. So somebody
+// who holds the whole company but manages nobody by that column saw exactly one name: their own,
+// and a board that said "assign a task" while offering nobody to assign it to.
+//
+// This adds the missing route: a person who may CHANGE employee records may also put work on them.
+// employee.manage already means, verbatim from registry.ts, "create or change employee records:
+// designation, employment terms, department, reporting line and exit" — assigning a task is a
+// strictly smaller act than editing somebody's employment terms, so no new capability is minted
+// and the population is exactly the one that could already reach those people through /admin/hr.
+//
+// It is deliberately NOT a role test. can() reads the capability matrix, so a custom role granted
+// employee.manage gets the same reach and 'super_admin' appears nowhere in this file.
+const { can } = await import('@/lib/auth/permissions');
+const assignsAcrossOrg = can(user as any, 'employee.manage');
+const assignOrgClause: SQL = assignsAcrossOrg
+  ? sql`OR e.is_active = true`
+  : sql``;
+
 const assignableScope: SQL = viewerUserId
   ? sql`(e.user_id::text = ${viewerUserId}
       OR e.reporting_manager_id::text = ${viewerUserId}
-      ${assignLeadClause})`
+      ${assignLeadClause}
+      ${assignOrgClause})`
   : sql`false`;
 
 /**
@@ -570,8 +594,11 @@ if (mayUse) {
       SELECT e.id::text AS id,
              e.full_name,
              e.designation,
+             e.department_id::text AS department_id,
+             e.employment_type,
              (e.user_id::text = ${viewerUserId}) AS is_me,
-             (e.reporting_manager_id::text = ${viewerUserId}) AS is_report
+             (e.reporting_manager_id::text = ${viewerUserId}) AS is_report,
+             ${scopeDepartmentId ? sql`(e.department_id::text = ${scopeDepartmentId})` : sql`false`} AS is_dept
         FROM hr_employees e
        WHERE e.is_active = true
          AND ${assignableScope}
@@ -589,10 +616,18 @@ if (mayUse) {
         // A name is not a permission and its absence is not an error. Never render a bare UUID.
         name: String(r.full_name || '').trim() || 'Name not recorded',
         designation: String(r.designation || '').trim(),
-        // is_me and is_report come back NULL when the underlying column is NULL, so both are tested
-        // for an explicit true. The order matters: somebody can be both your report and in the
-        // department you lead, and they are listed once, under the closer relationship.
-        relation: r.is_me === true ? 'me' : (r.is_report === true ? 'report' : 'dept'),
+        departmentId: String(r.department_id || '').trim(),
+        employmentType: String(r.employment_type || '').trim(),
+        // is_me, is_report and is_dept come back NULL when the underlying column is NULL, so each is
+        // tested for an explicit true. The order matters: somebody can be your report AND in the
+        // department you lead AND in the company, and they are listed ONCE under the closest
+        // relationship. 'org' is last precisely because it is the weakest claim — being reachable
+        // because you administer employee records is not the same as somebody reporting to you, and
+        // an optgroup that said "your department" over the whole company would be a lie the reader
+        // has no way to catch.
+        relation: r.is_me === true ? 'me'
+          : (r.is_report === true ? 'report'
+          : (r.is_dept === true ? 'dept' : 'org')),
       });
     }
   } catch (e: any) {
@@ -609,9 +644,23 @@ if (mayUse) {
 const assignMine = assignPeople.filter((p: any) => p.relation === 'me');
 const assignReports = assignPeople.filter((p: any) => p.relation === 'report');
 const assignDept = assignPeople.filter((p: any) => p.relation === 'dept');
+const assignOrg = assignPeople.filter((p: any) => p.relation === 'org');
 
-/** Name, plus the designation when there is one — two colleagues can share a name. */
-const personLabel = (p: any): string => (p.designation ? p.name + ', ' + p.designation : p.name);
+/**
+ * Name, then the designation, then the department, then the engagement.
+ *
+ * The dropdown previously showed a bare name, which is unusable the moment the list is longer than
+ * a handful: two colleagues share a name, and a person picking somebody to hand work to is choosing
+ * on ROLE, not on spelling. Everything after the name is omitted when it is not recorded rather
+ * than printed as an empty bracket, so a sparse record reads as a plain name instead of punctuation.
+ */
+const personLabel = (p: any): string => {
+  const parts: string[] = [];
+  if (p.designation) parts.push(p.designation);
+  if (p.departmentId) parts.push(p.departmentId);
+  if (p.employmentType && /\bintern(?!al)/i.test(p.employmentType)) parts.push('intern');
+  return parts.length ? p.name + ' — ' + parts.join(' · ') : p.name;
+};
 
 const assignPrioOptions = (TASK_PRIORITIES as string[]).map((p) => ({
   value: p,
@@ -855,6 +904,16 @@ const filterSummary = totalShown + (totalShown === 1 ? ' task' : ' tasks')
                 {assignDept.length > 0 && (
                   <optgroup label="The department you lead">
                     {assignDept.map((p: any) => (
+                      <option value={p.id} selected={assignWho === p.id}>{personLabel(p)}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {/* Everyone else in the company, shown only to somebody who may change employee
+                    records. Labelled for what it actually is — not "your department", which would
+                    be untrue for most of these people and unverifiable by the reader. */}
+                {assignOrg.length > 0 && (
+                  <optgroup label="Everyone else at EduRankAI">
+                    {assignOrg.map((p: any) => (
                       <option value={p.id} selected={assignWho === p.id}>{personLabel(p)}</option>
                     ))}
                   </optgroup>
