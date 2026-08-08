@@ -81,7 +81,25 @@ export interface IntegrityResult {
 export function computeIntegrityScore(events: { type: string; severity?: string }[]): IntegrityResult {
   const counts: Record<string, number> = {};
   for (const e of events) counts[e.type] = (counts[e.type] || 0) + 1;
+  return computeIntegrityFromCounts(counts);
+}
 
+/**
+ * The same score, from a {event_type: count} map instead of one object per event.
+ *
+ * WHY THIS EXISTS. computeIntegrityScore's first act is to collapse the array it was handed into
+ * exactly this map — every caller that had to materialise one row per event was paying for a shape
+ * the scorer immediately throws away. /admin/tests/attempts was fetching raw event rows for up to
+ * 200 attempts under a bare `LIMIT 50000` with no ORDER BY, so on a busy day the cut-off landed
+ * mid-board in whatever order the planner chose: some attempts were scored on their full evidence
+ * and others on a fragment of it, and the ones scored on a fragment came out CLEANER than they are.
+ * A truncated proctoring score is worse than no score, because it is believed.
+ *
+ * Postgres can do the counting exactly and return one row per (attempt, event_type), which is
+ * bounded by the number of event types, so there is nothing left to truncate. This entry point is
+ * what lets a caller hand that straight over.
+ */
+export function computeIntegrityFromCounts(counts: Record<string, number>): IntegrityResult {
   const byCategory: Record<string, number> = {};
   const bySeverity = { critical: 0, high: 0, medium: 0, low: 0 };
   let raw = 0;
@@ -116,9 +134,12 @@ export function computeIntegrityScore(events: { type: string; severity?: string 
     .sort((a, b) => (b.weight * b.count) - (a.weight * a.count))
     .slice(0, 8);
 
+  let totalEvents = 0;
+  for (const c of Object.values(counts)) totalEvents += c;
+
   return {
     score, riskBand, bySeverity, byCategory,
-    totalEvents: events.length,
+    totalEvents,
     flaggedEvents: bySeverity.critical + bySeverity.high + bySeverity.medium,
     topFlags,
   };

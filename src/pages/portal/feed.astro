@@ -2,101 +2,43 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import {
+  ensureFeedSchema, rows, dbReason,
+  likePost, addComment, listComments, recordShare, toggleSave, savedPostIds,
+} from '@/lib/feed';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=/portal/feed');
 
-function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
+// ---------------- Bootstrap schema (once per process, and it reports failure) ----------------
+// Six CREATE TABLE statements used to run on EVERY load of this page inside one `catch (e) {}`.
+// They are in src/lib/feed.ts now, behind a once-per-process guard, and a boot failure reaches the
+// page as a sentence instead of rendering an empty feed that looks like a quiet one.
+const schemaBoot = await ensureFeedSchema();
 
-// ---------------- Bootstrap schema ----------------
-try {
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS feed_posts (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      author_user_id UUID NOT NULL,
-      kind VARCHAR(20) NOT NULL DEFAULT 'reel',
-      title TEXT,
-      description TEXT,
-      topic_tags JSONB DEFAULT '[]'::jsonb,
-      media_url TEXT,
-      thumbnail_url TEXT,
-      duration_seconds INT,
-      visibility VARCHAR(20) DEFAULT 'public',
-      course_id UUID,
-      ar_filter_id UUID,
-      engagement_score INT DEFAULT 0,
-      view_count INT DEFAULT 0,
-      like_count INT DEFAULT 0,
-      comment_count INT DEFAULT 0,
-      share_count INT DEFAULT 0,
-      is_pinned BOOLEAN DEFAULT false,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS feed_likes (
-      post_id UUID NOT NULL REFERENCES feed_posts(id) ON DELETE CASCADE,
-      user_id UUID NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      PRIMARY KEY (post_id, user_id)
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS feed_comments (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      post_id UUID REFERENCES feed_posts(id) ON DELETE CASCADE,
-      user_id UUID,
-      body TEXT,
-      reply_to UUID,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS feed_view_events (
-      user_id UUID,
-      post_id UUID,
-      watched_pct INT,
-      device VARCHAR(20),
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS ar_filters (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      creator_user_id UUID,
-      slug VARCHAR(120) UNIQUE,
-      name VARCHAR(200),
-      kind VARCHAR(20),
-      preview_url TEXT,
-      code TEXT,
-      use_count INT DEFAULT 0,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS feed_user_interests (
-      user_id UUID PRIMARY KEY,
-      interests JSONB DEFAULT '[]'::jsonb,
-      follows JSONB DEFAULT '[]'::jsonb,
-      daily_cap_minutes INT DEFAULT 90,
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-} catch (e) {}
-
-// ---------------- Seed AR filter catalogue if empty ----------------
+// ---------------- AR filter catalogue ----------------
+// The presets are a real, idempotent seed of a real table: the AR tray renders one card per row and
+// the camera routines are keyed by slug, so a missing row means a missing filter.
+//
+// THE DESCRIPTIONS BELOW NOW DESCRIBE WHAT THE CODE IN THIS FILE ACTUALLY DOES. Two of them did
+// not. "Hand Trail" was described as a "particle trail following motion regions" and its
+// implementation pushes particles at Math.random() * width, Math.random() * height every frame —
+// its own comment admits there is no motion detection. "Anatomy Overlay" was described as "skull
+// and facial muscle landmarks projected on the camera" and it draws an ellipse and dots at fixed
+// fractions of the canvas with no face detection of any kind. Naming a drawing a detection is how a
+// learner comes to believe a camera is tracking their face when nothing is.
 try {
   const f = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM ar_filters`));
   if ((f[0]?.n ?? 0) === 0) {
     const presets = [
-      ['soft-glow', 'Soft Glow', 'face', 'Gentle Gaussian halo around facial features'],
+      ['soft-glow', 'Soft Glow', 'face', 'Gentle Gaussian halo over the whole frame'],
       ['threshold', 'Ink Stamp', 'face', 'Binary high-contrast etching of the visible scene'],
       ['rgb-shift', 'Chroma Drift', 'face', 'Channel separation effect with R/G/B offset'],
-      ['anatomy', 'Anatomy Overlay', 'educational-overlay', 'Skull and facial muscle landmarks projected on the camera'],
-      ['math-notation', 'Math Notation', 'educational-overlay', 'Live equation grid and coordinate axes'],
-      ['molecule', 'Molecule Halo', 'educational-overlay', 'Ball-and-stick caffeine molecule orbiting the face'],
-      ['hand-trail', 'Hand Trail', 'hand', 'Particle trail following motion regions'],
-      ['world-grid', 'World Grid', 'world', 'Perspective grid anchored to the scene floor'],
+      ['anatomy', 'Anatomy Overlay', 'educational-overlay', 'Decorative skull-and-muscle diagram drawn at a fixed position — it does not detect or track a face'],
+      ['math-notation', 'Math Notation', 'educational-overlay', 'Equation grid and coordinate axes drawn over the frame'],
+      ['molecule', 'Molecule Halo', 'educational-overlay', 'Ball-and-stick caffeine molecule orbiting the centre of the frame'],
+      ['hand-trail', 'Hand Trail', 'hand', 'Decorative particle trail — it is not driven by hand or motion tracking'],
+      ['world-grid', 'World Grid', 'world', 'Perspective grid drawn over the lower half of the frame'],
       ['polar-warp', 'Polar Warp', 'face', 'Radial coordinate warp around the centre'],
       ['edge-find', 'Edge Find', 'face', 'Sobel edge detection in cyan'],
     ];
@@ -108,55 +50,22 @@ try {
       `);
     }
   }
-} catch (e) {}
+} catch (e: any) {
+  console.error('[feed] ar_filters seed failed:', dbReason(e));
+}
 
-// ---------------- Seed posts if empty ----------------
-try {
-  const p = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM feed_posts`));
-  if ((p[0]?.n ?? 0) === 0) {
-    const reels = [
-      ['Why entropy never decreases — 30 sec', 'reel', ['thermodynamics','physics','jee'], 32, 18400, 2100, 140],
-      ['Solve any integration by parts in 3 steps', 'reel', ['calculus','math','jee'], 41, 31200, 4800, 312],
-      ['What is a transformer attention head?', 'reel', ['ai','transformers','ml'], 58, 12100, 980, 89],
-      ['Spotting a fake proof: the missing axiom', 'reel', ['logic','math','foundations'], 47, 8700, 540, 41],
-      ['Why DNA is right-handed and what would happen if it were not', 'reel', ['biology','biochem'], 39, 21300, 2950, 180],
-      ['Reduce a matrix to row-echelon form, fast', 'reel', ['linear-algebra','math'], 52, 9400, 720, 55],
-      ['Build a NAND gate from two transistors', 'reel', ['electronics','digital'], 44, 14800, 1180, 92],
-      ['What pH actually means (it is not what you think)', 'reel', ['chemistry','acid-base'], 36, 19200, 1620, 121],
-      ['A 60-second proof of the Pythagorean theorem', 'reel', ['geometry','math'], 60, 38700, 5210, 410],
-      ['Why orbitals are not little planets', 'reel', ['quantum','chemistry'], 51, 22100, 2800, 195],
-      ['Difference between weak and strong induction', 'reel', ['discrete','proof'], 43, 6700, 410, 28],
-      ['The fastest way to balance a redox equation', 'reel', ['chemistry','redox'], 38, 11400, 870, 64],
-    ];
-    const clips = [
-      ['Full lecture: Tensor calculus for general relativity', 'clip', ['relativity','tensor','physics'], 3420, 142000, 11200, 980],
-      ['One-hour deep dive: discrete Fourier transform from scratch', 'clip', ['fourier','signal','math'], 3680, 89000, 7100, 540],
-      ['Walkthrough: building a simple operating-system kernel', 'clip', ['os','systems'], 4900, 67000, 5800, 410],
-      ['Organic chemistry exam-prep marathon', 'clip', ['organic','chemistry','exam'], 5400, 102000, 8200, 670],
-      ['Number theory: from Fermat to elliptic curves', 'clip', ['number-theory','math'], 4200, 41000, 3100, 220],
-      ['Microeconomics: indifference curves and utility', 'clip', ['economics','micro'], 3120, 28000, 1900, 120],
-      ['Human physiology: the cardiac cycle in detail', 'clip', ['biology','physiology'], 2880, 56000, 4200, 280],
-      ['Recursion and the call stack, visualised', 'clip', ['programming','cs'], 1980, 73000, 6100, 380],
-    ];
-    const xr = [
-      ['Try the Anatomy Overlay AR filter', 'xr-experience', ['biology','ar'], 0, 4200, 320, 42],
-      ['Floating molecule halo: caffeine in 3D', 'xr-experience', ['chemistry','ar'], 0, 3100, 240, 18],
-      ['Math notation overlay on your study desk', 'xr-experience', ['math','ar'], 0, 5600, 410, 51],
-    ];
-    const all = [...reels, ...clips, ...xr];
-    for (const r of all) {
-      await db.execute(sql`
-        INSERT INTO feed_posts (author_user_id, kind, title, topic_tags, duration_seconds, view_count, like_count, comment_count, engagement_score)
-        VALUES (
-          ${user.id}, ${r[1]}, ${r[0]},
-          ${JSON.stringify(r[2])}::jsonb,
-          ${r[3]}, ${r[4]}, ${r[5]}, ${r[6]},
-          ${Math.floor((r[4] as number)/10 + (r[5] as number)/3)}
-        )
-      `);
-    }
-  }
-} catch (e) {}
+// ---------------- THE 23 POSTS THAT WERE NOT REAL ----------------
+//
+// REMOVED, DELIBERATELY, AND NOT REPLACED. The first time any signed-in person opened this page on
+// an empty table, it INSERTed 12 reels, 8 clips and 3 XR experiences from literal arrays — with
+// view counts of 18,400 / 31,200 / 142,000 and like counts in the thousands, all typed into this
+// file — and set author_user_id to THAT PERSON. Whoever opened the feed first became the credited
+// author of 23 lectures they never made, with fabricated engagement, and no media behind any of
+// them: media_url was never written, and the "thumbnail" is a canvas gradient keyed on the array
+// index.
+//
+// The feed has a real writer (the Publish composer below, action=create_post) and real readers, so
+// an empty feed is now simply an empty feed, and it says so.
 
 // ---------------- Load user interests (or default) ----------------
 let interests: string[] = [];
@@ -213,6 +122,35 @@ if (
   const filterSlug = String(body?.filter_slug || '');
 
   try {
+    // THE THREE CONTROLS THAT USED TO DO NOTHING AT ALL.
+    //
+    // The comment, share and bookmark buttons on every reel had no id, no data attribute, no class
+    // any script read and no handler — tapping one was indistinguishable from tapping the
+    // background — while each carried a count taken from the seed literals. These are their
+    // writers. Each returns the number that is now stored, so the button shows a real figure.
+    const act = String(body?.act || '');
+    if (act) {
+      const target = String(body?.post_id_target || '');
+      if (!/^[0-9a-fA-F-]{36}$/.test(target)) return jsonOut({ ok: false, error: 'bad post id' }, 400);
+      if (act === 'comment') {
+        const r = await addComment(target, user.id, String(body?.body || ''));
+        return r.ok ? jsonOut({ ok: true, count: r.rows.count }, 200) : jsonOut({ ok: false, error: r.error }, 400);
+      }
+      if (act === 'share') {
+        const r = await recordShare(target);
+        return r.ok ? jsonOut({ ok: true, count: r.rows.count }, 200) : jsonOut({ ok: false, error: r.error }, 400);
+      }
+      if (act === 'save') {
+        const r = await toggleSave(target, user.id);
+        return r.ok ? jsonOut({ ok: true, saved: r.rows.saved }, 200) : jsonOut({ ok: false, error: r.error }, 400);
+      }
+      if (act === 'like') {
+        const r = await likePost(target, user.id);
+        return r.ok ? jsonOut({ ok: true, count: r.rows.count, liked: r.rows.liked }, 200) : jsonOut({ ok: false, error: r.error }, 400);
+      }
+      return jsonOut({ ok: false, error: 'unknown action' }, 400);
+    }
+
     if (postId) {
       if (!/^[0-9a-fA-F-]{36}$/.test(postId)) return jsonOut({ ok: false, error: 'bad post id' }, 400);
       const pct = Math.max(0, Math.min(100, Math.round(Number(body?.watched_pct) || 0)));
@@ -254,13 +192,24 @@ if (Astro.request.method === 'POST') {
       const tagsRaw = String(form.get('tags') || '');
       const visibility = String(form.get('visibility') || 'public');
       const tags = tagsRaw.split(',').map(t => t.trim().toLowerCase()).filter(Boolean).slice(0, 12);
+      // The link and the length the author actually typed, stored in the columns that were
+      // declared for them and never written.
+      const mediaUrlRaw = String(form.get('media_url') || '').trim().slice(0, 2000);
+      const mediaUrl = /^https?:\/\//i.test(mediaUrlRaw) ? mediaUrlRaw : null;
+      const durRaw = parseInt(String(form.get('duration_seconds') || ''), 10);
+      const duration = Number.isFinite(durRaw) && durRaw > 0 ? Math.min(86400, durRaw) : null;
       if (!title) { errMsg = 'Title is required'; }
+      else if (mediaUrlRaw && !mediaUrl) { errMsg = 'The link must start with http:// or https://. Nothing was published.'; }
       else {
-        await db.execute(sql`
-          INSERT INTO feed_posts (author_user_id, kind, title, description, topic_tags, visibility)
-          VALUES (${user.id}, ${kind}, ${title}, ${description}, ${JSON.stringify(tags)}::jsonb, ${visibility})
-        `);
-        okMsg = 'Post published';
+        const created = rows(await db.execute(sql`
+          INSERT INTO feed_posts (author_user_id, kind, title, description, topic_tags, visibility, media_url, duration_seconds)
+          VALUES (${user.id}, ${kind}, ${title}, ${description}, ${JSON.stringify(tags)}::jsonb, ${visibility}, ${mediaUrl}, ${duration})
+          RETURNING id
+        `));
+        okMsg = created.length > 0
+          ? 'Published' + (mediaUrl ? '.' : ' — with no link attached, so the card will say there is no recording behind it.')
+          : '';
+        if (created.length === 0) errMsg = 'The post was not stored (the database returned no row). Nothing was published.';
       }
     } else if (action === 'save_interests') {
       const raw = String(form.get('interests') || '');
@@ -273,35 +222,60 @@ if (Astro.request.method === 'POST') {
       interests = list;
       okMsg = 'Interests saved';
     } else if (action === 'like') {
+      // Goes through likePost(), which increments only when a like row was really inserted. The
+      // statement here used to add 1 to like_count on every press, including the presses the
+      // ON CONFLICT threw away — so a reader who tapped twice inflated the number by one.
       const postId = String(form.get('post_id') || '');
       if (postId) {
-        await db.execute(sql`
-          INSERT INTO feed_likes (post_id, user_id) VALUES (${postId}::uuid, ${user.id})
-          ON CONFLICT DO NOTHING
-        `);
-        await db.execute(sql`UPDATE feed_posts SET like_count = like_count + 1 WHERE id = ${postId}::uuid`);
+        const r = await likePost(postId, user.id);
+        if (!r.ok) errMsg = 'Your like was not recorded: ' + r.error;
       }
     }
-  } catch (e: any) { errMsg = e?.message || 'Error'; }
+  } catch (e: any) {
+    // e.message from postgres-js is the failed SQL. The reason is on e.cause.
+    errMsg = 'That did not save: ' + dbReason(e);
+    console.error('[feed] POST failed:', dbReason(e));
+  }
 }
 
 // ---------------- Fetch posts ----------------
-const allPosts = rows(await db.execute(sql`
-  SELECT id, kind, title, description, topic_tags, duration_seconds, view_count, like_count, comment_count, share_count, engagement_score, created_at
-  FROM feed_posts ORDER BY created_at DESC LIMIT 200
-`));
+// EVERY READ BELOW REPORTS ITS FAILURE. A feed that renders "no reels yet" because the query threw
+// is the same picture as a feed nobody has posted to, and this page shipped exactly that picture
+// for 23 posts' worth of invented content.
+let allPosts: any[] = [];
+let feedReadError = '';
+try {
+  allPosts = rows(await db.execute(sql`
+    SELECT id, author_user_id, kind, title, description, topic_tags, media_url, duration_seconds,
+           view_count, like_count, comment_count, share_count, engagement_score, created_at
+    FROM feed_posts ORDER BY created_at DESC LIMIT 200
+  `));
+} catch (e: any) {
+  feedReadError = dbReason(e);
+  console.error('[feed] post read failed:', feedReadError);
+}
 
 // ---------------- Seen post ids today ----------------
-const seenRows = rows(await db.execute(sql`
-  SELECT DISTINCT post_id FROM feed_view_events WHERE user_id = ${user.id} AND created_at > NOW() - INTERVAL '7 days'
-`));
+let seenRows: any[] = [];
+try {
+  seenRows = rows(await db.execute(sql`
+    SELECT DISTINCT post_id FROM feed_view_events WHERE user_id = ${user.id} AND created_at > NOW() - INTERVAL '7 days'
+  `));
+} catch (e: any) { console.error('[feed] seen read failed:', dbReason(e)); }
 const seenSet = new Set(seenRows.map((r: any) => r.post_id));
 
 // ---------------- Watched-time today ----------------
-const watchRow = rows(await db.execute(sql`
-  SELECT COALESCE(SUM(watched_pct), 0)::int AS pct_sum
-  FROM feed_view_events WHERE user_id = ${user.id} AND created_at >= CURRENT_DATE
-`));
+let watchRow: any[] = [];
+let watchReadFailed = false;
+try {
+  watchRow = rows(await db.execute(sql`
+    SELECT COALESCE(SUM(watched_pct), 0)::int AS pct_sum
+    FROM feed_view_events WHERE user_id = ${user.id} AND created_at >= CURRENT_DATE
+  `));
+} catch (e: any) {
+  watchReadFailed = true;
+  console.error('[feed] watch-time read failed:', dbReason(e));
+}
 const pctSumToday = watchRow[0]?.pct_sum || 0;
 // Rough: assume avg post is 45s, watched_pct of 100 = 45s watched. So minutes ~ pct_sum/100 * 45 / 60
 const minutesToday = Math.floor((pctSumToday / 100) * 45 / 60);
@@ -342,9 +316,32 @@ const clips = scored.filter((p: any) => p.kind === 'clip').slice(0, 20);
 const xrPosts = scored.filter((p: any) => p.kind === 'xr-experience').slice(0, 20);
 
 // ---------------- AR filters ----------------
-const filters = rows(await db.execute(sql`
-  SELECT id, slug, name, kind, code, use_count FROM ar_filters ORDER BY use_count DESC, name ASC LIMIT 24
-`));
+let filters: any[] = [];
+let filtersReadError = '';
+try {
+  filters = rows(await db.execute(sql`
+    SELECT id, slug, name, kind, code, use_count FROM ar_filters ORDER BY use_count DESC, name ASC LIMIT 24
+  `));
+} catch (e: any) {
+  filtersReadError = dbReason(e);
+  console.error('[feed] ar_filters read failed:', filtersReadError);
+}
+
+// ---------------- Comments, and what this reader has saved ----------------
+// Both tables exist; neither had a reader. feed_comments was created and never selected from, and
+// there was no bookmark table at all, so the two counts under every reel were seed literals.
+const visibleIds: string[] = [...reels, ...clips, ...xrPosts].map((p: any) => String(p.id));
+const commentsRead = await listComments(visibleIds);
+const commentsByPost: Record<string, any[]> = commentsRead.ok ? commentsRead.rows : {};
+const savesRead = await savedPostIds(user.id);
+const savedSet = new Set(savesRead.ok ? savesRead.rows : []);
+
+// Topic options for the clips filter, taken from the tags actually present on the clips on screen.
+// The dropdown used to offer a hardcoded seven-topic list, so it could filter to a topic no clip
+// carried, and could not offer one that every clip carried.
+const clipTopics = Array.from(new Set(
+  clips.flatMap((c: any) => (Array.isArray(c.tags) ? c.tags : []) as string[])
+)).sort().slice(0, 40);
 
 const safeReels = JSON.stringify(reels);
 const safeClips = JSON.stringify(clips);
@@ -416,9 +413,43 @@ const safeInterests = JSON.stringify(interests);
     background: rgba(167,139,250,0.16); color: #c4b5fd; padding: 3px 8px; border-radius: 6px;
     font-size: 11px; font-family: 'Geist Mono', monospace;
   }
+  .reel-meta .rmedia {
+    display: inline-block; margin-bottom: 6px; font-size: 12px; color: #67e8f9;
+    font-family: 'Geist Mono', monospace; text-decoration: none; border-bottom: 1px solid rgba(103,232,249,0.5);
+  }
+  .reel-meta .rnomedia {
+    margin-bottom: 6px; font-size: 11px; line-height: 1.45; color: #9a9aa8; font-family: 'Geist Mono', monospace;
+  }
+  /* Comment sheet — the reader and composer for feed_comments. */
+  .comment-sheet {
+    display: none; position: absolute; left: 0; right: 0; bottom: 0; z-index: 6; max-height: 62%;
+    background: rgba(10,10,14,0.97); border-top: 1px solid #2a2a35; border-radius: 16px 16px 0 0;
+    padding: 12px 14px 14px; overflow-y: auto;
+  }
+  .comment-sheet.open { display: block; }
+  .cs-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 13px; color: #c8c8d2; }
+  .cs-close { background: none; border: 1px solid #2a2a35; color: #c8c8d2; border-radius: 8px; padding: 3px 10px; cursor: pointer; font-family: inherit; font-size: 12px; }
+  .cs-empty { color: #8a8a99; font-style: italic; font-size: 13px; margin: 6px 0; }
+  .cs-error { color: #fb7185; font-size: 12px; line-height: 1.5; margin: 6px 0; }
+  .cs-item { font-size: 13px; line-height: 1.45; margin-bottom: 8px; color: #e8e8ee; }
+  .cs-item strong { display: block; font-family: 'Geist Mono', monospace; font-size: 11px; color: #67e8f9; }
+  .cs-form { display: flex; gap: 6px; margin-top: 8px; }
+  .cs-form input {
+    flex: 1; background: #11131a; border: 1px solid #2a2a35; color: #e8e8ee;
+    border-radius: 8px; padding: 8px 10px; font-family: inherit; font-size: 13px;
+  }
+  .cs-form button { background: #67e8f9; color: #0a0a0c; border: 0; border-radius: 8px; padding: 8px 14px; font-family: inherit; font-weight: 600; cursor: pointer; }
+  .cs-msg { font-size: 12px; color: #fb7185; margin: 6px 0 0; min-height: 1em; }
+  .clip-open { display: inline-block; margin: 4px 0 6px; font-size: 12px; color: #67e8f9; font-family: 'Geist Mono', monospace; text-decoration: none; border-bottom: 1px solid rgba(103,232,249,0.5); }
+  .clip-nolink { margin: 4px 0 6px; font-size: 11px; color: #8a8a99; font-family: 'Geist Mono', monospace; }
+  .read-error {
+    margin: 12px 22px; padding: 12px 16px; background: #1a1114; border: 1px solid #fb7185;
+    border-radius: 8px; color: #fb7185; font-size: 13px; line-height: 1.55;
+  }
   .reel-side {
     position: absolute; right: 12px; bottom: 24px; z-index: 3; display: flex; flex-direction: column; gap: 14px;
   }
+  .rs-btn.saved { color: #a78bfa; border-color: #a78bfa; }
   .rs-btn {
     background: rgba(20,20,28,0.6); border: 1px solid rgba(255,255,255,0.08); color: #e8e8ee;
     width: 46px; height: 46px; border-radius: 50%; display: flex; flex-direction: column;
@@ -594,8 +625,27 @@ const safeInterests = JSON.stringify(interests);
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1v6m0 6v6m11-11h-6m-6 0H1"/></svg>
     <span>We use engagement signals to recommend, but we cap daily watch time at {dailyCap} min and never show you content optimised purely for outrage.</span>
     <div class="wb-meter"><div style={`width:${watchPct}%`}></div></div>
-    <span class="wb-text">{minutesToday}m / {dailyCap}m today</span>
+    <span class="wb-text">{watchReadFailed ? 'watch time unavailable' : minutesToday + 'm / ' + dailyCap + 'm today'}</span>
   </div>
+
+  {!schemaBoot.ok && (
+    <div class="read-error">
+      The feed's tables could not be prepared ({schemaBoot.error}). Nothing below is a picture of an
+      empty feed — it is a picture of a feed that could not be read. Posting is likely to fail too.
+    </div>
+  )}
+  {feedReadError && (
+    <div class="read-error">
+      The posts could not be read ({feedReadError}). This is NOT "nobody has posted" — the query did
+      not run. Reload once the database recovers.
+    </div>
+  )}
+  {watchReadFailed && (
+    <div class="read-error">
+      Your watch time for today could not be read, so the daily cap is not being enforced on this
+      page load. The meter above is blank rather than showing a zero it cannot stand behind.
+    </div>
+  )}
 
   {okMsg && <div class="toast show">{okMsg}</div>}
   {errMsg && <div class="toast show" style="border-color:#fb7185;color:#fb7185">{errMsg}</div>}
@@ -603,7 +653,12 @@ const safeInterests = JSON.stringify(interests);
   <!-- REELS PANEL -->
   <div class="panel active" id="panel-reels">
     <div class="reels-panel" id="reelsScroll">
-      {reels.length === 0 && <div class="empty">No reels yet. Be the first to post one.</div>}
+      {reels.length === 0 && !feedReadError && (
+        <div class="empty">
+          Nothing has been posted to the feed yet. Use the + button to publish the first reel —
+          give it a title, tags and a link to the recording.
+        </div>
+      )}
       {reels.map((r: any, i: number) => (
         <div class="reel" data-post-id={r.id} data-idx={i}>
           <div class="reel-card">
@@ -613,9 +668,9 @@ const safeInterests = JSON.stringify(interests);
               <button class="why-btn" title="Why am I seeing this?" data-idx={i}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
               </button>
-              <button title="More">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>
-              </button>
+              {/* The "More" overflow button that used to sit here had no handler, no menu and no
+                  action behind it — it was three dots that did nothing. Removed rather than left
+                  in place looking like a menu. */}
             </div>
             <div class="why-tip" data-tip={i}>
               <h4>Why am I seeing this</h4>
@@ -627,28 +682,56 @@ const safeInterests = JSON.stringify(interests);
             </div>
             <div class="reel-meta">
               <div class="rtitle">{r.title}</div>
-              <div class="rauth">by educator · {r.duration_seconds}s</div>
+              <div class="rauth">{r.duration_seconds ? r.duration_seconds + 's' : 'no duration recorded'}</div>
+              {r.media_url
+                ? <a class="rmedia" href={r.media_url} target="_blank" rel="noopener noreferrer">Open the linked recording &rarr;</a>
+                : <div class="rnomedia">No recording is attached to this post — the panel behind it is a generated pattern, not a video frame.</div>}
               <div class="rtags">
                 {(Array.isArray(r.tags) ? r.tags : []).slice(0,4).map((t: string) => <span>#{t}</span>)}
               </div>
             </div>
             <div class="reel-side">
-              <button class="rs-btn like-btn" data-post-id={r.id}>
+              <button class="rs-btn like-btn" data-post-id={r.id} title="Like">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
                 <span class="rs-count">{r.like_count}</span>
               </button>
-              <button class="rs-btn">
+              <button class="rs-btn comment-btn" data-post-id={r.id} title="Comments">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                <span class="rs-count">{r.comment_count}</span>
+                <span class="rs-count">{(commentsByPost[String(r.id)] || []).length}</span>
               </button>
-              <button class="rs-btn">
+              <button class="rs-btn share-btn" data-post-id={r.id} title="Share a link to this post">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-                <span class="rs-count">{r.share_count}</span>
+                <span class="rs-count">{r.share_count || 0}</span>
               </button>
-              <button class="rs-btn">
+              <button class={'rs-btn save-btn' + (savedSet.has(String(r.id)) ? ' saved' : '')} data-post-id={r.id} title="Save for later">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
-                <span class="rs-count">save</span>
+                <span class="rs-count rs-save-label">{savedSet.has(String(r.id)) ? 'Saved' : 'Save'}</span>
               </button>
+            </div>
+            {/* THE COMMENT THREAD. feed_comments was created by this page and never read from or
+                written to, and the button above carried a count from the seed array. This sheet is
+                the reader and the composer for it. */}
+            <div class="comment-sheet" data-sheet={r.id}>
+              <div class="cs-head">
+                <span>Comments</span>
+                <button class="cs-close" data-close-sheet={r.id} type="button">Close</button>
+              </div>
+              {!commentsRead.ok && (
+                <p class="cs-error">The comments could not be read ({commentsRead.error}). This is not "no comments" — reload once the database recovers.</p>
+              )}
+              <div class="cs-list" data-list={r.id}>
+                {commentsRead.ok && (commentsByPost[String(r.id)] || []).length === 0 && (
+                  <p class="cs-empty">No comments yet. Yours would be the first.</p>
+                )}
+                {(commentsByPost[String(r.id)] || []).map((c: any) => (
+                  <div class="cs-item"><strong>{c.author_name}</strong><span>{c.body}</span></div>
+                ))}
+              </div>
+              <form class="cs-form" data-form={r.id}>
+                <input type="text" maxlength="2000" placeholder="Add a comment" data-input={r.id} />
+                <button type="submit">Post</button>
+              </form>
+              <p class="cs-msg" data-msg={r.id}></p>
             </div>
           </div>
         </div>
@@ -661,10 +744,12 @@ const safeInterests = JSON.stringify(interests);
     <div class="clips-panel">
       <div class="filter-bar">
         <input type="text" id="clipSearch" placeholder="Search titles or tags..." />
+        {/* Topics come from the tags on the clips actually on screen. The seven hardcoded options
+            that used to be here could filter to a topic no clip carried — and hid every topic a
+            clip did carry. */}
         <select id="clipTopic">
           <option value="">All topics</option>
-          <option>math</option><option>physics</option><option>chemistry</option><option>biology</option>
-          <option>cs</option><option>ai</option><option>economics</option>
+          {clipTopics.map((t: string) => <option value={t}>{t}</option>)}
         </select>
         <select id="clipDur">
           <option value="">Any duration</option>
@@ -673,7 +758,7 @@ const safeInterests = JSON.stringify(interests);
         </select>
       </div>
       <div class="clip-grid" id="clipGrid">
-        {clips.length === 0 && <div class="empty">No long-form clips yet.</div>}
+        {clips.length === 0 && !feedReadError && <div class="empty">No long-form clips have been published yet.</div>}
         {clips.map((c: any, i: number) => (
           <div class="clip-card" data-tags={(Array.isArray(c.tags) ? c.tags : []).join(',')} data-dur={c.duration_seconds}>
             <div class="clip-thumb">
@@ -682,7 +767,13 @@ const safeInterests = JSON.stringify(interests);
             </div>
             <div class="clip-body">
               <h3>{c.title}</h3>
-              <div class="meta">{c.view_count.toLocaleString()} views · score {c.score}</div>
+              <div class="meta">{Number(c.view_count || 0).toLocaleString()} views · score {c.score}</div>
+              {/* A clip card used to have no click handler and there is no player route, so the
+                  grid was a poster wall. A card now opens the link its author attached, and says
+                  plainly when there is none instead of looking clickable. */}
+              {c.media_url
+                ? <a class="clip-open" href={c.media_url} target="_blank" rel="noopener noreferrer">Open the recording &rarr;</a>
+                : <div class="clip-nolink">No recording link was attached to this post.</div>}
               <div class="ctags">
                 {(Array.isArray(c.tags) ? c.tags : []).slice(0,5).map((t: string) => <span>#{t}</span>)}
               </div>
@@ -697,6 +788,12 @@ const safeInterests = JSON.stringify(interests);
   <div class="panel" id="panel-xr">
     <div class="xr-panel">
       <div class="xr-grid" id="xrGrid">
+        {filtersReadError && (
+          <div class="read-error">The AR filter catalogue could not be read ({filtersReadError}). The camera effects below are missing because the query failed, not because none exist.</div>
+        )}
+        {!filtersReadError && filters.length === 0 && (
+          <div class="empty">No camera filters are published yet.</div>
+        )}
         {filters.map((f: any, i: number) => (
           <div class="xr-card" data-filter-slug={f.slug}>
             <div class="xr-preview"><canvas data-preview-slug={f.slug} data-preview-idx={i}></canvas></div>
@@ -756,6 +853,14 @@ const safeInterests = JSON.stringify(interests);
         <textarea name="description" maxlength="2000"></textarea>
         <label>Topic tags (comma-separated)</label>
         <input type="text" name="tags" placeholder="math, integration, jee" />
+        {/* THE LINK IS WHAT MAKES A POST A POST. feed_posts.media_url has existed since this table
+            was created and nothing ever wrote it, so every card on the feed was a title over a
+            generated gradient with nothing behind it. Documents and recordings are links on this
+            project — never uploads — so this is a URL field. */}
+        <label>Link to the recording or document (Drive or any public URL)</label>
+        <input type="url" name="media_url" maxlength="2000" placeholder="https://drive.google.com/..." />
+        <label>Length in seconds (optional)</label>
+        <input type="number" name="duration_seconds" min="0" max="86400" />
         <label>Visibility</label>
         <select name="visibility">
           <option value="public">Public</option>
@@ -1013,17 +1118,132 @@ const safeInterests = JSON.stringify(interests);
     });
   });
 
-  // -------- LIKE buttons (optimistic + POST) --------
+  // -------- REEL ACTION BUTTONS --------
+  //
+  // THE COUNT SHOWN IS THE COUNT THAT WAS STORED. Every one of these posts JSON to this page and
+  // paints the number the SERVER returns. The like button used to paint an optimistic +1 and
+  // swallow the response entirely (`catch(e) {}`), so a like the database refused still moved the
+  // number in front of the reader. The other three buttons had no handler at all.
+  async function feedAct(payload) {
+    const res = await fetch(window.location.pathname, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    let data = null;
+    try { data = await res.json(); } catch (_) { data = null; }
+    if (!res.ok || !data || data.ok !== true) {
+      throw new Error((data && data.error) || ('the server answered ' + res.status));
+    }
+    return data;
+  }
+  function sheetMsg(postId, text) {
+    const el = document.querySelector('.cs-msg[data-msg="' + postId + '"]');
+    if (el) el.textContent = text || '';
+  }
+
   document.querySelectorAll('.like-btn').forEach(b => {
     b.addEventListener('click', async () => {
       if (b.classList.contains('liked')) return;
-      b.classList.add('liked');
       const c = b.querySelector('.rs-count');
-      if (c) c.textContent = (parseInt(c.textContent) + 1).toString();
-      const fd = new FormData();
-      fd.append('action', 'like');
-      fd.append('post_id', b.dataset.postId);
-      try { await fetch(window.location.pathname, { method: 'POST', body: fd }); } catch(e) {}
+      const before = c ? c.textContent : '';
+      try {
+        const data = await feedAct({ act: 'like', post_id_target: b.dataset.postId });
+        b.classList.add('liked');
+        if (c) c.textContent = String(data.count);
+      } catch (err) {
+        // The like did NOT happen, so the number must not move and the reader must be told.
+        if (c) c.textContent = before;
+        sheetMsg(b.dataset.postId, 'Your like was not saved: ' + err.message);
+        b.title = 'Like was not saved: ' + err.message;
+      }
+    });
+  });
+
+  // -------- COMMENTS: open the sheet, post a comment, read it back --------
+  document.querySelectorAll('.comment-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      const sheet = document.querySelector('.comment-sheet[data-sheet="' + b.dataset.postId + '"]');
+      if (sheet) sheet.classList.toggle('open');
+    });
+  });
+  document.querySelectorAll('.cs-close').forEach(b => {
+    b.addEventListener('click', () => {
+      const sheet = document.querySelector('.comment-sheet[data-sheet="' + b.dataset.closeSheet + '"]');
+      if (sheet) sheet.classList.remove('open');
+    });
+  });
+  document.querySelectorAll('.cs-form').forEach(f => {
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const postId = f.dataset.form;
+      const input = document.querySelector('.cs-form input[data-input="' + postId + '"]');
+      const list = document.querySelector('.cs-list[data-list="' + postId + '"]');
+      const btn = f.querySelector('button');
+      const text = input && input.value ? input.value.trim() : '';
+      if (!text) { sheetMsg(postId, 'Write something first.'); return; }
+      if (btn) btn.disabled = true;
+      sheetMsg(postId, '');
+      try {
+        const data = await feedAct({ act: 'comment', post_id_target: postId, body: text });
+        if (list) {
+          const empty = list.querySelector('.cs-empty');
+          if (empty) empty.remove();
+          const item = document.createElement('div');
+          item.className = 'cs-item';
+          const who = document.createElement('strong');
+          who.textContent = 'You';
+          const bodyEl = document.createElement('span');
+          bodyEl.textContent = text; // textContent, never innerHTML — a comment is somebody else's text
+          item.appendChild(who); item.appendChild(bodyEl);
+          list.appendChild(item);
+        }
+        const countEl = document.querySelector('.comment-btn[data-post-id="' + postId + '"] .rs-count');
+        if (countEl) countEl.textContent = String(data.count);
+        if (input) input.value = '';
+      } catch (err) {
+        sheetMsg(postId, 'Not posted: ' + err.message);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+  });
+
+  // -------- SHARE: only counted when a share or a copy actually happened --------
+  document.querySelectorAll('.share-btn').forEach(b => {
+    b.addEventListener('click', async () => {
+      const postId = b.dataset.postId;
+      const url = window.location.origin + window.location.pathname + '#post-' + postId;
+      let shared = false;
+      try {
+        if (navigator.share) { await navigator.share({ url: url }); shared = true; }
+        else if (navigator.clipboard) { await navigator.clipboard.writeText(url); shared = true; }
+      } catch (_) {
+        shared = false; // the person cancelled the share sheet, or the clipboard was refused
+      }
+      if (!shared) { sheetMsg(postId, 'Nothing was shared, so nothing was counted. Copy the address bar instead.'); return; }
+      try {
+        const data = await feedAct({ act: 'share', post_id_target: postId });
+        const c = b.querySelector('.rs-count');
+        if (c) c.textContent = String(data.count);
+        sheetMsg(postId, 'Link copied.');
+      } catch (err) {
+        sheetMsg(postId, 'The link was copied, but the share count was not recorded: ' + err.message);
+      }
+    });
+  });
+
+  // -------- SAVE / UNSAVE (feed_saves) --------
+  document.querySelectorAll('.save-btn').forEach(b => {
+    b.addEventListener('click', async () => {
+      const label = b.querySelector('.rs-save-label');
+      try {
+        const data = await feedAct({ act: 'save', post_id_target: b.dataset.postId });
+        b.classList.toggle('saved', data.saved === true);
+        if (label) label.textContent = data.saved ? 'Saved' : 'Save';
+      } catch (err) {
+        sheetMsg(b.dataset.postId, 'Not saved: ' + err.message);
+      }
     });
   });
 
@@ -1053,6 +1273,9 @@ const safeInterests = JSON.stringify(interests);
   const clipTopic = document.getElementById('clipTopic');
   const clipDur = document.getElementById('clipDur');
   function filterClips() {
+    // Guarded: these three lookups used to be dereferenced unconditionally inside the handler, so a
+    // markup change that removed any one of them would have killed clip filtering on first use.
+    if (!clipSearch || !clipTopic || !clipDur) return;
     const q = (clipSearch.value || '').toLowerCase();
     const t = clipTopic.value;
     const d = clipDur.value;

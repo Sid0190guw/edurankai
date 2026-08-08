@@ -41,23 +41,50 @@ if (Astro.request.method === 'POST') {
         okMsg = 'Course created. Add modules and lessons to it.';
       }
     } else if (action === 'toggle_publish') {
+      // ONE STATEMENT, AND THE ANSWER COMES BACK FROM THE ROW THAT WAS WRITTEN.
+      // This was SELECT is_published, then UPDATE ... = ${!pub}. Two faults in five lines:
+      //   1. Read-modify-write with nothing guarding it. Two people (or one double-click) both read
+      //      the same value and both wrote its negation, so the second click undid the first and the
+      //      course ended up in whichever state neither of them chose.
+      //   2. When the id matched NOTHING, `pub` was undefined, `!pub` was true, and the page said
+      //      "Course published." A deleted or mistyped course reported a publish that never happened.
+      // NOT is computed inside the UPDATE against the row's own current value, and RETURNING says
+      // what the row is now — so the message is read off the write instead of guessed before it.
       const id = fd.get('id') as string;
-      const cur = await db.execute(sql`SELECT is_published FROM training_courses WHERE id = ${id} LIMIT 1`);
-      const rows = Array.isArray(cur) ? cur : (cur?.rows || []);
-      const pub = (rows[0] as any)?.is_published;
-      await db.execute(sql`UPDATE training_courses SET is_published = ${!pub}, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = pub ? 'Course unpublished.' : 'Course published.';
+      const upd = await db.execute(sql`
+        UPDATE training_courses
+           SET is_published = NOT COALESCE(is_published, false), updated_at = NOW()
+         WHERE id = ${id}
+        RETURNING is_published
+      `);
+      const updRows = Array.isArray(upd) ? upd : (upd?.rows || []);
+      if (!updRows.length) errorMsg = 'That course is no longer on the register — nothing was changed.';
+      else okMsg = (updRows[0] as any)?.is_published ? 'Course published.' : 'Course unpublished.';
     } else if (action === 'delete_course') {
-      await db.execute(sql`DELETE FROM training_courses WHERE id = ${fd.get('id') as string}`);
-      okMsg = 'Course deleted.';
+      // RETURNING, so "Course deleted." is a report of a row that went, not of a statement that ran.
+      const del = await db.execute(sql`DELETE FROM training_courses WHERE id = ${fd.get('id') as string} RETURNING id`);
+      const delRows = Array.isArray(del) ? del : (del?.rows || []);
+      okMsg = delRows.length ? 'Course deleted.' : '';
+      if (!delRows.length) errorMsg = 'That course is no longer on the register — nothing was deleted.';
     } else if (action === 'add_module') {
+      // THE NEXT POSITION IS COMPUTED INSIDE THE INSERT, AND FROM MAX, NOT COUNT.
+      // It was SELECT COUNT(*) in one round trip and INSERT in the next. COUNT is not the next
+      // position: delete the second of three modules and the count is 2, which is the sort_order the
+      // third already holds — so the new module landed on top of an existing one and the list ordered
+      // arbitrarily between them. Under two people adding at once the same collision happened without
+      // any delete at all. MAX(sort_order)+1 in the INSERT itself is one statement and one read of
+      // the table, so nothing can move between the two.
       const courseId = fd.get('course_id') as string;
       const title = (fd.get('title') as string || '').trim();
-      const sortOrder = await db.execute(sql`SELECT COUNT(*)::int as n FROM training_modules WHERE course_id = ${courseId}`);
-      const sortRows = Array.isArray(sortOrder) ? sortOrder : (sortOrder?.rows || []);
-      const n = Number((sortRows[0] as any)?.n) || 0;
-      await db.execute(sql`INSERT INTO training_modules (course_id, title, sort_order) VALUES (${courseId}, ${title}, ${n})`);
-      okMsg = 'Module added.';
+      if (!title) { errorMsg = 'A module needs a title.'; }
+      else {
+        await db.execute(sql`
+          INSERT INTO training_modules (course_id, title, sort_order)
+          SELECT ${courseId}, ${title}, COALESCE(MAX(sort_order), -1) + 1
+            FROM training_modules WHERE course_id = ${courseId}
+        `);
+        okMsg = 'Module added.';
+      }
     } else if (action === 'add_lesson') {
       const courseId = fd.get('course_id') as string;
       const moduleId = fd.get('module_id') as string || null;
@@ -67,24 +94,40 @@ if (Astro.request.method === 'POST') {
       const videoUrl = (fd.get('video_url') as string || '').trim() || null;
       const durationMins = parseInt(fd.get('duration_mins') as string || '0') || 0;
       const isPreview = fd.get('is_preview') === 'on';
-      const sortCount = await db.execute(sql`SELECT COUNT(*)::int as n FROM training_lessons WHERE course_id = ${courseId}`);
-      const sortRows = Array.isArray(sortCount) ? sortCount : (sortCount?.rows || []);
-      const n = Number((sortRows[0] as any)?.n) || 0;
-      await db.execute(sql`
-        INSERT INTO training_lessons (course_id, module_id, title, type, content, video_url, duration_mins, is_preview, sort_order)
-        VALUES (${courseId}, ${moduleId}, ${title}, ${type}, ${content}, ${videoUrl}, ${durationMins}, ${isPreview}, ${n})
-      `);
-      // Update total lessons count
-      await db.execute(sql`UPDATE training_courses SET total_lessons = (SELECT COUNT(*) FROM training_lessons WHERE course_id = ${courseId}) WHERE id = ${courseId}`);
-      okMsg = 'Lesson added.';
+      if (!title) { errorMsg = 'A lesson needs a title.'; }
+      else {
+        // Same COUNT-is-not-the-next-position fault as add_module above, and the same fix: MAX+1
+        // computed inside the INSERT.
+        await db.execute(sql`
+          INSERT INTO training_lessons (course_id, module_id, title, type, content, video_url, duration_mins, is_preview, sort_order)
+          SELECT ${courseId}, ${moduleId}, ${title}, ${type}, ${content}, ${videoUrl}, ${durationMins}, ${isPreview},
+                 COALESCE(MAX(sort_order), -1) + 1
+            FROM training_lessons WHERE course_id = ${courseId}
+        `);
+        // The stored lesson count is recomputed from the lessons themselves rather than incremented,
+        // so a missed run corrects itself on the next add instead of drifting forever.
+        await db.execute(sql`UPDATE training_courses SET total_lessons = (SELECT COUNT(*) FROM training_lessons WHERE course_id = ${courseId}) WHERE id = ${courseId}`);
+        okMsg = 'Lesson added.';
+      }
     }
-  } catch(e: any) { errorMsg = e.message; }
+  // e.message on a Postgres error is only the statement that failed; the reason is on e.cause. An
+  // author who saw the SQL echoed back could not tell a duplicate slug from a missing column.
+  } catch(e: any) {
+    console.error('[admin/hr/training] POST', e?.cause?.message || e?.message);
+    errorMsg = String(e?.cause?.message || e?.message || 'The change could not be saved.').slice(0, 300);
+  }
 }
 
 const url = new URL(Astro.request.url);
 const selectedId = url.searchParams.get('course') || '';
 
+// AN EMPTY CATALOGUE AND A CATALOGUE THAT COULD NOT BE READ LOOK IDENTICAL, AND THEY ARE NOT.
+// Both of these were `catch(e) {}`. On a database missing training_courses — or during any transient
+// pooler failure — this page rendered "No courses yet. Create your first course." An author would
+// then have created a duplicate of a course that already existed, believing the catalogue was bare.
+// The reason is captured and shown; nothing is guessed.
 let courses: any[] = [];
+let coursesReadError = '';
 try {
   const r = await db.execute(sql`
     SELECT c.*,
@@ -92,20 +135,69 @@ try {
     FROM training_courses c ORDER BY c.created_at DESC
   `);
   courses = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+} catch(e: any) {
+  coursesReadError = String(e?.cause?.message || e?.message || 'unknown error').slice(0, 200);
+  console.error('[admin/hr/training] courses read', coursesReadError);
+}
 
 const selectedCourse = courses.find((c: any) => c.id === selectedId);
 
 let modules: any[] = [];
 let lessons: any[] = [];
+let structureReadError = '';
 if (selectedId) {
   try {
     const r = await db.execute(sql`SELECT * FROM training_modules WHERE course_id = ${selectedId} ORDER BY sort_order`);
     modules = Array.isArray(r) ? r : (r?.rows || []);
     const r2 = await db.execute(sql`SELECT * FROM training_lessons WHERE course_id = ${selectedId} ORDER BY sort_order`);
     lessons = Array.isArray(r2) ? r2 : (r2?.rows || []);
-  } catch(e) {}
+  } catch(e: any) {
+    structureReadError = String(e?.cause?.message || e?.message || 'unknown error').slice(0, 200);
+    console.error('[admin/hr/training] structure read', structureReadError);
+  }
 }
+
+// =================================================================================================
+// THE ENROLMENTS TAB WAS A TAB, A PANEL, AND A SENTENCE THAT DESCRIBED SOMETHING THAT DID NOT EXIST
+// =================================================================================================
+//
+// The panel read: "Enrollment data loads here. N enrolled." Nothing loaded it. There was no query,
+// no fetch, and no script — the tab could only ever print that sentence, and the count beside it
+// came from a subquery on the course card, so the number was real and everything the tab promised
+// to show about it was not. An author looking for who is on a course found a control that answered
+// nothing and had no way to tell it apart from one that was merely slow.
+//
+// Read here, with the rest of the page's reads, rather than fetched: the tab is server-rendered and
+// hidden with CSS, so there is no request to make and no state to lose.
+//
+// LEFT JOIN on users, because training_enrollments.user_id points at users and a learner whose
+// account was removed must still be COUNTED — an INNER JOIN would silently shorten the list and
+// disagree with the enrolment figure on the card above it.
+let enrolments: any[] = [];
+let enrolmentsReadError = '';
+if (selectedId) {
+  try {
+    const r = await db.execute(sql`
+      SELECT e.id, e.created_at, e.progress_pct, e.completed_at,
+             u.name AS user_name, u.email AS user_email
+        FROM training_enrollments e
+        LEFT JOIN users u ON u.id = e.user_id
+       WHERE e.course_id = ${selectedId}
+       ORDER BY e.created_at DESC
+       LIMIT 200`);
+    enrolments = Array.isArray(r) ? r : (r?.rows || []);
+  } catch(e: any) {
+    enrolmentsReadError = String(e?.cause?.message || e?.message || 'unknown error').slice(0, 200);
+    console.error('[admin/hr/training] enrolments read', enrolmentsReadError);
+  }
+}
+
+/** Dates on this page are read by people in IST; the server is UTC. */
+const fmtWhen = (v: any) => {
+  if (!v) return '';
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? '' : d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
+};
 
 const CATEGORY_COLORS: Record<string,string> = {
   technology:'#60a5fa', business:'#fbbf24', design:'#a78bfa',
@@ -354,9 +446,50 @@ const LEVEL_COLOR: Record<string,string> = { beginner:'#10b981', intermediate:'#
         </form>
       </div>
 
-      <!-- Enrollments tab -->
+      <!-- Enrollments tab. Server-rendered from the read above; see the comment on `enrolments`. -->
       <div id="tab-enrollments" style="display:none;">
-        <p style="font-size:12px;color:#6e6e78;text-align:center;padding:24px;">Enrollment data loads here. {selectedCourse.enrollments || 0} enrolled.</p>
+        {enrolmentsReadError && (
+          <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.55;margin-bottom:10px;">
+            <strong>The enrolments could not be read.</strong> Nobody is listed below for that reason,
+            not because nobody is enrolled — the count on the course card comes from a different query
+            and is still accurate.
+            <span style="display:block;margin-top:5px;font-family:'Geist Mono',monospace;font-size:11px;color:#f5b1b1;">{enrolmentsReadError}</span>
+          </div>
+        )}
+        {!enrolmentsReadError && enrolments.length === 0 && (
+          <p style="font-size:12.5px;color:#6e6e78;text-align:center;padding:24px;line-height:1.6;">
+            Nobody has enrolled on this course yet. Learners enrol themselves by opening it; there is
+            no way to enrol somebody from here, and assigning required learning is a separate record
+            kept on <a href="/admin/hr/performance/learning" style="color:#FF7040;">Assigned learning</a>.
+          </p>
+        )}
+        {enrolments.length > 0 && (
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <p style="font-size:10px;color:#6e6e78;margin:0 0 4px;font-family:'Geist Mono',monospace;">
+              {enrolments.length} shown{enrolments.length >= 200 ? ' (most recent 200)' : ''} of {selectedCourse.enrollments || 0} enrolled
+            </p>
+            {enrolments.map((en: any) => {
+              // progress_pct arrives as a plain number or as a numeric string depending on the
+              // column type; coerced once here rather than compared loosely in three places.
+              const pct = Math.max(0, Math.min(100, Math.round(Number(en.progress_pct) || 0)));
+              const done = !!en.completed_at;
+              return (
+                <div style="background:#15151a;border:1px solid #1a1a1f;border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                  <div style="flex:1;min-width:160px;">
+                    <p style="font-size:12.5px;font-weight:600;color:#fff;margin:0;">{en.user_name || 'Account removed'}</p>
+                    <p style="font-size:10.5px;color:#6e6e78;margin:2px 0 0;">{en.user_email || 'no address on file'}{en.created_at ? ' · enrolled ' + fmtWhen(en.created_at) : ''}</p>
+                  </div>
+                  <div style="width:120px;">
+                    <div style="background:#0f0f14;border-radius:100px;height:4px;">
+                      <div style={`background:${done ? '#10b981' : '#FF4F00'};height:100%;width:${pct}%;border-radius:100px;`}></div>
+                    </div>
+                    <p style="font-size:9.5px;color:#6e6e78;margin:3px 0 0;font-family:'Geist Mono',monospace;">{done ? 'Completed ' + fmtWhen(en.completed_at) : pct + '% complete'}</p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   )}

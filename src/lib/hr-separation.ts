@@ -150,13 +150,91 @@ export async function updateSeparation(id: string, patch: Record<string, any>) {
   }
 }
 
-export async function recordExitInterview(separationId: string, responses: Record<string, string>) {
-  await ensureSeparationSchema();
-  for (const [k, v] of Object.entries(responses)) {
-    if (!v || !v.trim()) continue;
-    await db.execute(sql`INSERT INTO hr_exit_interview_responses (separation_id, question_key, response) VALUES (${separationId}, ${k}, ${v.trim().slice(0, 5000)})`);
+/**
+ * Record the exit interview.
+ *
+ * WHAT WAS WRONG WITH THIS AS SHIPPED. It INSERTed every question/response pair into
+ * hr_exit_interview_responses, and NOTHING in the entire repository ever SELECTed that table — the
+ * only other mentions of it were its own CREATE TABLE and a comment. A person on their way out
+ * answered why they were leaving, what they would change first, and whether they would come back,
+ * and no screen anywhere could show one word of it to anybody. The stamp on hr_separations recorded
+ * that the interview HAPPENED; the answers themselves went into a hole.
+ *
+ * listExitInterviewResponses() below is the missing read, and /admin/hr/separation now renders it.
+ *
+ * The write also had no failure path: it threw out of an unguarded await in the page handler, so a
+ * failure part-way through left some answers stored, the separation unstamped, and the interviewer
+ * looking at a 500 with no way to know which. It now reports what happened, and only stamps the
+ * separation once every answer is in.
+ */
+export async function recordExitInterview(
+  separationId: string,
+  responses: Record<string, string>,
+): Promise<{ ok: true; saved: number } | { ok: false; error: string }> {
+  if (!separationId) return { ok: false, error: 'No separation was identified.' };
+  const answers = Object.entries(responses).filter(([, v]) => v && v.trim());
+  if (answers.length === 0) {
+    return { ok: false, error: 'Record at least one answer. An interview with nothing in it is not evidence that it took place.' };
   }
-  await db.execute(sql`UPDATE hr_separations SET exit_interview_at = NOW(), status = CASE WHEN status = 'notice' OR status = 'knowledge_transfer' THEN 'settlement' ELSE status END, updated_at = NOW() WHERE id = ${separationId}`);
+  try {
+    await ensureSeparationSchema();
+    for (const [k, v] of answers) {
+      await db.execute(sql`INSERT INTO hr_exit_interview_responses (separation_id, question_key, response) VALUES (${separationId}, ${k}, ${v.trim().slice(0, 5000)})`);
+    }
+    await db.execute(sql`UPDATE hr_separations SET exit_interview_at = NOW(), status = CASE WHEN status = 'notice' OR status = 'knowledge_transfer' THEN 'settlement' ELSE status END, updated_at = NOW() WHERE id = ${separationId}`);
+    return { ok: true, saved: answers.length };
+  } catch (e: any) {
+    const reason = String(e?.cause?.message || e?.message || 'unknown error');
+    console.error('[hr-separation] recordExitInterview', reason);
+    return { ok: false, error: reason };
+  }
+}
+
+export interface ExitInterviewAnswer {
+  questionKey: string;
+  /** The question as it was asked, when the key is still in the catalogue. */
+  question: string;
+  response: string;
+  createdAt: string;
+}
+
+export type ExitInterviewResult =
+  | { ok: true; answers: ExitInterviewAnswer[] }
+  | { ok: false; reason: string };
+
+/**
+ * The answers one leaver gave. Discriminated on purpose: "they were interviewed and said nothing"
+ * and "we could not read what they said" are different facts, and an HR screen that renders both as
+ * the same blank panel is how a body of exit feedback quietly stops existing.
+ */
+export async function listExitInterviewResponses(separationId: string): Promise<ExitInterviewResult> {
+  if (!separationId) return { ok: true, answers: [] };
+  try {
+    await ensureSeparationSchema();
+    const r = rows(await db.execute(sql`
+      SELECT question_key, response, created_at
+      FROM hr_exit_interview_responses
+      WHERE separation_id = ${separationId}
+      ORDER BY created_at ASC`));
+    return {
+      ok: true,
+      answers: r.map((x: any) => {
+        const key = String(x.question_key || '');
+        const known = EXIT_INTERVIEW_QUESTIONS.find((q) => q.key === key);
+        return {
+          questionKey: key,
+          // A question asked under an older catalogue still shows its key rather than vanishing.
+          question: known ? known.label : key.replace(/_/g, ' '),
+          response: String(x.response || ''),
+          createdAt: String(x.created_at),
+        };
+      }),
+    };
+  } catch (e: any) {
+    const reason = String(e?.cause?.message || e?.message || 'unknown error');
+    console.error('[hr-separation] listExitInterviewResponses', reason);
+    return { ok: false, reason };
+  }
 }
 
 export async function listSeparations(filterStatus?: string) {

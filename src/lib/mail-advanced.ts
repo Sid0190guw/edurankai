@@ -126,10 +126,37 @@ export async function deleteLabel(userId: string, id: string): Promise<void> {
   await db.execute(sql`DELETE FROM mail_message_labels WHERE label_id = ${id} AND user_id = ${userId}`).catch(() => {});
   await db.execute(sql`DELETE FROM mail_labels WHERE id = ${id} AND user_id = ${userId}`);
 }
-export async function setMessageLabel(userId: string, messageId: string, labelId: string, on: boolean): Promise<void> {
+/**
+ * Put a label on (or take it off) one message in one person's mailbox.
+ *
+ * IT USED TO WRITE TO A TABLE NOTHING READS. The old body inserted into `mail_message_labels`
+ * keyed by label ID. The mail client does not read that table and never has: listFolder() in
+ * src/lib/mail.ts filters on `b.labels @> ARRAY[...]::text[]` — the TEXT[] column on mail_box,
+ * keyed by label NAME. So a label could be created, stored and "applied" and the rail's ?label=
+ * filter would still return an empty folder, forever. The function also had zero callers, so
+ * nothing ever exercised the mismatch.
+ *
+ * It now writes mail_box.labels, which is the column the reader reads, and takes the label NAME
+ * for the same reason. mail_message_labels is left in place (never DROP) but is no longer the
+ * label store; nothing reads or writes it.
+ *
+ * Throws on failure, deliberately. A label the caller believes it applied and which silently was
+ * not applied is precisely the defect being repaired here.
+ */
+export async function setMessageLabel(userId: string, messageId: string, labelName: string, on: boolean): Promise<void> {
   await ensureMailAdvancedSchema();
-  if (on) await db.execute(sql`INSERT INTO mail_message_labels (message_id, label_id, user_id) VALUES (${messageId}, ${labelId}, ${userId}) ON CONFLICT DO NOTHING`).catch(() => {});
-  else await db.execute(sql`DELETE FROM mail_message_labels WHERE message_id = ${messageId} AND label_id = ${labelId} AND user_id = ${userId}`).catch(() => {});
+  const name = (labelName || '').trim().slice(0, 80);
+  if (!name) return;
+  if (on) {
+    await db.execute(sql`
+      UPDATE mail_box SET labels = array_append(labels, ${name})
+      WHERE user_id = ${userId}::uuid AND message_id = ${messageId}::uuid
+        AND NOT (labels @> ARRAY[${name}]::text[])`);
+  } else {
+    await db.execute(sql`
+      UPDATE mail_box SET labels = array_remove(labels, ${name})
+      WHERE user_id = ${userId}::uuid AND message_id = ${messageId}::uuid`);
+  }
 }
 
 // ---------- inbound rules ----------
@@ -152,29 +179,152 @@ function ruleMatches(op: string, hay: string, needle: string): boolean {
   if (op === 'endswith') return needle.length > 0 && hay.lastIndexOf(needle) === hay.length - needle.length;
   return hay.indexOf(needle) !== -1; // contains
 }
-// Apply a recipient's rules to a newly-delivered inbound message. Returns the
-// actions taken (label names / folder / flags) so the caller can persist them.
-export async function applyRules(userId: string, msg: { from: string; to: string; subject: string; body: string; messageId: string }): Promise<{ labels: string[]; folder?: string; star?: boolean; read?: boolean }> {
-  const out: { labels: string[]; folder?: string; star?: boolean; read?: boolean } = { labels: [] };
-  let rls: any[] = [];
-  try { rls = await listRules(userId); } catch (_) { return out; }
+/** The folder keys a rule is allowed to move a message into — src/lib/mail.ts FOLDERS. */
+const RULE_FOLDERS = ['inbox', 'archive', 'spam', 'trash'];
+
+export type RuleOutcome = { labels: string[]; folder?: string; star?: boolean; read?: boolean };
+
+/**
+ * Evaluate a person's rules against one message and return what should happen to it.
+ *
+ * PURE DECISION, NO WRITES. It used to half-persist: the label arm wrote `mail_message_labels`
+ * (a table nothing reads — see setMessageLabel above) inside a `catch (_) {}`, while the folder,
+ * star and read arms only ever ended up in the return value for a caller to apply. So the one
+ * action that appeared to persist itself was the one that persisted nowhere visible.
+ *
+ * Persisting is now applyRulesToMessage()'s job and this function's job is to decide. The rule
+ * read is no longer swallowed either: "your rules could not be read" and "you have no rules" are
+ * the same empty list, and quietly filing nothing under the second when it was the first is how a
+ * filing system silently stops running.
+ */
+export async function applyRules(userId: string, msg: { from: string; to: string; subject: string; body: string; messageId: string }): Promise<RuleOutcome> {
+  const out: RuleOutcome = { labels: [] };
+  const rls = await listRules(userId);
   for (const r of rls) {
     if (!r.is_active) continue;
     const field = r.match_field === 'to' ? msg.to : r.match_field === 'subject' ? msg.subject : r.match_field === 'body' ? msg.body : msg.from;
     if (!ruleMatches(r.match_op, field || '', r.match_value)) continue;
-    if (r.action === 'folder' && r.action_value) out.folder = r.action_value;
-    else if (r.action === 'star') out.star = true;
+    if (r.action === 'folder' && r.action_value) {
+      // An unrecognised folder key would file the message into a folder no view renders, which is
+      // indistinguishable from deleting it. Rules are typed by hand on /admin/mail/rules.
+      if (RULE_FOLDERS.includes(String(r.action_value))) out.folder = String(r.action_value);
+    } else if (r.action === 'star') out.star = true;
     else if (r.action === 'read') out.read = true;
     else if (r.action === 'label' && r.action_value) {
-      out.labels.push(r.action_value);
-      try {
-        await createLabel(userId, r.action_value, '#a78bfa');
-        const lid = rows(await db.execute(sql`SELECT id FROM mail_labels WHERE user_id = ${userId} AND name = ${r.action_value} LIMIT 1`))[0]?.id;
-        if (lid) await setMessageLabel(userId, msg.messageId, lid, true);
-      } catch (_) {}
+      const name = String(r.action_value).trim().slice(0, 80);
+      if (name && !out.labels.includes(name)) out.labels.push(name);
     }
   }
   return out;
+}
+
+/**
+ * Evaluate the rules against one message ALREADY in a person's mailbox and write the result.
+ *
+ * This is the half that never existed. applyRules() returned a decision object and had no callers
+ * at all, so no message in this product has ever been filed by a rule: an admin could build a full
+ * set of filters on /admin/mail/rules, see them save and list back correctly, and none of them
+ * would ever run against anything.
+ *
+ * Returns what actually changed, so the caller can report a real number rather than "done". A
+ * message already in the target folder, already starred or already carrying the label is NOT
+ * counted as changed — re-running the rules must be safe and must be honest about doing nothing.
+ */
+export async function applyRulesToMessage(
+  userId: string,
+  box: { message_id: string; folder: string; is_read: boolean; is_starred: boolean; labels: string[] | null },
+  msg: { from: string; to: string; subject: string; body: string },
+): Promise<{ changed: boolean; actions: string[] }> {
+  const decision = await applyRules(userId, { ...msg, messageId: box.message_id });
+  const actions: string[] = [];
+  const have = new Set((box.labels || []).map((l) => String(l)));
+
+  for (const name of decision.labels) {
+    if (have.has(name)) continue;
+    // The label has to exist in mail_labels for the rail to offer it as a filter, and on the
+    // message for the filter to find anything. Both, or neither is any use.
+    await createLabel(userId, name, '#a78bfa');
+    await setMessageLabel(userId, box.message_id, name, true);
+    have.add(name);
+    actions.push('labelled "' + name + '"');
+  }
+
+  const sets: any[] = [];
+  if (decision.folder && decision.folder !== box.folder) {
+    sets.push(sql`folder = ${decision.folder}`);
+    actions.push('moved to ' + decision.folder);
+  }
+  if (decision.star && !box.is_starred) {
+    sets.push(sql`is_starred = true`);
+    actions.push('starred');
+  }
+  if (decision.read && !box.is_read) {
+    sets.push(sql`is_read = true`);
+    actions.push('marked read');
+  }
+  if (sets.length > 0) {
+    let assign = sets[0];
+    for (let i = 1; i < sets.length; i++) assign = sql`${assign}, ${sets[i]}`;
+    await db.execute(sql`
+      UPDATE mail_box SET ${assign}
+      WHERE user_id = ${userId}::uuid AND message_id = ${box.message_id}::uuid`);
+  }
+  return { changed: actions.length > 0, actions };
+}
+
+/**
+ * Run the rules over mail already sitting in a person's mailbox.
+ *
+ * WHY A BACKFILL AND NOT ARRIVAL-TIME FILTERING. Filing a message as it lands belongs in the
+ * inbound delivery path (src/pages/api/mail/inbound.ts), which this run does not own — it is
+ * reported instead. This gives the rules a real execution path today: they run, against real rows,
+ * and the mailbox visibly changes. Every failure is thrown to the caller so the page can say which
+ * message it stopped on rather than reporting a filing that did not happen.
+ */
+export async function runRulesOnMailbox(
+  userId: string,
+  opts: { scope: 'inbox' | 'all'; limit?: number } = { scope: 'inbox' },
+): Promise<{ scanned: number; changed: number; actions: string[]; capped: boolean }> {
+  await ensureMailAdvancedSchema();
+  const limit = Math.min(Math.max(opts.limit || 300, 1), 1000);
+  const scopeWhere = opts.scope === 'all'
+    ? sql`b.folder NOT IN ('trash', 'drafts')`
+    : sql`b.folder = 'inbox'`;
+  // One row per message with everything both halves need: the mailbox flags to compare against and
+  // the message text to match on. body_text rather than body_html so a rule matching on "body"
+  // matches words the person actually read, not markup.
+  const box = rows(await db.execute(sql`
+    SELECT b.message_id, b.folder, b.is_read, b.is_starred, b.labels,
+           m.from_email, m.subject, m.body_text,
+           COALESCE((SELECT string_agg(r.email, ', ') FROM mail_recipients r WHERE r.message_id = b.message_id), '') AS to_list
+    FROM mail_box b
+    JOIN mail_messages m ON m.id = b.message_id
+    WHERE b.user_id = ${userId}::uuid AND ${scopeWhere} AND m.is_draft = false
+    ORDER BY m.created_at DESC
+    LIMIT ${limit}`));
+
+  let changed = 0;
+  const actions: string[] = [];
+  for (const b of box) {
+    const res = await applyRulesToMessage(userId, {
+      message_id: String(b.message_id),
+      folder: String(b.folder),
+      is_read: b.is_read === true,
+      is_starred: b.is_starred === true,
+      labels: Array.isArray(b.labels) ? b.labels : [],
+    }, {
+      from: String(b.from_email || ''),
+      to: String(b.to_list || ''),
+      subject: String(b.subject || ''),
+      body: String(b.body_text || ''),
+    });
+    if (res.changed) {
+      changed++;
+      // A sample, not the whole run — enough for the operator to see the rules did what they meant.
+      if (actions.length < 6) actions.push('"' + String(b.subject || '(no subject)').slice(0, 60) + '" — ' + res.actions.join(', '));
+    }
+  }
+  return { scanned: box.length, changed, actions, capped: box.length >= limit };
 }
 
 // ---------- click tracking ----------

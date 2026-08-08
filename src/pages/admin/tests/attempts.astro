@@ -2,23 +2,54 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { computeIntegrityScore, RISK_BAND_COLORS, EVENT_SEVERITY } from '@/lib/proctoring-integrity';
+import { computeIntegrityFromCounts, RISK_BAND_COLORS } from '@/lib/proctoring-integrity';
+import { can } from '@/lib/auth/permissions';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+// AUTHORIZATION FROM permissions.ts, NEVER users.role.
+//
+// The gate here was `user.role === 'applicant'`, the exact literal comparison this codebase has
+// standardised away from: it admits every other role by accident rather than admitting a named
+// population on purpose, and what is on this screen is candidate names, candidate email addresses
+// and proctoring flags against them. `admin.access` is the population src/middleware.ts already
+// admits to every /admin path, so this narrows nobody who can reach the URL today — it changes HOW
+// the question is asked, not who may act.
+//
+// It is still wider than this data deserves: admin.access holds the seven console roles, including
+// editor and marketing, and nothing on this page is theirs. A dedicated `proctoring.view` key is
+// what it should ask for; that union lives in src/lib/auth/permissions.ts, which another run owns,
+// so it is reported rather than edited here.
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
 
 const url = new URL(Astro.request.url);
 const testFilter = url.searchParams.get('test') || '';
 const flagFilter = url.searchParams.get('flag') || '';
 
+const dbReason = (e: any) => String(e?.cause?.message || e?.message || 'unknown error');
+
 let attempts: any[] = [];
 let tests: any[] = [];
+// EVERY READ ON THIS PAGE ENDED IN `catch (_) {}`.
+//
+// That is the defect that matters most on a proctoring board, because of what the empty result then
+// renders as. If the events query failed, eventsByAttempt stayed empty, every attempt took the
+// "zero events" branch and drew the grey NO DATA chip, and `?flag=1` matched nothing — so a total
+// proctoring-data outage was pixel-identical to a clean sitting with no flags anywhere, with no
+// message on the page and nothing in the log. A reviewer would have signed off on it.
+//
+// Each read now keeps its reason and the page says which one did not answer.
+let testsError = '';
+let attemptsError = '';
+let eventsError = '';
 
 try {
   const r = await db.execute(sql`SELECT id, slug, title FROM tests ORDER BY title`);
   tests = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+} catch (e: any) {
+  testsError = dbReason(e);
+  console.error('[admin/tests/attempts] test filter list failed:', testsError);
+}
 
 try {
   const r = await db.execute(sql`
@@ -33,39 +64,59 @@ try {
     ORDER BY a.started_at DESC NULLS LAST LIMIT 200
   `);
   attempts = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+} catch (e: any) {
+  attemptsError = dbReason(e);
+  console.error('[admin/tests/attempts] attempt list failed:', attemptsError);
+}
 
-// Fetch event TYPES per attempt in one shot, then compute the real integrity
-// score per row using the severity-weighted lib. The old "clean if no
-// warn/flag" logic was misleading — an attempt with zero events is suspicious
-// (no proctoring data at all), not clean.
+// EVENT COUNTS, COUNTED BY POSTGRES, WITH NOTHING LEFT TO TRUNCATE.
+//
+// This used to SELECT raw event rows for up to 200 attempts under a bare `LIMIT 50000` with no
+// ORDER BY. Two things followed from that on a busy day: the cut-off landed wherever the planner
+// happened to stop, and the attempts on the wrong side of it were scored on a FRAGMENT of their
+// evidence — which always scores cleaner than the whole, never dirtier. The board silently rewarded
+// the noisiest sittings.
+//
+// GROUP BY returns one row per (attempt, event_type). That is bounded by the number of event types
+// in EVENT_SEVERITY, not by how many events were captured, so the whole board fits with no limit at
+// all and every score is computed over the complete evidence.
 const attemptIds = attempts.map((a: any) => a.id).filter(Boolean);
-const eventsByAttempt: Record<string, { type: string }[]> = {};
+const countsByAttempt: Record<string, Record<string, number>> = {};
 if (attemptIds.length > 0) {
   try {
     const ev = await db.execute(sql`
-      SELECT attempt_id, event_type FROM test_attempt_events
+      SELECT attempt_id, event_type, COUNT(*)::int AS n
+      FROM test_attempt_events
       WHERE attempt_id = ANY(${attemptIds}::uuid[])
-      LIMIT 50000
+      GROUP BY attempt_id, event_type
     `);
     const evRows = Array.isArray(ev) ? ev : ((ev as any)?.rows || []);
     for (const e of evRows) {
       const aid = String(e.attempt_id);
-      if (!eventsByAttempt[aid]) eventsByAttempt[aid] = [];
-      eventsByAttempt[aid].push({ type: e.event_type });
+      if (!countsByAttempt[aid]) countsByAttempt[aid] = {};
+      countsByAttempt[aid][String(e.event_type)] = Number(e.n) || 0;
     }
-  } catch (_) {}
+  } catch (e: any) {
+    eventsError = dbReason(e);
+    console.error('[admin/tests/attempts] proctoring event counts failed:', eventsError);
+  }
 }
 
 for (const a of attempts) {
-  const evs = eventsByAttempt[a.id] || [];
-  if (evs.length === 0) {
+  const counts = countsByAttempt[a.id];
+  if (eventsError) {
+    // THE DISTINCTION THAT WAS MISSING. "We could not read the proctoring evidence" is not
+    // "there is no proctoring evidence", and it must never be drawn as the same chip.
+    a.integrity_score = null;
+    a.risk_band = 'unreadable';
+    a.critical_count = 0;
+  } else if (!counts || Object.keys(counts).length === 0) {
     // Zero events = no proctoring data captured at all. NOT clean — unknown.
     a.integrity_score = null;
     a.risk_band = 'unknown';
     a.critical_count = 0;
   } else {
-    const r = computeIntegrityScore(evs);
+    const r = computeIntegrityFromCounts(counts);
     a.integrity_score = r.score;
     a.risk_band = r.riskBand;
     a.critical_count = r.bySeverity.critical;
@@ -73,10 +124,16 @@ for (const a of attempts) {
   }
 }
 
-if (flagFilter === '1') {
+// A "flagged only" filter over evidence that could not be read would return an empty board and mean
+// nothing by it. It is refused instead, and the banner below says why.
+const flagFilterRefused = flagFilter === '1' && !!eventsError;
+if (flagFilter === '1' && !eventsError) {
   // Real flagged filter: critical / high band OR has critical/high severity events
   attempts = attempts.filter((a: any) => a.risk_band === 'critical' || a.risk_band === 'high' || a.critical_count > 0);
 }
+
+// Advisory only, and said out loud on the surface where a human acts on it.
+const bandChip = (band: string) => RISK_BAND_COLORS[band as keyof typeof RISK_BAND_COLORS] || null;
 
 function ago(d: any) {
   if (!d) return '-';
@@ -102,20 +159,53 @@ function fmtDur(s: number) {
         <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#FF7040;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px;">Test attempts</p>
         <h1 style="font-size:22px;font-weight:800;color:#fff;margin:0;">Proctored activity log</h1>
         <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;max-width:640px;line-height:1.55;">Every test attempt with its proctoring event count. Click an attempt to see the full text-only activity trail (tab switches, copy/paste, blocked shortcuts, focus loss, etc.).</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:8px 0 0;max-width:640px;line-height:1.55;border-left:2px solid #FF4F00;padding-left:10px;">These scores are <strong style="color:#d8d8de;">advisory</strong>. They are a weighted count of automated signals, not a finding of misconduct, and nothing here penalises a candidate on its own — a person reviews the trail and decides.</p>
       </div>
       <a href="/admin/tests" style="background:#15151a;border:1px solid #1a1a1f;color:#fff;font-size:12px;font-weight:600;padding:8px 14px;border-radius:8px;text-decoration:none;">&lt; All tests</a>
     </div>
 
+    {attemptsError && (
+      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:14px;">
+        <p style="font-size:13px;font-weight:700;color:#fca5a5;margin:0 0 5px;">The attempt list could not be read. This board is NOT empty.</p>
+        <p style="font-size:11.5px;color:#a0a0ab;margin:0;line-height:1.6;font-family:'Geist Mono',monospace;">{attemptsError}</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:8px 0 0;line-height:1.6;">Nothing below reflects real activity. Reload once the database is reachable; do not record this screen as "no attempts".</p>
+      </div>
+    )}
+
+    {eventsError && (
+      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:14px;">
+        <p style="font-size:13px;font-weight:700;color:#fca5a5;margin:0 0 5px;">The proctoring evidence could not be read, so no attempt below is scored.</p>
+        <p style="font-size:11.5px;color:#a0a0ab;margin:0;line-height:1.6;font-family:'Geist Mono',monospace;">{eventsError}</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:8px 0 0;line-height:1.6;">Every integrity chip reads EVIDENCE UNREADABLE rather than a score. An attempt shown here may or may not carry flags — this page cannot currently tell you which, and an absence of flags on this screen is not evidence of a clean sitting.</p>
+      </div>
+    )}
+
+    {testsError && (
+      <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:12px;padding:12px 16px;margin-bottom:14px;">
+        <p style="font-size:12.5px;font-weight:600;color:#fbbf24;margin:0 0 4px;">The per-test filter chips could not be loaded.</p>
+        <p style="font-size:11.5px;color:#a0a0ab;margin:0;line-height:1.6;font-family:'Geist Mono',monospace;">{testsError}</p>
+        <p style="font-size:11.5px;color:#8a8a94;margin:6px 0 0;line-height:1.6;">The attempts themselves are unaffected — you are seeing all of them rather than a filtered set.</p>
+      </div>
+    )}
+
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
       <a href="?" style={'background:' + (!testFilter && flagFilter !== '1' ? '#FF4F00' : '#15151a') + ';border:1px solid #1a1a1f;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:100px;text-decoration:none;'}>All attempts</a>
-      <a href="?flag=1" style={'background:' + (flagFilter === '1' ? '#FF4F00' : '#15151a') + ';border:1px solid #1a1a1f;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:100px;text-decoration:none;'}>Flagged only</a>
+      {eventsError
+        ? <span title="Filtering by flag needs the proctoring events, which could not be read." style="background:#15151a;border:1px dashed #3a3a44;color:#6e6e78;font-size:11px;font-weight:600;padding:6px 12px;border-radius:100px;cursor:not-allowed;">Flagged only &mdash; unavailable, evidence unreadable</span>
+        : <a href="?flag=1" style={'background:' + (flagFilter === '1' ? '#FF4F00' : '#15151a') + ';border:1px solid #1a1a1f;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:100px;text-decoration:none;'}>Flagged only</a>}
       {tests.map(t => (
         <a href={'?test=' + t.slug} style={'background:' + (testFilter === t.slug ? '#FF4F00' : '#15151a') + ';border:1px solid #1a1a1f;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:100px;text-decoration:none;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'}>{t.title}</a>
       ))}
     </div>
 
-    {attempts.length === 0 && (
-      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:30px;text-align:center;color:#8a8a94;font-size:13px;">No attempts match the current filter.</div>
+    {flagFilterRefused && (
+      <div style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:12px;padding:12px 16px;margin-bottom:14px;">
+        <p style="font-size:12.5px;color:#fbbf24;margin:0;line-height:1.6;">The "flagged only" filter was <strong>not applied</strong>: it selects on proctoring evidence that could not be read. Filtering anyway would have shown you an empty board that means nothing. Every attempt is listed instead.</p>
+      </div>
+    )}
+
+    {attempts.length === 0 && !attemptsError && (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:30px;text-align:center;color:#8a8a94;font-size:13px;">No attempts match the current filter. (The list was read successfully &mdash; there is genuinely nothing in this selection.)</div>
     )}
 
     {attempts.length > 0 && (
@@ -134,9 +224,15 @@ function fmtDur(s: number) {
             <p style="font-size:11px;margin:0;">{a.status}</p>
             <p style="font-size:11px;color:#a0a0ab;margin:0;font-family:'Geist Mono',monospace;">{fmtDur(a.duration_seconds)}</p>
             <p style="font-size:11.5px;margin:0;">
-              {a.risk_band === 'unknown'
-                ? <span style="background:rgba(110,110,120,0.18);color:#a0a0ab;padding:2px 8px;border-radius:100px;font-weight:700;font-size:10.5px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;">no data</span>
-                : <span style={`background:${RISK_BAND_COLORS[a.risk_band].bg};color:${RISK_BAND_COLORS[a.risk_band].fg};border:1px solid ${RISK_BAND_COLORS[a.risk_band].border};padding:2px 8px;border-radius:100px;font-weight:700;font-size:10.5px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;`}>{a.integrity_score}/100 · {RISK_BAND_COLORS[a.risk_band].label}</span>}
+              {/* Three distinct states, because two of them used to draw the same grey chip:
+                  evidence unreadable (the query failed), no evidence captured, and a real score.
+                  bandChip() is a lookup with a fallback — indexing RISK_BAND_COLORS directly threw
+                  a TypeError for any band not in the map, which is every non-scored row. */}
+              {a.risk_band === 'unreadable'
+                ? <span title="The proctoring events for this attempt could not be read." style="background:rgba(239,68,68,0.14);color:#fca5a5;border:1px solid rgba(239,68,68,0.4);padding:2px 8px;border-radius:100px;font-weight:700;font-size:10.5px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;">evidence unreadable</span>
+                : a.risk_band === 'unknown' || !bandChip(a.risk_band)
+                ? <span title="No proctoring events were captured for this attempt at all. That is not the same as a clean sitting." style="background:rgba(110,110,120,0.18);color:#a0a0ab;padding:2px 8px;border-radius:100px;font-weight:700;font-size:10.5px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;">no data captured</span>
+                : <span style={`background:${bandChip(a.risk_band)!.bg};color:${bandChip(a.risk_band)!.fg};border:1px solid ${bandChip(a.risk_band)!.border};padding:2px 8px;border-radius:100px;font-weight:700;font-size:10.5px;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;`}>{a.integrity_score}/100 · {bandChip(a.risk_band)!.label}</span>}
             </p>
             <p style="font-size:11px;color:#8a8a94;font-family:'Geist Mono',monospace;margin:0;">{a.event_count || 0}{a.critical_count ? <span style="color:#fca5a5;font-weight:700;"> ({a.critical_count}!)</span> : ''}</p>
             <p style="font-size:11px;color:#FF7040;font-weight:600;margin:0;">View &rarr;</p>

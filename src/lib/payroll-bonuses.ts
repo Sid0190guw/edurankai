@@ -271,10 +271,44 @@ export async function listBonuses(
   }
 }
 
-/** One person's own awards. Narrowed by employee_id in the WHERE clause. */
-export async function bonusesForEmployee(employeeId: string): Promise<BonusRow[]> {
-  if (!isUuid(employeeId)) return [];
-  return listBonuses({ employeeId, limit: 100 });
+export type OwnBonusesResult =
+  | { ok: true; rows: BonusRow[] }
+  | { ok: false; reason: string };
+
+/**
+ * One person's own awards. Narrowed by employee_id in the WHERE clause — this is the employee-facing
+ * read, so ownership IS the authorization and no id is taken from a URL.
+ *
+ * WHY THIS ONE IS DISCRIMINATED WHILE listBonuses() STILL RETURNS A BARE ARRAY. This function had NO
+ * CALLERS AT ALL. The admin side (/admin/hr/payroll/bonuses and src/lib/payroll.ts) used the module;
+ * the employee-facing read was dead, so an employee could not see a bonus that had been planned or
+ * paid to them anywhere in the product. That is the same class of defect as payroll mark-paid
+ * selecting a column that never existed, where no employee was ever notified they had been paid.
+ *
+ * Being wired for the first time, it gets the honest contract instead of inheriting the old one: an
+ * employee asking "was my bonus paid?" must never be answered "you have no bonuses" by a failed
+ * query. listBonuses() returns [] both for a real absence AND when safeEnsure() fails before any
+ * query runs, so this does its own ensure and says which happened.
+ */
+export async function bonusesForEmployee(employeeId: string): Promise<OwnBonusesResult> {
+  if (!isUuid(employeeId)) return { ok: false, reason: 'no employee record is linked to this account' };
+  try {
+    await ensureBonusSchema();
+  } catch (e: any) {
+    logFail('bonusesForEmployee.ensure', e);
+    return { ok: false, reason: String(e?.cause?.message || e?.message || 'unknown error') };
+  }
+  try {
+    const r = await db.execute(sql`
+      ${BONUS_SELECT}
+       WHERE b.employee_id = ${String(employeeId)}::uuid
+       ORDER BY b.effective_year DESC, b.effective_month DESC, b.created_at DESC
+       LIMIT 100`);
+    return { ok: true, rows: rows(r).map(mapBonus) };
+  } catch (e: any) {
+    logFail('bonusesForEmployee', e);
+    return { ok: false, reason: String(e?.cause?.message || e?.message || 'unknown error') };
+  }
 }
 
 // -------------------------------------------------------------------------------------------------

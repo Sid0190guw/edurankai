@@ -55,9 +55,43 @@ async function startSession(userId: string, req: Request, ip: string | undefined
   });
   setSessionCookie(cookies, token, session.expiresAt);
 }
-async function destinationFor(userId: string): Promise<string> {
-  const r = await db.select({ role: users.role }).from(users).where(eq(users.id, userId)).limit(1);
-  return r[0]?.role === 'applicant' ? '/portal' : '/admin';
+/**
+ * WHERE A SUCCESSFUL SIGN-IN LANDS. ONE ANSWER, AND THIS FILE IS NOT THE ONE GIVING IT.
+ *
+ * WHAT WAS HERE: `role === 'applicant' ? '/portal' : '/admin'` — a decision made from a ROLE VALUE,
+ * which is the exact predicate src/lib/workforce/landing.ts was written to replace. It had two
+ * costs, and the second one took a whole population's working day away.
+ *
+ *   1. IT WAS A SECOND DECIDER. resolveLanding() answers "where does this person belong" by asking
+ *      canOpenAdmin() — the same function the /admin door asks — and composeWorkspace() for the
+ *      employee record. Two surfaces answering that question answer it differently within a month,
+ *      and the disagreement between two redirects is a loop by definition: that is precisely what
+ *      produced ERR_TOO_MANY_REDIRECTS and locked every wrongly-promoted intern out of the portal.
+ *
+ *   2. IT STRANDED EVERY MANAGER WHO IS ALSO ON THE PAYROLL. A department head, a recruiter, an HR
+ *      account or an editor with an hr_employees row was sent straight to /admin every morning —
+ *      and src/lib/admin-nav.ts and src/layouts/AdminLayout.astro carry NO link to /portal/employee,
+ *      /portal/employee/attendance, /portal/employee/leave, /portal/employee/payslips or
+ *      /portal/approvals. The console has no door to the workspace. So the population that both
+ *      approves things and is employed had no route to clock in, take a break, clock out, file a
+ *      report, look at a payslip or work the queue of decisions routed to them. They could not have
+ *      an ordinary working day.
+ *
+ * NOW: everybody goes to /portal, and /portal asks resolveLanding() exactly once. Nobody's
+ * destination changes except the people the old line got wrong — an account with no employee record
+ * that canOpenAdmin admits is forwarded to /admin from there, which is one extra redirect and the
+ * same console. Somebody with an employee record gets their workspace, which carries the
+ * `console.admin` widget as the door back.
+ *
+ * NO LOOP: /portal -> /admin fires only when canOpenAdmin(user).allowed is true, and middleware
+ * sends /admin -> /portal only when the same call on the same user is false. Exact complements; at
+ * most one can fire. The full proof is at the top of src/lib/workforce/landing.ts.
+ *
+ * Kept as a function rather than inlined so the three call sites keep reading as "the destination",
+ * and async so none of them changes shape. The users.role read it used to make is gone with it.
+ */
+async function destinationFor(_userId: string): Promise<string> {
+  return '/portal';
 }
 
 let errorMsg = '';
@@ -262,7 +296,9 @@ if (Astro.request.method === 'POST') {
             await startSession(u.id, Astro.request, Astro.clientAddress, Astro.cookies);
             await db.update(users).set({ lastLoginAt: new Date(), updatedAt: new Date() }).where(eq(users.id, u.id)).catch(() => {});
             clearPendingCookies(Astro.cookies);
-            return Astro.redirect(isApplicant ? '/portal' : '/admin');
+            // The same one decider as every other branch. `isApplicant` still governs the legacy
+            // face-challenge posture above, which is a different question from where they land.
+            return Astro.redirect(await destinationFor(u.id));
           }
         } catch (e: any) {
           console.error('[portal/login password]', e?.cause?.message || e?.message, e?.stack);

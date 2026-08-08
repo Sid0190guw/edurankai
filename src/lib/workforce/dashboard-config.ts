@@ -134,8 +134,21 @@ export const RELATIONSHIPS: readonly RelationshipDefinition[] = [
     sparse: true,
     // countDirectReports() in composer.ts:173 — hr_employees.reporting_manager_id::text = users.id.
     resolve: (c) => c.directReports > 0,
+    // THIS SENTENCE MAY NOT CLAIM ANYTHING ABOUT A REAL TEAM, and the one it replaces did.
+    //
+    // It read "Nobody is recorded as reporting to you." `resolve` above is a COUNT off
+    // hr_employees.reporting_manager_id, and that count is 0 in three completely different worlds:
+    // nobody reports to this person; the Organization Graph — the layer that actually owns the
+    // relationship — has not been initialized, so it answers empty for absolutely everybody; or the
+    // read failed. Only the first is a fact about the person, and the old sentence stated it in all
+    // three. src/lib/org-graph.ts:339 sets out the required distinction and
+    // src/lib/workforce/loaders.ts directReportsView() implements it with five named sources; a
+    // registry entry that cannot see which of the five applies must not pick one.
+    //
+    // So this says what is actually known — the column is empty — and points at both ways it gets
+    // filled, without asserting either the team or the absence of one.
     emptyState:
-      'Nobody is recorded as reporting to you. If that is not right, ask HR to set you as the reporting manager on their record.',
+      'No reporting line to you is recorded on anybody\'s employee record. That may be because none exists, or because the Organization Graph, which holds who reports to whom, has not been loaded yet — a surface showing this must read directReportsView() rather than guess between them. If people do report to you, ask HR to record it.',
     notes:
       'THE ID-SPACE TRAP: reporting_manager_id holds a USERS id, never an hr_employees id. It has ONE ' +
       'writer — the Employment tab at src/pages/admin/hr/employees/[id].astro:329 — so it is filled in ' +

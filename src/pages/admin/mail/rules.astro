@@ -2,13 +2,16 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import {
   getSignature, setSignature, listLabels, createLabel, deleteLabel,
-  listRules, createRule, deleteRule,
+  listRules, createRule, deleteRule, runRulesOnMailbox,
+  listScheduled, cancelScheduled,
 } from '@/lib/mail-advanced';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 
 let okMsg = '', errMsg = '';
+// What the "run rules now" pass actually did, so the result is a real number and not a reassurance.
+let runReport: { scanned: number; changed: number; actions: string[]; capped: boolean } | null = null;
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = (fd.get('_action') as string) || '';
@@ -37,6 +40,21 @@ if (Astro.request.method === 'POST') {
     } else if (action === 'del_rule') {
       await deleteRule(user.id, g('id'));
       okMsg = 'Rule removed.';
+    } else if (action === 'run_rules') {
+      // THE RULES NOW RUN. Until this existed, applyRules() had no caller anywhere in the
+      // repository: every rule on this page was stored, listed back correctly, and evaluated
+      // against nothing, ever.
+      const scope = g('scope') === 'all' ? 'all' : 'inbox';
+      runReport = await runRulesOnMailbox(user.id, { scope });
+      okMsg = runReport.changed === 0
+        ? 'Rules ran over ' + runReport.scanned + ' message' + (runReport.scanned === 1 ? '' : 's') + '. Nothing matched, so nothing was changed.'
+        : 'Rules ran over ' + runReport.scanned + ' message' + (runReport.scanned === 1 ? '' : 's') + ' and changed ' + runReport.changed + '.';
+    } else if (action === 'cancel_scheduled') {
+      // The scheduled queue had a sender (/api/mail/scheduled-send) and no way to see or stop
+      // anything in it: listScheduled and cancelScheduled had zero callers. A message could be
+      // queued for a future date and then only be discovered by its recipient.
+      await cancelScheduled(user.id, g('id'));
+      okMsg = 'Scheduled message cancelled — it will not be sent.';
     }
   } catch (e: any) {
     // The real Postgres reason is on e.cause; e.message is only the failed SQL, which told the
@@ -68,6 +86,12 @@ let labels: any[] = [];
 try { labels = await listLabels(user.id); } catch (e: any) { noteFail('labels', e); }
 let rules: any[] = [];
 try { rules = await listRules(user.id); } catch (e: any) { noteFail('rules', e); }
+// The scheduled-send queue, which had no reader at all until now.
+let scheduled: any[] = [];
+let scheduledError = '';
+try { scheduled = await listScheduled(user.id); }
+catch (e: any) { scheduledError = String(e?.cause?.message || e?.message || 'unknown error'); noteFail('scheduled messages', e); }
+const pendingScheduled = scheduled.filter((s: any) => s.status === 'scheduled');
 
 const SWATCHES = ['#67e8f9', '#a78bfa', '#fca5a5', '#86efac', '#fcd34d', '#f9a8d4', '#93c5fd', '#fdba74'];
 function fieldLabel(f: string) { return ({ from: 'From', to: 'To', subject: 'Subject', body: 'Body' } as any)[f] || f; }
@@ -139,8 +163,22 @@ function actLabel(a: string, v: string) {
 
     <!-- RULES -->
     <div class="card">
-      <h2>Inbound rules</h2>
-      <p class="card-sub">Run automatically on every incoming message, top to bottom.</p>
+      <h2>Mail rules</h2>
+      {/* The old sub-line read "Run automatically on every incoming message" — which was not true
+          of a single message ever delivered by this product. Rules are matched top to bottom, and
+          the page now says exactly when that happens and when it does not. */}
+      <p class="card-sub">Matched top to bottom. Run them over your existing mail with the button below.</p>
+
+      <div class="notice">
+        <p class="notice-h">These rules do not yet run on arrival.</p>
+        <p>
+          Filing a message the moment it lands belongs to the inbound delivery route, which does not
+          call the rule engine yet. Until it does, a rule you add here changes nothing by itself:
+          <b>press &ldquo;Run rules now&rdquo;</b> and it is applied to the mail already in your
+          mailbox. New mail arriving after that is not filed until you run them again.
+        </p>
+      </div>
+
       {rules.length === 0 ? <p class="muted">No rules yet.</p> : (
         <ul class="rules">
           {rules.map((r: any) => (
@@ -164,7 +202,80 @@ function actLabel(a: string, v: string) {
         <input name="action_value" class="inp" placeholder="label / folder name" maxlength="80" />
         <button class="btn" type="submit">Add rule</button>
       </form>
-      <p class="hint">For "apply label", action value is the label name (created if new). For "move to folder", use inbox / archive / spam / trash. Star / mark-read need no value.</p>
+      <p class="hint">For "apply label", action value is the label name (created if new). For "move to folder", use inbox / archive / spam / trash &mdash; any other value is ignored rather than filing the message somewhere no folder shows. Star / mark-read need no value.</p>
+
+      <div class="run-box">
+        {rules.length === 0 ? (
+          <p class="muted">Add a rule above before running &mdash; there is nothing to apply yet.</p>
+        ) : (
+          <form method="post" class="rule-form">
+            <input type="hidden" name="_action" value="run_rules" />
+            <span>Run these {rules.length} rule{rules.length === 1 ? '' : 's'} over</span>
+            <select name="scope" class="inp sel">
+              <option value="inbox">my inbox</option>
+              <option value="all">all my mail (except drafts and trash)</option>
+            </select>
+            <button class="btn" type="submit">Run rules now</button>
+          </form>
+        )}
+        {runReport && (
+          <div class="run-report">
+            <p>
+              Scanned <b>{runReport.scanned}</b> message{runReport.scanned === 1 ? '' : 's'};
+              changed <b>{runReport.changed}</b>.
+              {runReport.capped ? ' This run stopped at the newest ' + runReport.scanned + ' messages — run it again to continue further back.' : ''}
+            </p>
+            {runReport.actions.length > 0 && (
+              <ul class="run-list">
+                {runReport.actions.map((a: string) => <li>{a}</li>)}
+                {runReport.changed > runReport.actions.length && <li class="muted">…and {runReport.changed - runReport.actions.length} more.</li>}
+              </ul>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+
+    <!-- SCHEDULED QUEUE -->
+    <div class="card">
+      <h2>Scheduled messages</h2>
+      {/* This panel did not exist. listScheduled() and cancelScheduled() were both written and both
+          had zero callers, while /api/mail/scheduled-send happily sent from the same table — so a
+          message could be queued for a future date with no way to see it and no way to stop it. */}
+      <p class="card-sub">Messages waiting to be sent, and the ones already dealt with.</p>
+      {scheduledError ? (
+        <p class="muted">
+          The scheduled queue could not be read, so nothing is listed here &mdash; that is a failure,
+          not an empty queue. A message may still be waiting to send. Reason: {scheduledError}
+        </p>
+      ) : scheduled.length === 0 ? (
+        <p class="muted">Nothing scheduled. (The queue was read successfully.)</p>
+      ) : (
+        <ul class="rules">
+          {scheduled.map((s: any) => (
+            <li class="rule">
+              <span class="rule-text">
+                <b>{s.subject || '(no subject)'}</b> to {s.to_list || '(no recipient)'}<br />
+                <span class="muted">
+                  {s.status === 'scheduled' ? 'sends ' : s.status === 'sent' ? 'sent ' : 'failed '}
+                  {s.scheduled_at ? new Date(s.scheduled_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '(no date)'}
+                  {s.error ? ' — ' + s.error : ''}
+                </span>
+              </span>
+              {s.status === 'scheduled' && (
+                <form method="post" class="inline">
+                  <input type="hidden" name="_action" value="cancel_scheduled" />
+                  <input type="hidden" name="id" value={s.id} />
+                  <button class="rule-x" type="submit">Cancel</button>
+                </form>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {!scheduledError && pendingScheduled.length > 0 && (
+        <p class="hint">{pendingScheduled.length} message{pendingScheduled.length === 1 ? '' : 's'} still waiting to send. Cancelling removes it from the queue permanently.</p>
+      )}
     </div>
   </section>
 
@@ -202,5 +313,13 @@ function actLabel(a: string, v: string) {
     .rule-x { background: 0; border: 0; color: #b91c1c; font-size: 0.78rem; font-weight: 600; cursor: pointer; }
     .muted { color: #a99e94; font-size: 0.85rem; }
     .hint { font-size: 0.74rem; color: #a99e94; margin: 12px 0 0; line-height: 1.5; }
+    .notice { background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 11px 14px; margin: 0 0 14px; }
+    .notice-h { font-size: 0.84rem; font-weight: 700; color: #92400e; margin: 0 0 4px; }
+    .notice p { font-size: 0.8rem; color: #78560f; margin: 0; line-height: 1.6; }
+    .run-box { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(14,11,8,0.08); }
+    .run-report { margin-top: 10px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 10px 13px; }
+    .run-report p { font-size: 0.82rem; color: #166534; margin: 0; line-height: 1.6; }
+    .run-list { margin: 7px 0 0; padding-left: 18px; }
+    .run-list li { font-size: 0.78rem; color: #3f6b4c; line-height: 1.6; }
   </style>
 </AdminLayout>

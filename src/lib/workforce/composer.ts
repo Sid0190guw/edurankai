@@ -491,6 +491,17 @@ async function compose(
   // is the sanctioned reader (relationships come from src/lib/org-graph.ts and from nowhere else) and
   // it fails closed to an empty array, so a graph that will not answer leaves the column's answer
   // standing rather than replacing it with a worse one.
+  //
+  // A FAILED GRAPH READ IS NAMED, and this is the half that was missing. The catch below logged and
+  // moved on, so a manager whose graph read threw got graphReports = 0, managesPeople = false, no
+  // reports.direct widget — and a workspace that said nothing at all about it. Silently withholding a
+  // card is the same class of mistake as silently showing one: the person cannot tell "you lead
+  // nobody" from "we could not find out", and only the first of those is a statement about them.
+  //
+  // WORDED AS THE GRAPH, NOT AS THE PERSON. contextGaps sentences are read aloud on the workspace, so
+  // this one names the layer that did not answer rather than implying anything about who reports to
+  // whom. loaders.ts keeps the same distinction one level down: 'graph-empty' means the Organization
+  // Graph is not initialized and says NOTHING about this person, and only 'none' is a fact about them.
   let graphReports = 0;
   if (trustworthy && directReports === 0 && workspace?.employeeId) {
     try {
@@ -499,6 +510,8 @@ async function compose(
       graphReports = Array.isArray(list) ? list.length : 0;
     } catch (e: any) {
       logFail('org-graph direct reports', e);
+      degraded = true;
+      contextGaps.push('the Organization Graph, which holds who reports to whom');
     }
   }
 
