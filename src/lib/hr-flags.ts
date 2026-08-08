@@ -123,19 +123,122 @@ export async function listFlags(employeeId: string) {
   `));
 }
 
-export async function setAppealStatus(flagId: string, status: 'pending' | 'upheld' | 'modified' | 'overturned', notes: string) {
-  await ensureFlagsSchema();
-  await db.execute(sql`UPDATE hr_employee_flags SET appeal_status = ${status}, appeal_notes = ${notes} WHERE id = ${flagId}`);
+export const APPEAL_STATUSES = ['pending', 'upheld', 'modified', 'overturned'] as const;
+export type AppealStatus = (typeof APPEAL_STATUSES)[number];
+
+export const APPEAL_LABELS: Record<AppealStatus, string> = {
+  pending: 'Appeal lodged, awaiting decision',
+  upheld: 'Appeal rejected — the flag stands',
+  modified: 'Appeal partly accepted — the flag was modified',
+  overturned: 'Appeal accepted — the flag is overturned',
+};
+
+/**
+ * Decide an appeal against a flag.
+ *
+ * THIS WAS THE ONLY WRITER OF AN APPEAL OUTCOME AND NOTHING CALLED IT. The module's single consumer
+ * was /admin/hr/employees/[id].astro, which imports raiseFlag and listFlags and neither of the two
+ * functions below. So a Level 3 breach flag — the kind whose recorded action is "immediate
+ * termination, no certificate, legal action possible" — could be raised against a named employee and
+ * its appeal could never be decided by any screen in the product. appeal_status and appeal_notes
+ * were columns that could only ever hold NULL.
+ *
+ * /admin/hr/flags now calls this. A decision needs a written reason: an appeal outcome recorded with
+ * no rationale is exactly the record that cannot be defended to the person it is about.
+ */
+export async function setAppealStatus(
+  flagId: string,
+  status: AppealStatus,
+  notes: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!flagId) return { ok: false, error: 'No flag was identified.' };
+  if (!(APPEAL_STATUSES as readonly string[]).includes(status)) {
+    return { ok: false, error: 'Unknown appeal outcome.' };
+  }
+  const note = String(notes || '').trim();
+  if (status !== 'pending' && note.length < 15) {
+    return { ok: false, error: 'Give the reason for this decision, in at least 15 characters. An appeal outcome with no rationale on the record cannot be defended to the person it is about.' };
+  }
+  try {
+    await ensureFlagsSchema();
+    const r = rows(await db.execute(sql`
+      UPDATE hr_employee_flags SET appeal_status = ${status}, appeal_notes = ${note.slice(0, 4000) || null}
+      WHERE id = ${flagId}::uuid
+      RETURNING id`));
+    if (r.length === 0) return { ok: false, error: 'That flag no longer exists, so nothing was decided.' };
+    return { ok: true };
+  } catch (e: any) {
+    logFail('setAppealStatus', e);
+    return { ok: false, error: String(e?.cause?.message || e?.message || 'The decision was not recorded.') };
+  }
 }
 
-export async function recentFlags(limit = 50) {
-  await ensureFlagsSchema();
-  return rows(await db.execute(sql`
-    SELECT f.id, f.employee_id, f.level, f.breach_type, f.description, f.action_taken,
-      f.flagged_by_name, f.is_escalation, f.appeal_status, f.created_at,
-      e.full_name AS employee_name, e.email AS employee_email
-    FROM hr_employee_flags f
-    LEFT JOIN hr_employees e ON e.id = f.employee_id
-    ORDER BY f.created_at DESC LIMIT ${limit}
-  `));
+export interface FlagRow {
+  id: string;
+  employeeId: string;
+  employeeName: string | null;
+  employeeEmail: string | null;
+  level: number;
+  breachType: string;
+  breachLabel: string;
+  description: string;
+  actionTaken: string | null;
+  flaggedByName: string | null;
+  isEscalation: boolean;
+  appealStatus: AppealStatus | null;
+  appealNotes: string | null;
+  createdAt: string;
+}
+
+export type FlagsResult = { ok: true; rows: FlagRow[] } | { ok: false; reason: string };
+
+/**
+ * Every flag across the organisation, newest first — the appeals desk's read.
+ *
+ * Discriminated: an empty disciplinary register that actually means "the query failed" is a
+ * particularly bad lie, because the screen reading it is the one deciding whether anybody has an
+ * appeal outstanding.
+ */
+export async function recentFlags(limit = 100): Promise<FlagsResult> {
+  try {
+    await ensureFlagsSchema();
+    const r = rows(await db.execute(sql`
+      SELECT f.id, f.employee_id, f.level, f.breach_type, f.description, f.action_taken,
+        f.flagged_by_name, f.is_escalation, f.appeal_status, f.appeal_notes, f.created_at,
+        e.full_name AS employee_name, e.email AS employee_email
+      FROM hr_employee_flags f
+      LEFT JOIN hr_employees e ON e.id = f.employee_id
+      ORDER BY f.created_at DESC LIMIT ${Math.min(500, Math.max(1, limit))}
+    `));
+    return {
+      ok: true,
+      rows: r.map((x: any) => {
+        const bt = String(x.breach_type || '');
+        const spec = (BREACH_TYPES as Record<string, { label: string }>)[bt];
+        const appeal = String(x.appeal_status || '');
+        return {
+          id: String(x.id),
+          employeeId: String(x.employee_id),
+          employeeName: x.employee_name || null,
+          employeeEmail: x.employee_email || null,
+          level: Number(x.level || 1),
+          breachType: bt,
+          // An auto-escalation row carries a breach_type that is not in the catalogue; show it
+          // readably rather than blank.
+          breachLabel: spec ? spec.label : bt.replace(/_/g, ' '),
+          description: String(x.description || ''),
+          actionTaken: x.action_taken || null,
+          flaggedByName: x.flagged_by_name || null,
+          isEscalation: !!x.is_escalation,
+          appealStatus: (APPEAL_STATUSES as readonly string[]).includes(appeal) ? (appeal as AppealStatus) : null,
+          appealNotes: x.appeal_notes || null,
+          createdAt: String(x.created_at),
+        };
+      }),
+    };
+  } catch (e: any) {
+    const reason = String(e?.cause?.message || e?.message || 'unknown error');
+    logFail('recentFlags', e);
+    return { ok: false, reason };
+  }
 }

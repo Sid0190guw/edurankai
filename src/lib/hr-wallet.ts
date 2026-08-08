@@ -867,7 +867,7 @@ export async function payWithdrawal(id: string, user: any, manualRef?: string): 
       // A NETWORK ERROR IS NOT PROOF THE PAYOUT DID NOT HAPPEN. The instruction may have reached the
       // bank; the answer did not reach us. So the request is left at 'paying' for a human to check
       // against the payout channel rather than put back where a second press would resend it.
-      console.error('[hr-wallet] payout request to RazorpayX did not return for withdrawal', id, '-', e?.message);
+      console.error('[hr-wallet] payout request to RazorpayX did not return for withdrawal', id, '-', e?.cause?.message || e?.message);
       return {
         ok: false,
         error: 'The payout instruction was sent but no confirmation came back, so this request is held at '

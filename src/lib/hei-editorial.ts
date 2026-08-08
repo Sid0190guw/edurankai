@@ -127,6 +127,147 @@ export function ensureHeiEditorialSchema(): Promise<void> {
   });
 }
 
+// =================================================================================================
+// EVIDENCE LOCKS — the sign-off gate that had no way to be satisfied.
+//
+// /admin/hei/index.astro renders, on every finding awaiting sign-off:
+//     IN REVIEW · {locked_count}/{total_locks} EVIDENCE LOCKED
+// from two sub-selects over hei_evidence_locks. That table is CREATEd above and there was not one
+// INSERT into it anywhere in the repository, and no lock control on /admin/hei/findings — whose
+// actions are create_draft / send_notice / set_response_quality / publish / unpublish / delete.
+//
+// So the badge read 0/0 for every finding, forever. That is worse than absent: a reviewer reads
+// "0/0" as "nobody has locked the evidence yet" — a fact about the workflow — rather than "locking
+// is not implemented", and can publish a finding about a NAMED INSTITUTION believing a gate stood
+// behind it. The number cannot move, so it can never warn anybody.
+//
+// These four functions are that missing half. Evidence is attached to a finding, then locked; a
+// locked row records who locked it and when, and cannot be silently edited afterwards — unlock is a
+// separate, deliberate act. addEvidence/lockEvidence are called from /admin/hei/findings and the
+// counts are what /admin/hei has been displaying all along.
+// =================================================================================================
+
+export interface EvidenceRow {
+  id: string;
+  findingId: string;
+  label: string;
+  evidenceUrl: string | null;
+  isLocked: boolean;
+  lockedBy: string | null;
+  lockedAt: string | null;
+}
+
+export type EvidenceResult =
+  | { ok: true; rows: EvidenceRow[] }
+  | { ok: false; reason: string };
+
+function toEvidence(r: any): EvidenceRow {
+  return {
+    id: String(r.id),
+    findingId: r.finding_id ? String(r.finding_id) : '',
+    label: String(r.label || 'Untitled evidence'),
+    evidenceUrl: r.evidence_url || null,
+    isLocked: !!r.is_locked,
+    lockedBy: r.locked_by ? String(r.locked_by) : null,
+    lockedAt: r.locked_at ? String(r.locked_at) : null,
+  };
+}
+
+/**
+ * The evidence attached to one finding.
+ *
+ * Discriminated, because "no evidence has been attached" and "we could not read the evidence table"
+ * must not both render as an empty list on a screen whose whole job is deciding whether a finding
+ * about a named institution is safe to publish.
+ */
+export async function listEvidence(findingId: string): Promise<EvidenceResult> {
+  if (!findingId) return { ok: true, rows: [] };
+  try {
+    await ensureHeiEditorialSchema();
+    const r = await db.execute(sql`
+      SELECT id, finding_id, label, evidence_url, is_locked, locked_by, locked_at
+      FROM hei_evidence_locks WHERE finding_id = ${findingId}::uuid
+      ORDER BY created_at ASC`);
+    return { ok: true, rows: heiRows(r).map(toEvidence) };
+  } catch (e: any) {
+    const reason = heiReason(e);
+    console.error('[hei-editorial] listEvidence', reason);
+    return { ok: false, reason };
+  }
+}
+
+/**
+ * Attach a piece of evidence to a finding. Documents are LINKS on this project, never uploads, so
+ * evidence_url is a URL and is validated as one.
+ */
+export async function addEvidence(
+  findingId: string,
+  label: string,
+  evidenceUrl: string,
+): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const name = String(label || '').trim();
+  if (!findingId) return { ok: false, error: 'No finding was identified.' };
+  if (name.length < 3) return { ok: false, error: 'Give the evidence a label of at least 3 characters, so a reviewer can tell the items apart.' };
+  const url = String(evidenceUrl || '').trim();
+  if (!url) return { ok: false, error: 'Give the link to the evidence. Evidence nobody can open cannot support a published finding.' };
+  if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'The evidence link must start with http:// or https://.' };
+  try {
+    await ensureHeiEditorialSchema();
+    const r = heiRows(await db.execute(sql`
+      INSERT INTO hei_evidence_locks (finding_id, label, evidence_url, is_locked)
+      VALUES (${findingId}::uuid, ${name.slice(0, 300)}, ${url.slice(0, 2000)}, false)
+      RETURNING id`));
+    if (!r[0]?.id) return { ok: false, error: 'The evidence was not attached. Nothing has been recorded.' };
+    return { ok: true, id: String(r[0].id) };
+  } catch (e: any) {
+    const reason = heiReason(e);
+    console.error('[hei-editorial] addEvidence', reason);
+    return { ok: false, error: reason };
+  }
+}
+
+/**
+ * Lock or unlock one piece of evidence.
+ *
+ * Locking stamps WHO and WHEN. The UPDATE is guarded on the row not already being in the target
+ * state, so a double-submit cannot rewrite an earlier locker's name and timestamp onto somebody
+ * else's decision.
+ */
+export async function lockEvidence(
+  evidenceId: string,
+  actorUserId: string,
+  locked: boolean,
+): Promise<{ ok: true; changed: boolean } | { ok: false; error: string }> {
+  if (!evidenceId) return { ok: false, error: 'No evidence item was identified.' };
+  if (!actorUserId) return { ok: false, error: 'Only a signed-in editor can lock evidence.' };
+  try {
+    await ensureHeiEditorialSchema();
+    const r = heiRows(await db.execute(sql`
+      UPDATE hei_evidence_locks
+      SET is_locked = ${locked},
+          locked_by = ${locked ? actorUserId : null},
+          locked_at = ${locked ? sql`NOW()` : sql`NULL`}
+      WHERE id = ${evidenceId}::uuid AND is_locked <> ${locked}
+      RETURNING id`));
+    return { ok: true, changed: r.length > 0 };
+  } catch (e: any) {
+    const reason = heiReason(e);
+    console.error('[hei-editorial] lockEvidence', reason);
+    return { ok: false, error: reason };
+  }
+}
+
+/**
+ * The pair of numbers /admin/hei has always displayed, computed where the rest of the codebase can
+ * reach them. `total === 0` genuinely means no evidence has been attached — which, now that
+ * attaching is possible, is a statement about the finding rather than about the software.
+ */
+export async function evidenceLockCounts(findingId: string): Promise<{ ok: true; locked: number; total: number } | { ok: false; reason: string }> {
+  const res = await listEvidence(findingId);
+  if (!res.ok) return { ok: false, reason: res.reason };
+  return { ok: true, locked: res.rows.filter((r) => r.isLocked).length, total: res.rows.length };
+}
+
 export type PromoteResult = { ok: boolean; message: string };
 
 /**

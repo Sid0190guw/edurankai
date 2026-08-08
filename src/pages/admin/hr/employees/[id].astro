@@ -3,6 +3,8 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql as sqlExpr } from 'drizzle-orm';
 import { ensureOnce } from '@/lib/ensure-once';
+// A PROBATION START DATE IS A CIVIL DATE. `new Date()` in this process is UTC, and IST is UTC+05:30.
+import { civilToday } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -619,8 +621,27 @@ const staleDepartmentLabel = (currentDepartmentUnrecognised && departmentRegiste
 // the employee portal read and write through src/lib/hr-leave.ts, and hr_leave_types /
 // hr_leave_balances / hr_leave_requests (plural), which only ever had readers. This tab queried
 // the plural set, so an employee's Leave tab was empty no matter how much leave they had taken.
+//
+// AN EMPTY LEAVE TAB IS NOT A FACT ABOUT THIS PERSON — IT IS A FAILED READ, ALWAYS.
+// getBalances() maps over the LEAVE_TYPES constant, so it returns one row per type or it throws;
+// there is no such thing as an employee with no leave types. The old line was
+// `getBalances(id).catch(() => [])`, and the panel below then printed "No leave balances set for
+// <year>", which is a sentence about HR not having allocated anything. Nobody would go looking for
+// a broken query after reading it.
+//
+// Worse, the non-strict path swallows the CONSUMPTION aggregate too: `safe()` returns [] on failure
+// and every type then reports used 0 / pending 0, i.e. FULL ENTITLEMENT REMAINING. An HR desk
+// approving leave off this tab would have been reading an unfailed-looking screen that had failed.
+// strict:true makes that read throw so the failure is shown instead of flattered.
 const { getBalances, LEAVE_TYPES } = await import('@/lib/hr-leave');
-const _balances = await getBalances(id).catch(() => [] as any[]);
+let leaveReadError = '';
+let _balances: any[] = [];
+try {
+  _balances = await getBalances(id, undefined, { strict: true });
+} catch (e: any) {
+  // e.message is only the failed SQL on a Postgres error; the reason is on e.cause.
+  leaveReadError = String(e?.cause?.message || e?.message || 'unknown error').slice(0, 200);
+}
 const leaveBalanceRows = _balances.map((b: any) => ({
   name: b.name, code: b.id, is_paid: b.id !== 'unpaid',
   allocated: b.allowance, used: b.used, pending: b.pending, carried_forward: 0,
@@ -656,6 +677,9 @@ const attendanceRows = (Array.isArray(attendance) ? attendance : ((attendance as
 
 // Recent leave requests — same singular table the leave workflow writes (see note above).
 let leaveRequestRows: any[] = [];
+// Declared before the try that writes it — `const`/`let` is not hoisted in a way the reader can rely
+// on here, and every page-level declaration in this file is deliberately above its first use.
+let leaveRequestReadError = '';
 try {
   const leaveRequests = await db.execute(sqlExpr`
     SELECT * FROM hr_leave_request WHERE employee_id = ${id}
@@ -663,14 +687,26 @@ try {
   `);
   leaveRequestRows = ((Array.isArray(leaveRequests) ? leaveRequests : (leaveRequests as any)?.rows || []) as any[])
     .map((lr: any) => ({ ...lr, leave_name: LEAVE_NAME[lr.leave_type] || lr.leave_type, code: lr.leave_type }));
-} catch (e) { leaveRequestRows = []; }
+// "No leave requests" is a statement about this person. It was also what a failed read produced,
+// with nothing logged — so an HR screen could tell somebody that an employee had never asked for
+// leave when the truth was that the question had not been answered.
+} catch (e: any) {
+  leaveRequestReadError = String(e?.cause?.message || e?.message || 'unknown error').slice(0, 160);
+  console.error('[admin/hr/employees] leave requests', leaveRequestReadError);
+}
 
 // Fetch recent daily work reports
 let dailyReportRows: any[] = [];
+let dailyReportReadError = '';
 try {
   const dr = await db.execute(sqlExpr`SELECT * FROM hr_daily_reports WHERE employee_id = ${id} ORDER BY report_date DESC LIMIT 30`);
   dailyReportRows = (Array.isArray(dr) ? dr : (dr?.rows || [])) as any[];
-} catch (e) {}
+} catch (e: any) {
+  // Same fault, same fix: "No daily reports submitted yet." is a judgement on a person's diligence,
+  // and it must not be printed over a query that did not run.
+  dailyReportReadError = String(e?.cause?.message || e?.message || 'unknown error').slice(0, 160);
+  console.error('[admin/hr/employees] daily reports', dailyReportReadError);
+}
 
 function formatDate(d: any) {
   if (!d) return '—';
@@ -981,7 +1017,7 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
           <input type="hidden" name="action" value="open_probation" />
           <p style="font-size:11.5px;color:#9aa6b6;margin:0 0 10px;font-weight:600;">Open probation period</p>
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:10px;">
-            <input name="start_date" type="date" required value={new Date().toISOString().slice(0,10)} style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:8px 10px;border-radius:6px;font-size:12px;" />
+            <input name="start_date" type="date" required value={civilToday()} style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:8px 10px;border-radius:6px;font-size:12px;" />
             <select name="duration_months" style="background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:8px 10px;border-radius:6px;font-size:12px;">
               <option value="3">3 months</option>
               <option value="6" selected>6 months (standard)</option>
@@ -1263,9 +1299,13 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
     <div id="panel-3" class="hr-panel" style="display:none;">
       <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">
         {leaveBalanceRows.length === 0 ? (
-          <div style="text-align:center;padding:32px;color:#6e6e78;">
-            <p style="font-size:13px;">No leave balances set for {new Date().getFullYear()}</p>
-            <p style="font-size:12px;margin-top:4px;">Use Leave Management to allocate leave.</p>
+          <div style="text-align:center;padding:32px;color:#c98a5a;">
+            <p style="font-size:13px;font-weight:600;">Leave could not be read.</p>
+            <p style="font-size:12px;margin-top:4px;color:#8a8a94;">
+              Every employee has the same leave types, so this panel is never legitimately empty.
+              Nothing below is a statement about this person's entitlement or what they have taken.
+            </p>
+            {leaveReadError && <p style="font-size:11.5px;margin-top:8px;color:#6e6e78;font-family:ui-monospace,monospace;">{leaveReadError}</p>}
           </div>
         ) : leaveBalanceRows.map((lb: any) => {
           const remaining = lb.unlimited
@@ -1298,7 +1338,9 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
 
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px;">
         <p style="font-size:12px;font-weight:600;color:#8a8a94;margin:0 0 10px;text-transform:uppercase;letter-spacing:0.08em;">Recent Leave Requests</p>
-        {leaveRequestRows.length === 0 ? (
+        {leaveRequestReadError ? (
+          <p style="font-size:12px;color:#fca5a5;padding:12px 0;line-height:1.55;">The leave requests could not be read, so this is not a statement that there are none. {leaveRequestReadError}</p>
+        ) : leaveRequestRows.length === 0 ? (
           <p style="font-size:12px;color:#6e6e78;text-align:center;padding:16px 0;">No leave requests</p>
         ) : leaveRequestRows.map((lr: any) => (
           <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1a1a1f;">
@@ -1472,7 +1514,9 @@ const hasExited = !emp.is_active || emp.employment_status === 'exited';
 
     <!-- REPORTS (daily work reports submitted by the employee) -->
     <div id="panel-6" class="hr-panel" style="display:none;">
-      {dailyReportRows.length === 0 ? (
+      {dailyReportReadError ? (
+        <div style="padding:24px 16px;color:#fca5a5;"><p style="font-size:13px;line-height:1.6;">The daily reports could not be read. This panel is empty for that reason and NOT because this person has filed none.</p><p style="font-size:11px;font-family:'Geist Mono',monospace;color:#f5b1b1;margin:6px 0 0;">{dailyReportReadError}</p></div>
+      ) : dailyReportRows.length === 0 ? (
         <div style="text-align:center;padding:48px 16px;color:#6e6e78;"><p style="font-size:13px;">No daily reports submitted yet.</p></div>
       ) : (
         <div style="display:flex;flex-direction:column;gap:8px;">

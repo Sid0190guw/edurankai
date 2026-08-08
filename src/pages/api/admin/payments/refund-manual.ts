@@ -29,9 +29,34 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
   if (!paymentRowId) return json({ ok: false, error: 'paymentRowId required' }, 400);
   if (!reason || reason.length < 10) return json({ ok: false, error: 'reason required (min 10 chars) — this is a manual refund without API verification' }, 400);
 
-  const pay = rows(await db.execute(sql`SELECT id, amount, status FROM payments WHERE id = ${paymentRowId} LIMIT 1`))[0] as any;
+  // amount_paise, NOT amount — see the note in refund.ts. Nothing in this codebase creates or writes
+  // a `payments.amount` column; every row is inserted with amount_paise and every other reader reads
+  // it. These two endpoints were the only two that named `amount`.
+  const pay = rows(await db.execute(sql`SELECT id, amount_paise, status FROM payments WHERE id = ${paymentRowId} LIMIT 1`))[0] as any;
   if (!pay) return json({ ok: false, error: 'payment not found' }, 404);
-  if (pay.status === 'refunded') return json({ ok: false, error: 'already refunded' }, 409);
+  // A PART-REFUNDED PAYMENT IS ALSO ALREADY REFUNDED, for this endpoint's purposes. Only the fully
+  // refunded state was refused, and this path has NO gateway behind it to refuse anything: a second
+  // manual entry simply overwrote refund_amount with the later figure, so a payment refunded twice
+  // read in the books as refunded once, for whichever amount was typed last. There is nowhere else
+  // the total is kept.
+  if (pay.status === 'refunded' || pay.status === 'partially_refunded') {
+    return json({
+      ok: false,
+      error: 'This payment is already recorded as ' + String(pay.status).replace('_', ' ')
+        + '. This record holds one refund amount, so a second entry would replace the first rather '
+        + 'than add to it. Nothing was changed.',
+    }, 409);
+  }
+
+  const paidPaise = Number(pay.amount_paise) || 0;
+  // AND IT CANNOT SAY MORE WENT BACK THAN CAME IN. There is no gateway on this path to reject it:
+  // whatever is typed here becomes the finance record.
+  if (amountPaise != null && Number.isFinite(amountPaise) && amountPaise > paidPaise) {
+    return json({
+      ok: false,
+      error: 'That is more than this payment was for (' + paidPaise + ' paise). Nothing was recorded.',
+    }, 400);
+  }
 
   try {
     await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_id VARCHAR(64)`);
@@ -42,8 +67,12 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
     await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_mode VARCHAR(20)`);
   } catch (_) {}
 
-  const refundAmount = (amountPaise && amountPaise > 0) ? amountPaise : pay.amount;
-  const newStatus = refundAmount < pay.amount ? 'partially_refunded' : 'refunded';
+  // BOTH SIDES IN PAISE. refundAmount was `amountPaise` (paise) or `pay.amount` (which this file
+  // believed to be rupees), and the comparison below then decided the status by comparing the two
+  // against each other — so a manual entry of INR 100 against a payment of INR 500 compared 10000
+  // with 500 and wrote 'refunded' on a payment four fifths of which had not been returned.
+  const refundAmount = (amountPaise && amountPaise > 0) ? amountPaise : paidPaise;
+  const newStatus = refundAmount < paidPaise ? 'partially_refunded' : 'refunded';
 
   await db.execute(sql`
     UPDATE payments

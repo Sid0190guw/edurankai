@@ -3,6 +3,7 @@ import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
 import { heiFindings, heiInstitutions, heiDimensions, institutionClaims, users } from '@/lib/db/schema';
 import { desc, eq, asc } from 'drizzle-orm';
+import { addEvidence, lockEvidence, listEvidence } from '@/lib/hei-editorial';
 
 const user = Astro.locals.user!;
 if (!user || user.role === 'applicant') return Astro.redirect('/portal');
@@ -96,9 +97,31 @@ if (Astro.request.method === 'POST') {
       const findingId = (fd.get('finding_id') as string || '').trim();
       await db.delete(heiFindings).where(eq(heiFindings.id, findingId));
       okMsg = 'Finding deleted.';
+    } else if (action === 'add_evidence') {
+      // The missing half of the sign-off gate. /admin/hei has always rendered
+      // "{locked}/{total} EVIDENCE LOCKED" per finding from hei_evidence_locks — a table with no
+      // INSERT anywhere in the repository and no control on this page — so the badge read 0/0 for
+      // every finding forever and could never warn anybody about anything.
+      const res = await addEvidence(
+        (fd.get('finding_id') as string || '').trim(),
+        (fd.get('label') as string || ''),
+        (fd.get('evidence_url') as string || ''),
+      );
+      if (res.ok) okMsg = 'Evidence attached. It stays unlocked until an editor locks it.';
+      else errorMsg = res.error;
+    } else if (action === 'lock_evidence' || action === 'unlock_evidence') {
+      const res = await lockEvidence(
+        (fd.get('evidence_id') as string || '').trim(),
+        user.id,
+        action === 'lock_evidence',
+      );
+      if (!res.ok) errorMsg = res.error;
+      else if (!res.changed) okMsg = 'That item was already in this state. Nothing changed, and no existing lock record was overwritten.';
+      else okMsg = action === 'lock_evidence' ? 'Evidence locked, against your name and the current time.' : 'Lock released.';
     }
   } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+    // The real Postgres reason lives on err.cause; err.message is only the SQL that failed.
+    errorMsg = 'Failed: ' + (err?.cause?.message || err?.message || 'Unknown error');
   }
 }
 
@@ -127,6 +150,14 @@ for (const c of allFresh) {
   counts[c.status] = (counts[c.status] || 0) + 1;
 }
 
+// Evidence per finding, for the lock panel. Read failures are kept per-finding and NAMED on screen:
+// a finding whose evidence list could not be read must not render as a finding with no evidence,
+// because that is the state in which publishing looks safe.
+const evidenceByFinding: Record<string, { rows: Awaited<ReturnType<typeof listEvidence>> }> = {};
+for (const f of allFindings) {
+  evidenceByFinding[f.id] = { rows: await listEvidence(f.id) };
+}
+
 function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '-'; }
 function daysUntil(d: any): number | null {
   if (!d) return null;
@@ -134,7 +165,10 @@ function daysUntil(d: any): number | null {
   return Math.ceil(ms / (1000 * 60 * 60 * 24));
 }
 ---
-<HeiAdminLayout title="HEI Findings" activeNav="hei-findings">
+{/* The layout's prop is `active` and its value is a nav item ID. `activeNav="hei-findings"` was
+    silently dropped — not a type error the build would catch under the old any-typed props — so the
+    sidebar highlighted nothing on this route. */}
+<HeiAdminLayout title="HEI Findings" active="findings">
   <div style="padding-bottom:80px;">
 
     <div class="admin-page-header" style="margin-bottom:18px;display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;">
@@ -211,6 +245,10 @@ function daysUntil(d: any): number | null {
         const inst = instMap[f.institutionId];
         const days = daysUntil(f.responseWindowEndsAt);
         const portalToken = tokenByInstId[f.institutionId];
+        const ev = evidenceByFinding[f.id]?.rows;
+        const evRows = ev && ev.ok ? ev.rows : [];
+        const evFailed = !!ev && !ev.ok;
+        const lockedCount = evRows.filter((r) => r.isLocked).length;
 
         return (
           <div class="admin-card" style="padding:18px;">
@@ -250,6 +288,48 @@ function daysUntil(d: any): number | null {
             {portalToken && (
               <p style="font-size:10px;color:#6e6e78;margin-top:8px;font-family:'Geist Mono',monospace;">Institution portal: <a href={'/hei/portal/' + portalToken + '/findings'} target="_blank" style="color:#FF7040;text-decoration:underline;">/hei/portal/{portalToken.substring(0, 12)}.../findings</a></p>
             )}
+
+            {/* EVIDENCE LOCKS. The counter on /admin/hei reads exactly these rows. Before this
+                panel existed there was no way to create one, so it said 0/0 for every finding. */}
+            <div style="margin-top:12px;padding-top:12px;border-top:1px solid #1f1f26;">
+              <p style="font-size:9.5px;color:#FF7040;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;margin-bottom:8px;">
+                Evidence {evFailed ? '· could not be read' : '· ' + lockedCount + ' of ' + evRows.length + ' locked'}
+              </p>
+
+              {evFailed && (
+                <p style="font-size:11.5px;color:#fca5a5;line-height:1.55;margin-bottom:8px;">
+                  The evidence for this finding could not be read, so this is <strong>not</strong> a finding with
+                  no evidence — it is a finding whose evidence we cannot see. Do not publish it from this screen.
+                  <span style="display:block;color:#6e6e78;font-family:'Geist Mono',monospace;font-size:10px;margin-top:4px;">Reason recorded: {ev && !ev.ok ? ev.reason : ''}</span>
+                </p>
+              )}
+
+              {!evFailed && evRows.length === 0 && (
+                <p style="font-size:11.5px;color:#6e6e78;margin-bottom:8px;">Nothing attached yet. Attach the sources this finding rests on, then lock each one before sign-off.</p>
+              )}
+
+              {evRows.map((r) => (
+                <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;background:#0e0e12;padding:7px 10px;border-radius:5px;margin-bottom:5px;flex-wrap:wrap;">
+                  <div style="min-width:200px;flex:1;">
+                    <a href={r.evidenceUrl || '#'} target="_blank" rel="noopener" style="font-size:11.5px;color:#d8d8de;text-decoration:underline;">{r.label}</a>
+                    {r.isLocked && <span style="display:block;font-size:10px;color:#6ee7b7;margin-top:2px;">Locked {fmt(r.lockedAt)}</span>}
+                  </div>
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="_action" value={r.isLocked ? 'unlock_evidence' : 'lock_evidence'} />
+                    <input type="hidden" name="evidence_id" value={r.id} />
+                    <button type="submit" class="admin-btn" style={'padding:3px 10px;font-size:10px;' + (r.isLocked ? 'color:#6ee7b7;border-color:#10b981;' : '')}>{r.isLocked ? 'Unlock' : 'Lock'}</button>
+                  </form>
+                </div>
+              ))}
+
+              <form method="POST" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+                <input type="hidden" name="_action" value="add_evidence" />
+                <input type="hidden" name="finding_id" value={f.id} />
+                <input type="text" name="label" required minlength="3" placeholder="What this evidence is" class="rfi" style="flex:1;min-width:150px;padding:4px 8px;font-size:10.5px;width:auto;" />
+                <input type="url" name="evidence_url" required placeholder="https://link-to-source" class="rfi" style="flex:1;min-width:180px;padding:4px 8px;font-size:10.5px;width:auto;" />
+                <button type="submit" class="admin-btn" style="padding:4px 10px;font-size:10.5px;">Attach</button>
+              </form>
+            </div>
 
             <div style="display:flex;gap:6px;margin-top:12px;padding-top:12px;border-top:1px solid #1f1f26;flex-wrap:wrap;align-items:center;">
               {f.status === 'draft' && (

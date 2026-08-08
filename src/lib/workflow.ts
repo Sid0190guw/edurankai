@@ -590,7 +590,18 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 3, via: 'executive_sponsor', minAmount: 500000 },
     ],
     escalateAfterHours: 96,
-    approvalUrl: '/admin/hr/leave/workflow',
+    // THE ROOM THE DECISION IS ACTUALLY IN.
+    //
+    // This pointed at /admin/hr/leave/workflow, which is wrong twice over. That page is gated by
+    // canAccessSection(user, 'leave', 'edit'), which the ordinary employee the Organization Graph
+    // routes a procurement request to almost never holds; and its list is listInstances({ domain:
+    // 'leave' }), so even an HR account that followed the link would be shown leave requests and
+    // nothing at all about the request they had just been asked to decide. The notification named a
+    // room the approver could not enter, displaying somebody else's business.
+    //
+    // /portal/employee/procurement filters pendingForApprover() to this domain and is where the
+    // decision genuinely lives.
+    approvalUrl: '/portal/employee/procurement',
   },
   // Opening a position belongs to the department, so the head is the FIRST rung rather than the
   // requester's own manager — the requester is often the manager.
@@ -603,7 +614,10 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
       { step: 2, via: 'approval_owner', optional: true },
     ],
     escalateAfterHours: 96,
-    approvalUrl: '/admin/hr/leave/workflow',
+    // Same correction, and there is no recruitment-specific portal surface, so this goes to the
+    // aggregate queue — /portal/approvals renders every routed step through pendingForApprover(),
+    // including this one, and is reachable by the ordinary employee a department head is.
+    approvalUrl: '/portal/approvals',
   },
   travel: {
     key: 'travel',

@@ -11,8 +11,13 @@ import AdminLayout from '@/layouts/AdminLayout.astro';
 import { can, canAccessSection } from '@/lib/auth/permissions';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ledgerFor, reviewsFor, termsFor, setTermsFor } from '@/lib/credit-ledger';
+import { ledgerFor, reviewsForDetailed, termsFor, setTermsFor } from '@/lib/credit-ledger';
 import { completionFigures, remainingWeeks, weeklyHoursFor } from '@/lib/credit-hours';
+// The date this engagement ENDED is a claim printed on a certificate, not a formatting choice, and
+// this process runs in UTC — five and a half hours behind the people whose record it is. Between
+// 00:00 and 05:29 IST `new Date().toISOString().slice(0,10)` named YESTERDAY as the last day of
+// somebody's engagement, on the document they hand to a university.
+import { civilToday } from '@/lib/page-safety';
 
 const user = Astro.locals.user!;
 // This gate used to read `can(user, 'hr.edit') && can(user, 'employees.edit')`. Neither name exists
@@ -49,13 +54,23 @@ if (Astro.request.method === 'POST') {
   if (fd.get('_action') === 'terms') {
     const kind = String(fd.get('kind') || 'full-time') === 'part-time' ? 'part-time' : 'full-time';
     const wh = parseFloat(String(fd.get('weeklyHours') || '')) || null;
-    await setTermsFor(id, {
-      kind,
-      weeklyHours: wh ?? (kind === 'full-time' ? 40 : undefined),
-      workingDaysPerWeek: parseInt(String(fd.get('daysPerWeek') || '5')) || 5,
-      requiredCreditHours: parseInt(String(fd.get('required') || '')) || undefined,
-    });
-    msg = 'Engagement terms saved.';
+    // "Engagement terms saved." used to be printed on the line after the call with nothing between
+    // them. setTermsFor() runs four ALTERs and an UPDATE and reports nothing back, so a rejected
+    // write took the whole page down with a stack trace — and the terms it names are what the
+    // credit requirement is measured against.
+    try {
+      await setTermsFor(id, {
+        kind,
+        weeklyHours: wh ?? (kind === 'full-time' ? 40 : undefined),
+        workingDaysPerWeek: parseInt(String(fd.get('daysPerWeek') || '5')) || 5,
+        requiredCreditHours: parseInt(String(fd.get('required') || '')) || undefined,
+      });
+      msg = 'Engagement terms saved.';
+    } catch (e: any) {
+      console.error('[admin/hr/completion] terms', e?.cause?.message || e?.message);
+      msg = 'The engagement terms were NOT saved: ' + (e?.cause?.message || e?.message || 'unknown error');
+      msgOk = false;
+    }
   } else if (fd.get('_action') === 'review') {
     const note = String(fd.get('note') || '').trim();
     if (!note) { msg = 'A review needs a note. Nothing was saved.'; msgOk = false; }
@@ -85,14 +100,28 @@ const emp = rows(await db.execute(sql`
 if (!emp) return Astro.redirect('/admin/hr/employees');
 
 const terms = await termsFor(id);
-const { summary, days } = await ledgerFor(id, terms);
-const reviews = await reviewsFor(id);
+// `ok` is the whole point of reading these two through the detailed readers. Both used to answer an
+// empty result on a failed read that looked EXACTLY like a genuinely empty one — no attendance, no
+// reviews — and this page then rendered a signed-looking certificate over it: nought credit-hours,
+// nought per cent attendance, and no achievements. A certificate stating figures nobody measured is
+// worse than no certificate, so when either read failed the letter is not rendered at all.
+const ledger = await ledgerFor(id, terms);
+const { summary, days } = ledger;
+const reviewRead = await reviewsForDetailed(id);
+const reviews = reviewRead.reviews;
 const achievements = reviews.filter((r) => (r.rating || 0) >= 4).map((r) => r.note).slice(0, 6);
+
+/** True only when every figure on the letter came from a read that actually happened. */
+const figuresTrustworthy = ledger.ok && reviewRead.ok;
+const readProblem = [ledger.error, reviewRead.error].filter(Boolean).join(' ');
+
+// The last day of the engagement, cut in the zone the company works in. See the import note.
+const letterEndDate = civilToday();
 
 const figures = completionFigures({
   name: emp.full_name, role: emp.designation || '',
   startDate: String(emp.joining_date || '').slice(0, 10),
-  endDate: new Date().toISOString().slice(0, 10),
+  endDate: letterEndDate,
   terms, summary, reviews, achievements,
 });
 const weeksLeft = remainingWeeks(summary, terms);
@@ -109,6 +138,16 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
     <p style="font-size:13px;color:#8a8a94;margin:0 0 16px;">{emp.designation} · joined {String(emp.joining_date || '').slice(0, 10) || 'unknown'}</p>
 
     {msg && <div style={'padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;border:1px solid ' + (msgOk ? '#14532d;background:rgba(20,83,45,0.2);' : 'rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;')}>{msg}</div>}
+
+    {!figuresTrustworthy && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">
+        <strong>The figures below could not be read, so this is not a measurement.</strong>
+        Every number on this page defaults to zero when the read fails, which looks identical to an
+        intern who attended nothing and was never reviewed. The completion letter is withheld for
+        that reason rather than printed over guesses.
+        {readProblem && <span style="display:block;margin-top:6px;color:#f5b1b1;font-family:'Geist Mono',monospace;font-size:11px;">{readProblem}</span>}
+      </div>
+    )}
 
     {termsMissing && (
       <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #b45309;background:rgba(180,83,9,0.14);font-size:13px;line-height:1.55;">
@@ -162,8 +201,14 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
 
     {/* Reviews */}
     <div style={card + 'margin-bottom:16px;'}>
-      <p style="font-size:13px;font-weight:600;margin:0 0 10px;">Reviews ({reviews.length})</p>
-      {reviews.length === 0 && <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;">No reviews recorded yet.</p>}
+      <p style="font-size:13px;font-weight:600;margin:0 0 10px;">Reviews {reviewRead.ok ? '(' + reviews.length + ')' : '(could not be read)'}</p>
+      {!reviewRead.ok && (
+        <p style="font-size:12px;color:#fca5a5;margin:0 0 10px;line-height:1.5;">
+          The recorded reviews could not be read, so this list is empty for a reason that has nothing
+          to do with whether anybody has reviewed this person. Nothing has been lost — do not re-enter them.
+        </p>
+      )}
+      {reviewRead.ok && reviews.length === 0 && <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;">No reviews recorded yet.</p>}
       {reviews.map((r) => (
         <div style="border-top:1px solid #1a1a22;padding:8px 0;">
           <p style="font-size:12px;color:#e8e8ee;margin:0;">{r.note}</p>
@@ -178,14 +223,26 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
       </form>
     </div>
 
-    {/* The letter */}
+    {/* The letter. Withheld entirely when the figures on it were not measured — see the banner
+        above. A certificate is a claim, and printing one over a failed read is making a claim we
+        cannot stand behind, which the header of this file says is the one thing it must not do. */}
+    {!figuresTrustworthy ? (
+      <div style={card}>
+        <p style="font-size:13px;font-weight:600;margin:0 0 6px;">The completion letter is not shown.</p>
+        <p style="font-size:12.5px;color:#8a8a94;margin:0;line-height:1.6;">
+          It states credit-hours, attendance and achievements, and none of those could be read on this
+          request. Reload the page; if it keeps failing, the reason is in the banner above and in the
+          server log, and the letter will render the moment the figures can be measured again.
+        </p>
+      </div>
+    ) : (
     <div style="border:1px solid #2a2a30;border-radius:12px;background:#fff;color:#111;padding:26px;" id="letter">
       <p style="font-family:'Geist Mono',monospace;font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:#a33;margin:0 0 14px;">Certificate of completion</p>
       <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
         This is to certify that <strong>{emp.full_name}</strong> served as
         <strong> {emp.designation}</strong> at EduRankAI from
         <strong> {String(emp.joining_date || '').slice(0, 10) || '—'}</strong> to
-        <strong> {new Date().toISOString().slice(0, 10)}</strong>.
+        <strong> {letterEndDate}</strong>.
       </p>
       <p style="font-size:15px;line-height:1.75;margin:0 0 12px;">
         Over this engagement they completed <strong>{figures.creditHours} credit-hours</strong> of
@@ -208,15 +265,20 @@ const stat = (label: string, value: string, tone = '#e8e8ee') =>
         reviews. One credit-hour represents one hour of verified engagement; a full-time week is 40.
       </p>
     </div>
+    )}
 
-    <div style="display:flex;gap:8px;margin-top:12px;">
-      <button type="button" onclick="window.print()" style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;">Print / save as PDF</button>
-      <span style={`font-size:12px;padding:10px 0;color:${figures.eligible ? '#4ade80' : '#fbbf24'};`}>
-        {figures.eligible ? 'Requirement met.' : 'Requirement not yet met — issuing is your call.'}
-      </span>
-    </div>
+    {figuresTrustworthy && (
+      <div style="display:flex;gap:8px;margin-top:12px;">
+        <button type="button" onclick="window.print()" style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:13px;padding:10px 18px;border-radius:8px;cursor:pointer;">Print / save as PDF</button>
+        <span style={`font-size:12px;padding:10px 0;color:${figures.eligible ? '#4ade80' : '#fbbf24'};`}>
+          {figures.eligible ? 'Requirement met.' : 'Requirement not yet met — issuing is your call.'}
+        </span>
+      </div>
+    )}
     <p style="font-size:11.5px;color:#6e6e78;margin:10px 0 0;">
-      {days.length} attendance day(s) counted. Nothing on the letter is typed by hand.
+      {figuresTrustworthy
+        ? days.length + ' attendance day(s) counted. Nothing on the letter is typed by hand.'
+        : 'No attendance day was counted, because the attendance ledger could not be read.'}
     </p>
   </div>
 </AdminLayout>

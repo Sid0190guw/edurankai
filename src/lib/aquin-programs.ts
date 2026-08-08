@@ -89,6 +89,20 @@ function slugify(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
 }
 
+/**
+ * THE FAILURE THAT LOOKED LIKE AN EMPTY CATALOGUE.
+ *
+ * ensureProgramsSchema() ended in `catch (_) { _ready = null; }` and seedPrograms() in
+ * `catch (_) {}`, with nothing logged by either. listPrograms() then ran its SELECT against a table
+ * that might not exist, and /aquintutor/programs rendered a catalogue with no programmes in it and
+ * no message — pixel-identical to "nothing has been published yet". The programme portfolio is the
+ * university model's public face; "we publish nothing" is not a sentence to say by accident.
+ *
+ * Both now log the real reason (e.cause, not e.message, which is only the failed SQL), and
+ * listPrograms() reports whether it actually looked.
+ */
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
 let _ready: Promise<void> | null = null;
 export function ensureProgramsSchema(): Promise<void> {
   if (_ready) return _ready;
@@ -109,9 +123,17 @@ export function ensureProgramsSchema(): Promise<void> {
         sort_order INT NOT NULL DEFAULT 0,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
       await db.execute(sql`CREATE INDEX IF NOT EXISTS aquin_programs_model_idx ON aquin_programs (delivery_model, sort_order)`);
-    } catch (_) { _ready = null; }
+    } catch (e: any) {
+      // Dropped from the cache so the next request retries, and NAMED so the empty catalogue that
+      // follows is explicable to whoever is looking at the logs.
+      console.error('[aquin-programs] ensureProgramsSchema', reasonOf(e));
+      _ready = null;
+      throw e;
+    }
   })();
-  return _ready;
+  // Swallowed here only so existing callers keep their tolerate-missing-schema behaviour; the reason
+  // is already logged and listPrograms() below reports the failure to the page.
+  return _ready.catch(() => {});
 }
 
 /** Idempotent seed — inserts the portfolio once; safe to call on every page load (skips if present). */
@@ -132,7 +154,11 @@ export async function seedPrograms(): Promise<void> {
         VALUES (${slugify(r.name)}, ${r.name}, 'Bachelor', ${r.discipline}, 5, 60, 'Accredited teaching hospitals / regulated partners', true, ${r.note}, ${order++})
         ON CONFLICT (slug) DO NOTHING`);
     }
-  } catch (_) { /* seeding is best-effort; the page still renders the taxonomy */ }
+  } catch (e: any) {
+    // Best-effort by design — a seed failure must not take the page down — but never silent. An
+    // unseeded catalogue and a published-nothing catalogue look identical on screen.
+    console.error('[aquin-programs] seedPrograms', reasonOf(e));
+  }
 }
 
 export interface Program {
@@ -147,9 +173,34 @@ function toProgram(r: any): Program {
   };
 }
 
+export type ProgramsResult =
+  | { ok: true; programs: Program[] }
+  | { ok: false; reason: string };
+
+/**
+ * The published portfolio, with the read's own outcome attached.
+ *
+ * This used to throw out of the page (or, with the swallowed schema-ensure above it, return nothing
+ * at all) and the catalogue rendered empty. An empty catalogue is a claim — "we publish no
+ * programmes" — and it must never be made by a failed query.
+ */
+export async function listProgramsResult(): Promise<ProgramsResult> {
+  try {
+    await seedPrograms();
+    const r = rows(await db.execute(sql`SELECT * FROM aquin_programs WHERE is_published = true ORDER BY regulated ASC, delivery_model ASC, sort_order ASC`));
+    return { ok: true, programs: r.map(toProgram) };
+  } catch (e: any) {
+    const reason = reasonOf(e);
+    console.error('[aquin-programs] listPrograms', reason);
+    return { ok: false, reason };
+  }
+}
+
+/** Kept for callers that only want the rows. Prefer listProgramsResult() on any page that renders
+ *  an empty state, so a read failure is not printed as "nothing is published". */
 export async function listPrograms(): Promise<Program[]> {
-  await seedPrograms();
-  return rows(await db.execute(sql`SELECT * FROM aquin_programs WHERE is_published = true ORDER BY regulated ASC, delivery_model ASC, sort_order ASC`)).map(toProgram);
+  const r = await listProgramsResult();
+  return r.ok ? r.programs : [];
 }
 
 export async function getProgram(slug: string): Promise<Program | null> {
@@ -181,10 +232,19 @@ export function deliveryBreakdown(p: Program): { digital: string; practical: str
 }
 
 /** Programs grouped by delivery model (virtual first), plus a separate regulated/hybrid bucket. */
-export async function programsByModel(): Promise<{ virtual: { model: DeliveryModel; programs: Program[] }[]; regulated: Program[] }> {
-  const all = await listPrograms();
+/**
+ * `ok` travels with the grouping so /aquintutor/programs can distinguish "no programme is published"
+ * from "the catalogue could not be read". The page used to wrap this whole call in
+ * `catch (e) { /* renders the taxonomy even if the DB is unavailable *\/ }` and then render the
+ * delivery-model taxonomy with zero programmes under it, which reads as a portfolio we have not
+ * filled in rather than one we could not load.
+ */
+export async function programsByModel(): Promise<{ ok: boolean; reason?: string; virtual: { model: DeliveryModel; programs: Program[] }[]; regulated: Program[] }> {
+  const res = await listProgramsResult();
+  if (!res.ok) return { ok: false, reason: res.reason, virtual: [], regulated: [] };
+  const all = res.programs;
   const virtual = DELIVERY_MODELS.map((model) => ({ model, programs: all.filter((p) => !p.regulated && p.deliveryModel === model.n) }))
     .filter((g) => g.programs.length > 0);
   const regulated = all.filter((p) => p.regulated);
-  return { virtual, regulated };
+  return { ok: true, virtual, regulated };
 }

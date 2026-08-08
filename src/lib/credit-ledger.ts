@@ -25,26 +25,45 @@ const iso = (d: any): string => {
   return s.slice(0, 10);
 };
 
+/** The real Postgres reason is on `e.cause`; `e.message` is only the SQL that failed. */
+const logFail = (tag: string, e: any) =>
+  console.error('[credit-ledger] ' + tag, e?.cause?.message || e?.message);
+
+const errText = (e: any, fallback: string): string =>
+  String(e?.cause?.message || e?.message || fallback).slice(0, 300);
+
 /** Approved leave, with whether it was notified before it started. */
 interface LeaveWindow { start: string; end: string; noticeGivenAt: string | null; }
 
+/**
+ * Approved leave windows for one employee.
+ *
+ * THIS MUST NOT SWALLOW, AND FOR ONCE AN EMPTY RESULT IS ACTIVELY DANGEROUS RATHER THAN MERELY
+ * UNINFORMATIVE. It was `catch { return [] }`. Read statusFor() below with that in mind: an empty
+ * leave list does not produce "we do not know", it produces `unauthorised-leave` for EVERY stored
+ * on_leave and absent day. So one transient pooler error turned a person's authorised, approved,
+ * properly-notified leave into a page of unauthorised absences — on the offboarding report and on
+ * the completion letter, the document this product exists to let somebody show a university or an
+ * employer. Nothing was logged and nothing on screen differed.
+ *
+ * It now throws. ledgerFor() catches, says so, and returns a result marked `ok: false` — because a
+ * figure that could not be read must not be rendered as a figure that was.
+ */
 async function approvedLeave(employeeId: string): Promise<LeaveWindow[]> {
-  try {
-    return rows(await db.execute(sql`
-      SELECT start_date, end_date, requested_at
-      FROM hr_leave_request
-      WHERE employee_id = ${employeeId} AND status = 'approved'
-      ORDER BY start_date ASC`)).map((r: any) => {
-        const start = iso(r.start_date);
-        const requested = iso(r.requested_at);
-        return {
-          start,
-          end: iso(r.end_date),
-          // Strictly before: a request filed on the morning of the absence is not prior notice.
-          noticeGivenAt: requested && start && requested < start ? requested : null,
-        };
-      });
-  } catch { return []; }
+  return rows(await db.execute(sql`
+    SELECT start_date, end_date, requested_at
+    FROM hr_leave_request
+    WHERE employee_id = ${employeeId} AND status = 'approved'
+    ORDER BY start_date ASC`)).map((r: any) => {
+      const start = iso(r.start_date);
+      const requested = iso(r.requested_at);
+      return {
+        start,
+        end: iso(r.end_date),
+        // Strictly before: a request filed on the morning of the absence is not prior notice.
+        noticeGivenAt: requested && start && requested < start ? requested : null,
+      };
+    });
 }
 
 const covers = (w: LeaveWindow, date: string) => !!w.start && date >= w.start && date <= (w.end || w.start);
@@ -80,6 +99,15 @@ export interface LedgerResult {
   summary: CreditSummary;
   days: AttendanceDay[];
   weeksRemaining: number | null;
+  /**
+   * FALSE MEANS THE FIGURES BELOW ARE NOT A MEASUREMENT. Zero attendance and unreadable attendance
+   * are different facts and a screen must be able to tell them apart; every one of these fields is
+   * a plausible-looking zero when the read failed. Added rather than replacing anything, so callers
+   * that destructure `{ summary, days }` keep working untouched.
+   */
+  ok: boolean;
+  /** The real Postgres reason, for a screen that wants to say WHY rather than only THAT. */
+  error: string | null;
 }
 
 /**
@@ -108,8 +136,10 @@ function toDays(attRows: any[], leave: LeaveWindow[]): AttendanceDay[] {
  * requirement — and guessing them would misstate what someone signed up to.
  */
 export async function ledgerFor(employeeId: string, terms: EngagementTerms): Promise<LedgerResult> {
-  const empty: LedgerResult = { summary: summarise([], terms), days: [], weeksRemaining: null };
-  if (!employeeId) return empty;
+  const empty = (ok: boolean, error: string | null): LedgerResult =>
+    ({ summary: summarise([], terms), days: [], weeksRemaining: null, ok, error });
+  // No employee is a genuine "nothing to count", not a failed read.
+  if (!employeeId) return empty(true, null);
   try {
     const leave = await approvedLeave(employeeId);
     const att = rows(await db.execute(sql`
@@ -119,9 +149,12 @@ export async function ledgerFor(employeeId: string, terms: EngagementTerms): Pro
 
     const days = toDays(att, leave);
     const summary = summarise(days, terms);
-    return { summary, days, weeksRemaining: remainingWeeks(summary, terms) };
-  } catch {
-    return empty;
+    return { summary, days, weeksRemaining: remainingWeeks(summary, terms), ok: true, error: null };
+  } catch (e: any) {
+    // WAS a bare `catch { return empty }`: no log, and a zeroed summary that reads on screen as an
+    // intern who turned up on no day at all. Both halves of that were wrong.
+    logFail('ledgerFor', e);
+    return empty(false, errText(e, 'The attendance ledger could not be read.'));
   }
 }
 
@@ -147,7 +180,12 @@ export async function ledgerForMany(
   const out = new Map<string, LedgerResult>();
   const wanted = input.filter((i) => i && i.employeeId);
   for (const i of wanted) {
-    out.set(String(i.employeeId), { summary: summarise([], i.terms), days: [], weeksRemaining: null });
+    // Seeded as NOT ok: until the two reads below succeed, these zeros are a placeholder and not a
+    // measurement. The success path overwrites each entry with ok: true.
+    out.set(String(i.employeeId), {
+      summary: summarise([], i.terms), days: [], weeksRemaining: null,
+      ok: false, error: 'The attendance ledger has not been read yet.',
+    });
   }
   if (!wanted.length) return out;
 
@@ -190,14 +228,16 @@ export async function ledgerForMany(
       const key = String(employeeId);
       const days = toDays(attBy.get(key) || [], leaveBy.get(key) || []);
       const summary = summarise(days, terms);
-      out.set(key, { summary, days, weeksRemaining: remainingWeeks(summary, terms) });
+      out.set(key, { summary, days, weeksRemaining: remainingWeeks(summary, terms), ok: true, error: null });
     }
     return out;
   } catch (e: any) {
-    // Every employee is already seeded with an empty summary above, so a failure here reads as
-    // "nothing recorded" rather than dropping people off the list entirely. The caller is expected
-    // to say on screen that the figures could not be read.
-    console.error('[credit-ledger] ledgerForMany', e?.cause?.message || e?.message);
+    // Every employee is already seeded above, and seeded with ok:false — so a failure here reads as
+    // "could not be read" rather than as "nothing recorded", which are different facts and were
+    // indistinguishable while the seed claimed to be a measurement.
+    logFail('ledgerForMany', e);
+    const why = errText(e, 'The attendance ledger could not be read.');
+    for (const [k, v] of out) out.set(k, { ...v, ok: false, error: why });
     return out;
   }
 }
@@ -260,7 +300,14 @@ export async function termsFor(employeeId: string): Promise<EngagementTerms> {
       FROM hr_employees WHERE id = ${employeeId} LIMIT 1`))[0];
     if (!r) return fallback;
     return termsFromRow(r);
-  } catch { return fallback; }
+  } catch (e: any) {
+    // The fallback claims full-time, 40 hours. That is a CONTRACT being invented by a failed read,
+    // and on a part-timer it inflates the denominator of every attendance percentage on the
+    // completion letter. It stays (there is no shape to return instead), but it is no longer
+    // silent — this was a bare `catch { return fallback }`.
+    logFail('termsFor', e);
+    return fallback;
+  }
 }
 
 export async function setTermsFor(employeeId: string, t: EngagementTerms): Promise<void> {
@@ -274,9 +321,23 @@ export async function setTermsFor(employeeId: string, t: EngagementTerms): Promi
     WHERE id = ${employeeId}`);
 }
 
-/** Reviews recorded against an employee, newest first, for the offboarding report. */
-export async function reviewsFor(employeeId: string): Promise<ReviewEntry[]> {
-  if (!employeeId) return [];
+export interface ReviewsRead {
+  ok: boolean;
+  error: string | null;
+  reviews: ReviewEntry[];
+}
+
+/**
+ * Reviews recorded against an employee, newest first, WITH whether the read happened.
+ *
+ * WHY THE FLAG MATTERS HERE SPECIFICALLY: /admin/hr/completion/[id] turns every review rated 4 or
+ * above into the achievements PRINTED ON THE COMPLETION CERTIFICATE. reviewsFor() answered `[]` on
+ * a failed read exactly as it answers `[]` for somebody nobody has reviewed, and said nothing in
+ * the log either — so a certificate could go out with a person's achievements quietly missing and
+ * the only visible difference was a shorter list nobody could compare against anything.
+ */
+export async function reviewsForDetailed(employeeId: string): Promise<ReviewsRead> {
+  if (!employeeId) return { ok: true, error: null, reviews: [] };
   try {
     // Self-bootstrapping so the feature works before any migration is run by hand.
     await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_reviews (
@@ -291,7 +352,7 @@ export async function reviewsFor(employeeId: string): Promise<ReviewEntry[]> {
     )`).catch(() => {});
     await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_reviews_emp_idx ON hr_reviews (employee_id, created_at DESC)`).catch(() => {});
 
-    return rows(await db.execute(sql`
+    const reviews = rows(await db.execute(sql`
       SELECT created_at, reviewer_name, rating, note FROM hr_reviews
       WHERE employee_id = ${employeeId} ORDER BY created_at DESC LIMIT 200`))
       .map((r: any) => ({
@@ -300,7 +361,19 @@ export async function reviewsFor(employeeId: string): Promise<ReviewEntry[]> {
         rating: r.rating == null ? null : Number(r.rating),
         note: r.note || '',
       }));
-  } catch { return []; }
+    return { ok: true, error: null, reviews };
+  } catch (e: any) {
+    logFail('reviewsFor', e);
+    return { ok: false, error: errText(e, 'The recorded reviews could not be read.'), reviews: [] };
+  }
+}
+
+/**
+ * The list on its own, for callers that only render it and have nothing to say about a failed read.
+ * Prefer reviewsForDetailed() anywhere the ABSENCE of a review changes what a document claims.
+ */
+export async function reviewsFor(employeeId: string): Promise<ReviewEntry[]> {
+  return (await reviewsForDetailed(employeeId)).reviews;
 }
 
 /** Everything the completion letter and offboarding report state, in one call. */
