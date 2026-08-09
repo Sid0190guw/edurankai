@@ -699,7 +699,10 @@ async function coverageRow(
   if (direct) {
     const assertion = assertionForSkillSource(direct.source);
     const citation: EvidenceCitation = {
-      kind: assertion === 'verified' ? 'Checked record' : 'Statement',
+      // 'factual', not 'verified': assertionForSkillSource() returns the platform's own record of a
+      // completion or a passed assessment. No human verified anything here, and the word for a row
+      // this platform wrote about its own act is a recorded fact.
+      kind: assertion === 'factual' ? 'Record this platform holds' : 'Statement',
       label: direct.evidence
         || (SKILL_LEVEL_LABELS[direct.level] || String(direct.level)) + ' in ' + req.skillName
           + ', recorded by ' + skillSourceActor(direct.source) + '.',
@@ -708,7 +711,7 @@ async function coverageRow(
       at: direct.at,
     };
     const short = req.minLevel !== null && direct.level < req.minLevel;
-    const status: CoverageStatus = assertion === 'verified' ? 'evidenced' : 'stated';
+    const status: CoverageStatus = assertion === 'factual' ? 'evidenced' : 'stated';
     const band: CoverageBand = status === 'evidenced' ? (short ? 'partial' : 'strong') : 'partial';
     return {
       ...base,

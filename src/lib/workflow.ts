@@ -311,6 +311,28 @@ export const WORKFLOW_DOMAINS = [
   // eventually disagree about who plans an intern's week.
   // ---------------------------------------------------------------------------------------------
   'schedule',
+  // ---------------------------------------------------------------------------------------------
+  // A FEE WAIVER ON A PAID COURSE. src/lib/course-waiver.ts.
+  //
+  // THE SUBJECT OF THIS ONE IS NOT AN EMPLOYEE, AND USUALLY IS NOBODY THIS COMPANY KNOWS. A learner
+  // who cannot afford a course fee asks for it to be waived. They have no manager, no department and
+  // no hr_employees row, so THERE IS NO EDGE IN THE ORGANIZATION GRAPH THAT COULD ROUTE THIS. Every
+  // other domain in this list routes off a relationship because every other domain is about somebody
+  // who works here.
+  //
+  // WHY IT IS STILL IN THIS FILE RATHER THAN DECIDED INSIDE THE WAIVER MODULE. It is an approval:
+  // somebody asks, somebody with authority answers, and the answer has to be recorded with who, when
+  // and why. This codebase has exactly one engine for that, and a second one living in
+  // src/lib/course-waiver.ts would be the parallel approval system every comment above refuses.
+  //
+  // WHAT ROUTES IT INSTEAD — read `subjectOptional` on DomainDefinition below before changing any of
+  // this. The rung is the fee-waiver APPROVAL OWNER, resolved org-wide from the graph; where the
+  // organisation has recorded nobody, the step is written against THE DESK rather than against a
+  // person: no approver id, decidable only by a holder of the domain's standing capability
+  // (`learning.waiver.grant`). That is not an auto-approval and it is not a halt — it is the honest
+  // answer to "who decides a request from somebody outside the company", and the alternative is a
+  // queue of learners' requests that nothing in this system could ever answer.
+  'fee_waiver',
 ] as const;
 
 export type WorkflowDomain = (typeof WORKFLOW_DOMAINS)[number];
@@ -540,6 +562,31 @@ interface DomainDefinition {
    * a one-line, reviewable policy decision in permissions.ts; it is not this engine's to make.
    */
   capability: Permission | null;
+  /**
+   * THE SUBJECT OF THIS DOMAIN IS NOT NECESSARILY AN EMPLOYEE. Default false, and it must stay false
+   * for every domain about somebody who works here.
+   *
+   * Set on exactly one domain today (`fee_waiver`) and only ever legitimate where the requester is
+   * outside the organisation altogether — a learner, an applicant, a member of the public. For those
+   * people the Organization Graph holds NO row, so there is no reporting manager and no department
+   * head to walk to; asking for one produces the halt sentence "this request is not linked to an
+   * employee record", which is true and useless, forever.
+   *
+   * THREE THINGS FOLLOW, AND ALL THREE ARE ENFORCED IN resolveRoute():
+   *
+   *   1. ONLY `approval_owner` RUNGS ARE LEGAL. reporting_manager, department_head and
+   *      executive_sponsor are all resolved relative to a subject employee; declaring one on a
+   *      subject-optional domain is a programming error and halts rather than quietly resolving
+   *      somebody else's manager.
+   *   2. THE DOMAIN MUST DECLARE A `capability`. Without a subject there is no relationship, so the
+   *      standing authority is the ONLY authority — a subject-optional domain with capability null
+   *      would produce requests literally nobody in the product could decide.
+   *   3. WHERE THE APPROVAL OWNER IS UNRECORDED THE STEP IS WRITTEN AGAINST THE DESK: approver ids
+   *      NULL, and mayAct() admits only arm 3, the standing capability. It is not approved, it is
+   *      not skipped, and it does not appear on any individual's routed queue — it sits pending on
+   *      the domain's own console until a holder of that capability decides it.
+   */
+  subjectOptional?: boolean;
   route: RouteRule[];
   /**
    * Hours a pending step may sit before escalateStep() will consider it overdue. Escalation is never
@@ -1040,6 +1087,38 @@ const DOMAINS: Record<WorkflowDomain, DomainDefinition> = {
     approvalUrl: '/portal/employee/schedule/approvals',
     requesterUrl: '/portal/employee/schedule',
   },
+
+  // ===============================================================================================
+  // A COURSE FEE WAIVER. THE ONLY SUBJECT-OPTIONAL DOMAIN. See WORKFLOW_DOMAINS and `subjectOptional`
+  // on DomainDefinition above; both explain why this one cannot be routed off a relationship.
+  //
+  // ONE RUNG, AND IT IS THE APPROVAL OWNER. An `approval_owner` edge scoped to the domain
+  // 'fee_waiver' names the person who reads these requests, exactly as `benefits` does. It is
+  // REQUIRED rather than optional, which for a subject-optional domain means: resolve the owner if
+  // one is recorded, otherwise write the step against the desk. It never halts, because halting
+  // would mean a learner's request sits with a sentence about an organisation chart they are not in.
+  //
+  // capability: 'learning.waiver.grant' — the domain's standing authority, and the one the phase
+  // brief requires. It exists in src/lib/auth/permissions.ts (the union AND PERMS_BY_ROLE) and in
+  // registry.ts BUILTIN_PERMISSIONS, where it is marked sensitive. A key outside the union is a
+  // permanent 403, and a key that only Layer 2 knows about is a permanent silent refusal.
+  //
+  // WHAT THIS CAPABILITY STILL CANNOT DO: decide the holder's OWN request. src/lib/course-waiver.ts
+  // refuses that before this engine is asked anything, and resolveRoute()'s `seen` set separately
+  // prevents an employee-subject request from ever being routed to its own subject.
+  //
+  // A DECLINE IS A DECISION, NOT A DISAPPEARANCE. `rejected` is terminal here as everywhere, and the
+  // waiver module writes the reason onto the request so the person who asked can read it.
+  fee_waiver: {
+    key: 'fee_waiver',
+    label: 'Course fee waiver',
+    capability: 'learning.waiver.grant',
+    subjectOptional: true,
+    route: [{ step: 1, via: 'approval_owner' }],
+    escalateAfterHours: 120,
+    approvalUrl: '/admin/course-waivers',
+    requesterUrl: '/portal/course-waivers',
+  },
 };
 
 /** The chain a domain uses, for a screen that wants to explain the process before anything starts. */
@@ -1082,6 +1161,19 @@ export interface RoutePlan {
   approvers: ResolvedApprover[];
   /** Present exactly when ok is false. A sentence, rendered verbatim. */
   haltReason: string | null;
+  /**
+   * A STEP OWED BY A DESK RATHER THAN BY A NAMED PERSON.
+   *
+   * Only ever set for a `subjectOptional` domain (today: `fee_waiver`) whose approval owner is not
+   * recorded in the Organization Graph. The step is written with NO approver ids, so mayAct() can
+   * only admit arm 3 — the domain's standing capability — and pendingForApprover() will never put it
+   * on anybody's personal queue, because it is nobody's personally.
+   *
+   * NULL EVERYWHERE ELSE. A domain about an employee whose rung resolves nobody HALTS, and that must
+   * not change: "we could not find this person's manager" has an answer (record the relationship),
+   * whereas "this learner has no manager" never will.
+   */
+  desk?: { step: number; via: RouteVia } | null;
 }
 
 export interface WorkflowStepRow {
@@ -1268,6 +1360,101 @@ function missingRungReason(via: RouteVia, subjectName: string): string {
 }
 
 /**
+ * ROUTING FOR A REQUEST WHOSE SUBJECT IS NOT AN EMPLOYEE — a learner asking for a course fee to be
+ * waived. See `subjectOptional` on DomainDefinition for the three rules this enforces.
+ *
+ * It resolves ONE kind of rung: the domain-scoped approval owner, org-wide, from the Organization
+ * Graph. It walks no reporting line, because the person who asked is not on one.
+ *
+ * IT NEVER HALTS FOR LACK OF AN OWNER, and that is the single difference from resolveRoute(). A halt
+ * is the right answer when a relationship is MISSING and could be recorded; there is no relationship
+ * to record between this company and a member of the public, so a halt here would be a permanent
+ * dead end dressed up as a data problem. Instead the step is owed by the desk that holds the
+ * domain's standing capability. Nothing is approved, nothing is skipped, and only a holder of that
+ * capability can decide it.
+ *
+ * It DOES halt if the domain is misdeclared — a non-approval-owner rung, or no capability at all —
+ * because both of those are programming errors that would otherwise produce a request nobody in the
+ * product could ever decide.
+ *
+ * Declared ABOVE its only caller. `const` is not hoisted on this project and function order is kept
+ * readable for the same reason.
+ */
+async function resolveDeskRoute(
+  domain: WorkflowDomain,
+  def: DomainDefinition,
+  asOf: Date | null,
+): Promise<RoutePlan> {
+  if (!def.capability) {
+    return {
+      ok: false,
+      initialized: false,
+      approvers: [],
+      desk: null,
+      haltReason: HALT_PREFIX + 'this kind of request has no desk recorded that may decide it',
+    };
+  }
+
+  // Whether the graph has any rows at all. It cannot change the outcome here — this route does not
+  // depend on the requester being in it — but the field means one specific thing to the screens that
+  // read it, and answering it with a guess would be the first lie in a chain of them.
+  let initialized = false;
+  try { initialized = await isInitialized(); } catch (e: any) { logFail('resolveDeskRoute.isInitialized', e); }
+
+  const approvers: ResolvedApprover[] = [];
+  let desk: { step: number; via: RouteVia } | null = null;
+
+  for (const rule of def.route) {
+    if (rule.via !== 'approval_owner') {
+      return {
+        ok: false,
+        initialized,
+        approvers: [],
+        desk: null,
+        haltReason: HALT_PREFIX + 'this request was not raised by an employee, so it cannot be sent up a reporting line',
+      };
+    }
+
+    let owner: OrgPerson | null = null;
+    try {
+      owner = await getApprovalOwner(domain, asOf ? { asOf } : undefined);
+    } catch (e: any) {
+      // FAILS TO THE DESK, NOT TO NOBODY. A query that could not run must not silently produce an
+      // unrouted request; the desk still owes the decision either way.
+      logFail('resolveDeskRoute.getApprovalOwner', e);
+      owner = null;
+    }
+
+    if (owner?.employeeId) {
+      approvers.push({
+        step: rule.step,
+        mode: 'sequential',
+        via: 'approval_owner',
+        employeeId: owner.employeeId,
+        userId: owner.userId || null,
+        fullName: owner.fullName || null,
+        designation: owner.designation || null,
+      });
+    } else if (!desk) {
+      desk = { step: rule.step, via: 'approval_owner' };
+    }
+  }
+
+  if (approvers.length === 0 && !desk) {
+    return {
+      ok: false,
+      initialized,
+      approvers: [],
+      desk: null,
+      haltReason: HALT_PREFIX + 'this kind of request has no rung to route',
+    };
+  }
+
+  approvers.sort((a, b) => a.step - b.step);
+  return { ok: true, initialized, approvers, desk, haltReason: null };
+}
+
+/**
  * WHO APPROVES THIS REQUEST, RIGHT NOW. The routing question, and only the routing question.
  *
  * This says nothing about whether the people it names MAY approve — that is mayAct(), Layer 2, asked
@@ -1299,6 +1486,17 @@ export async function resolveRoute(
   if (!def) {
     return { ok: false, initialized: false, approvers: [], haltReason: HALT_PREFIX + 'unknown request type' };
   }
+  // A REQUEST FROM SOMEBODY WHO IS NOT IN THIS ORGANISATION AT ALL.
+  //
+  // Asked BEFORE the employee test below, because for these domains the absence of an employee
+  // record is the ordinary case rather than a fault. Everything else in this function is unchanged
+  // and unreachable from here: a subject-optional domain that IS given a real employee id falls
+  // through to the normal relationship routing, which is what should happen when an employee asks
+  // for a course fee to be waived.
+  if (def.subjectOptional && !isUuid(subjectEmployeeId)) {
+    return resolveDeskRoute(domain, def, opts.asOf ?? null);
+  }
+
   if (!isUuid(subjectEmployeeId)) {
     return { ok: false, initialized: false, approvers: [], haltReason: HALT_NO_EMPLOYEE };
   }
@@ -1857,8 +2055,15 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<Workflow
   const recordId = String(input?.recordId || '').trim();
   if (!recordId) return { ok: false, error: 'That request has no id to attach an approval to.' };
 
-  const subject = String(input?.subjectEmployeeId || '').trim();
-  if (!isUuid(subject)) return { ok: false, error: 'That request is not linked to an employee record.' };
+  // THE SUBJECT IS REQUIRED FOR EVERY DOMAIN ABOUT SOMEBODY WHO WORKS HERE, and optional for the one
+  // domain whose requester is a member of the public — see `subjectOptional` on DomainDefinition. The
+  // test is the domain's own declaration, never the caller's word for it: a leave request arriving
+  // with no employee id is still refused exactly as before.
+  const subjectRaw = String(input?.subjectEmployeeId || '').trim();
+  const subject: string | null = isUuid(subjectRaw) ? subjectRaw : null;
+  if (!subject && !DOMAINS[domain].subjectOptional) {
+    return { ok: false, error: 'That request is not linked to an employee record.' };
+  }
 
   const requestedBy = isUuid(input?.requestedByUserId) ? String(input.requestedByUserId) : null;
   const createdBy = isUuid(input?.createdByUserId) ? String(input.createdByUserId) : null;
@@ -1880,8 +2085,15 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<Workflow
       };
     }
 
-    const plan = await resolveRoute(domain, subject, { amount, currency });
+    const plan = await resolveRoute(domain, subject || '', { amount, currency });
     const state: WorkflowState = plan.ok ? 'pending' : 'halted';
+
+    // WHICH STEP IS LIVE THE MOMENT THIS IS CREATED. It used to be `plan.approvers[0].step`, which is
+    // correct for every routed plan and throws on a desk-only one (no named approvers, one step owed
+    // by the desk). Declared here, above the insert that reads it — `const` is not hoisted.
+    const firstStep = plan.ok
+      ? (plan.approvers.length ? plan.approvers[0].step : (plan.desk?.step || 1))
+      : 1;
 
     // draft -> pending / draft -> halted. Asked rather than assumed, so this file has exactly one
     // definition of which state changes are legal and every write goes through it.
@@ -1900,7 +2112,7 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<Workflow
          halt_reason, summary, amount, currency, created_by)
       VALUES
         (${domain}, ${recordId}, ${subject}::uuid, ${requestedBy}::uuid, ${state},
-         ${plan.ok ? plan.approvers[0].step : 1}, ${plan.haltReason}::text, ${summary}::text,
+         ${firstStep}, ${plan.haltReason}::text, ${summary}::text,
          ${amount}::numeric, ${currency}::text, ${createdBy}::uuid)
       ON CONFLICT DO NOTHING
       RETURNING id`));
@@ -1936,6 +2148,22 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<Workflow
              NOW() + (${dueHours} * INTERVAL '1 hour'))
           ON CONFLICT DO NOTHING`);
       }
+
+      // THE DESK STEP. One row, no approver ids, and only for a subject-optional domain whose
+      // approval owner is unrecorded (see resolveDeskRoute). mayAct() cannot admit anybody through
+      // arms 1 or 2 against a step with no approver, so the ONLY way this is decided is the domain's
+      // standing capability — which is precisely what "the desk decides it" has to mean if it is not
+      // to become "anybody decides it".
+      if (plan.desk) {
+        await db.execute(sql`
+          INSERT INTO workflow_steps
+            (instance_id, step_no, mode, via, approver_employee_id, approver_user_id, decision, due_at)
+          VALUES
+            (${instanceId}::uuid, ${plan.desk.step}, 'sequential', ${plan.desk.via},
+             NULL, NULL, 'pending',
+             NOW() + (${dueHours} * INTERVAL '1 hour'))
+          ON CONFLICT DO NOTHING`);
+      }
     }
 
     const created = await getInstance(instanceId);
@@ -1958,6 +2186,7 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<Workflow
       state,
       haltReason: plan.haltReason,
       route: plan.approvers.map((a) => ({ step: a.step, via: a.via, employeeId: a.employeeId })),
+      desk: plan.desk ? { step: plan.desk.step, via: plan.desk.via, capability: DOMAINS[domain].capability } : null,
     });
 
     return { ok: true, instanceId, state, changed: true, haltReason: plan.haltReason };
@@ -2491,8 +2720,35 @@ async function settleDomainRecord(
   state: 'approved' | 'rejected',
   actorId: string | null,
 ): Promise<void> {
-  if (instance.domain !== 'leave') return;
   if (!instance.recordId) return;
+
+  // A COURSE FEE WAIVER SETTLES WHEREVER IT WAS DECIDED.
+  //
+  // Same shape and same reason as the leave arm below: the decision can be taken from the waiver
+  // console, or from any surface that calls decideStep()/decideInstance(), and the REQUEST ITSELF has
+  // to end up carrying the outcome either way. A settlement that only ran on one of those doors is
+  // how a decided request keeps showing as "under review" to the person waiting on it.
+  //
+  // The waiver module owns the write, including the percentage granted and the reason; this file
+  // does not know what a partial waiver is and must not learn.
+  if (instance.domain === 'fee_waiver') {
+    try {
+      const { settleCourseWaiverFromWorkflow } = await import('@/lib/course-waiver');
+      const settled = await settleCourseWaiverFromWorkflow(instance.recordId, state, actorId, instance.id);
+      if (!settled.settled) return;
+      await auditWorkflow(actorId, 'settle.fee_waiver', instance.id, {
+        recordId: instance.recordId,
+        state,
+        grantPct: settled.grantPct ?? null,
+        warning: settled.warning || null,
+      });
+    } catch (e: any) {
+      logFail('settleDomainRecord.fee_waiver', e);
+    }
+    return;
+  }
+
+  if (instance.domain !== 'leave') return;
   try {
     // THE SETTLEMENT ITSELF BELONGS TO THE LEAVE MODULE, AND IT IS ONE FUNCTION RATHER THAN TWO.
     //

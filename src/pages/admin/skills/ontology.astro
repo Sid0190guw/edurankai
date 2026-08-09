@@ -1,0 +1,923 @@
+---
+// /admin/skills/ontology — THE SKILL GRAPH, BROWSABLE AND EXTENDABLE.
+//
+// =================================================================================================
+// WHAT THIS SCREEN IS
+// =================================================================================================
+//
+// src/lib/skill-ontology.ts has existed with no surface. Every edge in it, every alias, the starter
+// set and the whole divergence report were reachable only from other modules, which means an
+// administrator could not see what the graph says about a skill, could not correct an edge somebody
+// typed the wrong way round, and could not tell whether the graph was empty or simply never set up.
+// This page is that surface and it writes NOTHING of its own: every read and every write below is a
+// function that module already exports. There is no second ontology here.
+//
+// =================================================================================================
+// THE GATE
+// =================================================================================================
+//
+// `skills.administer`, asked with can() — PERMS_BY_ROLE only, never the registry, because page_key
+// is free text and a hand-typed custom-role row could otherwise spell the same string. Both keys
+// used here already exist in the Permission union, in PERMS_BY_ROLE and in registry.ts
+// BUILTIN_PERMISSIONS; nothing was invented for this page, which matters because a key outside the
+// union answers false for every role including super_admin and is a permanent 403.
+//
+//   skills.administer   maintain the graph: assert and remove an edge, record another name.
+//                       super_admin and hr.
+//   skills.manage       the catalogue itself: add a skill. Asked separately, so somebody who
+//                       curates the graph cannot quietly acquire the front door to the catalogue.
+//
+// Editing an ontology that decides what a person is credited with knowing is a sensitive act: an
+// edge here is what lets a screen say somebody has some SQL because they recorded PostgreSQL.
+//
+// =================================================================================================
+// WHY THERE IS NO MERGE BUTTON
+// =================================================================================================
+//
+// The spec for this page asked for merging a synonym into a canonical node, and said that if the
+// module cannot merge without losing evidence, the page must say so instead of offering it. It
+// cannot. mergeSkills() in src/lib/skill-graph.ts is careful and well-reasoned, and it still
+// destroys evidence in four separate places — each one named on the page, in full, beside a
+// read-only preview of exactly what a merge WOULD do. The lossless half of a merge, recording the
+// other spelling as another name for the canonical node, is offered and does the job for a synonym
+// that is not already its own catalogue row. Where it is, the page says there is no clean route
+// today rather than offering a button that eats somebody's evidence link.
+//
+// =================================================================================================
+// THREE STATES, EVERYWHERE
+// =================================================================================================
+//
+// not-configured, genuinely-empty and could-not-read are three different sentences on this page and
+// never share one. The graph tables are asked of information_schema rather than assumed from
+// ensureSkillOntologySchema() returning, because ensureOnce swallows and a returned ensure proves
+// only that a promise settled. The catalogue list is cross-checked against a COUNT from the same
+// database: a list that comes back empty while the count says there are skills is a failed read,
+// not an empty catalogue, and it says so.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { flashFailed } from '@/lib/flash-tone';
+import { can } from '@/lib/auth/permissions';
+import { listSkills, createSkill, type Skill } from '@/lib/skills';
+import {
+  verifyOntologySchema,
+  ontologyStats,
+  ontologySelfCheck,
+  skillGraphView,
+  resolveSkillNode,
+  assertRelation,
+  removeRelation,
+  addAlias,
+  removeAlias,
+  seedStarterOntology,
+  SKILL_RELATIONS,
+  RELATION_LABELS,
+  RELATION_MEANING,
+  ALIAS_KINDS,
+  ALIAS_KIND_LABELS,
+  isSkillRelation,
+  isAliasKind,
+  type SkillRelation,
+  type SkillGraphView,
+} from '@/lib/skill-ontology';
+import { mergePreview, type MergePreview } from '@/lib/skill-graph';
+import {
+  claimCountsBySkill,
+  EVIDENCE_LEVELS,
+  EVIDENCE_LEVEL_LABELS,
+  EVIDENCE_LEVEL_MEANING,
+  SUBJECT_KINDS,
+  SUBJECT_KIND_LABELS,
+  type SkillClaimCountsReport,
+} from '@/lib/evidence-graph';
+
+const PATH = '/admin/skills/ontology';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+
+const hasConsole = can(user as any, 'admin.access');
+if (!hasConsole) return Astro.redirect('/admin');
+
+// The two keys, asked separately and read before the POST handler that uses them.
+const allowed = can(user as any, 'skills.administer');
+const canCatalogue = can(user as any, 'skills.manage');
+
+// Declared ABOVE the POST handler — const is not hoisted, and a const read before its declaration
+// throws on the first line of the handler that reads it. That has taken pages down on this project.
+const back = (msg: string, skill: string, q: string) => {
+  const parts: string[] = [];
+  if (skill) parts.push('skill=' + encodeURIComponent(skill));
+  if (q) parts.push('q=' + encodeURIComponent(q));
+  parts.push('msg=' + encodeURIComponent(msg.slice(0, 400)));
+  return Astro.redirect(PATH + '?' + parts.join('&'));
+};
+
+if (Astro.request.method === 'POST') {
+  if (!allowed) return Astro.redirect(PATH);
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  const skill = String(fd.get('skill') || '');
+  const q = String(fd.get('q') || '');
+
+  if (action === 'add_relation') {
+    const relation = String(fd.get('relation') || '');
+    const r = await assertRelation({
+      fromSkillId: String(fd.get('from_skill_id') || ''),
+      relation: (isSkillRelation(relation) ? relation : 'related') as SkillRelation,
+      toSkillId: String(fd.get('to_skill_id') || ''),
+      note: String(fd.get('note') || ''),
+      actorUserId: String(user.id),
+    });
+    return back(
+      r.ok
+        ? 'Relation recorded. It carries your name and the time, and it can be removed again.'
+        : (r.error || 'That relation was not recorded.'),
+      skill,
+      q,
+    );
+  }
+
+  if (action === 'remove_relation') {
+    const r = await removeRelation(String(fd.get('relation_id') || ''), String(user.id));
+    return back(
+      r.ok
+        ? 'Relation removed. An edge is an assertion about two concepts, not a record about a person, '
+          + 'so it is genuinely gone — and the removal is in the audit log with your name on it.'
+        : (r.error || 'That relation was not removed.'),
+      skill,
+      q,
+    );
+  }
+
+  if (action === 'add_alias') {
+    const kind = String(fd.get('kind') || '');
+    const r = await addAlias({
+      skillId: String(fd.get('alias_skill_id') || ''),
+      alias: String(fd.get('alias') || ''),
+      kind: (isAliasKind(kind) ? kind : 'synonym') as any,
+      actorUserId: String(user.id),
+    });
+    return back(
+      r.ok
+        ? 'Other name recorded. Anything that resolves a written skill name now answers this node for it.'
+        : (r.error || 'That name was not recorded.'),
+      skill,
+      q,
+    );
+  }
+
+  if (action === 'remove_alias') {
+    const r = await removeAlias(String(fd.get('alias_id') || ''), String(user.id));
+    return back(
+      r.ok ? 'Other name removed.' : (r.error || 'That name was not removed.'),
+      skill,
+      q,
+    );
+  }
+
+  if (action === 'add_skill') {
+    if (!canCatalogue) {
+      return back(
+        'Adding a skill to the catalogue needs skills.manage, which you do not hold. Nothing was written.',
+        skill,
+        q,
+      );
+    }
+    const r = await createSkill({
+      name: String(fd.get('name') || ''),
+      category: String(fd.get('category') || ''),
+      description: String(fd.get('description') || ''),
+      actorUserId: String(user.id),
+    });
+    return back(
+      r.ok
+        ? 'Skill added to the catalogue. It has no relations yet, so nothing is inferred from it.'
+        : (r.error || 'That skill was not added.'),
+      r.ok && r.id ? String(r.id) : skill,
+      q,
+    );
+  }
+
+  if (action === 'seed_starter') {
+    if (!canCatalogue) {
+      return back(
+        'The starter set creates catalogue skills, so it needs skills.manage as well. Nothing was written.',
+        skill,
+        q,
+      );
+    }
+    const r = await seedStarterOntology(String(user.id));
+    const tail = r.refusals.length ? ' Skipped: ' + r.refusals.slice(0, 3).join(' ') : '';
+    return back((r.sentence || (r.error ? 'The starter graph was not applied.' : '')) + tail, skill, q);
+  }
+
+  return back('That action is not one this page performs.', skill, q);
+}
+
+// -------------------------------------------------------------------------------------------------
+// READING
+// -------------------------------------------------------------------------------------------------
+
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 400);
+const q = String(params.get('q') || '').slice(0, 120);
+const selectedId = String(params.get('skill') || '').slice(0, 60);
+const mergeA = String(params.get('merge_a') || '').slice(0, 60);
+const mergeB = String(params.get('merge_b') || '').slice(0, 60);
+
+let schema: Awaited<ReturnType<typeof verifyOntologySchema>> | null = null;
+let stats: Awaited<ReturnType<typeof ontologyStats>> | null = null;
+let catalogue: Skill[] = [];
+let view: SkillGraphView | null = null;
+let counts: SkillClaimCountsReport | null = null;
+let resolved: Awaited<ReturnType<typeof resolveSkillNode>> | null = null;
+let preview: MergePreview | null = null;
+const problems: string[] = allowed ? ontologySelfCheck() : [];
+
+if (allowed) {
+  schema = await verifyOntologySchema();
+  stats = await ontologyStats();
+  catalogue = await listSkills({ includeRetired: true });
+  if (q) resolved = await resolveSkillNode(q);
+  if (selectedId) {
+    view = await skillGraphView(selectedId);
+    counts = await claimCountsBySkill([selectedId]);
+  }
+  if (mergeA && mergeB) preview = await mergePreview(mergeA, mergeB);
+}
+
+// THE THREE STATES OF THE GRAPH ITSELF, decided once so no card below can word it differently.
+// `not_configured` is the tables genuinely not being there; `unreadable` is us failing to look.
+const relationsTable = schema ? schema.tables.find((t) => t.table === 'skill_relations') : undefined;
+const aliasesTable = schema ? schema.tables.find((t) => t.table === 'skill_aliases') : undefined;
+const graphState: 'ok' | 'not_configured' | 'unreadable' = !schema
+  ? 'unreadable'
+  : schema.error
+    ? 'unreadable'
+    : (relationsTable && relationsTable.present && aliasesTable && aliasesTable.present ? 'ok' : 'not_configured');
+
+// THE CATALOGUE'S THREE STATES, cross-checked rather than assumed. listSkills() swallows and returns
+// an empty array on a failed read, which is indistinguishable from an empty catalogue — so the list
+// is compared against a COUNT taken from the same database. A list of none where the count says
+// there are some is a failed read, and saying "there are no skills" would be a confident wrong.
+const catalogueState: 'ok' | 'empty' | 'unreadable' = !stats || !stats.ok
+  ? 'unreadable'
+  : (catalogue.length === 0 && stats.skills > 0
+    ? 'unreadable'
+    : (catalogue.length === 0 ? 'empty' : 'ok'));
+
+const needle = q.trim().toLowerCase();
+const matching = needle
+  ? catalogue.filter((s) => s.name.toLowerCase().includes(needle) || s.category.toLowerCase().includes(needle))
+  : catalogue;
+const listed = matching.slice(0, 120);
+// THE PICKERS OFFER THE WHOLE CATALOGUE, NOT THE SEARCH RESULT. A relation joins two skills and the
+// second one is usually not what was searched for; a select that offers only the filtered list makes
+// half the edges in this graph impossible to record without clearing the search first, and the
+// person doing it has no way to know that is why their skill is missing.
+const pickable = catalogue;
+const selected = view && view.node ? view.node : null;
+
+// Edges grouped by what they assert, in a fixed order, built here rather than in the markup: a typed
+// map indexed inside JSX is one of the .astro parser's known failures on this project.
+const edgeGroups: { relation: SkillRelation; label: string; meaning: string; edges: SkillGraphView['edges'] }[] = [];
+if (view && view.edges.length) {
+  for (const r of SKILL_RELATIONS) {
+    const edges = view.edges.filter((e) => e.relation === r);
+    if (edges.length) edgeGroups.push({ relation: r, label: RELATION_LABELS[r], meaning: RELATION_MEANING[r], edges });
+  }
+}
+
+const relationOptions = SKILL_RELATIONS.map((r) => ({ value: r as string, label: RELATION_LABELS[r], meaning: RELATION_MEANING[r] }));
+const aliasKindOptions = ALIAS_KINDS.map((k) => ({ value: k as string, label: ALIAS_KIND_LABELS[k] }));
+
+const skillCount = counts && counts.counts.length ? counts.counts[0] : null;
+const levelRows = EVIDENCE_LEVELS.map((l) => ({
+  level: l as string,
+  label: EVIDENCE_LEVEL_LABELS[l],
+  meaning: EVIDENCE_LEVEL_MEANING[l],
+  n: skillCount ? skillCount.byLevel[l] : 0,
+}));
+const kindRows = SUBJECT_KINDS.map((k) => ({
+  kind: k as string,
+  label: SUBJECT_KIND_LABELS[k],
+  n: skillCount ? skillCount.byKind[k] : 0,
+}));
+
+const selectedCatalogueRow = selected ? catalogue.find((s) => s.id === selected.id) : undefined;
+const matrixHolders = selectedCatalogueRow ? selectedCatalogueRow.holders : null;
+
+const linkTo = (id: string) => PATH + '?skill=' + encodeURIComponent(id) + (q ? '&q=' + encodeURIComponent(q) : '');
+const isEmptyGraph = stats && stats.ok && stats.relations === 0 && stats.aliases === 0;
+---
+
+<AdminLayout title="Skill graph" activeNav="hr">
+  <style>
+    .on{max-width:1080px}
+    .on h1{font-size:22px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px}
+    .on .lede{font-size:13.5px;line-height:1.6;color:#6b6255;margin:0 0 18px;max-width:70ch}
+    .on .flash{background:rgba(5,150,105,.09);border:1px solid rgba(5,150,105,.3);color:#065f46;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:16px;
+      overflow-wrap:anywhere}
+    .on .flash.warn{background:rgba(220,38,38,.07);border-color:rgba(220,38,38,.34);color:#8a1c1c}
+    .on .deny{background:#fbf7f1;border:1px solid #eadecd;color:#6d470d;border-radius:12px;
+      padding:16px;font-size:13.5px;line-height:1.6;max-width:70ch}
+    .on .card{background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:16px;
+      margin-bottom:14px}
+    .on .card h2{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;
+      letter-spacing:.13em;text-transform:uppercase;color:#9a8f7d;font-weight:700;margin:0 0 12px}
+    .on .card h3{font-size:14px;font-weight:700;margin:16px 0 6px;color:#1a1510}
+    .on .card h3:first-of-type{margin-top:0}
+    .on p{margin:0 0 9px}
+    .on .muted{font-size:12.5px;line-height:1.6;color:#6b6255;overflow-wrap:anywhere}
+    .on .state{border-radius:10px;padding:12px 13px;font-size:13px;line-height:1.6;
+      overflow-wrap:anywhere;margin-bottom:12px}
+    .on .state.absent{background:#fbf7f1;border:1px solid #eadecd;color:#6d470d}
+    .on .state.blank{background:#faf7f1;border:1px solid #ece4d6;color:#6b6255}
+    .on .state.broken{background:rgba(220,38,38,.06);border:1px solid rgba(220,38,38,.3);color:#8a1c1c}
+    .on label{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;
+      letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;display:block;
+      margin:10px 0 4px}
+    .on input,.on select,.on textarea{width:100%;background:#faf7f1;border:1px solid #e6ddcd;
+      border-radius:9px;padding:10px 12px;font-size:14px;font-family:inherit;color:#1a1510;
+      outline:none;min-height:44px}
+    .on textarea{min-height:66px;resize:vertical}
+    .on input:focus,.on select:focus,.on textarea:focus{border-color:#c2410c}
+    .on .row2{display:grid;grid-template-columns:1fr;gap:9px}
+    .on .row3{display:grid;grid-template-columns:1fr;gap:9px}
+    .on .btn{background:#c2410c;color:#fff;border:none;border-radius:10px;padding:11px 18px;
+      font-size:14px;font-weight:650;cursor:pointer;font-family:inherit;min-height:44px;margin-top:12px}
+    .on .btn.ghost{background:#fff;color:#6b6255;border:1px solid #e6ddcd}
+    .on .btn.slim{padding:9px 14px;font-size:13px;margin-top:0;min-height:44px}
+    .on .chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:4px}
+    .on .chip{display:inline-flex;align-items:center;min-height:44px;padding:8px 13px;
+      border:1px solid #e6ddcd;border-radius:999px;background:#faf7f1;color:#1a1510;
+      font-size:13px;text-decoration:none;line-height:1.3}
+    .on .chip.sel{background:#c2410c;border-color:#c2410c;color:#fff}
+    .on .chip small{color:#9a8f7d;margin-left:7px;font-size:11.5px}
+    .on .chip.sel small{color:#f6e3d8}
+    .on .edge{border:1px solid #f0e9db;border-radius:11px;padding:12px;margin-bottom:9px;
+      background:#fdfbf7}
+    .on .edge p{margin:0 0 6px;font-size:13.5px;line-height:1.55}
+    .on .edge .meta{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
+      letter-spacing:.04em;color:#9a8f7d;text-transform:uppercase}
+    .on .edge form{display:inline-block;margin-top:8px}
+    .on .kv{display:flex;justify-content:space-between;gap:10px;padding:9px 0;
+      border-bottom:1px solid #f4efe6;font-size:13.5px;line-height:1.5}
+    .on .kv:last-child{border-bottom:none}
+    .on .kv span{color:#6b6255}
+    .on .kv b{flex:none;font-weight:700}
+    .on .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:10px}
+    .on table{border-collapse:collapse;width:100%;min-width:520px;font-size:13.5px}
+    .on th{text-align:left;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;
+      letter-spacing:.1em;text-transform:uppercase;color:#9a8f7d;font-weight:700;padding:8px 10px;
+      border-bottom:1px solid #ece4d6;white-space:nowrap}
+    .on td{padding:10px;border-bottom:1px solid #f4efe6;vertical-align:top;line-height:1.5}
+    .on .danger{border-color:#e7c4c4;background:#fdf7f6}
+    .on .danger h2{color:#8a1c1c}
+    .on a{color:#c2410c}
+    .on code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;
+      background:#f6f1e8;border-radius:5px;padding:1px 5px}
+    @media (min-width:760px){
+      .on .row2{grid-template-columns:1fr 1fr}
+      .on .row3{grid-template-columns:1fr 1fr 1fr}
+    }
+  </style>
+
+  <div class="on">
+    <h1>Skill graph</h1>
+    <p class="lede">
+      What this organization has written down about how skills relate to one another, and the other
+      names people type for them. It is curated by hand, one row at a time, by the people whose names
+      are on each row. It is not a map of any field, and an absent edge means nobody has written it
+      down yet.
+    </p>
+
+    {!allowed && (
+      <div class="deny">
+        <p><b>This is the skill graph desk.</b> You hold the admin console but not
+          <code> skills.administer</code>, which is what says two skills are related and what
+          maintains the other names a skill is known by.</p>
+        <p>It is held by super admins and by HR. Editing this graph changes what the system is
+          willing to infer about people, which is why it is a separate key from the catalogue.</p>
+        <p>The catalogue itself, and who has recorded what, is at
+          <a href="/admin/hr/performance/skills">/admin/hr/performance/skills</a>.</p>
+      </div>
+    )}
+
+    {allowed && (
+      <>
+        {msg && <p class={flashFailed(msg) ? 'flash warn' : 'flash'} role={flashFailed(msg) ? 'alert' : 'status'}>{msg}</p>}
+
+        {graphState === 'unreadable' && (
+          <div class="state broken">
+            <b>We could not read the database schema.</b> Nothing below is a statement about what is
+            recorded — it is a statement that we could not look. {schema && schema.error ? schema.error : ''}
+          </div>
+        )}
+
+        {graphState === 'not_configured' && (
+          <div class="state absent">
+            <b>The graph tables have not been created in this database yet.</b> {schema ? schema.sentence : ''}
+            <br />That is not the same as an empty graph: nothing has been able to be recorded at all.
+            The tables are created additively the first time this page writes anything, and this
+            report is read back from <code>information_schema</code> afterwards rather than assumed.
+          </div>
+        )}
+
+        {graphState === 'ok' && schema && (
+          <div class="card">
+            <h2>What is actually there</h2>
+            <p class="muted">{schema.sentence}</p>
+            {!schema.normalizedNameIndex && (
+              <p class="muted">The uniqueness backstop on normalised skill names is not in place. That
+                usually means the catalogue already holds two names that differ only in case or
+                punctuation, and both will keep resolving separately.</p>
+            )}
+            {schema.divergenceSentence && (
+              <div class="state absent" style="margin-top:10px">
+                <b>There is a second edge store in this codebase and this graph does not read it.</b>
+                <br />{schema.divergenceSentence}
+              </div>
+            )}
+            {stats && stats.ok && <p class="muted" style="margin-top:10px">{stats.sentence}</p>}
+            {stats && !stats.ok && (
+              <p class="muted" style="margin-top:10px">The size of the graph could not be counted just
+                now, so no number is shown rather than a zero.</p>
+            )}
+            {problems.length > 0 && (
+              <div class="state broken" style="margin-top:10px">
+                <b>The graph's own invariants are failing.</b>
+                {problems.map((p) => <div>{p}</div>)}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div class="card">
+          <h2>Find a skill</h2>
+          <form method="get">
+            <label for="q">Search the catalogue, or type a name somebody wrote</label>
+            <input id="q" name="q" value={q} maxlength="120" placeholder="Postgres, ML, a11y" />
+            <button class="btn" type="submit">Search</button>
+          </form>
+
+          {resolved && resolved.matchedBy === 'alias' && resolved.node && (
+            <p class="muted" style="margin-top:12px">{resolved.sentence} <a href={linkTo(resolved.node.id)}>Open {resolved.node.name}</a></p>
+          )}
+          {resolved && resolved.matchedBy === 'unreadable' && (
+            <div class="state broken" style="margin-top:12px">{resolved.sentence}</div>
+          )}
+
+          {catalogueState === 'unreadable' && (
+            <div class="state broken" style="margin-top:12px">
+              <b>The catalogue could not be read.</b> This is not an empty catalogue and must not be
+              read as one; the count taken from the same database disagrees with the list that came
+              back. Try again in a moment.
+            </div>
+          )}
+          {catalogueState === 'empty' && (
+            <div class="state blank" style="margin-top:12px">
+              <b>The catalogue is genuinely empty.</b> There are no skills to relate to one another
+              yet, so there is no graph. Add one below, or apply the starter set.
+            </div>
+          )}
+          {catalogueState === 'ok' && (
+            <>
+              <p class="muted" style="margin-top:12px">
+                {listed.length} of {matching.length} shown{matching.length !== catalogue.length ? ' (filtered from ' + catalogue.length + ')' : ''}.
+                A retired skill is still listed: retiring drops it out of the pickers, it does not
+                delete what people recorded against it.
+              </p>
+              <div class="chips">
+                {listed.map((s) => (
+                  <a class={selected && selected.id === s.id ? 'chip sel' : 'chip'} href={linkTo(s.id)}>
+                    {s.name}<small>{s.isActive ? s.category : 'retired'}</small>
+                  </a>
+                ))}
+              </div>
+              {matching.length === 0 && (
+                <p class="muted">Nothing in the catalogue matches that. It may still be recorded as
+                  another name for a skill — search the exact spelling to find out.</p>
+              )}
+            </>
+          )}
+        </div>
+
+        {selected && view && (
+          <div class="card">
+            <h2>{selected.name}</h2>
+            <p class="muted">
+              {selected.category}{selected.isActive ? '' : ' · retired from the pickers'}
+            </p>
+
+            {view.state === 'unreadable' && <div class="state broken" style="margin-top:12px">{view.sentence}</div>}
+            {view.state === 'not_configured' && <div class="state absent" style="margin-top:12px">{view.sentence}</div>}
+            {view.state === 'empty' && <div class="state blank" style="margin-top:12px">{view.sentence}</div>}
+
+            {view.state === 'ok' && (
+              <>
+                {edgeGroups.map((g) => (
+                  <>
+                    <h3>{g.label}</h3>
+                    <p class="muted">{g.meaning}</p>
+                    {g.edges.map((e) => (
+                      <div class="edge">
+                        <p>{e.sentence}</p>
+                        {e.note && <p class="muted">{e.note}</p>}
+                        <p class="meta">
+                          <a href={linkTo(e.otherSkillId)}>{e.otherSkillName}</a>
+                          {' · '}{e.source === 'seed' ? 'shipped as part of the starter set' : 'recorded here'}
+                          {e.assertedAt ? ' · ' + e.assertedAt.slice(0, 10) : ''}
+                          {e.assertedByUserId ? '' : ' · no author recorded on this row'}
+                        </p>
+                        <form method="post">
+                          <input type="hidden" name="action" value="remove_relation" />
+                          <input type="hidden" name="relation_id" value={e.id} />
+                          <input type="hidden" name="skill" value={selected.id} />
+                          <input type="hidden" name="q" value={q} />
+                          <button class="btn ghost slim" type="submit">Remove this relation</button>
+                        </form>
+                      </div>
+                    ))}
+                  </>
+                ))}
+
+                {view.aliases.length > 0 && (
+                  <>
+                    <h3>Other names for this skill</h3>
+                    <p class="muted">Anything that turns a written skill name into a node answers
+                      {' ' + selected.name} for each of these.</p>
+                    {view.aliases.map((a) => (
+                      <div class="edge">
+                        <p>{a.alias}</p>
+                        <p class="meta">{a.kind} · {a.source === 'seed' ? 'starter set' : 'recorded here'}</p>
+                        <form method="post">
+                          <input type="hidden" name="action" value="remove_alias" />
+                          <input type="hidden" name="alias_id" value={a.id} />
+                          <input type="hidden" name="skill" value={selected.id} />
+                          <input type="hidden" name="q" value={q} />
+                          <button class="btn ghost slim" type="submit">Remove this name</button>
+                        </form>
+                      </div>
+                    ))}
+                  </>
+                )}
+
+                {view.implied.length > 0 && (
+                  <>
+                    <h3>What holding this skill lets the system infer</h3>
+                    <p class="muted">Only the broader areas, only through the parent relation, and every
+                      one of them is an inference that carries the chain that produced it. Nothing else
+                      on this page supports any statement about a person.</p>
+                    {view.implied.map((i) => (
+                      <div class="edge">
+                        <p>{i.sentence}</p>
+                        <p class="meta">inferred · {i.depth === 1 ? 'one step up' : i.depth + ' steps up'}</p>
+                      </div>
+                    ))}
+                  </>
+                )}
+
+                {view.narrower.length > 0 && (
+                  <>
+                    <h3>Everything underneath it</h3>
+                    <p class="muted">Somebody who records one of these has recorded something that sits
+                      inside {selected.name}. Holding {selected.name} says nothing about any of them.</p>
+                    {view.narrower.map((n) => (
+                      <div class="edge">
+                        <p><a href={linkTo(n.skillId)}>{n.name}</a></p>
+                        <p class="meta">{n.depth === 1 ? 'directly underneath' : n.depth + ' steps down'}</p>
+                      </div>
+                    ))}
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {selected && (
+          <div class="card">
+            <h2>Who holds it, and on what basis</h2>
+            <p class="muted">
+              These are counts of RECORDS and never a list of people, and there is nothing here to
+              open. An employee record, a candidate record and a learner account are three id spaces
+              this codebase does not claim are one human, so they are counted apart and never added
+              together into a headcount.
+            </p>
+
+            {matrixHolders === null && (
+              <div class="state broken" style="margin-top:10px">The skill matrix count could not be read.</div>
+            )}
+            {matrixHolders !== null && (
+              <p class="muted" style="margin-top:10px">
+                <b>{matrixHolders}</b> {matrixHolders === 1 ? 'row' : 'rows'} in the skill matrix record
+                a level against this skill. That is what somebody wrote down, at whatever level they
+                chose; it is not evidence, and it is counted separately from the ladder below for
+                exactly that reason.
+              </p>
+            )}
+
+            {counts && counts.state === 'unreadable' && <div class="state broken" style="margin-top:10px">{counts.sentence}</div>}
+            {counts && counts.state === 'not_configured' && <div class="state absent" style="margin-top:10px">{counts.sentence}</div>}
+            {counts && counts.state === 'empty' && <div class="state blank" style="margin-top:10px">{counts.sentence}</div>}
+
+            {counts && counts.state === 'ok' && skillCount && (
+              <>
+                <div class="tablewrap">
+                  <table>
+                    <thead>
+                      <tr><th>Evidence level</th><th>Records</th><th>What it means</th></tr>
+                    </thead>
+                    <tbody>
+                      {levelRows.map((r) => (
+                        <tr>
+                          <td><b>{r.label}</b></td>
+                          <td>{r.n}</td>
+                          <td class="muted">{r.meaning}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <h3>Which record each claim belongs to</h3>
+                {kindRows.map((r) => (
+                  <div class="kv"><span>{r.label}</span><b>{r.n}</b></div>
+                ))}
+                <p class="muted" style="margin-top:10px">
+                  {skillCount.evidenceRows} evidence {skillCount.evidenceRows === 1 ? 'row is' : 'rows are'}
+                  {' '}attached to those claims. {counts.sentence}
+                </p>
+              </>
+            )}
+          </div>
+        )}
+
+        {graphState !== 'unreadable' && (
+          <div class="card">
+            <h2>Record a relation</h2>
+            <p class="muted">
+              Read it as a sentence in the order you type it: the first skill, then what it says, then
+              the second. Only the broader relation ever supports anything about a person, and even
+              then only as an inference — the rest are context for a human reading the page.
+            </p>
+            <form method="post">
+              <input type="hidden" name="action" value="add_relation" />
+              <input type="hidden" name="skill" value={selected ? selected.id : ''} />
+              <input type="hidden" name="q" value={q} />
+              <div class="row3">
+                <div>
+                  <label for="from">First skill</label>
+                  <select id="from" name="from_skill_id" required>
+                    <option value="">Choose</option>
+                    {pickable.map((s) => (
+                      <option value={s.id} selected={!!selected && selected.id === s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label for="rel">What it says</label>
+                  <select id="rel" name="relation" required>
+                    {relationOptions.map((r) => <option value={r.value}>{r.label}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label for="to">Second skill</label>
+                  <select id="to" name="to_skill_id" required>
+                    <option value="">Choose</option>
+                    {pickable.map((s) => <option value={s.id}>{s.name}</option>)}
+                  </select>
+                </div>
+              </div>
+              <label for="note">Why, in your words</label>
+              <textarea id="note" name="note" maxlength="500"
+                placeholder="Optional. It stays on the row with your name, so somebody can ask you about it later"></textarea>
+              <button class="btn" type="submit">Record the relation</button>
+            </form>
+
+            <h3>What each relation asserts</h3>
+            {relationOptions.map((r) => (
+              <div class="kv"><span>{r.label}</span><b style="font-weight:400;text-align:right">{r.meaning}</b></div>
+            ))}
+          </div>
+        )}
+
+        {graphState !== 'unreadable' && (
+          <div class="card">
+            <h2>Record another name</h2>
+            <p class="muted">
+              The non-destructive way to make two spellings one skill. Nothing is retired, nobody's
+              record changes, and every place that turns a written skill name into a node starts
+              answering the canonical skill for the other spelling.
+            </p>
+            <form method="post">
+              <input type="hidden" name="action" value="add_alias" />
+              <input type="hidden" name="skill" value={selected ? selected.id : ''} />
+              <input type="hidden" name="q" value={q} />
+              <div class="row3">
+                <div>
+                  <label for="alias-skill">The skill it belongs to</label>
+                  <select id="alias-skill" name="alias_skill_id" required>
+                    <option value="">Choose</option>
+                    {listed.map((s) => (
+                      <option value={s.id} selected={!!selected && selected.id === s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label for="alias">The other name</label>
+                  <input id="alias" name="alias" maxlength="160" required placeholder="Postgres" />
+                </div>
+                <div>
+                  <label for="alias-kind">What kind of name</label>
+                  <select id="alias-kind" name="kind">
+                    {aliasKindOptions.map((k) => <option value={k.value}>{k.label}</option>)}
+                  </select>
+                </div>
+              </div>
+              <button class="btn" type="submit">Record the name</button>
+            </form>
+            <p class="muted" style="margin-top:10px">
+              A name that is already another skill's catalogue name is refused rather than recorded,
+              because recording it would make that skill unreachable by name forever.
+            </p>
+          </div>
+        )}
+
+        <div class="card danger">
+          <h2>Merging two skills into one</h2>
+          <p><b>This page does not offer a merge button, and that is deliberate.</b></p>
+          <p class="muted">
+            The one merge this codebase has is <code>mergeSkills()</code> in
+            <code> src/lib/skill-graph.ts</code>. It is careful about the thing it set out to be
+            careful about: it prefers the checked record over the higher number, it retires the losing
+            skill rather than deleting it, it leaves a person's row where it is rather than deleting
+            it when their other row is stronger, and it writes what it did to the audit log. It still
+            destroys evidence in four places, so it is not offered here.
+          </p>
+
+          <h3>One. A person's evidence sentence and evidence link are overwritten and kept nowhere.</h3>
+          <p class="muted">
+            Where somebody holds both skills and the row on the retiring skill is the stronger record,
+            the surviving row is overwritten with that row's level, evidence, evidence link, source
+            and assessor, and the losing row is then deleted. The audit entry records the replaced
+            level and the replaced source. It does not record the replaced evidence text or the
+            replaced link. That text is a person's account of what they did, and after the merge it is
+            in no table.
+          </p>
+
+          <h3>Two. Deleting that row breaks an evidence chain that points at it by id.</h3>
+          <p class="muted">
+            When a person's skills are carried into the evidence graph, each evidence row stores the
+            id of the skill matrix row it came from. Deleting the losing row leaves those evidence
+            rows pointing at a row that no longer exists, so the first step of the chain cannot be
+            walked. An evidence chain that cannot be walked is the failure this whole spine exists to
+            prevent.
+          </p>
+
+          <h3>Three. Capability claims are not moved, so the record splits in two.</h3>
+          <p class="muted">
+            The merge repoints skill matrix rows, job requirements and the other edge store. It does
+            not repoint <code>capability_claims</code>. Every claim stays on the retired skill while
+            the person's matrix row moves to the kept one, so the counts on this page and the person's
+            own record would disagree from that moment on, in opposite directions.
+          </p>
+
+          <h3>Four. It does not touch this graph at all.</h3>
+          <p class="muted">
+            The relations and the other names shown on this page live in different tables from the
+            ones that merge repoints. After it ran, the other names recorded for the retired skill
+            would keep resolving to the retired skill — which is precisely the thing merging a synonym
+            into a canonical node is supposed to fix.
+          </p>
+
+          <h3>What to do instead</h3>
+          <p class="muted">
+            If the duplicate is only a spelling, record it above as another name for the canonical
+            skill. It is lossless, it is audited, and every surface that resolves a written name
+            starts answering the canonical node. If the duplicate is already its own catalogue row
+            with people recorded against it, there is no lossless route today: recording the name is
+            refused because it would make a real catalogue row unreachable, and the merge that would
+            join them is the one described above. Say so out loud rather than working around it — the
+            fix belongs in the module, not in a screen that calls it.
+          </p>
+
+          <h3>What a merge would do, if you want to see the size of the problem</h3>
+          <p class="muted">
+            Read-only. Choosing two skills here runs the preview and performs nothing; there is no
+            action on this page that merges anything.
+          </p>
+          <form method="get">
+            <input type="hidden" name="q" value={q} />
+            <input type="hidden" name="skill" value={selected ? selected.id : ''} />
+            <div class="row2">
+              <div>
+                <label for="ma">The skill that would be retired</label>
+                <select id="ma" name="merge_a">
+                  <option value="">Choose</option>
+                  {listed.map((s) => <option value={s.id} selected={mergeA === s.id}>{s.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label for="mb">The skill that would be kept</label>
+                <select id="mb" name="merge_b">
+                  <option value="">Choose</option>
+                  {listed.map((s) => <option value={s.id} selected={mergeB === s.id}>{s.name}</option>)}
+                </select>
+              </div>
+            </div>
+            <button class="btn ghost" type="submit">Show me what it would do</button>
+          </form>
+
+          {preview && !preview.ok && (
+            <div class="state broken" style="margin-top:12px">
+              {preview.error || 'The preview could not be produced, so nothing is shown.'}
+            </div>
+          )}
+          {preview && preview.ok && preview.loser && preview.winner && (
+            <div style="margin-top:14px">
+              <div class="kv"><span>Would be retired</span><b>{preview.loser.name} · {preview.loser.holders} recorded</b></div>
+              <div class="kv"><span>Would be kept</span><b>{preview.winner.name} · {preview.winner.holders} recorded</b></div>
+              <div class="kv"><span>Rows that would move untouched</span><b>{preview.movingRows}</b></div>
+              <div class="kv"><span>People holding both</span><b>{preview.conflicts.length}</b></div>
+              <div class="kv"><span>Edges and job requirements repointed</span><b>{preview.relationsMoving} and {preview.requirementsMoving}</b></div>
+              {preview.sentences.map((s) => <p class="muted" style="margin-top:9px">{s}</p>)}
+              {preview.conflicts.length > 0 && (
+                <div class="tablewrap">
+                  <table>
+                    <thead><tr><th>Person</th><th>What would happen to their two rows</th></tr></thead>
+                    <tbody>
+                      {preview.conflicts.map((c) => (
+                        <tr>
+                          <td>{c.employeeName}</td>
+                          <td class="muted">{c.outcome}{c.replaces ? ' Their evidence text and link on the kept row would be overwritten and are recorded nowhere.' : ''}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {canCatalogue && (
+          <div class="card">
+            <h2>Add a skill</h2>
+            <p class="muted">
+              The catalogue is the one store of skills and this is its front door. A name that is a
+              protected or sensitive attribute is refused here, and no relation or other name can be
+              built onto one that predates that check, so it stays unreachable through this graph.
+            </p>
+            <form method="post">
+              <input type="hidden" name="action" value="add_skill" />
+              <input type="hidden" name="q" value={q} />
+              <div class="row2">
+                <div>
+                  <label for="n">Name</label>
+                  <input id="n" name="name" maxlength="120" required />
+                </div>
+                <div>
+                  <label for="c">Category</label>
+                  <input id="c" name="category" maxlength="60" placeholder="general" />
+                </div>
+              </div>
+              <label for="d">What it means here</label>
+              <textarea id="d" name="description" maxlength="1000"
+                placeholder="Optional. So two people record the same thing the same way"></textarea>
+              <button class="btn" type="submit">Add skill</button>
+            </form>
+          </div>
+        )}
+
+        {!canCatalogue && (
+          <div class="card">
+            <h2>Add a skill</h2>
+            <p class="muted">
+              Adding to the catalogue needs <code>skills.manage</code>, which is a different key from
+              the one that maintains this graph and which you do not hold. The catalogue is at
+              <a href="/admin/hr/performance/skills"> /admin/hr/performance/skills</a>.
+            </p>
+          </div>
+        )}
+
+        {canCatalogue && isEmptyGraph && (
+          <div class="card">
+            <h2>The starter set</h2>
+            <p class="muted">
+              Twenty-three skills and twenty-five relations somebody can read in a minute and correct:
+              a starting point, not a taxonomy. Every row it writes is marked as shipped rather than
+              decided here, so the difference stays visible forever. It runs only into an empty graph
+              and will not top up one this organization has curated.
+            </p>
+            <form method="post">
+              <input type="hidden" name="action" value="seed_starter" />
+              <input type="hidden" name="q" value={q} />
+              <button class="btn ghost" type="submit">Apply the starter set</button>
+            </form>
+          </div>
+        )}
+      </>
+    )}
+  </div>
+</AdminLayout>

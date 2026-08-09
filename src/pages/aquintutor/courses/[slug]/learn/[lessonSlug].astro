@@ -23,6 +23,9 @@
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+// The one resolver for a pasted link (allowlisted shapes, https only, embed address built by us)
+// and the one sanitiser for every other URL a block can carry.
+import { resolveVideoLink, safeResourceUrl } from '@/lib/video-embed';
 import {
   ensureAquintutorAuthoringSchema,
   listBlocks,
@@ -48,7 +51,45 @@ if (!course) return Astro.redirect('/aquintutor');
 const lesson = rowsOf(await db.execute(sql`SELECT * FROM training_lessons WHERE slug = ${lessonSlug} AND course_id = ${course.id} LIMIT 1`))[0] as any;
 if (!lesson) return Astro.redirect('/aquintutor/courses/' + slug);
 
-const blocks = await listBlocks(lesson.id);
+const rawBlocks = await listBlocks(lesson.id);
+
+// EVERY URL IN A BLOCK IS RESOLVED HERE, ON THE SERVER, BEFORE IT IS HANDED TO THE BROWSER.
+//
+// The client script below builds HTML strings and assigns them with innerHTML. Its esc() replaces
+// < > & " — an HTML-context escape, not a URL validator — so a stored `javascript:alert(1)` used to
+// travel through it untouched and land in an iframe src, an <img src> and an <a href download>. The
+// block payloads are author-controlled and this page is opened by learners.
+//
+// So the browser never sees an author's raw URL any more. A video block arrives already resolved to
+// a player address THIS CODEBASE BUILT from an allowlisted shape, with the sandbox / allow /
+// referrer attributes it must be rendered under; anything unrecognised arrives as `problem`, a
+// sentence, and the renderer prints that instead of framing something. Images and attachments go
+// through safeResourceUrl(), which returns a normalised https URL or null — never a scheme we did
+// not check.
+const blocks = rawBlocks.map((b: any) => {
+  const c = { ...(b.content || {}) };
+  if (b.kind === 'video_embed') {
+    const r = resolveVideoLink(c.url, { allowLinkOut: c.opensElsewhere === true });
+    if (r.ok && (r.kind === 'embed' || r.kind === 'internal')) {
+      return { ...b, content: { caption: c.caption || '', embedUrl: r.embedUrl, sandbox: r.sandbox, allow: r.allow, referrerPolicy: r.referrerPolicy, linkOut: '', problem: '' } };
+    }
+    if (r.ok && (r.kind === 'file' || r.kind === 'link')) {
+      // A direct file or an explicit "opens elsewhere" — the renderer gives a button or a <video>,
+      // never a frame.
+      return { ...b, content: { caption: c.caption || '', embedUrl: '', sandbox: '', allow: '', referrerPolicy: r.referrerPolicy, linkOut: r.embedUrl, isFile: r.kind === 'file', problem: '' } };
+    }
+    return { ...b, content: { caption: c.caption || '', embedUrl: '', sandbox: '', allow: '', referrerPolicy: '', linkOut: '', problem: 'This lesson has a video link we are not able to play here. Nothing is missing on your side — please tell whoever runs the course.' } };
+  }
+  if (b.kind === 'image') {
+    const safe = safeResourceUrl(c.url);
+    return { ...b, content: { alt: c.alt || '', caption: c.caption || '', url: safe || '', problem: safe ? '' : 'An image on this lesson could not be shown, because its address is not one we are able to load.' } };
+  }
+  if (b.kind === 'file_attachment') {
+    const safe = safeResourceUrl(c.url);
+    return { ...b, content: { name: c.name || '', url: safe || '', problem: safe ? '' : 'An attachment on this lesson could not be linked, because its address is not one we are able to open.' } };
+  }
+  return b;
+});
 
 // Course syllabus for the right sidebar (resilient to legacy module schema)
 let modules: any[] = [];
@@ -309,13 +350,25 @@ const nextL = idx >= 0 && idx < flatLessons.length - 1 ? flatLessons[idx + 1] : 
       switch (b.kind) {
         case 'text': html = '<p>' + md(c.md || '') + '</p>'; break;
         case 'heading': var lvl = c.level || 2; html = '<h' + lvl + '>' + esc(c.text || '') + '</h' + lvl + '>'; break;
-        case 'image': if (c.url) html = '<figure><img src="' + esc(c.url) + '" alt="' + esc(c.alt || '') + '"/>' + (c.caption ? '<figcaption style="font-size:13px;color:#7A6F68;margin-top:6px;text-align:center;font-style:italic;">' + esc(c.caption) + '</figcaption>' : '') + '</figure>'; break;
-        case 'video_embed': if (c.url) {
-          var u = c.url;
-          if (u.indexOf('youtube.com/watch') >= 0) u = u.replace('youtube.com/watch?v=', 'youtube.com/embed/').split('&')[0];
-          if (u.indexOf('youtu.be/') >= 0) u = u.replace('youtu.be/', 'youtube.com/embed/');
-          html = '<div style="margin:18px 0;"><iframe src="' + esc(u) + '" frameborder="0" allowfullscreen style="width:100%;aspect-ratio:16/9;border-radius:10px;"></iframe>' + (c.caption ? '<p style="font-size:13px;color:#7A6F68;margin-top:6px;text-align:center;font-style:italic;">' + esc(c.caption) + '</p>' : '') + '</div>';
-        } break;
+        // c.url arrived from safeResourceUrl() on the server, or empty with a sentence in c.problem.
+        case 'image': if (c.url) html = '<figure><img src="' + esc(c.url) + '" alt="' + esc(c.alt || '') + '" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"/>' + (c.caption ? '<figcaption style="font-size:13px;color:#7A6F68;margin-top:6px;text-align:center;font-style:italic;">' + esc(c.caption) + '</figcaption>' : '') + '</figure>';
+          else if (c.problem) html = '<p style="font-size:13px;color:#8a6d1f;background:rgba(250,204,21,0.16);border:1px solid rgba(250,204,21,0.4);border-radius:8px;padding:10px 12px;margin:14px 0;">' + esc(c.problem) + '</p>'; break;
+        // NOTHING IS PARSED HERE. c.embedUrl was built server-side from an allowlisted shape; the
+        // two string rewrites that used to stand in for validation are gone with the string they
+        // rewrote. A caption is the only author text on this branch.
+        case 'video_embed': {
+          var cap = c.caption ? '<p style="font-size:13px;color:#7A6F68;margin-top:6px;text-align:center;font-style:italic;">' + esc(c.caption) + '</p>' : '';
+          if (c.embedUrl) {
+            html = '<div style="margin:18px 0;"><iframe src="' + esc(c.embedUrl) + '" title="Lesson video" loading="lazy" frameborder="0" sandbox="' + esc(c.sandbox) + '" allow="' + esc(c.allow) + '" referrerpolicy="' + esc(c.referrerPolicy) + '" allowfullscreen style="width:100%;aspect-ratio:16/9;border-radius:10px;background:#000;"></iframe>' + cap + '</div>';
+          } else if (c.linkOut && c.isFile) {
+            html = '<div style="margin:18px 0;"><video controls preload="metadata" src="' + esc(c.linkOut) + '" style="width:100%;aspect-ratio:16/9;border-radius:10px;background:#000;"></video>' + cap + '</div>';
+          } else if (c.linkOut) {
+            html = '<div style="margin:18px 0;padding:18px;border:1px solid #e5dcc6;border-radius:10px;background:#FBF8F1;"><p style="font-size:13px;color:#5C544A;margin:0 0 10px;line-height:1.6;">This video is hosted somewhere we cannot play inside the page. The button opens it in a new tab.</p><a href="' + esc(c.linkOut) + '" target="_blank" rel="noopener noreferrer" style="display:inline-block;min-height:44px;line-height:24px;background:#FF4F00;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700;">Open the video in a new tab</a>' + cap + '</div>';
+          } else if (c.problem) {
+            html = '<p style="font-size:13px;color:#8a6d1f;background:rgba(250,204,21,0.16);border:1px solid rgba(250,204,21,0.4);border-radius:8px;padding:10px 12px;margin:18px 0;">' + esc(c.problem) + '</p>';
+          }
+          break;
+        }
         case 'callout': var tone = c.tone || 'info'; html = '<div class="callout callout-' + esc(tone) + '"><p class="callout-title">' + esc(c.title || tone) + '</p><p>' + md(c.body || '') + '</p></div>'; break;
         case 'code': html = '<pre><code>' + esc(c.code || '') + '</code></pre>'; break;
         case 'mcq': var opts = (c.options || []).map(function (o, i) { return '<label class="mcq-opt"><input type="radio" name="mcq-' + b.id + '" value="' + i + '"/> ' + esc(o) + '</label>'; }).join('');
@@ -326,7 +379,9 @@ const nextL = idx >= 0 && idx < flatLessons.length - 1 ? flatLessons[idx + 1] : 
         case 'quote': html = '<blockquote>' + esc(c.text || '') + (c.attribution ? '<footer style="font-size:14px;color:#7A6F68;font-style:normal;margin-top:6px;font-family:DM Sans;">— ' + esc(c.attribution) + '</footer>' : '') + '</blockquote>'; break;
         case 'latex': html = '<div style="background:#fbf5f3;border:1px solid #e5dcc6;padding:14px;border-radius:8px;margin:18px 0;font-family:ui-monospace,monospace;font-size:15px;text-align:center;">' + esc(c.tex || '') + '</div>'; break;
         case 'divider': html = '<hr/>'; break;
-        case 'file_attachment': if (c.url) html = '<a href="' + esc(c.url) + '" download style="display:inline-flex;align-items:center;gap:8px;background:#FFF3EE;color:#FF4F00;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:700;margin:18px 0;">↓ ' + esc(c.name || 'Download') + '</a>'; break;
+        // c.url was normalised by safeResourceUrl() on the server; rel=noopener because this leaves us.
+        case 'file_attachment': if (c.url) html = '<a href="' + esc(c.url) + '" download target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:8px;min-height:44px;background:#FFF3EE;color:#FF4F00;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:700;margin:18px 0;">↓ ' + esc(c.name || 'Download') + '</a>';
+          else if (c.problem) html = '<p style="font-size:13px;color:#8a6d1f;background:rgba(250,204,21,0.16);border:1px solid rgba(250,204,21,0.4);border-radius:8px;padding:10px 12px;margin:18px 0;">' + esc(c.problem) + '</p>'; break;
         case 'embed_lab': {
           var src = '/aquintutor/labs/' + esc(c.slug || 'pendulum');
           html = '<figure style="margin:20px 0;"><iframe src="' + src + '" loading="lazy" style="width:100%;height:' + (parseInt(c.height,10) || 620) + 'px;border:1px solid #e5dcc6;border-radius:12px;background:#0a0a0c;"></iframe>' + (c.caption ? '<figcaption style="font-size:13px;color:#7A6F68;margin-top:6px;text-align:center;font-style:italic;">' + esc(c.caption) + '</figcaption>' : '') + '<p style="font-size:12px;color:#7A6F68;margin-top:4px;text-align:center;"><a href="' + src + '" target="_blank" rel="noopener" style="color:#FF4F00;">Open the lab full-screen ↗</a></p></figure>';

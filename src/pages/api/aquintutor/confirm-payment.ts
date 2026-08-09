@@ -23,18 +23,26 @@
 // the same hole.
 //
 // =================================================================================================
-// enrolled_count WAS BUMPED ON EVERY CALL, INCLUDING THE ONES THAT ENROLLED NOBODY
+// THE ENROLMENT ITSELF IS NO LONGER WRITTEN HERE, AND THE STATEMENT IT USED COULD NOT HAVE WORKED
 // =================================================================================================
 //
-// The enrolment INSERT is `ON CONFLICT (course_id, user_id) DO UPDATE`, so a replay or a double-tap
-// creates no new learner — but the `enrolled_count = enrolled_count + 1` beneath it ran regardless,
-// so the seat counter climbed every time and no query could ever reconcile it back. It is now driven
-// by whether the INSERT actually inserted (xmax = 0 on the returned row), which is the only way to
-// tell an insert from an ON CONFLICT update in one statement.
+// It was `INSERT ... ON CONFLICT (course_id, user_id) DO UPDATE`, with the seat counter driven off
+// `xmax = 0`. But training_enrollments HAS NO UNIQUE KEY on (course_id, user_id) — four other files
+// in this repository say so in their own comments, which is why ensureEnrolment() uses
+// INSERT ... WHERE NOT EXISTS instead. Postgres answers an ON CONFLICT naming columns with no
+// matching constraint by refusing the whole statement, so this route threw on every paid enrolment,
+// the catch below turned it into "we could not finish that enrolment", and the money was already
+// taken.
+//
+// The write now goes through completeCoursePurchase() in src/lib/course-purchase.ts — the SAME
+// function applyPaidEffects() calls, so the browser, the Razorpay webhook and the reconcile backstop
+// all finish a purchase the same way. Before that, course confirmation existed only here: a learner
+// whose tab closed after paying was charged and never enrolled, and nothing else could complete it.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { verifyPaymentSignature, fetchPayment } from '@/lib/razorpay';
+import { completeCoursePurchase } from '@/lib/course-purchase';
 
 // Declared before the handler that uses them — `const` is not hoisted.
 const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
@@ -101,18 +109,20 @@ export const POST: APIRoute = async ({ request, locals }) => {
         AND status NOT IN ('refunded', 'partially_refunded')
     `);
 
-    // Create enrollment. `xmax = 0` is true only for a row this statement actually INSERTED, so a
-    // repeat that lands on ON CONFLICT does not move the seat counter.
-    const enrolled = rowsOf(await db.execute(sql`
-      INSERT INTO training_enrollments (course_id, user_id, progress_pct, payment_id, amount_paid_paise)
-      VALUES (${courseId}, ${user.id}, 0, ${payment.id}, ${payment.amount_paise})
-      ON CONFLICT (course_id, user_id) DO UPDATE SET payment_id = EXCLUDED.payment_id, amount_paid_paise = EXCLUDED.amount_paid_paise
-      RETURNING (xmax = 0) AS inserted
-    `));
-    const isNew = !!(enrolled[0] as any)?.inserted;
-    if (isNew) {
-      await db.execute(sql`UPDATE training_courses SET enrolled_count = enrolled_count + 1 WHERE id = ${courseId}`)
-        .catch((e: any) => console.error('[aquintutor/confirm-payment] seat counter not incremented for course', courseId, '-', causeOf(e)));
+    // THE ENROLMENT, THROUGH THE ONE WRITER. Idempotent: a replayed confirmation enrols nobody a
+    // second time, does not move the seat counter, and does not spend the waiver twice.
+    const done = await completeCoursePurchase(orderId, paymentId);
+    if (done.refunded) {
+      return json({ ok: false, error: 'This payment has been refunded. Nothing was changed.' }, 409);
+    }
+    if (!done.applied) {
+      // The payment is marked paid above and the learner is NOT enrolled. Never silent: the log
+      // names the order, and the sentence tells them not to pay again.
+      console.error('[aquintutor/confirm-payment] order', orderId, 'is paid but no course enrolment was applied');
+      return json({
+        ok: false,
+        error: 'Your payment went through but we could not open the course. Do not pay again - email connect@edurankai.in with your payment id and we will fix it.',
+      }, 500);
     }
 
     return json({ ok: true, redirect: '/portal/courses/' + courseSlug });

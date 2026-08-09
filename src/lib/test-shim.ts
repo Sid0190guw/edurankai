@@ -46,6 +46,9 @@ type Matchers = {
   toBeNull: () => void;
   toBeCloseTo: (x: number, digits?: number) => void;
   toBeGreaterThan: (x: number) => void;
+  toBeGreaterThanOrEqual: (x: number) => void;
+  toBeLessThan: (x: number) => void;
+  toBeLessThanOrEqual: (x: number) => void;
   toContain: (x: any) => void;
   toHaveLength: (n: number) => void;
   toMatch: (re: RegExp | string) => void;
@@ -64,6 +67,11 @@ function build(actual: any, negate: boolean): any {
     toBeCloseTo: (x: number, digits = 2) =>
       check(Math.abs(Number(actual) - x) < Math.pow(10, -digits) / 2, 'is close to ' + x),
     toBeGreaterThan: (x: number) => check(Number(actual) > x, 'is greater than ' + x),
+    toBeGreaterThanOrEqual: (x: number) =>
+      check(Number(actual) >= x, 'is at least ' + x),
+    toBeLessThan: (x: number) => check(Number(actual) < x, 'is less than ' + x),
+    toBeLessThanOrEqual: (x: number) =>
+      check(Number(actual) <= x, 'is at most ' + x),
     toContain: (x: any) =>
       check(Array.isArray(actual) ? actual.includes(x) : String(actual).includes(String(x)),
         'contains ' + show(x)),

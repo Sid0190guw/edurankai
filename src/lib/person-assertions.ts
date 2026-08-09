@@ -297,10 +297,15 @@ export interface ProtectedConcern {
 /**
  * Does this text name a protected or sensitive attribute?
  *
- * Called before a skill enters the catalogue and before a requirement is attached to a job — the two
- * places in the spine where somebody could create the seam. It is NOT called on free text a person
- * wrote about their own life: refusing somebody a sentence about themselves is a different and worse
- * thing than refusing to make that sentence a decision variable.
+ * WHERE IT IS ACTUALLY CALLED, which is not the same as where it should be and is written down here
+ * rather than assumed: createSkill() in src/lib/skills.ts (the one front door to the catalogue),
+ * assertRelation() and addAlias() in src/lib/skill-ontology.ts (so no graph structure can be built
+ * around a protected-named node), and requirementLine() in src/lib/capability-coverage.ts, which
+ * surfaces the concern beside a job requirement rather than refusing it.
+ *
+ * It is NOT called on free text a person wrote about their own life: refusing somebody a sentence
+ * about themselves is a different and worse thing than refusing to make that sentence a decision
+ * variable.
  */
 export function protectedAttributeConcern(text: string): ProtectedConcern {
   const raw = String(text || '').trim();
@@ -359,18 +364,36 @@ export function assertAllowedAboutPerson(subject: string): { allowed: boolean; w
  * self / manager      a person stated a level. Different people, same epistemic weight: nobody
  *                     checked either. The screen still shows WHO, because "my manager says" and
  *                     "I say" are different sentences even when both are unchecked.
- * course / assessment CHECKED. src/lib/skills.ts re-reads the completion or the passed attempt
- *                     through the module that owns it and refuses a reference that does not confirm,
- *                     so a row carrying one of these was verified at WRITE time, not at read time.
+ * course / assessment THIS PLATFORM'S OWN RECORD OF ITS OWN ACT — 'factual'. src/lib/skills.ts
+ *                     re-reads the completion or the passed attempt through the module that owns it
+ *                     and refuses a reference that does not confirm, so the ATTACHMENT is confirmed
+ *                     at write time. That is a machine reading its own table.
  *
- * An unknown value maps to explicitly_provided, never to verified: an unrecognised source is a
- * source nobody checked, and defaulting the other way would upgrade a claim by accident.
+ * THIS USED TO RETURN 'verified' AND THAT WAS THE ONE RULE THIS FILE EXISTS TO HOLD, BROKEN.
+ * 'verified' means a NAMED HUMAN checked a claim against something and said so, in writing, on a
+ * date — src/lib/provenance.ts will not produce one without an actor id, an actor name, a written
+ * reason and a method, and refuses to manufacture it any other way. No human is anywhere near this
+ * function: a completion row confirmed by our own code named nobody, gave no reason, and could be
+ * asked no questions in six months. It also carried `sufficientAlone: true`, so a consequential
+ * decision could rest on it with nothing beside it.
+ *
+ * 'factual' is the honest word and it is the word src/lib/evidence-graph.ts already uses for exactly
+ * these three kinds (course_completion, platform_certificate and assessment_pass all support
+ * 'demonstrated', which ASSERTION_BY_EVIDENCE_LEVEL maps to 'factual'). Two modules were describing
+ * one row with two different words, and the stronger of the two was the wrong one.
+ *
+ * NOTE WHAT IS STILL TRUE AND STILL UNCOMFORTABLE: the LEVEL on that row was chosen by a person
+ * from a dropdown. What this platform recorded is the completion, not the level. Callers say so —
+ * see the note built in personSkillsPanel() in src/lib/person-360.ts.
+ *
+ * An unknown value maps to explicitly_provided, never upwards: an unrecognised source is a source
+ * nobody checked, and defaulting the other way would upgrade a claim by accident.
  */
 export function assertionForSkillSource(source: string | null | undefined): AssertionType {
   switch (String(source || '').toLowerCase()) {
     case 'course':
     case 'assessment':
-      return 'verified';
+      return 'factual';
     case 'self':
     case 'manager':
       return 'explicitly_provided';

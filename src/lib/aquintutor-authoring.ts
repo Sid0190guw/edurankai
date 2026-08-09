@@ -427,7 +427,10 @@ export const BLOCK_KINDS = {
   text:          { label: 'Paragraph',       defaults: { md: '' } },
   heading:       { label: 'Heading',         defaults: { level: 2, text: '' } },
   image:         { label: 'Image',           defaults: { url: '', alt: '', caption: '' } },
-  video_embed:   { label: 'Video',           defaults: { provider: 'youtube', url: '', caption: '' } },
+  // No provider field: which service a link belongs to is derived from the link by
+  // src/lib/video-embed.ts at save and at render. Seeding a provider here put a company name
+  // into stored content and into the editor a person reads.
+  video_embed:   { label: 'Video',           defaults: { url: '', caption: '', opensElsewhere: false } },
   callout:       { label: 'Callout',         defaults: { tone: 'info', title: '', body: '' } },
   code:          { label: 'Code',            defaults: { language: 'python', code: '' } },
   mcq:           { label: 'Multiple choice', defaults: { question: '', options: ['', ''], correct: 0, explanation: '' } },

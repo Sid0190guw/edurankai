@@ -1,0 +1,351 @@
+---
+// /admin/courses/<id>/sessions — THE ONE PLACE A COURSE'S LIVE SESSIONS ARE SCHEDULED.
+//
+// WHY IT LIVES UNDER /admin/courses. src/middleware.ts maps that prefix to the `lms` section, so this
+// page inherits the door the rest of the course console already stands behind — no new section key,
+// no new capability, nothing for a role matrix to forget. The write gate is the same
+// canAccessSection(user, 'lms', 'edit') the course list uses, asked again on the POST, because a
+// hidden form is not a permission check.
+//
+// WHAT IS DELIBERATELY NOT ON THIS PAGE: a file input. A session is a link or an in-house room, and a
+// recording is a link. This platform stores no video, by design, and the storage bill for one is
+// somebody else's on purpose.
+//
+// AND NO PRODUCT IS NAMED. The field says "meeting link". The organiser can paste an address from any
+// conferencing tool they like and the platform will not have an opinion about which — see
+// src/lib/course-sessions.ts, which accepts every https address and names none of them.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import { canAccessSection } from '@/lib/auth/permissions';
+import {
+  listCourseSessionsForOrganiser, createCourseSession, setSessionRecording, updateSessionLink,
+  cancelCourseSession, organiserBoardUrl, sessionState, stateLabel, formatInZone, countdownLabel,
+  COMMON_TIME_ZONES, DEFAULT_TIME_ZONE, JOIN_OPENS_MINUTES, MEETING_LINK_LABEL,
+} from '@/lib/course-sessions';
+
+export const prerender = false;
+
+// Every const is declared ABOVE the POST handler that reads it. `const` is not hoisted, and a handler
+// reaching a later declaration throws on its first line while the page still reports success — that
+// has taken two screens down on this project already.
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+if (user.role === 'applicant') return Astro.redirect('/portal');
+
+const courseId = String(Astro.params.id || '');
+const canWrite = await canAccessSection(user as any, 'lms', 'edit');
+
+let course: any = null;
+let loadFailed = '';
+try {
+  course = rowsOf(await db.execute(sql`
+    SELECT id, slug, title, is_published FROM training_courses WHERE id::text = ${courseId} LIMIT 1`))[0] || null;
+} catch (e: any) {
+  // A course that could not be READ is not a course that does not exist. Redirecting to the list as
+  // though it were missing hides an outage behind a "not found".
+  loadFailed = causeOf(e);
+  console.error('[admin/courses/sessions] course read failed -', loadFailed);
+}
+if (!course && !loadFailed) return Astro.redirect('/admin/courses');
+
+let okMsg = '';
+let errMsg = '';
+
+if (Astro.request.method === 'POST' && course) {
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+  if (!canWrite) {
+    errMsg = 'Your role can open this schedule but cannot change it. Nothing was saved.';
+  } else if (action === 'create_session') {
+    const made = await createCourseSession({
+      courseId: String(course.id),
+      title: String(fd.get('title') || ''),
+      subject: String(fd.get('subject') || ''),
+      startLocal: String(fd.get('start_local') || ''),
+      timeZone: String(fd.get('time_zone') || DEFAULT_TIME_ZONE),
+      durationMinutes: Number(fd.get('duration_minutes') || 60),
+      mode: String(fd.get('mode') || 'external') === 'in_house' ? 'in_house' : 'external',
+      meetUrl: String(fd.get('meet_url') || ''),
+      isRecorded: fd.get('is_recorded') === 'on',
+      capacity: Number(fd.get('capacity') || 500),
+      hostUserId: String(user.id),
+    });
+    // The message is the RESULT, not the intention. Every writer in this module returns what actually
+    // happened, and a failure carries the database's own reason rather than "could not save".
+    okMsg = made.ok ? 'Session scheduled. Learners on this course see it immediately.' : '';
+    errMsg = made.ok ? '' : made.error;
+  } else if (action === 'set_recording') {
+    const done = await setSessionRecording(String(fd.get('session_id') || ''), String(fd.get('recording_url') || ''));
+    okMsg = done.ok ? 'Recording added. It shows on the session once it has finished.' : '';
+    errMsg = done.ok ? '' : done.error;
+  } else if (action === 'update_link') {
+    const done = await updateSessionLink(String(fd.get('session_id') || ''), String(fd.get('meet_url') || ''));
+    okMsg = done.ok ? 'The ' + MEETING_LINK_LABEL + ' was updated.' : '';
+    errMsg = done.ok ? '' : done.error;
+  } else if (action === 'cancel_session') {
+    const done = await cancelCourseSession(String(fd.get('session_id') || ''));
+    okMsg = done.ok ? 'Session cancelled. Learners see it as cancelled rather than losing it from the list.' : '';
+    errMsg = done.ok ? '' : done.error;
+  } else {
+    errMsg = 'That action is not one this page performs. Nothing was changed.';
+  }
+  return Astro.redirect('/admin/courses/' + encodeURIComponent(courseId) + '/sessions?msg=' +
+    encodeURIComponent(okMsg || errMsg) + (okMsg ? '' : '&kind=err'));
+}
+
+const params = new URL(Astro.request.url).searchParams;
+const flash = params.get('msg') || '';
+const flashIsError = params.get('kind') === 'err';
+
+const listed = course
+  ? await listCourseSessionsForOrganiser(String(course.id))
+  : { ok: false, sessions: [], error: 'The course could not be read.' };
+
+// Resolved once, above the JSX, so the template does no awaiting: the board address for each in-house
+// session, for the teacher who is going to drive it.
+const boardUrls = new Map<string, string>();
+for (const s of listed.sessions) {
+  if (s.mode === 'in_house') {
+    const u = await organiserBoardUrl(s.id);
+    if (u) boardUrls.set(s.id, u);
+  }
+}
+
+const now = Date.now();
+const nowIso = new Date(now + 60 * 60000).toISOString().slice(0, 16);
+const title = course ? String(course.title || 'Course') : 'Course';
+---
+<AdminLayout title={'Live sessions: ' + title} activeNav="courses">
+  <main class="cs-wrap">
+    <div class="cs-head">
+      <div>
+        <p class="cs-eyebrow">Course schedule</p>
+        <h1 class="cs-title">Live sessions</h1>
+        <p class="cs-sub">{title}{course && course.is_published === false ? ' (unpublished)' : ''}</p>
+      </div>
+      <a class="cs-back" href={'/admin/courses/' + courseId + '/edit'}>Back to the course</a>
+    </div>
+
+    {flash && (
+      <p class={flashIsError ? 'cs-flash cs-flash-err' : 'cs-flash'}>{flash}</p>
+    )}
+
+    {loadFailed && (
+      <p class="cs-flash cs-flash-err">
+        This course could not be read, so nothing below is the schedule. The reason is in the server log.
+      </p>
+    )}
+
+    {!listed.ok && !loadFailed && (
+      <p class="cs-flash cs-flash-err">{listed.error}</p>
+    )}
+
+    {!canWrite && (
+      <p class="cs-note">
+        You can read this schedule. Changing it needs edit rights on the course section, which this
+        account does not hold, so the controls below are not shown.
+      </p>
+    )}
+
+    {canWrite && course && (
+      <form method="POST" class="cs-card cs-form">
+        <input type="hidden" name="action" value="create_session" />
+        <h2 class="cs-h2">Schedule a session</h2>
+        <div class="cs-grid">
+          <label class="cs-field cs-wide">Title
+            <input name="title" required maxlength="300" placeholder="Week 3 live: rotational dynamics" />
+          </label>
+          <label class="cs-field">Subject
+            <input name="subject" maxlength="120" placeholder="Physics" />
+          </label>
+          <label class="cs-field">Starts at
+            <input name="start_local" type="datetime-local" required value={nowIso} />
+          </label>
+          <label class="cs-field">Time zone
+            <select name="time_zone">
+              {COMMON_TIME_ZONES.map((tz) => (
+                <option value={tz} selected={tz === DEFAULT_TIME_ZONE}>{tz}</option>
+              ))}
+            </select>
+            <span class="cs-hint">
+              The zone the class is scheduled in. Learners see this time in this zone, and their own
+              local time beside it. A time with no zone is wrong for everybody outside one country.
+            </span>
+          </label>
+          <label class="cs-field">Minutes
+            <input name="duration_minutes" type="number" min="10" max="600" value="60" />
+          </label>
+          <label class="cs-field">Seats
+            <input name="capacity" type="number" min="1" max="5000" value="500" />
+          </label>
+          <label class="cs-field cs-wide">Where it happens
+            <select name="mode" id="csMode">
+              <option value="external">Somewhere else, on a meeting link I paste</option>
+              <option value="in_house">Here, on the live teaching board</option>
+            </select>
+            <span class="cs-hint">
+              The in-house option opens the platform's own live board: you drive it, and every learner
+              follows the same session on whatever device they have. It broadcasts what you draw and
+              fire, not a camera feed. Choose a meeting link when you need faces and voices.
+            </span>
+          </label>
+          <label class="cs-field cs-wide" id="csLinkField">Meeting link
+            <input name="meet_url" type="url" inputmode="url" placeholder="https://..." />
+            <span class="cs-hint">
+              Paste the address from your invitation. Any conferencing tool works. It is never shown on
+              a page: learners get a Join button that checks their enrolment and forwards them, and it
+              opens {JOIN_OPENS_MINUTES} minutes before the start.
+            </span>
+          </label>
+          <label class="cs-check cs-wide">
+            <input type="checkbox" name="is_recorded" />
+            <span>This session will be recorded</span>
+          </label>
+        </div>
+        <button class="cs-btn cs-btn-primary" type="submit">Schedule it</button>
+      </form>
+    )}
+
+    <h2 class="cs-h2 cs-h2-sep">Scheduled</h2>
+
+    {listed.sessions.length === 0 ? (
+      <p class="cs-empty">
+        {listed.ok
+          ? 'This course has no live sessions. That is what learners are told on the course page too — an empty schedule says so in words rather than showing an empty box.'
+          : 'The schedule could not be read, which is not the same as it being empty.'}
+      </p>
+    ) : (
+      <ul class="cs-list">
+        {listed.sessions.map((s) => {
+          const state = sessionState({ startIso: s.startIso, durationMinutes: s.durationMinutes, status: s.status }, now);
+          const board = boardUrls.get(s.id) || '';
+          return (
+            <li class="cs-card">
+              <div class="cs-row">
+                <div class="cs-row-main">
+                  <p class={'cs-pill cs-pill-' + state}>{stateLabel(state)}</p>
+                  <h3 class="cs-item-title">{s.title}</h3>
+                  <p class="cs-when">
+                    {formatInZone(s.startIso, s.timeZone)} &middot; {s.durationMinutes} min
+                    {state === 'scheduled' || state === 'open' ? ' · ' + countdownLabel(s.startIso, now) : ''}
+                  </p>
+                  <p class="cs-meta">
+                    {s.mode === 'in_house' ? 'On the live board here' : 'On a ' + MEETING_LINK_LABEL}
+                    {s.isRecorded ? ' · recorded' : ' · not recorded'}
+                    {s.hasLink ? '' : ' · NO JOIN TARGET YET'}
+                  </p>
+                  {s.recordingProblem && (
+                    <p class="cs-warn">
+                      A recording address is stored on this session but will not open: {s.recordingProblem}
+                    </p>
+                  )}
+                </div>
+                <div class="cs-row-side">
+                  {board && (
+                    <a class="cs-btn cs-btn-ghost" href={board}>Open the board</a>
+                  )}
+                  {s.mode === 'external' && s.meetUrl && (
+                    <a class="cs-btn cs-btn-ghost" href={s.meetUrl} target="_blank" rel="noopener noreferrer">Open the meeting</a>
+                  )}
+                </div>
+              </div>
+
+              {canWrite && s.status !== 'cancelled' && (
+                <div class="cs-actions">
+                  {s.mode === 'external' && (
+                    <form method="POST" class="cs-inline">
+                      <input type="hidden" name="action" value="update_link" />
+                      <input type="hidden" name="session_id" value={s.id} />
+                      <input name="meet_url" type="url" placeholder="Replace the meeting link" value={s.meetUrl || ''} />
+                      <button class="cs-btn cs-btn-ghost" type="submit">Save link</button>
+                    </form>
+                  )}
+                  <form method="POST" class="cs-inline">
+                    <input type="hidden" name="action" value="set_recording" />
+                    <input type="hidden" name="session_id" value={s.id} />
+                    <input name="recording_url" type="url" placeholder="Recording link, once you have one" value={s.recordingUrl || ''} />
+                    <button class="cs-btn cs-btn-ghost" type="submit">Save recording</button>
+                  </form>
+                  <form method="POST" class="cs-inline">
+                    <input type="hidden" name="action" value="cancel_session" />
+                    <input type="hidden" name="session_id" value={s.id} />
+                    <button class="cs-btn cs-btn-danger" type="submit">Cancel session</button>
+                  </form>
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    )}
+  </main>
+
+  <script is:inline>
+    // The meeting-link field belongs to the external mode only. Hidden, never removed: the server
+    // ignores it for an in-house session anyway, so this is a convenience and not a gate.
+    (function () {
+      var mode = document.getElementById('csMode');
+      var field = document.getElementById('csLinkField');
+      if (!mode || !field) return;
+      function sync() {
+        var external = mode.value !== 'in_house';
+        field.style.display = external ? '' : 'none';
+        var input = field.querySelector('input');
+        if (input) input.required = external;
+      }
+      mode.addEventListener('change', sync);
+      sync();
+    })();
+  </script>
+
+  <style>
+    .cs-wrap { max-width: 900px; margin: 0 auto; padding: 20px 14px 72px; }
+    .cs-head { display: flex; gap: 14px; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; margin-bottom: 16px; }
+    .cs-eyebrow { font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: #FF4F00; font-weight: 700; margin: 0 0 6px; }
+    .cs-title { font-size: 26px; font-weight: 600; margin: 0; color: #1A1612; line-height: 1.15; }
+    .cs-sub { margin: 4px 0 0; color: #5C544A; font-size: 14px; }
+    .cs-back { font-size: 13px; color: #5C544A; text-decoration: none; border: 1px solid rgba(26,22,18,0.16); border-radius: 8px; padding: 10px 14px; min-height: 44px; display: inline-flex; align-items: center; }
+    .cs-flash { border: 1px solid rgba(255,79,0,0.3); border-left: 3px solid #FF4F00; background: #fff; border-radius: 8px; padding: 12px 14px; font-size: 13.5px; color: #1A1612; margin: 0 0 14px; }
+    .cs-flash-err { border-color: rgba(220,38,38,0.35); border-left-color: #DC2626; }
+    .cs-note { background: #fff; border: 1px dashed rgba(26,22,18,0.2); border-radius: 8px; padding: 12px 14px; font-size: 13.5px; color: #5C544A; margin: 0 0 14px; }
+    .cs-card { background: #fff; border: 1px solid rgba(26,22,18,0.12); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+    .cs-h2 { font-size: 17px; font-weight: 600; color: #1A1612; margin: 0 0 12px; }
+    .cs-h2-sep { margin-top: 26px; }
+    .cs-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    .cs-field { display: flex; flex-direction: column; gap: 5px; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #5C544A; font-weight: 700; }
+    .cs-field input, .cs-field select { background: #FAF8F5; border: 1px solid rgba(26,22,18,0.18); border-radius: 8px; padding: 11px 12px; font-size: 15px; font-family: inherit; color: #1A1612; min-height: 44px; }
+    .cs-field input:focus, .cs-field select:focus { outline: 2px solid #FF4F00; outline-offset: 1px; }
+    .cs-hint { font-size: 12px; letter-spacing: 0; text-transform: none; color: #8B8175; font-weight: 400; line-height: 1.45; }
+    .cs-check { display: flex; align-items: center; gap: 10px; font-size: 14px; color: #1A1612; min-height: 44px; }
+    .cs-check input { width: 20px; height: 20px; }
+    .cs-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 11px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; border: 1px solid transparent; text-decoration: none; }
+    .cs-btn-primary { background: #FF4F00; color: #fff; }
+    .cs-btn-ghost { background: #fff; color: #1A1612; border-color: rgba(26,22,18,0.18); }
+    .cs-btn-danger { background: #fff; color: #B91C1C; border-color: rgba(185,28,28,0.35); }
+    .cs-list { list-style: none; margin: 0; padding: 0; }
+    .cs-row { display: flex; gap: 12px; justify-content: space-between; flex-wrap: wrap; }
+    .cs-row-main { flex: 1 1 260px; min-width: 0; }
+    .cs-row-side { display: flex; flex-direction: column; gap: 8px; }
+    .cs-item-title { font-size: 17px; font-weight: 600; color: #1A1612; margin: 6px 0 4px; }
+    .cs-when { font-size: 13.5px; color: #1A1612; margin: 0 0 4px; }
+    .cs-meta { font-size: 12.5px; color: #8B8175; margin: 0; }
+    .cs-warn { font-size: 12.5px; color: #B91C1C; margin: 6px 0 0; }
+    .cs-pill { display: inline-block; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; font-weight: 700; padding: 4px 9px; border-radius: 100px; margin: 0; background: rgba(26,22,18,0.06); color: #5C544A; }
+    .cs-pill-live { background: #DC2626; color: #fff; }
+    .cs-pill-open { background: rgba(255,79,0,0.12); color: #FF4F00; }
+    .cs-pill-cancelled { background: rgba(185,28,28,0.10); color: #B91C1C; }
+    .cs-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; border-top: 1px solid rgba(26,22,18,0.08); padding-top: 12px; }
+    .cs-inline { display: flex; gap: 8px; flex-wrap: wrap; }
+    .cs-inline input { flex: 1 1 200px; min-width: 0; background: #FAF8F5; border: 1px solid rgba(26,22,18,0.18); border-radius: 8px; padding: 10px 12px; font-size: 14px; min-height: 44px; font-family: inherit; }
+    .cs-empty { background: #fff; border: 1px dashed rgba(26,22,18,0.2); border-radius: 12px; padding: 26px 16px; color: #5C544A; font-size: 14px; }
+    @media (min-width: 720px) {
+      .cs-wrap { padding: 28px 22px 80px; }
+      .cs-grid { grid-template-columns: 1fr 1fr; }
+      .cs-wide { grid-column: 1 / -1; }
+    }
+  </style>
+</AdminLayout>

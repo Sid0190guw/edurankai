@@ -327,9 +327,10 @@ async function skillsPanel(employeeId: string | null, audience: Audience): Promi
       assertion,
       note: 'Recorded by ' + skillSourceActor(s.source) + '. '
         + (s.evidence ? s.evidence + ' ' : '')
-        + (assertion === 'verified'
-          ? 'The attachment was checked against the record that owns it when it was saved. The LEVEL itself '
-            + 'was still chosen by a person — it is not derived from the result.'
+        + (assertion === 'factual'
+          ? 'The attachment was confirmed against the record that owns it when it was saved — by this '
+            + 'platform reading its own table, not by a person. The LEVEL itself was still chosen by '
+            + 'somebody; it is not derived from the result, and nobody has verified it.'
           : 'Nobody has checked this.'),
       url: s.evidenceUrl,
       at: s.assessedAt,

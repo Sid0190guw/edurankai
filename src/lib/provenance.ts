@@ -542,6 +542,9 @@ function freezeElement<T extends ProvenanceElement>(el: T): T {
   Object.freeze(el.assumptions);
   Object.freeze(el.basis);
   Object.freeze(el.evidence);
+  // The events too, not only the array holding them. A hydrated history arrives as plain parsed
+  // JSON, and an unfrozen event is an editable record of who verified what.
+  for (const h of el.history) Object.freeze(h);
   Object.freeze(el.history);
   if (el.verification) {
     Object.freeze(el.verification.evidence);
@@ -855,6 +858,17 @@ export function verify(
   if (isProtectedField(element.field)) {
     return fail('A protected or sensitive attribute is held because the person provided it. It is not checked, not confirmed, and never a factor in a decision.');
   }
+  // A VERIFICATION IS ABOUT ONE VALUE. Without a fingerprint there is nothing for
+  // checkAgainstValue() to compare, so the verification could never go stale: the column underneath
+  // it could change every day and the screen would keep printing "Verified by ...". That is the
+  // most expensive lie named in the header, and it is closed here rather than described.
+  if (!element.fingerprint) {
+    return fail(
+      'Nothing records which value was recorded here, so there is nothing for a verification to be '
+      + 'about — it could never notice the value changing underneath it. Record the field again with '
+      + 'the value as it stands, then verify that.',
+    );
+  }
 
   const actorUserId = isUuid(act?.actorUserId) ? String(act.actorUserId) : '';
   if (!actorUserId) return fail('A verification has to name the person making it. Nothing was recorded.');
@@ -1099,7 +1113,10 @@ export interface ProvenanceRender {
 export function renderProvenance(el: ProvenanceElement): ProvenanceRender {
   const staleVerified = el.assertion === 'verified' && el.stale;
   const effective: AssertionType = staleVerified ? (el as VerifiedElement).derivedFrom : el.assertion;
-  const descriptor = assertionDescriptor(effective) || ASSERTIONS[1];
+  // The fallback is the ADVISORY one, not the stated one. An element whose assertion this file does
+  // not recognise is an element nobody can vouch for, and the safe reading of it is the quietest,
+  // never a chip that reads "Stated" beside a value with unknown provenance.
+  const descriptor = assertionDescriptor(effective) || assertionDescriptor('inferred')!;
 
   // A stale verification is never printed as a verification, and a stale anything is never allowed
   // to carry the weight of a record.
@@ -1404,7 +1421,7 @@ const REQUIRED_COLUMNS: readonly string[] = [
   'owner_kind', 'owner_subject_kind', 'owner_subject_id', 'owner_label', 'access_level',
   'confidence', 'reasoning', 'uncertainty', 'assumptions', 'basis', 'evidence', 'history',
   'verified_by_user_id', 'verified_by_name', 'verification_reason', 'verification_method',
-  'verified_at', 'recorded_at', 'recorded_by_user_id', 'updated_at',
+  'verification_evidence', 'verified_at', 'recorded_at', 'recorded_by_user_id', 'updated_at',
 ];
 
 /**
@@ -1450,6 +1467,7 @@ export function ensureProvenanceSchema(): Promise<void> {
         verified_by_name VARCHAR(200),
         verification_reason TEXT,
         verification_method VARCHAR(40),
+        verification_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
         verified_at TIMESTAMPTZ,
         recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         recorded_by_user_id UUID,
@@ -1462,6 +1480,11 @@ export function ensureProvenanceSchema(): Promise<void> {
       await db.execute(sql`ALTER TABLE provenance_records ADD COLUMN IF NOT EXISTS value_fingerprint TEXT`);
       await db.execute(sql`ALTER TABLE provenance_records ADD COLUMN IF NOT EXISTS history JSONB NOT NULL DEFAULT '[]'::jsonb`);
       await db.execute(sql`ALTER TABLE provenance_records ADD COLUMN IF NOT EXISTS verification_method VARCHAR(40)`);
+      // WHAT THE HUMAN ACTUALLY CHECKED, kept apart from what the element already carried. Storing
+      // one merged list meant the round trip handed the verifier credit for evidence they never
+      // looked at: "what was checked" is the whole content of a verification, and it was being
+      // reconstructed from the wrong column. Additive, so a table from an earlier version completes.
+      await db.execute(sql`ALTER TABLE provenance_records ADD COLUMN IF NOT EXISTS verification_evidence JSONB NOT NULL DEFAULT '[]'::jsonb`);
 
       await db.execute(sql`CREATE UNIQUE INDEX IF NOT EXISTS provenance_records_key
         ON provenance_records (entity_type, entity_id, field)`);
@@ -1596,6 +1619,34 @@ export function elementFromRow(row: any): ProvenanceResult<ProvenanceElement> {
   if (!isAssertionType(assertion)) {
     return fail('the stored row records an assertion type this system does not have (' + assertion + ').');
   }
+
+  // THE TWO REFUSALS, AGAIN, AT THE OTHER END OF THE JOURNEY.
+  //
+  // build() refuses a forbidden field and refuses a derived protected one, and that closed the seam
+  // in the code — but a row is not only ever written by build(). An older version of this file, a
+  // migration, a console session or a restored backup can put one in the table, and until now
+  // hydration read it back happily and renderProvenance() printed it. "No seam exists" has to be
+  // true on the way out as well, so an unreadable row is what a forbidden field becomes, and the
+  // caller renders renderUnreadable() rather than a working annotation on a column nobody may hold.
+  const storedField = String(row?.field || '');
+  if (isForbiddenField(storedField)) {
+    return fail(
+      'the stored row annotates a field this system does not hold (' + storedField + '). Predictions '
+      + 'about a person\'s future behaviour and signals collected by monitoring people are refused '
+      + 'here, so this row cannot be read as provenance and nothing was rendered from it.',
+    );
+  }
+  // 'explicitly_provided' EXACTLY, and not 'verified' either: verify() refuses a protected field
+  // outright, so a stored verification on one could only have been written around this module.
+  if (isProtectedField(storedField) && assertion !== 'explicitly_provided') {
+    return fail(
+      'the stored row records ' + storedField + ' — a protected or sensitive attribute — as '
+      + assertionLabel(assertion).toLowerCase() + ' rather than as something the person provided. It '
+      + 'may only ever be held as their own statement, never derived and never confirmed, so this '
+      + 'row cannot be read as provenance.',
+    );
+  }
+
   const evidence = parseJsonArray(row?.evidence).map((e: any) => Object.freeze({
     kind: String(e?.kind || 'external'),
     id: e?.id ? String(e.id) : null,
@@ -1650,6 +1701,18 @@ export function elementFromRow(row: any): ProvenanceResult<ProvenanceElement> {
     return fail('the stored row says this was verified but does not record what it was before, so it cannot be read as a checked claim rather than a fact.');
   }
   const method = String(row?.verification_method || 'checked_against_record');
+  // WHAT THE VERIFIER CHECKED, from its own column. A row written before that column existed has
+  // nothing there, and the honest reading of those is the merged list the element carries: it is
+  // what the verification was stored as, and inventing an empty one would say the human named
+  // nothing when the row does not record either way.
+  const verificationEvidence = row?.verification_evidence === undefined || row?.verification_evidence === null
+    ? evidence
+    : parseJsonArray(row.verification_evidence).map((e: any) => Object.freeze({
+      kind: String(e?.kind || 'external'),
+      id: e?.id ? String(e.id) : null,
+      label: String(e?.label || 'Unnamed evidence'),
+      url: e?.url ? String(e.url) : null,
+    })) as EvidenceRef[];
   return good(freezeElement({
     ...core,
     assertion: 'verified' as const,
@@ -1661,7 +1724,7 @@ export function elementFromRow(row: any): ProvenanceResult<ProvenanceElement> {
       method: ((VERIFICATION_METHODS as readonly string[]).indexOf(method) >= 0
         ? method : 'checked_against_record') as VerificationMethod,
       at,
-      evidence,
+      evidence: verificationEvidence,
     },
   } as VerifiedElement));
 }
@@ -1692,7 +1755,11 @@ export async function saveProvenance(
   if (!element || !isAssertionType(element.assertion)) return fail('There is nothing here to record.');
   if (element.assertion === 'verified') {
     const v = (element as VerifiedElement).verification;
-    if (!v || !isUuid(v.actorUserId) || clean(v.reason, 10).length < MIN_REASON_CHARS || !(element as VerifiedElement).derivedFrom) {
+    // clean(v, max) TRUNCATES to `max` characters. Reading the reason at 10 made this comparison
+    // `10 < 12` for every non-empty reason, so every verified element was refused here and no
+    // verification could ever be stored — verify() succeeded and the write always failed. The cap
+    // must be the storage cap, not a number smaller than the minimum being tested.
+    if (!v || !isUuid(v.actorUserId) || clean(v.reason, 2000).length < MIN_REASON_CHARS || !(element as VerifiedElement).derivedFrom) {
       return fail('A verified element must name who verified it, why, and what it was before. Nothing was recorded.');
     }
   }
@@ -1734,13 +1801,25 @@ export async function saveProvenance(
     }
 
     const v = element.assertion === 'verified' ? (element as VerifiedElement).verification : null;
+
+    // THE ON CONFLICT GUARD BELOW, IN WORDS (it cannot be a SQL comment: a backtick inside a sql
+    // template literal ends the template, and this file's explanations are full of identifiers).
+    //
+    // A verified row may be replaced by an unverified one only through a named supersede. It may be
+    // replaced by ANOTHER VERIFICATION only when it is the same verification being re-written —
+    // same verifier, same timestamp. Allowing any incoming verification to win let one person's
+    // verification overwrite another's with no withdrawal and no history: verify() refuses
+    // re-verification in memory, but two requests that both read the row while it was still
+    // unverified race straight past that check, and the second one used to win silently. The first
+    // verification is the record, and losing it is what withdrawVerification() exists to prevent.
     const rows = rowsOf(await db.execute(sql`
       INSERT INTO provenance_records (
         entity_type, entity_id, field, assertion, derived_from, value_fingerprint,
         source_system, source_detail, source_actor_user_id, source_actor_name,
         owner_kind, owner_subject_kind, owner_subject_id, owner_label, access_level,
         confidence, reasoning, uncertainty, assumptions, basis, evidence, history,
-        verified_by_user_id, verified_by_name, verification_reason, verification_method, verified_at,
+        verified_by_user_id, verified_by_name, verification_reason, verification_method,
+        verification_evidence, verified_at,
         recorded_at, recorded_by_user_id, updated_at
       ) VALUES (
         ${element.entityType}, ${element.entityId}, ${element.field}, ${element.assertion},
@@ -1753,7 +1832,8 @@ export async function saveProvenance(
         ${JSON.stringify(element.assumptions)}::jsonb, ${JSON.stringify(element.basis)}::jsonb,
         ${JSON.stringify(element.evidence)}::jsonb, ${JSON.stringify(history)}::jsonb,
         ${v ? v.actorUserId : null}::uuid, ${v ? v.actorName : null}::varchar,
-        ${v ? v.reason : null}::text, ${v ? v.method : null}::varchar, ${v ? v.at : null}::timestamptz,
+        ${v ? v.reason : null}::text, ${v ? v.method : null}::varchar,
+        ${JSON.stringify(v ? v.evidence : [])}::jsonb, ${v ? v.at : null}::timestamptz,
         ${element.recordedAt}::timestamptz, ${isUuid(opts?.recordedByUserId) ? String(opts.recordedByUserId) : null}::uuid,
         NOW()
       )
@@ -1781,42 +1861,63 @@ export async function saveProvenance(
         verified_by_name = EXCLUDED.verified_by_name,
         verification_reason = EXCLUDED.verification_reason,
         verification_method = EXCLUDED.verification_method,
+        verification_evidence = EXCLUDED.verification_evidence,
         verified_at = EXCLUDED.verified_at,
         recorded_at = EXCLUDED.recorded_at,
         recorded_by_user_id = EXCLUDED.recorded_by_user_id,
         updated_at = NOW()
       WHERE provenance_records.assertion <> 'verified'
-         OR EXCLUDED.assertion = 'verified'
          OR ${allowSupersede}::boolean
+         OR (EXCLUDED.assertion = 'verified'
+             AND provenance_records.verified_by_user_id IS NOT DISTINCT FROM EXCLUDED.verified_by_user_id
+             AND provenance_records.verified_at IS NOT DISTINCT FROM EXCLUDED.verified_at)
       RETURNING id`));
 
     if (!rows.length) {
-      return fail(
-        'This field is recorded as verified and the replacement was refused, so nothing was changed. '
-        + 'Withdraw the verification with a written reason first.',
-      );
+      // Zero rows back means the ON CONFLICT guard refused the update — but only say WHY when the
+      // row that was read a moment ago actually was verified. Naming a verification that is not
+      // there would send somebody hunting for a withdrawal they cannot make.
+      const blockedByVerification = !!existing && String(existing.assertion) === 'verified';
+      return fail(blockedByVerification
+        ? 'This field is already recorded as verified, and nothing here may replace that quietly, so '
+          + 'nothing was changed. Withdraw the existing verification with a written reason first; the '
+          + 'withdrawal stays on the record.'
+        : WRITE_FAILED);
     }
 
-    await logAudit({
-      userId: v ? v.actorUserId : (isUuid(opts?.recordedByUserId) ? String(opts.recordedByUserId) : element.source.actorUserId),
-      action: element.assertion === 'verified' ? 'provenance.verify' : 'provenance.record',
-      entity: TABLE,
-      entityId: String(rows[0].id),
-      diff: {
-        entityType: element.entityType,
-        entityId: element.entityId,
-        field: element.field,
-        assertion: element.assertion,
-        derivedFrom: element.derivedFrom,
-        superseded: allowSupersede,
-      },
-    });
+    // THE AUDIT ENTRY IS AFTER THE ROW EXISTS, so its failure is a different fact from the write
+    // failing, and must not be reported as one. Returning the generic refusal here would tell an
+    // administrator nothing was recorded while the row sat in the table — the exact divergence
+    // between reported success and observable result this project keeps paying for, inverted.
+    try {
+      await logAudit({
+        userId: v ? v.actorUserId : (isUuid(opts?.recordedByUserId) ? String(opts.recordedByUserId) : element.source.actorUserId),
+        action: element.assertion === 'verified' ? 'provenance.verify' : 'provenance.record',
+        entity: TABLE,
+        entityId: String(rows[0].id),
+        diff: {
+          entityType: element.entityType,
+          entityId: element.entityId,
+          field: element.field,
+          assertion: element.assertion,
+          derivedFrom: element.derivedFrom,
+          superseded: allowSupersede,
+        },
+      });
+    } catch (e: any) {
+      logFail('saveProvenance:audit', e);
+      return fail(
+        'The record was written but the audit entry was not, so this change is on the record and '
+        + 'not in the audit log. Tell an administrator before recording anything else here.',
+      );
+    }
     return good({ id: String(rows[0].id) });
   } catch (e: any) {
-    // NEVER SWALLOWED. A write path that hides its own failure is how ten tables were reported
-    // created and none existed.
+    // NEVER SWALLOWED — it is logged with the real Postgres reason off e.cause. What the CALLER gets
+    // back is the sentence a person can read: a raw Postgres message on a screen is both useless to
+    // the reader and a description of the schema to anybody else looking at it.
     logFail('saveProvenance', e);
-    return fail(e?.cause?.message || e?.message || WRITE_FAILED);
+    return fail(WRITE_FAILED);
   }
 }
 
@@ -1902,8 +2003,17 @@ export async function readProvenanceFor(
       return { ok: true, field, element: el };
     });
   } catch (e: any) {
+    // AN EMPTY ARRAY WOULD BE A LIE HERE. "Nothing is recorded about this person" and "we could not
+    // read what is recorded about this person" render identically to a caller that only counts the
+    // rows, and the first one invites a screen to print every value with no provenance beside it —
+    // the most confident screen in the product. One refusal entry comes back instead, and the page
+    // renders renderUnreadable().
     logFail('readProvenanceFor', e);
-    return [];
+    return [{
+      ok: false,
+      field: '',
+      error: 'we could not read how the values on this record came to be known.',
+    }];
   }
 }
 

@@ -138,6 +138,7 @@ import {
   isUuid,
   logFail,
   rowsOf,
+  uuidList,
   type PerfViewer,
 } from '@/lib/performance-scope';
 import { SKILL_LEVEL_LABELS, SKILL_SOURCE_LABELS, skillsForEmployee } from '@/lib/skills';
@@ -2081,6 +2082,128 @@ export async function requirementCoverage(
       + 'questions and a single number would hide which ones were answered.',
     identityNote: IDENTITY_NOT_JOINED,
   };
+}
+
+// =================================================================================================
+// HOW MANY RECORDS SIT AT EACH RUNG, PER SKILL — A COUNT, AND NEVER A LIST
+// =================================================================================================
+
+export type ClaimCountState = 'ok' | 'not_configured' | 'empty' | 'unreadable';
+
+export interface SkillClaimCounts {
+  skillId: string;
+  /** How many claim rows sit at each rung of the ladder. Records, not people — see below. */
+  byLevel: Record<EvidenceLevel, number>;
+  /** Split by the id space the record lives in, because the three are NOT known to be one human. */
+  byKind: Record<SubjectKind, number>;
+  claims: number;
+  /** How many evidence rows are attached to those claims. Zero claims cannot have evidence. */
+  evidenceRows: number;
+}
+
+export interface SkillClaimCountsReport {
+  state: ClaimCountState;
+  sentence: string;
+  counts: SkillClaimCounts[];
+  error?: string;
+}
+
+/**
+ * PER SKILL, HOW MANY CAPABILITY CLAIMS SIT AT EACH EVIDENCE LEVEL.
+ *
+ * WHAT THIS COUNTS, EXACTLY, BECAUSE THE WORD "PEOPLE" WOULD BE A LIE HERE. It counts ROWS in
+ * capability_claims. Each row belongs to an employee record, a candidate record or a learner
+ * account, and this codebase does not claim those three id spaces are one human — subject_id is TEXT
+ * for that reason, and IDENTITY_NOT_JOINED is printed wherever the question comes up. So the counts
+ * come back split by kind and are never added together into a headcount, and a screen that prints
+ * "8 people" over these numbers has invented a join nobody made.
+ *
+ * IT IS A COUNT AND THERE IS NO WAY TO OPEN IT. No name, no id, no link to a person is returned or
+ * reachable from here. A skill is not a protected attribute, and a count of records against a skill
+ * discloses nothing about any one of them; a list would be a different screen with different
+ * consequences for the people on it.
+ *
+ * FOUR STATES, KEPT APART. not_configured is asked of information_schema after the ensure, not
+ * inferred from it: ensureOnce swallows, so a returned ensure is not evidence that the table exists,
+ * and an absent table reported as an empty one would say "nobody has evidence for this skill" about
+ * a database that has never been able to hold the answer.
+ */
+export async function claimCountsBySkill(skillIds: readonly string[]): Promise<SkillClaimCountsReport> {
+  const ids = (skillIds || []).filter(isUuid).slice(0, 200);
+  if (!ids.length) {
+    return { state: 'empty', sentence: 'No skill was named, so nothing was counted.', counts: [] };
+  }
+  const zeroLevels = (): Record<EvidenceLevel, number> => {
+    const o = {} as Record<EvidenceLevel, number>;
+    for (const l of EVIDENCE_LEVELS) o[l] = 0;
+    return o;
+  };
+  const zeroKinds = (): Record<SubjectKind, number> => {
+    const o = {} as Record<SubjectKind, number>;
+    for (const k of SUBJECT_KINDS) o[k] = 0;
+    return o;
+  };
+  try {
+    await ensureEvidenceGraphSchema();
+    const tables = rowsOf(await db.execute(sql`
+      SELECT table_name FROM information_schema.tables
+       WHERE table_schema = 'public'
+         AND table_name IN ('capability_claims', 'capability_evidence')`));
+    const have = new Set(tables.map((r: any) => String(r.table_name)));
+    if (!have.has('capability_claims')) {
+      return {
+        state: 'not_configured',
+        sentence: 'The evidence graph has not been set up in this database yet, so no capability claim '
+          + 'can have been recorded against any skill. This is not a statement that nobody holds these '
+          + 'skills — the people who recorded them in the skill matrix are counted separately.',
+        counts: [],
+      };
+    }
+    const rows = rowsOf(await db.execute(sql`
+      SELECT c.skill_id::text AS skill_id, c.evidence_level, c.subject_kind,
+             COUNT(*)::int AS n,
+             COALESCE(SUM((SELECT COUNT(*) FROM capability_evidence e WHERE e.claim_id = c.id)), 0)::int AS ev
+        FROM capability_claims c
+       WHERE c.skill_id IN (${uuidList(ids)})
+       GROUP BY 1, 2, 3`));
+    const bySkill = new Map<string, SkillClaimCounts>();
+    for (const id of ids) {
+      bySkill.set(id, { skillId: id, byLevel: zeroLevels(), byKind: zeroKinds(), claims: 0, evidenceRows: 0 });
+    }
+    let total = 0;
+    for (const r of rows) {
+      const entry = bySkill.get(String(r.skill_id));
+      if (!entry) continue;
+      const n = Number(r.n) || 0;
+      // An unrecognised level or kind is NOT folded into the nearest known one: a row this module
+      // cannot name is left out of the ladder and said so in the sentence, rather than quietly
+      // counted as something it may not be.
+      if (isEvidenceLevel(r.evidence_level)) entry.byLevel[r.evidence_level] += n;
+      if (isSubjectKind(r.subject_kind)) entry.byKind[r.subject_kind] += n;
+      entry.claims += n;
+      entry.evidenceRows += Number(r.ev) || 0;
+      total += n;
+    }
+    const counts = ids.map((id) => bySkill.get(id)!);
+    return {
+      state: total === 0 ? 'empty' : 'ok',
+      sentence: total === 0
+        ? 'No capability claim has been recorded against ' + (ids.length === 1 ? 'this skill' : 'these skills')
+          + ' yet. The evidence graph is filled by carrying records over one person at a time, so an '
+          + 'empty count here is a statement about the graph and not about anybody.'
+        : 'These are counts of RECORDS, not of people. ' + IDENTITY_NOT_JOINED,
+      counts,
+    };
+  } catch (e: any) {
+    logFail(MOD, 'claimCountsBySkill', e);
+    return {
+      state: 'unreadable',
+      sentence: 'We could not read the capability claims just now, so no count is shown rather than a '
+        + 'zero. A zero here would read as "nobody has evidence for this", which is not what happened.',
+      counts: [],
+      error: e?.cause?.message || e?.message || 'unreadable',
+    };
+  }
 }
 
 // =================================================================================================

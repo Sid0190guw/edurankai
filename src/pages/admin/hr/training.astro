@@ -5,6 +5,12 @@ import { sql } from 'drizzle-orm';
 import { ensureAquintutorAuthoringSchema } from '@/lib/aquintutor-authoring';
 // OPENING THE CATALOGUE AND REWRITING IT ARE NOT THE SAME POWER. See the gate below.
 import { canAccessSection } from '@/lib/auth/permissions';
+// A PASTED LINK IS NOT A URL WE MAY RENDER UNTIL ONE PLACE SAYS SO. src/lib/video-embed.ts parses
+// it, requires https, matches it against an allowlist of known shapes and BUILDS the player address
+// itself; src/lib/lesson-video.ts stores both the pasted form and the derived one. Refusal happens
+// here, at the point of entry, with a sentence - never silently, to fail later in front of a learner.
+import { resolveVideoLink, describeVideoLink } from '@/lib/video-embed';
+import { persistLessonVideo } from '@/lib/lesson-video';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -118,23 +124,49 @@ if (Astro.request.method === 'POST') {
       const title = (fd.get('title') as string || '').trim();
       const type = fd.get('type') as string || 'video';
       const content = (fd.get('content') as string || '').trim() || null;
-      const videoUrl = (fd.get('video_url') as string || '').trim() || null;
+      const rawVideo = (fd.get('video_url') as string || '').trim();
+      // The author ticked "this one opens elsewhere". That does not relax the checks - https, a real
+      // public host and no embedded credentials are still required - it only means we will not frame it.
+      const opensElsewhere = fd.get('video_opens_elsewhere') === 'on';
       const durationMins = parseInt(fd.get('duration_mins') as string || '0') || 0;
       const isPreview = fd.get('is_preview') === 'on';
+
+      // RESOLVED BEFORE ANYTHING IS WRITTEN. A link we cannot play is refused here with the reason,
+      // rather than stored to render as an empty black rectangle - or worse, as an arbitrary origin
+      // in an iframe - on a page every enrolled learner opens.
+      const link = rawVideo ? resolveVideoLink(rawVideo, { allowLinkOut: opensElsewhere }) : null;
+
       if (!title) { errorMsg = 'A lesson needs a title.'; }
+      else if (link && !link.ok) {
+        errorMsg = 'That video link was not saved. ' + link.reason
+          + (link.canLinkOut ? ' If it is meant to open in a new tab rather than play here, tick "opens elsewhere" and save again.' : '');
+      }
       else {
         // Same COUNT-is-not-the-next-position fault as add_module above, and the same fix: MAX+1
         // computed inside the INSERT.
-        await db.execute(sql`
+        const ins = await db.execute(sql`
           INSERT INTO training_lessons (course_id, module_id, title, type, content, video_url, duration_mins, is_preview, sort_order)
-          SELECT ${courseId}, ${moduleId}, ${title}, ${type}, ${content}, ${videoUrl}, ${durationMins}, ${isPreview},
+          SELECT ${courseId}, ${moduleId}, ${title}, ${type}, ${content}, ${link ? link.originalUrl : null}, ${durationMins}, ${isPreview},
                  COALESCE(MAX(sort_order), -1) + 1
             FROM training_lessons WHERE course_id = ${courseId}
+          RETURNING id
         `);
+        const insertedId = (Array.isArray(ins) ? ins : ((ins as any)?.rows || []))[0]?.id;
         // The stored lesson count is recomputed from the lessons themselves rather than incremented,
         // so a missed run corrects itself on the next add instead of drifting forever.
         await db.execute(sql`UPDATE training_courses SET total_lessons = (SELECT COUNT(*) FROM training_lessons WHERE course_id = ${courseId}) WHERE id = ${courseId}`);
-        okMsg = 'Lesson added.';
+
+        // Both forms are stored: the address as pasted, and the player address we derived from it.
+        // If the derived half cannot be written the lesson still exists and the author is told so -
+        // a half-written row is never reported as a whole one.
+        let note = '';
+        if (insertedId && link && link.ok) {
+          const p = await persistLessonVideo(String(insertedId), link);
+          note = p.note;
+        }
+        okMsg = 'Lesson added.'
+          + (link && link.ok ? ' ' + describeVideoLink(link) : '')
+          + (note ? ' ' + note : '');
       }
     }
   // e.message on a Postgres error is only the statement that failed; the reason is on e.cause. An
@@ -467,8 +499,17 @@ const LEVEL_COLOR: Record<string,string> = { beginner:'#10b981', intermediate:'#
             </div>
           </div>
           <div id="videoField">
-            <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Video URL</label>
-            <input name="video_url" placeholder="YouTube, Vimeo, or direct MP4 URL..." style="width:100%;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+            <label for="lessonVideoUrl" style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Video link</label>
+            <input id="lessonVideoUrl" name="video_url" type="url" inputmode="url" autocomplete="off" placeholder="Paste the address shown when the video is open" style="width:100%;min-height:44px;background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;" />
+            <p style="font-size:11px;color:#6e6e78;margin:6px 0 0;line-height:1.5;">Nothing is uploaded. Paste the link and the lesson plays it from where it already lives.</p>
+            <!-- The live check. It calls the same resolver the save handler uses, so what it says
+                 here is what will happen on save. It never renders the pasted string - only the
+                 sentence the server returned. -->
+            <p id="lessonVideoCheck" role="status" aria-live="polite" style="display:none;font-size:12px;line-height:1.5;margin:8px 0 0;padding:8px 10px;border-radius:8px;"></p>
+            <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;margin-top:8px;min-height:44px;">
+              <input type="checkbox" name="video_opens_elsewhere" id="lessonVideoLinkOut" style="accent-color:#FF4F00;width:18px;height:18px;margin-top:12px;flex-shrink:0;" />
+              <span style="font-size:12px;color:#d8d8de;line-height:1.5;padding-top:10px;">This one opens elsewhere &ndash; give learners a button to a new tab instead of playing it in the lesson.</span>
+            </label>
           </div>
           <div>
             <label style="display:block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin-bottom:5px;">Content / Description</label>
@@ -610,7 +651,55 @@ function showTab(tab, btn) {
 function toggleLessonFields() {
   var type = document.getElementById('lessonType')?.value;
   var vf = document.getElementById('videoField');
-  if (vf) vf.style.display = type === 'video' ? 'block' : 'none';
+  // A 'link' lesson carries an address too - hiding the field for it is why some link lessons were
+  // saved with nothing to open.
+  if (vf) vf.style.display = (type === 'video' || type === 'link') ? 'block' : 'none';
 }
+
+// LIVE CHECK ON THE VIDEO FIELD.
+// Asks the server the same question the save handler will ask, and prints the server's sentence.
+// It is advisory in the sense that it cannot let anything through - the save handler resolves the
+// link again for itself and refuses independently - but it means an author learns the link is wrong
+// while they are looking at it, not after a learner opens the lesson.
+(function () {
+  var input = document.getElementById('lessonVideoUrl');
+  var out = document.getElementById('lessonVideoCheck');
+  var linkOut = document.getElementById('lessonVideoLinkOut');
+  if (!input || !out) return;
+  var timer = null;
+  var seq = 0;
+
+  function paint(text, tone) {
+    out.textContent = text;
+    out.style.display = text ? 'block' : 'none';
+    if (tone === 'ok') { out.style.background = 'rgba(16,185,129,0.12)'; out.style.border = '1px solid rgba(16,185,129,0.35)'; out.style.color = '#6ee7b7'; }
+    else if (tone === 'bad') { out.style.background = 'rgba(239,68,68,0.10)'; out.style.border = '1px solid rgba(239,68,68,0.32)'; out.style.color = '#fca5a5'; }
+    else { out.style.background = 'rgba(255,255,255,0.04)'; out.style.border = '1px solid #1a1a1f'; out.style.color = '#9a9aa4'; }
+  }
+
+  function check() {
+    var value = (input.value || '').trim();
+    if (!value) { paint('', ''); return; }
+    var mine = ++seq;
+    paint('Checking that link...', '');
+    fetch('/api/admin/video-link/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: value, allowLinkOut: !!(linkOut && linkOut.checked) })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (mine !== seq) return;
+      if (!d || d.ok !== true) { paint('We could not check that link just now. You can still save - the link is checked again on the server before anything is stored.', ''); return; }
+      paint(d.message, d.recognised ? 'ok' : 'bad');
+    }).catch(function () {
+      if (mine !== seq) return;
+      // Honest about what a failed CHECK means: it is not a verdict on the link.
+      paint('We could not check that link just now (no answer from the server). The link is checked again before it is stored.', '');
+    });
+  }
+
+  input.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(check, 450); });
+  input.addEventListener('blur', function () { clearTimeout(timer); check(); });
+  if (linkOut) linkOut.addEventListener('change', check);
+})();
 </script>
 </AdminLayout>

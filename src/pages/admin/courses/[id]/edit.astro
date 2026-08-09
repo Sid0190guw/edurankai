@@ -5,6 +5,12 @@ import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
 import { ensureAquintutorAuthoringSchema } from '@/lib/aquintutor-authoring';
 import { textArray } from '@/lib/pg-array';
+// ONE RESOLVER FOR A PASTED VIDEO LINK, shared with /admin/hr/training and both learner players.
+// It requires https, matches an allowlist of known shapes and builds the player address itself, so
+// no author-supplied string is ever interpolated into an iframe src. Refusal happens here, with a
+// sentence, rather than being stored to break in front of a learner.
+import { resolveVideoLink, describeVideoLink } from '@/lib/video-embed';
+import { persistLessonVideo, lessonVideo } from '@/lib/lesson-video';
 
 // WHAT CHANGED, AND WHY
 //
@@ -33,6 +39,15 @@ import { textArray } from '@/lib/pg-array';
 //    course that does not exist.
 const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
 const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+// Declared here, above every reader below - `const` is not hoisted.
+const lessonLinkOk = (l: any): boolean => { const v = lessonVideo(l); return !!v && v.ok; };
+const lessonLinkNote = (l: any): string => {
+  const v = lessonVideo(l);
+  if (!v) return '';
+  if (!v.ok) return 'This link will not play: ' + v.reason;
+  if (v.kind === 'link') return 'Opens elsewhere in a new tab.';
+  return 'Plays in the lesson (' + v.description + ').';
+};
 
 /**
  * A SQL fragment holding `xs` in the form the named column of training_courses actually accepts.
@@ -174,19 +189,36 @@ if (Astro.request.method === 'POST') {
       const moduleId = (fd.get('module_id') as string || '').trim() || null;
       const type = (fd.get('type') as string || 'text').trim();
       const content = (fd.get('content') as string || '').trim() || null;
-      const videoUrl = (fd.get('video_url') as string || '').trim() || null;
+      const rawVideo = (fd.get('video_url') as string || '').trim();
+      // "Opens elsewhere" does not relax the checks - https, a real public host and no embedded
+      // credentials are still required. It only means we hand out a button instead of a player.
+      const opensElsewhere = fd.get('video_opens_elsewhere') === 'on';
       const durationMins = parseInt(fd.get('duration_mins') as string || '0');
       const sortOrder = parseInt(fd.get('sort_order') as string || '99');
       const isPreview = fd.get('is_preview') === 'on';
+      // Resolved BEFORE the insert, so an unusable link never reaches the table.
+      const link = rawVideo ? resolveVideoLink(rawVideo, { allowLinkOut: opensElsewhere }) : null;
       if (!title) {
         errorMsg = 'A lesson needs a title. Nothing was added.';
+      } else if (link && !link.ok) {
+        errorMsg = 'Nothing was added. ' + link.reason
+          + (link.canLinkOut ? ' If it is meant to open in a new tab rather than play here, tick "opens elsewhere" and add it again.' : '');
       } else {
         const r = await db.execute(sql`
           INSERT INTO training_lessons (course_id, module_id, title, type, content, video_url, duration_mins, sort_order, is_preview)
-          VALUES (${id}, ${moduleId}, ${title}, ${type}, ${content}, ${videoUrl}, ${durationMins}, ${sortOrder}, ${isPreview})
+          VALUES (${id}, ${moduleId}, ${title}, ${type}, ${content}, ${link ? link.originalUrl : null}, ${durationMins}, ${sortOrder}, ${isPreview})
           RETURNING id
         `);
-        if (rowsOf(r).length) okMsg = 'Lesson added.';
+        const newId = (rowsOf(r)[0] as any)?.id;
+        if (newId) {
+          // The pasted address and the derived player address are both stored. A derived half that
+          // could not be written says so rather than riding along inside "Lesson added."
+          let note = '';
+          if (link && link.ok) note = (await persistLessonVideo(String(newId), link)).note;
+          okMsg = 'Lesson added.'
+            + (link && link.ok ? ' ' + describeVideoLink(link) : '')
+            + (note ? ' ' + note : '');
+        }
         else errorMsg = 'The lesson was not added.';
       }
     } else if (action === 'delete_lesson') {
@@ -491,7 +523,17 @@ const tagsText = Array.isArray(course.tags) ? course.tags.join(', ') : '';
           </select>
           <input type="number" name="duration_mins" placeholder="Mins" value="10" style="background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12px;outline:none;" />
         </div>
-        <input type="text" name="video_url" placeholder="Video URL (YouTube/Vimeo) if type=video" style="background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12.5px;outline:none;" />
+        <div>
+          <input id="lessonVideoUrl" type="url" inputmode="url" autocomplete="off" name="video_url" placeholder="Video link - paste the address shown when the video is open" style="width:100%;min-height:44px;background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12.5px;outline:none;" />
+          <p style="font-size:11px;color:#6e6e78;margin:5px 0 0;line-height:1.5;">Nothing is uploaded. The lesson plays the video from where it already lives.</p>
+          <!-- Live check: the same resolver the save handler runs, so this sentence and the saved
+               outcome cannot disagree. Only the server's sentence is rendered, never the input. -->
+          <p id="lessonVideoCheck" role="status" aria-live="polite" style="display:none;font-size:12px;line-height:1.5;margin:7px 0 0;padding:8px 10px;border-radius:6px;"></p>
+          <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#d8d8de;cursor:pointer;margin-top:7px;min-height:44px;">
+            <input type="checkbox" name="video_opens_elsewhere" id="lessonVideoLinkOut" style="width:18px;height:18px;margin-top:12px;flex-shrink:0;" />
+            <span style="line-height:1.5;padding-top:10px;">This one opens elsewhere &ndash; give learners a button to a new tab instead of playing it here.</span>
+          </label>
+        </div>
         <textarea name="content" placeholder="Lesson content (markdown supported for text type)" rows="5" style="background:#15151a;border:1px solid #1a1a1f;border-radius:6px;padding:8px 10px;color:#fff;font-size:12.5px;outline:none;resize:vertical;font-family:inherit;line-height:1.55;"></textarea>
         <div style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;">
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#d8d8de;cursor:pointer;">
@@ -516,6 +558,10 @@ const tagsText = Array.isArray(course.tags) ? course.tags.join(', ') : '';
                 {mod && <span> . in: {mod.title}</span>}
                 {l.is_preview && <span style="color:#FF7040;"> . FREE PREVIEW</span>}
               </p>
+              {/* What a learner will actually get from this lesson's link, resolved the same way the
+                  player resolves it. A link that stopped matching a known shape is visible HERE, to
+                  the person who can fix it, instead of only to whoever opens the lesson. */}
+              {lessonLinkNote(l) && <p style={'font-size:10.5px;margin:3px 0 0;color:' + (lessonLinkOk(l) ? '#6e6e78' : '#fca5a5') + ';'}>{lessonLinkNote(l)}</p>}
             </div>
             <form method="POST" style="margin:0;" onsubmit='return confirm("Delete lesson?")'>
               <input type="hidden" name="action" value="delete_lesson" />
@@ -529,4 +575,43 @@ const tagsText = Array.isArray(course.tags) ? course.tags.join(', ') : '';
 
   </div>
 </div>
+<script is:inline>
+// LIVE CHECK ON THE VIDEO FIELD. Advisory in one direction only: it cannot let anything through,
+// because the save handler resolves the link again server-side and refuses on its own. What it buys
+// is that the author finds out while they are still looking at the field.
+(function () {
+  var input = document.getElementById('lessonVideoUrl');
+  var out = document.getElementById('lessonVideoCheck');
+  var linkOut = document.getElementById('lessonVideoLinkOut');
+  if (!input || !out) return;
+  var timer = null, seq = 0;
+  function paint(text, tone) {
+    out.textContent = text;
+    out.style.display = text ? 'block' : 'none';
+    if (tone === 'ok') { out.style.background = 'rgba(16,185,129,0.12)'; out.style.border = '1px solid rgba(16,185,129,0.35)'; out.style.color = '#6ee7b7'; }
+    else if (tone === 'bad') { out.style.background = 'rgba(239,68,68,0.10)'; out.style.border = '1px solid rgba(239,68,68,0.32)'; out.style.color = '#fca5a5'; }
+    else { out.style.background = 'rgba(255,255,255,0.04)'; out.style.border = '1px solid #1a1a1f'; out.style.color = '#9a9aa4'; }
+  }
+  function check() {
+    var value = (input.value || '').trim();
+    if (!value) { paint('', ''); return; }
+    var mine = ++seq;
+    paint('Checking that link...', '');
+    fetch('/api/admin/video-link/check', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: value, allowLinkOut: !!(linkOut && linkOut.checked) })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (mine !== seq) return;
+      if (!d || d.ok !== true) { paint('We could not check that link just now. The link is checked again on the server before anything is stored.', ''); return; }
+      paint(d.message, d.recognised ? 'ok' : 'bad');
+    }).catch(function () {
+      if (mine !== seq) return;
+      paint('We could not check that link just now (no answer from the server). It is checked again before it is stored.', '');
+    });
+  }
+  input.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(check, 450); });
+  input.addEventListener('blur', function () { clearTimeout(timer); check(); });
+  if (linkOut) linkOut.addEventListener('change', check);
+})();
+</script>
 </AdminLayout>
