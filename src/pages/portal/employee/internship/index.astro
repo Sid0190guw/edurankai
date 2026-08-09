@@ -1,0 +1,755 @@
+---
+// /portal/employee/internship - YOUR INTERNSHIP, AND THE LEDGER IT IS MEASURED FROM.
+//
+// =================================================================================================
+// THIS IS THE STUDENT'S COPY OF THE AUTHORITATIVE RECORD
+// =================================================================================================
+//
+// Everything a completion document will eventually say about this person is computed from the rows
+// at the bottom of this page. So the rows are ON the page, in full, with the same five columns the
+// engine reads: date, activity, type, allocated, completed, verified, and the evidence behind them.
+// Nobody should first learn what their record says when somebody else prints it.
+//
+// =================================================================================================
+// NOTHING HERE IS ATTENDANCE
+// =================================================================================================
+//
+// There is no clock on this page, no attendance figure, no presence percentage, and nowhere for one
+// to be added. hr_attendance answers "was this person logged in"; this screen answers "what did this
+// person do". A day worked without ever touching a clock is fully creditable here on its evidence,
+// and a day with a clock left running earns nothing on its own.
+//
+// There is also no webcam, no screenshot, no keystroke record and no activity monitor, and there is
+// no seam on this page where one could be switched on.
+//
+// =================================================================================================
+// THE THREE STATES ARE THREE COLUMNS, NEVER ONE NUMBER
+// =================================================================================================
+//
+// ALLOCATED is the plan. COMPLETED is what you reported, kept exactly as you reported it including
+// when it is above the plan. VERIFIED is what a named mentor said actually happened. RECOGNISED is
+// the verified figure capped at the weekly ceiling, and it is the only one that counts towards
+// completion. They are never added together and they are never collapsed into a single total,
+// because they disagree in DIRECTION and not only in size - you can be over on one and short on
+// another in the same week.
+//
+// FORTY HOURS IS A CEILING, NOT A TARGET, and holistic fitness is INSIDE it, never added on top.
+//
+// =================================================================================================
+// NO BARE ZERO. THIS IS THE RULE THIS PAGE EXISTS TO ENFORCE.
+// =================================================================================================
+//
+// A "0" on a screen about somebody's work can mean three different things - nothing was recorded,
+// nothing has been measured yet, or the source could not be read - and only the first is a fact
+// about the person. Every figure below goes through figureOf(), which renders "None recorded",
+// "Not measured yet" or "Could not be read" as different strings, each with the sentence that says
+// what it counts and over what period. A zero that means an outage is a false statement about a
+// student, and it is the one this page must never make.
+//
+// MOBILE FIRST: 360px, every control at least 44px, the ledger scrolls inside its own box and the
+// page never scrolls sideways.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import { internWeek, internProgress, type InternWeek, type InternProgress } from '@/lib/eims-workload';
+import { governingProgramme } from '@/lib/eims-programme';
+import { outstandingHours, SCHEDULE_PORTAL_URL, type OutstandingRead } from '@/lib/eims-schedule';
+import { verifierFor, readEvidenceForEmployee, type EvidenceRow } from '@/lib/eims-evidence';
+import { hoursWord } from '@/lib/eims-activity';
+import { weekStartOf, isoDate } from '@/lib/credit-week';
+
+const PATH = '/portal/employee/internship';
+
+// Every const declared BEFORE anything that reads it. `const` is not hoisted.
+const TODAY = isoDate(new Date());
+const THIS_WEEK = weekStartOf(TODAY);
+
+const NOT_READ = 'Could not be read';
+const NOT_RECORDED = 'None recorded';
+
+/**
+ * THE ONLY WAY A NUMBER REACHES THIS PAGE.
+ *
+ * `unread` is the honest case and it wins over everything: when the source failed there is no figure,
+ * and a zero would be a lie about the person rather than a fact. `value === null` means nobody has
+ * recorded one. `value === 0` means the source was read, and it really is none.
+ */
+function figureOf(
+  value: number | null,
+  opts: { unread: boolean; means: string; zeroMeans?: string },
+): { text: string; means: string; muted: boolean } {
+  if (opts.unread) {
+    return {
+      text: NOT_READ,
+      means: 'This figure is not being shown because the record behind it could not be read. That is '
+        + 'a failure on our side and not a statement about your work.',
+      muted: true,
+    };
+  }
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+    return {
+      text: 'Not recorded',
+      means: opts.means,
+      muted: true,
+    };
+  }
+  const n = Number(value);
+  if (n === 0) {
+    return {
+      text: NOT_RECORDED,
+      means: (opts.zeroMeans || 'Nothing has been recorded for this yet.') + ' ' + opts.means,
+      muted: true,
+    };
+  }
+  return { text: hoursWord(n), means: opts.means, muted: false };
+}
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+const employeeId = workspace ? workspace.employeeId : '';
+
+// ------------------------------------------------------------------------------------------------
+// READS. This page writes nothing. It has no POST handler and no button that changes a record: the
+// three things an intern can do about what they see here - report effort, file evidence, propose a
+// schedule - each already have a screen that owns them, and a fourth writer of the same rows on a
+// summary page is how two of them start disagreeing.
+// ------------------------------------------------------------------------------------------------
+let week: InternWeek | null = null;
+let progress: InternProgress | null = null;
+let outstanding: OutstandingRead | null = null;
+let programmeSentence = '';
+let programmeLabel = '';
+let requiredHours: number | null = null;
+let requiredBasis = '';
+let enrolledFrom = '';
+let verifierSentence = '';
+let evidenceOk = true;
+let evidence: EvidenceRow[] = [];
+let readError = '';
+
+if (employeeId) {
+  try {
+    const governing = await governingProgramme(employeeId);
+    programmeSentence = governing.sentence;
+    programmeLabel = governing.enrolment ? governing.enrolment.programmeLabel : '';
+    requiredHours = governing.enrolment ? governing.enrolment.requiredHours : null;
+    requiredBasis = governing.enrolment ? governing.enrolment.requiredHoursBasis : '';
+    enrolledFrom = governing.enrolment ? governing.enrolment.startedOn : '';
+
+    week = await internWeek(employeeId, THIS_WEEK, { programmeKey: governing.programmeKey });
+    progress = await internProgress(employeeId, {
+      fromIso: enrolledFrom || null,
+      toIso: TODAY,
+      spanBasis: enrolledFrom
+        ? 'Everything with a deadline between ' + enrolledFrom + ', the day your enrolment started, '
+          + 'and today.'
+        : '',
+      requiredHours,
+      requiredBasis,
+      programmeKey: governing.programmeKey,
+      todayIso: TODAY,
+    });
+    outstanding = await outstandingHours(employeeId);
+    verifierSentence = (await verifierFor(employeeId)).sentence;
+
+    const evRead = await readEvidenceForEmployee(employeeId, { limit: 200 });
+    evidenceOk = evRead.ok;
+    evidence = evRead.evidence;
+  } catch (e: any) {
+    // NEVER SWALLOWED. The page renders and says what failed rather than showing zeroes.
+    readError = 'Part of your internship record could not be loaded. Nothing below is missing because '
+      + 'it does not exist; it is missing because the read failed. Reload, and tell your mentor if it '
+      + 'keeps happening.';
+    console.error('[portal/internship] read', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// VIEW MODELS. Every label resolved to a plain string HERE rather than by indexing a typed map from
+// inside the markup, which is one of the two things that reliably breaks the .astro compiler on this
+// project - and it blames a line nowhere near the real one.
+// ------------------------------------------------------------------------------------------------
+// `progress` IS NULL WHEN THE READ THREW, and that case must reach figureOf() as `unread` rather
+// than as a missing value. Without this, every tile below would render "Not recorded" - which reads
+// as a statement that nothing was allocated to this person - on a page whose whole purpose is that a
+// failure to look never gets shown as a fact about the student.
+const progressMissing = !progress;
+const hoursUnread = progressMissing || progress!.unread.indexOf('activity hours') >= 0;
+const activitiesUnread = progressMissing
+  || !progress!.ok
+  || progress!.unread.indexOf('activities') >= 0;
+const anyUnread = hoursUnread || activitiesUnread || !!readError;
+
+const spanSentence = progress ? progress.spanBasis : '';
+const weekSpan = week ? week.weekStart + ' to ' + week.weekEnd : '';
+
+// ---- OVERALL PROGRESS ---------------------------------------------------------------------------
+const overall = [
+  {
+    key: 'required',
+    label: 'Required',
+    ...figureOf(progress ? progress.requiredHours : null, {
+      // NOT hoursUnread: the required total comes from the enrolment, not from the activity ledger,
+      // so it is still a real figure on a day the ledger cannot be read.
+      unread: progressMissing,
+      means: progress ? progress.requiredBasis : '',
+    }),
+  },
+  {
+    key: 'allocated',
+    label: 'Allocated',
+    ...figureOf(progress ? progress.allocatedHours : null, {
+      unread: hoursUnread,
+      means: 'The plan: hours somebody allocated to activities across ' + spanSentence.toLowerCase(),
+      zeroMeans: 'Nothing has been allocated to you in this period.',
+    }),
+  },
+  {
+    key: 'completed',
+    label: 'Completed',
+    ...figureOf(progress ? progress.completedHours : null, {
+      unread: hoursUnread,
+      means: 'What you reported, kept exactly as you reported it, including any effort above what was '
+        + 'allocated. Nothing here has been trimmed.',
+      zeroMeans: 'You have not reported effort on anything in this period.',
+    }),
+  },
+  {
+    key: 'verified',
+    label: 'Verified',
+    ...figureOf(progress ? progress.verifiedHours : null, {
+      unread: hoursUnread,
+      means: 'What a named mentor looked at the evidence for and stated actually happened.',
+      zeroMeans: 'No hours have been verified yet. That usually means evidence is still waiting with '
+        + 'your mentor, not that the work was rejected.',
+    }),
+  },
+  {
+    key: 'recognised',
+    label: 'Recognised',
+    ...figureOf(progress ? progress.recognisedHours : null, {
+      unread: hoursUnread,
+      means: 'Verified hours, capped at the weekly ceiling in each week they fell in. THIS is the '
+        + 'figure completion is measured from.',
+      zeroMeans: 'Nothing has been recognised yet.',
+    }),
+  },
+  {
+    key: 'outstanding',
+    label: 'Outstanding',
+    ...figureOf(progress ? progress.outstandingHours : null, {
+      unread: hoursUnread,
+      means: 'Allocated work that has not been verified yet. Outstanding means waiting on evidence or '
+        + 'on a mentor. It does not mean missed and it is not a penalty.',
+      zeroMeans: 'Nothing allocated to you is waiting to be verified.',
+    }),
+  },
+];
+
+const completionPct = progress ? progress.completionPct : null;
+// THREE OUTCOMES, THREE WORDINGS. "Could not be read" is a failure on our side, "Not measurable" is
+// a gap in the configuration, and a percentage is a measurement. Collapsing the first two into one
+// phrase would tell a student their programme is misconfigured when in fact our read failed.
+const completionText = progressMissing
+  ? 'Could not be read'
+  : (completionPct === null ? 'Not measurable' : String(completionPct) + '%');
+const completionBasis = progressMissing
+  ? 'Your record could not be read just now, so no progress figure is being shown. This is not a '
+    + 'progress of zero and nothing has been recalculated.'
+  : (progress ? progress.completionBasis : '');
+const completionBarPct = completionPct === null ? 0 : Math.max(0, Math.min(100, completionPct));
+const hasCompletionBar = completionPct !== null;
+
+// ---- THIS WEEK ----------------------------------------------------------------------------------
+const weekFigures = week ? [
+  {
+    key: 'w-allocated',
+    label: 'Allocated',
+    ...figureOf(week.allocatedHours, {
+      unread: hoursUnread,
+      means: 'Planned into this week. The ceiling limits this as well as what is recognised.',
+      zeroMeans: 'Nothing is allocated into this week.',
+    }),
+  },
+  {
+    key: 'w-completed',
+    label: 'Completed',
+    ...figureOf(week.completedHours, {
+      unread: hoursUnread,
+      means: 'What you reported this week, as reported.',
+      zeroMeans: 'You have not reported effort this week.',
+    }),
+  },
+  {
+    key: 'w-verified',
+    label: 'Verified',
+    ...figureOf(week.verifiedHours, {
+      unread: hoursUnread,
+      means: 'Verified by your mentor for this week.',
+      zeroMeans: 'Nothing is verified for this week yet.',
+    }),
+  },
+  {
+    key: 'w-recognised',
+    label: 'Recognised',
+    ...figureOf(week.recognisedHours, {
+      unread: hoursUnread,
+      means: 'Verified, capped at this week\'s ceiling.',
+      zeroMeans: 'Nothing is recognised for this week yet.',
+    }),
+  },
+  {
+    key: 'w-remaining',
+    label: 'Room left',
+    ...figureOf(week.remainingCapacityHours, {
+      unread: hoursUnread,
+      means: 'How much more may still be allocated into this week before the ceiling is reached.',
+      zeroMeans: 'This week is full. Nothing further may be allocated into it.',
+    }),
+  },
+] : [];
+
+const ceilingText = week ? hoursWord(week.ceilingHours) : '';
+const ceilingBasis = week ? week.ceilingBasis : '';
+const ceilingApplied = !!week && week.ceilingApplied;
+const weekBarPct = week && week.ceilingHours > 0
+  ? Math.max(0, Math.min(100, (week.recognisedHours / week.ceilingHours) * 100))
+  : 0;
+const weekNotes = week ? week.notes : [];
+const hasWeekNotes = weekNotes.length > 0;
+
+// ---- THE PER-TYPE BREAKDOWN ---------------------------------------------------------------------
+const weekTypes = week ? week.byType.map((t) => ({
+  key: t.key,
+  label: t.label,
+  wellbeingNote: t.wellbeing
+    ? 'Well-being. Counted INSIDE the ceiling, never added on top of it.'
+    : '',
+  allocated: hoursWord(t.allocatedHours),
+  completed: hoursWord(t.completedHours),
+  verified: hoursWord(t.verifiedHours),
+  outstanding: hoursWord(t.outstandingHours),
+  count: t.activities,
+})) : [];
+const hasWeekTypes = weekTypes.length > 0;
+
+const spanTypes = progress ? progress.byType.map((t) => ({
+  key: t.key,
+  label: t.label,
+  wellbeing: t.wellbeing,
+  allocated: hoursWord(t.allocatedHours),
+  completed: hoursWord(t.completedHours),
+  verified: hoursWord(t.verifiedHours),
+  count: t.activities,
+})) : [];
+
+// The three the specification names explicitly. Matched on the seeded taxonomy keys; where a
+// programme has renamed or removed one, the tile says it is not configured rather than showing zero.
+const NAMED_STREAMS = [
+  { match: 'learning', label: 'Learning' },
+  { match: 'holistic', label: 'Holistic fitness and well-being' },
+  { match: 'project', label: 'Project work' },
+];
+const streams = NAMED_STREAMS.map((s) => {
+  const line = spanTypes.find((t) => t.key.indexOf(s.match) >= 0);
+  return {
+    key: s.match,
+    label: s.label,
+    found: !!line,
+    allocated: line ? line.allocated : '',
+    completed: line ? line.completed : '',
+    verified: line ? line.verified : '',
+    count: line ? line.count : 0,
+    absentSentence: 'No activity in this category has been recorded in this period. If you have been '
+      + 'doing this work, it has not been allocated or categorised yet - that is a gap in the plan '
+      + 'rather than a fact about you.',
+  };
+});
+
+// ---- ACTIVITIES PENDING AND IN PROGRESS ----------------------------------------------------------
+const openActivities = progress ? progress.activities
+  .filter((a) => !a.closed && !a.verified)
+  .slice(0, 40)
+  .map((a) => ({
+    id: a.id,
+    title: a.title,
+    typeLabel: a.activityTypeLabel,
+    statusLabel: a.statusLabel,
+    deadline: a.deadline || '',
+    allocated: a.allocatedHours === null ? 'Not allocated' : hoursWord(a.allocatedHours),
+    reported: a.reportedHours === null ? 'Not reported' : hoursWord(a.reportedHours),
+    evidenceLabel: a.evidenceRequirementLabel,
+    overdue: !!a.deadline && a.deadline < TODAY,
+  })) : [];
+const hasOpenActivities = openActivities.length > 0;
+
+// ---- THE LEDGER ----------------------------------------------------------------------------------
+//
+// Evidence is attached per activity from the links the intern filed. An activity with no evidence
+// shows what its requirement is, never a blank cell - a blank would read as "none needed".
+const evidenceByActivity = new Map<string, { title: string; url: string; status: string }[]>();
+for (const ev of evidence) {
+  for (const link of ev.links) {
+    const aid = String(link.activityId || '');
+    if (!aid) continue;
+    const list = evidenceByActivity.get(aid) || [];
+    list.push({ title: ev.title, url: ev.url, status: String(ev.status) });
+    evidenceByActivity.set(aid, list);
+  }
+}
+
+const ledger = progress ? progress.activities.map((a) => {
+  const ev = evidenceByActivity.get(a.id) || [];
+  return {
+    id: a.id,
+    date: a.deadline || 'No date',
+    title: a.title,
+    typeLabel: a.activityTypeLabel,
+    statusLabel: a.statusLabel,
+    closed: a.closed,
+    allocated: a.closed
+      ? 'Closed'
+      : (a.allocatedHours === null ? 'Not allocated' : hoursWord(a.allocatedHours)),
+    completed: a.reportedHours === null ? 'Not reported' : hoursWord(a.reportedHours),
+    verified: a.verified
+      ? hoursWord(a.verifiedHours === null ? 0 : a.verifiedHours)
+      : 'Not verified',
+    evidence: ev,
+    hasEvidence: ev.length > 0,
+    evidenceNote: !evidenceOk
+      ? 'Your evidence could not be read'
+      : (a.evidenceRequirement === 'required'
+        ? 'Required, none linked yet'
+        : (a.evidenceRequirement === 'none' ? 'Not required' : 'Optional, none linked')),
+  };
+}) : [];
+const hasLedger = ledger.length > 0;
+
+// ---- OUTSTANDING FROM LEAVE -----------------------------------------------------------------------
+const leaveOutstanding = outstanding && outstanding.ok ? outstanding.remainingHours : null;
+const leaveRead = !!outstanding && outstanding.ok;
+const leaveAwaiting = outstanding ? outstanding.awaitingHours : 0;
+const leaveMadeUp = outstanding ? outstanding.madeUpHours : 0;
+const hasLeaveOutstanding = leaveRead && leaveOutstanding !== null && leaveOutstanding > 0;
+
+const progressNotes = progress ? progress.notes : [];
+const hasProgressNotes = progressNotes.length > 0;
+const headerName = workspace ? workspace.fullName : 'Your internship';
+const notEnrolled = !!progress && !programmeLabel;
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Your internship - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;
+      -webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 2px;margin:0;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;border:1px solid #DFDCD8;
+      border-radius:999px;background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .wrap{max-width:860px;margin:0 auto;padding:12px 12px 0;}
+    h2.sec{margin:24px 0 0;font-size:0.6875rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#70685C;}
+    .card{margin:10px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h3{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .card p + p{margin-top:8px;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CFE3D2;border-radius:10px;background:#F3F9F4;font-size:0.8125rem;line-height:1.55;color:#245C33;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .notice{margin:10px 0 0;padding:10px 12px;border:1px solid #EADECD;border-radius:10px;background:#FBF7F1;font-size:0.8125rem;line-height:1.55;color:#6D470D;}
+    .notice p{margin:0;}
+    .notice p + p{margin-top:7px;}
+    .figs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:10px 0 0;}
+    .fig{padding:11px;border:1px solid #DFDCD8;border-radius:11px;background:#FDFDFC;}
+    .fig dt{margin:0;font-size:0.6875rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#70685C;}
+    .fig dd{margin:4px 0 0;font-size:1.0625rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.25;overflow-wrap:anywhere;}
+    .fig dd.muted{font-size:0.8125rem;font-weight:650;color:#70685C;}
+    .fig .means{margin:6px 0 0;font-size:0.6875rem;line-height:1.5;color:#70685C;}
+    .bar{height:9px;border-radius:999px;background:#EDEAE5;overflow:hidden;margin:10px 0 0;}
+    .bar span{display:block;height:100%;background:#1B1813;border-radius:999px;}
+    .bar.ceil span{background:#4E6B4F;}
+    .big{margin:8px 0 0;font-size:1.5rem;font-weight:750;letter-spacing:-0.02em;font-variant-numeric:tabular-nums;}
+    .rowline{display:grid;grid-template-columns:1fr auto;gap:4px 10px;padding:9px 0;border-top:1px solid #EDEAE5;font-size:0.8125rem;}
+    .rowline:first-of-type{border-top:0;}
+    .rowline .nm{font-weight:650;overflow-wrap:anywhere;}
+    .rowline .vl{text-align:right;font-variant-numeric:tabular-nums;color:#564E43;white-space:nowrap;}
+    .rowline .sub{grid-column:1 / -1;margin:2px 0 0;font-size:0.6875rem;line-height:1.5;color:#70685C;}
+    .item{margin:10px 0 0;padding:12px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .item h3{margin:0;font-size:0.875rem;font-weight:680;line-height:1.35;overflow-wrap:anywhere;}
+    .item .meta{margin:5px 0 0;font-size:0.75rem;line-height:1.5;color:#70685C;overflow-wrap:anywhere;}
+    .chip{display:inline-flex;align-items:center;padding:3px 9px;border-radius:999px;border:1px solid #DFDCD8;
+      background:#F6F4F1;font-size:0.6875rem;font-weight:700;color:#564E43;white-space:nowrap;margin:8px 6px 0 0;}
+    .chip.warn{background:#FBF3EC;border-color:#EADECD;color:#6D470D;}
+    .scroller{margin:10px 0 0;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    table{border-collapse:collapse;width:100%;min-width:720px;font-size:0.75rem;}
+    caption{text-align:left;padding:11px 12px 0;font-size:0.6875rem;line-height:1.5;color:#70685C;}
+    th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #EDEAE5;vertical-align:top;}
+    th{font-size:0.625rem;text-transform:uppercase;letter-spacing:0.06em;color:#70685C;white-space:nowrap;}
+    td.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
+    td.mut{color:#8B8377;}
+    tr:last-child td{border-bottom:0;}
+    .evl{display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+      vertical-align:bottom;color:#1B1813;}
+    .go{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:11px 15px;margin:12px 8px 0 0;
+      border:1px solid #1B1813;border-radius:10px;background:#1B1813;color:#FFFFFF;text-decoration:none;
+      font-size:0.8125rem;font-weight:700;}
+    .go.alt{background:#FDFDFC;color:#1B1813;}
+    .foot{margin:24px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+    @media (min-width:560px){ .figs{grid-template-columns:repeat(3,minmax(0,1fr));} }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Your internship</h1>
+    <p>{headerName}{programmeLabel ? ' - ' + programmeLabel : ''}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Your record">
+    <a class="tab" href={PATH} aria-current="page">Internship</a>
+    <a class="tab" href="/portal/employee/evidence">Evidence</a>
+    <a class="tab" href={SCHEDULE_PORTAL_URL}>Schedule</a>
+    <a class="tab" href="/portal/employee/reports">Daily reports</a>
+    <a class="tab" href="/portal/employee/learning">Learning</a>
+  </nav>
+
+  <main class="wrap">
+    {readError ? <div class="bad">{readError}</div> : null}
+
+    <section class="card">
+      <h3>What this page is</h3>
+      <p>This is the record your internship is measured from, exactly as the system holds it. It counts
+        what you DID. Nothing on this page comes from attendance, a clock or a login, and a day you
+        worked without touching a clock counts here in full on its evidence.</p>
+      {programmeSentence ? <p>{programmeSentence}</p> : null}
+      {verifierSentence ? <p>{verifierSentence}</p> : null}
+    </section>
+
+    {notEnrolled ? (
+      <div class="notice">
+        <p>You are not recorded on an internship programme, so the ceiling and the required total below
+          are being inferred rather than read from an enrolment. Ask HR to enrol you: it replaces a
+          guess with a dated record, and it is what decides what your completion document can say.</p>
+      </div>
+    ) : null}
+
+    <h2 class="sec">Overall progress</h2>
+
+    <section class="card">
+      <h3>Completion</h3>
+      <p class="big">{completionText}</p>
+      {hasCompletionBar ? (
+        <div class="bar"><span style={'width:' + completionBarPct + '%'}></span></div>
+      ) : null}
+      <p>{completionBasis}</p>
+      {spanSentence ? <p>{spanSentence}</p> : null}
+    </section>
+
+    <dl class="figs">
+      {overall.map((f) => (
+        <div class="fig">
+          <dt>{f.label}</dt>
+          <dd class={f.muted ? 'muted' : ''}>{f.text}</dd>
+          <p class="means">{f.means}</p>
+        </div>
+      ))}
+    </dl>
+
+    {hasLeaveOutstanding ? (
+      <div class="notice">
+        <p>{hoursWord(leaveOutstanding || 0)} are outstanding from approved leave. Approved leave does
+          not waive the hours: it moves them, and they are made up on a schedule that still has to fit
+          inside the weekly ceiling. {leaveMadeUp > 0 ? hoursWord(leaveMadeUp) + ' have already been covered by approved make-up. ' : ''}
+          {leaveAwaiting > 0 ? hoursWord(leaveAwaiting) + ' of make-up is proposed and not yet decided; a proposal is not a payment and it is not netted off above. ' : ''}</p>
+        <p><a class="go alt" href={SCHEDULE_PORTAL_URL}>Propose a make-up week</a></p>
+      </div>
+    ) : null}
+
+    {!leaveRead ? (
+      <div class="notice">
+        <p>Whether any hours are outstanding from approved leave could not be read just now. That is not
+          the same as none being outstanding, and nothing has been written off.</p>
+      </div>
+    ) : null}
+
+    <h2 class="sec">This week, against the ceiling</h2>
+
+    <section class="card">
+      <h3>{weekSpan}</h3>
+      <p>Recognised this week is capped at {ceilingText}. That is a CEILING and not a target: it is the
+        most that can ever be recognised in one week, holistic fitness and well-being included, never
+        added on top.</p>
+      <div class="bar ceil"><span style={'width:' + weekBarPct + '%'}></span></div>
+      {ceilingBasis ? <p>{ceilingBasis}</p> : null}
+      {ceilingApplied ? (
+        <p><span class="chip warn">Ceiling applied</span> Hours above the ceiling stay on your record.
+          They are recorded and not recognised. Nothing was deleted and this is not a penalty.</p>
+      ) : null}
+    </section>
+
+    <dl class="figs">
+      {weekFigures.map((f) => (
+        <div class="fig">
+          <dt>{f.label}</dt>
+          <dd class={f.muted ? 'muted' : ''}>{f.text}</dd>
+          <p class="means">{f.means}</p>
+        </div>
+      ))}
+    </dl>
+
+    {hasWeekTypes ? (
+      <section class="card">
+        <h3>This week by category</h3>
+        {weekTypes.map((t) => (
+          <div class="rowline">
+            <span class="nm">{t.label}</span>
+            <span class="vl">{t.verified} verified</span>
+            <span class="sub">{t.count} activity(s). Allocated {t.allocated}, reported {t.completed},
+              outstanding {t.outstanding}. {t.wellbeingNote}</span>
+          </div>
+        ))}
+      </section>
+    ) : (
+      <section class="card">
+        <h3>This week by category</h3>
+        <p>{hoursUnread || activitiesUnread
+          ? 'The breakdown for this week could not be read. That is a failure to read it, not an empty week.'
+          : 'Nothing is allocated into this week yet, so there is no breakdown to show. That is a gap in the plan rather than a statement about your work.'}</p>
+      </section>
+    )}
+
+    {hasWeekNotes ? (
+      <div class="notice">{weekNotes.map((n) => <p>{n}</p>)}</div>
+    ) : null}
+
+    <h2 class="sec">Learning, holistic and project</h2>
+
+    {streams.map((s) => (
+      <section class="card">
+        <h3>{s.label}</h3>
+        {s.found ? (
+          <p>{s.count} activity(s) over this period. Allocated {s.allocated}, reported {s.completed},
+            verified {s.verified}.</p>
+        ) : (
+          <p>{s.absentSentence}</p>
+        )}
+        {s.key === 'holistic' ? (
+          <p>Holistic fitness sits INSIDE the weekly ceiling. It is never an extra allowance on top of
+            it, and there is no configuration that can make it one.</p>
+        ) : null}
+      </section>
+    ))}
+
+    <h2 class="sec">Activities pending and in progress</h2>
+
+    {hasOpenActivities ? (
+      openActivities.map((a) => (
+        <article class="item">
+          <h3>{a.title}</h3>
+          <p class="meta">{a.typeLabel} - {a.statusLabel}
+            {a.deadline ? ' - due ' + a.deadline : ' - no deadline recorded'}</p>
+          <p class="meta">Allocated {a.allocated}. Reported {a.reported}. Evidence: {a.evidenceLabel}.</p>
+          {a.overdue ? (
+            <span class="chip warn">Past its date</span>
+          ) : null}
+        </article>
+      ))
+    ) : (
+      <section class="card">
+        <p>{activitiesUnread
+          ? 'Your activities could not be read just now, so this list is not empty because you have nothing open. Reload before treating it as complete.'
+          : 'Nothing is open. Every activity in this period is either verified or closed.'}</p>
+      </section>
+    )}
+
+    <h2 class="sec">The workload ledger</h2>
+
+    <section class="card">
+      <h3>This is the authoritative record</h3>
+      <p>Every figure above is computed from these rows, and you are entitled to read all of them. If a
+        row here is wrong, that is what to raise with your mentor: correcting it corrects the totals,
+        because there is no second copy of these numbers anywhere.</p>
+      <p>ALLOCATED is the plan. COMPLETED is what you reported, kept as reported. VERIFIED is what a
+        named mentor confirmed. Only verified hours, capped weekly, count towards completion.</p>
+    </section>
+
+    {hasLedger ? (
+      <div class="scroller">
+        <table>
+          <caption>{spanSentence} Newest first. Closed activities stay listed and count towards nothing.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Date</th>
+              <th scope="col">Activity</th>
+              <th scope="col">Type</th>
+              <th scope="col">Allocated</th>
+              <th scope="col">Completed</th>
+              <th scope="col">Verified</th>
+              <th scope="col">Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ledger.map((r) => (
+              <tr>
+                <td class="num">{r.date}</td>
+                <td>{r.title}<br/><span class="mut">{r.statusLabel}</span></td>
+                <td>{r.typeLabel}</td>
+                <td class={r.allocated.indexOf('Not ') === 0 || r.closed ? 'num mut' : 'num'}>{r.allocated}</td>
+                <td class={r.completed.indexOf('Not ') === 0 ? 'num mut' : 'num'}>{r.completed}</td>
+                <td class={r.verified.indexOf('Not ') === 0 ? 'num mut' : 'num'}>{r.verified}</td>
+                <td>
+                  {r.hasEvidence
+                    ? r.evidence.map((e) => (
+                      <a class="evl" href={e.url} target="_blank" rel="noopener noreferrer">{e.title}</a>
+                    ))
+                    : <span class="mut">{r.evidenceNote}</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <section class="card">
+        <p>{activitiesUnread
+          ? 'Your ledger could not be read. It is not empty; the read failed. Nothing has been lost and nothing has been recomputed.'
+          : 'No activities have been recorded against you in this period yet. Once work is allocated to you it appears here, and every hour you are eventually credited for will be traceable to a row in this table.'}</p>
+      </section>
+    )}
+
+    {hasProgressNotes ? (
+      <div class="notice">{progressNotes.map((n) => <p>{n}</p>)}</div>
+    ) : null}
+
+    {anyUnread ? (
+      <div class="bad">
+        <p>Some of what is shown above is incomplete because a source could not be read. Every figure
+          affected says so in its own words rather than showing a zero. A zero on this page always
+          means none was recorded; it never means we could not look.</p>
+      </div>
+    ) : null}
+
+    <p>
+      <a class="go" href="/portal/employee/evidence">File evidence</a>
+      <a class="go alt" href={SCHEDULE_PORTAL_URL}>Your schedule</a>
+    </p>
+
+    <p class="foot">
+      Hours are recognised on evidence a named mentor verified, never on attendance or login time.
+      Reported effort above what was allocated is kept on the record and is not recognised without a
+      written reason from your mentor. EduRankAI is the technology platform that computes and evidences
+      this record; an accredited partner awards any credential that follows from it.
+    </p>
+  </main>
+</body>
+</html>

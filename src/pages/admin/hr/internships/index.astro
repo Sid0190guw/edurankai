@@ -1,0 +1,995 @@
+---
+// /admin/hr/internships - THE PROGRAMMES, THE PEOPLE ON THEM, AND WHAT THE COHORT LOOKS LIKE.
+//
+// =================================================================================================
+// WHY THERE ARE NO NEW CAPABILITY KEYS ON THIS PAGE. READ THIS BEFORE ADDING ONE.
+// =================================================================================================
+//
+// The brief for this screen suggested five keys: internship.configure, internship.enrol,
+// internship.verify, internship.grade and internship.credit.award. Four of the five ALREADY EXIST
+// under the names this codebase gave them, and adding a second spelling of a key that already exists
+// is not a smaller change than adding a key - it is a permanent fork, because can() answers on the
+// exact string and two strings for one power means one of them is eventually the one nobody granted.
+// So this page asks for the keys that are already in the union:
+//
+//   internship.configure     -> `eims.programme.configure`  (sensitive) ceiling, required hours, role
+//   internship.enrol         -> `eims.enrolment.manage`     (sensitive) enrol, assign, close
+//   internship.grade         -> `eims.credit.configure`     (sensitive) rubric, weights, grade bands
+//   internship.credit.award  -> `eims.credit.configure` to decide what a credit MEANS, and
+//                               `eims.record.issue` (sensitive) to put the record into the world
+//
+// THE FIFTH ONE, internship.verify, IS DELIBERATELY NOT A KEY AND MUST NOT BECOME ONE. Whether a
+// person may verify an intern's hours is a per-ROW question about a RELATIONSHIP - is this the
+// mentor, the reporting manager, or somebody above them in the chain - and it is answered from
+// src/lib/org-graph.ts at the write, in mayVerifyActivity() and mayVerify(). A capability key is a
+// standing power held by a USER over EVERYTHING of that kind. Spelling verification as a key would
+// therefore hand every holder the power to verify the hours of every intern in the company, which is
+// exactly the widening the three-layer architecture exists to prevent, and it would put the hours on
+// somebody's certificate at the disposal of a desk rather than of the person who watched them work.
+//
+// That is why THERE IS NO VERIFY CONTROL ON THIS PAGE AT ALL. Verification happens in the portal, at
+// /portal/mentor, addressed to the named mentor. HR can see that hours were verified and by whom;
+// HR cannot verify them from here, and no grant available on this screen makes them able to.
+//
+// =================================================================================================
+// WHAT IS AUDITED, AND WHERE
+// =================================================================================================
+//
+// Every configuration change on this page is audited with who and when - and it is audited by the
+// ENGINE, not by this page. saveProgramme(), setProgrammeCeiling(), enrolIntern(), assignPeople(),
+// closeEnrolment(), saveCreditConfig() and saveRubricCriterion() each call logAudit() themselves. A
+// page that logged its own audit rows would be a second record, written only when somebody used THIS
+// screen, and silently absent when the same function was called from anywhere else.
+//
+// =================================================================================================
+// THIS PAGE MEASURES NOBODY ON A RENDER
+// =================================================================================================
+//
+// cohortOverview() READS. It grants nothing, verifies nothing and writes nothing, and it is four
+// grouped queries plus two batched graph reads rather than a query per head. Nothing on this screen
+// changes a record of achievement as a side effect of somebody looking at a list.
+//
+// NOT ONE FIGURE HERE COMES FROM ATTENDANCE. Average verified hours means hours a named mentor
+// confirmed against evidence. There is no presence column, no clock, and nowhere for one to go.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  listProgrammes, saveProgramme, programmeRules, listEnrolments, enrolIntern, assignPeople,
+  closeEnrolment, cohortOverview, roleOptions, programmeStateOptions,
+  type ProgrammeRow, type ProgrammeRules, type EnrolmentRow, type CohortOverview,
+} from '@/lib/eims-programme';
+import {
+  saveCreditConfig, seedRubric, saveRubricCriterion, activeCreditConfig, listRubricCriteria,
+  type CreditConfig, type RubricCriterion,
+} from '@/lib/eims-credit';
+import { evidenceTypesForRole, type EvidenceType } from '@/lib/eims-evidence';
+import { DEFAULT_PROGRAMME_KEY } from '@/lib/eims-workload';
+import { isoDate } from '@/lib/credit-week';
+
+// -------------------------------------------------------------------------------------------------
+// EVERY const DECLARED BEFORE THE POST HANDLER THAT READS IT. `const` is not hoisted, and the two
+// production outages this project has had from that rule were both on a POST handler's first line.
+// -------------------------------------------------------------------------------------------------
+const PATH = '/admin/hr/internships';
+const TODAY = isoDate(new Date());
+
+/** postgres-js resolves to a PLAIN ARRAY, never { rows }. */
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+const numOrNull = (v: unknown): number | null => {
+  const s = String(v ?? '').trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+};
+
+const user = Astro.locals.user!;
+
+// The same question /admin/hr/credits asks, asked the same way: reaching the page needs the HR desk,
+// and each ACTION on it is asked again below against its own key. Opening a console is not authority
+// to change what is on it.
+const isHrDesk = can(user, 'employee.manage');
+const mayOpen = can(user, 'admin.access')
+  && (isHrDesk || await canAccessSection(user as any, 'hr', 'edit').catch(() => false));
+if (!mayOpen) return Astro.redirect('/admin');
+
+// THE THREE GRANTS THIS SCREEN ACTS UNDER. Each is asked here to decide whether a form is RENDERED,
+// and asked again inside the engine at the write - the engine's answer is the one that governs, and
+// a form posted by somebody without the key is refused there whatever this page drew.
+const mayConfigure = can(user, 'eims.programme.configure');
+const mayEnrol = can(user, 'eims.enrolment.manage');
+const mayCredit = can(user, 'eims.credit.configure');
+
+const actor = { id: String(user.id), role: String((user as any).role || ''), permissions: (user as any).permissions };
+
+let msg = '';
+let msgOk = true;
+let msgNotes: string[] = [];
+
+// -------------------------------------------------------------------------------------------------
+// THE WRITES. Every one is an explicit action; nothing here happens on a render.
+// -------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('_action') || '');
+
+    if (action === 'programme_save') {
+      const res = await saveProgramme(actor as any, {
+        programmeKey: String(fd.get('programme_key') || ''),
+        label: String(fd.get('label') || ''),
+        description: String(fd.get('description') || ''),
+        state: String(fd.get('state') || 'draft'),
+        partnerInstitution: String(fd.get('partner') || '') || null,
+        durationWeeks: numOrNull(fd.get('duration_weeks')),
+        requiredHours: numOrNull(fd.get('required_hours')),
+        roleKey: String(fd.get('role_key') || 'general'),
+        note: String(fd.get('note') || ''),
+        weeklyCeilingHours: numOrNull(fd.get('ceiling_hours')),
+      });
+      msgOk = res.ok;
+      msg = res.ok
+        ? 'Programme saved. The change is on the audit log with your name and the time against it.'
+        : res.error;
+
+    } else if (action === 'enrol') {
+      const res = await enrolIntern(actor as any, {
+        employeeId: String(fd.get('employee_id') || ''),
+        programmeKey: String(fd.get('programme_key') || ''),
+        roleKey: String(fd.get('role_key') || '') || null,
+        startedOn: String(fd.get('started_on') || ''),
+        endsOn: String(fd.get('ends_on') || '') || null,
+        requiredHours: numOrNull(fd.get('required_hours')),
+        note: String(fd.get('note') || ''),
+        mentorEmployeeId: String(fd.get('mentor_id') || '') || null,
+        managerEmployeeId: String(fd.get('manager_id') || '') || null,
+      });
+      msgOk = res.ok;
+      msg = res.ok
+        ? 'Enrolled. This person is now measured against that programme\'s ceiling, credit conversion '
+          + 'and rubric.'
+        : res.error;
+      msgNotes = res.notes;
+
+    } else if (action === 'assign') {
+      // undefined LEAVES AN EDGE ALONE and null CLOSES it. A blank box must not silently disconnect
+      // somebody's mentor, so a field that was not submitted at all is passed as undefined.
+      const rawMentor = fd.get('mentor_id');
+      const rawManager = fd.get('manager_id');
+      const res = await assignPeople(actor as any, {
+        employeeId: String(fd.get('employee_id') || ''),
+        mentorEmployeeId: rawMentor === null ? undefined : (String(rawMentor) || null),
+        managerEmployeeId: rawManager === null ? undefined : (String(rawManager) || null),
+        note: String(fd.get('note') || ''),
+      });
+      msgOk = res.ok;
+      msg = res.ok ? 'Recorded in the Organization Graph.' : res.error;
+      msgNotes = res.notes;
+
+    } else if (action === 'close') {
+      const res = await closeEnrolment(actor as any, {
+        enrolmentId: String(fd.get('enrolment_id') || ''),
+        state: String(fd.get('state') || '') === 'withdrawn' ? 'withdrawn' : 'completed',
+        reason: String(fd.get('reason') || ''),
+        closedOn: String(fd.get('closed_on') || '') || null,
+      });
+      msgOk = res.ok;
+      msg = res.ok
+        ? 'Enrolment closed. The written reason is on the record and it is the only thing that can '
+          + 'answer this question later.'
+        : res.error;
+
+    } else if (action === 'credit_save') {
+      const res = await saveCreditConfig(actor as any, {
+        programmeKey: String(fd.get('programme_key') || ''),
+        programmeName: String(fd.get('programme_name') || ''),
+        partnerInstitution: String(fd.get('partner') || '') || null,
+        totalCredits: numOrNull(fd.get('total_credits')) ?? 12,
+        creditStep: numOrNull(fd.get('credit_step')) ?? 0.5,
+        weeklyCeilingHours: numOrNull(fd.get('ceiling_hours')) ?? 40,
+        programmeWeeks: numOrNull(fd.get('programme_weeks')),
+        partnerHoursPerCredit: numOrNull(fd.get('hours_per_credit')),
+        ownerUserId: String(user.id),
+        ownerName: String((user as any).name || (user as any).email || 'Unnamed'),
+        notes: String(fd.get('notes') || ''),
+        activate: String(fd.get('activate') || '') === 'yes',
+      });
+      msgOk = !!res.ok;
+      msg = res.ok
+        ? 'Credit conversion saved as version ' + res.version + '. A configuration is never edited in '
+          + 'place, so any record already issued still says what rule it was computed under.'
+        : (res.errors || ['That could not be saved.']).join(' ');
+
+    } else if (action === 'rubric_seed') {
+      const res = await seedRubric(actor as any, String(fd.get('programme_key') || ''));
+      msgOk = res.ok;
+      msg = res.ok
+        ? res.created + ' rubric criteria created. Adjust the weights below; they are what a mentor '
+          + 'scores against.'
+        : (res.error || 'The rubric could not be seeded.');
+
+    } else if (action === 'rubric_save') {
+      const res = await saveRubricCriterion(actor as any, {
+        programmeKey: String(fd.get('programme_key') || ''),
+        code: String(fd.get('code') || ''),
+        label: String(fd.get('label') || ''),
+        descriptor: String(fd.get('descriptor') || ''),
+        weightPct: numOrNull(fd.get('weight_pct')) ?? 0,
+        maxScore: numOrNull(fd.get('max_score')) ?? 5,
+        sortOrder: numOrNull(fd.get('sort_order')) ?? 0,
+      });
+      msgOk = res.ok;
+      msg = res.ok ? 'Criterion saved.' : (res.error || 'That criterion could not be saved.');
+
+    } else {
+      msg = 'That is not something this page does. Nothing was changed.';
+      msgOk = false;
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. This page changes what a person's record of achievement will say, and the
+    // real Postgres reason is on e.cause - e.message is only the SQL that failed.
+    console.error('[admin/hr/internships] post', e?.cause?.message || e?.message);
+    msg = 'That did not happen: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    msgOk = false;
+  }
+}
+
+// -------------------------------------------------------------------------------------------------
+// READS
+// -------------------------------------------------------------------------------------------------
+const askedKey = String(Astro.url.searchParams.get('programme') || '').trim().toLowerCase();
+
+let programmes: ProgrammeRow[] = [];
+let programmesOk = true;
+let programmesError = '';
+try {
+  const read = await listProgrammes(true);
+  programmes = read.programmes;
+  programmesOk = read.ok;
+  programmesError = read.error;
+} catch (e: any) {
+  console.error('[admin/hr/internships] programmes', e?.cause?.message || e?.message);
+  programmesOk = false;
+  programmesError = 'The programme list could not be read.';
+}
+
+const selectedKey = programmes.find((p) => p.programmeKey === askedKey)
+  ? askedKey
+  : (programmes.length ? programmes[0].programmeKey : DEFAULT_PROGRAMME_KEY);
+
+let rules: ProgrammeRules | null = null;
+let creditConfig: CreditConfig | null = null;
+let rubric: RubricCriterion[] = [];
+let evidenceTypes: EvidenceType[] = [];
+try {
+  rules = await programmeRules(selectedKey);
+  creditConfig = await activeCreditConfig(selectedKey);
+  rubric = await listRubricCriteria(selectedKey);
+  const roleKey = rules && rules.programme ? rules.programme.roleKey : 'general';
+  evidenceTypes = await evidenceTypesForRole(roleKey);
+} catch (e: any) {
+  console.error('[admin/hr/internships] rules', e?.cause?.message || e?.message);
+}
+
+let enrolments: EnrolmentRow[] = [];
+let enrolmentsOk = true;
+try {
+  const read = await listEnrolments({ limit: 200 });
+  enrolments = read.enrolments;
+  enrolmentsOk = read.ok;
+} catch (e: any) {
+  console.error('[admin/hr/internships] enrolments', e?.cause?.message || e?.message);
+  enrolmentsOk = false;
+}
+
+let cohort: CohortOverview | null = null;
+try {
+  cohort = await cohortOverview(TODAY);
+} catch (e: any) {
+  console.error('[admin/hr/internships] cohort', e?.cause?.message || e?.message);
+}
+
+// The people who can be enrolled, and the people who can be named as mentor or manager. Two lists,
+// because they are two different questions - anybody may mentor, only an intern is enrolled.
+let candidates: { id: string; name: string; code: string; designation: string }[] = [];
+let staff: { id: string; name: string; designation: string }[] = [];
+let peopleError = '';
+try {
+  candidates = rowsOf(await db.execute(sql`
+    SELECT e.id::text AS id, e.full_name, e.employee_code, e.designation
+      FROM hr_employees e
+     WHERE e.is_active = TRUE
+       AND (e.employment_type ILIKE '%intern%' OR e.designation ILIKE '%intern%'
+            OR e.employment_type ILIKE '%apprentice%' OR e.designation ILIKE '%apprentice%')
+     ORDER BY e.full_name ASC
+     LIMIT 300`)).map((r) => ({
+    id: String(r.id),
+    name: String(r.full_name || 'Unnamed record'),
+    code: String(r.employee_code || ''),
+    designation: String(r.designation || ''),
+  }));
+  staff = rowsOf(await db.execute(sql`
+    SELECT e.id::text AS id, e.full_name, e.designation
+      FROM hr_employees e
+     WHERE e.is_active = TRUE
+     ORDER BY e.full_name ASC
+     LIMIT 400`)).map((r) => ({
+    id: String(r.id),
+    name: String(r.full_name || 'Unnamed record'),
+    designation: String(r.designation || ''),
+  }));
+} catch (e: any) {
+  console.error('[admin/hr/internships] people', e?.cause?.message || e?.message);
+  peopleError = 'The employee list could not be read, so the enrolment form has nobody to choose '
+    + 'from. That is a failed read, not an empty company.';
+}
+
+// -------------------------------------------------------------------------------------------------
+// VIEW MODELS. Every label resolved to a plain string HERE rather than indexed from a typed map
+// inside the markup, which reliably breaks the .astro compiler on this project.
+// -------------------------------------------------------------------------------------------------
+const roleChoices = roleOptions();
+const stateChoices = programmeStateOptions();
+
+const programmeTabs = programmes.map((p) => ({
+  key: p.programmeKey,
+  label: p.label,
+  href: PATH + '?programme=' + encodeURIComponent(p.programmeKey),
+  current: p.programmeKey === selectedKey,
+}));
+
+const selected = rules && rules.programme ? rules.programme : null;
+const ceilingHours = rules && rules.ceiling ? rules.ceiling.ceilingHours : null;
+const ceilingText = ceilingHours === null ? 'Not configured' : String(ceilingHours) + ' hours';
+const requiredText = selected && selected.requiredHours !== null
+  ? String(selected.requiredHours) + ' hours'
+  : 'Not recorded';
+const rubricTotal = rules ? rules.rubricWeightTotal : 0;
+const rubricBalanced = rubricTotal === 100;
+const rulesUnread = rules ? rules.unread : [];
+const hasRulesUnread = rulesUnread.length > 0;
+const rulesNotes = rules ? rules.notes : [];
+
+const creditText = creditConfig
+  ? String(creditConfig.totalCredits) + ' credits, version ' + creditConfig.version
+  : 'No credit conversion is in force';
+const creditOwner = creditConfig ? creditConfig.ownerName : '';
+
+const rubricRows = rubric.map((c) => ({
+  id: c.id,
+  code: c.code,
+  label: c.label,
+  weight: c.weightPct,
+  maxScore: c.maxScore,
+  descriptor: c.descriptor || '',
+}));
+const hasRubric = rubricRows.length > 0;
+
+const evidenceRows = evidenceTypes.map((t) => ({
+  key: t.typeKey,
+  label: t.label,
+  kind: t.referenceKind === 'drive' ? 'Drive link' : 'External reference',
+  description: t.description || '',
+}));
+const hasEvidenceTypes = evidenceRows.length > 0;
+
+const enrolmentRows = enrolments.map((e) => ({
+  id: e.id,
+  employeeId: e.employeeId,
+  name: e.employeeName,
+  code: e.employeeCode,
+  programme: e.programmeLabel,
+  role: e.roleLabel,
+  state: e.state,
+  stateLabel: e.stateLabel,
+  started: e.startedOn,
+  ends: e.endsOn || 'No end date recorded',
+  required: e.requiredHours === null ? 'Not recorded' : String(e.requiredHours) + ' h',
+  requiredBasis: e.requiredHoursBasis,
+  closedReason: e.closedReason || '',
+}));
+const hasEnrolments = enrolmentRows.length > 0;
+const activeEnrolments = enrolmentRows.filter((e) => e.state === 'active');
+const hasActiveEnrolments = activeEnrolments.length > 0;
+
+// ---- THE HR VIEW --------------------------------------------------------------------------------
+const cohortUnread = cohort ? cohort.unread : ['the cohort'];
+const cohortIncomplete = cohortUnread.length > 0;
+const totalInterns = cohort ? cohort.totalEnrolments : null;
+const activeCount = cohort ? cohort.active : null;
+const completionRate = cohort && cohort.completionRatePct !== null
+  ? String(cohort.completionRatePct) + '%'
+  : 'No rate yet';
+const completionBasis = cohort ? cohort.completionBasis : '';
+const avgVerified = cohort && cohort.averageVerifiedHours !== null
+  ? String(cohort.averageVerifiedHours) + ' h'
+  : 'Nothing verified yet';
+const verifiedBasis = cohort ? cohort.verifiedHoursBasis : '';
+const buckets = cohort ? cohort.buckets : [];
+const workloadBasis = cohort ? cohort.workloadBasis : '';
+const mentorLoads = cohort ? cohort.mentorLoads : [];
+const withoutMentor = cohort ? cohort.withoutMentor : [];
+const withoutManager = cohort ? cohort.withoutManager : [];
+const relationshipsRead = cohort ? cohort.relationshipsRead : false;
+const certIssued = cohort ? cohort.certificatesIssued : null;
+const certDraft = cohort ? cohort.certificatesDraft : null;
+const certWithdrawn = cohort ? cohort.certificatesWithdrawn : null;
+const certBasis = cohort ? cohort.certificateBasis : '';
+const cohortNotes = cohort ? cohort.notes : [];
+const hasCohortNotes = cohortNotes.length > 0;
+const cohortWeek = cohort ? cohort.weekStart + ' to ' + cohort.weekEnd : '';
+
+const hasMsgNotes = msgNotes.length > 0;
+const noGrants = !mayConfigure && !mayEnrol && !mayCredit;
+
+const card = 'border:1px solid #2a2a30;border-radius:12px;background:#0f0f14;padding:14px;';
+const lbl = 'display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;color:#8a8a94;margin:12px 0 5px;';
+const inp = 'width:100%;min-height:44px;padding:10px 11px;border:1px solid #2a2a30;border-radius:9px;background:#08080b;color:#e8e8ee;font:inherit;font-size:13px;';
+const btn = 'min-height:44px;padding:11px 16px;margin-top:14px;border:1px solid #e8e8ee;border-radius:9px;background:#e8e8ee;color:#08080b;font:inherit;font-size:13px;font-weight:700;cursor:pointer;';
+const hint = 'font-size:12px;color:#8a8a94;margin:6px 0 0;line-height:1.6;';
+const th = 'text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.07em;color:#6e6e78;padding:8px 10px;white-space:nowrap;';
+const td = 'padding:9px 10px;border-top:1px solid #1e1e25;font-size:12.5px;vertical-align:top;';
+const sensitive = 'display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #b45309;background:rgba(180,83,9,0.16);color:#fcd34d;font-size:10px;font-weight:700;letter-spacing:0.04em;margin-left:8px;vertical-align:middle;';
+---
+<AdminLayout title="Internship programmes">
+  <div style="max-width:1120px;">
+    <h1 style="font-family:'Fraunces',serif;font-size:24px;margin:0 0 4px;">Internship programmes</h1>
+    <p style="font-size:13px;color:#8a8a94;margin:0 0 6px;line-height:1.6;">
+      A programme is a rule set: the weekly ceiling on what may be recognised, the total hours it asks
+      for, the credit conversion, the rubric and the evidence types its role draws on. An enrolment is
+      what BINDS a named person to that rule set.
+    </p>
+    <p style="font-size:13px;color:#8a8a94;margin:0 0 14px;line-height:1.6;">
+      Nothing on this page is derived from attendance. Verified hours means hours a named mentor
+      confirmed against evidence. EduRankAI is the technology platform: it computes and evidences, and
+      an accredited partner awards any credential that follows.
+    </p>
+
+    {msg && (
+      <div style={'padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;line-height:1.55;border:1px solid '
+        + (msgOk ? '#14532d;background:rgba(20,83,45,0.2);' : 'rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;')}>{msg}</div>
+    )}
+
+    {hasMsgNotes && (
+      <div style="padding:10px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #b45309;background:rgba(180,83,9,0.14);font-size:13px;line-height:1.6;">
+        {msgNotes.map((n) => <p style="margin:0 0 6px;">{n}</p>)}
+      </div>
+    )}
+
+    {noGrants && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #b45309;background:rgba(180,83,9,0.14);font-size:13px;line-height:1.6;">
+        <strong>You can read this console and change nothing on it.</strong>
+        <span> Configuring a programme, enrolling somebody and owning the credit conversion are three
+        separate grants, and you hold none of them. The figures below are still real.</span>
+      </div>
+    )}
+
+    {!programmesOk && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">
+        <strong>The programme list could not be read.</strong>
+        <span> This is not an empty list of programmes. {programmesError}</span>
+      </div>
+    )}
+
+    <!-- ======================================================================================= -->
+    <h2 style="font-family:'Fraunces',serif;font-size:17px;margin:22px 0 8px;">The cohort</h2>
+
+    {cohortIncomplete && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:12px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">
+        <strong>These could not be read: {cohortUnread.join(', ')}.</strong>
+        <span> Every figure they feed is shown as unavailable rather than as a zero. A zero that means
+        "could not read" is the defect this whole console exists to remove, and it is at its most
+        dangerous on a screen somebody rebalances a cohort from.</span>
+      </div>
+    )}
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:12px;">
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Total interns</p>
+        <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{totalInterns === null ? 'Unavailable' : totalInterns}</p>
+        <p style={hint}>Enrolments ever recorded, in any state.</p>
+      </div>
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Active</p>
+        <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{activeCount === null ? 'Unavailable' : activeCount}</p>
+        <p style={hint}>Enrolments open right now.</p>
+      </div>
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Completion rate</p>
+        <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{completionRate}</p>
+        <p style={hint}>{completionBasis}</p>
+      </div>
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Average verified hours</p>
+        <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{avgVerified}</p>
+        <p style={hint}>{verifiedBasis}</p>
+      </div>
+      <div style={card}>
+        <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Certificates</p>
+        <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{certIssued === null ? 'Unavailable' : certIssued}</p>
+        <p style={hint}>{certBasis} {certDraft !== null ? certDraft + ' draft, ' + certWithdrawn + ' withdrawn.' : ''}</p>
+      </div>
+    </div>
+
+    <div style={card}>
+      <h3 style="font-size:13px;margin:0 0 4px;font-weight:700;">Workload distribution, week of {cohortWeek}</h3>
+      <p style={hint}>{workloadBasis}</p>
+      {buckets.map((b) => (
+        <div style="display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid #1e1e25;font-size:12.5px;">
+          <span>{b.label}</span>
+          <span style="font-family:'Geist Mono',monospace;color:#8a8a94;">
+            {b.count} {b.count > 0 ? '- ' + b.people.map((p) => p.name).slice(0, 4).join(', ') : ''}
+          </span>
+        </div>
+      ))}
+    </div>
+
+    <div style={card + 'margin-top:10px;'}>
+      <h3 style="font-size:13px;margin:0 0 4px;font-weight:700;">Mentor workload</h3>
+      {!relationshipsRead ? (
+        <p style={hint}>The mentor and reporting relationships could not be read, so no load is shown.
+          Nobody is shown as unmentored on the strength of a failed read.</p>
+      ) : (
+        <div>
+          {mentorLoads.length === 0 ? (
+            <p style={hint}>No mentor is recorded against any active intern yet.</p>
+          ) : mentorLoads.map((m) => (
+            <div style="display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid #1e1e25;font-size:12.5px;">
+              <span>{m.mentorName}</span>
+              <span style="font-family:'Geist Mono',monospace;color:#8a8a94;">{m.menteeCount} mentee(s)</span>
+            </div>
+          ))}
+          {withoutMentor.length > 0 && (
+            <p style={hint}><strong style="color:#fcd34d;">{withoutMentor.length} active intern(s) have no mentor:</strong>
+              {' ' + withoutMentor.map((p) => p.name).join(', ')}. Nobody can verify their hours until one is recorded.</p>
+          )}
+          {withoutManager.length > 0 && (
+            <p style={hint}>{withoutManager.length} have no reporting manager: {withoutManager.map((p) => p.name).join(', ')}.</p>
+          )}
+        </div>
+      )}
+    </div>
+
+    {hasCohortNotes && (
+      <div style="padding:12px 14px;border-radius:8px;margin-top:10px;border:1px solid #b45309;background:rgba(180,83,9,0.14);font-size:12.5px;line-height:1.6;">
+        {cohortNotes.map((n) => <p style="margin:0 0 6px;">{n}</p>)}
+      </div>
+    )}
+
+    <!-- ======================================================================================= -->
+    <h2 style="font-family:'Fraunces',serif;font-size:17px;margin:26px 0 8px;">Programmes</h2>
+
+    <div style="display:flex;gap:6px;overflow-x:auto;padding-bottom:8px;">
+      {programmeTabs.map((t) => (
+        <a href={t.href} style={'flex:none;min-height:36px;display:inline-flex;align-items:center;padding:8px 13px;border-radius:999px;text-decoration:none;font-size:12.5px;font-weight:600;border:1px solid '
+          + (t.current ? '#e8e8ee;background:#e8e8ee;color:#08080b;' : '#2a2a30;background:#0f0f14;color:#8a8a94;')}>{t.label}</a>
+      ))}
+    </div>
+
+    {selected ? (
+      <div style={card}>
+        <h3 style="font-size:14px;margin:0 0 6px;font-weight:700;">{selected.label}</h3>
+        <p style={hint}>{selected.description}</p>
+        <p style={hint}>
+          Weekly ceiling <strong style="color:#e8e8ee;">{ceilingText}</strong> - the most that may EVER
+          be recognised in one week, holistic fitness included, never added on top.
+          Required in total <strong style="color:#e8e8ee;">{requiredText}</strong>.
+          Evidence drawn from the <strong style="color:#e8e8ee;">{selected.roleLabel}</strong> role.
+          {selected.partnerInstitution ? ' Run with ' + selected.partnerInstitution + ', who awards.' : ' No accredited partner is recorded, so nothing issued under it can name an awarding body.'}
+        </p>
+        <p style={hint}>Credit conversion in force: <strong style="color:#e8e8ee;">{creditText}</strong>
+          {creditOwner ? ', owned by ' + creditOwner + '.' : '.'}
+          Rubric weights total <strong style={rubricBalanced ? 'color:#86efac;' : 'color:#fcd34d;'}>{rubricTotal}</strong>
+          {rubricBalanced ? '.' : ' - which is not 100, and it is stated rather than silently scaled.'}</p>
+        {rulesNotes.map((n) => <p style={hint}>{n}</p>)}
+        {hasRulesUnread && (
+          <p style={hint + 'color:#fca5a5;'}>These could not be read: {rulesUnread.join(', ')}. The rules
+            shown are incomplete, and that is a failure to read them rather than a programme with gaps.</p>
+        )}
+      </div>
+    ) : (
+      <div style={card}><p style="font-size:13px;margin:0;">No programme is configured yet. Until one
+        exists, a person's ceiling and credit meaning are inferred from how somebody typed their job
+        title - which is a coincidence, not a configuration.</p></div>
+    )}
+
+    {mayConfigure && (
+      <div style={card + 'margin-top:12px;'}>
+        <h3 style="font-size:13px;margin:0 0 4px;font-weight:700;">Configure a programme
+          <span style={sensitive}>Sensitive</span></h3>
+        <p style={hint}>The ceiling and the required total are the two figures a completion record is
+          measured against, so they decide much of what it says about a person before any work is done.
+          Every save is written to the audit log with your name and the time. The ceiling cannot be set
+          above the statutory weekly maximum by anybody, and holistic development cannot be moved
+          outside it.</p>
+        <form method="POST">
+          <input type="hidden" name="_action" value="programme_save"/>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:0 14px;">
+            <div>
+              <label style={lbl} for="pk">Programme key</label>
+              <input style={inp} id="pk" name="programme_key" required maxlength="60"
+                value={selected ? selected.programmeKey : ''}/>
+            </div>
+            <div>
+              <label style={lbl} for="plabel">Name</label>
+              <input style={inp} id="plabel" name="label" required maxlength="120"
+                value={selected ? selected.label : ''}/>
+            </div>
+            <div>
+              <label style={lbl} for="pstate">Open to enrol into</label>
+              <select style={inp} id="pstate" name="state">
+                {stateChoices.map((s) => (
+                  <option value={s.value} selected={!!selected && selected.state === s.value}>{s.label}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="prole">Kind of work its evidence is drawn from</label>
+              <select style={inp} id="prole" name="role_key">
+                {roleChoices.map((r) => (
+                  <option value={r.value} selected={!!selected && selected.roleKey === r.value}>{r.label}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="pceil">Weekly ceiling, hours</label>
+              <input style={inp} id="pceil" name="ceiling_hours" type="number" step="0.5" min="1"
+                value={ceilingHours === null ? '' : String(ceilingHours)}/>
+            </div>
+            <div>
+              <label style={lbl} for="preq">Required in total, hours</label>
+              <input style={inp} id="preq" name="required_hours" type="number" step="1" min="0"
+                value={selected && selected.requiredHours !== null ? String(selected.requiredHours) : ''}/>
+            </div>
+            <div>
+              <label style={lbl} for="pweeks">Length, weeks</label>
+              <input style={inp} id="pweeks" name="duration_weeks" type="number" step="1" min="1"
+                value={selected && selected.durationWeeks !== null ? String(selected.durationWeeks) : ''}/>
+            </div>
+            <div>
+              <label style={lbl} for="ppartner">Accredited partner who awards</label>
+              <input style={inp} id="ppartner" name="partner" maxlength="200"
+                value={selected && selected.partnerInstitution ? selected.partnerInstitution : ''}/>
+            </div>
+          </div>
+          <label style={lbl} for="pdesc">Description</label>
+          <input style={inp} id="pdesc" name="description" maxlength="500"
+            value={selected ? selected.description : ''}/>
+          <button style={btn} type="submit">Save programme</button>
+        </form>
+      </div>
+    )}
+
+    <!-- ======================================================================================= -->
+    <h2 style="font-family:'Fraunces',serif;font-size:17px;margin:26px 0 8px;">Evidence types for this programme</h2>
+
+    <div style={card}>
+      <p style={hint}>What counts as evidence for the role this programme draws on. Evidence is always
+        a LINK - a Drive document shared as "anyone with the link", a commit, a pull request, an LMS
+        record, a notebook. Nothing is ever uploaded and there is nowhere on this platform for an
+        upload to go.</p>
+      {hasEvidenceTypes ? (
+        <div>
+          {evidenceRows.map((t) => (
+            <div style="padding:9px 0;border-top:1px solid #1e1e25;font-size:12.5px;">
+              <strong>{t.label}</strong>
+              <span style="color:#8a8a94;"> - {t.kind}</span>
+              <p style={hint}>{t.description}</p>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p style={hint}>No evidence types are configured for this role, so an intern on this programme
+          has nothing to choose from when filing evidence. That is a configuration gap and it blocks
+          them, not a statement that no evidence is needed.</p>
+      )}
+    </div>
+
+    <!-- ======================================================================================= -->
+    {mayCredit && (
+      <div>
+        <h2 style="font-family:'Fraunces',serif;font-size:17px;margin:26px 0 8px;">Credit conversion and rubric
+          <span style={sensitive}>Sensitive</span></h2>
+
+        <div style={card}>
+          <p style={hint}>This decides what a CREDIT MEANS on a document an accredited partner reads,
+            which is why it is a versioned record with a named owner rather than a setting, and why a
+            save writes a new version instead of editing the one a record already points at.</p>
+          <p style={hint}>Credit can never be made to depend on attendance, presence, login time, clock
+            time or punctuality. A component worded that way is refused at the save, for every holder
+            of this grant including a super administrator. That is not a permission question.</p>
+          <form method="POST">
+            <input type="hidden" name="_action" value="credit_save"/>
+            <input type="hidden" name="programme_key" value={selectedKey}/>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px;">
+              <div>
+                <label style={lbl} for="cname">Programme name on the record</label>
+                <input style={inp} id="cname" name="programme_name" required maxlength="200"
+                  value={selected ? selected.label : ''}/>
+              </div>
+              <div>
+                <label style={lbl} for="ctot">Total credits</label>
+                <input style={inp} id="ctot" name="total_credits" type="number" step="0.5" min="0"
+                  value={creditConfig ? String(creditConfig.totalCredits) : '12'}/>
+              </div>
+              <div>
+                <label style={lbl} for="cstep">Credit step</label>
+                <input style={inp} id="cstep" name="credit_step" type="number" step="0.25" min="0.25"
+                  value={creditConfig ? String(creditConfig.creditStep) : '0.5'}/>
+              </div>
+              <div>
+                <label style={lbl} for="cceil">Weekly ceiling used in the conversion</label>
+                <input style={inp} id="cceil" name="ceiling_hours" type="number" step="0.5" min="1"
+                  value={ceilingHours === null ? '40' : String(ceilingHours)}/>
+              </div>
+              <div>
+                <label style={lbl} for="cweeks">Programme weeks</label>
+                <input style={inp} id="cweeks" name="programme_weeks" type="number" step="1" min="1"
+                  value={selected && selected.durationWeeks !== null ? String(selected.durationWeeks) : ''}/>
+              </div>
+              <div>
+                <label style={lbl} for="chpc">Partner hours per credit</label>
+                <input style={inp} id="chpc" name="hours_per_credit" type="number" step="1" min="1"
+                  value={creditConfig && creditConfig.partnerHoursPerCredit !== null ? String(creditConfig.partnerHoursPerCredit) : ''}/>
+              </div>
+            </div>
+            <label style={lbl} for="cnotes">Notes kept with this version</label>
+            <input style={inp} id="cnotes" name="notes" maxlength="2000"/>
+            <label style="display:flex;align-items:center;gap:10px;margin-top:14px;font-size:13px;color:#c8c8d0;">
+              <input type="checkbox" name="activate" value="yes" style="width:22px;height:22px;"/>
+              Put this version in force now, retiring the one it replaces
+            </label>
+            <button style={btn} type="submit">Save credit conversion</button>
+          </form>
+        </div>
+
+        <div style={card + 'margin-top:12px;'}>
+          <h3 style="font-size:13px;margin:0 0 4px;font-weight:700;">Grading rubric</h3>
+          <p style={hint}>What a mentor scores against. Weights total {rubricTotal}
+            {rubricBalanced ? ', which is what they should.' : ' rather than 100. Nothing is scaled to hide that.'}
+            A criterion cannot be worded in terms of attendance or clock time; it is refused at the save.</p>
+          {hasRubric ? (
+            <div style="overflow-x:auto;">
+              <table style="border-collapse:collapse;width:100%;min-width:560px;">
+                <thead><tr>
+                  <th style={th}>Code</th><th style={th}>Criterion</th>
+                  <th style={th}>Weight</th><th style={th}>Max score</th>
+                </tr></thead>
+                <tbody>
+                  {rubricRows.map((c) => (
+                    <tr>
+                      <td style={td}>{c.code}</td>
+                      <td style={td}>{c.label}<br/><span style="color:#6e6e78;font-size:11.5px;">{c.descriptor}</span></td>
+                      <td style={td + 'font-family:\'Geist Mono\',monospace;'}>{c.weight}</td>
+                      <td style={td + 'font-family:\'Geist Mono\',monospace;'}>{c.maxScore}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div>
+              <p style={hint}>No rubric exists for this programme, so the "weekly mentor review against
+                a published rubric" this platform promises has nothing published behind it.</p>
+              <form method="POST">
+                <input type="hidden" name="_action" value="rubric_seed"/>
+                <input type="hidden" name="programme_key" value={selectedKey}/>
+                <button style={btn} type="submit">Create the default rubric</button>
+              </form>
+            </div>
+          )}
+
+          <form method="POST" style="margin-top:14px;border-top:1px solid #1e1e25;padding-top:6px;">
+            <input type="hidden" name="_action" value="rubric_save"/>
+            <input type="hidden" name="programme_key" value={selectedKey}/>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:0 14px;">
+              <div>
+                <label style={lbl} for="rcode">Code</label>
+                <input style={inp} id="rcode" name="code" required maxlength="20"/>
+              </div>
+              <div>
+                <label style={lbl} for="rlabel">Criterion</label>
+                <input style={inp} id="rlabel" name="label" required maxlength="200"/>
+              </div>
+              <div>
+                <label style={lbl} for="rweight">Weight</label>
+                <input style={inp} id="rweight" name="weight_pct" type="number" step="1" min="0" required/>
+              </div>
+              <div>
+                <label style={lbl} for="rmax">Max score</label>
+                <input style={inp} id="rmax" name="max_score" type="number" step="1" min="1" value="5"/>
+              </div>
+            </div>
+            <label style={lbl} for="rdesc">What good looks like</label>
+            <input style={inp} id="rdesc" name="descriptor" maxlength="1000"/>
+            <button style={btn} type="submit">Save criterion</button>
+          </form>
+        </div>
+      </div>
+    )}
+
+    <!-- ======================================================================================= -->
+    <h2 style="font-family:'Fraunces',serif;font-size:17px;margin:26px 0 8px;">Enrolments</h2>
+
+    {peopleError && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:12px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">{peopleError}</div>
+    )}
+
+    {!enrolmentsOk && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:12px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">
+        The enrolment record could not be read. This is not an empty cohort.
+      </div>
+    )}
+
+    {mayEnrol && (
+      <div style={card}>
+        <h3 style="font-size:13px;margin:0 0 4px;font-weight:700;">Enrol somebody
+          <span style={sensitive}>Sensitive</span></h3>
+        <p style={hint}>An enrolment binds this person to the ceiling, the required hours, the credit
+          conversion and the rubric they will be measured under, so moving somebody between programmes
+          changes what their record will say without touching a single hour. The mentor and manager are
+          written into the Organization Graph as dated edges, so "who was the mentor on the day this
+          hour was verified" stays answerable. Recording a mentor here makes nobody able to verify
+          anybody else's hours.</p>
+        <form method="POST">
+          <input type="hidden" name="_action" value="enrol"/>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 14px;">
+            <div>
+              <label style={lbl} for="eemp">Person</label>
+              <select style={inp} id="eemp" name="employee_id" required>
+                <option value="">Choose</option>
+                {candidates.map((c) => (
+                  <option value={c.id}>{c.name}{c.code ? ' (' + c.code + ')' : ''}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="eprog">Programme</label>
+              <select style={inp} id="eprog" name="programme_key" required>
+                {programmes.map((p) => (
+                  <option value={p.programmeKey} selected={p.programmeKey === selectedKey}>{p.label}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="estart">Starts</label>
+              <input style={inp} id="estart" name="started_on" type="date" required value={TODAY}/>
+            </div>
+            <div>
+              <label style={lbl} for="eend">Ends</label>
+              <input style={inp} id="eend" name="ends_on" type="date"/>
+            </div>
+            <div>
+              <label style={lbl} for="ementor">Mentor</label>
+              <select style={inp} id="ementor" name="mentor_id">
+                <option value="">Not recorded yet</option>
+                {staff.map((s) => <option value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="emgr">Reporting manager</label>
+              <select style={inp} id="emgr" name="manager_id">
+                <option value="">Not recorded yet</option>
+                {staff.map((s) => <option value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="ereq">Required hours for this person</label>
+              <input style={inp} id="ereq" name="required_hours" type="number" step="1" min="0"/>
+            </div>
+            <div>
+              <label style={lbl} for="enote">Note</label>
+              <input style={inp} id="enote" name="note" maxlength="500"/>
+            </div>
+          </div>
+          <button style={btn} type="submit">Enrol</button>
+        </form>
+      </div>
+    )}
+
+    {hasEnrolments ? (
+      <div style="overflow-x:auto;margin-top:12px;">
+        <table style="border-collapse:collapse;width:100%;min-width:820px;">
+          <thead><tr>
+            <th style={th}>Person</th><th style={th}>Programme</th><th style={th}>State</th>
+            <th style={th}>From</th><th style={th}>To</th><th style={th}>Required</th>
+          </tr></thead>
+          <tbody>
+            {enrolmentRows.map((e) => (
+              <tr>
+                <td style={td}>{e.name}<br/><span style="color:#6e6e78;font-size:11.5px;">{e.code}</span></td>
+                <td style={td}>{e.programme}<br/><span style="color:#6e6e78;font-size:11.5px;">{e.role}</span></td>
+                <td style={td}>{e.stateLabel}{e.closedReason ? <span style="display:block;color:#6e6e78;font-size:11.5px;">{e.closedReason}</span> : null}</td>
+                <td style={td + 'font-family:\'Geist Mono\',monospace;'}>{e.started}</td>
+                <td style={td + 'font-family:\'Geist Mono\',monospace;'}>{e.ends}</td>
+                <td style={td}>{e.required}<br/><span style="color:#6e6e78;font-size:11.5px;">{e.requiredBasis}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <div style={card + 'margin-top:12px;'}>
+        <p style="font-size:13px;margin:0;">{enrolmentsOk
+          ? 'Nobody is enrolled yet. Until somebody is, their ceiling and the meaning of their credits are inferred from their employment type and job title, which is a guess rather than a decision anybody made.'
+          : 'The enrolment record could not be read, so this is not a statement that nobody is enrolled.'}</p>
+      </div>
+    )}
+
+    {mayEnrol && hasActiveEnrolments && (
+      <div style={card + 'margin-top:12px;'}>
+        <h3 style="font-size:13px;margin:0 0 4px;font-weight:700;">Reassign or close
+          <span style={sensitive}>Sensitive</span></h3>
+        <p style={hint}>Changing a mentor closes the previous edge and opens the new one at the same
+          instant. Closing an enrolment needs a written reason, and it is the only thing that can
+          answer this question later. Nothing is deleted by either.</p>
+
+        <form method="POST" style="border-top:1px solid #1e1e25;padding-top:6px;">
+          <input type="hidden" name="_action" value="assign"/>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px;">
+            <div>
+              <label style={lbl} for="aemp">Intern</label>
+              <select style={inp} id="aemp" name="employee_id" required>
+                <option value="">Choose</option>
+                {activeEnrolments.map((e) => <option value={e.employeeId}>{e.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="amentor">New mentor</label>
+              <select style={inp} id="amentor" name="mentor_id">
+                <option value="">Close the mentor edge, leaving none</option>
+                {staff.map((s) => <option value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="amgr">New reporting manager</label>
+              <select style={inp} id="amgr" name="manager_id">
+                <option value="">Close the manager edge, leaving none</option>
+                {staff.map((s) => <option value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+          </div>
+          <button style={btn} type="submit">Record relationships</button>
+        </form>
+
+        <form method="POST" style="border-top:1px solid #1e1e25;margin-top:14px;padding-top:6px;">
+          <input type="hidden" name="_action" value="close"/>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px;">
+            <div>
+              <label style={lbl} for="cenrol">Enrolment</label>
+              <select style={inp} id="cenrol" name="enrolment_id" required>
+                <option value="">Choose</option>
+                {activeEnrolments.map((e) => <option value={e.id}>{e.name} - {e.programme}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="cstate">Closing as</label>
+              <select style={inp} id="cstate" name="state">
+                <option value="completed">Completed</option>
+                <option value="withdrawn">Withdrawn</option>
+              </select>
+            </div>
+            <div>
+              <label style={lbl} for="cdate">On</label>
+              <input style={inp} id="cdate" name="closed_on" type="date" value={TODAY}/>
+            </div>
+          </div>
+          <label style={lbl} for="creason">Why, in your own words</label>
+          <input style={inp} id="creason" name="reason" required minlength="10" maxlength="2000"/>
+          <button style={btn} type="submit">Close enrolment</button>
+        </form>
+      </div>
+    )}
+
+    <p style="font-size:12px;color:#6e6e78;margin:26px 0 0;line-height:1.7;border-top:1px solid #1e1e25;padding-top:12px;">
+      Hours are verified by the named mentor from the Organization Graph, on
+      <a href="/portal/mentor" style="color:#8a8a94;"> their own queue</a>, never from this console:
+      verification is a relationship resolved per row at the write, not a standing power a desk holds
+      over a cohort. Forty hours a week is a ceiling on everything recognised, holistic fitness
+      included and never added on top. Approved leave does not waive required hours - it creates
+      outstanding hours and a make-up schedule, which must itself fit inside the ceiling.
+    </p>
+  </div>
+</AdminLayout>
