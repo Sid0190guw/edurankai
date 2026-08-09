@@ -28,6 +28,39 @@ if (!attempt) return Astro.redirect('/admin/tests/attempts');
 
 function aRows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 let gradeMsg = '';
+// A FAILED SAVE USED TO BE PRINTED ON GREEN. gradeMsg was rendered in the success box whatever it
+// said, so 'Grade save failed: ...' arrived in the same reassuring panel as 'Grades saved'. The two
+// outcomes are now separate variables and separate panels.
+let gradeErr = '';
+
+/**
+ * The objective (auto-marked) part of this attempt, in marks.
+ *
+ * WHY THIS IS NOT `attempt.auto_score ?? attempt.total_score`, WHICH IS WHAT IT USED TO BE.
+ * total_score is the column this very handler OVERWRITES with auto + manual. So on any attempt
+ * where auto_score is null — a guest attempt, or anything submitted before /api/tests/submit.ts
+ * started writing that column — the fallback read back a number that ALREADY CONTAINED the manual
+ * marks, and adding the manual marks to it again inflated the candidate's score by the full manual
+ * total on every single press of Save. Two saves and a 40/100 paper reads 60/100, with the audit
+ * showing nothing but a grader saving the same marks twice.
+ *
+ * The recovery is exact rather than a guess: manual_scores holds precisely what the last save added,
+ * so subtracting it from total_score gives back the objective part. Clamped at zero because a
+ * hand-edited row must not produce a negative base.
+ */
+function objectiveScoreOf(a: any): number {
+  const declared = Number(a?.auto_score);
+  if (a?.auto_score !== null && a?.auto_score !== undefined && Number.isFinite(declared)) return declared;
+  let prior: any = a?.manual_scores || {};
+  if (typeof prior === 'string') { try { prior = JSON.parse(prior); } catch { prior = {}; } }
+  let priorManual = 0;
+  for (const v of Object.values(prior as Record<string, unknown>)) {
+    const n = Number(v);
+    if (Number.isFinite(n)) priorManual += n;
+  }
+  const total = Number(a?.total_score);
+  return Math.max(0, (Number.isFinite(total) ? total : 0) - priorManual);
+}
 
 // Manual grading: save marks + feedback for subjective questions, then
 // recompute total = auto (objective) + manual, plus percentage, then re-rank.
@@ -51,25 +84,57 @@ if (Astro.request.method === 'POST') {
         const fb = (fd.get('fb_' + q.id) as string || '').trim();
         if (fb) manualFeedback[q.id] = fb.slice(0, 2000);
       }
-      const autoScore = Number(attempt.auto_score ?? attempt.total_score ?? 0);
+      const autoScore = objectiveScoreOf(attempt);
       const maxScore = Number(attempt.max_score ?? 0);
       const newTotal = autoScore + manualTotal;
       const newPct = maxScore > 0 ? (newTotal / maxScore) * 100 : 0;
-      await db.execute(sql`
+      // BOUND, NOT INTERPOLATED. Both jsonb values used to be assembled with sql.raw() out of
+      // string concatenation with a hand-rolled quote-doubling pass — over text a grader types into
+      // the feedback box. Passing them as parameters with an explicit ::jsonb cast is the same
+      // statement with nothing to escape.
+      // RETURNING, so 'Grades saved' cannot print over a statement that matched no row.
+      const saved = aRows(await db.execute(sql`
         UPDATE test_attempts SET
-          manual_scores = ${sql.raw("'" + JSON.stringify(manualScores).replace(/'/g, "''") + "'::jsonb")},
-          manual_feedback = ${sql.raw("'" + JSON.stringify(manualFeedback).replace(/'/g, "''") + "'::jsonb")},
+          manual_scores = ${JSON.stringify(manualScores)}::jsonb,
+          manual_feedback = ${JSON.stringify(manualFeedback)}::jsonb,
           total_score = ${newTotal}, percentage = ${newPct.toFixed(2)},
           graded = true, graded_by = ${user.id}, graded_at = NOW()
         WHERE id = ${id}
-      `);
-      // Re-rank the cohort by the updated scores.
-      const ar = aRows(await db.execute(sql`SELECT id FROM test_attempts WHERE test_id = ${attempt.test_id} AND status IN ('submitted','auto_submitted') ORDER BY percentage DESC NULLS LAST, duration_seconds ASC NULLS LAST, submitted_at ASC`));
-      for (let i = 0; i < ar.length; i++) await db.execute(sql`UPDATE test_attempts SET rank = ${i + 1} WHERE id = ${(ar[i] as any).id}`);
-      gradeMsg = 'Grades saved. New score: ' + newTotal + '/' + maxScore + ' (' + newPct.toFixed(1) + '%).';
-      const rr = aRows(await db.execute(sql`SELECT a.*, t.title as test_title, t.slug as test_slug, t.total_questions, t.duration_mins FROM test_attempts a LEFT JOIN tests t ON a.test_id = t.id WHERE a.id = ${id} LIMIT 1`));
-      attempt = rr[0] || attempt;
-    } catch (e: any) { gradeMsg = 'Grade save failed: ' + (e?.message || 'error'); }
+        RETURNING id
+      `));
+      if (saved.length === 0) {
+        gradeErr = 'Nothing was saved: this attempt no longer exists, or it was changed by somebody else while this page was open. Reload before grading again.';
+      } else {
+        // ONE TRANSACTION FOR THE RE-RANK. This is a read of the whole cohort followed by a write
+        // per attempt. Two graders finishing at the same moment used to interleave their loops and
+        // leave the cohort holding a mixture of two orderings — duplicate ranks, missing ranks — with
+        // nothing able to say which pass produced which row.
+        const ar = aRows(await db.execute(sql`SELECT id FROM test_attempts WHERE test_id = ${attempt.test_id} AND status IN ('submitted','auto_submitted') ORDER BY percentage DESC NULLS LAST, duration_seconds ASC NULLS LAST, submitted_at ASC`));
+        let rankFailed = '';
+        try {
+          await db.transaction(async (tx: any) => {
+            for (let i = 0; i < ar.length; i++) {
+              await tx.execute(sql`UPDATE test_attempts SET rank = ${i + 1} WHERE id = ${(ar[i] as any).id}`);
+            }
+          });
+        } catch (e: any) {
+          rankFailed = e?.cause?.message || e?.message || 'unknown reason';
+          console.error('[admin/tests/attempts] re-rank failed for test', attempt.test_id, '-', rankFailed);
+        }
+        gradeMsg = 'Grades saved. New score: ' + newTotal + '/' + maxScore + ' (' + newPct.toFixed(1) + '%).';
+        // The marks are committed; the leaderboard position is not. Saying so is the difference
+        // between a grader who knows to re-run it and one who does not.
+        if (rankFailed) gradeErr = 'The marks are saved, but the cohort ranking was NOT recalculated, so positions on the leaderboard are stale. Reason: ' + rankFailed;
+        const rr = aRows(await db.execute(sql`SELECT a.*, t.title as test_title, t.slug as test_slug, t.total_questions, t.duration_mins FROM test_attempts a LEFT JOIN tests t ON a.test_id = t.id WHERE a.id = ${id} LIMIT 1`));
+        attempt = rr[0] || attempt;
+      }
+    } catch (e: any) {
+      // e.message on a drizzle error is the failed SQL, not the reason, and it was being printed at
+      // the grader while nothing at all was logged.
+      const real = e?.cause?.message || e?.message || 'unknown reason';
+      console.error('[admin/tests/attempts] grade save failed for', id, '-', real);
+      gradeErr = 'Nothing was saved. The marks you typed are still in the form above — do not close this page. Reason: ' + real;
+    }
   }
 }
 
@@ -167,6 +232,7 @@ function labelFor(t: string) { return evtLabel[t] || t; }
     </div>
 
     {gradeMsg && <div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;">{gradeMsg}</div>}
+    {gradeErr && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;line-height:1.55;">{gradeErr}</div>}
 
     {gradeQuestions.length > 0 && (
       <form method="POST" style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:18px 22px;margin-bottom:18px;">
@@ -175,7 +241,7 @@ function labelFor(t: string) { return evtLabel[t] || t; }
           <p style="font-size:13px;font-weight:700;color:#fff;margin:0;">Manual grading ({gradeQuestions.length} subjective question{gradeQuestions.length === 1 ? '' : 's'})</p>
           <span style={'font-size:11px;font-family:monospace;' + (attempt.graded ? 'color:#6ee7b7;' : 'color:#fbbf24;')}>{attempt.graded ? 'graded' : 'needs grading'}</span>
         </div>
-        <p style="font-size:11px;color:#8a8a94;margin:0 0 14px;">Objective (auto) score: {attempt.auto_score ?? attempt.total_score ?? 0}. Enter marks for each subjective answer; the total + rank update on save.</p>
+        <p style="font-size:11px;color:#8a8a94;margin:0 0 14px;">Objective (auto) score: {objectiveScoreOf(attempt)}. Enter marks for each subjective answer; the total + rank update on save.</p>
         {gradeQuestions.map((q: any, i: number) => (
           <div style="border-top:1px solid #1a1a1f;padding:12px 0;">
             <p style="font-size:12.5px;color:#d8d8de;margin:0 0 6px;"><strong style="color:#fff;">Q{i + 1}</strong> ({q.question_type}, max {q.marks}) &middot; {q.question_text}</p>

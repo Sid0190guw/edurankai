@@ -14,7 +14,21 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 await ensureMailSchema();
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
+// A FAILED READ IS NOT A QUIET MAILBOX - AND ON THIS PAGE THAT DISTINCTION IS THE WHOLE POINT.
+// Both queries below used to end in `catch (_) {}` over an all-zero default, so a pooler timeout or
+// a renamed column rendered "0 inbound, 0 outbound, 0 external send attempts, 0 failed, last never"
+// and "No external sends logged yet" - on the screen an operator opens specifically to answer "is
+// mail working?". The most alarming state this page can be in and the calmest one looked identical.
+// The reasons are collected and stated instead. Declared above everything that writes to it -
+// `const` is not hoisted.
+const readFailures: string[] = [];
+const dbReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
 const cfg = await getMailConfig();
+// The configuration read is a read like any other on this page, and it was the one whose failure
+// was invisible: getMailConfig() swallowed its SELECT and returned an empty config, so this screen
+// drew "no transport configured" over a live mail server. It now reports itself.
+if (cfg.readError) readFailures.push('Mail configuration row: ' + cfg.readError);
 const imap = await getImapConfig();
 const transport = await transportStatus();
 
@@ -34,7 +48,11 @@ try {
       (SELECT COUNT(*)::int FROM mail_reads) AS reads
   `);
   stats = (rows(r)[0] || stats);
-} catch (_) {}
+} catch (e: any) {
+  console.error('[admin/mail/health] traffic read failed:', dbReason(e));
+  readFailures.push('Traffic counters: ' + dbReason(e));
+}
+const statsOk = readFailures.length === 0;
 
 // CRON_SECRET runtime presence — we can't read the value, but we CAN show whether
 // it's set (so the admin knows the IMAP cron is actually authorised in prod).
@@ -48,7 +66,11 @@ try {
     SELECT to_email, from_email, subject, status, provider, error, created_at
     FROM email_logs ORDER BY created_at DESC LIMIT 10
   `));
-} catch (_) {}
+} catch (e: any) {
+  console.error('[admin/mail/health] send log read failed:', dbReason(e));
+  readFailures.push('Recent send log: ' + dbReason(e));
+}
+const logOk = readFailures.every((f) => f.indexOf('Recent send log') !== 0);
 
 function fmt(d: any): string { try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return ''; } }
 function ago(d: any): string {
@@ -68,6 +90,7 @@ function badge(ok: boolean, label: string) {
   return { bg, fg, label };
 }
 
+if (imap.configRead === false) readFailures.push('IMAP settings: the mail_config row could not be read');
 const smtpOk = !!cfg.smtpHost && !!cfg.smtpUser && !!cfg.smtpPass;
 const imapOk = !!imap.host && !!imap.user && !!imap.pass;
 const inboundOk = !!cfg.inboundSecret;
@@ -82,11 +105,21 @@ const inboundOk = !!cfg.inboundSecret;
     </div>
   </div>
 
+  {readFailures.length > 0 && (
+    <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:14px 16px;margin-bottom:18px;">
+      <p style="font-size:12.5px;font-weight:700;color:#fca5a5;margin:0 0 6px;">Part of this page could not be read, so the numbers below are not a measurement.</p>
+      <p style="font-size:12px;color:#d8d8de;margin:0 0 8px;line-height:1.6;">Do not read a zero on this page as "no mail". Nothing has been sent, received or lost because of this; the database simply did not answer these questions.</p>
+      <ul style="font-size:11.5px;color:#fca5a5;margin:0;padding-left:18px;line-height:1.7;font-family:'Geist Mono',monospace;">
+        {readFailures.map((f: string) => <li>{f}</li>)}
+      </ul>
+    </div>
+  )}
+
   <!-- Top status grid -->
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:18px;">
     {[
       { label: 'Outbound SMTP',  ok: smtpOk,           detail: smtpOk ? cfg.smtpHost + ':' + cfg.smtpPort : 'not configured' },
-      { label: 'Inbound IMAP',   ok: imapOk,           detail: imapOk ? imap.host + ':' + imap.port : 'not configured' },
+      { label: 'Inbound IMAP',   ok: imapOk,           detail: imapOk ? imap.host + ':' + imap.port : (imap.configRead === false ? 'settings could not be read - NOT the same as unconfigured' : 'not configured') },
       { label: 'Inbound webhook',ok: inboundOk,        detail: inboundOk ? 'secret set' : 'no x-mail-secret stored' },
       { label: 'Cron secret',    ok: cronSecretSet,    detail: cronSecretSet ? 'CRON_SECRET env present' : 'NOT set — IMAP cron will get 401' },
     ].map((t: any) => {
@@ -117,6 +150,9 @@ const inboundOk = !!cfg.inboundSecret;
   <!-- Traffic stats -->
   <div class="admin-card" style="margin-bottom:18px;">
     <div class="admin-card-title" style="margin-bottom:10px;">Traffic</div>
+    {!statsOk && (
+      <p style="font-size:11.5px;color:#fca5a5;margin:0 0 10px;line-height:1.6;">These counters did not load. The figures below are the empty defaults, not counts - treat every one of them as unknown.</p>
+    )}
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-family:'Geist Mono',monospace;font-size:12px;">
       <div style="background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:10px 12px;">
         <p style="font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#8a8a94;margin:0 0 3px;">Inbound messages</p>
@@ -161,7 +197,9 @@ const inboundOk = !!cfg.inboundSecret;
   <!-- Recent external send log -->
   <div class="admin-card" style="margin-bottom:18px;">
     <div class="admin-card-title" style="margin-bottom:10px;">Recent external send attempts (last 10)</div>
-    {recentLog.length === 0 ? (
+    {!logOk ? (
+      <p style="font-size:12px;color:#fca5a5;margin:0;">This log could not be read, so nothing is being claimed about what has or has not been sent. See the message at the top of the page.</p>
+    ) : recentLog.length === 0 ? (
       <p style="font-size:12px;color:#6e6e78;margin:0;">No external sends logged yet. Send a test from <a href="/admin/mail/settings" style="color:#FF7040;">Mail Settings</a> to populate this.</p>
     ) : (
       <div style="display:flex;flex-direction:column;gap:6px;font-family:'Geist Mono',monospace;font-size:11px;">
@@ -211,23 +249,31 @@ const inboundOk = !!cfg.inboundSecret;
       .then(function (d) {
         btn.disabled = false; btn.textContent = prev;
         if (!d.ok) { box.innerHTML = '<span style="color:#fca5a5;">' + (d.error || 'lookup failed') + '</span>'; return; }
-        function line(label, ok, detail, note) {
-          var color = ok ? '#6ee7b7' : '#fca5a5';
-          var icon = ok ? 'PASS' : 'FAIL';
+        // A LOOKUP THAT DID NOT RUN IS NOT A MISSING RECORD. /api/mail/dns-check now reports
+        // `checked` per record; an unchecked one is drawn as NOT CHECKED, never as FAIL. Telling an
+        // operator "no v=spf1 record found" after a resolver timeout is how a domain ends up with a
+        // SECOND SPF record, which makes every provider treat the domain as failing SPF.
+        function stateOf(rec, present) { return rec && rec.checked === false ? 'unknown' : (present ? 'pass' : 'fail'); }
+        function line(label, state, detail, note) {
+          var color = state === 'pass' ? '#6ee7b7' : state === 'unknown' ? '#fbbf24' : '#fca5a5';
+          var icon = state === 'pass' ? 'PASS' : state === 'unknown' ? 'NOT CHECKED' : 'FAIL';
           return '<div style="margin-bottom:6px;"><strong style="color:' + color + ';">[' + icon + '] ' + label + '</strong> <span style="color:#d8d8de;">' + (detail || '') + '</span>' + (note ? '<div style="color:#fbbf24;margin-top:2px;font-size:10.5px;">' + note + '</div>' : '') + '</div>';
         }
         var html = '';
-        html += line('SPF (TXT @)', d.spf.present, d.spf.record || 'no v=spf1 record found', d.spf.note);
-        html += line('DMARC (TXT _dmarc)', d.dmarc.present, d.dmarc.record || 'no v=DMARC1 record found', d.dmarc.policy ? ('policy=' + d.dmarc.policy) : null);
+        if (d.unchecked && d.unchecked.length) {
+          html += '<div style="margin-bottom:10px;color:#fbbf24;">Some lookups did not complete, so nothing is claimed about them: ' + d.unchecked.join('; ') + '</div>';
+        }
+        html += line('SPF (TXT @)', stateOf(d.spf, d.spf.present), d.spf.record || (d.spf.checked === false ? 'the lookup did not complete' : 'no v=spf1 record found'), d.spf.note);
+        html += line('DMARC (TXT _dmarc)', stateOf(d.dmarc, d.dmarc.present), d.dmarc.record || (d.dmarc.checked === false ? 'the lookup did not complete' : 'no v=DMARC1 record found'), d.dmarc.policy ? ('policy=' + d.dmarc.policy) : null);
         if (d.dkim.present) {
           html += '<div style="margin-bottom:6px;"><strong style="color:#6ee7b7;">[PASS] DKIM</strong> <span style="color:#d8d8de;">found selectors: ' + d.dkim.selectors.map(function (s) { return s.selector; }).join(', ') + '</span></div>';
         } else {
-          html += line('DKIM', false, 'no DKIM record at common selectors (default, google, k1, s1, selector1, selector2, mail, smtp)', 'Your SMTP provider should give you a selector + record. Add a TXT at <selector>._domainkey.' + d.domain);
+          html += line('DKIM', stateOf(d.dkim, false), d.dkim.checked === false ? 'the lookups did not complete' : ('no DKIM record at the selectors tried (' + (d.dkim.triedSelectors || []).join(', ') + ') - a provider using its own selector name does not show up here'), 'Your SMTP provider should give you a selector + record. Add a TXT at <selector>._domainkey.' + d.domain);
         }
         if (d.mx && d.mx.length) {
           html += '<div style="margin-bottom:6px;"><strong style="color:#6ee7b7;">[PASS] MX</strong> <span style="color:#d8d8de;">' + d.mx.map(function (m) { return m.priority + ' ' + m.host; }).join(', ') + '</span></div>';
         } else {
-          html += line('MX', false, 'no MX records found — inbound mail to this domain has nowhere to land', null);
+          html += line('MX', d.mxChecked === false ? 'unknown' : 'fail', d.mxChecked === false ? 'the lookup did not complete' : 'no MX records found - inbound mail to this domain has nowhere to land', null);
         }
         box.innerHTML = html;
       })

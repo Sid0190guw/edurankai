@@ -7,6 +7,20 @@ import { SITE } from '@/lib/site';
 const { slug } = Astro.params;
 if (!slug) return Astro.redirect('/aquintutor/courses');
 
+// EVERY READ ON THIS PAGE ENDED IN `catch (_) {}`, AND EACH ONE HAD A DIFFERENT LIE READY.
+//
+//   - The course read: on failure `course` stayed null and the next line redirected to the
+//     catalogue. A published course became "this course does not exist" the moment the database
+//     was unreachable, and the learner was bounced with no explanation at all.
+//   - The lessons read: on failure `lessons` stayed [] and the syllabus printed "Lessons coming
+//     soon." over a course that has a full syllabus. It also drove totalLessonsCount, so the skill
+//     tree silently disappeared and the progress bar read 0%.
+//   - The reviews and rating reads: on failure the page printed "No reviews yet" and, through the
+//     Course JSON-LD, told search engines this course has no aggregate rating.
+//
+// Each read now records whether it worked. Nothing below prints an absence it has not verified.
+const reason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
 let course: any = null;
 let lessons: any[] = [];
 let modules: any[] = [];
@@ -14,62 +28,118 @@ let reviews: any[] = [];
 let reviewStats: any = null;
 let relatedCourses: any[] = [];
 
+let courseReadFailed = false;
+let syllabusFailed = false;
+let reviewsFailed = false;
+
 try {
   const r = await db.execute(sql`SELECT * FROM training_courses WHERE slug = ${slug} AND is_published = true AND access_type IN ('public', 'both') LIMIT 1`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   course = rows[0] || null;
-} catch (_) {}
-if (!course) return Astro.redirect('/aquintutor/courses');
+} catch (e: any) {
+  console.error('[aquintutor/course] course read:', reason(e));
+  courseReadFailed = true;
+}
+// A FAILED LOOKUP IS NOT A MISSING COURSE. Only a successful read that found nothing means the
+// slug is wrong; a failure gets a page that says the fault is ours, on the URL the learner typed,
+// so a shared or bookmarked course link does not silently become the catalogue.
+if (!course && !courseReadFailed) return Astro.redirect('/aquintutor/courses');
 
-try {
-  const r = await db.execute(sql`SELECT id, title, type, duration_mins, is_preview, sort_order, module_id FROM training_lessons WHERE course_id = ${course.id} ORDER BY sort_order ASC, created_at ASC`);
-  lessons = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
-try {
-  const r = await db.execute(sql`SELECT id, title, description, sort_order FROM training_modules WHERE course_id = ${course.id} ORDER BY sort_order ASC`);
-  modules = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
-try {
-  const r = await db.execute(sql`SELECT r.id, r.rating, r.review, r.created_at, u.name as reviewer_name FROM training_reviews r JOIN users u ON r.user_id = u.id WHERE r.course_id = ${course.id} ORDER BY r.created_at DESC LIMIT 6`);
-  reviews = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
-try {
-  const r = await db.execute(sql`
-    SELECT COUNT(*)::int as total, ROUND(AVG(rating)::numeric, 1) as avg_rating,
-      COUNT(*) FILTER (WHERE rating = 5)::int as r5,
-      COUNT(*) FILTER (WHERE rating = 4)::int as r4,
-      COUNT(*) FILTER (WHERE rating = 3)::int as r3,
-      COUNT(*) FILTER (WHERE rating = 2)::int as r2,
-      COUNT(*) FILTER (WHERE rating = 1)::int as r1
-    FROM training_reviews WHERE course_id = ${course.id}
-  `);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  reviewStats = rows[0] || null;
-} catch (_) {}
-try {
-  const r = await db.execute(sql`
-    SELECT slug, title, short_desc, level, duration_hours FROM training_courses
-    WHERE is_published = true AND access_type IN ('public', 'both') AND id != ${course.id}
-      AND (category = ${course.category} OR level = ${course.level})
-    ORDER BY enrolled_count DESC NULLS LAST LIMIT 3
-  `);
-  relatedCourses = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+// The read failed and there is no course object, so every reference below it — course.id,
+// course.title, the JSON-LD — would throw. Answer 503 with the truth instead. 503 and not 404:
+// a search engine must not be told this course has been withdrawn because a pooler refused a
+// connection for thirty seconds.
+if (!course) {
+  const body = '<!doctype html><meta charset="utf-8"><title>This course could not be loaded</title>'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
+    + '<style>body{font-family:system-ui,-apple-system,sans-serif;background:#FBFAF4;color:#141414;'
+    + 'margin:0;padding:56px 20px;line-height:1.65;}main{max-width:36rem;margin:0 auto;}'
+    + 'h1{font-size:1.5rem;margin:0 0 12px;}p{color:#3a3a3a;margin:0 0 12px;}'
+    + 'a{color:#B8512E;font-weight:600;}</style>'
+    + '<main><h1>This course could not be loaded.</h1>'
+    + '<p>This is a fault on our side, not a course that has been removed. The address you used is '
+    + 'still correct &mdash; please reload in a moment.</p>'
+    + '<p><a href="/aquintutor/courses">Browse the course catalogue</a></p></main>';
+  return new Response(body, {
+    status: 503,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+  });
+}
 
-// Load this user's completed lessons for the skill tree
+if (course) {
+  try {
+    const r = await db.execute(sql`SELECT id, title, type, duration_mins, is_preview, sort_order, module_id FROM training_lessons WHERE course_id = ${course.id} ORDER BY sort_order ASC, created_at ASC`);
+    lessons = Array.isArray(r) ? r : (r?.rows || []);
+  } catch (e: any) {
+    console.error('[aquintutor/course] lessons:', reason(e));
+    syllabusFailed = true;
+  }
+  try {
+    const r = await db.execute(sql`SELECT id, title, description, sort_order FROM training_modules WHERE course_id = ${course.id} ORDER BY sort_order ASC`);
+    modules = Array.isArray(r) ? r : (r?.rows || []);
+  } catch (e: any) {
+    console.error('[aquintutor/course] modules:', reason(e));
+    syllabusFailed = true;
+  }
+  try {
+    const r = await db.execute(sql`SELECT r.id, r.rating, r.review, r.created_at, u.name as reviewer_name FROM training_reviews r JOIN users u ON r.user_id = u.id WHERE r.course_id = ${course.id} ORDER BY r.created_at DESC LIMIT 6`);
+    reviews = Array.isArray(r) ? r : (r?.rows || []);
+  } catch (e: any) {
+    console.error('[aquintutor/course] reviews:', reason(e));
+    reviewsFailed = true;
+  }
+  try {
+    const r = await db.execute(sql`
+      SELECT COUNT(*)::int as total, ROUND(AVG(rating)::numeric, 1) as avg_rating,
+        COUNT(*) FILTER (WHERE rating = 5)::int as r5,
+        COUNT(*) FILTER (WHERE rating = 4)::int as r4,
+        COUNT(*) FILTER (WHERE rating = 3)::int as r3,
+        COUNT(*) FILTER (WHERE rating = 2)::int as r2,
+        COUNT(*) FILTER (WHERE rating = 1)::int as r1
+      FROM training_reviews WHERE course_id = ${course.id}
+    `);
+    const rows = Array.isArray(r) ? r : (r?.rows || []);
+    reviewStats = rows[0] || null;
+  } catch (e: any) {
+    console.error('[aquintutor/course] review stats:', reason(e));
+    reviewsFailed = true;
+  }
+  try {
+    const r = await db.execute(sql`
+      SELECT slug, title, short_desc, level, duration_hours FROM training_courses
+      WHERE is_published = true AND access_type IN ('public', 'both') AND id != ${course.id}
+        AND (category = ${course.category} OR level = ${course.level})
+      ORDER BY enrolled_count DESC NULLS LAST LIMIT 3
+    `);
+    relatedCourses = Array.isArray(r) ? r : (r?.rows || []);
+  } catch (e: any) {
+    // The only genuinely decorative read on the page: a missing "you might also like" rail costs
+    // the learner nothing and is not worth a banner. It is still logged.
+    console.error('[aquintutor/course] related:', reason(e));
+  }
+}
+
+// This learner's completed lessons, for the skill tree and the progress figure.
+//
+// This block used to declare training_lesson_completions inline and query it directly — the third
+// copy of the same read in three files, and the only one of them that counted nothing written by the
+// OLD completion path. completedLessonIds() in the authoring library is the single read now: it
+// counts the live table and the legacy training_lesson_progress rows, de-duplicated by lesson, so a
+// learner who finished lessons before the write moved does not lose them off this page.
+//
+// The failure is recorded rather than swallowed into `catch (_) {}`. "0 of 12 complete" is a
+// statement about somebody's work and it must not be printed because a query failed.
 const me = Astro.locals.user;
 const completedSet = new Set<string>();
+let completionsFailed = false;
 if (me) {
   try {
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS training_lesson_completions (
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      course_id UUID NOT NULL, lesson_id UUID NOT NULL,
-      completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (user_id, lesson_id))`).catch(() => {});
-    const r = await db.execute(sql`SELECT lesson_id FROM training_lesson_completions WHERE user_id = ${me.id} AND course_id = ${course.id}`);
-    const rs = Array.isArray(r) ? r : (r?.rows || []);
-    for (const row of rs as any[]) completedSet.add(String(row.lesson_id));
-  } catch (_) {}
+    const { completedLessonIds } = await import('@/lib/aquintutor-authoring');
+    for (const id of await completedLessonIds(me.id, String(course.id))) completedSet.add(String(id));
+  } catch (e: any) {
+    console.error('[aquintutor/course] completions:', e?.cause?.message || e?.message);
+    completionsFailed = true;
+  }
 }
 const totalLessonsCount = lessons.length;
 const completedLessonsCount = completedSet.size;
@@ -299,7 +369,15 @@ function starRow(n: number) {
               <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:14px; flex-wrap:wrap; margin-bottom:14px;">
                 <div>
                   <p style="font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:0.16em; text-transform:uppercase; color:var(--ac-amber); font-weight:700; margin:0 0 4px;">Your skill tree</p>
-                  <h2 class="ac-display" style="font-size:1.4rem; margin:0;">{completedLessonsCount} of {totalLessonsCount} lessons complete</h2>
+                  <h2 class="ac-display" style="font-size:1.4rem; margin:0;">
+                    {completionsFailed ? 'Progress unavailable' : completedLessonsCount + ' of ' + totalLessonsCount + ' lessons complete'}
+                  </h2>
+                  {completionsFailed && (
+                    <p style="font-size:12.5px; color:var(--ac-ink-muted); margin:6px 0 0; max-width:46ch; line-height:1.6;">
+                      We could not read your completions just now, so the ticks below are not your
+                      record. Nothing you have finished has been lost.
+                    </p>
+                  )}
                 </div>
                 {nextLesson && (
                   <a href={'/aquintutor/learn/' + nextLesson.id} style="background:var(--ac-amber); color:#1a0f08; padding:11px 22px; border:none; border-radius:10px; font-family:'Inter Tight',sans-serif; font-size:13.5px; font-weight:700; cursor:pointer; box-shadow:0 4px 14px rgba(217,119,87,0.3); text-decoration:none; display:inline-block;">Start: {nextLesson.title} →</a>
@@ -359,8 +437,18 @@ function starRow(n: number) {
                 </ul>
               </details>
             )}
-            {lessons.length === 0 && (
-              <p style="font-size:14.5px; color:var(--ac-ink-soft); font-style:italic; text-align:center; padding:40px 0;">Lessons coming soon.</p>
+            {/* "Lessons coming soon." was printed whenever `lessons` was empty, and `lessons` was
+                empty on a FAILED read as readily as on a course with no syllabus yet. A learner who
+                had paid for this course was told the material had not been written. */}
+            {syllabusFailed ? (
+              <div style="border:1px solid #B8512E; border-radius:12px; padding:16px 18px; background:#fff;">
+                <p style="font-size:14.5px; font-weight:700; color:var(--ac-ink); margin:0 0 6px;">The syllabus could not be loaded.</p>
+                <p style="font-size:13.5px; color:var(--ac-ink-soft); line-height:1.6; margin:0;">
+                  This is a fault on our side. It does not mean this course has no lessons &mdash; please reload in a moment.
+                </p>
+              </div>
+            ) : lessons.length === 0 && (
+              <p style="font-size:14.5px; color:var(--ac-ink-soft); font-style:italic; text-align:center; padding:40px 0;">No lessons have been published for this course yet.</p>
             )}
           </div>
         </div>
@@ -417,7 +505,14 @@ function starRow(n: number) {
 
         <div class="tab-panel" id="panel-reviews">
           <h2 class="ac-display ac-mb-6" style="font-size:1.6rem;">Reviews</h2>
-          {totalReviews === 0 ? (
+          {/* "No reviews yet" was drawn over a failed read too, which is a claim about other
+              students' opinions that nothing on the page had checked. */}
+          {reviewsFailed ? (
+            <div class="ac-card" style="padding:20px 22px;">
+              <p style="font-size:15px; font-weight:700; color:var(--ac-ink); margin-bottom:6px;">Reviews could not be loaded.</p>
+              <p style="font-size:13px; color:var(--ac-ink-soft); line-height:1.6;">This is a fault on our side, not an absence of reviews.</p>
+            </div>
+          ) : totalReviews === 0 ? (
             <div class="ac-card" style="text-align:center; padding:48px 20px;">
               <p style="font-size:15px; color:var(--ac-ink-soft); margin-bottom:6px;">No reviews yet.</p>
               <p style="font-size:13px; color:var(--ac-ink-muted);">Enrolled students can rate the course on completion.</p>
@@ -695,7 +790,7 @@ function starRow(n: number) {
                 if (c.ok) window.location.href = c.redirect || ('/portal/courses/' + courseSlug);
                 else { alert('Payment received but enrolment failed: ' + (c.error || 'unknown')); enrolBtn.disabled = false; enrolBtn.innerHTML = prev; }
               }).catch(function() {
-                alert('Payment received but network failed. Contact hr@edurankai.in with payment ID: ' + resp.razorpay_payment_id);
+                alert('Payment received but network failed. Contact connect@edurankai.in with payment ID: ' + resp.razorpay_payment_id);
               });
             },
             modal: {
@@ -714,25 +809,11 @@ function starRow(n: number) {
       });
     });
   </script>
-  <script is:inline>
-    (function () {
-      var btn = document.getElementById('completeBtn');
-      if (!btn) return;
-      btn.addEventListener('click', function () {
-        var lessonId = btn.getAttribute('data-lesson');
-        var courseId = btn.getAttribute('data-course');
-        btn.disabled = true; btn.textContent = 'Marking complete…';
-        fetch('/api/aquintutor/lesson-complete', { method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ courseId: courseId, lessonId: lessonId })})
-          .then(function (r) { return r.json(); })
-          .then(function (d) {
-            if (!d.ok) { btn.disabled = false; btn.textContent = 'Retry'; return; }
-            var msg = '+' + (d.xpAwarded || 0) + ' XP earned. ';
-            if (d.certificate && !d.certificate.alreadyIssued) msg += 'Course complete! Certificate ' + d.certificate.certNumber;
-            alert(msg + ' (' + d.progressPct + '% complete)');
-            location.reload();
-          });
-      });
-    })();
-  </script>
+  {/* A "mark complete" handler for #completeBtn used to be shipped here. NO ELEMENT WITH THAT ID
+      EXISTS ANYWHERE IN THIS REPOSITORY — the real control is #markCompleteBtn on the lesson page,
+      src/pages/aquintutor/courses/[slug]/learn/[lessonSlug].astro, which has its own handler with
+      the rejection path this one lacked (it had .then().then() and no .catch, so a dropped
+      connection would have left the button disabled and silent). Dead on arrival and removed rather
+      than left to read as a working feature. */}
   <script src="/era-fx.js" defer></script>
 </AquintutorLayout>

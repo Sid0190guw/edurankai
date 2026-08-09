@@ -60,6 +60,18 @@ export const POST: APIRoute = async ({ request, locals }) => {
   // Expand @group:slug tokens. Hidden-recipient groups go into BCC regardless
   // of which field the token was placed in.
   const expanded = await expandGroupTokens({ to: toTokens, cc: ccTokens, bcc: bccTokens });
+  // A NAMED GROUP THAT RESOLVED TO NOBODY IS NOT A RECIPIENT LIST THAT SHRANK QUIETLY.
+  // expandGroupTokens() used to delete an unrecognised `@group:slug` token and carry on, so a
+  // mistyped list plus one ordinary address sent to that one address and answered "Sent". Refused
+  // before anything is written: the message is still in the composer and the operator is told which
+  // name did not resolve.
+  if (expanded.unknownGroups.length) {
+    return json({
+      ok: false,
+      error: 'No distribution list is called ' + expanded.unknownGroups.map((g) => '@group:' + g).join(' or ')
+        + '. Nothing has been sent. Check the slug on /admin/mail/groups.',
+    }, 400);
+  }
   const to = parseAddressList(expanded.to);
   const cc = parseAddressList(expanded.cc);
   const bcc = parseAddressList(expanded.bcc);
@@ -209,6 +221,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
         ok: true,
         threadId: result.threadId,
         messageId: result.messageId,
+        // An EXISTING group with no members is not an error - the message still went to everyone
+        // else named - but it must be said, because "it went to the list" is what the sender
+        // otherwise assumes.
+        groupWarning: expanded.emptyGroups.length
+          ? expanded.emptyGroups.map((g) => '@group:' + g).join(' and ') + ' has no members, so nobody received it through that list.'
+          : null,
         delivery: { ...status, ...deliveryWording(status) },
         // kept for any older caller reading this shape
         external: { attempted: result.external.length, delivered: send.ok, provider: send.provider, error: send.error },
@@ -218,6 +236,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const internal: DeliveryStatus = { state: 'internal', externalCount: 0, sent: 0, failed: 0, provider: null, error: null };
     return json({
       ok: true, threadId: result.threadId, messageId: result.messageId,
+      groupWarning: expanded.emptyGroups.length
+        ? expanded.emptyGroups.map((g) => '@group:' + g).join(' and ') + ' has no members, so nobody received it through that list.'
+        : null,
       delivery: { ...internal, ...deliveryWording(internal) },
     });
   } catch (e: any) {

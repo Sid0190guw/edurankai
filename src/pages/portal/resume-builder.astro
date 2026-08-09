@@ -2,10 +2,15 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/resume-builder'));
 
+// SELF-BOOTSTRAP, ONCE PER PROCESS. This CREATE TABLE ran on every load AND on every autosave POST —
+// and the autosave fires as somebody types. Additive only, and it never drops: there are live CVs
+// behind it.
+await ensureOnce('user_resumes_v1', async () => {
 await db.execute(sql`CREATE TABLE IF NOT EXISTS user_resumes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID UNIQUE,
@@ -22,6 +27,11 @@ await db.execute(sql`CREATE TABLE IF NOT EXISTS user_resumes (
   pdf_url TEXT,
   updated_at TIMESTAMPTZ DEFAULT NOW()
 )`);
+}).catch((e: any) => {
+  // ensureOnce drops its memo on a throw, so the next request retries rather than caching a broken
+  // state. The real Postgres reason is on e.cause; e.message is only the failed SQL.
+  console.error('[portal/resume-builder] schema bootstrap', e?.cause?.message || e?.message);
+});
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
@@ -53,7 +63,10 @@ if (Astro.request.method === 'POST') {
     }
     return new Response(JSON.stringify({ ok: true, savedAt: new Date().toISOString() }), { status: 200, headers: { 'content-type': 'application/json' } });
   } catch (e: any) {
-    return new Response(JSON.stringify({ ok: false, error: String(e?.message || e).slice(0, 240) }), { status: 500, headers: { 'content-type': 'application/json' } });
+    // e.message on a postgres-js failure is the failed SQL — table and column names shipped to the
+    // browser of whoever is typing a CV, with nothing written to a log. The reason is on e.cause.
+    console.error('[portal/resume-builder] save', e?.cause?.message || e?.message);
+    return new Response(JSON.stringify({ ok: false, error: 'Your resume could not be saved just now. Nothing has been lost - try again in a moment.' }), { status: 500, headers: { 'content-type': 'application/json' } });
   }
 }
 

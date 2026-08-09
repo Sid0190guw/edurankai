@@ -246,12 +246,24 @@ export async function listRequests(status?: RequestStatus): Promise<Verification
   } catch { return []; }
 }
 
-/** Answer a request. Refuses while a firm's fee is outstanding. */
-export async function answerRequest(id: string, byUserId: string, note: string): Promise<{ ok: boolean; error?: string }> {
+/**
+ * Answer a request. Refuses while a firm's fee is outstanding.
+ *
+ * IT REPORTS WHETHER THE ANSWER ACTUALLY LEFT THE BUILDING. The delivery call sat behind
+ * `.catch(() => {})` with a comment saying delivery "is reported separately" — and it was not
+ * reported anywhere: this returned `{ ok: true }` whatever the mail transport said, and
+ * /admin/offer-verifications printed "Response recorded." So a firm that had paid could be moved
+ * into the Answered column having received nothing, and the only person who could have chased it
+ * was told it had gone.
+ */
+export async function answerRequest(id: string, byUserId: string, note: string): Promise<{ ok: boolean; error?: string; delivered?: boolean; deliveryError?: string }> {
   try {
     await ensureVerificationSchema();
-    const req = rows(await db.execute(sql`SELECT kind, paid FROM offer_verification_requests WHERE id = ${id} LIMIT 1`))[0];
+    const req = rows(await db.execute(sql`SELECT kind, paid, status FROM offer_verification_requests WHERE id = ${id} LIMIT 1`))[0];
     if (!req) return { ok: false, error: 'That request no longer exists.' };
+    if (String(req.status) === 'rejected') {
+      return { ok: false, error: 'That request was declined, so it cannot be answered. Nothing was changed.' };
+    }
     if (!isFreePath(req.kind) && !req.paid) {
       return { ok: false, error: 'This request has not been paid for yet, so it cannot be answered.' };
     }
@@ -263,11 +275,97 @@ export async function answerRequest(id: string, byUserId: string, note: string):
     // Tell the requester. Answering used to write the note to the database and stop there, so the
     // firm that had just paid 5 CHF for a verification received nothing at all and had no way to
     // know it had been answered. A paid request that produces silence is worse than no service.
-    await deliverAnswer(id).catch(() => { /* the answer is recorded; delivery is reported separately */ });
+    let delivered = false;
+    let deliveryError = '';
+    try {
+      const sent = await deliverAnswer(id);
+      delivered = !!sent.ok;
+      if (!sent.ok) deliveryError = sent.error || 'The mail transport did not accept the message.';
+    } catch (e: any) {
+      deliveryError = e?.cause?.message || e?.message || 'The answer could not be sent.';
+    }
+    if (!delivered) {
+      console.error('[offer-verification] the requester was NOT sent the answer to', id, '-', deliveryError);
+    }
 
-    return { ok: true };
+    return { ok: true, delivered, deliveryError: delivered ? undefined : deliveryError };
   } catch (e: any) {
     return { ok: false, error: e?.cause?.message || e?.message || 'Could not save.' };
+  }
+}
+
+/**
+ * DECLINE A REQUEST — the transition 'rejected' never had.
+ *
+ * RequestStatus has declared 'rejected' since this module shipped and NOTHING in src/ ever wrote it.
+ * The console's own header says "this is where a human confirms or declines", and there was no
+ * decline: a request from somebody with no legitimate interest, or one whose fee never arrived,
+ * had exactly two futures — answered, or sitting on the queue forever. The requester was never told
+ * either, so they waited on an answer that was never coming.
+ *
+ * The reason is stored in response_note, the same column an answer uses, because it is the same
+ * thing from the requester's side: the sentence they are given. No new column, no migration.
+ */
+export async function rejectRequest(id: string, byUserId: string, reason: string): Promise<{ ok: boolean; error?: string; delivered?: boolean; deliveryError?: string }> {
+  const why = String(reason || '').trim().slice(0, 2000);
+  if (why.length < 5) {
+    return { ok: false, error: 'Say why it is being declined. The requester is sent this sentence, so "no" on its own is not enough.' };
+  }
+  try {
+    await ensureVerificationSchema();
+    // The UPDATE's own answer decides, rather than a read followed by a write: two reviewers on the
+    // same queue must not both be told they declined it.
+    const changed = rows(await db.execute(sql`
+      UPDATE offer_verification_requests
+         SET status = 'rejected', response_note = ${why}, answered_by = ${byUserId}, answered_at = NOW()
+       WHERE id = ${id} AND status <> 'answered' AND status <> 'rejected'
+       RETURNING requester_name, requester_email, organisation, token`));
+    if (!changed.length) {
+      return { ok: false, error: 'That request is already answered or already declined. Nothing was changed. Reload the list.' };
+    }
+
+    const r = changed[0] as any;
+    let delivered = false;
+    let deliveryError = '';
+    if (r.requester_email) {
+      try {
+        const { sendExternal } = await import('@/lib/mail-transport');
+        const safe = (s: string) => String(s || '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' } as any)[c]);
+        const ref = String(r.token || '').slice(0, 10);
+        const html = '<p>Dear ' + safe(r.requester_name) + ',</p>'
+          + '<p>We are not able to complete the offer-letter verification you requested'
+          + (r.organisation ? ' on behalf of ' + safe(r.organisation) : '') + '.</p>'
+          + '<blockquote style="margin:16px 0;padding:12px 16px;background:#faf6ef;border-left:3px solid #c2410c;">'
+          + safe(why).replace(/\n/g, '<br>') + '</blockquote>'
+          + '<p style="color:#5c5349;font-size:13px;">No information about any candidate has been disclosed. '
+          + 'If a fee was taken for this request it is refundable; reply to this message and quote the reference.</p>'
+          + '<p style="color:#5c5349;font-size:13px;">Reference ' + safe(ref) + '.</p>'
+          + '<p>EduRankAI</p>';
+        const res = await sendExternal({
+          from: 'EduRankAI Verification <hr@edurankai.in>',
+          to: r.requester_email,
+          subject: 'Offer letter verification - reference ' + ref,
+          html,
+          text: 'Dear ' + r.requester_name + ',\n\nWe are not able to complete the offer-letter verification you requested.\n\n'
+            + why + '\n\nNo information about any candidate has been disclosed. If a fee was taken for this request it is refundable.\n\nReference '
+            + ref + '.\n\nEduRankAI',
+        });
+        delivered = !!(res as any)?.ok;
+        if (!delivered) deliveryError = (res as any)?.error || 'The mail transport did not accept the message.';
+      } catch (e: any) {
+        deliveryError = e?.cause?.message || e?.message || 'The decline notice could not be sent.';
+      }
+    } else {
+      deliveryError = 'There is no email address on the request, so nobody could be told.';
+    }
+    if (!delivered) {
+      console.error('[offer-verification] the requester was NOT told about the decline of', id, '-', deliveryError);
+    }
+
+    return { ok: true, delivered, deliveryError: delivered ? undefined : deliveryError };
+  } catch (e: any) {
+    console.error('[offer-verification/rejectRequest]', e?.cause?.message || e?.message);
+    return { ok: false, error: e?.cause?.message || e?.message || 'The request was not declined.' };
   }
 }
 

@@ -7,39 +7,73 @@ const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
 
+function mRows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+
 let okMsg = '', errorMsg = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
   try {
+    // EVERY WRITE ON THIS PAGE NOW READS ITS OWN RESULT. They were all fire-and-forget UPDATEs and
+    // DELETEs followed by an unconditional 'Flag resolved.' / 'Domain unblocked.' — so a flag another
+    // moderator had already closed, or a row deleted in a second tab, produced the green box and a
+    // list that still showed the item, with nothing on screen explaining the contradiction.
     if (action === 'resolve') {
       const id = fd.get('id') as string;
       const resolution = fd.get('resolution') as string;
-      await db.execute(sql`UPDATE content_flags SET status = 'resolved', resolution = ${resolution}, resolved_by = ${user.id}, resolved_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Flag resolved.';
+      const done = mRows(await db.execute(sql`UPDATE content_flags SET status = 'resolved', resolution = ${resolution}, resolved_by = ${user.id}, resolved_at = NOW() WHERE id = ${id} AND status = 'pending' RETURNING id`));
+      okMsg = done.length ? 'Flag resolved.' : '';
+      if (!done.length) errorMsg = 'That flag was not resolved: it no longer exists, or somebody else already actioned it. Reload to see its current state.';
     } else if (action === 'dismiss') {
       const id = fd.get('id') as string;
-      await db.execute(sql`UPDATE content_flags SET status = 'dismissed', resolved_by = ${user.id}, resolved_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Flag dismissed.';
+      const done = mRows(await db.execute(sql`UPDATE content_flags SET status = 'dismissed', resolved_by = ${user.id}, resolved_at = NOW() WHERE id = ${id} AND status = 'pending' RETURNING id`));
+      okMsg = done.length ? 'Flag dismissed.' : '';
+      if (!done.length) errorMsg = 'That flag was not dismissed: it no longer exists, or somebody else already actioned it. Reload to see its current state.';
     } else if (action === 'warn_user') {
       const userId = fd.get('user_id') as string;
       const message = fd.get('message') as string;
-      await db.execute(sql`INSERT INTO notifications (user_id, title, body, type) VALUES (${userId}, 'Content Warning', ${message}, 'system')`);
+      // THROUGH THE ONE NOTIFIER, NOT A HAND-WRITTEN INSERT. This used to be a raw
+      // `INSERT INTO notifications (user_id, title, body, type)` straight from this page: it never
+      // ran the schema ensure, wrote none of the columns src/lib/push.ts fills (category, priority),
+      // and — because it is not the notifier — sent no push, so a warning about flagged content sat
+      // silently in a bell the person may never open while this page said "Warning sent to user."
+      const { sendPushToUser } = await import('@/lib/push');
+      await sendPushToUser(userId, {
+        type: 'content_warning',
+        title: 'Content warning',
+        body: message,
+        url: '/portal',
+        tag: 'content-warning',
+      });
       okMsg = 'Warning sent to user.';
     } else if (action === 'add_domain') {
       const domain = (fd.get('domain') as string || '').trim().toLowerCase();
       const reason = (fd.get('reason') as string || '').trim();
       const category = fd.get('category') as string;
-      if (domain) {
-        await db.execute(sql`INSERT INTO content_blocked_domains (domain, reason, category, added_by) VALUES (${domain}, ${reason||null}, ${category||null}, ${user.id}) ON CONFLICT (domain) DO NOTHING`);
-        okMsg = 'Domain blocked.';
+      if (!domain) {
+        errorMsg = 'Type a domain to block. Nothing was changed.';
+      } else {
+        const added = mRows(await db.execute(sql`INSERT INTO content_blocked_domains (domain, reason, category, added_by) VALUES (${domain}, ${reason || null}, ${category || null}, ${user.id}) ON CONFLICT (domain) DO NOTHING RETURNING id`));
+        // ON CONFLICT DO NOTHING is silent by design, and the page used to report it as a fresh
+        // block. An operator who mistypes a domain that is already listed deserves to know which of
+        // the two happened.
+        okMsg = added.length ? 'Domain blocked.' : '';
+        if (!added.length) errorMsg = 'That domain was already on the block list, so nothing was added. Its existing reason and category are unchanged.';
       }
     } else if (action === 'remove_domain') {
-      await db.execute(sql`DELETE FROM content_blocked_domains WHERE id = ${fd.get('id') as string}`);
-      okMsg = 'Domain unblocked.';
+      const removed = mRows(await db.execute(sql`DELETE FROM content_blocked_domains WHERE id = ${fd.get('id') as string} RETURNING id`));
+      okMsg = removed.length ? 'Domain unblocked.' : '';
+      if (!removed.length) errorMsg = 'That domain was not unblocked: the entry no longer exists. Reload to see the current list.';
     }
-  } catch(e: any) { errorMsg = e.message; }
+  } catch (e: any) {
+    // e.message on a drizzle error is only the failed SQL. The reason is on e.cause, and NOTHING
+    // was being logged here at all — a moderation action that threw left no trace anywhere.
+    const real = e?.cause?.message || e?.message || 'unknown reason';
+    console.error('[admin/moderation]', action, 'failed -', real);
+    okMsg = '';
+    errorMsg = 'Nothing was changed. Reason: ' + real;
+  }
 }
 
 const url = new URL(Astro.request.url);
@@ -49,6 +83,13 @@ const filter = url.searchParams.get('filter') || 'pending';
 let flags: any[] = [];
 let blockedDomains: any[] = [];
 let stats = { pending: 0, resolved: 0, dismissed: 0, total: 0 };
+// A ZERO AND A FAILED READ ARE NOT THE SAME FACT, AND ON A SAFETY QUEUE THE DIFFERENCE IS THE WHOLE
+// POINT. All three reads below used to end in `catch(e) {}`, so a database that refused the query
+// rendered "0 pending", "No pending flags — Content is clean." and an empty block list. A moderator
+// reading that closes the tab. Each read now records whether it answered.
+let flagsError = '';
+let statsError = '';
+let domainsError = '';
 
 try {
   const r = await db.execute(sql`
@@ -59,22 +100,32 @@ try {
     WHERE f.status = ${filter}
     ORDER BY f.created_at DESC LIMIT 50
   `);
-  flags = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+  flags = mRows(r);
+} catch (e: any) {
+  flagsError = e?.cause?.message || e?.message || 'the flag queue did not answer';
+  console.error('[admin/moderation] flags read failed -', flagsError);
+}
 
 try {
   const r = await db.execute(sql`SELECT COUNT(*)::int as n, status FROM content_flags GROUP BY status`);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  for (const row of rows as any[]) {
-    stats[row.status as keyof typeof stats] = Number(row.n) || 0;
+  for (const row of mRows(r) as any[]) {
+    if (row.status === 'pending' || row.status === 'resolved' || row.status === 'dismissed') {
+      stats[row.status as 'pending' | 'resolved' | 'dismissed'] = Number(row.n) || 0;
+    }
     stats.total += Number(row.n) || 0;
   }
-} catch(e) {}
+} catch (e: any) {
+  statsError = e?.cause?.message || e?.message || 'the flag counts did not answer';
+  console.error('[admin/moderation] stats read failed -', statsError);
+}
 
 try {
   const r = await db.execute(sql`SELECT * FROM content_blocked_domains ORDER BY created_at DESC`);
-  blockedDomains = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+  blockedDomains = mRows(r);
+} catch (e: any) {
+  domainsError = e?.cause?.message || e?.message || 'the blocked-domain list did not answer';
+  console.error('[admin/moderation] blocked domains read failed -', domainsError);
+}
 
 const FLAG_COLOR: Record<string,string> = {
   nudity:'#ef4444', explicit:'#f97316', propaganda:'#a78bfa',
@@ -116,10 +167,10 @@ function timeAgo(d: any) {
       <!-- Stats -->
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px;">
         {[
-          { label:'Total', value:stats.total, color:'#fff' },
-          { label:'Pending', value:stats.pending, color:'#ef4444' },
-          { label:'Resolved', value:stats.resolved, color:'#10b981' },
-          { label:'Dismissed', value:stats.dismissed, color:'#6b7280' },
+          { label:'Total', value: statsError ? 'unknown' : stats.total, color: statsError ? '#e8c46a' : '#fff' },
+          { label:'Pending', value: statsError ? 'unknown' : stats.pending, color: statsError ? '#e8c46a' : '#ef4444' },
+          { label:'Resolved', value: statsError ? 'unknown' : stats.resolved, color: statsError ? '#e8c46a' : '#10b981' },
+          { label:'Dismissed', value: statsError ? 'unknown' : stats.dismissed, color: statsError ? '#e8c46a' : '#6b7280' },
         ].map(s => (
           <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:10px;text-align:center;">
             <p style={`font-size:20px;font-weight:800;color:${s.color};margin:0;font-family:'Geist Mono',monospace;`}>{s.value}</p>
@@ -135,11 +186,16 @@ function timeAgo(d: any) {
         ))}
       </div>
 
-      {flags.length === 0 && (
+      {flagsError ? (
+        <div style="padding:16px 18px;background:#0f0f14;border:1px solid rgba(232,196,106,0.3);border-radius:12px;color:#e8c46a;font-size:12.5px;line-height:1.6;">
+          <p style="margin:0 0 4px;font-weight:700;">The flag queue could not be read.</p>
+          <p style="margin:0;color:#8a8a94;">This is NOT "no flags" — it is unknown. Nothing below has been checked. Reason: {flagsError}</p>
+        </div>
+      ) : flags.length === 0 && (
         <div style="text-align:center;padding:40px;background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;color:#6e6e78;">
           <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#6e6e78" stroke-width="1.5" style="margin-bottom:12px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
           <p style="font-size:14px;font-weight:600;color:#fff;margin-bottom:4px;">No {filter} flags</p>
-          <p style="font-size:12px;">Content is clean.</p>
+          <p style="font-size:12px;">Nothing is waiting in this state right now.</p>
         </div>
       )}
 
@@ -224,6 +280,15 @@ function timeAgo(d: any) {
         <input name="reason" placeholder="Reason (optional)" style="background:#15151a;border:1px solid #1a1a1f;border-radius:8px;padding:8px 12px;color:#fff;font-size:12px;outline:none;" />
       </form>
 
+      {domainsError && (
+        <div style="padding:14px 16px;margin-bottom:10px;background:#0f0f14;border:1px solid rgba(232,196,106,0.3);border-radius:12px;color:#e8c46a;font-size:12.5px;line-height:1.6;">
+          <p style="margin:0 0 4px;font-weight:700;">The block list could not be read.</p>
+          <p style="margin:0;color:#8a8a94;">The list below is empty because the query failed, not because nothing is blocked. Blocking is still enforced from the table by /api/safety/check-domain. Reason: {domainsError}</p>
+        </div>
+      )}
+      {!domainsError && blockedDomains.length === 0 && (
+        <p style="font-size:12.5px;color:#6e6e78;margin:0 0 10px;">No domain is blocked yet.</p>
+      )}
       <div style="display:flex;flex-direction:column;gap:6px;">
         {blockedDomains.map((d: any) => (
           <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:10px 14px;display:flex;align-items:center;gap:10px;">
@@ -246,49 +311,54 @@ function timeAgo(d: any) {
 
   {tab === 'wellbeing' && (
     <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
+      <!--
+        THIS TAB CLAIMED A SAFETY CONTROL THAT DOES NOT EXIST.
+
+        "NSFW Image Detection — ACTIVE", followed by a whole panel headed "How NSFW Detection Works"
+        stating as fact that "the system runs them through a TensorFlow.js NSFW classification model
+        before storage" with a five-row table of classes, thresholds and Allow/Block/Flag actions.
+        There is no such model, no such dependency and no such call anywhere in this repository: not
+        in package.json, not in any upload handler, not in src/lib. Every image a user uploads is
+        stored unexamined.
+
+        That is worse than a missing feature. This is the safety console — the screen somebody opens
+        to decide whether uploads are being screened — and it was answering yes. The fabricated
+        pipeline description is gone and the row now says what is true, so the gap is visible to the
+        person who can act on it.
+
+        THE OTHER ROWS WERE CHECKED, NOT ASSUMED. Link Safety Check and User Report System are real:
+        public/safety.js is loaded by BaseLayout and calls /api/safety/check-domain and
+        /api/safety/report, and the reports land in the queue on the Flags tab. The propaganda row is
+        real but was overstated — the scan is a client-side keyword pass over page text in
+        public/safety.js, which is not "detection in text submissions", so it is described as what it
+        is and marked advisory. Automated signals on this platform are advisory: a human decides.
+      -->
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;">
-        <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 12px;">Platform Safety Features</p>
+        <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 4px;">Platform safety features</p>
+        <p style="font-size:11px;color:#6e6e78;margin:0 0 12px;line-height:1.6;">What is actually running today, named against the file that runs it. A row marked NOT BUILT is not a plan and not a partial rollout — nothing on the platform does it.</p>
         {[
-          { label: 'NSFW Image Detection', desc: 'Scan uploaded images using AI before storage. Block explicit content automatically.', status: 'active', color: '#10b981' },
-          { label: 'Link Safety Check', desc: 'Warn users before navigating to blocked or unverified external domains.', status: 'active', color: '#10b981' },
-          { label: 'Propaganda Filter', desc: 'Keyword-based detection for misinformation and extremist language in text submissions.', status: 'active', color: '#10b981' },
-          { label: 'User Report System', desc: 'Any user can flag content. All flags go to this moderation queue.', status: 'active', color: '#10b981' },
-          { label: 'Content Warnings', desc: 'Show warning overlays on sensitive topics before displaying content.', status: 'planned', color: '#fbbf24' },
-          { label: 'Screen Time Limits', desc: 'Let users set daily usage limits with reminders.', status: 'planned', color: '#fbbf24' },
-          { label: 'AI Chat Safety', desc: 'Filter harmful prompts in any AI-powered features.', status: 'planned', color: '#6b7280' },
+          { label: 'User reports', desc: 'Any visitor can flag content from the page (public/safety.js). Every report lands in the Flags tab on this screen.', status: 'live', color: '#10b981' },
+          { label: 'Blocked-domain warning', desc: 'Outbound links are checked against the block list below before the visitor leaves (public/safety.js, /api/safety/check-domain).', status: 'live', color: '#10b981' },
+          { label: 'Propaganda keyword scan', desc: 'A client-side keyword pass over page text that raises a report for a human to read. Advisory only — it blocks nothing and penalises nobody.', status: 'advisory', color: '#fbbf24' },
+          { label: 'Uploaded-image screening', desc: 'Images uploaded to the platform are NOT examined by anything. There is no classifier, no threshold and no automatic rejection. Anything reported has to be found by a person.', status: 'not built', color: '#ef4444' },
+          { label: 'Content warnings', desc: 'Warning overlays on sensitive topics before content is displayed.', status: 'not built', color: '#6b7280' },
+          { label: 'Screen time limits', desc: 'Daily usage limits with reminders that a user sets for themselves.', status: 'not built', color: '#6b7280' },
+          { label: 'AI chat safety', desc: 'Filtering of harmful prompts in AI-powered features.', status: 'not built', color: '#6b7280' },
         ].map(f => (
           <div style="display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid #1a1a1f;">
             <div style={`width:8px;height:8px;border-radius:50%;background:${f.color};flex-shrink:0;margin-top:5px;`}></div>
             <div style="flex:1;">
               <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 2px;">{f.label}</p>
-              <p style="font-size:11px;color:#6e6e78;margin:0;">{f.desc}</p>
+              <p style="font-size:11px;color:#6e6e78;margin:0;line-height:1.5;">{f.desc}</p>
             </div>
-            <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;flex-shrink:0;background:${f.color}22;color:${f.color};`}>{f.status.toUpperCase()}</span>
+            <span style={`font-size:9px;font-weight:700;padding:2px 8px;border-radius:100px;flex-shrink:0;background:${f.color}22;color:${f.color};text-transform:uppercase;`}>{f.status}</span>
           </div>
         ))}
       </div>
 
-      <!-- NSFW detection explanation -->
-      <div style="background:#0f0f14;border:1px solid rgba(251,191,36,0.2);border-radius:12px;padding:16px;">
-        <p style="font-size:13px;font-weight:600;color:#fbbf24;margin:0 0 8px;">How NSFW Detection Works</p>
-        <p style="font-size:12px;color:#8a8a94;margin:0 0 10px;line-height:1.6;">When users upload images (profile photos, evidence, documents), the system runs them through a TensorFlow.js NSFW classification model before storage. Images scoring above 70% explicit are automatically rejected and flagged for review.</p>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-          {[
-            { label: 'Drawing/Cartoon', threshold: '< 30%', action: 'Allow' },
-            { label: 'Hentai', threshold: '> 50%', action: 'Block' },
-            { label: 'Neutral', threshold: '> 60%', action: 'Allow' },
-            { label: 'Explicit/Porn', threshold: '> 50%', action: 'Block' },
-            { label: 'Sexy', threshold: '> 70%', action: 'Flag' },
-          ].map(c => (
-            <div style="background:#15151a;border-radius:6px;padding:8px 10px;display:flex;justify-content:space-between;align-items:center;">
-              <div>
-                <p style="font-size:11px;color:#d8d8de;margin:0;">{c.label}</p>
-                <p style="font-size:10px;color:#6e6e78;margin:0;">{c.threshold}</p>
-              </div>
-              <span style={`font-size:9px;font-weight:700;padding:1px 7px;border-radius:100px;${c.action==='Allow'?'background:rgba(16,185,129,0.15);color:#6ee7b7;':c.action==='Block'?'background:rgba(239,68,68,0.15);color:#fca5a5;':'background:rgba(251,191,36,0.15);color:#fbbf24;'}`}>{c.action}</span>
-            </div>
-          ))}
-        </div>
+      <div style="background:#0f0f14;border:1px solid rgba(239,68,68,0.2);border-radius:12px;padding:16px;">
+        <p style="font-size:13px;font-weight:600;color:#fca5a5;margin:0 0 8px;">Uploaded images are not screened</p>
+        <p style="font-size:12px;color:#8a8a94;margin:0;line-height:1.6;">This panel used to describe an image classifier with per-class thresholds and an automatic block at 70% explicit. No such classifier exists in this codebase, so nothing was ever rejected by it and nothing was ever flagged by it. Until one is built and named here, the only thing standing between an explicit upload and the rest of the platform is a person reporting it into the Flags tab.</p>
       </div>
     </div>
   )}

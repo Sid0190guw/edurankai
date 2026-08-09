@@ -210,7 +210,20 @@ export async function listApplicantRequests(userId: string) {
     title: 'Vis-vambhara access',
     href: '/portal/requests/visvambhara/' + r.id,
   }));
+  // A FAILED READ IS NOT AN ABSENCE OF REQUESTS. This ended in `catch (_) {}` over an empty array,
+  // so a fee-waiver query that could not run — a missing bookkeeping column, a pooler timeout —
+  // returned the applicant a list with their waiver thread simply gone from it, and
+  // /portal/requests then drew "No requests yet. When you request access to gated content or apply
+  // for a fee waiver, the thread shows up here." That is a statement about what the person has
+  // done, made on the strength of a question that was never answered, on the one screen they open
+  // to find out whether anybody has replied about the money.
+  //
+  // The failure is reported instead: the reason goes to the log, and `unreadable` travels back with
+  // the rows so a caller can say so rather than inventing an empty state. The visvambhara read
+  // above is deliberately left to throw — its caller already handles that, and swallowing it here
+  // would recreate the same fault on the other half.
   let waivers: any[] = [];
+  const unreadable: string[] = [];
   try {
     waivers = rows(await db.execute(sql`
       SELECT id, 'fee_waiver' AS kind, status, situation_note AS subject,
@@ -224,6 +237,19 @@ export async function listApplicantRequests(userId: string) {
       title: 'Fee waiver',
       href: '/portal/requests/fee-waiver/' + r.id,
     }));
-  } catch (_) {}
-  return [...visv, ...waivers].sort((a, b) => new Date(b.last_message_at || 0).getTime() - new Date(a.last_message_at || 0).getTime());
+  } catch (e: any) {
+    console.error('[request-threads] fee-waiver requests could not be read for', userId, '-', e?.cause?.message || e?.message);
+    unreadable.push('Fee waiver');
+  }
+  const out = [...visv, ...waivers].sort((a, b) => new Date(b.last_message_at || 0).getTime() - new Date(a.last_message_at || 0).getTime()) as any[];
+  // Carried as a non-enumerable property so every existing consumer — .length, .map, the spread in
+  // /portal/index — behaves exactly as before, and a surface that wants to be honest can ask.
+  Object.defineProperty(out, 'unreadable', { value: unreadable, enumerable: false });
+  return out;
+}
+
+/** Which request kinds could not be read for this list, if any. Empty means every read answered. */
+export function unreadableKinds(list: any): string[] {
+  const u = (list as any)?.unreadable;
+  return Array.isArray(u) ? u : [];
 }

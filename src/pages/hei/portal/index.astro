@@ -2,23 +2,49 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { institutionClaims, heiInstitutions, institutionSubmissions, institutionSubmissionScores, heiDimensions } from '@/lib/db/schema';
-import { eq, desc, asc } from 'drizzle-orm';
+import { eq, desc, asc, sql } from 'drizzle-orm';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/hei/login');
-if (user.role !== 'institution_admin') {
+// 'institution_admin' is a live Postgres enum value that userRoleEnum in src/lib/db/schema.ts does
+// not list (scripts/fix-user-role-enum.mjs adds it), so TypeScript types this comparison as
+// impossible while it works at runtime. Compared as a string: nothing that executes changes.
+if (String(user.role) !== 'institution_admin') {
   return Astro.redirect('/hei/login');
 }
-if (!user.institutionId) {
+
+// THIS PAGE READ `user.institutionId`, AND NOTHING HAS EVER PUT IT THERE.
+//
+// `users` in src/lib/db/schema.ts declares no institution_id column — it was added out-of-band by
+// scripts/setup-institution-auth.mjs — so drizzle never selects it, Astro.locals.user never carries
+// it, and the guard below was true for every institution admin that has ever signed in. Every one of
+// them was told 'No institution linked to this account', which is a statement about their record
+// that was really a fact about this file. (/hei/register was also passing institutionId into a
+// drizzle INSERT that dropped it; that write is now a separate, guarded UPDATE.)
+//
+// Read here from the column itself, scoped to this session's own id. A failure is NOT reported as
+// 'no institution linked': an unreadable column and an unlinked account are different answers and
+// only one of them is about the person reading the screen.
+let institutionId: string | null = null;
+try {
+  const linkRows = await db.execute(sql`SELECT institution_id FROM users WHERE id = ${user.id} LIMIT 1`);
+  const link = (Array.isArray(linkRows) ? linkRows : ((linkRows as any)?.rows || []))[0];
+  institutionId = link && link.institution_id ? String(link.institution_id) : null;
+} catch (e: any) {
+  // The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+  console.error('[hei/portal] institution link lookup failed', (e as any)?.cause?.message || (e as any)?.message);
+  return new Response('We could not load your institution just now. Try again shortly, or email hei@edurankai.in.', { status: 503 });
+}
+if (!institutionId) {
   return new Response('No institution linked to this account. Contact hei@edurankai.in.', { status: 400 });
 }
 
-const inst = (await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, user.institutionId)).limit(1))[0];
+const inst = (await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, institutionId)).limit(1))[0];
 if (!inst) return new Response('Institution not found.', { status: 404 });
 
 // Find the most recent claim for this institution
 const claims = await db.select().from(institutionClaims)
-  .where(eq(institutionClaims.institutionId, user.institutionId))
+  .where(eq(institutionClaims.institutionId, institutionId))
   .orderBy(desc(institutionClaims.submittedAt))
   .limit(1);
 const myClaim = claims[0] || null;
@@ -26,7 +52,7 @@ const claimStatus = myClaim ? myClaim.status : 'unknown';
 const portalToken = myClaim ? myClaim.claimToken : null;
 
 const submissions = await db.select().from(institutionSubmissions)
-  .where(eq(institutionSubmissions.institutionId, user.institutionId))
+  .where(eq(institutionSubmissions.institutionId, institutionId))
   .orderBy(desc(institutionSubmissions.submittedAt));
 
 let latestScoreDetails: any[] = [];

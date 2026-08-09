@@ -2,14 +2,18 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/doubts'));
 
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
 
-// Self-bootstrap schema
-try {
+// SELF-BOOTSTRAP, ONCE PER PROCESS. This was four DDL round trips on every single load of the
+// board. Additive only, and it never drops: there are live rows behind these tables.
+await ensureOnce('doubts_board_index_v2', async () => {
   await db.execute(sql`
     CREATE TABLE IF NOT EXISTS doubts (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -38,9 +42,11 @@ try {
   `);
   await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_doubts_status_created ON doubts (status, created_at DESC)`);
   await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_doubt_answers_doubt ON doubt_answers (doubt_id)`);
-} catch (e) {
-  console.error('doubts schema bootstrap', e);
-}
+}).catch((e: any) => {
+  // ensureOnce drops its memo on a throw, so the next request retries rather than caching a broken
+  // state. The board can still be READ without these statements having run.
+  console.error('[portal/doubts] schema bootstrap', causeOf(e));
+});
 
 const SUBJECTS = ['Math', 'Physics', 'Chemistry', 'Biology', 'CS', 'GK', 'English', 'Hindi', 'Sanskrit', 'Tamil', 'Bengali', 'Marathi'];
 const URGENCY_LABEL: Record<string, string> = { low: 'Low', med: 'Medium', high: 'High' };
@@ -65,11 +71,24 @@ if (Astro.request.method === 'POST') {
     const fd = await Astro.request.formData();
     const subject = (fd.get('subject') as string || '').trim().slice(0, 80);
     const body = (fd.get('body') as string || '').trim().slice(0, 6000);
-    const language = (fd.get('language') as string || 'en').trim().slice(0, 8);
-    const urgency = (fd.get('urgency') as string || 'med').trim();
-    const courseId = (fd.get('course_id') as string || '').trim() || null;
+    const languageRaw = (fd.get('language') as string || 'en').trim().slice(0, 8);
+    const urgencyRaw = (fd.get('urgency') as string || 'med').trim();
+    const courseIdRaw = (fd.get('course_id') as string || '').trim();
 
-    if (!subject) errMsg = 'Pick a subject.';
+    // THE POSTED VALUES ARE CHECKED AGAINST THE VOCABULARIES THIS PAGE ALREADY DECLARES.
+    //
+    // subject, urgency and language went into the INSERT exactly as typed. The board filters by
+    // subject and the detail page colours by urgency, both from the fixed lists above, so a value
+    // off the list is a doubt that no filter finds and no badge describes — and it is stored, not
+    // rejected, so nobody ever learns it happened. `course_id` is a uuid column: an arbitrary string
+    // there raises 22P02, which surfaced as a database complaint about the learner's own click.
+    const urgency = ['low', 'med', 'high'].includes(urgencyRaw) ? urgencyRaw : 'med';
+    const language = LANG_OPTIONS.some((l) => l.code === languageRaw) ? languageRaw : 'en';
+    const courseId = /^[0-9a-fA-F-]{36}$/.test(courseIdRaw) ? courseIdRaw : null;
+
+    // 'quick' is a real option on the form below (Quick — Aquin priority) and is deliberately not in
+    // SUBJECTS, which is the filter-chip vocabulary. It is allowed here, and nothing else is.
+    if (!SUBJECTS.includes(subject) && subject !== 'quick') errMsg = 'Pick a subject.';
     else if (body.length < 15) errMsg = 'Describe your doubt in at least 15 characters so a peer can help.';
     else {
       const r = rowsOf(await db.execute(sql`
@@ -118,7 +137,12 @@ if (Astro.request.method === 'POST') {
         }
       }
     }
-  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+  } catch (e: any) {
+    // e.message on a postgres-js failure is the failed SQL — table and column names handed to
+    // whoever pressed the button, with nothing written to a log for anyone investigating.
+    console.error('[portal/doubts] post', causeOf(e));
+    errMsg = 'Your doubt could not be posted just now. Nothing has been saved - please try again in a moment.';
+  }
 }
 
 // Filter by subject

@@ -187,3 +187,40 @@ export async function coverWithCredit(opts: {
     return { covered: true, error: 'Your credit was used and the payment is recorded, but setting up what you paid for did not finish. Our team has been alerted.' };
   }
 }
+
+/**
+ * THE WALLET, READ HONESTLY — balance AND ledger, with a flag saying whether the read RAN.
+ *
+ * getCreditBalance() returns 0 and getCreditLedger() returns [] when the query fails. That is the
+ * safe direction for a CHECKOUT (it falls back to a card order rather than spending credit that may
+ * not exist), which is why those two keep that shape and every existing caller is untouched.
+ *
+ * It is the wrong shape for a SCREEN. /portal/wallet printed "Available balance ₹0.00", the
+ * reassurance that a stray payment "appears here automatically", "No wallet activity yet." and an
+ * Add money button — the exact page somebody opens to check whether their money arrived, telling
+ * them it never did because the pooler refused one connection. Somebody reading that tops up again.
+ *
+ * Additive: a second entry point, no signature changed under any existing caller.
+ */
+export async function readWallet(
+  userId: string,
+  ledgerLimit = 50,
+): Promise<{ ok: boolean; balancePaise: number; ledger: any[]; reason?: string }> {
+  if (!userId) return { ok: true, balancePaise: 0, ledger: [] };
+  try {
+    await ensureCreditSchema();
+    const bal = rows(await db.execute(
+      sql`SELECT COALESCE(SUM(delta_paise), 0)::bigint AS bal FROM account_credit_ledger WHERE user_id = ${userId}`,
+    ))[0] as any;
+    const ledger = rows(await db.execute(sql`
+      SELECT delta_paise, reason, ref_type, ref_id, created_at
+      FROM account_credit_ledger WHERE user_id = ${userId} ORDER BY created_at DESC LIMIT ${ledgerLimit}
+    `));
+    return { ok: true, balancePaise: Number(bal?.bal) || 0, ledger };
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+    const real = e?.cause?.message || e?.message;
+    console.error('[credit] readWallet failed for user', userId, '-', real);
+    return { ok: false, balancePaise: 0, ledger: [], reason: String(real || 'unknown reason').slice(0, 200) };
+  }
+}

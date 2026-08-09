@@ -11,13 +11,21 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 await ensureVisvambharaAccessSchema();
 
 let okMsg = '', errMsg = '';
+// Declared before the handler that fills it. Each entry names one thing the applicant was supposed
+// to receive and did not. See the note on postDecisionToThread below.
+const missedEffects: string[] = [];
 
 function rowsLocal(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-async function postDecisionToThread(requestId: string, applicantUid: string | null, body: string) {
+// WAS `catch (_) {}`, UNDER THREE MESSAGES THAT SAID "Decision posted into thread, applicant
+// notified." That claim was printed whether or not the post happened. This thread is the ONLY place
+// the applicant reads why they were approved, refused or revoked — /products/visvambhara/access
+// shows them the status and nothing else — so a swallowed failure here means a researcher whose
+// access was pulled is never told, and the reviewer closes the case believing they were.
+async function postDecisionToThread(requestId: string, applicantUid: string | null, body: string): Promise<boolean> {
   try {
     const { postMessage } = await import('@/lib/request-threads');
-    await postMessage({
+    const posted = await postMessage({
       requestType: 'visvambhara_access',
       requestId,
       applicantUserId: applicantUid,
@@ -26,39 +34,79 @@ async function postDecisionToThread(requestId: string, applicantUid: string | nu
       senderName: user.name || 'Research team',
       body,
     });
-  } catch (_) {}
+    if (!posted.ok) {
+      console.error('[admin/visvambhara-access] thread post refused for', requestId, '-', posted.error);
+      missedEffects.push('the decision was NOT posted into the applicant’s thread (' + (posted.error || 'unknown reason') + ')');
+      return false;
+    }
+    if (posted.warning) missedEffects.push('the decision is in the thread but no unread badge was raised for the applicant');
+    return true;
+  } catch (e: any) {
+    console.error('[admin/visvambhara-access] thread post failed for', requestId, '-', e?.cause?.message || e?.message);
+    missedEffects.push('the decision was NOT posted into the applicant’s thread');
+    return false;
+  }
 }
 
 if (Astro.request.method === 'POST') {
+  const fd = await Astro.request.formData();
+  const action = (fd.get('_action') as string || '').trim();
+  const id = (fd.get('id') as string || '').trim();
+  const reason = (fd.get('reason') as string || '').trim() || null;
   try {
-    const fd = await Astro.request.formData();
-    const action = (fd.get('_action') as string || '').trim();
-    const id = (fd.get('id') as string || '').trim();
-    const reason = (fd.get('reason') as string || '').trim() || null;
-
     // Look up the applicant once so every action below can post a decision
     // message into the thread (and so the push notification routes correctly).
     const reqRow = id ? (rowsLocal(await db.execute(sql`SELECT user_id FROM visvambhara_access_requests WHERE id = ${id} LIMIT 1`))[0] as any) : null;
     const applicantUid: string | null = reqRow?.user_id || null;
 
+    // RETURNING ON EVERY DECISION. All three writes used to be fire-and-forget UPDATEs followed by
+    // an unconditional "Approved." — so an id that matched no row, or a request another reviewer had
+    // already decided, produced the green box over a statement that changed nothing.
     if (action === 'approve' && id) {
-      await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'approved', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = NULL WHERE id = ${id}`);
-      await postDecisionToThread(id, applicantUid, 'Your Viśvambhara access request has been approved.\n\nYou now have access to the Viśvambhara modules from your portal. Replies to this thread reach the research team directly.');
-      okMsg = 'Approved. Decision posted into thread, applicant notified.';
+      const done = rowsLocal(await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'approved', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = NULL WHERE id = ${id} RETURNING id`));
+      if (!done.length) {
+        errMsg = 'Nothing was approved: that request no longer exists. Reload the queue.';
+      } else {
+        await postDecisionToThread(id, applicantUid, 'Your Viśvambhara access request has been approved.\n\nYou now have access to the Viśvambhara modules from your portal. Replies to this thread reach the research team directly.');
+        okMsg = 'Approved.';
+      }
     } else if (action === 'reject' && id) {
-      await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'rejected', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = ${reason} WHERE id = ${id}`);
-      const body = 'Your Viśvambhara access request was not granted at this time.'
-        + (reason ? '\n\nReason from the reviewer:\n' + reason : '')
-        + '\n\nYou are welcome to update your engagement note and re-submit, or reply on this thread with additional context.';
-      await postDecisionToThread(id, applicantUid, body);
-      okMsg = 'Marked as rejected. Decision posted into thread.';
+      const done = rowsLocal(await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'rejected', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = ${reason} WHERE id = ${id} RETURNING id`));
+      if (!done.length) {
+        errMsg = 'Nothing was rejected: that request no longer exists. Reload the queue.';
+      } else {
+        const body = 'Your Viśvambhara access request was not granted at this time.'
+          + (reason ? '\n\nReason from the reviewer:\n' + reason : '')
+          + '\n\nYou are welcome to update your engagement note and re-submit, or reply on this thread with additional context.';
+        await postDecisionToThread(id, applicantUid, body);
+        okMsg = 'Marked as rejected.';
+      }
     } else if (action === 'revoke' && id) {
       const finalReason = reason || 'Access revoked';
-      await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'rejected', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = COALESCE(${reason}, 'Access revoked') WHERE id = ${id}`);
-      await postDecisionToThread(id, applicantUid, 'Your Viśvambhara access has been revoked.\n\nReason: ' + finalReason + '\n\nReplies to this thread reach the research team directly.');
-      okMsg = 'Access revoked. Decision posted into thread.';
+      const done = rowsLocal(await db.execute(sql`UPDATE visvambhara_access_requests SET status = 'rejected', reviewed_by_user_id = ${user.id}, reviewed_at = NOW(), reject_reason = COALESCE(${reason}, 'Access revoked') WHERE id = ${id} RETURNING id`));
+      if (!done.length) {
+        errMsg = 'Nothing was revoked: that request no longer exists. Reload the queue.';
+      } else {
+        await postDecisionToThread(id, applicantUid, 'Your Viśvambhara access has been revoked.\n\nReason: ' + finalReason + '\n\nReplies to this thread reach the research team directly.');
+        okMsg = 'Access revoked.';
+      }
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+    if (okMsg) {
+      if (!applicantUid) missedEffects.push('this request has no portal account attached, so nobody could be told');
+      if (missedEffects.length) {
+        errMsg = 'The decision is recorded, but ' + missedEffects.join('; ') + '. The applicant has not been told — contact them directly.';
+      } else {
+        okMsg += ' Decision posted into the applicant’s thread.';
+      }
+    }
+  } catch (e: any) {
+    // e.message on a drizzle error is only the failed SQL, and it was being handed to the operator
+    // with nothing written to any log.
+    const real = e?.cause?.message || e?.message || 'unknown reason';
+    console.error('[admin/visvambhara-access]', action, 'failed for', id, '-', real);
+    okMsg = '';
+    errMsg = 'Nothing was changed. Reason: ' + real;
+  }
 }
 
 function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
@@ -144,8 +192,9 @@ function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { timeZone
             <p style="color:#6e6e78;font-size:11.5px;text-align:center;padding:12px;">Loading…</p>
           </div>
           <textarea class="thread-input" rows="3" placeholder="Reply to the applicant — they will see this inside their portal thread" maxlength="5000" style="width:100%;background:#08080a;border:1px solid #1a1a1f;color:#fff;border-radius:8px;padding:9px 12px;font-size:13px;font-family:inherit;outline:none;resize:vertical;line-height:1.55;"></textarea>
-          <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px;">
-            <button type="button" class="thread-send" data-req={r.id} style="background:#FF4F00;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:7px 16px;border-radius:6px;cursor:pointer;">Send reply</button>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px;">
+            <span class="thread-status" style="font-size:11px;color:#6e6e78;line-height:1.5;"></span>
+            <button type="button" class="thread-send" data-req={r.id} style="background:#FF4F00;border:none;color:#fff;font-size:11.5px;font-weight:700;padding:7px 16px;border-radius:6px;cursor:pointer;flex-shrink:0;">Send reply</button>
           </div>
         </div>
       </div>
@@ -178,11 +227,22 @@ function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { timeZone
       }).join('');
       list.scrollTop = list.scrollHeight;
     }
+    // A REFUSED OR FAILED READ USED TO LEAVE 'Loading…' ON SCREEN FOR EVER. There was no .catch and
+    // no else: a 403 from the endpoint, a 500, an HTML error page or a dropped connection all ended
+    // the chain silently, and the reviewer sat looking at a spinner that was never going to resolve.
+    function note(panel, text, color) {
+      var list = panel.querySelector('.thread-list');
+      if (list) list.innerHTML = '<p style="color:' + color + ';font-size:11.5px;text-align:center;padding:12px;line-height:1.6;">' + esc(text) + '</p>';
+    }
     function load(panel) {
       var req = panel.getAttribute('data-req');
       fetch('/api/admin/visvambhara-access/thread?id=' + encodeURIComponent(req), { credentials: 'same-origin' })
-        .then(function (r) { return r.json(); })
-        .then(function (d) { if (d && d.ok) renderThread(panel, d.messages); });
+        .then(function (r) { return r.json().catch(function () { return { ok: false, error: 'the server answered ' + r.status + ' with something that is not JSON' }; }); })
+        .then(function (d) {
+          if (d && d.ok) renderThread(panel, d.messages);
+          else note(panel, 'This thread could not be loaded, so it is not empty — it is unknown. ' + ((d && d.error) || ''), '#e8c46a');
+        })
+        .catch(function () { note(panel, 'This thread could not be loaded: the request never reached the server. Nothing here has been checked.', '#e8c46a'); });
     }
     document.querySelectorAll('.toggle-thread').forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -201,11 +261,22 @@ function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { timeZone
         var body = (ta.value || '').trim();
         if (!body) return;
         b.disabled = true; b.textContent = 'Sending…';
+        // The reply either went to the applicant or it did not, and the reviewer has to be told
+        // which. This used to re-enable the button and stop: a refused reply looked identical to a
+        // sent one except that the text stayed in the box, which reads as a mis-click.
+        var st = panel.querySelector('.thread-status');
+        function say(text, color) { if (st) { st.textContent = text; st.style.color = color; } }
+        say('', '#6e6e78');
         fetch('/api/admin/visvambhara-access/reply', { method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ requestId: req, body: body })})
-          .then(function (r) { return r.json(); })
+          .then(function (r) { return r.json().catch(function () { return { ok: false, error: 'the server answered ' + r.status + ' with something that is not JSON' }; }); })
           .then(function (d) {
             b.disabled = false; b.textContent = 'Send reply';
-            if (d && d.ok) { ta.value = ''; load(panel); }
+            if (d && d.ok) { ta.value = ''; say('Sent. The applicant sees it in their portal thread.', '#6ee7b7'); load(panel); }
+            else say('NOT sent — the applicant has not received this. ' + ((d && d.error) || ''), '#fca5a5');
+          })
+          .catch(function () {
+            b.disabled = false; b.textContent = 'Send reply';
+            say('NOT sent — the request never reached the server. Your text is still in the box.', '#fca5a5');
           });
       });
     });

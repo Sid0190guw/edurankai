@@ -84,8 +84,20 @@ export async function getImapConfig() {
   await ensureMailSchema();
   await ensureImapSchema();
   let row: any = {};
-  try { row = rows(await db.execute(sql`SELECT imap_host, imap_port, imap_user, imap_pass, imap_secure, imap_last_uid, imap_last_run FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; } catch (_) {}
+  // "NOT CONFIGURED" AND "COULD NOT BE READ" ARE DIFFERENT FACTS. This ended in `catch (_) {}` over
+  // an empty object, so a failed read of mail_config produced a config with no host - and the two
+  // consumers then state that as fact: pollImapInbox() answers 'IMAP not configured' and
+  // /admin/mail/health draws the red "Inbound IMAP - not configured" card. An operator reading that
+  // goes and re-enters credentials that were never lost. `configRead` travels with the config so a
+  // caller can tell the two apart.
+  let configRead = true;
+  try { row = rows(await db.execute(sql`SELECT imap_host, imap_port, imap_user, imap_pass, imap_secure, imap_last_uid, imap_last_run FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; }
+  catch (e: any) {
+    configRead = false;
+    console.error('[mail-imap] IMAP config could not be read:', e?.cause?.message || e?.message);
+  }
   return {
+    configRead,
     host: row.imap_host || '',
     port: Number(row.imap_port || 993),
     user: row.imap_user || '',
@@ -100,6 +112,9 @@ export async function getImapConfig() {
 // re-running will not produce duplicates because we record last_uid.
 export async function pollImapInbox(opts: { force?: boolean; limit?: number } = {}): Promise<{ ok: boolean; fetched: number; delivered: number; error?: string; detail?: string }> {
   const cfg = await getImapConfig();
+  if (!cfg.configRead) {
+    return { ok: false, fetched: 0, delivered: 0, error: 'The IMAP settings could not be read, so no poll was attempted. This is not the same as IMAP being unconfigured - nothing has been changed or lost.' };
+  }
   if (!cfg.host || !cfg.user || !cfg.pass) return { ok: false, fetched: 0, delivered: 0, error: 'IMAP not configured' };
   const since = cfg.lastUid;
   const limit = opts.limit || 50;
@@ -119,9 +134,17 @@ export async function pollImapInbox(opts: { force?: boolean; limit?: number } = 
       const range = since > 0 ? `${since + 1}:*` : '1:*';
       for await (const msg of client.fetch(range, { uid: true, source: true, envelope: true, internalDate: true })) {
         if (!opts.force && msg.uid <= since) continue;
+        // THE LIMIT USED TO EAT ONE MESSAGE, PERMANENTLY. The order was `fetched++; maxUid =
+        // msg.uid; if (fetched > limit) break;` - so on the (limit + 1)th message the watermark was
+        // raised to ITS uid and the loop broke without delivering it. The watermark is persisted
+        // below, so the next poll starts AFTER that message and it is never fetched again: on any
+        // mailbox with more than `limit` new messages, exactly one real email was destroyed on every
+        // poll, and the only outward sign was `fetched` exceeding `delivered` by one. The bound is
+        // now tested BEFORE this message is claimed, so the watermark never passes a message that
+        // was not processed.
+        if (fetched >= limit) break;
         fetched++;
         if (msg.uid > maxUid) maxUid = msg.uid;
-        if (fetched > limit) break;
         try {
           const parsed = await simpleParser(msg.source as Buffer);
           const fromAddr = (parsed.from?.value?.[0]?.address || '').toString().toLowerCase();
@@ -175,12 +198,28 @@ export async function pollImapInbox(opts: { force?: boolean; limit?: number } = 
     }
     await client.logout();
 
-    // Persist watermark + run time
-    await db.execute(sql`UPDATE mail_config SET imap_last_uid = ${maxUid}, imap_last_run = NOW() WHERE id = 1`).catch(() => {});
+    // Persist watermark + run time. NOT swallowed: a watermark that did not save means the next
+    // poll re-reads everything since the old UID. The per-message de-duplication above keeps that
+    // from producing duplicates, so it is a cost problem rather than a correctness one - but a poll
+    // that silently cannot record its own progress is exactly the thing an operator needs told.
+    let watermarkSaved = true;
+    try {
+      await db.execute(sql`UPDATE mail_config SET imap_last_uid = ${maxUid}, imap_last_run = NOW() WHERE id = 1`);
+    } catch (e: any) {
+      watermarkSaved = false;
+      console.error('[mail-imap] the IMAP watermark could not be saved:', e?.cause?.message || e?.message);
+    }
 
-    return { ok: true, fetched, delivered, detail: `Fetched ${fetched} new message(s) since UID ${since}; ${delivered} delivered to a known mailbox; max UID is now ${maxUid}.` };
+    return {
+      ok: true, fetched, delivered,
+      detail: `Fetched ${fetched} new message(s) since UID ${since}; ${delivered} delivered to a known mailbox; max UID is now ${maxUid}.`
+        + (watermarkSaved ? '' : ' The position marker could NOT be saved, so the next poll will re-read from UID ' + since + '.'),
+    };
   } catch (e: any) {
     try { await client.logout(); } catch (_) {}
-    return { ok: false, fetched, delivered, error: e?.message || 'IMAP poll failed' };
+    // e.message on a wrapped driver error is only the failed statement; the reason is on e.cause.
+    const reason = e?.cause?.message || e?.message || 'IMAP poll failed';
+    console.error('[mail-imap] poll failed:', reason);
+    return { ok: false, fetched, delivered, error: reason };
   }
 }

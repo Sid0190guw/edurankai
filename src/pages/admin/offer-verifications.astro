@@ -11,7 +11,7 @@
 // relying on this page hiding a button.
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { can } from '@/lib/auth/permissions';
-import { listRequests, answerRequest, markPaid, isFreePath, FIRM_VERIFICATION_FEE_CHF } from '@/lib/offer-verification';
+import { listRequests, answerRequest, rejectRequest, markPaid, isFreePath, FIRM_VERIFICATION_FEE_CHF } from '@/lib/offer-verification';
 import { logAudit } from '@/lib/audit';
 
 const user = Astro.locals.user!;
@@ -28,8 +28,23 @@ if (Astro.request.method === 'POST' && canAnswer) {
   try {
     if (action === 'answer') {
       const r = await answerRequest(id, user.id, String(fd.get('note') || ''));
-      if (r.ok) { msg = 'Response recorded.'; }
-      else err = r.error || 'Could not save.';
+      // "Response recorded." was printed whatever the mail transport said. The record and the
+      // requester receiving it are two different facts, and only one of them is what they asked for.
+      if (r.ok) {
+        msg = r.delivered
+          ? 'Response recorded and sent to the requester.'
+          : 'Response recorded, but it was NOT sent: ' + (r.deliveryError || 'unknown reason')
+            + ' - contact them yourself, or they are still waiting.';
+      } else err = r.error || 'Could not save.';
+    } else if (action === 'decline') {
+      // THE TRANSITION 'rejected' NEVER HAD. See src/lib/offer-verification.ts.
+      const r = await rejectRequest(id, user.id, String(fd.get('reason') || ''));
+      if (r.ok) {
+        msg = r.delivered
+          ? 'Request declined and the requester told why.'
+          : 'Request declined, but the requester was NOT told: ' + (r.deliveryError || 'unknown reason')
+            + ' - contact them yourself, or they are still waiting.';
+      } else err = r.error || 'The request was not declined.';
     } else if (action === 'mark_paid') {
       // Manual capture, for a fee settled by invoice or transfer rather than the card flow. Recorded
       // as an audit event because it is someone asserting money arrived.
@@ -46,6 +61,9 @@ const all = await listRequests();
 const awaitingPayment = all.filter((r) => r.status === 'pending_payment');
 const open = all.filter((r) => r.status === 'open');
 const answered = all.filter((r) => r.status === 'answered');
+// Declined requests were not listed anywhere: nothing wrote the status, and this page filtered for
+// three of the four values it can hold. A settled request has to remain findable, with its reason.
+const declined = all.filter((r) => r.status === 'rejected');
 
 const KIND_LABEL: Record<string, string> = {
   individual: 'Individual', institution: 'Educational institution', firm: 'Firm / employer',
@@ -68,6 +86,7 @@ const when = (s: string) => { try { return new Date(s).toLocaleString('en-IN', {
       <div style={card}><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">To answer</p><p style="font-size:20px;font-weight:700;margin:0;color:#fbbf24;font-family:'Geist Mono',monospace;">{open.length}</p></div>
       <div style={card}><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Awaiting payment</p><p style="font-size:20px;font-weight:700;margin:0;color:#8a8a94;font-family:'Geist Mono',monospace;">{awaitingPayment.length}</p></div>
       <div style={card}><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Answered</p><p style="font-size:20px;font-weight:700;margin:0;color:#4ade80;font-family:'Geist Mono',monospace;">{answered.length}</p></div>
+      <div style={card}><p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Declined</p><p style="font-size:20px;font-weight:700;margin:0;color:#f87171;font-family:'Geist Mono',monospace;">{declined.length}</p></div>
     </div>
 
     {open.length === 0 && awaitingPayment.length === 0 && (
@@ -128,8 +147,36 @@ const when = (s: string) => { try { return new Date(s).toLocaleString('en-IN', {
             </form>
           )
         )}
+
+        {canAnswer && (
+          <form method="POST" style="margin-top:10px;border-top:1px solid #2a2a30;padding-top:10px;">
+            <input type="hidden" name="_action" value="decline" />
+            <input type="hidden" name="id" value={r.id} />
+            <p style="font-size:11.5px;color:#8a8a94;margin:0 0 6px;line-height:1.5;">
+              Not something we will confirm &mdash; no legitimate interest, a fee that will not arrive,
+              or a request we cannot place. The requester is sent this sentence, so write it to them.
+            </p>
+            <textarea name="reason" rows="2" required maxlength="2000"
+              placeholder="Why this is being declined. They read exactly this."
+              style="width:100%;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:9px;border-radius:6px;font-size:12.5px;font-family:inherit;"></textarea>
+            <button type="submit" style="margin-top:8px;background:#1a1a22;border:1px solid #7f1d1d;color:#fca5a5;font-weight:700;font-size:12.5px;padding:8px 16px;border-radius:6px;cursor:pointer;">Decline this request</button>
+          </form>
+        )}
       </div>
     ))}
+
+    {declined.length > 0 && (
+      <>
+        <h2 style="font-family:'Fraunces',serif;font-size:17px;margin:22px 0 8px;">Declined</h2>
+        {declined.slice(0, 40).map((r) => (
+          <div style={card}>
+            <p style="font-size:13px;color:#e8e8ee;margin:0;">{r.requesterName}{r.organisation ? ' · ' + r.organisation : ''}</p>
+            <p style="font-size:11px;color:#6e6e78;margin:3px 0 0;">{KIND_LABEL[r.kind] || r.kind} &middot; declined {r.answeredAt ? when(r.answeredAt) : ''}</p>
+            {r.responseNote && <p style="font-size:12px;color:#fca5a5;margin:6px 0 0;line-height:1.55;">{r.responseNote}</p>}
+          </div>
+        ))}
+      </>
+    )}
 
     {answered.length > 0 && (
       <>

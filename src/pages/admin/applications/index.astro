@@ -6,10 +6,23 @@ import { eq, desc, sql, and, or, ilike, inArray, gte } from 'drizzle-orm';
 // pageParam so a query-string page number can never reach OFFSET as NaN or a negative.
 import { pageParam } from '@/lib/page-safety';
 import { uuidIn } from '@/lib/pg-array';
+import { can } from '@/lib/auth/permissions';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+// AUTHORIZATION FROM permissions.ts, NEVER a users.role literal.
+//
+// The gate here was `user.role === 'applicant'`, which is a DENY-ONE list: it bounces applicants and
+// admits every other value of users.role by accident, including any role added to the enum later
+// and any account whose row carries a role this screen was never considered against. This register
+// lists candidate names, personal emails and payment state, and it can permanently delete an
+// application, so "not an applicant" is not the question to ask of it.
+//
+// `admin.access` is the same population src/middleware.ts already admits to every /admin path, so
+// this narrows nobody who can reach the URL today — it changes HOW the question is asked. Sent to
+// /portal, not /admin, because an account without admin.access is bounced off /admin too and
+// redirecting there would loop.
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
 
 let errorMsg = '';
 let okMsg = '';
@@ -17,7 +30,11 @@ let okMsg = '';
 // Soft-delete support: "Delete" now moves an application to Trash (recoverable) instead of a
 // permanent DELETE — this is the fix for "we deleted her and lost the record". deleted_at IS NOT
 // NULL == trashed. Permanent removal is a separate, deliberate action only offered from Trash.
-try { await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS deleted_at timestamptz`); } catch (_) {}
+// Logged, not swallowed. If this ALTER fails, every read below filters on a column that does not
+// exist and the register 500s — a silent catch here turned that into a mystery rather than a line
+// in the log naming the reason.
+try { await db.execute(sql`ALTER TABLE applications ADD COLUMN IF NOT EXISTS deleted_at timestamptz`); }
+catch (e: any) { console.error('[admin/applications] deleted_at ensure:', e?.cause?.message || e?.message); }
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
@@ -91,7 +108,9 @@ if (Astro.request.method === 'POST') {
 // Ensure the 'pending_payment' enum value exists before any query uses it.
 try {
   await db.execute(sql`ALTER TYPE application_status ADD VALUE IF NOT EXISTS 'pending_payment'`);
-} catch (_) {}
+} catch (e: any) {
+  console.error('[admin/applications] pending_payment enum ensure:', e?.cause?.message || e?.message);
+}
 
 // REVERSE the previous (too-aggressive) auto-demote: any application currently
 // in pending_payment that has a captured/paid payments row was legitimately
@@ -109,7 +128,11 @@ try {
       AND p.purpose = 'application_fee'
       AND p.status IN ('paid','captured')
   `);
-} catch (_) {}
+} catch (e: any) {
+  // This reconcile is what moves a candidate who HAS paid out of pending_payment. Swallowed, a
+  // failure left paid applicants sitting in "awaiting payment" with nothing anywhere saying why.
+  console.error('[admin/applications] paid-reconcile:', e?.cause?.message || e?.message);
+}
 
 const url = new URL(Astro.request.url);
 const statusFilter = url.searchParams.get('status') || 'all';

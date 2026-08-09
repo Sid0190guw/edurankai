@@ -271,6 +271,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
       prefill: { name: candidateName, email: app.email || user.email || '' },
     });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'server error' }, 500);
+    // e.message on a postgres-js/drizzle error is the FAILED SQL — table and column names handed to
+    // whoever posted, and nothing they can act on. The real reason is on e.cause and belongs in the
+    // log: a checkout that never opened left no trace for anyone asked why the applicant could not pay.
+    console.error('[payments/start-application-fee]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
   }
 };

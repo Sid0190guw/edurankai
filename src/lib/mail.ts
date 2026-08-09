@@ -301,6 +301,27 @@ export interface MailConfig {
   smtpHost: string; smtpPort: number; smtpUser: string; smtpPass: string; smtpSecure: boolean; smtpInsecure: boolean;
   fromName: string; fromAddress: string; resendApiKey: string; inboundSecret: string;
   outboundEnabled: boolean; source: 'db' | 'env' | 'none';
+  /**
+   * NOT-CONFIGURED AND COULD-NOT-BE-READ ARE DIFFERENT ANSWERS, AND THEY USED TO BE THE SAME ONE.
+   *
+   * The mail_config SELECT below sat in a bare `catch (e) {}` over `row = {}`. Everything downstream
+   * then read the environment fallback (empty in production, where the credentials live in the DB
+   * row) and concluded the mail system was switched off:
+   *
+   *   sendExternal()        `if (!c.smtpHost)` -> logs 'no_transport' and answers "No SMTP transport
+   *                         configured (add your mail server in Mail Settings)" for EVERY outbound
+   *                         message, including password resets and offer letters
+   *   /api/mail/inbound     `secret` comes out '' and the guard answers 403 forbidden to a real MTA,
+   *                         which reads as "your shared secret is wrong" — so inbound mail is
+   *                         rejected and the operator goes looking for a secret that never changed
+   *   /admin/mail/health    draws the red "not configured" card
+   *   /admin/mail/settings  renders a BLANK credential form over a live configuration
+   *
+   * getImapConfig() in src/lib/mail-imap.ts was repaired for exactly this and this half was left
+   * behind. The read failure is now carried on the value instead of being thrown away: '' means the
+   * row was read (however empty it was), a non-empty string is the database's own reason.
+   */
+  readError: string;
 }
 
 // Merged mail-server config: DB row (UI-editable) wins over environment vars.
@@ -309,7 +330,15 @@ function nonEmpty(v: any): string { const s = (v ?? '').toString().trim(); retur
 export async function getMailConfig(): Promise<MailConfig> {
   await ensureMailSchema();
   let row: any = {};
-  try { row = rows(await db.execute(sql`SELECT * FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {}; } catch (e) {}
+  // e.message on a drizzle/postgres-js error is only the failed SQL; the database's real complaint
+  // is on e.cause. Silence here is what made an unreadable row look like an unconfigured one.
+  let readError = '';
+  try {
+    row = rows(await db.execute(sql`SELECT * FROM mail_config WHERE id = 1 LIMIT 1`))[0] || {};
+  } catch (e: any) {
+    readError = String(e?.cause?.message || e?.message || 'unknown error');
+    console.error('[mail] mail_config could not be read:', readError);
+  }
 
   const dbSmtpHost = nonEmpty(row.smtp_host);
   const dbResendKey = nonEmpty(row.resend_api_key);
@@ -334,6 +363,7 @@ export async function getMailConfig(): Promise<MailConfig> {
     inboundSecret: nonEmpty(row.inbound_secret) || nonEmpty(process.env.MAIL_INBOUND_SECRET),
     outboundEnabled: !!(smtpHost || resendApiKey),
     source: hasDb ? 'db' : (hasEnv ? 'env' : 'none'),
+    readError,
   };
 }
 

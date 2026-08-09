@@ -140,19 +140,46 @@ if (Astro.request.method === 'POST' && room) {
       actionResult = { ok: true };
     }
 
+    // A VOTE IS SCOPED TO THIS ROOM'S POLL, AND TO ONE OF ITS OWN OPTIONS.
+    //
+    // The UPDATE used to be `WHERE id = <poll id from the form>` and nothing else, with the choice
+    // written through verbatim. Two consequences, both reachable by anybody who can open any room:
+    //   - a poll belonging to a DIFFERENT room could be voted in by posting its id. The room is the
+    //     only thing that decides who is entitled to answer a question, and it was not consulted.
+    //   - the tally could be given a value that is not on the ballot. The results panel counts the
+    //     jsonb values, so a free-text choice appears in the room as a line the host never wrote.
+    //
+    // `room_id` now rides in the WHERE, and the option is checked against the poll's own options
+    // array before anything is written. Zero rows back is a refusal and is said out loud, because
+    // the client reads actionResult and would otherwise toast success over a vote nobody counted.
     if (action === 'vote') {
       const pollId = (fd.get('poll_id') as string || '').trim();
       const choice = (fd.get('choice') as string || '').trim();
-      if (pollId && choice) {
-        await db.execute(sql`
+      if (!pollId || !choice) {
+        actionResult = { ok: false, error: 'That vote could not be read.' };
+        // The STATUS is the only channel the client reads. A refusal that answers 200 is a success
+        // as far as votePoll() is concerned.
+        Astro.response.status = 400;
+      } else {
+        const written = rowsOf(await db.execute(sql`
           UPDATE meet_polls SET votes = jsonb_set(
             COALESCE(votes,'{}'::jsonb),
             ${'{' + user.id + '}'}::text[],
             to_jsonb(${choice}::text)
-          ) WHERE id = ${pollId}::uuid
-        `);
+          )
+          WHERE id = ${pollId}::uuid
+            AND room_id = ${room.id}::uuid
+            AND status = 'live'
+            AND COALESCE(options, '[]'::jsonb) @> to_jsonb(${choice}::text)
+          RETURNING id
+        `));
+        if (written.length) {
+          actionResult = { ok: true };
+        } else {
+          actionResult = { ok: false, error: 'That poll is not open in this room, or that is not one of its options. Nothing was recorded.' };
+          Astro.response.status = 403;
+        }
       }
-      actionResult = { ok: true };
     }
 
     if (action === 'create_breakout' && isHost) {

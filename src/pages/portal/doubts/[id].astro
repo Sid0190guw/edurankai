@@ -2,15 +2,19 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user;
 const { id } = Astro.params;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/doubts/' + id));
 
 function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
 
-// Idempotent schema (safe re-run)
-try {
+// SELF-BOOTSTRAP, ONCE PER PROCESS — not two CREATE TABLE round trips on every single view of every
+// doubt. Additive only, and it never drops: there are live rows behind these tables.
+await ensureOnce('doubts_board_v2', async () => {
   await db.execute(sql`
     CREATE TABLE IF NOT EXISTS doubts (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -37,7 +41,22 @@ try {
       created_at timestamptz DEFAULT now()
     )
   `);
-} catch (e) { console.error('doubts schema bootstrap', e); }
+  // WHO VOTED, NOT JUST HOW MANY. See the upvote handler below for why the counter on its own was
+  // not a number anybody could rely on. The primary key IS the one-vote-per-person rule, enforced
+  // by the database rather than by a page remembering to check.
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS doubt_answer_votes (
+      answer_id uuid NOT NULL REFERENCES doubt_answers(id) ON DELETE CASCADE,
+      user_id uuid NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (answer_id, user_id)
+    )
+  `);
+}).catch((e: any) => {
+  // ensureOnce drops its memo on a throw, so the next request retries rather than caching a broken
+  // state. The page can still be READ without these statements having run.
+  console.error('[portal/doubts/id] schema bootstrap', causeOf(e));
+});
 
 let errMsg = '', okMsg = '';
 
@@ -61,28 +80,107 @@ if (Astro.request.method === 'POST') {
         okMsg = 'Your reply was posted.';
       }
     } else if (action === 'upvote') {
+      // ===========================================================================================
+      // AN UPVOTE IS ONE PERSON, ONCE, ON AN ANSWER TO THIS DOUBT.
+      //
+      // This used to be a bare `UPDATE doubt_answers SET upvotes = upvotes + 1 WHERE id = <the id
+      // in the form>`. Three things were wrong with it and all three were reachable by anybody
+      // signed in:
+      //   - NOTHING RECORDED WHO VOTED, so the same person could press the button as many times as
+      //     they liked. The answer list is ordered `COALESCE(upvotes,0) DESC`, so the top answer on
+      //     a doubt — the one a learner reads first and trusts most — was decided by a counter that
+      //     could be pumped by holding down a key.
+      //   - THE ID WAS NEVER SCOPED TO THIS DOUBT, so an id belonging to an answer on a completely
+      //     different doubt could be posted here and would be incremented just the same.
+      //   - IT SAID NOTHING AT ALL. No okMsg, no errMsg: the page reloaded and the reader had to
+      //     compare a number to work out whether anything happened.
+      //
+      // The vote row is the rule now — PRIMARY KEY (answer_id, user_id) — and the counter is
+      // RECOMPUTED from it rather than nudged, so it cannot drift away from the votes behind it.
+      // ===========================================================================================
       const ansId = (fd.get('answer_id') as string || '').trim();
-      if (ansId) {
-        await db.execute(sql`UPDATE doubt_answers SET upvotes = COALESCE(upvotes, 0) + 1 WHERE id = ${ansId}`);
+      if (!/^[0-9a-fA-F-]{36}$/.test(ansId)) {
+        errMsg = 'That answer could not be identified, so nothing was recorded.';
+      } else {
+        const voted = rowsOf(await db.execute(sql`
+          INSERT INTO doubt_answer_votes (answer_id, user_id)
+          SELECT ${ansId}::uuid, ${user.id}::uuid
+           WHERE EXISTS (
+             SELECT 1 FROM doubt_answers a
+              WHERE a.id = ${ansId}::uuid AND a.doubt_id = ${id}::uuid
+           )
+          ON CONFLICT (answer_id, user_id) DO NOTHING
+          RETURNING answer_id
+        `));
+        if (voted.length) {
+          // Recomputed, not incremented. A count derived from the rows can never disagree with them.
+          await db.execute(sql`
+            UPDATE doubt_answers a
+               SET upvotes = (SELECT COUNT(*)::int FROM doubt_answer_votes v WHERE v.answer_id = a.id)
+             WHERE a.id = ${ansId}::uuid
+          `);
+          okMsg = 'Thanks - your upvote was recorded.';
+        } else {
+          // Either the answer is not on this doubt, or this person has already voted on it. Said
+          // plainly rather than silently reloading a page that looks unchanged.
+          errMsg = 'No upvote was added. You have already upvoted that answer, or it does not belong to this doubt.';
+        }
       }
     } else if (action === 'accept') {
       const ansId = (fd.get('answer_id') as string || '').trim();
-      // Only the original poster can accept
-      const owner = rowsOf(await db.execute(sql`SELECT user_id FROM doubts WHERE id = ${id}`));
-      if (owner[0]?.user_id === user.id && ansId) {
-        await db.execute(sql`
-          UPDATE doubts SET accepted_answer_id = ${ansId}, status = 'resolved'
-          WHERE id = ${id}
-        `);
-        okMsg = 'Marked as accepted. Doubt is now resolved.';
+      // ONLY THE POSTER, AND ONLY AN ANSWER THAT IS ACTUALLY ON THIS DOUBT.
+      //
+      // The ownership test was already here; what was missing is that `accepted_answer_id` was set
+      // to whatever id was posted, with no check that the answer belongs to this doubt at all. The
+      // accepted badge is then drawn by comparing that column to the ids in THIS doubt's answer
+      // list, so pointing it elsewhere marks the doubt resolved with no answer showing as accepted.
+      //
+      // Both tests now live in the WHERE, so there is no gap between checking and writing, and the
+      // RETURNING is read: "Marked as accepted" is no longer printed over a statement that matched
+      // no row.
+      if (!/^[0-9a-fA-F-]{36}$/.test(ansId)) {
+        errMsg = 'That answer could not be identified, so nothing was recorded.';
       } else {
-        errMsg = 'Only the original poster can accept an answer.';
+        const done = rowsOf(await db.execute(sql`
+          UPDATE doubts d
+             SET accepted_answer_id = ${ansId}::uuid, status = 'resolved'
+           WHERE d.id = ${id}::uuid
+             AND d.user_id = ${user.id}::uuid
+             AND EXISTS (
+               SELECT 1 FROM doubt_answers a
+                WHERE a.id = ${ansId}::uuid AND a.doubt_id = d.id
+             )
+          RETURNING d.id
+        `));
+        if (done.length) okMsg = 'Marked as accepted. Doubt is now resolved.';
+        else errMsg = 'Nothing was changed. Only the person who asked can accept an answer, and it has to be an answer on this doubt.';
       }
     }
-  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+  } catch (e: any) {
+    // e.message on a postgres-js failure is the failed SQL — table and column names, handed to
+    // whoever pressed the button, with nothing written to a log for anyone investigating.
+    console.error('[portal/doubts/id] action', causeOf(e));
+    errMsg = 'That could not be saved just now. Nothing has been changed - please try again in a moment.';
+  }
 }
 
-const doubtRows = rowsOf(await db.execute(sql`SELECT * FROM doubts WHERE id = ${id} LIMIT 1`));
+// doubts.id is a uuid column, and this is a route parameter — anything can be in it. Comparing a
+// non-uuid raises 22P02, which threw out of this unguarded await as a 500 rather than the 404 the
+// URL actually deserves.
+if (!/^[0-9a-fA-F-]{36}$/.test(String(id || ''))) {
+  return new Response('Doubt not found', { status: 404 });
+}
+let doubtRows: any[] = [];
+try {
+  doubtRows = rowsOf(await db.execute(sql`SELECT * FROM doubts WHERE id = ${id}::uuid LIMIT 1`));
+} catch (e: any) {
+  // A doubt that could not be READ is not a doubt that does not exist. Answering 404 over a failed
+  // query tells the reader their question was deleted.
+  console.error('[portal/doubts/id] load', causeOf(e));
+  return new Response('This doubt could not be loaded just now. Please try again in a moment.', {
+    status: 503, headers: { 'content-type': 'text/plain; charset=utf-8' },
+  });
+}
 const doubt = doubtRows[0];
 if (!doubt) {
   return new Response('Doubt not found', { status: 404 });
@@ -95,13 +193,22 @@ try {
   if (poster[0]) posterName = poster[0].name || (poster[0].email ? String(poster[0].email).split('@')[0] : 'a learner');
 } catch {}
 
-const answers = rowsOf(await db.execute(sql`
-  SELECT da.*, u.name AS user_name, u.email AS user_email
-  FROM doubt_answers da
-  LEFT JOIN users u ON da.user_id = u.id
-  WHERE da.doubt_id = ${id}
-  ORDER BY COALESCE(da.upvotes, 0) DESC, da.created_at ASC
-`));
+// DID THE ANSWER LIST ACTUALLY LOAD? "No replies yet. Be the first to help." is a statement about
+// what other learners have done, and it must not be made out of a query that never came back.
+let answers: any[] = [];
+let answersOk = true;
+try {
+  answers = rowsOf(await db.execute(sql`
+    SELECT da.*, u.name AS user_name, u.email AS user_email
+    FROM doubt_answers da
+    LEFT JOIN users u ON da.user_id = u.id
+    WHERE da.doubt_id = ${id}::uuid
+    ORDER BY COALESCE(da.upvotes, 0) DESC, da.created_at ASC
+  `));
+} catch (e: any) {
+  answersOk = false;
+  console.error('[portal/doubts/id] answers', causeOf(e));
+}
 
 const isOwner = doubt.user_id === user.id;
 const URGENCY_LABEL: Record<string, string> = { low: 'Low', med: 'Medium', high: 'High' };
@@ -164,14 +271,19 @@ const statusTone = doubt.status === 'resolved' ? 'bg-leaf-bg text-leaf border-le
 
   <div class="mt-6 mb-3 flex items-center justify-between gap-2 flex-wrap">
     <h2 class="font-display text-[1.4rem] font-semibold text-ink m-0">
-      {answers.length} {answers.length === 1 ? 'answer' : 'answers'}
+      {answersOk ? answers.length + (answers.length === 1 ? ' answer' : ' answers') : 'Answers'}
     </h2>
     {doubt.status === 'resolved' && (
       <span class="font-mono text-[0.62rem] uppercase tracking-[0.14em] font-bold px-2.5 py-1 rounded-full border bg-leaf-bg text-leaf border-leaf-border">Resolved</span>
     )}
   </div>
 
-  {answers.length === 0 ? (
+  {!answersOk ? (
+    <div class="bg-burn-pale border border-burn-dim rounded-2xl p-6 mb-6">
+      <p class="text-[0.9rem] text-burn font-semibold m-0">We could not load the replies to this doubt just now.</p>
+      <p class="text-[0.85rem] text-ink-2 m-0 mt-1">Nothing has been lost - any answers already posted are still there. Please reload in a moment.</p>
+    </div>
+  ) : answers.length === 0 ? (
     <div class="bg-cream-2/60 border border-ink/10 rounded-2xl p-6 text-center mb-6">
       <p class="text-[0.9rem] text-ink-soft m-0">No replies yet. Be the first to help.</p>
     </div>

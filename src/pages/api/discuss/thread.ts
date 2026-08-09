@@ -54,6 +54,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const rows = Array.isArray(r) ? r : (r?.rows || []);
     return json({ ok: true, id: (rows[0] as any)?.id });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'db error' }, 500);
+    // e.message on a drizzle/postgres-js error is the failed SQL STATEMENT — table and column names
+    // handed straight to whoever posted — while the database's actual complaint sits unread on
+    // e.cause. A thread that was never created also left nothing behind for anyone investigating.
+    console.error('[api/discuss/thread] insert failed for course', courseId, '-', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'Your post was not saved. Nothing has been published; try again.' }, 500);
   }
 };

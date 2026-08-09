@@ -24,7 +24,14 @@ export function ensureApiKeysSchema(): Promise<void> {
         request_count BIGINT NOT NULL DEFAULT 0,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
-    } catch (_) { /* table may already exist */ }
+    } catch (e: any) {
+      // NOT SWALLOWED, AND NOT REMEMBERED AS A SUCCESS. This was `catch (_) {}` under a memoised
+      // promise: on a database where the CREATE failed, every later call sailed past a resolved
+      // cache and every query against api_keys threw, with nothing anywhere naming the reason.
+      // e.message on a drizzle error is only the failed SQL; the reason is on e.cause.
+      console.error('[api-keys] ensureApiKeysSchema failed -', e?.cause?.message || e?.message);
+      ready = null;
+    }
   })();
   return ready;
 }
@@ -66,9 +73,25 @@ export async function listApiKeys(): Promise<any[]> {
   return rows(await db.execute(sql`SELECT id, key_prefix, label, organization, is_active, last_used_at, request_count, created_at FROM api_keys ORDER BY created_at DESC LIMIT 200`));
 }
 
-export async function revokeApiKey(id: string): Promise<void> {
+/**
+ * Revoke a key. Answers whether a key was actually revoked.
+ *
+ * WAS `Promise<void>` with a bare UPDATE, and its only caller printed "Key revoked." on the strength
+ * of the call not throwing. So an id that matched no row, or a key somebody had already revoked in
+ * another tab, produced the green box — on the screen that answers whether a partner still holds a
+ * live credential against the public REST API. `is_active` is in the WHERE now as well, so 'revoked'
+ * means this call is the one that did it.
+ *
+ * The id is validated here rather than bound blind: api_keys.id is uuid, and a non-uuid string makes
+ * Postgres raise 22P02, which the console then showed the operator as a database complaint about
+ * their own click.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export async function revokeApiKey(id: string): Promise<boolean> {
+  if (!id || !UUID_RE.test(id.trim())) return false;
   await ensureApiKeysSchema();
-  await db.execute(sql`UPDATE api_keys SET is_active = false WHERE id = ${id}`);
+  const r = rows(await db.execute(sql`UPDATE api_keys SET is_active = false WHERE id = ${id.trim()} AND is_active = true RETURNING id`));
+  return r.length > 0;
 }
 
 // Validate an inbound request's API key (header x-api-key or Authorization: Bearer).

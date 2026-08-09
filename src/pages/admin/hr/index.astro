@@ -25,7 +25,7 @@ import { sql } from 'drizzle-orm';
 import { pendingForReview, docTypeLabel } from '@/lib/hr-onboarding';
 import { listLeave } from '@/lib/hr-leave';
 import { ensureBgvSchema } from '@/lib/hr-bgv';
-import { ledgerForMany } from '@/lib/credit-ledger';
+import { ledgerForMany, termsFromRow } from '@/lib/credit-ledger';
 import { weeklyHoursFor, FULL_TIME_WEEKLY_HOURS } from '@/lib/credit-hours';
 import type { EngagementTerms } from '@/lib/credit-hours';
 
@@ -136,9 +136,30 @@ const waitLabel = (d: any): string => {
 // intern-guard.ts matches one: lowercase, substring, and check the designation too.
 const INTERN_MATCH = sql`(lower(coalesce(e.employment_type, '')) LIKE '%intern%'
                        OR lower(coalesce(e.designation, '')) LIKE '%intern%')`;
+// =================================================================================================
+// THE DAY THIS CONSOLE COUNTS, AND THE ZONE IT IS CUT IN
+// =================================================================================================
+//
+// Every figure below used CURRENT_DATE. CURRENT_DATE is the DATABASE SESSION's date, and nothing in
+// this codebase sets that session's zone - src/lib/db/index.ts opens postgres() with no timezone
+// option and no SET TIME ZONE, so it inherits the server default, which is UTC. IST is UTC+05:30,
+// so between 00:00 and 05:29 every night CURRENT_DATE still named YESTERDAY.
+//
+// That is not a labelling problem here, because the rows being counted are cut in IST. Attendance is
+// written against src/lib/attendance.ts today(), which is `(NOW() AT TIME ZONE 'Asia/Kolkata')::date`
+// - deliberately, because "did I clock in today" is a claim about somebody's pay. So the exception
+// panel asked UTC's question of IST's rows: before dawn, an early shift that had just punched was
+// counted under "not marked", "absent today" reported YESTERDAY's absences under today's heading,
+// and the joiners/leavers windows rolled a whole month over a day late on the 1st.
+//
+// The comment that stood lower down said attendance "is written against CURRENT_DATE by the portal
+// clock". That stopped being true when attendance.ts was moved onto the zone; this is the other half
+// of that repair. Named once, above every reader - `const` is not hoisted.
+const HR_TIME_ZONE = 'Asia/Kolkata';
+const TODAY = sql`(NOW() AT TIME ZONE ${HR_TIME_ZONE})::date`;
 // Both sides of the month window, so a joining_date on the 1st and one on the 31st both land in it.
-const MONTH_START = sql`date_trunc('month', CURRENT_DATE)::date`;
-const MONTH_END = sql`(date_trunc('month', CURRENT_DATE) + interval '1 month')::date`;
+const MONTH_START = sql`date_trunc('month', (NOW() AT TIME ZONE ${HR_TIME_ZONE})::date)::date`;
+const MONTH_END = sql`(date_trunc('month', (NOW() AT TIME ZONE ${HR_TIME_ZONE})::date) + interval '1 month')::date`;
 
 // ---------------------------------------------------------------------------------------------
 // Reads. Independent queries run together — this is a landing screen and it should not feel like a
@@ -154,7 +175,7 @@ const [totalsRows, deptRows, joinerRows, leaverRows, exceptionRows, openPunchRow
   : await Promise.all([
   q('totals', sql`
     SELECT
-      CURRENT_DATE AS today,
+      ${TODAY} AS today,
       COUNT(*) FILTER (WHERE e.is_active = true)::int AS active_total,
       COUNT(*) FILTER (WHERE e.is_active = true AND e.department_id IS NULL)::int AS no_department,
       COUNT(*) FILTER (WHERE e.is_active = true AND ${INTERN_MATCH})::int AS active_interns,
@@ -199,20 +220,20 @@ const [totalsRows, deptRows, joinerRows, leaverRows, exceptionRows, openPunchRow
     SELECT
       (SELECT COUNT(*)::int FROM hr_employees e
         WHERE e.is_active = true
-          AND NOT EXISTS (SELECT 1 FROM hr_attendance a WHERE a.employee_id = e.id AND a.date = CURRENT_DATE)) AS not_marked,
+          AND NOT EXISTS (SELECT 1 FROM hr_attendance a WHERE a.employee_id = e.id AND a.date = ${TODAY})) AS not_marked,
       (SELECT COUNT(*)::int FROM hr_attendance a JOIN hr_employees e ON e.id = a.employee_id
-        WHERE e.is_active = true AND a.date = CURRENT_DATE AND a.status = 'absent') AS absent_today,
+        WHERE e.is_active = true AND a.date = ${TODAY} AND a.status = 'absent') AS absent_today,
       (SELECT COUNT(*)::int FROM hr_attendance a JOIN hr_employees e ON e.id = a.employee_id
-        WHERE e.is_active = true AND a.clock_in IS NOT NULL AND a.clock_out IS NULL AND a.date < CURRENT_DATE) AS open_punches,
+        WHERE e.is_active = true AND a.clock_in IS NOT NULL AND a.clock_out IS NULL AND a.date < ${TODAY}) AS open_punches,
       (SELECT COUNT(*)::int FROM hr_attendance a JOIN hr_employees e ON e.id = a.employee_id
         WHERE e.is_active = true AND a.clock_in IS NOT NULL AND a.clock_out IS NOT NULL
-          AND COALESCE(a.work_hours, 0) <= 0 AND a.date >= (CURRENT_DATE - 30)) AS zero_hours`),
+          AND COALESCE(a.work_hours, 0) <= 0 AND a.date >= (${TODAY} - 30)) AS zero_hours`),
 
   q('open-punches', sql`
     SELECT a.date, a.clock_in, e.full_name, e.employee_code, e.designation
     FROM hr_attendance a
     JOIN hr_employees e ON e.id = a.employee_id
-    WHERE e.is_active = true AND a.clock_in IS NOT NULL AND a.clock_out IS NULL AND a.date < CURRENT_DATE
+    WHERE e.is_active = true AND a.clock_in IS NOT NULL AND a.clock_out IS NULL AND a.date < ${TODAY}
     ORDER BY a.date DESC
     LIMIT 12`),
 ]);
@@ -223,9 +244,9 @@ const noDepartment = num(totals.no_department);
 const activeInterns = num(totals.active_interns);
 const joinersMonth = num(totals.joiners_month);
 const leaversMonth = num(totals.leavers_month);
-// The date the database is working from. Attendance is written against CURRENT_DATE by the portal
-// clock, so "today" here has to be the server's day or the exception counts would disagree with the
-// rows they are counting.
+// The date this console is working from: the civil date in IST, which is the day attendance rows are
+// cut on. It is the same expression the exception counts use above, so the heading and the figures
+// under it always describe the same day.
 const serverToday = totals.today ? fmtFull(totals.today) : '';
 
 const exceptions = (exceptionRows[0] as any) || {};
@@ -310,19 +331,18 @@ if (!denied && unread.includes('interns')) {
   internTermsAvailable = unread.includes('interns');
 }
 
+// THE SAME READING OF A CONTRACT THE COMPLETION LETTER USES, and not a second one written here.
+//
+// This block used to fill in FULL_TIME_WEEKLY_HOURS whenever weekly_hours was null and the kind was
+// full-time — which is the very defaulting removed from credit-hours.ts and credit-ledger.ts, put
+// back by hand on this page. Because engagement_kind itself defaults to 'full-time', that handed a
+// 40-hour contract to every intern whose hours nobody had entered, and the panel below then rated
+// them against it. termsFromRow() is the single mapping now: unset stays UNSET, weeklyHoursFor()
+// answers 0, and the row is badged "Hours not set" instead of being measured against a week nobody
+// agreed to.
 const termsById = new Map<string, EngagementTerms>();
 for (const r of internRowsRaw) {
-  const kind = (r as any).engagement_kind === 'part-time' ? 'part-time' : 'full-time';
-  termsById.set(String((r as any).id), {
-    kind,
-    // Part-time with no agreed hours stays undefined on purpose: weeklyHoursFor() resolves it to 0
-    // so a missing contract reads as missing instead of being quietly filled in.
-    weeklyHours: (r as any).weekly_hours == null
-      ? (kind === 'full-time' ? FULL_TIME_WEEKLY_HOURS : undefined)
-      : Number((r as any).weekly_hours),
-    workingDaysPerWeek: (r as any).working_days_per_week == null ? 5 : Number((r as any).working_days_per_week),
-    requiredCreditHours: (r as any).required_credit_hours == null ? undefined : Number((r as any).required_credit_hours),
-  });
+  termsById.set(String((r as any).id), termsFromRow(r));
 }
 
 const ledgers = await ledgerForMany(
@@ -772,10 +792,16 @@ const monthLabel = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolk
       </div>
 
       <p class="hrempty">
-        One credit-hour is one hour of verified engagement; a full-time week is {FULL_TIME_WEEKLY_HOURS}.
+        One credit-hour is one hour of verified engagement, and a full-time week is
+        {FULL_TIME_WEEKLY_HOURS} where somebody has recorded that as the agreed load. An engagement
+        whose weekly hours were never entered shows as &ldquo;Hours not set&rdquo; rather than being
+        measured against {FULL_TIME_WEEKLY_HOURS} nobody agreed to, and a day marked present with no
+        recorded hours earns nothing rather than a notional eight.
         &ldquo;Behind pace&rdquo; compares what has been earned against what the weeks since the
         joining date should have produced at the load that was agreed &mdash; it is a prompt to talk
         to someone, not a judgement. Part-time runs longer to reach the same total, never a smaller one.
+        Weekly credits, where one credit is one completed week, are decided on
+        <a href="/admin/hr/credits">the weekly credit register</a>.
       </p>
 
       {!internTermsAvailable && (

@@ -43,6 +43,7 @@ import { sql } from 'drizzle-orm';
 import { requireTeamLead, departmentFilter, DEPARTMENT_COVERAGE_NOTICE } from '@/lib/auth/workspace-access';
 import { ensureLeaveSchema } from '@/lib/hr-leave';
 import { ensureTermColumns, termsFromRow, ledgerForMany } from '@/lib/credit-ledger';
+import { ATTENDANCE_TIME_ZONE } from '@/lib/attendance';
 
 const user = Astro.locals.user;
 
@@ -108,6 +109,11 @@ let truncated = false;
 let loadError = '';
 let leaveError = '';
 let creditError = '';
+// Whether the two attendance reads RAN. "Working today 0 / Nothing recorded 9" is a statement about
+// nine people's morning, and it may not be made out of a query that threw. Declared before the
+// block that sets them — const/let is not hoisted and that has taken pages down here before.
+let todayError = '';
+let weekError = '';
 const todayBy: any = {};
 const weekBy: any = {};
 const ledgerBy: any = {};
@@ -153,6 +159,15 @@ if (scoped) {
 
   // Today. Scoped by the same department predicate rather than by an id list assembled in
   // JavaScript, so the boundary is enforced by the query itself.
+  //
+  // AND CUT IN THE ZONE THE ROWS WERE WRITTEN IN. This was `a.date = CURRENT_DATE`. CURRENT_DATE is
+  // the database SESSION's date, and nothing in this codebase sets that session's zone — src/lib/db
+  // opens postgres() with no timezone option — so it resolves to UTC. hr_attendance.date is written
+  // by src/lib/attendance.ts today(), which is deliberately `(NOW() AT TIME ZONE 'Asia/Kolkata')::date`
+  // and says in its own docblock why. The two disagree by a day between 00:00 and 05:29 IST: an early
+  // shift that had just punched in was counted as "Nothing recorded", and the strip showed yesterday's
+  // attendance under the heading "Working today". /admin/hr was repaired for exactly this; the screen a
+  // lead actually opens was not. The seven-day window below is shifted by the same amount.
   try {
     for (const t of rowsOf(await db.execute(sql`
       SELECT a.employee_id::text AS employee_id, a.status, a.work_hours
@@ -160,11 +175,12 @@ if (scoped) {
         JOIN hr_employees e ON e.id = a.employee_id
        WHERE ${departmentFilter(scoped)}
          AND e.is_active = true
-         AND a.date = CURRENT_DATE`))) {
+         AND a.date = (NOW() AT TIME ZONE ${ATTENDANCE_TIME_ZONE})::date`))) {
       todayBy[String(t.employee_id)] = t;
     }
   } catch (e: any) {
     console.error('[portal/team] today', e?.cause?.message || e?.message);
+    todayError = "Today's attendance could not be read just now.";
   }
 
   // The last seven days, as one grouped read. Enough to see a drift starting without turning the
@@ -178,13 +194,14 @@ if (scoped) {
         JOIN hr_employees e ON e.id = a.employee_id
        WHERE ${departmentFilter(scoped)}
          AND e.is_active = true
-         AND a.date >= CURRENT_DATE - INTERVAL '6 days'
-         AND a.date <= CURRENT_DATE
+         AND a.date >= (NOW() AT TIME ZONE ${ATTENDANCE_TIME_ZONE})::date - INTERVAL '6 days'
+         AND a.date <= (NOW() AT TIME ZONE ${ATTENDANCE_TIME_ZONE})::date
        GROUP BY a.employee_id`))) {
       weekBy[String(w.employee_id)] = w;
     }
   } catch (e: any) {
     console.error('[portal/team] week', e?.cause?.message || e?.message);
+    weekError = 'The last seven days could not be read just now.';
   }
 
   // Leave. hr_leave_request (SINGULAR) is the live table; the plural hr_leave_requests /
@@ -210,8 +227,8 @@ if (scoped) {
        WHERE l.status = 'approved'
          AND ${departmentFilter(scoped)}
          AND e.is_active = true
-         AND l.end_date >= CURRENT_DATE
-         AND l.start_date <= CURRENT_DATE + INTERVAL '30 days'
+         AND l.end_date >= (NOW() AT TIME ZONE ${ATTENDANCE_TIME_ZONE})::date
+         AND l.start_date <= (NOW() AT TIME ZONE ${ATTENDANCE_TIME_ZONE})::date + INTERVAL '30 days'
        ORDER BY l.start_date ASC
        LIMIT 40`));
   } catch (e: any) {
@@ -289,7 +306,17 @@ const deptLabel = scoped ? (deptName || String(scoped.scopeDepartmentId)) : '';
           </div>
         )}
 
-        {members.length > 0 && (
+        {(todayError || weekError) && (
+          <div style="background:#fbeceb;border:1px solid #f0cfcb;border-radius:14px;padding:14px 16px;margin-bottom:18px;">
+            <p style="font-size:13px;color:#a5342a;margin:0;line-height:1.6;">
+              {todayError}{todayError && weekError ? ' ' : ''}{weekError}
+              {' '}Nobody below is being reported as absent or idle on the strength of that — the figures that
+              depend on it are not shown. Please reload in a moment.
+            </p>
+          </div>
+        )}
+
+        {members.length > 0 && !todayError && (
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px;">
             <div style="background:#fff;border:1px solid #ece4d6;border-radius:14px;padding:14px 16px;">
               <p style="font-size:10.5px;letter-spacing:0.1em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0 0 4px;">Working today</p>
@@ -316,7 +343,7 @@ const deptLabel = scoped ? (deptName || String(scoped.scopeDepartmentId)) : '';
         </p>
 
         {creditError && (
-          <p style="font-size:12.5px;color:#a5342a;line-height:1.6;margin:0 0 12px;">{creditError} Names and today's status below are still accurate.</p>
+          <p style="font-size:12.5px;color:#a5342a;line-height:1.6;margin:0 0 12px;">{creditError}{todayError ? '' : " Names and today's status below are still accurate."}</p>
         )}
 
         {members.length === 0 && !loadError && (
@@ -337,7 +364,11 @@ const deptLabel = scoped ? (deptName || String(scoped.scopeDepartmentId)) : '';
             {members.map((m: any) => {
               const id = String(m.id);
               const t = todayBy[id];
-              const chip = chipFor(String(t?.status || ''));
+              // "Not recorded yet" is a finding about a person. When the attendance read did not run
+              // it is a finding about the query, and the two must not print the same words.
+              const chip = todayError
+                ? { label: 'Not read', fg: '#a5342a', bg: '#fbeceb' }
+                : chipFor(String(t?.status || ''));
               const hoursToday = round1(num(t?.work_hours));
               const week = weekBy[id];
               const weekHours = round1(num(week?.hours));
@@ -372,15 +403,16 @@ const deptLabel = scoped ? (deptName || String(scoped.scopeDepartmentId)) : '';
                     <div>
                       <p style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0;">Last 7 days</p>
                       <p style="font-size:15px;font-weight:700;color:#1a1510;margin:2px 0 0;font-family:'Geist Mono',monospace;">{weekHours > 0 ? weekHours + 'h' : '--'}</p>
-                      <p style="font-size:10.5px;color:#8a7f70;margin:1px 0 0;">{weekDays} day{weekDays === 1 ? '' : 's'} in</p>
+                      <p style="font-size:10.5px;color:#8a7f70;margin:1px 0 0;">{weekError ? 'not read' : weekDays + ' day' + (weekDays === 1 ? '' : 's') + ' in'}</p>
                     </div>
                     <div>
                       <p style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0;">Attendance</p>
                       <p style={`font-size:15px;font-weight:700;margin:2px 0 0;font-family:'Geist Mono',monospace;color:${s ? attendanceColour(num(s.attendancePct)) : '#8a7f70'};`}>{s ? num(s.attendancePct) + '%' : '--'}</p>
                     </div>
                     <div>
-                      <p style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0;">Credit</p>
+                      <p style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#8a7f70;font-family:'Geist Mono',monospace;font-weight:700;margin:0;">Credit-hours</p>
                       <p style="font-size:15px;font-weight:700;color:#1a1510;margin:2px 0 0;font-family:'Geist Mono',monospace;">{s ? num(s.creditHours) : '--'}{req > 0 ? ' / ' + req : ''}</p>
+                      <p style="font-size:10.5px;color:#8a7f70;margin:1px 0 0;">{s ? num(s.measuredDays) + ' measured day(s)' : 'not read'}</p>
                     </div>
                   </div>
 
@@ -390,6 +422,22 @@ const deptLabel = scoped ? (deptName || String(scoped.scopeDepartmentId)) : '';
                         <div style={`height:100%;width:${pct}%;background:${pct >= 100 ? '#1c7a45' : '#c2410c'};border-radius:99px;`}></div>
                       </div>
                     </div>
+                  )}
+
+                  {s && (num(s.unmeasuredDays) > 0 || !s.expectationKnown) && (
+                    <p style="font-size:12px;color:#6b5a3a;line-height:1.6;margin:10px 0 0;background:#fbf7f1;border:1px solid #eadecd;border-radius:10px;padding:8px 10px;">
+                      {num(s.incompleteDays) > 0
+                        ? num(s.incompleteDays) + ' day(s) were checked in and never checked out, so those hours are unknown rather than zero. '
+                        : ''}
+                      {num(s.unmeasuredDays) - num(s.incompleteDays) > 0
+                        ? (num(s.unmeasuredDays) - num(s.incompleteDays)) + ' day(s) marked as worked carry no recorded hours and earned none. '
+                        : ''}
+                      {!s.expectationKnown
+                        ? 'No weekly hours are recorded for this engagement, so the percentage has no denominator and is not a judgement about them. '
+                        : ''}
+                      A weekly credit is only granted automatically when the week measures up, so
+                      these days are what a week ends up waiting on somebody for.
+                    </p>
                   )}
 
                   {s && (num(s.unauthorisedLeaveDays) > 0 || num(s.noticeBreaches) > 0) && (

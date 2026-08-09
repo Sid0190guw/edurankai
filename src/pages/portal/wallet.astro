@@ -2,7 +2,7 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { getCreditBalance, getCreditLedger } from '@/lib/account-credit';
+import { readWallet } from '@/lib/account-credit';
 import { walletAmounts, currencyFor } from '@/lib/local-currency';
 import { isConfigured } from '@/lib/razorpay';
 
@@ -16,12 +16,31 @@ function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 // (see script below) so the Razorpay API never blocks this page's render.
 
 let country = 'India';
-try { country = (rows(await db.execute(sql`SELECT country FROM users WHERE id = ${user.id} LIMIT 1`))[0]?.country) || 'India'; } catch (_) {}
+try {
+  country = (rows(await db.execute(sql`SELECT country FROM users WHERE id = ${user.id} LIMIT 1`))[0]?.country) || 'India';
+} catch (e: any) {
+  // Falling back to India is fine — it only picks the display currency — but a swallowed read left
+  // nothing anywhere saying why somebody's balance was suddenly quoted in the wrong currency.
+  console.error('[portal/wallet] country', e?.cause?.message || e?.message);
+}
 
-const balancePaise = await getCreditBalance(user.id).catch(() => 0);
+// A BALANCE OF ZERO IS A CLAIM ABOUT SOMEBODY'S MONEY, AND IT MAY ONLY BE MADE OUT OF A READ THAT RAN.
+//
+// This was `getCreditBalance(user.id).catch(() => 0)` and `getCreditLedger(...).catch(() => [])`.
+// Those helpers already degrade to 0/[] internally, so BOTH the page and the library were converting
+// a failed query into a confident financial statement: "Available balance ₹0.00", "No wallet activity
+// yet.", and — because `balancePaise <= 0` — the reassurance that a payment which went through "appears
+// here automatically once we reconcile". This is the page somebody opens precisely because they think
+// money is missing. Told it is gone, with an Add money button underneath, they pay twice.
+//
+// readWallet() reports whether the read happened. When it did not, the balance card, the empty-wallet
+// notice and the "no activity" line are all suppressed and the failure is named instead.
+const wallet = await readWallet(user.id, 50);
+const walletOk = wallet.ok;
+const balancePaise = wallet.balancePaise;
 const w = await walletAmounts(balancePaise, country);
 const cur = currencyFor(country);
-const ledger = await getCreditLedger(user.id, 50).catch(() => []);
+const ledger = wallet.ledger;
 const paymentsReady = isConfigured();
 const QUICK = [100, 500, 1000, 2000];
 
@@ -38,7 +57,20 @@ function signed(paise: any) {
     <h1 class="font-display text-[clamp(1.7rem,4vw,2.4rem)] font-semibold text-ink leading-tight tracking-tight mb-2">Your wallet.</h1>
     <p class="text-[0.9rem] text-ink-soft leading-relaxed mb-7">Credit on your account - including any payment that went through but didn't finish - usable for <strong>any</strong> EduRankAI fee or product. Balance is held in our base currency and shown in yours at today's live rate.</p>
 
+    {!walletOk && (
+      <div class="rounded-2xl p-5 mb-6" style="background:#fff5f0;border:1px solid #f0b49a;">
+        <p class="text-[0.95rem] font-semibold" style="color:#9a3412;margin:0;">Your balance could not be read just now.</p>
+        <p class="text-[0.86rem] leading-relaxed" style="color:#5c5349;margin:6px 0 0;">
+          This is <strong>not</strong> a statement that your wallet is empty, and nothing has been lost or spent.
+          The ledger simply could not be reached on this load. Please reload in a moment, and do not top up to
+          replace credit you may still have. If it keeps failing, write to <a href="mailto:hr@edurankai.in" class="text-burn font-semibold">hr@edurankai.in</a>.
+        </p>
+        <p class="text-[0.72rem] font-mono" style="color:#8a7f70;margin:8px 0 0;word-break:break-word;">{wallet.reason}</p>
+      </div>
+    )}
+
     <!-- Balance card -->
+    {walletOk && (
     <div class="rounded-2xl p-6 mb-6 text-white" style="background:linear-gradient(135deg,#100b08,#2a1a12);">
       <p class="text-[0.66rem] font-mono uppercase tracking-[0.16em] text-white/55 mb-2">Available balance</p>
       <p class="font-display text-[2.6rem] font-semibold leading-none">{w.baseLabel}</p>
@@ -48,6 +80,7 @@ function signed(paise: any) {
       </div>
       <p class="text-[0.72rem] text-white/45 mt-4">{w.baseCode} is our base currency. {cur.code === 'INR' ? 'Held and settled in INR.' : 'Converted from INR at the live ECB rate; the actual charge is always in INR via Razorpay.'}</p>
     </div>
+    )}
 
     <!-- Add money -->
     {paymentsReady && (
@@ -70,7 +103,7 @@ function signed(paise: any) {
       </div>
     )}
 
-    {balancePaise <= 0 && (
+    {walletOk && balancePaise <= 0 && (
       <div class="bg-cream-2 border border-ink/10 rounded-xl p-5 mb-6 text-[0.86rem] text-ink-soft leading-relaxed">
         If you paid a fee but your application didn't go through, it appears here automatically once we reconcile the payment - this page checks every time you open it. Questions? <a href="mailto:hr@edurankai.in" class="text-burn font-semibold">hr@edurankai.in</a>
       </div>
@@ -78,7 +111,9 @@ function signed(paise: any) {
 
     <!-- Ledger -->
     <h2 class="font-display text-[1.1rem] font-semibold text-ink mb-3">Activity</h2>
-    {ledger.length === 0 ? (
+    {!walletOk ? (
+      <p class="text-[0.86rem]" style="color:#9a3412;">Your activity could not be read just now — this is not a statement that there is none.</p>
+    ) : ledger.length === 0 ? (
       <p class="text-[0.86rem] text-ink-soft">No wallet activity yet.</p>
     ) : (
       <div class="bg-white border border-ink/10 rounded-2xl overflow-hidden">

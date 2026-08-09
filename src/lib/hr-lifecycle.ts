@@ -548,6 +548,16 @@ export async function listPips(employeeId: string) {
   return rows(await db.execute(sql`SELECT * FROM hr_pips WHERE employee_id = ${employeeId} ORDER BY opened_at DESC`));
 }
 
+/**
+ * A PIP check-in is dated in the zone the week is counted in.
+ *
+ * The last raw CURRENT_DATE left in this module after the probation dates were moved onto
+ * LIFECYCLE_TIME_ZONE. CURRENT_DATE is the database session's zone, which nothing here sets, so it
+ * resolves to UTC: a check-in written between 00:00 and 05:29 IST was dated the PREVIOUS day. On a
+ * performance improvement plan, whose whole structure is "week N, checked on this date", a check-in
+ * landing on the day before the week it belongs to is the record somebody's continued employment is
+ * argued from.
+ */
 export async function logPipCheckin(opts: {
   pipId: string;
   weekNumber: number;
@@ -558,7 +568,7 @@ export async function logPipCheckin(opts: {
   await ensureLifecycleSchema();
   await db.execute(sql`
     INSERT INTO hr_pip_checkins (pip_id, week_number, check_date, progress_summary, progress_rating, manager_user_id)
-    VALUES (${opts.pipId}, ${opts.weekNumber}, CURRENT_DATE, ${opts.progressSummary}, ${opts.progressRating}, ${opts.managerUserId || null})
+    VALUES (${opts.pipId}, ${opts.weekNumber}, (NOW() AT TIME ZONE ${LIFECYCLE_TIME_ZONE})::date, ${opts.progressSummary}, ${opts.progressRating}, ${opts.managerUserId || null})
   `);
 }
 

@@ -28,10 +28,47 @@ if (Astro.request.method === 'POST') {
         errorMsg = 'An account with this email already exists. Sign in instead.';
       } else {
         const passwordHash = await hashPassword(password);
+        // THE CONSENT TICK WAS BEING THROWN AWAY, EXACTLY AS IT WAS ON /portal/signup.
+        //
+        // This form refuses to create an account without it, then handed drizzle `consentGivenAt` /
+        // `consentIp` - two properties that are on no column of the users table in
+        // src/lib/db/schema.ts and in no CREATE or ALTER anywhere in the repository. drizzle builds
+        // its INSERT from the columns it knows and silently drops everything else, so the statement
+        // succeeded, the learner's account was created, and the record of the agreement that made
+        // creating it lawful was written nowhere at all. Nothing said so - astro check has been
+        // reporting it as ts2769 on this line the whole time. /portal/signup was repaired for this;
+        // this was the surviving copy.
+        //
+        // Recorded below instead: the same additive column-ensure (IF NOT EXISTS, once per process,
+        // under the same guard key as the portal so the ALTER runs once for both) and a plain UPDATE
+        // whose result is read. Signup is NOT refused when that fails - blocking somebody's account
+        // over an audit column would be the worse failure - but the reason is logged with the account
+        // id, so the gap is findable rather than invisible.
         const inserted = await db.insert(users).values({
-          email, name, passwordHash, role: 'applicant', isActive: true,
-          consentGivenAt: new Date(), consentIp: Astro.clientAddress
+          email, name, passwordHash, role: 'applicant', isActive: true
         }).returning({ id: users.id });
+
+        try {
+          const { sql } = await import('drizzle-orm');
+          const { ensureOnce } = await import('@/lib/ensure-once');
+          await ensureOnce('users_consent_columns_v1', async () => {
+            await db.execute(sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_given_at TIMESTAMPTZ`);
+            await db.execute(sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_ip VARCHAR(64)`);
+          });
+          const recorded = await db.execute(sql`
+            UPDATE users
+               SET consent_given_at = NOW(), consent_ip = ${Astro.clientAddress || null}
+             WHERE id = ${inserted[0].id}
+            RETURNING id`);
+          const got = Array.isArray(recorded) ? recorded : ((recorded as any)?.rows || []);
+          if (!got.length) {
+            console.error('[aquintutor/signup] consent was NOT recorded for user', inserted[0].id, '- the update matched no row');
+          }
+        } catch (e: any) {
+          // The real Postgres reason is on e.cause; e.message is only the SQL that failed.
+          console.error('[aquintutor/signup] consent was NOT recorded for user', inserted[0].id, '-',
+            (e as any)?.cause?.message || (e as any)?.message);
+        }
         try { const { pushNotify } = await import('@/lib/push'); await pushNotify.newUser(name, inserted[0].id); } catch (_) {}
         const token = generateSessionToken();
         const session = await createSession(token, inserted[0].id, {
@@ -43,6 +80,10 @@ if (Astro.request.method === 'POST') {
         return Astro.redirect('/aquintutor/onboarding');
       }
     } catch (e: any) {
+      // NEVER SWALLOWED. This is an account-creation path, and a bare catch on one of those has
+      // already hidden a total sign-in outage on this project for hours. The real Postgres reason is
+      // on e.cause; e.message is only the SQL that failed, and neither is for the caller.
+      console.error('[aquintutor/signup]', e?.cause?.message || e?.message, e?.stack);
       errorMsg = 'Could not create account. Please try again.';
     }
   }

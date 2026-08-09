@@ -48,6 +48,9 @@ export const POST: APIRoute = async ({ locals }) => {
     `);
     return json({ ok: true, key: keyId, orderId: j.id, amount: PASS_INR_PAISE, currency: 'INR' });
   } catch (e: any) {
-    return json({ ok: false, error: String(e?.message || e).slice(0, 240) }, 500);
+    // Its sibling ./verify.ts already logs the cause and answers a sentence; this one still handed
+    // back 240 characters of the failed SQL.
+    console.error('[payments/tool-pass/order]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not start that purchase just now, so nothing was charged. Try again in a moment.' }, 500);
   }
 };

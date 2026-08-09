@@ -116,12 +116,26 @@ export const EXIT_INTERVIEW_QUESTIONS = [
   { key: 'rehire_interest',     label: 'Would you consider rejoining in the future?' },
 ];
 
+/**
+ * THE ZONE A SEPARATION DAY IS CUT ON. Declared above the only statement that reads it — `const` is
+ * not hoisted.
+ *
+ * initiated_at is the day the notice clock starts: every screen that reads a separation reads the
+ * notice period FROM it, and /admin/hr/separation prints it as the date somebody gave notice.
+ * CURRENT_DATE is the database SESSION's zone, and nothing in this codebase sets it — db/index.ts
+ * opens postgres() with no timezone option and no SET TIME ZONE — so it resolves to UTC. IST is
+ * UTC+05:30, so a resignation recorded between 00:00 and 05:29 IST was dated the PREVIOUS day, which
+ * moves the last working day a resigner is owed. src/lib/hr-lifecycle.ts names the same zone for the
+ * same reason.
+ */
+const SEPARATION_TIME_ZONE = 'Asia/Kolkata';
+
 export async function openSeparation(opts: any) {
   await ensureSeparationSchema();
   const r = rows(await db.execute(sql`
     INSERT INTO hr_separations (employee_id, kind, initiated_by, initiated_at, notice_days, last_working_day, reason, pip_id, related_flag_id)
     VALUES (${opts.employeeId}, ${opts.kind}, ${opts.initiatedBy || 'employee'},
-      ${opts.initiatedAt || sql`CURRENT_DATE`}, ${opts.noticeDays || 30}, ${opts.lastWorkingDay || null}, ${opts.reason || null},
+      ${opts.initiatedAt || sql`(NOW() AT TIME ZONE ${SEPARATION_TIME_ZONE})::date`}, ${opts.noticeDays || 30}, ${opts.lastWorkingDay || null}, ${opts.reason || null},
       ${opts.pipId || null}, ${opts.relatedFlagId || null})
     RETURNING id
   `));
