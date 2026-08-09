@@ -1,0 +1,289 @@
+---
+// /portal/employee/credits/approvals — WEEKLY CREDITS WAITING ON THIS PERSON.
+//
+// =================================================================================================
+// WHY THIS IS IN THE PORTAL AND NOT IN /admin
+// =================================================================================================
+//
+// The person a weekly credit routes to is the intern's REPORTING MANAGER, resolved per row from the
+// Organization Graph. Most reporting managers have no admin access at all, so a queue behind /admin
+// would mean the one person the request was addressed to could not open it - the week would sit
+// pending until it escalated, and a week somebody worked would quietly go uncredited. So it lives
+// where the people it is addressed to already are. HR has the full list at /admin/hr/credits.
+//
+// =================================================================================================
+// THE LIST IS NOT THE PERMISSION, AND THE LIST IS NOT WHAT DECIDES
+// =================================================================================================
+//
+// pendingForApprover() answers "what is routed to you, or delegated to you, right now". It does not
+// admit capability holders, deliberately - standing authority means somebody MAY act on a request
+// that reaches them, not that every intern's week belongs on their personal list.
+//
+// decidePendingCreditWeek() then goes through decideStep(), which re-asks the whole question at the
+// moment of the write: the instance must still be pending, the step must be the current rung, and
+// mayAct() must say this signed-in user is the routed approver, their in-force delegate, or a holder
+// of the domain's standing authority. A posted week id from somebody else's queue is refused by the
+// engine, not by the absence of a button here.
+//
+// =================================================================================================
+// A REASON IS REQUIRED ON BOTH ANSWERS, AND THAT IS THE POINT OF THE SCREEN
+// =================================================================================================
+//
+// Every week on this list is one the measurement did not fully support. Crediting it says somebody
+// worked a week the clock could not confirm; declining says the opposite. Neither is a thing to do
+// with an empty note, and the sentence is stored beside the credit where it can still be read six
+// months later. The ledger enforces this too - this page is not the only thing standing in the way.
+//
+// MOBILE FIRST. This is a queue people clear on a phone between two other things.
+import { requireEmployee } from '@/lib/auth/workspace-access';
+import { pendingForApprover, escalateStep, STATE_LABELS, type PendingApproval } from '@/lib/workflow';
+import {
+  decidePendingCreditWeek,
+  creditWeekForRecord,
+  type CreditWeekRow,
+} from '@/lib/credit-week-ledger';
+import { describeEvidence, weekLabel } from '@/lib/credit-week';
+import {
+  hoursLabel, CREDIT_UNIT_SENTENCE, INTERN_WEEK_SENTENCE, CREDIT_THREE_FACTS_SENTENCE,
+} from '@/lib/credit-week-copy';
+
+const PATH = '/portal/employee/credits/approvals';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PATH));
+
+const gate = await requireEmployee(user as any, PATH);
+if (!gate.ok && gate.redirect) return Astro.redirect(gate.redirect);
+const workspace = gate.ok ? gate.workspace : null;
+
+const CREDIT_DOMAIN = 'credit';
+const DECISIONS = ['approved', 'refused'];
+const MIN_REASON = 8;
+
+let flash = '';
+let flashError = '';
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const form = await Astro.request.formData();
+    const action = String(form.get('action') || 'decide');
+
+    if (action === 'escalate') {
+      const res = await escalateStep(String(form.get('step_id') || ''), user as any);
+      if (res.ok) flash = 'Sent to the next person above them in the organization graph.';
+      else flashError = res.error || 'That could not be escalated.';
+    } else {
+      const weekId = String(form.get('week_id') || '');
+      const decision = String(form.get('decision') || '');
+      const reason = String(form.get('reason') || '').trim().slice(0, 500);
+
+      if (!weekId || DECISIONS.indexOf(decision) < 0) {
+        flashError = 'That decision could not be read. Nothing was changed.';
+      } else if (reason.length < MIN_REASON) {
+        // NOT A FORMALITY. This week is being credited or declined against what was measured, and
+        // the record stores this sentence as the reason it happened.
+        flashError = 'Write a reason. This week is being decided against what the measurement found, '
+          + 'and the record has to be able to say why.';
+      } else {
+        const res = await decidePendingCreditWeek(weekId, user as any, decision as any, reason);
+        if (res.ok) {
+          flash = decision === 'approved'
+            ? 'Credited, with your reason recorded against the week.'
+            : 'Not credited, with your reason recorded against the week.';
+        } else {
+          // NEVER SWALLOWED. The engine's sentence is shown exactly as it came back.
+          flashError = res.error || 'That decision could not be recorded.';
+        }
+      }
+    }
+  } catch (e: any) {
+    flashError = 'That decision could not be recorded: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    console.error('[portal/credits/approvals] decide', e?.cause?.message || e?.message);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+interface QueueItem { approval: PendingApproval; week: CreditWeekRow | null; }
+
+let queue: QueueItem[] = [];
+if (gate.ok) {
+  const all = await pendingForApprover(String(user.id));
+  const mine = all.filter((p) => String(p.instance.domain) === CREDIT_DOMAIN);
+  for (const approval of mine) {
+    // The workflow record id IS the credit week's id, so the evidence the verdict was recorded with
+    // is one read away. A queue that showed only "a weekly credit" would be asking somebody to
+    // decide blind, which is the opposite of what this whole change is for.
+    const week = await creditWeekForRecord(String(approval.instance.recordId));
+    queue.push({ approval, week });
+  }
+}
+
+const when = (iso: string | null) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+};
+---
+<!doctype html>
+<html lang="en" style="background:#F8F8F6;">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex,nofollow"/>
+  <title>Weekly credits waiting on you - EduRankAI</title>
+  <style>
+    *{box-sizing:border-box}
+    html,body{overflow-x:hidden;}
+    body{margin:0;background:#F8F8F6;color:#1B1813;padding-bottom:96px;
+      font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;-webkit-text-size-adjust:100%;}
+    .topbar{position:sticky;top:0;z-index:20;background:#FDFDFC;border-bottom:1px solid #DFDCD8;padding:14px 16px 10px;}
+    .topbar h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-0.01em;}
+    .topbar p{margin:4px 0 0;font-size:0.75rem;line-height:1.5;color:#564E43;}
+    .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 2px;margin:0;}
+    .tab{flex:none;display:inline-flex;align-items:center;min-height:36px;padding:7px 12px;border:1px solid #DFDCD8;
+      border-radius:999px;background:#FDFDFC;color:#564E43;font-size:0.8125rem;font-weight:600;text-decoration:none;white-space:nowrap;}
+    .tab[aria-current="page"]{background:#1B1813;border-color:#1B1813;color:#FFFFFF;}
+    .wrap{max-width:760px;margin:0 auto;padding:12px 12px 0;}
+    .card{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .card h2{margin:0 0 6px;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .card p{margin:0;font-size:0.8125rem;line-height:1.55;color:#564E43;overflow-wrap:anywhere;}
+    .card p + p{margin-top:8px;}
+    .ok{margin:12px 0 0;padding:10px 12px;border:1px solid #CBE3D2;border-radius:10px;background:#F1F8F3;font-size:0.8125rem;line-height:1.55;color:#1F5132;}
+    .bad{margin:12px 0 0;padding:10px 12px;border:1px solid #EFCFCB;border-radius:10px;background:#FDF3F2;font-size:0.8125rem;line-height:1.55;color:#8A2C21;}
+    .item{margin:12px 0 0;padding:13px;border:1px solid #DFDCD8;border-radius:12px;background:#FDFDFC;}
+    .item h3{margin:0;font-size:0.9375rem;font-weight:680;line-height:1.35;}
+    .item .sub{margin:3px 0 0;font-size:0.75rem;color:#70685C;line-height:1.5;overflow-wrap:anywhere;}
+    .kv{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:10px 0 0;font-size:0.8125rem;}
+    .kv dt{color:#70685C;}
+    .kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;font-weight:650;}
+    .list{list-style:none;margin:10px 0 0;padding:0;}
+    .list li{padding:8px 10px;border:1px solid #EFEDEA;border-radius:8px;background:#FCFBFA;margin-bottom:6px;font-size:0.8125rem;line-height:1.5;overflow-wrap:anywhere;}
+    .lab{display:block;margin:12px 0 3px;font-size:0.75rem;font-weight:650;color:#564E43;}
+    .field{width:100%;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #DFDCD8;border-radius:8px;background:#FDFDFC;color:#1B1813;font:inherit;font-size:0.875rem;}
+    .row{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0;}
+    .go{flex:1 1 160px;min-height:48px;padding:12px 14px;border:1px solid #1B1813;border-radius:10px;background:#1B1813;color:#fff;font:inherit;font-size:0.9375rem;font-weight:650;cursor:pointer;}
+    .thin{flex:1 1 160px;min-height:48px;padding:12px 14px;border:1px solid #DFDCD8;border-radius:10px;background:#FDFDFC;color:#564E43;font:inherit;font-size:0.875rem;font-weight:650;cursor:pointer;}
+    .foot{margin:16px 0 0;padding:12px 2px;border-top:1px solid #DFDCD8;font-size:0.75rem;line-height:1.6;color:#70685C;}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Weekly credits waiting on you</h1>
+    <p>{workspace ? workspace.fullName : 'Your queue'}</p>
+  </header>
+
+  <nav class="tabs" aria-label="Credits">
+    <a class="tab" href="/portal/employee/credits">My credits</a>
+    <a class="tab" href={PATH} aria-current="page">Waiting on me</a>
+    <a class="tab" href="/portal/employee/attendance/approvals">Working time</a>
+    <a class="tab" href="/portal/approvals">All approvals</a>
+  </nav>
+
+  <main class="wrap">
+    {flash && <div class="ok">{flash}</div>}
+    {flashError && <div class="bad">{flashError}</div>}
+
+    {!gate.ok && (
+      <section class="card">
+        <h2>{gate.title || 'This screen is not available'}</h2>
+        <p>{gate.reason || 'Your employee record is what this screen is built from.'}</p>
+      </section>
+    )}
+
+    {gate.ok && (
+      <section class="card">
+        <h2>What you are being asked</h2>
+        <p>{CREDIT_UNIT_SENTENCE} {INTERN_WEEK_SENTENCE}</p>
+        <p>Every week below is one the measurement did not fully support. Crediting it says the person
+        worked a week the clock could not confirm; declining says the opposite. Both need a reason,
+        and the reason is stored with the week.</p>
+        <p>{CREDIT_THREE_FACTS_SENTENCE}</p>
+      </section>
+    )}
+
+    {gate.ok && queue.length === 0 && (
+      <section class="card">
+        <h2>Nothing is waiting on you</h2>
+        <p>Weeks appear here only when they are routed to you or delegated to you. A week whose hours
+        were there and whose work was done never reaches this queue at all - it credits itself.</p>
+      </section>
+    )}
+
+    {gate.ok && queue.map((q) => (
+      <article class="item">
+        <h3>{q.approval.instance.subjectName || 'An employee'}</h3>
+        <p class="sub">
+          {q.week ? (q.week.label || weekLabel(q.week.weekStart)) : (q.approval.instance.summary || 'A week')}
+          {q.approval.step.dueAt ? ' · due ' + when(q.approval.step.dueAt) : ''}
+          {' · ' + (STATE_LABELS[q.approval.instance.state as keyof typeof STATE_LABELS] || q.approval.instance.state)}
+        </p>
+
+        {!q.week && (
+          <p class="sub" style="margin-top:8px;">
+            The credit record behind this request could not be read, so its figures are not shown.
+            Do not decide it blind - reload the page first. Nothing about the request itself is lost.
+          </p>
+        )}
+
+        {q.week && (
+          <dl class="kv">
+            <dt>Hours measured</dt><dd>{hoursLabel(q.week.hoursMeasured)}</dd>
+            <dt>Hours required</dt><dd>{hoursLabel(q.week.hoursRequired)}</dd>
+            <dt>From check-in and check-out</dt><dd>{hoursLabel(q.week.evidence ? q.week.evidence.hoursFromClock : null)}</dd>
+            <dt>Leave and holidays excused</dt><dd>{q.week.evidence ? q.week.evidence.excusedDays : 0} day(s)</dd>
+            <dt>Daily reports filed</dt><dd>{q.week.reportsFiled} of {q.week.reportsExpected}</dd>
+            <dt>Work due that week done</dt><dd>{q.week.tasksCompleted} of {q.week.tasksAssigned}</dd>
+            <dt>Days never clocked out of</dt><dd>{q.week.evidence ? q.week.evidence.incompleteDates.length : 0}</dd>
+          </dl>
+        )}
+
+        {q.week && q.week.evidence && (
+          <details style="margin-top:10px;">
+            <summary style="cursor:pointer;font-size:0.8125rem;font-weight:650;min-height:44px;display:flex;align-items:center;">What this rests on</summary>
+            <ul class="list">
+              {describeEvidence(q.week.evidence).map((line: string) => <li>{line}</li>)}
+            </ul>
+          </details>
+        )}
+
+        {q.week && (
+          <form method="POST">
+            <input type="hidden" name="action" value="decide" />
+            <input type="hidden" name="week_id" value={q.week.id} />
+            <label class="lab" for={'reason-' + q.week.id}>Your reason (required)</label>
+            <textarea class="field" id={'reason-' + q.week.id} name="reason" rows="3" required minlength={MIN_REASON}
+              placeholder="What you know about this week that the measurement does not show."></textarea>
+            <div class="row">
+              <button class="go" type="submit" name="decision" value="approved">Credit this week</button>
+              <button class="thin" type="submit" name="decision" value="refused">Do not credit</button>
+            </div>
+          </form>
+        )}
+
+        <form method="POST">
+          <input type="hidden" name="action" value="escalate" />
+          <input type="hidden" name="step_id" value={q.approval.step.id} />
+          <div class="row">
+            <button class="thin" type="submit">Not mine to decide - send it above me</button>
+          </div>
+        </form>
+      </article>
+    ))}
+
+    {gate.ok && (
+      <p class="foot">
+        This list is what is routed or delegated to you, and it is not the permission - the engine
+        re-checks who you are at the moment you press a button. A week you send above you goes to the
+        next person up the reporting line in the organization graph; where the graph names nobody it
+        says so rather than picking somebody.
+      </p>
+    )}
+  </main>
+</body>
+</html>

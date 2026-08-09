@@ -6,6 +6,10 @@ import { applications, applicationMessages, users } from '@/lib/db/schema';
 import { eq, asc, sql } from 'drizzle-orm';
 import LocationTrailMap from '@/components/LocationTrailMap.astro';
 import { getLocationTrail, assessVpn, locationFlags, canViewLocations } from '@/lib/applicant-location';
+// The funnel engine. applications.stage is what the candidate is shown; it is never written by hand
+// from here — advanceStage() owns the column, its history table and the notification that goes with
+// a move. See src/lib/application-stages.ts.
+import { advanceStage, stageForStatus, stageDescriptor } from '@/lib/application-stages';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -22,6 +26,11 @@ let successMsg = '';
 // are assigned inside the POST handler below, so they are declared here, above it.
 let hrSyncWarning = '';
 let hrSyncNote = '';
+// The candidate's own six-step tracker, reported separately for the same reason: a status the
+// reviewer can see and a tracker the candidate can see are two different screens, and they were
+// silently allowed to disagree.
+let stageWarning = '';
+let stageNote = '';
 
 const STATUS_LABELS: Record<string, string> = {
   submitted: 'Submitted',
@@ -84,6 +93,56 @@ if (Astro.request.method === 'POST') {
             isSystem: true
           });
         }
+        // -----------------------------------------------------------------------------------------
+        // THE CANDIDATE'S OWN TRACKER MOVES WITH THE STATUS.
+        // -----------------------------------------------------------------------------------------
+        //
+        // applications.status and applications.stage describe the same funnel and were entirely
+        // unconnected. This handler — the ONE place a human actually moves an application — wrote
+        // status and never touched stage, /api/admin/applications/advance-stage has no caller on any
+        // page in the repo, and completeHire() writes only 'onboarded'. The result: a candidate went
+        // through review, an assessment, an interview and a rejection while /portal/applications/[id]
+        // told them "01 · Submitted — your application is in our queue. We acknowledge every
+        // applicant individually." A closed application never reached an ending at all, because
+        // nothing in src/ had ever written 'decision_no' or 'withdrawn'.
+        //
+        // 'hired' is deliberately NOT advanced here: completeHire() below owns that step and records
+        // its outcome in the handoff ledger that /admin/hr/reconciliation reads. Two writers of one
+        // step is how a step ends up reported twice and done once.
+        //
+        // A stage that does not move must never roll back a status the reviewer has already been
+        // shown as saved, so this reports instead of throwing — but it does report.
+        if (oldStatus !== newStatus && newStatus !== 'hired') {
+          const toStage = stageForStatus(newStatus);
+          if (toStage) {
+            try {
+              const moved = await advanceStage({
+                applicationId: id,
+                toStage,
+                actorUserId: user.id,
+                actorName: user.name || user.email || 'People desk',
+                note: 'Status set to ' + (STATUS_LABELS[newStatus] || newStatus) + '.',
+              });
+              if (!moved.ok) {
+                stageWarning = 'The status is saved, but the candidate’s six-step tracker did NOT move: '
+                  + (moved.error || 'unknown reason') + ' — they still see the previous step.';
+              } else if (moved.changed) {
+                const d = stageDescriptor(toStage);
+                stageNote = 'Their tracker now reads ' + (d ? d.short : toStage) + ', and they have been told.';
+              }
+            } catch (e: any) {
+              // Never swallowed: the real Postgres reason is on e.cause.
+              console.error('[admin/applications] stage advance failed for', id, '-', e?.cause?.message || e?.message);
+              stageWarning = 'The status is saved, but the candidate’s six-step tracker did NOT move: '
+                + (e?.cause?.message || e?.message || 'unknown reason')
+                + ' — they still see the previous step.';
+            }
+          } else {
+            stageWarning = 'This status has no place on the six-step tracker, so the candidate’s '
+              + 'view of where they are has not changed. Move it yourself if it should.';
+          }
+        }
+
         // Push notification to other admins
         // HR sync: hired -> create employee, withdrawn -> offboard.
         //
@@ -176,7 +235,9 @@ if (Astro.request.method === 'POST') {
             });
           } catch (_) {}
         }
-        successMsg = 'Status updated and applicant notified in thread' + (hrSyncNote ? ' — ' + hrSyncNote : '');
+        successMsg = 'Status updated and applicant notified in thread'
+          + (hrSyncNote ? ' — ' + hrSyncNote : '')
+          + (stageNote ? ' ' + stageNote : '');
       }
     } else if (action === 'send_message') {
       const body = (fd.get('body') as string || '').trim();
@@ -395,6 +456,7 @@ function formatMsgTime(d: Date): string {
   {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {successMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
   {hrSyncWarning && <div style="margin:10px 16px;background:rgba(232,196,106,0.1);border:1px solid rgba(232,196,106,0.35);color:#e8c46a;border-radius:8px;padding:10px 14px;font-size:13px;line-height:1.55;">{hrSyncWarning}</div>}
+  {stageWarning && <div style="margin:10px 16px;background:rgba(232,196,106,0.1);border:1px solid rgba(232,196,106,0.35);color:#e8c46a;border-radius:8px;padding:10px 14px;font-size:13px;line-height:1.55;">{stageWarning}</div>}
 
   <!-- Quick actions bar -->
   <div style="padding:10px 16px;display:flex;gap:8px;border-bottom:1px solid #1a1a1f;overflow-x:auto;">
@@ -742,7 +804,15 @@ fetch('/admin/api/applications/' + appId + '/activity', { credentials: 'same-ori
   .then(function(r) { return r.json(); })
   .then(function(data) {
     var panel = document.getElementById('activityPanel');
-    if (!data || !data.events || data.events.length === 0) {
+    // NONE AND UNKNOWN ARE DIFFERENT SENTENCES. The endpoint used to answer 200 with an empty
+    // array when its read threw, so "this candidate has never opened their thread" got printed
+    // over a failure - and that is the version a recruiter acts on. It now answers ok:false, and
+    // this branch reports the failure instead of inventing silence.
+    if (!data || data.ok === false) {
+      panel.innerHTML = '<p style="font-size:11px;color:#c0a35e;text-align:center;padding:8px;">Activity could not be read, so this is not "no activity" - it is unknown.</p>';
+      return;
+    }
+    if (!data.events || data.events.length === 0) {
       panel.innerHTML = '<p style="font-size:11px;color:#6e6e78;text-align:center;padding:8px;">No activity yet. Appears when applicant opens their thread or views the offer.</p>';
       return;
     }

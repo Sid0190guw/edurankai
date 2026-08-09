@@ -108,6 +108,20 @@ const isDateIso = (v: unknown): v is string => typeof v === 'string' && DATE_RE.
  *                 not load. Explicitly NOT folded into no_match: "our server had a bad minute" and
  *                 "that is not your face" are different sentences and only one of them is about
  *                 the person.
+ *
+ * FOUR MORE, ADDED FOR THE CLOCK-OUT GATE (src/lib/attendance-verify-clockout.ts), where the second
+ * factor may also be an authenticator or a recovery code, and where a person must be able to say "I
+ * cannot do this" and still go home. They are ADDITIVE: every value above keeps exactly the meaning
+ * it had, so nothing already written to face_verify_outcome changes meaning.
+ *
+ *   code_match         an authenticator code or a one-time recovery code, verified server-side.
+ *   code_no_match      it did not match. THE CLOCK-OUT IS STILL RECORDED.
+ *   declined           the person could not complete the check — camera denied, phone lost, an
+ *                      enrolment that is genuinely broken — and said so. Their own words are kept
+ *                      with it. This is the escape hatch that stops the gate stranding somebody at
+ *                      work overnight, and it is a fact about an attempt, never an accusation.
+ *   too_many_attempts  several checks failed within a few minutes, so we stopped asking rather than
+ *                      keep somebody clocked in. Also still recorded.
  */
 export const VERIFY_OUTCOMES = [
   'match',
@@ -115,6 +129,10 @@ export const VERIFY_OUTCOMES = [
   'not_enrolled',
   'no_capture',
   'unavailable',
+  'code_match',
+  'code_no_match',
+  'declined',
+  'too_many_attempts',
 ] as const;
 export type VerifyOutcome = (typeof VERIFY_OUTCOMES)[number];
 
@@ -123,8 +141,17 @@ export function isVerifyOutcome(v: unknown): v is VerifyOutcome {
   return typeof v === 'string' && OUTCOME_SET.has(v);
 }
 
-/** How the check was attempted. One value today; a column so a second method does not need a migration. */
-export const VERIFY_METHODS = ['face', 'none'] as const;
+/**
+ * How the check was attempted.
+ *
+ *   face  a descriptor compared against the enrolment, server-side.
+ *   code  an authenticator code or a one-time recovery code, verified server-side. One value for
+ *         both deliberately: verifyLoginCode() accepts either and does not say which it was, and a
+ *         label that guessed from the shape of what was typed would sometimes be wrong about how
+ *         somebody proved who they were.
+ *   none  no check was attempted, or the person said they could not complete one.
+ */
+export const VERIFY_METHODS = ['face', 'code', 'none'] as const;
 export type VerifyMethod = (typeof VERIFY_METHODS)[number];
 
 /**
@@ -367,9 +394,18 @@ export async function dayVerification(employeeId: string, dateIso: string): Prom
  * an unavailable server are all ordinary and none of them is about the employee.
  *
  * A true answer means "somebody should glance at this", never "reject this", never "dock this".
+ *
+ * THE CLOCK-OUT OUTCOMES follow the same line exactly. A code that did not match is the same kind of
+ * fact as a face that did not match. 'declined' and 'too_many_attempts' are here because the gate
+ * PROMISES the person that a human will look — the escape hatch out of a broken enrolment is only
+ * honest if somebody actually reads it — and for no other reason: appearing in this list deducts
+ * nothing, decides nothing and is not a finding about anybody.
  */
 export function needsHumanLook(outcome: string | null | undefined): boolean {
-  return outcome === 'no_match';
+  return outcome === 'no_match'
+    || outcome === 'code_no_match'
+    || outcome === 'declined'
+    || outcome === 'too_many_attempts';
 }
 
 /**
@@ -395,6 +431,18 @@ export function verificationLine(outcome: string | null | undefined): string {
   if (outcome === 'unavailable') {
     return 'Your punch is recorded. We could not run the face check just now - that is our side, not yours, and nothing is marked against you.';
   }
+  if (outcome === 'code_match') {
+    return 'Your punch is recorded and your identity was confirmed by the code you entered.';
+  }
+  if (outcome === 'code_no_match') {
+    return 'Your punch is recorded. The code did not match, so it is marked for someone to look at. Nothing is deducted and nothing is decided by this.';
+  }
+  if (outcome === 'declined') {
+    return 'Your punch is recorded. You told us you could not complete the identity check, and your reason is kept with it for a person to read. Nothing is deducted and nothing is decided automatically.';
+  }
+  if (outcome === 'too_many_attempts') {
+    return 'Your punch is recorded. Several identity checks failed on this account in the last few minutes, so we stopped asking rather than keep you here. It is marked for a person to look at.';
+  }
   return '';
 }
 
@@ -405,5 +453,9 @@ export function verificationBadge(outcome: string | null | undefined): string {
   if (outcome === 'not_enrolled') return 'No face enrolled';
   if (outcome === 'no_capture') return 'No face check';
   if (outcome === 'unavailable') return 'Face check unavailable';
+  if (outcome === 'code_match') return 'Confirmed by code';
+  if (outcome === 'code_no_match') return 'Code did not match';
+  if (outcome === 'declined') return 'Identity check not completed';
+  if (outcome === 'too_many_attempts') return 'Identity check stopped';
   return 'Not recorded';
 }

@@ -140,24 +140,80 @@
     `;
     document.body.appendChild(modal);
 
-    document.getElementById('confirmSOS').onclick = function() {
-      var msg = document.getElementById('sosMessage')?.value || '';
-      this.textContent = 'Sending...';
-      this.disabled = true;
+    // ── THE PANIC BUTTON USED TO LIE ────────────────────────────────────────────────────────
+    //
+    // The old handler took ANY JSON response and said "SOS sent. Help is coming." — including
+    // `{ ok:false, error:... }`, which is exactly what /api/safety/sos returns when its INSERT
+    // fails. And on a network failure the `.catch` removed the modal and showed NOTHING AT ALL:
+    // a person in an emergency tapped SEND SOS, the dialog vanished, and they believed help was
+    // on the way. `data.nearbyCount` was printed unguarded too, so a failed call rendered
+    // "undefined nearby users identified".
+    //
+    // Success is claimed ONLY when the server said ok. Every other outcome states plainly that the
+    // alert did not go through, and the modal STAYS OPEN so it can be sent again.
+    var sosBtn = document.getElementById('confirmSOS');
+    if (!sosBtn) return;
+    sosBtn.onclick = function() {
+      var btn = this;
+      var msgEl = document.getElementById('sosMessage');
+      var msg = (msgEl && msgEl.value) || '';
+      btn.textContent = 'Sending...';
+      btn.disabled = true;
+
+      function failed(detail) {
+        btn.textContent = 'RETRY SOS';
+        btn.disabled = false;
+        var box = document.getElementById('sosResult');
+        if (!box) {
+          box = document.createElement('p');
+          box.id = 'sosResult';
+          box.style.cssText = 'font-size:12px;line-height:1.5;color:#fca5a5;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.4);border-radius:8px;padding:10px 12px;margin:0 0 12px;text-align:left;';
+          if (btn.parentNode && btn.parentNode.parentNode) {
+            btn.parentNode.parentNode.insertBefore(box, btn.parentNode);
+          } else {
+            modal.appendChild(box);
+          }
+        }
+        box.textContent = 'YOUR ALERT WAS NOT SENT. ' + detail + ' Nobody has been notified. Contact someone directly, then try again.';
+      }
+
       fetch('/api/safety/sos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
         body: JSON.stringify({ lat: lat, lon: lon, message: msg, radiusM: 100 })
-      }).then(function(r) { return r.json(); })
-      .then(function(data) {
+      }).then(function(r) {
+        // A 401 or a 500 with an HTML body must never be read as a delivered alert.
+        return r.json().then(
+          function(data) { return { status: r.status, data: data || null }; },
+          function() { return { status: r.status, data: null }; }
+        );
+      }).then(function(res) {
+        if (!res.data || res.data.ok !== true) {
+          failed(res.data && res.data.error
+            ? 'The server refused it: ' + res.data.error + '.'
+            : 'The server answered ' + res.status + ' with no confirmation.');
+          return;
+        }
         modal.remove();
+        var count = typeof res.data.nearbyCount === 'number' ? res.data.nearbyCount : null;
         var toast = document.createElement('div');
-        toast.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#ef4444;color:#fff;font-size:13px;font-weight:700;padding:12px 24px;border-radius:100px;z-index:99999;text-align:center;';
-        toast.innerHTML = 'SOS sent. Help is coming.<br><span style="font-size:11px;font-weight:400;">' + data.nearbyCount + ' nearby users identified</span>';
+        toast.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#ef4444;color:#fff;font-size:13px;font-weight:700;padding:12px 24px;border-radius:100px;z-index:99999;text-align:center;max-width:90vw;';
+        var head = document.createElement('span');
+        head.textContent = 'SOS recorded. Admins have been alerted.';
+        var sub = document.createElement('span');
+        sub.style.cssText = 'display:block;font-size:11px;font-weight:400;';
+        sub.textContent = count === null
+          ? 'Nearby users could not be counted.'
+          : count === 0
+            ? 'No one nearby was sharing a location.'
+            : count + (count === 1 ? ' nearby user identified' : ' nearby users identified');
+        toast.appendChild(head);
+        toast.appendChild(sub);
         document.body.appendChild(toast);
-      }).catch(function() {
-        modal.remove();
+        setTimeout(function() { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 12000);
+      }).catch(function(err) {
+        failed('The request never reached the server' + (err && err.message ? ' (' + err.message + ')' : '') + '.');
       });
     };
   }

@@ -1,0 +1,559 @@
+---
+// /portal/wellness/consultant — the wellness consultant's queue.
+//
+// WHY THIS PAGE EXISTS.
+// The consultation request form (/portal/wellness/consult) told every woman who used it: "It goes
+// to one wellness consultant, who reads it and writes back on this page." That was not true. The
+// request was stored correctly and then nothing listed it, nothing routed it and nothing could
+// answer it — listAssignedConsults, getAssignedConsult, respondToConsult, listUnassignedForRouting
+// and routeConsultToConsultant were called by no page in the repository. This is the missing half.
+//
+// WHO MAY OPEN IT. isWellnessConsultant() only — active membership of the consultant pool, read
+// from wellness_consultants on the server on every request. Not a role, not a permission, not an
+// administrator: nothing in the admin console can read a request, and appointing somebody to the
+// pool (which is an administrator's job, at /admin/wellness/consultants) is a separate act from
+// being able to read anything, because the pool row is what the engine checks.
+//
+// WHAT IT SHOWS, AND WHAT IT REFUSES TO.
+//   - The waiting queue shows an identifier, an urgency and how long a request has waited. It does
+//     NOT show the words, the topic, or who wrote it. That is listUnassignedForRouting()'s whole
+//     design: deciding who should read a request needs none of those. Taking one is what makes it
+//     readable, and taking one is recorded as an assignment against your name.
+//   - Your own queue shows the full note, because you are the person it was sent to.
+//   - There is no list of everybody's requests on this page and there is no way to ask for one.
+//
+// FAILURE IS PRINTED, NEVER ROUNDED DOWN TO "NOBODY IS WAITING". Both reads return a discriminated
+// result. On a health queue, an error rendered as an empty list tells a consultant that nobody
+// needs her, which is the most dangerous sentence this system could get wrong.
+//
+// NO JAVASCRIPT. Two forms, both posting to this URL, both redirecting after a successful write so
+// a refresh cannot send a reply twice.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import '@/styles/wellness.css';
+import Card from '@/components/wellness/Card.astro';
+import Notice from '@/components/wellness/Notice.astro';
+import EmptyState from '@/components/wellness/EmptyState.astro';
+import {
+  isWellnessConsultant,
+  listAssignedConsults,
+  listUnassignedForRouting,
+  respondToConsult,
+  routeConsultToConsultant,
+  URGENCY_LABELS,
+  type ConsultRow,
+  type RoutingRow,
+} from '@/lib/wellness';
+
+// --- constants and helpers, all declared above the POST handler that uses them ------------------
+
+const PAGE_PATH = '/portal/wellness/consultant';
+const MAX_REPLY = 4000;
+
+function urgencyLabel(value: string): string {
+  const found = URGENCY_LABELS.find((u) => u.value === value);
+  return found ? found.label : 'Whenever there is time';
+}
+
+function fmtWhen(iso: string): string {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+  } catch {
+    return '';
+  }
+}
+
+/** Plain words for a wait. No colour carries any of this. */
+function waitingLine(hours: number): string {
+  if (hours < 1) return 'Arrived within the hour';
+  if (hours < 24) return 'Waiting ' + hours + (hours === 1 ? ' hour' : ' hours');
+  const days = Math.round(hours / 24);
+  return 'Waiting ' + days + (days === 1 ? ' day' : ' days');
+}
+
+/** A short, stable handle for a request nobody has taken yet. Not a name and not a person. */
+function shortRef(id: string): string {
+  return String(id || '').slice(0, 8);
+}
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent(PAGE_PATH));
+
+// The gate, read fresh from the pool on every request. Fails closed.
+const inPool = await isWellnessConsultant(user.id);
+
+// --- POST --------------------------------------------------------------------------------------
+let errMsg = '';
+let keptReply = '';
+let keptReplyFor = '';
+
+if (inPool && Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const intent = String(fd.get('intent') || '');
+    const target = String(fd.get('request_id') || '').trim();
+
+    if (intent === 'take') {
+      // Taking a request for yourself. routeConsultToConsultant checks pool membership again and
+      // its WHERE status = 'open' means two consultants cannot both take the same one.
+      const res = await routeConsultToConsultant(target, user.id, user.id);
+      if (res.ok) return Astro.redirect(PAGE_PATH + '?taken=1');
+      errMsg = res.error || 'That request could not be taken.';
+    } else if (intent === 'reply') {
+      keptReplyFor = target;
+      keptReply = String(fd.get('response') || '').slice(0, MAX_REPLY);
+      const res = await respondToConsult(user.id, target, keptReply);
+      if (res.ok) return Astro.redirect(PAGE_PATH + '?replied=1');
+      // Keep every word. A failed save is the worst moment to lose a written reply.
+      errMsg = res.error || 'That did not send.';
+    }
+  } catch (e: any) {
+    // Never swallowed: this is a write path.
+    console.error('[wellness/consultant]', e?.cause?.message || e?.message);
+    errMsg = 'That did not send. Please try once more.';
+  }
+}
+
+// --- GET ---------------------------------------------------------------------------------------
+const taken = Astro.url.searchParams.get('taken') === '1';
+const replied = Astro.url.searchParams.get('replied') === '1';
+
+const queueRead = inPool ? await listAssignedConsults(user.id, 50) : null;
+const waitingRead = inPool ? await listUnassignedForRouting(50) : null;
+
+const mine: ConsultRow[] = queueRead && queueRead.ok ? queueRead.value : [];
+const waiting: RoutingRow[] = waitingRead && waitingRead.ok ? waitingRead.value : [];
+
+// The reasons, printed rather than rounded to an empty list.
+const queueFailed = !!queueRead && !queueRead.ok;
+const waitingFailed = !!waitingRead && !waitingRead.ok;
+const queueReason = queueRead && !queueRead.ok ? queueRead.reason : '';
+const waitingReason = waitingRead && !waitingRead.ok ? waitingRead.reason : '';
+// Membership can lapse between the gate above and the read below.
+const lapsed = queueReason === 'not-in-pool';
+
+const openCount = mine.filter((r) => r.status === 'assigned').length;
+---
+
+<BaseLayout
+  title="Consultant queue"
+  description="Requests routed to you, and requests waiting to be taken."
+  noindex={true}
+>
+  <main class="wc" data-module="therapy">
+    <div class="wc-inner">
+
+      <a class="wc-back" href="/portal">Back to the portal</a>
+
+      <header class="wc-head">
+        <p class="wc-eyebrow">Wellness consultation</p>
+        <h1 class="wc-title">Your queue</h1>
+        <p class="wc-lede">
+          Requests routed to you, and requests still waiting for somebody to take them. Taking one is
+          recorded against your name, and it is what makes the words readable.
+        </p>
+      </header>
+
+      {!inPool ? (
+        <Card module="therapy" padding="lg" class="wc-still">
+          <h2 class="wc-h2">This page is for the consultant pool</h2>
+          <p class="wc-p">
+            Consultation requests are readable only by the consultants they are routed to. Your
+            account is not an active member of that pool, so there is nothing here to show you.
+          </p>
+          <p class="wc-p wc-p--muted">
+            If that is wrong, an administrator can add you at the consultant pool screen. Nobody can
+            grant themselves this, and no administrator can read a request.
+          </p>
+        </Card>
+      ) : (
+        <div class="wc-stack">
+
+          {errMsg && (
+            <Notice kind="urgent" title="That did not go through" class="wc-still">
+              <p>{errMsg}</p>
+            </Notice>
+          )}
+
+          {taken && !errMsg && (
+            <Notice kind="info" title="Taken">
+              <p>It is in your queue below, with what she wrote.</p>
+            </Notice>
+          )}
+
+          {replied && !errMsg && (
+            <Notice kind="info" title="Sent">
+              <p>She has been told there is a reply waiting, and can read it on her own page.</p>
+            </Notice>
+          )}
+
+          {lapsed && (
+            <Notice kind="urgent" title="Your pool membership is not active" class="wc-still">
+              <p>
+                We cannot show your queue because your consultant record is not marked active. This is
+                not the same as having nothing waiting. Ask an administrator to reactivate it.
+              </p>
+            </Notice>
+          )}
+
+          <!-- ---------------------------------------------------------------
+               YOUR QUEUE. The full note, because you are who it was sent to.
+               ---------------------------------------------------------------- -->
+          <section class="wc-section" aria-labelledby="queue-h">
+            <h2 class="wc-section-h" id="queue-h">Routed to you</h2>
+
+            {queueFailed && !lapsed ? (
+              <Card module="therapy" padding="lg" class="wc-still">
+                <h3 class="wc-item-title">Your queue could not be read</h3>
+                <p class="wc-p">
+                  This is a fault on our side. We are not going to show you an empty queue and let you
+                  conclude that nobody is waiting, because we do not know that.
+                </p>
+                <p class="wc-p wc-p--muted">Reason recorded: {queueReason}</p>
+              </Card>
+            ) : mine.length === 0 ? (
+              <EmptyState
+                module="therapy"
+                title="Nothing is routed to you"
+                body="When you take a waiting request, or somebody routes one to you, it appears here with what she wrote."
+                headingLevel={3}
+              />
+            ) : (
+              <ul class="wc-list">
+                {mine.map((r) => (
+                  <li class="wc-item">
+                    <Card module="therapy" padding="lg" as="article">
+                      <div class="wc-item-head">
+                        <h3 class="wc-item-title">{r.topic || 'No topic given'}</h3>
+                        <span class="wc-status">{r.status === 'answered' ? 'Answered' : 'Waiting on you'}</span>
+                      </div>
+                      <p class="wc-meta">
+                        {urgencyLabel(r.urgency)} · Sent {fmtWhen(r.createdAt)}
+                        {r.answeredAt ? ' · Answered ' + fmtWhen(r.answeredAt) : ''}
+                      </p>
+
+                      {r.message ? (
+                        <div class="wc-reply">
+                          <p class="wc-reply-from">What she wrote</p>
+                          <p class="wc-reply-body">{r.message}</p>
+                        </div>
+                      ) : (
+                        <p class="wc-p wc-p--muted">
+                          The note is no longer stored. She withdrew this request, which deletes what
+                          she wrote.
+                        </p>
+                      )}
+
+                      {r.response && (
+                        <div class="wc-reply">
+                          <p class="wc-reply-from">Your reply</p>
+                          <p class="wc-reply-body">{r.response}</p>
+                        </div>
+                      )}
+
+                      {r.status === 'assigned' && r.message && (
+                        <form method="POST" class="wc-form" style="margin-top:1rem;">
+                          <input type="hidden" name="intent" value="reply" />
+                          <input type="hidden" name="request_id" value={r.id} />
+                          <div class="wc-field">
+                            <label class="wc-label" for={'reply-' + r.id}>Write back</label>
+                            <textarea
+                              class="wc-textarea"
+                              id={'reply-' + r.id}
+                              name="response"
+                              maxlength={MAX_REPLY}
+                              required
+                              aria-describedby={'reply-hint-' + r.id}
+                            >{keptReplyFor === r.id ? keptReply : ''}</textarea>
+                            <p class="wc-hint" id={'reply-hint-' + r.id}>
+                              Up to {MAX_REPLY} characters. She reads it on her own page, and she is
+                              told a reply is waiting without any of it being repeated in the notice.
+                            </p>
+                          </div>
+                          <button class="wc-submit" type="submit">Send the reply</button>
+                        </form>
+                      )}
+                    </Card>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          <!-- ---------------------------------------------------------------
+               THE WAITING QUEUE. No words, no topic, no name: an identifier, an
+               urgency and a wait. Taking one is what opens it.
+               ---------------------------------------------------------------- -->
+          <section class="wc-section" aria-labelledby="waiting-h">
+            <h2 class="wc-section-h" id="waiting-h">Waiting to be taken</h2>
+
+            <p class="wc-p wc-p--muted">
+              Nothing about these requests is shown until one is taken: not the words, not the topic,
+              not who wrote them. Taking one records the assignment against your name.
+            </p>
+
+            {waitingFailed ? (
+              <Card module="therapy" padding="lg" class="wc-still">
+                <h3 class="wc-item-title">The waiting queue could not be read</h3>
+                <p class="wc-p">
+                  We cannot tell you whether anybody is waiting. That is different from nobody waiting,
+                  so we are not going to print the second one.
+                </p>
+                <p class="wc-p wc-p--muted">Reason recorded: {waitingReason}</p>
+              </Card>
+            ) : waiting.length === 0 ? (
+              <EmptyState
+                module="therapy"
+                title="Nobody is waiting"
+                body="Every request that has been sent is with a consultant."
+                headingLevel={3}
+              />
+            ) : (
+              <ul class="wc-list">
+                {waiting.map((w) => (
+                  <li class="wc-item">
+                    <Card module="therapy" padding="md" as="article">
+                      <div class="wc-item-head">
+                        <h3 class="wc-item-title">Request {shortRef(w.id)}</h3>
+                        <span class="wc-status">{urgencyLabel(w.urgency)}</span>
+                      </div>
+                      <p class="wc-meta">{waitingLine(w.waitingHours)}</p>
+                      <form method="POST">
+                        <input type="hidden" name="intent" value="take" />
+                        <input type="hidden" name="request_id" value={w.id} />
+                        <button class="wc-submit" type="submit">Take this one</button>
+                      </form>
+                    </Card>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          <Notice kind="info" title="What this page is allowed to see">
+            <p>
+              You can read a request because it was routed to you. There is no screen in this system,
+              here or in the admin console, that shows one person's cycle, symptoms or consultation to
+              anybody else, and no administrator can read what is on this page.
+            </p>
+          </Notice>
+
+          {openCount > 0 && (
+            <p class="wc-p wc-p--muted">
+              {openCount === 1 ? 'One request is waiting on your reply.' : openCount + ' requests are waiting on your reply.'}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  </main>
+</BaseLayout>
+
+<style>
+  /* Every value is a token from src/styles/wellness.css. */
+
+  .wc {
+    background-color: var(--w-ground);
+    color: var(--w-ink);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-base);
+    line-height: var(--w-leading-relaxed);
+  }
+
+  .wc-inner {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: var(--w-container-readable);
+    margin: 0 auto;
+    padding: var(--w-space-5) var(--w-space-4) var(--w-space-10);
+  }
+
+  @media (min-width: 640px) {
+    .wc-inner {
+      padding-top: var(--w-space-7);
+      padding-inline: var(--w-space-5);
+    }
+  }
+
+  .wc-back {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--w-tap-min);
+    color: var(--w-ink-3);
+    font-size: var(--w-text-caption);
+    text-decoration: none;
+  }
+  .wc-back:hover { color: var(--w-ink); }
+  .wc-back:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: var(--w-focus-offset);
+    border-radius: var(--w-radius-xs);
+  }
+
+  .wc-head { margin: var(--w-space-2) 0 var(--w-space-6); }
+
+  .wc-eyebrow {
+    margin: 0 0 var(--w-space-2);
+    font-size: var(--w-text-label);
+    font-weight: var(--w-weight-semibold);
+    letter-spacing: var(--w-tracking-wide);
+    text-transform: uppercase;
+    color: var(--w-ink-3);
+  }
+
+  .wc-title {
+    margin: 0 0 var(--w-space-3);
+    font-family: var(--w-font-display);
+    font-size: var(--w-text-h1);
+    font-weight: var(--w-weight-regular);
+    line-height: var(--w-leading-tight);
+    letter-spacing: var(--w-tracking-tight);
+    color: var(--w-ink);
+    text-wrap: balance;
+  }
+
+  .wc-lede { margin: 0; color: var(--w-ink-2); text-wrap: pretty; }
+
+  .wc-stack { display: flex; flex-direction: column; gap: var(--w-space-6); }
+
+  .wc-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-4);
+    scroll-margin-top: var(--w-space-6);
+  }
+
+  .wc-section-h,
+  .wc-h2 {
+    margin: 0;
+    font-family: var(--w-font-display);
+    font-size: var(--w-text-h2);
+    font-weight: var(--w-weight-regular);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+  }
+  .wc-h2 { margin-bottom: var(--w-space-2); }
+
+  .wc-p { margin: 0 0 var(--w-space-3); color: var(--w-ink-2); overflow-wrap: anywhere; }
+  .wc-p:last-child { margin-bottom: 0; }
+  .wc-p--muted { color: var(--w-ink-3); }
+
+  /* Anything shown after a failure holds still, in every motion preference. */
+  .wc-still { animation: none; transition: none; }
+
+  .wc-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--w-space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .wc-item { min-width: 0; }
+
+  .wc-item-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--w-space-2);
+  }
+
+  .wc-item-title {
+    margin: 0;
+    font-size: var(--w-text-h3);
+    font-weight: var(--w-weight-medium);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+    overflow-wrap: anywhere;
+  }
+
+  .wc-status {
+    flex: 0 0 auto;
+    padding: var(--w-space-1) var(--w-space-3);
+    background-color: var(--w-surface-sunk);
+    border-radius: var(--w-radius-pill);
+    font-size: var(--w-text-caption);
+    line-height: var(--w-leading-normal);
+    color: var(--w-ink-2);
+  }
+
+  .wc-meta {
+    margin: var(--w-space-1) 0 var(--w-space-4);
+    font-size: var(--w-text-caption);
+    color: var(--w-ink-3);
+  }
+
+  .wc-reply {
+    margin: 0 0 var(--w-space-3);
+    padding: var(--w-space-4);
+    background-color: var(--w-module-surface);
+    border: var(--w-border-width) solid var(--w-module-border);
+    border-radius: var(--w-radius-md);
+  }
+  .wc-reply-from { margin: 0 0 var(--w-space-2); font-size: var(--w-text-caption); color: var(--w-ink-3); }
+  .wc-reply-body { margin: 0; color: var(--w-ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  .wc-form { display: flex; flex-direction: column; gap: var(--w-space-4); }
+  .wc-field { display: block; }
+
+  .wc-label {
+    display: block;
+    margin: 0 0 var(--w-space-2);
+    font-size: var(--w-text-base);
+    font-weight: var(--w-weight-medium);
+    line-height: var(--w-leading-snug);
+    color: var(--w-ink);
+  }
+
+  .wc-hint {
+    margin: var(--w-space-2) 0 0;
+    font-size: var(--w-text-caption);
+    line-height: var(--w-leading-normal);
+    color: var(--w-ink-3);
+  }
+
+  .wc-textarea {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-height: 8rem;
+    padding: var(--w-space-3);
+    background-color: var(--w-surface-sunk);
+    color: var(--w-ink);
+    border: var(--w-border-width) solid var(--w-hairline-strong);
+    border-radius: var(--w-radius-sm);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-base);
+    line-height: var(--w-leading-normal);
+    resize: vertical;
+    overflow-wrap: anywhere;
+  }
+  .wc-textarea:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: 1px;
+  }
+
+  .wc-submit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    align-self: flex-start;
+    min-height: var(--w-tap-min);
+    padding: var(--w-space-3) var(--w-space-6);
+    background-color: var(--w-module-text);
+    color: var(--w-ink-on-fill);
+    border: 0;
+    border-radius: var(--w-radius-pill);
+    font-family: var(--w-font-text);
+    font-size: var(--w-text-base);
+    font-weight: var(--w-weight-medium);
+    line-height: var(--w-leading-snug);
+    cursor: pointer;
+  }
+  .wc-submit:focus-visible {
+    outline: var(--w-focus-width) solid var(--w-focus);
+    outline-offset: 3px;
+  }
+</style>

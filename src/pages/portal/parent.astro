@@ -7,26 +7,66 @@
 import BaseLayout from '@/layouts/BaseLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/portal/login?next=' + encodeURIComponent('/portal/parent'));
 
-// Self-bootstrap the parent_child_links table.
-try {
-  await db.execute(sql`
-    CREATE TABLE IF NOT EXISTS parent_child_links (
-      id BIGSERIAL PRIMARY KEY,
-      parent_user_id BIGINT NOT NULL,
-      child_user_id BIGINT NOT NULL,
-      relationship TEXT NOT NULL DEFAULT 'parent',
-      is_primary BOOLEAN NOT NULL DEFAULT TRUE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (parent_user_id, child_user_id)
-    )
-  `);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_parent_child_links_parent ON parent_child_links(parent_user_id)`);
-  await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_parent_child_links_child ON parent_child_links(child_user_id)`);
-} catch (_) {}
+// SELF-BOOTSTRAP, ONCE PER PROCESS, AND WITH THE TYPE users.id ACTUALLY HAS.
+//
+// THIS PAGE HAS NEVER WORKED. The table was declared `parent_user_id BIGINT, child_user_id BIGINT`
+// while users.id is UUID (src/lib/db/schema.ts:47). So the INSERT below bound a UUID string into a
+// bigint column (22P02 invalid input syntax) and the read JOINed `u.id = l.child_user_id`, which is
+// uuid = bigint and has no operator at all. Both threw on every single request. The insert's failure
+// was printed at the parent as a raw SQL string, and the read's failure was swallowed entirely, so a
+// parent who had linked a child was shown "No children linked yet" - the one sentence guaranteed to
+// be false for them.
+//
+// THE REPAIR CANNOT LOSE A ROW. The type change runs only when the column is not already uuid AND
+// the table holds no rows - which it cannot, because every insert into it has always failed. Nothing
+// is dropped and nothing is rewritten. On a database where rows did arrive by some other route the
+// guard simply declines, and the page then reports the read failure rather than inventing an answer.
+//
+// It also runs ONCE PER PROCESS instead of three DDL round trips on every page load.
+await ensureOnce('parent_child_links_uuid_v2', async () => {
+  try {
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS parent_child_links (
+        id BIGSERIAL PRIMARY KEY,
+        parent_user_id UUID NOT NULL,
+        child_user_id UUID NOT NULL,
+        relationship TEXT NOT NULL DEFAULT 'parent',
+        is_primary BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (parent_user_id, child_user_id)
+      )
+    `);
+    await db.execute(sql`
+      DO $do$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+           WHERE table_schema = current_schema()
+             AND table_name = 'parent_child_links'
+             AND column_name IN ('parent_user_id', 'child_user_id')
+             AND data_type <> 'uuid'
+        ) AND NOT EXISTS (SELECT 1 FROM parent_child_links) THEN
+          ALTER TABLE parent_child_links
+            ALTER COLUMN parent_user_id TYPE UUID USING parent_user_id::text::uuid,
+            ALTER COLUMN child_user_id  TYPE UUID USING child_user_id::text::uuid;
+        END IF;
+      END
+      $do$
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_parent_child_links_parent ON parent_child_links(parent_user_id)`);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_parent_child_links_child ON parent_child_links(child_user_id)`);
+  } catch (e: any) {
+    // The real Postgres reason is on e.cause; e.message is only the SQL that failed. Rethrown so
+    // ensureOnce drops the memo and the next request retries rather than caching a broken state.
+    console.error('[portal/parent] schema bootstrap failed -', e?.cause?.message || e?.message);
+    throw e;
+  }
+});
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
@@ -48,20 +88,31 @@ if (Astro.request.method === 'POST') {
       if (found.length === 0) {
         formError = 'No EduRankAI account found for that email. The child must register first, then come back here to link.';
       } else {
-        const childId = Number((found[0] as any).id);
-        if (childId === Number(user.id)) {
+        // users.id is a UUID. This was Number() on BOTH sides, so the self-link guard compared
+        // NaN === NaN - which is false - and the NaN was then bound into the insert.
+        const childId = String((found[0] as any).id || '');
+        if (!childId) {
+          formError = 'That account could not be read just now. Try again in a moment.';
+        } else if (childId === String(user.id)) {
           formError = 'You cannot link your own account as a child.';
         } else {
           try {
-            await db.execute(sql`
+            // RETURNING, so "linked" is something the database said rather than something this page
+            // assumed. A statement that changed nothing comes back empty and is reported as such.
+            const wrote = rows(await db.execute(sql`
               INSERT INTO parent_child_links (parent_user_id, child_user_id, relationship, is_primary)
-              VALUES (${user.id}, ${childId}, ${relationship}, ${isPrimary})
+              VALUES (${String(user.id)}::uuid, ${childId}::uuid, ${relationship}, ${isPrimary})
               ON CONFLICT (parent_user_id, child_user_id) DO UPDATE
                 SET relationship = EXCLUDED.relationship, is_primary = EXCLUDED.is_primary
-            `);
-            formOk = 'Child linked. Their dashboard is now visible to you below.';
+              RETURNING id
+            `));
+            if (wrote.length) formOk = 'Child linked. Their dashboard is now visible to you below.';
+            else formError = 'That link was not saved. Nothing else changed - try again in a moment.';
           } catch (e: any) {
-            formError = 'Could not link child: ' + (e?.message || 'database error');
+            // The real reason is on e.cause; e.message is only the failed SQL, and printing that at
+            // a parent taught them nothing while hiding a schema fault for the life of the page.
+            console.error('[portal/parent] could not link child -', e?.cause?.message || e?.message);
+            formError = 'Could not link that account. The reason has been recorded; try again in a moment.';
           }
         }
       }
@@ -83,33 +134,28 @@ type ChildRow = {
   last_login: string | null;
 };
 let children: ChildRow[] = [];
+// AN EMPTY LIST AND A FAILED READ ARE DIFFERENT SENTENCES, and only one of them may be printed as
+// "No children linked yet". When this is set the page says the read did not happen, instead of
+// telling a parent their child is not on the account.
+let childrenError: string | null = null;
 try {
+  // users has no `organization` column - it is declared nowhere in src/lib/db/schema.ts and read
+  // nowhere else in the repository - so the first of the two statements that used to sit here threw
+  // on every load and its "fallback" ran every time. One statement, with the columns that exist.
   children = rows(await db.execute(sql`
     SELECT l.id, l.child_user_id, l.relationship, l.is_primary,
       COALESCE(u.name, u.email, 'Learner') AS name,
       u.email,
-      COALESCE(u.organization, '') AS school,
+      '' AS school,
       u.last_login_at AS last_login
     FROM parent_child_links l
     JOIN users u ON u.id = l.child_user_id
-    WHERE l.parent_user_id = ${user.id}
+    WHERE l.parent_user_id = ${String(user.id)}::uuid
     ORDER BY l.is_primary DESC, l.created_at ASC
   `)) as ChildRow[];
-} catch (_) {
-  // Fallback: users table may not have organization / last_login_at columns.
-  try {
-    children = rows(await db.execute(sql`
-      SELECT l.id, l.child_user_id, l.relationship, l.is_primary,
-        COALESCE(u.name, u.email, 'Learner') AS name,
-        u.email,
-        '' AS school,
-        NULL AS last_login
-      FROM parent_child_links l
-      JOIN users u ON u.id = l.child_user_id
-      WHERE l.parent_user_id = ${user.id}
-      ORDER BY l.is_primary DESC, l.created_at ASC
-    `)) as ChildRow[];
-  } catch (_) {}
+} catch (e: any) {
+  childrenError = String(e?.cause?.message || e?.message || 'unknown database error');
+  console.error('[portal/parent] children read failed -', childrenError);
 }
 
 // Per-child: progress courses, last test, pending fees.
@@ -126,25 +172,38 @@ type ChildDetail = {
   nextClass: string | null;
   weeklyClasses: number;
   weeklyProblems: number;
-  weeklyHours: number;
+  /** Practice SESSIONS recorded this week. Not hours: practice_sessions stores no duration. */
+  weeklyPractice: number;
   lastTestPct: number | null;
 };
 const details: ChildDetail[] = [];
+// Which per-child reads did not happen. Named on the page rather than rendered as a zero, because a
+// zero and a failed query look identical to a parent and only one of them is a fact about a child.
+const readGaps = new Set<string>();
 
 for (const child of children) {
-  // Progress per course/training. Try a few plausible shapes; never throw.
+  // COURSES THIS CHILD IS ENROLLED IN.
+  //
+  // "Try a few plausible shapes; never throw" is how this came to be permanently empty. It read
+  // `trainings` (a table named nowhere else in the repository), `e.training_id` and
+  // `e.progress_percent` (the column is progress_pct, and the join key is course_id - see
+  // src/pages/api/aquintutor/start-enrollment.ts and src/pages/academy/[slug].astro). Every load
+  // threw, the catch ate it, and the parent read "No active course" about a child who had several.
   let courses: CourseRow[] = [];
   try {
     courses = rows(await db.execute(sql`
-      SELECT COALESCE(t.title, 'Course') AS title,
-        COALESCE(e.progress_percent, 0)::int AS percent
+      SELECT COALESCE(c.title, 'Course') AS title,
+        COALESCE(e.progress_pct, 0)::int AS percent
       FROM training_enrollments e
-      LEFT JOIN trainings t ON t.id = e.training_id
-      WHERE e.user_id = ${child.child_user_id}
-      ORDER BY e.created_at DESC
+      LEFT JOIN training_courses c ON c.id = e.course_id
+      WHERE e.user_id = ${String(child.child_user_id)}::uuid
+      ORDER BY COALESCE(e.progress_pct, 0) DESC
       LIMIT 6
     `)).map((r: any) => ({ title: r.title, percent: Number(r.percent || 0) }));
-  } catch (_) {}
+  } catch (e: any) {
+    readGaps.add('courses');
+    console.error('[portal/parent] course progress read failed -', e?.cause?.message || e?.message);
+  }
 
   // Recent test scores from test_attempts (uses candidate_id, not user_id —
   // codebase convention; we honour both via UNION to be safe).
@@ -168,19 +227,29 @@ for (const child of children) {
       total_score: r.total_score !== null ? Number(r.total_score) : null,
       max_score: r.max_score !== null ? Number(r.max_score) : null
     }));
-  } catch (_) {}
+  } catch (e: any) {
+    readGaps.add('tests');
+    console.error('[portal/parent] test history read failed -', e?.cause?.message || e?.message);
+  }
 
-  // Pending fees. Spec says payment_intents — codebase uses `payments`. Try
-  // both shapes; treat any unpaid row as pending.
+  // PENDING FEES, from the ONE table that holds them.
+  //
+  // There is no `payment_intents` table anywhere in src/ or db/ - the name appears in this file and
+  // nowhere else - so the first statement threw every time and fell into a "fallback" that also
+  // threw: `payments.notes` is jsonb and COALESCE(jsonb, text, text) has no common type. Two dead
+  // statements per child per load, and a fee list that could never contain anything.
+  //
+  // `payments` columns are the ones every writer in the product actually names (account-credit.ts,
+  // fee-waiver.ts, create-order): order_id, amount_paise, currency, status, purpose, user_id.
   let pendingFees: FeeRow[] = [];
   try {
     pendingFees = rows(await db.execute(sql`
-      SELECT COALESCE(description, purpose, 'Fee') AS description,
-        COALESCE(amount_paise, amount, 0)::bigint AS amount,
+      SELECT COALESCE(NULLIF(purpose, ''), 'Fee') AS description,
+        COALESCE(amount_paise, 0)::bigint AS amount,
         COALESCE(currency, 'INR') AS currency,
         created_at
-      FROM payment_intents
-      WHERE user_id = ${child.child_user_id}
+      FROM payments
+      WHERE user_id = ${String(child.child_user_id)}::uuid
         AND status IN ('created', 'pending', 'unpaid', 'failed')
       ORDER BY created_at DESC
       LIMIT 5
@@ -190,25 +259,9 @@ for (const child of children) {
       currency: String(r.currency || 'INR'),
       created_at: r.created_at
     }));
-  } catch (_) {
-    try {
-      pendingFees = rows(await db.execute(sql`
-        SELECT COALESCE(notes, purpose, 'Fee') AS description,
-          COALESCE(amount_paise, 0)::bigint AS amount,
-          COALESCE(currency, 'INR') AS currency,
-          created_at
-        FROM payments
-        WHERE user_id = ${child.child_user_id}
-          AND status IN ('created', 'pending', 'unpaid', 'failed')
-        ORDER BY created_at DESC
-        LIMIT 5
-      `)).map((r: any) => ({
-        description: String(r.description || 'Fee'),
-        amount: Number(r.amount || 0),
-        currency: String(r.currency || 'INR'),
-        created_at: r.created_at
-      }));
-    } catch (_) {}
+  } catch (e: any) {
+    readGaps.add('fees');
+    console.error('[portal/parent] pending fee read failed -', e?.cause?.message || e?.message);
   }
 
   // Next class — the child's next LIVE CLASS THEY HOLD A SEAT IN.
@@ -235,36 +288,62 @@ for (const child of children) {
       const r: any = nc[0];
       nextClass = String(r.title || 'Class') + ' to ' + new Date(r.scheduled_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'short', hour: '2-digit', minute: '2-digit' });
     }
-  } catch (_) {}
+  } catch (e: any) {
+    readGaps.add('next class');
+    console.error('[portal/parent] next class read failed -', e?.cause?.message || e?.message);
+  }
 
-  // Weekly summary: attempts in last 7 days, hours studied, problems solved.
+  // THE WEEK, COUNTED FROM ROWS THAT EXIST.
+  //
+  // Two of the three figures here were fiction. "Hours studied" was the number of practice sessions
+  // multiplied by 0.5 - practice_sessions records questions_attempted and questions_correct and no
+  // duration at all, so half an hour per session was invented in this file and shown to a parent as
+  // a measurement of their child. It is now the count of practice sessions, which is a thing that
+  // was actually recorded, and the label below says that.
+  //
+  // "Classes attended" read live_classes.user_id and live_classes.start_at. The comment forty lines
+  // above already establishes that neither column exists (the table has host_user_id and
+  // scheduled_at, and a seat is a row in live_class_enrollments) - but only the OTHER query using
+  // them was repaired, so this one went on throwing and the tile read 0 for everybody, forever.
   let weeklyClasses = 0;
   let weeklyProblems = 0;
-  let weeklyHours = 0;
+  let weeklyPractice = 0;
   try {
     const wc = rows(await db.execute(sql`
       SELECT COUNT(*)::int AS n FROM test_attempts
-      WHERE candidate_id = ${child.child_user_id}
+      WHERE candidate_id = ${String(child.child_user_id)}::uuid
         AND submitted_at >= NOW() - INTERVAL '7 days'
     `));
     weeklyProblems = Number((wc[0] as any)?.n || 0);
-  } catch (_) {}
+  } catch (e: any) {
+    readGaps.add('tests this week');
+    console.error('[portal/parent] weekly attempts read failed -', e?.cause?.message || e?.message);
+  }
   try {
     const wp = rows(await db.execute(sql`
       SELECT COUNT(*)::int AS n FROM practice_sessions
-      WHERE user_id = ${child.child_user_id}
+      WHERE user_id = ${String(child.child_user_id)}::uuid
         AND created_at >= NOW() - INTERVAL '7 days'
     `));
-    weeklyHours = Math.round((Number((wp[0] as any)?.n || 0) * 0.5) * 10) / 10;
-  } catch (_) {}
+    weeklyPractice = Number((wp[0] as any)?.n || 0);
+  } catch (e: any) {
+    readGaps.add('practice this week');
+    console.error('[portal/parent] weekly practice read failed -', e?.cause?.message || e?.message);
+  }
   try {
     const wcl = rows(await db.execute(sql`
-      SELECT COUNT(*)::int AS n FROM live_classes
-      WHERE user_id = ${child.child_user_id}
-        AND start_at >= NOW() - INTERVAL '7 days' AND start_at < NOW()
+      SELECT COUNT(*)::int AS n
+        FROM live_class_enrollments e
+        JOIN live_classes c ON c.id = e.class_id
+       WHERE e.user_id = ${String(child.child_user_id)}::uuid
+         AND c.scheduled_at >= NOW() - INTERVAL '7 days'
+         AND c.scheduled_at < NOW()
     `));
     weeklyClasses = Number((wcl[0] as any)?.n || 0);
-  } catch (_) {}
+  } catch (e: any) {
+    readGaps.add('classes this week');
+    console.error('[portal/parent] weekly class read failed -', e?.cause?.message || e?.message);
+  }
 
   const primaryCourse = courses[0]?.title || 'No active course';
   const primaryProgress = courses[0]?.percent ?? 0;
@@ -273,7 +352,7 @@ for (const child of children) {
   details.push({
     child, courses, primaryCourse, primaryProgress,
     recentTests, pendingFees, nextClass,
-    weeklyClasses, weeklyProblems, weeklyHours, lastTestPct
+    weeklyClasses, weeklyProblems, weeklyPractice, lastTestPct
   });
 }
 
@@ -281,10 +360,11 @@ for (const child of children) {
 const agg = details.reduce((acc, d) => {
   acc.classes += d.weeklyClasses;
   acc.problems += d.weeklyProblems;
-  acc.hours += d.weeklyHours;
+  acc.practice += d.weeklyPractice;
   if (d.lastTestPct !== null) acc.testTotal += d.lastTestPct, acc.testCount += 1;
   return acc;
-}, { classes: 0, problems: 0, hours: 0, testTotal: 0, testCount: 0 });
+}, { classes: 0, problems: 0, practice: 0, testTotal: 0, testCount: 0 });
+const readGapList = Array.from(readGaps).sort().join(', ');
 const weeklyTestPct = agg.testCount > 0 ? Math.round(agg.testTotal / agg.testCount) : null;
 
 function fmtMoney(amount: number, currency: string): string {
@@ -340,10 +420,19 @@ function initial(name: string): string {
     {children.length === 0 ? (
       <div>
         <div class="bg-white border border-ink/10 rounded-2xl p-8 md:p-10 mb-6">
-          <p class="text-[0.62rem] font-mono uppercase tracking-[0.16em] text-burn font-bold mb-3">No children linked yet</p>
-          <h2 class="font-display text-[1.5rem] font-semibold text-ink mb-3 leading-[1.2]">Link your first child to begin.</h2>
+          {/* "No children linked yet" is a claim about this account, and it may only be made when the
+              read that would have found them actually ran. When it did not, that is what is said, and
+              the link form stays below either way so the page is still useful. */}
+          <p class="text-[0.62rem] font-mono uppercase tracking-[0.16em] text-burn font-bold mb-3">
+            {childrenError ? 'Linked children could not be loaded' : 'No children linked yet'}
+          </p>
+          <h2 class="font-display text-[1.5rem] font-semibold text-ink mb-3 leading-[1.2]">
+            {childrenError ? 'This is not the same as having none.' : 'Link your first child to begin.'}
+          </h2>
           <p class="text-[0.92rem] text-ink-soft leading-relaxed max-w-xl mb-6">
-            Your child needs an EduRankAI account first. Once they have one, drop their email below and pick the relationship &mdash; their dashboard appears here instantly.
+            {childrenError
+              ? 'The list of children on your account could not be read just now, so nothing below is a statement about who is linked. The reason has been recorded. Reload in a moment; if it keeps happening, tell us and quote the time.'
+              : 'Your child needs an EduRankAI account first. Once they have one, drop their email below and pick the relationship — their dashboard appears here instantly.'}
           </p>
           <form method="post" class="bg-white border border-ink/10 rounded-2xl p-6 max-w-xl">
             <div class="mb-4">
@@ -375,8 +464,11 @@ function initial(name: string): string {
         <div class="bg-white border border-ink/10 rounded-2xl p-6 md:p-7 mb-8">
           <p class="text-[0.62rem] font-mono uppercase tracking-[0.16em] text-burn font-bold mb-3">This week</p>
           <p class="font-display text-[1.25rem] md:text-[1.45rem] text-ink leading-[1.35]">
-            <strong class="text-ink font-semibold">{agg.classes}</strong> {agg.classes === 1 ? 'class' : 'classes'} attended, <strong class="text-ink font-semibold">{agg.problems}</strong> {agg.problems === 1 ? 'problem' : 'problems'} solved, <strong class="text-ink font-semibold">{agg.hours}</strong> hours studied{weeklyTestPct !== null ? <>, <strong class="text-ink font-semibold">{weeklyTestPct}%</strong> on the last test</> : null}.
+            <strong class="text-ink font-semibold">{agg.classes}</strong> {agg.classes === 1 ? 'class' : 'classes'} attended, <strong class="text-ink font-semibold">{agg.problems}</strong> {agg.problems === 1 ? 'test' : 'tests'} taken, <strong class="text-ink font-semibold">{agg.practice}</strong> practice {agg.practice === 1 ? 'session' : 'sessions'}{weeklyTestPct !== null ? <>, <strong class="text-ink font-semibold">{weeklyTestPct}%</strong> on the last test</> : null}.
           </p>
+          {readGapList && (
+            <p class="text-[0.78rem] text-[#991b1b] mt-2">Not everything on this page could be read: {readGapList}. Those figures are missing, not zero.</p>
+          )}
           {children.length > 1 && (
             <p class="text-[0.78rem] font-mono uppercase tracking-wider text-ink-soft mt-2">Aggregated across {children.length} children</p>
           )}
@@ -487,11 +579,11 @@ function initial(name: string): string {
                 </span>
                 <span class="flex items-center gap-1.5">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
-                  {d.weeklyProblems} problems
+                  {d.weeklyProblems} tests
                 </span>
                 <span class="flex items-center gap-1.5">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                  {d.weeklyHours}h studied
+                  {d.weeklyPractice} practice
                 </span>
               </div>
             </article>

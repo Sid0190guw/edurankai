@@ -5,15 +5,41 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { can } from '@/lib/rbac';
 import { LOCALES, STRINGS, BASE_LOCALE, coverageMerged, getStringOverrides } from '@/lib/i18n';
+import { dbReason } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 const gate = await can(user, 'write', { type: 'content' });
 if (!gate.allow) return Astro.redirect('/admin');
 const sel = (Astro.url.searchParams.get('locale') || 'hi');
-const overrides = await getStringOverrides(sel).catch(() => ({} as Record<string, string>));
+
+// NO TRANSLATIONS AND NO ANSWER ARE NOT THE SAME COVERAGE FIGURE.
+//
+// Both reads below fell back to `{}`, so a database that refused the override query rendered every
+// key as "(missing - falls back)" and every locale at 0%. Somebody looking at that would conclude
+// months of translation work had been lost and start retyping it over rows that are still there.
+// Each read now records whether it answered, and the page says which of the two it is.
+//
+// `const` before first use, and dbReason() unwraps the real Postgres message off e.cause -
+// e.message on a drizzle error is only the SQL that failed.
+const readFailures: string[] = [];
+const overridesFor = async (code: string): Promise<Record<string, string> | null> => {
+  try {
+    return await getStringOverrides(code);
+  } catch (e: any) {
+    readFailures.push(code + ' - ' + dbReason(e));
+    return null;
+  }
+};
+
+const overridesRaw = await overridesFor(sel);
+const overridesReadOk = overridesRaw !== null;
+const overrides: Record<string, string> = overridesRaw || {};
 const baseKeys = Object.keys(STRINGS[BASE_LOCALE] || {});
-const cov = await Promise.all(LOCALES.map(async (l) => ({ l, c: coverageMerged(l.code, await getStringOverrides(l.code).catch(() => ({}))) })));
+const cov = await Promise.all(LOCALES.map(async (l) => {
+  const o = await overridesFor(l.code);
+  return { l, ok: o !== null, c: coverageMerged(l.code, o || {}) };
+}));
 const merged: Record<string, string> = { ...(STRINGS[sel] || {}), ...overrides };
 const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;margin-bottom:16px;';
 const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'Geist Mono',monospace;letter-spacing:0.1em;font-weight:700;margin:0 0 10px;";
@@ -28,17 +54,31 @@ const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'G
     <div style={CARD}>
       <p style={HD}>Coverage</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
-        {cov.map(({ l, c }) => (
+        {cov.map(({ l, ok, c }) => (
           <a href={'/admin/i18n?locale=' + l.code} style={'text-decoration:none;padding:8px 14px;border-radius:10px;border:1px solid ' + (l.code === sel ? '#26324a' : '#1a1a1f') + ';background:' + (l.code === sel ? '#1c2230' : '#12121a') + ';'}>
             <div style="font-size:13px;color:#d6d6de;">{l.native} <span style="font-size:10px;color:#8a8a94;">{l.dir}</span></div>
-            <div style={'font-family:Geist Mono,monospace;font-size:12px;color:' + (c.pct === 100 ? '#6ee7b7' : c.pct >= 50 ? '#c0a35e' : '#fca5a5') + ';'}>{c.pct}% · {c.c ? '' : ''}{c.translated}/{c.total}</div>
+            {ok
+              ? <div style={'font-family:Geist Mono,monospace;font-size:12px;color:' + (c.pct === 100 ? '#6ee7b7' : c.pct >= 50 ? '#c0a35e' : '#fca5a5') + ';'}>{c.pct}% · {c.translated}/{c.total}</div>
+              : <div style="font-family:Geist Mono,monospace;font-size:12px;color:#e8c46a;">unknown</div>}
           </a>
         ))}
       </div>
+      {readFailures.length > 0 && (
+        <p style="font-size:12px;color:#e8c46a;margin:10px 0 0;line-height:1.55;">
+          Stored translations could not be read for {readFailures.length} locale(s), so those figures are unknown rather than zero: {readFailures.join(' | ')}
+        </p>
+      )}
     </div>
 
     <div style={CARD}>
       <p style={HD}>Strings — {sel}</p>
+      {!overridesReadOk && (
+        <p style="font-size:12px;color:#e8c46a;margin:0 0 10px;line-height:1.55;">
+          The stored overrides for this locale could not be read. Every row below is showing the built-in
+          base string only, so "(missing)" here means UNKNOWN, not untranslated. Saving over it would
+          overwrite work that may still exist.
+        </p>
+      )}
       <table style="width:100%;border-collapse:collapse;font-size:12.5px;">
         <thead><tr style="text-align:left;color:#8a8a94;font-size:11px;text-transform:uppercase;"><th style="padding:6px 8px;">Key</th><th style="padding:6px 8px;">English (base)</th><th style="padding:6px 8px;">{sel}</th><th style="padding:6px 8px;"></th></tr></thead>
         <tbody>
@@ -57,15 +97,51 @@ const HD = "font-size:11px;color:#8a8a94;text-transform:uppercase;font-family:'G
   </div>
 
   <script is:inline define:vars={{ sel }}>
+    // IT REPORTED SUCCESS FOR EVERY OUTCOME INCLUDING TOTAL FAILURE.
+    //
+    // The old handler counted the responses that came back ok, printed "Saved N translations" in the
+    // GREEN box whatever N was, and reloaded. Every request being refused produced "Saved 0
+    // translations" on a green background followed by a reload that wiped the typed text — the
+    // translator watched their work vanish and was told it had been saved. There was no .catch
+    // either, so a network failure or a 500 with a non-JSON body left the button sitting there with
+    // no message at all.
+    //
+    // Now: failures are counted and named, the box is only green when NOTHING failed, and the page
+    // reloads only when there is something saved to reload for. When some failed, the typed values
+    // stay on screen so they can be retried rather than retyped.
     document.getElementById('saveAll').addEventListener('click', function () {
+      var btn = this;
       var inputs = Array.prototype.slice.call(document.querySelectorAll('.strIn')).filter(function (i) { return i.value.trim(); });
       var msg = document.getElementById('msg');
+      function say(text, good) {
+        msg.style.display = 'block';
+        msg.style.background = good ? '#0f2a1c' : '#2a0f0f';
+        msg.style.color = good ? '#6ee7b7' : '#fca5a5';
+        msg.textContent = text;
+      }
+      if (inputs.length === 0) { say('Nothing to save - no translation was typed.', false); return; }
+      btn.disabled = true;
       Promise.all(inputs.map(function (i) {
-        return fetch('/api/admin/i18n', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ locale: sel, key: i.getAttribute('data-key'), value: i.value.trim() }) }).then(function (r) { return r.json(); });
+        return fetch('/api/admin/i18n', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ locale: sel, key: i.getAttribute('data-key'), value: i.value.trim() })
+        })
+          .then(function (r) { return r.json().catch(function () { return { ok: false, error: 'HTTP ' + r.status }; }); })
+          .then(function (j) { return { key: i.getAttribute('data-key'), ok: !!(j && j.ok), error: (j && j.error) || 'refused' }; })
+          .catch(function (e) { return { key: i.getAttribute('data-key'), ok: false, error: (e && e.message) || 'network error' }; });
       })).then(function (results) {
-        var okc = results.filter(function (r) { return r.ok; }).length;
-        msg.style.display = 'block'; msg.style.background = '#0f2a1c'; msg.style.color = '#6ee7b7'; msg.textContent = 'Saved ' + okc + ' translations. Reloading…';
-        setTimeout(function () { location.reload(); }, 800);
+        btn.disabled = false;
+        var failed = results.filter(function (r) { return !r.ok; });
+        var okc = results.length - failed.length;
+        if (failed.length === 0) {
+          say('Saved ' + okc + ' translation(s). Reloading...', true);
+          setTimeout(function () { location.reload(); }, 800);
+          return;
+        }
+        var first = failed.slice(0, 3).map(function (r) { return r.key + ' (' + r.error + ')'; }).join(', ');
+        say(okc + ' saved, ' + failed.length + ' NOT saved: ' + first + (failed.length > 3 ? ' and ' + (failed.length - 3) + ' more' : '') + '. Your typing is still on screen - the page has not been reloaded.', false);
       });
     });
   </script>

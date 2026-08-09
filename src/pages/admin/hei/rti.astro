@@ -3,9 +3,17 @@ import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { ensureHeiEditorialSchema } from '@/lib/hei-editorial';
+import { can } from '@/lib/auth/permissions';
+import { dbReason } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
+// AUTHORIZATION FROM permissions.ts, NEVER a users.role literal. `admin.access` is the population
+// src/middleware.ts already admits to every /admin path, so this narrows nobody.
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
+
+// Declared above the POST handler and the reads that set it - `const` is not hoisted.
+let loadError = '';
 
 // hei_rti_filings has no CREATE TABLE anywhere in this repository. The tracker's list query sits in
 // catch(e){}, so a filed RTI vanished from the desk and the sidebar counter read nothing.
@@ -34,7 +42,12 @@ if (Astro.request.method === 'POST') {
       await db.execute(sql`UPDATE hei_rti_filings SET status = ${status}, response_text = ${response||null}, responded_at = ${status==='responded' ? new Date().toISOString() : null}, updated_at = NOW() WHERE id = ${id}`);
       okMsg = 'RTI status updated.';
     }
-  } catch(e: any) { errorMsg = e.message; }
+  } catch (e: any) {
+    // e.message on a drizzle/postgres-js error is the failed SQL; the reason is on e.cause.
+    const reason = dbReason(e);
+    console.error('[admin/hei/rti] ' + action + ' failed -', reason);
+    errorMsg = 'Nothing was saved: ' + reason;
+  }
 }
 
 const url = new URL(Astro.request.url);
@@ -45,7 +58,12 @@ try {
   const statusFilter = filter !== 'all' ? sql`AND status = ${filter}` : sql``;
   const r = await db.execute(sql`SELECT * FROM hei_rti_filings WHERE 1=1 ${statusFilter} ORDER BY filed_at DESC LIMIT 100`);
   filings = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+} catch (e: any) {
+  // `catch(e) {}` drew an unreadable tracker as "No RTI filings yet." An RTI has a statutory reply
+  // clock on it; a filing that has vanished from the desk is not a filing that was never made.
+  loadError = dbReason(e);
+  console.error('[admin/hei/rti] filings read failed -', loadError);
+}
 
 const STATUS_COLOR: Record<string,string> = { filed:'#60a5fa', responded:'#10b981', awaiting:'#fbbf24', declined:'#ef4444', appealed:'#a78bfa' };
 
@@ -77,7 +95,14 @@ function fmtDate(d: any) { if (!d) return '-'; return new Date(d).toLocaleDateSt
   {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
 
   <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
-    {filings.length === 0 && <div style="text-align:center;padding:40px;color:#6e6e78;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;"><p style="font-size:13px;">No RTI filings yet.</p></div>}
+    {loadError && (
+      <div style="padding:16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);border-radius:10px;margin-bottom:10px;">
+        <p style="font-size:13px;font-weight:700;color:#fca5a5;margin:0 0 6px;">The RTI tracker could not be read. This is NOT "no filings".</p>
+        <p style="font-size:12px;color:#f8b4b4;margin:0;line-height:1.6;">A filing with a statutory reply clock running may be invisible here right now. Reload before treating the desk as clear.</p>
+        <p style="font-size:11px;color:#d89a9a;margin:8px 0 0;font-family:'Geist Mono',monospace;word-break:break-word;">{loadError}</p>
+      </div>
+    )}
+    {!loadError && filings.length === 0 && <div style="text-align:center;padding:40px;color:#6e6e78;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;"><p style="font-size:13px;">No RTI filings yet. (The tracker was read successfully.)</p></div>}
     {filings.map((f: any) => {
       const sc = STATUS_COLOR[f.status] || '#6b7280';
       return (

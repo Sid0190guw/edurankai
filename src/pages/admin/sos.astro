@@ -1,52 +1,102 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
+import {
+  listSosEvents, listLiveLocations, resolveSos, parseNearby,
+  SOS_STATUS_LABELS, LIVE_LOCATION_MINUTES,
+} from '@/lib/safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 
+// AUTHORIZATION FROM permissions.ts, NEVER a users.role literal.
+//
+// This page had NO check at all beyond sign-in — src/lib/auth/permissions.ts says so in its own
+// conversion notes ("/admin/sos.astro has NO role check and no PATH_SECTION entry, so canOpenAdmin()
+// alone stands in front of live staff GPS"). `admin.access` is exactly the population that
+// src/middleware.ts already admits to every /admin path, so this narrows nobody who can reach the
+// URL today: it changes HOW the question is asked, not who may act.
+//
+// A NARROWER KEY ALREADY EXISTS AND IS DELIBERATELY NOT USED HERE. `safety.respond` is defined and
+// granted (super_admin + hr) for precisely this console, and enforcing it would REMOVE the other
+// admin roles' access to live colleague locations. That is a policy decision about who answers an
+// emergency, not a mechanism fix, so it is surfaced in the banner below for a human to settle rather
+// than made unilaterally in a repair pass.
+// Sent to /portal, not /admin: an account without admin.access is bounced off /admin by
+// src/middleware.ts too, and redirecting there would be a loop.
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
+
+const holdsSafetyRespond = can(user as any, 'safety.respond');
+
 let okMsg = '';
+let errMsg = '';
+
 if (Astro.request.method === 'POST') {
+  // WRITE PATH. The old handler was `try { UPDATE ... } catch(e) {}` with the success message set
+  // inside the try: a failed close produced NO message of any kind, so a responder saw the alert
+  // still sitting there with no explanation and no idea whether their click had landed.
   const fd = await Astro.request.formData();
-  const id = fd.get('id') as string;
-  const status = fd.get('status') as string;
-  try {
-    await db.execute(sql`UPDATE sos_events SET status=${status}, resolved_by=${user.id}, resolved_at=NOW() WHERE id=${id}`);
-    okMsg = 'SOS status updated.';
-  } catch(e) {}
+  const res = await resolveSos({
+    eventId: String(fd.get('id') || ''),
+    status: String(fd.get('status') || ''),
+    actorId: user.id,
+  });
+  if (res.ok) {
+    okMsg = res.status === 'false_alarm'
+      ? 'Marked as a false alarm. ' + res.subjectName + ' is no longer shown as needing help.'
+      : 'Marked resolved for ' + res.subjectName + '. Recorded against your name and the current time.';
+  } else {
+    errMsg = 'The alert was NOT changed. ' + res.reason;
+  }
 }
 
-let events: any[] = [];
-try {
-  const r = await db.execute(sql`
-    SELECT s.*, u.name as user_name, u.email as user_email
-    FROM sos_events s JOIN users u ON s.user_id = u.id
-    ORDER BY CASE s.status WHEN 'active' THEN 1 ELSE 2 END, s.created_at DESC
-    LIMIT 50
-  `);
-  events = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+const eventsRead = await listSosEvents(50);
+const locationsRead = await listLiveLocations(200);
 
-let onlineLocations: any[] = [];
-try {
-  const r = await db.execute(sql`
-    SELECT ul.*, u.name, u.role FROM user_locations ul
-    JOIN users u ON ul.user_id = u.id
-    WHERE ul.updated_at >= NOW() - INTERVAL '10 minutes'
-    ORDER BY ul.updated_at DESC LIMIT 50
-  `);
-  onlineLocations = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+const events = eventsRead.ok ? eventsRead.rows : [];
+const eventsError = eventsRead.ok ? null : eventsRead.reason;
+const locations = locationsRead.ok ? locationsRead.rows : [];
+const locationsError = locationsRead.ok ? null : locationsRead.reason;
+
+const activeEvents = events.filter((e) => e.status === 'active');
+const pastEvents = events.filter((e) => e.status !== 'active');
+
+// Everything with coordinates belongs on the map. THE MAP USED TO BE RENDERED ONLY WHEN A LOCATION
+// BEACON HAD REPORTED IN THE LAST TEN MINUTES — so an active SOS raised by the one person on a quiet
+// evening, the single case the map exists for, was plotted nowhere at all.
+const plottableSos = activeEvents.filter((e) => e.lat != null && e.lon != null);
+const plottableLocations = locations.filter((l) => l.lat != null && l.lon != null);
+const hasMapPoints = plottableSos.length > 0 || plottableLocations.length > 0;
+
+// Coordinates only. Nothing else on this page needs to reach the browser, and an SOS message can
+// contain anything the person in trouble typed.
+const mapSos = plottableSos.map((e) => ({
+  lat: Number(e.lat), lon: Number(e.lon),
+  name: String(e.user_name || e.user_email || 'Unknown'),
+  message: String(e.message || ''),
+}));
+const mapLocations = plottableLocations.map((l) => ({
+  lat: Number(l.lat), lon: Number(l.lon),
+  name: String(l.name || 'Unknown'),
+  role: String(l.role || ''),
+}));
 
 function timeAgo(d: any) {
   if (!d) return '';
-  const diff = Date.now() - new Date(d).getTime();
-  const mins = Math.floor(diff / 60000);
+  const t = new Date(d).getTime();
+  if (!isFinite(t)) return '';
+  const mins = Math.floor((Date.now() - t) / 60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return mins + 'm ago';
-  return Math.floor(mins / 60) + 'h ago';
+  if (mins < 1440) return Math.floor(mins / 60) + 'h ago';
+  return Math.floor(mins / 1440) + 'd ago';
 }
+function fmt(d: any) {
+  if (!d) return '';
+  try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); }
+  catch { return ''; }
+}
+function statusLabel(s: string) { return (SOS_STATUS_LABELS as any)[s] || s; }
 ---
 <AdminLayout title="SOS & Safety" activeNav="sos">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
@@ -55,48 +105,103 @@ function timeAgo(d: any) {
   .leaflet-popup-content-wrapper { background: #0f0f14; border: 1px solid #1a1a1f; border-radius: 10px; color: #fff; }
   .leaflet-popup-tip { background: #0f0f14; }
   @keyframes sosPulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.4);opacity:0.6} }
+  .sos-alert { background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;border-radius:10px;padding:12px 15px;font-size:13px;line-height:1.6; }
+  .sos-ok { background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px; }
+  .sos-note { background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:12px 15px;font-size:12px;color:#8a8a94;line-height:1.6; }
 </style>
 <div style="padding-bottom:80px;">
   <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;">
-    <div style="display:flex;align-items:center;justify-content:space-between;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
       <div>
         <p style="font-size:10px;font-family:'Geist Mono',monospace;color:#ef4444;letter-spacing:0.12em;text-transform:uppercase;margin:0;">Safety</p>
-        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">SOS & Proximity</h1>
+        <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">SOS &amp; Proximity</h1>
       </div>
-      <div style="display:flex;align-items:center;gap:8px;">
-        {events.filter((e:any)=>e.status==='active').length > 0 && (
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        {/* THE COUNT IS ONLY SHOWN WHEN THE QUEUE WAS ACTUALLY READ. A "0 ACTIVE SOS" badge drawn
+            over a failed read is the single most dangerous pixel on this page. */}
+        {eventsError ? (
+          <span style="font-size:11px;color:#fca5a5;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);padding:4px 10px;border-radius:100px;font-weight:700;">SOS QUEUE UNREADABLE</span>
+        ) : activeEvents.length > 0 ? (
           <div style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.4);border-radius:100px;padding:4px 12px;animation:sosPulse 2s infinite;">
-            <span style="font-size:12px;font-weight:700;color:#ef4444;">{events.filter((e:any)=>e.status==='active').length} ACTIVE SOS</span>
+            <span style="font-size:12px;font-weight:700;color:#ef4444;">{activeEvents.length} ACTIVE SOS</span>
           </div>
+        ) : (
+          <span style="font-size:11px;color:#6ee7b7;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);padding:4px 10px;border-radius:100px;">No active SOS</span>
         )}
-        <span style="font-size:11px;color:#6e6e78;background:#15151a;border:1px solid #1a1a1f;padding:4px 10px;border-radius:100px;">{onlineLocations.length} tracked</span>
+        <span style="font-size:11px;color:#6e6e78;background:#15151a;border:1px solid #1a1a1f;padding:4px 10px;border-radius:100px;">
+          {locationsError ? 'locations unreadable' : locations.length + ' tracked'}
+        </span>
       </div>
     </div>
   </div>
 
-  {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
-
   <div style="padding:12px 16px;display:flex;flex-direction:column;gap:12px;">
+
+    {okMsg && <div class="sos-ok">{okMsg}</div>}
+    {errMsg && <div class="sos-alert"><strong>Nothing changed.</strong> {errMsg}</div>}
+
+    {/* READ FAILURES, SAID OUT LOUD. Both of these used to be `catch(e) {}`, which rendered a total
+        database outage as a quiet evening. */}
+    {eventsError && (
+      <div class="sos-alert">
+        <p style="margin:0 0 6px;font-weight:700;color:#fca5a5;">The SOS queue could not be read. This screen is NOT showing that there are no emergencies.</p>
+        <p style="margin:0;color:#f8b4b4;">There may be an active alert right now that this console cannot see. Reload; if it persists, treat the emergency channel as down and tell someone.</p>
+        <p style="margin:8px 0 0;font-family:'Geist Mono',monospace;font-size:11px;color:#d89a9a;word-break:break-word;">{eventsError}</p>
+      </div>
+    )}
+    {locationsError && (
+      <div class="sos-alert">
+        <p style="margin:0 0 6px;font-weight:700;color:#fca5a5;">Live locations could not be read.</p>
+        <p style="margin:0;color:#f8b4b4;">The map below is missing every location beacon, not showing that nobody is sharing one.</p>
+        <p style="margin:8px 0 0;font-family:'Geist Mono',monospace;font-size:11px;color:#d89a9a;word-break:break-word;">{locationsError}</p>
+      </div>
+    )}
+
+    {!holdsSafetyRespond && (
+      <div class="sos-note">
+        You are reading this console under <strong style="color:#cfd6da;">admin.access</strong>, the permission that
+        opens every admin page. The narrower <strong style="color:#cfd6da;">safety.respond</strong> capability exists
+        for this screen and you do not hold it. Nothing is blocked today; enforcing it would decide who on staff may
+        see colleagues' live locations, and that decision has not been taken.
+      </div>
+    )}
 
     <!-- Live map -->
     <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
-      <div style="padding:10px 14px;border-bottom:1px solid #1a1a1f;display:flex;align-items:center;gap:8px;">
+      <div style="padding:10px 14px;border-bottom:1px solid #1a1a1f;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <div style="width:8px;height:8px;background:#10b981;border-radius:50%;animation:sosPulse 2s infinite;"></div>
-        <p style="font-size:12px;font-weight:600;color:#fff;margin:0;">Live User Locations (last 10 min)</p>
+        <p style="font-size:12px;font-weight:600;color:#fff;margin:0;">Live map — active alerts and beacons from the last {LIVE_LOCATION_MINUTES} minutes</p>
       </div>
-      {onlineLocations.length === 0 ? (
-        <div style="padding:32px;text-align:center;color:#6e6e78;">
-          <p style="font-size:13px;">No active location data. Users share location via GPS permission.</p>
-        </div>
-      ) : (
+      {hasMapPoints ? (
         <div id="sosMap"></div>
+      ) : (
+        <div style="padding:32px;text-align:center;color:#6e6e78;">
+          <p style="font-size:13px;margin:0;">
+            {eventsError || locationsError
+              ? 'Nothing can be plotted because the reads above failed. This is not an empty map.'
+              : 'Nothing to plot: no active alert carries coordinates and no beacon has reported in the last ' + LIVE_LOCATION_MINUTES + ' minutes.'}
+          </p>
+        </div>
+      )}
+      {/* If Leaflet is blocked or offline, the container stays and this line explains the blank box
+          instead of leaving a grey rectangle that reads as "no one is anywhere". */}
+      {hasMapPoints && (
+        <p id="sosMapFallback" style="display:none;padding:14px;margin:0;font-size:12px;color:#fca5a5;">
+          The map library could not be loaded, so the pins below are not drawn. Every alert is still listed in full underneath, with its coordinates.
+        </p>
       )}
     </div>
 
     <!-- Active SOS alerts -->
-    {events.filter((e:any)=>e.status==='active').map((ev: any) => {
-      let nearby: any[] = [];
-      try { nearby = typeof ev.nearby_users === 'string' ? JSON.parse(ev.nearby_users) : (ev.nearby_users || []); } catch(e) {}
+    {!eventsError && activeEvents.length === 0 && (
+      <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:26px;text-align:center;">
+        <p style="font-size:13px;color:#6ee7b7;margin:0 0 4px;font-weight:600;">No active emergencies.</p>
+        <p style="font-size:11.5px;color:#6e6e78;margin:0;">The queue was read successfully at {fmt(new Date())}.</p>
+      </div>
+    )}
+
+    {activeEvents.map((ev: any) => {
+      const nearby = parseNearby(ev.nearby_users);
       return (
         <div style="background:#0f0f14;border:2px solid rgba(239,68,68,0.5);border-radius:12px;overflow:hidden;">
           <div style="background:rgba(239,68,68,0.1);padding:12px 14px;border-bottom:1px solid rgba(239,68,68,0.2);">
@@ -105,28 +210,45 @@ function timeAgo(d: any) {
               <p style="font-size:14px;font-weight:700;color:#ef4444;margin:0;">SOS ALERT</p>
               <span style="font-size:10px;color:#6e6e78;margin-left:auto;">{timeAgo(ev.created_at)}</span>
             </div>
-            <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 2px;">{ev.user_name}</p>
-            <p style="font-size:11px;color:#8a8a94;margin:0;">{ev.user_email}</p>
+            <p style="font-size:13px;font-weight:600;color:#fff;margin:0 0 2px;">{ev.user_name || 'Unknown user'}</p>
+            <p style="font-size:11px;color:#8a8a94;margin:0;">{ev.user_email || 'no email on record'}</p>
             {ev.message && <p style="font-size:12px;color:#fca5a5;margin:6px 0 0;">"{ev.message}"</p>}
           </div>
           <div style="padding:12px 14px;">
-            <p style="font-size:11px;font-weight:700;color:#6e6e78;text-transform:uppercase;margin:0 0 8px;">Location: {ev.lat}, {ev.lon}</p>
-            <p style="font-size:11px;font-weight:700;color:#6e6e78;text-transform:uppercase;margin:0 0 8px;">{nearby.length} users were nearby ({nearby.length === 0 ? 'No witnesses' : 'Potential witnesses'})</p>
-            {nearby.length > 0 && (
+            <p style="font-size:11px;font-weight:700;color:#6e6e78;text-transform:uppercase;margin:0 0 8px;">
+              {ev.lat != null && ev.lon != null
+                ? 'Location: ' + ev.lat + ', ' + ev.lon
+                : 'No coordinates were captured — the alert was raised without GPS'}
+            </p>
+            {/* "0 witnesses" and "the witness list is corrupt" are different facts about an
+                emergency record and used to render as the same sentence. */}
+            <p style="font-size:11px;font-weight:700;color:#6e6e78;text-transform:uppercase;margin:0 0 8px;">
+              {!nearby.ok
+                ? 'The nearby-user list on this record could not be read'
+                : nearby.list.length === 0
+                  ? 'Nobody was sharing a location nearby — no witnesses identified'
+                  : nearby.list.length + ' users were nearby (potential witnesses)'}
+            </p>
+            {nearby.list.length > 0 && (
               <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:12px;">
-                {nearby.map((n: any) => (
-                  <div style="background:#15151a;border-radius:6px;padding:6px 10px;display:flex;justify-content:space-between;">
-                    <span style="font-size:12px;color:#fff;">{n.name}</span>
-                    <span style="font-size:11px;color:#6e6e78;">{Math.round(n.distance_m)}m away</span>
+                {nearby.list.map((n: any) => (
+                  <div style="background:#15151a;border-radius:6px;padding:6px 10px;display:flex;justify-content:space-between;gap:8px;">
+                    <span style="font-size:12px;color:#fff;">{n?.name || 'Unknown'}</span>
+                    <span style="font-size:11px;color:#6e6e78;">{Number.isFinite(Number(n?.distance_m)) ? Math.round(Number(n.distance_m)) + 'm away' : 'distance unknown'}</span>
                   </div>
                 ))}
               </div>
             )}
-            <div style="display:flex;gap:6px;">
-              <a href={`https://maps.google.com/?q=${ev.lat},${ev.lon}`} target="_blank" style="flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#60a5fa;text-decoration:none;font-size:11px;font-weight:600;padding:7px;border-radius:6px;">Open in Maps</a>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              {ev.lat != null && ev.lon != null ? (
+                <a href={'https://maps.google.com/?q=' + ev.lat + ',' + ev.lon} target="_blank" rel="noopener" style="flex:1;min-width:120px;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#60a5fa;text-decoration:none;font-size:11px;font-weight:600;padding:7px;border-radius:6px;">Open in Maps</a>
+              ) : (
+                /* A DISABLED CONTROL THAT EXPLAINS ITSELF, rather than a link to `?q=null,null`. */
+                <span title="This alert carries no coordinates, so there is nothing to open on a map." style="flex:1;min-width:120px;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#4a4a52;font-size:11px;font-weight:600;padding:7px;border-radius:6px;cursor:not-allowed;">No coordinates to map</span>
+              )}
               <form method="POST" style="display:contents;">
                 <input type="hidden" name="id" value={ev.id}/><input type="hidden" name="status" value="resolved"/>
-                <button type="submit" style="flex:1;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:11px;font-weight:600;padding:7px;border-radius:6px;cursor:pointer;">Mark Resolved</button>
+                <button type="submit" style="flex:1;min-width:120px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;font-size:11px;font-weight:600;padding:7px;border-radius:6px;cursor:pointer;">Mark Resolved</button>
               </form>
               <form method="POST" style="display:contents;">
                 <input type="hidden" name="id" value={ev.id}/><input type="hidden" name="status" value="false_alarm"/>
@@ -139,15 +261,21 @@ function timeAgo(d: any) {
     })}
 
     <!-- Past SOS -->
-    {events.filter((e:any)=>e.status!=='active').length > 0 && (
+    {pastEvents.length > 0 && (
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;overflow:hidden;">
-        <div style="padding:10px 14px;border-bottom:1px solid #1a1a1f;"><p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0;">Past Events</p></div>
-        {events.filter((e:any)=>e.status!=='active').map((ev: any) => (
+        <div style="padding:10px 14px;border-bottom:1px solid #1a1a1f;"><p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0;">Past events</p></div>
+        {pastEvents.map((ev: any) => (
           <div style="padding:10px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #0a0a0c;">
-            <div style={`width:8px;height:8px;border-radius:50%;background:${ev.status==='resolved'?'#10b981':'#6b7280'};flex-shrink:0;`}></div>
-            <div style="flex:1;">
-              <p style="font-size:12px;font-weight:600;color:#fff;margin:0;">{ev.user_name}</p>
-              <p style="font-size:10px;color:#6e6e78;margin:1px 0 0;">{ev.status} - {timeAgo(ev.created_at)}</p>
+            <div style={'width:8px;height:8px;border-radius:50%;flex-shrink:0;background:' + (ev.status === 'resolved' ? '#10b981' : '#6b7280') + ';'}></div>
+            <div style="flex:1;min-width:0;">
+              <p style="font-size:12px;font-weight:600;color:#fff;margin:0;">{ev.user_name || 'Unknown user'}</p>
+              {/* WHO CLOSED IT AND WHEN. Both columns were already written and neither was ever
+                  shown, so an emergency record could not be audited from the screen that owns it. */}
+              <p style="font-size:10px;color:#6e6e78;margin:1px 0 0;">
+                {statusLabel(ev.status)} · raised {timeAgo(ev.created_at)}
+                {ev.resolved_at ? ' · closed ' + fmt(ev.resolved_at) : ''}
+                {ev.resolver_name ? ' by ' + ev.resolver_name : ev.resolved_at ? ' by an account since removed' : ''}
+              </p>
             </div>
           </div>
         ))}
@@ -157,33 +285,77 @@ function timeAgo(d: any) {
   </div>
 </div>
 
-{onlineLocations.length > 0 && (
+{hasMapPoints && (
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script is:inline define:vars={{ locations: onlineLocations, sosEvents: events.filter((e:any)=>e.status==='active') }}>
-  document.addEventListener('DOMContentLoaded', function() {
-    var map = L.map('sosMap').setView([20.5937, 78.9629], 5);
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
-    var bounds = [];
+  <script is:inline define:vars={{ locations: mapLocations, sosEvents: mapSos }}>
+  // GUARDED ON EVERY SIDE. This handler used to call L.map('sosMap') with no check on either L or
+  // the container: if the CDN was blocked (or the page was opened offline) the whole listener threw
+  // on its first line, and on a page whose entire purpose is an emergency the failure was silent.
+  (function () {
+    // One popup builder for both marker kinds. Every value goes in through textContent, so a name
+    // or an emergency message can never be parsed as markup.
+    function popupNode(lines) {
+      var holder = document.createElement('div');
+      holder.style.minWidth = '140px';
+      for (var i = 0; i < lines.length; i++) {
+        var p = document.createElement('p');
+        p.style.cssText = lines[i][0];
+        p.textContent = String(lines[i][1] == null ? '' : lines[i][1]);
+        holder.appendChild(p);
+      }
+      return holder;
+    }
+    function draw() {
+      var el = document.getElementById('sosMap');
+      var fallback = document.getElementById('sosMapFallback');
+      if (!el) return;
+      if (typeof L === 'undefined' || !L || !L.map) {
+        el.style.display = 'none';
+        if (fallback) fallback.style.display = 'block';
+        return;
+      }
+      try {
+        var map = L.map('sosMap').setView([20.5937, 78.9629], 5);
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
+        var bounds = [];
 
-    // SOS events - red pulsing
-    sosEvents.forEach(function(ev) {
-      if (!ev.lat || !ev.lon) return;
-      bounds.push([ev.lat, ev.lon]);
-      var m = L.circleMarker([ev.lat, ev.lon], { radius: 16, fillColor: '#ef4444', color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.9 }).addTo(map);
-      m.bindPopup('<div style="min-width:140px;"><p style="font-size:13px;font-weight:700;color:#ef4444;margin:0 0 4px;">SOS: ' + ev.user_name + '</p><p style="font-size:11px;color:#8a8a94;margin:0;">' + (ev.message||'No message') + '</p></div>');
-    });
+        (sosEvents || []).forEach(function (ev) {
+          bounds.push([ev.lat, ev.lon]);
+          var m = L.circleMarker([ev.lat, ev.lon], { radius: 16, fillColor: '#ef4444', color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.9 }).addTo(map);
+          // Built as DOM nodes and bound as an ELEMENT. The old popup concatenated the raised name
+          // and the free-typed emergency message straight into an HTML string.
+          m.bindPopup(popupNode([
+            ['font-size:13px;font-weight:700;color:#ef4444;margin:0 0 4px;', 'SOS'],
+            ['font-size:12px;color:#fff;margin:0;', ev.name],
+            ['font-size:11px;color:#8a8a94;margin:2px 0 0;', ev.message || 'No message']
+          ]));
+        });
 
-    // Regular user locations
-    locations.forEach(function(loc) {
-      if (!loc.lat || !loc.lon) return;
-      bounds.push([loc.lat, loc.lon]);
-      var color = loc.role === 'applicant' ? '#60a5fa' : '#FF7040';
-      var m = L.circleMarker([loc.lat, loc.lon], { radius: 7, fillColor: color, color: color, weight: 1, opacity: 1, fillOpacity: 0.8 }).addTo(map);
-      m.bindPopup('<div><p style="font-size:12px;font-weight:600;color:#fff;margin:0;">' + loc.name + '</p><p style="font-size:10px;color:#8a8a94;margin:2px 0 0;">' + loc.role + '</p></div>');
-    });
+        (locations || []).forEach(function (loc) {
+          bounds.push([loc.lat, loc.lon]);
+          var color = loc.role === 'applicant' ? '#60a5fa' : '#FF7040';
+          var m = L.circleMarker([loc.lat, loc.lon], { radius: 7, fillColor: color, color: color, weight: 1, opacity: 1, fillOpacity: 0.8 }).addTo(map);
+          m.bindPopup(popupNode([
+            ['font-size:12px;font-weight:600;color:#fff;margin:0;', loc.name],
+            ['font-size:10px;color:#8a8a94;margin:2px 0 0;', loc.role]
+          ]));
+        });
 
-    if (bounds.length > 0) map.fitBounds(bounds, { padding: [30, 30] });
-  });
+        if (bounds.length > 0) map.fitBounds(bounds, { padding: [30, 30] });
+      } catch (err) {
+        // A map that fails must say so. Swallowing this is how a responder ends up staring at a
+        // blank rectangle believing there is nothing to see.
+        console.error('[sos] map failed to draw:', err && err.message);
+        el.style.display = 'none';
+        if (fallback) {
+          fallback.textContent = 'The map could not be drawn (' + ((err && err.message) || 'unknown error') + '). Every alert is still listed in full below, with its coordinates.';
+          fallback.style.display = 'block';
+        }
+      }
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', draw);
+    else draw();
+  })();
   </script>
 )}
 </AdminLayout>

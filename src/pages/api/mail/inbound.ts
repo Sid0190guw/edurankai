@@ -4,16 +4,21 @@
 //       -> parsed here with postal-mime. This lets a Cloudflare Email Worker just
 //          forward the raw message with no bundling.
 // Secured by a shared secret (header x-mail-secret, or "secret" in JSON body).
+//
+// THIS ROUTE NO LONGER HAND-WRITES THE DELIVERY. It carried its own copy of the thread lookup, its
+// own INSERTs and its own notification — a second implementation of what src/lib/mail.ts already
+// does, drifted from the IMAP puller's third one. Two consequences no screen could show: a reply
+// whose client dropped In-Reply-To started a brand new thread, because the subject/counterpart
+// fallback in findThreadForInbound() was never reached (the function had no callers at all); and no
+// inbound rule an administrator built on /admin/mail/rules had ever filed a message on arrival.
+// Both doors now go through deliverInbound(). See the block above it in src/lib/mail.ts.
 import type { APIRoute } from 'astro';
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
-import { parseAddressList, resolveAddress, makeSnippet, ensureMailSchema, getMailConfig } from '@/lib/mail';
+import { parseAddressList, resolveAddress, ensureMailSchema, getMailConfig, deliverInbound } from '@/lib/mail';
 import { randomUUID } from 'node:crypto';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
-function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
 
 export const POST: APIRoute = async ({ request }) => {
   await ensureMailSchema();
@@ -66,30 +71,17 @@ export const POST: APIRoute = async ({ request }) => {
       if (!resolved.userId || seen.has(resolved.userId)) continue;
       seen.add(resolved.userId);
 
-      let threadId: string | null = null;
-      if (inReplyTo) {
-        const t = rows(await db.execute(sql`SELECT thread_id FROM mail_messages WHERE rfc_message_id = ${inReplyTo} LIMIT 1`));
-        if (t[0]) threadId = t[0].thread_id;
-      }
-      if (!threadId) threadId = randomUUID();
-
-      const ins = rows(await db.execute(sql`
-        INSERT INTO mail_messages (thread_id, subject, from_user_id, from_email, from_name, body_html, body_text, snippet, direction, rfc_message_id, in_reply_to)
-        VALUES (${threadId}, ${subject}, NULL, ${fromEmail}, ${fromName}, ${bodyHtml || null}, ${bodyText || null}, ${makeSnippet(bodyText, bodyHtml)}, 'inbound', ${rfcId}, ${inReplyTo})
-        RETURNING id
-      `));
-      const messageId = ins[0].id;
-      await db.execute(sql`INSERT INTO mail_recipients (message_id, kind, user_id, email, name) VALUES (${messageId}, 'to', ${resolved.userId}, ${resolved.email}, ${resolved.name})`);
-      await db.execute(sql`
-        INSERT INTO mail_box (user_id, message_id, thread_id, folder, is_read)
-        VALUES (${resolved.userId}, ${messageId}, ${threadId}, 'inbox', false)
-        ON CONFLICT (user_id, message_id) DO NOTHING
-      `);
-      // Notify the recipient that new mail arrived
-      try {
-        const { pushNotify } = await import('@/lib/push');
-        await pushNotify.inboundMail(resolved.userId, fromName || fromEmail || 'someone', subject);
-      } catch (_) {}
+      // Threading, storage, arrival filtering and the recipient's notification, in the one place
+      // that does all four. A throw here still aborts the request and answers 500 — this is a write
+      // path and it must not report a delivery that did not happen.
+      await deliverInbound({
+        userId: resolved.userId,
+        email: resolved.email,
+        name: resolved.name,
+        fromEmail, fromName, subject, bodyText, bodyHtml,
+        rfcMessageId: rfcId,
+        inReplyTo,
+      });
       delivered += 1;
     }
     return json({ ok: true, delivered });

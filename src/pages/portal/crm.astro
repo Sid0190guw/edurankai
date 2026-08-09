@@ -92,9 +92,13 @@ if (Astro.request.method === 'POST') {
       if (!fullName || !email) {
         errMsg = 'Name and email are required.';
       } else {
-        await db.execute(sql`INSERT INTO crm_contacts(owner_user_id, full_name, email, phone, company, role, location, source, pipeline_stage, lifetime_value_chf, tags, notes)
-          VALUES (${user.id}, ${fullName}, ${email}, ${phone}, ${company}, ${role}, ${location}, ${source}, ${stage}, ${ltv}, ${JSON.stringify(tags)}::jsonb, ${notes})`);
-        okMsg = 'Contact added.';
+        // RETURNING, so "added" is the database's answer and not this page's assumption. The rest
+        // of this file was rewritten to that rule; these three writes were left behind.
+        const added = toRows(await db.execute(sql`INSERT INTO crm_contacts(owner_user_id, full_name, email, phone, company, role, location, source, pipeline_stage, lifetime_value_chf, tags, notes)
+          VALUES (${user.id}, ${fullName}, ${email}, ${phone}, ${company}, ${role}, ${location}, ${source}, ${stage}, ${ltv}, ${JSON.stringify(tags)}::jsonb, ${notes})
+          RETURNING id`));
+        if (added.length) okMsg = 'Contact added.';
+        else errMsg = 'That contact was not saved. Nothing else changed - try again in a moment.';
       }
     } else if (action === 'log_activity') {
       const contactId = String(form.get('contact_id') || '');
@@ -104,10 +108,25 @@ if (Astro.request.method === 'POST') {
       if (!contactId || !summary) {
         errMsg = 'Contact and summary required.';
       } else {
-        await db.execute(sql`INSERT INTO crm_activities(contact_id, user_id, kind, summary, due_at, completed_at)
-          VALUES (${contactId}::uuid, ${user.id}, ${kind}, ${summary}, ${dueAt ? sql`${dueAt}::timestamptz` : sql`NULL`}, ${kind === 'task' ? null : sql`NOW()`})`);
-        await db.execute(sql`UPDATE crm_contacts SET last_contacted_at = NOW(), updated_at = NOW() WHERE id = ${contactId}::uuid`);
-        okMsg = 'Activity logged.';
+        // A contact id that is not a UUID reaches Postgres as an invalid literal and raises 22P02,
+        // which the catch then reports as a database complaint about the operator's own click.
+        if (!uuidish(contactId)) {
+          errMsg = 'That is not a contact this page can log against. Nothing was recorded.';
+        } else {
+          const logged = toRows(await db.execute(sql`INSERT INTO crm_activities(contact_id, user_id, kind, summary, due_at, completed_at)
+            VALUES (${contactId}::uuid, ${user.id}, ${kind}, ${summary}, ${dueAt ? sql`${dueAt}::timestamptz` : sql`NULL`}, ${kind === 'task' ? null : sql`NOW()`})
+            RETURNING id`));
+          if (!logged.length) {
+            errMsg = 'That activity was not saved. The contact was not touched either.';
+          } else {
+            // Only after the activity landed. "Last contacted" moving without an entry behind it is
+            // a contact record that says somebody was spoken to and cannot say when or by whom.
+            const touched = toRows(await db.execute(sql`UPDATE crm_contacts SET last_contacted_at = NOW(), updated_at = NOW() WHERE id = ${contactId}::uuid RETURNING id`));
+            okMsg = touched.length
+              ? 'Activity logged.'
+              : 'Activity logged, but no contact with that id exists to stamp, so the timeline entry stands alone.';
+          }
+        }
       }
     } else if (action === 'move_deal_stage') {
       const dealId = String(form.get('deal_id') || '');
@@ -168,9 +187,19 @@ if (Astro.request.method === 'POST') {
       if (!contactId || !title) {
         errMsg = 'Contact and deal title required.';
       } else {
-        await db.execute(sql`INSERT INTO crm_deals(contact_id, owner_user_id, title, amount_chf, stage, close_date, probability_pct)
-          VALUES (${contactId}::uuid, ${user.id}, ${title}, ${amount}, ${stage}, ${closeDate ? sql`${closeDate}::date` : sql`NULL`}, ${prob})`);
-        okMsg = 'Deal created.';
+        if (!uuidish(contactId)) {
+          errMsg = 'That is not a contact this page can open a deal against. Nothing was created.';
+        } else if (!(STAGES as readonly string[]).includes(stage)) {
+          // Same rule the move handler already applies: an unrecognised stage puts a deal in a
+          // column no view renders, where it is invisible rather than merely wrong.
+          errMsg = 'That is not a stage on this pipeline. Nothing was created.';
+        } else {
+          const created = toRows(await db.execute(sql`INSERT INTO crm_deals(contact_id, owner_user_id, title, amount_chf, stage, close_date, probability_pct)
+            VALUES (${contactId}::uuid, ${user.id}, ${title}, ${amount}, ${stage}, ${closeDate ? sql`${closeDate}::date` : sql`NULL`}, ${prob})
+            RETURNING id`));
+          if (created.length) okMsg = 'Deal created.';
+          else errMsg = 'That deal was not saved. Nothing else changed - try again in a moment.';
+        }
       }
     } else if (action === 'close_task') {
       // THE TASKS PANEL LISTED WORK AND OFFERED NO WAY TO FINISH IT. crm_activities.completed_at was
@@ -202,15 +231,10 @@ const page = pageParam(Astro.url.searchParams.get('p'));
 const perPage = 25;
 const offset = (page - 1) * perPage;
 
-const allowedSort: Record<string, string> = {
-  name: 'full_name ASC',
-  company: 'company ASC NULLS LAST',
-  last_contacted: 'last_contacted_at DESC NULLS LAST',
-  ltv: 'lifetime_value_chf DESC NULLS LAST',
-  stage: 'pipeline_stage ASC',
-  updated_at: 'updated_at DESC',
-};
-const orderBy = allowedSort[sortKey] || allowedSort.updated_at;
+// The ORDER BY vocabulary that used to be restated here is gone. It was computed into `orderBy` and
+// then never read by anything: listContacts() in src/lib/crm.ts owns the mapping and is what the
+// sort control actually reaches. A second copy of a vocabulary that nothing consults is the drift
+// this file has already been bitten by twice.
 
 // Stage counts for kanban
 // Derived from STAGES above rather than restated, so the list the handler validates against and the

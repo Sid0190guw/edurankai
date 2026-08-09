@@ -18,7 +18,7 @@ import { sql as sqlExpr } from 'drizzle-orm';
 // THE CONSEQUENCE IS REAL AND IS STATED ON SCREEN BELOW: until statutory components are configured, a
 // new run deducts none of them, so net pay is higher than a run generated before this change. That is
 // visible on this page, not silent.
-import { generateRun, computePay, listComponents, MONTH_NAMES as PAYROLL_MONTHS } from '@/lib/payroll';
+import { generateRun, computePay, listComponents, ensurePayrollSchema, MONTH_NAMES as PAYROLL_MONTHS } from '@/lib/payroll';
 // safeRows keeps "there are no payroll runs" apart from "we could not read the payroll runs" —
 // on this screen the second one, rendered as the first, invites somebody to generate a duplicate
 // month. clip/confirmAttr keep a long or apostrophe-bearing name from breaking a card or a prompt.
@@ -43,6 +43,17 @@ if (!can(user as any, 'payroll.manage')) return Astro.redirect('/admin?denied=pa
 
 let errorMsg = '';
 let successMsg = '';
+
+// WHO THE RUN REFUSED TO PAY, AND THE LINK TO THE RECORD THAT MAKES THEM PAYABLE.
+//
+// Declared here, above the POST handler that fills it and above the markup that renders it — `const`
+// is not hoisted and a binding declared under its first reader has taken pages down on this project.
+//
+// This is a separate slot from the flash strings on purpose. "Two people were skipped" inside a
+// sentence is a fact somebody reads and forgets; a named row with a route to /admin/hr/employees/<id>
+// is a fact somebody can act on before the run is marked paid. The whole point of refusing to write
+// a zero payslip is lost if the refusal is not reachable.
+let skippedFromRun: Awaited<ReturnType<typeof generateRun>>['skipped'] = [];
 
 // Payroll decisions and salary changes are money decisions: they must leave a trail. Nothing
 // under /admin/hr wrote to audit_log, so a salary could be changed and there was no record of
@@ -107,6 +118,27 @@ if (Astro.request.method === 'POST') {
         if (run.failed.length) {
           parts.push(`${run.failed.length} employee${run.failed.length === 1 ? ' was' : 's were'} left out because their payslip could not be written: ${run.failed.join(', ')}. Nobody was paid a wrong amount — they simply have no payslip in this run.`);
         }
+        // PEOPLE THE RUN REFUSED TO PAY ARE NOT A FOOTNOTE ON A SUCCESS MESSAGE.
+        //
+        // generateRun() now declines to build a payslip out of a salary that was never recorded —
+        // the state a newly signed joiner is left in — because that payslip reads zero, reconciles
+        // (0 == 0), and is then marked paid and pushed to the person as "Salary credited ... 0".
+        // The refusal only helps if it is READ, so it goes in the error slot with the reason and a
+        // route, and it is written to the run as well: see the notices on each run card, which are
+        // still there on the day somebody presses Approve or Mark Paid.
+        const skippedSentences = run.skipped.map((sk) => sk.name + ' — ' + sk.reason);
+        // THE REFUSALS GO IN THEIR OWN BLOCK, WITH A ROUTE TO EACH RECORD.
+        //
+        // generateRun() now declines to write a payslip for anybody who has no base salary and no
+        // salary structure — the state the candidate signing path leaves a new joiner in, because
+        // completeHire() will not guess a number out of an offer letter's free text. Before this, a
+        // NULL salary produced a complete payslip of zeroes that balanced, reported success and was
+        // then marked paid, pushing the person "Salary credited ... 0" for their first month.
+        //
+        // The names go into skippedFromRun rather than into the flash sentence so each one can carry
+        // a link to the employee record where the salary is entered. A refusal nobody can act on is
+        // the same silence in a different shape.
+        skippedFromRun = run.skipped;
         if (run.noStatutoryComponents) {
           // THE PAGE NO LONGER INSTRUCTS AN ACTION IT DOES NOT PROVIDE. This ended "…then regenerate",
           // and there is no regenerate: generateRun() refuses a second run for a period that already
@@ -120,10 +152,21 @@ if (Astro.request.method === 'POST') {
         // bonus which never reached its ledger is the one class of failure in this run somebody has
         // to repair by hand: the loan balance stays high and the person is charged again next month,
         // or a one-off bonus pays a second time.
-        if (run.ledgerWarnings.length) {
-          errorMsg = run.ledgerWarnings.length + ' thing'
-            + (run.ledgerWarnings.length === 1 ? '' : 's')
-            + ' on this run need checking by hand. ' + run.ledgerWarnings.join(' ');
+        if (run.skipped.length || run.ledgerWarnings.length) {
+          const bits: string[] = [];
+          if (run.skipped.length) {
+            bits.push(run.skipped.length + ' employee'
+              + (run.skipped.length === 1 ? ' was' : 's were')
+              + ' NOT paid by this run and ' + (run.skipped.length === 1 ? 'has' : 'have')
+              + ' no payslip for this month: ' + skippedSentences.join(' ')
+              + ' Fix the record and pay them by hand — this month cannot be regenerated.');
+          }
+          if (run.ledgerWarnings.length) {
+            bits.push(run.ledgerWarnings.length + ' thing'
+              + (run.ledgerWarnings.length === 1 ? '' : 's')
+              + ' on this run need checking by hand. ' + run.ledgerWarnings.join(' '));
+          }
+          errorMsg = bits.join(' ');
         }
         successMsg = parts.join(' ');
       }
@@ -224,6 +267,14 @@ if (Astro.request.method === 'POST') {
         if (res.credited > 0) bits.push(`${res.credited} wallet${res.credited === 1 ? '' : 's'} credited (₹${Math.round(res.total).toLocaleString('en-IN')})`);
         if (res.alreadyCredited > 0) bits.push(`${res.alreadyCredited} ${res.alreadyCredited === 1 ? 'was' : 'were'} already credited by an earlier run of this step`);
         if (res.credited === 0 && res.alreadyCredited === 0) bits.push('no wallet was credited');
+        // creditPayrollRun() has always counted the payslips it passed over — a net of zero, or a
+        // payslip with no employee linked to it — and this console threw the number away. Those people
+        // are then notified about a payslip and never credited, so the count belongs on the same
+        // sentence as the credits rather than nowhere.
+        if (res.skipped > 0) {
+          bits.push(res.skipped + ' payslip' + (res.skipped === 1 ? '' : 's')
+            + ' had nothing to credit (no net pay on ' + (res.skipped === 1 ? 'it' : 'them') + ')');
+        }
         payoutMsg = ' ' + bits.join('; ') + '.';
         if (res.failures.length) {
           walletCreditFailed = true;
@@ -269,6 +320,14 @@ if (Astro.request.method === 'POST') {
           // actually did — the single most misleading message this module can send.
           const inWallet = walletOk.has(String(row.employee_id));
           const amount = row.net_pay != null ? 'Rs ' + Math.round(Number(row.net_pay)).toLocaleString('en-IN') : null;
+          // A THIRD STATE, BETWEEN "CREDITED" AND "THE CREDIT FAILED".
+          //
+          // creditPayrollRun() writes no wallet transaction for a payslip whose net is zero — full
+          // loss of pay, or a month that genuinely owes nothing — and that person is not in walletOk,
+          // so they were pushed "the wallet credit has not gone through yet, HR is completing it".
+          // They then wait for money that is not coming and nobody is expecting to send. The payslip
+          // itself is the true answer and it is already selected here.
+          const nothingToCredit = row.net_pay != null && !(Number(row.net_pay) > 0);
           try {
             await sendPushToUser(row.user_id, {
               type: 'payroll_run',
@@ -277,6 +336,10 @@ if (Astro.request.method === 'POST') {
                 ? (amount
                     ? 'Your payslip is ready and ' + amount + ' has been credited to your wallet.'
                     : 'Your payslip is ready and your salary has been credited to your wallet.')
+                : nothingToCredit
+                ? 'Your payslip for this month is ready and it shows no net pay, so nothing has been '
+                  + 'credited to your wallet. Open the payslip to see how that was worked out, and '
+                  + 'ask HR if it does not look right.'
                 : (amount
                     ? 'Your payslip for this run is ready (' + amount + '). The wallet credit has not gone through yet — HR is completing it.'
                     : 'Your payslip for this run is ready. The wallet credit has not gone through yet — HR is completing it.'),
@@ -422,6 +485,54 @@ const runsRes = await safeRows('[payroll] run list', () =>
   db.execute(sqlExpr`SELECT * FROM hr_payroll_runs ORDER BY year DESC, month DESC LIMIT 24`));
 const runRows = runsRes.rows;
 
+// =================================================================================================
+// WHAT EACH RUN COULD NOT DO, ON THE SCREEN WHERE THE MONEY IS RELEASED
+// =================================================================================================
+//
+// generateRun() returns the people it refused to pay and everything that needs checking by hand, and
+// this page printed all of it ONCE — in the response to the POST that created the run. Approve and
+// Mark Paid are pressed on a later page load, usually another day and often by somebody who never
+// saw that message. So a month with a joiner left out of it looked, on the screen where the money is
+// released, exactly like a month with nobody left out.
+//
+// hr_payroll_run_notices is the same sentences, kept. Read here for every run in the list above, in
+// ONE statement rather than one per card.
+//
+// A FAILED READ IS NOT AN EMPTY LIST. If this read does not answer, the cards below say nothing —
+// which would read as "nothing was left out" over a Mark Paid button. It is named in the banner with
+// the other failed reads instead.
+let noticeReadOk = true;
+let noticeRows: any[] = [];
+try {
+  await ensurePayrollSchema();
+  const nres = await db.execute(sqlExpr`
+    SELECT n.payroll_run_id, n.employee_id, n.employee_name, n.severity, n.message
+      FROM hr_payroll_run_notices n
+     WHERE n.payroll_run_id IN (SELECT id FROM hr_payroll_runs ORDER BY year DESC, month DESC LIMIT 24)
+     ORDER BY n.payroll_run_id, (n.severity = 'skipped') DESC, n.created_at ASC
+     LIMIT 500`);
+  // postgres-js hands back a PLAIN ARRAY. `.rows` is undefined on it and would read as "no notices".
+  noticeRows = Array.isArray(nres) ? nres : ((nres as any)?.rows || []);
+} catch (e: any) {
+  noticeReadOk = false;
+  console.error('[payroll] run notices could not be read -', dbReason(e));
+}
+const noticesByRun = new Map<string, any[]>();
+for (const n of noticeRows) {
+  const key = String(n.payroll_run_id);
+  const list = noticesByRun.get(key);
+  if (list) list.push(n);
+  else noticesByRun.set(key, [n]);
+}
+/** Every notice on one run. Declared above the markup that calls it. */
+function noticesFor(runId: any): any[] {
+  return noticesByRun.get(String(runId)) || [];
+}
+/** How many people on that run have NO payslip at all. The number that belongs beside Mark Paid. */
+function skippedOn(runId: any): number {
+  return noticesFor(runId).filter((n) => String(n.severity) === 'skipped').length;
+}
+
 // Payslips for selected run. PAGED: a run for a few thousand employees rendered every payslip card
 // into one column, and this is the tab HR opens on a phone the morning after a run.
 const PAYSLIP_PER_PAGE = 50;
@@ -485,6 +596,7 @@ if (payslipsRes && !payslipsRes.ok) readFailures.push('the payslips on the selec
 if (payslipCountRes && !payslipCountRes.ok) readFailures.push('how many payslips that run carries');
 if (!employeesRes.ok) readFailures.push('the employees on Salary Setup');
 if (!componentsReadOk) readFailures.push('the salary component catalogue');
+if (!noticeReadOk) readFailures.push('whether anybody was left out of these runs, and what on them still needs checking by hand — the cards below are NOT saying that nothing was');
 const firstReadError = runsRes.error || (payslipsRes && payslipsRes.error) || employeesRes.error || null;
 
 const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -524,6 +636,33 @@ function fmt(n: any) {
 
   {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {successMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{successMsg}</div>}
+
+  {/* NOBODY WAS PAID ZERO BY ACCIDENT — AND HERE IS WHO WAS LEFT OUT INSTEAD.
+      Amber rather than red: nothing failed and no money moved wrongly. The run deliberately declined
+      to write a payslip it could not compute from an agreed figure, and each name carries the link to
+      the record where that figure is entered, so the refusal ends in an action rather than in a
+      sentence. */}
+  {skippedFromRun.length > 0 && (
+    <div style="margin:12px 16px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.35);color:#fcd34d;border-radius:8px;padding:12px 14px;font-size:13px;">
+      <div style="font-weight:700;margin-bottom:6px;">
+        {skippedFromRun.length === 1
+          ? '1 employee was left out of this run on purpose'
+          : skippedFromRun.length + ' employees were left out of this run on purpose'}
+      </div>
+      <div style="margin-bottom:8px;color:#fde68a;">
+        No payslip was written for them and no money has moved. Record their pay, then include them in
+        the next period — this run cannot be regenerated.
+      </div>
+      <ul style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px;">
+        {skippedFromRun.map((s) => (
+          <li>
+            <a href={s.fixHref} style="color:#fcd34d;font-weight:600;text-decoration:underline;">{s.name}</a>
+            <span> — {s.reason}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )}
 
   {/* WHAT COULD NOT BE READ, ON THE SCREEN THAT CREATES PAYROLL RUNS. Without this, a failed read
       of hr_payroll_runs renders as "No payroll runs yet" directly above a button that creates one —
@@ -607,6 +746,41 @@ function fmt(n: any) {
                 <p style="font-size:12px;font-weight:600;color:#6ee7b7;margin:2px 0 0;overflow-wrap:anywhere;">₹{fmt(run.total_net)}</p>
               </div>
             </div>
+            {/* WHAT THIS RUN COULD NOT DO — ABOVE THE BUTTONS THAT RELEASE THE MONEY.
+                These sentences were printed once, in the response to the POST that created the run,
+                and Approve and Mark Paid happen on a later page load. A month with a joiner left out
+                of it therefore looked identical here to a month with nobody left out. Each notice
+                names the person and links to the record that makes them payable. */}
+            {noticesFor(run.id).length > 0 && (
+              <div style="background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.32);border-radius:8px;padding:10px 12px;margin-bottom:10px;">
+                <p style="font-size:12px;font-weight:700;color:#fbbf24;margin:0 0 6px;">
+                  {skippedOn(run.id) > 0
+                    ? skippedOn(run.id) + ' person' + (skippedOn(run.id) === 1 ? ' has' : 's have') + ' NO payslip in this run'
+                    : 'This run needs checking by hand'}
+                  {skippedOn(run.id) > 0 && noticesFor(run.id).length > skippedOn(run.id)
+                    ? ', and there is more to check by hand'
+                    : ''}
+                </p>
+                {noticesFor(run.id).slice(0, 6).map(n => (
+                  <p style="font-size:11.5px;color:#fde68a;margin:0 0 5px;line-height:1.6;overflow-wrap:anywhere;">
+                    {clip(String(n.message || ''), 320)}
+                    {n.employee_id && (
+                      <a href={'/admin/hr/employees/' + n.employee_id} style="color:#FF7040;"> Open their record</a>
+                    )}
+                  </p>
+                ))}
+                {noticesFor(run.id).length > 6 && (
+                  <p style="font-size:11px;color:#d1a54a;margin:0;">
+                    And {noticesFor(run.id).length - 6} more on this run.
+                  </p>
+                )}
+                <p style="font-size:11px;color:#d1a54a;margin:6px 0 0;line-height:1.6;">
+                  A month cannot be regenerated — a second run for one period recovers every loan
+                  instalment and pays every one-off bonus again. Fix the record, then pay anybody
+                  listed above by hand.
+                </p>
+              </div>
+            )}
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
               <a href={`?tab=payslips&run=${run.id}`} style="flex:1;text-align:center;background:#15151a;border:1px solid #1a1a1f;color:#d8d8de;text-decoration:none;font-size:12px;font-weight:500;padding:7px;border-radius:6px;min-width:80px;">
                 View Payslips
@@ -634,7 +808,11 @@ function fmt(n: any) {
                   'Mark the ' + (MONTH_NAMES[(run.month || 1) - 1] || 'unknown month') + ' ' + run.year
                   + ' payroll as paid? ' + (run.total_employees ?? 0) + ' employee'
                   + (Number(run.total_employees) === 1 ? '' : 's') + ' will be credited ' + fmt(run.total_net)
-                  + ' net in their wallets and told they have been paid. There is no undo.')}>
+                  + ' net in their wallets and told they have been paid. There is no undo.'
+                  + (skippedOn(run.id) > 0
+                      ? ' ' + skippedOn(run.id) + ' other person on this month has NO payslip and will'
+                        + ' be paid nothing — read the notices on this card first.'
+                      : ''))}>
                   <input type="hidden" name="action" value="mark_paid" />
                   <input type="hidden" name="runId" value={run.id} />
                   <button type="submit" style="width:100%;background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.4);color:#a7f3d0;font-size:12px;font-weight:600;padding:7px;border-radius:6px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;min-height:44px;">
@@ -674,6 +852,16 @@ function fmt(n: any) {
         <div style="background:#0f0f14;border:1px solid #FF4F00;border-radius:10px;padding:10px 14px;margin-bottom:12px;">
           <p style="font-size:12px;color:#FF7040;margin:0;font-weight:600;">{MONTH_NAMES[(selectedRun.month||1)-1]} {selectedRun.year} — {selectedRun.status ? String(selectedRun.status).toUpperCase() : 'NO STATUS'}</p>
           <p style="font-size:11px;color:#6e6e78;margin:4px 0 0;">{selectedRun.total_employees ?? 0} employees · Net: ₹{fmt(selectedRun.total_net)}</p>
+          {/* THE COUNT ABOVE IS PEOPLE WHO WERE PAID, NOT PEOPLE WHO WORKED THAT MONTH. Anybody the
+              run refused to build a payslip for is missing from this list of payslips as well, so
+              the reason is repeated here rather than left on the other tab. */}
+          {skippedOn(selectedRun.id) > 0 && (
+            <p style="font-size:11.5px;color:#fbbf24;margin:6px 0 0;line-height:1.6;">
+              {skippedOn(selectedRun.id)} more {skippedOn(selectedRun.id) === 1 ? 'person is' : 'people are'} NOT
+              on this run and {skippedOn(selectedRun.id) === 1 ? 'has' : 'have'} no payslip for this month.
+              <a href="?tab=runs" style="color:#FF7040;"> See why on the run</a>.
+            </p>
+          )}
         </div>
       )}
       {/* A RUN ID THAT IS NOT IN THE LIST. The list is the latest 24 runs, so this is reachable
@@ -808,9 +996,24 @@ function fmt(n: any) {
                 Astro does not interpolate — the browser received the literal text, dropped the
                 declaration, and "Not set" was rendered in the same colour as a real salary. */}
             <div style="text-align:right;flex:0 0 auto;">
-              <p style={`font-size:13px;font-weight:600;margin:0;color:${emp.gross_salary ? '#fff' : '#8a8a94'};`}>
-                {emp.gross_salary ? `${emp.currency || 'INR'} ${fmt(emp.gross_salary)}/mo` : 'Not set'}
+              {/* "NOT SET" IS NO LONGER A COSMETIC BLANK. A person with no salary structure AND no
+                  base salary is skipped by the next payroll run — generateRun() refuses to build a
+                  payslip out of an absent figure, because that payslip reads zero and is then marked
+                  paid. This column is where somebody sees that coming, so it distinguishes the two
+                  states it used to collapse: a base salary recorded with no structure yet, and
+                  nothing recorded anywhere. */}
+              <p style={`font-size:13px;font-weight:600;margin:0;color:${emp.gross_salary || emp.base_salary ? '#fff' : '#fbbf24'};`}>
+                {emp.gross_salary
+                  ? `${emp.currency || 'INR'} ${fmt(emp.gross_salary)}/mo`
+                  : emp.base_salary
+                  ? `${emp.currency || 'INR'} ${fmt(emp.base_salary)}/mo`
+                  : 'No salary recorded'}
               </p>
+              {!emp.gross_salary && !emp.base_salary && (
+                <p style="font-size:10px;color:#fbbf24;margin:2px 0 0;line-height:1.5;max-width:150px;">
+                  Payroll will leave them out of the next run rather than pay them zero.
+                </p>
+              )}
               <p style="font-size:10px;color:#FF7040;margin:0;">Tap to edit</p>
             </div>
           </summary>

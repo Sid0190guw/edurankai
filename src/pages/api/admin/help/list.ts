@@ -1,14 +1,24 @@
 // GET /api/admin/help/list - list conversations for the admin inbox.
 // ?status=open|closed|all (default open)
 // ?unread=1 to filter only conversations with unread visitor messages
+//
+// The failure path handed the caller `e.message` - the failed SQL, not a sentence anybody can act on
+// - which is the same leak its sibling thread.ts already closed. The reason goes to the log; the
+// inbox gets something it can print.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { denyAdminApi } from '@/lib/auth/api-guard';
+import { logEvent } from '@/lib/logger';
 
+// Declared above the handler that uses them: `const` is not hoisted, and a handler reaching a later
+// declaration has taken pages down on this project.
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
+
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 export const GET: APIRoute = async ({ request, locals }) => {
   // The whole applicant support inbox. middleware.ts:50 maps /admin/help to the `messages` section,
@@ -55,6 +65,7 @@ export const GET: APIRoute = async ({ request, locals }) => {
 
     return json({ ok: true, conversations: rows, unreadCount });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'db error' }, 500);
+    logEvent('error', 'help.list.failed', { message: reasonOf(e) });
+    return json({ ok: false, error: 'The support inbox could not be read just now.' }, 500);
   }
 };

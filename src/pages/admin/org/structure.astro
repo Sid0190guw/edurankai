@@ -1,0 +1,416 @@
+---
+// /admin/org/structure — teams, positions, and who currently sits where.
+//
+// WHY THIS PAGE EXISTS. src/lib/org-graph-schema.ts creates org_teams, org_positions and
+// org_employee_assignments with real care — column back-fills, three indexes each, and a partial
+// unique index enforcing one open primary posting per person. Nothing in the repository ever
+// INSERTed into any of them. src/lib/org-chart.ts read org_teams to draw the Team dimension of
+// /portal/organization, so that view was not "empty until somebody fills it in": it was a branch
+// that could never render a row, because no screen in the product could create a team. The Position
+// dimension had no reader and no writer at all.
+//
+// This page is the writer. Everything on it goes through src/lib/org-structure.ts, which runs
+// against the tables the schema module already declares and creates none of its own.
+//
+// WHAT THIS PAGE IS NOT. It is not an authorization screen. Posting somebody to a team grants
+// nothing: capabilities come from src/lib/auth/permissions.ts and relationships (reporting manager,
+// department head, approval chains) from src/lib/org-graph.ts, neither of which reads a row written
+// here. This is the organisation layer on its own — where a seat is, and who is in it.
+//
+// APPEND-ONLY. Moving somebody closes their open posting and opens a new one inside one
+// transaction. Standing a team down deactivates it and never deletes it, because assignments point
+// at it and history has to keep resolving.
+export const prerender = false;
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { departments } from '@/lib/db/schema';
+import { asc } from 'drizzle-orm';
+import {
+  listTeams, createTeam, setTeamActive,
+  listPositions, createPosition, setPositionActive,
+  listOpenAssignments, listAssignableEmployees, assignEmployee, endAssignment,
+} from '@/lib/org-structure';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login');
+// Reading the structure is an admin-console act; changing it is an employee-record act. Both keys
+// exist in the capability matrix already — no new permission is invented here, because a key that
+// is not in PERMS_BY_ROLE evaluates to false for every role including super_admin.
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
+const mayEdit = can(user as any, 'employee.manage');
+
+let okMsg = '';
+let errMsg = '';
+
+if (Astro.request.method === 'POST') {
+  if (!mayEdit) {
+    errMsg = 'Changing the organisation structure needs the employee.manage capability. Your account can read this page but not change it.';
+  } else {
+    try {
+      const fd = await Astro.request.formData();
+      const intent = String(fd.get('intent') || '');
+
+      if (intent === 'create_team') {
+        const res = await createTeam({
+          name: String(fd.get('name') || ''),
+          departmentId: String(fd.get('department_id') || '') || null,
+          parentTeamId: String(fd.get('parent_team_id') || '') || null,
+          createdBy: user.id,
+        });
+        if (res.ok) okMsg = 'Team created. It is now selectable when posting somebody, and it appears on the organisation chart.';
+        else errMsg = res.error;
+      } else if (intent === 'team_active') {
+        const res = await setTeamActive(String(fd.get('team_id') || ''), String(fd.get('active') || '') === '1');
+        if (res.ok) okMsg = 'Team updated. No posting was changed — people already in it stay in it.';
+        else errMsg = res.error;
+      } else if (intent === 'create_position') {
+        const res = await createPosition({
+          title: String(fd.get('title') || ''),
+          code: String(fd.get('code') || '') || null,
+          departmentId: String(fd.get('department_id') || '') || null,
+          teamId: String(fd.get('team_id') || '') || null,
+          grade: String(fd.get('grade') || '') || null,
+          createdBy: user.id,
+        });
+        if (res.ok) okMsg = 'Position created. It is a seat, not a person and not a permission.';
+        else errMsg = res.error;
+      } else if (intent === 'position_active') {
+        const res = await setPositionActive(String(fd.get('position_id') || ''), String(fd.get('active') || '') === '1');
+        if (res.ok) okMsg = 'Position updated.';
+        else errMsg = res.error;
+      } else if (intent === 'assign') {
+        const res = await assignEmployee({
+          employeeId: String(fd.get('employee_id') || ''),
+          teamId: String(fd.get('team_id') || '') || null,
+          positionId: String(fd.get('position_id') || '') || null,
+          departmentId: String(fd.get('department_id') || '') || null,
+          isPrimary: String(fd.get('is_primary') || '1') === '1',
+          allocationPct: fd.get('allocation_pct') ? Number(fd.get('allocation_pct')) : null,
+          createdBy: user.id,
+        });
+        if (res.ok) okMsg = 'Posting recorded. Any previous primary posting was closed with today’s date, not overwritten.';
+        else errMsg = res.error;
+      } else if (intent === 'end_assignment') {
+        const res = await endAssignment(String(fd.get('assignment_id') || ''));
+        if (res.ok) okMsg = 'Posting closed. The record of it stays, so past dates still resolve.';
+        else errMsg = res.error;
+      }
+    } catch (e: any) {
+      // Never swallowed: these are write paths.
+      console.error('[admin/org/structure]', e?.cause?.message || e?.message);
+      errMsg = 'That did not save. Nothing has been changed.';
+    }
+  }
+}
+
+// --- reads ---------------------------------------------------------------------------------------
+const teamsRes = await listTeams(true);
+const positionsRes = await listPositions(true);
+const assignRes = await listOpenAssignments(300);
+const staffRes = await listAssignableEmployees(500);
+
+const teams = teamsRes.ok ? teamsRes.value : [];
+const positions = positionsRes.ok ? positionsRes.value : [];
+const postings = assignRes.ok ? assignRes.value : [];
+const staff = staffRes.ok ? staffRes.value : [];
+
+let depts: { id: string; name: string }[] = [];
+let deptsFailed = false;
+try {
+  const rowsD = await db.select({ id: departments.id, name: departments.name }).from(departments).orderBy(asc(departments.name));
+  depts = rowsD.map((d) => ({ id: String(d.id), name: String(d.name) }));
+} catch (e: any) {
+  console.error('[admin/org/structure] departments:', e?.cause?.message || e?.message);
+  deptsFailed = true;
+}
+
+const activeTeams = teams.filter((t) => t.isActive);
+const activePositions = positions.filter((p) => p.isActive);
+
+function fmtDate(iso: string): string {
+  if (!iso) return '';
+  try { return new Date(iso).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' }); }
+  catch { return iso.slice(0, 10); }
+}
+
+const CARD = 'background:#fff;border:1px solid rgba(14,11,8,0.10);border-radius:14px;padding:20px;';
+const LABEL = 'display:block;font-size:12px;color:#6b6455;margin:0 0 4px;';
+const INPUT = 'width:100%;box-sizing:border-box;padding:9px 11px;border:1px solid rgba(14,11,8,0.18);border-radius:8px;font-size:14px;font-family:inherit;background:#fff;';
+const BTN = 'background:#FF4F00;color:#fff;border:none;padding:10px 20px;border-radius:8px;font-weight:700;cursor:pointer;font-family:ui-monospace,monospace;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;';
+const QUIET = 'background:none;border:none;padding:0;color:#6b6455;font-size:12px;text-decoration:underline;cursor:pointer;font-family:inherit;';
+const H2 = 'font-size:20px;font-weight:700;margin:0 0 4px;';
+const NOTE = 'font-size:13px;color:#6b6455;margin:0 0 16px;line-height:1.6;max-width:78ch;';
+---
+<AdminLayout title="Organisation structure" activeNav="hr">
+  <div style="max-width:1080px;margin:0 auto;padding:26px 20px 80px;">
+    <p style="font-family:ui-monospace,monospace;font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#FF4F00;font-weight:700;margin:0 0 6px;">Organisation</p>
+    <h1 style="font-size:28px;font-weight:700;margin:0 0 6px;">Teams, positions and postings</h1>
+    <p style={NOTE}>
+      The organisation layer: what the teams are, what the seats are, and who is in them today. The
+      Team view on the organisation chart reads exactly these rows. Nothing on this page grants a
+      permission or creates a reporting line &mdash; those are separate layers, and they are decided
+      elsewhere on purpose.
+    </p>
+
+    {okMsg && <div style="background:#EBF5EF;border:1px solid #1A6B35;border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">{okMsg}</div>}
+    {errMsg && <div style="background:#FFF3EE;border:1px solid #FF4F00;border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">{errMsg}</div>}
+    {!mayEdit && <div style="background:#F3EFE8;border:1px solid rgba(14,11,8,0.12);border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">Read-only: changing the structure needs the employee.manage capability.</div>}
+    {deptsFailed && <div style="background:#FFF3EE;border:1px solid #FF4F00;border-radius:10px;padding:12px 16px;margin-bottom:18px;font-size:14px;">The department list could not be read, so the department pickers below are empty. A team or position created now would have no department attached to it.</div>}
+
+    <!-- ============================ TEAMS ============================ -->
+    <section style={CARD + 'margin-bottom:20px;'}>
+      <h2 style={H2}>Teams</h2>
+      <p style={NOTE}>
+        A team is a working group inside a department. It is the unit the organisation chart groups
+        people by, and until one exists that view has nothing to draw.
+      </p>
+
+      {!teamsRes.ok ? (
+        <div style="border:1px solid #FF4F00;border-radius:10px;padding:16px;">
+          <p style="font-size:15px;font-weight:700;margin:0 0 6px;">The team list could not be read.</p>
+          <p style="font-size:13.5px;color:#2E2520;line-height:1.6;margin:0;max-width:70ch;">
+            This is not telling you there are no teams. Creating one now could duplicate a team that
+            already exists, so check the reason below before adding anything.
+          </p>
+          <p style="font-family:ui-monospace,monospace;font-size:12px;color:#7A6F68;margin:10px 0 0;">Reason recorded: {teamsRes.ok ? '' : teamsRes.reason}</p>
+        </div>
+      ) : teams.length === 0 ? (
+        <p style="font-size:14px;color:#6b6455;margin:0 0 16px;">
+          No team has been created yet. The Team view on the organisation chart is empty for that
+          reason, and it will fill in as soon as one exists here.
+        </p>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:18px;">
+          {teams.map((t) => (
+            <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;border:1px solid rgba(14,11,8,0.08);border-radius:10px;padding:12px 14px;">
+              <div style="min-width:220px;flex:1;">
+                <p style="font-size:15px;font-weight:600;margin:0;">{t.name}{!t.isActive && <span style="font-size:11px;color:#6b6455;font-weight:400;"> &middot; stood down</span>}</p>
+                <p style="font-size:12.5px;color:#7A6F68;margin:2px 0 0;">
+                  {t.departmentName || (t.departmentId ? 'Department ' + t.departmentId : 'No department')}
+                  {' · '}
+                  {t.memberCount === 1 ? '1 person posted here' : t.memberCount + ' people posted here'}
+                </p>
+              </div>
+              {mayEdit && (
+                <form method="POST">
+                  <input type="hidden" name="intent" value="team_active" />
+                  <input type="hidden" name="team_id" value={t.id} />
+                  <input type="hidden" name="active" value={t.isActive ? '0' : '1'} />
+                  <button type="submit" style={QUIET}>{t.isActive ? 'Stand down' : 'Reactivate'}</button>
+                </form>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {mayEdit && (
+        <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;align-items:end;border-top:1px solid rgba(14,11,8,0.08);padding-top:16px;">
+          <input type="hidden" name="intent" value="create_team" />
+          <div>
+            <label style={LABEL} for="team-name">Team name</label>
+            <input style={INPUT} type="text" id="team-name" name="name" required maxlength="120" />
+          </div>
+          <div>
+            <label style={LABEL} for="team-dept">Department</label>
+            <select style={INPUT} id="team-dept" name="department_id">
+              <option value="">Not attached to one</option>
+              {depts.map((d) => <option value={d.id}>{d.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={LABEL} for="team-parent">Sits inside</label>
+            <select style={INPUT} id="team-parent" name="parent_team_id">
+              <option value="">Nothing &mdash; it is top level</option>
+              {activeTeams.map((t) => <option value={t.id}>{t.name}</option>)}
+            </select>
+          </div>
+          <div><button type="submit" style={BTN}>Create team</button></div>
+        </form>
+      )}
+    </section>
+
+    <!-- ========================== POSITIONS ========================== -->
+    <section style={CARD + 'margin-bottom:20px;'}>
+      <h2 style={H2}>Positions</h2>
+      <p style={NOTE}>
+        A position is a seat, not a person and not a role name: &ldquo;Backend Engineer II in
+        Engineering&rdquo;. Who occupies it is a posting below, and the title here is never compared
+        to a permission.
+      </p>
+
+      {!positionsRes.ok ? (
+        <div style="border:1px solid #FF4F00;border-radius:10px;padding:16px;">
+          <p style="font-size:15px;font-weight:700;margin:0 0 6px;">The position list could not be read.</p>
+          <p style="font-family:ui-monospace,monospace;font-size:12px;color:#7A6F68;margin:8px 0 0;">Reason recorded: {positionsRes.ok ? '' : positionsRes.reason}</p>
+        </div>
+      ) : positions.length === 0 ? (
+        <p style="font-size:14px;color:#6b6455;margin:0 0 16px;">No position has been defined yet.</p>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:18px;">
+          {positions.map((p) => (
+            <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;border:1px solid rgba(14,11,8,0.08);border-radius:10px;padding:12px 14px;">
+              <div style="min-width:220px;flex:1;">
+                <p style="font-size:15px;font-weight:600;margin:0;">
+                  {p.title}
+                  {p.code && <span style="font-family:ui-monospace,monospace;font-size:11px;color:#6b6455;font-weight:400;"> &middot; {p.code}</span>}
+                  {!p.isActive && <span style="font-size:11px;color:#6b6455;font-weight:400;"> &middot; closed</span>}
+                </p>
+                <p style="font-size:12.5px;color:#7A6F68;margin:2px 0 0;">
+                  {p.departmentName || 'No department'}{p.teamName ? ' · ' + p.teamName : ''}
+                  {p.grade ? ' · grade ' + p.grade : ''}
+                  {' · '}
+                  {p.filledCount === 0 ? 'vacant' : p.filledCount === 1 ? 'filled' : p.filledCount + ' people hold it'}
+                </p>
+              </div>
+              {mayEdit && (
+                <form method="POST">
+                  <input type="hidden" name="intent" value="position_active" />
+                  <input type="hidden" name="position_id" value={p.id} />
+                  <input type="hidden" name="active" value={p.isActive ? '0' : '1'} />
+                  <button type="submit" style={QUIET}>{p.isActive ? 'Close the seat' : 'Reopen the seat'}</button>
+                </form>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {mayEdit && (
+        <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;align-items:end;border-top:1px solid rgba(14,11,8,0.08);padding-top:16px;">
+          <input type="hidden" name="intent" value="create_position" />
+          <div>
+            <label style={LABEL} for="pos-title">Title</label>
+            <input style={INPUT} type="text" id="pos-title" name="title" required maxlength="160" />
+          </div>
+          <div>
+            <label style={LABEL} for="pos-code">Code</label>
+            <input style={INPUT} type="text" id="pos-code" name="code" maxlength="40" placeholder="optional, unique" />
+          </div>
+          <div>
+            <label style={LABEL} for="pos-dept">Department</label>
+            <select style={INPUT} id="pos-dept" name="department_id">
+              <option value="">None</option>
+              {depts.map((d) => <option value={d.id}>{d.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={LABEL} for="pos-team">Team</label>
+            <select style={INPUT} id="pos-team" name="team_id">
+              <option value="">None</option>
+              {activeTeams.map((t) => <option value={t.id}>{t.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={LABEL} for="pos-grade">Grade</label>
+            <input style={INPUT} type="text" id="pos-grade" name="grade" maxlength="40" />
+          </div>
+          <div><button type="submit" style={BTN}>Create position</button></div>
+        </form>
+      )}
+    </section>
+
+    <!-- ========================== POSTINGS =========================== -->
+    <section style={CARD}>
+      <h2 style={H2}>Who sits where</h2>
+      <p style={NOTE}>
+        Open postings. Moving somebody closes the row they are in and opens a new one, in one
+        transaction, so the chart never shows a person who is in no team at all &mdash; and
+        &ldquo;which team was she in in March&rdquo; keeps answering.
+      </p>
+
+      {!assignRes.ok ? (
+        <div style="border:1px solid #FF4F00;border-radius:10px;padding:16px;">
+          <p style="font-size:15px;font-weight:700;margin:0 0 6px;">The postings could not be read.</p>
+          <p style="font-size:13.5px;color:#2E2520;line-height:1.6;margin:0;max-width:70ch;">
+            Do not post anybody while this is failing: this screen cannot see whether they already
+            hold a seat, and the record it would write beside an unread one is a guess.
+          </p>
+          <p style="font-family:ui-monospace,monospace;font-size:12px;color:#7A6F68;margin:10px 0 0;">Reason recorded: {assignRes.ok ? '' : assignRes.reason}</p>
+        </div>
+      ) : postings.length === 0 ? (
+        <p style="font-size:14px;color:#6b6455;margin:0 0 16px;">
+          Nobody has been posted to a team or a position yet.
+        </p>
+      ) : (
+        <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:18px;">
+          {postings.map((a) => (
+            <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;border:1px solid rgba(14,11,8,0.08);border-radius:10px;padding:12px 14px;">
+              <div style="min-width:240px;flex:1;">
+                <p style="font-size:15px;font-weight:600;margin:0;">{a.employeeName}</p>
+                <p style="font-size:12.5px;color:#7A6F68;margin:2px 0 0;">
+                  {a.teamName || 'No team'}{a.positionTitle ? ' · ' + a.positionTitle : ''}
+                  {a.isPrimary ? ' · primary' : ' · secondary'}
+                  {a.allocationPct ? ' · ' + a.allocationPct + '%' : ''}
+                  {' · since ' + fmtDate(a.effectiveFrom)}
+                </p>
+              </div>
+              {mayEdit && (
+                <form method="POST">
+                  <input type="hidden" name="intent" value="end_assignment" />
+                  <input type="hidden" name="assignment_id" value={a.id} />
+                  <button type="submit" style={QUIET}>End this posting</button>
+                </form>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {mayEdit && (
+        staff.length === 0 ? (
+          <p style="font-size:13.5px;color:#6b6455;border-top:1px solid rgba(14,11,8,0.08);padding-top:16px;margin:0;">
+            {staffRes.ok
+              ? 'There is no employee record to post. Somebody has to exist in the employee register before they can be given a seat.'
+              : 'The employee list could not be read, so there is nobody to choose from. Reason recorded: ' + (staffRes.ok ? '' : staffRes.reason)}
+          </p>
+        ) : (
+          <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;align-items:end;border-top:1px solid rgba(14,11,8,0.08);padding-top:16px;">
+            <input type="hidden" name="intent" value="assign" />
+            <div>
+              <label style={LABEL} for="as-emp">Person</label>
+              <select style={INPUT} id="as-emp" name="employee_id" required>
+                <option value="">Choose</option>
+                {staff.map((s) => <option value={s.id}>{s.fullName}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={LABEL} for="as-team">Team</label>
+              <select style={INPUT} id="as-team" name="team_id">
+                <option value="">None</option>
+                {activeTeams.map((t) => <option value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={LABEL} for="as-pos">Position</label>
+              <select style={INPUT} id="as-pos" name="position_id">
+                <option value="">None</option>
+                {activePositions.map((p) => <option value={p.id}>{p.title}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={LABEL} for="as-dept">Department</label>
+              <select style={INPUT} id="as-dept" name="department_id">
+                <option value="">None</option>
+                {depts.map((d) => <option value={d.id}>{d.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={LABEL} for="as-primary">Kind</label>
+              <select style={INPUT} id="as-primary" name="is_primary">
+                <option value="1">Primary &mdash; replaces their current seat</option>
+                <option value="0">Secondary &mdash; alongside it</option>
+              </select>
+            </div>
+            <div>
+              <label style={LABEL} for="as-alloc">Allocation %</label>
+              <input style={INPUT} type="number" id="as-alloc" name="allocation_pct" min="1" max="100" placeholder="optional" />
+            </div>
+            <div><button type="submit" style={BTN}>Record the posting</button></div>
+          </form>
+        )
+      )}
+    </section>
+  </div>
+</AdminLayout>

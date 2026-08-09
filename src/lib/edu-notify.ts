@@ -3,6 +3,30 @@
 // hardcoded keys), triggered by real platform events (credential issued, assessment graded, admission
 // decision, deadlines). Respects the student's per-type/channel preferences (Prompt 14) and fans out
 // GUARDIAN alerts for linked minors. The preference logic is pure and unit-tested.
+//
+// =================================================================================================
+// THE EMAIL CHANNEL HAS NEVER SENT AN EMAIL, AND NOTHING SAID SO
+// =================================================================================================
+//
+// The line was `const mail = await import('@/lib/mail'); if (mail?.sendExternal) { ... }`.
+// `sendExternal` is NOT exported by src/lib/mail.ts — it lives in src/lib/mail-transport.ts, and
+// mail.ts does not re-export it. So `mail.sendExternal` was `undefined` on every call, the `if`
+// never entered, `delivered` never contained 'email', and the whole branch sat inside a `catch {}`
+// that would have hidden the failure even if it had thrown. Every learner who ticked "email me" in
+// their notification preferences has been getting nothing, silently, since this was written — and
+// the delivery log on the admin side agreed with the preference screen, because both read a channel
+// that was simply never attempted.
+//
+// The call was also malformed independently of the import. SendExternalParams requires `from` and
+// `html`; this passed neither. sendExternal only normalises a From when it can parse an address out
+// of the caller's, so an absent `from` stays absent and nodemailer refuses the message. Both are
+// supplied now: the configured from_name/from_address (the one mail identity this product has) and
+// an escaped HTML part built from the same text.
+//
+// It stays BEST EFFORT — a notification that cannot be emailed must still exist in the app, so the
+// in-app row is written first and an email failure never throws out of notify(). What changes is
+// that the reason is written down and the returned channel list tells the truth about what was
+// actually delivered.
 
 export type NotifType = 'result' | 'credential' | 'admission' | 'deadline' | 'guardian' | 'general';
 
@@ -44,8 +68,36 @@ export async function notify(userId: string, n: { type: NotifType; title: string
   if (shouldEmail(prefs)) {
     try {
       const to = rows(await db.execute(sql`SELECT email FROM users WHERE id = ${userId} LIMIT 1`))[0]?.email;
-      if (to) { const mail: any = await import('@/lib/mail').catch(() => null); if (mail?.sendExternal) { await mail.sendExternal({ to, subject: n.title, text: (n.body || '') + (n.link ? '\n\n' + n.link : '') }); delivered.push('email'); } }
-    } catch { /* email best-effort; provider via env/DB, never hardcoded */ }
+      if (to) {
+        const { sendExternal } = await import('@/lib/mail-transport');
+        const { getMailConfig } = await import('@/lib/mail');
+        const { escapeHtml } = await import('@/lib/content-render');
+        const cfg: any = await getMailConfig();
+        const fromAddress = String(cfg?.fromAddress || '').trim();
+        if (!fromAddress) {
+          // Said out loud rather than attempted. With no configured sending address there is no
+          // From header to write, and a send that cannot name its sender is refused by the server
+          // anyway — reporting 'email' as delivered here would be the original bug in a new place.
+          console.error('[edu-notify] email requested but no from_address is configured; in-app only');
+        } else {
+          const text = (n.body || '') + (n.link ? '\n\n' + n.link : '');
+          const html = '<div>' + escapeHtml(n.body || '').replace(/\n/g, '<br/>') +
+            (n.link ? '<p><a href="' + escapeHtml(n.link) + '">' + escapeHtml(n.link) + '</a></p>' : '') + '</div>';
+          const res: any = await sendExternal({
+            from: String(cfg?.fromName || 'EduRankAI') + ' <' + fromAddress + '>',
+            to, subject: n.title, html, text,
+          });
+          // Only claim the channel when the transport says it went. `delivered` is read by callers
+          // and by the delivery log; an optimistic push here is how "we emailed you" outlives the
+          // mail server being down.
+          if (res?.ok) delivered.push('email');
+          else console.error('[edu-notify] email not delivered:', res?.error || 'unknown error');
+        }
+      }
+    } catch (e: any) {
+      // Best effort, NEVER silent. The in-app row above is already committed.
+      console.error('[edu-notify] email send failed:', e?.cause?.message || e?.message);
+    }
   }
   return delivered;
 }
@@ -53,7 +105,17 @@ export async function notify(userId: string, n: { type: NotifType; title: string
 /** Fan out a guardian alert to everyone linked to a minor. */
 export async function notifyGuardians(minorId: string, n: { title: string; body?: string; link?: string }): Promise<number> {
   const { db, sql } = await ctx();
-  const guardians = rows(await db.execute(sql`SELECT guardian_user_id FROM rbac_guardian_links WHERE minor_user_id = ${minorId}`).catch(() => []));
+  // The `.catch(() => [])` that used to sit here returned 0 to the caller for BOTH "this minor has
+  // no guardian linked" and "the guardian table could not be read" — two facts a guardian-alert
+  // fan-out must never confuse, because the second one means an alert about a child went nowhere
+  // and the return value said everything was fine. The read failure is now recorded.
+  let guardians: any[] = [];
+  try {
+    guardians = rows(await db.execute(sql`SELECT guardian_user_id FROM rbac_guardian_links WHERE minor_user_id = ${minorId}`));
+  } catch (e: any) {
+    console.error('[edu-notify] guardian lookup failed for ' + minorId + ':', e?.cause?.message || e?.message);
+    throw e;
+  }
   for (const g of guardians) await notify(g.guardian_user_id, { type: 'guardian', title: n.title, body: n.body, link: n.link });
   return guardians.length;
 }

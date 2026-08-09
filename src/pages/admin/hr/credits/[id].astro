@@ -1,0 +1,300 @@
+---
+// /admin/hr/credits/[id] — ONE PERSON'S WEEKS, THE EVIDENCE BEHIND EACH, AND THE DECISION.
+//
+// =================================================================================================
+// WHY DECIDING HAPPENS HERE AND NOT ON THE LIST
+// =================================================================================================
+//
+// A week that reaches a person is a week the measurement did not fully support. Crediting one says
+// somebody worked a week the clock could not confirm. That decision belongs beside the evidence it
+// is being made against, not on a list where the figures are two columns wide.
+//
+// =================================================================================================
+// THE DECISION GOES THROUGH THE ONE APPROVAL ENGINE. THIS PAGE HAS NO SECOND PATH.
+// =================================================================================================
+//
+// decidePendingCreditWeek() calls decideStep() in src/lib/workflow.ts, which re-asks the whole
+// question at the moment of the write: the instance must still be pending, the step must be the
+// current rung, and mayAct() must say this signed-in user is the routed approver, their in-force
+// delegate, or a holder of the domain's standing authority. The 'credit' domain carries capability
+// 'employee.manage' - the key that already means "runs the HR desk" - which is how HR decides a week
+// without a chain of its own, and escalateStep() is how a more senior authority reaches one.
+//
+// NOTHING HERE WRITES A CREDIT BY ITSELF. The ledger records the outcome only after the engine has
+// settled the step.
+//
+// A REASON IS REQUIRED ON BOTH ANSWERS. It is stored beside the credit and is still readable when
+// the completion letter is printed months later.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { can, canAccessSection } from '@/lib/auth/permissions';
+import { db } from '@/lib/db';
+import { sql } from 'drizzle-orm';
+import {
+  reconcileCreditWeeks,
+  routePendingCreditWeeks,
+  syncCreditDecisions,
+  decidePendingCreditWeek,
+  type ReconcileResult,
+} from '@/lib/credit-week-ledger';
+import { describeEvidence, positionFrom, weekLabel } from '@/lib/credit-week';
+import {
+  creditsLabel, hoursLabel, stateLabel, stateToneDark,
+  CREDIT_UNIT_SENTENCE, INTERN_WEEK_SENTENCE, CREDIT_THREE_FACTS_SENTENCE, CREDIT_SCOPE_SENTENCE,
+} from '@/lib/credit-week-copy';
+
+const user = Astro.locals.user!;
+
+const isHrDesk = can(user, 'employee.manage');
+const mayOpen = can(user, 'admin.access')
+  && (isHrDesk || await canAccessSection(user as any, 'hr', 'edit').catch(() => false));
+if (!mayOpen) return Astro.redirect('/admin');
+
+const id = Astro.params.id!;
+const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+const DECISIONS = ['approved', 'refused'];
+const MIN_REASON = 8;
+
+let msg = '';
+let msgOk = true;
+
+// ------------------------------------------------------------------------------------------------
+// THE WRITE
+// ------------------------------------------------------------------------------------------------
+if (Astro.request.method === 'POST') {
+  try {
+    const fd = await Astro.request.formData();
+    const action = String(fd.get('_action') || '');
+
+    if (action === 'decide') {
+      const weekId = String(fd.get('week_id') || '');
+      const decision = String(fd.get('decision') || '');
+      const reason = String(fd.get('reason') || '').trim().slice(0, 500);
+
+      if (!weekId || DECISIONS.indexOf(decision) < 0) {
+        msg = 'That decision could not be read. Nothing was changed.';
+        msgOk = false;
+      } else if (reason.length < MIN_REASON) {
+        msg = 'Write a reason. This week is being decided against what the measurement found, and '
+          + 'the record has to be able to say why.';
+        msgOk = false;
+      } else {
+        const res = await decidePendingCreditWeek(weekId, user as any, decision as any, reason);
+        if (res.ok) {
+          msg = decision === 'approved'
+            ? 'Credited, with your reason recorded against the week.'
+            : 'Not credited, with your reason recorded against the week.';
+        } else {
+          msg = res.error || 'That decision could not be recorded.';
+          msgOk = false;
+        }
+      }
+    } else if (action === 'route') {
+      const routed = await routePendingCreditWeeks(id, String(user.id));
+      if (!routed.ok) {
+        msg = routed.error || 'Those weeks could not be sent for a decision.';
+        msgOk = false;
+      } else if (routed.halted.length) {
+        msg = routed.halted.length + ' week(s) could not be sent: ' + routed.halted[0].reason;
+        msgOk = false;
+      } else {
+        msg = routed.routed + ' week(s) sent to the approver the organization graph names.';
+      }
+    } else {
+      msg = 'That is not something this page does.';
+      msgOk = false;
+    }
+  } catch (e: any) {
+    // NEVER SWALLOWED. This is the path that grants somebody a week of credit.
+    console.error('[admin/hr/credits/id] post', e?.cause?.message || e?.message);
+    msg = 'That did not happen: ' + (e?.cause?.message || e?.message || 'unknown reason');
+    msgOk = false;
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// READS
+// ------------------------------------------------------------------------------------------------
+const emp = rows(await db.execute(sql`
+  SELECT id, full_name, email, designation, joining_date, employment_type
+    FROM hr_employees WHERE id = ${id} LIMIT 1`))[0];
+if (!emp) return Astro.redirect('/admin/hr/credits');
+
+// Decisions taken elsewhere first, then measure. Both idempotent; a decided week is never rewritten.
+await syncCreditDecisions(id);
+const result: ReconcileResult = await reconcileCreditWeeks(id, { maxWeeks: 52 });
+const weeks = result.weeks;
+const position = positionFrom(weeks);
+const notMeasurable = weeks.filter(
+  (w) => !!w.evidence && Array.isArray(w.evidence.incompleteDates) && w.evidence.incompleteDates.length > 0,
+).length;
+const unrouted = weeks.filter((w) => w.state === 'pending' && !w.workflowInstanceId).length;
+
+const card = 'border:1px solid #2a2a30;border-radius:12px;background:#0f0f14;padding:14px;';
+---
+<AdminLayout title={'Weekly credits — ' + emp.full_name}>
+  <div style="max-width:900px;">
+    <p style="font-size:12px;margin:0 0 6px;"><a href="/admin/hr/credits" style="color:#8a8a94;text-decoration:none;">Back to weekly credits</a></p>
+    <h1 style="font-family:'Fraunces',serif;font-size:24px;margin:0 0 2px;">{emp.full_name}</h1>
+    <p style="font-size:13px;color:#8a8a94;margin:0 0 14px;">
+      {emp.designation || 'role not recorded'} · joined {String(emp.joining_date || '').slice(0, 10) || 'unknown'}
+      {' · '}<a href={'/admin/hr/completion/' + id} style="color:#8a8a94;">completion letter</a>
+    </p>
+
+    {msg && (
+      <div style={'padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;line-height:1.55;border:1px solid '
+        + (msgOk ? '#14532d;background:rgba(20,83,45,0.2);' : 'rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;')}>{msg}</div>
+    )}
+
+    {!result.ok && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.12);color:#fca5a5;font-size:13px;line-height:1.55;">
+        <strong>These are not measurements.</strong>
+        <span> {result.error} Nothing has been granted, refused or routed on the strength of it.</span>
+      </div>
+    )}
+
+    {result.ok && result.unread.length > 0 && (
+      <div style="padding:12px 14px;border-radius:8px;margin-bottom:14px;border:1px solid #b45309;background:rgba(180,83,9,0.14);font-size:13px;line-height:1.55;">
+        <strong>Part of the week could not be read: {result.unread.join(', ')}.</strong>
+        <span> A verdict is never built on a silent gap, so any week affected is left waiting for a
+        person rather than counted or discounted.</span>
+      </div>
+    )}
+
+    {result.ok && !result.applicable ? (
+      <div style={card}>
+        <p style="font-size:13.5px;font-weight:650;margin:0 0 6px;">Weekly credits are not measured for this engagement.</p>
+        <p style="font-size:12.5px;color:#8a8a94;margin:0;line-height:1.6;">
+          {result.notApplicableReason || 'Hours are not the certified deliverable on this engagement.'}
+        </p>
+        <p style="font-size:12.5px;color:#8a8a94;margin:8px 0 0;line-height:1.6;">{CREDIT_SCOPE_SENTENCE}</p>
+      </div>
+    ) : (
+      <>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px;">
+          <div style={card}>
+            <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Credits</p>
+            <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{position.credits}</p>
+          </div>
+          <div style={card}>
+            <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Automatic</p>
+            <p style="font-size:20px;font-weight:700;margin:0;font-family:'Geist Mono',monospace;">{position.earnedAutomatically}</p>
+          </div>
+          <div style={card}>
+            <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Waiting</p>
+            <p style={'font-size:20px;font-weight:700;margin:0;font-family:\'Geist Mono\',monospace;color:' + (position.pending ? '#fcd34d' : '#e8e8ee') + ';'}>{position.pending}</p>
+          </div>
+          <div style={card}>
+            <p style="font-size:9.5px;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 4px;">Not measurable</p>
+            <p style={'font-size:20px;font-weight:700;margin:0;font-family:\'Geist Mono\',monospace;color:' + (notMeasurable ? '#fca5a5' : '#e8e8ee') + ';'}>{notMeasurable}</p>
+          </div>
+        </div>
+
+        <div style={card + 'margin-bottom:14px;'}>
+          <p style="font-size:12.5px;color:#c8c8d0;margin:0;line-height:1.6;">{CREDIT_UNIT_SENTENCE} {INTERN_WEEK_SENTENCE}</p>
+          <p style="font-size:12.5px;color:#8a8a94;margin:8px 0 0;line-height:1.6;">{CREDIT_THREE_FACTS_SENTENCE}</p>
+          {unrouted > 0 && (
+            <form method="POST" style="margin-top:10px;">
+              <input type="hidden" name="_action" value="route" />
+              <button type="submit" style="background:#1a1a22;border:1px solid #2a2a30;color:#e8e8ee;font-size:12.5px;padding:9px 14px;border-radius:8px;cursor:pointer;min-height:44px;">
+                Send {unrouted} waiting week(s) to an approver
+              </button>
+              <span style="font-size:11.5px;color:#6e6e78;margin-left:10px;">
+                Routing resolves the reporting manager from the organization graph, and says which
+                relationship is missing when it names nobody.
+              </span>
+            </form>
+          )}
+        </div>
+
+        {weeks.length === 0 && (
+          <div style={card}>
+            <p style="font-size:13px;margin:0;color:#8a8a94;">
+              {result.notApplicableReason || 'No finished week to measure yet.'}
+            </p>
+          </div>
+        )}
+
+        {weeks.map((w) => (
+          <div style={card + 'margin-bottom:12px;'}>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+              <strong style="font-size:13.5px;">{w.label || weekLabel(w.weekStart)}</strong>
+              <span style={'display:inline-flex;padding:3px 9px;border-radius:999px;border:1px solid;font-size:10.5px;font-weight:700;background:'
+                + stateToneDark(w.state).bg + ';color:' + stateToneDark(w.state).fg + ';border-color:' + stateToneDark(w.state).bd + ';'}>
+                {stateLabel(w.state)}
+              </span>
+            </div>
+
+            <p style="font-size:12.5px;color:#8a8a94;margin:6px 0 0;line-height:1.6;">
+              {hoursLabel(w.hoursMeasured)} measured of {hoursLabel(w.hoursRequired)} required
+              {w.evidence ? ' · from the clock ' + hoursLabel(w.evidence.hoursFromClock) : ''}
+              {' · reports ' + w.reportsFiled + '/' + w.reportsExpected}
+              {' · tasks ' + w.tasksCompleted + '/' + w.tasksAssigned}
+              {w.evidence && w.evidence.excusedDays > 0
+                ? ' · ' + w.evidence.excusedDays + ' day(s) leave or holiday excused'
+                : ''}
+            </p>
+
+            {w.decisionReason && (
+              <p style="font-size:12.5px;color:#c8c8d0;margin:8px 0 0;line-height:1.6;border-left:2px solid #2a2a30;padding-left:10px;">
+                <strong>
+                  {w.decidedByName ? w.decidedByName : 'Granted automatically'}
+                  {w.decidedAt ? ' · ' + String(w.decidedAt).slice(0, 10) : ''}:
+                </strong> {w.decisionReason}
+              </p>
+            )}
+
+            {w.haltReason && w.state === 'pending' && (
+              <p style="font-size:12.5px;color:#fca5a5;margin:8px 0 0;line-height:1.6;">
+                <strong>Halted:</strong> {w.haltReason} Record that relationship in the organization
+                graph and this week resumes from where it stopped. Nothing is auto-approved to get it unstuck.
+              </p>
+            )}
+
+            <details style="margin-top:10px;">
+              <summary style="cursor:pointer;font-size:12px;color:#8a8a94;">What this rests on</summary>
+              <ul style="margin:8px 0 0;padding-left:18px;">
+                {describeEvidence(w.evidence).map((line: string) => (
+                  <li style="font-size:12px;color:#8a8a94;line-height:1.6;">{line}</li>
+                ))}
+              </ul>
+              {w.evidence && w.evidence.incompleteDates.length > 0 && (
+                <p style="font-size:12px;color:#fca5a5;margin:8px 0 0;line-height:1.6;">
+                  Clocked in and never clocked out on {w.evidence.incompleteDates.join(', ')}. Those
+                  hours are unknown, not zero, which is why this week cannot credit itself.
+                </p>
+              )}
+            </details>
+
+            {w.state === 'pending' && w.workflowInstanceId && !w.haltReason && (
+              <form method="POST" style="margin-top:12px;border-top:1px solid #1a1a22;padding-top:12px;">
+                <input type="hidden" name="_action" value="decide" />
+                <input type="hidden" name="week_id" value={w.id} />
+                <label style="font-size:11px;color:#8a8a94;display:block;margin-bottom:4px;" for={'reason-' + w.id}>Your reason (required)</label>
+                <textarea id={'reason-' + w.id} name="reason" rows="2" required minlength={MIN_REASON}
+                  placeholder="What you know about this week that the measurement does not show."
+                  style="width:100%;background:#12121a;border:1px solid #2a2a30;color:#e8e8ee;padding:9px;border-radius:6px;font-size:12.5px;font-family:inherit;"></textarea>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+                  <button type="submit" name="decision" value="approved" style="background:#FF4F00;border:0;color:#fff;font-weight:700;font-size:12.5px;padding:10px 16px;border-radius:6px;cursor:pointer;min-height:44px;">Credit this week</button>
+                  <button type="submit" name="decision" value="refused" style="background:#1a1a22;border:1px solid #2a2a30;color:#e8e8ee;font-size:12.5px;padding:10px 16px;border-radius:6px;cursor:pointer;min-height:44px;">Do not credit</button>
+                </div>
+              </form>
+            )}
+
+            {w.state === 'pending' && !w.workflowInstanceId && (
+              <p style="font-size:12.5px;color:#fbbf24;margin:8px 0 0;line-height:1.6;">
+                This week has not been sent for a decision yet, so there is no approval to act on. Use
+                the button above; routing names the approver from the organization graph.
+              </p>
+            )}
+          </div>
+        ))}
+
+        <p style="font-size:11.5px;color:#6e6e78;margin:16px 0 0;line-height:1.6;">
+          {CREDIT_SCOPE_SENTENCE} {creditsLabel(position.credits)} recorded across {weeks.length} measured
+          week(s). Every decision on this page goes through the one approval engine, which re-checks
+          who you are at the moment you press the button.
+        </p>
+      </>
+    )}
+  </div>
+</AdminLayout>

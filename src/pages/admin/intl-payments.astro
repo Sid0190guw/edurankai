@@ -2,71 +2,141 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
+import { ensureOnce } from '@/lib/ensure-once';
+import { dbReason, uuidish } from '@/lib/page-safety';
 
 const user = Astro.locals.user!;
 if (!user) return Astro.redirect('/admin/login');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+// AUTHORIZATION FROM permissions.ts, NEVER a users.role literal. This screen lists who owes an
+// application fee, what they paid and by what route, and the button on it materialises an
+// application on the strength of money the operator says arrived. `payments.view` is the key that
+// already describes reading that (super_admin + hr, the same two who hold the refund console).
+if (!can(user as any, 'payments.view')) return Astro.redirect('/admin');
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
-// Self-bootstrap the schema so this page works even before the api endpoint runs.
+// Self-bootstrapping schema, additive, inside the ensureOnce guard rather than running its DDL on
+// every single page load and swallowing the outcome.
+let schemaError = '';
 try {
-  await db.execute(sql`CREATE TABLE IF NOT EXISTS application_intl_payments (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    intent_id UUID,
-    country VARCHAR(80),
-    preferred_method VARCHAR(40),
-    applicant_notes TEXT,
-    admin_notes TEXT,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    invoice_url TEXT,
-    reviewer_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    reviewed_at TIMESTAMPTZ,
-    paid_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-} catch (_) {}
+  await ensureOnce('intl-payments:schema', async () => {
+    await db.execute(sql`CREATE TABLE IF NOT EXISTS application_intl_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      intent_id UUID,
+      country VARCHAR(80),
+      preferred_method VARCHAR(40),
+      applicant_notes TEXT,
+      admin_notes TEXT,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      invoice_url TEXT,
+      reviewer_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      reviewed_at TIMESTAMPTZ,
+      paid_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  });
+} catch (e: any) {
+  schemaError = dbReason(e);
+  console.error('[admin/intl-payments] schema ensure failed -', schemaError);
+}
 
 let okMsg = '', errMsg = '';
 if (Astro.request.method === 'POST') {
   try {
     const fd = await Astro.request.formData();
     const action = (fd.get('_action') as string || '').trim();
-    const id = (fd.get('id') as string || '').trim();
+    // uuidish, because a non-UUID bound against a uuid column raises 22P02 and the operator is then
+    // shown a Postgres complaint about their own click.
+    const id = uuidish((fd.get('id') as string || '').trim());
     const invoiceUrl = (fd.get('invoice_url') as string || '').trim() || null;
     const adminNote = (fd.get('admin_note') as string || '').trim() || null;
-    if (!id) errMsg = 'id required';
+    if (!id) errMsg = 'That request reference is not valid. Nothing was changed.';
     else if (action === 'mark_invoice_sent') {
-      await db.execute(sql`UPDATE application_intl_payments SET status='invoice_sent', invoice_url=COALESCE(${invoiceUrl}, invoice_url), admin_notes=COALESCE(${adminNote}, admin_notes), reviewer_user_id=${user.id}, reviewed_at=NOW() WHERE id=${id}`);
-      okMsg = 'Marked as invoice sent. Applicant gets a thread message + push.';
-      try {
-        const r0 = rows(await db.execute(sql`SELECT user_id, intent_id, invoice_url FROM application_intl_payments WHERE id = ${id}`))[0] as any;
+      // RETURNING, so the banner is only shown when a row actually changed. The old statement
+      // matched nothing on a stale id and still reported success.
+      const upd = rows(await db.execute(sql`UPDATE application_intl_payments SET status='invoice_sent', invoice_url=COALESCE(${invoiceUrl}, invoice_url), admin_notes=COALESCE(${adminNote}, admin_notes), reviewer_user_id=${user.id}, reviewed_at=NOW() WHERE id=${id} RETURNING user_id, invoice_url`));
+      if (upd.length === 0) {
+        errMsg = 'No request with that id was found, so nothing was changed. Reload the queue.';
+      } else {
+        // THE BANNER USED TO PROMISE TWO THINGS AND DELIVER AT MOST ONE. It read "Applicant gets a
+        // thread message + push": there is no thread message anywhere in this handler, and the push
+        // sat inside `catch (_) {}` so a failed notification still read as a delivered one. The
+        // operator then believed the applicant had been told to pay and moved on.
+        let notified = false;
+        let notifyError = '';
+        const r0 = upd[0] as any;
         if (r0?.user_id) {
-          const { sendPushToUser } = await import('@/lib/push');
-          await sendPushToUser(r0.user_id, { type: 'intl_payment_invoice', title: 'Your invoice is ready', body: 'Open it to complete payment.', url: r0.invoice_url || '/portal', tag: 'intl-pay-invoice-' + id });
+          try {
+            const { sendPushToUser } = await import('@/lib/push');
+            await sendPushToUser(r0.user_id, { type: 'intl_payment_invoice', title: 'Your invoice is ready', body: 'Open it to complete payment.', url: r0.invoice_url || '/portal', tag: 'intl-pay-invoice-' + id });
+            notified = true;
+          } catch (e2: any) {
+            notifyError = dbReason(e2);
+            console.error('[admin/intl-payments] invoice notification failed -', notifyError);
+          }
         }
-      } catch (_) {}
+        okMsg = notified
+          ? 'Marked as invoice sent, and the applicant was notified in their portal.'
+          : 'Marked as invoice sent. THE APPLICANT WAS NOT NOTIFIED' + (notifyError ? ' (' + notifyError + ')' : '') + ' - tell them another way.';
+      }
     } else if (action === 'mark_paid') {
       // Mark the request paid + materialise the application via intent if present.
       const r0 = rows(await db.execute(sql`SELECT user_id, intent_id FROM application_intl_payments WHERE id = ${id}`))[0] as any;
       let appId: string | null = null;
-      if (r0?.intent_id) {
-        const { materialiseFromIntent } = await import('@/lib/fee-waiver');
-        appId = await materialiseFromIntent(r0.intent_id, { paid: true, waiverGranted: false, waiverReason: 'International payment received (offline / wire / Stripe / PayPal). Confirmed by ' + (user.name || user.email) });
-      }
-      await db.execute(sql`UPDATE application_intl_payments SET status='paid', paid_at=NOW(), reviewer_user_id=${user.id} WHERE id=${id}`);
-      try {
-        if (r0?.user_id) {
-          const { sendPushToUser } = await import('@/lib/push');
-          await sendPushToUser(r0.user_id, { type: 'intl_payment_received', title: 'Payment received', body: 'Your application is now in review.', url: appId ? '/portal/applications/' + appId : '/portal', tag: 'intl-pay-paid-' + id });
+      let materialiseNote = '';
+      if (!r0) {
+        errMsg = 'No request with that id was found, so nothing was changed.';
+      } else {
+        if (r0.intent_id) {
+          const { materialiseFromIntent, lastMaterialiseError } = await import('@/lib/fee-waiver');
+          appId = await materialiseFromIntent(r0.intent_id, { paid: true, waiverGranted: false, waiverReason: 'International payment received (offline / wire / Stripe / PayPal). Confirmed by ' + (user.name || user.email) });
+          if (!appId) {
+            // materialiseFromIntent RETURNS NULL ON FAILURE and records the reason in
+            // lastMaterialiseError(), which this page threw away while telling the operator
+            // "Application materialised". A person whose money had arrived was then left with no
+            // application and nobody looking for them.
+            materialiseNote = lastMaterialiseError() || 'the intent could not be turned into an application';
+            console.error('[admin/intl-payments] materialise failed -', materialiseNote);
+          }
+        } else {
+          materialiseNote = 'this request carries no application intent, so there was nothing to materialise';
         }
-      } catch (_) {}
-      okMsg = 'Marked paid. Application materialised + applicant notified.';
+
+        await db.execute(sql`UPDATE application_intl_payments SET status='paid', paid_at=NOW(), reviewer_user_id=${user.id} WHERE id=${id}`);
+
+        let notified = false;
+        let notifyError = '';
+        if (r0.user_id) {
+          try {
+            const { sendPushToUser } = await import('@/lib/push');
+            await sendPushToUser(r0.user_id, { type: 'intl_payment_received', title: 'Payment received', body: appId ? 'Your application is now in review.' : 'We have recorded your payment.', url: appId ? '/portal/applications/' + appId : '/portal', tag: 'intl-pay-paid-' + id });
+            notified = true;
+          } catch (e2: any) {
+            notifyError = dbReason(e2);
+            console.error('[admin/intl-payments] paid notification failed -', notifyError);
+          }
+        }
+
+        // EVERY CLAUSE IS A FACT ABOUT WHAT HAPPENED. The old single sentence asserted both the
+        // application and the notification unconditionally.
+        okMsg = 'Marked paid.'
+          + (appId ? ' Application created.' : ' NO APPLICATION WAS CREATED - ' + materialiseNote + '.')
+          + (notified ? ' Applicant notified.' : ' APPLICANT NOT NOTIFIED' + (notifyError ? ' (' + notifyError + ')' : '') + '.');
+        if (!appId) {
+          errMsg = 'The money is recorded but this person has no application. Resolve it before closing this row - they have paid and nothing is in the queue for them.';
+        }
+      }
     } else if (action === 'reject') {
       await db.execute(sql`UPDATE application_intl_payments SET status='rejected', admin_notes=COALESCE(${adminNote}, admin_notes), reviewer_user_id=${user.id}, reviewed_at=NOW() WHERE id=${id}`);
       okMsg = 'Request rejected.';
     }
-  } catch (e: any) { errMsg = 'Failed: ' + (e?.message || 'unknown'); }
+  } catch (e: any) {
+    // e.message on a drizzle/postgres-js error is the failed SQL; the reason is on e.cause.
+    const reason = dbReason(e);
+    console.error('[admin/intl-payments] action failed -', reason);
+    errMsg = 'Failed, and nothing was recorded: ' + reason;
+  }
 }
 
 const filter = new URL(Astro.request.url).searchParams.get('status') || 'pending';
@@ -101,6 +171,12 @@ function fmt(d: any) { return d ? new Date(d).toLocaleString('en-IN', { timeZone
     </div>
   </div>
 
+  {schemaError && (
+    <div style="margin:12px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.6;">
+      The payment-request table could not be prepared, so this queue may be incomplete or empty for a reason that has nothing to do with how many people are waiting.
+      <span style="display:block;margin-top:6px;font-family:'Geist Mono',monospace;font-size:11px;color:#d89a9a;word-break:break-word;">{schemaError}</span>
+    </div>
+  )}
   {okMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.30);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
   {errMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errMsg}</div>}
 

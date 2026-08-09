@@ -1677,6 +1677,24 @@ export async function cancelConsultRequest(userId: string, id: string): Promise<
 }
 
 // --- The consultant side -----------------------------------------------------
+//
+// THIS HALF OF THE SYSTEM HAD NO SCREEN AT ALL.
+//
+// A woman could write a consultation request and the row was stored correctly. Nothing then listed
+// it for anybody, nothing routed it, and nothing could answer it: listAssignedConsults,
+// getAssignedConsult, respondToConsult, listUnassignedForRouting, routeConsultToConsultant,
+// upsertConsultant and setConsultantActive were called by no page in the repository. The request
+// form told her "it goes to one wellness consultant, who reads it and writes back on this page",
+// and no consultant could have read it. That is the worst shape of stub in this codebase — not a
+// dead helper, but a promise made to somebody at the moment she asked for help.
+//
+// There are now two surfaces: /portal/wellness/consultant (the pool's own queue: take a waiting
+// request, read the one assigned to you, write back) and /admin/wellness/consultants (appointing
+// the pool, which involves no health data at all).
+//
+// EVERY READ BELOW IS DISCRIMINATED. These functions used to return [] or null on a query failure,
+// which on a consultant's queue reads as "nobody is waiting" — the single most dangerous empty
+// state in this system. { ok:false, reason } is now returned and the page prints it.
 
 export interface ConsultantRow {
   userId: string;
@@ -1686,23 +1704,54 @@ export interface ConsultantRow {
   isActive: boolean;
 }
 
+/**
+ * The engine's read result. An empty list and a failed query are different facts, and on a health
+ * queue they are opposite instructions to the person reading the screen.
+ */
+export type WellnessRead<T> = { ok: true; value: T } | { ok: false; reason: string };
+
 /** Names only. Safe to show on the request form so she can choose who reads it. */
-export async function listConsultants(activeOnly = true): Promise<ConsultantRow[]> {
+export async function listConsultants(activeOnly = true): Promise<WellnessRead<ConsultantRow[]>> {
   try {
     await ensureWellnessSchema();
     const r = activeOnly
       ? await db.execute(sql`SELECT user_id, display_name, credentials, focus, is_active FROM wellness_consultants WHERE is_active = true ORDER BY display_name`)
       : await db.execute(sql`SELECT user_id, display_name, credentials, focus, is_active FROM wellness_consultants ORDER BY is_active DESC, display_name`);
-    return rows(r).map((x) => ({
-      userId: x.user_id,
-      displayName: x.display_name,
-      credentials: x.credentials || null,
-      focus: x.focus || null,
-      isActive: !!x.is_active,
-    }));
+    return {
+      ok: true,
+      value: rows(r).map((x) => ({
+        userId: x.user_id,
+        displayName: x.display_name,
+        credentials: x.credentials || null,
+        focus: x.focus || null,
+        isActive: !!x.is_active,
+      })),
+    };
   } catch (e: any) {
-    console.error('[wellness] listConsultants:', errText(e));
-    return [];
+    const reason = errText(e);
+    console.error('[wellness] listConsultants:', reason);
+    return { ok: false, reason };
+  }
+}
+
+/**
+ * An account to appoint to the pool, looked up by the address the administrator typed.
+ *
+ * Reads name and email from `users` and nothing else. It touches no wellness table, no employee
+ * record and no health column: appointing a consultant is an administrative act about an account,
+ * not about anybody's health.
+ */
+export async function findAccountForConsultant(email: string): Promise<WellnessRead<{ id: string; name: string; email: string } | null>> {
+  const addr = String(email || '').trim().toLowerCase();
+  if (!addr) return { ok: true, value: null };
+  try {
+    const r = await db.execute(sql`SELECT id, name, email FROM users WHERE LOWER(email) = ${addr} LIMIT 1`);
+    const row = rows(r)[0];
+    return { ok: true, value: row ? { id: String(row.id), name: String(row.name || ''), email: String(row.email || '') } : null };
+  } catch (e: any) {
+    const reason = errText(e);
+    console.error('[wellness] findAccountForConsultant:', reason);
+    return { ok: false, reason };
   }
 }
 
@@ -1761,9 +1810,15 @@ export async function setConsultantActive(userId: string, active: boolean): Prom
   }
 }
 
-/** A consultant's own queue: only what was routed to her. */
-export async function listAssignedConsults(consultantUserId: string, limit = 50): Promise<ConsultRow[]> {
-  if (!(await isWellnessConsultant(consultantUserId))) return [];
+/**
+ * A consultant's own queue: only what was routed to her.
+ *
+ * 'not-in-pool' is returned as a FAILURE rather than an empty queue, because a consultant whose
+ * pool membership was deactivated while she was reading needs to be told that, not shown a page
+ * saying nobody needs her.
+ */
+export async function listAssignedConsults(consultantUserId: string, limit = 50): Promise<WellnessRead<ConsultRow[]>> {
+  if (!(await isWellnessConsultant(consultantUserId))) return { ok: false, reason: 'not-in-pool' };
   try {
     const r = await db.execute(sql`
       SELECT q.id, q.topic, q.urgency, q.message, q.status, q.response, q.created_at, q.answered_at,
@@ -1774,15 +1829,17 @@ export async function listAssignedConsults(consultantUserId: string, limit = 50)
       ORDER BY CASE q.urgency WHEN 'priority' THEN 0 WHEN 'soon' THEN 1 ELSE 2 END, q.created_at ASC
       LIMIT ${Math.max(1, Math.min(200, Math.floor(limit)))}
     `);
-    return rows(r).map(mapConsultRow);
+    return { ok: true, value: rows(r).map(mapConsultRow) };
   } catch (e: any) {
-    console.error('[wellness] listAssignedConsults:', errText(e));
-    return [];
+    const reason = errText(e);
+    console.error('[wellness] listAssignedConsults:', reason);
+    return { ok: false, reason };
   }
 }
 
-export async function getAssignedConsult(consultantUserId: string, id: string): Promise<ConsultRow | null> {
-  if (!(await isWellnessConsultant(consultantUserId))) return null;
+/** One assigned request. value===null means "not yours / no such request", which is not a failure. */
+export async function getAssignedConsult(consultantUserId: string, id: string): Promise<WellnessRead<ConsultRow | null>> {
+  if (!(await isWellnessConsultant(consultantUserId))) return { ok: false, reason: 'not-in-pool' };
   try {
     const r = await db.execute(sql`
       SELECT q.id, q.topic, q.urgency, q.message, q.status, q.response, q.created_at, q.answered_at,
@@ -1792,13 +1849,26 @@ export async function getAssignedConsult(consultantUserId: string, id: string): 
       LIMIT 1
     `);
     const row = rows(r)[0];
-    return row ? mapConsultRow(row) : null;
+    return { ok: true, value: row ? mapConsultRow(row) : null };
   } catch (e: any) {
-    console.error('[wellness] getAssignedConsult:', errText(e));
-    return null;
+    const reason = errText(e);
+    console.error('[wellness] getAssignedConsult:', reason);
+    return { ok: false, reason };
   }
 }
 
+/**
+ * Write the reply, and tell her it arrived.
+ *
+ * THE NOTIFICATION CARRIES NO CONTENT. It says a reply is waiting and links to her own page; the
+ * words are read there, behind her own gate. The UPDATE returns the requester's user id for that
+ * one purpose — it is the id of the person being written to, which the consultant is already
+ * authorised to correspond with, and it is not returned to any caller.
+ *
+ * The notify() failure is caught SEPARATELY from the write. A notifier that is down must never
+ * make a saved reply report itself as unsaved — she would be told to write it again and the
+ * consultant would answer twice.
+ */
 export async function respondToConsult(
   consultantUserId: string,
   id: string,
@@ -1807,19 +1877,36 @@ export async function respondToConsult(
   const text = cleanText(response, MAX_MESSAGE_CHARS);
   if (!text) return { ok: false, error: 'Please write a reply first.' };
   if (!(await isWellnessConsultant(consultantUserId))) return { ok: false, error: 'Not available.' };
+  let requesterId = '';
   try {
     const r = await db.execute(sql`
       UPDATE wellness_consult_requests
       SET response = ${text}, answered_at = NOW(), status = 'answered', updated_at = NOW()
       WHERE id = ${id}::uuid AND assigned_to = ${String(consultantUserId)}::uuid
-      RETURNING id
+      RETURNING id, user_id
     `);
-    if (!rows(r).length) return { ok: false, error: 'Not available.' };
-    return { ok: true };
+    const row = rows(r)[0];
+    if (!row) return { ok: false, error: 'That request is no longer open to you.' };
+    requesterId = String(row.user_id || '');
   } catch (e: any) {
     console.error('[wellness] respondToConsult:', errText(e));
-    return { ok: false, error: 'That did not save.' };
+    return { ok: false, error: 'That did not save. Nothing has been sent.' };
   }
+  if (requesterId) {
+    try {
+      const { notifyUser } = await import('@/lib/notify');
+      await notifyUser(requesterId, {
+        title: 'There is a reply to your consultation',
+        body: 'Open your consultation page to read it.',
+        type: 'message',
+        actionUrl: '/portal/wellness/consult',
+      });
+    } catch (e: any) {
+      // Logged, never surfaced as a failed reply: the reply IS saved by this point.
+      console.error('[wellness] respondToConsult.notify:', errText(e));
+    }
+  }
+  return { ok: true };
 }
 
 export interface RoutingRow {
@@ -1838,7 +1925,7 @@ export interface RoutingRow {
  * none of that. This is the only function in the file that touches a request belonging to somebody
  * other than the writer or the assigned consultant, and this is why its SELECT list is short.
  */
-export async function listUnassignedForRouting(limit = 50): Promise<RoutingRow[]> {
+export async function listUnassignedForRouting(limit = 50): Promise<WellnessRead<RoutingRow[]>> {
   try {
     await ensureWellnessSchema();
     const r = await db.execute(sql`
@@ -1849,20 +1936,38 @@ export async function listUnassignedForRouting(limit = 50): Promise<RoutingRow[]
       ORDER BY CASE urgency WHEN 'priority' THEN 0 WHEN 'soon' THEN 1 ELSE 2 END, created_at ASC
       LIMIT ${Math.max(1, Math.min(200, Math.floor(limit)))}
     `);
-    return rows(r).map((x) => ({
-      id: x.id,
-      urgency: x.urgency || 'routine',
-      createdAt: x.created_at ? new Date(x.created_at).toISOString() : '',
-      waitingHours: Number(x.waiting_hours) || 0,
-    }));
+    return {
+      ok: true,
+      value: rows(r).map((x) => ({
+        id: x.id,
+        urgency: x.urgency || 'routine',
+        createdAt: x.created_at ? new Date(x.created_at).toISOString() : '',
+        waitingHours: Number(x.waiting_hours) || 0,
+      })),
+    };
   } catch (e: any) {
-    console.error('[wellness] listUnassignedForRouting:', errText(e));
-    return [];
+    const reason = errText(e);
+    console.error('[wellness] listUnassignedForRouting:', reason);
+    return { ok: false, reason };
   }
 }
 
-/** Routes a request by id. Reads nothing about it, and writes only the assignment. */
-export async function routeConsultToConsultant(id: string, consultantUserId: string): Promise<{ ok: boolean; error?: string }> {
+/**
+ * Routes a request by id. Reads nothing about it, and writes only the assignment.
+ *
+ * `routedBy` exists so the consultant page can call this to TAKE a request for herself: when the
+ * router and the consultant are the same person there is nobody to notify, and when they differ the
+ * consultant is told there is something in her queue. The notification names no requester, no topic
+ * and no words — only that a request was routed.
+ *
+ * WHERE status = 'open' is the whole concurrency story: two consultants pressing "Take this" on the
+ * same waiting request cannot both win, and the second is told plainly that somebody else has it.
+ */
+export async function routeConsultToConsultant(
+  id: string,
+  consultantUserId: string,
+  routedBy?: string | null,
+): Promise<{ ok: boolean; error?: string }> {
   if (!(await isWellnessConsultant(consultantUserId))) return { ok: false, error: 'That person is not an active consultant.' };
   try {
     const r = await db.execute(sql`
@@ -1871,12 +1976,25 @@ export async function routeConsultToConsultant(id: string, consultantUserId: str
       WHERE id = ${id}::uuid AND status = 'open'
       RETURNING id
     `);
-    if (!rows(r).length) return { ok: false, error: 'That request is no longer waiting.' };
-    return { ok: true };
+    if (!rows(r).length) return { ok: false, error: 'That request is no longer waiting — somebody else has taken it.' };
   } catch (e: any) {
     console.error('[wellness] routeConsultToConsultant:', errText(e));
-    return { ok: false, error: 'That did not save.' };
+    return { ok: false, error: 'That did not save. The request is still waiting.' };
   }
+  if (routedBy && routedBy !== consultantUserId) {
+    try {
+      const { notifyUser } = await import('@/lib/notify');
+      await notifyUser(consultantUserId, {
+        title: 'A consultation request was routed to you',
+        body: 'It is in your consultant queue.',
+        type: 'message',
+        actionUrl: '/portal/wellness/consultant',
+      });
+    } catch (e: any) {
+      console.error('[wellness] routeConsultToConsultant.notify:', errText(e));
+    }
+  }
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------

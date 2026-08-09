@@ -134,6 +134,19 @@ export function ensureAquintutorAuthoringSchema(): Promise<void> {
       )`);
       await ex(sql`CREATE INDEX IF NOT EXISTS tlp_user_idx ON training_lesson_progress(user_id, course_id)`);
 
+      // The table lesson completion is ACTUALLY written to, by /api/aquintutor/lesson-complete.
+      // Declared here as well, identical to that route's definition, so a page that only READS
+      // completions does not depend on the write route having run first on a fresh database.
+      // CREATE TABLE IF NOT EXISTS makes the second declaration a no-op; it redefines nothing.
+      await ex(sql`CREATE TABLE IF NOT EXISTS training_lesson_completions (
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        course_id UUID NOT NULL,
+        lesson_id UUID NOT NULL,
+        completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, lesson_id)
+      )`);
+      await ex(sql`CREATE INDEX IF NOT EXISTS tlc_user_course_idx ON training_lesson_completions(user_id, course_id)`);
+
       // Per-lesson discussions (threaded by parent_id).
       await ex(sql`CREATE TABLE IF NOT EXISTS training_lesson_discussions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -268,27 +281,72 @@ export async function restoreVersion(opts: { lessonId: string; versionId: string
 }
 
 // ============ Progress ============
-export async function markLessonComplete(opts: { userId: string; lessonId: string; courseId?: string; timeSpentSeconds?: number }) {
+//
+// THERE WERE TWO COMPLETION TABLES AND ONLY ONE OF THEM WAS EVER WRITTEN.
+//
+// markLessonComplete() here INSERTed into training_lesson_progress and was called by nothing. The
+// button a learner actually presses posts to /api/aquintutor/lesson-complete, which creates and
+// writes its OWN table, training_lesson_completions. So the write landed in one table and the
+// surfaces read the other:
+//
+//   - the lesson runner read training_lesson_progress to decide whether to show "Completed", so
+//     pressing the button, reloading, and finding it still saying "Mark as complete" was the
+//     guaranteed outcome for every learner on every lesson, forever;
+//   - getCourseProgress() counted the empty table, so course progress was always 0 of N;
+//   - /aquintutor/progress drew its 84-day lesson chart from the empty table (its fallback query
+//     selected created_at, a column training_lesson_completions does not have, so the fallback
+//     could only throw).
+//
+// The duplicate WRITER is gone rather than repaired: the API route owns the write, and two
+// functions recording the same fact into two tables is the defect, not a missing feature.
+//
+// The READ counts BOTH tables, de-duplicated by lesson, because rows written by the old path on a
+// live database are real completions a learner earned. That union is the only reason
+// training_lesson_progress is still read at all; nothing writes it any more.
+
+/** Lesson ids this learner has completed on a course, from both the live and the legacy table. */
+export async function completedLessonIds(userId: string, courseId: string): Promise<string[]> {
   await ensureAquintutorAuthoringSchema();
-  await db.execute(sql`
-    INSERT INTO training_lesson_progress (user_id, lesson_id, course_id, completed_at, time_spent_seconds)
-    VALUES (${opts.userId}, ${opts.lessonId}, ${opts.courseId || null}, NOW(), ${opts.timeSpentSeconds || 0})
-    ON CONFLICT (user_id, lesson_id) DO UPDATE
-      SET completed_at = COALESCE(training_lesson_progress.completed_at, NOW()),
-        time_spent_seconds = training_lesson_progress.time_spent_seconds + EXCLUDED.time_spent_seconds
-  `);
+  const r = rows(await db.execute(sql`
+    SELECT lesson_id::text AS lesson_id FROM training_lesson_completions
+    WHERE user_id = ${userId} AND course_id = ${courseId}
+    UNION
+    SELECT p.lesson_id::text AS lesson_id FROM training_lesson_progress p
+    JOIN training_lessons l ON l.id = p.lesson_id
+    WHERE p.user_id = ${userId} AND l.course_id = ${courseId} AND p.completed_at IS NOT NULL
+  `));
+  return r.map((x: any) => String(x.lesson_id));
+}
+
+/**
+ * Has this learner completed this lesson?
+ *
+ * Throws on a read failure ON PURPOSE, and every caller is written to expect it. `false` is the
+ * answer that makes a page offer a button to redo work already done, and it is indistinguishable
+ * from a real "not yet".
+ */
+export async function isLessonComplete(userId: string, lessonId: string): Promise<boolean> {
+  await ensureAquintutorAuthoringSchema();
+  const r = rows(await db.execute(sql`
+    SELECT 1 AS hit FROM training_lesson_completions WHERE user_id = ${userId} AND lesson_id = ${lessonId}
+    UNION ALL
+    SELECT 1 AS hit FROM training_lesson_progress WHERE user_id = ${userId} AND lesson_id = ${lessonId} AND completed_at IS NOT NULL
+    LIMIT 1
+  `));
+  return r.length > 0;
 }
 
 export async function getCourseProgress(userId: string, courseId: string) {
   await ensureAquintutorAuthoringSchema();
+  const done = await completedLessonIds(userId, courseId);
   const r = rows(await db.execute(sql`
-    SELECT
-      (SELECT COUNT(*)::int FROM training_lessons WHERE course_id = ${courseId} AND status = 'published') AS total,
-      (SELECT COUNT(*)::int FROM training_lesson_progress p
-        JOIN training_lessons l ON p.lesson_id = l.id
-        WHERE p.user_id = ${userId} AND l.course_id = ${courseId} AND p.completed_at IS NOT NULL) AS completed
+    SELECT COUNT(*)::int AS total FROM training_lessons
+    WHERE course_id = ${courseId} AND status = 'published'
   `));
-  return { total: r[0]?.total || 0, completed: r[0]?.completed || 0 };
+  const total = Number(r[0]?.total || 0);
+  // A learner can hold completions for lessons that were later unpublished; the count of finished
+  // work must never exceed the count of work on offer, or a progress bar reads over 100%.
+  return { total, completed: Math.min(total, done.length) };
 }
 
 // ============ Modules ============

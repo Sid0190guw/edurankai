@@ -1,10 +1,37 @@
 // POST /api/help/start - get or create a help conversation for the current visitor.
 // Sets a long-lived era_help_session cookie if missing. Optional initial message.
+//
+// TWO THINGS WERE WRONG HERE, AND BOTH ENDED WITH A MEMBER OF THE PUBLIC WAITING FOR AN ANSWER THAT
+// NOBODY KNEW THEY HAD ASKED FOR.
+//
+// 1. A MESSAGE INTO A CLOSED CONVERSATION VANISHED. This appended `initialMessage` to whatever
+//    conversation the cookie pointed at, whatever its status, and bumped unread_admin. But
+//    /admin/help lists `status = 'open'` by default (api/admin/help/list.ts), so a message written
+//    into a closed conversation was invisible on the inbox anybody actually opens. The visitor,
+//    meanwhile, cannot escape: /api/help/send.ts matches on `status = 'open'` and refuses, and this
+//    endpoint only mints a NEW conversation when the token matches NO row - so a person whose chat
+//    was closed had exactly one route to support left and it silently discarded everything they
+//    wrote. A visitor writing again REOPENS the conversation now. That is not new authority: it is
+//    the inverse of the Close button an agent already holds, it is what /api/admin/help/reply.ts's
+//    `reopen` does from the other side, and the alternative is a support channel that swallows mail.
+//
+// 2. EVERY WAY OF TELLING STAFF WAS WRAPPED IN A BARE CATCH. Push, email and the in-app notifier
+//    each failed in total silence, so a broken SMTP password or an absent VAPID key meant help chats
+//    piled up unseen with nothing anywhere recording that the alert had been attempted. They are
+//    still best-effort - a failed notification must never lose the visitor's message, which IS
+//    saved by then - but the reason now reaches the log, which is the difference between a fault
+//    somebody can find and one nobody can.
+//
+// The catch-all also stopped handing the caller `e.message`: that is the failed SQL, which describes
+// this schema to an anonymous visitor and tells them nothing they can act on.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import crypto from 'node:crypto';
+import { logEvent } from '@/lib/logger';
 
+// Declared above the handler that uses them: `const` is not hoisted, and a handler reaching a later
+// declaration has taken pages down on this project.
 const COOKIE_NAME = 'era_help_session';
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 180; // 180 days
 
@@ -18,6 +45,9 @@ function json(d: any, s = 200, headers?: Record<string, string>) {
 function newToken() {
   return crypto.randomBytes(24).toString('base64url');
 }
+
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 export const POST: APIRoute = async ({ request, cookies, locals }) => {
   let body: any = {};
@@ -79,10 +109,14 @@ export const POST: APIRoute = async ({ request, cookies, locals }) => {
         INSERT INTO help_messages (conversation_id, sender_role, sender_name, body)
         VALUES (${conv.id}, 'visitor', ${name || null}, ${initialMessage})
       `);
+      // `status = 'open'` is the line that stops this message disappearing into a closed thread the
+      // support inbox does not list. It is a no-op on the overwhelmingly common case (the
+      // conversation was already open) and the only thing that makes the write reachable otherwise.
       await db.execute(sql`
         UPDATE help_conversations SET
           message_count = message_count + 1,
           unread_admin = unread_admin + 1,
+          status = 'open',
           last_message_at = NOW(),
           last_message_by = 'visitor',
           last_message_preview = ${initialMessage.substring(0, 200)},
@@ -93,11 +127,15 @@ export const POST: APIRoute = async ({ request, cookies, locals }) => {
       try {
         const { sendPushToAdmins } = await import('@/lib/push');
         await sendPushToAdmins({ type: 'help_message', title: 'New help chat: ' + (name || 'visitor'), body: String(initialMessage).slice(0, 160), url: '/admin/help', tag: 'help-' + conv.id });
-      } catch (_) {}
+      } catch (e: any) {
+        logEvent('error', 'help.start.push-failed', { conversationId: String(conv.id), message: reasonOf(e) });
+      }
       try {
         const { sendEmail } = await import('@/lib/email');
         await sendEmail({ to: 'hr@edurankai.in', subject: 'New help chat from ' + (name || 'a visitor'), html: '<p><strong>' + (name || 'A visitor') + '</strong> started a help chat:</p><blockquote>' + String(initialMessage).replace(/[<>]/g, '') + '</blockquote><p><a href="https://edurankai.in/admin/help">Open the help inbox</a></p>', text: (name || 'A visitor') + ': ' + initialMessage + '\n\nOpen: https://edurankai.in/admin/help' });
-      } catch (_) {}
+      } catch (e: any) {
+        logEvent('error', 'help.start.email-failed', { conversationId: String(conv.id), message: reasonOf(e) });
+      }
     }
 
     // Return the conversation + recent messages
@@ -115,6 +153,7 @@ export const POST: APIRoute = async ({ request, cookies, locals }) => {
       messages,
     });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'db error' }, 500);
+    logEvent('error', 'help.start.failed', { message: reasonOf(e) });
+    return json({ ok: false, error: 'The help chat could not be opened just now. Please try again.' }, 500);
   }
 };

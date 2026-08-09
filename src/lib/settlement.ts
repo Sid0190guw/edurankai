@@ -211,12 +211,38 @@ export interface SettlementFacts {
   finalMonthLabel: string;
   /** The person's regular monthly gross, from the live salary structure. Bonuses excluded by design. */
   regularGross: number;
+  /**
+   * WHETHER regularGross ABOVE IS A FIGURE OR AN ABSENCE.
+   *
+   * FALSE means no salary was ever recorded for this person — hr_employees.base_salary NULL and no
+   * hr_salary_structures row — or the read that would have found one did not answer. In both cases
+   * regularGross, perDayRate and unpaidFinalSalary below are 0 because nothing was FOUND, and every
+   * screen that prints them must say so instead of printing 0.00 beside a currency symbol on the
+   * final document somebody who has just lost their income will read.
+   *
+   * A RECORDED ZERO IS TRUE, not false. An unpaid engagement is a decision somebody made and it
+   * settles at zero correctly.
+   */
+  regularGrossKnown: boolean;
   /** regularGross divided by the days in the final month. The only per-day figure this module offers. */
   perDayRate: number;
   /** Salary for the days worked in the final month, IF no payslip for that month exists yet. */
   unpaidFinalSalary: number;
   /** True when payroll already ran for the final month, so no salary line is proposed. */
   finalMonthAlreadyPaid: boolean;
+  /**
+   * NO FINAL-MONTH SALARY LINE COULD BE PROPOSED, AND NOT BECAUSE NOTHING IS OWED.
+   *
+   * The final month is unpaid, so a line belongs on this statement — and the amount could not be
+   * computed because no salary is on record. refreshComputedLines() writes the line only when the
+   * figure is above zero, so this state produced a statement with the salary line simply ABSENT: a
+   * full and final settlement that quietly pays a leaver nothing for the days they worked, and looks
+   * on screen exactly like one where the month happened to be already paid.
+   *
+   * finaliseSettlement() refuses the handoff while this is true and no earning line has been entered
+   * by hand, so somebody has to make the decision rather than inherit it from an empty column.
+   */
+  finalSalaryUnknown: boolean;
   /** Unused balance per leave type. Facts only — this module proposes no encashment. */
   leaveBalances: LeaveBalance[];
   /** Live loans and advances with something still owed. */
@@ -278,11 +304,19 @@ export async function settlementFacts(separationId: string): Promise<SettlementF
 
   let regularGross = 0;
   let currency = String(sep.ff_currency || sep.emp_currency || 'INR');
+  // A FIGURE THIS MODULE ACTUALLY OBTAINED, as opposed to the zero that a missing record and a failed
+  // read both leave behind. Declared here, above the block that sets it and the arithmetic below that
+  // depends on it. Starts FALSE: nothing is known until a read says so, which is the opposite of how
+  // `regularGross = 0` reads on its own.
+  let regularGrossKnown = false;
   if (haveLwd && isUuid(employeeId)) {
     try {
       const pay = await computePay(employeeId, { month, year });
       regularGross = pay.regularGross;
       currency = String(sep.ff_currency || pay.currency || currency);
+      // computePay() distinguishes "recorded as zero" from "never recorded" and from "could not be
+      // read"; only the first of those is a salary this statement may prorate.
+      regularGrossKnown = pay.salaryOnRecord && !pay.unpayableReason;
       for (const g of pay.gaps) gaps.push(g);
     } catch (e: any) {
       logFail('settlementFacts.pay', e);
@@ -313,6 +347,21 @@ export async function settlementFacts(separationId: string): Promise<SettlementF
   const unpaidFinalSalary = finalMonthAlreadyPaid || finalMonthDays <= 0
     ? 0
     : round2((regularGross * finalMonthDaysWorked) / finalMonthDays);
+
+  // THE ZERO ABOVE HAS TWO MEANINGS AND ONLY ONE OF THEM IS A SETTLEMENT.
+  //
+  // Nothing owed for the final month is a legitimate answer — payroll already paid it, or the person
+  // left on the last day of a month that was run. Nothing KNOWN about the final month is not: it is
+  // an unread column being handed to somebody as their last payment. This flag is the difference, and
+  // it is what the console prints and what the handoff refuses on.
+  const finalSalaryUnknown = haveLwd && !finalMonthAlreadyPaid && !regularGrossKnown;
+  if (finalSalaryUnknown) {
+    gaps.push(
+      'any salary to prorate the final month from, so NO salary line has been put on this statement '
+      + 'for ' + (MONTH_NAMES[month - 1] || '') + ' ' + year + '. That is an absence, not a figure of '
+      + 'zero - record the salary on the employee and recalculate, or enter the final month by hand',
+    );
+  }
 
   let leaveBalances: LeaveBalance[] = [];
   if (isUuid(employeeId)) {
@@ -380,9 +429,11 @@ export async function settlementFacts(separationId: string): Promise<SettlementF
     finalMonthDays,
     finalMonthLabel: haveLwd ? (MONTH_NAMES[month - 1] + ' ' + year) : 'not known',
     regularGross,
+    regularGrossKnown,
     perDayRate,
     unpaidFinalSalary,
     finalMonthAlreadyPaid,
+    finalSalaryUnknown,
     leaveBalances,
     loans,
     loanOutstandingTotal: sumMoney(loans.map((l) => l.outstanding)),
@@ -683,6 +734,11 @@ export async function refreshComputedLines(
       action: 'settlement.recomputed', entity: 'hr_settlement', entityId: settlementId,
       diff: {
         unpaidFinalSalary: facts.unpaidFinalSalary,
+        // WHY THE SALARY LINE IS MISSING, IN THE AUDIT RECORD OF THE RECALCULATION. Without it the
+        // trail shows a settlement recomputed to no salary line and cannot say whether that was
+        // because the month was paid or because nobody ever recorded what this person earned.
+        finalSalaryUnknown: facts.finalSalaryUnknown,
+        finalMonthAlreadyPaid: facts.finalMonthAlreadyPaid,
         loanOutstandingTotal: facts.loanOutstandingTotal,
         gaps: facts.gaps,
       },
@@ -984,6 +1040,29 @@ export async function finaliseSettlement(opts: {
         + ' for ' + facts.finalMonthLabel + ', but payroll has since run for that month and already '
         + 'paid it. Handing this off would pay the final month twice. Reopen the settlement so the '
         + 'line is recomputed against a month that is now paid, and have the new figure approved.',
+      );
+    }
+
+    // ---- AND THE FINAL MONTH NOBODY COULD PUT A NUMBER ON ---------------------------------------
+    //
+    // The mirror image of the double-pay refusal above. There, a line exists for a month that has
+    // since been paid; here, NO line exists for a month that has not been paid, because no salary is
+    // recorded for this person at all and the proration had nothing to work from. refreshComputedLines()
+    // writes the salary line only when the amount is above zero, so that statement is not marked
+    // incomplete anywhere — it simply has one fewer row, and hands somebody their last payment with
+    // the month they worked missing from it.
+    //
+    // A LINE ENTERED BY HAND LIFTS THIS. If somebody has typed the final month in as a manual earning
+    // — which is exactly what the console tells them to do — the decision has been made by a person
+    // and this has nothing to add.
+    const manualEarning = s.lines.some((l) => l.source !== 'auto' && l.kind === 'earning' && l.amount > 0);
+    if (facts && facts.finalSalaryUnknown && !finalSalaryLine && !manualEarning) {
+      blockers.push(
+        'No salary is recorded for this person, so the ' + facts.finalMonthLabel + ' salary could not '
+        + 'be calculated and this statement carries no line for it. Payroll has not paid that month '
+        + 'either. Handing this off would settle them for the days they worked at nothing. Record the '
+        + 'salary on the employee record and recalculate, or add the final month as a line here, and '
+        + 'have the figure approved.',
       );
     }
 

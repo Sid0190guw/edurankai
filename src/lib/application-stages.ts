@@ -55,18 +55,100 @@ export const STAGES = [
   { key: 'onboarded',   label: 'Offer + onboarded',  short: '06 · Onboarded',     blurb: 'Offer signed, statutory enrolment complete, KRAs set, day one scheduled.' },
 ] as const;
 
-export const TERMINAL_STAGES = ['decision_no', 'withdrawn'];
+/**
+ * WHERE A FUNNEL ACTUALLY ENDS — AND WHY THESE ARE NOW REAL STAGES RATHER THAN TWO BARE STRINGS.
+ *
+ * `TERMINAL_STAGES` was `['decision_no', 'withdrawn']` and NOTHING in src/ read it and NOTHING wrote
+ * either value. So the six-step tracker a candidate is shown had no way to say "this is over": a
+ * closed application kept rendering whichever open step it had last reached, with that step's
+ * present-tense blurb. Worse, because stageIndex() falls back to 0 for a key it does not recognise,
+ * the first person whose stage WAS set to a terminal key would have been shown "01 · Submitted —
+ * your application is in our queue" about an application that had been closed.
+ *
+ * Both endings therefore carry a label and a sentence of their own, and everything that renders or
+ * notifies looks a key up through stageDescriptor() rather than through STAGES alone.
+ */
+export const CLOSED_STAGES = [
+  { key: 'decision_no', label: 'Closed',    short: 'Closed',    blurb: 'This application is closed. The written reason is in your application thread, and the decision is appealable.' },
+  { key: 'withdrawn',   label: 'Withdrawn', short: 'Withdrawn', blurb: 'This application is no longer being taken forward at your request. Every other open role remains available to you.' },
+] as const;
+
+/** The key list this module has always exported, unchanged in shape for existing readers. */
+export const TERMINAL_STAGES: string[] = CLOSED_STAGES.map((s) => s.key);
 
 export type StageKey = typeof STAGES[number]['key'];
+export type ClosedStageKey = typeof CLOSED_STAGES[number]['key'];
 
 export function stageIndex(key: string): number {
   const i = STAGES.findIndex(s => s.key === key);
   return i >= 0 ? i : 0;
 }
 
+export function isTerminalStage(key: string): boolean {
+  return TERMINAL_STAGES.indexOf(String(key || '')) >= 0;
+}
+
+/** The label + sentence for ANY stage key, open or closed. Null when the key is not one of ours. */
+export function stageDescriptor(key: string): { key: string; label: string; short: string; blurb: string } | null {
+  const k = String(key || '');
+  const open = STAGES.find(s => s.key === k);
+  if (open) return open;
+  const closed = CLOSED_STAGES.find(s => s.key === k);
+  return closed || null;
+}
+
+export function isKnownStage(key: string): boolean {
+  return stageDescriptor(key) !== null;
+}
+
+/**
+ * ONE MAP BETWEEN THE TWO COLUMNS THAT DESCRIBE THE SAME FUNNEL.
+ *
+ * `applications.status` is what the people desk sets on /admin/applications/[id]; `applications.stage`
+ * is what the candidate is shown on /portal/applications/[id]. They were entirely independent: the
+ * ONLY writers of `stage` in the whole repo were completeHire() (which writes 'onboarded') and the
+ * talent-pool reopen. /api/admin/applications/advance-stage exists but has no caller on any page, so
+ * in practice a candidate moved through review, assessment, interview and a rejection while their
+ * tracker sat on "01 · Submitted — your application is in our queue".
+ *
+ * Pairs rather than a Record because this is imported into .astro files, where a typed
+ * Record<string,string> in JSX breaks the compiler.
+ */
+const STATUS_STAGE_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ['submitted', 'submitted'],
+  ['reviewing', 'review'],
+  ['task_sent', 'assessment'],
+  ['interview', 'interview'],
+  ['offer', 'decision'],
+  ['hired', 'onboarded'],
+  ['rejected', 'decision_no'],
+  ['withdrawn', 'withdrawn'],
+];
+
+/** The funnel stage an application status implies, or null for a status with no funnel meaning. */
+export function stageForStatus(status: string): string | null {
+  const hit = STATUS_STAGE_PAIRS.find(p => p[0] === String(status || ''));
+  return hit ? hit[1] : null;
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export async function advanceStage(opts: { applicationId: string; toStage: string; actorUserId: string | null; actorName: string; note?: string }) {
+/** What advanceStage() answers. `changed` is false when the stage was already what was asked for. */
+export type StageAdvanceResult = { ok: boolean; changed: boolean; error?: string };
+
+export async function advanceStage(opts: { applicationId: string; toStage: string; actorUserId: string | null; actorName: string; note?: string }): Promise<StageAdvanceResult> {
+  // IT REFUSES A STAGE IT DOES NOT KNOW, AND IT SAYS SO.
+  //
+  // This wrote whatever key it was handed straight into applications.stage. A typo, or a status this
+  // module has never heard of, therefore landed a value that stageIndex() resolves to 0 — so the
+  // candidate's tracker silently reset to "01 · Submitted" on an application that had moved on. The
+  // caller is told rather than the column being corrupted, and the result is returned rather than
+  // thrown so that a stage failure never rolls back the status change that prompted it.
+  const target = stageDescriptor(opts.toStage);
+  if (!target) {
+    console.error('[application-stages] refused an unknown stage:', String(opts.toStage));
+    return { ok: false, changed: false, error: '"' + String(opts.toStage) + '" is not a stage of the recruitment funnel, so nothing was changed.' };
+  }
   await ensureStageSchema();
   // actor_user_id is a UUID column. It used to take whatever the caller passed, and an empty string
   // (which is what a system-driven advance has for an actor) fails the cast and takes the whole
@@ -75,7 +157,7 @@ export async function advanceStage(opts: { applicationId: string; toStage: strin
   const cur = await db.execute(sql`SELECT stage FROM applications WHERE id = ${opts.applicationId} LIMIT 1`);
   const r = Array.isArray(cur) ? cur : ((cur as any)?.rows || []);
   const fromStage = r[0]?.stage || 'submitted';
-  if (fromStage === opts.toStage) return;
+  if (fromStage === opts.toStage) return { ok: true, changed: false };
   await db.execute(sql`UPDATE applications SET stage = ${opts.toStage}, stage_updated_at = NOW(), updated_at = NOW() WHERE id = ${opts.applicationId}`);
   await db.execute(sql`
     INSERT INTO application_stage_events (application_id, from_stage, to_stage, actor_user_id, actor_name, note)
@@ -88,11 +170,14 @@ export async function advanceStage(opts: { applicationId: string; toStage: strin
   // is already committed above; a notification failure must not report the advance as having failed,
   // but it is logged with the real Postgres reason rather than dropped.
   try {
-    const stage = STAGES.find((s) => s.key === opts.toStage);
+    // stageDescriptor(), not STAGES.find(). An ENDING is the change a candidate most needs to hear
+    // about, and the old lookup covered only the six open steps — so a closed or withdrawn
+    // application would have moved with no notification at all.
+    const stage = target;
     const who = await db.execute(sql`SELECT applicant_user_id FROM applications WHERE id = ${opts.applicationId} LIMIT 1`);
     const wRows = Array.isArray(who) ? who : ((who as any)?.rows || []);
     const applicantUserId = wRows[0]?.applicant_user_id;
-    if (applicantUserId && stage) {
+    if (applicantUserId) {
       const { notifyUser } = await import('@/lib/notify');
       await notifyUser(String(applicantUserId), {
         title: 'Your application: ' + stage.label,
@@ -106,6 +191,7 @@ export async function advanceStage(opts: { applicationId: string; toStage: strin
   } catch (e: any) {
     console.error('[application-stages] the candidate was NOT told about stage', opts.toStage, '-', e?.cause?.message || e?.message);
   }
+  return { ok: true, changed: true };
 }
 
 export async function getStageEvents(applicationId: string) {

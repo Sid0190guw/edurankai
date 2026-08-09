@@ -1,15 +1,26 @@
 // GET /api/help/poll?since=<iso>
 // Returns messages newer than `since` for the visitor's conversation.
 // Marks unread_visitor = 0 (visitor read everything).
+//
+// THE FAILURE PATH HANDED THE VISITOR `e.message`, WHICH IS THE FAILED SQL. This runs on a poll in
+// an anonymous visitor's browser; the database's own words about which table or column broke belong
+// in the log, not in a five-second fetch a stranger can read. The reason is recorded and the caller
+// gets a sentence.
 import type { APIRoute } from 'astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { logEvent } from '@/lib/logger';
 
+// Declared above the handler that uses them: `const` is not hoisted, and a handler reaching a later
+// declaration has taken pages down on this project.
 const COOKIE_NAME = 'era_help_session';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 }
+
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 
 export const GET: APIRoute = async ({ request, cookies }) => {
   const token = cookies.get(COOKIE_NAME)?.value;
@@ -45,6 +56,7 @@ export const GET: APIRoute = async ({ request, cookies }) => {
       assigned: !!conv.assigned_to,
     });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'db error' }, 500);
+    logEvent('error', 'help.poll.failed', { message: reasonOf(e) });
+    return json({ ok: false, error: 'The conversation could not be read just now.' }, 500);
   }
 };

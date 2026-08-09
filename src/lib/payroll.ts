@@ -270,6 +270,29 @@ export function ensurePayrollSchema(): Promise<void> {
       await db.execute(sql`ALTER TABLE hr_payslips
         ADD COLUMN IF NOT EXISTS employer_cost NUMERIC(14,2) NOT NULL DEFAULT 0`);
 
+      // =========================================================================================
+      // WHAT A RUN COULD NOT DO, KEPT AFTER THE FLASH MESSAGE HAS GONE
+      // =========================================================================================
+      //
+      // generateRun() has always returned `failed` and `ledgerWarnings`, and the payroll console
+      // printed them ONCE — in the response to the POST that created the run. Approve and Mark Paid
+      // happen on a LATER page load, usually a different day and often a different person, and by
+      // then every one of those sentences is gone. The run header says "42 employees" and nothing on
+      // the screen where the money is released says a forty-third was left out, or why.
+      //
+      // These rows are that record: written after the payslips, read beside the Approve and Mark
+      // Paid buttons, and deleted by nothing here. Additive table; no existing one is altered.
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS hr_payroll_run_notices (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        payroll_run_id UUID NOT NULL,
+        employee_id UUID,
+        employee_name TEXT NOT NULL DEFAULT '',
+        severity TEXT NOT NULL DEFAULT 'warning',
+        message TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+      await db.execute(sql`CREATE INDEX IF NOT EXISTS hr_payroll_run_notices_run
+        ON hr_payroll_run_notices (payroll_run_id, created_at)`);
+
       // ===========================================================================================
       // THE TWO INVARIANTS generateRun() ALREADY CLAIMS, ASSERTED WHERE THEY CAN ACTUALLY HOLD
       // ===========================================================================================
@@ -724,6 +747,46 @@ export interface PayComputation {
   /** True when the component catalogue has no active statutory component at all. Not an error — an
    *  honest fact a screen must be able to state rather than imply a deduction was calculated. */
   noStatutoryComponents: boolean;
+  /**
+   * IS THERE A SALARY ON THIS PERSON'S RECORD AT ALL?
+   *
+   * FALSE means NOTHING WAS EVER RECORDED — hr_employees.base_salary is NULL *and* the employee has
+   * no row in hr_salary_structures. That is exactly the state the candidate signing path leaves
+   * behind: completeHire() deliberately refuses to parse an offer letter's free-text compensation
+   * into a number, so a new joiner exists with no pay figure anywhere until a human types one.
+   *
+   * IT IS NOT THE SAME AS A SALARY OF ZERO. A structure whose basic is 0, or a base_salary column
+   * explicitly set to 0, is a DECISION somebody recorded — an unpaid internship engagement is a real
+   * arrangement on this platform — and a run must go on producing that payslip without complaint. A
+   * missing record is an ABSENCE, and an absence paid out looks on the row exactly like a deliberate
+   * zero. The two must never be told apart by reading a number, which is why this is its own flag
+   * and not `grossEarnings > 0`.
+   *
+   * TRUE when the read failed, too. An unreadable structure is reported through `gaps` and must not
+   * be mistaken for a missing one — refusing to pay somebody because the database hiccuped would be
+   * the same silent harm in the other direction.
+   */
+  salaryOnRecord: boolean;
+  /**
+   * THE SENTENCE THAT REFUSES A PAYSLIP, or null when one may be written.
+   *
+   * Derived from salaryOnRecord above and from whether the structure read actually answered. Two
+   * states set it, and both mean the same thing about the figures underneath: every one of them is 0
+   * because nothing was FOUND, not because nothing is owed.
+   *
+   *   * no salary on record at all — the state the candidate signing path leaves behind.
+   *   * the structure read failed AND nothing else on the month adds up to any pay, so the only
+   *     payslip that could be written is a zero one produced by a database error.
+   *
+   * A RECORDED ZERO NEVER SETS IT. An unpaid engagement entered deliberately is a decision somebody
+   * made, and payroll goes on producing that payslip without complaint.
+   *
+   * generateRun() skips the person, names them in the run summary and writes the reason to
+   * hr_payroll_run_notices, so the omission is visible on the screen where the money is released
+   * rather than only in the flash message of the POST that created the run. A preview screen shows
+   * this sentence in place of the zeros.
+   */
+  unpayableReason: string | null;
   /** Named things that could not be read, in words. Never an empty list dressed up as a zero. */
   gaps: string[];
 }
@@ -854,7 +917,10 @@ export async function computePay(
     deductionsReduced: false, deductionReductions: [],
     bonusCharges: [], loanCharges: [],
     lopDays: 0, lopDeduction: 0, daysWorked: 0, daysLeave: 0, daysAbsent: 0,
-    noStatutoryComponents: true, gaps,
+    // TRUE on the empty shape on purpose. `empty` is returned when the id is not an employee id at
+    // all, and answering "this person has no salary recorded" about somebody who is not an employee
+    // would put a name on a payroll refusal list that has no business being there.
+    noStatutoryComponents: true, salaryOnRecord: true, unpayableReason: null, gaps,
   };
   if (!isUuid(employeeId)) {
     gaps.push('this account is not linked to an employee record');
@@ -894,9 +960,21 @@ export async function computePay(
   let structure: any = null;
   let baseSalary = 0;
   let currency = 'INR';
+  // See PayComputation.salaryOnRecord. Optimistic default: only a SUCCESSFUL read that finds neither
+  // a structure row nor a non-NULL base_salary is allowed to set this false, so a failed read can
+  // never take somebody off a payroll run.
+  let salaryOnRecord = true;
+  // SEPARATE FROM salaryOnRecord ON PURPOSE. That flag stays optimistic through a failed read, so a
+  // database hiccup can never assert "this person has no salary". But a read that did not answer
+  // still leaves `basic` at 0, and a zero payslip written out of a failure is the same silent harm
+  // in document form — so the failure is remembered here and refused below only when it would
+  // otherwise produce a payslip of nothing.
+  let structureReadFailed = false;
   try {
     const r = await db.execute(sql`
-      SELECT ss.*, e.base_salary, e.currency AS emp_currency
+      SELECT ss.*, e.base_salary, e.currency AS emp_currency,
+             (e.base_salary IS NOT NULL) AS has_base_salary,
+             (ss.id IS NOT NULL)         AS has_structure
         FROM hr_employees e
         LEFT JOIN LATERAL (
           SELECT s.*
@@ -914,8 +992,15 @@ export async function computePay(
     structure = rows(r)[0] || null;
     baseSalary = Number(structure?.base_salary) || 0;
     currency = String(structure?.currency || structure?.emp_currency || 'INR');
+    // A row came back for a real employee. If it says neither a structure nor a base salary exists,
+    // nothing was ever recorded for this person and that is a fact, not a reading failure. `structure`
+    // being null here means the employee id matched nothing at all, which is not an absent salary.
+    if (structure) {
+      salaryOnRecord = Boolean(structure.has_structure) || Boolean(structure.has_base_salary);
+    }
   } catch (e: any) {
     logFail('computePay.structure', e);
+    structureReadFailed = true;
     gaps.push('the salary structure on file');
   }
 
@@ -982,11 +1067,51 @@ export async function computePay(
   // there are legitimate zero-gross rows (an unpaid intern engagement recorded deliberately). It is
   // NAMED — on the payslip's gap list, in the run summary, and therefore on the screen of the person
   // pressing the button, who is the one human able to fix it before the money moves.
-  if (regularGross <= 0) {
+  //
+  // TWO DIFFERENT SENTENCES, BECAUSE THEY ARE TWO DIFFERENT FACTS. `salaryOnRecord === false` is the
+  // one generateRun() refuses to pay at all (see the skip in the run loop); a recorded zero is only
+  // worth mentioning, because somebody chose it.
+  if (!salaryOnRecord) {
     gaps.push(
-      'a salary on the employee record - basic and every recurring earning came to zero, so this '
-      + 'payslip pays nothing. Set the base salary on the employee before this run is marked paid',
+      'any salary at all - this employee has no base salary and no salary structure on record, so '
+      + 'nothing here was computed from an agreed figure. Record their pay on the employee before '
+      + 'they can be included in a payroll run',
     );
+  } else if (regularGross <= 0) {
+    gaps.push(
+      'a salary above zero - basic and every recurring earning came to zero, so this payslip pays '
+      + 'nothing. That is recorded as their pay; check it is meant before this run is marked paid',
+    );
+  }
+
+  // =================================================================================================
+  // AND THE PAYSLIP THAT MUST NOT BE WRITTEN AT ALL
+  // =================================================================================================
+  //
+  // Naming the absence on a gap list was half the fix: the payslip was still written, still stored
+  // gross 0 / deductions 0 / net 0, still reconciled (0 == 0, so no warning fired), and Mark Paid
+  // still pushed the person "Salary credited ... 0". A document that says somebody was paid nothing
+  // is a claim about their pay. Nothing here is entitled to make it out of an empty column.
+  //
+  // So the refusal is a VALUE, not a throw. Throwing would land in generateRun()'s per-employee catch
+  // and be reported as "their payslip could not be written" — true, but for the wrong reason and with
+  // no way to say what to do about it. A sentence travels: into the run summary, into
+  // hr_payroll_run_notices beside the Approve and Mark Paid buttons, and onto the salary preview.
+  //
+  // regularGross is used rather than salaryOnRecord alone for the read-failure arm, so somebody whose
+  // pay is still computable from configured earnings is never taken off a run by a database hiccup —
+  // which is the rule PayComputation.salaryOnRecord is written to protect.
+  let unpayableReason: string | null = null;
+  if (!salaryOnRecord) {
+    unpayableReason = 'no salary is recorded for them at all - the base salary on the employee record '
+      + 'is empty and no salary structure has been saved, which is exactly the state a newly signed '
+      + 'joiner is left in. A payslip generated from that reads zero and is then marked paid. Record '
+      + 'their salary on the employee, then pay this month by hand or include them in the next run';
+  } else if (structureReadFailed && regularGross <= 0) {
+    unpayableReason = 'their salary structure could not be read, and nothing else this month adds up '
+      + 'to any pay, so the only payslip that could be written is a zero produced by a database '
+      + 'error rather than by their salary. Retry once the read is working, and pay this month by '
+      + 'hand if the run has already been approved';
   }
 
   // ---- attendance and loss of pay ------------------------------------------------------------------
@@ -1364,6 +1489,8 @@ export async function computePay(
     daysLeave,
     daysAbsent,
     noStatutoryComponents: !statutoryConfigured,
+    salaryOnRecord,
+    unpayableReason,
     gaps,
   };
 }
@@ -1371,6 +1498,22 @@ export async function computePay(
 // -------------------------------------------------------------------------------------------------
 // THE RUN
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * SOMEBODY THE RUN DELIBERATELY LEFT OUT, AND WHERE TO GO AND FIX IT.
+ *
+ * Distinct from RunSummary.failed, which is "we tried and the write threw". This is "we refused,
+ * on purpose, and here is why" — and it carries the employee id so the screen can make the reason
+ * REACHABLE rather than merely readable. A run summary that says "3 people were skipped" and gives
+ * no route to the record is the same dead end in a friendlier font.
+ */
+export interface SkippedEmployee {
+  employeeId: string;
+  name: string;
+  reason: string;
+  /** Where the human goes to make this person payable. An existing route, always. */
+  fixHref: string;
+}
 
 export interface RunSummary {
   ok: boolean;
@@ -1383,6 +1526,20 @@ export interface RunSummary {
   totalEmployerCost: number;
   /** Employees whose payslip could not be written, by name, so nobody is quietly left out of payroll. */
   failed: string[];
+  /**
+   * EMPLOYEES THE RUN REFUSED TO PAY, NAMED, WITH THE REASON AND THE ROUTE TO FIX IT.
+   *
+   * A FIRST PAYSLIP FROM A NULL SALARY IS ZERO, and until this list existed it was written and later
+   * marked paid with nothing anywhere raising a hand. Both reconciliation identities balance at zero,
+   * so no ledger warning fires; the run reports success; Mark Paid then pushes the person
+   * "Salary credited ... 0". They are formally paid nothing for their first month, on a document that
+   * looks exactly like a deliberate one, and the only trace is an empty field on an admin screen
+   * nobody was told to open.
+   *
+   * A run that says "I could not include Priya, and here is why" is strictly better than a run that
+   * quietly pays Priya nothing. The caller MUST render this list.
+   */
+  skipped: SkippedEmployee[];
   /** True when no statutory component is configured. The caller MUST say so on screen. */
   noStatutoryComponents: boolean;
   /**
@@ -1418,7 +1575,7 @@ export async function generateRun(
   const y = Math.round(Number(year) || 0);
   const blank: RunSummary = {
     ok: false, employees: 0, totalGross: 0, totalDeductions: 0, totalNet: 0,
-    totalEmployerCost: 0, failed: [], noStatutoryComponents: true, ledgerWarnings: [],
+    totalEmployerCost: 0, failed: [], skipped: [], noStatutoryComponents: true, ledgerWarnings: [],
   };
   if (m < 1 || m > 12) return { ...blank, error: 'Pick a month between January and December.' };
   if (y < 2000 || y > 2100) return { ...blank, error: 'That is not a year this payroll covers.' };
@@ -1511,6 +1668,9 @@ export async function generateRun(
     const employerCostAmounts: number[] = [];
     let count = 0;
     const failed: string[] = [];
+    // Declared here, above the loop that pushes to it and above the return that reads it. `const` is
+    // not hoisted and a list declared under its first writer has taken pages down on this project.
+    const skipped: SkippedEmployee[] = [];
     const ledgerWarnings: string[] = [];
     let noStatutory = true;
 
@@ -1519,6 +1679,55 @@ export async function generateRun(
       try {
         const pay = await computePay(empId, { month: m, year: y });
         if (!pay.noStatutoryComponents) noStatutory = false;
+
+        // =========================================================================================
+        // A PERSON WITH NO SALARY ON RECORD IS NOT PAID ZERO. THEY ARE NAMED.
+        // =========================================================================================
+        //
+        // This is the refusal the run never had. computePay() has always been able to see that
+        // hr_employees.base_salary is NULL and that no hr_salary_structures row exists — the exact
+        // state completeHire() leaves a new joiner in, because it will not guess a number out of an
+        // offer letter's free text — and the run went on to write a complete payslip of zeroes
+        // anyway. Nothing downstream can tell that document from a deliberate unpaid engagement:
+        // both reconciliation identities balance at zero, no ledger warning fires, the run reports
+        // success, and Mark Paid pushes the person "Salary credited ... 0" for their first month.
+        //
+        // NOTHING IS WRITTEN FOR THEM. No payslip row, no lines, no ledger entries, and they are not
+        // counted in `employees` or in any total — so the run header stays equal to the sum of the
+        // payslips it actually contains. The `continue` is BEFORE the INSERT for that reason.
+        //
+        // A RECORDED ZERO STILL GETS ITS PAYSLIP. salaryOnRecord is false only when nobody ever put a
+        // figure anywhere; an unpaid internship whose base_salary is explicitly 0 is a decision a
+        // human made, and refusing to honour it would be this same bug pointing the other way.
+        if (!pay.salaryOnRecord) {
+          skipped.push({
+            employeeId: empId,
+            name: String(emp.full_name || empId),
+            reason: 'No base salary and no salary structure are recorded for them, so a payslip '
+              + 'would have paid them zero and said nothing about it. They have no payslip in this '
+              + 'run and no money has moved.',
+            fixHref: '/admin/hr/employees/' + empId,
+          });
+          continue;
+        }
+
+        // AND THE OTHER WAY A PAYSLIP BECOMES A ZERO NOBODY MEANT.
+        //
+        // salaryOnRecord stays TRUE through a failed read on purpose — a database hiccup must never
+        // assert that somebody has no salary. But a read that did not answer still leaves basic at 0,
+        // and if nothing else on the month adds up to any pay either, the only payslip that could be
+        // written is a zero produced by an error. computePay() says so in unpayableReason and this is
+        // where it is honoured; somebody whose pay is still computable from configured earnings is
+        // NOT taken off the run, which is the rule salaryOnRecord exists to protect.
+        if (pay.unpayableReason) {
+          skipped.push({
+            employeeId: empId,
+            name: String(emp.full_name || empId),
+            reason: pay.unpayableReason,
+            fixHref: '/admin/hr/employees/' + empId,
+          });
+          continue;
+        }
 
         // WHAT THIS PAYSLIP COULD NOT SEE, SAID TO THE PERSON PRESSING THE BUTTON.
         //
@@ -1717,6 +1926,48 @@ export async function generateRun(
       );
     }
 
+    // =============================================================================================
+    // THE RUN'S OWN RECORD OF WHAT IT COULD NOT DO
+    // =============================================================================================
+    //
+    // `skipped`, `failed` and `ledgerWarnings` are returned to the caller and printed ONCE, in the
+    // response to the POST that created the run. Approve and Mark Paid are pressed on a LATER page
+    // load — usually another day, often another person — and by then every one of those sentences
+    // has gone. The money is released over a screen on which the omission is invisible, which is the
+    // third state this whole pass exists to remove: it did not happen, and nothing looks wrong.
+    //
+    // These rows are the same sentences, kept. The payroll console reads them beside both buttons.
+    // Idempotent on (run, severity, message) through WHERE NOT EXISTS rather than ON CONFLICT, so it
+    // is safe without depending on a unique index existing.
+    //
+    // NON-FATAL AND NOT SILENT. The payslips are already written and correct; a notice that could not
+    // be saved is said out loud in the summary, because the entire point of the row is to be read
+    // later by somebody who was not here.
+    let noticesSaved = true;
+    for (const sk of skipped) {
+      const saved = await recordRunNotice(runId, sk.employeeId, sk.name, 'skipped',
+        sk.name + ' was left out of this run and has NO payslip for this month. ' + sk.reason);
+      if (!saved) noticesSaved = false;
+    }
+    for (const name of failed) {
+      const saved = await recordRunNotice(runId, null, name, 'skipped',
+        name + ' has NO payslip in this run: it could not be written. They have not been paid a wrong '
+        + 'amount - they have not been paid at all. The database reason is in the server log for this '
+        + 'run.');
+      if (!saved) noticesSaved = false;
+    }
+    for (const w of [...preflightWarnings, ...ledgerWarnings]) {
+      const saved = await recordRunNotice(runId, null, '', 'warning', w);
+      if (!saved) noticesSaved = false;
+    }
+    if (!noticesSaved) {
+      ledgerWarnings.push(
+        'Part of this run\'s warning list could not be saved against the run, so it will NOT be on '
+        + 'screen when somebody approves or pays this month. Write down what is on this page before '
+        + 'you leave it.',
+      );
+    }
+
     const totalGross = sumMoney(grossAmounts);
     const totalDeductions = sumMoney(deductionAmounts);
     const totalNet = sumMoney(netAmounts);
@@ -1734,6 +1985,10 @@ export async function generateRun(
         month: m, year: y, employees: count, totalGross,
         totalNet, failed, noStatutoryComponents: noStatutory,
         ledgerWarnings: ledgerWarnings.length,
+        // WHO WAS LEFT OUT, IN THE PERMANENT RECORD AND NOT ONLY ON ONE SCREEN. The run summary is
+        // rendered once, to whoever pressed the button; audit_log is what answers "why is there no
+        // March payslip for this person" a quarter later, when the screen is long gone.
+        skipped: skipped.map((s) => ({ employeeId: s.employeeId, name: s.name, reason: s.reason })),
       },
     });
 
@@ -1741,7 +1996,7 @@ export async function generateRun(
       ok: true, runId, employees: count,
       totalGross, totalDeductions,
       totalNet, totalEmployerCost,
-      failed, noStatutoryComponents: noStatutory,
+      failed, skipped, noStatutoryComponents: noStatutory,
       // The preflight list first: it says why the payslips below may be missing something, so it
       // belongs above the per-employee consequences rather than under them.
       ledgerWarnings: [...preflightWarnings, ...ledgerWarnings],
@@ -1750,6 +2005,82 @@ export async function generateRun(
     logFail('generateRun', e);
     return { ...blank, error: WRITE_FAILED, ledgerWarnings: [...preflightWarnings] };
   }
+}
+
+// -------------------------------------------------------------------------------------------------
+// WHAT A RUN COULD NOT DO — WRITTEN ONCE, READABLE FOR AS LONG AS THE RUN EXISTS
+// -------------------------------------------------------------------------------------------------
+
+export interface RunNotice {
+  id: string;
+  runId: string;
+  /** The person it is about, or '' for a notice about the run itself. */
+  employeeName: string;
+  /** Where to go and fix it, when the notice is about one person. Null otherwise. */
+  employeeId: string | null;
+  /** 'skipped' — no payslip exists for this person. 'warning' — one does, with something wrong. */
+  severity: string;
+  message: string;
+  createdAt: string | null;
+}
+
+/**
+ * Record one sentence against a run.
+ *
+ * Answers false rather than throwing: a notice that cannot be saved must never abort a run whose
+ * payslips are already written. The caller reports the failure instead of swallowing it.
+ */
+async function recordRunNotice(
+  runId: string,
+  employeeId: string | null,
+  employeeName: string,
+  severity: 'skipped' | 'warning',
+  message: string,
+): Promise<boolean> {
+  const text = String(message || '').slice(0, 2000);
+  if (!isUuid(runId) || !text) return true;
+  try {
+    await db.execute(sql`
+      INSERT INTO hr_payroll_run_notices
+        (payroll_run_id, employee_id, employee_name, severity, message)
+      SELECT ${runId}::uuid, ${isUuid(employeeId) ? employeeId : null}::uuid,
+             ${String(employeeName || '').slice(0, 200)}, ${severity}, ${text}
+       WHERE NOT EXISTS (
+         SELECT 1 FROM hr_payroll_run_notices
+          WHERE payroll_run_id = ${runId}::uuid AND severity = ${severity} AND message = ${text})`);
+    return true;
+  } catch (e: any) {
+    logFail('recordRunNotice', e);
+    return false;
+  }
+}
+
+/**
+ * Every notice on one run, the people who were left out first.
+ *
+ * THROWS RATHER THAN HIDING. A read that fails must not answer "nothing was left out of this month"
+ * — that sentence, printed over a failed read, next to a Mark Paid button, is the thing this table
+ * exists to prevent. Callers wrap it in their own read-failure banner.
+ */
+export async function runNotices(payrollRunId: string, limit = 200): Promise<RunNotice[]> {
+  if (!isUuid(payrollRunId)) return [];
+  await ensurePayrollSchema();
+  const lim = Math.min(Math.max(Number(limit) || 200, 1), 500);
+  const r = await db.execute(sql`
+    SELECT id, payroll_run_id, employee_id, employee_name, severity, message, created_at
+      FROM hr_payroll_run_notices
+     WHERE payroll_run_id = ${payrollRunId}::uuid
+     ORDER BY (severity = 'skipped') DESC, created_at ASC
+     LIMIT ${lim}`);
+  return rows(r).map((x: any) => ({
+    id: String(x.id),
+    runId: String(x.payroll_run_id),
+    employeeId: x.employee_id ? String(x.employee_id) : null,
+    employeeName: String(x.employee_name || ''),
+    severity: String(x.severity || 'warning'),
+    message: String(x.message || ''),
+    createdAt: x.created_at ? new Date(x.created_at).toISOString() : null,
+  }));
 }
 
 // -------------------------------------------------------------------------------------------------

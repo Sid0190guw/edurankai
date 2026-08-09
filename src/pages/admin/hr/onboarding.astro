@@ -8,7 +8,17 @@ import { pendingForReview, docTypeLabel, ACCESS_FORMAT, MAX_DOCS } from '@/lib/h
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
-const docs = await pendingForReview(150).catch(() => []);
+// AN EMPTY QUEUE AND A QUEUE THAT COULD NOT BE READ ARE NOT THE SAME FACT. This was
+// `.catch(() => [])`, so a database that refused the read rendered "No joining documents submitted
+// yet" — a claim about what new hires have done, made out of a failure to ask.
+let docs: any[] = [];
+let queueReadFailed = false;
+try {
+  docs = await pendingForReview(150);
+} catch (e: any) {
+  console.error('[admin/hr/onboarding] pendingForReview', e?.cause?.message || e?.message);
+  queueReadFailed = true;
+}
 const waiting = docs.filter((d: any) => d.status === 'submitted').length;
 const CARD = 'background:#0f0f14;border:1px solid #1a1a1f;border-radius:14px;padding:16px 18px;margin-bottom:16px;';
 const chip = (s: string) => s === 'verified' ? { bg: '#0f2a1c', fg: '#6ee7b7', label: 'Verified' }
@@ -25,11 +35,14 @@ const chip = (s: string) => s === 'verified' ? { bg: '#0f2a1c', fg: '#6ee7b7', l
     <div id="msg" style="display:none;margin:12px 0;padding:9px 13px;border-radius:8px;font-size:13px;"></div>
 
     <div style="display:flex;gap:12px;margin:16px 0;">
-      <div style={CARD + 'margin:0;flex:1;'}><p style="font-size:11px;color:#8a8a94;margin:0;">Awaiting review</p><p style="font-size:26px;font-weight:800;color:#c0a35e;margin:4px 0 0;">{waiting}</p></div>
-      <div style={CARD + 'margin:0;flex:1;'}><p style="font-size:11px;color:#8a8a94;margin:0;">Documents total</p><p style="font-size:26px;font-weight:800;color:#fff;margin:4px 0 0;">{docs.length}</p></div>
+      {/* A zero the page did not count is not a zero. When the read failed both tiles say so. */}
+      <div style={CARD + 'margin:0;flex:1;'}><p style="font-size:11px;color:#8a8a94;margin:0;">Awaiting review</p><p style="font-size:26px;font-weight:800;color:#c0a35e;margin:4px 0 0;">{queueReadFailed ? '—' : waiting}</p></div>
+      <div style={CARD + 'margin:0;flex:1;'}><p style="font-size:11px;color:#8a8a94;margin:0;">Documents total</p><p style="font-size:26px;font-weight:800;color:#fff;margin:4px 0 0;">{queueReadFailed ? '—' : docs.length}</p></div>
     </div>
 
-    {docs.length === 0 ? (
+    {queueReadFailed ? (
+      <div style={CARD}><p style="font-size:13px;color:#fca5a5;margin:0;">The review queue could not be read just now, so this page cannot say whether anything is waiting. Nothing is missing &mdash; reload in a moment.</p></div>
+    ) : docs.length === 0 ? (
       <div style={CARD}><p style="font-size:13px;color:#8a8a94;margin:0;">No joining documents submitted yet. New hires are prompted after they accept their offer letter.</p></div>
     ) : (
       <div style="display:flex;flex-direction:column;gap:10px;">
@@ -66,14 +79,42 @@ const chip = (s: string) => s === 'verified' ? { bg: '#0f2a1c', fg: '#6ee7b7', l
           note = prompt('Why is this being sent back? The hire will see this.');
           if (note === null) return;
         }
+        // THE CHAIN HAD NO .catch AND READ r.json() BLIND. A 403 from the section gate, a 500, a
+        // dropped connection or any HTML error page rejected the promise: the button stayed
+        // disabled, no message ever rendered, and the reviewer clicked Verify on a new hire's
+        // credential and watched nothing happen — with nothing on the page saying why. Every exit
+        // from here now re-enables the button and says something.
+        var fail = function (text) {
+          msg.style.display = 'block';
+          msg.style.background = '#2a0f0f';
+          msg.style.color = '#fca5a5';
+          msg.textContent = text;
+          b.disabled = false;
+        };
         b.disabled = true;
         fetch('/api/portal/onboarding/documents', {
           method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'review', id: Number(b.getAttribute('data-id')), status: status, note: note })
-        }).then(function (r) { return r.json(); }).then(function (j) {
-          msg.style.display = 'block';
-          if (j.ok) { msg.style.background = '#0f2a1c'; msg.style.color = '#6ee7b7'; msg.textContent = 'Saved. Reloading…'; setTimeout(function () { location.reload(); }, 700); }
-          else { msg.style.background = '#2a0f0f'; msg.style.color = '#fca5a5'; msg.textContent = j.error || 'Failed'; b.disabled = false; }
+        }).then(function (r) {
+          return r.text().then(function (t) {
+            var j = null;
+            try { j = JSON.parse(t); } catch (e) { j = null; }
+            if (!j) throw new Error(r.status === 403
+              ? 'You are not permitted to review joining documents.'
+              : 'The server answered ' + r.status + ' and not a result. Nothing was changed.');
+            return j;
+          });
+        }).then(function (j) {
+          if (j.ok) {
+            msg.style.display = 'block';
+            msg.style.background = '#0f2a1c'; msg.style.color = '#6ee7b7';
+            msg.textContent = 'Saved. Reloading…';
+            setTimeout(function () { location.reload(); }, 700);
+          } else {
+            fail(j.error || 'Nothing was changed.');
+          }
+        }).catch(function (e) {
+          fail((e && e.message) || 'We could not reach the server, so nothing was changed.');
         });
       });
     });

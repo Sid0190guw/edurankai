@@ -2,38 +2,118 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
-import { ensureAppealsSchema, APPEAL_KINDS } from '@/lib/application-appeals';
+import {
+  ensureAppealsSchema, APPEAL_KINDS,
+  appendAppealMessage, listAppealMessagesFor, groupMessagesByAppeal,
+} from '@/lib/application-appeals';
+import { can } from '@/lib/auth/permissions';
+import { notifyUser } from '@/lib/notify';
+import { logAudit } from '@/lib/audit';
+import { safeRows, dbReason, uuidish } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+// AUTHORIZATION FROM permissions.ts, NEVER a users.role literal. The gate was
+// `user.role === 'applicant'`, which admits every other role by accident rather than admitting a
+// named population on purpose. `admin.access` is the population src/middleware.ts already lets onto
+// every /admin path, so this narrows nobody who can reach the URL today.
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
 
 await ensureAppealsSchema();
 
 let okMsg = '', errMsg = '';
+
+// Declared BEFORE the POST handler that reads it — `const` is not hoisted, and a later declaration
+// has thrown on the first line of a handler on this project before.
+const DECISIONS: Record<string, string> = { uphold: 'upheld', deny: 'denied', reviewing: 'reviewing' };
+
 if (Astro.request.method === 'POST') {
-  try {
-    const fd = await Astro.request.formData();
-    const appealId = (fd.get('appeal_id') as string || '').trim();
-    const action = (fd.get('action') as string || '').trim();
-    const note = (fd.get('decision_note') as string || '').trim().slice(0, 6000);
-    if (action === 'uphold' || action === 'deny' || action === 'reviewing') {
-      const status = action === 'uphold' ? 'upheld' : action === 'deny' ? 'denied' : 'reviewing';
-      await db.execute(sql`
+  const fd = await Astro.request.formData();
+  const appealId = uuidish(String(fd.get('appeal_id') || ''));
+  const action = String(fd.get('action') || '').trim();
+
+  if (!appealId) {
+    errMsg = 'That appeal reference is not valid. Nothing was changed.';
+  } else if (action === 'reply') {
+    // THE REVIEWER CAN NOW ASK A QUESTION. application_appeal_messages was created and indexed when
+    // this feature shipped and had no writer and no reader anywhere in the repository, so a
+    // reviewer who needed one clarifying fact had to decide without it.
+    const body = String(fd.get('body') || '');
+    const res = await appendAppealMessage({
+      appealId,
+      senderRole: 'reviewer',
+      senderUserId: user.id,
+      senderName: user.name || 'Reviewer',
+      body,
+    });
+    if (res.ok) {
+      okMsg = 'Message posted. The appellant can see it in their portal.';
+      const owner = await safeRows<any>('[admin/appeals] appellant lookup', () => db.execute(
+        sql`SELECT user_id::text AS user_id FROM application_appeals WHERE id = ${appealId}`
+      ));
+      const ownerId = owner.rows[0]?.user_id;
+      if (ownerId) {
+        await notifyUser(String(ownerId), {
+          title: 'A reviewer replied to your appeal',
+          body: body.trim().slice(0, 160),
+          type: 'message',
+          actionUrl: '/portal/appeals',
+          entityType: 'application_appeal',
+          entityId: appealId,
+        });
+      }
+    } else {
+      errMsg = 'Your message was NOT saved. ' + res.reason;
+    }
+  } else if (DECISIONS[action]) {
+    const status = DECISIONS[action];
+    const note = String(fd.get('decision_note') || '').trim().slice(0, 6000);
+    try {
+      // RETURNING, so "Appeal upheld" is only said when a row actually moved. The old handler
+      // reported success even for an id that no longer existed.
+      const r = await db.execute(sql`
         UPDATE application_appeals SET status = ${status}, decision_note = ${note || null},
           decided_by_user_id = ${user.id}, decided_at = NOW(), updated_at = NOW()
         WHERE id = ${appealId}
+        RETURNING id::text AS id, user_id::text AS user_id
       `);
-      okMsg = 'Appeal ' + status + '.';
+      const rows = Array.isArray(r) ? r : ((r as any)?.rows || []);
+      if (rows.length === 0) {
+        errMsg = 'No appeal with that id was found, so nothing was changed. Reload the queue.';
+      } else {
+        okMsg = 'Appeal ' + status + '.';
+        await logAudit({
+          userId: user.id, action: 'appeal.' + status, entity: 'application_appeal',
+          entityId: appealId, diff: { status, has_note: note.length > 0 },
+        });
+        // THE APPELLANT IS TOLD. A decision used to be written into a row the candidate could only
+        // discover by opening the page again on their own initiative.
+        await notifyUser(String(rows[0].user_id), {
+          title: 'Your appeal was ' + status,
+          body: note ? note.slice(0, 160) : 'A decision has been recorded on your appeal.',
+          type: 'application',
+          actionUrl: '/portal/appeals',
+          entityType: 'application_appeal',
+          entityId: appealId,
+        });
+      }
+    } catch (e: any) {
+      // e.message on a drizzle/postgres-js error is the failed SQL; the reason is on e.cause.
+      const reason = dbReason(e);
+      console.error('[admin/appeals] decision failed -', reason);
+      errMsg = 'The decision was NOT recorded: ' + reason;
     }
-  } catch (e: any) { errMsg = String(e?.message || e).slice(0, 240); }
+  } else {
+    errMsg = 'Unknown action. Nothing was changed.';
+  }
 }
-
-function rowsOf(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 const url = new URL(Astro.request.url);
 const filterStatus = url.searchParams.get('status') || '';
-const all = rowsOf(await db.execute(sql`
+
+// This was a bare top-level await: any read failure took the whole page to a 500 with no
+// explanation of what had gone wrong.
+const listRead = await safeRows<any>('[admin/appeals] queue', () => db.execute(sql`
   SELECT aa.*, u.name AS user_name, u.email AS user_email, a.role_title_snapshot
   FROM application_appeals aa
   LEFT JOIN users u ON aa.user_id = u.id
@@ -41,6 +121,13 @@ const all = rowsOf(await db.execute(sql`
   ${filterStatus ? sql`WHERE aa.status = ${filterStatus}` : sql``}
   ORDER BY aa.created_at DESC LIMIT 200
 `));
+const all = listRead.rows;
+const listError = listRead.ok ? null : listRead.error;
+
+// One statement for every thread on the page, not one round-trip per appeal.
+const threadRead = await listAppealMessagesFor(all.map((a: any) => String(a.id)));
+const threads = threadRead.ok ? groupMessagesByAppeal(threadRead.rows) : {};
+const threadError = threadRead.ok ? null : threadRead.reason;
 
 function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' }); } catch { return ''; } }
 ---
@@ -64,13 +151,21 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
     <button type="submit" style="background:#15151a;border:1px solid #2a2a2f;color:#FF7040;padding:9px 16px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;">Filter</button>
   </form>
 
-  {all.length === 0 ? (
-    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:36px;text-align:center;color:#6e6e78;font-size:13px;">No appeals match.</div>
+  {listError ? (
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);border-radius:12px;padding:20px;">
+      <p style="font-size:13px;font-weight:700;color:#fca5a5;margin:0 0 6px;">The appeals queue could not be read. This is NOT "no appeals".</p>
+      <p style="font-size:12px;color:#f8b4b4;margin:0;line-height:1.6;">An appeal may be sitting on its 10-business-day clock right now that this screen cannot see. Reload before treating the queue as clear.</p>
+      <p style="font-size:11px;color:#d89a9a;margin:8px 0 0;font-family:'Geist Mono',monospace;word-break:break-word;">{listError}</p>
+    </div>
+  ) : all.length === 0 ? (
+    <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:36px;text-align:center;color:#6e6e78;font-size:13px;">No appeals match this filter. (The queue was read successfully.)</div>
   ) : (
     <div style="display:flex;flex-direction:column;gap:8px;">
       {all.map((a: any) => {
         const kindMeta = (APPEAL_KINDS as any)[a.appeal_kind] || APPEAL_KINDS.other;
         const sc = a.status === 'upheld' ? '#86efac' : a.status === 'denied' ? '#fca5a5' : a.status === 'reviewing' ? '#fbbf24' : '#67e8f9';
+        const msgs = threads[String(a.id)] || [];
+        const awaitingReviewer = msgs.length > 0 && msgs[msgs.length - 1].sender_role === 'appellant';
         return (
           <details style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:0;">
             <summary style="padding:14px 18px;cursor:pointer;list-style:none;display:grid;grid-template-columns:1.4fr 1.2fr 1fr 100px 110px;gap:12px;align-items:center;">
@@ -78,16 +173,52 @@ function fmt(d: any) { try { return new Date(d).toLocaleString('en-IN', { timeZo
                 <p style="font-size:13px;font-weight:700;color:#fff;margin:0;">{a.user_name || a.user_email}</p>
                 <p style="font-size:10.5px;color:#9aa6b6;margin:2px 0 0;font-family:'Geist Mono',monospace;">{a.user_email}</p>
               </div>
-              <p style="font-size:11.5px;color:#cfd6da;margin:0;">{a.role_title_snapshot || '—'}</p>
+              <p style="font-size:11.5px;color:#cfd6da;margin:0;">{a.role_title_snapshot || 'Application'}</p>
               <p style="font-size:11px;color:#67e8f9;margin:0;font-family:'Geist Mono',monospace;">{kindMeta.label}</p>
               <span style={`background:${sc}22;color:${sc};font-size:10px;font-weight:700;padding:3px 8px;border-radius:100px;text-align:center;font-family:'Geist Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;`}>{a.status}</span>
-              <p style="font-size:10.5px;color:#6e6e78;margin:0;font-family:'Geist Mono',monospace;">{fmt(a.created_at)}</p>
+              <p style="font-size:10.5px;color:#6e6e78;margin:0;font-family:'Geist Mono',monospace;">
+                {fmt(a.created_at)}
+                {awaitingReviewer && <span style="display:block;color:#fbbf24;font-weight:700;">reply waiting</span>}
+              </p>
             </summary>
             <div style="padding:0 18px 18px;border-top:1px solid #1a1a1f;">
               <div style="margin:14px 0;"><p style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;margin:0 0 6px;font-family:'Geist Mono',monospace;font-weight:700;">Grounds</p><p style="font-size:12.5px;color:#d8d8de;margin:0;line-height:1.65;white-space:pre-wrap;">{a.grounds}</p></div>
               {a.new_evidence && <div style="margin:14px 0;"><p style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;margin:0 0 6px;font-family:'Geist Mono',monospace;font-weight:700;">New evidence</p><p style="font-size:12.5px;color:#d8d8de;margin:0;line-height:1.65;white-space:pre-wrap;">{a.new_evidence}</p></div>}
-              {a.drive_url && <p style="font-size:11.5px;color:#67e8f9;margin:8px 0;font-family:'Geist Mono',monospace;"><a href={a.drive_url} target="_blank" style="color:#67e8f9;">Drive evidence ↗</a></p>}
+              {a.drive_url && <p style="font-size:11.5px;color:#67e8f9;margin:8px 0;font-family:'Geist Mono',monospace;"><a href={a.drive_url} target="_blank" style="color:#67e8f9;">Drive evidence (opens in a new tab)</a></p>}
               {a.decision_note && <div style="margin:14px 0;padding:10px 14px;background:rgba(74,222,128,0.06);border-left:3px solid #86efac;border-radius:0 6px 6px 0;"><p style="font-size:10.5px;color:#86efac;letter-spacing:0.1em;text-transform:uppercase;margin:0 0 4px;font-family:'Geist Mono',monospace;font-weight:700;">Decision note</p><p style="font-size:12px;color:#d8d8de;margin:0;line-height:1.6;white-space:pre-wrap;">{a.decision_note}</p></div>}
+
+              {/* CORRESPONDENCE. The table behind this existed from day one with no writer and no
+                  reader anywhere in the repository: a reviewer had no way to ask the one question
+                  that would settle an appeal, and an appellant had no way to answer it. */}
+              <div style="margin-top:14px;padding-top:12px;border-top:1px solid #1a1a1f;">
+                <p style="font-size:10.5px;color:#9aa6b6;letter-spacing:0.1em;text-transform:uppercase;margin:0 0 8px;font-family:'Geist Mono',monospace;font-weight:700;">Correspondence</p>
+
+                {threadError ? (
+                  <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:10px 12px;margin-bottom:10px;">
+                    <p style="font-size:12px;color:#fca5a5;margin:0;">The messages on this appeal could not be read. This is not an empty thread, and this appeal must not be decided on the assumption that nothing was said.</p>
+                    <p style="font-size:10.5px;color:#d89a9a;margin:6px 0 0;font-family:'Geist Mono',monospace;word-break:break-word;">{threadError}</p>
+                  </div>
+                ) : msgs.length === 0 ? (
+                  <p style="font-size:12px;color:#6e6e78;margin:0 0 10px;">No messages yet.</p>
+                ) : (
+                  <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px;">
+                    {msgs.map((m: any) => (
+                      <div style={'border-radius:8px;padding:8px 12px;border:1px solid ' + (m.sender_role === 'reviewer' ? '#2a2a2f;background:#15151a;' : 'rgba(103,232,249,0.25);background:rgba(103,232,249,0.06);')}>
+                        <p style="font-size:10px;color:#9aa6b6;margin:0 0 3px;font-family:'Geist Mono',monospace;text-transform:uppercase;letter-spacing:0.08em;font-weight:700;">
+                          {m.sender_role === 'reviewer' ? 'Reviewer' : 'Appellant'}{m.sender_name ? ' - ' + m.sender_name : ''} - {fmt(m.created_at)}
+                        </p>
+                        <p style="font-size:12px;color:#d8d8de;margin:0;line-height:1.6;white-space:pre-wrap;">{m.body}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <form method="POST">
+                  <input type="hidden" name="appeal_id" value={a.id} />
+                  <textarea name="body" rows="2" required maxlength="6000" placeholder="Ask the appellant for a fact, or explain a next step. Visible to them." style="width:100%;background:#08080a;border:1px solid #2a2a2f;color:#fff;padding:9px 12px;border-radius:6px;font-size:12px;font-family:'Inter Tight',sans-serif;line-height:1.55;resize:vertical;"></textarea>
+                  <button type="submit" name="action" value="reply" style="margin-top:8px;background:#15151a;border:1px solid #2a2a2f;color:#67e8f9;padding:7px 14px;border-radius:5px;font-size:11px;font-weight:700;cursor:pointer;font-family:'Geist Mono',monospace;">Post message</button>
+                </form>
+              </div>
 
               <form method="POST" style="margin-top:12px;padding-top:12px;border-top:1px solid #1a1a1f;">
                 <input type="hidden" name="appeal_id" value={a.id} />

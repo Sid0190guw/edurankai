@@ -4,7 +4,9 @@
 import { describe, it, expect } from 'vitest';
 import { summarise, type AttendanceDay, type EngagementTerms } from './credit-hours';
 
-const FULL: EngagementTerms = { kind: 'full-time', workingDaysPerWeek: 5, requiredCreditHours: 480 };
+// weeklyHours is STATED. An engagement that does not state one is unknown, not 40 — see
+// weeklyHoursFor() in credit-hours.ts and the note on termsFromRow() in credit-ledger.ts.
+const FULL: EngagementTerms = { kind: 'full-time', weeklyHours: 40, workingDaysPerWeek: 5, requiredCreditHours: 480 };
 
 // Mirrors statusFor() in credit-ledger.ts. Kept in step with it deliberately: if the two ever
 // disagree, one is wrong, and this is the cheaper place to find out.
@@ -76,13 +78,13 @@ describe('end to end through the engine', () => {
   it('notified leave protects attendance; unnotified absence does not', () => {
     const leave = [leaveWith('2026-02-03', '2026-02-03', '2026-01-28')];
     const stored = [
-      { date: '2026-02-02', status: 'present' },
+      { date: '2026-02-02', status: 'present', hours: 8 },
       { date: '2026-02-03', status: 'on_leave' },   // notified
       { date: '2026-02-04', status: 'absent' },     // not notified
     ];
-    const days: AttendanceDay[] = stored.map((r) => {
+    const days: AttendanceDay[] = stored.map((r: any) => {
       const s = statusFor(r, leave);
-      return { date: r.date, status: s.status, noticeGivenAt: s.noticeGivenAt };
+      return { date: r.date, status: s.status, hours: r.hours, noticeGivenAt: s.noticeGivenAt };
     });
     const sum = summarise(days, FULL);
 
@@ -95,13 +97,28 @@ describe('end to end through the engine', () => {
   });
 
   it('a stored 0 hours on a leave day is not read as working zero hours', () => {
-    // hr_attendance defaults work_hours to 0, so passing it through would understate credit.
+    // hr_attendance defaults work_hours to 0, so passing it through would understate credit. The
+    // leave day is excused: it neither credits nor expects, which is what keeps attendance at 100%.
     const days: AttendanceDay[] = [
       { date: '2026-02-03', status: 'authorised-leave', noticeGivenAt: '2026-01-28' },
-      { date: '2026-02-04', status: 'present' },   // no hours -> full expected day
+      { date: '2026-02-04', status: 'present', hours: 8 },
     ];
     const sum = summarise(days, FULL);
     expect(sum.creditHours).toBe(8);
     expect(sum.attendancePct).toBe(100);
+  });
+
+  it('a present day that reached the engine with no hours credits nothing and is named', () => {
+    // toDays() passes `hours: undefined` for a day whose work_hours column is 0 or null. That used
+    // to be credited the full expected day; it is now zero, counted, and dated.
+    const days: AttendanceDay[] = [
+      { date: '2026-02-04', status: 'present' },
+      { date: '2026-02-05', status: 'present', hours: 7.5 },
+    ];
+    const sum = summarise(days, FULL);
+    expect(sum.creditHours).toBe(7.5);
+    expect(sum.expectedHours).toBe(16);
+    expect(sum.unmeasuredDays).toBe(1);
+    expect(sum.unmeasuredDates).toEqual(['2026-02-04']);
   });
 });

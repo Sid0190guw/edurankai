@@ -90,29 +90,64 @@ try {
 // -- Form handlers ---------------------------------------------------------
 let flash: { kind: 'ok' | 'err'; text: string } | null = null;
 if (Astro.request.method === 'POST') {
+  // Declared BEFORE the try, so the catch can name which action failed. const is not hoisted, and a
+  // catch block reaching a later declaration is a ReferenceError inside an error handler - the one
+  // place in a page that must not itself throw.
+  let action = '';
   try {
     const form = await Astro.request.formData();
-    const action = String(form.get('action') || '');
+    action = String(form.get('action') || '');
 
     if (action === 'borrow') {
       const rid = String(form.get('resource_id') || '');
-      if (rid) {
-        const rs = rowsOf(await db.execute(sql`SELECT available_copies FROM library_resources WHERE id = ${rid}::uuid`));
-        if (rs.length && (rs[0].available_copies || 0) > 0) {
-          // Two-week loan window
-          await db.execute(sql`
-            INSERT INTO library_loans (resource_id, user_id, due_at, status)
-            VALUES (${rid}::uuid, ${user.id}::uuid, NOW() + INTERVAL '14 days', 'active')
-          `);
-          await db.execute(sql`UPDATE library_resources SET available_copies = available_copies - 1 WHERE id = ${rid}::uuid AND available_copies > 0`);
-          flash = { kind: 'ok', text: 'Borrowed. Due in 14 days. Pick up at the issue desk with your member card.' };
-        } else {
+      if (!rid) {
+        flash = { kind: 'err', text: 'No item was named, so nothing was borrowed.' };
+      } else {
+        // THE COPY IS TAKEN FIRST, IN ONE STATEMENT, AND THE LOAN IS WRITTEN ONLY IF IT WAS.
+        //
+        // This used to SELECT available_copies, compare it in JavaScript, INSERT the loan, and then
+        // decrement. Two people borrowing the last copy at the same moment both read 1, both got a
+        // loan row, and the guarded decrement fired once - one physical book, two active loans, and
+        // a shelf count that said 0 while two people walked to the issue desk for it. The condition
+        // now lives inside the UPDATE, where the row is locked while it is evaluated, so exactly one
+        // of the two callers gets the copy and the other is told so.
+        const took = rowsOf(await db.execute(sql`
+          UPDATE library_resources
+             SET available_copies = available_copies - 1
+           WHERE id = ${rid}::uuid AND available_copies > 0
+          RETURNING id
+        `));
+        if (took.length === 0) {
           flash = { kind: 'err', text: 'No copies available right now. Try reserving instead.' };
+        } else {
+          try {
+            // Two-week loan window.
+            const lent = rowsOf(await db.execute(sql`
+              INSERT INTO library_loans (resource_id, user_id, due_at, status)
+              VALUES (${rid}::uuid, ${user.id}::uuid, NOW() + INTERVAL '14 days', 'active')
+              RETURNING id
+            `));
+            if (lent.length > 0) {
+              flash = { kind: 'ok', text: 'Borrowed. Due in 14 days. Pick up at the issue desk with your member card.' };
+            } else {
+              await db.execute(sql`UPDATE library_resources SET available_copies = available_copies + 1 WHERE id = ${rid}::uuid`);
+              flash = { kind: 'err', text: 'The loan was not recorded, so the copy has been put back on the shelf. Nothing is out in your name.' };
+            }
+          } catch (le: any) {
+            // The copy is already off the shelf at this point. Putting it back is not optional, and
+            // it must not be conditional on anything this handler believes.
+            console.error('[portal/library] loan insert failed, restoring the copy -', le?.cause?.message || le?.message);
+            await db.execute(sql`UPDATE library_resources SET available_copies = available_copies + 1 WHERE id = ${rid}::uuid`)
+              .catch((re: any) => console.error('[portal/library] COPY NOT RESTORED for resource', rid, '-', re?.cause?.message || re?.message));
+            flash = { kind: 'err', text: 'The loan was not recorded, so the copy has been put back on the shelf. Nothing is out in your name.' };
+          }
         }
       }
     } else if (action === 'reserve') {
       const rid = String(form.get('resource_id') || '');
-      if (rid) {
+      if (!rid) {
+        flash = { kind: 'err', text: 'No item was named, so nothing was reserved.' };
+      } else {
         const existing = rowsOf(await db.execute(sql`
           SELECT id FROM library_reservations
           WHERE resource_id = ${rid}::uuid AND user_id = ${user.id}::uuid AND status = 'pending'
@@ -130,44 +165,71 @@ if (Astro.request.method === 'POST') {
       }
     } else if (action === 'return') {
       const lid = String(form.get('loan_id') || '');
-      if (lid) {
-        const ls = rowsOf(await db.execute(sql`
-          SELECT id, resource_id, due_at FROM library_loans
-          WHERE id = ${lid}::uuid AND user_id = ${user.id}::uuid AND status = 'active'
-          LIMIT 1
+      if (!lid) {
+        flash = { kind: 'err', text: 'No loan was named, so nothing was returned.' };
+      } else {
+        // ONE STATEMENT CLOSES THE LOAN AND PRICES IT, and only one caller can win it.
+        //
+        // This used to SELECT the active loan, work the fine out in JavaScript, UPDATE the loan by
+        // id ALONE, and then add a copy back to the shelf. A double-tapped Return therefore ran
+        // twice: the second UPDATE still matched (the WHERE had dropped the status test), and the
+        // shelf was credited with a second copy that does not exist - the library gains stock every
+        // time somebody's finger slips. The status test is now part of the write, so the second
+        // request matches nothing and is told so.
+        //
+        // The fine is computed against NOW() in the same statement rather than against the render
+        // process's clock, which is a different machine and, on this deployment, a different day:
+        // the server is UTC and the borrowers are IST, so a book due at midnight was priced from
+        // whichever calendar the two clocks happened to agree on. 200 paise (Rs 2) per day overdue,
+        // capped at Rs 500, unchanged - and a NULL due date is not overdue rather than NaN.
+        const closed = rowsOf(await db.execute(sql`
+          UPDATE library_loans
+             SET returned_at = NOW(),
+                 status = 'returned',
+                 fine_amount_paise = COALESCE(
+                   LEAST(GREATEST(CEIL(EXTRACT(EPOCH FROM (NOW() - due_at)) / 86400.0), 0) * 200, 50000),
+                   0)
+           WHERE id = ${lid}::uuid
+             AND user_id = ${user.id}::uuid
+             AND status = 'active'
+          RETURNING resource_id, fine_amount_paise
         `));
-        if (ls.length) {
-          const due = ls[0].due_at ? new Date(ls[0].due_at) : null;
-          const now = new Date();
-          let fine = 0;
-          if (due && now.getTime() > due.getTime()) {
-            const overdueDays = Math.ceil((now.getTime() - due.getTime()) / (1000 * 60 * 60 * 24));
-            // 200 paise (Rs 2) per day overdue, capped at Rs 500
-            fine = Math.min(overdueDays * 200, 50000);
-          }
-          await db.execute(sql`
-            UPDATE library_loans
-            SET returned_at = NOW(), status = 'returned', fine_amount_paise = ${fine}
-            WHERE id = ${lid}::uuid
-          `);
-          await db.execute(sql`UPDATE library_resources SET available_copies = available_copies + 1 WHERE id = ${ls[0].resource_id}::uuid`);
+        if (closed.length) {
+          const fine = Number(closed[0].fine_amount_paise || 0);
+          await db.execute(sql`UPDATE library_resources SET available_copies = available_copies + 1 WHERE id = ${closed[0].resource_id}::uuid`);
           flash = fine > 0
             ? { kind: 'ok', text: 'Returned. A late fine of Rs ' + (fine / 100).toFixed(2) + ' has been recorded against your account.' }
             : { kind: 'ok', text: 'Returned on time. Thank you.' };
+        } else {
+          // Silence here read as success: the page reloaded with the loan still listed and not one
+          // word about why. A loan that matched nothing is a refusal and is stated as one.
+          flash = { kind: 'err', text: 'That loan is not open in your name, so nothing was returned.' };
         }
       }
     } else if (action === 'cancel_reservation') {
       const rid = String(form.get('reservation_id') || '');
-      if (rid) {
-        await db.execute(sql`
+      if (!rid) {
+        flash = { kind: 'err', text: 'No reservation was named, so nothing was cancelled.' };
+      } else {
+        // RETURNING, because "Reservation cancelled." was printed whether or not a row matched -
+        // including for a reservation belonging to somebody else, or one already cancelled.
+        const cancelled = rowsOf(await db.execute(sql`
           UPDATE library_reservations SET status = 'cancelled'
           WHERE id = ${rid}::uuid AND user_id = ${user.id}::uuid AND status = 'pending'
-        `);
-        flash = { kind: 'ok', text: 'Reservation cancelled.' };
+          RETURNING id
+        `));
+        flash = cancelled.length
+          ? { kind: 'ok', text: 'Reservation cancelled.' }
+          : { kind: 'err', text: 'No pending reservation of yours matched that, so nothing was cancelled.' };
       }
+    } else {
+      flash = { kind: 'err', text: 'That action is not one this page performs. Nothing was changed.' };
     }
   } catch (e: any) {
-    flash = { kind: 'err', text: 'Action failed: ' + (e?.message || 'unknown error') };
+    // e.message is only the SQL that failed. The real Postgres reason is on e.cause, and it belongs
+    // in the log rather than on a reader's screen.
+    console.error('[portal/library]', action, 'failed -', e?.cause?.message || e?.message);
+    flash = { kind: 'err', text: 'That did not go through. Nothing was changed - try again in a moment.' };
   }
 }
 
@@ -178,6 +240,14 @@ const subject = (url.searchParams.get('subject') || '').trim();
 
 const SUBJECTS = ['Mathematics','Physics','Chemistry','Biology','Computer Science','Engineering','Humanities','Law','Business','Languages','Vedic Studies'];
 
+// AN EMPTY SHELF AND A SHELF NOBODY COULD SEE ARE DIFFERENT SENTENCES. Each of the three reads
+// below used to end in `catch (_) {}`, so a database that refused the query produced "No matching
+// items", "No active loans" and "No pending reservations" - three confident claims about somebody's
+// borrowing, none of which had been checked. The reason is now logged and the screen says which
+// happened.
+let resourcesError: string | null = null;
+let loansError: string | null = null;
+let reservationsError: string | null = null;
 let resources: any[] = [];
 try {
   if (q && subject) {
@@ -204,7 +274,10 @@ try {
       SELECT * FROM library_resources ORDER BY created_at DESC LIMIT 60
     `));
   }
-} catch (_) {}
+} catch (e: any) {
+  resourcesError = String(e?.cause?.message || e?.message || 'unknown database error');
+  console.error('[portal/library] catalogue read failed -', resourcesError);
+}
 
 // -- My loans --------------------------------------------------------------
 let loans: any[] = [];
@@ -217,7 +290,10 @@ try {
     WHERE l.user_id = ${user.id}::uuid AND l.status = 'active'
     ORDER BY l.due_at ASC
   `));
-} catch (_) {}
+} catch (e: any) {
+  loansError = String(e?.cause?.message || e?.message || 'unknown database error');
+  console.error('[portal/library] loan read failed -', loansError);
+}
 
 // -- My reservations -------------------------------------------------------
 let reservations: any[] = [];
@@ -230,7 +306,10 @@ try {
     WHERE res.user_id = ${user.id}::uuid AND res.status = 'pending'
     ORDER BY res.reserved_at DESC
   `));
-} catch (_) {}
+} catch (e: any) {
+  reservationsError = String(e?.cause?.message || e?.message || 'unknown database error');
+  console.error('[portal/library] reservation read failed -', reservationsError);
+}
 
 function fmtDate(d: any): string {
   if (!d) return '';
@@ -351,7 +430,9 @@ function coverHue(t: string): number {
   <section class="lib-section">
     <h2>{q || subject ? 'Results' : 'Recently added'} <em>&middot; {resources.length}</em></h2>
     {resources.length === 0 ? (
-      <div class="empty">No matching items in the catalogue. Try a different search or clear the subject filter.</div>
+      <div class="empty">{resourcesError
+        ? 'The catalogue could not be read just now, so this is not a statement about what the library holds. The reason has been recorded - reload in a moment.'
+        : 'No matching items in the catalogue. Try a different search or clear the subject filter.'}</div>
     ) : (
       <div class="grid-resources">
         {resources.map((r) => {
@@ -400,7 +481,9 @@ function coverHue(t: string): number {
   <section class="lib-section">
     <h2>My <em>loans</em> &middot; {loans.length}</h2>
     {loans.length === 0 ? (
-      <div class="empty">No active loans. Borrow a book from the catalogue above and it will appear here.</div>
+      <div class="empty">{loansError
+        ? 'Your loans could not be read just now. Do not treat this as "nothing is out" - anything you have borrowed is still due. Reload in a moment.'
+        : 'No active loans. Borrow a book from the catalogue above and it will appear here.'}</div>
     ) : (
       <div>
         {loans.map((l) => {
@@ -437,7 +520,9 @@ function coverHue(t: string): number {
   <section class="lib-section">
     <h2>My <em>reservations</em> &middot; {reservations.length}</h2>
     {reservations.length === 0 ? (
-      <div class="empty">No pending reservations. When a borrowed book has no copies left you can reserve it &mdash; we'll notify you the moment it's returned.</div>
+      <div class="empty">{reservationsError
+        ? 'Your reservations could not be read just now, so this is not a statement about what you have reserved. Reload in a moment.'
+        : "No pending reservations. When a borrowed book has no copies left you can reserve it - we'll notify you the moment it's returned."}</div>
     ) : (
       <div>
         {reservations.map((res) => (

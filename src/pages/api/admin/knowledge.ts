@@ -2,12 +2,24 @@
 // Each action is capability-gated via can() (which audits): create/edit/attach/prereq need
 // write-class caps (content_author+); publish/archive need 'execute' (content_author DENIED,
 // reviewer_examiner/faculty/dean ALLOWED). All writes go through the kernel content service.
+//
+// THE FAILURE PATH ANSWERED HTTP 200. `catch (e) { return j({ ok:false, error: e.cause.message }, 200) }`
+// on the last line meant every write that threw — a cycle, a missing table, a dropped connection —
+// came back as a SUCCESS status carrying the database's own words. Its caller (/admin/knowledge)
+// does read `ok`, so the author saw a message; nothing else did. Every log, every uptime check and
+// every retry rule reads the status, and to all of them a knowledge base that could not save a
+// single article was healthy. The reason now goes to the log and the status tells the truth.
 import type { APIRoute } from 'astro';
 import { can } from '@/lib/rbac';
 import { contentService } from '@/lib/kernel-content';
+import { logEvent } from '@/lib/logger';
 import type { Equation, WorkedExample, SecurityLabel } from '@/lib/kernel';
 
+// Declared above the handler that uses them: `const` is not hoisted, and a handler reaching a later
+// declaration has taken pages down on this project.
 function j(d: any, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } }); }
+// The real Postgres reason is on e.cause; e.message is only the failed SQL.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 const LABELS: SecurityLabel[] = ['public', 'enrolled-only', 'exam-secure'];
 function parseEquations(s: string): Equation[] { return String(s || '').split('\n').map((l) => l.trim()).filter(Boolean).map((latex) => ({ latex })); }
 function parseExamples(s: string): WorkedExample[] { return String(s || '').split('\n').map((l) => l.trim()).filter(Boolean).map((l) => { const [prompt, ...rest] = l.split('::'); return { prompt: (prompt || '').trim(), solution: rest.join('::').trim() }; }).filter((e) => e.prompt); }
@@ -88,6 +100,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     }
     return j({ ok: false, error: 'unknown action' }, 400);
   } catch (e: any) {
-    return j({ ok: false, error: e?.cause?.message || e?.message || 'server error' }, 200);
+    logEvent('error', 'admin.knowledge.failed', { userId: String(user.id), action, message: reasonOf(e) });
+    return j({ ok: false, error: 'That could not be saved. Nothing was changed.' }, 500);
   }
 };

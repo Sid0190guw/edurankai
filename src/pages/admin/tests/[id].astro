@@ -2,28 +2,45 @@
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { can } from '@/lib/auth/permissions';
+import { dbReason } from '@/lib/page-safety';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
-if (user.role === 'applicant') return Astro.redirect('/portal');
+// AUTHORIZATION FROM permissions.ts, NEVER a users.role literal. `admin.access` is the population
+// src/middleware.ts already admits to every /admin path, so this narrows nobody.
+if (!can(user as any, 'admin.access')) return Astro.redirect('/portal');
 
 const { id } = Astro.params;
 let test: any = null;
 let questions: any[] = [];
+// Declared with the rest of the page state, ABOVE the POST handler that reads them.
+let questionsError = '';
+let leaderboardError = '';
 let okMsg = '', errorMsg = '';
 
+// A FAILED READ IS NOT A MISSING TEST. `catch(e) {}` here left `test` null and the next line
+// bounced the examiner back to /admin/tests with no message at all, so a database wobble was
+// indistinguishable from "that exam has been deleted".
 try {
   const r = await db.execute(sql`SELECT * FROM tests WHERE id = ${id} LIMIT 1`);
   const rows = Array.isArray(r) ? r : (r?.rows || []);
   test = rows[0] || null;
-} catch(e) {}
+} catch (e: any) {
+  const reason = dbReason(e);
+  console.error('[admin/tests/id] test read failed -', reason);
+  return Astro.redirect('/admin/tests?error=' + encodeURIComponent('That exam could not be read: ' + reason));
+}
 
-if (!test) return Astro.redirect('/admin/tests');
+if (!test) return Astro.redirect('/admin/tests?error=' + encodeURIComponent('No exam with that id exists.'));
 
-// Restricted exams: their questions are limited to designated authority only
-// (super admin / HR). Other staff cannot view or edit the question bank.
-const isExamAuthority = user.role === 'super_admin' || user.role === 'hr';
-if (test.restricted && !isExamAuthority) {
+// RESTRICTED EXAMS. The capability `tests_restricted.view` was created for this exact line and
+// never asked here (src/lib/auth/permissions.ts records the conversion note beside it). The role
+// literal read `super_admin || hr`, but hr does not hold the `tests` section in ROLE_SECTIONS, so
+// middleware already turns hr away before this line runs -- the OBSERVED population is super_admin
+// alone, which is exactly who holds the key. This changes how the question is asked, not who may
+// open a restricted question bank.
+if (test.restricted && !can(user as any, 'tests_restricted.view')) {
   return Astro.redirect('/admin/tests?denied=restricted');
 }
 
@@ -189,13 +206,24 @@ if (Astro.request.method === 'POST') {
       await db.execute(sql`UPDATE test_questions SET question_text = ${qText}, marks = ${marks}, difficulty = ${difficulty}, explanation = ${explanation} WHERE id = ${qid}`);
       okMsg = 'Question updated.';
     }
-  } catch(e: any) { errorMsg = e.message; }
+  } catch (e: any) {
+    // e.message on a drizzle/postgres-js error is the failed SQL text; the reason is on e.cause.
+    const reason = dbReason(e);
+    console.error('[admin/tests/id] ' + action + ' failed -', reason);
+    errorMsg = 'Nothing was saved: ' + reason;
+  }
 }
 
+// THE QUESTION BANK. `catch(e) {}` rendered an unreadable bank as an EMPTY one - the header said
+// "0 questions", the editor showed nothing, and an examiner could add duplicates or declare results
+// believing the paper was empty. An exam is the last place a read failure may be drawn as a fact.
 try {
   const r = await db.execute(sql`SELECT * FROM test_questions WHERE test_id = ${id} ORDER BY sort_order, created_at`);
   questions = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+} catch (e: any) {
+  questionsError = dbReason(e);
+  console.error('[admin/tests/id] question bank read failed -', questionsError);
+}
 
 // Leaderboard (auto-ranked by score) for evaluation in the admin panel.
 let leaderboard: any[] = [];
@@ -208,7 +236,10 @@ try {
     LIMIT 200
   `);
   leaderboard = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+} catch (e: any) {
+  leaderboardError = dbReason(e);
+  console.error('[admin/tests/id] leaderboard read failed -', leaderboardError);
+}
 
 const Q_TYPE_LABELS: Record<string,string> = {
   mcq_single:'MCQ (Single)', mcq_multi:'MCQ (Multi)', true_false:'True/False',
@@ -225,7 +256,7 @@ const Q_TYPE_LABELS: Record<string,string> = {
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
       <div>
         <h1 style="font-size:18px;font-weight:700;color:#fff;margin:0;">{test.title}</h1>
-        <p style="font-size:11px;color:#8a8a94;margin:2px 0 0;">{test.test_type} - {test.duration_mins}min - {questions.length} questions - {test.total_marks} marks total</p>
+        <p style="font-size:11px;color:#8a8a94;margin:2px 0 0;">{test.test_type} - {test.duration_mins}min - {questionsError ? 'question count unavailable' : questions.length + ' questions'} - {test.total_marks} marks total</p>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <a href={`/admin/tests/${id}/translations`} style="background:rgba(96,165,250,0.1);border:1px solid rgba(96,165,250,0.3);color:#93c5fd;font-size:11px;font-weight:600;padding:7px 14px;border-radius:6px;text-decoration:none;">Translations</a>
@@ -236,6 +267,20 @@ const Q_TYPE_LABELS: Record<string,string> = {
 
   {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+
+  {questionsError && (
+    <div style="margin:10px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);border-radius:8px;padding:12px 15px;">
+      <p style="font-size:13px;font-weight:700;color:#fca5a5;margin:0 0 6px;">The question bank could not be read. This paper is NOT empty.</p>
+      <p style="font-size:12px;color:#f8b4b4;margin:0;line-height:1.6;">Do not add questions and do not declare results from this screen until it loads - you would be acting on a bank you cannot see.</p>
+      <p style="font-size:11px;color:#d89a9a;margin:8px 0 0;font-family:'Geist Mono',monospace;word-break:break-word;">{questionsError}</p>
+    </div>
+  )}
+  {leaderboardError && (
+    <div style="margin:10px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);border-radius:8px;padding:12px 15px;">
+      <p style="font-size:13px;font-weight:700;color:#fca5a5;margin:0 0 6px;">The results table could not be read. This is not "no attempts".</p>
+      <p style="font-size:11px;color:#d89a9a;margin:6px 0 0;font-family:'Geist Mono',monospace;word-break:break-word;">{leaderboardError}</p>
+    </div>
+  )}
 
   <!-- TEST SETTINGS - pricing + premium + publish + meta -->
   <details style="margin:14px 16px;background:#14181d;border:1px solid #2a3038;border-radius:12px;padding:14px 18px;" open={Astro.url.searchParams.get('settings') === '1'}>
@@ -362,7 +407,7 @@ const Q_TYPE_LABELS: Record<string,string> = {
               <td style="padding:6px 8px;"><a href={'/admin/tests/attempts/' + a.id} style="color:#60a5fa;text-decoration:none;">review</a></td>
             </tr>
           ))}
-          {leaderboard.length === 0 && <tr><td colspan="7" style="padding:14px 8px;color:#6e6e78;">No graded attempts yet.</td></tr>}
+          {leaderboard.length === 0 && <tr><td colspan="7" style="padding:14px 8px;color:#6e6e78;">{leaderboardError ? 'The results could not be read - see the notice above.' : 'No graded attempts yet.'}</td></tr>}
         </tbody>
       </table>
     </div>
@@ -373,7 +418,7 @@ const Q_TYPE_LABELS: Record<string,string> = {
     <!-- Questions list -->
     <div>
       <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#6e6e78;margin:0 0 10px;">{questions.length} Questions</p>
-      {questions.length === 0 && (
+      {questions.length === 0 && !questionsError && (
         <div style="background:#0f0f14;border:1px dashed #1a1a1f;border-radius:12px;padding:32px;text-align:center;color:#6e6e78;">
           <p style="font-size:13px;color:#fff;margin-bottom:4px;">No questions yet</p>
           <p style="font-size:11px;">Add your first question using the form on the right.</p>
