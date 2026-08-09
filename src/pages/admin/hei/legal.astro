@@ -1,6 +1,7 @@
 ---
 import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
+import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
 import { ensureHeiEditorialSchema } from '@/lib/hei-editorial';
 
@@ -12,11 +13,39 @@ if (!user) return Astro.redirect('/admin/login');
 // one console whose job is to catch defamation risk before publication.
 await ensureHeiEditorialSchema();
 
+// Declared before the POST handler that reads them - const is not hoisted.
+// LEGAL_STATUSES is the vocabulary STATUS_COLOR below already draws from, and it is now the
+// vocabulary the write enforces: `status` used to go into the column exactly as posted, so a value
+// off this list produced an item no filter tab could find and no badge could describe - silently
+// parked, on the desk whose whole job is that nothing defamatory reaches publication unreviewed.
+const LEGAL_STATUSES = ['open', 'in_review', 'cleared', 'rejected'];
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+// THE WRITES ON THIS CONSOLE WERE NOT AUTHORISED AT ALL.
+//
+// src/middleware.ts maps this path to the hei_institutions section and getViewableSectionKeys() enforces
+// VIEW there and only VIEW, so every account that could OPEN this page could also change what it
+// holds. src/lib/auth/permissions.ts says in as many words never to use role !== 'applicant' as an
+// authorisation test, and the identical repair was already made on /admin/ai-interview-templates.
+//
+// GATED ON 'edit', NOT 'delete', DELIBERATELY: canAccessSection() gives a built-in role holding a
+// section view/edit/export and reserves delete for super_admin, so asking for 'delete' here would
+// take an action away from a role that holds this section today. Narrowing it further is a policy
+// decision for a human; refusing a custom VIEW-ONLY role is the mechanism fix, and that is this.
+const canWrite = await canAccessSection(user as any, 'hei_institutions', 'edit');
+
 let okMsg = '', errorMsg = '';
+// J: "No items in legal queue." and "the queue could not be read" were the same screen. On this
+// desk the first is a green light to publish.
+let listReadFailed = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
+  if (!canWrite) {
+    errorMsg = 'Your role can open the legal queue but cannot change it. Nothing was saved.';
+  } else
   try {
     if (action === 'add') {
       const title = (fd.get('title') as string || '').trim();
@@ -25,17 +54,29 @@ if (Astro.request.method === 'POST') {
       const findingId = fd.get('finding_id') as string;
       if (!title) { errorMsg = 'Title required.'; }
       else {
-        await db.execute(sql`INSERT INTO hei_legal_queue (title, risk_type, notes, finding_id, status, created_by) VALUES (${title}, ${riskType||null}, ${notes||null}, ${findingId||null}, 'open', ${user.id})`);
-        okMsg = 'Added to legal queue.';
+        const r = await db.execute(sql`INSERT INTO hei_legal_queue (title, risk_type, notes, finding_id, status, created_by) VALUES (${title}, ${riskType||null}, ${notes||null}, ${findingId||null}, 'open', ${user.id}) RETURNING id`);
+        if (rowsOf(r).length) okMsg = 'Added to legal queue.';
+        else errorMsg = 'The item was not added to the legal queue.';
       }
     } else if (action === 'update') {
       const id = fd.get('id') as string;
       const status = fd.get('status') as string;
       const notes = (fd.get('notes') as string || '').trim();
-      await db.execute(sql`UPDATE hei_legal_queue SET status = ${status}, notes = ${notes||null}, resolved_at = ${['cleared','rejected'].includes(status) ? new Date().toISOString() : null} WHERE id = ${id}`);
-      okMsg = 'Legal queue updated.';
+      if (!LEGAL_STATUSES.includes(status)) {
+        errorMsg = 'That is not one of the statuses this desk uses, so nothing was changed.';
+      } else {
+        const r = await db.execute(sql`UPDATE hei_legal_queue SET status = ${status}, notes = ${notes||null}, resolved_at = ${['cleared','rejected'].includes(status) ? new Date().toISOString() : null} WHERE id = ${id} RETURNING id`);
+        if (rowsOf(r).length) okMsg = 'Legal queue updated.';
+        else errorMsg = 'Nothing was changed - that item is no longer on the queue. The list below is the current state.';
+      }
     }
-  } catch(e: any) { errorMsg = e.message; }
+  } catch(e: any) {
+    // e.message on a drizzle error is only the failed SQL. The reason is on e.cause, and nothing
+    // was being logged at all.
+    console.error('[admin/hei/legal]', action, 'failed -', causeOf(e));
+    okMsg = '';
+    errorMsg = 'Nothing was saved. Reason: ' + causeOf(e);
+  }
 }
 
 const url = new URL(Astro.request.url);
@@ -48,14 +89,19 @@ try {
   // of these statements selected `title` and therefore threw, which is a second reason this desk
   // was blank even where hei_legal_queue did exist. Aliased so the markup below is untouched.
   const r = await db.execute(sql`SELECT q.*, f.finding_title AS finding_title FROM hei_legal_queue q LEFT JOIN hei_findings f ON q.finding_id = f.id WHERE 1=1 ${sf} ORDER BY q.created_at DESC`);
-  items = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+  items = rowsOf(r);
+} catch(e: any) {
+  console.error('[admin/hei/legal] queue read', causeOf(e));
+  listReadFailed = causeOf(e);
+}
 
 let findings: any[] = [];
 try {
   const r = await db.execute(sql`SELECT id, finding_title AS title FROM hei_findings ORDER BY finding_title LIMIT 50`);
-  findings = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+  findings = rowsOf(r);
+} catch(e: any) {
+  console.error('[admin/hei/legal] findings read', causeOf(e));
+}
 
 const STATUS_COLOR: Record<string,string> = { open:'#ef4444', in_review:'#fbbf24', cleared:'#10b981', rejected:'#6b7280' };
 const RISK_COLOR: Record<string,string> = { defamation:'#ef4444', named_case:'#f97316', public_official:'#fbbf24', citation:'#60a5fa', other:'#6b7280' };
@@ -93,7 +139,13 @@ function timeAgo(d: any) {
   {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
 
-  {items.length === 0 && (
+  {listReadFailed && (
+    <div style="margin:16px;padding:14px;color:#fca5a5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;">
+      <p style="font-size:13px;font-weight:600;margin:0 0 4px;">The legal queue could not be read</p>
+      <p style="font-size:12px;color:#8a8a94;margin:0;line-height:1.55;">This is not the same as "there is nothing to review". Nothing below should be taken as a clearance to publish. Reason: {listReadFailed}</p>
+    </div>
+  )}
+  {items.length === 0 && !listReadFailed && (
     <div style="margin:16px;text-align:center;padding:40px;color:#6e6e78;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;">
       <p style="font-size:13px;">No items in legal queue.</p>
     </div>

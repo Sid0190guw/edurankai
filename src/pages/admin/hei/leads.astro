@@ -1,6 +1,7 @@
 ---
 import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
+import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
 import { ensureHeiEditorialSchema } from '@/lib/hei-editorial';
 
@@ -14,11 +15,27 @@ if (!user) return Astro.redirect('/admin/login');
 // editorial tables) once per process. If the table already exists this is a no-op.
 await ensureHeiEditorialSchema();
 
+// THE WRITES ON THIS CONSOLE WERE NOT AUTHORISED AT ALL.
+//
+// src/middleware.ts maps this path to the hei_institutions section and getViewableSectionKeys() enforces
+// VIEW there and only VIEW, so every account that could OPEN this page could also change what it
+// holds. src/lib/auth/permissions.ts says in as many words never to use role !== 'applicant' as an
+// authorisation test, and the identical repair was already made on /admin/ai-interview-templates.
+//
+// GATED ON 'edit', NOT 'delete', DELIBERATELY: canAccessSection() gives a built-in role holding a
+// section view/edit/export and reserves delete for super_admin, so asking for 'delete' here would
+// take an action away from a role that holds this section today. Narrowing it further is a policy
+// decision for a human; refusing a custom VIEW-ONLY role is the mechanism fix, and that is this.
+const canWrite = await canAccessSection(user as any, 'hei_institutions', 'edit');
+
 let okMsg = '', errorMsg = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
+  if (!canWrite) {
+    errorMsg = 'Your role can open the lead queue but cannot change it. Nothing was changed.';
+  } else
   try {
     if (action === 'promote') {
       // ONE EXPRESSION OF PROMOTION, NOT TWO. This page and /admin/hei both carried their own copy
@@ -30,8 +47,12 @@ if (Astro.request.method === 'POST') {
       const res = await promoteLeadToFinding(fd.get('id') as string, user.id);
       if (res.ok) okMsg = res.message; else errorMsg = res.message;
     } else if (action === 'dismiss') {
-      await db.execute(sql`UPDATE hei_leads SET status = 'dismissed', updated_at = NOW() WHERE id = ${fd.get('id') as string}`);
-      okMsg = 'Lead dismissed.';
+      // No RETURNING: "Lead dismissed." printed over an id another editor had already promoted or
+      // removed, so two people could each believe they had closed it.
+      const r = await db.execute(sql`UPDATE hei_leads SET status = 'dismissed', updated_at = NOW() WHERE id = ${fd.get('id') as string} RETURNING id`);
+      const ok = (Array.isArray(r) ? r : (r as any)?.rows || []).length > 0;
+      if (ok) okMsg = 'Lead dismissed.';
+      else errorMsg = 'Nothing was dismissed - that lead is no longer in the queue. The list below is the current state.';
     } else if (action === 'add') {
       const title = (fd.get('title') as string || '').trim();
       const summary = (fd.get('summary') as string || '').trim();
@@ -42,14 +63,16 @@ if (Astro.request.method === 'POST') {
       const confidence = parseInt(fd.get('confidence') as string || '0') || 0;
       if (!title) { errorMsg = 'Title required.'; }
       else {
-        await db.execute(sql`INSERT INTO hei_leads (title, summary, priority, category, pipeline, institution_name, confidence_pct, status, created_by) VALUES (${title}, ${summary||null}, ${priority}, ${category}, ${pipeline||null}, ${instName||null}, ${confidence}, 'needs_review', ${user.id})`);
-        okMsg = 'Lead added to queue.';
+        const r = await db.execute(sql`INSERT INTO hei_leads (title, summary, priority, category, pipeline, institution_name, confidence_pct, status, created_by) VALUES (${title}, ${summary||null}, ${priority}, ${category}, ${pipeline||null}, ${instName||null}, ${confidence}, 'needs_review', ${user.id}) RETURNING id`);
+        if ((Array.isArray(r) ? r : (r as any)?.rows || []).length) okMsg = 'Lead added to queue.';
+        else errorMsg = 'The lead was not added to the queue.';
       }
     } else if (action === 'assign') {
       const id = fd.get('id') as string;
       const assignTo = fd.get('assign_to') as string;
-      await db.execute(sql`UPDATE hei_leads SET assigned_to = ${assignTo||null}, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Assigned.';
+      const r = await db.execute(sql`UPDATE hei_leads SET assigned_to = ${assignTo||null}, updated_at = NOW() WHERE id = ${id} RETURNING id`);
+      if ((Array.isArray(r) ? r : (r as any)?.rows || []).length) okMsg = assignTo ? 'Assigned.' : 'Assignment cleared.';
+      else errorMsg = 'Nothing was assigned - that lead is no longer in the queue.';
     }
   } catch(e: any) {
     // `.message` from drizzle is only the failed SQL text; the reason lives on `.cause`. Printing
@@ -90,7 +113,11 @@ let admins: any[] = [];
 try {
   const r = await db.execute(sql`SELECT id, name FROM users WHERE role != 'applicant' AND is_active = true ORDER BY name`);
   admins = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+} catch(e: any) {
+  // An empty Assign-to picker reads as "there is nobody to assign this to".
+  console.error('[hei/leads] assignee list could not be read -', e?.cause?.message || e?.message);
+  errorMsg = errorMsg || 'The list of people this lead can be assigned to could not be read, so the Assign picker is empty for a reason that has nothing to do with staffing.';
+}
 
 const PRIORITY_COLOR: Record<string,string> = { critical:'#ef4444', high:'#f97316', medium:'#fbbf24', low:'#6b7280', signal:'#60a5fa' };
 const STATUS_COLOR: Record<string,string> = { needs_review:'#fbbf24', drafting:'#60a5fa', context_needed:'#a78bfa', file_rti:'#f97316', promoted:'#10b981', dismissed:'#6b7280' };

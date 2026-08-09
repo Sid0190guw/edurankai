@@ -1,6 +1,7 @@
 ---
 import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
+import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
 import { ensureHeiEditorialSchema } from '@/lib/hei-editorial';
 
@@ -12,27 +13,68 @@ if (!user) return Astro.redirect('/admin/login');
 // one is the worst possible place for an unreadable list to render as "nothing pending".
 await ensureHeiEditorialSchema();
 
+// Declared before the POST handler that reads them - const is not hoisted.
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+// THE WRITES ON THIS CONSOLE WERE NOT AUTHORISED AT ALL.
+//
+// src/middleware.ts maps this path to the hei_institutions section and getViewableSectionKeys() enforces
+// VIEW there and only VIEW, so every account that could OPEN this page could also change what it
+// holds. src/lib/auth/permissions.ts says in as many words never to use role !== 'applicant' as an
+// authorisation test, and the identical repair was already made on /admin/ai-interview-templates.
+//
+// GATED ON 'edit', NOT 'delete', DELIBERATELY: canAccessSection() gives a built-in role holding a
+// section view/edit/export and reserves delete for super_admin, so asking for 'delete' here would
+// take an action away from a role that holds this section today. Narrowing it further is a policy
+// decision for a human; refusing a custom VIEW-ONLY role is the mechanism fix, and that is this.
+const canWrite = await canAccessSection(user as any, 'hei_institutions', 'edit');
+
 let okMsg = '', errorMsg = '';
+// J: an unreadable table drew "No right-of-reply notices yet." Right of reply is the step that lets
+// a named institution answer BEFORE publication, so "nothing pending" is precisely the sentence
+// that lets a finding go out unanswered.
+let listReadFailed = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
+  if (!canWrite) {
+    errorMsg = 'Your role can open the right-of-reply desk but cannot change it. Nothing was saved.';
+  } else
   try {
     if (action === 'add_reply') {
       const findingId = fd.get('finding_id') as string;
       const instName = (fd.get('institution_name') as string || '').trim();
       const sentAt = fd.get('sent_at') as string;
       const deadline = fd.get('deadline_at') as string;
-      await db.execute(sql`INSERT INTO hei_right_of_reply (finding_id, institution_name, sent_at, deadline_at, status) VALUES (${findingId||null}, ${instName||null}, ${sentAt||null}, ${deadline||null}, 'sent')`);
-      okMsg = 'Right-of-reply sent.';
+      if (!instName) {
+        errorMsg = 'A right-of-reply notice has to name the institution it was sent to. Nothing was recorded.';
+      } else {
+        const r = await db.execute(sql`INSERT INTO hei_right_of_reply (finding_id, institution_name, sent_at, deadline_at, status) VALUES (${findingId||null}, ${instName}, ${sentAt||null}, ${deadline||null}, 'sent') RETURNING id`);
+        // "Right-of-reply sent." was never true of this handler - it records that a notice WAS sent,
+        // it does not send one. Nothing in this file touches a transport.
+        if (rowsOf(r).length) okMsg = 'Right-of-reply recorded as sent. This desk records the notice; it does not send it.';
+        else errorMsg = 'The notice was not recorded.';
+      }
     } else if (action === 'record_response') {
       const id = fd.get('id') as string;
       const response = (fd.get('response_text') as string || '').trim();
-      const modifier = parseFloat(fd.get('modifier_score') as string || '0') || 0;
-      await db.execute(sql`UPDATE hei_right_of_reply SET status = 'responded', response_text = ${response}, response_received_at = NOW(), modifier_score = ${modifier} WHERE id = ${id}`);
-      okMsg = 'Response recorded.';
+      const modifierRaw = parseFloat(fd.get('modifier_score') as string || '0');
+      // A modifier is a number applied to a published ranking. NaN used to fall through `|| 0` and
+      // read as a deliberate zero; a hand-made POST had no bound at all.
+      const modifier = Number.isFinite(modifierRaw) ? Math.min(10, Math.max(-10, modifierRaw)) : 0;
+      const r = await db.execute(sql`UPDATE hei_right_of_reply SET status = 'responded', response_text = ${response}, response_received_at = NOW(), modifier_score = ${modifier} WHERE id = ${id} RETURNING id`);
+      if (rowsOf(r).length) okMsg = 'Response recorded.';
+      else errorMsg = 'Nothing was recorded - that notice is no longer on this desk. The list below is the current state.';
     }
-  } catch(e: any) { errorMsg = e.message; }
+  } catch(e: any) {
+    // e.message on a drizzle error is only the failed SQL. The reason is on e.cause, and nothing
+    // was being logged.
+    console.error('[admin/hei/replies]', action, 'failed -', causeOf(e));
+    okMsg = '';
+    errorMsg = 'Nothing was saved. Reason: ' + causeOf(e);
+  }
 }
 
 const url = new URL(Astro.request.url);
@@ -45,14 +87,19 @@ try {
   // asked for a column that does not exist and therefore threw into their catch, which is a second,
   // independent reason this desk was blank.
   const r = await db.execute(sql`SELECT r.*, f.finding_title AS finding_title FROM hei_right_of_reply r LEFT JOIN hei_findings f ON r.finding_id = f.id WHERE 1=1 ${sf} ORDER BY r.sent_at DESC LIMIT 100`);
-  replies = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+  replies = rowsOf(r);
+} catch(e: any) {
+  console.error('[admin/hei/replies] list read', causeOf(e));
+  listReadFailed = causeOf(e);
+}
 
 let findings: any[] = [];
 try {
   const r = await db.execute(sql`SELECT id, finding_title AS title FROM hei_findings WHERE status IN ('draft','review') ORDER BY finding_title LIMIT 50`);
-  findings = Array.isArray(r) ? r : (r?.rows || []);
-} catch(e) {}
+  findings = rowsOf(r);
+} catch(e: any) {
+  console.error('[admin/hei/replies] findings read', causeOf(e));
+}
 
 function fmtDate(d: any) { if (!d) return '-'; return new Date(d).toLocaleDateString('en-IN',{ timeZone: 'Asia/Kolkata',day:'numeric',month:'short',year:'numeric'}); }
 const STATUS_COLOR: Record<string,string> = { pending:'#6b7280', sent:'#60a5fa', responded:'#10b981', no_response:'#ef4444', waived:'#a78bfa' };
@@ -83,7 +130,13 @@ const STATUS_COLOR: Record<string,string> = { pending:'#6b7280', sent:'#60a5fa',
   {okMsg && <div style="margin:10px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
 
   <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
-    {replies.length === 0 && <div style="text-align:center;padding:40px;color:#6e6e78;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;"><p style="font-size:13px;">No right-of-reply notices yet.</p></div>}
+    {listReadFailed && (
+      <div style="padding:14px;color:#fca5a5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;">
+        <p style="font-size:13px;font-weight:600;margin:0 0 4px;">The right-of-reply list could not be read</p>
+        <p style="font-size:12px;color:#8a8a94;margin:0;line-height:1.55;">This is not the same as "nothing is pending". No finding should be published on the strength of this screen until it loads cleanly. Reason: {listReadFailed}</p>
+      </div>
+    )}
+    {replies.length === 0 && !listReadFailed && <div style="text-align:center;padding:40px;color:#6e6e78;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;"><p style="font-size:13px;">No right-of-reply notices yet.</p></div>}
     {replies.map((r: any) => {
       const sc = STATUS_COLOR[r.status] || '#6b7280';
       const isOverdue = r.deadline_at && new Date(r.deadline_at) < new Date() && r.status !== 'responded';

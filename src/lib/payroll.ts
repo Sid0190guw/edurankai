@@ -270,6 +270,19 @@ export function ensurePayrollSchema(): Promise<void> {
       await db.execute(sql`ALTER TABLE hr_payslips
         ADD COLUMN IF NOT EXISTS employer_cost NUMERIC(14,2) NOT NULL DEFAULT 0`);
 
+      // LOSS OF PAY, PROVISIONED BY THE MODULE THAT WRITES IT. These two columns are in the payslip
+      // INSERT in generateRun() below and in db/hr-schema.sql, and the only place they were ever
+      // added at runtime was /admin/hr/payroll/index.astro — two ALTERs run on EVERY Create-run POST
+      // and both ending in `.catch(() => {})`. A DDL failure there was invisible, and its actual
+      // consequence was every payslip in the month landing in generateRun()'s `failed[]` with a
+      // message about the INSERT rather than about the column that is missing. Moved here so it runs
+      // once behind the same guard as the rest of the schema, and so a failure throws where
+      // ensurePayrollSchema() already logs the Postgres cause and resets `ready` for a retry.
+      await db.execute(sql`ALTER TABLE hr_payslips
+        ADD COLUMN IF NOT EXISTS lop_days NUMERIC(6,2) NOT NULL DEFAULT 0`);
+      await db.execute(sql`ALTER TABLE hr_payslips
+        ADD COLUMN IF NOT EXISTS lop_deduction NUMERIC(14,2) NOT NULL DEFAULT 0`);
+
       // =========================================================================================
       // WHAT A RUN COULD NOT DO, KEPT AFTER THE FLASH MESSAGE HAS GONE
       // =========================================================================================
@@ -354,12 +367,20 @@ export function ensurePayrollSchema(): Promise<void> {
   return ready;
 }
 
-/** Provision, but never throw into a reader — a read that cannot run returns an empty list. */
+/**
+ * Provision, but never throw into a reader — a read that cannot run returns an empty list.
+ *
+ * THE FALSE IS LOGGED NOW. This used to be a bare `catch { return false }`: a DDL failure took every
+ * component read down to an empty array and left no line anywhere, so "the catalogue could not be
+ * provisioned" and "no component has been configured" were the same silence. The boolean is what
+ * callers act on; the reason is what a person needs in order to fix it.
+ */
 async function safeEnsure(): Promise<boolean> {
   try {
     await ensurePayrollSchema();
     return true;
-  } catch {
+  } catch (e: any) {
+    logFail('safeEnsure', e);
     return false;
   }
 }
@@ -408,21 +429,49 @@ function mapComponent(r: any): PayrollComponent {
   };
 }
 
-/** Every configured component. `includeInactive` for the admin screen; readers want the default. */
-export async function listComponents(
+/**
+ * The outcome of a catalogue read, keeping the difference between "nothing is configured" and "the
+ * catalogue could not be read".
+ *
+ * AN EMPTY CATALOGUE IS A STATEMENT ABOUT SOMEBODY'S PAY. Every statutory deduction in this product
+ * lives in payroll_components: with none of them computePay() writes a payslip whose net is the
+ * whole gross, and the admin screen prints "No component is configured yet". Both sentences are
+ * true of a catalogue nobody has filled in and FALSE of a catalogue that refused to answer — and
+ * the second hands an employee more money than they are owed, on a document that says it is right.
+ */
+export interface ComponentRead {
+  /** False when the schema could not be provisioned or the SELECT failed. */
+  ok: boolean;
+  components: PayrollComponent[];
+}
+
+/** Every configured component, carrying whether the read actually happened. */
+export async function readComponents(
   opts: { includeInactive?: boolean } = {},
-): Promise<PayrollComponent[]> {
-  if (!(await safeEnsure())) return [];
+): Promise<ComponentRead> {
+  if (!(await safeEnsure())) return { ok: false, components: [] };
   try {
     const activeFilter = opts.includeInactive ? sql`` : sql`WHERE is_active = true`;
     const r = await db.execute(sql`
       SELECT * FROM payroll_components ${activeFilter}
        ORDER BY (kind = 'deduction'), sort_order ASC, label ASC`);
-    return rows(r).map(mapComponent);
+    return { ok: true, components: rows(r).map(mapComponent) };
   } catch (e: any) {
     logFail('listComponents', e);
-    return [];
+    return { ok: false, components: [] };
   }
+}
+
+/**
+ * Every configured component. `includeInactive` for the admin screen; readers want the default.
+ *
+ * Kept for callers that genuinely cannot act on a failure. Anything that computes money, or that
+ * prints a sentence about what is configured, must use readComponents() instead.
+ */
+export async function listComponents(
+  opts: { includeInactive?: boolean } = {},
+): Promise<PayrollComponent[]> {
+  return (await readComponents(opts)).components;
 }
 
 export interface SaveComponentInput {
@@ -613,9 +662,22 @@ export interface EmployeeOverride {
   note: string;
 }
 
-export async function employeeOverrides(employeeId: string): Promise<EmployeeOverride[]> {
-  if (!isUuid(employeeId)) return [];
-  if (!(await safeEnsure())) return [];
+/** An override read, carrying whether it happened. See ComponentRead for why the flag exists. */
+export interface OverrideRead {
+  ok: boolean;
+  overrides: EmployeeOverride[];
+}
+
+/**
+ * One person's overrides, carrying whether the read actually happened.
+ *
+ * AN OVERRIDE THAT DID NOT LOAD IS NOT AN OVERRIDE THAT DOES NOT EXIST. `enabled: false` is how a
+ * component is switched OFF for one person, and a non-null employeeValue is how their rate differs;
+ * losing either to a failed read applies the catalogue's figure to their pay instead, silently.
+ */
+export async function readEmployeeOverrides(employeeId: string): Promise<OverrideRead> {
+  if (!isUuid(employeeId)) return { ok: true, overrides: [] };
+  if (!(await safeEnsure())) return { ok: false, overrides: [] };
   try {
     const r = await db.execute(sql`
       SELECT o.component_id, o.employee_value, o.enabled, o.note,
@@ -624,19 +686,27 @@ export async function employeeOverrides(employeeId: string): Promise<EmployeeOve
         JOIN payroll_components c ON c.id = o.component_id
        WHERE o.employee_id = ${employeeId}::uuid
        ORDER BY c.sort_order ASC`);
-    return rows(r).map((x) => ({
-      componentId: String(x.component_id),
-      code: String(x.code),
-      label: String(x.label),
-      kind: (String(x.kind) === 'deduction' ? 'deduction' : 'earning') as ComponentKind,
-      employeeValue: x.employee_value === null || x.employee_value === undefined ? null : Number(x.employee_value),
-      enabled: x.enabled !== false,
-      note: String(x.note || ''),
-    }));
+    return {
+      ok: true,
+      overrides: rows(r).map((x) => ({
+        componentId: String(x.component_id),
+        code: String(x.code),
+        label: String(x.label),
+        kind: (String(x.kind) === 'deduction' ? 'deduction' : 'earning') as ComponentKind,
+        employeeValue: x.employee_value === null || x.employee_value === undefined ? null : Number(x.employee_value),
+        enabled: x.enabled !== false,
+        note: String(x.note || ''),
+      })),
+    };
   } catch (e: any) {
     logFail('employeeOverrides', e);
-    return [];
+    return { ok: false, overrides: [] };
   }
+}
+
+/** Kept for readers that only display overrides. Anything computing money uses readEmployeeOverrides(). */
+export async function employeeOverrides(employeeId: string): Promise<EmployeeOverride[]> {
+  return (await readEmployeeOverrides(employeeId)).overrides;
 }
 
 /** Set — or clear — one person's override of one component. */
@@ -1007,10 +1077,39 @@ export async function computePay(
   const basic = round2(Number(structure?.basic) || baseSalary || 0);
 
   // ---- the catalogue and this person's overrides ---------------------------------------------------
-  const catalogue = await listComponents();
-  const overrides = await employeeOverrides(employeeId);
+  //
+  // A FAILED CATALOGUE READ USED TO PAY SOMEBODY MORE THAN THEY ARE OWED, SILENTLY. Both of these
+  // were `listComponents()` / `employeeOverrides()`, each of which logs and hands back an empty
+  // array. Every statutory deduction in this product lives in that catalogue, so a refused read
+  // produced a payslip with NO provident fund, NO state insurance, NO professional tax and NO
+  // withholding — a net equal to the whole gross — which reconciles perfectly (nothing was deducted,
+  // so gross - 0 == net), fires no ledger warning, is approved, and is then marked paid. The
+  // employee is over-paid, the deduction is never remitted, and the only outward sign is a payslip
+  // that looks like a payslip. The salary-structure read three blocks above was hardened for exactly
+  // this shape; these two were left on the silent form.
+  //
+  // NAMED, NOT REFUSED, for the reason written out at the zero-gross block below: aborting would
+  // take everybody off the run for one transient failure. The gap travels onto the payslip, into the
+  // run summary and onto the screen of the person about to press Approve.
+  const catalogueRead = await readComponents();
+  const overrideRead = await readEmployeeOverrides(employeeId);
+  const catalogue = catalogueRead.components;
+  const overrides = overrideRead.overrides;
   const overrideBy = new Map<string, EmployeeOverride>();
   for (const o of overrides) overrideBy.set(o.componentId, o);
+  if (!catalogueRead.ok) {
+    gaps.push(
+      'the salary component catalogue - every configured earning and every statutory deduction is '
+      + 'absent from this payslip because that read did not answer, not because none is configured. '
+      + 'The net below is the whole gross. Do not mark this run paid until it reads again',
+    );
+  }
+  if (!overrideRead.ok) {
+    gaps.push(
+      "this employee's own component overrides - a component switched off for them, or set to a "
+      + 'different rate, has been computed at the catalogue rate instead',
+    );
+  }
 
   const configuredCodes = new Set<string>(catalogue.map((c) => c.code));
 
@@ -2099,6 +2198,58 @@ export interface PayslipSummary {
   status: string;
   paidAt: string | null;
   runStatus: string;
+}
+
+/**
+ * The same read as payslipsForEmployee(), with "you have none" and "we could not look" kept apart.
+ *
+ * WHY THIS EXISTS. payslipsForEmployee() catches and returns [] - correct for a caller that only
+ * wants a list, and a lie on the screen where a person's own pay is printed. An employee shown
+ * "No payslip has been issued yet" over a read that never completed concludes they were not paid.
+ * /portal/employee/payslips uses this form so it can say which of the two happened.
+ */
+export interface PayslipRead {
+  ok: boolean;
+  rows: PayslipSummary[];
+  /** Present only when ok is false. Already unwrapped from `.cause`. */
+  reason: string | null;
+}
+
+export async function payslipsForEmployeeResult(employeeId: string, limit = 24): Promise<PayslipRead> {
+  if (!isUuid(employeeId)) {
+    return { ok: false, rows: [], reason: 'employee id is not in the expected form' };
+  }
+  const lim = Math.min(Math.max(Number(limit) || 24, 1), 120);
+  try {
+    const r = await db.execute(sql`
+      SELECT ps.id, ps.month, ps.year, ps.gross_salary, ps.total_deductions, ps.net_salary,
+             ps.currency, ps.status, ps.paid_at, pr.status AS run_status
+        FROM hr_payslips ps
+        LEFT JOIN hr_payroll_runs pr ON pr.id = ps.payroll_run_id
+       WHERE ps.employee_id = ${employeeId}::uuid
+       ORDER BY ps.year DESC, ps.month DESC
+       LIMIT ${lim}`);
+    return {
+      ok: true,
+      reason: null,
+      rows: rows(r).map((x) => ({
+        id: String(x.id),
+        month: Number(x.month) || 1,
+        year: Number(x.year) || 0,
+        periodLabel: (MONTH_NAMES[(Number(x.month) || 1) - 1] || '') + ' ' + (x.year ?? ''),
+        gross: Number(x.gross_salary) || 0,
+        totalDeductions: Number(x.total_deductions) || 0,
+        net: Number(x.net_salary) || 0,
+        currency: String(x.currency || 'INR'),
+        status: String(x.status || 'pending'),
+        paidAt: x.paid_at ? new Date(x.paid_at).toISOString() : null,
+        runStatus: String(x.run_status || ''),
+      })),
+    };
+  } catch (e: any) {
+    logFail('payslipsForEmployee', e);
+    return { ok: false, rows: [], reason: e?.cause?.message || e?.message || 'unknown database error' };
+  }
 }
 
 /** One employee's own payslips, newest first. Scoped by employee_id in the WHERE clause. */

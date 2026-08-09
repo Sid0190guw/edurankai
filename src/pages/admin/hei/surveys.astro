@@ -1,6 +1,7 @@
 ---
 import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
+import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
 import { ensureHeiEditorialSchema } from '@/lib/hei-editorial';
 
@@ -16,11 +17,33 @@ if (!user) return Astro.redirect('/admin/login');
 // exists at src/pages/surveys/[slug].astro.
 await ensureHeiEditorialSchema();
 
+// Declared before the POST handler that reads them - const is not hoisted.
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+// THE WRITES ON THIS CONSOLE WERE NOT AUTHORISED AT ALL.
+//
+// src/middleware.ts maps this path to the hei_institutions section and getViewableSectionKeys() enforces
+// VIEW there and only VIEW, so every account that could OPEN this page could also change what it
+// holds. src/lib/auth/permissions.ts says in as many words never to use role !== 'applicant' as an
+// authorisation test, and the identical repair was already made on /admin/ai-interview-templates.
+//
+// GATED ON 'edit', NOT 'delete', DELIBERATELY: canAccessSection() gives a built-in role holding a
+// section view/edit/export and reserves delete for super_admin, so asking for 'delete' here would
+// take an action away from a role that holds this section today. Narrowing it further is a policy
+// decision for a human; refusing a custom VIEW-ONLY role is the mechanism fix, and that is this.
+const canWrite = await canAccessSection(user as any, 'hei_institutions', 'edit');
+
 let okMsg = '', errorMsg = '';
+// J: an unreadable table drew a builder with no forms on it and a total of 0 responses.
+let listReadFailed = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
+  if (!canWrite) {
+    errorMsg = 'Your role can open the survey builder but cannot change it. Nothing was saved.';
+  } else
   try {
     if (action === 'create_form') {
       const title = (fd.get('title') as string || '').trim();
@@ -29,26 +52,53 @@ if (Astro.request.method === 'POST') {
       const slug = title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'') + '-' + Date.now();
       if (!title) { errorMsg = 'Title required.'; }
       else {
-        let questions = [];
-        try { questions = JSON.parse(questionsRaw || '[]'); } catch(e) {}
-        await db.execute(sql`
-          INSERT INTO hei_survey_forms (title, slug, description, questions, created_by, is_active)
-          VALUES (${title}, ${slug}, ${desc||null}, ${JSON.stringify(questions)}, ${user.id}, true)
-        `);
-        okMsg = 'Survey form created successfully!';
+        // WAS `try { questions = JSON.parse(...) } catch(e) {}` - a builder whose question list
+        // failed to parse got an ACTIVE, publicly answerable form with NO QUESTIONS on it, and the
+        // word "successfully". The parse failure is the one thing worth saying here.
+        let questions: any[] = [];
+        let parseFailed = false;
+        try {
+          const parsed = JSON.parse(questionsRaw || '[]');
+          if (Array.isArray(parsed)) questions = parsed; else parseFailed = true;
+        } catch (e: any) {
+          parseFailed = true;
+        }
+        if (parseFailed) {
+          errorMsg = 'The question list did not come through as readable JSON, so no form was created. Nothing was saved - add the questions again and retry.';
+        } else if (questions.length === 0) {
+          errorMsg = 'A survey with no questions cannot be answered, so it was not created. Add at least one question.';
+        } else {
+          const r = await db.execute(sql`
+            INSERT INTO hei_survey_forms (title, slug, description, questions, created_by, is_active)
+            VALUES (${title}, ${slug}, ${desc||null}, ${JSON.stringify(questions)}, ${user.id}, true)
+            RETURNING id
+          `);
+          if (rowsOf(r).length) okMsg = 'Survey form created with ' + questions.length + ' question' + (questions.length === 1 ? '' : 's') + '.';
+          else errorMsg = 'The form was not created.';
+        }
       }
     } else if (action === 'toggle_form') {
+      // WAS a read, a negation in JavaScript, and a blind write - so two editors toggling together
+      // both read the same value and the second undid the first, and an id matching nothing had
+      // `!undefined` = true written at it and reported "Form activated." Postgres does the flip now,
+      // in one statement, and reports the state it actually left behind.
       const id = fd.get('id') as string;
-      const cur = await db.execute(sql`SELECT is_active FROM hei_survey_forms WHERE id = ${id} LIMIT 1`);
-      const rows = Array.isArray(cur) ? cur : (cur?.rows || []);
-      const isActive = (rows[0] as any)?.is_active;
-      await db.execute(sql`UPDATE hei_survey_forms SET is_active = ${!isActive}, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = isActive ? 'Form paused.' : 'Form activated.';
+      const r = await db.execute(sql`UPDATE hei_survey_forms SET is_active = NOT is_active, updated_at = NOW() WHERE id = ${id} RETURNING is_active`);
+      const now = rowsOf(r)[0] as any;
+      if (now) okMsg = now.is_active ? 'Form activated - it can be answered now.' : 'Form paused - it can no longer be answered.';
+      else errorMsg = 'Nothing was changed - that form no longer exists.';
     } else if (action === 'delete_form') {
-      await db.execute(sql`DELETE FROM hei_survey_forms WHERE id = ${fd.get('id') as string}`);
-      okMsg = 'Form deleted.';
+      const r = await db.execute(sql`DELETE FROM hei_survey_forms WHERE id = ${fd.get('id') as string} RETURNING id`);
+      if (rowsOf(r).length) okMsg = 'Form deleted.';
+      else errorMsg = 'Nothing was deleted - that form no longer exists.';
     }
-  } catch(e: any) { errorMsg = e.message; }
+  } catch(e: any) {
+    // e.message on a drizzle error is only the failed SQL. The reason is on e.cause, and nothing
+    // was being logged.
+    console.error('[admin/hei/surveys]', action, 'failed -', causeOf(e));
+    okMsg = '';
+    errorMsg = 'Nothing was saved. Reason: ' + causeOf(e);
+  }
 }
 
 const url = new URL(Astro.request.url);
@@ -61,9 +111,12 @@ try {
     SELECT f.*, (SELECT COUNT(*)::int FROM hei_survey_responses WHERE form_id = f.id) as responses
     FROM hei_survey_forms f ORDER BY f.created_at DESC
   `);
-  forms = Array.isArray(r) ? r : (r?.rows || []);
+  forms = rowsOf(r);
   totalResponses = forms.reduce((s: number, f: any) => s + (Number(f.responses)||0), 0);
-} catch(e) {}
+} catch(e: any) {
+  console.error('[admin/hei/surveys] forms read', causeOf(e));
+  listReadFailed = causeOf(e);
+}
 
 let editForm: any = null;
 if (editId) {
@@ -110,7 +163,7 @@ function timeAgo(d: any) {
         <button onclick="openBuilder()" style="background:#FF4F00;border:none;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer;">+ New Form</button>
       </div>
     </div>
-    <p style="font-size:11px;color:#6e6e78;margin:4px 0 0;">{forms.length} forms - {totalResponses} total responses</p>
+    <p style="font-size:11px;color:#6e6e78;margin:4px 0 0;">{listReadFailed ? 'counts unavailable - the form list could not be read' : forms.length + ' forms - ' + totalResponses + ' total responses'}</p>
   </div>
 
   {errorMsg && <div style="margin:10px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
@@ -118,7 +171,13 @@ function timeAgo(d: any) {
 
   <!-- Forms list -->
   <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
-    {forms.length === 0 && (
+    {listReadFailed && (
+      <div style="padding:14px;color:#fca5a5;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:12px;">
+        <p style="font-size:13px;font-weight:600;margin:0 0 4px;">The survey forms could not be read</p>
+        <p style="font-size:12px;color:#8a8a94;margin:0;line-height:1.55;">This is not the same as "there are none", and the counts above are not the real counts. Reason: {listReadFailed}</p>
+      </div>
+    )}
+    {forms.length === 0 && !listReadFailed && (
       <div style="text-align:center;padding:48px 24px;color:#6e6e78;background:#0f0f14;border:1px dashed #1a1a1f;border-radius:12px;">
         <p style="font-size:28px;margin-bottom:8px;">[F]</p>
         <p style="font-size:14px;font-weight:600;color:#fff;margin-bottom:4px;">No survey forms yet</p>

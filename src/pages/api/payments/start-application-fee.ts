@@ -141,16 +141,32 @@ export const POST: APIRoute = async ({ request, locals }) => {
       });
       if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
-      await db.execute(sql`
-        INSERT INTO payments (
-          order_id, amount_paise, currency, status, purpose,
-          reference_type, reference_id, user_id, email, notes
-        ) VALUES (
-          ${result.order.id}, ${amountPaise}, 'INR', 'created', 'application_fee_intent',
-          'application_intent', ${intentRow.id}, ${user.id}, ${intentRow.email || user.email || 'unknown@edurankai.in'},
-          ${sql.raw("'" + JSON.stringify({ receipt, intentId: intentRow.id, feeChf, fxRate: co.fxRate, fxDate: co.fxDate, fxLive: co.fxLive, breakdown: bd }).replace(/'/g, "''") + "'::jsonb")}
-        )
-      `).catch(() => {});
+      // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED.
+      //
+      // It ended in `.catch(() => {})`. This row is the ONLY link between the money and the intent:
+      // applyPaidEffects() materialises the application from `payments.reference_id`, and
+      // reconcilePending() finds stranded payers by scanning `payments` for reference_type
+      // 'application_intent'. Without the row the applicant pays the fee and NO application is ever
+      // created — the exact "paid but lost application" that machinery exists to prevent — with
+      // nothing for the backstop to find and nothing to refund against.
+      //
+      // Refusing costs an unused order at the gateway, which expires on its own and charges nobody.
+      try {
+        await db.execute(sql`
+          INSERT INTO payments (
+            order_id, amount_paise, currency, status, purpose,
+            reference_type, reference_id, user_id, email, notes
+          ) VALUES (
+            ${result.order.id}, ${amountPaise}, 'INR', 'created', 'application_fee_intent',
+            'application_intent', ${intentRow.id}, ${user.id}, ${intentRow.email || user.email || 'unknown@edurankai.in'},
+            ${sql.raw("'" + JSON.stringify({ receipt, intentId: intentRow.id, feeChf, fxRate: co.fxRate, fxDate: co.fxDate, fxLive: co.fxLive, breakdown: bd }).replace(/'/g, "''") + "'::jsonb")}
+          )
+        `);
+      } catch (e: any) {
+        console.error('[payments] application-fee order', result.order.id, 'could not be recorded for intent', intentRow.id,
+          '-', e?.cause?.message || e?.message);
+        return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
+      }
 
       const candidateName = ((intentRow.first_name || '') + ' ' + (intentRow.last_name || '')).trim();
       return json({
@@ -243,19 +259,32 @@ export const POST: APIRoute = async ({ request, locals }) => {
     });
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
-    // Record the chosen fee on the application so verify.ts / admin can see it.
-    await db.execute(sql`UPDATE applications SET fee_chf = ${feeChf} WHERE id = ${app.id}`).catch(() => {});
+    // Record the chosen fee on the application so verify.ts / admin can see it. Not fatal — the fee is
+    // also in the payments row and in the order's notes — but the reason belongs in the log rather
+    // than on the floor.
+    await db.execute(sql`UPDATE applications SET fee_chf = ${feeChf} WHERE id = ${app.id}`)
+      .catch((e: any) => console.error('[payments] could not stamp fee_chf on application', app.id, '-', e?.cause?.message || e?.message));
 
-    await db.execute(sql`
-      INSERT INTO payments (
-        order_id, amount_paise, currency, status, purpose,
-        reference_type, reference_id, user_id, email, notes
-      ) VALUES (
-        ${result.order.id}, ${amountPaise}, 'INR', 'created', 'application_fee',
-        'application', ${app.id}, ${user.id}, ${app.email || user.email || 'unknown@edurankai.in'},
-        ${sql.raw("'" + JSON.stringify({ receipt, applicationId: app.id, feeChf, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")}
-      )
-    `).catch(() => {});
+    // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED. applyPaidEffects()
+    // reads the order out of `payments` and returns IMMEDIATELY when there is none, so a failed
+    // insert here meant the applicant paid the processing fee and the application never joined the
+    // live queue — invisible to every admin, with no row for reconcile or a refund to work from.
+    try {
+      await db.execute(sql`
+        INSERT INTO payments (
+          order_id, amount_paise, currency, status, purpose,
+          reference_type, reference_id, user_id, email, notes
+        ) VALUES (
+          ${result.order.id}, ${amountPaise}, 'INR', 'created', 'application_fee',
+          'application', ${app.id}, ${user.id}, ${app.email || user.email || 'unknown@edurankai.in'},
+          ${sql.raw("'" + JSON.stringify({ receipt, applicationId: app.id, feeChf, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")}
+        )
+      `);
+    } catch (e: any) {
+      console.error('[payments] application-fee order', result.order.id, 'could not be recorded for application', app.id,
+        '-', e?.cause?.message || e?.message);
+      return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
+    }
 
     const candidateName = ((app.first_name || '') + ' ' + (app.last_name || '')).trim();
     return json({

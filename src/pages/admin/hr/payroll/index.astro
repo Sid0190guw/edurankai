@@ -65,7 +65,13 @@ async function audit(userId: string, action: string, entityId: string, diff: Rec
   try {
     const { logAudit } = await import('@/lib/audit');
     await logAudit({ userId, action, entity: 'hr_payroll', entityId, diff });
-  } catch (_) {}
+  } catch (e: any) {
+    // The paragraph above says a salary change must leave a trail, and then this swallowed the one
+    // failure that means it did not. The write itself must not be rolled back for a failed audit -
+    // the money decision is already made - but "the trail was not written" is exactly the line an
+    // investigator needs, and there was none.
+    console.error('[hr-payroll] AUDIT NOT WRITTEN for', action, entityId, '-', e?.cause?.message || e?.message);
+  }
 }
 
 // THE PERIOD THIS CONSOLE DEFAULTS TO, CUT IN THE ZONE PAYROLL IS RUN IN.
@@ -107,6 +113,47 @@ const currentYear = civilNowParts.y;
 const PAYROLL_TIME_ZONE = 'Asia/Kolkata';
 const EFFECTIVE_TODAY = sqlExpr`(NOW() AT TIME ZONE ${PAYROLL_TIME_ZONE})::date`;
 
+// =================================================================================================
+// WHO THERE IS TO PAY — ASKED BEFORE THE PERIOD IS CONSUMED, NOT AFTER
+// =================================================================================================
+//
+// THE DAY-ONE FAILURE THIS CLOSES. On a fresh deployment this page said "No payroll runs yet. Click
+// '+ Run Payroll' to create your first payroll run", and pressing it with zero employees SUCCEEDED:
+// generateRun() inserts the hr_payroll_runs row before it counts anybody, then reported "Payroll run
+// created for <month> <year> with 0 employees. Total net 0."
+//
+// That period is then permanently gone. generateRun() refuses a second run for a month that already
+// has one, this console exposes only create / approve / mark_paid / update_salary, and there is no
+// delete and no void anywhere in src/lib/payroll.ts — the page's own copy says the run cannot be
+// regenerated. Somebody exploring the console on their first afternoon destroyed their first real
+// payroll month, and the only screen that would have warned them was the message they got AFTER.
+//
+// So the precondition is asked here, in the write path, and the run is REFUSED rather than created
+// empty. The refusal names what is missing and links to the record that fixes it.
+//
+// Declared ABOVE the POST handler that calls it. A function declaration would hoist; this file's
+// convention is to put the thing above its reader either way, because a `const` arrow under its
+// first caller is how pages on this project have died on their first line.
+async function countPayable(): Promise<{ ok: boolean; active: number; payable: number; error: string | null }> {
+  const res = await safeRows<any>('[payroll] payable employee count', () => db.execute(sqlExpr`
+    SELECT
+      COUNT(*)::int AS active,
+      COUNT(*) FILTER (
+        WHERE COALESCE(e.base_salary, 0) > 0
+           OR EXISTS (
+                SELECT 1 FROM hr_salary_structures ss
+                 WHERE ss.employee_id = e.id
+                   AND ss.effective_from <= NOW()
+                   AND (ss.effective_to IS NULL OR ss.effective_to >= NOW())
+              )
+      )::int AS payable
+    FROM hr_employees e
+    WHERE e.is_active = true`));
+  if (!res.ok) return { ok: false, active: 0, payable: 0, error: res.error };
+  const row = res.rows[0] || {};
+  return { ok: true, active: Number(row.active) || 0, payable: Number(row.payable) || 0, error: null };
+}
+
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
@@ -117,11 +164,32 @@ if (Astro.request.method === 'POST') {
       const year = parseInt(fd.get('year') as string);
       const notes = (fd.get('notes') as string || '').trim();
 
-      // Loss-of-pay columns. Additive and idempotent, matching how the rest of the HR schema
-      // provisions itself; see db/hr-schema.sql for the full canonical definition.
-      await db.execute(sqlExpr`ALTER TABLE hr_payslips ADD COLUMN IF NOT EXISTS lop_days NUMERIC(6,2) NOT NULL DEFAULT 0`).catch(() => {});
-      await db.execute(sqlExpr`ALTER TABLE hr_payslips ADD COLUMN IF NOT EXISTS lop_deduction NUMERIC(14,2) NOT NULL DEFAULT 0`).catch(() => {});
+      // The loss-of-pay columns used to be added HERE, on every Create-run POST, both ending in
+      // `.catch(() => {})`. They are written by generateRun()'s payslip INSERT, so provisioning them
+      // now lives with the module that writes them (ensurePayrollSchema in src/lib/payroll.ts) —
+      // behind its once-only guard, and with the Postgres cause logged instead of discarded. A
+      // swallowed ALTER here meant every payslip in the month failed for a reason nothing said.
 
+      // THE PRECONDITION, CHECKED BEFORE THE PERIOD IS CONSUMED. See countPayable() above: a run
+      // created for a month cannot be regenerated, deleted or voided, so a run that would pay nobody
+      // is refused rather than written. The refusal is not a silent no-op — it says which of the
+      // three states this is and where to fix it.
+      const payable = await countPayable();
+      if (!payable.ok) {
+        errorMsg = 'Nothing was created. This page could not read how many employees there are to '
+          + 'pay, and a payroll run for a month cannot be undone, so it will not start one on an '
+          + 'assumption. Reason: ' + (payable.error || 'unknown database error');
+      } else if (payable.active === 0) {
+        errorMsg = 'Nothing was created, and this month is still available. There is no active '
+          + 'employee record to pay, so the run would have consumed ' + PAYROLL_MONTHS[month - 1] + ' '
+          + year + ' with nobody on it and could never be regenerated. Add employees under HR first.';
+      } else if (payable.payable === 0) {
+        errorMsg = 'Nothing was created, and this month is still available. There are '
+          + payable.active + ' active employee' + (payable.active === 1 ? '' : 's')
+          + ', but none of them has a base salary or a current salary structure, so a run would have '
+          + 'refused every payslip and consumed ' + PAYROLL_MONTHS[month - 1] + ' ' + year
+          + ' with nobody paid. Record pay under Salary Setup first.';
+      } else {
       // ONE CALL, and every rate in it came from the component catalogue rather than from this file.
       // generateRun() is idempotent on (month, year), refuses a second run for a period that already
       // has one, and reports per-employee failures by name instead of aborting the whole month or
@@ -169,6 +237,7 @@ if (Astro.request.method === 'POST') {
         }
         successMsg = parts.join(' ');
       }
+      } // end of the payable-employee precondition
     } else if (action === 'approve_run') {
       const runId = fd.get('runId') as string;
       // THE WRITE RE-STATES THE PRECONDITION THE BUTTON WAS DRAWN UNDER.
@@ -411,7 +480,11 @@ if (Astro.request.method === 'POST') {
         const p = await db.execute(sqlExpr`SELECT gross_salary, net_salary, currency FROM hr_salary_structures
           WHERE employee_id = ${empId} AND effective_to IS NULL ORDER BY effective_from DESC LIMIT 1`);
         prev = (Array.isArray(p) ? p : (p as any)?.rows || [])[0] || null;
-      } catch (_) {}
+      } catch (e: any) {
+        // prev is what makes the audit entry a CHANGE rather than a result. Swallowed, the trail
+        // said the salary was set from nothing, which is not what happened.
+        console.error('[hr-payroll] previous salary structure not read for', empId, '-', e?.cause?.message || e?.message);
+      }
 
       // ONE STATEMENT, SO A PERSON CANNOT END UP WITH NO SALARY.
       //
@@ -606,6 +679,13 @@ try {
 }
 const statutoryConfigured = activeComponents.filter((c) => c.statutory).length;
 
+// WHO THERE IS TO PAY, SAID BEFORE THE BUTTON IS PRESSED RATHER THAN AFTER.
+//
+// The same question the write path asks, asked again for the screen. It is deliberately NOT derived
+// from employeeRows above: that list is capped at 100 for rendering, so a company with more than a
+// hundred people would have had this sentence computed from a slice.
+const payableNow = await countPayable();
+
 // One banner naming every read that did not answer.
 const readFailures: string[] = [];
 if (!runsRes.ok) readFailures.push('the list of payroll runs');
@@ -727,12 +807,51 @@ function fmt(n: any) {
           already — this page does not know. Do not press "+ Run Payroll" until this list loads.
         </div>
       )}
+      {/* WHO THERE IS TO PAY — THE PRECONDITION, BEFORE THE BUTTON.
+          A run cannot be regenerated, deleted or voided, so "there is nobody to pay" has to be said
+          on the way IN. Three states, as everywhere else: unknown, nobody, and nobody with pay
+          recorded. Pressing the button in any of them is now refused by the write path as well; this
+          banner is so nobody has to discover that by pressing it. */}
+      {!payableNow.ok ? (
+        <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px;padding:12px 14px;color:#fca5a5;font-size:12.5px;line-height:1.65;">
+          <strong style="color:#fecaca;">This page could not read how many employees there are to pay.</strong>
+          It is not saying there are none. A run started now would be refused for that reason rather
+          than created empty, which is the safe direction, but nothing here can tell you whether the
+          month is ready.
+          <span style="display:block;margin-top:6px;font-family:'Geist Mono',monospace;font-size:11px;overflow-wrap:anywhere;color:#f87171;">{clip(payableNow.error || '', 300)}</span>
+        </div>
+      ) : payableNow.active === 0 ? (
+        <div style="background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.30);border-radius:10px;padding:12px 14px;color:#fcd34d;font-size:12.5px;line-height:1.65;">
+          <strong style="color:#fde68a;">There is nobody to pay yet.</strong>
+          No active employee record exists, so a payroll run would consume the month with nobody on
+          it and could never be regenerated. Creating one is refused until at least one employee has
+          pay recorded.
+          <a href="/admin/hr/employees" style="color:#fcd34d;font-weight:700;text-decoration:underline;text-underline-offset:3px;display:inline-flex;align-items:center;min-height:44px;">Add the first employee</a>
+        </div>
+      ) : payableNow.payable === 0 ? (
+        <div style="background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.30);border-radius:10px;padding:12px 14px;color:#fcd34d;font-size:12.5px;line-height:1.65;">
+          <strong style="color:#fde68a;">Nobody has pay recorded.</strong>
+          {' '}{payableNow.active} active employee{payableNow.active === 1 ? '' : 's'}, and not one of
+          them has a base salary or a current salary structure. A run refuses to write a payslip
+          without an agreed figure, so it would consume the month and pay nobody. Creating one is
+          refused until pay is recorded.
+          <a href="?tab=salary" style="color:#fcd34d;font-weight:700;text-decoration:underline;text-underline-offset:3px;display:inline-flex;align-items:center;min-height:44px;">Open Salary Setup</a>
+        </div>
+      ) : null}
+
       {runsRes.ok && runRows.length === 0 && (
         <div style="text-align:center;padding:48px;color:#6e6e78;">
           <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px;opacity:0.7;"><path d="M20 12V8H6a2 2 0 0 1-2-2c0-1.1.9-2 2-2h12v4"/><path d="M4 6v12c0 1.1.9 2 2 2h14v-4"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/></svg>
           <p style="font-size:13px;">No payroll runs yet</p>
           <p style="font-size:12px;margin-top:4px;">This list was read successfully and is genuinely empty.</p>
-          <p style="font-size:12px;margin-top:4px;">Click "+ Run Payroll" to create your first payroll run</p>
+          {/* THE INSTRUCTION IS CONDITIONAL NOW. "Click + Run Payroll to create your first payroll
+              run" was printed unconditionally, including on the deployment where pressing it would
+              consume a month and pay nobody. */}
+          {payableNow.ok && payableNow.payable > 0 ? (
+            <p style="font-size:12px;margin-top:4px;">Click "+ Run Payroll" to create your first payroll run. It cannot be undone once created.</p>
+          ) : (
+            <p style="font-size:12px;margin-top:4px;">Do not start one yet — see the note above. <a href="/admin/setup" style="color:#FF7040;">The setup order</a> says what has to exist first.</p>
+          )}
         </div>
       )}
       {runRows.map(run => (
@@ -1143,7 +1262,32 @@ function fmt(n: any) {
         <input type="text" name="notes" placeholder="e.g. May 2026 payroll" style="width:100%;background:#15151a;border:1px solid #26262e;border-radius:8px;padding:10px 12px;color:#fff;font-size:13px;outline:none;min-height:44px;" />
       </label>
       <div style="background:rgba(255,159,0,0.08);border:1px solid rgba(255,159,0,0.2);border-radius:8px;padding:10px 12px;">
-        <p style="font-size:11px;color:#fbbf24;margin:0;">This will auto-calculate salary for all active employees based on their salary structures and attendance data for the selected month.</p>
+        <p style="font-size:11px;color:#fbbf24;margin:0;line-height:1.65;">This will auto-calculate salary for all active employees based on their salary structures and attendance data for the selected month.</p>
+        {/* THE ONE-WAY DOOR, NAMED ON THE DOOR. This sheet is where the decision is actually taken,
+            and until now nothing in it said the decision could not be reversed. */}
+        <p style="font-size:11px;color:#fbbf24;margin:8px 0 0;line-height:1.65;">
+          <strong style="color:#fde68a;">This cannot be undone.</strong> A month that has a run cannot
+          be run again, and there is no delete and no void on this console. Check the month and year
+          above before generating.
+        </p>
+        {payableNow.ok && payableNow.payable > 0 && (
+          <p style="font-size:11px;color:#fbbf24;margin:8px 0 0;line-height:1.65;">
+            {payableNow.payable} of {payableNow.active} active employee{payableNow.active === 1 ? '' : 's'} have
+            pay recorded. The rest are left out by name rather than paid a zero.
+          </p>
+        )}
+        {payableNow.ok && payableNow.payable === 0 && (
+          <p style="font-size:11px;color:#fca5a5;margin:8px 0 0;line-height:1.65;">
+            Nobody has pay recorded, so this will be refused rather than create an empty run that
+            consumes the month.
+          </p>
+        )}
+        {!payableNow.ok && (
+          <p style="font-size:11px;color:#fca5a5;margin:8px 0 0;line-height:1.65;">
+            This page could not read how many people there are to pay, so it cannot tell you what this
+            run would contain. It will be refused rather than guessed at.
+          </p>
+        )}
       </div>
       <button type="submit" style="width:100%;background:#FF4F00;border:none;color:#fff;font-weight:600;font-size:14px;padding:12px;border-radius:10px;cursor:pointer;min-height:44px;">Generate Payroll</button>
       <a href={runModalBack} style="text-align:center;color:#8a8a94;font-size:12.5px;text-decoration:underline;min-height:44px;display:flex;align-items:center;justify-content:center;">Cancel</a>

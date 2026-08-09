@@ -49,7 +49,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
         try {
           const r = rows(await db.execute(sql`SELECT smtp_pass FROM mail_config WHERE id = 1 LIMIT 1`))[0] as any;
           inlinePass = (r?.smtp_pass || '').toString();
-        } catch (_) {}
+        } catch (e: any) {
+          // Swallowed, an unreadable saved password produced an EMPTY password, the server answered
+          // "authentication failed", and this endpoint's own hint tells the operator their username
+          // or app password is wrong. It is neither.
+          console.error('[api/mail/test] saved SMTP password could not be read:', String(e?.cause?.message || e?.message || 'unknown error'));
+        }
       }
       const inlineUser = (body.user || '').toString().trim();
       const inlinePort = Number(body.port || 587);
@@ -95,6 +100,12 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
   // Saved-config path
   const cfg = await getMailConfig();
+  // NOT-CONFIGURED AND COULD-NOT-BE-READ ARE DIFFERENT ANSWERS. getMailConfig() used to swallow its
+  // SELECT, so an unreadable mail_config row arrived here as source 'none' and this endpoint told the
+  // operator to type their SMTP credentials in again — over a configuration that was intact.
+  if (cfg.readError) {
+    return json({ ok: false, error: 'The saved mail configuration could not be read, so nothing was sent and nothing is known about your settings: ' + cfg.readError + ' Do not re-enter credentials on the strength of this — retry in a moment.' }, 503);
+  }
   if (cfg.source === 'none') {
     return json({ ok: false, error: 'No transport configured. Fill the SMTP host, username and password in the form above, then either click "Verify connection" or paste the values into Send test (it will use whatever is in the form, even before Save).' }, 400);
   }

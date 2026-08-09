@@ -32,6 +32,19 @@ if (Astro.request.method === 'POST') {
   }
 }
 
+// =================================================================================================
+// "NO DUPLICATES" AND "THE QUERY DID NOT ANSWER" ARE OPPOSITE FACTS
+// =================================================================================================
+//
+// Both reads below ended in `catch (e) {}`. A pooler timeout therefore rendered "No duplicate live
+// applications" in green AND "Backstop status: OFF" in amber — and the button those two states
+// together enable runs a CREATE UNIQUE INDEX over the live applications table. The whole safety
+// interlock on this page (`disabled={!clean}`) is computed from a read that was allowed to fail
+// silently, so the one guard against building a unique index across real duplicates was armed by a
+// failure. Each read now records that it did not answer, and the page refuses rather than reassures.
+let dupesFailed = '';
+let indexFailed = '';
+
 let dupes: any[] = [];
 try {
   dupes = rows(await db.execute(sql`
@@ -44,14 +57,24 @@ try {
       AND status NOT IN ('withdrawn', 'rejected')
     GROUP BY applicant_user_id, role_id HAVING COUNT(*) > 1
     ORDER BY COUNT(*) DESC`));
-} catch (e) {}
+} catch (e: any) {
+  // The real Postgres reason is on e.cause; e.message is only the failed SQL.
+  console.error('[applications/dedup] duplicates', e?.cause?.message || e?.message);
+  dupesFailed = 'The duplicate check could not run, so this page cannot say whether any exist.';
+}
 
 let indexExists = false;
 try {
   indexExists = rows(await db.execute(sql`SELECT 1 FROM pg_indexes WHERE indexname = 'applications_one_live_per_user_role' LIMIT 1`)).length > 0;
-} catch (e) {}
+} catch (e: any) {
+  console.error('[applications/dedup] index probe', e?.cause?.message || e?.message);
+  indexFailed = 'Whether the database backstop is already on could not be read.';
+}
 
-const clean = dupes.length === 0;
+// UNKNOWN IS NOT CLEAN. `clean` gates the Turn-on-backstop button; a failed duplicate query must
+// leave it false, not true.
+const readsFailed = dupesFailed || indexFailed;
+const clean = !dupesFailed && dupes.length === 0;
 ---
 <AdminLayout title="Duplicate applications" activeNav="applications">
 <div style="padding:16px;max-width:900px;margin:0 auto;">
@@ -61,11 +84,17 @@ const clean = dupes.length === 0;
 
   {msg && <div style="background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.35);color:#6ee7b7;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:14px;">{msg}</div>}
   {err && <div style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:14px;">{err}</div>}
+  {readsFailed && (
+    <div style="background:rgba(251,146,60,0.12);border:1px solid rgba(251,146,60,0.35);color:#fdba74;border-radius:10px;padding:12px 14px;font-size:13px;margin-bottom:14px;line-height:1.6;">
+      {dupesFailed}{dupesFailed && indexFailed ? ' ' : ''}{indexFailed} Nothing below is a statement
+      about the data, and the backstop cannot be turned on until this page can read it.
+    </div>
+  )}
 
   <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;">
     <div>
       <p style="font-size:13px;font-weight:700;color:#fff;margin:0 0 3px;">Backstop status</p>
-      <p style="font-size:12.5px;margin:0;color:{indexExists ? '#6ee7b7' : '#fbbf24'};">{indexExists ? 'ON — the database blocks duplicate live applications.' : 'OFF — not yet enabled.'}</p>
+      <p style="font-size:12.5px;margin:0;color:{indexExists ? '#6ee7b7' : '#fbbf24'};">{indexExists ? 'ON — the database blocks duplicate live applications.' : (indexFailed ? 'Unknown — this could not be read.' : 'OFF — not yet enabled.')}</p>
     </div>
     {!indexExists && (
       <form method="POST">
@@ -78,8 +107,10 @@ const clean = dupes.length === 0;
     )}
   </div>
 
-  <h2 style="font-size:14px;font-weight:700;color:#fff;margin:0 0 10px;">Existing duplicates ({dupes.length})</h2>
-  {clean ? (
+  <h2 style="font-size:14px;font-weight:700;color:#fff;margin:0 0 10px;">Existing duplicates ({dupesFailed ? 'unknown' : dupes.length})</h2>
+  {dupesFailed ? (
+    <p style="font-size:13px;color:#fdba74;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:14px;line-height:1.6;">{dupesFailed} This is not the same as there being none.</p>
+  ) : clean ? (
     <p style="font-size:13px;color:#6ee7b7;background:#0f0f14;border:1px solid #1a1a1f;border-radius:10px;padding:14px;">No duplicate live applications. {indexExists ? 'The backstop is on — you are fully covered.' : 'Click "Turn on backstop" above to enable the database guarantee.'}</p>
   ) : (
     <div style="display:flex;flex-direction:column;gap:8px;">

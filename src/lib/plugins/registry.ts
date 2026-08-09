@@ -111,6 +111,3 @@ export function scenePrimitiveTypes(): string[] {
   for (const p of byId.values()) for (const pack of p.scenePacks ?? []) for (const t of pack.primitiveTypes) set.add(t);
   return [...set].sort();
 }
-
-// test-only: reset the memoized boot state so a test can bootstrap a synthetic catalog.
-export function __resetPluginsForTest(): void { booted = false; byId = new Map(); bootOrder = []; }

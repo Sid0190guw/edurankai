@@ -73,11 +73,26 @@ export const POST: APIRoute = async ({ request, locals }) => {
     });
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
-    await db.execute(sql`
-      INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
-      VALUES (${result.order.id}, ${amountPaise}, 'INR', 'created', 'event_level', 'event_level', ${prog.id}, ${user.id}, ${reg.participant_email || user.email || 'unknown@edurankai.in'},
-        ${sql.raw("'" + JSON.stringify({ receipt, registrationId, levelId, feeChf, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")})
-    `).catch(() => {});
+    // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED.
+    //
+    // This ended in `.catch(() => {})`. /api/payments/verify updates `payments WHERE order_id = ...`
+    // and applyPaidEffects() reads the order out of `payments` and returns IMMEDIATELY when there is
+    // none — so a failed insert here handed the browser an order id, the participant paid, and the
+    // level was never marked paid: they could not proceed, the credential that auto-issues on that
+    // level never issued, and nothing anywhere recorded that money had been taken.
+    //
+    // Refusing costs an unused order at the gateway, which expires on its own and charges nobody.
+    try {
+      await db.execute(sql`
+        INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
+        VALUES (${result.order.id}, ${amountPaise}, 'INR', 'created', 'event_level', 'event_level', ${prog.id}, ${user.id}, ${reg.participant_email || user.email || 'unknown@edurankai.in'},
+          ${sql.raw("'" + JSON.stringify({ receipt, registrationId, levelId, feeChf, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")})
+      `);
+    } catch (e: any) {
+      console.error('[payments] event-level fee order', result.order.id, 'could not be recorded for progress', prog.id,
+        '-', e?.cause?.message || e?.message);
+      return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
+    }
 
     return json({
       ok: true, orderId: result.order.id, keyId: getPublicKeyId(), amountPaise, currency: 'INR',

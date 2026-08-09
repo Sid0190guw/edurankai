@@ -12,6 +12,8 @@ if (user.role !== 'applicant') return Astro.redirect('/admin');
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 
 let req: any = null;
+// Declared BEFORE the try that sets it — `let` is not hoisted in a way a later reader can rely on.
+let readFailed = false;
 try {
   const r = await db.execute(sql`
     SELECT id, status, note, cv_url, reject_reason, created_at, reviewed_at,
@@ -20,11 +22,42 @@ try {
     WHERE id = ${id} AND user_id = ${user.id} LIMIT 1
   `);
   req = rows(r)[0] || null;
-} catch (_) {}
+} catch (e: any) {
+  // "THIS DOES NOT EXIST" AND "I COULD NOT LOOK" ARE DIFFERENT ANSWERS, AND ONLY ONE OF THEM IS
+  // THE APPLICANT'S PROBLEM. This was `catch (_) {}`, and the very next line redirects on a null
+  // `req` — so a pooler timeout bounced somebody straight off their own access request to the list,
+  // with nothing said and nothing logged. It is indistinguishable from following a link to a
+  // request that was deleted, and the reasonable response to that is to raise a second one.
+  readFailed = true;
+  console.error('[portal/requests/visvambhara_access] request read failed for', id, '-', e?.cause?.message || e?.message);
+}
+if (readFailed) {
+  return new Response(
+    'We could not open that request just now — this is a fault at our end, not a sign that it is gone. '
+    + 'Nothing has changed. Please try again in a moment; your requests are always listed at /portal/requests.',
+    { status: 503, headers: { 'content-type': 'text/plain; charset=utf-8' } },
+  );
+}
 if (!req) return Astro.redirect('/portal/requests');
 
-await markApplicantRead('visvambhara_access', String(id));
-const messages = await getThread('visvambhara_access', String(id));
+// THE CONVERSATION IS THE POINT OF THIS PAGE. Both calls were bare top-level awaits, so a failure
+// was a 500 with no explanation. The read is reported instead: an empty thread and an unreadable
+// one must not draw the same "No messages yet" panel, because the second one hides a reply the
+// admissions team has already sent.
+let threadFailed = false;
+try {
+  await markApplicantRead('visvambhara_access', String(id));
+} catch (e: any) {
+  // Losing the read-marker only leaves an unread dot showing; it must not stop the thread rendering.
+  console.error('[portal/requests/visvambhara_access] read marker failed for', id, '-', e?.cause?.message || e?.message);
+}
+let messages: any[] = [];
+try {
+  messages = await getThread('visvambhara_access', String(id));
+} catch (e: any) {
+  threadFailed = true;
+  console.error('[portal/requests/visvambhara_access] thread read failed for', id, '-', e?.cause?.message || e?.message);
+}
 
 function fmt(d: any): string {
   try { return new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
@@ -64,7 +97,13 @@ const badge = statusBadge(req.status);
       <p class="text-[0.62rem] font-mono uppercase tracking-[0.14em] text-ink-soft font-bold">Conversation</p>
     </div>
 
-    {messages.length === 0 ? (
+    {threadFailed && (
+      <div class="bg-white border border-amber-300 rounded-xl p-5 mb-4 text-[0.85rem] text-amber-900">
+        The conversation on this request could not be loaded just now, so this is not a record of what
+        has been said. Nothing has been lost — please reload in a moment.
+      </div>
+    )}
+    {!threadFailed && messages.length === 0 ? (
       <div class="bg-white border border-ink/10 rounded-xl p-5 mb-4 text-[0.85rem] text-ink-soft text-center">
         No replies yet. The research team will respond here when your request is reviewed.
       </div>

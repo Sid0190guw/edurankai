@@ -109,17 +109,31 @@ export const POST: APIRoute = async ({ request, locals }) => {
     });
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
-    // Insert pending payment row so webhook can correlate
-    await db.execute(sql`
-      INSERT INTO payments (
-        order_id, amount_paise, currency, status, purpose,
-        reference_type, reference_id, user_id, email, notes
-      ) VALUES (
-        ${result.order.id}, ${amountPaise}, 'INR', 'created', 'course_enrollment',
-        'training_course', ${course.id}, ${user.id}, ${user.email || 'unknown@edurankai.in'},
-        ${sql.raw("'" + JSON.stringify({ receipt, courseSlug: course.slug }).replace(/'/g, "''") + "'::jsonb")}
-      )
-    `).catch(() => {});
+    // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED.
+    //
+    // It ended in `.catch(() => {})` under the comment "so webhook can correlate" — which understates
+    // it: this row is the ONLY thing that says which course was bought and by whom.
+    // /api/aquintutor/confirm-payment looks the order up here and answers 'Payment record missing'
+    // (404) when it is absent, so a failed insert meant the learner paid, was not enrolled, and was
+    // told to email support — with no row for support to find, reconcile or refund against.
+    //
+    // Refusing costs an unused order at the gateway, which expires on its own and charges nobody.
+    try {
+      await db.execute(sql`
+        INSERT INTO payments (
+          order_id, amount_paise, currency, status, purpose,
+          reference_type, reference_id, user_id, email, notes
+        ) VALUES (
+          ${result.order.id}, ${amountPaise}, 'INR', 'created', 'course_enrollment',
+          'training_course', ${course.id}, ${user.id}, ${user.email || 'unknown@edurankai.in'},
+          ${sql.raw("'" + JSON.stringify({ receipt, courseSlug: course.slug }).replace(/'/g, "''") + "'::jsonb")}
+        )
+      `);
+    } catch (e: any) {
+      console.error('[aquintutor/start-enrollment] order', result.order.id, 'could not be recorded for user', user.id,
+        'course', course.id, '-', e?.cause?.message || e?.message);
+      return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
+    }
 
     return json({
       ok: true,
@@ -133,6 +147,10 @@ export const POST: APIRoute = async ({ request, locals }) => {
       prefill: { name: user.name || '', email: user.email || '' },
     });
   } catch (e: any) {
-    return json({ ok: false, error: e?.message || 'server error' }, 500);
+    // `.message` on a drizzle/postgres-js error is only the SQL that failed — table and column names
+    // handed to whoever posted — while the database's real reason sits unread on `.cause`. The reason
+    // goes to the log; the learner gets a sentence.
+    console.error('[aquintutor/start-enrollment]', e?.cause?.message || e?.message);
+    return json({ ok: false, error: 'We could not start that enrolment just now, so nothing was charged. Try again in a moment.' }, 500);
   }
 };

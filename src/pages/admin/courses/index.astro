@@ -1,11 +1,44 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
+import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
+
+// WHAT CHANGED, AND WHY
+//
+// Three writes, none of which asked whether it had happened. "Course deleted." printed over a DELETE
+// that matched nothing (a stale list, a row another author had just removed) exactly as it printed
+// over a real deletion, and "Publish status toggled." said nothing about WHICH status - so a toggle
+// that matched no row read as a successful publish. The create had no uniqueness test on the slug,
+// and slug is what /aquintutor/courses/<slug> resolves, so a second course could be created on a
+// live URL and the message said it had worked.
+//
+// The catch put `e?.message` on the operator's screen - on a drizzle/postgres-js error that is the
+// failed SQL statement, table and column names included - while the database's own reason sat unread
+// on e.cause and nothing was written to a log.
+//
+// The course read ended in `catch (_) {}`, so a pooler timeout drew "No courses yet - click
+// + New course to create your first one" on the console that answers what the LMS contains.
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 if (user.role === 'applicant') return Astro.redirect('/portal');
+
+// EVERY WRITE ON THIS PAGE WAS FRONTED BY user.role === 'applicant' AND NOTHING ELSE.
+//
+// src/middleware.ts maps this path to the lms section and getViewableSectionKeys() enforces
+// VIEW there and only VIEW, so any account that could OPEN this console could also change what it
+// holds. src/lib/auth/permissions.ts says in as many words never to use role !== 'applicant' as an
+// authorisation test; the identical repair was already made on /admin/ai-interview-templates and
+// /admin/hr/training.
+//
+// GATED ON 'edit', NOT 'delete', DELIBERATELY: canAccessSection() gives a built-in role holding a
+// section view/edit/export and reserves delete for super_admin, so asking for 'delete' here would
+// take an action away from a role that holds this section today. Narrowing it further is a policy
+// decision for a human; refusing a custom VIEW-ONLY role is the mechanism fix, and that is this.
+const canWrite = await canAccessSection(user as any, 'lms', 'edit');
 
 let okMsg = '';
 let errorMsg = '';
@@ -13,6 +46,9 @@ let errorMsg = '';
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
+  if (!canWrite) {
+    errorMsg = 'Your role can open the course list but cannot change it. Nothing was saved.';
+  } else
   try {
     if (action === 'create') {
       const title = (fd.get('title') as string || '').trim();
@@ -24,27 +60,37 @@ if (Astro.request.method === 'POST') {
       const isFree = fd.get('is_free') === 'on';
       if (!title || !slug) { errorMsg = 'Title and slug are required.'; }
       else {
-        await db.execute(sql`
+        const r = await db.execute(sql`
           INSERT INTO training_courses (title, slug, short_desc, category, level, access_type, is_free, is_published, created_by, created_at, updated_at)
-          VALUES (${title}, ${slug}, ${shortDesc}, ${category}, ${level}, ${accessType}, ${isFree}, false, ${user.id}, NOW(), NOW())
+          SELECT ${title}, ${slug}, ${shortDesc}, ${category}, ${level}, ${accessType}, ${isFree}, false, ${user.id}, NOW(), NOW()
+          WHERE NOT EXISTS (SELECT 1 FROM training_courses WHERE slug = ${slug})
+          RETURNING id
         `);
-        okMsg = 'Course "' + title + '" created. Click Edit to add lessons and publish.';
+        if (rowsOf(r).length) okMsg = 'Course "' + title + '" created. Click Edit to add lessons and publish.';
+        else errorMsg = 'Nothing was created: /aquintutor/courses/' + slug + ' already belongs to another course. Choose a different slug.';
       }
     } else if (action === 'toggle_publish') {
       const id = fd.get('id') as string;
-      await db.execute(sql`UPDATE training_courses SET is_published = NOT is_published, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Publish status toggled.';
+      const r = await db.execute(sql`UPDATE training_courses SET is_published = NOT is_published, updated_at = NOW() WHERE id = ${id} RETURNING is_published`);
+      const now = rowsOf(r)[0] as any;
+      if (now) okMsg = now.is_published ? 'Course published.' : 'Course unpublished.';
+      else errorMsg = 'Nothing was changed - that course no longer exists.';
     } else if (action === 'delete') {
       const id = fd.get('id') as string;
-      await db.execute(sql`DELETE FROM training_courses WHERE id = ${id}`);
-      okMsg = 'Course deleted.';
+      const r = await db.execute(sql`DELETE FROM training_courses WHERE id = ${id} RETURNING id`);
+      if (rowsOf(r).length) okMsg = 'Course deleted.';
+      else errorMsg = 'Nothing was deleted - that course no longer exists.';
     }
   } catch (e: any) {
-    errorMsg = 'Error: ' + (e?.message || 'Unknown');
+    console.error('[admin/courses]', action, 'failed -', causeOf(e));
+    okMsg = '';
+    errorMsg = 'Nothing was saved. Reason: ' + causeOf(e);
   }
 }
 
 let courses: any[] = [];
+// J: an unreadable table must not draw as "No courses yet".
+let listReadFailed = '';
 try {
   const r = await db.execute(sql`
     SELECT c.id, c.slug, c.title, c.short_desc, c.category, c.level, c.is_published, c.is_free,
@@ -53,8 +99,11 @@ try {
       (SELECT COUNT(*)::int FROM training_modules WHERE course_id = c.id) as module_count
     FROM training_courses c ORDER BY c.created_at DESC
   `);
-  courses = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  courses = rowsOf(r);
+} catch (e: any) {
+  console.error('[admin/courses] list read', causeOf(e));
+  listReadFailed = causeOf(e);
+}
 
 const url = new URL(Astro.request.url);
 const filter = url.searchParams.get('filter') || 'all';
@@ -92,10 +141,16 @@ const ACCESS = [
   {okMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
 
   <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;">
-    {filtered.length === 0 && (
+    {listReadFailed && (
+      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:12px;padding:16px;color:#fca5a5;">
+        <p style="font-size:13px;font-weight:600;margin:0 0 4px;">The course list could not be read</p>
+        <p style="font-size:12px;color:#8a8a94;margin:0;line-height:1.55;">This is not the same as "there are none". Reason: {listReadFailed}</p>
+      </div>
+    )}
+    {filtered.length === 0 && !listReadFailed && (
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:32px;text-align:center;color:#6e6e78;">
-        <p style="font-size:14px;color:#fff;margin-bottom:6px;">No courses yet</p>
-        <p style="font-size:12px;">Click "+ New course" to create your first one.</p>
+        <p style="font-size:14px;color:#fff;margin-bottom:6px;">{filter === 'all' ? 'No courses yet' : 'No courses in this filter'}</p>
+        <p style="font-size:12px;">{filter === 'all' ? 'Click "+ New course" to create your first one.' : 'Other courses exist under the other tabs.'}</p>
       </div>
     )}
     {filtered.map((c) => (

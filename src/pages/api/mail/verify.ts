@@ -32,13 +32,28 @@ export const POST: APIRoute = async ({ request, locals }) => {
   let body: any = {};
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
 
+  // AN UNREADABLE SAVED PASSWORD BECAME AN EMPTY PASSWORD, AND THE SERVER BLAMED THE OPERATOR.
+  // This is the same fault already repaired in /api/mail/test.ts and left standing here. The form
+  // omits the password when the operator is re-testing saved settings, so this fallback IS the
+  // credential on the ordinary path; `catch (_) {}` turned a pooler timeout into pass = '', SMTP
+  // answered "authentication failed", and the only thing the admin is told is that their username
+  // or app password is wrong. It is neither, and the natural response - rotating a working app
+  // password - breaks mail for real. A read that failed is now said out loud instead of tested.
   let pass = (body.pass || '').toString();
   if (!pass) {
     try {
       await ensureMailSchema();
       const r = rows(await db.execute(sql`SELECT smtp_pass FROM mail_config WHERE id = 1 LIMIT 1`))[0] as any;
       pass = (r?.smtp_pass || '').toString();
-    } catch (_) {}
+    } catch (e: any) {
+      const reason = String(e?.cause?.message || e?.message || 'unknown error');
+      console.error('[api/mail/verify] saved password read failed:', reason);
+      return json({
+        ok: false,
+        error: 'The saved SMTP password could not be read (' + reason + '), so nothing was tested. '
+          + 'This is NOT an authentication failure - do not change the password on the strength of it.',
+      }, 503);
+    }
   }
 
   const res = await verifySmtp({

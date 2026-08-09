@@ -1,14 +1,25 @@
 ---
 import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
+import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
+import { ensureOnce } from '@/lib/ensure-once';
+
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
 
 // Self-bootstrap: hei_crawlers had no CREATE TABLE anywhere in the repo, so on any
 // environment without the manual migration every action here failed silently.
-try {
+//
+// IT RAN ON EVERY PAGE LOAD, inside a bare `catch (_) {}`. That is a DDL round trip per request on a
+// table that needs creating once, and a bootstrap failure that nothing anywhere could see - the
+// same shape already repaired on /portal/liveclass and /admin/offline-work. ensureOnce memoises the
+// run per process and drops a failed run from its cache so the next request retries; the reason is
+// now written to the log instead of being discarded.
+await ensureOnce('admin_hei_crawlers_v1', async () => {
   await db.execute(sql`CREATE TABLE IF NOT EXISTS hei_crawlers (
     id SERIAL PRIMARY KEY,
     code VARCHAR(40) NOT NULL UNIQUE,
@@ -19,47 +30,86 @@ try {
     records_24h INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-} catch (_) {}
+}).catch((e: any) => console.error('[hei/crawlers] schema bootstrap failed -', causeOf(e)));
 
 // live miner state (written by the daily cron /api/cron/hei-refresh)
-let minerState: any = null, storedCount = 0;
+//
+// J: both reads ended in `catch (_) {}`. An unreadable hei_miner_state hid the "Daily pipeline -
+// last run ..." strip entirely, which reads as "the cron has never been configured"; an unreadable
+// hei_institutions printed "0 institutions stored" on the screen that answers whether ingestion is
+// working at all. Neither is the same fact as the read having failed.
+let minerState: any = null;
+let storedCount: number | null = 0;
+let minerStateFailed = false;
 try {
   const ms = await db.execute(sql`SELECT country, next_offset, last_run_at, last_report FROM hei_miner_state WHERE id = 'default'`);
-  minerState = (Array.isArray(ms) ? ms : (ms as any)?.rows || [])[0] || null;
-} catch (_) {}
+  minerState = rowsOf(ms)[0] || null;
+} catch (e: any) {
+  console.error('[hei/crawlers] miner state read failed -', causeOf(e));
+  minerStateFailed = true;
+}
 try {
   const sc = await db.execute(sql`SELECT COUNT(*)::int AS c FROM hei_institutions`);
-  storedCount = ((Array.isArray(sc) ? sc : (sc as any)?.rows || [])[0] as any)?.c || 0;
-} catch (_) {}
+  storedCount = Number((rowsOf(sc)[0] as any)?.c || 0);
+} catch (e: any) {
+  console.error('[hei/crawlers] stored institution count read failed -', causeOf(e));
+  storedCount = null;
+}
+
+// THE WRITES ON THIS CONSOLE WERE NOT AUTHORISED AT ALL.
+//
+// src/middleware.ts maps this path to the hei_institutions section and getViewableSectionKeys() enforces
+// VIEW there and only VIEW, so every account that could OPEN this page could also change what it
+// holds. src/lib/auth/permissions.ts says in as many words never to use role !== 'applicant' as an
+// authorisation test, and the identical repair was already made on /admin/ai-interview-templates.
+//
+// GATED ON 'edit', NOT 'delete', DELIBERATELY: canAccessSection() gives a built-in role holding a
+// section view/edit/export and reserves delete for super_admin, so asking for 'delete' here would
+// take an action away from a role that holds this section today. Narrowing it further is a policy
+// decision for a human; refusing a custom VIEW-ONLY role is the mechanism fix, and that is this.
+const canWrite = await canAccessSection(user as any, 'hei_institutions', 'edit');
 
 let okMsg = '', errorMsg = '';
 
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
+  if (!canWrite) {
+    errorMsg = 'Your role can open the crawler register but cannot change it. Nothing was saved.';
+  } else
   try {
     if (action === 'toggle') {
+      // WAS a SELECT, a comparison in JavaScript and a blind UPDATE: two editors toggling together
+      // both read the same status and the second undid the first, and an id matching nothing had
+      // `undefined !== 'active'` written at it and reported "Crawler active." Postgres does the flip
+      // in one statement and reports the state it actually left behind.
       const id = fd.get('id') as string;
-      const cur = await db.execute(sql`SELECT status FROM hei_crawlers WHERE id = ${id} LIMIT 1`);
-      const rows = Array.isArray(cur) ? cur : (cur?.rows || []);
-      const curStatus = (rows[0] as any)?.status;
-      const newStatus = curStatus === 'active' ? 'paused' : 'active';
-      await db.execute(sql`UPDATE hei_crawlers SET status = ${newStatus}, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Crawler ' + newStatus + '.';
+      const r = await db.execute(sql`
+        UPDATE hei_crawlers SET status = CASE WHEN status = 'active' THEN 'paused' ELSE 'active' END,
+               updated_at = NOW()
+        WHERE id = ${id} RETURNING status`);
+      const now = rowsOf(r)[0] as any;
+      if (now) okMsg = 'Crawler ' + now.status + '.';
+      else errorMsg = 'Nothing was changed - that pipeline no longer exists.';
     } else if (action === 'update_counts') {
       const id = fd.get('id') as string;
       const sources = parseInt(fd.get('sources_count') as string || '0') || 0;
       const records = parseInt(fd.get('records_24h') as string || '0') || 0;
-      await db.execute(sql`UPDATE hei_crawlers SET sources_count = ${sources}, records_24h = ${records}, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Crawler stats updated.';
+      const r = await db.execute(sql`UPDATE hei_crawlers SET sources_count = ${sources}, records_24h = ${records}, updated_at = NOW() WHERE id = ${id} RETURNING id`);
+      if (rowsOf(r).length) okMsg = 'Crawler stats updated.';
+      else errorMsg = 'Nothing was updated - that pipeline no longer exists.';
     } else if (action === 'add_crawler') {
       const code = (fd.get('code') as string || '').trim().toUpperCase();
       const name = (fd.get('name') as string || '').trim();
       const desc = (fd.get('description') as string || '').trim();
       if (!code || !name) { errorMsg = 'Code and name required.'; }
       else {
-        await db.execute(sql`INSERT INTO hei_crawlers (code, name, description, status) VALUES (${code}, ${name}, ${desc||null}, 'active') ON CONFLICT (code) DO NOTHING`);
-        okMsg = 'Crawler added.';
+        // ON CONFLICT DO NOTHING with no RETURNING reported "Crawler added." for a code that already
+        // belonged to another pipeline, so the editor believed a pipeline had been created and the
+        // row they then looked for was a different one.
+        const r = await db.execute(sql`INSERT INTO hei_crawlers (code, name, description, status) VALUES (${code}, ${name}, ${desc||null}, 'active') ON CONFLICT (code) DO NOTHING RETURNING id`);
+        if (rowsOf(r).length) okMsg = 'Crawler added.';
+        else errorMsg = 'Nothing was added: the code ' + code + ' already belongs to a pipeline. Pick a different code.';
       }
     }
   } catch(e: any) {
@@ -107,7 +157,11 @@ const rankingYears = [0, 1, 2, 3].map((n) => String(thisYear - n));
 // The official US directory and its metrics file publish on a lag, so they start a year back.
 const directoryYears = [1, 2, 3, 4].map((n) => String(thisYear - n));
 ---
-<HeiAdminLayout title="Crawlers" activeNav="hei">
+{/* The layout prop is `active` and its value is a nav item ID (HeiAdminLayout NAV: 'crawlers').
+    `activeNav="hei"` was never read and matched no id, so the highlight only ever came from the
+    layout's URL fallback - and astro check had been reporting it as ts(2322) the whole time. Same
+    repair already made on legal.astro and replies.astro. */}
+<HeiAdminLayout title="Crawlers" active="crawlers">
 <div style="padding-bottom:80px;">
   <div style="background:#08080a;border-bottom:1px solid #1a1a1f;padding:14px 16px;position:sticky;top:0;z-index:10;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
@@ -131,7 +185,7 @@ const directoryYears = [1, 2, 3, 4].map((n) => String(thisYear - n));
         <p style="font-size:10px;font-family:monospace;color:#67e8f9;letter-spacing:0.1em;text-transform:uppercase;margin:0 0 3px;font-weight:700;">Automated pipeline - live source</p>
         <h2 style="font-size:15px;font-weight:700;color:#fff;margin:0;">One-click university data miner</h2>
       </div>
-      <span style="font-size:11px;color:#8a8a94;font-family:monospace;">{storedCount} institutions stored</span>
+      <span style="font-size:11px;color:#8a8a94;font-family:monospace;">{storedCount === null ? 'stored count unavailable - the institutions table could not be read' : storedCount + ' institutions stored'}</span>
     </div>
     <p style="font-size:11.5px;color:#8a8a94;line-height:1.6;margin:0 0 12px;max-width:760px;">
       Pulls real, structured university records (name, city, country, website, founding year, student count) from an open public knowledge graph that is edited continuously - so a change made moments ago is picked up. Records are stored <b style="color:#fbbf24;">unpublished</b>: a human reviews and publishes them from Institutions. The daily pipeline advances a rolling window automatically, so data keeps refreshing without anyone clicking.
@@ -222,6 +276,11 @@ const directoryYears = [1, 2, 3, 4].map((n) => String(thisYear - n));
       </div>
       <pre id="imOut" style="margin:10px 0 0;background:#08080a;border:1px solid #1a1a1f;border-radius:8px;padding:11px;font-size:11px;color:#cfd6da;font-family:monospace;white-space:pre-wrap;max-height:220px;overflow:auto;">Ready.</pre>
     </div>
+    {minerStateFailed && (
+      <div style="margin:10px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:10px 14px;font-size:12px;color:#fca5a5;line-height:1.55;">
+        The daily pipeline state could not be read, so this page cannot say when it last ran. That is not the same as it never having run.
+      </div>
+    )}
     {minerState && (
       <p style="font-size:10.5px;color:#6e6e78;font-family:monospace;margin:8px 0 0;">
         Daily pipeline - last run {minerState.last_run_at ? new Date(minerState.last_run_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'never'} - next offset {minerState.next_offset} - country {minerState.country}

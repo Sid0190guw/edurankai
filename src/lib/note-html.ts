@@ -46,13 +46,3 @@ export function safeNoteHtml(raw: unknown): string {
 
   return escaped.replace(TAG_RE, (_m, slash: string, tag: string) => '<' + slash + tag.toLowerCase() + '>');
 }
-
-/** Plain text of a note, for previews and meta descriptions. */
-export function noteExcerpt(raw: unknown, max = 180): string {
-  const text = String(typeof raw === 'string' ? raw : '')
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return text.length > max ? text.slice(0, max - 1) + '…' : text;
-}

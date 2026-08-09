@@ -4,6 +4,7 @@
 // mail.ts stays untouched. All tables self-bootstrap.
 import { db } from '@/lib/db';
 import { sql } from 'drizzle-orm';
+import { uuidIn } from '@/lib/pg-array';
 
 function rows(r: any): any[] { return Array.isArray(r) ? r : (r?.rows || []); }
 async function ex(q: any) { try { await db.execute(q); } catch (_) { /* idempotent */ } }
@@ -427,9 +428,16 @@ export async function recordClick(messageId: string, url: string, ip?: string, u
  * makes "how many messages in this campaign were opened" the count of keys present, with no second
  * DISTINCT query.
  *
- * `= ANY(${ids})` is the parameter form campaignStats() below and the recipient/delivery reads on
- * that page already use. It is kept rather than "improved": this is a performance repair, and
- * changing how the array binds would be an unverified behaviour change riding along with it.
+ * AND THE OPENS AND CLICKS HAD NEVER ARRIVED. Both statements matched on `= ANY(${ids})`, which an
+ * earlier pass left alone on the grounds that the recipient and delivery reads on /admin/mail/analytics
+ * "already use" it. They do not — that page binds them through uuidIn(). drizzle renders an
+ * interpolated array as a ROW CONSTRUCTOR, so this came out as `= ANY(($1, $2))` and Postgres
+ * answers "op ANY/ALL (array) requires array on right side"; with a single id it is `= ANY(($1))`,
+ * a bare text parameter where an array belongs, which fails the same way. There is no message count
+ * at which it worked. The whole open/click half of the campaign console has therefore only ever
+ * shown zeros, and since the swallowing catches were removed it shows the Postgres complaint in the
+ * page's read-failure banner on every load instead. uuidIn() is the house form for this and
+ * message_id is a UUID column in both tables.
  *
  * THE SWALLOWED CATCHES ARE GONE, AND THAT IS THE POINT OF THE CHANGE. Both statements used to end
  * in `.catch(() => [])`, which meant this function could never reject - so the `.catch()` its only
@@ -445,19 +453,29 @@ export async function campaignStatsByMessage(messageIds: string[]): Promise<{ op
   const opens: Record<string, number> = {};
   const clicks: Record<string, number> = {};
   if (!ids.length) return { opens, clicks };
-  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_reads WHERE message_id = ANY(${ids}) GROUP BY message_id`))) {
+  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_reads WHERE message_id IN ${uuidIn(ids)} GROUP BY message_id`))) {
     opens[String(r.message_id)] = Number(r.c) || 0;
   }
-  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_link_clicks WHERE message_id = ANY(${ids}) GROUP BY message_id`))) {
+  for (const r of rows(await db.execute(sql`SELECT message_id, COUNT(*)::int AS c FROM mail_link_clicks WHERE message_id IN ${uuidIn(ids)} GROUP BY message_id`))) {
     clicks[String(r.message_id)] = Number(r.c) || 0;
   }
   return { opens, clicks };
 }
 
+/**
+ * The single-campaign form of the above. Same two defects, same repair.
+ *
+ * `= ANY(${messageIds})` never ran (see campaignStatsByMessage), and both statements ended in
+ * `.catch(() => [])` — so the function could not reject and a caller had no way to tell a campaign
+ * nobody opened from an aggregate that never executed. It has no caller in this repository today;
+ * it is left exported and made correct rather than left exported and broken, because the next
+ * caller would inherit a function that reports zeros for a query Postgres refused.
+ */
 export async function campaignStats(messageIds: string[]): Promise<{ opens: number; clicks: number; openedMsgs: number; clickedMsgs: number }> {
   await ensureMailAdvancedSchema();
-  if (!messageIds.length) return { opens: 0, clicks: 0, openedMsgs: 0, clickedMsgs: 0 };
-  const opens = rows(await db.execute(sql`SELECT COUNT(*)::int AS c, COUNT(DISTINCT message_id)::int AS d FROM mail_reads WHERE message_id = ANY(${messageIds})`).catch(() => [] as any))[0] || { c: 0, d: 0 };
-  const clicks = rows(await db.execute(sql`SELECT COUNT(*)::int AS c, COUNT(DISTINCT message_id)::int AS d FROM mail_link_clicks WHERE message_id = ANY(${messageIds})`).catch(() => [] as any))[0] || { c: 0, d: 0 };
+  const ids = (messageIds || []).filter((x) => typeof x === 'string' && x.length > 0);
+  if (!ids.length) return { opens: 0, clicks: 0, openedMsgs: 0, clickedMsgs: 0 };
+  const opens = rows(await db.execute(sql`SELECT COUNT(*)::int AS c, COUNT(DISTINCT message_id)::int AS d FROM mail_reads WHERE message_id IN ${uuidIn(ids)}`))[0] || { c: 0, d: 0 };
+  const clicks = rows(await db.execute(sql`SELECT COUNT(*)::int AS c, COUNT(DISTINCT message_id)::int AS d FROM mail_link_clicks WHERE message_id IN ${uuidIn(ids)}`))[0] || { c: 0, d: 0 };
   return { opens: opens.c || 0, clicks: clicks.c || 0, openedMsgs: opens.d || 0, clickedMsgs: clicks.d || 0 };
 }

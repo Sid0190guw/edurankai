@@ -71,6 +71,7 @@ import { holdsCapability } from '@/lib/auth/capability';
 import { mdLite } from '@/lib/content-render';
 import { BUILTIN_PERMISSION_KEYS } from '@/lib/auth/registry';
 import { TICKET_CATEGORIES, categoryLabel } from '@/lib/helpdesk';
+import { textArray } from '@/lib/pg-array';
 
 // -------------------------------------------------------------------------------------------------
 // MODULE CONSTANTS — every one declared ABOVE the functions that read it. `const` is not hoisted,
@@ -835,6 +836,20 @@ export async function saveArticle(
   try {
     await ensureKnowledgeSchema();
 
+    // THE KNOWLEDGE BASE COULD NOT BE WRITTEN TO AT ALL, AND SAID SO IN ONE GENERIC SENTENCE.
+    //
+    // Every statement in this module that touched `tags` bound a JS array and cast it —
+    // `${tags}::text[]` — which is the exact defect src/lib/pg-array.ts was written about. drizzle
+    // renders an interpolated array as a ROW CONSTRUCTOR, so the four statements below came out as
+    // `()::text[]` with no tags (a syntax error), `($1)::text[]` with one (cannot cast text to
+    // text[]) and `($1, $2)::text[]` with more (cannot cast record to text[]). There is no input
+    // that made them legal: creating an article, editing one, and the version snapshot taken on
+    // publish ALL threw, every time, for everybody. Each sat inside this try/catch, so the author
+    // got WRITE_FAILED — "That could not be saved" — with the real reason only in the log, and the
+    // library the helpdesk deflects tickets into stayed permanently empty.
+    //
+    // textArray() sends the list as one ordinary JSON text parameter and lets Postgres unpack it.
+    // Do NOT re-add a `::text[]` cast at the call site: the fragment is already text[]-typed.
     if (!id) {
       const slug = await freeSlug(slugify(title), null);
       const ins = rows(await db.execute(sql`
@@ -842,7 +857,7 @@ export async function saveArticle(
           (slug, kind, title, summary, category, tags, body, audience, required_capability,
            status, version, ack_required, effective_from, author_user_id, author_employee_id, author_name)
         VALUES
-          (${slug}, ${kind}, ${title}, ${summary}, ${category}, ${tags}::text[], ${body}, ${audience},
+          (${slug}, ${kind}, ${title}, ${summary}, ${category}, ${textArray(tags)}, ${body}, ${audience},
            ${requiredCapability}::text, 'draft', 1, ${ackRequired}, ${effectiveFrom}::date,
            ${actorId}::uuid, ${authorEmployeeId}::uuid, ${authorName})
         RETURNING id, slug`));
@@ -877,7 +892,7 @@ export async function saveArticle(
         VALUES
           (${id}::uuid, ${Number(before.version) || 1}, ${String(before.title || '')},
            ${String(before.summary || '')}, ${String(before.body || '')},
-           ${toTags(before.tags)}::text[], ${changeNote}, ${actorId}::uuid, ${authorName})
+           ${textArray(toTags(before.tags))}, ${changeNote}, ${actorId}::uuid, ${authorName})
         ON CONFLICT (article_id, version) DO NOTHING`);
     }
 
@@ -888,7 +903,7 @@ export async function saveArticle(
     const wrote = rows(await db.execute(sql`
       UPDATE kb_articles
          SET slug = ${slug}, kind = ${kind}, title = ${title}, summary = ${summary},
-             category = ${category}, tags = ${tags}::text[], body = ${body},
+             category = ${category}, tags = ${textArray(tags)}, body = ${body},
              audience = ${audience}, required_capability = ${requiredCapability}::text,
              ack_required = ${ackRequired}, effective_from = ${effectiveFrom}::date,
              author_name = ${authorName || String(before.author_name || '')},
@@ -959,7 +974,7 @@ export async function publishArticle(
           (article_id, version, title, summary, body, tags, change_note, author_user_id, author_name)
         VALUES
           (${articleId}::uuid, ${nextVersion}, ${String(a.title || '')}, ${String(a.summary || '')},
-           ${String(a.body || '')}, ${toTags(a.tags)}::text[],
+           ${String(a.body || '')}, ${textArray(toTags(a.tags))},
            ${String(changeNote || '').slice(0, 500)}, ${actorId}::uuid, '')
         ON CONFLICT (article_id, version) DO NOTHING`);
     }

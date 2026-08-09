@@ -63,7 +63,30 @@ export const POST: APIRoute = async ({ request, locals }) => {
       INSERT INTO notifications (user_id, title, body, type, action_url)
       VALUES (${user.id}, ${'Test notification'}, ${'If you can see this in the bell dropdown, the in-app feed is wired correctly. ' + new Date().toLocaleTimeString()}, ${'test'}, ${'/admin/notifications'})
     `);
-    // Also try a push to confirm the browser channel
+    // Also try a push to confirm the browser channel.
+    //
+    // THE DIAGNOSTIC ANSWERED ok:true WHETHER OR NOT THE THING IT DIAGNOSES WORKED. This whole block
+    // sat in `catch (_) {}` followed by an unconditional success, so the ONE button whose purpose is
+    // to prove the push channel is wired reported the same result when the push threw — an operator
+    // pressing it and seeing the in-app row appear concludes push delivery is healthy. The in-app
+    // insert above is the part that genuinely succeeded and the response still says so; the push half
+    // now reports itself separately instead of being erased.
+    //
+    // WHAT THIS CAN HONESTLY REPORT. sendPushToUser() swallows per-subscription failures internally
+    // and returns void, so "it did not throw" is NOT evidence that a push arrived and this response
+    // must not imply otherwise. What IS knowable here is whether this account has a browser
+    // subscription at all — with none, no push can possibly have been delivered, and that is exactly
+    // the state the button is pressed to detect. So the response reports the in-app write (which did
+    // succeed, above), the subscription count, and whether the attempt threw. Nothing more.
+    let attemptThrew = '';
+    let subscriptions = 0;
+    try {
+      const subRows = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM push_subscriptions WHERE user_id = ${user.id}`));
+      subscriptions = Number((subRows[0] as any)?.n) || 0;
+    } catch (e: any) {
+      console.error('[api/admin/notifications-recent] subscription count failed:', String(e?.cause?.message || e?.message || 'unknown error'));
+      subscriptions = -1; // unknown, and said so rather than reported as zero
+    }
     try {
       const { sendPushToUser } = await import('@/lib/push');
       await sendPushToUser(user.id, {
@@ -73,8 +96,20 @@ export const POST: APIRoute = async ({ request, locals }) => {
         url: '/admin/notifications',
         tag: 'admin-test',
       });
-    } catch (_) {}
-    return json({ ok: true });
+    } catch (e: any) {
+      attemptThrew = String(e?.cause?.message || e?.message || 'unknown error');
+      console.error('[api/admin/notifications-recent] test push threw:', attemptThrew);
+    }
+    return json({
+      ok: true,
+      inApp: true,
+      pushSubscriptions: subscriptions,
+      pushAttempted: !attemptThrew,
+      pushError: attemptThrew || undefined,
+      note: subscriptions === 0
+        ? 'The in-app notification was written. No browser push subscription is registered for this account, so no push was delivered.'
+        : 'The in-app notification was written and a push was attempted. Delivery to the browser cannot be confirmed from the server.',
+    });
   }
   return json({ ok: false, error: 'unknown action' }, 400);
 };

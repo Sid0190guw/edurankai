@@ -43,11 +43,28 @@ export const POST: APIRoute = async ({ locals }) => {
     });
     if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
-    await db.execute(sql`
-      INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
-      VALUES (${result.order.id}, ${amountPaise}, 'INR', 'created', 'registration_fee', 'user', ${u.id}, ${u.id}, ${u.email || 'unknown@edurankai.in'},
-        ${sql.raw("'" + JSON.stringify({ receipt, feeChf: REGISTRATION_FEE_CHF, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")})
-    `).catch(() => {});
+    // THE PAYMENTS ROW IS NOT OPTIONAL, AND ITS FAILURE MUST NOT BE SWALLOWED.
+    //
+    // This ended in `.catch(() => {})`. Everything downstream of the activation fee is keyed on this
+    // row: /api/payments/verify updates `payments WHERE order_id = ...`, and applyPaidEffects() reads
+    // the order out of `payments` and returns IMMEDIATELY when there is none. So if the insert failed
+    // the browser was still handed an order id, the person paid, and their account was never approved
+    // — locked out of the one thing the fee buys, with no record anywhere to reconcile against and
+    // nothing for support to find.
+    //
+    // Refusing here costs an unused order at the gateway, which expires on its own and charges nobody.
+    // That is the trade /api/payments/wallet-recharge already makes for the same reason.
+    try {
+      await db.execute(sql`
+        INSERT INTO payments (order_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, notes)
+        VALUES (${result.order.id}, ${amountPaise}, 'INR', 'created', 'registration_fee', 'user', ${u.id}, ${u.id}, ${u.email || 'unknown@edurankai.in'},
+          ${sql.raw("'" + JSON.stringify({ receipt, feeChf: REGISTRATION_FEE_CHF, fxRate: fx.rate, fxDate: fx.date, fxLive: fx.live }).replace(/'/g, "''") + "'::jsonb")})
+      `);
+    } catch (e: any) {
+      console.error('[payments] activation-fee order', result.order.id, 'could not be recorded for user', u.id,
+        '-', e?.cause?.message || e?.message);
+      return json({ ok: false, error: 'We could not open checkout just now, so nothing was charged. Try again in a moment.' }, 500);
+    }
 
     return json({ ok: true, orderId: result.order.id, keyId: getPublicKeyId(), amountPaise, currency: 'INR', feeChf: REGISTRATION_FEE_CHF, prefill: { name: u.name || '', email: u.email || '' } });
   } catch (e: any) {

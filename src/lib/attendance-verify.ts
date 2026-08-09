@@ -335,7 +335,22 @@ const EMPTY_DAY: DayVerification = {
 };
 
 /**
+ * THE ZONE THIS MODULE'S DAY IS CUT ON.
+ *
+ * The same value as ATTENDANCE_TIME_ZONE in src/lib/attendance.ts, declared again here rather than
+ * imported: attendance.ts imports THIS file (see its header, "the import is one-directional"), so
+ * importing back would close the cycle. dayVerification() is handed the day attendance.ts named, and
+ * the window below has to be cut in the same zone or it summarises a different day's punches.
+ */
+const VERIFY_DAY_ZONE = 'Asia/Kolkata';
+
+/**
  * Summarise a day's punches. Pure read; writes nothing.
+ *
+ * THE WINDOW IS CUT IN IST, NOT IN THE SESSION'S ZONE. `event_time >= <dateIso>::date` casts a
+ * civil date to timestamptz in the database session's zone, which nothing here sets and which is
+ * therefore UTC — so a punch made between 00:00 and 05:29 IST was summarised against the previous
+ * day, and a verification outcome appeared beside the wrong date on the attendance console.
  *
  * Fails closed to EMPTY_DAY, whose allVerified is NULL — so a database problem renders as "nothing
  * recorded about verification", never as "this person failed a check".
@@ -348,8 +363,8 @@ export async function dayVerification(employeeId: string, dateIso: string): Prom
       SELECT face_verified, face_verify_method, face_verify_outcome, face_verified_at
         FROM hr_clock_events
        WHERE employee_id = ${employeeId}::uuid
-         AND event_time >= ${dateIso}::date
-         AND event_time < (${dateIso}::date + INTERVAL '1 day')
+         AND event_time >= (${dateIso}::timestamp AT TIME ZONE ${VERIFY_DAY_ZONE})
+         AND event_time < ((${dateIso}::timestamp + INTERVAL '1 day') AT TIME ZONE ${VERIFY_DAY_ZONE})
        ORDER BY event_time ASC
        LIMIT 200`);
 

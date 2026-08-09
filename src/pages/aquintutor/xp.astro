@@ -1,59 +1,145 @@
 ---
-// /aquintutor/xp — XP, streak, badges, leaderboard from the auditable ledger (Prompt 15, main
-// surface). Real actions only. Leaderboard honors opt-out (toggle here). Server-rendered.
+// /aquintutor/xp — XP, streak, badges and the leaderboard, read from THE ledger.
+//
+// WHAT CHANGED HERE AND WHY IT MATTERED. This page used to read src/lib/xp-ledger.ts
+// (edu_xp_ledger + edu_gamer_state) while /aquintutor/dashboard, /portal/index and
+// /portal/achievements read src/lib/xp.ts (user_xp + xp_events). Both pages are linked from
+// /aquintutor/access, so one learner could open two screens of the same product and be told two
+// different XP totals — and neither number was wrong, which is worse than one of them being broken.
+// There is one ledger now. src/lib/xp.ts owns the write side; src/lib/gamification.ts is its read
+// model and owns the badge grid, and both are what this page reads.
+//
+// The badges are no longer computed at render time from a handful of counts — they are rows in
+// learner_badges with the date they were first earned, so a badge cannot silently un-earn itself
+// when a query behind it changes.
 export const prerender = false;
 import AquintutorLayout from '@/layouts/AquintutorLayout.astro';
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
-import { totalXp, gamerState, leaderboard, BADGES, evaluateBadges } from '@/lib/xp-ledger';
+import { getLearnerStats, getLeaderboard, BADGE_RULES } from '@/lib/gamification';
+import { isOptedOutOfLeaderboard } from '@/lib/xp';
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/aquintutor/login?next=/aquintutor/xp');
-const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
-const one = async (s: any) => { try { return rows(await db.execute(s))[0]; } catch { return null; } };
-const xp = await totalXp(user.id).catch(() => 0);
-const state = await gamerState(user.id).catch(() => ({ streak: 0, optOut: false }));
-const lessons = Number((await one(sql`SELECT COUNT(*) FILTER (WHERE completed)::int AS c FROM edu_progress WHERE user_id = ${user.id}`))?.c || 0);
-const mastered = Number((await one(sql`SELECT COUNT(*)::int AS c FROM aq_mastery WHERE user_id = ${user.id} AND skill_id LIKE 'ko:%' AND (state='mastered' OR verified=true)`))?.c || 0);
-const perfectPass = !!(await one(sql`SELECT 1 AS x FROM edu_attempts WHERE user_id = ${user.id} AND mode='official' AND pct >= 100 LIMIT 1`))?.x;
-const earned = new Set(evaluateBadges({ lessons, mastered, streak: state.streak, perfectPass, xp }));
-const board = await leaderboard(10).catch(() => []);
+
+// Discriminated results throughout: a read that FAILED and a learner who has earned nothing are
+// different sentences, and this page has to be able to say which one it means.
+const statsResult = await getLearnerStats(user.id);
+const stats = statsResult.ok ? statsResult.stats : null;
+const statsError = statsResult.ok ? null : statsResult.reason;
+
+const boardResult = await getLeaderboard(10);
+const board = boardResult.ok ? boardResult.rows : [];
+const boardError = boardResult.ok ? null : boardResult.reason;
+
+const optedOut = await isOptedOutOfLeaderboard(user.id);
+const earned = new Set(stats?.badgeKeys || []);
+const totalXp = stats?.totalXp || 0;
+const streak = stats?.currentStreak || 0;
+const level = stats?.level || 1;
+const inBoard = board.some((r) => r.user_id === user.id);
+
 const CARD = 'background:#fff;border:1px solid var(--line,#e6e1d6);border-radius:14px;padding:20px 22px;margin-bottom:16px;';
+const NOTE = "font-family:'Inter Tight',sans-serif;font-size:13.5px;color:#6b6455;margin:0;line-height:1.6;";
+const REASON = "font-family:'Geist Mono',monospace;font-size:11.5px;color:#8a8478;margin:8px 0 0;word-break:break-word;";
 ---
 <AquintutorLayout title="XP & rewards">
-  <main style="max-width:800px;margin:0 auto;padding:44px 22px 80px;">
+  <main style="max-width:800px;margin:0 auto;padding:44px 18px 80px;">
     <p style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:var(--rust,#b3541e);margin:0 0 8px;">Rewards</p>
     <h1 style="font-family:Fraunces,serif;font-size:32px;font-weight:600;color:var(--ink,#1a1712);margin:0 0 18px;line-height:1.15;">Your progress rewards</h1>
 
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px;">
-      <div style={CARD}><p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:0;">XP</p><p style="font-family:Fraunces,serif;font-size:30px;font-weight:600;margin:4px 0 0;color:var(--ink,#1a1712);">{xp}</p></div>
-      <div style={CARD}><p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:0;">Day streak</p><p style="font-family:Fraunces,serif;font-size:30px;font-weight:600;margin:4px 0 0;color:var(--ink,#1a1712);">{state.streak}</p></div>
-      <div style={CARD}><p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:0;">Badges</p><p style="font-family:Fraunces,serif;font-size:30px;font-weight:600;margin:4px 0 0;color:var(--ink,#1a1712);">{earned.size}<span style="font-size:15px;color:#8a8478;"> / {BADGES.length}</span></p></div>
-    </div>
+    {statsError ? (
+      <div style={CARD}>
+        <p style={NOTE}>Your XP could not be read just now. This is not a score of zero &mdash; it is an unread one, and nothing you have earned has been lost.</p>
+        <p style={REASON}>{statsError}</p>
+      </div>
+    ) : (
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px;">
+        <div style={CARD}><p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:0;">XP</p><p style="font-family:Fraunces,serif;font-size:30px;font-weight:600;margin:4px 0 0;color:var(--ink,#1a1712);">{totalXp}</p></div>
+        <div style={CARD}><p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:0;">Level</p><p style="font-family:Fraunces,serif;font-size:30px;font-weight:600;margin:4px 0 0;color:var(--ink,#1a1712);">{level}</p></div>
+        <div style={CARD}><p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:0;">Day streak</p><p style="font-family:Fraunces,serif;font-size:30px;font-weight:600;margin:4px 0 0;color:var(--ink,#1a1712);">{streak}</p></div>
+        <div style={CARD}><p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:0;">Badges</p><p style="font-family:Fraunces,serif;font-size:30px;font-weight:600;margin:4px 0 0;color:var(--ink,#1a1712);">{earned.size}<span style="font-size:15px;color:#8a8478;"> / {BADGE_RULES.length}</span></p></div>
+      </div>
+    )}
 
     <div style={CARD}>
       <h2 style="font-family:Fraunces,serif;font-size:18px;font-weight:600;margin:0 0 12px;">Badges</h2>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;">{BADGES.map((b) => (
-        <span style={'font-family:Inter Tight,sans-serif;font-size:12.5px;border-radius:100px;padding:5px 13px;border:1px solid var(--line,#e6e1d6);' + (earned.has(b.id) ? 'background:#eef8f1;color:#1f7a4d;' : 'background:#faf8f2;color:#b0a99a;')}>{earned.has(b.id) ? 'x ' : ''}{b.label}</span>
+      {stats && stats.badgeError ? (
+        <div style="margin:0 0 12px;">
+          <p style={NOTE}>The badge grid could not be read, so what is shown below may be out of date.</p>
+          <p style={REASON}>{stats.badgeError}</p>
+        </div>
+      ) : null}
+      <div style="display:flex;flex-wrap:wrap;gap:8px;">{BADGE_RULES.map((b) => (
+        <span
+          title={b.description}
+          style={'display:inline-flex;align-items:center;gap:7px;min-height:34px;font-family:Inter Tight,sans-serif;font-size:12.5px;border-radius:100px;padding:6px 14px;border:1px solid var(--line,#e6e1d6);' + (earned.has(b.key) ? 'background:#eef8f1;color:#1f7a4d;' : 'background:#faf8f2;color:#b0a99a;')}
+        >
+          <span style="display:inline-flex;width:16px;height:16px;" set:html={b.icon} />
+          {b.name}
+        </span>
       ))}</div>
+      <p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:12px 0 0;">A badge is kept with the date you first earned it. It never goes away.</p>
     </div>
 
     <div style={CARD}>
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
         <h2 style="font-family:Fraunces,serif;font-size:18px;font-weight:600;margin:0;">Leaderboard</h2>
-        <label style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#6b6455;"><input type="checkbox" id="optOut" checked={state.optOut} /> Hide me from the leaderboard</label>
+        <label style="display:inline-flex;align-items:center;gap:8px;min-height:44px;font-family:'Inter Tight',sans-serif;font-size:13px;color:#6b6455;cursor:pointer;">
+          <input type="checkbox" id="optOut" checked={optedOut} style="width:18px;height:18px;" /> Hide me from the leaderboard
+        </label>
       </div>
-      {board.length === 0 ? <p style="font-family:'Inter Tight',sans-serif;font-size:14px;color:#6b6455;margin:0;">No XP earned yet — complete a lesson to appear here.</p> :
+      <p id="optMsg" style="display:none;font-family:'Inter Tight',sans-serif;font-size:13px;margin:0 0 10px;"></p>
+      {boardError ? (
+        <div>
+          <p style={NOTE}>The leaderboard could not be read. This is not an empty board &mdash; it is an unread one.</p>
+          <p style={REASON}>{boardError}</p>
+        </div>
+      ) : board.length === 0 ? (
+        <p style={NOTE}>Nobody has earned XP yet &mdash; complete a lesson and you will be first.</p>
+      ) : (
         <ol style="list-style:none;margin:0;padding:0;">{board.map((e: any, i: number) => (
-          <li style={'display:flex;justify-content:space-between;padding:8px 10px;border-radius:8px;font-family:Inter Tight,sans-serif;font-size:14px;' + (e.userId === user.id ? 'background:#faf8f2;font-weight:700;' : '')}><span>{i + 1}. {e.userId === user.id ? 'You' : e.name}</span><span style="color:var(--rust,#b3541e);">{e.xp} XP</span></li>
-        ))}</ol>}
+          <li style={'display:flex;justify-content:space-between;gap:10px;padding:10px;border-radius:8px;font-family:Inter Tight,sans-serif;font-size:14px;' + (e.user_id === user.id ? 'background:#faf8f2;font-weight:700;' : '')}>
+            <span>{i + 1}. {e.user_id === user.id ? 'You' : e.display_name}</span>
+            <span style="color:var(--rust,#b3541e);white-space:nowrap;">{e.total_xp} XP</span>
+          </li>
+        ))}</ol>
+      )}
+      {optedOut ? (
+        <p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:12px 0 0;">You are hidden from this board and from the one on your staff portal. You still earn XP, and you can still see your own.</p>
+      ) : (!inBoard && stats && stats.rank ? (
+        <p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:12px 0 0;">You are ranked {stats.rank} overall &mdash; the top ten is shown here.</p>
+      ) : null)}
     </div>
-    <p style="font-family:'Inter Tight',sans-serif;font-size:12px;color:#8a8478;margin:16px 0 0;">Every point comes from a real action and is recorded once — re-doing a lesson never double-counts.</p>
+
+    <p style="font-family:'Inter Tight',sans-serif;font-size:12.5px;color:#8a8478;margin:16px 0 0;line-height:1.6;">
+      Every point comes from something you actually did, and a lesson you have already completed never pays twice.
+      The same total appears on your dashboard and on your staff portal &mdash; there is one record of it.
+    </p>
   </main>
 
   <script is:inline>
-    (function () { var el = document.getElementById('optOut'); if (!el) return; el.addEventListener('change', function () {
-      fetch('/api/aquintutor/xp-optout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ optOut: el.checked }) }).then(function () { location.reload(); });
-    }); })();
+    (function () {
+      var el = document.getElementById('optOut');
+      var msg = document.getElementById('optMsg');
+      if (!el) return;
+      el.addEventListener('change', function () {
+        var wanted = el.checked;
+        el.disabled = true;
+        fetch('/api/xp/opt-out', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ optOut: wanted })
+        }).then(function (r) { return r.json(); }).then(function (j) {
+          if (j && j.ok) { location.reload(); return; }
+          // Never leave the box looking as though the choice was saved when it was not.
+          el.checked = !wanted;
+          el.disabled = false;
+          if (msg) { msg.style.display = 'block'; msg.style.color = '#a33'; msg.textContent = (j && j.error) || 'That setting could not be saved. Please try again.'; }
+        }).catch(function () {
+          el.checked = !wanted;
+          el.disabled = false;
+          if (msg) { msg.style.display = 'block'; msg.style.color = '#a33'; msg.textContent = 'That setting could not be saved. Please try again.'; }
+        });
+      });
+    })();
   </script>
 </AquintutorLayout>

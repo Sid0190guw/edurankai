@@ -88,9 +88,6 @@ export function normalizeScene(input: any): { spec: SceneSpec; issues: string[] 
   return { spec: SceneSpecZ.parse(spec) as SceneSpec, issues };   // parse guarantees the shape post-repair
 }
 
-/** A minimal valid scene. */
-export function blankScene(title = 'Untitled scene'): SceneSpec { return normalizeScene({ title }).spec; }
-
 // ---- persistence: a spec is a kernel AnimationObject, optionally linked to a KnowledgeObject ----
 export class SceneService {
   constructor(private repo: KernelRepository = createPgKernel()) {}

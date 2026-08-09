@@ -1008,6 +1008,27 @@ export interface PunchResult extends WriteResult {
   verification?: PunchVerification | null;
 }
 
+/**
+ * THE DAY IS NAMED IN IST AND WAS THEN LOOKED UP IN UTC.
+ *
+ * `event_time >= <dateIso>::date AND event_time < (<dateIso>::date + INTERVAL '1 day')` casts a
+ * civil date to timestamptz in the DATABASE SESSION's zone, and nothing in this codebase sets that
+ * zone (src/lib/db/index.ts opens postgres() with no timezone option), so it is UTC. today() above
+ * hands callers the IST civil day on purpose — its docblock explains why at length — and every one
+ * of these windows then asked UTC's question of it: the "day" ran 05:30 IST to 05:30 IST.
+ *
+ * What that produced, on a table of pay records:
+ *   * a punch made between 00:00 and 05:29 IST fell into the PREVIOUS day's window, so an early
+ *     shift showed "clocked out, zero hours" on /portal/employee while the person was at work — and
+ *     allowedPunches() then offered Clock in a second time;
+ *   * a night shift's small hours were counted against the day before;
+ *   * the punch log on the timesheet disagreed with the hr_attendance row punch() had just written,
+ *     which is cut with (NOW() AT TIME ZONE 'Asia/Kolkata')::date.
+ *
+ * `<date>::timestamp AT TIME ZONE '<zone>'` converts a wall-clock date in that zone into the
+ * timestamptz instant it began. It stays a range comparison, so the (employee_id, event_time) index
+ * is still used — unlike wrapping the column in AT TIME ZONE, which would not be.
+ */
 /** Today's punches for one employee, oldest first. */
 export async function punchesOn(employeeId: string, dateIso: string): Promise<PunchEvent[]> {
   if (!isUuid(employeeId) || !isDateIso(dateIso)) return [];
@@ -1017,8 +1038,8 @@ export async function punchesOn(employeeId: string, dateIso: string): Promise<Pu
       SELECT event_type, event_time
         FROM hr_clock_events
        WHERE employee_id = ${employeeId}::uuid
-         AND event_time >= ${dateIso}::date
-         AND event_time < (${dateIso}::date + INTERVAL '1 day')
+         AND event_time >= (${dateIso}::timestamp AT TIME ZONE ${ATTENDANCE_TIME_ZONE})
+         AND event_time < ((${dateIso}::timestamp + INTERVAL '1 day') AT TIME ZONE ${ATTENDANCE_TIME_ZONE})
        ORDER BY event_time ASC
        LIMIT ${LIST_LIMIT}`);
     return rows(r).map((row: any) => ({
@@ -1061,8 +1082,8 @@ export async function punchLog(employeeId: string, dateIso: string): Promise<Pun
         FROM hr_clock_events c
         LEFT JOIN hr_attendance_qr_stations s ON s.id = c.qr_station_id
        WHERE c.employee_id = ${employeeId}::uuid
-         AND c.event_time >= ${dateIso}::date
-         AND c.event_time < (${dateIso}::date + INTERVAL '1 day')
+         AND c.event_time >= (${dateIso}::timestamp AT TIME ZONE ${ATTENDANCE_TIME_ZONE})
+         AND c.event_time < ((${dateIso}::timestamp + INTERVAL '1 day') AT TIME ZONE ${ATTENDANCE_TIME_ZONE})
        ORDER BY c.event_time ASC
        LIMIT ${LIST_LIMIT}`);
     return rows(r).map((row: any) => ({

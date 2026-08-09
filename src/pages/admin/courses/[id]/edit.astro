@@ -1,8 +1,63 @@
 ---
 import AdminLayout from '@/layouts/AdminLayout.astro';
 import { db } from '@/lib/db';
+import { canAccessSection } from '@/lib/auth/permissions';
 import { sql } from 'drizzle-orm';
 import { ensureAquintutorAuthoringSchema } from '@/lib/aquintutor-authoring';
+import { textArray } from '@/lib/pg-array';
+
+// WHAT CHANGED, AND WHY
+//
+// 1. "COURSE DETAILS SAVED." OVER AN UPDATE THAT COULD NEVER RUN. The statement ended
+//    `learning_outcomes = ${learningOutcomes}, prerequisites = ${prerequisites}, tags = ${tags}` -
+//    three JS ARRAYS interpolated into a drizzle sql template. That is the exact defect
+//    src/lib/pg-array.ts was written about: postgres-js serialises a JS array as a RECORD literal
+//    and Postgres refuses the whole statement. So NOTHING on the course-details form saved - not the
+//    title, not the slug, not the credit hours - because one statement carried all of it, and the
+//    only sign was a red box holding the failed SQL. Every other write on this page then reported
+//    success without asking whether it had happened.
+//
+// 2. NONE OF THE THREE COLUMNS HAS A CREATE IN THIS REPOSITORY, so their live types cannot be read
+//    from source: the only mention is ALTER TABLE ... ADD COLUMN IF NOT EXISTS in
+//    src/lib/aquintutor-authoring.ts (learning_outcomes JSONB, prerequisites TEXT), which does
+//    nothing at all if the column already exists with another type - and every reader in the product
+//    (this page's own textareas, /aquintutor/courses/[slug]) treats all three as ARRAYS. Guessing
+//    silently is what produced the situation above, so the shape is now READ from
+//    information_schema and the value is written in whatever form that column actually takes. No
+//    DDL, no type change, no guess.
+//
+// 3. The catch printed `e?.message` - on a drizzle error the failed SQL statement - and logged
+//    nothing; add_module / add_lesson with an empty title answered with complete silence (no
+//    success, no error, an unchanged reload); and the course read ended in `catch (_) {}` followed
+//    by `if (!course) redirect('/admin/courses')`, so a failed query was indistinguishable from a
+//    course that does not exist.
+const causeOf = (e: any): string => e?.cause?.message || e?.message || 'unknown error';
+const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
+
+/**
+ * A SQL fragment holding `xs` in the form the named column of training_courses actually accepts.
+ *
+ * jsonb/json  -> a JSON array, cast
+ * text[]      -> textArray() (one text parameter that Postgres unpacks; see src/lib/pg-array.ts)
+ * text/varchar-> the lines joined, which is the only lossless single-value form
+ */
+async function courseArrayValue(column: string, xs: string[]) {
+  let udt = '';
+  try {
+    const r = await db.execute(sql`
+      SELECT udt_name FROM information_schema.columns
+      WHERE table_name = 'training_courses' AND column_name = ${column} LIMIT 1
+    `);
+    udt = String((rowsOf(r)[0] as any)?.udt_name || '');
+  } catch (e: any) {
+    console.error('[admin/courses/edit] column shape', column, causeOf(e));
+  }
+  if (udt === 'jsonb' || udt === 'json') return sql`${JSON.stringify(xs)}::jsonb`;
+  if (udt.startsWith('_')) return textArray(xs);
+  if (udt) return sql`${xs.join('\n')}`;
+  // Unknown shape: refuse to write rather than corrupt the column.
+  return null;
+}
 
 const user = Astro.locals.user;
 if (!user) return Astro.redirect('/admin/login');
@@ -18,6 +73,20 @@ if (!id) return Astro.redirect('/admin/courses');
 // to call it for that to happen in its process.
 await ensureAquintutorAuthoringSchema();
 
+// EVERY WRITE ON THIS PAGE WAS FRONTED BY user.role === 'applicant' AND NOTHING ELSE.
+//
+// src/middleware.ts maps this path to the lms section and getViewableSectionKeys() enforces
+// VIEW there and only VIEW, so any account that could OPEN this console could also change what it
+// holds. src/lib/auth/permissions.ts says in as many words never to use role !== 'applicant' as an
+// authorisation test; the identical repair was already made on /admin/ai-interview-templates and
+// /admin/hr/training.
+//
+// GATED ON 'edit', NOT 'delete', DELIBERATELY: canAccessSection() gives a built-in role holding a
+// section view/edit/export and reserves delete for super_admin, so asking for 'delete' here would
+// take an action away from a role that holds this section today. Narrowing it further is a policy
+// decision for a human; refusing a custom VIEW-ONLY role is the mechanism fix, and that is this.
+const canWrite = await canAccessSection(user as any, 'lms', 'edit');
+
 let okMsg = '';
 let errorMsg = '';
 let course: any = null;
@@ -27,6 +96,9 @@ let lessons: any[] = [];
 if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('action') as string;
+  if (!canWrite) {
+    errorMsg = 'Your role can open this course but cannot change it. Nothing was saved.';
+  } else
   try {
     if (action === 'update_meta') {
       const title = (fd.get('title') as string || '').trim();
@@ -50,32 +122,53 @@ if (Astro.request.method === 'POST') {
       const learningOutcomes = ((fd.get('learning_outcomes') as string || '').trim().split('\n').map(s => s.trim()).filter(Boolean));
       const prerequisites = ((fd.get('prerequisites') as string || '').trim().split('\n').map(s => s.trim()).filter(Boolean));
       const tags = ((fd.get('tags') as string || '').trim().split(',').map(s => s.trim()).filter(Boolean));
-      await db.execute(sql`
-        UPDATE training_courses SET
-          title = ${title}, slug = ${slug}, short_desc = ${shortDesc}, description = ${description},
-          subtitle = ${subtitle}, course_code = ${courseCode}, credit_hours = ${creditHours},
-          duration_weeks = ${durationWeeks}, pricing_model = ${pricingModel},
-          school_id = ${schoolId}::uuid, department_id = ${departmentId}::uuid,
-          category = ${category}, level = ${level}, access_type = ${accessType}, is_free = ${isFree},
-          duration_hours = ${durationHours},
-          instructor_name = ${instructorName}, instructor_title = ${instructorTitle},
-          learning_outcomes = ${learningOutcomes}, prerequisites = ${prerequisites}, tags = ${tags},
-          updated_at = NOW()
-        WHERE id = ${id}
-      `);
-      okMsg = 'Course details saved.';
+      const outcomesVal = await courseArrayValue('learning_outcomes', learningOutcomes);
+      const prereqVal = await courseArrayValue('prerequisites', prerequisites);
+      const tagsVal = await courseArrayValue('tags', tags);
+      const unwritable = [
+        outcomesVal ? '' : 'learning outcomes',
+        prereqVal ? '' : 'prerequisites',
+        tagsVal ? '' : 'tags',
+      ].filter(Boolean);
+      if (!title) {
+        errorMsg = 'A course needs a title. Nothing was saved.';
+      } else {
+        const r = await db.execute(sql`
+          UPDATE training_courses SET
+            title = ${title}, slug = ${slug}, short_desc = ${shortDesc}, description = ${description},
+            subtitle = ${subtitle}, course_code = ${courseCode}, credit_hours = ${creditHours},
+            duration_weeks = ${durationWeeks}, pricing_model = ${pricingModel},
+            school_id = ${schoolId}::uuid, department_id = ${departmentId}::uuid,
+            category = ${category}, level = ${level}, access_type = ${accessType}, is_free = ${isFree},
+            duration_hours = ${durationHours},
+            instructor_name = ${instructorName}, instructor_title = ${instructorTitle},
+            ${outcomesVal ? sql`learning_outcomes = ${outcomesVal},` : sql``}
+            ${prereqVal ? sql`prerequisites = ${prereqVal},` : sql``}
+            ${tagsVal ? sql`tags = ${tagsVal},` : sql``}
+            updated_at = NOW()
+          WHERE id = ${id}
+          RETURNING id
+        `);
+        if (!rowsOf(r).length) errorMsg = 'Nothing was saved - this course no longer exists.';
+        else if (unwritable.length) okMsg = 'Course details saved, except ' + unwritable.join(' and ') + ': that column is not present on this database, so those values were NOT stored.';
+        else okMsg = 'Course details saved.';
+      }
     } else if (action === 'add_module') {
       const title = (fd.get('title') as string || '').trim();
       const description = (fd.get('description') as string || '').trim() || null;
       const sortOrder = parseInt(fd.get('sort_order') as string || '99');
-      if (title) {
-        await db.execute(sql`INSERT INTO training_modules (course_id, title, description, sort_order) VALUES (${id}, ${title}, ${description}, ${sortOrder})`);
-        okMsg = 'Module added.';
+      if (!title) {
+        errorMsg = 'A module needs a title. Nothing was added.';
+      } else {
+        const r = await db.execute(sql`INSERT INTO training_modules (course_id, title, description, sort_order) VALUES (${id}, ${title}, ${description}, ${sortOrder}) RETURNING id`);
+        if (rowsOf(r).length) okMsg = 'Module added.';
+        else errorMsg = 'The module was not added.';
       }
     } else if (action === 'delete_module') {
       const moduleId = fd.get('module_id') as string;
-      await db.execute(sql`DELETE FROM training_modules WHERE id = ${moduleId}`);
-      okMsg = 'Module deleted.';
+      const r = await db.execute(sql`DELETE FROM training_modules WHERE id = ${moduleId} AND course_id = ${id} RETURNING id`);
+      if (rowsOf(r).length) okMsg = 'Module deleted.';
+      else errorMsg = 'Nothing was deleted - that module is not on this course any more.';
     } else if (action === 'add_lesson') {
       const title = (fd.get('title') as string || '').trim();
       const moduleId = (fd.get('module_id') as string || '').trim() || null;
@@ -85,44 +178,70 @@ if (Astro.request.method === 'POST') {
       const durationMins = parseInt(fd.get('duration_mins') as string || '0');
       const sortOrder = parseInt(fd.get('sort_order') as string || '99');
       const isPreview = fd.get('is_preview') === 'on';
-      if (title) {
-        await db.execute(sql`
+      if (!title) {
+        errorMsg = 'A lesson needs a title. Nothing was added.';
+      } else {
+        const r = await db.execute(sql`
           INSERT INTO training_lessons (course_id, module_id, title, type, content, video_url, duration_mins, sort_order, is_preview)
           VALUES (${id}, ${moduleId}, ${title}, ${type}, ${content}, ${videoUrl}, ${durationMins}, ${sortOrder}, ${isPreview})
+          RETURNING id
         `);
-        okMsg = 'Lesson added.';
+        if (rowsOf(r).length) okMsg = 'Lesson added.';
+        else errorMsg = 'The lesson was not added.';
       }
     } else if (action === 'delete_lesson') {
       const lessonId = fd.get('lesson_id') as string;
-      await db.execute(sql`DELETE FROM training_lessons WHERE id = ${lessonId}`);
-      okMsg = 'Lesson deleted.';
+      const r = await db.execute(sql`DELETE FROM training_lessons WHERE id = ${lessonId} AND course_id = ${id} RETURNING id`);
+      if (rowsOf(r).length) okMsg = 'Lesson deleted.';
+      else errorMsg = 'Nothing was deleted - that lesson is not on this course any more.';
     } else if (action === 'publish') {
-      await db.execute(sql`UPDATE training_courses SET is_published = true, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Course published. Visible at /aquintutor/courses/<slug>.';
+      const r = await db.execute(sql`UPDATE training_courses SET is_published = true, updated_at = NOW() WHERE id = ${id} RETURNING slug`);
+      const row = rowsOf(r)[0] as any;
+      if (row) okMsg = 'Course published. Visible at /aquintutor/courses/' + row.slug + '.';
+      else errorMsg = 'Nothing was published - this course no longer exists.';
     } else if (action === 'unpublish') {
-      await db.execute(sql`UPDATE training_courses SET is_published = false, updated_at = NOW() WHERE id = ${id}`);
-      okMsg = 'Course unpublished.';
+      const r = await db.execute(sql`UPDATE training_courses SET is_published = false, updated_at = NOW() WHERE id = ${id} RETURNING id`);
+      if (rowsOf(r).length) okMsg = 'Course unpublished.';
+      else errorMsg = 'Nothing was unpublished - this course no longer exists.';
     }
   } catch (e: any) {
-    errorMsg = 'Error: ' + (e?.message || 'Unknown');
+    // e.message on a drizzle error is only the failed SQL; the database's reason is on e.cause, and
+    // nothing at all was being logged.
+    console.error('[admin/courses/edit]', action, 'failed -', causeOf(e));
+    okMsg = '';
+    errorMsg = 'Nothing was saved. Reason: ' + causeOf(e);
   }
 }
 
+// J: this read used to end in `catch (_) {}` and fall into the redirect below, so a pooler timeout
+// and "there is no such course" left the operator on the same screen with the same explanation.
+let courseReadFailed = '';
 try {
   const r = await db.execute(sql`SELECT * FROM training_courses WHERE id = ${id} LIMIT 1`);
-  const rows = Array.isArray(r) ? r : (r?.rows || []);
-  course = rows[0] || null;
-} catch (_) {}
-if (!course) return Astro.redirect('/admin/courses');
+  course = rowsOf(r)[0] || null;
+} catch (e: any) {
+  console.error('[admin/courses/edit] course read', causeOf(e));
+  courseReadFailed = causeOf(e);
+}
+if (!course) return Astro.redirect('/admin/courses?' + (courseReadFailed ? 'error=read' : 'error=missing'));
 
+// J: an unreadable module or lesson list must not draw as "this course has no lessons" on the
+// screen somebody uses to decide whether a course is ready to publish.
+let outlineReadFailed = '';
 try {
   const r = await db.execute(sql`SELECT id, title, description, sort_order FROM training_modules WHERE course_id = ${id} ORDER BY sort_order ASC`);
-  modules = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  modules = rowsOf(r);
+} catch (e: any) {
+  console.error('[admin/courses/edit] modules read', causeOf(e));
+  outlineReadFailed = 'The module list could not be read.';
+}
 try {
   const r = await db.execute(sql`SELECT id, title, type, content, video_url, duration_mins, sort_order, is_preview, module_id FROM training_lessons WHERE course_id = ${id} ORDER BY sort_order ASC`);
-  lessons = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  lessons = rowsOf(r);
+} catch (e: any) {
+  console.error('[admin/courses/edit] lessons read', causeOf(e));
+  outlineReadFailed = (outlineReadFailed ? outlineReadFailed + ' ' : '') + 'The lesson list could not be read.';
+}
 
 const lessonsByModule: Record<string, any[]> = {};
 const unmoduledLessons: any[] = [];
@@ -136,14 +255,23 @@ for (const l of lessons) {
 
 let schools: any[] = [];
 let departments: any[] = [];
+// An empty School / Department picker reads as "this organisation has none". Both are optional on
+// the form, so a failed read is reported rather than drawn as an empty list.
+let pickerReadFailed = '';
 try {
   const r = await db.execute(sql`SELECT id, code, name, slug FROM schools WHERE is_published = true ORDER BY display_order ASC`);
-  schools = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  schools = rowsOf(r);
+} catch (e: any) {
+  console.error('[admin/courses/edit] schools read', causeOf(e));
+  pickerReadFailed = 'The School and Department pickers could not be filled.';
+}
 try {
   const r = await db.execute(sql`SELECT id, school_id, name, slug FROM academic_departments WHERE is_published = true ORDER BY display_order ASC`);
-  departments = Array.isArray(r) ? r : (r?.rows || []);
-} catch (_) {}
+  departments = rowsOf(r);
+} catch (e: any) {
+  console.error('[admin/courses/edit] departments read', causeOf(e));
+  pickerReadFailed = 'The School and Department pickers could not be filled.';
+}
 
 const CATEGORIES = ['general', 'technology', 'business', 'design', 'mathematics', 'liberal-arts', 'language', 'communication', 'compliance', 'hr'];
 const LEVELS = ['beginner', 'intermediate', 'advanced'];
@@ -181,6 +309,11 @@ const tagsText = Array.isArray(course.tags) ? course.tags.join(', ') : '';
 
   {errorMsg && <div style="margin:12px 16px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;">{errorMsg}</div>}
   {okMsg && <div style="margin:12px 16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7;border-radius:8px;padding:10px 14px;font-size:13px;">{okMsg}</div>}
+  {(outlineReadFailed || pickerReadFailed) && (
+    <div style="margin:12px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:8px;padding:10px 14px;font-size:12.5px;line-height:1.55;">
+      {outlineReadFailed} {pickerReadFailed} This is not the same as "there are none" - do not judge whether this course is ready to publish from what is drawn below until the page loads cleanly.
+    </div>
+  )}
 
   <div style="padding:16px;display:flex;flex-direction:column;gap:14px;max-width:900px;margin:0 auto;">
 

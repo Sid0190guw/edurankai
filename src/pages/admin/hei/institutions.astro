@@ -3,9 +3,26 @@ import HeiAdminLayout from '@/layouts/HeiAdminLayout.astro';
 import { db } from '@/lib/db';
 import { heiInstitutions, heiEntityTypes, heiInstitutionScores, heiDimensions } from '@/lib/db/schema';
 import { asc, eq, desc, inArray, sql } from 'drizzle-orm';
+import { canAccessSection } from '@/lib/auth/permissions';
 
 const user = Astro.locals.user!;
 if (!user || user.role === 'applicant') return Astro.redirect('/portal');
+
+// EVERY WRITE ON THIS CONSOLE WAS FRONTED BY user.role === 'applicant' AND NOTHING ELSE.
+//
+// src/middleware.ts maps /admin/hei/institutions to the hei_institutions section and
+// getViewableSectionKeys() enforces VIEW there and only VIEW - so any account that could READ this
+// console could bulk-DELETE institutions, flip is_published on the public ranking, and overwrite the
+// Truth Score that ranking is ordered by. These are rows about real, named institutions on a public
+// league table. role !== 'applicant' is the exact test src/lib/auth/permissions.ts warns against,
+// and the identical repair was already made on /admin/ai-interview-templates.
+//
+// GATED ON 'edit', NOT 'delete', DELIBERATELY. canAccessSection() gives a built-in role holding a
+// section view/edit/export and reserves delete for super_admin, so asking for 'delete' on the bulk
+// remove would take that action away from the marketing role, which holds hei_institutions today and
+// may be using it. Narrowing that is a policy decision for a human; closing the door on a custom
+// view-only role is the mechanism fix, and that is what this is.
+const canWrite = await canAccessSection(user as any, 'hei_institutions', 'edit');
 
 let errorMsg = '';
 let okMsg = '';
@@ -14,6 +31,9 @@ if (Astro.request.method === 'POST') {
   const fd = await Astro.request.formData();
   const action = fd.get('_action') as string;
 
+  if (!canWrite) {
+    errorMsg = 'Your role can open the institution register but cannot change it. Nothing was saved.';
+  } else
   try {
     if (action === 'create' || action === 'update') {
       const id = fd.get('id') as string;
@@ -47,21 +67,28 @@ if (Astro.request.method === 'POST') {
           if (exists.length > 0) { errorMsg = 'Slug already exists.'; }
           else { await db.insert(heiInstitutions).values(candidate); okMsg = 'Created: ' + candidate.name; }
         } else {
-          await db.update(heiInstitutions).set({ ...candidate, updatedAt: new Date() }).where(eq(heiInstitutions.id, id));
-          okMsg = 'Updated: ' + candidate.name;
+          const saved = await db.update(heiInstitutions).set({ ...candidate, updatedAt: new Date() }).where(eq(heiInstitutions.id, id)).returning({ id: heiInstitutions.id });
+          if (saved.length) okMsg = 'Updated: ' + candidate.name;
+          else errorMsg = 'Nothing was updated - that institution no longer exists. The list below is the current state.';
         }
       }
     } else if (action === 'delete') {
       const id = fd.get('id') as string;
-      await db.delete(heiInstitutions).where(eq(heiInstitutions.id, id));
-      okMsg = 'Deleted.';
+      const removed = await db.delete(heiInstitutions).where(eq(heiInstitutions.id, id)).returning({ id: heiInstitutions.id });
+      if (removed.length) okMsg = 'Deleted.';
+      else errorMsg = 'Nothing was deleted - that institution had already gone.';
     } else if (action === 'toggle_publish') {
       const id = fd.get('id') as string;
-      const target = await db.select().from(heiInstitutions).where(eq(heiInstitutions.id, id)).limit(1);
-      if (target.length > 0) {
-        await db.update(heiInstitutions).set({ isPublished: !target[0].isPublished, updatedAt: new Date() }).where(eq(heiInstitutions.id, id));
-        okMsg = target[0].isPublished ? 'Hidden' : 'Published';
-      }
+      // Read-then-negate-then-write with no guard: two editors toggling together had the second undo
+      // the first, and an id matching nothing produced TOTAL SILENCE - no success, no error, an
+      // unchanged reload - on the control that decides whether an institution appears on the public
+      // ranking. Postgres does the negation in one statement now, and tells us the row it changed.
+      const flipped = await db.update(heiInstitutions)
+        .set({ isPublished: sql`NOT ${heiInstitutions.isPublished}`, updatedAt: new Date() })
+        .where(eq(heiInstitutions.id, id))
+        .returning({ id: heiInstitutions.id, isPublished: heiInstitutions.isPublished });
+      if (flipped.length) okMsg = flipped[0].isPublished ? 'Published' : 'Hidden';
+      else errorMsg = 'Nothing was changed - that institution no longer exists.';
     } else if (action === 'bulk_publish' || action === 'bulk_unpublish' || action === 'bulk_delete' || action === 'bulk_compute' || action === 'bulk_set_type') {
       const idsRaw = fd.get('selected_ids') as string;
       const ids = (idsRaw || '').split(',').map(s => s.trim()).filter(s => s.length > 0);
@@ -69,14 +96,14 @@ if (Astro.request.method === 'POST') {
         errorMsg = 'No institutions selected.';
       } else {
         if (action === 'bulk_publish') {
-          await db.update(heiInstitutions).set({ isPublished: true, updatedAt: new Date() }).where(inArray(heiInstitutions.id, ids));
-          okMsg = 'Published ' + ids.length + ' institutions.';
+          const done = await db.update(heiInstitutions).set({ isPublished: true, updatedAt: new Date() }).where(inArray(heiInstitutions.id, ids)).returning({ id: heiInstitutions.id });
+          okMsg = 'Published ' + done.length + ' institution(s).' + (done.length === ids.length ? '' : ' ' + (ids.length - done.length) + ' of the selected rows no longer exist and were not changed.');
         } else if (action === 'bulk_unpublish') {
-          await db.update(heiInstitutions).set({ isPublished: false, updatedAt: new Date() }).where(inArray(heiInstitutions.id, ids));
-          okMsg = 'Unpublished ' + ids.length + ' institutions.';
+          const done = await db.update(heiInstitutions).set({ isPublished: false, updatedAt: new Date() }).where(inArray(heiInstitutions.id, ids)).returning({ id: heiInstitutions.id });
+          okMsg = 'Unpublished ' + done.length + ' institution(s).' + (done.length === ids.length ? '' : ' ' + (ids.length - done.length) + ' of the selected rows no longer exist and were not changed.');
         } else if (action === 'bulk_delete') {
-          await db.delete(heiInstitutions).where(inArray(heiInstitutions.id, ids));
-          okMsg = 'Deleted ' + ids.length + ' institutions.';
+          const done = await db.delete(heiInstitutions).where(inArray(heiInstitutions.id, ids)).returning({ id: heiInstitutions.id });
+          okMsg = 'Deleted ' + done.length + ' institution(s).' + (done.length === ids.length ? '' : ' ' + (ids.length - done.length) + ' of the selected rows had already gone.');
         } else if (action === 'bulk_compute') {
           // For each institution: compute truth score from existing dimension scores
           const allDims = await db.select().from(heiDimensions);
@@ -108,14 +135,17 @@ if (Astro.request.method === 'POST') {
           const typeId = fd.get('bulk_entity_type_id') as string;
           if (!typeId) { errorMsg = 'Pick an entity type for bulk update.'; }
           else {
-            await db.update(heiInstitutions).set({ entityTypeId: typeId, updatedAt: new Date() }).where(inArray(heiInstitutions.id, ids));
-            okMsg = 'Set entity type on ' + ids.length + ' institutions.';
+            const done = await db.update(heiInstitutions).set({ entityTypeId: typeId, updatedAt: new Date() }).where(inArray(heiInstitutions.id, ids)).returning({ id: heiInstitutions.id });
+            okMsg = 'Set entity type on ' + done.length + ' institution(s).' + (done.length === ids.length ? '' : ' ' + (ids.length - done.length) + ' of the selected rows no longer exist.');
           }
         }
       }
     }
   } catch (err: any) {
-    errorMsg = 'Failed: ' + (err.message || 'Unknown error');
+    // e.message on a drizzle/postgres-js failure is the STATEMENT that failed - table and column
+    // names handed to the operator - while the database's real reason sits unread on e.cause.
+    console.error('[admin/hei/institutions] write failed:', err?.cause?.message || err?.message);
+    errorMsg = 'That did not save. Nothing has been changed. The reason has been recorded in the server log.';
   }
 }
 

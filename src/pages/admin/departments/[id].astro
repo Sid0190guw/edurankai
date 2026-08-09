@@ -6,6 +6,13 @@ import { can } from '@/lib/auth/permissions';
 import { departmentSchema } from '@/lib/validators';
 import { logAudit } from '@/lib/audit';
 import { eq, sql } from 'drizzle-orm';
+// A FAILED READ IS NOT A MISSING DEPARTMENT. Both reads here were bare top-level awaits: an
+// unreadable `departments` table took the page down with an unexplained 500, and a catch that
+// returned nothing would have bounced to the list as though the department did not exist. The second
+// is the worse of the two — it invites somebody to create a duplicate of a record that is still
+// there.
+import { safeRows } from '@/lib/page-safety';
+import DayOne from '@/components/admin/DayOne.astro';
 
 const user = Astro.locals.user!;
 const canEdit = can(user, 'roles.edit');
@@ -13,21 +20,35 @@ const canEdit = can(user, 'roles.edit');
 const { id } = Astro.params;
 if (!id) return Astro.redirect('/admin/departments');
 
-const existing = await db.select().from(departments).where(eq(departments.id, id)).limit(1);
-if (existing.length === 0) return Astro.redirect('/admin/departments');
-let current = existing[0];
+const existingRes = await safeRows<any>('[departments] one department', () =>
+  db.select().from(departments).where(eq(departments.id, id)).limit(1));
+// Redirect ONLY on a read that worked and found nothing. On a failed read the page renders and says
+// what failed, because "this department does not exist" is a claim it cannot make.
+if (existingRes.ok && existingRes.rows.length === 0) return Astro.redirect('/admin/departments');
+let current: any = existingRes.rows[0] || null;
 
 let errorMsg = '';
 let okMsg = '';
 
-if (Astro.request.method === 'POST' && canEdit) {
+// NO WRITE ON A RECORD WE DID NOT READ. Without `current` the update below would build its payload
+// from `current.id` and throw, and the delete would audit a name it does not have.
+if (Astro.request.method === 'POST' && canEdit && current) {
   const fd = await Astro.request.formData();
   const intent = fd.get('_intent');
 
   if (intent === 'delete') {
-    const inUse = await db.select({ count: sql<number>`count(*)::int` }).from(roles).where(eq(roles.departmentId, id));
-    if (inUse[0].count > 0) {
-      errorMsg = 'Cannot delete: ' + inUse[0].count + ' role(s) still in this department. Move or delete those roles first.';
+    // THE GUARD REFUSES WHEN IT CANNOT ANSWER. This was `inUse[0].count`, which throws on a read
+    // that failed and on a driver that returned no row — an unexplained 500 in a DESTRUCTIVE path.
+    // The failure is not swallowed: it is reported to the person pressing the button and logged with
+    // the real Postgres reason, and the delete does not happen.
+    const inUse = await safeRows<any>('[departments] roles still in this department', () =>
+      db.select({ count: sql<number>`count(*)::int` }).from(roles).where(eq(roles.departmentId, id)));
+    const inUseCount = inUse.ok ? Number(inUse.rows[0]?.count ?? 0) : null;
+    if (inUseCount === null) {
+      errorMsg = 'Nothing was deleted. This page could not check whether any role is still in this '
+        + 'department, so it will not remove it on an assumption: ' + (inUse.error || 'unknown database error');
+    } else if (inUseCount > 0) {
+      errorMsg = 'Cannot delete: ' + inUseCount + ' role(s) still in this department. Move or delete those roles first.';
     } else {
       await db.delete(departments).where(eq(departments.id, id));
       await logAudit({
@@ -67,24 +88,40 @@ if (Astro.request.method === 'POST' && canEdit) {
         ipAddress: Astro.clientAddress
       });
       okMsg = 'Saved.';
-      const refreshed = await db.select().from(departments).where(eq(departments.id, id)).limit(1);
-      current = refreshed[0];
+      // The re-read can fail on its own. Keep the record we already have rather than replacing it
+      // with undefined, which crashed the whole page on the line after a SUCCESSFUL save.
+      const refreshed = await safeRows<any>('[departments] re-read after save', () =>
+        db.select().from(departments).where(eq(departments.id, id)).limit(1));
+      if (refreshed.ok && refreshed.rows[0]) current = refreshed.rows[0];
     }
   }
 }
 
-const roleCountResult = await db.select({ count: sql<number>`count(*)::int` }).from(roles).where(eq(roles.departmentId, id));
-const roleCount = roleCountResult[0].count;
+const roleCountRes = await safeRows<any>('[departments] role count for one department', () =>
+  db.select({ count: sql<number>`count(*)::int` }).from(roles).where(eq(roles.departmentId, id)));
+// Null, not 0. "0 role(s)" over a failed count is what makes somebody delete a department that is
+// still in use — and the delete guard below reads the same table, so it would refuse anyway. Saying
+// "unknown" keeps the screen and the guard telling the same story.
+const roleCount: number | null = roleCountRes.ok ? Number(roleCountRes.rows[0]?.count ?? 0) : null;
+const roleCountWords = roleCount === null ? 'role count unknown' : roleCount + ' role(s)';
 ---
-<AdminLayout title={'Edit · ' + current.name} activeNav="departments">
+<AdminLayout title={current ? 'Edit · ' + current.name : 'Department could not be read'} activeNav="departments">
   <div class="admin-page" style="max-width:680px;">
     <div class="admin-page-header">
       <div class="admin-page-title-block">
-        <div class="admin-page-eyebrow"><a href="/admin/departments" style="color:#6e6e78;text-decoration:none;">← Departments</a></div>
-        <h1 class="admin-page-title">{current.name}</h1>
-        <p class="admin-page-sub" style="font-family:'Geist Mono',monospace;">{current.id} · {roleCount} role(s)</p>
+        <div class="admin-page-eyebrow"><a href="/admin/departments" style="color:#6e6e78;text-decoration:none;">Departments</a></div>
+        <h1 class="admin-page-title">{current ? current.name : 'This department could not be read'}</h1>
+        <p class="admin-page-sub" style="font-family:'Geist Mono',monospace;">{current ? current.id + ' · ' + roleCountWords : 'read failed'}</p>
       </div>
     </div>
+
+    {!current && (
+      <DayOne
+        state="unreadable"
+        thing="This department"
+        error={existingRes.error}
+      />
+    )}
 
     {errorMsg && (
       <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.25);color:#fca5a5;font-size:12.5px;padding:11px 14px;border-radius:7px;margin-bottom:18px;">
@@ -97,6 +134,7 @@ const roleCount = roleCountResult[0].count;
       </div>
     )}
 
+    {current && (
     <form method="POST" class="admin-card" style="display:flex;flex-direction:column;gap:16px;">
       <div>
         <label class="rolefield-label">Name *</label>
@@ -131,19 +169,26 @@ const roleCount = roleCountResult[0].count;
         </div>
       )}
     </form>
+    )}
 
-    {canEdit && (
+    {current && canEdit && (
       <div class="admin-card" style="margin-top:24px;border-color:rgba(220,38,38,0.25);">
         <div class="admin-card-title" style="color:#fca5a5;">Danger Zone</div>
         <p style="font-size:12.5px;color:#8a8a94;line-height:1.7;margin:8px 0 12px;">
-          Departments can only be deleted when they contain zero roles. Currently this department has <strong style="color:#fff;">{roleCount}</strong> role(s).
+          Departments can only be deleted when they contain zero roles.
+          {roleCount === null
+            ? ' The role count could not be read, so this page cannot tell whether this department is in use. Delete is off until it can.'
+            : ' Currently this department has ' + roleCount + ' role(s).'}
         </p>
+        {/* THE BUTTON IS OFF WHEN THE COUNT IS UNKNOWN, NOT ONLY WHEN IT IS NON-ZERO. `roleCount > 0`
+            on a null read is false, which used to leave Delete ENABLED on exactly the page load
+            where nothing was known about what the department still holds. */}
         <form method="POST" onsubmit="return confirm('Delete this department?');">
           <button type="submit" name="_intent" value="delete" class="admin-btn"
-            style={roleCount > 0
+            style={roleCount === null || roleCount > 0
               ? 'background:rgba(120,120,128,0.1);border-color:rgba(120,120,128,0.2);color:#6e6e78;cursor:not-allowed;'
               : 'background:rgba(220,38,38,0.12);border-color:rgba(220,38,38,0.3);color:#fca5a5;'}
-            disabled={roleCount > 0}>
+            disabled={roleCount === null || roleCount > 0}>
             Delete this department
           </button>
         </form>

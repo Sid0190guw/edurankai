@@ -10,10 +10,35 @@ const rows = (r: any): any[] => (Array.isArray(r) ? r : (r?.rows || []));
 const { order } = Astro.params;
 if (!order) return Astro.redirect('/');
 
+// "THERE IS NO SUCH RECEIPT" AND "THE RECEIPT COULD NOT BE READ" WERE THE SAME REDIRECT.
+//
+// `.catch(() => [])` left `pay` undefined and the next line sent the reader to the homepage. A pooler
+// timeout therefore answered a request for the record of a payment somebody had just made by quietly
+// dropping them on the marketing site — which reads as "we have no record of your payment", and the
+// reasonable response to that is to pay again. A failed read now says so, and says not to pay again.
+let payReadFailed = false;
 const pay = rows(await db.execute(sql`
   SELECT order_id, payment_id, amount_paise, currency, status, purpose, reference_type, reference_id, user_id, email, created_at, notes
   FROM payments WHERE order_id = ${order} LIMIT 1
-`).catch(() => []))[0] as any;
+`).catch((e: any) => {
+  payReadFailed = true;
+  // The real Postgres reason is on e.cause; e.message is only the failed SQL, and neither goes on screen.
+  console.error('[receipt] payment read failed for order', order, '-', e?.cause?.message || e?.message);
+  return [] as any;
+}))[0] as any;
+if (payReadFailed) {
+  return new Response(
+    '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>Receipt unavailable - EduRankAI</title>'
+    + '<div style="max-width:34rem;margin:12vh auto;padding:0 1.25rem;font:16px/1.7 system-ui,sans-serif;color:#1a1a1a">'
+    + '<h1 style="font-size:1.35rem;margin:0 0 .75rem">This receipt could not be loaded</h1>'
+    + '<p style="margin:0 0 .75rem">Our records could not be reached just now. This does <strong>not</strong> mean your payment is missing, and it does not mean it failed.</p>'
+    + '<p style="margin:0 0 .75rem">Please reload in a moment. <strong>Do not pay again.</strong> If it keeps happening, email connect@edurankai.in and quote your order reference.</p>'
+    + '<p style="margin:0;color:#6b6255;font-family:ui-monospace,monospace;font-size:.85rem">Order ' + String(order).replace(/[<>&"]/g, '') + '</p>'
+    + '</div>',
+    { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } },
+  );
+}
 if (!pay) return Astro.redirect('/');
 
 // Itemised breakdown + waiver flag, from the payment's stored notes.
@@ -57,7 +82,14 @@ const cur = pay.currency || 'INR';
 const curSym = cur === 'INR' ? 'Rs. ' : cur + ' ';
 const when = pay.created_at ? new Date(pay.created_at) : new Date();
 const dateStr = when.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
-const receiptNo = 'ERA-' + when.getFullYear() + '-' + String(pay.order_id || '').replace(/^order_/, '').slice(0, 10).toUpperCase();
+// THE YEAR IN THE RECEIPT NUMBER IS THE YEAR PRINTED ON THE RECEIPT.
+//
+// `when.getFullYear()` is the SERVER's year, and this server runs in UTC while dateStr above is
+// deliberately rendered in Asia/Kolkata. A payment taken at 00:30 IST on 1 January is 19:00 UTC on
+// 31 December, so the document read "Date: 1 January 2027" beside receipt number "ERA-2026-..." —
+// two different financial years on one receipt, on the paper somebody files for their accounts.
+const receiptYear = new Intl.DateTimeFormat('en-GB', { year: 'numeric', timeZone: 'Asia/Kolkata' }).format(when);
+const receiptNo = 'ERA-' + receiptYear + '-' + String(pay.order_id || '').replace(/^order_/, '').slice(0, 10).toUpperCase();
 const paid = String(pay.status || '').toLowerCase() === 'paid';
 const billName = app ? ((app.first_name || '') + ' ' + (app.last_name || '')).trim() : (me?.name || '');
 ---

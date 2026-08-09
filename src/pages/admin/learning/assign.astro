@@ -1,0 +1,493 @@
+---
+// /admin/learning/assign — ASSIGN, UNASSIGN, AND MOVE A DEADLINE ON THE RECORD.
+//
+// WHO MAY DO IT. `learning.assign` reaches the whole organization. A DEPARTMENT HEAD reaches their
+// own department without that key, and the scope comes from the Organization Graph
+// (userHeadedDepartmentIds), applied to every query as a WHERE clause and re-checked per row before
+// any write. There is no users.role test on this page.
+//
+// ASSIGNING TO A GROUP IS HONEST ABOUT SIZE FIRST. The count under the button comes from the SAME
+// query that will do the assigning, and the write refuses if the group has changed size since that
+// count was shown. It also says how many of those people have no platform account, because
+// hr_learning_assignments.user_id is nullable and an assignment with no account behind it can never
+// join to an enrolment — it reads "not started" forever, however much work the person does.
+//
+// The single-person write goes through assignCourse() in src/lib/performance-learning.ts, which owns
+// hr_learning_assignments. This page adds no second assignment writer.
+import AdminLayout from '@/layouts/AdminLayout.astro';
+import { flashFailed } from '@/lib/flash-tone';
+import { can } from '@/lib/auth/permissions';
+import { confirmAttr, clip } from '@/lib/page-safety';
+import { resolvePerfViewer, LEARNING_ASSIGN } from '@/lib/performance-scope';
+import { assignCourse, withdrawAssignment, courseOptions, type CourseOption } from '@/lib/performance-learning';
+import {
+  resolveLearningScope,
+  scopeCoversEmployee,
+  previewCohort,
+  assignToCohort,
+  cohortValueOptions,
+  employeesInScope,
+  assignmentsInScope,
+  assignmentOwner,
+  extendDeadline,
+  departmentNameMap,
+  COHORT_KINDS,
+  COHORT_KIND_LABELS,
+  type CohortFilter,
+  type CohortPreview,
+  type LearningScope,
+  type ScopedAssignment,
+} from '@/lib/learning-admin';
+
+const PATH = '/admin/learning/assign';
+
+const user = Astro.locals.user;
+if (!user) return Astro.redirect('/admin/login?next=' + encodeURIComponent(PATH));
+if (!can(user as any, 'admin.access')) return Astro.redirect('/admin');
+
+// Every const above the handler — `const` is not hoisted.
+const holds = (k: string) => can(user as any, k as any);
+const scope: LearningScope = await resolveLearningScope(String(user.id), holds, LEARNING_ASSIGN);
+const viewer = await resolvePerfViewer(String(user.id), holds);
+
+const back = (msg: string, qs = '') =>
+  Astro.redirect(PATH + '?msg=' + encodeURIComponent(msg.slice(0, 400)) + qs);
+
+const fmtDay = (d: string | null) =>
+  d ? new Date(d + 'T00:00:00Z').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : 'No date';
+
+if (Astro.request.method === 'POST') {
+  if (!scope.canSeeAnything) return back('You do not hold the ability to assign learning, so nothing was changed.');
+  const fd = await Astro.request.formData();
+  const action = String(fd.get('action') || '');
+
+  if (action === 'assign_one') {
+    const employeeId = String(fd.get('employee_id') || '');
+    // PER ROW, from the graph. A department head may assign inside their department and nowhere else.
+    const covered = await scopeCoversEmployee(scope, employeeId);
+    if (!covered) {
+      return back('The Organization Graph does not put that person inside your scope, so nothing was assigned.');
+    }
+    const r = await assignCourse(viewer, {
+      employeeId,
+      courseId: String(fd.get('course_id') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      required: fd.get('required') === '1',
+      reason: String(fd.get('reason') || ''),
+      orgWide: true, // the scope check above is the authority; assignCourse must not re-derive it
+    });
+    return back(r.ok ? 'Course assigned.' : (r.error || 'Could not assign that.'));
+  }
+
+  if (action === 'assign_cohort') {
+    const filter: CohortFilter = {
+      kind: String(fd.get('ckind') || 'department') as CohortFilter['kind'],
+      value: String(fd.get('cvalue') || '') || null,
+    };
+    const r = await assignToCohort(viewer, scope, {
+      filter,
+      courseId: String(fd.get('course_id') || ''),
+      dueOn: String(fd.get('due_on') || ''),
+      required: fd.get('required') === '1',
+      reason: String(fd.get('reason') || ''),
+      expectedCount: Number(fd.get('expected_count') || -1),
+    });
+    return back(r.ok ? (r.info || 'Assigned.') : (r.error || 'Nothing was assigned.'));
+  }
+
+  if (action === 'withdraw') {
+    const assignmentId = String(fd.get('assignment_id') || '');
+    const owner = await assignmentOwner(assignmentId);
+    if (!owner || !(await scopeCoversEmployee(scope, owner))) {
+      return back('That assignment is not inside your scope, so nothing was withdrawn.');
+    }
+    const r = await withdrawAssignment(viewer, assignmentId, true);
+    return back(r.ok
+      ? 'Assignment withdrawn. The row is kept, so the record still says who asked for it and when.'
+      : (r.error || 'Could not withdraw that.'));
+  }
+
+  if (action === 'extend') {
+    const assignmentId = String(fd.get('assignment_id') || '');
+    const owner = await assignmentOwner(assignmentId);
+    if (!owner || !(await scopeCoversEmployee(scope, owner))) {
+      return back('That assignment is not inside your scope, so no deadline was moved.');
+    }
+    const r = await extendDeadline(String(user.id), {
+      assignmentId,
+      dueOn: String(fd.get('due_on') || ''),
+      reason: String(fd.get('reason') || ''),
+    });
+    return back(r.ok ? (r.info || 'Deadline moved.') : (r.error || 'Could not move that deadline.'));
+  }
+
+  return back('That action is not one this page performs.');
+}
+
+const params = Astro.url.searchParams;
+const msg = String(params.get('msg') || '').slice(0, 400);
+const overdueOnly = params.get('overdue') === '1';
+const extendId = String(params.get('extend') || '');
+const ckind = String(params.get('ckind') || '');
+const cvalue = String(params.get('cvalue') || '');
+
+let courses: CourseOption[] = [];
+let people: { id: string; name: string; hasAccount: boolean }[] = [];
+let peopleError = '';
+let assignments: ScopedAssignment[] = [];
+let assignmentsError = '';
+let departments = new Map<string, string>();
+let designations: string[] = [];
+let employmentTypes: string[] = [];
+let preview: CohortPreview | null = null;
+
+if (scope.canSeeAnything) {
+  courses = await courseOptions();
+  departments = await departmentNameMap();
+  const emp = await employeesInScope(scope);
+  people = emp.rows;
+  peopleError = emp.ok ? '' : (emp.error || '');
+  const list = await assignmentsInScope(scope, { overdueOnly });
+  assignments = list.rows;
+  assignmentsError = list.ok ? '' : (list.error || '');
+  const opts = await cohortValueOptions(scope);
+  designations = opts.designations;
+  employmentTypes = opts.employmentTypes;
+
+  if ((COHORT_KINDS as readonly string[]).indexOf(ckind) >= 0) {
+    preview = await previewCohort(
+      { kind: ckind as CohortFilter['kind'], value: cvalue || null },
+      scope,
+      departments,
+    );
+  }
+}
+
+const departmentList = [...departments.entries()].map(([id, name]) => ({ id, name }));
+const scopedDepartments = scope.orgWide
+  ? departmentList
+  : departmentList.filter((d) => scope.departmentIds.indexOf(d.id) >= 0);
+const extendTarget = assignments.find((a) => a.assignmentId === extendId) || null;
+const overdueCount = assignments.filter((a) => a.overdue).length;
+const unlinkedCount = assignments.filter((a) => !a.userId).length;
+---
+
+<AdminLayout title="Assign learning" activeNav="hr">
+  <style>
+    .la{max-width:1100px;padding:16px 16px 80px;margin:0 auto}
+    .la h1{font-size:21px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px;color:var(--o-hi,#fff)}
+    .la .lede{font-size:13px;line-height:1.6;color:#9aa6b6;margin:0 0 16px;max-width:74ch}
+    .la .flash{background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.34);color:#34d399;
+      border-radius:10px;padding:11px 13px;font-size:13px;line-height:1.5;margin-bottom:14px;overflow-wrap:anywhere}
+    .la .flash.warn{background:rgba(220,38,38,.1);border-color:rgba(220,38,38,.36);color:#fca5a5}
+    .la .notice{background:rgba(255,79,0,.07);border:1px solid rgba(255,79,0,.26);color:#ffb08a;
+      border-radius:11px;padding:12px 14px;font-size:12.5px;line-height:1.6;margin-bottom:12px;max-width:78ch}
+    .la .card{background:var(--o-bg2,#11151c);border:1px solid var(--o-stroke,#1a1a1f);border-radius:14px;
+      padding:15px;margin-bottom:13px}
+    .la .card h2{font-family:'Geist Mono',ui-monospace,monospace;font-size:10px;letter-spacing:.13em;
+      text-transform:uppercase;color:#FF7040;font-weight:700;margin:0 0 11px}
+    .la .muted{font-size:12.5px;line-height:1.6;color:#9aa6b6;overflow-wrap:anywhere}
+    .la label{font-family:'Geist Mono',ui-monospace,monospace;font-size:9.5px;letter-spacing:.1em;
+      text-transform:uppercase;color:#8a8a94;font-weight:700;display:block;margin:11px 0 4px}
+    .la input,.la select,.la textarea{width:100%;background:var(--o-bg0,#08080a);
+      border:1px solid var(--o-stroke,#2a2a32);border-radius:9px;padding:10px 12px;font-size:14px;
+      font-family:inherit;color:var(--o-hi,#fff);outline:none;min-height:44px;box-sizing:border-box}
+    .la textarea{min-height:76px;resize:vertical;font-size:13px}
+    .la input:focus,.la select:focus,.la textarea:focus{border-color:#FF4F00}
+    .la .row2{display:grid;grid-template-columns:1fr;gap:9px}
+    .la .btn{background:#FF4F00;color:#fff;border:none;border-radius:10px;padding:11px 17px;font-size:14px;
+      font-weight:650;cursor:pointer;font-family:inherit;min-height:44px;margin-top:12px}
+    .la .btn.ghost{background:transparent;color:#c9ccd4;border:1px solid var(--o-stroke,#2a2a32)}
+    .la .btn.slim{padding:9px 13px;font-size:12.5px;margin-top:0;min-height:40px}
+    .la .tabs{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;margin-bottom:14px}
+    .la .tab{flex:none;display:inline-flex;align-items:center;min-height:40px;padding:8px 14px;
+      border:1px solid var(--o-stroke,#2a2a32);border-radius:999px;background:transparent;color:#9aa6b6;
+      font-size:12.5px;font-weight:600;text-decoration:none;white-space:nowrap}
+    .la .tab[aria-current="page"]{background:#FF4F00;border-color:#FF4F00;color:#fff}
+    .la .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:10px}
+    .la table{border-collapse:collapse;width:100%;min-width:700px;font-size:13px}
+    .la th{text-align:left;font-family:'Geist Mono',ui-monospace,monospace;font-size:9.5px;
+      letter-spacing:.1em;text-transform:uppercase;color:#8a8a94;font-weight:700;padding:8px 10px;
+      border-bottom:1px solid var(--o-stroke,#1a1a1f);white-space:nowrap}
+    .la td{padding:10px;border-bottom:1px solid rgba(255,255,255,.05);vertical-align:top;color:#c9ccd4}
+    .la .pill{font-family:'Geist Mono',ui-monospace,monospace;font-size:9px;font-weight:700;padding:3px 8px;
+      border-radius:99px;text-transform:uppercase;letter-spacing:.05em;background:rgba(255,255,255,.07);
+      color:#9aa6b6;display:inline-block;white-space:nowrap}
+    .la .pill.live{background:rgba(16,185,129,.15);color:#34d399}
+    .la .pill.late{background:rgba(220,38,38,.13);color:#fca5a5}
+    .la .pill.warn{background:rgba(234,179,8,.15);color:#facc15}
+    .la a.lnk{color:#FF7040;text-decoration:none}
+    .la .big{font-size:30px;font-weight:800;color:var(--o-hi,#fff);line-height:1.1;letter-spacing:-.02em}
+    .la .inline{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    @media (min-width:760px){ .la .row2{grid-template-columns:1fr 1fr} }
+  </style>
+
+  <div class="la">
+    <h1>Assign learning</h1>
+    <p class="lede">
+      An assignment is a request with a date on it. It does not grant access to anything — anybody
+      signed in can already take a course the catalogue offers them — and it is the only record of
+      what somebody was <i>asked</i> to do.
+    </p>
+
+    <div class="tabs">
+      <a class="tab" href="/admin/learning/catalogue">Catalogue</a>
+      <a class="tab" href={PATH} aria-current="page">Assign</a>
+      <a class="tab" href="/admin/learning/progress">Progress</a>
+    </div>
+
+    {msg && <p class={flashFailed(msg) ? 'flash warn' : 'flash'} role={flashFailed(msg) ? 'alert' : 'status'}>{msg}</p>}
+
+    {!scope.canSeeAnything && (
+      <div class="notice">
+        <p><b>This is the learning desk.</b> {scope.explanation}</p>
+        <p style="margin-top:8px">Organization-wide assigning is <code>learning.assign</code>, held by
+        super admins and by HR. Assigning to your own reports is opened by the reporting relationship
+        instead, from <a class="lnk" href="/portal/employee/learning">the employee learning page</a>.</p>
+      </div>
+    )}
+
+    {scope.canSeeAnything && (
+      <>
+        <p class="muted" style="margin-bottom:12px">{scope.explanation}</p>
+
+        {courses.length === 0 && (
+          <p class="notice">No published courses were found, so there is nothing to assign. Courses are
+            published on <a class="lnk" href="/admin/learning/catalogue">the catalogue screen</a>.</p>
+        )}
+
+        <div class="card">
+          <h2>Assign to one person</h2>
+          {peopleError && (
+            <p class="flash warn" role="alert">The employee list could not be read: {peopleError}. That is
+              a failed read, not an organization with nobody in it.</p>
+          )}
+          <form method="post">
+            <input type="hidden" name="action" value="assign_one" />
+            <div class="row2">
+              <div>
+                <label for="who">Who</label>
+                <select id="who" name="employee_id" required>
+                  <option value="">Choose a person</option>
+                  {people.map((p) => (
+                    <option value={p.id}>{p.name}{p.hasAccount ? '' : ' (no platform account)'}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label for="crs">Course</label>
+                <select id="crs" name="course_id" required>
+                  <option value="">Choose a course</option>
+                  {courses.map((c) => <option value={c.id}>{clip(c.title, 70)}</option>)}
+                </select>
+              </div>
+            </div>
+            <div class="row2">
+              <div>
+                <label for="due">Due by</label>
+                <input id="due" name="due_on" type="date" />
+              </div>
+              <div>
+                <label for="req">Required</label>
+                <select id="req" name="required">
+                  <option value="0">Recommended</option>
+                  <option value="1">Required</option>
+                </select>
+              </div>
+            </div>
+            <label for="why">Why</label>
+            <textarea id="why" name="reason" maxlength="1000" placeholder="Shown to the person it is assigned to"></textarea>
+            <button class="btn" type="submit">Assign</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2>Assign to a group</h2>
+          <p class="muted">
+            Choose the group first. The number below comes from the query that will do the assigning,
+            not from an estimate, and the assignment refuses to run if that number has changed by the
+            time you press it.
+          </p>
+
+          <form method="get">
+            <div class="row2">
+              <div>
+                <label for="ck">Group</label>
+                <select id="ck" name="ckind">
+                  {COHORT_KINDS.map((k) => (
+                    <option value={k} selected={k === ckind}>{COHORT_KIND_LABELS[k]}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label for="cv">Which one</label>
+                <select id="cv" name="cvalue">
+                  <option value="">Not needed for "everybody"</option>
+                  <optgroup label="Departments">
+                    {scopedDepartments.map((d) => <option value={d.id} selected={d.id === cvalue}>{d.name}</option>)}
+                  </optgroup>
+                  <optgroup label="Role levels">
+                    {designations.map((d) => <option value={d} selected={d === cvalue}>{d}</option>)}
+                  </optgroup>
+                  <optgroup label="Employment types">
+                    {employmentTypes.map((t) => <option value={t} selected={t === cvalue}>{t}</option>)}
+                  </optgroup>
+                </select>
+              </div>
+            </div>
+            <button class="btn ghost" type="submit">Count this group</button>
+          </form>
+
+          {preview && !preview.ok && (
+            <p class="flash warn" role="alert" style="margin-top:14px">{preview.error}</p>
+          )}
+
+          {preview && preview.ok && (
+            <div style="margin-top:16px;border-top:1px solid var(--o-stroke,#1a1a1f);padding-top:14px">
+              <p class="muted">{preview.label}</p>
+              <p class="big">{preview.total} {preview.total === 1 ? 'person' : 'people'}</p>
+              {preview.error && <p class="notice" style="margin-top:8px">{preview.error}</p>}
+              {preview.withoutAccount > 0 && (
+                <p class="notice" style="margin-top:8px">
+                  {preview.withoutAccount} of them have no platform account linked to their employee
+                  record. They can be assigned, but their progress can never be read until an account
+                  is linked, so they will show as "not started" indefinitely.
+                </p>
+              )}
+              {preview.sample.length > 0 && (
+                <p class="muted" style="margin-top:8px">
+                  Starting with: {preview.sample.map((s) => s.name).join(', ')}
+                  {preview.total > preview.sample.length ? ' and ' + (preview.total - preview.sample.length) + ' more.' : '.'}
+                </p>
+              )}
+
+              {preview.total > 0 && (
+                <form method="post" style="margin-top:12px">
+                  <input type="hidden" name="action" value="assign_cohort" />
+                  <input type="hidden" name="ckind" value={ckind} />
+                  <input type="hidden" name="cvalue" value={cvalue} />
+                  <input type="hidden" name="expected_count" value={String(preview.total)} />
+                  <label for="gcrs">Course</label>
+                  <select id="gcrs" name="course_id" required>
+                    <option value="">Choose a course</option>
+                    {courses.map((c) => <option value={c.id}>{clip(c.title, 70)}</option>)}
+                  </select>
+                  <div class="row2">
+                    <div>
+                      <label for="gdue">Due by</label>
+                      <input id="gdue" name="due_on" type="date" />
+                    </div>
+                    <div>
+                      <label for="greq">Required</label>
+                      <select id="greq" name="required">
+                        <option value="0">Recommended</option>
+                        <option value="1">Required</option>
+                      </select>
+                    </div>
+                  </div>
+                  <label for="gwhy">Why</label>
+                  <textarea id="gwhy" name="reason" maxlength="1000"></textarea>
+                  <button class="btn" type="submit"
+                    onclick={confirmAttr('Assign this course to ' + preview.total + ' people? Each one is told about it.')}>
+                    Assign to these {preview.total} people
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
+        </div>
+
+        {extendTarget && (
+          <div class="card">
+            <h2>Move a deadline</h2>
+            <p class="muted">
+              {clip(extendTarget.employeeName, 60)} — {clip(extendTarget.courseTitle, 70)}. Currently due
+              {' ' + fmtDay(extendTarget.dueOn)}.
+            </p>
+            <form method="post">
+              <input type="hidden" name="action" value="extend" />
+              <input type="hidden" name="assignment_id" value={extendTarget.assignmentId} />
+              <label for="nd">New date</label>
+              <input id="nd" name="due_on" type="date" required value={extendTarget.dueOn || ''} />
+              <label for="nr">Why it is moving</label>
+              <textarea id="nr" name="reason" maxlength="1000" required
+                placeholder="Recorded against the assignment and told to the learner"></textarea>
+              <div class="inline">
+                <button class="btn" type="submit">Move the deadline</button>
+                <a class="btn ghost slim" style="text-decoration:none;display:inline-block" href={PATH}>Cancel</a>
+              </div>
+            </form>
+          </div>
+        )}
+
+        <div class="card">
+          <h2>Assigned</h2>
+          {assignmentsError && (
+            <p class="flash warn" role="alert">The assignment list could not be read: {assignmentsError}.
+              Nothing below is a complete list.</p>
+          )}
+          <p class="muted">
+            {assignments.length} shown{overdueCount > 0 ? ' · ' + overdueCount + ' overdue' : ''}
+            {unlinkedCount > 0 ? ' · ' + unlinkedCount + ' with no platform account' : ''}
+            {' · '}
+            <a class="lnk" href={PATH + (overdueOnly ? '' : '?overdue=1')}>
+              {overdueOnly ? 'Show everything' : 'Show overdue only'}
+            </a>
+          </p>
+          <p class="muted" style="margin-top:6px">
+            The percentage here is the one stored on the enrolment — the figure the two players
+            overwrite each other with. The reconciled figure, counted across both, is on the person.
+          </p>
+
+          {assignments.length === 0 && !assignmentsError && (
+            <p class="muted" style="margin-top:12px">Nothing assigned in your scope yet.</p>
+          )}
+
+          {assignments.length > 0 && (
+            <div class="tablewrap">
+              <table>
+                <thead>
+                  <tr><th>Person</th><th>Course</th><th>Stored</th><th>Due</th><th>State</th><th></th></tr>
+                </thead>
+                <tbody>
+                  {assignments.map((a) => (
+                    <tr>
+                      <td>
+                        <a class="lnk" href={'/admin/learning/person/' + a.employeeId}>{clip(a.employeeName, 40)}</a>
+                        {!a.userId && <><br /><span class="pill warn">No account</span></>}
+                      </td>
+                      <td>{clip(a.courseTitle, 50)}{a.required ? <><br /><span class="pill">Required</span></> : null}</td>
+                      <td>{a.storedPct === null ? '—' : a.storedPct + '%'}</td>
+                      <td>{fmtDay(a.dueOn)}</td>
+                      <td>
+                        {a.completedAt
+                          ? <span class="pill live">Complete</span>
+                          : a.overdue
+                            ? <span class="pill late">Overdue</span>
+                            : <span class="pill">Assigned</span>}
+                      </td>
+                      <td>
+                        <div class="inline">
+                          <a class="btn ghost slim" style="text-decoration:none;display:inline-block"
+                            href={PATH + '?extend=' + a.assignmentId}>Move date</a>
+                          <form method="post">
+                            <input type="hidden" name="action" value="withdraw" />
+                            <input type="hidden" name="assignment_id" value={a.assignmentId} />
+                            <button class="btn ghost slim" type="submit"
+                              onclick={confirmAttr('Withdraw "' + a.courseTitle + '" from ' + a.employeeName + '? The row is kept so the record still says it was asked for.')}>
+                              Unassign
+                            </button>
+                          </form>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </>
+    )}
+  </div>
+</AdminLayout>

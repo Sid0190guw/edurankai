@@ -206,8 +206,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
           console.error('[api/mail/send] delivery log failed:', reasonOf(le));
         }
       }
-      // mark message as outbound when it left the platform
-      await db.execute(sql`UPDATE mail_messages SET direction = 'outbound' WHERE id = ${result.messageId}`).catch(() => {});
+      // Mark the message as outbound now it has left the platform. Best-effort ON PURPOSE - the
+      // mail has already gone and refusing the response would tell the sender it had not - but not
+      // SILENT: `direction` is what /admin/mail/analytics filters every campaign figure on and what
+      // decides which folder the copy sits in, so a row stuck on the wrong side is a sent message
+      // that no report can see, and `.catch(() => {})` left no line anywhere saying why.
+      await db.execute(sql`UPDATE mail_messages SET direction = 'outbound' WHERE id = ${result.messageId}`)
+        .catch((de: any) => console.error('[api/mail/send] outbound flag not set for ' + result.messageId + ':', reasonOf(de)));
 
       const status: DeliveryStatus = {
         state: send.ok ? 'sent' : (send.provider === 'none' ? 'no_transport' : 'failed'),

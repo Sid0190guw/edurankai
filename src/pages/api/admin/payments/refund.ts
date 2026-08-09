@@ -8,6 +8,7 @@ import { sql } from 'drizzle-orm';
 import { refundPayment } from '@/lib/razorpay';
 import { logAudit } from '@/lib/audit';
 import { denyAdminApi } from '@/lib/auth/api-guard';
+import { ensureOnce } from '@/lib/ensure-once';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
@@ -83,6 +84,42 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
     }, 400);
   }
 
+  // ===============================================================================================
+  // THE COLUMNS ARE ADDED BEFORE THE MONEY MOVES, NOT AFTER IT
+  // ===============================================================================================
+  //
+  // These five ALTERs used to run AFTER the Razorpay call, inside `catch (_) {}`, and the UPDATE that
+  // needs them ran with no error handling at all. So a database that could not provide the refund_*
+  // columns — or a pooler that dropped the connection in that window — produced this sequence: the
+  // money went back to the payer, the UPDATE threw, the route answered HTTP 500, and /admin/finance
+  // told the operator in as many words "Refund failed ... if this keeps failing, use Mark refunded
+  // (manual)". The payments row still said 'paid', so the Refund button was still there, and pressing
+  // it again issues a SECOND REAL REFUND — Razorpay stacks partial refunds up to the captured amount.
+  // Retrying after a failure message is the ordinary thing to do, and it sent the payer more money.
+  //
+  // Running the DDL first means a schema problem is found while nothing has been refunded yet, and it
+  // is behind ensureOnce so it is five round trips once per process rather than five per refund. A
+  // failure here refuses the refund outright: the recording cannot be written, so the refund must not
+  // be issued.
+  try {
+    await ensureOnce('payments.refund_columns', async () => {
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_id VARCHAR(64)`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_amount BIGINT`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_reason TEXT`);
+      await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
+    });
+    // ensureOnce swallows the throw on behalf of its callers, so the columns are probed directly — a
+    // silent no-op there is exactly the state that used to lose a refund record.
+    await db.execute(sql`SELECT refund_id, refund_amount, refunded_at, refund_reason, refunded_by_user_id FROM payments WHERE false`);
+  } catch (e: any) {
+    console.error('[payments/refund] the refund columns are not available, so nothing was refunded -', e?.cause?.message || e?.message);
+    return json({
+      ok: false,
+      error: 'This payment record cannot store a refund right now, so nothing was refunded. Nobody has been charged or credited. Tell an engineer before trying again.',
+    }, 503);
+  }
+
   const result = await refundPayment({
     paymentId: pay.razorpay_payment_id,
     amountPaise: amountPaise && amountPaise > 0 ? amountPaise : undefined,
@@ -90,25 +127,42 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
   });
   if (!result.ok) return json({ ok: false, error: result.error }, 502);
 
+  // ===============================================================================================
+  // BELOW THIS LINE THE MONEY HAS ALREADY GONE BACK, AND NOTHING MAY SAY OTHERWISE
+  // ===============================================================================================
+  //
+  // Everything from here is RECORDING. A failure is serious — the books then disagree with the
+  // gateway — but it is never reported as "the refund failed", because that sentence is what produces
+  // the second refund.
   const refund = result.refund;
+  const refundedPaise = Number(refund?.amount) || paidPaise;
+  const newStatus = refundedPaise < paidPaise ? 'partially_refunded' : 'refunded';
+  let recorded = false;
+  let recordError: string | null = null;
   try {
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_id VARCHAR(64)`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_amount BIGINT`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refund_reason TEXT`);
-    await db.execute(sql`ALTER TABLE payments ADD COLUMN IF NOT EXISTS refunded_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL`);
-  } catch (_) {}
-
-  await db.execute(sql`
-    UPDATE payments
-    SET status = ${refund?.amount && refund.amount < paidPaise ? 'partially_refunded' : 'refunded'},
-        refund_id = ${refund?.id || null},
-        refund_amount = ${refund?.amount || paidPaise},
-        refunded_at = NOW(),
-        refund_reason = ${reason},
-        refunded_by_user_id = ${user.id}
-    WHERE id = ${paymentRowId}
-  `);
+    // The terminal guard is repeated on the statement: a refund recorded by somebody else between the
+    // read at the top of this handler and this write must not be overwritten, because the row holds
+    // ONE refund amount and the later write would hide the earlier one.
+    const written = rows(await db.execute(sql`
+      UPDATE payments
+      SET status = ${newStatus},
+          refund_id = ${refund?.id || null},
+          refund_amount = ${refundedPaise},
+          refunded_at = NOW(),
+          refund_reason = ${reason},
+          refunded_by_user_id = ${user.id}
+      WHERE id = ${paymentRowId}
+        AND status NOT IN ('refunded', 'partially_refunded')
+      RETURNING id
+    `));
+    recorded = written.length > 0;
+    if (!recorded) recordError = 'another refund was recorded against this payment while this one was being issued';
+  } catch (e: any) {
+    recordError = e?.cause?.message || e?.message || 'unknown database error';
+  }
+  if (!recorded) {
+    console.error('[payments/refund] RAZORPAY REFUND', refund?.id, 'OF', refundedPaise, 'PAISE WAS ISSUED AND NOT RECORDED on payment', paymentRowId, '-', recordError);
+  }
 
   try {
     await logAudit({
@@ -116,10 +170,24 @@ export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
       action: 'payment.refund',
       entity: 'payment',
       entityId: paymentRowId,
-      diff: { refundId: refund?.id, amount: refund?.amount, reason, razorpayPaymentId: pay.razorpay_payment_id },
+      diff: { refundId: refund?.id, amount: refundedPaise, reason, razorpayPaymentId: pay.razorpay_payment_id, recorded, recordError },
       ipAddress: clientAddress,
     });
-  } catch (_) {}
+  } catch (e: any) {
+    // Money leaving the company with no trail is the one thing this must not do quietly.
+    console.error('[payments/refund] the audit entry for refund', refund?.id, 'on payment', paymentRowId, 'could not be written -', e?.cause?.message || e?.message);
+  }
 
-  return json({ ok: true, refundId: refund?.id, amount: refund?.amount, status: refund?.status });
+  return json({
+    ok: true,
+    refundId: refund?.id,
+    amount: refundedPaise,
+    status: refund?.status,
+    recorded,
+    // Read by /admin/finance, which shows this instead of the plain success alert.
+    warning: recorded ? undefined
+      : 'The refund WAS issued at the gateway (refund id ' + (refund?.id || 'see the Razorpay dashboard')
+        + ') but this payment record could not be updated. Do NOT refund it again. Record it with '
+        + '"Mark refunded (manual)" once the record is writable.',
+  });
 };

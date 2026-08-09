@@ -15,9 +15,16 @@ if (user.role === 'applicant') return Astro.redirect('/portal');
 const { id } = Astro.params;
 if (!id) return Astro.redirect('/admin/hr/employees');
 
-// Self-bootstrap offboarding columns (idempotent). Runs each load; UPDATE noop
-// after the first time. Lets the Exit tab work without a manual migration.
-try {
+// Self-bootstrap offboarding columns (idempotent). Lets the Exit tab work without a manual
+// migration.
+//
+// BOTH OF THESE RAN ON EVERY PAGE LOAD INSIDE A BARE `catch (_) {}` - two DDL round trips per
+// request on columns that need adding once, and a bootstrap failure nothing could see, on a page
+// whose Exit tab then failed for a reason with no trace anywhere. The department_id ALTER below was
+// already moved behind ensureOnce for exactly that reason and its comment says so; these two were
+// left behind. ensureOnce memoises per process and drops a failed run from its cache so the next
+// request retries, and the reason now reaches the log.
+await ensureOnce('hr_employees_offboarding_v1', async () => {
   await db.execute(sqlExpr`ALTER TABLE hr_employees
     ADD COLUMN IF NOT EXISTS exit_type VARCHAR(40),
     ADD COLUMN IF NOT EXISTS last_working_day DATE,
@@ -25,14 +32,14 @@ try {
     ADD COLUMN IF NOT EXISTS notice_served_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS offboarding_state JSONB DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS relieving_letter_url TEXT`);
-} catch (_) {}
+}).catch((e: any) => console.error('[hr-employee] offboarding columns bootstrap:', e?.cause?.message || e?.message));
 
 // The reporting line. Its own statement, not another clause on the block above: if any one clause
 // of a multi-clause ALTER fails the whole statement is rolled back, and this is the column the
 // approval chain depends on. UUID, holding a USERS id (see the select below).
-try {
+await ensureOnce('hr_employees_reporting_manager_v1', async () => {
   await db.execute(sqlExpr`ALTER TABLE hr_employees ADD COLUMN IF NOT EXISTS reporting_manager_id UUID`);
-} catch (_) {}
+}).catch((e: any) => console.error('[hr-employee] reporting_manager_id bootstrap:', e?.cause?.message || e?.message));
 
 // The org column, and the other half of the same dependency: reporting_manager_id says who approves,
 // department_id says which lists a person appears in at all.
@@ -620,7 +627,11 @@ if (currentManagerId && !managerUserIds.has(currentManagerId)) {
     if (sm?.full_name) {
       staleManagerLabel = sm.full_name + (sm.designation ? ' (' + sm.designation + ')' : '') + ' — no longer active';
     }
-  } catch (_) {}
+  } catch (e: any) {
+    // The label falls back to the generic sentence, which is still true. But a read that failed is
+    // why HR sees an id instead of a name, and that reason has to be somewhere.
+    console.error('[hr-employee] stale manager lookup:', e?.cause?.message || e?.message);
+  }
 }
 
 // Same treatment for the department on file: a stored id that is not on the register is shown as

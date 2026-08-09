@@ -121,10 +121,6 @@ export interface ObjectDataMap {
   ResearchObject: ResearchObjectData;
 }
 
-export function isObjectType(v: unknown): v is ObjectType {
-  return typeof v === 'string' && (OBJECT_TYPES as readonly string[]).includes(v);
-}
-
 // ==========================================================================
 // Block 01 additions — capability actor, edge grammar, sync-state machine.
 // ==========================================================================

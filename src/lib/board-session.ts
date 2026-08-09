@@ -89,7 +89,6 @@ async function ctx() {
   if (!_ready) { for (const ddl of BOARD_DDL) await db.execute(sql.raw(ddl)); _ready = true; }
   return { db, sql };
 }
-export async function ensureBoardTables(): Promise<void> { await ctx(); }
 
 /** Persist a fire as a broadcast event; returns its monotonic seq (also the SSE event id). */
 export async function fireBoardEvent(sessionId: string, ev: { templateId: string; params: any; playState?: string; timelinePos?: number }, actor: string | null): Promise<number> {

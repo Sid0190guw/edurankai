@@ -31,7 +31,12 @@ const fStatus = url.searchParams.get('status') || '';
 let kpi = { cashPaise: 0, creditPaise: 0, cashCount: 0, creditCount: 0, attempts: 0, failed: 0, waivedApps: 0 };
 let byPurpose: any[] = [];
 let recent: any[] = [];
+// J: "no table" and "the query failed" were the same flag, and the sentence it drew said BOTH -
+// "No payments table / no data yet." - on the console that answers how much money came in. A pooler
+// timeout therefore rendered as a calm note about an empty product while six KPI tiles below it
+// printed zero rupees. They are different facts and only one of them is ever true at a time.
 let hasTable = true;
+let readError = '';
 const NOT_CREDIT = sql`COALESCE(order_id,'') NOT LIKE 'CREDIT-%'`;
 const IS_CREDIT = sql`order_id LIKE 'CREDIT-%'`;
 try {
@@ -54,7 +59,12 @@ try {
   try {
     const w = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM applications WHERE fee_waiver_granted = true`))[0] as any;
     kpi.waivedApps = Number(w?.n || 0);
-  } catch (_) {}
+  } catch (e: any) {
+    // A swallowed failure here printed "0 waived" on a finance screen, which is a claim that every
+    // applicant paid.
+    console.error('[admin/finance] waived count', e?.cause?.message || e?.message);
+    readError = 'The waived-application count could not be read, so the waived figure below is not the real one.';
+  }
   byPurpose = rows(await db.execute(sql`
     SELECT purpose, COUNT(*) FILTER (WHERE status='paid' AND ${NOT_CREDIT})::int AS paid_count,
            COALESCE(SUM(amount_paise) FILTER (WHERE status='paid' AND ${NOT_CREDIT}),0)::bigint AS paid_paise,
@@ -65,7 +75,16 @@ try {
     FROM payments
     WHERE (${fPurpose} = '' OR purpose = ${fPurpose}) AND (${fStatus} = '' OR status = ${fStatus})
     ORDER BY created_at DESC LIMIT 100`));
-} catch (e) { hasTable = false; }
+} catch (e: any) {
+  // e.message on a drizzle error is only the failed SQL; the database's reason is on e.cause, and
+  // nothing at all was being logged on the finance console.
+  const real = (e as any)?.cause?.message || (e as any)?.message || 'unknown error';
+  console.error('[admin/finance] payments read failed -', real);
+  // "relation does not exist" is the only shape that genuinely means there is no table. Everything
+  // else is a read that failed, and it must not be reported as an empty product.
+  if (/relation .* does not exist|undefined table/i.test(real)) hasTable = false;
+  else readError = real;
+}
 
 const inr = (paise: number) => '₹' + (Number(paise) / 100).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 const fmt = (d: any) => d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) : '-';
@@ -89,7 +108,12 @@ const paymentsReady = isConfigured();
         Razorpay is <strong>not configured</strong> (no API keys in this environment). New payments cannot be taken until <code>RAZORPAY_KEY_ID</code> and <code>RAZORPAY_KEY_SECRET</code> are added in Vercel. Existing records still show below.
       </div>
     )}
-    {!hasTable && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px;">No payments table / no data yet.</div>}
+    {!hasTable && <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px;">There is no payments table on this database, so no payment has ever been recorded here.</div>}
+    {readError && (
+      <div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.55;">
+        <strong>The payments read failed, so every figure on this page is unreliable.</strong> This is not the same as "no money came in" - do not reconcile or report from this screen until it loads cleanly. Reason: {readError}
+      </div>
+    )}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px;">
       <div style="background:#0f0f14;border:1px solid #1a1a1f;border-radius:12px;padding:14px 16px;">
@@ -195,7 +219,15 @@ const paymentsReady = isConfigured();
               body: JSON.stringify({ paymentRowId: paymentRowId, amountPaise: amountPaise, reason: reason }),
             }).then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); }).then(function (res) {
               var d = res.body || {};
-              if (d.ok) { alert('Refund issued. Razorpay refund id: ' + (d.refundId || '(see dashboard)')); location.reload(); }
+              if (d.ok) {
+                // `warning` is set when the gateway refunded but this row could not be updated. The
+                // plain success alert plus a reload would show the payment still sitting at 'paid'
+                // with a Refund button beside it, which is how the same money goes back twice.
+                alert(d.warning
+                  ? ('Refund issued at the gateway, but NOT recorded here.\n\n' + d.warning)
+                  : ('Refund issued. Razorpay refund id: ' + (d.refundId || '(see dashboard)')));
+                location.reload();
+              }
               else {
                 btn.disabled = false; btn.innerHTML = prev;
                 var msg = 'Refund failed (HTTP ' + res.status + '): ' + (d.error || 'unknown') + '\n\nIf this keeps failing, use "Mark refunded (manual)" — it records the refund in our books without calling Razorpay (use when refund was processed offline or the API window has lapsed).';

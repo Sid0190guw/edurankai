@@ -1,25 +1,29 @@
 // POST /api/aquintutor/lesson-complete
 // Body: { courseId, lessonId }
-// Marks a lesson complete for the signed-in user, awards XP, recomputes the
-// enrollment progress %, and if it hits 100% issues a course certificate.
+//
+// Marks a lesson complete for the signed-in user and awards XP.
+//
+// THE PROGRESS ARITHMETIC IS NO LONGER HERE, and that is the point of this change. This route used
+// to count training_lesson_completions, divide by the lesson count, and write the result into
+// training_enrollments.progress_pct — while /portal/courses/[slug] counted a DIFFERENT table,
+// training_progress, and wrote the SAME column. Two denominators, no reader in common: finish four
+// of five lessons here (80%), then mark one lesson done in the portal player, and the stored figure
+// became 20%. Nothing threw. The employee learning path, which reads that column, then reported the
+// wrong number to a manager.
+//
+// Both players now call recordLessonComplete() in src/lib/learning-progress.ts. It counts every
+// completion table together, writes the percentage once, writes completed_at — which nothing in this
+// repository wrote before, so a finished course stayed "in progress" on the employee surface forever
+// — and issues the certificate through the hash-chained ledger in src/lib/certificates.ts.
+//
+// XP STAYS HERE. It is this surface's concern, it has its own once-only key, and moving it into the
+// shared writer would have given the portal player an XP behaviour nobody asked for.
 import type { APIRoute } from 'astro';
-import { db } from '@/lib/db';
-import { sql } from 'drizzle-orm';
 import { awardXp } from '@/lib/xp';
-import { issueCertificate } from '@/lib/certificates';
+import { recordLessonComplete } from '@/lib/learning-progress';
 
 function json(d: any, s = 200) {
   return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
-}
-function rows(r: any) { return Array.isArray(r) ? r : (r?.rows || []); }
-
-async function ensureSchema() {
-  try { await db.execute(sql`CREATE TABLE IF NOT EXISTS training_lesson_completions (
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    course_id UUID NOT NULL,
-    lesson_id UUID NOT NULL,
-    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, lesson_id))`); } catch (_) {}
 }
 
 export const POST: APIRoute = async ({ request, locals }) => {
@@ -29,61 +33,62 @@ export const POST: APIRoute = async ({ request, locals }) => {
   try { body = await request.json(); } catch { return json({ ok: false, error: 'invalid JSON' }, 400); }
   const courseId = (body.courseId || '').toString();
   const lessonId = (body.lessonId || '').toString();
-  if (!courseId || !lessonId) return json({ ok: false, error: 'courseId + lessonId required' }, 400);
+  if (!lessonId) return json({ ok: false, error: 'lessonId required' }, 400);
 
-  await ensureSchema();
-  // Insert completion idempotently
-  const ins = await db.execute(sql`
-    INSERT INTO training_lesson_completions (user_id, course_id, lesson_id)
-    VALUES (${user.id}, ${courseId}, ${lessonId})
-    ON CONFLICT (user_id, lesson_id) DO NOTHING
-    RETURNING lesson_id
-  `).catch(() => null);
-  const wasNew = Array.isArray(ins) ? ins.length > 0 : ((ins as any)?.rows?.length || 0) > 0;
+  // The single writer. It resolves the course FROM THE LESSON, so a caller that posts an empty
+  // courseId (aquintutor/learn/[lesson].astro does) still files the completion under the right one.
+  const res = await recordLessonComplete({
+    userId: String(user.id),
+    courseId: courseId || null,
+    lessonId,
+    source: 'aquintutor',
+  });
+
+  // A write that failed is reported as a failure. This route used to swallow both the completion
+  // insert and the percentage update and return ok:true regardless, so a learner could be told
+  // "Completed" over work that was never recorded.
+  if (!res.ok) return json({ ok: false, error: res.error || 'That did not save.' }, 500);
 
   let xpDelta = 0;
-  if (wasNew) {
+  if (res.completedNow) {
     xpDelta = 15; // 15 XP per lesson
-    try { await awardXp({ userId: user.id, source: 'lesson_complete', refId: lessonId, delta: xpDelta, reason: 'Lesson completed' }); } catch (_) {}
-  }
-
-  // Recompute progress %
-  const total = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM training_lessons WHERE course_id = ${courseId}`))[0]?.n || 0;
-  const done = rows(await db.execute(sql`SELECT COUNT(*)::int AS n FROM training_lesson_completions WHERE user_id = ${user.id} AND course_id = ${courseId}`))[0]?.n || 0;
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-
-  try {
-    await db.execute(sql`
-      UPDATE training_enrollments SET progress_pct = ${pct}, last_lesson_id = ${lessonId}, last_accessed_at = NOW()
-      WHERE user_id = ${user.id} AND course_id = ${courseId}
-    `);
-  } catch (_) {}
-
-  // Issue certificate at 100%
-  let certificate: any = null;
-  if (pct >= 100) {
     try {
-      const course = rows(await db.execute(sql`SELECT title FROM training_courses WHERE id = ${courseId} LIMIT 1`))[0] as any;
-      const cert = await issueCertificate({
-        userId: user.id,
-        courseId,
-        courseTitle: course?.title || 'EduRankAI course',
-        grade: 'Pass',
-      });
-      certificate = cert;
-      if (cert && !cert.alreadyIssued) {
-        // 100 XP completion bonus on top
-        await awardXp({ userId: user.id, source: 'course_complete', refId: courseId, delta: 100, reason: 'Course completed' }).catch(() => {});
-        try {
-          const { pushNotify } = await import('@/lib/push');
-          const learner = (user as any).name || (user as any).email || 'A learner';
-          const title = course?.title || 'an EduRankAI course';
-          await pushNotify.courseCompleted(learner, title, cert.certNumber);
-          await pushNotify.certificateIssued(user.id, title, cert.certNumber);
-        } catch (_) {}
-      }
-    } catch (_) {}
+      await awardXp({ userId: user.id, source: 'lesson_complete', refId: lessonId, delta: xpDelta, reason: 'Lesson completed' });
+    } catch (e: any) {
+      // The lesson IS recorded; missing XP is not a reason to tell somebody their work did not save.
+      // Logged with the real Postgres reason rather than dropped.
+      console.error('[lesson-complete] awardXp', e?.cause?.message || e?.message);
+      xpDelta = 0;
+    }
   }
 
-  return json({ ok: true, lessonId, completedNow: wasNew, progressPct: pct, xpAwarded: xpDelta, certificate });
+  if (res.courseCompletedNow) {
+    try {
+      await awardXp({ userId: user.id, source: 'course_complete', refId: res.progress?.courseId || courseId, delta: 100, reason: 'Course completed' });
+    } catch (e: any) {
+      console.error('[lesson-complete] awardXp course', e?.cause?.message || e?.message);
+    }
+    try {
+      const { pushNotify } = await import('@/lib/push');
+      const learner = (user as any).name || (user as any).email || 'A learner';
+      const title = res.certificate?.courseTitle || 'a course on EduRankAI';
+      if (res.certificate) {
+        await pushNotify.courseCompleted(learner, title, res.certificate.certNumber);
+        await pushNotify.certificateIssued(user.id, title, res.certificate.certNumber);
+      }
+    } catch (e: any) {
+      console.error('[lesson-complete] notify', e?.cause?.message || e?.message);
+    }
+  }
+
+  return json({
+    ok: true,
+    lessonId,
+    completedNow: res.completedNow,
+    progressPct: res.progress?.pct ?? 0,
+    lessonsCompleted: res.progress?.completedLessons ?? 0,
+    totalLessons: res.progress?.totalLessons ?? 0,
+    xpAwarded: xpDelta,
+    certificate: res.certificate,
+  });
 };

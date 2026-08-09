@@ -23,6 +23,14 @@ const transport = await transportStatus();
 
 const smtpOk = !!cfg.smtpHost && !!cfg.smtpUser && !!cfg.smtpPass;
 // A config that could not be READ is not a config that is missing - see getImapConfig().
+//
+// THE SMTP HALF WAS LEFT BEHIND WHEN THE IMAP HALF WAS REPAIRED. getMailConfig() swallowed its
+// mail_config SELECT, so an unreadable row came back empty and this wizard marked FOUR steps undone
+// at once - "Configure SMTP", "Set sender address", "Set inbound webhook secret", "Verify SMTP" -
+// over a mail system that was working. The instruction it then gives is to fill the form and press
+// Generate secret, which ROTATES the inbound secret the forwarding MTA is already using and takes
+// inbound mail down for real. Unknown is now drawn as unknown.
+const mailUnreadable = !!cfg.readError;
 const imapUnreadable = imap.configRead === false;
 const imapOk = !!imap.host && !!imap.user && !!imap.pass;
 const inboundOk = !!cfg.inboundSecret;
@@ -31,27 +39,42 @@ const fromOk = !!cfg.fromAddress;
 const suggestedCronSecret = cronOk ? '' : randomBytes(24).toString('hex');
 
 // Last test send + last IMAP poll
+// THE OTHER HALF OF THE SAME DISTINCTION THIS FILE ALREADY MAKES. The config reads above were
+// repaired so an unreadable setting shows as UNKNOWN rather than UNDONE; these two were left in
+// `catch (_) {}`. A failed email_logs read leaves lastTestSendAt null, which marks step 3 - "Verify
+// SMTP + send a test email" - as not done over a mail system that has been sending for months, and
+// empties the recent-attempts strip an operator uses to see whether the last send bounced. The
+// instruction this wizard then gives is to send another test, which is harmless, and to distrust a
+// working configuration, which is not.
 let lastTestSendAt: string | null = null;
 let lastImapRun = imap.lastRun;
 let recentLog: any[] = [];
+let logUnreadable = '';
+const logReason = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
 try {
   const r = await db.execute(sql`SELECT MAX(created_at) AS at FROM email_logs WHERE status='sent'`);
   const rs = rows(r);
   lastTestSendAt = rs[0]?.at || null;
-} catch (_) {}
+} catch (e: any) {
+  logUnreadable = logReason(e);
+  console.error('[admin/mail/setup] last-send read failed:', logUnreadable);
+}
 try {
   recentLog = rows(await db.execute(sql`SELECT to_email, status, provider, error, created_at FROM email_logs ORDER BY created_at DESC LIMIT 5`));
-} catch (_) {}
+} catch (e: any) {
+  if (!logUnreadable) logUnreadable = logReason(e);
+  console.error('[admin/mail/setup] recent log read failed:', logReason(e));
+}
 
 const origin = new URL(Astro.request.url).origin;
 const inboundUrl = origin + '/api/mail/inbound';
 
 // Step state — each step is done/pending. Drives the visual progress.
 const steps = [
-  { key: 'smtp',     done: smtpOk,    title: 'Configure SMTP (outbound)',                go: '/admin/mail/settings#smtp' },
-  { key: 'from',     done: fromOk,    title: 'Set sender (From) address',                go: '/admin/mail/settings#smtp' },
-  { key: 'verify',   done: smtpOk && !!lastTestSendAt, title: 'Verify SMTP + send a test email', go: '#verify-section' },
-  { key: 'inbound',  done: inboundOk, title: 'Set inbound webhook secret',               go: '#inbound-section' },
+  { key: 'smtp',     done: smtpOk,    title: mailUnreadable ? 'Configure SMTP (outbound) - the saved settings could NOT be read, so this step is unknown rather than undone' : 'Configure SMTP (outbound)', go: '/admin/mail/settings#smtp' },
+  { key: 'from',     done: fromOk,    title: mailUnreadable ? 'Set sender (From) address - unknown, the saved settings could not be read' : 'Set sender (From) address', go: '/admin/mail/settings#smtp' },
+  { key: 'verify',   done: smtpOk && !!lastTestSendAt, title: logUnreadable ? 'Verify SMTP + send a test email - the send log could NOT be read, so this step is unknown rather than undone' : 'Verify SMTP + send a test email', go: '#verify-section' },
+  { key: 'inbound',  done: inboundOk, title: mailUnreadable ? 'Set inbound webhook secret - unknown, the saved settings could not be read. Do NOT generate a new one until this reads clean' : 'Set inbound webhook secret', go: '#inbound-section' },
   { key: 'cron',     done: cronOk,    title: 'Set CRON_SECRET on Vercel (for IMAP cron)', go: '#cron-section' },
   { key: 'imap',     done: imapOk,    title: imapUnreadable ? 'Configure IMAP (inbound polling) - settings could NOT be read, so this step is unknown rather than undone' : 'Configure IMAP (inbound polling)', go: '/admin/mail/settings#imap' },
   { key: 'dns',      done: false,     title: 'Add SPF / DKIM / DMARC DNS records',       go: '#dns-section' },
@@ -125,6 +148,7 @@ const totalCount = steps.length;
     </div>
     <p id="sendTestMsg" style="font-size:12px;color:var(--o-mid,#9aa6b6);margin:0;min-height:1.2em;"></p>
     {lastTestSendAt && <p style="font-size:11px;color:#6e6e78;margin:6px 0 0;font-family:'Geist Mono',monospace;">Last successful send: {new Date(lastTestSendAt).toLocaleString('en-IN')}</p>}
+    {logUnreadable && <p style="font-size:11.5px;color:#fbbf24;margin:6px 0 0;line-height:1.5;overflow-wrap:anywhere;">The mail send log could not be read ({logUnreadable}), so this step is unknown rather than undone - do not read "not verified" from it.</p>}
   </div>
 
   <!-- ============================================================ -->

@@ -24,6 +24,13 @@ async function geo(ip: string | null): Promise<{ country?: string; region?: stri
   } catch (_) { return {}; }
 }
 
+// A READ RECEIPT THAT NEVER LANDED USED TO LEAVE NO TRACE. Both catches here were bare, so a
+// failing mail_reads insert simply meant the "read" column on /admin/mail/analytics stayed at zero
+// for ever, indistinguishable from mail nobody had opened, with nothing in any log to say otherwise.
+// The catches stay - this is fire-and-forget and must never affect the caller's response - but they
+// now say what happened. e.message is only the failed SQL; the reason is on e.cause.
+const reasonOf = (e: any): string => String(e?.cause?.message || e?.message || 'unknown error');
+
 async function logOpens(ids: string[], userId: string, ip: string | null, ua: string) {
   try {
     await ensureMailSchema();
@@ -39,9 +46,13 @@ async function logOpens(ids: string[], userId: string, ip: string | null, ua: st
                 AND read_at > NOW() - INTERVAL '30 minutes'
             )
         `);
-      } catch (_) {}
+      } catch (e: any) {
+        console.error('[api/mail/open] read receipt not recorded for message', id, '-', reasonOf(e));
+      }
     }
-  } catch (_) {}
+  } catch (e: any) {
+    console.error('[api/mail/open] read receipts abandoned:', reasonOf(e));
+  }
 }
 
 export const POST: APIRoute = async ({ request, locals, clientAddress }) => {
